@@ -15,10 +15,29 @@ import sys
 import sysconfig
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 
-if __package__:
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "scripts"
+
+from scripts.ci_pytest_evidence import (
+    aggregate_pytest_results,
+    ci_context,
+    parse_aggregate_receipt,
+    validate_execution_provenance,
+    validate_shard_receipt,
+)
+from tools.coverage_objectives import SCOPES, require_ci_coverage
+from tools.pytest_result_identity import (
+    CI_CONTEXT_ENV,
+    PytestReceipt,
+    parse_pytest_receipt,
+    source_identity,
+)
+
+if TYPE_CHECKING or __package__:
     from scripts.ci_coverage_config import (
         IDENTITY_GROUPS,
         ROOT,
@@ -29,6 +48,7 @@ if __package__:
         _test_owner,
         deployment_only_source_files,
         load_config,
+        parse_pytest_workers,
         pytest_targets,
         shard_coverage_sources,
         validate_test_partition,
@@ -61,6 +81,7 @@ else:
         _test_owner,
         deployment_only_source_files,
         load_config,
+        parse_pytest_workers,
         pytest_targets,
         shard_coverage_sources,
         validate_test_partition,
@@ -84,7 +105,7 @@ else:
     )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 GATE_NAME = "coverage-shard-gate.json"
 BUNDLE_NAME = "coverage-shard-gate.bundle.json"
 BASE_GATE_NAME = "base-coverage-shard-gate.json"
@@ -101,6 +122,9 @@ FAULT_RUNNER_FILES = {
     "tools/pytest_result_identity.py",
     "tools/run_fault_test_cases.py",
     "tools/run_regional_acceptance.py",
+    "tools/scenario_coverage.py",
+    "tools/scenario_requirements.py",
+    "tools/scenario_test_evidence.py",
 }
 
 
@@ -156,7 +180,10 @@ def _identity_group(
         return "protocol"
     if relative.startswith("tests/"):
         return _test_owner(relative, config, root=root)
-    if relative.startswith("testcases/") or relative in FAULT_RUNNER_FILES:
+    if (
+        relative.startswith(("testcases/", "tools/", "scripts/e2e/regional/"))
+        or relative in FAULT_RUNNER_FILES
+    ):
         return "fault_runner_source"
     if _is_deployment_input(relative, deployment_only):
         return "deployment_source"
@@ -289,9 +316,10 @@ def shard_identity(
     protocol["coverage_sources"] = list(shard_coverage_sources(config, shard))
     protocol["pytest_workers"] = (
         pytest_workers
-        or os.getenv("PYTEST_XDIST_WORKERS")
-        or str(protocol["pytest_workers"])
+        if pytest_workers is not None
+        else os.getenv("PYTEST_XDIST_WORKERS", str(protocol["pytest_workers"]))
     )
+    parse_pytest_workers(protocol["pytest_workers"])
     if shard != "postgres":
         protocol.pop("postgres_stress_rounds")
         protocol.pop("postgres_stress_workers")
@@ -357,10 +385,29 @@ def _load_json(path: Path, message: str) -> dict[str, Any]:
     return value
 
 
-def _verify_pytest_results(path: Path) -> dict[str, Any]:
+def _verify_pytest_results(
+    path: Path,
+    *,
+    root: Path = ROOT,
+    identity: Mapping[str, Any] | None = None,
+    suite: str = "pytest",
+) -> dict[str, Any]:
     value = _load_json(path, "coverage shard pytest evidence is invalid")
-    if value.get("schema_version") != 1 or not isinstance(value.get("records"), dict):
-        raise CoverageGateError("coverage shard pytest evidence is invalid")
+    try:
+        if identity is not None:
+            validate_shard_receipt(value, root=root, identity=identity, suite=suite)
+        else:
+            parse_pytest_receipt(
+                value,
+                root=root,
+                expected_identity=str(value.get("source_identity") or ""),
+                require_session=True,
+                require_passed=True,
+            )
+    except ValueError as exc:
+        raise CoverageGateError(
+            f"coverage shard pytest evidence is invalid: {exc}"
+        ) from exc
     return value
 
 
@@ -383,7 +430,7 @@ def verify_coverage_data(root: Path, shard: str, path: Path) -> tuple[str, ...]:
         measured = tuple(sorted(data.measured_files()))
     except Exception as exc:
         raise CoverageGateError("coverage shard data is invalid") from exc
-    if not measured and shard != "fault_runner":
+    if not measured:
         raise CoverageGateError("coverage shard data contains no measured files")
     if shard != "deployment":
         deployment_only = set(deployment_only_source_files(root))
@@ -396,6 +443,20 @@ def verify_coverage_data(root: Path, shard: str, path: Path) -> tuple[str, ...]:
             raise CoverageGateError(
                 "non-deployment coverage shard measured deploy-host-only source: "
                 + ", ".join(leaked)
+            )
+    if not data.has_arcs():
+        raise CoverageGateError("coverage shard must contain real branch data")
+    sources = shard_coverage_sources(load_config(root), shard)
+    for value in measured:
+        relative = _relative_measured_file(root, value)
+        if (
+            relative is None
+            or not any(relative.startswith(source + "/") for source in sources)
+            or not (root / relative).is_file()
+            or ".." in Path(relative).parts
+        ):
+            raise CoverageGateError(
+                "coverage shard measured source outside its identity"
             )
     return measured
 
@@ -413,7 +474,9 @@ def verify_shard_gate(
     gate = _load_json(gate_path, "coverage shard gate is invalid")
     identity = gate.get("identity")
     shard = str(gate.get("shard") or "")
-    identity_sha = str((identity or {}).get("sha256") or "")
+    identity_sha = (
+        str(identity.get("sha256") or "") if isinstance(identity, dict) else ""
+    )
     if (
         gate.get("schema_version") != SCHEMA_VERSION
         or gate.get("domain") != "coverage-shard"
@@ -458,14 +521,32 @@ def verify_shard_gate(
     if verify_coverage_payload:
         verify_coverage_data(source_root, shard, coverage_path)
     pytest_path = artifact_root / str(verified["pytest_results"]["path"])
-    _verify_pytest_results(pytest_path)
+    pytest_value = _verify_pytest_results(
+        pytest_path, root=source_root, identity=identity
+    )
+    try:
+        validate_execution_provenance(
+            gate.get("execution"), original_identity=pytest_value["source_identity"]
+        )
+    except ValueError as exc:
+        raise CoverageGateError(str(exc)) from exc
     durations_path = artifact_root / str(verified["durations"]["path"])
     durations = _load_json(durations_path, "coverage duration evidence is invalid")
     if durations.get("schema_version") != 1 or durations.get("shard") != shard:
         raise CoverageGateError("coverage duration evidence is invalid")
     if shard == "postgres":
         stress_path = artifact_root / str(verified["postgres_stress_results"]["path"])
-        _verify_pytest_results(stress_path)
+        stress_value = _verify_pytest_results(
+            stress_path, root=source_root, identity=identity, suite="postgres_stress"
+        )
+        if (
+            stress_value["source_identity"] != pytest_value["source_identity"]
+            or stress_value["session"]["discovered_nodeids"]
+            != pytest_value["session"]["discovered_nodeids"]
+        ):
+            raise CoverageGateError(
+                "PostgreSQL stress does not cover the original suite"
+            )
     reused_from = gate.get("reused_from")
     if reused_from is not None and (
         not isinstance(reused_from, dict)
@@ -475,6 +556,10 @@ def verify_shard_gate(
         or not str(reused_from.get("producer_run_id") or "").isdecimal()
     ):
         raise CoverageGateError("reused coverage shard provenance is invalid")
+    if reused_from is None and gate["execution"]["producer"] != producer:
+        raise CoverageGateError("fresh coverage shard original producer does not match")
+    if reused_from is not None and reused_from["identity_sha256"] != identity_sha:
+        raise CoverageGateError("reused coverage shard content identity does not match")
     return gate
 
 
@@ -594,7 +679,7 @@ def build_shard_gate(
 ) -> dict[str, Any]:
     shard = str(identity["shard"])
     verify_coverage_data(root, shard, coverage_data)
-    _verify_pytest_results(pytest_results)
+    pytest_value = _verify_pytest_results(pytest_results, root=root, identity=identity)
     duration_value = _load_json(durations, "coverage duration evidence is invalid")
     if (
         duration_value.get("schema_version") != 1
@@ -604,7 +689,17 @@ def build_shard_gate(
     if shard == "postgres":
         if stress_results is None:
             raise CoverageGateError("PostgreSQL stress evidence is required")
-        _verify_pytest_results(stress_results)
+        stress_value = _verify_pytest_results(
+            stress_results, root=root, identity=identity, suite="postgres_stress"
+        )
+        if (
+            stress_value["source_identity"] != pytest_value["source_identity"]
+            or stress_value["session"]["discovered_nodeids"]
+            != pytest_value["session"]["discovered_nodeids"]
+        ):
+            raise CoverageGateError(
+                "PostgreSQL stress does not cover the original suite"
+            )
     elif stress_results is not None:
         raise CoverageGateError("only PostgreSQL shard accepts stress evidence")
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -633,6 +728,18 @@ def build_shard_gate(
     ):
         raise CoverageGateError("coverage shard gate must be built by the CI workflow")
     trusted = workflow_ref == expected_workflow
+    producer = {
+        "git_commit": git(root, "rev-parse", "HEAD"),
+        "git_tree": git(root, "rev-parse", "HEAD^{tree}"),
+        "repository": repository,
+        "run_id": run_id,
+        "trusted": trusted,
+        "workflow_ref": workflow_ref,
+    }
+    execution = {
+        "producer": producer,
+        "source_identity": pytest_value["source_identity"],
+    }
     reused_from = None
     base_gate_path = artifact_root / BASE_GATE_NAME
     if base_gate_path.is_file():
@@ -650,6 +757,9 @@ def build_shard_gate(
             "producer_git_commit": base_gate["producer"]["git_commit"],
             "producer_run_id": base_gate["producer"]["run_id"],
         }
+        execution = base_gate["execution"]
+    elif pytest_value["source_identity"] != source_identity(root):
+        raise CoverageGateError("fresh pytest evidence does not match current source")
     gate: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "domain": "coverage-shard",
@@ -657,14 +767,8 @@ def build_shard_gate(
         "artifact_name": artifact_name(shard, str(identity["sha256"])),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "identity": identity,
-        "producer": {
-            "git_commit": git(root, "rev-parse", "HEAD"),
-            "git_tree": git(root, "rev-parse", "HEAD^{tree}"),
-            "repository": repository,
-            "run_id": run_id,
-            "trusted": trusted,
-            "workflow_ref": workflow_ref,
-        },
+        "producer": producer,
+        "execution": execution,
         "quality_gates": _quality_gates(shard),
         "evidence": {
             name: evidence_entry(artifact_root, path)
@@ -725,9 +829,9 @@ def _run(command: list[str], *, root: Path, environment: Mapping[str, str]) -> f
     return elapsed
 
 
-def _duration_records(path: Path) -> list[dict[str, object]]:
+def _duration_records(path: Path) -> list[dict[str, Any]]:
     value = _verify_pytest_results(path)
-    records = []
+    records: list[dict[str, Any]] = []
     for nodeid, raw in value["records"].items():
         if not isinstance(raw, dict):
             raise CoverageGateError("pytest duration record is invalid")
@@ -790,12 +894,18 @@ def run_shard(
     distribution: str,
     durations: int,
     include_stress: bool,
+    postgres_image: str = "",
 ) -> None:
     validate_test_partition(root)
     if shard == "postgres" and not os.getenv("GPU_FAULT_TEST_POSTGRES_URL", ""):
         raise CoverageGateError("GPU_FAULT_TEST_POSTGRES_URL is required")
     if include_stress and shard != "postgres":
         raise CoverageGateError("only PostgreSQL shard supports stress")
+    if shard == "postgres" and (not include_stress or not postgres_image):
+        raise CoverageGateError("PostgreSQL shard requires stress and image identity")
+    identity = shard_identity(
+        root, shard, postgres_image=postgres_image, pytest_workers=workers
+    )
     artifact_root = _clean_directory(root, artifact_root, "coverage artifact root")
     coverage_config = artifact_root / "coverage.ini"
     coverage_data = artifact_root / COVERAGE_DATA_NAME
@@ -806,6 +916,13 @@ def run_shard(
     environment = dict(os.environ)
     environment["COVERAGE_FILE"] = str(coverage_data)
     environment["PYTEST_GPU_FAULT_CASE_REPORT"] = str(pytest_results)
+    environment[CI_CONTEXT_ENV] = json.dumps(ci_context(identity, "pytest"))
+    environment.pop("PYTEST_ADDOPTS", None)
+    for name in (
+        "GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS",
+        "GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS",
+    ):
+        environment.pop(name, None)
     if shard != "postgres":
         environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
     if shard in RUNTIME_SHARDS:
@@ -826,10 +943,14 @@ def run_shard(
     ]
     if shard != "postgres":
         command.extend(["-n", workers, f"--dist={distribution}"])
+    else:
+        command.extend(["-n", "0"])
     command.extend(
         [
             "-p",
             "tools.pytest_case_reporter",
+            "-o",
+            "addopts=",
             *(f"--cov={source}" for source in shard_coverage_sources(config, shard)),
             "--cov-branch",
             f"--cov-config={coverage_config}",
@@ -843,9 +964,13 @@ def run_shard(
     if include_stress:
         stress_results = artifact_root / STRESS_RESULTS_NAME
         stress_environment = dict(os.environ)
+        stress_environment.pop("PYTEST_ADDOPTS", None)
         stress_environment.pop("PYTEST_GPU_FAULT_PARTITION_COUNT", None)
         stress_environment.pop("PYTEST_GPU_FAULT_PARTITION_INDEX", None)
         stress_environment["PYTEST_GPU_FAULT_CASE_REPORT"] = str(stress_results)
+        stress_environment[CI_CONTEXT_ENV] = json.dumps(
+            ci_context(identity, "postgres_stress")
+        )
         stress_environment["GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS"] = str(
             config["protocol"]["postgres_stress_workers"]
         )
@@ -857,8 +982,12 @@ def run_shard(
             "-m",
             "pytest",
             *pytest_targets(root, "postgres"),
+            "-n",
+            "0",
             "-p",
             "tools.pytest_case_reporter",
+            "-o",
+            "addopts=",
             f"--durations={durations}",
         ]
         stress_wall = _run(
@@ -866,6 +995,14 @@ def run_shard(
             root=root,
             environment=stress_environment,
         )
+        _verify_pytest_results(
+            stress_results, root=root, identity=identity, suite="postgres_stress"
+        )
+    if identity != shard_identity(
+        root, shard, postgres_image=postgres_image, pytest_workers=workers
+    ):
+        raise CoverageGateError("coverage shard content changed during pytest")
+    _verify_pytest_results(pytest_results, root=root, identity=identity)
     verify_coverage_data(root, shard, coverage_data)
     write_durations(
         shard=shard,
@@ -916,14 +1053,7 @@ def verify_current_shards(
     )
     for shard, (path, gate) in gates.items():
         identity = gate["identity"]
-        current = shard_identity(
-            root,
-            shard,
-            postgres_image=str(identity["environment"].get("postgres_image") or ""),
-            distributions=identity["installed_distributions"],
-            environment_identity=identity["environment"],
-            pytest_workers=str(identity["protocol"]["pytest_workers"]),
-        )
+        current = current_shard_identity(root, shard, identity)
         verify_shard_gate(
             path,
             path.parent,
@@ -941,38 +1071,42 @@ def verify_current_shards(
     return gates
 
 
+def current_shard_identity(
+    root: Path, shard: str, previous: Mapping[str, Any]
+) -> dict[str, Any]:
+    return shard_identity(
+        root,
+        shard,
+        distributions=previous["installed_distributions"],
+        environment_identity=previous["environment"],
+        pytest_workers=str(previous["protocol"]["pytest_workers"]),
+    )
+
+
+def parse_combined_pytest_receipt(
+    value: Mapping[str, Any], root: Path, expected_identity: str
+) -> PytestReceipt:
+    return parse_aggregate_receipt(
+        value,
+        root=root,
+        expected_identity=expected_identity,
+        resolve_identity=current_shard_identity,
+    )
+
+
 def _merge_pytest_results(
     root: Path,
     gates: Mapping[str, tuple[Path, dict[str, Any]]],
     output: Path,
 ) -> None:
-    merged: dict[str, dict[str, Any]] = {}
-    for shard, (gate_path, gate) in sorted(gates.items()):
-        evidence = gate["evidence"]["pytest_results"]
-        path = gate_path.parent / str(evidence["path"])
-        value = _verify_pytest_results(path)
-        for nodeid, raw in value["records"].items():
-            if nodeid in merged and merged[nodeid] != raw:
-                raise CoverageGateError(
-                    f"pytest result differs across shards: {nodeid}"
-                )
-            merged[str(nodeid)] = raw
-    if __package__:
-        from tools.pytest_result_identity import source_identity
-    else:
-        sys.path.insert(0, str(root))
-        from tools.pytest_result_identity import source_identity
-    output.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source_identity": source_identity(root),
-                "records": dict(sorted(merged.items())),
-            },
-            indent=2,
-            sort_keys=True,
+    try:
+        value = aggregate_pytest_results(
+            root, gates, resolve_identity=current_shard_identity
         )
-        + "\n",
+    except ValueError as exc:
+        raise CoverageGateError(str(exc)) from exc
+    output.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -982,7 +1116,7 @@ def _aggregate_durations(
     output: Path,
 ) -> dict[str, Any]:
     shards: dict[str, Any] = {}
-    slowest: list[dict[str, object]] = []
+    slowest: list[dict[str, Any]] = []
     for shard, (gate_path, gate) in sorted(gates.items()):
         evidence = gate["evidence"]["durations"]
         value = _load_json(
@@ -1098,6 +1232,7 @@ def combine_shards(
             "coverage",
             "report",
             f"--rcfile={final_config}",
+            "--include=" + ",".join(source + "/*" for source in SCOPES["production"]),
             f"--fail-under={config['coverage']['floor']}",
         ],
         root=root,
@@ -1119,14 +1254,7 @@ def combine_shards(
     # Checked on the combined report rather than per shard: the administrator
     # modules are omitted from every runtime shard, so only the merged data
     # knows what they actually cover.
-    violations = module_floor_violations(
-        output_root / "coverage.json",
-        config=config,
-    )
-    if violations:
-        raise CoverageGateError(
-            "coverage module floors failed:\n- " + "\n- ".join(violations)
-        )
+    require_ci_coverage(output_root / "coverage.json", config=config, root=root)
     _merge_pytest_results(
         root,
         gates,
@@ -1169,6 +1297,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     run.add_argument("--dist", default=os.getenv("PYTEST_XDIST_DIST", "worksteal"))
     run.add_argument("--durations", type=int, default=50)
     run.add_argument("--include-stress", action="store_true")
+    run.add_argument("--postgres-container")
+    run.add_argument("--postgres-image")
     combine = commands.add_parser("combine")
     combine.add_argument("--python", default=sys.executable)
     combine.add_argument("--shards-root", type=Path, required=True)
@@ -1176,6 +1306,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     combine.add_argument("--require-run-id")
     module_floors = commands.add_parser("module-floors")
     module_floors.add_argument("--coverage-json", type=Path, required=True)
+    floors = commands.add_parser("floors")
+    floors.add_argument("--coverage-json", type=Path, required=True)
     for name in ("identity", "restore", "build", "verify"):
         command = commands.add_parser(name)
         command.add_argument("--shard", choices=SHARDS, required=True)
@@ -1220,6 +1352,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 distribution=options.dist,
                 durations=options.durations,
                 include_stress=options.include_stress,
+                postgres_image=(
+                    postgres_image_identity(
+                        container=options.postgres_container,
+                        image=options.postgres_image,
+                    )
+                    if options.shard == "postgres"
+                    else ""
+                ),
             )
         elif options.command == "combine":
             combine_shards(
@@ -1229,12 +1369,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 python=options.python,
                 require_run_id=options.require_run_id,
             )
+        elif options.command == "floors":
+            require_ci_coverage(
+                options.coverage_json.resolve(), config=load_config(ROOT), root=ROOT
+            )
+            print("production and runner coverage floors passed")
         elif options.command == "module-floors":
             # The same check ``combine`` runs, exposed so ``make coverage`` fails
             # on a local run instead of leaving it to CI.
             violations = module_floor_violations(
                 options.coverage_json.resolve(),
                 config=load_config(ROOT),
+                root=ROOT,
             )
             if violations:
                 raise CoverageGateError(

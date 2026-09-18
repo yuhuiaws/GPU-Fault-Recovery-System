@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.e2e.regional import seeded_command_fixture as seeded  # noqa: E402
+from scripts.e2e.regional import seeded_command_fixture  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -47,12 +47,14 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python,
     predecessor_evidence,
 )
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
     STORE_DSN_SNIPPET,
 )
 
+seeded = seeded_command_fixture
 NetCommandProbe = seeded.SeededCommandProbe
 NetCommandError = seeded.SeededCommandError
 SYNTHETIC_CLUSTER_ID = seeded.SYNTHETIC_CLUSTER_ID
@@ -119,9 +121,8 @@ def reset_cpu_pod_cache() -> None:
 def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
     """Run ``script`` inside the cached CPU API Pod and return its last JSON line.
 
-    A failed exec drops the cache and retries once against a fresh lookup, so
-    a Pod that was replaced mid-case (a rollout, an eviction) costs one retry
-    instead of failing every later store read.
+    A failed exec drops the cache but never replays the script: it may have
+    committed a mutation before the acknowledgement was lost.
     """
 
     def attempt(pod: str) -> dict[str, Any]:
@@ -130,7 +131,7 @@ def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
             "-i",
             pod,
             "--",
-            "python3",
+            component_python("cpu"),
             "-",
             *arguments,
             stdin=script.encode(),
@@ -147,7 +148,8 @@ def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
     try:
         return attempt(cpu_pod())
     except RuntimeError:
-        return attempt(cpu_pod(refresh=True))
+        reset_cpu_pod_cache()
+        raise
 
 
 def run_identity(run_dir: Path, attempt: int, prefix: str) -> str:
@@ -181,7 +183,7 @@ prefix = sys.argv[1]
 like = "%" + prefix + "%"
 queries = {
     "objects": (
-        "SELECT count(*) FROM gpu_fault_objects "
+        "SELECT count(*) FROM gpu_fault_control_records "
         "WHERE key LIKE %s OR payload->>'cluster_id' LIKE 'perf-cap-%%'"
     ),
     "links": (
@@ -329,7 +331,7 @@ def predecessor_gate(
 
 
 def require_predecessor(predecessor: dict[str, Any]) -> None:
-    if not predecessor.get("valid", False):
+    if predecessor.get("valid") is not True:
         raise NetCommandError("formal predecessor evidence is not PASS")
 
 
@@ -344,6 +346,7 @@ def cleanup(
     seed: dict[str, Any],
     *,
     purge: Callable[[dict[str, Any]], dict[str, Any]] = purge_seed,
+    state: dict[str, Any],
 ) -> None:
     """Undo everything the case created; any failure downgrades to FAIL.
 
@@ -352,48 +355,16 @@ def cleanup(
     module's nine-table one.
     """
 
-    if seed:
-        try:
-            seed_cleanup = purge(seed)
-            result["seed_cleanup"] = seed_cleanup
-            write_json(case_dir / "seed-cleanup.json", seed_cleanup)
-        except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
-            result["cleanup_error"] = f"seed cleanup: {type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-    dataplane("delete", "pod", probe.pod, "--ignore-not-found", check=False)
-    dataplane("delete", "configmap", probe.configmap, "--ignore-not-found", check=False)
-    try:
-        seeded.teardown(
-            purge=True,
-            deregister_clusters=True,
-            allow_live_registry=True,
-            live_registry_confirmation=seeded.LIVE_REGISTRY_CONFIRMATION,
-            artifacts=case_dir,
-            run_id=run_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
-        result["cleanup_error"] = f"registry cleanup: {type(exc).__name__}: {exc}"
-        result["verdict"] = "FAIL"
-    try:
-        postflight = {
-            "database": database_residuals(probe.run_prefix),
-            "registry": registry_residuals(),
-            "kubernetes": kubernetes_residuals(probe),
-        }
-        names = {
-            "database": "database-postflight.json",
-            "registry": "registry-verification-postflight.json",
-            "kubernetes": "kubernetes-postflight.json",
-        }
-        for name, value in postflight.items():
-            result[f"{name}_postflight"] = value
-            write_json(case_dir / names[name], value)
-            key = "total" if name == "database" else "count"
-            if value.get(key) != 0:
-                raise NetCommandError(f"{name} postflight found residuals: {value}")
-    except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
-        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-        result["verdict"] = "FAIL"
+    seeded.cleanup(
+        probe,
+        case_dir,
+        run_id,
+        result,
+        seed,
+        state=state,
+        purge=purge,
+        database_probe=database_residuals,
+    )
 
 
 def run_main(
@@ -418,6 +389,8 @@ def run_main(
     predecessor = predecessor_gate(args.run_dir, case_id, args.predecessor_evidence)
     if not args.execute:
         plan = build_plan(
+            arguments=args,
+            preflight_passed=predecessor.get("valid") is True,
             run_dir=args.run_dir,
             case_id=case_id,
             attempt=args.attempt,
@@ -425,7 +398,7 @@ def run_main(
             details=plan_details(predecessor),
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if predecessor.get("valid") is True else 1
     deadline = authorize_execution(args, case_id=case_id, confirmation=confirmation)
     return run_case(
         args.run_dir,

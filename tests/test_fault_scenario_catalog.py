@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from gpu_fault.policy import load_xid_policy
+from tests._script_loader import load_script_module
 from tools import pytest_case_reporter
 from tools import run_fault_test_cases as runner
 from tools.pytest_result_identity import source_identity
@@ -27,9 +28,23 @@ from tools.run_fault_test_cases import (
     run_pytest_batch,
     select_cases,
 )
+from tools.scenario_requirements import load_requirements, required_registry_keys
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "testcases" / "fault-scenarios.yaml"
+
+
+def test_every_operation_and_channel_has_an_independent_requirement() -> None:
+    catalog = {case["id"]: case for case in load_catalog(CATALOG)}
+    requirements = load_requirements(
+        ROOT / "testcases/scenario-requirements.yaml", root=ROOT, catalog=catalog
+    )
+    keys = {key for requirement in requirements for key in requirement.covers}
+    assert required_registry_keys() <= keys, (
+        "new registered capabilities require scenario review"
+    )
+
+
 REGIONAL_DOCUMENT = ROOT / "docs" / "区域模式端到端验收测试用例.md"
 FAULT_MANUAL = ROOT / "docs" / "故障模拟测试手册.md"
 REGIONAL_CASE_HEADING = re.compile(
@@ -232,6 +247,11 @@ def test_isolated_environment_does_not_inherit_credentials() -> None:
         "PYTHONPATH": "src",
         "GPU_FAULT_STORE_URL": "",
         "GPU_FAULT_TEST_POSTGRES_URL": "",
+        "AWS_CONFIG_FILE": os.devnull,
+        "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+        "BOTO_CONFIG": os.devnull,
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "KUBECONFIG": os.devnull,
     }
 
 
@@ -570,9 +590,16 @@ def test_pytest_batch_preserves_per_case_results() -> None:
     assert results["GF-BATCH-PARAM"]["status"] == "PASS", results
 
 
-def test_pytest_case_reporter_records_failure() -> None:
-    pytest_case_reporter.pytest_configure(object())
-    pytest_case_reporter.pytest_runtest_logreport(
+@pytest.fixture
+def isolated_case_reporter(monkeypatch: pytest.MonkeyPatch):
+    reporter = load_script_module(ROOT / "tools/pytest_case_reporter.py")
+    monkeypatch.delenv(reporter.REPORT_ENV, raising=False)
+    return reporter
+
+
+def test_pytest_case_reporter_records_failure(isolated_case_reporter) -> None:
+    isolated_case_reporter.pytest_configure(object())
+    isolated_case_reporter.pytest_runtest_logreport(
         SimpleNamespace(
             nodeid="tests/example.py::test_failure",
             duration=0.25,
@@ -585,7 +612,7 @@ def test_pytest_case_reporter_records_failure() -> None:
         )
     )
 
-    record = pytest_case_reporter.REPORTS["tests/example.py::test_failure"]
+    record = isolated_case_reporter.REPORTS["tests/example.py::test_failure"]
 
     assert record["status"] == "FAIL"
     assert record["duration_seconds"] == 0.25
@@ -599,9 +626,9 @@ def test_pytest_report_control_does_not_use_runtime_environment_namespace() -> N
     assert runner.PYTEST_BATCH_REPORT_ENV == pytest_case_reporter.REPORT_ENV
 
 
-def test_pytest_case_reporter_fails_closed_on_skip() -> None:
-    pytest_case_reporter.pytest_configure(object())
-    pytest_case_reporter.pytest_runtest_logreport(
+def test_pytest_case_reporter_fails_closed_on_skip(isolated_case_reporter) -> None:
+    isolated_case_reporter.pytest_configure(object())
+    isolated_case_reporter.pytest_runtest_logreport(
         SimpleNamespace(
             nodeid="tests/example.py::test_skipped",
             duration=0.01,
@@ -615,7 +642,7 @@ def test_pytest_case_reporter_fails_closed_on_skip() -> None:
         )
     )
 
-    record = pytest_case_reporter.REPORTS["tests/example.py::test_skipped"]
+    record = isolated_case_reporter.REPORTS["tests/example.py::test_skipped"]
 
     assert record["status"] == "FAIL"
     assert record["output"] == ["requires unavailable dependency"]
@@ -625,6 +652,12 @@ def test_pytest_case_reporter_merges_xdist_workers(tmp_path: Path) -> None:
     report = tmp_path / "pytest-results.json"
     environment = build_isolated_environment()
     environment[runner.PYTEST_BATCH_REPORT_ENV] = str(report)
+    nodeids = [
+        "tests/test_builders.py::test_shared_builders_preserve_control_plane_defaults",
+        "tests/test_builders.py::test_execute_workflow_builds_the_fencing_request",
+        "tests/test_fault_scenario_catalog.py::test_pytest_case_reporter_records_failure",
+        "tests/test_fault_scenario_catalog.py::test_pytest_case_reporter_fails_closed_on_skip",
+    ]
 
     completed = subprocess.run(
         [
@@ -636,21 +669,37 @@ def test_pytest_case_reporter_merges_xdist_workers(tmp_path: Path) -> None:
             "2",
             "-p",
             "tools.pytest_case_reporter",
-            "tests/test_builders.py::test_shared_builders_preserve_control_plane_defaults",
-            "tests/test_builders.py::test_execute_workflow_builds_the_fencing_request",
+            *nodeids,
         ],
         cwd=ROOT,
         env=environment,
         text=True,
         capture_output=True,
         check=False,
+        timeout=60,
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     value = json.loads(report.read_text(encoding="utf-8"))
     assert value["schema_version"] == 1
     assert value["source_identity"] == source_identity(ROOT)
-    assert len(value["records"]) == 2
+    assert set(value["records"]) == set(nodeids), (
+        "reporter self-tests must not add synthetic results to the live report"
+    )
+    assert set(value["session"]["collected_nodeids"]) == set(nodeids), (
+        "reporter self-tests must not clear the live collection"
+    )
+    assert set(nodeids) <= set(value["session"]["discovered_nodeids"]), (
+        "discovery may include unselected module siblings but must retain every selected test"
+    )
+    assert value["session"]["collection_errors"] == []
+    assert value["session"]["collection_skips"] == []
+    assert all(
+        record["status"] == "PASS"
+        and record["phases"]
+        == {"setup": "passed", "call": "passed", "teardown": "passed"}
+        for record in value["records"].values()
+    ), "the outer session must retain complete real test results"
 
 
 def test_fault_runner_reuses_pytest_results(
@@ -836,7 +885,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 190
+    assert len(regional) == 197
     assert all((case.get("evidence") or {}).get("verdict") for case in regional), (
         "every regional case must record a verdict"
     )
@@ -1198,36 +1247,16 @@ def test_cap005_uses_the_postgres_stress_runner_consistently() -> None:
     )
 
     runner_path = ROOT / command[1]
-    runner_text = runner_path.read_text(encoding="utf-8")
-    tree = ast.parse(runner_text)
-    # The stress shard must run under the venv interpreter (sys.executable), never
-    # the system python3 that lacks pytest-xdist; the CAP-005 fix (commit 73e12d6)
-    # made the make PYTHON argument an f-string, so match the list structurally
-    # rather than as all-constants.
-    make_lists = [
-        node.elts
-        for node in ast.walk(tree)
-        if isinstance(node, ast.List)
-        and len(node.elts) == 3
-        and isinstance(node.elts[0], ast.Constant)
-        and node.elts[0].value == "make"
-        and isinstance(node.elts[1], ast.Constant)
-        and node.elts[1].value == "test-postgres-stress"
-    ]
-    assert make_lists, "CAP-005 runner must invoke make test-postgres-stress"
-    python_arg = make_lists[0][2]
-    assert isinstance(python_arg, ast.JoinedStr), (
-        'CAP-005 must pass PYTHON=<venv interpreter>, e.g. f"PYTHON={sys.executable}"'
-    )
-    unparsed = ast.unparse(python_arg)
-    assert "PYTHON=" in unparsed and "sys.executable" in unparsed
-    assert '"PYTHON=python3"' not in runner_text
-    assert "GPU_FAULT_CAP005_WORKDIR" in runner_text
-    assert '"/work"' not in runner_text
+    assert runner_path.is_file(), "CAP-005's declared runner must exist"
+    # Command routing and serial execution are exercised through run_suite in
+    # test_cap005_safety, including the active interpreter's dynamic path.
 
     body = _regional_case_bodies()["GF-REGIONAL-CAP-005"]
     assert command[1] in body
     assert "make test-postgres-stress" in body
+    assert "sys.executable" in body, (
+        "CAP-005 must document using the active project interpreter for both suites"
+    )
     assert "`2` 与 `4`" in body
 
 

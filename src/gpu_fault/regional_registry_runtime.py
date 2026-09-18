@@ -4,14 +4,15 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from threading import Event, RLock
+from threading import Event, Lock, RLock
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
-from gpu_fault.channel_registry import COLLECTOR_EVENT_PREFIX
+from gpu_fault.channel_registry import channel_for_path
 from gpu_fault.regional import (
     RegionalClusterLifecycle,
     RegionalClusterRegistration,
+    RegionalRegistryHead,
     RegionalRegistryMember,
     RegionalRegistryRevision,
 )
@@ -25,6 +26,14 @@ LOGGER = logging.getLogger(__name__)
 # only needs Aurora again when it comes back.
 STARTUP_RETRY_INITIAL_SECONDS = 0.5
 STARTUP_RETRY_MAX_INTERVAL_SECONDS = 10.0
+
+
+def _read_registry_head(store: Any) -> RegionalRegistryHead:
+    try:
+        return cast(RegionalRegistryHead, store.get_regional_registry_head())
+    except ValueError:
+        # Extra model fields can carry credentials, including during bootstrap.
+        raise ValueError("regional registry head validation failed") from None
 
 
 @dataclass(frozen=True)
@@ -66,11 +75,15 @@ class RegionalRegistryRuntime:
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.started_at = self.now()
         self._lock = RLock()
+        self._heartbeat_lock = Lock()
+        self._refresh_sequence = 0
+        self._applied_refresh_sequence = 0
         self._snapshot: RegionalRegistrySnapshot | None = None
         self._target_generation = 0
         self._target_content_sha256 = "0" * 64
         self._last_successful_refresh: datetime | None = None
         self._last_error: str | None = "regional registry has not loaded"
+        self._snapshot_integrity_failed = False
         # Digest of the GPU_FAULT_REGIONAL_CLUSTERS_JSON Secret this process was
         # started with; None when the caller did not supply one.
         self.secret_config_sha256: str | None = None
@@ -125,7 +138,7 @@ class RegionalRegistryRuntime:
                 runtime._log_secret_drift()
                 return runtime
             except ValueError:
-                # Configuration errors (poll/stale) are not store outages.
+                # Configuration and stored-data validation are not transient I/O.
                 raise
             except Exception as exc:
                 remaining = (deadline - observed()).total_seconds()
@@ -158,7 +171,7 @@ class RegionalRegistryRuntime:
     ) -> RegionalRegistryRuntime:
         observed = now
         try:
-            store.get_regional_registry_head()
+            _read_registry_head(store)
         except NotFoundError:
             registrations = store.list_regional_clusters()
             revision = RegionalRegistryRevision.build(
@@ -176,7 +189,7 @@ class RegionalRegistryRuntime:
                 )
             except ValueError:
                 # Another process may have won the generation-1 bootstrap.
-                store.get_regional_registry_head()
+                _read_registry_head(store)
         runtime = cls(
             store,
             member_id=member_id,
@@ -200,6 +213,7 @@ class RegionalRegistryRuntime:
 
     def is_ready(self, observed_at: datetime | None = None) -> bool:
         observed = observed_at or self.now()
+        threshold = observed - timedelta(seconds=self.stale_seconds)
         with self._lock:
             # ``_last_error`` is no longer a criterion (A-7): one closed
             # connection (~1/min baseline) failed readiness for the whole
@@ -209,11 +223,15 @@ class RegionalRegistryRuntime:
             # target to it, and the comparison below fails at once.
             return (
                 self._snapshot is not None
+                and not self._snapshot_integrity_failed
                 and self._snapshot.generation == self._target_generation
                 and self._snapshot.content_sha256 == self._target_content_sha256
                 and self._last_successful_refresh is not None
-                and observed - self._last_successful_refresh
-                <= timedelta(seconds=self.stale_seconds)
+                and threshold <= self._last_successful_refresh <= observed
+                # Convergence may retire a stale row, so reads alone cannot
+                # extend traffic readiness beyond the durable heartbeat.
+                and self._last_heartbeat_at is not None
+                and threshold <= self._last_heartbeat_at <= observed
             )
 
     def durable_config_sha256(self) -> str | None:
@@ -273,18 +291,32 @@ class RegionalRegistryRuntime:
             }
 
     def refresh_once(self, *, raise_on_failure: bool = False) -> bool:
+        # Order overlapping reads independently of wall-clock changes. A newer
+        # applied result fences both successes and failures from older reads.
+        with self._lock:
+            self._refresh_sequence += 1
+            refresh_sequence = self._refresh_sequence
         observed = self.now()
         head = None
+        integrity_failure = False
         try:
-            head = self.store.get_regional_registry_head()
-            revision = self.store.get_regional_registry_revision(head.generation)
+            try:
+                head = _read_registry_head(self.store)
+                revision = self.store.get_regional_registry_revision(head.generation)
+            except ValueError:
+                integrity_failure = True
+                if head is None:
+                    raise
+                # ValidationError text can contain registration credential values.
+                raise ValueError(
+                    "regional registry revision validation failed"
+                ) from None
             if revision.generation != head.generation:
+                integrity_failure = True
                 raise RuntimeError("regional registry head generation mismatch")
             if revision.content_sha256 != head.content_sha256:
+                integrity_failure = True
                 raise RuntimeError("regional registry head digest mismatch")
-            current = self._snapshot
-            if current is not None and revision.generation < current.generation:
-                raise RuntimeError("regional registry generation moved backward")
             registrations = MappingProxyType(
                 {
                     item.cluster_id: item
@@ -300,17 +332,35 @@ class RegionalRegistryRuntime:
                 registrations=registrations,
             )
             with self._lock:
+                if refresh_sequence < self._applied_refresh_sequence:
+                    return False
+                current = self._snapshot
+                if current is not None and revision.generation < current.generation:
+                    integrity_failure = True
+                    raise RuntimeError("regional registry generation moved backward")
+                self._applied_refresh_sequence = refresh_sequence
                 self._target_generation = head.generation
                 self._target_content_sha256 = head.content_sha256
                 self._snapshot = snapshot
                 self._last_successful_refresh = observed
                 self._last_error = None
-            self._heartbeat(self._member(snapshot, ready=True, observed_at=observed))
+                self._snapshot_integrity_failed = False
+            self._heartbeat(
+                self._member(snapshot, ready=True, observed_at=observed),
+                refresh_sequence=refresh_sequence,
+            )
             self._log_secret_drift()
             return True
         except Exception as exc:
             with self._lock:
+                if refresh_sequence < self._applied_refresh_sequence:
+                    if raise_on_failure:
+                        raise
+                    return False
+                self._applied_refresh_sequence = refresh_sequence
                 self._last_error = f"{type(exc).__name__}: {exc}"
+                if integrity_failure:
+                    self._snapshot_integrity_failed = True
                 if head is not None:
                     # The head was read and could not be served (digest or
                     # generation mismatch, or the revision read failed):
@@ -325,7 +375,8 @@ class RegionalRegistryRuntime:
                         current_snapshot,
                         ready=False,
                         observed_at=observed,
-                    )
+                    ),
+                    refresh_sequence=refresh_sequence,
                 )
             except Exception:
                 pass
@@ -345,7 +396,9 @@ class RegionalRegistryRuntime:
 
         return stale_seconds / 3.0
 
-    def _heartbeat(self, member: RegionalRegistryMember) -> None:
+    def _heartbeat(
+        self, member: RegionalRegistryMember, *, refresh_sequence: int
+    ) -> None:
         """Write the member row if its content changed or the heartbeat is due."""
 
         fingerprint: tuple[object, ...] = (
@@ -354,20 +407,27 @@ class RegionalRegistryRuntime:
             member.ready,
             member.error,
         )
-        with self._lock:
-            last_written = self._last_heartbeat_at
-            unchanged = fingerprint == self._last_heartbeat_fingerprint
-        if (
-            unchanged
-            and last_written is not None
-            and (member.last_seen_at - last_written).total_seconds()
-            < self.heartbeat_interval_seconds(self.stale_seconds)
-        ):
-            return
-        self.store.save_regional_registry_member(member)
-        with self._lock:
-            self._last_heartbeat_at = member.last_seen_at
-            self._last_heartbeat_fingerprint = fingerprint
+        # A watcher and an API refresh can overlap. Serialize writes without
+        # holding the snapshot lock, and never backdate the durable lease.
+        with self._heartbeat_lock:
+            with self._lock:
+                if refresh_sequence != self._applied_refresh_sequence:
+                    return
+                last_written = self._last_heartbeat_at
+                unchanged = fingerprint == self._last_heartbeat_fingerprint
+            if last_written is not None and (
+                member.last_seen_at < last_written
+                or (
+                    unchanged
+                    and (member.last_seen_at - last_written).total_seconds()
+                    < self.heartbeat_interval_seconds(self.stale_seconds)
+                )
+            ):
+                return
+            self.store.save_regional_registry_member(member)
+            with self._lock:
+                self._last_heartbeat_at = member.last_seen_at
+                self._last_heartbeat_fingerprint = fingerprint
 
     def run(self, stop: Event) -> None:
         while not stop.is_set():
@@ -424,7 +484,7 @@ def regional_cluster_request_allowed(
         # A join verifies collector readiness before it activates the
         # cluster, and readiness is built from these events; claims stay
         # refused, so telemetry admitted here cannot start a node action.
-        return path.startswith(COLLECTOR_EVENT_PREFIX)
+        return method == "POST" and channel_for_path(path) is not None
     if state is RegionalClusterLifecycle.FAILED:
         return False
     return path == "/v1/regional/executors/hyperpod-submissions/outcome" or (
@@ -452,13 +512,52 @@ def registry_revision_converged(
     observed_at: datetime,
     stale_seconds: float,
 ) -> bool:
-    threshold = observed_at - timedelta(seconds=stale_seconds)
-    by_id = {member.member_id: member for member in members}
-    return all(
-        (member := by_id.get(member_id)) is not None
-        and member.ready
+    return not registry_revision_missing_member_ids(
+        revision,
+        members,
+        observed_at=observed_at,
+        stale_seconds=stale_seconds,
+    )
+
+
+def member_serves_revision(
+    member: RegionalRegistryMember,
+    revision: RegionalRegistryRevision,
+) -> bool:
+    """Match a ready ACK to the exact revision; freshness is checked separately."""
+
+    return (
+        member.ready
         and member.generation == revision.generation
         and member.content_sha256 == revision.content_sha256
-        and member.last_seen_at >= threshold
-        for member_id in revision.required_member_ids
     )
+
+
+def registry_revision_missing_member_ids(
+    revision: RegionalRegistryRevision,
+    members: list[RegionalRegistryMember],
+    *,
+    observed_at: datetime,
+    stale_seconds: float,
+) -> list[str]:
+    """Return unresolved required rows and all active processes without an ACK."""
+
+    active_ids = active_registry_member_ids(
+        members,
+        observed_at=observed_at,
+        stale_seconds=stale_seconds,
+    )
+    by_id = {member.member_id: member for member in members}
+    if not active_ids:
+        # Only an empty required set with no known rows is the bootstrap case.
+        # A known fleet must not converge through universal heartbeat expiry.
+        return sorted(revision.required_member_ids or by_id)
+    # Stale rows no longer authorize traffic; absent rows prove no deadline.
+    missing = set(revision.required_member_ids) - by_id.keys()
+    missing.update(
+        member_id
+        for member_id in active_ids
+        if by_id[member_id].last_seen_at > observed_at
+        or not member_serves_revision(by_id[member_id], revision)
+    )
+    return sorted(missing)

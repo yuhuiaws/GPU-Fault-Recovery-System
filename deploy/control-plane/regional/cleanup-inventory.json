@@ -201,6 +201,8 @@
       "Secret"
     ],
     "node_annotations": [
+      "gpu-fault.io/node-key-activation",
+      "gpu-fault.io/node-key-activated",
       "gpu-fault.io/installer-version",
       "gpu-fault.io/installer-config-digest",
       "gpu-fault.io/installer-artifact-sha256",
@@ -270,7 +272,8 @@
         "scope": "namespaced",
         "phase": "producer",
         "order": 40,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "deployment",
@@ -278,7 +281,8 @@
         "scope": "namespaced",
         "phase": "producer",
         "order": 50,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "daemonset",
@@ -328,7 +332,8 @@
         "scope": "cluster",
         "phase": "support",
         "order": 100,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "clusterrole",
@@ -368,7 +373,8 @@
         "scope": "cluster",
         "phase": "support",
         "order": 100,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "clusterrolebinding",
@@ -456,7 +462,8 @@
         "scope": "namespaced",
         "phase": "support",
         "order": 100,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "serviceaccount",
@@ -464,7 +471,8 @@
         "scope": "namespaced",
         "phase": "support",
         "order": 100,
-        "clean": "delete"
+        "clean": "delete",
+        "retired": true
       },
       {
         "kind": "serviceaccount",

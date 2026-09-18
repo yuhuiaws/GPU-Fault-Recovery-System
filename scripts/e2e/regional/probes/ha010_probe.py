@@ -17,6 +17,7 @@ could not complete at all), plus ``regional_registry.ready`` and
 from __future__ import annotations
 
 import json
+import math
 import socket
 import sys
 import time
@@ -87,8 +88,14 @@ def main(argv: list[str]) -> int:
     port = int(argv[1])
     duration = float(argv[2])
     interval = float(argv[3]) if len(argv) > 3 else 2.0
-    if port <= 0 or duration <= 0 or interval <= 0:
-        raise SystemExit("port, duration and interval must be positive")
+    if (
+        port <= 0
+        or duration <= 0
+        or interval <= 0
+        or not math.isfinite(duration)
+        or not math.isfinite(interval)
+    ):
+        raise SystemExit("port, duration and interval must be finite and positive")
     samples: list[dict[str, Any]] = []
     deadline = time.monotonic() + duration
     while True:

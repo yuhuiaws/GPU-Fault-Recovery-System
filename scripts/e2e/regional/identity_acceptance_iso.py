@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-import time
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
@@ -13,12 +13,7 @@ from scripts.e2e.regional.identity_acceptance_common import (
     IdentityAcceptanceError,
     IdentityCaseFailure,
     IdentitySite,
-    run_cleanup_steps,
 )
-
-TERMINAL_COMMAND_STATUSES = {"FAILED", "SUCCEEDED", "CANCELLED"}
-COMMAND_SETTLE_TIMEOUT_SECONDS = 180
-
 
 FLEET_CROSS_CLUSTER_PROBE = r"""
 import json
@@ -32,9 +27,18 @@ from gpu_fault.cluster_executor import (
 )
 from gpu_fault.fleet import AgentTransitionRequest
 
+requests = []
+class NoNetworkClient(RegionalExecutorClient):
+    def _get(self, *args, **kwargs):
+        requests.append("GET")
+        raise AssertionError("Fleet local guard attempted an HTTP request")
+    def _post(self, *args, **kwargs):
+        requests.append("POST")
+        raise AssertionError("Fleet local guard attempted an HTTP request")
+
 other = sys.argv[1]
 registry = RegionalFleetRegistry(
-    RegionalExecutorClient(
+    NoNetworkClient(
         os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
         os.environ["GPU_FAULT_CLUSTER_ID"],
         os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
@@ -62,7 +66,7 @@ for label, call in (
         result[label] = {"rejected": False}
     except ClusterExecutorError as exc:
         result[label] = {"rejected": True, "error": str(exc)}
-print(json.dumps(result, sort_keys=True))
+print(json.dumps({**result, "request_count": len(requests)}, sort_keys=True))
 """
 
 AGENT_LIST_PROBE = r"""
@@ -106,20 +110,12 @@ def run_iso003(
         "revoke_agent_rejected": result["revoke_agent"]["rejected"]
         and "cannot transition an agent in another cluster"
         in result["revoke_agent"]["error"],
+        "no_http_requests": result.get("request_count") == 0,
+        "secondary_agent_state_unchanged": before == after,
     }
     return {
         "verdict": verdict(checks),
         "checks": checks,
-        # RegionalFleetRegistry raises locally, before any HTTP request, so the
-        # secondary's agents cannot have changed because of this probe; the
-        # before/after comparison proved nothing about the boundary and is
-        # recorded as data, not as a check.
-        "not_evaluated": {
-            "secondary_agent_state_unchanged": (
-                "n/a: the proxy rejects both calls locally before any request "
-                "reaches the control plane, so the comparison is vacuous"
-            )
-        },
         "secondary_agents_before_after_equal": before == after,
         "results": result,
         "limitations": [
@@ -235,6 +231,7 @@ from gpu_fault.models import (
     WorkflowStepSpec,
 )
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
+from gpu_fault.store import InMemoryStore
 
 cluster_id, suffix, workload_id = sys.argv[1:]
 now = datetime.now(timezone.utc)
@@ -273,7 +270,9 @@ context = WorkflowStepContext(
     request=WorkflowExecutionRequest(expected_fencing_token=1),
     idempotency_key=f"{workflow.request_id}/0/STOP_WORKLOADS",
 )
-store = ApplicationContext.from_environment().store
+registration = ApplicationContext.from_environment().store.get_regional_cluster(cluster_id)
+store = InMemoryStore()
+store.save_regional_cluster(registration)
 adapter = RegionalRemoteWorkflowAdapter(
     store,
     owners={"gpu-fault-kubernetes-adapter"},
@@ -295,119 +294,51 @@ print(json.dumps({
     },
     "commands": commands,
     "workflow_id": workflow.request_id,
+    "isolated_store": True,
 }, sort_keys=True, default=str))
 """
 
-REMOTE_COMMAND_PROBE = r"""
+EXECUTOR_ALLOWLIST_PROBE = r"""
 import json
+import os
 import sys
-from gpu_fault.app import ApplicationContext
-workflow_id = sys.argv[1]
-commands = [
-    item.model_dump(mode="json")
-    for item in ApplicationContext.from_environment().store.list_remote_commands()
-    if item.workflow_request_id == workflow_id
-]
-print(json.dumps({"commands": commands}, sort_keys=True, default=str))
-"""
+from types import SimpleNamespace
+from gpu_fault.cluster_executor import ClusterActionExecutor
+from gpu_fault.regional import RemoteActionCommand
 
-# Settle, cancel, then delete. The probe commands belong to a workflow that
-# was never saved, so nothing else will ever retire them; but a LEASED command
-# is in the executor's hands and deleting the row under it makes its result
-# POST a 404 and leaves a ledger entry for a command that no longer exists.
-# Each command is therefore given a bounded wait for its terminal state, a
-# public ``cancel_remote_command`` if it is still open and unleased, and only
-# then the row removal (there is no public delete; ``_delete`` is the shared
-# store primitive, and it is the last step, never the first).
-REMOTE_COMMAND_RETIRE_PROBE = r"""
-import json
-import sys
-import time
-from gpu_fault.app import ApplicationContext
-settle_seconds = float(sys.argv[1])
-command_ids = sys.argv[2:]
-store = ApplicationContext.from_environment().store
-terminal = {"FAILED", "SUCCEEDED", "CANCELLED"}
-deadline = time.monotonic() + settle_seconds
-final = {}
-while True:
-    final = {}
-    for command_id in command_ids:
-        try:
-            item = store.get_remote_command(command_id)
-        except Exception as exc:  # absent already
-            final[command_id] = {"status": None, "error": type(exc).__name__}
-            continue
-        final[command_id] = {
-            "status": item.status.value,
-            "status_source": item.status_source,
-            "lease_owner_present": item.lease_owner is not None,
-        }
-    if all(
-        value["status"] is None or value["status"] in terminal
-        for value in final.values()
-    ) or time.monotonic() >= deadline:
-        break
-    time.sleep(2)
-cancelled = {}
-for command_id, value in final.items():
-    if value["status"] in {"PENDING", "WAITING"}:
-        cancelled[command_id] = store.cancel_remote_command(
-            command_id, reason="GF-REGIONAL-ISO-005 cleanup"
-        )
-deleted = []
-skipped = []
-for command_id, value in final.items():
-    if value["status"] == "LEASED":
-        # Still in an executor's hands after the settle window: leave the row
-        # for the lease to expire rather than delete it under the executor.
-        skipped.append(command_id)
-        continue
-    store._delete("remote_command", command_id)
-    deleted.append(command_id)
-print(json.dumps({
-    "final": final,
-    "cancelled": cancelled,
-    "deleted": deleted,
-    "skipped_leased": skipped,
-}, sort_keys=True, default=str))
-"""
-
-
-def workload_snapshot(
-    site: IdentitySite,
-    target: ClusterTarget,
-) -> dict[str, Any]:
-    deployment = json.loads(
-        site.regional(target).kubectl(
-            "gpu",
-            "get",
-            "deployment",
-            "regional-allowlist-probe",
-            "-o",
-            "json",
-            namespace=FORBIDDEN_NAMESPACE,
-        )
-    )
-    pods = json.loads(
-        site.regional(target).kubectl(
-            "gpu",
-            "get",
-            "pod",
-            "-l",
-            "app=regional-allowlist-probe",
-            "-o",
-            "json",
-            namespace=FORBIDDEN_NAMESPACE,
-        )
-    )
+expected_cluster, forbidden_workload, payload = sys.argv[1:]
+cluster_id = os.environ["GPU_FAULT_CLUSTER_ID"]
+if cluster_id != expected_cluster:
+    raise ValueError("executor Pod cluster differs from the selected cluster")
+allowed = {
+    item.strip()
+    for item in os.environ["GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES"].split(",")
+    if item.strip()
+}
+executor = ClusterActionExecutor(
+    SimpleNamespace(cluster_id=cluster_id), [],
+    executor_id="iso005-local-guard", allowed_namespaces=allowed,
+)
+positive = RemoteActionCommand.model_validate(json.loads(payload))
+positive = positive.model_copy(update={"lease_token": "iso005-local-probe"})
+foreign_step = positive.step.model_copy(update={"workload_ids": [forbidden_workload]})
+foreign_workflow = positive.workflow.model_copy(update={"official_steps": [foreign_step]})
+negative = positive.model_copy(update={"step": foreign_step, "workflow": foreign_workflow})
+def outcome(command):
+    result = executor._execute(command)
     return {
-        "deployment_uid": deployment["metadata"]["uid"],
-        "replicas": deployment["spec"]["replicas"],
-        "pod_uids": sorted(
-            str(item["metadata"]["uid"]) for item in pods.get("items", [])
-        ),
+        "status": result.status.value,
+        "status_source": result.status_source,
+        "error": result.error,
     }
+print(json.dumps({
+    "cluster_id": cluster_id,
+    "allowed_namespaces": sorted(allowed),
+    "negative": outcome(negative),
+    "positive": outcome(positive),
+    "adapter_count": len(executor.adapters),
+}, sort_keys=True))
+"""
 
 
 def run_iso005(
@@ -428,212 +359,109 @@ def run_iso005(
         )
     registration = matching[0]
     original_allowlist = list(registration.get("allowed_namespaces") or [])
+    if not original_allowlist:
+        raise IdentityAcceptanceError("cluster has no allowed fixture namespace")
     if FORBIDDEN_NAMESPACE in original_allowlist:
         raise IdentityAcceptanceError(
             f"{FORBIDDEN_NAMESPACE} is already in the cluster allowlist"
         )
-    manifest = {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": "regional-allowlist-probe",
-            "namespace": FORBIDDEN_NAMESPACE,
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"app": "regional-allowlist-probe"}},
-            "template": {
-                "metadata": {"labels": {"app": "regional-allowlist-probe"}},
-                "spec": {
-                    "containers": [
-                        {
-                            "name": "pause",
-                            "image": "registry.k8s.io/pause:3.10",
-                            "resources": {
-                                "requests": {"cpu": "1m", "memory": "4Mi"},
-                                "limits": {"cpu": "10m", "memory": "16Mi"},
-                            },
-                        }
-                    ]
-                },
-            },
-        },
-    }
     regional = site.regional(target)
-    command_ids: list[str] = []
-    result: dict[str, Any] = {"verdict": "FAIL", "checks": {}}
-    failure: Exception | None = None
+    suffix = (
+        "iso005-" + hashlib.sha256(str(case_dir.resolve()).encode()).hexdigest()[:12]
+    )
+    forbidden_workload = f"{FORBIDDEN_NAMESPACE}/deployment/{suffix}"
+    allowed_namespace = (
+        site.namespace
+        if site.namespace in original_allowlist
+        else original_allowlist[0]
+    )
+    result: dict[str, Any] = {
+        "verdict": "FAIL",
+        "checks": {},
+        "fixture_scope": "isolated deployed-code guards",
+        "allowed_fixture_namespace": allowed_namespace,
+        "forbidden_target_namespace": FORBIDDEN_NAMESPACE,
+        "cleanup": {"resources_created": False, "registry_modified": False},
+        "limitations": [
+            "Both guards run in deployed CPU/GPU processes using the current "
+            "registration and executor namespace settings. Commands remain in an "
+            "isolated in-memory Store; the local executor has no adapters.",
+            "No production allowlist is widened, no foreign namespace is created, "
+            "and no production command or workload is submitted or removed. This "
+            "does not test Kubernetes admission or mutate a placeholder Deployment.",
+        ],
+    }
     try:
-        site.gpu(target, "create", "namespace", FORBIDDEN_NAMESPACE)
-        regional.kubectl(
-            "gpu",
-            "apply",
-            "-f",
-            "-",
-            input_text=json.dumps(manifest),
-            namespace=FORBIDDEN_NAMESPACE,
-        )
-        regional.kubectl(
-            "gpu",
-            "rollout",
-            "status",
-            "deployment/regional-allowlist-probe",
-            "--timeout=180s",
-            namespace=FORBIDDEN_NAMESPACE,
-        )
-        baseline = workload_snapshot(site, target)
-        suffix = f"iso005-control-{int(time.time())}"
-        # attempts=1: the probe creates a remote command; a retried exec after
-        # a lost receipt would create a second one the cleanup never learns of.
         control = regional.cpu_python(
             ALLOWLIST_WORKFLOW_PROBE,
             target.cluster_id,
-            suffix,
-            f"{FORBIDDEN_NAMESPACE}/deployment/regional-allowlist-probe",
+            suffix + "-negative",
+            forbidden_workload,
             attempts=1,
         )
-        command_ids.extend(item["command_id"] for item in control.get("commands") or [])
-        updated = [dict(item) for item in original_registry]
-        for item in updated:
-            if item.get("cluster_id") == target.cluster_id:
-                item["allowed_namespaces"] = [
-                    *original_allowlist,
-                    FORBIDDEN_NAMESPACE,
-                ]
-        site.write_registry(updated)
-        site.rollout_control()
-        suffix = f"iso005-executor-{int(time.time())}"
-        executor = regional.cpu_python(
+        checks = result["checks"]
+        checks["control_plane_rejects_outside_allowlist"] = (
+            control["outcome"]["status"] == "FAILED"
+            and control["outcome"].get("error")
+            == "workflow targets a namespace outside the cluster registration: "
+            + FORBIDDEN_NAMESPACE
+        )
+        checks["control_plane_created_no_command"] = control.get("commands") == []
+        checks["control_store_is_isolated"] = control.get("isolated_store") is True
+        if not all(checks.values()):
+            raise IdentityAcceptanceError(
+                "control-plane namespace guard did not refuse"
+            )
+        positive = regional.cpu_python(
             ALLOWLIST_WORKFLOW_PROBE,
             target.cluster_id,
-            suffix,
-            f"{FORBIDDEN_NAMESPACE}/deployment/regional-allowlist-probe",
+            suffix + "-positive",
+            f"{allowed_namespace}/deployment/{suffix}",
             attempts=1,
         )
-        command_ids.extend(
-            item["command_id"] for item in executor.get("commands") or []
+        checks["allowed_namespace_passes_control_guard"] = (
+            positive.get("isolated_store") is True
+            and positive["outcome"]["status"] == "WAITING"
+            and len(positive.get("commands") or []) == 1
         )
-        workflow_id = str(executor["workflow_id"])
-        deadline = time.monotonic() + COMMAND_SETTLE_TIMEOUT_SECONDS
-        final: dict[str, Any] = {"commands": []}
-        while time.monotonic() < deadline:
-            final = regional.cpu_python(REMOTE_COMMAND_PROBE, workflow_id)
-            if final["commands"] and all(
-                item["status"] in TERMINAL_COMMAND_STATUSES
-                for item in final["commands"]
-            ):
-                break
-            time.sleep(2)
-        after = workload_snapshot(site, target)
-        commands = final["commands"]
-        checks = {
-            "control_plane_rejects_outside_allowlist": (
-                control["outcome"]["status"] == "FAILED"
-                and "workflow targets a namespace outside"
-                in str(control["outcome"].get("error") or "")
-            ),
-            "control_plane_created_no_command": not control["commands"],
-            "executor_command_created": len(commands) == 1,
-            "executor_rejects_local_allowlist": (
-                len(commands) == 1
-                and commands[0]["status"] == "FAILED"
-                and "workload namespace is not allowed"
-                in str(commands[0].get("error") or "")
-            ),
-            "placeholder_workload_unchanged": after == baseline,
-        }
-        result = {
-            "verdict": verdict(checks),
-            "checks": checks,
-            "control_plane": control,
-            "executor": final,
-            # The probe's workflow was never saved, so the executor's result
-            # POST completes a command whose workflow does not exist. How the
-            # control plane closed it is evidence in its own right.
-            "executor_completion": [
-                {
-                    "command_id": item.get("command_id"),
-                    "status": item.get("status"),
-                    "status_source": item.get("status_source"),
-                    "error": item.get("error"),
-                    "workflow_saved": False,
-                }
-                for item in commands
-            ],
-        }
+        if not checks["allowed_namespace_passes_control_guard"]:
+            raise IdentityAcceptanceError("allowed namespace positive control failed")
+        executor = regional.executor_python(
+            EXECUTOR_ALLOWLIST_PROBE,
+            target.cluster_id,
+            forbidden_workload,
+            json.dumps(positive["commands"][0], separators=(",", ":")),
+            attempts=1,
+        )
+        negative = executor["negative"]
+        local_positive = executor["positive"]
+        checks.update(
+            {
+                "executor_cluster_matches": executor.get("cluster_id")
+                == target.cluster_id,
+                "executor_has_no_adapters": executor.get("adapter_count") == 0,
+                "executor_rejects_local_allowlist": (
+                    negative.get("status") == "FAILED"
+                    and negative.get("status_source") == "executor-rejected"
+                    and negative.get("error")
+                    == f"ClusterExecutorError: workload namespace is not allowed: {FORBIDDEN_NAMESPACE}"
+                ),
+                "allowed_namespace_reaches_adapter_selection": (
+                    local_positive.get("status") == "FAILED"
+                    and local_positive.get("status_source") == "executor-rejected"
+                    and local_positive.get("error")
+                    == "ClusterExecutorError: remote command requires exactly one local adapter; found 0"
+                ),
+                "registry_unchanged": site.registry() == original_registry,
+            }
+        )
+        result["control_plane"] = control["outcome"]
+        result["positive_control"] = positive["outcome"]
+        result["executor"] = executor
+        result["verdict"] = verdict(checks)
     except Exception as exc:
-        failure = exc
         result["error"] = f"{type(exc).__name__}: {exc}"
+        raise IdentityCaseFailure(str(exc), details=result) from exc
     finally:
-
-        def retire_commands() -> dict[str, Any]:
-            if not command_ids:
-                return {}
-            return regional.cpu_python(
-                REMOTE_COMMAND_RETIRE_PROBE,
-                str(COMMAND_SETTLE_TIMEOUT_SECONDS),
-                *command_ids,
-                timeout=COMMAND_SETTLE_TIMEOUT_SECONDS + 120,
-                attempts=1,
-            )
-
-        def delete_namespace() -> str:
-            site.gpu(
-                target,
-                "delete",
-                "namespace",
-                FORBIDDEN_NAMESPACE,
-                "--ignore-not-found",
-                "--wait=true",
-                check=False,
-                timeout=300,
-            )
-            return site.gpu(
-                target,
-                "get",
-                "namespace",
-                FORBIDDEN_NAMESPACE,
-                "--ignore-not-found",
-                "-o",
-                "name",
-                check=False,
-            ).strip()
-
-        cleanup, cleanup_errors = run_cleanup_steps(
-            [
-                ("retire_commands", retire_commands),
-                ("restore_registry", lambda: site.write_registry(original_registry)),
-                ("rollout_control", site.rollout_control),
-                ("delete_namespace", delete_namespace),
-                ("read_registry", site.registry),
-            ]
-        )
-        residual = str(cleanup.get("delete_namespace") or "")
-        registry_restored = cleanup.get("read_registry") == original_registry
-        retired = cleanup.get("retire_commands") or {}
-        result["cleanup"] = {
-            **cleanup,
-            "registry_restored": registry_restored,
-            "namespace_residual": residual,
-            "commands_left_leased": list(retired.get("skipped_leased") or []),
-        }
-        result["cleanup_errors"] = cleanup_errors
-        if (
-            residual
-            or not registry_restored
-            or cleanup_errors
-            or retired.get("skipped_leased")
-        ):
-            result["verdict"] = "FAIL"
-        result["limitations"] = [
-            "The target is a one-replica pause Deployment in a dedicated "
-            "namespace; the runner verifies that neither defense changes its "
-            "UID or Pod set.",
-            "The probe commands belong to a workflow that is never saved; the "
-            "executor-side completion of such a command is recorded under "
-            "executor_completion.",
-        ]
         write_json_atomic(case_dir / "iso005-details.json", result)
-    if failure is not None:
-        raise IdentityCaseFailure(str(failure), details=result) from failure
     return result

@@ -281,8 +281,8 @@ class ClientOperationsMixin:
         clients: dict[tuple[str, str], dict[str, str]] = {}
         try:
             processes = list(self.proc_root.iterdir())
-        except OSError:
-            processes = []
+        except OSError as exc:
+            raise OSError("host process inventory is unavailable") from exc
         for process in processes:
             if not process.name.isdigit():
                 continue

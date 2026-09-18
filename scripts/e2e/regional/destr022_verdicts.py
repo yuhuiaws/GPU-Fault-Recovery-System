@@ -72,7 +72,7 @@ def parse_time(value: Any) -> datetime | None:
         except ValueError:
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -94,10 +94,8 @@ def counter_of(breadcrumb: dict[str, Any] | None) -> int | None:
     counters = (breadcrumb or {}).get("counters")
     if not isinstance(counters, dict) or RECLAIM_COUNTER not in counters:
         return None
-    try:
-        return int(counters[RECLAIM_COUNTER])
-    except (TypeError, ValueError):
-        return None
+    value = counters[RECLAIM_COUNTER]
+    return value if type(value) is int and value >= 0 else None
 
 
 def breadcrumb_claimed_at(breadcrumb: dict[str, Any] | None) -> datetime | None:
@@ -319,8 +317,20 @@ def counter_errors(
     """
 
     errors: list[str] = []
-    before_by_pod = {str(item.get("pod")): item for item in before}
-    after_by_pod = {str(item.get("pod")): item for item in after}
+    before_by_pod = {(item.get("pod"), item.get("uid")): item for item in before}
+    after_by_pod = {(item.get("pod"), item.get("uid")): item for item in after}
+    if (
+        not before
+        or not after
+        or len(before_by_pod) != len(before)
+        or len(after_by_pod) != len(after)
+        or any(
+            not isinstance(value, str) or not value
+            for identity in (*before_by_pod, *after_by_pod)
+            for value in identity
+        )
+    ):
+        return ["executor breadcrumb identity is missing or duplicated"]
     if set(before_by_pod) != set(after_by_pod):
         errors.append(
             "the executor replica set changed during the case: "
@@ -328,8 +338,9 @@ def counter_errors(
         )
     increments = 0
     judged = 0
-    for pod, first in before_by_pod.items():
-        second = after_by_pod.get(pod)
+    for identity, first in before_by_pod.items():
+        pod = identity[0]
+        second = after_by_pod.get(identity)
         if second is None:
             continue
         start = counter_of(first.get("claim_state"))
@@ -343,10 +354,24 @@ def counter_errors(
             )
             continue
         claimed = breadcrumb_claimed_at(second.get("claim_state"))
-        if claimed is not None and claimed > reclaimed_at:
+        previous = breadcrumb_claimed_at(first.get("claim_state"))
+        observed = parse_time(second.get("observed_at"))
+        if first.get("claim_state_error") or second.get("claim_state_error"):
+            errors.append(f"executor {pod} breadcrumb read failed")
+        if (
+            claimed is not None
+            and previous is not None
+            and observed is not None
+            and previous < claimed
+            and reclaimed_at < claimed <= observed
+        ):
             judged += 1
             increments += end - start
-    if judged and increments < 1:
+        else:
+            errors.append(f"executor {pod} has no fresh post-reclaim breadcrumb")
+    if not judged:
+        errors.append("no executor breadcrumb was rewritten after the reclaim")
+    elif increments < 1:
         errors.append(
             f"no executor replica moved {RECLAIM_COUNTER} although its breadcrumb "
             "was rewritten after the reclaim"

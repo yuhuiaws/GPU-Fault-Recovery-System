@@ -342,8 +342,13 @@ def registry_probe_errors(probes: list[dict[str, Any]]) -> list[str]:
     if not probes:
         return ["no CPU Pod answered the registry probe"]
     errors: list[str] = []
+    heads: set[tuple[int, str, str]] = set()
+    pods: set[str] = set()
     for probe in probes:
         label = str(probe.get("pod") or probe.get("hostname") or "pod")
+        if label == "pod" or label in pods:
+            errors.append("registry probe Pod identity is missing or duplicated")
+        pods.add(label)
         secret = probe.get("secret_config_sha256")
         durable = probe.get("durable_config_sha256")
         for name, value in (("secret", secret), ("durable", durable)):
@@ -354,6 +359,19 @@ def registry_probe_errors(probes: list[dict[str, Any]]) -> list[str]:
                 f"{label}: durable registry head digest {durable} differs from the "
                 f"Secret digest {secret}; the release did not publish durably"
             )
+        generation = probe.get("head_generation")
+        head_digest = probe.get("head_content_sha256")
+        if type(generation) is not int or generation < 1:
+            errors.append(
+                f"{label}: durable registry head generation is missing or invalid"
+            )
+        if (
+            not isinstance(head_digest, str)
+            or HEX_DIGEST.fullmatch(head_digest) is None
+        ):
+            errors.append(f"{label}: durable registry head digest is not a sha256")
+        elif type(generation) is int and generation > 0 and isinstance(durable, str):
+            heads.add((generation, head_digest, durable))
         healthz = probe.get("healthz") or {}
         if healthz.get("status") != 200:
             errors.append(f"{label}: /healthz returned {healthz.get('status')}")
@@ -365,13 +383,15 @@ def registry_probe_errors(probes: list[dict[str, Any]]) -> list[str]:
             )
         if registry.get("ready") is not True:
             errors.append(f"{label}: /healthz reports the registry not ready")
-        if registry.get("secret_config_sha256") not in (None, secret):
+        if registry.get("secret_config_sha256") != secret:
             errors.append(
                 f"{label}: /healthz secret_config_sha256 differs from the probe's"
             )
         livez = probe.get("livez") or {}
         if livez.get("status") != 200:
             errors.append(f"{label}: /livez returned {livez.get('status')}")
+    if len(heads) > 1:
+        errors.append("CPU Pods disagree on the durable registry head")
     return errors
 
 

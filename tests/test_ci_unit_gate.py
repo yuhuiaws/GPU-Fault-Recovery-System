@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import configparser
 import fnmatch
 import hashlib
@@ -18,8 +19,11 @@ import pytest
 from coverage import CoverageData
 
 from scripts import ci_coverage_gate, ci_gate_artifacts, ci_unit_gate
+from scripts.ci_pytest_evidence import aggregate_pytest_results, ci_context
 from scripts.component_wheels import APPLICATION_COMPONENT_NAMES, component_modules
+from tools.coverage_objectives import SCOPES, measured_files
 from tools.pytest_case_reporter import partition_for_nodeid
+from tools.pytest_result_identity import source_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,14 +51,19 @@ def _identity_root(tmp_path: Path) -> Path:
         "src/gpu_fault/admin/only.py": "VALUE = 'deployment'\n",
         "src/gpu_fault/failure_domains.py": "VALUE = 'domains'\n",
         "src/gpu_fault/release_state_snapshot.py": "VALUE = 'snapshot'\n",
-        "src/gpu_fault/runtime.py": "VALUE = 'runtime'\n",
+        "src/gpu_fault/runtime.py": (
+            "def choose(flag):\n    if flag:\n        return 1\n    return 0\n"
+        ),
+        "scripts/e2e/regional/sample.py": "VALUE = 'regional'\n",
         "testcases/fault-scenarios.yaml": "schema_version: 1\n",
         "tests/admin/test_admin.py": "def test_admin(): pass\n",
         "tests/conftest.py": "VALUE = 'shared tests'\n",
         "tests/store/test_postgres_store.py": "def test_postgres(): pass\n",
         "tests/test_case_scheduler.py": "def test_scheduler(): pass\n",
         "tests/test_runtime.py": "def test_runtime(): pass\n",
-        "tools/case_scheduler.py": "VALUE = 'fault'\n",
+        "tools/case_scheduler.py": (
+            "def choose(flag):\n    if flag:\n        return 1\n    return 0\n"
+        ),
         "uv.lock": "version = 1\n",
     }
     for relative, content in files.items():
@@ -96,6 +105,85 @@ def _identity(root: Path, shard: str) -> dict:
     )
 
 
+def test_repository_inputs_include_untracked_and_exclude_unstaged_deletions(
+    tmp_path: Path,
+) -> None:
+    root = _identity_root(tmp_path)
+    before = _identity(root, "runtime_0")["sha256"]
+    deleted = root / "src/gpu_fault/runtime.py"
+    deleted.unlink()
+    added = root / "src/gpu_fault/new module.py"
+    added.write_text("VALUE = 'new'\n", encoding="utf-8")
+
+    inputs = ci_gate_artifacts.repository_files(root)
+
+    assert deleted not in inputs, "deleted tracked files are not candidate inputs"
+    assert added in inputs, "untracked replacement files must enter the candidate"
+    assert _identity(root, "runtime_0")["sha256"] != before, (
+        "a deletion and replacement must invalidate a reusable shard identity"
+    )
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink", "broken-symlink"])
+def test_repository_inputs_still_reject_non_regular_indexed_files(
+    tmp_path: Path, replacement: str
+) -> None:
+    root = _identity_root(tmp_path)
+    target = root / "src/gpu_fault/runtime.py"
+    target.unlink()
+    if replacement == "directory":
+        target.mkdir()
+    else:
+        destination = tmp_path / "outside.py"
+        if replacement == "symlink":
+            destination.write_text("VALUE = 'outside'\n", encoding="utf-8")
+        target.symlink_to(destination)
+
+    with pytest.raises(
+        ci_gate_artifacts.GateArtifactError, match="unsupported gate input"
+    ):
+        ci_gate_artifacts.repository_files(root)
+
+
+def test_repository_inputs_reject_a_vanished_untracked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _identity_root(tmp_path)
+    transient = root / "untracked.py"
+    transient.write_text("VALUE = 1\n", encoding="utf-8")
+    run = subprocess.run
+
+    def disappear(arguments, **kwargs):
+        completed = run(arguments, **kwargs)
+        if "--deleted" in arguments:
+            transient.unlink()
+        return completed
+
+    monkeypatch.setattr(ci_gate_artifacts.subprocess, "run", disappear)
+    with pytest.raises(
+        ci_gate_artifacts.GateArtifactError, match="unsupported gate input"
+    ):
+        ci_gate_artifacts.repository_files(root)
+
+
+def test_repository_inputs_refuse_an_unreadable_deletion_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _identity_root(tmp_path)
+    run = subprocess.run
+
+    def deny_deletions(arguments, **kwargs):
+        if "--deleted" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, b"", b"denied")
+        return run(arguments, **kwargs)
+
+    monkeypatch.setattr(ci_gate_artifacts.subprocess, "run", deny_deletions)
+    with pytest.raises(
+        ci_gate_artifacts.GateArtifactError, match="deleted gate inputs"
+    ):
+        ci_gate_artifacts.repository_files(root)
+
+
 def test_coverage_test_partition_is_complete_and_disjoint() -> None:
     counts = ci_coverage_gate.validate_test_partition(ROOT)
     config = ci_coverage_gate.load_config(ROOT)
@@ -121,34 +209,54 @@ _POSTGRES_URL_READ = re.compile(
 )
 
 
-def _postgres_gated_test_files() -> set[str]:
+def _postgres_gated_test_files(root: Path = ROOT) -> set[str]:
     """Every collected test file whose cases skip without a Postgres URL.
 
-    Written as a textual expression on purpose, independent from the partition
-    code under test: a module is gated when it reads the variable from the
-    process environment itself, or imports a ``tests`` helper that does (the
-    claim-support module reads it once and every Postgres fixture goes through
-    it). A dict literal or ``monkeypatch.setenv`` mentioning the name is not a
-    gate.
+    The environment-read matcher remains independent from the partition code.
+    Inspect actual expressions and imports, not strings containing generated
+    child code or comments. A dict literal or ``monkeypatch.setenv`` mentioning
+    the name is not a gate.
     """
 
-    tests = ROOT / "tests"
-    readers = {
-        path
-        for path in tests.rglob("*.py")
-        if _POSTGRES_URL_READ.search(path.read_text(encoding="utf-8"))
+    trees = {
+        path: ast.parse(path.read_text(encoding="utf-8"))
+        for path in (root / "tests").rglob("*.py")
     }
+    readers = set()
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and node.args:
+                receiver, key, opening = node.func, node.args[0], "("
+            elif isinstance(node, ast.Subscript):
+                receiver, key, opening = node.value, node.slice, "["
+            else:
+                continue
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "GPU_FAULT_TEST_POSTGRES_URL"
+                and _POSTGRES_URL_READ.search(
+                    f"{ast.unparse(receiver)}{opening}{key.value!r}"
+                )
+            ):
+                readers.add(path)
+                break
     reader_modules = {
-        ".".join(path.relative_to(ROOT).with_suffix("").parts) for path in readers
+        ".".join(path.relative_to(root).with_suffix("").parts) for path in readers
     }
     gated: set[str] = set()
-    for path in tests.rglob("test_*.py"):
-        relative = path.relative_to(ROOT).as_posix()
+    for path, tree in trees.items():
+        if not path.name.startswith("test_"):
+            continue
+        relative = path.relative_to(root).as_posix()
         if path in readers:
             gated.add(relative)
             continue
-        text = path.read_text(encoding="utf-8")
-        if any(f"from {module} import" in text for module in reader_modules):
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module in reader_modules
+            for node in ast.walk(tree)
+        ):
             gated.add(relative)
     return gated
 
@@ -184,6 +292,51 @@ def test_every_postgres_gated_test_file_runs_in_the_postgres_shard() -> None:
     }
 
 
+def test_native_activation_and_history_partitions_preserve_shared_backends() -> None:
+    native = {
+        "tests/metrics/test_kernel_pcie_composite_postgres.py",
+        "tests/orchestration/test_provider_correlation_postgres.py",
+        "tests/store/test_postgres_activation_inhibition.py",
+        "tests/store/test_postgres_health_signal_semantics.py",
+        "tests/store/test_postgres_terminal_quarantine.py",
+    }
+    history = "tests/store/test_job_recovery_history.py"
+    shared = {
+        "tests/metrics/test_kernel_pcie_composite.py",
+        "tests/orchestration/test_provider_correlation_arbitration.py",
+        "tests/store/test_activation_inhibition_claims.py",
+        "tests/store/test_activation_inhibition_query.py",
+        "tests/store/test_remote_command_claim_cancellation.py",
+        "tests/store/test_health_signal_semantics.py",
+        "tests/orchestration/test_terminal_quarantine_constraints.py",
+    }
+    config = ci_coverage_gate.load_config(ROOT)
+    postgres = set(ci_coverage_gate.pytest_targets(ROOT, "postgres"))
+    makefile = _makefile_postgres_tests()
+
+    # Module-alias fixtures are not discovered by the environment-read matcher.
+    assert native <= set(config["tests"]["postgres_files"]), (
+        "native PostgreSQL fixtures need explicit serial shard ownership"
+    )
+    assert native | {history} <= postgres & makefile, (
+        "native SQL cases and all three history backends must run in the serial gate"
+    )
+    assert shared.isdisjoint(postgres | makefile), (
+        "native wrappers must not move their Memory/SQLite helpers into PostgreSQL"
+    )
+    for shard in ci_coverage_gate.SHARDS:
+        if shard == "postgres":
+            continue
+        targets = set(ci_coverage_gate.pytest_targets(ROOT, shard))
+        assert (native | {history}).isdisjoint(targets), (
+            "PostgreSQL-dependent modules must not leak into ordinary coverage"
+        )
+        if shard in ci_coverage_gate.RUNTIME_SHARDS:
+            assert shared <= targets, (
+                "every runtime nodeid partition must retain the shared backend tests"
+            )
+
+
 def test_postgres_gate_detection_reads_the_environment_not_mentions(
     tmp_path: Path,
 ) -> None:
@@ -207,6 +360,20 @@ def test_postgres_gate_detection_reads_the_environment_not_mentions(
             "def test_env(monkeypatch):\n"
             "    monkeypatch.setenv('GPU_FAULT_TEST_POSTGRES_URL', 'postgresql://x')\n"
         ),
+        "tests/test_fstring_gate.py": (
+            "import os\nVALUE = f\"{os.getenv('GPU_FAULT_TEST_POSTGRES_URL')}\"\n"
+        ),
+        "tests/test_generated_child.py": "PROGRAM = "
+        + repr(
+            "import os\n"
+            "URL = os.environ['GPU_FAULT_TEST_POSTGRES_URL']\n"
+            "from tests.store._pg_support import POSTGRES_URL\n"
+        )
+        + "\n",
+        "tests/test_commented_reads.py": (
+            "# os.getenv('GPU_FAULT_TEST_POSTGRES_URL')\n"
+            "# from tests.store._pg_support import POSTGRES_URL\n"
+        ),
     }
     for relative, content in files.items():
         path = root / relative
@@ -227,6 +394,25 @@ def test_postgres_gate_detection_reads_the_environment_not_mentions(
     assert "tests/test_mention.py" in runtime
     assert "tests/regional/test_baseline.py" not in deployment
     assert "tests/test_mention.py" not in postgres
+    observed = _postgres_gated_test_files(root)
+    actual_readers = {
+        "tests/store/test_direct.py",
+        "tests/store/test_indirect.py",
+        "tests/regional/test_baseline.py",
+        "tests/test_fstring_gate.py",
+    }
+    assert actual_readers <= observed and actual_readers <= postgres, (
+        "both independent checks must retain executable and imported database reads"
+    )
+    for relative in (
+        "tests/test_mention.py",
+        "tests/test_generated_child.py",
+        "tests/test_commented_reads.py",
+    ):
+        assert relative not in observed and relative not in postgres, (
+            f"{relative} does not depend on an ambient PostgreSQL allocation"
+        )
+        assert relative in runtime, f"{relative} must remain an ordinary test"
 
 
 def test_runtime_nodeid_partitions_are_stable_disjoint_and_complete() -> None:
@@ -261,8 +447,22 @@ def test_coverage_excludes_the_static_documentation_and_ci_tests() -> None:
         for line in tooling_block.splitlines()
         if line.strip()
     }
+    promql_block = makefile.split("PROMQL_TESTS = \\\n", 1)[1].split(
+        "\nDOCUMENTATION_TESTS =", 1
+    )[0]
+    promql = {
+        line.strip().rstrip("\\").strip()
+        for line in promql_block.splitlines()
+        if line.strip()
+    }
 
-    assert docs | tooling <= set(config["tests"]["coverage_excluded_files"])
+    assert promql == {
+        "tests/metrics/test_closed_loop_promql.py",
+        "tests/metrics/test_observability_evidence_promql.py",
+        "tests/metrics/test_review_dashboard_promql.py",
+        "tests/test_alert_rules_promtool.py",
+    }, "the pinned static gate owns every native PromQL test file"
+    assert docs | tooling | promql <= set(config["tests"]["coverage_excluded_files"])
 
 
 def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
@@ -319,22 +519,19 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
 
 
 def test_coverage_config_names_the_deploy_roots_as_deployment_only_sources() -> None:
-    """The gate measures three source roots; two of them only in ``deployment``.
-
-    ``coverage.source`` was a single string, so the release orchestrator under
-    ``deploy/`` sat outside every floor. Schema 3 replaces it with ``sources``
-    plus the subset runtime shards must not measure.
-    """
+    """Both objective scopes are measured; deploy roots remain deployment-only."""
 
     config = ci_coverage_gate.load_config(ROOT)
     coverage = config["coverage"]
 
-    assert config["schema_version"] == 3
+    assert config["schema_version"] == 4
     assert "source" not in coverage
     assert coverage["sources"] == [
         "src/gpu_fault",
         "src/gpu_fault_release",
         "deploy/control-plane/tools",
+        "scripts/e2e/regional",
+        "tools",
     ]
     assert coverage["deployment_only_sources"] == [
         "src/gpu_fault_release",
@@ -408,7 +605,7 @@ def _coverage_ini_list(path: Path, option: str) -> set[str]:
 def test_only_the_deployment_shard_measures_the_deploy_roots(
     tmp_path: Path, shard: str
 ) -> None:
-    """Runtime shards keep measuring ``src/gpu_fault`` alone.
+    """Runtime shards measure runtime and runner code without deployment roots.
 
     Their identities exclude ``deploy/``, so a runtime shard that measured the
     release orchestrator could be reused against a changed orchestrator.
@@ -429,10 +626,12 @@ def test_only_the_deployment_shard_measures_the_deploy_roots(
             "src/gpu_fault",
             "src/gpu_fault_release",
             "deploy/control-plane/tools",
+            "scripts/e2e/regional",
+            "tools",
         }
         assert omitted == set()
     else:
-        assert sources == {"src/gpu_fault"}
+        assert sources == {"src/gpu_fault", "scripts/e2e/regional", "tools"}
         assert "src/gpu_fault/admin/only.py" in omitted
         assert not any(item.startswith("deploy/") for item in omitted), (
             "a root that is not measured has nothing to omit"
@@ -473,7 +672,9 @@ def test_non_deployment_shard_measuring_deploy_source_is_rejected(
         ("tests/admin/test_admin.py", {"deployment"}),
         ("tests/test_case_scheduler.py", {"fault_runner"}),
         ("tests/store/test_postgres_store.py", {"postgres"}),
-        ("testcases/fault-scenarios.yaml", {"fault_runner"}),
+        ("testcases/fault-scenarios.yaml", set(ci_coverage_gate.SHARDS)),
+        ("tools/case_scheduler.py", set(ci_coverage_gate.SHARDS)),
+        ("scripts/e2e/regional/sample.py", set(ci_coverage_gate.SHARDS)),
         ("tests/conftest.py", set(ci_coverage_gate.SHARDS)),
         ("docs/guide.md", set()),
         (".github/workflows/ci.yml", set()),
@@ -499,7 +700,12 @@ def test_shard_identity_changes_only_affected_domains(
 
 def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
     data = CoverageData(basename=str(path))
-    measured = [root / "src/gpu_fault/runtime.py"]
+    measured = [
+        root / "src/gpu_fault/runtime.py",
+        root / "tools/case_scheduler.py",
+        root / "scripts/e2e/regional/sample.py",
+        root / "src/gpu_fault/admin/config.py",
+    ]
     if shard == "deployment":
         # Every deployment-only module has a module floor, and a floor that
         # matches no measured file is itself a failure, so the shard that owns
@@ -511,33 +717,81 @@ def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
             root / "src/gpu_fault_release/regional_release_config.py",
             root / "src/gpu_fault_release/regional_dns.py",
             root / "deploy/control-plane/tools/cleanup_state.py",
-            # Measured because a test loaded it, floored by nothing: the probe
-            # family is mostly parsed rather than executed, so it has no group.
-            root / "deploy/control-plane/regional/probes/node_probe.py",
         ]
-    else:
-        measured.append(root / "src/gpu_fault/admin/config.py")
-    data.add_lines({item.relative_to(root).as_posix(): {1} for item in measured})
+    data.add_arcs(
+        {
+            item.relative_to(root).as_posix(): (
+                {(-1, 1), (1, -1), (-1, 2), (2, 3), (2, 4), (3, -1), (4, -1)}
+                if item.name in {"runtime.py", "case_scheduler.py"}
+                else {(-1, 1), (1, -1)}
+            )
+            for item in measured
+        }
+    )
     data.write()
 
 
-def _write_pytest_results(path: Path, nodeid: str) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source_identity": "a" * 64,
-                "records": {
-                    nodeid: {
-                        "duration_seconds": 0.01,
-                        "output": "",
-                        "phases": {"call": "passed"},
-                        "status": "PASS",
-                    }
-                },
+def _pytest_value(root: Path, identity: dict, *, suite: str = "pytest") -> dict:
+    shard = identity["shard"]
+    targets = list(ci_coverage_gate.pytest_targets(root, shard))
+    partition = (
+        [3, ci_coverage_gate.RUNTIME_SHARDS.index(shard)]
+        if shard in ci_coverage_gate.RUNTIME_SHARDS
+        else None
+    )
+    discovered = sorted(
+        f"{target}::test_pass[{index}]"
+        for target in targets
+        for index in range(12 if partition is not None else 1)
+    )
+    selected = [
+        nodeid
+        for nodeid in discovered
+        if partition is None or partition_for_nodeid(nodeid, 3) == partition[1]
+    ]
+    original = source_identity(root)
+    return {
+        "schema_version": 1,
+        "source_identity": original,
+        "session": {
+            "source_identity": original,
+            "started_at": "2026-09-14T01:00:00+00:00",
+            "finished_at": "2026-09-14T01:01:00+00:00",
+            "exitstatus": 0,
+            "collected_nodeids": selected,
+            "discovered_nodeids": discovered,
+            "collected_files": targets,
+            "collection_errors": [],
+            "collection_skips": [],
+            "ci_context": ci_context(identity, suite),
+            "selection": {
+                "targets": targets,
+                "partition": partition,
+                "keyword": "",
+                "markexpr": "",
+                "deselect": [],
+                "numprocesses": 0 if shard == "postgres" else 4,
+                "stress_workers": "8" if suite == "postgres_stress" else "",
+                "stress_rounds": "40" if suite == "postgres_stress" else "",
+            },
+        },
+        "records": {
+            nodeid: {
+                "duration_seconds": 0.01,
+                "output": "",
+                "phases": {"setup": "passed", "call": "passed", "teardown": "passed"},
+                "status": "PASS",
             }
-        ),
-        encoding="utf-8",
+            for nodeid in selected
+        },
+    }
+
+
+def _write_pytest_results(
+    path: Path, *, root: Path, identity: dict, suite: str = "pytest"
+) -> None:
+    path.write_text(
+        json.dumps(_pytest_value(root, identity, suite=suite)), encoding="utf-8"
     )
 
 
@@ -587,14 +841,17 @@ def _build_shard(
         else None
     )
     _write_coverage_data(root, coverage_data, shard)
-    _write_pytest_results(pytest_results, f"tests/{shard}.py::test_pass")
+    identity = _identity(root, shard)
+    _write_pytest_results(pytest_results, root=root, identity=identity)
     _write_durations(durations, shard)
     if stress is not None:
-        _write_pytest_results(stress, "tests/postgres.py::test_stress")
+        _write_pytest_results(
+            stress, root=root, identity=identity, suite="postgres_stress"
+        )
     gate = ci_coverage_gate.build_shard_gate(
         root,
         destination,
-        identity=_identity(root, shard),
+        identity=identity,
         coverage_data=coverage_data,
         pytest_results=pytest_results,
         durations=durations,
@@ -708,20 +965,44 @@ def test_restore_network_failure_falls_back_to_fresh(
     assert result["reused"] == "false"
 
 
-def _unit_evidence(root: Path) -> tuple[Path, Path, Path, Path]:
+def _unit_evidence(
+    root: Path, *, source_root: Path, gates: dict
+) -> tuple[Path, Path, Path, Path]:
     coverage = root / "coverage.json"
     coverage.write_text(
         json.dumps(
             {
                 "meta": {"branch_coverage": True},
-                "files": {"src/gpu_fault/runtime.py": {}},
-                "totals": {"percent_covered": 80.0},
+                "files": {
+                    name: {
+                        "summary": {
+                            "num_statements": 100,
+                            "covered_lines": 100,
+                            "missing_lines": 0,
+                            "num_branches": 100,
+                            "covered_branches": 100,
+                            "missing_branches": 0,
+                        }
+                    }
+                    for scope in SCOPES
+                    for name in measured_files(source_root, scope)
+                },
+                "totals": {"percent_covered": 100.0},
             }
         ),
         encoding="utf-8",
     )
     pytest_results = root / "pytest-case-results.json"
-    _write_pytest_results(pytest_results, "tests/runtime.py::test_pass")
+    pytest_results.write_text(
+        json.dumps(
+            aggregate_pytest_results(
+                source_root,
+                gates,
+                resolve_identity=ci_coverage_gate.current_shard_identity,
+            )
+        ),
+        encoding="utf-8",
+    )
     fault_report = root / "fault-report.json"
     fault_report.write_text(
         json.dumps({"schema_version": 2, "verdict": "PASS", "results": []}),
@@ -758,7 +1039,11 @@ def test_unit_gate_aggregates_all_signed_shards(
         _build_shard(root, shards_root / shard, shard, monkeypatch)
     evidence_root = tmp_path / "evidence"
     evidence_root.mkdir()
-    coverage, pytest_results, fault_report, durations = _unit_evidence(evidence_root)
+    coverage, pytest_results, fault_report, durations = _unit_evidence(
+        evidence_root,
+        source_root=root,
+        gates=ci_coverage_gate.discover_shard_gates(shards_root, source_root=root),
+    )
     artifact_root = tmp_path / "unit"
     _set_main_environment(monkeypatch, run_id="123")
 
@@ -813,7 +1098,12 @@ def test_coverage_combine_uses_the_configured_data_file_basename(
         (output_root / "pytest-case-results.json").read_text(encoding="utf-8")
     )
     assert summary["totals"]["percent_covered"] >= 78
-    assert len(merged["records"]) == len(ci_coverage_gate.SHARDS)
+    assert summary["meta"]["branch_coverage"] is True, (
+        "branch-enabled shard proofs must combine real branch data"
+    )
+    assert len(merged["records"]) == 15, (
+        "all runtime variants and other domains survive"
+    )
 
 
 def test_reusable_artifact_requires_a_successful_producer_job(
@@ -900,7 +1190,10 @@ def _coverage_report(files: dict[str, tuple[int, int]]) -> dict:
             relative: {
                 "summary": {
                     "num_statements": total,
+                    "covered_lines": reached,
                     "num_branches": 0,
+                    "covered_branches": 0,
+                    "missing_branches": 0,
                     "missing_lines": total - reached,
                     "num_partial_branches": 0,
                 }
@@ -911,6 +1204,11 @@ def _coverage_report(files: dict[str, tuple[int, int]]) -> dict:
 
 
 def _write_report(path: Path, files: dict[str, tuple[int, int]]) -> Path:
+    _git(path.parent, "init", "-q")
+    for relative in files:
+        source = path.parent / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("VALUE = 1\n", encoding="utf-8")
     path.write_text(json.dumps(_coverage_report(files)), encoding="utf-8")
     return path
 
@@ -966,7 +1264,9 @@ def test_module_floors_report_group_and_file_shortfalls(tmp_path: Path) -> None:
         },
     )
 
-    violations = ci_coverage_gate.module_floor_violations(report, config=config)
+    violations = ci_coverage_gate.module_floor_violations(
+        report, config=config, root=tmp_path
+    )
 
     assert violations == [
         "src/gpu_fault/admin/bad.py covers 10.0% of 100 measurable points, "
@@ -997,7 +1297,10 @@ def test_module_floors_pass_when_the_family_clears_both_floors(tmp_path: Path) -
         },
     )
 
-    assert ci_coverage_gate.module_floor_violations(report, config=config) == []
+    assert (
+        ci_coverage_gate.module_floor_violations(report, config=config, root=tmp_path)
+        == []
+    )
 
 
 def test_module_floor_group_that_matches_nothing_fails(tmp_path: Path) -> None:
@@ -1018,9 +1321,9 @@ def test_module_floor_group_that_matches_nothing_fails(tmp_path: Path) -> None:
         tmp_path / "coverage.json", {"src/gpu_fault/runtime.py": (90, 100)}
     )
 
-    assert ci_coverage_gate.module_floor_violations(report, config=config) == [
-        "coverage module floor renamed matched no measured file"
-    ]
+    assert ci_coverage_gate.module_floor_violations(
+        report, config=config, root=tmp_path
+    ) == ["coverage module floor renamed matched no measured file"]
 
 
 @pytest.mark.parametrize(

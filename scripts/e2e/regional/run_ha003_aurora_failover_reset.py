@@ -22,6 +22,13 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
 )
+from scripts.e2e.regional.aurora_binding import regional_binding  # noqa: E402
+from scripts.e2e.regional.ha_cleanup import (  # noqa: E402
+    ProcessSupervisionLost,
+    record_supervision_loss,
+    run_cleanup,
+)
+from scripts.e2e.regional.ha_plan_preflight import require_window  # noqa: E402
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -33,7 +40,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     reusable_focused_tests,
     run_standard_case,
 )
-from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
+from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     PROVIDER_MUTATIONS,
     RegionalFixtureError,
@@ -45,6 +52,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     WarmSpareLiveFixture,
 )
@@ -57,7 +65,7 @@ NON_TERMINAL_COMMAND_STATUSES = {"PENDING", "LEASED", "WAITING"}
 # the control plane's "rejected request (NNN)"; an accepted result logs nothing.
 RESULT_REJECTED_LINE = "could not report result"
 REJECTED_STATUS_PATTERN = re.compile(r"rejected request \((\d{3})\)")
-ALLOWED_RESULT_SUBMISSION_CODES = {200, 409}
+ALLOWED_RESULT_SUBMISSION_CODES = {200, 409, 503}
 
 
 @dataclass(frozen=True)
@@ -199,12 +207,18 @@ def wait_rds_failover(
     samples: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         last = rds_snapshot(settings)
-        state = observe() if observe is not None else None
+        state = None
+        observation_error = None
+        try:
+            state = observe() if observe is not None else None
+        except RegionalCommandFailed as exc:
+            observation_error = type(exc).__name__
         samples.append(
             {
                 "observed_at": datetime.now(timezone.utc).isoformat(),
                 "rds_status": last.get("status"),
                 "writer": last.get("writer"),
+                "store_observation_error": observation_error,
                 "reset_command_status": (
                     reset_command_status(state) if state is not None else None
                 ),
@@ -214,6 +228,7 @@ def wait_rds_failover(
             last.get("status") == "available"
             and last.get("writer")
             and last.get("writer") != previous_writer
+            and (observe is None or state is not None)
         ):
             return last, samples
         sleep(5)
@@ -252,7 +267,8 @@ def result_submission_codes(logs: str) -> list[int]:
     A rejected ``complete`` logs "could not report result" followed by the
     traceback whose last line carries "rejected request (NNN)"; an accepted
     result is silent. So the codes returned here are the non-200 submissions,
-    and the catalog allows only 409 among them.
+    and a bounded retryable 503 is expected during the database failover.
+    The case still requires the workflow and remote command to converge.
     """
 
     codes: list[int] = []
@@ -260,7 +276,6 @@ def result_submission_codes(logs: str) -> list[int]:
     for line in logs.splitlines():
         if RESULT_REJECTED_LINE in line:
             pending = True
-            continue
         if pending:
             match = REJECTED_STATUS_PATTERN.search(line)
             if match:
@@ -282,7 +297,6 @@ def executor_logs(
             str(pod["name"]),
             "--since-time",
             started_at.isoformat(),
-            check=False,
             timeout=120,
         )
         pod_codes = result_submission_codes(output)
@@ -344,13 +358,15 @@ def read_only_preflight(
     case_dir: Path,
 ) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
+    binding = regional_binding(regional, settings.rds_cluster_id).read()
     node = regional.node_snapshot(settings.node)
     state = regional.store_snapshot(node=settings.node)
     workloads = regional.business_workloads(settings.node)
+    identity = regional.evidence_identity()
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
-        **regional.evidence_identity(),
+        **identity,
     )
     rds = rds_snapshot(settings)
     # The plan phase already paid for the focused pytest run; --execute reuses
@@ -391,7 +407,8 @@ def read_only_preflight(
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": state.get("release_id"),
+        **identity,
+        "aurora_binding": binding,
         "node": node,
         "store": state,
         "business_workloads": workloads,
@@ -413,6 +430,7 @@ def wait_reset_claim(
     observed_after: datetime,
     timeout_seconds: int = 120,
     evidence: WaitingEvidence | None = None,
+    observe_state: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = {}
@@ -423,6 +441,8 @@ def wait_reset_claim(
             observed_after=observed_after,
             queue_attempts=1,
         )
+        if observe_state is not None:
+            observe_state(last)
         if evidence is not None:
             evidence.observe(last)
         commands = [
@@ -473,7 +493,6 @@ def control_logs(
                 str(pod["name"]),
                 "--since-time",
                 started_at.isoformat(),
-                check=False,
                 timeout=120,
             )
             relevant = [
@@ -513,6 +532,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "WAITING on the Node Agent) and before it reaches a terminal state"
         ),
         "preflight_identity": {
+            "aurora_binding": preflight["aurora_binding"],
             "release_id": preflight["release_id"],
             "node_uid": preflight["node"]["uid"],
             "agent_generation": (state.get("agent") or {}).get("generation"),
@@ -554,6 +574,7 @@ def verify_plan_identity(
     plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
     planned = plan["details"]["preflight_identity"]
     current = {
+        "aurora_binding": preflight["aurora_binding"],
         "release_id": preflight["release_id"],
         "node_uid": preflight["node"]["uid"],
         "agent_generation": (preflight["store"].get("agent") or {}).get("generation"),
@@ -738,6 +759,91 @@ def cleanup_case(
     return result
 
 
+def execution_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+    preflight = read_only_preflight(settings, case_dir)
+    if preflight["errors"]:
+        raise RegionalFixtureError(
+            "preflight failed: " + "; ".join(preflight["errors"])
+        )
+    verify_plan_identity(case_dir, preflight)
+    return preflight
+
+
+def inject_bound_reset(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    preflight: dict[str, Any],
+    host: HostProbeFixture,
+    *,
+    marker: str,
+    run_id: str,
+    target_bdf: str,
+    maintenance_window_end: datetime,
+) -> tuple[datetime, dict[str, Any]]:
+    regional_binding(regional, settings.rds_cluster_id).read(
+        preflight["aurora_binding"]
+    )
+    if datetime.now(timezone.utc) >= maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before injection")
+    injected_at = datetime.now(timezone.utc)
+    return injected_at, host.execute(
+        "write-xid46",
+        "--marker",
+        marker,
+        "--drill-id",
+        run_id,
+        "--pci-bdf",
+        target_bdf,
+    )
+
+
+def request_bound_failover(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    preflight: dict[str, Any],
+    command: dict[str, Any],
+    evidence: WaitingEvidence,
+    *,
+    marker: str,
+    observed_after: datetime,
+    maintenance_window_end: datetime,
+    observe_state: Callable[[dict[str, Any]], None],
+) -> tuple[datetime, dict[str, Any]]:
+    regional_binding(regional, settings.rds_cluster_id).read(
+        preflight["aurora_binding"]
+    )
+    latest = regional.store_snapshot(
+        node=settings.node,
+        marker=marker,
+        observed_after=observed_after,
+        queue_attempts=1,
+    )
+    observe_state(latest)
+    evidence.observe(latest)
+    current = [
+        item
+        for item in latest.get("commands", [])
+        if "RESET_GPU" in command_operations(item)
+    ]
+    if (
+        len(current) != 1
+        or current[0].get("command_id") != command.get("command_id")
+        or current[0].get("status") not in {"LEASED", "WAITING"}
+    ):
+        raise RegionalFixtureError(
+            "reset is no longer uniquely in flight before failover"
+        )
+    if datetime.now(timezone.utc) >= maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before failover")
+    requested_at = datetime.now(timezone.utc)
+    return requested_at, aws_rds(
+        settings,
+        "failover-db-cluster",
+        "--db-cluster-identifier",
+        settings.rds_cluster_id,
+    )
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -746,12 +852,7 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
-    if preflight["errors"]:
-        raise RegionalFixtureError(
-            "preflight failed: " + "; ".join(preflight["errors"])
-        )
-    verify_plan_identity(case_dir, preflight)
+    preflight = execution_preflight(settings, case_dir)
     regional = RegionalLiveFixture(settings.regional)
     run_id = f"ha003-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"ha003-{int(time.time())}-a{attempt}"
@@ -764,6 +865,7 @@ def execute_case(
             image=settings.host_probe_image,
             case_id=CASE_ID,
             run_id=run_id,
+            state_directory=case_dir / "host-probes",
             probe_script=reset_case.PROBE_SCRIPT,
             active_deadline_seconds=3600,
         )
@@ -773,10 +875,22 @@ def execute_case(
         "attempt": attempt,
         "verdict": "FAIL",
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "release_id": preflight["release_id"],
+        "cluster_id": settings.regional.cluster_id,
     }
     incident_id = ""
     sampler_started = False
+
+    def remember_incident(state: dict[str, Any]) -> None:
+        nonlocal incident_id
+        observed = str((state.get("incident") or {}).get("incident_id") or "")
+        if observed:
+            if incident_id and incident_id != observed:
+                raise RegionalFixtureError("reset incident identity changed")
+            incident_id = observed
+
     try:
+        require_window(maintenance_window_end)
         host.create()
         baseline_host = host.execute("snapshot")
         write_json_atomic(case_dir / "host-baseline.json", baseline_host)
@@ -792,17 +906,15 @@ def execute_case(
             timeout=60,
         )
         sampler_started = True
-        if datetime.now(timezone.utc) >= maintenance_window_end:
-            raise RegionalFixtureError("maintenance window ended before injection")
-        injected_at = datetime.now(timezone.utc)
-        injection = host.execute(
-            "write-xid46",
-            "--marker",
-            marker,
-            "--drill-id",
-            run_id,
-            "--pci-bdf",
-            target_bdf,
+        injected_at, injection = inject_bound_reset(
+            settings,
+            regional,
+            preflight,
+            host,
+            marker=marker,
+            run_id=run_id,
+            target_bdf=target_bdf,
+            maintenance_window_end=maintenance_window_end,
         )
         write_json_atomic(case_dir / "injection.json", injection)
         # Every store read from injection onwards feeds the WAITING evidence:
@@ -816,14 +928,22 @@ def execute_case(
             marker=marker,
             observed_after=injected_at,
             evidence=waiting_evidence,
+            observe_state=remember_incident,
         )
+        remember_incident(claimed_state)
+        if not incident_id:
+            raise RegionalFixtureError("claimed reset has no cleanup incident identity")
         write_json_atomic(case_dir / "reset-claimed.json", claimed_state)
-        failover_requested_at = datetime.now(timezone.utc)
-        failover = aws_rds(
+        failover_requested_at, failover = request_bound_failover(
             settings,
-            "failover-db-cluster",
-            "--db-cluster-identifier",
-            settings.rds_cluster_id,
+            regional,
+            preflight,
+            command,
+            waiting_evidence,
+            marker=marker,
+            observed_after=injected_at,
+            maintenance_window_end=maintenance_window_end,
+            observe_state=remember_incident,
         )
         write_json_atomic(case_dir / "failover-request.json", failover)
 
@@ -834,6 +954,7 @@ def execute_case(
                 observed_after=injected_at,
                 queue_attempts=1,
             )
+            remember_incident(sample)
             waiting_evidence.observe(sample)
             return sample
 
@@ -861,7 +982,7 @@ def execute_case(
             )
         )
         write_json_atomic(case_dir / "workflow-state.json", state)
-        incident_id = str((state.get("incident") or {}).get("incident_id") or "")
+        remember_incident(state)
         errors, evidence = evaluate_reset(
             settings=settings,
             regional=regional,
@@ -900,22 +1021,26 @@ def execute_case(
                 "no store sample showed Aurora mid-failover while RESET_GPU was "
                 "still open; the reset and the failover did not provably overlap"
             )
+    except ProcessSupervisionLost:
+        record_supervision_loss(result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup = cleanup_case(
-            settings=settings,
-            regional=regional,
-            host=host,
-            preflight=preflight,
-            incident_id=incident_id,
-            run_id=run_id,
-            sampler_started=sampler_started,
+        cleanup = run_cleanup(
+            result,
+            lambda: cleanup_case(
+                settings=settings,
+                regional=regional,
+                host=host,
+                preflight=preflight,
+                incident_id=incident_id,
+                run_id=run_id,
+                sampler_started=sampler_started,
+            ),
         )
         result["cleanup"] = cleanup
-        if cleanup["errors"]:
+        if cleanup is not None and cleanup["errors"]:
             result["verdict"] = "FAIL"
-    result.update(regional.evidence_identity())
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

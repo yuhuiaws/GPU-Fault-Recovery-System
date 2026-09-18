@@ -522,7 +522,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 18
       },
@@ -593,8 +593,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 18
       },
       "id": 10,
@@ -626,7 +626,7 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_run_ok{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "min by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_run_ok{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
           "legendFormat": "{{control_plane_cluster}} {{region}} last run ok",
           "range": true,
@@ -637,6 +637,80 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "A configured status projection is missing, unreadable, malformed or future-dated. This is unknown evidence, not a successful refresh.\n\nAlert GpuFaultAuroraCredentialRefreshStatusUnknown (warning, for 15m): docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "id": 11,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultAuroraCredentialRefreshStatusUnknown",
+          "url": "docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_status_unreadable{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Aurora refresh evidence unknown",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -644,7 +718,7 @@
         "x": 0,
         "y": 26
       },
-      "id": 11,
+      "id": 12,
       "panels": [],
       "title": "Control-loop review counters",
       "type": "row"
@@ -692,7 +766,7 @@
         "x": 0,
         "y": 27
       },
-      "id": 12,
+      "id": 13,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -710,7 +784,7 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "sum by (control_plane_cluster, region) (increase(gpu_fault_periodic_cleanup_rows_total{job=\"stale_fence_remote_commands\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[30m]))",
+          "expr": "sum by (control_plane_cluster, region) (increase(gpu_fault_periodic_cleanup_rows_total{periodic_job=\"stale_fence_remote_commands\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[30m]))",
           "instant": false,
           "legendFormat": "{{control_plane_cluster}} {{region}}",
           "range": true,
@@ -763,7 +837,7 @@
         "x": 8,
         "y": 27
       },
-      "id": 13,
+      "id": 14,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -834,7 +908,7 @@
         "x": 16,
         "y": 27
       },
-      "id": 14,
+      "id": 15,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -870,7 +944,7 @@
         "x": 0,
         "y": 35
       },
-      "id": 15,
+      "id": 16,
       "panels": [],
       "title": "Processor queue",
       "type": "row"
@@ -922,7 +996,7 @@
         "x": 0,
         "y": 36
       },
-      "id": 16,
+      "id": 17,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -993,7 +1067,7 @@
         "x": 6,
         "y": 36
       },
-      "id": 17,
+      "id": 18,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1064,7 +1138,7 @@
         "x": 12,
         "y": 36
       },
-      "id": 18,
+      "id": 19,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1131,7 +1205,7 @@
         "x": 18,
         "y": 36
       },
-      "id": 19,
+      "id": 20,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1167,7 +1241,7 @@
         "x": 0,
         "y": 44
       },
-      "id": 20,
+      "id": 21,
       "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
@@ -1211,7 +1285,7 @@
         "x": 0,
         "y": 45
       },
-      "id": 21,
+      "id": 22,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1278,7 +1352,7 @@
         "x": 12,
         "y": 45
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1314,7 +1388,7 @@
         "x": 0,
         "y": 53
       },
-      "id": 23,
+      "id": 24,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -1362,7 +1436,7 @@
         "x": 0,
         "y": 54
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1433,7 +1507,7 @@
         "x": 8,
         "y": 54
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1508,7 +1582,7 @@
         "x": 16,
         "y": 54
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1544,7 +1618,7 @@
         "x": 0,
         "y": 62
       },
-      "id": 27,
+      "id": 28,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -1588,11 +1662,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 63
       },
-      "id": 28,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1659,11 +1733,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
         "y": 63
       },
-      "id": 29,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1696,7 +1770,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Sustained for a full 5m window; a transient mismatch during a reconcile is not drift.\n\nAlert GpuFaultProcessorCounterDrift (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorcounterdrift",
+      "description": "Five-minute minimum from the newest complete, fresh scan. An old task owner cannot preserve repaired drift; unavailable scans are shown separately.\n\nAlert GpuFaultProcessorCounterDrift (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorcounterdrift",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1730,11 +1804,18 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 12,
         "y": 63
       },
-      "id": 30,
+      "id": 31,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultProcessorCounterDrift",
+          "url": "docs/管理员日常运维.md#gpufaultprocessorcounterdrift"
+        }
+      ],
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1752,7 +1833,7 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (control_plane_cluster, region) (min_over_time(gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
+          "expr": "min_over_time((max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} and ((gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == on (control_plane_cluster, region) group_left max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) and (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))))[5m:1m]) and on (control_plane_cluster, region) max by (control_plane_cluster, region) ((gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == on (control_plane_cluster, region) group_left max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) and (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))",
           "instant": false,
           "legendFormat": "drift",
           "range": true,
@@ -1763,7 +1844,7 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (control_plane_cluster, region) (min_over_time(gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
+          "expr": "min_over_time((max by (control_plane_cluster, region) (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} and ((gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == on (control_plane_cluster, region) group_left max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) and (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))))[5m:1m]) and on (control_plane_cluster, region) max by (control_plane_cluster, region) ((gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == on (control_plane_cluster, region) group_left max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) and (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))",
           "instant": false,
           "legendFormat": "mismatched clusters",
           "range": true,
@@ -1774,6 +1855,80 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "1 when no current complete counter scan is available; 0 when one is known.\n\nAlert GpuFaultProcessorCounterDriftScanUnavailable (warning, for 5m): docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 63
+      },
+      "id": 32,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultProcessorCounterDriftScanUnavailable",
+          "url": "docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "(max by (control_plane_cluster, region) (up{job=\"gpu-fault-control-plane\",service_role=\"gpu-fault-control-worker\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1) unless on (control_plane_cluster, region) max by (control_plane_cluster, region) ((gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == on (control_plane_cluster, region) group_left max by (control_plane_cluster, region) (gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= gpu_fault_processor_counter_drift_scan_max_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) and (gpu_fault_processor_counter_drift_abs{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (gpu_fault_processor_counter_mismatched_clusters{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))) or (0 * max by (control_plane_cluster, region) (up{job=\"gpu-fault-control-plane\",service_role=\"gpu-fault-control-worker\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1))",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Processor counter scan unavailable",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1781,7 +1936,7 @@
         "x": 0,
         "y": 71
       },
-      "id": 31,
+      "id": 33,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -1816,7 +1971,7 @@
         "x": 0,
         "y": 72
       },
-      "id": 32,
+      "id": 34,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -1890,7 +2045,7 @@
         "x": 8,
         "y": 72
       },
-      "id": 33,
+      "id": 35,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1961,7 +2116,7 @@
         "x": 16,
         "y": 72
       },
-      "id": 34,
+      "id": 36,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2032,7 +2187,7 @@
         "x": 0,
         "y": 80
       },
-      "id": 35,
+      "id": 37,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2103,7 +2258,7 @@
         "x": 12,
         "y": 80
       },
-      "id": 36,
+      "id": 38,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2139,7 +2294,7 @@
         "x": 0,
         "y": 88
       },
-      "id": 37,
+      "id": 39,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -2187,7 +2342,7 @@
         "x": 0,
         "y": 89
       },
-      "id": 38,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2258,7 +2413,7 @@
         "x": 8,
         "y": 89
       },
-      "id": 39,
+      "id": 41,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2325,7 +2480,7 @@
         "x": 16,
         "y": 89
       },
-      "id": 40,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2392,7 +2547,7 @@
         "x": 0,
         "y": 97
       },
-      "id": 41,
+      "id": 43,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2459,7 +2614,7 @@
         "x": 12,
         "y": 97
       },
-      "id": 42,
+      "id": 44,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2506,7 +2661,7 @@
         "x": 0,
         "y": 105
       },
-      "id": 43,
+      "id": 45,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -2550,11 +2705,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 106
       },
-      "id": 44,
+      "id": 46,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2598,7 +2753,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Fault events the processor refused, per worker Pod (summed over the Pod's four processes by /metrics).\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected",
+      "description": "Fault events refused by worker processes. Increase is computed per reset domain before regional aggregation.\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2632,11 +2787,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
         "y": 106
       },
-      "id": 45,
+      "id": 47,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2703,11 +2858,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 12,
         "y": 106
       },
-      "id": 46,
+      "id": 48,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2736,14 +2891,88 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "time() - max by (control_plane_cluster, region, job) (gpu_fault_periodic_job_error_last_seen_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "time() - max by (control_plane_cluster, region, periodic_job) (gpu_fault_periodic_job_error_last_seen_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "{{job}}",
+          "legendFormat": "{{periodic_job}}",
           "range": true,
           "refId": "B"
         }
       ],
       "title": "Periodic service error last seen age",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "1 for stale, missing or invalid process publications, or a missing merger verdict on a reachable Pod. Unknown process coverage is not zero activity.\n\nAlert GpuFaultMetricsAggregationIncomplete (warning, for 5m): docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 106
+      },
+      "id": 49,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultMetricsAggregationIncomplete",
+          "url": "docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region, pod, service_role) (gpu_fault_metrics_aggregation_degraded{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} or ((up{job=\"gpu-fault-control-plane\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1) unless on (control_plane_cluster, region, pod, instance, service_role) gpu_fault_metrics_aggregation_degraded{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}))",
+          "instant": false,
+          "legendFormat": "{{pod}} {{service_role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Process metric coverage incomplete",
       "type": "timeseries"
     }
   ],

@@ -9,7 +9,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from math import ceil
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 
 # One definition of "failure domain" for the whole system: the remediation
 # budget's per-domain tier reads the same label priority through the same
@@ -34,16 +36,15 @@ from gpu_fault_release.regional_release_config import (
     ReleaseError,
 )
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
+from gpu_fault_release.regional_release_images import NodeDependencyTarget
+from gpu_fault_release.regional_release_interfaces import AgentNodeSet
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_rendering import (
     INSTALLER_PRODUCTS_FILE_ENV,
-    INSTALLER_REUSE_NODE_SET_ENV,
-    INSTALLER_REUSE_TEMPLATE_ENV,
     build_reconciler_environment,
     installer_product_inputs_digest,
     record_installer_products,
-    recorded_installer_products,
 )
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
 from gpu_fault_release.regional_release_runtime_identity import (
@@ -52,6 +53,10 @@ from gpu_fault_release.regional_release_runtime_identity import (
     exec_cpu_ingress_probe,
 )
 from gpu_fault_release.regional_release_timing import record_rollback_wave_event
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 
 ROOT = repository_root()
 CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS = 75.0
@@ -59,7 +64,8 @@ ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS = 60.0
 ROLLOUT_AGENT_POLL_SECONDS = 5.0
 ROLLOUT_AGENT_LEASE_MARGIN_SECONDS = 40
 ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS = 30
-MAX_UPGRADE_UNAVAILABLE = 32
+MAX_UPGRADE_UNAVAILABLE = DEPLOY_CONCURRENCY.cluster_installers
+MAX_SITE_INSTALLER_UNAVAILABLE = DEPLOY_CONCURRENCY.site_installers
 INSTALLER_WAVE_CONFIG_MAP_ENV = "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP"
 INSTALLER_BUNDLE_ENV = "GPU_FAULT_INSTALLER_BUNDLE_SHA256"
 INSTALLER_TEMPLATE_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_SHA256"
@@ -96,6 +102,11 @@ class FleetWaveContext:
     node_installer_image: str | None
     allow_legacy_identity: bool
     agent_identity: dict[str, Any] | None
+    template_content_sha256: str | None = None
+
+    @property
+    def node_dependency_target(self) -> NodeDependencyTarget:
+        return NodeDependencyTarget.for_phase(self.phase)
 
 
 def backup_secret(
@@ -106,30 +117,20 @@ def backup_secret(
     backup: str,
     required: bool,
 ) -> str | None:
-    exists = release.runner.probe(
-        kubectl
-        + [
-            "-n",
-            release.config.namespace,
-            "get",
-            "secret",
-            source,
-        ],
-    )
-    if not exists:
+    value = probe_resource(
+        release.runner,
+        kubectl,
+        ResourceRef("secret", "Secret", source, release.config.namespace),
+    ).require_readable()
+    if value is None:
         if required:
             raise ReleaseError(f"required Secret is missing: {source}")
         return None
-    value = release._get_json(
-        kubectl
-        + [
-            "-n",
-            release.config.namespace,
-            "get",
-            "secret",
-            source,
-        ]
-    )
+    data = value.get("data") or {}
+    if not isinstance(data, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in data.items()
+    ):
+        raise ReleaseError("Secret backup source data is invalid")
     document = {
         "apiVersion": "v1",
         "kind": "Secret",
@@ -145,7 +146,7 @@ def backup_secret(
             },
         },
         "type": value.get("type") or "Opaque",
-        "data": dict(value.get("data") or {}),
+        "data": dict(data),
     }
     release.runner.run(
         kubectl + ["apply", "-f", "-"],
@@ -517,7 +518,7 @@ def nodes_have_legacy_installer_identity(
 
 
 def finish_legacy_node_runtime_rollback(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     *,
     enabled: bool,
@@ -536,6 +537,8 @@ def finish_legacy_node_runtime_rollback(
     steady_template_config_map: str | None,
     node_installer_image: str | None,
     max_unavailable: int,
+    node_dependency_target: NodeDependencyTarget,
+    template_content_sha256: str | None = None,
 ) -> tuple[str, str] | None:
     if not enabled or not nodes_have_legacy_installer_identity(
         release,
@@ -558,10 +561,17 @@ def finish_legacy_node_runtime_rollback(
         bundle_sha256=desired_bundle,
         template_sha256=desired_template,
         template_config_map=steady_template_config_map or template_config_map,
+        template_content_sha256=(
+            template_content_sha256
+            if not steady_template_config_map
+            or steady_template_config_map == template_config_map
+            else None
+        ),
         allowed_node_names=None,
         max_unavailable=max_unavailable,
         runtime_image=steady_runtime_image or runtime_image,
         node_installer_image=node_installer_image,
+        node_dependency_target=node_dependency_target,
     )
     if final_identity != paused_identity:
         raise ReleaseError(f"{target.cluster_id} legacy installer identity changed")
@@ -584,6 +594,14 @@ def node_rollout_policy(
     domains = set(failure_domains.values())
     if not node_count:
         raise ReleaseError("upgrade rollout policy has no nodes")
+    parallel_clusters = int(getattr(release.config, "upgrade_max_parallel_clusters", 1))
+    if not 1 <= parallel_clusters <= 8:
+        raise ReleaseError("upgrade cluster parallelism must be within 1..8")
+    if phase == "bootstrap":
+        parallel_clusters = max(
+            parallel_clusters, min(4, len(getattr(release.config, "clusters", ())))
+        )
+    cluster_budget = MAX_SITE_INSTALLER_UNAVAILABLE // parallel_clusters
     if UNKNOWN_FAILURE_DOMAIN in domains:
         effective = 1
         per_domain = 1
@@ -606,6 +624,7 @@ def node_rollout_policy(
             configured if configured > 0 else size_cap,
             size_cap,
             MAX_UPGRADE_UNAVAILABLE,
+            cluster_budget,
         )
         per_domain = (
             effective if len(domains) == 1 else ceil(effective / max(1, len(domains)))
@@ -753,7 +772,11 @@ def wait_candidate_cpu_agent_heartbeats(
         raise ReleaseError(
             "candidate CPU Agent heartbeat barrier returned invalid evidence"
         ) from exc
-    if not isinstance(result, dict) or result.get("status") != "PASSED":
+    if not isinstance(result, dict):
+        raise ReleaseError(
+            "candidate CPU Agent heartbeat barrier returned invalid evidence"
+        )
+    if result.get("status") != "PASSED":
         diagnostics = {
             "expected_count": result.get("expected_count"),
             "refreshed_count": result.get("refreshed_count"),
@@ -802,16 +825,25 @@ def live_agent_node_names(
         return ()
     value = _read_active_agent_node_sets(release)
     listed = value.get(target.cluster_id)
-    live = {str(node_id) for node_id in listed} if isinstance(listed, list) else set()
+    if target.cluster_id not in value:
+        return ()
+    if (
+        not isinstance(listed, list)
+        or any(not isinstance(node_id, str) or not node_id for node_id in listed)
+        or len(listed) != len(set(listed))
+        or not set(listed).issubset(node_names)
+    ):
+        raise ReleaseError("joining cluster active Agent inventory is invalid")
+    live = set(listed)
     return tuple(name for name in node_names if name in live)
 
 
-def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
+def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentNodeSet]:
     if release.runner.dry_run:
         return {}
     value = _read_active_agent_node_sets(release)
     expected = {target.cluster_id for target in release.config.clusters}
-    result = {
+    result: dict[str, AgentNodeSet] = {
         str(cluster_id): {
             "node_ids": sorted({str(node_id) for node_id in node_ids if str(node_id)})
         }
@@ -821,7 +853,7 @@ def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
     missing = sorted(
         cluster_id
         for cluster_id in expected
-        if not (result.get(cluster_id) or {}).get("node_ids")
+        if cluster_id not in result or not result[cluster_id]["node_ids"]
     )
     if missing:
         raise ReleaseError(
@@ -1129,6 +1161,7 @@ def run_fleet_waves(
     context: FleetWaveContext,
     deployment: dict[str, Any],
 ) -> None:
+    safety_node_names = set(context.node_names)
     while deployment.get("status") != "SUCCEEDED":
         if deployment.get("status") == "FAILED":
             raise ReleaseError(f"{target.cluster_id} fleet deployment failed")
@@ -1168,7 +1201,7 @@ def run_fleet_waves(
                 release,
                 target,
                 wave=expected_wave,
-                node_names=context.node_names,
+                node_names=tuple(sorted(safety_node_names)),
             )
             lease = release._fleet_command(
                 "next-wave",
@@ -1191,7 +1224,7 @@ def run_fleet_waves(
                     release,
                     target,
                     wave=wave,
-                    node_names=context.node_names,
+                    node_names=tuple(sorted(safety_node_names)),
                     timeout_seconds=0,
                     minimum_lease_remaining_seconds=(
                         ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS
@@ -1222,11 +1255,13 @@ def run_fleet_waves(
                     bundle_sha256=context.desired_bundle,
                     template_sha256=context.desired_template,
                     template_config_map=context.template_config_map,
+                    template_content_sha256=context.template_content_sha256,
                     allowed_node_names=wave,
                     max_unavailable=context.max_unavailable,
                     sync_registry=False,
                     runtime_image=context.runtime_image,
                     node_installer_image=context.node_installer_image,
+                    node_dependency_target=context.node_dependency_target,
                 )
             if identity != context.paused_identity:
                 raise ReleaseError(
@@ -1251,6 +1286,7 @@ def run_fleet_waves(
                 legacy_identity=context.allow_legacy_identity,
                 agent_identity=context.agent_identity,
             )
+            safety_node_names.update(wave)
             install_seconds = time.monotonic() - install_started
             if context.phase == "rollback":
                 record_rollback_wave_event(
@@ -1310,13 +1346,14 @@ def deploy_reconciler(
     bundle_sha256: str | None = None,
     template_sha256: str | None = None,
     template_config_map: str | None = None,
+    template_content_sha256: str | None = None,
     allowed_node_names: tuple[str, ...] | None = None,
     max_unavailable: int | None = None,
     sync_registry: bool = True,
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
+    node_dependency_target: NodeDependencyTarget = NodeDependencyTarget.CANDIDATE,
 ) -> tuple[str, str]:
-    release._settle_installer_jobs(target)
     # The Reconciler's own knob is a count of nodes it may install on at once,
     # so it can never be the "auto" sentinel: a caller that does not hand a
     # wave policy (the Reconciler-only component path) gets the conservative
@@ -1335,34 +1372,22 @@ def deploy_reconciler(
         bundle_sha256=bundle_sha256,
         template_sha256=template_sha256,
         template_config_map=template_config_map,
+        template_content_sha256=template_content_sha256,
         allowed_node_names=allowed_node_names,
         max_unavailable=max_unavailable,
         sync_registry=sync_registry,
         runtime_image=runtime_image,
         node_installer_image=node_installer_image,
+        node_dependency_target=node_dependency_target,
     )
+    release._settle_installer_jobs(target)
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
-    # The paused-state deploy, every compatibility-path wave and the finalize
-    # deploy run this same script inside one release, and each one provisioned
-    # the node action keys and rendered the template again (measured 2026-09-12:
-    # the two later runs re-did the first one's work). The first mutating run
-    # records what it produced; the later ones hand it back as hints, and the
-    # script re-checks them against the live cluster before trusting them.
+    # Product reports are diagnostic, not authorization to skip fresh key
+    # proof or replace a trusted full template pin with a name-derived hash.
     products_dir: str | None = None
     inputs_digest = ""
     if not release.runner.dry_run:
         inputs_digest = installer_product_inputs_digest(environment)
-        recorded = recorded_installer_products(
-            release, target, inputs_digest=inputs_digest
-        )
-        if recorded is not None:
-            environment[INSTALLER_REUSE_NODE_SET_ENV] = str(recorded["node_set_sha256"])
-            # An explicit template override (a rollback's steady template) is
-            # the caller's decision and outranks anything this release rendered.
-            if not template_config_map and recorded.get("template_config_map"):
-                environment[INSTALLER_REUSE_TEMPLATE_ENV] = str(
-                    recorded["template_config_map"]
-                )
         products_dir = tempfile.mkdtemp(prefix="gpu-fault-reconciler-products-")
         environment[INSTALLER_PRODUCTS_FILE_ENV] = os.path.join(
             products_dir, "products.json"
@@ -1392,7 +1417,7 @@ def deploy_reconciler(
     )
     if release.runner.dry_run:
         return (
-            bundle_sha256 or release.bundle_sha,
-            template_sha256 or release.node_template_sha,
+            environment["GPU_FAULT_INSTALLER_BUNDLE_SHA256"],
+            environment["GPU_FAULT_INSTALLER_TEMPLATE_SHA256"],
         )
     return reconciler_installer_identity(reconciler_container_env(release, target))

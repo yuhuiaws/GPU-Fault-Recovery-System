@@ -23,6 +23,7 @@ from gpu_fault.async_store import (
 )
 from gpu_fault.channel_registry import CHANNEL_REGISTRY
 from gpu_fault.env import env_bool
+from gpu_fault.postgres_capacity import PostgresPoolCapacity as PostgresPoolCapacity
 from gpu_fault.processor import ProcessorCoordinator
 from gpu_fault.processor.settings import ProcessorPoolSettings
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
@@ -74,8 +75,8 @@ def declared_body_oversize(headers: Mapping[str, str], max_bytes: int) -> bool:
     authentication middleware and processor dispatch -- so that whichever runs
     first refuses to buffer an announced flood (A-3). A compressed body is held
     to :func:`max_compressed_request_bytes`; the decoder stays authoritative
-    for the decompressed size. No usable declaration (chunked, malformed) means
-    the post-decode check decides.
+    for the decompressed size. A bounded stream reader enforces the wire cap
+    even when no usable declaration is available (chunked or malformed).
     """
 
     try:
@@ -160,46 +161,6 @@ def inflate_bounded(body: bytes, max_bytes: int) -> bytes:
         # unbounded number of members nor silently drops the caller's data.
         raise ValueError("gzip request body has trailing data after the stream")
     return decoded
-
-
-@dataclass(frozen=True)
-class PostgresPoolCapacity:
-    """What this role can ask of its connection pool at full load (F-E5).
-
-    ``demand_by_consumer`` is every thread family that checks a connection out
-    of the pool; ``unpooled_connections`` are the LISTEN connections opened
-    beside it, which count against Aurora's ``max_connections`` but never
-    against the pool, so they are reported and kept out of the ratio.
-    """
-
-    pool_max: int
-    demand_by_consumer: dict[str, int]
-    unpooled_connections: int
-
-    # Connections the steady consumers must leave free: one for the
-    # ``/metrics`` scrape, one for a route that goes straight to the store
-    # (heartbeat, receipt poll). An estimate that came out exactly equal to
-    # ``pool_max`` used to pass, and the registry refresh -- the readiness
-    # criterion -- then queued 10 s behind saturated store threads (A-5).
-    REQUIRED_HEADROOM = 2
-
-    @property
-    def demand(self) -> int:
-        return sum(self.demand_by_consumer.values())
-
-    @property
-    def oversubscription_ratio(self) -> float:
-        return self.demand / self.pool_max if self.pool_max > 0 else float("inf")
-
-    @property
-    def headroom(self) -> int:
-        """Connections left once every steady consumer holds one."""
-
-        return self.pool_max - self.demand
-
-    @property
-    def has_headroom(self) -> bool:
-        return self.headroom >= self.REQUIRED_HEADROOM
 
 
 @dataclass
@@ -551,19 +512,19 @@ class AdmissionRuntimeFactory:
                     str(pools.default_pool * 2),
                 )
             )
-        unpooled = 0
-        if queued_processor and background_services:
-            unpooled += 1  # LISTEN gpu_fault_processor_queue
-        if (
-            queued_processor
-            and spool_enabled
-            and service_role in {"all", "spool-worker"}
-        ):
-            unpooled += 1  # LISTEN gpu_fault_telemetry_spool
+        listeners = PostgresPoolCapacity.listener_connections(
+            service_role,
+            queued_processor=queued_processor,
+            spool_enabled=spool_enabled,
+            workflow_dispatcher_enabled=env_bool(
+                "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", True
+            ),
+            regional=regional,
+        )
         estimate = PostgresPoolCapacity(
             pool_max=pool_max,
             demand_by_consumer=demand,
-            unpooled_connections=unpooled,
+            unpooled_connections=sum(listeners.values()),
         )
         if not estimate.has_headroom:
             LOGGER.warning(

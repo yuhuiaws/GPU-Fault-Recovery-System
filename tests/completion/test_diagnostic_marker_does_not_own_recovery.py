@@ -57,6 +57,7 @@ def _marker(
     return NodeMarker(
         marker_id="marker-diagnostic",
         source="host-collector",
+        cluster_id="cluster-a",
         trusted=True,
         incident_id=incident_id,
         observed_at=ended_at - timedelta(seconds=10),

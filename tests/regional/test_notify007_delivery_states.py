@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -23,6 +24,11 @@ from scripts.e2e.regional import run_notify007_delivery_states as notify007
 from scripts.e2e.regional.probes import notify007_delivery_drill as drill
 
 ROOT = Path(__file__).resolve().parents[2]
+TERMINAL_METRIC = "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds"
+LATEST_FAILURE = (
+    f"max by (control_plane_cluster, region) (max_over_time({TERMINAL_METRIC}[15m]))"
+)
+RUNBOOK_TEXT = f"### {verdicts.FAILING_ALERT}\n\n### {verdicts.UNDELIVERED_ALERT}\n"
 
 
 def _text(errors: list[str]) -> str:
@@ -156,6 +162,7 @@ def _metrics(failed: int, dead: int, *, families: bool = True) -> str:
                 "gpu_fault_notification_oldest_pending_age_seconds 0",
                 "gpu_fault_notification_dead_lettered_total 0",
                 "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds 1.0",
+                "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds 0",
             ]
         )
     return "\n".join(lines)
@@ -188,13 +195,308 @@ def test_the_shipped_alert_rule_reads_terminal_failed_and_has_its_runbook() -> N
     rules = (ROOT / "deploy/observability/amp-rules.yaml").read_text(encoding="utf-8")
     runbook = (ROOT / "docs/管理员日常运维.md").read_text(encoding="utf-8")
     assert verdicts.alert_rule_errors(rules, runbook) == []
-    retry_rule = rules.replace(
+    assert "no runbook anchor" in _text(verdicts.alert_rule_errors(rules, "nothing"))
+
+
+@pytest.fixture
+def alert_document() -> dict[str, Any]:
+    return {
+        "groups": [
+            {
+                "name": "notification-contract",
+                "rules": [
+                    {
+                        "alert": verdicts.FAILING_ALERT,
+                        "expr": (
+                            f"(time() - {LATEST_FAILURE}) < 900 "
+                            f"and {LATEST_FAILURE} > 0"
+                        ),
+                        "for": "5m",
+                        "labels": {"severity": "critical"},
+                        "annotations": {
+                            "runbook_url": "docs/管理员日常运维.md"
+                            "#gpufaultnotificationdeliveryfailing"
+                        },
+                    },
+                    {
+                        "alert": verdicts.UNDELIVERED_ALERT,
+                        "expr": (
+                            "max by (control_plane_cluster, region) "
+                            "(gpu_fault_notification_oldest_pending_age_seconds) > 1800"
+                        ),
+                        "for": "10m",
+                        "labels": {"severity": "critical"},
+                        "annotations": {
+                            "runbook_url": "docs/管理员日常运维.md"
+                            "#gpufaultnotificationundeliveredtoolong"
+                        },
+                    },
+                ],
+            }
+        ]
+    }
+
+
+def _failing_rule(document: dict[str, Any]) -> dict[str, Any]:
+    return next(
+        rule
+        for group in document["groups"]
+        for rule in group["rules"]
+        if rule.get("alert") == verdicts.FAILING_ALERT
+    )
+
+
+def _alert_errors(document: dict[str, Any], runbook: str = RUNBOOK_TEXT) -> list[str]:
+    return verdicts.alert_rule_errors(yaml.safe_dump(document), runbook)
+
+
+@pytest.mark.parametrize("flow_style", [False, True])
+def test_alert_contract_accepts_structured_yaml_and_promql_whitespace(
+    alert_document: dict[str, Any], flow_style: bool
+) -> None:
+    rule = _failing_rule(alert_document)
+    rule["expr"] = rule["expr"].replace("(", "( \n").replace(")", "\t)")
+    text = yaml.safe_dump(alert_document, default_flow_style=flow_style)
+    assert verdicts.alert_rule_errors(text, RUNBOOK_TEXT) == []
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
         'gpu_fault_notification_total{status="FAILED"}',
         'gpu_fault_notification_delivery_total{status="RETRY"}',
+        "gpu_fault_notification_dead_lettered_total",
+        TERMINAL_METRIC + "_unrelated",
+    ],
+    ids=["retained-failed", "retry-population", "dead-counter", "wrong-name"],
+)
+def test_alert_contract_rejects_nonterminal_event_metrics(
+    alert_document: dict[str, Any], metric: str
+) -> None:
+    rule = _failing_rule(alert_document)
+    assert rule["expr"].count(TERMINAL_METRIC) == 2
+    rule["expr"] = rule["expr"].replace(TERMINAL_METRIC, metric)
+    assert "terminal failure event-time contract" in _text(
+        _alert_errors(alert_document)
     )
-    errors = verdicts.alert_rule_errors(retry_rule, runbook)
-    assert "does not read gpu_fault_notification_total" in _text(errors), errors
-    assert "no runbook anchor" in _text(verdicts.alert_rule_errors(rules, "nothing"))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("[15m]", "[5m]"),
+        ("[15m]", "[30m]"),
+        ("[15m]", ""),
+        ("max_over_time", "last_over_time"),
+        ("max_over_time", "increase"),
+        ("max_over_time", "delta"),
+        ("< 900", "< 1800"),
+        ("< 900", "<= 900"),
+        ("< 900", "> 900"),
+        ("< 900", "< bool 900"),
+        ("> 0", ">= 0"),
+        ("> 0", "> bool 0"),
+        ("> 0", "> 1"),
+        ("and", "or"),
+        ("control_plane_cluster, region", "region"),
+        ("control_plane_cluster, region", "control_plane_cluster, region, pod"),
+        ("max by", "sum by"),
+        ("time()", "timestamp(vector(1))"),
+    ],
+    ids=[
+        "short-window",
+        "long-window",
+        "no-window",
+        "no-restart-memory",
+        "counter-increase",
+        "population-delta",
+        "long-age",
+        "inclusive-age",
+        "stale-age",
+        "bool-age",
+        "zero-stamp",
+        "bool-stamp",
+        "wrong-stamp-threshold",
+        "or",
+        "missing-cluster",
+        "replica-fanout",
+        "sum",
+        "scrape-time",
+    ],
+)
+def test_alert_contract_rejects_changed_event_window_or_logic(
+    alert_document: dict[str, Any], old: str, new: str
+) -> None:
+    rule = _failing_rule(alert_document)
+    assert old in rule["expr"], "negative control must change the parsed expression"
+    rule["expr"] = rule["expr"].replace(old, new, 1)
+    assert "terminal failure event-time contract" in _text(
+        _alert_errors(alert_document)
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["comment", "string", "always-true", "no-guard"])
+def test_alert_contract_cannot_pass_from_an_expression_mention(
+    alert_document: dict[str, Any], wrapper: str
+) -> None:
+    rule = _failing_rule(alert_document)
+    expr = rule["expr"]
+    if wrapper == "comment":
+        rule["expr"] = f"vector(1) # {expr}"
+    elif wrapper == "string":
+        rule["expr"] = f'label_replace(vector(1), "note", "{expr}", "__name__", ".*")'
+    elif wrapper == "always-true":
+        rule["expr"] = f"({expr}) or vector(1)"
+    else:
+        rule["expr"] = expr.partition(" and ")[0]
+    assert "terminal failure event-time contract" in _text(
+        _alert_errors(alert_document)
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("expr", None, "event-time contract"),
+        ("expr", True, "event-time contract"),
+        ("expr", 1, "event-time contract"),
+        ("expr", [], "event-time contract"),
+        ("expr", {"text": LATEST_FAILURE}, "event-time contract"),
+        ("labels", {"severity": "warning"}, "severity must be critical"),
+        ("labels", {"severity": True}, "severity must be critical"),
+        ("labels", {}, "severity must be critical"),
+        ("labels", None, "severity must be critical"),
+        ("labels", ["critical"], "severity must be critical"),
+        ("for", "1m", "hold duration must be 5m"),
+        ("for", "15m", "hold duration must be 5m"),
+        ("for", None, "hold duration must be 5m"),
+        ("for", 300, "hold duration must be 5m"),
+        ("for", True, "hold duration must be 5m"),
+        ("annotations", {}, "no runbook anchor"),
+        ("annotations", None, "no runbook anchor"),
+        ("annotations", ["runbook_url"], "no runbook anchor"),
+    ],
+)
+def test_alert_contract_rejects_wrong_typed_fields_severity_and_hold(
+    alert_document: dict[str, Any], field: str, value: Any, error: str
+) -> None:
+    _failing_rule(alert_document)[field] = value
+    assert error in _text(_alert_errors(alert_document))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "null",
+        "groups: [",
+        "groups: []\n---\ngroups: []",
+        "[]",
+        "true",
+        "rules",
+        "groups: null",
+        "groups: {}",
+        "groups: [null]",
+        "groups: [{rules: false}]",
+        "groups: [{rules: [null]}]",
+        "groups: [{rules: [unstructured]}]",
+    ],
+)
+def test_alert_contract_rejects_malformed_yaml_structure(text: str) -> None:
+    errors = verdicts.alert_rule_errors(text, RUNBOOK_TEXT)
+    assert errors, "malformed YAML must produce a failing rule verdict"
+    assert verdicts.case_verdict({"alert_rule": errors}) == "FAIL"
+
+
+@pytest.mark.parametrize("name", [verdicts.FAILING_ALERT, verdicts.UNDELIVERED_ALERT])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_alert_contract_requires_one_definition_per_alert(
+    alert_document: dict[str, Any], name: str, duplicate: bool
+) -> None:
+    rules = alert_document["groups"][0]["rules"]
+    target = next(rule for rule in rules if rule["alert"] == name)
+    if duplicate:
+        alert_document["groups"].append(
+            {"name": "duplicate", "rules": [{**target, "expr": "vector(1)"}]}
+        )
+    else:
+        rules.remove(target)
+    expected = "defined more than once" if duplicate else "not defined"
+    assert f"alert {name} is {expected}" in _alert_errors(alert_document)
+
+
+@pytest.mark.parametrize("name", [verdicts.FAILING_ALERT, verdicts.UNDELIVERED_ALERT])
+@pytest.mark.parametrize("defect", ["absent", "fragment", "other-alert", "document"])
+def test_alert_contract_requires_the_correct_runbook_url(
+    alert_document: dict[str, Any], name: str, defect: str
+) -> None:
+    target = next(
+        rule for rule in alert_document["groups"][0]["rules"] if rule["alert"] == name
+    )
+    annotations = target["annotations"]
+    if defect == "absent":
+        annotations.pop("runbook_url")
+    elif defect == "fragment":
+        annotations["runbook_url"] += "-missing"
+    elif defect == "other-alert":
+        other = next(
+            rule
+            for rule in alert_document["groups"][0]["rules"]
+            if rule["alert"] != name
+        )
+        annotations["runbook_url"] = other["annotations"]["runbook_url"]
+    else:
+        annotations["runbook_url"] = f"docs/missing.md#{name.lower()}"
+    assert _alert_errors(alert_document) == [
+        f"alert {name} has no runbook anchor in the operations manual"
+    ]
+
+
+@pytest.mark.parametrize("name", [verdicts.FAILING_ALERT, verdicts.UNDELIVERED_ALERT])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{name}",
+        "See `{name}`.",
+        "### {name}Extra",
+        "```markdown\n### {name}\n```",
+        "~~~markdown\n### {name}\n~~~",
+        "````markdown\n```\n### {name}\n````",
+        "<!--\n### {name}\n-->",
+    ],
+)
+def test_alert_contract_requires_real_headings_not_runbook_mentions(
+    alert_document: dict[str, Any], name: str, template: str
+) -> None:
+    runbook = RUNBOOK_TEXT.replace(f"### {name}\n", template.format(name=name) + "\n")
+    assert _alert_errors(alert_document, runbook) == [
+        f"alert {name} has no runbook anchor in the operations manual"
+    ]
+
+
+def test_alert_headings_after_closed_code_and_comment_blocks_are_valid(
+    alert_document: dict[str, Any],
+) -> None:
+    runbook = (
+        "````markdown\n```\n### Example\n````\n"
+        "~~~text\n```not-a-closing-fence\n~~~\n<!-- ignored -->\n" + RUNBOOK_TEXT
+    )
+    assert _alert_errors(alert_document, runbook) == []
+
+
+def test_terminal_event_rule_does_not_replace_the_production_census_proof() -> None:
+    assert verdicts.RESULT_METRIC == "gpu_fault_notification_total"
+    before = _metrics(2, 1).replace(f"{TERMINAL_METRIC} 0", f"{TERMINAL_METRIC} 100")
+    after = _metrics(3, 1).replace(f"{TERMINAL_METRIC} 0", f"{TERMINAL_METRIC} 100")
+    assert "status=FAILED" in _text(
+        verdicts.production_untouched_errors([before], [after])
+    )
+    timestamp_only = before.replace(
+        'gpu_fault_notification_total{status="FAILED"} 2', ""
+    )
+    assert "missing or changed gpu_fault_notification_total" in _text(
+        verdicts.production_untouched_errors([timestamp_only], [timestamp_only])
+    )
 
 
 def test_the_runner_is_plan_by_default_with_the_documented_flags(
@@ -209,7 +511,7 @@ def test_the_runner_is_plan_by_default_with_the_documented_flags(
         parser.parse_args(["--run-dir", str(tmp_path), "--plan", "--execute"])
     assert notify007.CASE_ID == "GF-REGIONAL-NOTIFY-007"
     assert notify007.CONFIRMATION == "NOTIFY007_EXECUTE"
-    assert verdicts.PREDECESSOR_CASE_ID == "GF-REGIONAL-NOTIFY-006"
+    assert verdicts.PREDECESSOR_CASE_ID == "GF-REGIONAL-NOTIFY-005"
     assert (
         ROOT / "scripts/e2e/regional/run_notify007_delivery_states.py"
     ).stat().st_mode & 0o777 == 0o775

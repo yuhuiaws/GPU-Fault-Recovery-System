@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_images import previous_executor_image
+
 import json
 from typing import Any
 
@@ -15,7 +17,6 @@ from gpu_fault_release.regional_release_gpu_rollout import (
 )
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
-from gpu_fault_release.regional_release_state import require_digest_pinned_image
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 
 GPU_COMPONENTS = frozenset(
@@ -209,7 +210,7 @@ def _require_ready_deployment(
         raise ReleaseError(
             f"{target.cluster_id} resume {deployment_name} is not fully Ready"
         )
-    if _container_image(deployment, deployment_name) != release.runtime_image:
+    if _container_image(deployment, deployment_name) != release.executor_image:
         raise ReleaseError(
             f"{target.cluster_id} resume {deployment_name} image drifted"
         )
@@ -440,6 +441,12 @@ def validate_resume_checkpoint(
     expected_ids = {target.cluster_id for target in release.config.clusters}
     if set(loaded.get("cluster_ids") or []) != expected_ids:
         raise ReleaseError("resume cluster membership drifted")
+    if (
+        plan.has(ReleaseComponent.AURORA_REFRESH)
+        and "aurora-refresh-ready" in set(loaded.get("completed_phases") or [])
+        and release._aurora_refresh_drift()
+    ):
+        raise ReleaseError("resume Aurora credential refresher drifted")
     if loaded.get("cluster_registry_digest") != release.cluster_registry_digest:
         raise ReleaseError("resume cluster identity digest drifted")
     attempt_states = {
@@ -474,10 +481,7 @@ def validate_resume_checkpoint(
     planned_gpu = frozenset(plan.nodes).intersection(GPU_COMPONENTS)
     if not planned_gpu:
         return
-    previous_runtime = require_digest_pinned_image(
-        "resume previous runtime",
-        previous.get("runtime_image") or release.runtime_image,
-    )
+    previous_runtime = previous_executor_image(previous)
     for target in release.config.clusters:
         identity = (previous.get("agent_identities") or {}).get(target.cluster_id)
         if not isinstance(identity, dict):

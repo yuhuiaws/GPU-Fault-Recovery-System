@@ -21,6 +21,7 @@ from scripts.e2e.regional import destr022_verdicts as verdicts
 from scripts.e2e.regional import run_destr022_spare_reservation_reclaim as destr022
 from scripts.e2e.regional.probes import destr022_executor_probe as probe
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 SPARE = "spare-a"
@@ -28,7 +29,6 @@ INCIDENT = verdicts.synthetic_incident_id("abc123-a1")
 T0 = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
 RECLAIMED_AT = T0 + timedelta(minutes=4)
 RESERVED_AT = verdicts.stale_reserved_at(T0)
-TOPOLOGY_STRINGS = ("/secure/gpu-fault-bootstrap", "514385905925", "gpu-fault-gpu-1-")
 
 
 def _text(errors: list[str]) -> str:
@@ -120,6 +120,8 @@ def _probe(pod: str = "executor-0", **overrides: Any) -> dict[str, Any]:
         "env": {"GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER": "true"},
     }
     value.update(overrides)
+    claimed = verdicts.breadcrumb_claimed_at(value.get("claim_state")) or T0
+    value["observed_at"] = (claimed + timedelta(seconds=1)).isoformat()
     return value
 
 
@@ -360,9 +362,8 @@ def test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcru
         _probe(claim_state=_breadcrumb(counter=3, claimed_at=T0)),
         _probe("executor-1", claim_state=_breadcrumb(counter=3, claimed_at=T0)),
     ]
-    assert verdicts.counter_errors(before, stale, reclaimed_at=RECLAIMED_AT) == [], (
-        "a breadcrumb that predates the reclaim cannot be judged for the increment"
-    )
+    errors = verdicts.counter_errors(before, stale, reclaimed_at=RECLAIMED_AT)
+    assert any("no executor breadcrumb" in item for item in errors), errors
     backwards = [
         _probe(claim_state=_breadcrumb(counter=1, claimed_at=later)),
         _probe("executor-1", claim_state=_breadcrumb(counter=3, claimed_at=later)),
@@ -607,8 +608,7 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         ROOT / "scripts/e2e/regional/destr022_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for value in TOPOLOGY_STRINGS:
-            assert value not in source, (path.name, value)
+        assert not site_topology_leaks(source), (path.name, site_topology_leaks(source))
         if path.name.startswith("destr022_verdicts"):
             continue
         mode = path.stat().st_mode & 0o777

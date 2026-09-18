@@ -24,6 +24,7 @@ import pytest
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
 from gpu_fault.store import SqliteStore
 from gpu_fault.store.shared.errors import (
+    StaleFencingTokenError,
     StaleWriteError,
     WorkflowLeaseError,
     WorkflowMergedError,
@@ -40,12 +41,21 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 NOW = datetime(2026, 9, 5, 20, 0, tzinfo=timezone.utc)
 GROUP = '["cluster-a","job-a","job-a-a001"]'
 
 
-@pytest.fixture(params=["memory", "sqlite", "postgres"])
+@pytest.fixture(
+    params=[
+        "memory",
+        "sqlite",
+        "postgres-legacy",
+        "postgres-dual",
+        "postgres-dedicated",
+    ]
+)
 def store(request, tmp_path):
     if request.param == "memory":
         yield build_store()
@@ -59,9 +69,19 @@ def store(request, tmp_path):
         return
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
     for postgres in postgres_store_instance():
-        yield postgres
-    _truncate()
+        try:
+            with psycopg.connect(
+                os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+            ) as connection:
+                select_mode(
+                    connection, "workflow", request.param.removeprefix("postgres-")
+                )
+            yield postgres
+        finally:
+            _truncate()
 
 
 def _create(existing_incident, existing_workflow):
@@ -106,6 +126,55 @@ def _widen(node: str):
         )
 
     return build
+
+
+@pytest.mark.parametrize("with_incident", [False, True])
+def test_leased_save_cannot_restore_a_fence_advanced_by_full_cas(
+    store, with_incident: bool
+) -> None:
+    incident, workflow = store.merge_attempt_fault_workflow(GROUP, "event-1", _create)
+    claimed = store.claim_workflow(
+        workflow.request_id, "executor-a", workflow.fencing_token
+    )
+    advanced = copy_model(claimed, fencing_token=claimed.fencing_token + 1)
+    store.save_workflow(advanced, expected=claimed)
+    progressed = copy_model(claimed, completed_step_indexes=[0])
+
+    with pytest.raises(StaleFencingTokenError, match="fencing token"):
+        if with_incident:
+            store.save_workflow_and_incident_if_leased(
+                progressed,
+                copy_model(incident, state=IncidentState.RECOVERED),
+                "executor-a",
+                claimed.execution_epoch,
+            )
+        else:
+            store.save_workflow_if_leased(
+                progressed, "executor-a", claimed.execution_epoch
+            )
+    assert store.get_workflow(workflow.request_id) == advanced
+    assert store.get_incident(incident.incident_id) == incident
+
+
+@pytest.mark.parametrize("with_incident", [False, True])
+def test_leased_save_cannot_write_a_payload_from_another_execution_epoch(
+    store, with_incident: bool
+) -> None:
+    incident, workflow = store.merge_attempt_fault_workflow(GROUP, "event-1", _create)
+    claimed = store.claim_workflow(
+        workflow.request_id, "executor-a", workflow.fencing_token
+    )
+    stale = copy_model(claimed, execution_epoch=claimed.execution_epoch - 1)
+
+    with pytest.raises(WorkflowLeaseError, match="lease"):
+        if with_incident:
+            store.save_workflow_and_incident_if_leased(
+                stale, incident, "executor-a", claimed.execution_epoch
+            )
+        else:
+            store.save_workflow_if_leased(stale, "executor-a", claimed.execution_epoch)
+    assert store.get_workflow(workflow.request_id) == claimed
+    assert store.get_incident(incident.incident_id) == incident
 
 
 def _nodes(workflow) -> list[str]:

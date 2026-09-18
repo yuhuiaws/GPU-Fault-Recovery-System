@@ -35,7 +35,15 @@ if str(ROOT / "src") not in sys.path:
 if str(ROOT / "scripts" / "perf") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts" / "perf"))
 
+from scripts.e2e.regional.site_profile import install_site_profile  # noqa: E402
+
+# Perf helpers capture routing settings at import, before a runner's main().
+install_site_profile()
+
 from scripts.e2e.regional.acceptance_scope import scoped_case_evidence  # noqa: E402
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python as component_python,
+)
 
 _action_capacity = importlib.import_module("regional_action_capacity_suite")
 _registry = importlib.import_module("regional_capacity_registry")
@@ -58,6 +66,7 @@ LIVE_REGISTRY_CONFIRMATION = "ALLOW_PERF_CAPACITY_LIVE_REGISTRY"
 TOKEN_SECRET = "gpu-fault-perf-clusters"
 CONNECTION_SECRET = "gpu-fault-regional-connection"
 DEFAULT_POD_DEADLINE_SECONDS = 900
+RUN_LABEL: str = _registry.RUN_LABEL
 
 
 class SeededCommandError(RuntimeError):
@@ -117,7 +126,7 @@ def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
         "-i",
         pod,
         "--",
-        "python3",
+        component_python("cpu"),
         "-",
         *arguments,
         stdin=script.encode(),
@@ -141,7 +150,7 @@ prefix = sys.argv[1]
 like = "%" + prefix + "%"
 queries = {
     "objects": (
-        "SELECT count(*) FROM gpu_fault_objects "
+        "SELECT count(*) FROM gpu_fault_control_records "
         "WHERE key LIKE %s OR payload->>'cluster_id' LIKE 'perf-cap-%%'"
     ),
     "links": (
@@ -205,7 +214,6 @@ def kubernetes_residuals(probe: SeededCommandProbe) -> dict[str, Any]:
             "--ignore-not-found",
             "-o",
             "name",
-            check=False,
         ).strip()
         resources[f"{kind}/{name}"] = bool(output)
     return {"count": sum(resources.values()), "resources": resources}
@@ -214,15 +222,15 @@ def kubernetes_residuals(probe: SeededCommandProbe) -> dict[str, Any]:
 def preflight_residuals(probe: SeededCommandProbe, case_dir: Path) -> dict[str, Any]:
     database = database_residuals(probe.run_prefix)
     write_json(case_dir / "database-preflight.json", database)
-    if database.get("total") != 0:
+    if type(database.get("total")) is not int or database["total"] != 0:
         raise SeededCommandError(f"database preflight found residuals: {database}")
     registry = registry_residuals()
     write_json(case_dir / "registry-verification-preflight.json", registry)
-    if registry.get("count") != 0:
+    if type(registry.get("count")) is not int or registry["count"] != 0:
         raise SeededCommandError(f"registry preflight found residuals: {registry}")
     kubernetes = kubernetes_residuals(probe)
     write_json(case_dir / "kubernetes-preflight.json", kubernetes)
-    if kubernetes.get("count") != 0:
+    if type(kubernetes.get("count")) is not int or kubernetes["count"] != 0:
         raise SeededCommandError(f"Kubernetes preflight found residuals: {kubernetes}")
     return {"database": database, "registry": registry, "kubernetes": kubernetes}
 
@@ -324,6 +332,16 @@ print(json.dumps({
 SEED_LEASE_SECONDS = 30 * 60
 
 
+def seed_identity(run_id: str) -> dict[str, Any]:
+    return {
+        "incident_id": f"incident-{run_id}",
+        "event_id": f"event-{run_id}",
+        "workflow_id": f"workflow-actionperf-{run_id}",
+        "command_id": f"remote-{run_id}",
+        "cluster_id": SYNTHETIC_CLUSTER_ID,
+    }
+
+
 def seed_command(
     run_id: str,
     *,
@@ -371,6 +389,10 @@ def stamp(value):
 
 print(json.dumps({
     "command_id": command.command_id,
+    "workflow_request_id": command.workflow_request_id,
+    "incident_id": command.incident_id,
+    "cluster_id": command.cluster_id,
+    "idempotency_key": command.idempotency_key,
     "status": command.status.value,
     "status_source": command.status_source,
     "last_lease_owner": command.last_lease_owner,
@@ -416,11 +438,11 @@ with psycopg.connect(store_dsn(), autocommit=True) as connection:
         ("incident", incident_id),
     ):
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s", (kind, key)
+            "SELECT gpu_fault_delete_control_state(%s,%s)", (kind, key)
         )
-        deleted[f"{kind}/{key}"] = cursor.rowcount
+        deleted[f"{kind}/{key}"] = int(cursor.fetchone()[0])
     cursor.execute(
-        "SELECT kind, key FROM gpu_fault_objects WHERE (kind, key) IN "
+        "SELECT kind, key FROM gpu_fault_control_records WHERE (kind, key) IN "
         "(('remote_command', %s), ('workflow', %s), ('incident', %s)) "
         "ORDER BY kind, key",
         (command_id, workflow_id, incident_id),
@@ -451,7 +473,11 @@ def purge_seed(
         str(seed["incident_id"]),
         str(seed["event_id"]),
     )
-    if result.get("remaining") or result.get("remaining_links"):
+    if (
+        result.get("remaining") != []
+        or type(result.get("remaining_links")) is not int
+        or result["remaining_links"] != 0
+    ):
         raise SeededCommandError(f"seed cleanup left residual state: {result}")
     return result
 
@@ -552,23 +578,73 @@ def register_synthetic_cluster(case_dir: Path, run_id: str) -> None:
         allow_live_registry=True,
         live_registry_confirmation=LIVE_REGISTRY_CONFIRMATION,
     )
+    metadata = resource_metadata("secret", TOKEN_SECRET)
+    if not metadata.get("uid") or not metadata.get("resourceVersion"):
+        raise SeededCommandError("synthetic token Secret identity is unknown")
+    if (metadata.get("labels") or {}).get(RUN_LABEL) != run_id:
+        raise SeededCommandError("synthetic token Secret belongs to another run")
+    if metadata["uid"] != probe_resource_uid(case_dir, "secret", TOKEN_SECRET, run_id):
+        raise SeededCommandError(
+            "synthetic token Secret was replaced after registration"
+        )
 
 
-def create_probe_pod(probe: SeededCommandProbe, case_dir: Path) -> dict[str, Any]:
+def create_probe_pod(
+    probe: SeededCommandProbe, case_dir: Path, *, run_id: str
+) -> dict[str, Any]:
     identity = executor_identity(require_dataplane_deployment=True)
     image = executor_image()
-    upsert_configmap(
-        probe.configmap,
-        text={probe.script.name: probe.script.read_text(encoding="utf-8")},
-    )
-    dataplane("delete", "pod", probe.pod, "--ignore-not-found", check=False)
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(pod_manifest(probe, image, identity)).encode(),
-    )
+    manifest = pod_manifest(probe, image, identity)
+    manifest["metadata"]["labels"][RUN_LABEL] = run_id
+    configmap: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": probe.configmap,
+            "namespace": NAMESPACE,
+            "labels": {RUN_LABEL: run_id},
+        },
+        "data": {probe.script.name: probe.script.read_text(encoding="utf-8")},
+    }
+    journal_path = case_dir / "probe-resource-identities.json"
+    journal: dict[str, Any] = {"run_id": run_id, "resources": {}}
+    write_json(journal_path, journal)
+    for resource in (configmap, manifest):
+        kind, name = resource["kind"].lower(), resource["metadata"]["name"]
+        journal["resources"][f"{kind}/{name}"] = None
+        write_json(journal_path, journal)
+        try:
+            output = dataplane(
+                "create",
+                "-f",
+                "-",
+                "-o",
+                "jsonpath={.metadata}",
+                stdin=json.dumps(resource).encode(),
+            )
+            metadata = json.loads(output)
+        except Exception:
+            # Capture a committed create after ACK loss, without replaying it.
+            metadata = resource_metadata(kind, name)
+            if metadata and (metadata.get("labels") or {}).get(RUN_LABEL) == run_id:
+                journal["resources"][f"{kind}/{name}"] = metadata.get("uid")
+                write_json(journal_path, journal)
+            raise
+        if (
+            not isinstance(metadata, dict)
+            or not metadata.get("uid")
+            or not metadata.get("resourceVersion")
+            or (metadata.get("labels") or {}).get(RUN_LABEL) != run_id
+        ):
+            raise SeededCommandError("probe create identity was not confirmed")
+        journal["resources"][f"{kind}/{name}"] = metadata["uid"]
+        write_json(journal_path, journal)
     dataplane("wait", "--for=condition=Ready", f"pod/{probe.pod}", "--timeout=180s")
+    if (
+        resource_metadata("pod", probe.pod).get("uid")
+        != journal["resources"][f"pod/{probe.pod}"]
+    ):
+        raise SeededCommandError("probe Pod was replaced before readiness")
     wait_file(probe, "/state/ready.json", 60)
     ready = read_state(probe, "/state/ready.json")
     write_json(case_dir / "probe-ready.json", ready)
@@ -664,40 +740,236 @@ def wait_executor_state(
 # --------------------------------------------------------------------------- #
 # Cleanup
 # --------------------------------------------------------------------------- #
+def resource_metadata(
+    kind: str, name: str, *, client: Callable[..., str] | None = None
+) -> dict[str, Any]:
+    raw = (client or dataplane)(
+        "get",
+        kind,
+        name,
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata}",
+        timeout=60,
+    ).strip()
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict) or not value:
+        raise SeededCommandError("resource metadata is not an object")
+    return value
+
+
+def probe_resource_uid(case_dir: Path, kind: str, name: str, run_id: str) -> str | None:
+    token = kind == "secret" and name == TOKEN_SECRET
+    path = case_dir / (
+        "registry-token-proof.json" if token else "probe-resource-identities.json"
+    )
+    if not path.exists():
+        return None
+    proof = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(proof, dict) or proof.get("run_id") != run_id:
+        raise SeededCommandError("probe resource proof belongs to another run")
+    uid = (
+        proof.get("uid") if token else proof.get("resources", {}).get(f"{kind}/{name}")
+    )
+    if uid is not None and (not isinstance(uid, str) or not uid):
+        raise SeededCommandError("probe resource UID proof is invalid")
+    return uid
+
+
+def delete_owned_resource(
+    kind: str,
+    name: str,
+    run_id: str,
+    *,
+    client: Callable[..., str] | None = None,
+    namespace: str | None = None,
+    expected_uid: str | None = None,
+    expected_resource_version: str | None = None,
+    require_uid: bool = False,
+) -> None:
+    resources = {
+        "pod": ("api/v1", "pods"),
+        "configmap": ("api/v1", "configmaps"),
+        "secret": ("api/v1", "secrets"),
+        "job": ("apis/batch/v1", "jobs"),
+        "serviceaccount": ("api/v1", "serviceaccounts"),
+        "role": ("apis/rbac.authorization.k8s.io/v1", "roles"),
+        "rolebinding": ("apis/rbac.authorization.k8s.io/v1", "rolebindings"),
+        "clusterrole": ("apis/rbac.authorization.k8s.io/v1", "clusterroles"),
+        "clusterrolebinding": (
+            "apis/rbac.authorization.k8s.io/v1",
+            "clusterrolebindings",
+        ),
+        "validatingwebhookconfiguration": (
+            "apis/admissionregistration.k8s.io/v1",
+            "validatingwebhookconfigurations",
+        ),
+        "validatingadmissionpolicy": (
+            "apis/admissionregistration.k8s.io/v1",
+            "validatingadmissionpolicies",
+        ),
+        "validatingadmissionpolicybinding": (
+            "apis/admissionregistration.k8s.io/v1",
+            "validatingadmissionpolicybindings",
+        ),
+    }
+    if kind not in resources:
+        raise SeededCommandError("unsupported synthetic probe resource")
+    metadata = resource_metadata(kind, name, client=client)
+    if not metadata:
+        return
+    uid = metadata.get("uid")
+    version = metadata.get("resourceVersion")
+    if (
+        not uid
+        or not version
+        or (metadata.get("labels") or {}).get(RUN_LABEL) != run_id
+    ):
+        raise SeededCommandError(
+            f"{kind}/{name} ownership belongs to another run or is unknown"
+        )
+    if require_uid and not expected_uid:
+        raise SeededCommandError(f"{kind}/{name} has no recorded UID proof")
+    if expected_uid is not None and uid != expected_uid:
+        raise SeededCommandError(f"{kind}/{name} was replaced before cleanup")
+    if expected_resource_version is not None and version != expected_resource_version:
+        raise SeededCommandError(f"{kind}/{name} changed after its full cleanup check")
+    api, plural = resources[kind]
+    scope = (
+        ""
+        if kind
+        in {
+            "clusterrole",
+            "clusterrolebinding",
+            "validatingwebhookconfiguration",
+            "validatingadmissionpolicy",
+            "validatingadmissionpolicybinding",
+        }
+        else f"/namespaces/{namespace or NAMESPACE}"
+    )
+    try:
+        (client or dataplane)(
+            "delete",
+            "--raw",
+            f"/{api}{scope}/{plural}/{name}",
+            "-f",
+            "-",
+            stdin=json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": uid, "resourceVersion": version},
+                    "propagationPolicy": "Foreground",
+                }
+            ).encode(),
+            timeout=120,
+        )
+    except Exception:
+        remaining = resource_metadata(kind, name, client=client)
+        if not remaining:
+            return
+        if remaining.get("uid") != uid:
+            raise SeededCommandError(
+                f"{kind}/{name} was replaced during cleanup"
+            ) from None
+        if not remaining.get("deletionTimestamp"):
+            raise
+    deadline = time.monotonic() + 120
+    while True:
+        remaining = resource_metadata(kind, name, client=client)
+        if not remaining:
+            return
+        if remaining.get("uid") != uid:
+            raise SeededCommandError(f"{kind}/{name} was replaced during cleanup")
+        if time.monotonic() >= deadline:
+            raise SeededCommandError(f"{kind}/{name} removal was not confirmed")
+        time.sleep(1)
+
+
+def deregister_synthetic_cluster(case_dir: Path, run_id: str) -> None:
+    scope = _registry.validate_registry_target(
+        allow_live_registry=True, confirmation=LIVE_REGISTRY_CONFIRMATION
+    )
+    _registry.deregister(scope=scope, artifacts=case_dir, run_id=run_id)
+
+
 def cleanup(
     probe: SeededCommandProbe,
     case_dir: Path,
     run_id: str,
     result: dict[str, Any],
     seed: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    purge: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    database_probe: Callable[[str], dict[str, Any]] | None = None,
 ) -> None:
-    """Undo everything the case created; any failure downgrades to FAIL."""
+    """Clean only this run; never purge under a possibly running claimant."""
 
-    if seed:
+    registry_started = state.get("registry_started") is True
+    probe_started = state.get("probe_started") is True
+    if not registry_started and not probe_started and not seed:
+        result["cleanup_skipped"] = "no owned mutation attempted"
+        return
+    errors: list[str] = []
+    claimant_stopped = not probe_started
+    if probe_started:
         try:
-            seed_cleanup = purge_seed(seed)
+            delete_owned_resource(
+                "pod",
+                probe.pod,
+                run_id,
+                require_uid=True,
+                expected_uid=probe_resource_uid(case_dir, "pod", probe.pod, run_id),
+            )
+            claimant_stopped = True
+        except Exception as exc:
+            errors.append(f"probe stop: {type(exc).__name__}: {exc}")
+    if seed and claimant_stopped:
+        try:
+            seed_cleanup = (purge or purge_seed)(seed)
             result["seed_cleanup"] = seed_cleanup
             write_json(case_dir / "seed-cleanup.json", seed_cleanup)
-        except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
-            result["cleanup_error"] = f"seed cleanup: {type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-    dataplane("delete", "pod", probe.pod, "--ignore-not-found", check=False)
-    dataplane("delete", "configmap", probe.configmap, "--ignore-not-found", check=False)
-    try:
-        teardown(
-            purge=True,
-            deregister_clusters=True,
-            allow_live_registry=True,
-            live_registry_confirmation=LIVE_REGISTRY_CONFIRMATION,
-            artifacts=case_dir,
-            run_id=run_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
-        result["cleanup_error"] = f"registry cleanup: {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            errors.append(f"seed cleanup: {type(exc).__name__}: {exc}")
+    if probe_started:
+        try:
+            delete_owned_resource(
+                "configmap",
+                probe.configmap,
+                run_id,
+                require_uid=True,
+                expected_uid=probe_resource_uid(
+                    case_dir, "configmap", probe.configmap, run_id
+                ),
+            )
+        except Exception as exc:
+            errors.append(f"probe configmap: {type(exc).__name__}: {exc}")
+    if registry_started and claimant_stopped:
+        try:
+            delete_owned_resource(
+                "secret",
+                TOKEN_SECRET,
+                run_id,
+                require_uid=True,
+                expected_uid=probe_resource_uid(
+                    case_dir, "secret", TOKEN_SECRET, run_id
+                ),
+            )
+        except Exception as exc:
+            errors.append(f"probe token: {type(exc).__name__}: {exc}")
+        try:
+            deregister_synthetic_cluster(case_dir, run_id)
+        except Exception as exc:
+            errors.append(f"registry cleanup: {type(exc).__name__}: {exc}")
+    if errors:
+        result["cleanup_error"] = "; ".join(errors)
         result["verdict"] = "FAIL"
     try:
         postflight = {
-            "database": database_residuals(probe.run_prefix),
+            "database": (database_probe or database_residuals)(probe.run_prefix),
             "registry": registry_residuals(),
             "kubernetes": kubernetes_residuals(probe),
         }
@@ -710,7 +982,7 @@ def cleanup(
             result[f"{name}_postflight"] = value
             write_json(case_dir / names[name], value)
             key = "total" if name == "database" else "count"
-            if value.get(key) != 0:
+            if type(value.get(key)) is not int or value[key] != 0:
                 raise SeededCommandError(f"{name} postflight found residuals: {value}")
     except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
         result["postflight_error"] = f"{type(exc).__name__}: {exc}"
@@ -724,9 +996,12 @@ def residual_free(result: dict[str, Any]) -> bool:
     registry = result.get("registry_postflight") or {}
     kubernetes = result.get("kubernetes_postflight") or {}
     return (
-        database.get("total") == 0
-        and registry.get("count") == 0
-        and kubernetes.get("count") == 0
+        type(database.get("total")) is int
+        and database["total"] == 0
+        and type(registry.get("count")) is int
+        and registry["count"] == 0
+        and type(kubernetes.get("count")) is int
+        and kubernetes["count"] == 0
         and "cleanup_error" not in result
         and "postflight_error" not in result
     )

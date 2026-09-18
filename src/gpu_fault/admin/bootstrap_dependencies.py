@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import hashlib
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.api_budget import resolve_tool
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
+from gpu_fault.admin.execution import (
+    PROOFS,
+    ProofKey,
+    ProofSubject,
+    current_deadline,
+    deadline_scope,
+    run_command,
+)
 
 TOOL_MANIFEST = "data/deploy-host-tools.json"
 
@@ -51,8 +62,8 @@ def deploy_host_dependency_report(
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
     source = dict(manifest or load_deploy_host_tool_manifest())
-    active_which = which or shutil.which
-    active_runner = runner or subprocess.run
+    active_which = which or resolve_tool
+    parent_deadline = current_deadline()
     python = dict(source["python"])
     expected_python = (int(python["major"]), int(python["minor"]))
     actual_python = (sys.version_info.major, sys.version_info.minor)
@@ -84,13 +95,15 @@ def deploy_host_dependency_report(
                 "status": "MISSING",
                 "version": "",
             }
-        completed = active_runner(
-            [str(item) for item in raw["command"]],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
+        arguments = [str(item) for item in raw["command"]]
+        with deadline_scope(f"tool version: {name}", 15, parent=parent_deadline):
+            completed = (
+                runner(
+                    arguments, text=True, capture_output=True, check=False, timeout=15
+                )
+                if runner
+                else run_command(arguments, timeout_seconds=15)
+            )
         version_field = raw.get("version_json_field")
         version = (
             _json_version(completed.stdout or "", str(version_field))
@@ -111,7 +124,9 @@ def deploy_host_dependency_report(
     # Eleven `--version` processes at ~0.3-1 s each were the first serial second
     # of every deploy; they share nothing, so they run together. The report keeps
     # the manifest order so its output is stable.
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(tools)))) as pool:
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(DEPLOY_CONCURRENCY.read_only_checks, len(tools)))
+    ) as pool:
         tool_reports = list(pool.map(probe, tools))
     return {
         "schema_version": 1,
@@ -126,7 +141,7 @@ def deploy_host_dependency_report(
     }
 
 
-def validate_bootstrap_dependencies() -> dict[str, Any]:
+def _verify_bootstrap_dependencies() -> dict[str, Any]:
     report = deploy_host_dependency_report()
     failures = [item["name"] for item in report["tools"] if item["status"] != "PASS"]
     if report["python"]["status"] != "PASS":
@@ -136,6 +151,44 @@ def validate_bootstrap_dependencies() -> dict[str, Any]:
             "deployment host dependency check failed: " + ", ".join(failures)
         )
     return report
+
+
+def validate_bootstrap_dependencies() -> dict[str, Any]:
+    manifest = load_deploy_host_tool_manifest()
+    binaries: dict[str, object] = {}
+    for tool in manifest["tools"]:
+        executable = str(tool["executable"])
+        resolved = resolve_tool(executable)
+        if resolved is None:
+            return _verify_bootstrap_dependencies()
+        path = Path(resolved).resolve()
+        binaries[executable] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    interpreter = Path(sys.executable).resolve()
+    identity = hashlib.sha256(
+        json.dumps(
+            {
+                "manifest": manifest,
+                "binaries": binaries,
+                "python": sys.version,
+                "interpreter": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return PROOFS.verify(
+        ProofKey(
+            ProofSubject.TOOLCHAIN,
+            f"deploy-host:{sys.prefix}",
+            identity,
+            hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        ),
+        _verify_bootstrap_dependencies,
+        max_age=60,
+    )
 
 
 def main(arguments: Sequence[str] | None = None) -> int:

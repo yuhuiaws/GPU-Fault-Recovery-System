@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
@@ -21,6 +20,10 @@ from gpu_fault.admin.aurora_capacity import (
     AuroraClusterSpec,
     create_db_cluster_arguments,
 )
+from gpu_fault.admin.bootstrap_access import (
+    ClusterAccessPlan,
+    create_cluster_access_plan,
+)
 from gpu_fault.admin.bootstrap_aurora import (
     AURORA_SECRET_NAME,
     assert_aurora_ready,
@@ -28,12 +31,19 @@ from gpu_fault.admin.bootstrap_aurora import (
     bootstrap_aurora_capacity,
     ensure_cluster_parameter_group,
     ensure_rds_site_tag,
-    ensure_serverless_writer,
+    ensure_serverless_instances,
     ensure_subnet_group,
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
 )
-from gpu_fault.admin.bootstrap_checkpoint import HYPERPOD_HINTS, load_hyperpod_hints
+from gpu_fault.admin.bootstrap_checkpoint import (
+    HYPERPOD_HINTS as HYPERPOD_HINTS,
+)
+from gpu_fault.admin.bootstrap_checkpoint import (
+    bind_bootstrap_inputs,
+    load_hyperpod_hints,
+    remember_hyperpod_hints,
+)
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     Arn,
@@ -43,31 +53,20 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapState,
     ClusterIdentity,
     CommandRunner,
+    KubernetesResourceNotFound,
     assert_site_tag,
     describe_or_absent,
     tag_map,
 )
-from gpu_fault.admin.bootstrap_common import (
-    ensure_namespace as _ensure_namespace,
-)
-from gpu_fault.admin.bootstrap_common import (
-    kubectl_apply as _kubectl_apply,
-)
+from gpu_fault.admin.bootstrap_common import ensure_namespace as _ensure_namespace
+from gpu_fault.admin.bootstrap_common import kubectl_apply as _kubectl_apply
 from gpu_fault.admin.bootstrap_common import safe_name as _safe_name
-from gpu_fault.admin.bootstrap_common import (
-    write_secret as _write_secret,
-)
-from gpu_fault.admin.bootstrap_common import (
-    write_yaml as _write_yaml,
-)
+from gpu_fault.admin.bootstrap_common import write_secret as _write_secret
+from gpu_fault.admin.bootstrap_common import write_yaml as _write_yaml
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
 from gpu_fault.admin.bootstrap_network import RouteTableIndex
-from gpu_fault.admin.bootstrap_network import (
-    describe_subnets as _describe_subnets,
-)
-from gpu_fault.admin.bootstrap_network import (
-    private_subnets as _private_subnets,
-)
+from gpu_fault.admin.bootstrap_network import describe_subnets as _describe_subnets
+from gpu_fault.admin.bootstrap_network import private_subnets as _private_subnets
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
 )
@@ -78,15 +77,11 @@ from gpu_fault.admin.bootstrap_site import (
     discover_subnet_cidrs,
     finalize_bootstrap_site,
     hyperpod_inventory,
-    unique_gpu_vpcs,
 )
-from gpu_fault.admin.bootstrap_site import (
-    site_identifier as _site_identifier,
-)
+from gpu_fault.admin.bootstrap_site import site_identifier as _site_identifier
 from gpu_fault.admin.bootstrap_tasks import (
     foundation_task_graph,
     platform_task_graph,
-    revalidate_pod_identity_agent,
     run_bootstrap_tasks,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
@@ -96,11 +91,17 @@ from gpu_fault.admin.grafana import (
     grafana_site_health,
 )
 from gpu_fault.admin.notifications import NotificationRouting
+from gpu_fault.admin.rds_ca_bundle import RDS_CA_BUNDLE_PATH
 from gpu_fault.admin.release_repositories import (
     SignedReleaseBuild,
     prepare_signed_release,
 )
-from gpu_fault.admin.site import bootstrap_archive_s3_uri
+from gpu_fault.admin.resource_registry_dns import (
+    association_identity,
+    recorded_zone_vpc_ownership,
+    zone_vpc_associations,
+)
+from gpu_fault.admin.site import bootstrap_archive_s3_uri, site_image_references
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
     "public.ecr.aws/aws-observability/aws-otel-collector@"
@@ -134,24 +135,22 @@ def _secret_manifest(
     return json.dumps(document)
 
 
-def _aurora_dsn(*, username: str, password: str, endpoint: str) -> str:
-    """Build the control-plane Postgres DSN with an authenticated TLS channel.
+def _aurora_dsn(
+    *, username: str, password: str, endpoint: str, ca_bundle_path: str | None = None
+) -> str:
+    """Require verify-full TLS against the CA bundle mounted in the consumer.
 
-    ``sslmode=require`` encrypts the connection but does not verify the server
-    certificate, so it accepts a man-in-the-middle that presents any cert. The
-    DSN is consumed inside the control-plane Pod, so the RDS CA bundle must be
-    mounted there and its in-Pod path supplied via ``GPU_FAULT_RDS_CA_BUNDLE``;
-    the connection then uses ``sslmode=verify-full`` against that bundle. When
-    the bundle is not wired we refuse rather than silently emit an unverified
-    ``require`` DSN.
+    Managed bootstrap supplies its manifest path; legacy callers use
+    ``GPU_FAULT_RDS_CA_BUNDLE``. Missing CA input never enables unverified TLS.
     """
-    ca_bundle = os.getenv(RDS_CA_BUNDLE_ENVIRONMENT, "").strip()
+    if ca_bundle_path is None:
+        ca_bundle_path = os.getenv(RDS_CA_BUNDLE_ENVIRONMENT, "")
+    ca_bundle = ca_bundle_path.strip()
     if not ca_bundle:
         raise BootstrapError(
             "control-plane Postgres TLS cannot be verified: set "
-            f"{RDS_CA_BUNDLE_ENVIRONMENT} to the in-Pod path of the RDS CA "
-            "bundle so the DSN can use sslmode=verify-full instead of an "
-            "unverified sslmode=require"
+            f"{RDS_CA_BUNDLE_ENVIRONMENT} to the mounted RDS CA path; "
+            "sslmode=verify-full is required"
         )
     query = "sslmode=verify-full&sslrootcert=" + quote(ca_bundle, safe="/")
     return (
@@ -354,8 +353,8 @@ def _ensure_base_secrets(
             ],
             sensitive=True,
         )
-    except BootstrapError as exc:
-        if "NotFound" not in str(exc):
+    except KubernetesResourceNotFound as exc:
+        if exc.resource_kind != "secrets" or exc.resource_name != secret_name:
             raise
         values = {
             "execution-token": secrets.token_hex(32),
@@ -918,7 +917,13 @@ def _ensure_private_zone(
     cpu: ClusterIdentity,
     gpu_clusters: Sequence[ClusterIdentity],
     site_id: str,
+    state: BootstrapState | None = None,
 ) -> dict[str, Any]:
+    planned = zone_vpc_associations(cpu, gpu_clusters)
+    ownership = {association_identity(item): item["ownership"] for item in planned}
+    previous = state.value["resources"].get("pki") if state is not None else None
+    if previous is not None and not isinstance(previous, Mapping):
+        raise BootstrapError("recorded Route53 PKI checkpoint is invalid")
     zone_name = f"{site_id}.gpu-fault.internal."
     zones = cast(
         list[dict[str, Any]],
@@ -941,6 +946,9 @@ def _ensure_private_zone(
     )
     if zone is not None:
         zone_id = str(zone["Id"]).rsplit("/", 1)[-1]
+        recorded = recorded_zone_vpc_ownership(
+            previous, hosted_zone_id=zone_id, cpu=cpu
+        )
         tags = (
             runner.aws_json(
                 cpu.region,
@@ -960,24 +968,35 @@ def _ensure_private_zone(
             description=f"Route53 hosted zone {zone_id}",
             allow_missing=True,
         )
-        if not tagged:
-            runner.run(
-                [
-                    "aws",
-                    "route53",
-                    "change-tags-for-resource",
-                    "--resource-type",
-                    "hostedzone",
-                    "--resource-id",
-                    zone_id,
-                    "--add-tags",
-                    f"Key={SITE_TAG_KEY},Value={site_id}",
-                ],
-                mutate=True,
-                capture=False,
+        details = runner.aws_json(
+            cpu.region, "route53", "get-hosted-zone", "--id", zone_id
+        )
+        vpcs = details.get("VPCs") if isinstance(details, dict) else None
+        if not isinstance(vpcs, list) or any(
+            not isinstance(item, dict) for item in vpcs
+        ):
+            raise BootstrapError(
+                "Route53 returned an invalid VPC association inventory"
             )
-        zone_ownership = "CREATED"
+        associated_vpcs = {
+            association_identity(
+                {"vpc_region": item.get("VPCRegion"), "vpc_id": item.get("VPCId")}
+            )
+            for item in vpcs
+        }
+        if (cpu.region, cpu.vpc_id) not in associated_vpcs:
+            raise BootstrapError(
+                "Route53 hosted zone is not associated with the CPU VPC"
+            )
+        if any(
+            recorded[identity] != "CREATED"
+            for identity in (ownership.keys() & recorded.keys()) - associated_vpcs
+        ):
+            raise BootstrapError("recorded external Route53 association is absent")
+        ownership.update(recorded)
     else:
+        if previous:
+            raise BootstrapError("recorded Route53 hosted zone is absent; reconcile it")
         created = runner.aws_json(
             cpu.region,
             "route53",
@@ -993,7 +1012,10 @@ def _ensure_private_zone(
             mutate=True,
         )
         zone_id = str(created["HostedZone"]["Id"]).rsplit("/", 1)[-1]
-        zone_ownership = "CREATED"
+        associated_vpcs = {(cpu.region, cpu.vpc_id)}
+        ownership[(cpu.region, cpu.vpc_id)] = "CREATED"
+        tagged = False
+    if not tagged:
         runner.run(
             [
                 "aws",
@@ -1004,78 +1026,59 @@ def _ensure_private_zone(
                 "--resource-id",
                 zone_id,
                 "--add-tags",
-                f"Key=gpu-fault:site-id,Value={site_id}",
+                f"Key={SITE_TAG_KEY},Value={site_id}",
             ],
             mutate=True,
             capture=False,
         )
-    associated_vpcs: set[tuple[str, str]] = set()
-    if zone is not None:
-        details = runner.aws_json(
-            cpu.region,
-            "route53",
-            "get-hosted-zone",
-            "--id",
-            zone_id,
-        )
-        associated_vpcs = {
-            (str(item.get("VPCRegion") or ""), str(item.get("VPCId") or ""))
-            for item in details.get("VPCs", [])
-        }
-    associations = [
-        {
-            "vpc_id": cpu.vpc_id,
-            "vpc_region": cpu.region,
-            "ownership": "CREATED",
-        }
-    ]
-    associated_vpcs.add((cpu.region, cpu.vpc_id))
-    for region, vpc_id in unique_gpu_vpcs(cpu, gpu_clusters):
-        association = (region, vpc_id)
-        if association in associated_vpcs:
-            associations.append(
-                {
-                    "vpc_id": vpc_id,
-                    "vpc_region": region,
-                    "ownership": "CREATED",
-                }
-            )
-            continue
-        result = subprocess.run(
-            [
-                "aws",
-                "route53",
-                "associate-vpc-with-hosted-zone",
-                "--hosted-zone-id",
-                zone_id,
-                "--vpc",
-                f"VPCRegion={region},VPCId={vpc_id}",
-                "--comment",
-                "GPU fault managed data plane",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode and not any(
-            value in result.stderr for value in ("PriorRequestNotComplete",)
-        ):
-            raise BootstrapError(result.stderr.strip())
-        associations.append(
-            {
-                "vpc_id": vpc_id,
-                "vpc_region": region,
-                "ownership": "CREATED",
-            }
-        )
-        associated_vpcs.add(association)
-    return {
+    dns: dict[str, Any] = {
         "zone_name": zone_name.rstrip("."),
         "hosted_zone_id": zone_id,
-        "zone_ownership": zone_ownership,
-        "vpc_associations": associations,
+        "zone_ownership": "CREATED",
         "hostname": f"api.{zone_name}".rstrip("."),
     }
+
+    def checkpoint() -> None:
+        dns["vpc_associations"] = [
+            item
+            for item in zone_vpc_associations(
+                cpu, gpu_clusters, ownership_by_vpc=ownership
+            )
+            if association_identity(item) in associated_vpcs
+        ]
+        if state is not None:
+            state.record("pki", {**(previous or {}), **dns})
+
+    # Preserve creation provenance if later DNS or certificate preparation fails.
+    checkpoint()
+    for item in planned:
+        region, vpc_id = identity = association_identity(item)
+        if identity in associated_vpcs:
+            continue
+        result = runner.aws_json(
+            cpu.region,
+            "route53",
+            "associate-vpc-with-hosted-zone",
+            "--hosted-zone-id",
+            zone_id,
+            "--vpc",
+            f"VPCRegion={region},VPCId={vpc_id}",
+            "--comment",
+            "GPU fault managed data plane",
+            mutate=True,
+        )
+        change = result.get("ChangeInfo") if isinstance(result, dict) else None
+        if (
+            not isinstance(change, dict)
+            or not isinstance(change.get("Id"), str)
+            or re.fullmatch(r"/change/[A-Za-z0-9]+", change["Id"]) is None
+            or change.get("Status") not in {"PENDING", "INSYNC"}
+        ):
+            raise BootstrapError("Route53 association returned invalid ChangeInfo")
+        ownership[identity] = "CREATED"
+        associated_vpcs.add(identity)
+        checkpoint()
+    return dns
 
 
 def _generate_pki(
@@ -1191,12 +1194,14 @@ def _ensure_pki(
     gpu_clusters: Sequence[ClusterIdentity],
     state_dir: Path,
     site_id: str,
+    state: BootstrapState | None = None,
 ) -> dict[str, Any]:
     dns = _ensure_private_zone(
         runner,
         cpu=cpu,
         gpu_clusters=gpu_clusters,
         site_id=site_id,
+        state=state,
     )
     secret_name = f"gpu-fault/{site_id}/regional-pki"
     secret_description = describe_or_absent(
@@ -1417,16 +1422,12 @@ def _ensure_aurora(
     site_id: str,
     capacity: AuroraCapacityConfig,
 ) -> dict[str, Any]:
-    """The foundation ``aurora`` task: everything up to the writer's create.
+    """Create Aurora resources, gating replica creation on primary readiness.
 
-    Subnet group, security group, parameter group, the cluster and the writer's
-    ``create-db-instance`` -- not the five-to-ten-minute waits, the reader (RDS
-    refuses it until the writer is available) nor the credential read. Those are
-    ``_aurora_ready``, a platform-graph task that depends on this one, so the
-    waits overlap the monitoring and node-key installs instead of holding them.
-    ``master_secret_arn`` is reported here when RDS already exposes it (it does
-    on an existing cluster and in the create response); ``_aurora_ready`` is
-    the authoritative source and overrides it.
+    The writer and cluster must be available before creating the reader.
+    Final reader readiness and credentials belong to ``_aurora_ready``.
+    Both tasks overlap independent foundation, monitoring and node-key work.
+    ``_aurora_ready`` is authoritative for the master Secret ARN.
     """
 
     cluster_id = _safe_name(f"gpu-fault-{site_id}-aurora", maximum=63)
@@ -1548,19 +1549,18 @@ def _ensure_aurora(
             mutate=True,
         )
         master_secret = (created.get("DBCluster") or {}).get("MasterUserSecret") or {}
-    # Only the writer: RDS refuses a replica until the cluster and its primary
-    # are available, so ``aurora_ready`` creates the reader after its writer wait.
-    instance_ids = ensure_serverless_writer(
+    instance_ids = ensure_serverless_instances(
         runner,
         aws_region=cpu.region,
         cluster_id=cluster_id,
         availability_zones=availability_zones,
         safe_name=_safe_name,
+        wait=False,
     )
     if cluster_exists:
-        # After the writer create: the shared reconciler proves the window on
+        # After both instance creates: the shared reconciler proves the window on
         # both members (waiting for any still creating), so a resumed bootstrap
-        # that had created the cluster but not its writer must not reach it first.
+        # must not reach it while a reader is still absent.
         reconcile_existing_capacity(
             runner,
             aws_region=cpu.region,
@@ -1598,17 +1598,16 @@ def _aurora_ready(
     aurora: Mapping[str, Any],
     probe_only: bool = False,
 ) -> dict[str, Any]:
-    """The platform ``aurora_ready`` task: wait for the writer the foundation
-    created, create and wait for the reader, then hand the control plane its
-    DSN Secret. The credential refresh CronJob and the release's schema Jobs
-    are what wait on this; the monitoring and node-key installs run alongside.
+    """Wait for final instance readiness, then hand the control plane its DSN.
+
+    Instance creation already enforced the available-primary/cluster barrier.
+    Independent monitoring and node-key tasks run alongside this wait.
     ``probe_only`` is the read-only re-proof on a rerun -- both instances
     available and the Secret present -- and costs two reads.
     """
 
     cluster_id = str(aurora["cluster_id"])
     instance_ids = [str(item) for item in aurora["instance_ids"]]
-    availability_zones = [str(item) for item in aurora.get("availability_zones") or ()]
     if probe_only:
         assert_aurora_ready(
             runner,
@@ -1624,7 +1623,6 @@ def _aurora_ready(
         aws_region=cpu.region,
         cluster_id=cluster_id,
         instance_ids=instance_ids,
-        availability_zones=availability_zones,
     )
     manifest = _secret_manifest(
         name=AURORA_SECRET_NAME,
@@ -1634,6 +1632,7 @@ def _aurora_ready(
                 username=ready.username,
                 password=ready.password,
                 endpoint=ready.endpoint,
+                ca_bundle_path=RDS_CA_BUNDLE_PATH,
             ),
             "master-secret-arn": ready.secret_arn,
         },
@@ -1745,12 +1744,12 @@ def _site_document(
                 "hostedZoneId": pki["hosted_zone_id"],
                 "hostname": pki["hostname"],
             },
-            "images": {
-                "runtime": release["images"]["runtime"],
-                "nodeInstaller": release["images"]["node_installer"],
-                "dcgmExporter": release["images"]["dcgm_exporter"],
-                "adot": release["images"].get("adot") or adot_image,
-            },
+            "images": site_image_references(
+                {
+                    **release["images"],
+                    "adot": release["images"].get("adot") or adot_image,
+                }
+            ),
             "health": {
                 "auroraClusterId": aurora["cluster_id"],
                 "ampWorkspaceId": monitoring["workspace_id"],
@@ -1767,19 +1766,7 @@ def _site_document(
     }
 
 
-def _remember_hyperpod_hints(
-    state: BootstrapState,
-    cpu: ClusterIdentity,
-    gpu_clusters: Sequence[ClusterIdentity],
-) -> None:
-    """Persist what discovery learned so the next deploy skips the inventory."""
-
-    hints = {cluster.eks_arn: cluster.hyperpod_arn for cluster in (cpu, *gpu_clusters)}
-    if state.value["resources"].get(HYPERPOD_HINTS) != hints:
-        state.record(HYPERPOD_HINTS, hints)
-
-
-def prepare_cluster_access(
+def plan_cluster_access(
     runner: CommandRunner,
     *,
     state: BootstrapState,
@@ -1790,67 +1777,20 @@ def prepare_cluster_access(
     secure_dir: Path,
     site_id: str,
     ensure_pod_identity_agent: Callable[[CommandRunner, ClusterIdentity, str], Any],
-) -> tuple[Path, Path, Path]:
-    """Kubeconfigs, namespaces, the base Secret and the Pod Identity add-on.
-
-    Three independent chains that used to run one after another: the CPU
-    kubeconfig, its namespace and the fleet master Secret depend on each other
-    and nothing else; the GPU kubeconfig contexts and their namespaces are their
-    own chain (one file holds every GPU context and ``update-kubeconfig``
-    rewrites it, so the GPU writes stay serial among themselves); the add-on
-    revalidation is an AWS read that needs no kubeconfig at all. Each chain
-    keeps its order and its checkpoint semantics; only the waiting is shared.
-    """
-
-    cpu_kubeconfig = state_dir / "cpu.kubeconfig"
-    gpu_kubeconfig = state_dir / "gpu.kubeconfig"
-
-    def control_plane() -> Path:
-        _update_kubeconfig(runner, cluster=cpu, path=cpu_kubeconfig)
-        _ensure_namespace(runner, kubeconfig=cpu_kubeconfig, namespace=namespace)
-        return _ensure_base_secrets(
-            runner,
-            cpu_kubeconfig=cpu_kubeconfig,
-            namespace=namespace,
-            secure_dir=secure_dir,
-        )
-
-    def data_plane() -> None:
-        for cluster in gpu_clusters:
-            _update_kubeconfig(runner, cluster=cluster, path=gpu_kubeconfig)
-        for cluster in gpu_clusters:
-            _ensure_namespace(
-                runner,
-                kubeconfig=gpu_kubeconfig,
-                namespace=namespace,
-                context=cluster.context,
-            )
-
-    def pod_identity() -> None:
-        # Completed exclusive resources are re-probed without mutation.
-        # A healthy probe reuses its checkpoint; detected drift enters ensure.
-        # Probe failures other than mutation-required drift remain fail-closed.
-        revalidate_pod_identity_agent(
-            runner, state, cpu, site_id, ensure_pod_identity_agent
-        )
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        master = pool.submit(control_plane)
-        chains: list[Future[Any]] = [
-            master,
-            pool.submit(data_plane),
-            pool.submit(pod_identity),
-        ]
-        # Every chain is awaited so a failure in one never leaves another
-        # half-written; the first failure is the one that propagates.
-        failures = [
-            failure
-            for failure in (future.exception() for future in chains)
-            if failure is not None
-        ]
-    if failures:
-        raise failures[0]
-    return cpu_kubeconfig, gpu_kubeconfig, master.result()
+) -> ClusterAccessPlan:
+    return create_cluster_access_plan(
+        runner,
+        cpu=cpu,
+        gpu_clusters=gpu_clusters,
+        state_dir=state_dir,
+        namespace=namespace,
+        secure_dir=secure_dir,
+        site_id=site_id,
+        ensure_pod_identity_agent=ensure_pod_identity_agent,
+        update_kubeconfig=_update_kubeconfig,
+        ensure_namespace=_ensure_namespace,
+        ensure_base_secrets=_ensure_base_secrets,
+    )
 
 
 def bootstrap_from_arns(
@@ -1858,9 +1798,6 @@ def bootstrap_from_arns(
     *,
     runner: CommandRunner | None = None,
 ) -> BootstrapResult:
-    from gpu_fault.admin.bootstrap_services import _ensure_pod_identity_agent
-    from gpu_fault.admin.notification_bootstrap import notification_routing
-
     validate_bootstrap_dependencies()
     active_runner = runner or CommandRunner()
     existing_site, cpu, gpu_clusters = discover_bootstrap_scope(
@@ -1877,7 +1814,15 @@ def bootstrap_from_arns(
     request.state_dir.chmod(0o700)
     state = BootstrapState(request.state_dir / "bootstrap-state.json", site_id=site_id)
     managed_gpu_clusters = bootstrap_gpu_scope(state, existing_site, cpu, gpu_clusters)
-    _remember_hyperpod_hints(state, cpu, gpu_clusters)
+    remember_hyperpod_hints(state, cpu, gpu_clusters)
+    # Legacy config migration must finish before either bind hashes desired.json.
+    aurora_capacity = bootstrap_aurora_capacity(request.state_dir)
+    bind_bootstrap_inputs(
+        state,
+        request=request,
+        cpu=cpu,
+        gpu_clusters=tuple(managed_gpu_clusters),
+    )
     state.phase("discovered")
     release_build = SignedReleaseBuild(
         prepare_signed_release,
@@ -1889,9 +1834,46 @@ def bootstrap_from_arns(
         site_id=site_id,
         state=state,
     )
-    # The candidate is known now; a candidate the operator has not consented to
-    # (superseding a failed transaction, crossing a schema version) is refused
-    # here, before the AWS re-validation and the rollout, in the engine's words.
+    failed = False
+    try:
+        return _finish_bootstrap(
+            request=request,
+            active_runner=active_runner,
+            existing_site=existing_site,
+            cpu=cpu,
+            gpu_clusters=gpu_clusters,
+            managed_gpu_clusters=managed_gpu_clusters,
+            site_id=site_id,
+            state=state,
+            release_build=release_build,
+            aurora_capacity=aurora_capacity,
+        )
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        release_build.close()
+        if failed:
+            state.phase("failed")
+
+
+def _finish_bootstrap(
+    *,
+    request: BootstrapRequest,
+    active_runner: CommandRunner,
+    existing_site: dict[str, Any] | None,
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+    managed_gpu_clusters: Sequence[ClusterIdentity],
+    site_id: str,
+    state: BootstrapState,
+    release_build: SignedReleaseBuild,
+    aurora_capacity: AuroraCapacityConfig,
+) -> BootstrapResult:
+    from gpu_fault.admin.bootstrap_services import _ensure_pod_identity_agent
+    from gpu_fault.admin.notification_bootstrap import notification_routing
+
+    # Candidate consent is checked when the release dependency completes.
     admin_email, routing = notification_routing(
         active_runner, cpu, request, state, existing_site=existing_site
     )
@@ -1900,7 +1882,7 @@ def bootstrap_from_arns(
         state_dir=request.state_dir,
         gpu_clusters=managed_gpu_clusters,
     )
-    cpu_kubeconfig, gpu_kubeconfig, fleet_master_file = prepare_cluster_access(
+    access = plan_cluster_access(
         active_runner,
         state=state,
         cpu=cpu,
@@ -1911,13 +1893,17 @@ def bootstrap_from_arns(
         site_id=site_id,
         ensure_pod_identity_agent=_ensure_pod_identity_agent,
     )
+    cpu_kubeconfig = access.cpu_kubeconfig
+    gpu_kubeconfig = access.gpu_kubeconfig
+    fleet_master_file = access.fleet_master_file
 
     grafana = grafana_settings(request, existing_site=existing_site, state=state)
-    # One dependency-aware graph: monitoring, node keys and the Aurora instance
-    # wait no longer sit behind the whole AWS foundation; each task starts when
-    # the tasks it reads from are done (see ``bootstrap_tasks``).
+    # Infrastructure and access tasks start as their dependencies finish.
+    # Versioned monitoring and refresher objects belong to the release that
+    # follows, after its snapshot and candidate gates.
     results = run_bootstrap_tasks(
         state=state,
+        access=access.graph,
         foundation=foundation_task_graph(
             runner=active_runner,
             state=state,
@@ -1929,7 +1915,7 @@ def bootstrap_from_arns(
             state_dir=request.state_dir,
             admin_email=admin_email,
             routing=routing,
-            aurora_capacity=bootstrap_aurora_capacity(request.state_dir),
+            aurora_capacity=aurora_capacity,
             ensure_nlb_network=_ensure_nlb_network,
             ensure_pki=_ensure_pki,
             ensure_aurora=_ensure_aurora,
@@ -1953,13 +1939,11 @@ def bootstrap_from_arns(
             fleet_master_file=fleet_master_file,
             ensure_aurora_ready=_aurora_ready,
             grafana=grafana,
+            existing_site=existing_site,
         ),
     )
     release = release_build.result()
-    release_build.close()
-    adot_image = str(release["images"]["adot"])
-    # The readiness task owns the master Secret ARN; a checkpoint written before
-    # the split still carries it on ``aurora`` itself, and either shape serves.
+    # Readiness owns the master Secret ARN; older checkpoints keep it on aurora.
     aurora = cast(
         dict[str, Any],
         {**results["aurora"], **(results.get("aurora_ready") or {})},
@@ -1984,7 +1968,7 @@ def bootstrap_from_arns(
         roles=results,
         token_files=token_files,
         fleet_master_file=fleet_master_file,
-        adot_image=adot_image,
+        adot_image=str(release["images"]["adot"]),
         admin_email=admin_email,
         routing=routing,
         grafana_health=grafana_site_health(state, grafana),

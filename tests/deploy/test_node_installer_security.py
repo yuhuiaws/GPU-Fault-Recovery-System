@@ -32,7 +32,8 @@ INSTALLER = NODE_DIR / "install-gpu-fault-collector.sh"
 JOB = NODE_DIR / "run-hyperpod-installer-job.sh"
 BUNDLE_BUILDER = NODE_DIR / "build-node-installer-bundle.sh"
 PREFLIGHT = NODE_DIR / "preflight-gpu-fault-node.sh"
-EDITED_SCRIPTS = (INSTALLER, JOB, BUNDLE_BUILDER, PREFLIGHT)
+SLOTS = NODE_DIR / "runtime-slot.sh"
+EDITED_SCRIPTS = (INSTALLER, JOB, BUNDLE_BUILDER, PREFLIGHT, SLOTS)
 
 
 def _text(path: Path) -> str:
@@ -158,9 +159,11 @@ def test_installer_accepts_a_token_file_and_keeps_token_for_compat() -> None:
 
 
 def test_node_runtime_dependencies_install_with_require_hashes() -> None:
-    installer = _text(INSTALLER)
+    installer = _text(SLOTS)
     slot = installer.split("prepare_runtime_slot() {", 1)[1].split("\n}\n", 1)[0]
-    assert "--require-hashes" in slot
+    layer = installer.split("prepare_dependency_layer() {", 1)[1].split("\n}\n", 1)[0]
+    assert "prepare_dependency_layer" in slot
+    assert "--require-hashes" in layer
     assert "--no-deps" in slot
     assert "[collectors]" not in slot, "extras resolve the closure online"
     assert "--upgrade" not in slot
@@ -169,7 +172,7 @@ def test_node_runtime_dependencies_install_with_require_hashes() -> None:
     assert pip_calls, "expected a direct pip install of the wheel"
     for pip_call in pip_calls:
         assert "--require-hashes" in pip_call or "--no-index" in pip_call, pip_call
-    pip_args = joined.split("PIP_ARGS=(", 1)[1].split(")", 1)[0]
+    pip_args = layer.split("pip_args=(", 1)[1].split(")", 1)[0]
     assert "--require-hashes" in pip_args and "--no-deps" in pip_args, pip_args
     assert '--requirement "${DEPENDENCY_LOCK}"' in pip_args
 

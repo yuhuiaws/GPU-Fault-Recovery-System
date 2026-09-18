@@ -20,6 +20,52 @@ ACTIVE_PROGRESS_STATUSES = frozenset(
 CLUSTER_ATTEMPT_STATES = frozenset(
     {"PENDING", "RUNNING", "CONVERGED", "PAUSED", "FAILED", "ROLLED_BACK"}
 )
+BOOTSTRAP_PHASES = frozenset(
+    {
+        "bootstrap-started",
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+        "bootstrap-failed",
+        "bootstrap-cleanup-started",
+        "bootstrap-cleanup-progress",
+        "bootstrap-cleanup-failed",
+        "bootstrap-cleaned",
+    }
+)
+
+
+def take_phase_checkpoint(
+    pending: dict[str, dict[str, Any]],
+    *,
+    current: str,
+    order: tuple[str, ...],
+    updates: dict[str, Any],
+) -> tuple[str, dict[str, Any], list[str]]:
+    """Drain pending phase updates into one ordered checkpoint.
+
+    The caller holds the state transaction and owns persistence and narration.
+    Pending updates merge in insertion order; explicit updates take precedence.
+    """
+
+    # The phase already on record counts towards the stamp, not just the
+    # phases this write carries. Without it a write whose only pending
+    # phase is an early one replayed during resume would
+    # move the recorded phase *backwards*, and a phase outside
+    # `RESUMABLE_PHASES` -- or simply an earlier one -- makes a crash
+    # here look like a release that must start over.
+    ranked = [phase for phase in {*pending, current} if phase in order]
+    stamp = max(ranked, key=order.index) if ranked else (current or "preflight")
+    carried = sorted(
+        (phase for phase in pending if phase != stamp and phase in order),
+        key=order.index,
+    )
+    merged: dict[str, Any] = {}
+    for values in pending.values():
+        merged.update(values)
+    pending.clear()
+    merged.update(updates)
+    return stamp, merged, carried
 
 
 def bootstrap_completion_state(
@@ -36,8 +82,9 @@ def bootstrap_completion_state(
     """
 
     epoch = time.time() if now is None else now
+    completed = sorted(cluster_ids)
     return {
-        "completed_cluster_ids": sorted(cluster_ids),
+        "completed_cluster_ids": completed,
         "cluster_attempts": {
             cluster_id: {
                 "state": "CONVERGED",
@@ -45,7 +92,7 @@ def bootstrap_completion_state(
                 "converged_at_epoch": epoch,
                 "updated_at_epoch": epoch,
             }
-            for cluster_id in sorted(cluster_ids)
+            for cluster_id in completed
         },
     }
 
@@ -122,7 +169,14 @@ CPU_COMPONENTS = frozenset(
     }
 )
 ROLLBACK_COMPONENTS = (
-    GPU_COMPONENTS | CPU_COMPONENTS | frozenset({ReleaseComponent.OBSERVABILITY})
+    GPU_COMPONENTS
+    | CPU_COMPONENTS
+    | frozenset(
+        {
+            ReleaseComponent.OBSERVABILITY,
+            ReleaseComponent.AURORA_REFRESH,
+        }
+    )
 )
 REPLAYED_MANIFEST_CHANGES = frozenset(
     {
@@ -162,6 +216,7 @@ previous-image`` for exactly that case rather than this set claiming it.
 """
 
 PHASE_COMPONENTS = {
+    "aurora-refresh-ready": ReleaseComponent.AURORA_REFRESH,
     "registry-staged": ReleaseComponent.REGISTRY,
     "cpu-staged": ReleaseComponent.CPU_STAGE,
     "profile-ready": ReleaseComponent.RUNTIME_PROFILE,
@@ -239,6 +294,7 @@ class RollbackCompensationPlan:
             "restores_data_plane": self.restores_data_plane,
             "restores_observability": self.restores_observability,
             "restores_endpoint": self.restores_endpoint,
+            "restores_aurora_refresh": self.global_has(ReleaseComponent.AURORA_REFRESH),
             "replayed_manifests": sorted(self.replayed_manifests),
         }
 

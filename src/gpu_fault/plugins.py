@@ -20,19 +20,19 @@ class PluginGroup(StrEnum):
 
 # Loading a plugin executes its module in-process, so any importable entry
 # point registered under one of these groups would run arbitrary code inside
-# the control plane. The four groups below are auto-discovered and loaded at
-# control-plane / API start-up, so they are constrained to exactly the
-# identifiers we ship (the ``[project.entry-points.*]`` tables in
-# pyproject.toml); anything else is refused and logged. METRIC_CONTRIBUTORS
-# ships no entry-point plugins today (its built-ins are wired in code with
-# ``register()``), so its allowlist is empty and every discovered entry point
-# is rejected (security review M-26).
+# the control plane. These utility groups accept only shipped identifiers
+# (the ``[project.entry-points.*]`` tables in pyproject.toml); installed metadata
+# never grants trust. Sinks, adapters and notification builders still use
+# explicit application composition. Only METRIC_CONTRIBUTORS is auto-discovered
+# by the runtime, and it ships no entry-point plugins today (its built-ins use
+# ``register()``), so its empty allowlist rejects every discovered entry point
+# (security review M-26).
 #
 # COLLECTORS is deliberately excluded (``None`` == unrestricted): it is not
-# auto-loaded in the control plane. A collector plugin only loads when the
-# operator runs ``gpu-fault-collector <command>`` and the entry point is
-# pip-installed into that collector's venv with a name equal to the command
-# (see ``collector_registry_with_plugins``); tightening it needs a
+# auto-loaded in the control plane. A collector plugin only loads when selected
+# by ``gpu-fault-collector <command>`` or explicitly validated with
+# ``gpu-fault-collector validate-plugins``. Its entry-point name must equal the
+# command (see ``collector_registry_with_plugins``); tightening it needs a
 # config-driven allowlist wired through the collector CLI (see report).
 _PLUGIN_ALLOWLIST: dict[str, frozenset[str] | None] = {
     PluginGroup.COLLECTORS.value: None,
@@ -51,6 +51,7 @@ _PLUGIN_ALLOWLIST: dict[str, frozenset[str] | None] = {
     PluginGroup.NOTIFICATION_BUILDERS.value: frozenset(
         {
             "dcgm-diagnostic",
+            "diagnostic-inconclusive",
             "efa-rdma",
             "hardware-escalation",
             "hardware-inventory",
@@ -85,6 +86,8 @@ def _allowlist(group_name: str) -> frozenset[str] | None:
 def discover_plugins(
     group: PluginGroup | str,
 ) -> dict[str, metadata.EntryPoint]:
+    """Read allowlisted entry-point metadata; never import plugin modules."""
+
     group_name = str(group)
     allowed = _allowlist(group_name)
     selected = metadata.entry_points().select(group=group_name)

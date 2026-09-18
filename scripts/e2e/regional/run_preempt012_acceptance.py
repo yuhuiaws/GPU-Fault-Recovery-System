@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -96,8 +97,11 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.store import SqliteStore
 
-cluster_id, node_id, stamp = sys.argv[1:]
+cluster_id, node_id, stamp, *mode = sys.argv[1:]
+if mode not in ([], ["--cleanup-only"]):
+    raise RuntimeError("invalid control audit mode")
 store = ApplicationContext.from_environment().store
 owner = f"preempt012-{stamp}"
 now = datetime.now(timezone.utc)
@@ -111,6 +115,60 @@ for label in ("clean", "dirty"):
     planned_ids.append(("incident", f"incident-{label}-{stamp}"))
     planned_ids.append(("workflow", f"workflow-{label}-pred-{stamp}"))
     planned_ids.append(("workflow", f"workflow-{label}-succ-{stamp}"))
+
+
+def cleanup_records():
+    incident_ids = {key for kind, key in planned_ids if kind == "incident"}
+    workflow_ids = [key for kind, key in planned_ids if kind == "workflow"]
+    for kind, key in planned_ids:
+        record = store._get_optional(kind, key)
+        if record is None:
+            continue
+        if kind == "incident":
+            owned = (
+                record.cluster_id == cluster_id
+                and record.node_ids == [node_id]
+                and record.event_type == "PREEMPT012_AUDIT"
+            )
+        else:
+            owned = record.incident_id in incident_ids and all(
+                step.execution_owner == "preempt012-audit"
+                for step in record.official_steps
+            )
+        if not owned:
+            raise RuntimeError("control audit cleanup ownership changed")
+    if store.list_remote_commands(workflow_request_ids=workflow_ids):
+        raise RuntimeError("unexpected remote commands require explicit reconciliation")
+    for label in ("clean", "dirty"):
+        event_id = f"event-{label}-{stamp}"
+        incident_id = f"incident-{label}-{stamp}"
+        if isinstance(store, SqliteStore):
+            with store._db:
+                store._db.execute(
+                    "DELETE FROM links WHERE kind='incident_by_event' AND key=? AND value=?",
+                    (event_id, incident_id),
+                )
+        else:
+            with store._db.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' AND key=%s AND value=%s",
+                    (event_id, incident_id),
+                )
+        if store._get_link("incident_by_event", event_id) is not None:
+            raise RuntimeError("control audit event link ownership changed")
+    for kind in ("workflow", "incident"):
+        for candidate_kind, key in planned_ids:
+            if candidate_kind == kind:
+                store._delete(kind, key)
+    if any(store._get_optional(kind, key) is not None for kind, key in planned_ids):
+        raise RuntimeError("control audit cleanup left records")
+
+
+if mode:
+    cleanup_records()
+    print(json.dumps({"residual_objects": [], "residual_links": 0}))
+    raise SystemExit(0)
+
 existing = [
     {"kind": kind, "key": key}
     for kind, key in planned_ids
@@ -285,9 +343,6 @@ def save_pair(label, completed, *, inherit_containment):
     incident = incident.model_copy(
         update={"workflow_request_id": successor.request_id}
     )
-    store.save_incident(incident)
-    store.save_workflow(predecessor)
-    store.save_workflow(successor)
     created.extend(
         [
             ("workflow", predecessor.request_id),
@@ -295,6 +350,9 @@ def save_pair(label, completed, *, inherit_containment):
             ("incident", incident.incident_id),
         ]
     )
+    store.save_incident(incident)
+    store.save_workflow(predecessor)
+    store.save_workflow(successor)
     return incident, predecessor, successor
 
 
@@ -383,8 +441,7 @@ try:
         store.list_remote_commands(workflow_request_ids=audit_workflow_ids)
     )
 finally:
-    for kind, key in reversed(created):
-        store._delete(kind, key)
+    cleanup_records()
 result["residual_objects"] = [
     {"kind": kind, "key": key}
     for kind, key in created
@@ -443,7 +500,7 @@ def read_only_preflight(
     regional: RegionalLiveFixture,
     *,
     node: str,
-    predecessor_id: str,
+    predecessor_id: str | None = None,
     predecessor_path_value: Path,
     case_dir: Path,
     plan_path: Path | None = None,
@@ -451,8 +508,12 @@ def read_only_preflight(
     node_state = regional.node_snapshot(node)
     store = regional.store_snapshot(node=node)
     tests = focused_tests(case_dir, reuse_from=plan_path)
-    # The predecessor is whatever the formal order names -- PREEMPT-009 today,
-    # the last PREEMPT contract case that writes evidence -- not a fixed id.
+    formal_predecessor_id, _ = predecessor_path(case_dir.parent.parent, CASE_ID, None)
+    if formal_predecessor_id is None:
+        raise PreemptAcceptanceError("formal predecessor identity is missing")
+    if predecessor_id is not None and predecessor_id != formal_predecessor_id:
+        raise PreemptAcceptanceError("formal predecessor identity changed")
+    predecessor_id = formal_predecessor_id
     predecessor = predecessor_evidence(predecessor_path_value, predecessor_id)
     errors = []
     if not predecessor["valid"]:
@@ -575,13 +636,17 @@ def evaluate_checks(
             quiesced_at <= audit_started_at and audit_completed_at <= restored_at
         ),
         "host_services_restored": all(
-            value == "active"
-            for service, value in final_host["services"].items()
-            if baseline["services"].get(service) == "active"
-        ),
+            final_host["services"].get(service) == "active"
+            for service, value in baseline["services"].items()
+            if value == "active"
+        )
+        and bool(baseline["services"]),
         "quiesce_state_removed": not final_host["quiesce_state_files"],
-        "gpu_count_unchanged": final_host["gpu_count"] == baseline["gpu_count"],
-        "all_gpu_nodes_ready_and_schedulable": all(
+        "gpu_count_unchanged": type(baseline["gpu_count"]) is int
+        and baseline["gpu_count"] > 0
+        and final_host["gpu_count"] == baseline["gpu_count"],
+        "all_gpu_nodes_ready_and_schedulable": bool(final_nodes)
+        and all(
             item["ready"] == "True"
             and not item["unschedulable"]
             and not any(
@@ -609,8 +674,7 @@ def cleanup_checks(
         ),
         "cycle_timer_inactive": (
             host_cleanup is not None
-            and str(host_cleanup.get("timer_active_state") or "unknown")
-            not in TIMER_LIVE_STATES
+            and host_cleanup.get("timer_active_state") == "inactive"
             and "restore_error" not in host_cleanup
         ),
     }
@@ -650,10 +714,8 @@ def execute_case(
         raise PreemptAcceptanceError(
             "maintenance window must have at least 10 minutes remaining"
         )
-    # The attempt number is part of every synthetic id (host unit, evidence
-    # file, control-audit workflows), so a re-run never collides with the
-    # objects an earlier attempt may have left behind.
-    run_id = f"preempt012-a{arguments.attempt}-{int(time.time())}"
+    # Attempt-scoped ids cannot adopt earlier workflows, host units or evidence.
+    run_id = f"preempt012-a{arguments.attempt}-{uuid4().hex[:12]}"
     host = HostProbeFixture(
         HostProbeSettings(
             kubeconfig=regional.settings.gpu_kubeconfig,
@@ -664,6 +726,7 @@ def execute_case(
             case_id=CASE_ID,
             run_id=run_id,
             probe_script=PROBE_SCRIPT,
+            state_directory=case_dir / "host-probes",
             active_deadline_seconds=1800,
         )
     )
@@ -678,6 +741,7 @@ def execute_case(
         **regional.evidence_identity(),
     }
     checks: dict[str, bool] = {}
+    control_started = False
     try:
         host.create()
         baseline = host.execute("snapshot")
@@ -712,6 +776,7 @@ def execute_case(
             )
         # One attempt only: the script writes and executes synthetic workflows,
         # and a retry after a partial run would execute them twice.
+        control_started = True
         control = regional.cpu_python(
             CONTROL_AUDIT,
             regional.settings.cluster_id,
@@ -757,6 +822,25 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if control_started:
+            try:
+                result["control_cleanup"] = regional.cpu_python(
+                    CONTROL_AUDIT,
+                    regional.settings.cluster_id,
+                    node,
+                    run_id,
+                    "--cleanup-only",
+                    attempts=1,
+                )
+                if (
+                    result["control_cleanup"].get("residual_objects") != []
+                    or result["control_cleanup"].get("residual_links") != 0
+                ):
+                    raise PreemptAcceptanceError(
+                        "control audit cleanup was not confirmed"
+                    )
+            except Exception as exc:
+                result["error"] = f"control audit cleanup failed: {type(exc).__name__}"
         host_cleanup: dict[str, Any] | None = None
         try:
             host_cleanup = host.execute(
@@ -865,6 +949,8 @@ def main() -> int:
         }
         record_focused_tests(details, preflight["focused_tests"])
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=not preflight["errors"],
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,

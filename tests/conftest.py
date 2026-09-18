@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from gpu_fault.admin.postgres_grant import ALLOCATION_ENV, POSTGRES_URL_ENV
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     AllocationEntry,
@@ -98,6 +99,20 @@ def block_cluster_binaries(request: pytest.FixtureRequest, monkeypatch) -> None:
     for mark in request.node.iter_markers(MARKER):
         allowed.update(mark.args)
     install_binary_guard(monkeypatch, frozenset(allowed))
+
+
+@pytest.fixture(autouse=True)
+def kubeconfig_is_never_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a test's explicit fixture may supply Kubernetes configuration."""
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def deploy_inputs_are_never_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deployment locators and unselected PG grants are not test configuration."""
+    monkeypatch.delenv("GPU_FAULT_REPOSITORY_ROOT", raising=False)
+    if not os.environ.get(POSTGRES_URL_ENV, "").strip():
+        monkeypatch.delenv(ALLOCATION_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)

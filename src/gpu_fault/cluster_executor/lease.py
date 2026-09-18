@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import random
 from threading import Event, Lock, Thread
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from gpu_fault.adapters.node_action.lease_guard import active_lease_guard
@@ -44,6 +45,10 @@ if TYPE_CHECKING:
 # carries ``%(name)s`` and operators filter on ``gpu_fault.cluster_executor``, so
 # every layer of the package logs under the one name it always had.
 LOGGER = logging.getLogger("gpu_fault.cluster_executor")
+
+
+class LeaseAuthorityError(ClusterExecutorError):
+    """A parsed lease response no longer proves this command's authority."""
 
 
 # Reporting a result is not a fire-once operation: the action has already run
@@ -195,22 +200,23 @@ class CommandLeaseWatch:
         lease_seconds: int,
         failure_limit: int,
         clock: Callable[[], float],
+        expires_at: float,
     ) -> None:
         self.lease_seconds = lease_seconds
         self.failure_limit = failure_limit
         self.clock = clock
         self._lock = Lock()
-        self.expires_at = clock() + lease_seconds
+        self.expires_at = expires_at
         self.consecutive_failures = 0
         self.lost_reason: str | None = None
         self.cancellation_reason: str | None = None
 
-    def renewed(self, response: Any) -> str | None:
+    def renewed(self, response: Any, *, expires_at: float) -> str | None:
         """Record a successful renewal; return the cancellation reason if any."""
 
         with self._lock:
             self.consecutive_failures = 0
-            self.expires_at = self.clock() + self.lease_seconds
+            self.expires_at = expires_at
             requested_at = getattr(response, "cancellation_requested_at", None)
             if requested_at is not None and self.cancellation_reason is None:
                 self.cancellation_reason = (
@@ -225,9 +231,14 @@ class CommandLeaseWatch:
 
         with self._lock:
             self.consecutive_failures += 1
-            if (
-                self.lost_reason is None
-                and self.consecutive_failures >= self.failure_limit
+            if self.lost_reason is None and (
+                self.consecutive_failures >= self.failure_limit
+                or isinstance(error, LeaseAuthorityError)
+                or (
+                    isinstance(error, ClusterExecutorError)
+                    and error.status_code is not None
+                    and error.status_code not in _RETRYABLE_REPORT_STATUS_CODES
+                )
             ):
                 self.lost_reason = (
                     f"lease renewal failed {self.consecutive_failures} time(s) "
@@ -235,6 +246,11 @@ class CommandLeaseWatch:
                 )
                 return True
         return False
+
+    def invalidate(self, reason: str) -> None:
+        with self._lock:
+            if self.lost_reason is None:
+                self.lost_reason = reason
 
     def abandon(self, reason: str) -> None:
         with self._lock:
@@ -271,13 +287,102 @@ class CommandLifecycle:
     def __init__(self, executor: ClusterActionExecutor) -> None:
         self.executor = executor
 
-    def run(self, command: RemoteActionCommand) -> CommandOutcome:
-        stop = Event()
+    def watch_claim(self, command: RemoteActionCommand) -> CommandLeaseWatch:
+        """Translate the server deadline once, before any local queue waiting."""
         watch = CommandLeaseWatch(
             lease_seconds=self.executor.lease_seconds,
             failure_limit=self.executor.lease_renewal_failure_limit,
             clock=self.executor.clock,
+            expires_at=self.executor.clock(),
         )
+        try:
+            watch.expires_at = self._confirmed_deadline(command, command)
+        except ClusterExecutorError as exc:
+            watch.invalidate(str(exc))
+        if command.cancellation_requested_at is not None:
+            watch.abandon(
+                command.cancellation_reason
+                or "cancellation requested by the control plane"
+            )
+        return watch
+
+    def _confirmed_deadline(
+        self,
+        response: RemoteActionCommand,
+        command: RemoteActionCommand,
+        *,
+        request_started: float | None = None,
+    ) -> float:
+        if (
+            response.status is not RemoteCommandStatus.LEASED
+            or not command.lease_token
+            or response.lease_token != command.lease_token
+            or response.lease_owner != self.executor.executor_id
+            or response.command_id != command.command_id
+            or response.cluster_id != self.executor.client.cluster_id
+            or response.cluster_id != command.cluster_id
+            or response.fencing_token != command.fencing_token
+            or response.lease_expires_at is None
+            or response.lease_expires_at.tzinfo is None
+        ):
+            raise LeaseAuthorityError("command has no matching authoritative lease")
+        remaining = (
+            response.lease_expires_at - datetime.now(timezone.utc)
+        ).total_seconds()
+        now = self.executor.clock()
+        # The response cannot grant time spent waiting on the HTTP round trip
+        # again. The absolute server expiry is an additional upper bound.
+        return min(
+            now + remaining,
+            (now if request_started is None else request_started)
+            + self.executor.lease_seconds,
+        )
+
+    def _admit_execution(
+        self, command: RemoteActionCommand, watch: CommandLeaseWatch
+    ) -> bool:
+        if watch.hold_reason() is not None or self.executor.stop_requested:
+            return False
+        started = self.executor.clock()
+        try:
+            response = self.executor.client.renew(
+                command, self.executor.executor_id, self.executor.lease_seconds
+            )
+            expires_at = self._confirmed_deadline(
+                response, command, request_started=started
+            )
+        except Exception as exc:
+            self.executor.increment("lease_renewal_failures")
+            # Before the first adapter call, a best-effort renewal is not
+            # sufficient admission. Leave the server row for a fresh claimant.
+            watch.invalidate(
+                f"pre-execution lease renewal was not confirmed: {type(exc).__name__}"
+            )
+            return False
+        cancellation = watch.renewed(response, expires_at=expires_at)
+        if cancellation is not None:
+            self.executor.increment("cancellations_observed_total")
+        return watch.hold_reason() is None and not self.executor.stop_requested
+
+    def run(
+        self,
+        command: RemoteActionCommand,
+        watch: CommandLeaseWatch | None = None,
+    ) -> CommandOutcome:
+        watch = watch if watch is not None else self.watch_claim(command)
+        if not self._admit_execution(command, watch):
+            if watch.lost():
+                self.executor.increment("lease_lost_total")
+            self.executor.increment("results_withheld_total")
+            LOGGER.warning(
+                "regional command not started: authoritative lease admission "
+                "failed: command=%s cluster=%s reason=%s",
+                command.command_id,
+                command.cluster_id,
+                watch.hold_reason() or "executor shutdown",
+            )
+            return CommandOutcome(RemoteCommandStatus.WAITING, False)
+        stop = Event()
         renewer = Thread(
             target=self.renew_lease,
             args=(command, stop, watch),
@@ -685,10 +790,16 @@ class CommandLifecycle:
                 )
                 return
             try:
+                started = self.executor.clock()
                 renewed = self.executor.client.renew(
                     command,
                     self.executor.executor_id,
                     self.executor.lease_seconds,
+                )
+                expires_at = (
+                    self._confirmed_deadline(renewed, command, request_started=started)
+                    if watch is not None
+                    else 0.0
                 )
             except Exception as exc:
                 self.executor.increment("lease_renewal_failures")
@@ -711,7 +822,7 @@ class CommandLifecycle:
                 continue
             if watch is None:
                 continue
-            cancellation = watch.renewed(renewed)
+            cancellation = watch.renewed(renewed, expires_at=expires_at)
             if cancellation is not None:
                 self.executor.increment("cancellations_observed_total")
                 LOGGER.warning(

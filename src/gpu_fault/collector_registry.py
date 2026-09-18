@@ -11,21 +11,23 @@ already reads, so a new collector edits these two tables, adds a channel to
 ``validate_collector_registry()`` runs at import time like the operation,
 channel and node-action registries: a row that names a channel the processor
 does not serve, an export the ``gpu_fault.collectors`` package does not
-publish, or a kind no subcommand produces fails the first import.
+publish, or an active kind no subcommand produces fails the first import.
+Retired kinds remain decodable in persisted telemetry but cannot be producers.
 
 Third-party collectors join through the ``gpu_fault.collectors`` entry-point
-group; ``collector_registry_with_plugins()`` merges them under the same
-validator when the CLI starts, never at import time.
+group. Discovery reads metadata only; the CLI merges the selected descriptor
+under the same validator after parsing. Explicit installation validation loads
+every plugin, never at import time.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib import import_module
+from importlib import import_module, metadata
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from gpu_fault import collectors as collectors_package
@@ -46,6 +48,9 @@ from gpu_fault.plugins import PluginGroup, discover_plugins
 if TYPE_CHECKING:
     from gpu_fault.collectors.models import CollectorContext
     from gpu_fault.collectors.sinks import EventSink
+
+OUTBOX_COMMAND = "outbox"
+VALIDATE_PLUGINS_COMMAND = "validate-plugins"
 
 
 class CollectorKind(StrEnum):
@@ -98,6 +103,7 @@ class CollectorKindSpec:
     systemd_unit: str | None
     # ``None`` for kinds the control plane does not expect on a schedule.
     silent_threshold: SilentThreshold | None
+    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,17 +200,16 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         producer="KUBERNETES_HMA_NODE_COLLECTOR",
         systemd_unit=None,
         silent_threshold=None,
+        retired=True,
     ),
     CollectorKind.HMA_CLOUDWATCH: CollectorKindSpec(
         kind=CollectorKind.HMA_CLOUDWATCH,
         producer="CLOUDWATCH_HMA_COLLECTOR",
         systemd_unit=None,
         silent_threshold=None,
+        retired=True,
     ),
 }
-
-HMA_KUBERNETES_NODE_PATH = "/v1/provider-events/hyperpod-hma/kubernetes-node"
-HMA_CLOUDWATCH_PATH = "/v1/provider-events/hyperpod-hma/cloudwatch"
 
 COLLECTOR_REGISTRY: dict[str, CollectorDescriptor] = {
     "kernel": CollectorDescriptor(
@@ -216,14 +221,6 @@ COLLECTOR_REGISTRY: dict[str, CollectorDescriptor] = {
         runs_in="node",
         needs_product_discovery=True,
     ),
-    "kubernetes-hma": CollectorDescriptor(
-        cli_command="kubernetes-hma",
-        kinds=(CollectorKind.HMA_NODE,),
-        channel_paths=(HMA_KUBERNETES_NODE_PATH,),
-        export_name="KubernetesHmaNodeCollector",
-        factory="gpu_fault.collectors_cli:build_kubernetes_hma",
-        runs_in="cluster",
-    ),
     "kubernetes-node-resources": CollectorDescriptor(
         cli_command="kubernetes-node-resources",
         kinds=(CollectorKind.HOST_TELEMETRY,),
@@ -231,15 +228,6 @@ COLLECTOR_REGISTRY: dict[str, CollectorDescriptor] = {
         export_name="KubernetesNodeResourceCollector",
         factory="gpu_fault.collectors_cli:build_kubernetes_node_resources",
         runs_in="cluster",
-    ),
-    "sqs-hma": CollectorDescriptor(
-        cli_command="sqs-hma",
-        kinds=(CollectorKind.HMA_CLOUDWATCH,),
-        channel_paths=(HMA_CLOUDWATCH_PATH,),
-        export_name="SqsHmaConsumer",
-        factory="gpu_fault.collectors_cli:build_sqs_hma",
-        runs_in="cluster",
-        needs_context=False,
     ),
     "dcgm": CollectorDescriptor(
         cli_command="dcgm",
@@ -336,6 +324,12 @@ def validate_collector_registry(
     for kind, spec in kinds.items():
         if spec.kind is not kind:
             raise RuntimeError(f"collector kind {kind.value} row declares {spec.kind}")
+        if spec.retired and (
+            spec.systemd_unit is not None or spec.silent_threshold is not None
+        ):
+            raise RuntimeError(
+                f"retired collector kind {kind.value} has runtime settings"
+            )
     producer_by_unit: dict[str, str] = {}
     for spec in kinds.values():
         if spec.systemd_unit is None:
@@ -356,6 +350,9 @@ def validate_collector_registry(
             )
         if len(set(descriptor.kinds)) != len(descriptor.kinds):
             raise RuntimeError(f"{command}: repeats a collector kind")
+        for kind in descriptor.kinds:
+            if kinds[kind].retired:
+                raise RuntimeError(f"{command}: collector kind {kind.value} is retired")
         if not descriptor.channel_paths:
             raise RuntimeError(f"{command}: declares no channel path")
         for path in descriptor.channel_paths:
@@ -385,18 +382,53 @@ def validate_collector_registry(
                 f"{sorted(unit for unit in units if unit is not None)}"
             )
         served.update(descriptor.kinds)
-    unserved = sorted(item.value for item in frozenset(CollectorKind) - served)
+    unserved = sorted(
+        kind.value
+        for kind, spec in kinds.items()
+        if not spec.retired and kind not in served
+    )
     if unserved:
         raise RuntimeError(
             f"collector registry mismatch: no CLI command produces {unserved}"
         )
 
 
-def collector_registry_with_plugins() -> dict[str, CollectorDescriptor]:
-    """The built-in table plus every installed ``gpu_fault.collectors`` plugin."""
+def _validate_plugin_names(names: Iterable[str]) -> None:
+    for name in names:
+        if name in COLLECTOR_REGISTRY or name in {
+            OUTBOX_COMMAND,
+            VALIDATE_PLUGINS_COMMAND,
+        }:
+            raise RuntimeError(f"collector plugin {name} collides with a CLI command")
 
+
+def discover_collector_plugins() -> dict[str, metadata.EntryPoint]:
+    """Check installed command names without executing any plugin code."""
+
+    plugins = discover_plugins(PluginGroup.COLLECTORS)
+    _validate_plugin_names(plugins)
+    return plugins
+
+
+def collector_registry_with_plugins(
+    *,
+    selected_command: str | None = None,
+    discovered: Mapping[str, metadata.EntryPoint] | None = None,
+) -> dict[str, CollectorDescriptor]:
+    """Merge selected plugins, or all plugins for explicit registry validation."""
+
+    plugins = discover_collector_plugins() if discovered is None else discovered
+    _validate_plugin_names(plugins)
     registry = dict(COLLECTOR_REGISTRY)
-    for name, entry_point in discover_plugins(PluginGroup.COLLECTORS).items():
+    if (
+        selected_command is not None
+        and selected_command not in registry
+        and selected_command not in plugins
+    ):
+        raise LookupError(f"collector plugin {selected_command} is not installed")
+    for name, entry_point in plugins.items():
+        if selected_command is not None and name != selected_command:
+            continue
         descriptor: object = entry_point.load()
         if not isinstance(descriptor, CollectorDescriptor):
             raise RuntimeError(
@@ -408,11 +440,18 @@ def collector_registry_with_plugins() -> dict[str, CollectorDescriptor]:
                 f"collector plugin {name} declares cli_command "
                 f"{descriptor.cli_command!r}; the two must agree"
             )
-        if name in registry:
-            raise RuntimeError(f"collector plugin {name} collides with a CLI command")
         registry[name] = descriptor
     validate_collector_registry(registry)
     return registry
+
+
+def validate_collector_plugins(
+    *, discovered: Mapping[str, metadata.EntryPoint] | None = None
+) -> None:
+    """Validate every descriptor and factory without constructing collectors."""
+
+    for descriptor in collector_registry_with_plugins(discovered=discovered).values():
+        _load_factory(descriptor.factory)
 
 
 validate_collector_registry()

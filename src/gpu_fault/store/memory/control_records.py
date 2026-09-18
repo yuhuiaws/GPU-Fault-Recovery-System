@@ -413,6 +413,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
         fabric_partitions: set[str],
         observed_from: datetime,
         observed_to: datetime,
+        cluster_id: str | None = None,
         limit: int = 1000,
     ) -> list[NodeMarker]:
         """Actionable markers whose scope touches an allocation, newest first.
@@ -432,6 +433,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                     if marker.active
                     and marker.trusted
                     and marker.recommended_action is not None
+                    and (cluster_id is None or marker.cluster_id == cluster_id)
                     and observed_from <= marker.observed_at <= observed_to
                     and (
                         set(marker.scope.node_ids).intersection(node_ids)

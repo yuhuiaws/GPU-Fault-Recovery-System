@@ -9,10 +9,12 @@ startup check must be a yes/no per kind rather than the CLI's counting status
 from __future__ import annotations
 
 import os
+from contextlib import closing
 
 import pytest
 
 from gpu_fault.store import PostgresStore
+from tests.store import _postgres_processor_claim_support as shared
 from tests.store._postgres_processor_claim_support import _truncate
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
@@ -24,8 +26,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def clean_tables():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 
@@ -88,3 +90,27 @@ def test_a_dedicated_store_fails_closed_and_names_the_kind_with_a_gap() -> None:
         "attempt_observation": False,
         "training_progress": False,
     }
+
+
+@pytest.mark.parametrize("schema_ready", [False, True], ids=["first-use", "reused"])
+def test_shared_fixture_cleans_legacy_rows_before_dedicated_startup(
+    monkeypatch: pytest.MonkeyPatch, schema_ready: bool
+) -> None:
+    monkeypatch.setattr(shared, "_SCHEMA_READY", schema_ready)
+    monkeypatch.setenv("GPU_FAULT_POSTGRES_HOT_STATE_MODE", "dedicated")
+    _insert_legacy_row(
+        "gpu_metric_latest",
+        "cluster-a/node-a/prior-test",
+        '{"cluster_id":"cluster-a","node_id":"node-a",'
+        '"observed_at":"2026-09-07T00:00:00Z"}',
+    )
+    assert POSTGRES_URL is not None
+    with pytest.raises(RuntimeError, match="backfill is incomplete"):
+        PostgresStore(POSTGRES_URL, initialize_schema=False, hot_state_mode="dedicated")
+
+    with closing(shared.postgres_store_instance()) as instances:
+        store = next(instances)
+        assert store.hot_state_mode == "dedicated"
+        assert not any(store.hot_state_backfill_gaps().values()), (
+            "prior-test legacy rows reached the configured Store startup"
+        )

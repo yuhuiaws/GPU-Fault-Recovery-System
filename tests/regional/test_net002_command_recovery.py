@@ -13,6 +13,8 @@ from scripts.e2e.regional import net_command_fixture as fixture
 from scripts.e2e.regional import run_net002_command_recovery as net002
 
 T0 = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
+COMMAND_ID = "remote-net002-test"
+UNBLOCKED_AT = T0 + timedelta(seconds=net002.BLOCK_SECONDS + 10)
 
 
 def _ready(**overrides: Any) -> dict[str, Any]:
@@ -21,14 +23,32 @@ def _ready(**overrides: Any) -> dict[str, Any]:
         "http_timeout_seconds": float(net002.HTTP_TIMEOUT_SECONDS),
         "lease_seconds": net002.LEASE_SECONDS,
         "result_submission_gate": True,
+        "first_result_submission_receipt": True,
+        "result_gate_closes_caller_transport_pool": True,
         "action_requires_network_block": True,
     }
     ready.update(overrides)
     return ready
 
 
+def _receipt(**overrides: Any) -> dict[str, Any]:
+    receipt = {
+        "command_id": COMMAND_ID,
+        "submission_index": 1,
+        "status_code": 409,
+        "stale_lease_reason": net002.STALE_LEASE_DETAIL,
+        "submitted_at_epoch": UNBLOCKED_AT.timestamp() + 0.1,
+        "observed_at_epoch": UNBLOCKED_AT.timestamp() + 0.2,
+        "gate_released_at_epoch": UNBLOCKED_AT.timestamp(),
+        "caller_transport_pool_closed": True,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
 def _errors(**overrides: Any) -> list[str]:
     leased = {
+        "command_id": COMMAND_ID,
         "status": "LEASED",
         "lease_expires_at": (T0 + timedelta(seconds=net002.LEASE_SECONDS)).isoformat(),
     }
@@ -36,7 +56,11 @@ def _errors(**overrides: Any) -> list[str]:
         "ready": _ready(),
         "leased": leased,
         "expired": dict(leased),
-        "final": {"status": "SUCCEEDED", "result_details": {"cached": True}},
+        "final": {
+            "command_id": COMMAND_ID,
+            "status": "SUCCEEDED",
+            "result_details": {"cached": True},
+        },
         "executor_state": {
             "claimed_total": 2,
             "reported_failures": 1,
@@ -49,7 +73,19 @@ def _errors(**overrides: Any) -> list[str]:
             "remote command lease is missing, stale, or changed"
         ),
         "blocked_seconds": net002.BLOCK_SECONDS + 3.0,
-        "unblocked_at": T0 + timedelta(seconds=net002.BLOCK_SECONDS + 10),
+        "unblocked_at": UNBLOCKED_AT,
+        "unblock_requested_at": UNBLOCKED_AT - timedelta(seconds=0.1),
+        "expected_command_id": COMMAND_ID,
+        "result_submit_waiting": {
+            "command_id": COMMAND_ID,
+            "observed_at_epoch": T0.timestamp() + 5,
+        },
+        "result_submit_released": {
+            "command_id": COMMAND_ID,
+            "observed_at_epoch": UNBLOCKED_AT.timestamp(),
+        },
+        "first_result_submission": _receipt(),
+        "first_result_submission_after_reclaim": _receipt(),
     }
     arguments.update(overrides)
     return net002.net002_errors(**arguments)
@@ -81,6 +117,144 @@ def test_the_intended_run_passes() -> None:
     assert _errors() == []
 
 
+@pytest.mark.parametrize("detail", net002.STALE_LEASE_DETAILS)
+def test_current_and_legacy_stale_lease_responses_are_recognized(detail: str) -> None:
+    assert (
+        _errors(
+            logs=f"regional control plane rejected request (409): {detail}",
+            first_result_submission=_receipt(stale_lease_reason=detail),
+            first_result_submission_after_reclaim=_receipt(stale_lease_reason=detail),
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "logs",
+    [
+        "regional control plane rejected request (409): unrelated conflict",
+        "regional control plane rejected request (403): remote command lease is stale",
+        "remote command lease is stale",
+    ],
+)
+def test_unrelated_conflicts_or_missing_http_status_do_not_prove_expiry(
+    logs: str,
+) -> None:
+    assert "executor log has no stale-lease HTTP 409" in _errors(logs=logs)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"),
+    [
+        (None, None),
+        (409, "unrelated conflict"),
+        (403, net002.STALE_LEASE_DETAIL),
+        (200, None),
+        ("409", net002.STALE_LEASE_DETAIL),
+        (409.0, net002.STALE_LEASE_DETAIL),
+        (True, net002.STALE_LEASE_DETAIL),
+        (409, net002.STALE_LEASE_DETAIL + ": untrusted suffix"),
+    ],
+)
+def test_renewal_only_409_cannot_replace_first_result_proof(
+    status_code: Any, reason: Any
+) -> None:
+    receipt = _receipt(status_code=status_code, stale_lease_reason=reason)
+    errors = _errors(
+        logs="renewal: regional control plane rejected request (409): "
+        + net002.STALE_LEASE_DETAIL,
+        first_result_submission=receipt,
+        first_result_submission_after_reclaim=dict(receipt),
+    )
+    assert "first result submission has no stale-lease HTTP 409 receipt" in errors
+
+
+def test_missing_first_receipt_fails_despite_stale_lease_logs() -> None:
+    assert "first result submission receipt is missing" in _errors(
+        first_result_submission={}
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "first_result_submission",
+        "result_submit_waiting",
+        "result_submit_released",
+        "leased",
+        "expired",
+        "final",
+    ],
+)
+def test_unrelated_command_receipts_gates_and_snapshots_are_rejected(
+    field: str,
+) -> None:
+    errors = _errors(**{field: {"command_id": "remote-unrelated"}})
+    assert any("intended command" in item for item in errors), errors
+
+
+@pytest.mark.parametrize("index", [None, 0, 2, True, "1"])
+def test_later_or_unidentified_submission_cannot_be_used_as_first(index: Any) -> None:
+    assert "result submission receipt is not the first attempt" in _errors(
+        first_result_submission=_receipt(submission_index=index)
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {},
+        _receipt(status_code=200, stale_lease_reason=None),
+        _receipt(command_id="other"),
+    ],
+    ids=["missing-after-reclaim", "cached-success", "other-command"],
+)
+def test_first_receipt_cannot_disappear_or_be_overwritten(
+    replacement: dict[str, Any],
+) -> None:
+    assert "first result submission receipt changed after reclaim" in _errors(
+        first_result_submission_after_reclaim=replacement
+    )
+
+
+@pytest.mark.parametrize(
+    "field", ["gate_released_at_epoch", "submitted_at_epoch", "observed_at_epoch"]
+)
+@pytest.mark.parametrize("value", [None, "later", True, float("nan"), float("inf")])
+def test_receipt_requires_finite_numeric_timestamps(field: str, value: Any) -> None:
+    assert (
+        "first result submission receipt has missing or invalid timestamps"
+        in _errors(first_result_submission=_receipt(**{field: value}))
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"gate_released_at_epoch": UNBLOCKED_AT.timestamp() - 1},
+        {"submitted_at_epoch": UNBLOCKED_AT.timestamp() - 1},
+        {"observed_at_epoch": UNBLOCKED_AT.timestamp() - 1},
+    ],
+    ids=["wrong-release", "submitted-before-unblock", "response-before-submit"],
+)
+def test_receipt_must_follow_the_actual_result_gate_release(
+    overrides: dict[str, Any],
+) -> None:
+    assert "first result submission was not recorded after unblock" in _errors(
+        first_result_submission=_receipt(**overrides)
+    )
+
+
+def test_result_gate_release_must_follow_the_unblock_request() -> None:
+    assert "first result submission was not recorded after unblock" in _errors(
+        unblock_requested_at=UNBLOCKED_AT + timedelta(seconds=1)
+    )
+
+
+def test_receipt_can_arrive_before_the_unblock_command_acknowledgement() -> None:
+    assert _errors(unblocked_at=UNBLOCKED_AT + timedelta(seconds=1)) == []
+
+
 def test_the_http_timeout_is_a_recorded_fact_not_a_pass_condition() -> None:
     assert _errors(ready=_ready(http_timeout_seconds=200.0)) == []
     assert _errors(ready=_ready(http_timeout_seconds=180.0)) == []
@@ -88,13 +262,19 @@ def test_the_http_timeout_is_a_recorded_fact_not_a_pass_condition() -> None:
 
 def test_the_limitation_is_declared_in_plan_and_result() -> None:
     assert net002.LIMITATIONS == [
-        "HTTP timeout 180s (production 15s) is used to reach the 409 path"
+        "HTTP timeout 180s (production 15s) is used to reach the 409 path",
+        "After the result gate releases, only the probe result caller's thread-local "
+        "HTTP pool is closed to avoid an expired keepalive; TLS verification is unchanged",
     ]
     predecessor = {"valid": True, "case_id": "GF-REGIONAL-NET-001", "verdict": "PASS"}
     details = net002.plan_details(predecessor)
     assert details["limitations"] == net002.LIMITATIONS
     assert details["predecessor"] is predecessor
     assert details["timing"]["block_seconds"] == net002.BLOCK_SECONDS
+    assert details["mutations"][1] == (
+        "converged CPU registry revision publication without Deployment rollout"
+    )
+    assert details["pod_active_deadline_seconds"] == 900
 
 
 def test_a_block_shorter_than_intended_fails_with_the_intended_length() -> None:
@@ -146,7 +326,7 @@ def test_cpu_pod_is_looked_up_once_per_process(monkeypatch) -> None:
     fixture.reset_cpu_pod_cache()
 
 
-def test_cpu_python_retries_once_against_a_fresh_pod(monkeypatch) -> None:
+def test_cpu_python_does_not_replay_a_failed_mutation(monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
     pods = iter(["api-pod-1", "api-pod-2"])
 
@@ -161,7 +341,11 @@ def test_cpu_python_retries_once_against_a_fresh_pod(monkeypatch) -> None:
     monkeypatch.setattr(fixture, "control", control)
     fixture.reset_cpu_pod_cache()
 
-    assert fixture.cpu_python("print(1)") == {"ok": True}
+    with pytest.raises(RuntimeError, match="pod not found"):
+        fixture.cpu_python("possibly_committed_mutation()")
+    assert len(calls) == 2
+    assert calls[0][0] == "get" and calls[1][0] == "exec"
+    assert fixture.cpu_python("independent_read()") == {"ok": True}
     assert [item for item in calls if item[0] == "get"] == [calls[0], calls[2]]
     assert fixture.cpu_pod() == "api-pod-2"
     fixture.reset_cpu_pod_cache()
@@ -249,9 +433,14 @@ def test_run_main_installs_the_site_profile_before_building_the_parser(
         "predecessor_gate",
         lambda *_args, **_kwargs: order.append("gate") or {"valid": True},
     )
-    monkeypatch.setattr(
-        fixture, "build_plan", lambda **_kwargs: {"case_id": "GF-REGIONAL-NET-002"}
-    )
+
+    def build_plan(*, arguments: Any, preflight_passed: bool, **kwargs: Any) -> dict:
+        assert arguments.run_dir == tmp_path
+        assert preflight_passed is True
+        assert kwargs["details"]["predecessor"] == {"valid": True}
+        return {"case_id": "GF-REGIONAL-NET-002"}
+
+    monkeypatch.setattr(fixture, "build_plan", build_plan)
     exit_code = fixture.run_main(
         case_id="GF-REGIONAL-NET-002",
         confirmation="X",

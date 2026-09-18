@@ -12,7 +12,24 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parents[3]
+for _path in (ROOT, ROOT / "src"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 if __package__:
+    from .ha_evidence import chain_preflight, require_chain, result_identity
+    from .ha_cleanup import (
+        ProcessSupervisionLost,
+        attempt_cleanup,
+        record_supervision_loss,
+        run_cleanup,
+    )
+    from .ha_plan_preflight import residual_preflight
+    from .ha_store_probe import cpu_store_probe
+    from .ha_probe_resources import OwnedProbeResources
+    from .ha_kubernetes import delete_pod
+    from .regional_live_fixture import component_python
     from .acceptance_runner_common import write_json_atomic
     from .live_driver_guard import (
         add_live_arguments,
@@ -21,6 +38,18 @@ if __package__:
         install_site_profile,
     )
 else:
+    from ha_evidence import chain_preflight, require_chain, result_identity
+    from ha_cleanup import (
+        ProcessSupervisionLost,
+        attempt_cleanup,
+        record_supervision_loss,
+        run_cleanup,
+    )
+    from ha_plan_preflight import residual_preflight
+    from ha_store_probe import cpu_store_probe
+    from ha_probe_resources import OwnedProbeResources
+    from ha_kubernetes import delete_pod
+    from regional_live_fixture import component_python
     from acceptance_runner_common import write_json_atomic
     from live_driver_guard import (
         add_live_arguments,
@@ -29,13 +58,12 @@ else:
         install_site_profile,
     )
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts" / "perf"))
 
 _action_capacity = importlib.import_module("regional_action_capacity_suite")
 _registry = importlib.import_module("regional_capacity_registry")
 _capacity_suite = importlib.import_module("regional_capacity_suite")
+run_manifest = importlib.import_module("regional_capacity_resources").run_manifest
 executor_identity = _action_capacity.executor_identity
 NAMESPACE = _registry.NAMESPACE
 control = _registry.control
@@ -43,13 +71,13 @@ dataplane = _registry.dataplane
 load_registry = _registry.load_registry
 register = _registry.register
 teardown = _capacity_suite.teardown
-upsert_configmap = _capacity_suite.upsert_configmap
 
 SCRIPT = Path(__file__).with_name("probes") / "ha006_executor.py"
 CONFIGMAP = "gpu-fault-ha006-executor"
 PODS = ("gpu-fault-ha006-a", "gpu-fault-ha006-b")
 CASE_ID = "GF-REGIONAL-HA-006"
 OWNER = "gpu-fault-ha006-test"
+SEED_LEASE_SECONDS = 30 * 60
 LEASE_SECONDS = 30
 WINNER_SLEEP_SECONDS = 60
 # The fixture executors poll every second but back off up to this after idle
@@ -138,27 +166,7 @@ def physical_action_total(*states: dict) -> int:
 
 
 def cpu_python(script: str, *arguments: str) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    output = control(
-        "exec",
-        "-i",
-        pod,
-        "--",
-        "python3",
-        "-",
-        *arguments,
-        stdin=script.encode(),
-        timeout=180,
-    )
-    return json.loads(output.splitlines()[-1])
+    return cpu_store_probe(control, script, *arguments)
 
 
 def database_residuals() -> dict:
@@ -169,7 +177,7 @@ import json
 import psycopg
 queries = {
     "objects": (
-        "SELECT count(*) FROM gpu_fault_objects "
+        "SELECT count(*) FROM gpu_fault_control_records "
         "WHERE payload->>'cluster_id' LIKE 'perf-cap-%' "
         "OR key LIKE '%ha006-%'"
     ),
@@ -230,7 +238,6 @@ def kubernetes_residuals() -> dict:
             "--ignore-not-found",
             "-o",
             "name",
-            check=False,
         ).strip()
         resources[f"{kind}/{name}"] = bool(output)
     return {"count": sum(resources.values()), "resources": resources}
@@ -240,6 +247,7 @@ def seed_command(run_id: str) -> dict:
     script = r"""
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     FaultIncident,
@@ -251,7 +259,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner = sys.argv[1:]
+run_id, cluster_id, owner, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 incident_id = f"incident-{run_id}"
 event_id = f"event-{run_id}"
 workflow_id = f"workflow-actionperf-{run_id}"
@@ -273,14 +282,18 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Keep the command out of the terminal-workflow orphan sweep and reserve
+# workflow execution for the seed identity until the fixture is cleaned up.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
-    status=WorkflowStatus.BLOCKED,
+    status=WorkflowStatus.PENDING,
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step],
-    blocked_reasons=["synthetic HA-006 executor takeover"],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 command = RemoteActionCommand(
     command_id=command_id,
@@ -306,7 +319,7 @@ print(json.dumps({
     "deduplication_key": f"{run_id}/shared-action-ledger",
 }, sort_keys=True))
 """
-    return cpu_python(script, run_id, "perf-cap-000", OWNER)
+    return cpu_python(script, run_id, "perf-cap-000", OWNER, str(SEED_LEASE_SECONDS))
 
 
 def command_snapshot(command_id: str) -> dict:
@@ -352,7 +365,7 @@ with psycopg.connect(store_dsn()) as connection:
     objects = {}
     if notification_id is not None:
         cursor.execute(
-            "SELECT kind, payload->>'status' FROM gpu_fault_objects "
+            "SELECT kind, payload->>'status' FROM gpu_fault_control_records "
             "WHERE key=%s AND kind IN "
             "('notification','notification_delivery','notification_result')",
             (notification_id,),
@@ -400,12 +413,12 @@ with psycopg.connect(store_dsn(), autocommit=True) as connection:
         ])
     for kind, key in items:
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s",
+            "SELECT gpu_fault_delete_control_state(%s,%s)",
             (kind, key),
         )
-        deleted[f"{kind}/{key}"] = cursor.rowcount
+        deleted[f"{kind}/{key}"] = int(cursor.fetchone()[0])
     cursor.execute(
-        "SELECT count(*) FROM gpu_fault_objects "
+        "SELECT count(*) FROM gpu_fault_control_records "
         "WHERE key LIKE '%ha006-%'"
     )
     objects = int(cursor.fetchone()[0])
@@ -453,14 +466,25 @@ def pod_manifest(
             "restartPolicy": "Never",
             "activeDeadlineSeconds": 600,
             "terminationGracePeriodSeconds": 5,
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 1001,
+                "runAsGroup": 1001,
+                "fsGroup": 1001,
+                "fsGroupChangePolicy": "OnRootMismatch",
+            },
             "serviceAccountName": "gpu-fault-completion-watcher",
             "tolerations": [{"operator": "Exists"}],
             "containers": [
                 {
                     "name": "executor",
                     "image": image,
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
                     "command": [
-                        "/opt/gpu-fault/executor/bin/python",
+                        component_python("gpu"),
                         f"/scripts/{SCRIPT.name}",
                     ],
                     "env": [
@@ -648,12 +672,14 @@ def takeover_errors(
     survivor: str,
     notification_id: str,
     timing: dict[str, Any],
-    remaining_lease: float,
+    remaining_lease: float | None,
     survivor_state: dict,
     physical_total: int,
     notification_final: dict,
 ) -> list[str]:
     errors = []
+    if final.get("status") != "SUCCEEDED":
+        errors.append("remote command is not SUCCEEDED")
     if final.get("last_lease_owner") != survivor:
         errors.append("survivor did not become the final lease owner")
     details = final.get("result_details", {})
@@ -665,7 +691,11 @@ def takeover_errors(
         )
     if details.get("shared_notification_id") != notification_id:
         errors.append("shared ledger identity changed across takeover")
-    if timing["takeover_seconds"] > remaining_lease + timing["tolerance_seconds"]:
+    if timing["takeover_seconds"] < 0:
+        errors.append("command completed before the recorded kill")
+    if remaining_lease is not None and (
+        timing["takeover_seconds"] > remaining_lease + timing["tolerance_seconds"]
+    ):
         errors.append(
             "takeover exceeded remaining lease plus poll/backoff tolerance "
             f"({timing['takeover_seconds']}s > {remaining_lease}s + "
@@ -690,6 +720,8 @@ def run_case(
     run_dir: Path,
     attempt: int,
     maintenance_window_end: datetime,
+    *,
+    chain: dict | None = None,
 ) -> int:
     if datetime.now(timezone.utc) >= maintenance_window_end:
         raise CaseError("approved maintenance window has ended")
@@ -699,6 +731,8 @@ def run_case(
     result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
     seed: dict = {}
     notification_id: str | None = None
+    cleanup_armed = False
+    resources = None
     try:
         database_preflight = database_residuals()
         registry_preflight = registry_residuals()
@@ -712,10 +746,19 @@ def run_case(
             raise CaseError(f"registry preflight residuals: {registry_preflight}")
         if kubernetes_preflight["count"] != 0:
             raise CaseError(f"Kubernetes preflight residuals: {kubernetes_preflight}")
+        resources = OwnedProbeResources(
+            case_dir / f"probe-resources-{run_id}.json",
+            lambda args, body: dataplane(
+                *args, stdin=body.encode() if body is not None else None
+            ),
+        )
+        cleanup_armed = True
 
+        artifacts = case_dir / f"capacity-{run_id}"
+        artifacts.mkdir(exist_ok=True)
         register(
             1,
-            case_dir,
+            artifacts,
             run_id=run_id,
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             allow_live_registry=True,
@@ -726,14 +769,20 @@ def run_case(
             dataplane("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")
         )
         image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
-        upsert_configmap(CONFIGMAP, text={SCRIPT.name: SCRIPT.read_text()})
+        resources.create(
+            run_manifest(
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": CONFIGMAP, "namespace": NAMESPACE},
+                    "data": {SCRIPT.name: SCRIPT.read_text()},
+                },
+                run_id,
+            )
+        )
         for pod in PODS:
-            dataplane("delete", "pod", pod, "--ignore-not-found", check=False)
-            dataplane(
-                "apply",
-                "-f",
-                "-",
-                stdin=json.dumps(pod_manifest(pod, image, identity, run_id)).encode(),
+            resources.create(
+                run_manifest(pod_manifest(pod, image, identity, run_id), run_id)
             )
         for pod in PODS:
             dataplane("wait", "--for=condition=Ready", f"pod/{pod}", "--timeout=180s")
@@ -755,19 +804,29 @@ def run_case(
         survivor = next(pod for pod in PODS if pod != owner)
         owner_state = read_state(owner, "/state/executor-state.json")
         write_json_atomic(case_dir / "owner-before-kill.json", owner_state)
+        pre_kill = command_snapshot(str(seed["command_id"]))
+        owner_pod = resources.owned("Pod", owner)
+        if owner_pod is None:
+            raise CaseError("lease owner Pod disappeared before the kill")
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise CaseError("maintenance window ended before owner deletion")
         kill_requested_at = datetime.now(timezone.utc)
         log(f"force deleting lease owner {owner}; survivor={survivor}")
-        dataplane(
-            "delete",
-            "pod",
-            owner,
-            "--grace-period=0",
-            "--force",
+        delete_pod(
+            lambda args, body: dataplane(*args, stdin=body.encode()),
+            NAMESPACE,
+            {"name": owner, "uid": owner_pod["metadata"]["uid"]},
+            force=True,
         )
         killed_at = datetime.now(timezone.utc)
         post_kill = command_snapshot(str(seed["command_id"]))
         write_json_atomic(case_dir / "post-kill-command.json", post_kill)
-        remaining_lease = remaining_lease_seconds(post_kill, killed_at)
+        remaining_lease = (
+            remaining_lease_seconds(pre_kill, kill_requested_at)
+            if pre_kill.get("status") == "LEASED"
+            and pre_kill.get("lease_owner") == owner
+            else None
+        )
         final, timeline = wait_terminal(seed)
         observed_completed_at = datetime.now(timezone.utc)
         timing = takeover_timing(
@@ -815,83 +874,143 @@ def run_case(
             "owner_state": owner_state,
             "survivor_state": survivor_state,
         }
-        if remaining_lease is None:
+        errors = takeover_errors(
+            final=final,
+            survivor=survivor,
+            notification_id=notification_id,
+            timing=timing,
+            remaining_lease=remaining_lease,
+            survivor_state=survivor_state,
+            physical_total=physical_total,
+            notification_final=notification_final,
+        )
+        result["errors"] = errors
+        if errors:
+            result["verdict"] = "FAIL"
+        elif remaining_lease is None or not waiting["reclaimed_by_other_replica"]:
             # The kill did not land on a LEASED command, so the LEASED-branch
             # bound cannot be judged; the run is inconclusive, not failed.
             result["verdict"] = "INCONCLUSIVE"
             result["inconclusive_reason"] = (
-                "command held no lease at the kill (lease_expires_at is null); "
-                "the LEASED takeover bound could not be measured"
+                "the killed owner's lease or the cross-replica WAITING reclaim "
+                "was not observed; both branches are required"
             )
         else:
-            errors = takeover_errors(
-                final=final,
-                survivor=survivor,
-                notification_id=notification_id,
-                timing=timing,
-                remaining_lease=remaining_lease,
-                survivor_state=survivor_state,
-                physical_total=physical_total,
-                notification_final=notification_final,
-            )
-            result["errors"] = errors
-            result["verdict"] = "PASS" if not errors else "FAIL"
+            result["verdict"] = "PASS"
+    except ProcessSupervisionLost:
+        record_supervision_loss(result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        for pod in PODS:
-            logs = dataplane("logs", pod, check=False, timeout=120)
-            path = case_dir / f"{pod}.log"
-            path.write_text(logs)
-            path.chmod(0o600)
-            dataplane("delete", "pod", pod, "--ignore-not-found", check=False)
-        dataplane(
-            "delete",
-            "configmap",
-            CONFIGMAP,
-            "--ignore-not-found",
-            check=False,
-        )
-        if seed:
-            try:
-                cleanup = cleanup_seed(seed, notification_id)
-                result["seed_cleanup"] = cleanup
-                write_json_atomic(case_dir / "seed-cleanup.json", cleanup)
-            except Exception as exc:
-                result["cleanup_error"] = f"{type(exc).__name__}: {exc}"
-                result["verdict"] = "FAIL"
-        try:
-            teardown(
-                purge=True,
-                deregister_clusters=True,
-                allow_live_registry=True,
-                live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
-                artifacts=case_dir,
-                run_id=run_id,
+        if cleanup_armed:
+            run_cleanup(
+                result,
+                lambda: cleanup_case(
+                    case_dir, run_id, seed, notification_id, result, resources=resources
+                ),
             )
-        except Exception as exc:
-            result["registry_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        try:
-            postflight = {
-                "database": database_residuals(),
-                "registry": registry_residuals(),
-                "kubernetes": kubernetes_residuals(),
-            }
-            result["postflight"] = postflight
-            write_json_atomic(case_dir / "postflight.json", postflight)
-            if postflight["database"]["total"] != 0:
-                raise CaseError(f"database residuals: {postflight}")
-            if postflight["registry"]["count"] != 0:
-                raise CaseError(f"registry residuals: {postflight}")
-            if postflight["kubernetes"]["count"] != 0:
-                raise CaseError(f"Kubernetes residuals: {postflight}")
-        except Exception as exc:
-            result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
+    result.update(result_identity(chain))
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
+
+
+def cleanup_case(
+    case_dir: Path,
+    run_id: str,
+    seed: dict,
+    notification_id: str | None,
+    result: dict,
+    *,
+    resources: OwnedProbeResources | None = None,
+) -> None:
+    if resources is None:
+        result["verdict"] = "FAIL"
+        result["cleanup_preserved"] = "probe resources have no ownership receipt"
+        return
+    pods_gone = True
+    for pod in PODS:
+        try:
+            if f"Pod/{pod}" not in resources.records:
+                continue
+            present = resources.owned("Pod", pod)
+        except Exception as exc:
+            result.setdefault("cleanup_errors", []).append(
+                f"read {pod}: {type(exc).__name__}: {exc}"
+            )
+            pods_gone = False
+            continue
+        if not present:
+            continue
+        path = case_dir / f"{pod}.log"
+        attempt_cleanup(
+            result,
+            f"log {pod}",
+            lambda pod=pod, path=path: (
+                path.write_text(dataplane("logs", pod, timeout=120)),
+                path.chmod(0o600),
+            ),
+        )
+
+        if not attempt_cleanup(
+            result, f"delete {pod}", lambda pod=pod: resources.delete("Pod", pod)
+        ):
+            pods_gone = False
+    if not pods_gone:
+        result["verdict"] = "FAIL"
+        result["cleanup_preserved"] = (
+            "probe shutdown unverified; retain registry and rows"
+        )
+        return
+    attempt_cleanup(
+        result,
+        "delete ConfigMap",
+        lambda: resources.delete("ConfigMap", CONFIGMAP),
+    )
+    if seed:
+
+        def remove_seed() -> None:
+            result["seed_cleanup"] = cleanup_seed(seed, notification_id)
+            write_json_atomic(case_dir / "seed-cleanup.json", result["seed_cleanup"])
+
+        if not attempt_cleanup(result, "seed", remove_seed):
+            result["cleanup_preserved"] = (
+                "seed cleanup unverified; retain registry and rows"
+            )
+            return
+    attempt_cleanup(
+        result,
+        "registry",
+        lambda: teardown(
+            purge=True,
+            deregister_clusters=True,
+            allow_live_registry=True,
+            live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
+            artifacts=case_dir / f"capacity-{run_id}",
+            run_id=run_id,
+        ),
+    )
+
+    def postflight() -> None:
+        observations = {
+            "database": database_residuals(),
+            "registry": registry_residuals(),
+            "kubernetes": kubernetes_residuals(),
+        }
+        result["postflight"] = observations
+        write_json_atomic(case_dir / "postflight.json", observations)
+        if any(
+            type(value.get(key)) is not int or value[key] != 0
+            for name, key in (
+                ("database", "total"),
+                ("registry", "count"),
+                ("kubernetes", "count"),
+            )
+            for value in (observations[name],)
+        ):
+            raise CaseError("HA-006 residual state is nonzero or unknown")
+
+    attempt_cleanup(result, "postflight", postflight)
 
 
 def main() -> int:
@@ -901,12 +1020,20 @@ def main() -> int:
     args = parser.parse_args()
     os.umask(0o077)
     if not args.execute:
+        chain = chain_preflight(args, CASE_ID)
+        preflight = residual_preflight(
+            database_residuals, registry_residuals, kubernetes_residuals
+        )
         plan = build_plan(
             run_dir=args.run_dir,
             case_id=CASE_ID,
             attempt=args.attempt,
             confirmation=CONFIRMATION,
+            arguments=args,
+            preflight_passed=not preflight["errors"] and not chain["errors"],
             details={
+                "preflight": preflight,
+                "chain": chain,
                 "risk": "live-non-destructive",
                 "synthetic_cluster_id": "perf-cap-000",
                 "fixture_lease_seconds": LEASE_SECONDS,
@@ -921,13 +1048,16 @@ def main() -> int:
             },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
+        return 0 if plan["preflight_passed"] is True else 1
     deadline = authorize_execution(
         args,
         case_id=CASE_ID,
         confirmation=CONFIRMATION,
     )
-    return run_case(args.run_dir, args.attempt, deadline)
+    chain = chain_preflight(args, CASE_ID)
+    plan = json.loads((args.run_dir / "cases" / CASE_ID / "plan.json").read_text())
+    require_chain(plan["details"].get("chain", {}), chain)
+    return run_case(args.run_dir, args.attempt, deadline, chain=chain)
 
 
 if __name__ == "__main__":

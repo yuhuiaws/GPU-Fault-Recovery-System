@@ -8,6 +8,26 @@ import pytest
 from tools.case_scheduler import ExecutionPolicy, ResourceLock, run_scheduled_cases
 
 
+def test_result_identity_mismatch_blocks_global_successor() -> None:
+    launched = []
+
+    def execute(case, _policy):
+        launched.append(case["id"])
+        return {"id": "different-case", "status": "PASS"}
+
+    results = run_scheduled_cases(
+        [{"id": "first"}, {"id": "second"}],
+        policy_for=lambda _case: ExecutionPolicy(
+            parallel_safe=False, failure_scope="global"
+        ),
+        execute=execute,
+        max_workers=4,
+    )
+    assert launched == ["first"]
+    assert [result["id"] for result in results] == ["first", "second"]
+    assert [result["status"] for result in results] == ["FAIL", "BLOCKED"]
+
+
 def _case(case_id: str) -> dict:
     return {
         "id": case_id,

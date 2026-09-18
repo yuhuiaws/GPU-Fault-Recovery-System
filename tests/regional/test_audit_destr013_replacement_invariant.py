@@ -167,11 +167,7 @@ def test_run_timestamps_read_top_level_keys_and_timeline_entries_only(
         },
     )
     _write(
-        case / "timeline.json",
-        {"entries": [{"observed_at": "2026-09-07T09:05:00Z"}, {"observed_at": None}]},
-    )
-    _write(
-        case / "step-timeline.json", {"transitions": [{"observed_at": "not-a-time"}]}
+        case / "timeline.json", {"entries": [{"observed_at": "2026-09-07T09:05:00Z"}]}
     )
     # Other case families and non-object documents are not the run's window.
     _write(
@@ -220,13 +216,93 @@ def test_focused_tests_report_a_failing_run_instead_of_a_constant(
     def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(command, 1, stdout="1 failed\n", stderr="")
 
-    monkeypatch.setattr(destr013.subprocess, "run", fake_run)
+    monkeypatch.setattr(destr013, "run", fake_run)
 
     result = destr013.focused_tests(tmp_path)
 
-    assert result["passed"] is False
-    assert result["returncode"] == 1
-    assert (tmp_path / "focused-tests.log").read_text(encoding="utf-8") == "1 failed\n"
+    assert result["passed"] is False, "a failed subprocess must fail the audit"
+    assert result["returncode"] == 1, "preserve the focused subprocess exit code"
+    log = (tmp_path / "focused-tests.log").read_text(encoding="utf-8")
+    assert log == "returncode=1\n<sensitive output redacted>\n", (
+        "subprocess logs must not expose raw environment or traceback data"
+    )
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-time", 123, "2026-09-07T09:00:00"])
+@pytest.mark.parametrize("shape", ["top-level", "entries", "transitions"])
+def test_invalid_timestamp_cannot_disappear_beside_valid_evidence(
+    tmp_path: Path, value: Any, shape: str
+) -> None:
+    case = tmp_path / "cases" / "GF-REGIONAL-DESTR-002"
+    _write(case / "valid.json", {"started_at": "2026-09-07T09:00:00Z"})
+    document = (
+        {"observed_at": value}
+        if shape == "top-level"
+        else {shape: [{"observed_at": value}]}
+    )
+    _write(case / "invalid.json", document)
+    with pytest.raises(destr013.AuditError, match="invalid.json.*(ISO-8601|timezone)"):
+        destr013.run_timestamps(tmp_path)
+
+
+@pytest.mark.parametrize("entries", [None, {}, "invalid", [None], [{}]])
+def test_malformed_timeline_cannot_disappear(tmp_path: Path, entries: Any) -> None:
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-002" / "timeline.json",
+        {"started_at": "2026-09-07T09:00:00Z", "entries": entries},
+    )
+    with pytest.raises(destr013.AuditError, match="timeline is malformed"):
+        destr013.run_timestamps(tmp_path)
+
+
+@pytest.mark.parametrize("defect", ["unreadable", "invalid-json", "missing-case-time"])
+def test_one_valid_case_does_not_cover_missing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-002" / "valid.json",
+        {"started_at": "2026-09-07T09:00:00Z"},
+    )
+    other = tmp_path / "cases" / "GF-REGIONAL-DESTR-003" / "data.json"
+    _write(other, {"nodes": []})
+    if defect == "invalid-json":
+        other.write_text("{", encoding="utf-8")
+    elif defect == "unreadable":
+        original = Path.read_text
+
+        def read(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == other:
+                raise OSError("unreadable")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    with pytest.raises(destr013.AuditError, match="cannot be read|no run timestamp"):
+        destr013.run_timestamps(tmp_path)
+
+
+def test_the_audit_cannot_supply_its_own_window_evidence(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "cases" / destr013.CASE_ID / f"{destr013.CASE_ID}.json",
+        {"window_start": "2026-09-07T09:00:00Z"},
+    )
+    assert destr013.run_timestamps(tmp_path) == [], (
+        "initial and previous DESTR013 output cannot prove earlier destructive coverage"
+    )
+
+
+def test_future_window_is_not_accepted_as_provisional() -> None:
+    errors, provisional = destr013.window_errors(
+        started_at=NOW - timedelta(hours=1),
+        ended_at=NOW + timedelta(minutes=5),
+        now=NOW,
+        accept_recent_window=True,
+        reboot_events=1,
+        expect_no_reboots=False,
+    )
+    assert errors == ["window must not extend into the future"], (
+        "an explicitly accepted recent window must still end in the past"
+    )
+    assert provisional is False, "future windows are invalid, not provisional"
 
 
 def test_parser_accepts_the_window_edge_flags_and_the_control_plane(

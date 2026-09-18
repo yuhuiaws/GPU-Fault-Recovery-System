@@ -47,6 +47,7 @@ from gpu_fault.admin.config_parser import (
 )
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
+from gpu_fault.postgres_capacity import PostgresPoolCapacity
 
 __all__ = ["AdminConfigError", "aurora_min_acu_floor"]
 
@@ -146,7 +147,7 @@ class CapacityConfig(_Section):
     telemetry_spool: TelemetrySpoolCapacity = TelemetrySpoolCapacity()
     remediation: RemediationCapacity = RemediationCapacity()
 
-    def validate(self) -> None:
+    def validate(self, *, enforce_connection_budget: bool = True) -> None:
         if not 1 <= self.control_worker_replicas <= 64:
             raise AdminConfigError(
                 "spec.capacity.controlWorkerReplicas must be within 1..64"
@@ -162,6 +163,8 @@ class CapacityConfig(_Section):
             )
         self.telemetry_spool.validate()
         self.remediation.validate()
+        if not enforce_connection_budget:
+            return
         ceiling = self.postgres_connection_ceiling()
         budget = self.postgres_fleet_connection_budget()
         if ceiling > budget:
@@ -175,11 +178,23 @@ class CapacityConfig(_Section):
 
     def postgres_connection_ceiling(self) -> int:
         ingress_pool = 48 if self.telemetry_spool.enabled else 40
-        ingress = ingress_pool * 4 * 3
-        worker_processes = self.control_worker_replicas * 4
-        worker = 24 * worker_processes + worker_processes
-        spool = self.telemetry_spool.replicas * (12 + 1)
-        return ingress + worker + spool
+        return sum(
+            PostgresPoolCapacity.role_connection_ceiling(
+                pool_max=pool,
+                processes_per_pod=processes,
+                replicas=replicas,
+                service_role=role,
+                queued_processor=True,
+                spool_enabled=self.telemetry_spool.enabled,
+                workflow_dispatcher_enabled=True,
+                regional=True,
+            )
+            for role, pool, processes, replicas in (
+                ("ingress", ingress_pool, 4, 3),
+                ("worker", 24, 4, self.control_worker_replicas),
+                ("spool-worker", 12, 1, self.telemetry_spool.replicas),
+            )
+        )
 
     def node_counts(self) -> dict[str, int]:
         return {
@@ -330,7 +345,7 @@ class AdminConfig(_Section):
         refuses.
         """
 
-        self.capacity.validate()
+        self.capacity.validate(enforce_connection_budget=enforce_capacity_evidence)
         self.aurora.validate()
         self.processor.validate()
         self.workflow.validate()
@@ -1173,8 +1188,9 @@ def complete_admin_config_apply(
     Success writes the result and clears ``pending.json``. Failure keeps it for
     the resume and, unless ``restore_before=False``, puts ``desired.json`` back
     to the config before the attempt. ``restore_before=False`` is for a failure
-    after the roles already run the target (Aurora did not settle in time):
-    the target is then what is live, and the rerun only has to finish waiting.
+    after the target committed or when restoration cannot be proved. Retain
+    the pending target even if partial release management alignment changed
+    desired.json; that desired record is intent, not a claim about live roles.
     """
 
     pending = load_pending_admin_config_apply(state_dir)
@@ -1185,12 +1201,18 @@ def complete_admin_config_apply(
         )
     history = admin_config_history_path(state_dir, str(pending["history"]))
     desired_path = admin_config_desired_path(state_dir)
-    if not success and restore_before:
+    if not success:
         write_json_atomic(
             desired_path,
             _desired_record(
-                AdminConfig.from_mapping(pending["before_config"]),
-                source=f"rollback-after-failed-apply:{pending['history']}",
+                AdminConfig.from_mapping(
+                    pending["before_config" if restore_before else "desired_config"]
+                ),
+                source=(
+                    f"rollback-after-failed-apply:{pending['history']}"
+                    if restore_before
+                    else f"pending-apply:{pending['history']}"
+                ),
                 reference=str(pending["reference"]),
                 approver_identity=str(pending["approver_identity"]),
             ),

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -50,6 +51,13 @@ class FakeRegional:
     def __init__(self, deployment: dict[str, Any]) -> None:
         self.deployment = deployment
         self.calls: list[tuple[str, ...]] = []
+        self.settings = SimpleNamespace(
+            environment=lambda: {"namespace": "test-ns", "context": "test-context"},
+            cluster_id="test-cluster",
+        )
+
+    def evidence_identity(self) -> dict[str, str]:
+        return {"release_id": "test-release", "cluster_id": "test-cluster"}
 
     def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
         self.calls.append((plane, *arguments))
@@ -60,7 +68,18 @@ def _deployment(
     env: list[dict[str, Any]], *, container: str = "control-worker"
 ) -> dict:
     return {
-        "metadata": {"generation": 7, "resourceVersion": "1234"},
+        "metadata": {
+            "uid": "test-worker-uid",
+            "generation": 7,
+            "resourceVersion": "1234",
+        },
+        "status": {
+            "observedGeneration": 7,
+            "replicas": 2,
+            "updatedReplicas": 2,
+            "readyReplicas": 2,
+            "availableReplicas": 2,
+        },
         "spec": {
             "replicas": 2,
             "template": {"spec": {"containers": [{"name": container, "env": env}]}},
@@ -544,10 +563,25 @@ def test_open_records_and_converges_on_the_completed_set(
             super().__init__(_deployment([]))
             self.env_arguments: list[str] = []
 
-        def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
             self.calls.append((plane, *arguments))
-            if arguments[:2] == ("set", "env"):
-                self.env_arguments = list(arguments[4:])
+            if arguments[:2] == ("patch", "deployment"):
+                patch = json.loads(kwargs["input_text"])
+                assert patch[:2] == [
+                    {"op": "test", "path": "/metadata/uid", "value": "test-worker-uid"},
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": "1234",
+                    },
+                ]
+                entries = patch[2]["value"]
+                self.deployment["spec"]["template"]["spec"]["containers"][0]["env"] = (
+                    entries
+                )
+                self.env_arguments = [
+                    f"{entry['name']}={entry['value']}" for entry in entries
+                ]
                 return ""
             if arguments[:2] == ("rollout", "status"):
                 return "deployment rolled out"
@@ -559,15 +593,21 @@ def test_open_records_and_converges_on_the_completed_set(
     regional = Fixture()
     expected = env_window.lockstep_assignments(180, 180)
 
-    def _converged(settings: Any, fixture: Any, wanted: dict, *, sleep: Any) -> list:
+    def _converged(
+        settings: Any, fixture: Any, wanted: dict, *, sleep: Any, expected_uid: str
+    ) -> list:
         assert wanted == expected, wanted
+        assert expected_uid == "test-worker-uid"
         return [{"pod": "a", "values": dict(wanted)}]
 
     monkeypatch.setattr(env_window, "converge", _converged)
     record = env_window.open_window(
         env_window.Settings(baseline=tmp_path / "b.json", rollout_timeout_seconds=1),
         regional,
-        {"deployment": env_window.deployment_env(regional)},
+        {
+            "deployment": env_window.deployment_env(regional),
+            "replicas": [{"pod": "old-a"}, {"pod": "old-b"}],
+        },
         {LIFETIME: "180", TIMEOUT: "180"},
     )
 
@@ -725,12 +765,12 @@ def test_the_close_falls_back_to_the_inline_baseline_without_a_survey() -> None:
     }
 
 
-class _ClosableRegional:
+class _ClosableRegional(FakeRegional):
     """A Deployment already restored to baseline whose replicas read the
     ConfigMap-sourced managed-recovery and lease values."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, ...]] = []
+        super().__init__(_deployment([]))
         self.values = {name: None for name in env_window.SURVEYED_VARIABLES}
         self.values[MANAGED] = "1800"
         self.values[LEASE] = "180"
@@ -754,6 +794,14 @@ def test_close_window_converges_on_a_configmap_sourced_baseline(tmp_path: Path) 
     baseline_path.write_text(
         json.dumps(
             {
+                "schema_version": 2,
+                "scope": env_window.window_scope(
+                    regional,
+                    plane=env_window.PLANE,
+                    deployment=env_window.DEPLOYMENT,
+                    container=env_window.CONTAINER,
+                ),
+                "state": "OPEN",
                 "opened_at": "t0",
                 "assignments": {LIFETIME: "180"},
                 "baseline": env_window.deployment_env(regional),

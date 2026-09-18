@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,41 @@ def test_failed_release_build_preserves_current_manifest(
 
     assert current.read_text(encoding="utf-8") == '{"release_id":"stable"}\n'
     assert not list(dist.glob(".build-*")), "failed staging directory was retained"
+
+
+def test_component_wheels_overlap_and_bundle_waits_only_for_node_wheel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    three_started = threading.Barrier(3, timeout=5)
+    bundle_started = threading.Event()
+    calls: list[str] = []
+
+    def build_component(*, name, output, **_kwargs):
+        three_started.wait()
+        if name != "node_runtime":
+            assert bundle_started.wait(timeout=5), "bundle waited for unrelated wheels"
+        wheel = output / f"{name}.whl"
+        wheel.write_text(name, encoding="utf-8")
+        calls.append(name)
+        return wheel, name, {name}
+
+    def bundle(_command, *, env):
+        assert Path(env["GPU_FAULT_NODE_WHEEL"]).is_file(), "node wheel was not ready"
+        (tmp_path / "gpu-fault-node-installer-test.tar.gz").write_bytes(b"bundle")
+        bundle_started.set()
+
+    monkeypatch.setattr(BUILD, "build_component", build_component)
+    monkeypatch.setattr(BUILD, "run", bundle)
+
+    result = BUILD.prepare_component_artifacts(
+        sys.executable, staging=tmp_path, reuse_artifacts_from=None
+    )
+
+    assert set(calls) == {"control_plane", "executor", "node_runtime"}
+    assert result.bundle.is_file(), "parallel build did not finish its node bundle"
+    assert all(path.is_file() for path in result.wheels.values()), (
+        "parallel build returned before all component wheels existed"
+    )
 
 
 def test_release_builder_never_deletes_published_dist(

@@ -64,7 +64,9 @@ class SharedLedgerAdapter:
         self.wait_first_round = wait_first_round
         self.physical_actions = 0
         self.rounds_by_key: dict[str, int] = {}
+        self._completed_keys: set[str] = set()
         self._lock = Lock()
+        self._execution_lock = Lock()
 
     def supports(self, step) -> bool:
         return step.execution_owner == self.owner
@@ -89,6 +91,10 @@ class SharedLedgerAdapter:
             )
 
     def execute(self, context) -> WorkflowStepOutcome:
+        with self._execution_lock:
+            return self._execute(context)
+
+    def _execute(self, context) -> WorkflowStepOutcome:
         round_number = self._next_round(context.idempotency_key)
         if self.wait_first_round and round_number == 1:
             return WorkflowStepOutcome.waiting(
@@ -112,7 +118,11 @@ class SharedLedgerAdapter:
             category="HA_ACCEPTANCE",
         )
         saved = self.registry.save_notification_if_absent(candidate)
-        won = saved.notification_id == candidate.notification_id
+        with self._lock:
+            won = (
+                saved.notification_id == candidate.notification_id
+                and context.idempotency_key not in self._completed_keys
+            )
         if won:
             self._record_physical()
             atomic_json(
@@ -124,6 +134,8 @@ class SharedLedgerAdapter:
                 },
             )
             time.sleep(self.sleep_seconds)
+            with self._lock:
+                self._completed_keys.add(context.idempotency_key)
         return WorkflowStepOutcome.succeeded(
             operation_id=f"ha006/{context.idempotency_key}",
             details={

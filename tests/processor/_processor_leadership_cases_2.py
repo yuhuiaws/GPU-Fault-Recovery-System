@@ -11,6 +11,7 @@ import pytest
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.processor import ProcessorRequest, ProcessorRequestStatus
 from tests._builders import asgi_client, copy_model, processor_request
+from tests.metrics._assertions import assert_sample
 from tests.processor._leadership_support import NOW, REQUEST_LEASE, _telemetry
 
 
@@ -435,8 +436,12 @@ def test_fault_ingress_has_its_own_store_io_lane(monkeypatch) -> None:
     assert "gpu_fault_total;dur=" in fault.headers["Server-Timing"]
     assert "gpu_fault_admission;dur=" in fault.headers["Server-Timing"]
     assert 'gpu_fault_ingress_lane_workers{lane="fault-store"} 1' in metrics.text
-    assert (
-        'gpu_fault_ingress_lane_rejections_total{lane="fault-store"} 0' in metrics.text
+    assert_sample(
+        metrics.text,
+        "gpu_fault_ingress_lane_rejections_total",
+        0,
+        lane="fault-store",
+        process="0",
     )
 
 
@@ -505,9 +510,13 @@ def test_ingress_backpressure_reserves_fault_capacity(monkeypatch) -> None:
     assert rejected.status_code == 503
     assert rejected.json()["scope"] == "normal"
     assert fault.status_code == 202
-    assert (
-        'gpu_fault_ingress_backpressure_rejections_total{scope="normal"} 1'
-    ) in metrics.text
+    assert_sample(
+        metrics.text,
+        "gpu_fault_ingress_backpressure_rejections_total",
+        1,
+        scope="normal",
+        process="0",
+    )
 
 
 def test_processor_queue_reserves_global_capacity_for_faults(stores) -> None:

@@ -34,6 +34,7 @@ from gpu_fault.processor import (
 )
 from gpu_fault.store import InMemoryStore
 from tests._builders import asgi_client, build_store, copy_model, processor_request
+from tests.metrics._assertions import assert_sample, assert_samples
 
 TOKEN = "telemetry-spool-token-" + "x" * 40
 INVENTORY_PATH = "/v1/collector-events/gpu-inventory"
@@ -1218,7 +1219,7 @@ def test_spool_metrics_report_zero_in_the_control_arm(monkeypatch) -> None:
 
     assert "gpu_fault_telemetry_spool_enabled 0" in metrics
     assert "gpu_fault_telemetry_spool_depth 0" in metrics
-    assert "gpu_fault_telemetry_spool_admitted_total 0" in metrics
+    assert_sample(metrics, "gpu_fault_telemetry_spool_admitted_total", 0, process="0")
 
 
 def test_spool_metrics_carry_the_arm_and_its_volume(monkeypatch) -> None:
@@ -1229,19 +1230,18 @@ def test_spool_metrics_carry_the_arm_and_its_volume(monkeypatch) -> None:
     client.post(INVENTORY_PATH, inventory_payload())
     metrics = client.get("/metrics").text
 
-    assert "gpu_fault_telemetry_spool_enabled 1" in metrics
-    assert "gpu_fault_telemetry_spool_depth 2" in metrics
-    assert "gpu_fault_telemetry_spool_admitted_total 2" in metrics
-    assert "gpu_fault_telemetry_spool_replay_batch_max_items 64" in metrics
-    assert "gpu_fault_telemetry_spool_errors_total 0" in metrics
-    assert "gpu_fault_telemetry_spool_notification_fallback_seconds 5" in metrics
-    assert (
-        "gpu_fault_telemetry_spool_admitted_by_path_total"
-        f'{{path="{INVENTORY_PATH}"}} 1' in metrics
-    )
-    assert (
-        "gpu_fault_telemetry_spool_cluster_depth"
-        f'{{cluster_id="{CLUSTER}"}} 2' in metrics
+    assert_samples(
+        metrics,
+        (
+            "gpu_fault_telemetry_spool_enabled 1",
+            "gpu_fault_telemetry_spool_depth 2",
+            'gpu_fault_telemetry_spool_admitted_total{process="0"} 2',
+            "gpu_fault_telemetry_spool_replay_batch_max_items 64",
+            'gpu_fault_telemetry_spool_errors_total{process="0"} 0',
+            "gpu_fault_telemetry_spool_notification_fallback_seconds 5",
+            f'gpu_fault_telemetry_spool_admitted_by_path_total{{path="{INVENTORY_PATH}",process="0"}} 1',
+            f'gpu_fault_telemetry_spool_cluster_depth{{cluster_id="{CLUSTER}"}} 2',
+        ),
     )
 
 
@@ -1507,21 +1507,6 @@ def spool_store(request):
     yield from postgres_store_instance()
 
 
-@pytest.fixture
-def postgres_spool_store():
-    """Only the Postgres store: the depth projection is Postgres-specific, and
-    a memory variant that skips would count against the CAP-005 zero-skip gate."""
-
-    from tests.store._postgres_processor_claim_support import (
-        POSTGRES_URL,
-        postgres_store_instance,
-    )
-
-    if not POSTGRES_URL:
-        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is not configured")
-    yield from postgres_store_instance()
-
-
 def test_a_failed_replay_comes_back_and_then_gives_up_on_every_store(
     spool_store,
 ) -> None:
@@ -1650,10 +1635,9 @@ def test_the_depth_projection_query_never_touches_the_payload() -> None:
     assert PostgresTelemetrySpoolMixin._TELEMETRY_SPOOL_DEPTH_TTL_SECONDS >= 1.0
 
 
-def test_the_depth_counts_agree_with_the_full_stats_on_postgres(
-    postgres_spool_store,
-) -> None:
-    store = postgres_spool_store
+@pytest.mark.parametrize("spool_store", ["postgres"], indirect=True)
+def test_the_depth_counts_agree_with_the_full_stats_on_postgres(spool_store) -> None:
+    store = spool_store
     spool(
         store,
         [

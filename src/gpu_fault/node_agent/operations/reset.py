@@ -8,15 +8,13 @@ from typing import Any, Callable
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+from gpu_fault.node_agent.late_ownership import (
+    OwnershipRefused,
+    final_ownership_boundary,
+    require_physical_ownership,
+)
 
-
-class ResetOutcomeUnknown(RuntimeError):
-    """A reset whose result nobody can read any more.
-
-    ``nvidia-smi`` was killed at its deadline while the driver kept resetting,
-    so the GPU may or may not have been reset. Distinct from a reset that
-    failed cleanly, because it is what decides reboot versus replace.
-    """
+MAX_RESET_BUSY_ATTEMPTS = 3
 
 
 class ResetProgressError(RuntimeError):
@@ -32,6 +30,23 @@ class ResetProgressError(RuntimeError):
         self.action_details = action_details
 
 
+class ResetOutcomeUnknown(ResetProgressError):
+    """A driver reset may outlive nvidia-smi; only an operator can resolve it."""
+
+    def __init__(self, message: str, *, gpu_uuids: list[str]) -> None:
+        super().__init__(
+            message,
+            action_details={
+                "outcome_unknown": True,
+                "manual_confirmation_required": True,
+                "reset_completed": [],
+                "reset_outcome_unknown": list(gpu_uuids),
+                "reset_failed": [],
+                "reset_not_attempted": [],
+            },
+        )
+
+
 class ResetOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     _gpu_inventory: Callable[..., Any]
@@ -44,7 +59,7 @@ class ResetOperationsMixin:
     single_gpu_reset_supported: Any
     sleep: Callable[..., Any]
 
-    _RESET_BUSY_ATTEMPTS = 3
+    _RESET_BUSY_ATTEMPTS = MAX_RESET_BUSY_ATTEMPTS
 
     def _run_reset_with_busy_retry(
         self,
@@ -54,6 +69,7 @@ class ResetOperationsMixin:
         timeout: int,
     ) -> int:
         for attempt in range(1, self._RESET_BUSY_ATTEMPTS + 1):
+            require_physical_ownership()
             try:
                 self._run_checked(command, timeout=timeout)
                 return attempt
@@ -66,9 +82,10 @@ class ResetOperationsMixin:
                 # or reboot the node).
                 raise ResetOutcomeUnknown(
                     f"gpu reset outcome unknown after {timeout}s; "
-                    "refusing to retry automatically"
+                    "refusing to retry automatically",
+                    gpu_uuids=gpu_uuids,
                 ) from exc
-            except RuntimeError as exc:
+            except (RuntimeError, OwnershipRefused) as exc:
                 if (
                     "In use by another client" not in str(exc)
                     or attempt == self._RESET_BUSY_ATTEMPTS
@@ -149,7 +166,7 @@ class ResetOperationsMixin:
                     gpu_uuids=[gpu_uuid],
                     timeout=120,
                 )
-            except RuntimeError as exc:
+            except (RuntimeError, OwnershipRefused) as exc:
                 # Report the loop's progress: the GPUs already reset, the one
                 # that failed (with or without a readable outcome) and the
                 # ones nothing touched. Only RuntimeError is wrapped, so the
@@ -158,6 +175,16 @@ class ResetOperationsMixin:
                 raise ResetProgressError(
                     f"{exc} (GPU {gpu_uuid}, {index + 1} of {len(gpu_uuids)})",
                     action_details={
+                        **(
+                            exc.action_details
+                            if isinstance(exc, (ResetProgressError, OwnershipRefused))
+                            else {}
+                        ),
+                        **(
+                            {"node_action_not_started": not completed}
+                            if isinstance(exc, OwnershipRefused)
+                            else {}
+                        ),
                         "reset_completed": completed,
                         "reset_outcome_unknown": [gpu_uuid] if unknown else [],
                         "reset_failed": [] if unknown else [gpu_uuid],
@@ -169,6 +196,8 @@ class ResetOperationsMixin:
             "reset_gpu_uuids": gpu_uuids,
             "verified_no_gpu_clients": True,
             "reset_attempts": reset_attempts,
+            "reset_successes": len(completed),
+            "reset_busy_refusals": reset_attempts - len(completed),
         }
 
     def _reset_all_preflight(self, gpu_uuids: list[str]) -> list[str]:
@@ -224,8 +253,11 @@ class ResetOperationsMixin:
             "verified_no_gpu_clients": True,
             "command": ["nvidia-smi", "--gpu-reset"],
             "reset_attempts": reset_attempts,
+            "reset_successes": 1,
+            "reset_busy_refusals": reset_attempts - 1,
         }
 
+    @final_ownership_boundary
     def _restart_fabric_manager(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.fabric_manager_restart_enabled:
             raise RuntimeError(
@@ -246,6 +278,7 @@ class ResetOperationsMixin:
             ],
             timeout=30,
         ).stdout.strip()
+        require_physical_ownership()
         self._run_checked(
             ["systemctl", "restart", service],
             timeout=120,

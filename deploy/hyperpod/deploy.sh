@@ -50,7 +50,6 @@ DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
 ENABLE_NODE_LOG_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR "${GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR:-false}")"
 ENABLE_TRAINING_HEALTH_MONITOR="$(normalize_bool GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR "${GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false}")"
-ENABLE_KUBERNETES_HMA_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR "${GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false}")"
 ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR "${GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR:-false}")"
 HYPERPOD_NODE_RECOVERY=""
 HYPERPOD_CONTROL_PLANE_ROLE_ARN=""
@@ -263,7 +262,6 @@ Optional environment:
   GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER,
   GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR,
   GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR,
-  GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR,
   GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR,
   GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS,
   GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS,
@@ -2850,33 +2848,19 @@ deploy_watcher_and_dcgm() {
         "GPU_FAULT_DEFAULT_RESTART_BUDGET=${DEFAULT_RESTART_BUDGET}" \
         "GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS=${PASSIVE_STOP_FALLBACK_SECONDS}"
     configure_dcgm_exporter
-    if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]; then
-        sed \
-            -e "s/REPLACE_WITH_CLUSTER_ID/${HYPERPOD_CLUSTER_NAME}/g" \
-            -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
-            -e "s/gpu-fault-executor-wheel-0100/${EXECUTOR_WHEEL_CONFIGMAP_NAME}/g" \
-            -e "s/gpu_fault_cluster_executor-0.10.0/gpu_fault_cluster_executor-${VERSION}/g" \
-            -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
-            "${REPO_DIR}/deploy/dataplane/optional/hma-watcher.yaml" |
-            kubectl apply -f -
-    else
-        kubectl -n "${NAMESPACE}" delete deployment \
-            gpu-fault-hma-watcher --ignore-not-found --wait=true
-        kubectl delete clusterrolebinding \
-            gpu-fault-hma-watcher --ignore-not-found
-        kubectl delete clusterrole \
-            gpu-fault-hma-watcher --ignore-not-found
-        kubectl -n "${NAMESPACE}" delete serviceaccount \
-            gpu-fault-hma-watcher --ignore-not-found
-    fi
+    # Retain cleanup of the historical optional watcher; it cannot be enabled.
+    kubectl -n "${NAMESPACE}" delete deployment \
+        gpu-fault-hma-watcher --ignore-not-found --wait=true
+    kubectl delete clusterrolebinding \
+        gpu-fault-hma-watcher --ignore-not-found
+    kubectl delete clusterrole \
+        gpu-fault-hma-watcher --ignore-not-found
+    kubectl -n "${NAMESPACE}" delete serviceaccount \
+        gpu-fault-hma-watcher --ignore-not-found
     kubectl -n "${NAMESPACE}" rollout status \
         deployment/gpu-fault-completion-watcher --timeout=10m
     kubectl -n "${NAMESPACE}" rollout status \
         deployment/gpu-fault-kubernetes-node-resource-collector --timeout=10m
-    if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]; then
-        kubectl -n "${NAMESPACE}" rollout status \
-            deployment/gpu-fault-hma-watcher --timeout=10m
-    fi
 }
 
 run_node_installer_job() {
@@ -3030,12 +3014,6 @@ validate_platform() {
         deployment/gpu-fault-api-ha --timeout=2m
     kubectl -n "${NAMESPACE}" rollout status \
         deployment/gpu-fault-completion-watcher --timeout=2m
-    if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]; then
-        kubectl -n "${NAMESPACE}" rollout status \
-            deployment/gpu-fault-hma-watcher --timeout=2m
-    else
-        printf 'SKIP Kubernetes HMA Node collector (disabled by deployment policy)\n'
-    fi
     if [[ "${RESOLVED_DCGM_EXPORTER_MODE}" == "managed" ]]; then
         kubectl -n "${NAMESPACE}" rollout status \
             daemonset/gpu-fault-dcgm-exporter --timeout=2m

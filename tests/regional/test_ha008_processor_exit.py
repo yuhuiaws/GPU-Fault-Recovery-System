@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+
 from scripts.e2e.regional import run_ha008_processor_exit_acceptance as ha008
 
 INJECTED_ONLY = """INFO gpu_fault.processor.coordinator processor started
@@ -85,4 +88,37 @@ def test_acceptance_evaluates_both_branches_on_the_processor_lines(
     assert report["verdict"] == "FAIL"
     assert any("could not release request" in item for item in report["errors"]), (
         report["errors"]
+    )
+
+
+def test_real_fatal_exit_is_taken_over_by_an_independent_process(tmp_path) -> None:
+    result = ha008.run_acceptance(tmp_path)
+    assert result["verdict"] == "PASS", result
+    assert result["sensitive_temp_files_removed"] is True
+    for branch in result["branches"]:
+        assert branch["exit_code"] == 70
+        assert branch["stale_result_rejected"] is True
+        assert (
+            len({branch["first_process_id"], branch["second_process_id"], os.getpid()})
+            == 3
+        )
+    assert not list(tmp_path.rglob("*.db")), (
+        f"processor takeover must remove temporary databases under {tmp_path}"
+    )
+    assert not list(tmp_path.rglob("claim.json")), (
+        f"processor takeover must remove sensitive claim files under {tmp_path}"
+    )
+    assert "lease_token" not in json.dumps(result)
+
+
+def test_probe_failure_still_writes_a_failed_case(monkeypatch, tmp_path) -> None:
+    def fail(*args, **kwargs):
+        raise RuntimeError("probe timeout")
+
+    monkeypatch.setattr(ha008, "_run_branch", fail)
+    result = ha008.run_acceptance(tmp_path)
+    assert result["verdict"] == "FAIL"
+    assert (
+        json.loads((tmp_path / f"{ha008.CASE_ID}.json").read_text())["verdict"]
+        == "FAIL"
     )

@@ -39,7 +39,7 @@ from urllib.error import URLError
 import pytest
 import yaml
 
-from gpu_fault.adapters import NodeActionWorkflowAdapter
+from gpu_fault.adapters import KubernetesWorkflowAdapter, NodeActionWorkflowAdapter
 from gpu_fault.cluster_executor import (
     DEFAULT_LIVENESS_STATE_PATH,
     LIVENESS_STALE_AFTER_SECONDS,
@@ -171,8 +171,8 @@ def test_a_stuck_adapter_stops_being_renewed_after_the_execution_cap(
         assert executor.metrics_snapshot()["stuck_executions"] == 1, (
             "the abandoned thread must be visible to the operator"
         )
-        assert client.renewals == [], (
-            "a command past the execution cap must not be renewed"
+        assert client.renewals == [("command-a", EXECUTOR, 120)], (
+            "only the pre-execution admission may renew; none after the cap"
         )
         assert marks[0] == 0, (
             "the renewer must be stopped before the timeout result is posted, "
@@ -419,8 +419,9 @@ def test_the_execution_cap_is_validated_and_read_from_the_environment(
     monkeypatch.delenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", raising=False)
     monkeypatch.delenv("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", raising=False)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
+        core = None
 
         def __init__(self, **_kwargs: Any) -> None:
             pass
@@ -440,9 +441,8 @@ def test_the_execution_cap_is_validated_and_read_from_the_environment(
 def test_sigterm_stops_claiming_and_stops_renewing(monkeypatch) -> None:
     """A rollout must release the lease instead of parking it for a window.
 
-    Two halves: ``run()`` stops claiming, and a command already in flight stops
-    being renewed so the local lease lapses and the sibling replica can take
-    the command over as soon as the control plane's window passes.
+    ``run()`` stops claiming and a claimed-but-not-started command is not
+    admitted after shutdown. In-flight work is covered separately below.
     """
 
     class OneRenewalStopEvent(Event):
@@ -474,9 +474,8 @@ def test_sigterm_stops_claiming_and_stops_renewing(monkeypatch) -> None:
     assert client.renewals == [], (
         "an in-flight command must stop being renewed so the lease lapses fast"
     )
-    assert client.reported("command-a").status is RemoteCommandStatus.SUCCEEDED, (
-        "the work already done still has to be reported"
-    )
+    assert client.completed == [], "shutdown preceded admission, so nothing ran"
+    assert executor.results_withheld_total == 1
 
     claims_before = len(client.claims)
     executor.run()
@@ -484,6 +483,35 @@ def test_sigterm_stops_claiming_and_stops_renewing(monkeypatch) -> None:
     assert len(client.claims) == claims_before, (
         "run() must not claim anything more after a stop was requested"
     )
+
+
+def test_shutdown_during_an_admitted_command_stops_renewal_but_reports_its_result(
+    monkeypatch,
+) -> None:
+    stopped = Event()
+
+    class ShutdownTick(Event):
+        def wait(self, timeout=None):
+            assert stopped.wait(5), (
+                "the adapter must request shutdown before the heartbeat tick"
+            )
+            return False
+
+    client = FakeExecutorClient([remote_command("command-a")])
+
+    class StoppingAdapter(RecordingAdapter):
+        def execute(self, context):
+            executor.request_stop("unit shutdown after admission")
+            stopped.set()
+            return super().execute(context)
+
+    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", ShutdownTick)
+    adapter = StoppingAdapter()
+    executor = build_executor(client, [adapter])
+    executor.run_once()
+    assert client.renewals == [("command-a", EXECUTOR, 120)]
+    assert adapter.executed_command_ids() == ["command-a"]
+    assert client.reported("command-a").status is RemoteCommandStatus.SUCCEEDED
 
 
 class BreadcrumbWatchingAdapter(RecordingAdapter):

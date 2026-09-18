@@ -17,6 +17,7 @@ from gpu_fault.models import (
     IncidentState,
     RestartAuthorization,
     WorkflowExecutionRequest,
+    WorkflowExecutionResult,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -26,6 +27,10 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
+from gpu_fault.restart_containment import (
+    STOP_OWNERSHIP_RECEIPT_KEY,
+    RestartContainmentProof,
+)
 from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
@@ -95,6 +100,8 @@ def issue_restart_authorization(
     incident: FaultIncident,
     step: WorkflowStepSpec,
     reservation_id: str,
+    *,
+    workflow: WorkflowRequest | None = None,
 ) -> RestartAuthorization | WorkflowStepOutcome:
     """The proof a data-plane restart carries: the preflight's reservation.
 
@@ -102,6 +109,12 @@ def issue_restart_authorization(
     back and signs it. A step without one is a step the preflight never
     admitted (or whose reservation was released as unattempted) and fails
     closed rather than reserving here.
+
+    With ``workflow`` the authorization also carries the predecessor
+    containment's contained STOP receipt when there is one to prove
+    (``containment_proof``): a passive recovery workflow has no STOP step of
+    its own and the data-plane ownership guard binds the restart to that
+    receipt instead.
     """
 
     parameters = step.parameters
@@ -159,6 +172,84 @@ def issue_restart_authorization(
         restart_budget=state.budget,
         restart_count=state.restart_count,
         reservation_id=reservation_id,
+        containment=containment_proof(store, workflow, incident, step),
+    )
+
+
+def containment_proof(
+    store: Any,
+    workflow: WorkflowRequest | None,
+    incident: FaultIncident,
+    step: WorkflowStepSpec,
+) -> RestartContainmentProof | None:
+    """The predecessor containment's contained STOP receipt, or ``None``.
+
+    Proven only when the recovery workflow chains behind a predecessor, the
+    restart step carries the ``requires_incident_state=RECOVERED`` premise on
+    that predecessor's incident, the predecessor SUCCEEDED, and its SUCCEEDED
+    STOP_WORKLOADS execution left a contained receipt for exactly the step's
+    workloads and source attempt in this cluster. Anything less is ``None``:
+    the data-plane guard then refuses the restart (``RECEIPT_MISSING``) the
+    way it always did, and the adapter's premise names why.
+    """
+
+    parameters = step.parameters
+    if (
+        workflow is None
+        or workflow.predecessor_workflow_id is None
+        or step.operation is not WorkflowOperation.RESTART_WORKLOAD
+        or parameters.get("requires_incident_state") != IncidentState.RECOVERED.value
+    ):
+        return None
+    try:
+        predecessor = store.get_workflow(workflow.predecessor_workflow_id)
+    except NotFoundError:
+        return None
+    if (
+        predecessor.status is not WorkflowStatus.SUCCEEDED
+        or predecessor.incident_id != str(parameters.get("incident_id") or "")
+    ):
+        return None
+    receipts = [
+        (item.details or {}).get(STOP_OWNERSHIP_RECEIPT_KEY)
+        for item in predecessor.step_executions
+        if item.operation is WorkflowOperation.STOP_WORKLOADS
+        and item.status is WorkflowStepStatus.SUCCEEDED
+    ]
+    receipt = receipts[-1] if receipts else None
+    if not isinstance(receipt, dict) or not _receipt_contains(
+        receipt, predecessor, incident, step
+    ):
+        return None
+    return RestartContainmentProof(
+        workflow_id=predecessor.request_id,
+        incident_id=predecessor.incident_id,
+        receipt=receipt,
+    )
+
+
+def _receipt_contains(
+    receipt: dict[str, Any],
+    predecessor: WorkflowRequest,
+    incident: FaultIncident,
+    step: WorkflowStepSpec,
+) -> bool:
+    workloads = receipt.get("workloads")
+    if not isinstance(workloads, list) or not workloads:
+        return False
+    try:
+        workload_ids = {str(item["workload_id"]) for item in workloads}
+        attempt_ids = {str(item["attempt_id"]) for item in workloads}
+    except (KeyError, TypeError):
+        return False
+    return (
+        receipt.get("contained") is True
+        and bool(receipt.get("completed_at"))
+        and receipt.get("cluster_id") == incident.cluster_id
+        and receipt.get("workflow_id") == predecessor.request_id
+        and receipt.get("incident_id") == predecessor.incident_id
+        and workload_ids == set(step.workload_ids)
+        and attempt_ids == {str(step.parameters.get("source_attempt_id"))}
     )
 
 
@@ -380,21 +471,52 @@ def prepare_claimed_workflow(
     execution_epoch = workflow.execution_epoch
     workflow = executor._adopt_quiesce_handoff_from_predecessor(workflow, incident)
     executor._save_leased(workflow, execution_epoch)
-    if (
-        workflow.pending_failure_step_index is not None
-        and not executor._job_failure_still_deferred(workflow)
-    ):
-        return ClaimedWorkflowPreparation(
-            workflow=workflow,
-            execution_epoch=execution_epoch,
-            result=executor._land_pending_failure(
-                workflow,
-                incident,
-                request,
-                execution_epoch,
-                is_safety=is_safety,
+    if workflow.pending_failure_step_index is not None:
+        steps = workflow.safety_steps if is_safety else workflow.official_steps
+        compensation_index = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+                and index not in resolved_step_indexes(workflow)
             ),
+            workflow.pending_failure_step_index,
         )
+        if not executor._job_failure_still_deferred(workflow, compensation_index):
+            return ClaimedWorkflowPreparation(
+                workflow=workflow,
+                execution_epoch=execution_epoch,
+                result=executor._land_pending_failure(
+                    workflow,
+                    incident,
+                    request,
+                    execution_epoch,
+                    is_safety=is_safety,
+                ),
+            )
+    if (
+        not is_safety
+        and executor.config.workflow_preemption_enabled
+        and any(
+            item.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+            and item.status is WorkflowStepStatus.WAITING
+            for item in workflow.step_executions
+        )
+    ):
+        successor = executor.store.get_preempting_successor(workflow.request_id)
+        if successor is not None:
+            # Preemption cleanup can run ahead of the ordinary step cursor.
+            restored = executor._restore_for_preemption(
+                workflow, incident, request, execution_epoch, successor
+            )
+            if isinstance(restored, WorkflowExecutionResult):
+                return ClaimedWorkflowPreparation(
+                    workflow=workflow,
+                    execution_epoch=execution_epoch,
+                    result=restored,
+                )
+            if restored is not None:
+                workflow = restored
     steps = workflow.safety_steps if is_safety else workflow.official_steps
     # Each pass either reserves every pending restart, withholds one whose
     # budget is spent and goes round again for the rest (the withheld step is

@@ -536,16 +536,16 @@ class WorkflowDispatcher:
                         continue
             busy = self._nodes_under_other_remediation(workflow)
             if not busy and self._is_unstarted_placement_hold(workflow):
-                # The repair the hold waited on ended inside the window: the
-                # job keeps running and the hold has nothing left to do.
-                if self._guarded_write(
+                # The nodes are free, so no STOP is due. A failed dissolution
+                # stays held until a later tick can claim it.
+                dissolved = self._guarded_write(
                     "placement_hold",
                     workflow,
                     lambda: self._dissolve_placement_hold(workflow),
                     default=False,
-                ):
-                    held("placement_hold_dissolved")
-                    continue
+                )
+                held("placement_hold_dissolved" if dissolved else "placement_hold")
+                continue
             if busy:
                 wait = timedelta(seconds=self.config.node_busy_wait_seconds)
                 if now < self._node_busy_wait_start(workflow, now) + wait:

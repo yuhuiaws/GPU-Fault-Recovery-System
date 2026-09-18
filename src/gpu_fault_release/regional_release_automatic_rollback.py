@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.admin.process_supervisor import ensure_supervision_safe
 from gpu_fault_release.regional_release_config import (
     PartialClusterRolloutError,
     ReleaseError,
@@ -58,6 +59,7 @@ def recover_failed_upgrade(
     ``ReleaseError`` chained to it when the rollback was refused or failed.
     """
 
+    ensure_supervision_safe()
     record_upgrade_failure(
         release,
         error=error,

@@ -13,6 +13,7 @@ from gpu_fault.adapters.common import (
     LABEL_ATTEMPT_ID,
     LABEL_JOB_ID,
 )
+from gpu_fault.adapters.kubernetes.stop_state import custom_workload_active
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -440,7 +441,7 @@ class KubernetesRestartOperationsMixin:
         gpu_uuids = {
             gpu_uuid
             for observation in self.store.list_attempt_observations(cluster_id)
-            if observation.attempt_id == attempt_id
+            if observation.attempt_id == attempt_id and observation.job_id == job_id
             for container in observation.containers
             for gpu_uuid in container.gpu_uuids
         }
@@ -502,7 +503,7 @@ class KubernetesRestartOperationsMixin:
             self.batch.read_namespaced_job(retry_name, namespace)
             return
         except Exception as exc:
-            if getattr(exc, "status", 404) != 404:
+            if getattr(exc, "status", None) != 404:
                 raise
         if isinstance(workload, dict):
             body = deepcopy(workload)
@@ -603,7 +604,7 @@ class KubernetesRestartOperationsMixin:
             )
             return retry_workload_id
         except Exception as exc:
-            if getattr(exc, "status", 404) != 404:
+            if getattr(exc, "status", None) != 404:
                 raise
 
         body = deepcopy(self._serialize_workload(workload))
@@ -874,32 +875,5 @@ class KubernetesRestartOperationsMixin:
             )
             return bool((active or 0) or (terminating or 0))
 
-        status = workload.get("status")
-        if not isinstance(status, dict):
-            return None
-        counts = []
-        for value in status.get("replicaStatuses", {}).values():
-            if isinstance(value, dict):
-                counts.append(value.get("active"))
-        for value in status.get("replicatedJobs", []):
-            if isinstance(value, dict):
-                counts.append(value.get("active"))
-        known = [value for value in counts if value is not None]
-        if known and any(int(value) > 0 for value in known):
-            return True
-        conditions = status.get("conditions", [])
-        for condition in conditions:
-            if str(condition.get("status", "")).lower() == "true" and condition.get(
-                "type"
-            ) in {
-                "Suspended",
-                "Succeeded",
-                "Failed",
-            }:
-                return False
-            if (
-                str(condition.get("status", "")).lower() == "true"
-                and condition.get("type") == "Running"
-            ):
-                return True
-        return False if known else None
+        # Terminal conditions win over frozen replica counts (see stop_state).
+        return custom_workload_active(workload.get("status"))

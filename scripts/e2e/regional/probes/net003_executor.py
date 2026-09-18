@@ -31,12 +31,15 @@ from gpu_fault.cluster_executor import (
     RegionalExecutorClient,
 )
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.transport.http_client import CONNECTION_POOL
 
 
 STATE = Path("/state")
 DROP_NEXT = STATE / "drop-next"
 DROP_OBSERVED = STATE / "drop-observed.json"
 ACTION_STARTED = STATE / "action-started"
+BLOCK = STATE / "block"
+ACTION_GATE_OBSERVED = STATE / "action-gate-observed.json"
 LEDGER = STATE / "ledger.json"
 READY = STATE / "ready.json"
 EXECUTOR_STATE = STATE / "executor-state.json"
@@ -47,7 +50,7 @@ RESULT_REPLAYS = STATE / "result-replays.json"
 OWNER = os.getenv("EXECUTOR_OWNER", "gpu-fault-net-test")
 DROP_ROLLBACK_SECONDS = int(os.getenv("DROP_ROLLBACK_SECONDS", "10"))
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
-LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "60"))
+LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "90"))
 # How long the upstream must stay silent after its response before the
 # client is reset. TLS is end-to-end through this proxy, so the response
 # cannot be parsed; a quiet upstream is what marks it complete.
@@ -83,6 +86,21 @@ class LedgerAdapter:
             )
             cached = context.idempotency_key in document["keys"]
         if not cached:
+            # The runner records the live lease before releasing this action.
+            deadline = time.monotonic() + 30
+            while not BLOCK.exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "network block was not armed before the simulated action"
+                    )
+                time.sleep(0.05)
+            _write_state(
+                ACTION_GATE_OBSERVED,
+                {
+                    "idempotency_key": context.idempotency_key,
+                    "observed_at_epoch": time.time(),
+                },
+            )
             time.sleep(5)
         with self._lock:
             document = (
@@ -112,11 +130,13 @@ class LedgerAdapter:
 
 
 def _write_state(path: Path, value: dict[str, Any]) -> None:
-    path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 class InterruptingRegionalExecutorClient(RegionalExecutorClient):
-    """Loses the response to the first result post, then retries it once.
+    """Inject one lost response; observe the product executor's report retry.
 
     The retry is the client-side half of the window under test: a client that
     never saw the control plane's answer cannot know whether the result was
@@ -128,31 +148,66 @@ class InterruptingRegionalExecutorClient(RegionalExecutorClient):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._drop_injected = False
+        self._interrupted_command_id: str | None = None
+        self._replay_responses: list[dict[str, Any]] = []
 
     def complete(self, command, result):
         if self._drop_injected:
-            return super().complete(command, result)
+            sent_at = time.time()
+            replay = super().complete(command, result)
+            if command.command_id == self._interrupted_command_id:
+                self._replay_responses.append(
+                    {
+                        "command_id": replay.command_id,
+                        "status": replay.status.value,
+                        "status_source": replay.status_source,
+                        "updated_at": replay.updated_at.isoformat(),
+                    }
+                )
+                _write_state(
+                    RESULT_REPLAYS,
+                    {
+                        "command_id": command.command_id,
+                        "count": len(self._replay_responses),
+                        "replay_sent_at_epoch": sent_at,
+                        "retry_owner": "product-executor",
+                        "responses": self._replay_responses,
+                    },
+                )
+            return replay
         self._drop_injected = True
+        # The proxy assigns the one-shot drop when it accepts a new connection.
+        CONNECTION_POOL.close()
         _write_state(
             RESULT_SUBMIT_STARTED,
-            {"command_id": command.command_id, "observed_at_epoch": time.time()},
+            {
+                "command_id": command.command_id,
+                "observed_at_epoch": time.time(),
+                "caller_transport_pool_closed": True,
+            },
         )
         DROP_NEXT.touch()
         try:
             first = super().complete(command, result)
-        except ClusterExecutorError:
-            # A 4xx/5xx is an answer the client did receive; that is not the
-            # lost-response window and must surface as the rejection it is.
-            raise
         except Exception as exc:  # noqa: BLE001 - the transport error under test
+            # A real HTTP status is a received answer, not a lost response.
+            if isinstance(exc, ClusterExecutorError) and exc.status_code is not None:
+                raise
             interrupted = {
                 "command_id": command.command_id,
                 "exception": type(exc).__name__,
+                "status_code": getattr(exc, "status_code", None),
                 "detail": str(exc)[:500],
                 "observed_at_epoch": time.time(),
                 "first_post_succeeded": False,
             }
             logging.warning("%s: %s: %s", LOST_RESPONSE_LOG, type(exc).__name__, exc)
+            self._interrupted_command_id = command.command_id
+            _write_state(RESULT_INTERRUPTED, interrupted)
+            # Delay surfacing the injected transport error, not a client-owned
+            # retry. The production report loop must make the next POST.
+            time.sleep(REPLAY_DELAY_SECONDS)
+            raise
         else:
             _write_state(
                 RESULT_INTERRUPTED,
@@ -163,27 +218,6 @@ class InterruptingRegionalExecutorClient(RegionalExecutorClient):
                 },
             )
             return first
-        _write_state(RESULT_INTERRUPTED, interrupted)
-        time.sleep(REPLAY_DELAY_SECONDS)
-        replay_sent_at = time.time()
-        replay = super().complete(command, result)
-        _write_state(
-            RESULT_REPLAYS,
-            {
-                "command_id": command.command_id,
-                "count": TERMINAL_RESULT_REPLAYS,
-                "replay_sent_at_epoch": replay_sent_at,
-                "responses": [
-                    {
-                        "command_id": replay.command_id,
-                        "status": replay.status.value,
-                        "status_source": replay.status_source,
-                        "updated_at": replay.updated_at.isoformat(),
-                    }
-                ],
-            },
-        )
-        return replay
 
 
 class TlsRecordScanner:
@@ -370,6 +404,7 @@ def record_executor_state(executor: ClusterActionExecutor) -> None:
                     "reported_failures": executor.reported_failures,
                     "unexpected_failures": executor.unexpected_failures,
                     "lease_renewal_failures": executor.lease_renewal_failures,
+                    "transport_retries_total": executor.transport_retries_total,
                     "last_successful_claim_at": (
                         executor.last_successful_claim_at.isoformat()
                         if executor.last_successful_claim_at is not None
@@ -440,6 +475,7 @@ def main() -> None:
             "response_quiet_seconds": RESPONSE_QUIET_SECONDS,
             "replay_delay_seconds": REPLAY_DELAY_SECONDS,
             "terminal_result_replays": TERMINAL_RESULT_REPLAYS,
+            "result_retry_owner": "product-executor",
         },
     )
     executor = ClusterActionExecutor(

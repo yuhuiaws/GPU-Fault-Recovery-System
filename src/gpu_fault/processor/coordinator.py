@@ -185,6 +185,7 @@ class ProcessorCoordinator(
         )
         self._stream_idle_until: dict[str, float] = {}
         self._stream_idle_interval: dict[str, float] = {}
+        self._next_evidence_path: dict[str, str] = {}
         self._initialize_claim_metrics()
         self.worker_counts = pools.worker_counts()
         self.fault_pressure_evidence_workers = pools.fault_pressure_evidence_workers
@@ -491,6 +492,8 @@ class ProcessorCoordinator(
         try:
             notification = json.loads(payload)
         except (TypeError, json.JSONDecodeError):
+            notification = None
+        if not isinstance(notification, dict):
             stream = "*"
         else:
             request_id = notification.get("request_id")
@@ -507,7 +510,7 @@ class ProcessorCoordinator(
             path = notification.get("path")
             if notification.get("priority") == 0:
                 stream = "fault"
-            elif path in self._OBSERVATION_PATHS:
+            elif isinstance(path, str) and path in self._OBSERVATION_PATHS:
                 stream = "observation"
             elif path == self._GPU_INVENTORY_PATH:
                 stream = "gpu-inventory"
@@ -987,67 +990,50 @@ class ProcessorCoordinator(
             )
         )
 
-        gpu_slots = pressure_limited_slots("gpu")
-        if gpu_slots > 0:
-            # Inventory batches amortize one worker across up to 16
-            # nodes. Reserve one slot for that stream and leave the
-            # remaining workers to the materially heavier DCGM rule
-            # evaluation path.
-            initial_inventory_slots = 1
-            inventory = claim(
-                limit=(initial_inventory_slots * GPU_INVENTORY_BATCH_SIZE),
-                stream="gpu-inventory",
-                include_paths={self._GPU_INVENTORY_PATH},
-            )
-            claimed.extend(inventory)
-            used_inventory_slots = (
-                len(inventory) + GPU_INVENTORY_BATCH_SIZE - 1
-            ) // GPU_INVENTORY_BATCH_SIZE
-            remaining_gpu_slots = max(0, gpu_slots - used_inventory_slots)
-            metrics = claim(
-                limit=(remaining_gpu_slots * GPU_METRICS_BATCH_SIZE),
-                stream="gpu-metrics",
-                include_paths={self._GPU_METRICS_PATH},
-            )
-            claimed.extend(metrics)
-            remaining_gpu_slots -= (
-                len(metrics) + GPU_METRICS_BATCH_SIZE - 1
-            ) // GPU_METRICS_BATCH_SIZE
-            if remaining_gpu_slots > 0:
-                claimed.extend(
-                    claim(
-                        limit=(remaining_gpu_slots * GPU_INVENTORY_BATCH_SIZE),
-                        stream="gpu-inventory",
-                        include_paths={self._GPU_INVENTORY_PATH},
-                    )
+        def claim_evidence_pool(
+            pool_name: str,
+            paths: tuple[tuple[str, str, int], tuple[str, str, int]],
+        ) -> None:
+            slots = pressure_limited_slots(pool_name)
+            if slots <= 0:
+                return
+            # Keep the normal one-slot reservation and heavier-path remainder.
+            # When only one slot is free, give the other path the next turn.
+            if slots == 1 and self._next_evidence_path.get(pool_name) == paths[1][0]:
+                paths = paths[1], paths[0]
+            remaining = slots
+            for turn, index in enumerate((0, 1, 0)):
+                if remaining <= 0:
+                    break
+                path, stream, batch_size = paths[index]
+                rows = claim(
+                    limit=(1 if turn == 0 else remaining) * batch_size,
+                    stream=stream,
+                    include_paths={path},
                 )
+                claimed.extend(rows)
+                remaining -= (len(rows) + batch_size - 1) // batch_size
+                if rows:
+                    self._next_evidence_path[pool_name] = paths[1 - index][0]
 
-        host_slots = pressure_limited_slots("host")
-        if host_slots > 0:
-            node_logs = claim(
-                limit=1,
-                stream="node-log",
-                include_paths={self._NODE_LOG_PATH},
-            )
-            claimed.extend(node_logs)
-            remaining_host_slots = host_slots - len(node_logs)
-            host_telemetry = claim(
-                limit=(remaining_host_slots * HOST_TELEMETRY_BATCH_SIZE),
-                stream="host-telemetry",
-                include_paths={self._HOST_TELEMETRY_PATH},
-            )
-            claimed.extend(host_telemetry)
-            remaining_host_slots -= (
-                len(host_telemetry) + HOST_TELEMETRY_BATCH_SIZE - 1
-            ) // HOST_TELEMETRY_BATCH_SIZE
-            if remaining_host_slots > 0:
-                claimed.extend(
-                    claim(
-                        limit=remaining_host_slots,
-                        stream="node-log",
-                        include_paths={self._NODE_LOG_PATH},
-                    )
-                )
+        claim_evidence_pool(
+            "gpu",
+            (
+                (self._GPU_INVENTORY_PATH, "gpu-inventory", GPU_INVENTORY_BATCH_SIZE),
+                (self._GPU_METRICS_PATH, "gpu-metrics", GPU_METRICS_BATCH_SIZE),
+            ),
+        )
+        claim_evidence_pool(
+            "host",
+            (
+                (self._NODE_LOG_PATH, "node-log", 1),
+                (
+                    self._HOST_TELEMETRY_PATH,
+                    "host-telemetry",
+                    HOST_TELEMETRY_BATCH_SIZE,
+                ),
+            ),
+        )
         return claimed
 
     def _pool_for_request(self, item: ProcessorRequest) -> str:
@@ -1060,31 +1046,28 @@ class ProcessorCoordinator(
     def _process(self, item: ProcessorRequest) -> None:
         if self._complete_if_stale(item):
             return
+        started = time.monotonic()
         deadline = self._request_started(item)
-        renewal_stop = Event()
-        renewal_thread = None
-        if self.active_consumers:
-            renewal_thread = Thread(
-                target=self._renew_active_request,
-                args=(item, renewal_stop, deadline),
-                name=f"gpu-fault-processor-renew-{item.request_id}",
-                daemon=True,
-            )
-            renewal_thread.start()
-        LOGGER.info(
-            "processor request started request_id=%s path=%s lane=%s owner=%s epoch=%s",
-            item.request_id,
-            item.path,
-            item.ordering_key(),
-            self.owner_id,
-            item.leader_epoch,
-        )
+        renewal_stop, renewal_thread = Event(), None
         try:
+            try:
+                renewal_stop, renewal_thread = self._start_batch_renewal(
+                    [item], renewal_stop_deadline=deadline
+                )
+            except Exception:
+                self._release_batch_after_failure([item], {item.request_id: started})
+                raise
+            LOGGER.info(
+                "processor request started request_id=%s path=%s lane=%s owner=%s epoch=%s",
+                item.request_id,
+                item.path,
+                item.ordering_key(),
+                self.owner_id,
+                item.leader_epoch,
+            )
             self._execute(item, deadline=deadline)
         finally:
-            renewal_stop.set()
-            if renewal_thread is not None:
-                renewal_thread.join(timeout=self.request_renew_seconds + 1)
+            self._stop_batch_renewal(renewal_stop, renewal_thread)
             self._request_finished(item.request_id)
 
     def _process_observation_batch(self, items: list[ProcessorRequest]) -> None:
@@ -1111,11 +1094,12 @@ class ProcessorCoordinator(
             return
         started = {item.request_id: time.monotonic() for item, _ in parsed}
         deadline = min(self._request_started(item) for item, _ in parsed)
-        renewal_stop, renewal_thread = self._start_batch_renewal(
-            [item for item, _ in parsed], renewal_stop_deadline=deadline
-        )
+        renewal_stop, renewal_thread = Event(), None
         disposed: set[str] = set()
         try:
+            renewal_stop, renewal_thread = self._start_batch_renewal(
+                [item for item, _ in parsed], renewal_stop_deadline=deadline
+            )
             self.store.save_attempt_observations_batch(
                 [observation for _, observation in parsed]
             )
@@ -1162,33 +1146,34 @@ class ProcessorCoordinator(
             return
         started = {item.request_id: time.monotonic() for item in items}
         deadline = min(self._request_started(item) for item in items)
-        renewal_stop, renewal_thread = self._start_batch_renewal(
-            items, renewal_stop_deadline=deadline
-        )
-        request = urllib_request.Request(
-            self.local_url + "/v1/internal/processor/telemetry-batch",
-            data=json.dumps(
-                {
-                    "items": [
-                        {
-                            "request_id": item.request_id,
-                            "path": item.path,
-                            "payload": json.loads(item.body()),
-                        }
-                        for item in items
-                    ]
-                },
-                separators=(",", ":"),
-            ).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "X-GPU-Fault-Processor-Replay": self.internal_token,
-                "Idempotency-Key": ",".join(item.request_id for item in items),
-            },
-            method="POST",
-        )
+        renewal_stop, renewal_thread = Event(), None
         disposed: set[str] = set()
         try:
+            renewal_stop, renewal_thread = self._start_batch_renewal(
+                items, renewal_stop_deadline=deadline
+            )
+            request = urllib_request.Request(
+                self.local_url + "/v1/internal/processor/telemetry-batch",
+                data=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "request_id": item.request_id,
+                                "path": item.path,
+                                "payload": json.loads(item.body()),
+                            }
+                            for item in items
+                        ]
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GPU-Fault-Processor-Replay": self.internal_token,
+                    "Idempotency-Key": ",".join(item.request_id for item in items),
+                },
+                method="POST",
+            )
             with urlopen(
                 request,
                 timeout=self.request_max_execution_seconds,
@@ -1266,12 +1251,7 @@ class ProcessorCoordinator(
         *,
         renewal_stop_deadline: float,
     ) -> tuple[Event, Thread | None]:
-        """Renew every lease of a batch while its handler runs (B-4).
-
-        The single-request path has had this since F-D5; the batch paths
-        ran up to 64 requests against a lease that expired exactly at the
-        execution deadline, so a slow handler completed into a fence.
-        """
+        """Renew single or batched requests; callers own startup failure cleanup."""
 
         stop = Event()
         if not self.active_consumers or not items:

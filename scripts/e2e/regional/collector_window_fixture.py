@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -32,6 +33,11 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    action_window,
+    finite_seconds,
+    require_action_time,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -42,14 +48,16 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     build_plan,
     install_site_profile,
 )
+from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
     predecessor_path,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     install_abort_signals,
     predecessor_evidence,
     required,
@@ -109,6 +117,7 @@ print(json.dumps({"records": [
 
 NODE_ACTIVITY_PROBE = r"""
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -118,8 +127,13 @@ from gpu_fault.app import ApplicationContext
 # their workflows, the markers those incidents hold, and the notifications
 # whose text names the node. A finding never quotes the kmsg marker, so time
 # and node are the join, as COLLECT-011/014 already do for SXID injections.
-cluster_id, node_id, since_text, kind = sys.argv[1:]
+cluster_id, node_id, since_text, kind, *evidence_filter = sys.argv[1:]
 since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+evidence_since = (
+    datetime.fromisoformat(evidence_filter[0].replace("Z", "+00:00"))
+    if evidence_filter else since
+)
+evidence_marker = evidence_filter[1] if evidence_filter else ""
 store = ApplicationContext.from_environment().store
 incidents = []
 workflows = []
@@ -164,6 +178,8 @@ if kind:
     evidence = [
         {
             "record_id": item.record_id,
+            "cluster_id": item.cluster_id,
+            "node_id": item.node_id,
             "observed_at": item.observed_at.isoformat(),
             "kind": str(item.kind),
             "payload": item.payload,
@@ -171,7 +187,15 @@ if kind:
         for item in store.list_raw_evidence(
             cluster_id, node_id=node_id, kind=EvidenceKind(kind), limit=2000
         )
-        if item.observed_at >= since
+        if item.observed_at >= evidence_since
+        and (
+            not evidence_marker
+            or re.search(
+                r"(?<![A-Za-z0-9_.:-])" + re.escape(evidence_marker)
+                + r"(?![A-Za-z0-9_.:-])",
+                str(item.payload.get("message") or ""),
+            ) is not None
+        )
     ]
 print(json.dumps({
     "incidents": incidents,
@@ -205,6 +229,8 @@ def parse_metric_samples(text: str, family: str) -> list[dict[str, Any]]:
             value = float(match.group("value"))
         except ValueError:
             continue
+        if not math.isfinite(value):
+            raise RegionalFixtureError("collector metric sample is not finite")
         samples.append({"labels": labels, "value": value})
     return samples
 
@@ -304,6 +330,7 @@ class CollectorWindowFixture:
         image: str,
         case_id: str,
         run_id: str,
+        case_dir: Path,
     ) -> None:
         self.regional = regional
         self.node = node
@@ -318,17 +345,29 @@ class CollectorWindowFixture:
                 case_id=case_id,
                 run_id=run_id,
                 probe_script=PROBE_SCRIPT,
+                state_directory=case_dir / "host-probes",
                 active_deadline_seconds=3600,
             )
         )
 
     def create(self) -> None:
+        require_action_time(180)
         self.host.create()
 
     def cleanup(self) -> dict[str, bool]:
         return self.host.cleanup()
 
     def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        finite_seconds(timeout)
+        if arguments[0] in {
+            "open-window",
+            "write-kmsg",
+            "post-rejected-event",
+            "stop-unit",
+            "seed-outbox-record",
+            "block",
+        }:
+            require_action_time(timeout)
         return self.host.execute(*arguments, timeout=timeout)
 
     def snapshot(self, marker: str | None = None) -> dict[str, Any]:
@@ -344,14 +383,23 @@ class CollectorWindowFixture:
         return cast(list[dict[str, Any]], value.get("records") or [])
 
     def node_activity(
-        self, since: datetime, *, evidence_kind: str = ""
+        self,
+        since: datetime,
+        *,
+        evidence_kind: str = "",
+        evidence_marker: str = "",
     ) -> dict[str, Any]:
+        evidence_since = marker_observed_after(evidence_marker, since)
         return self.regional.cpu_python(
             NODE_ACTIVITY_PROBE,
             self.regional.settings.cluster_id,
             self.node,
             since.isoformat(),
             evidence_kind,
+            evidence_since.isoformat()
+            if evidence_since is not None
+            else since.isoformat(),
+            evidence_marker,
         )
 
     def control_plane_metrics(self) -> list[str]:
@@ -369,7 +417,7 @@ class CollectorWindowFixture:
                     "-i",
                     str(pod["name"]),
                     "--",
-                    "python3",
+                    component_python("cpu"),
                     "-",
                     str(port),
                     input_text=METRICS_PROBE,
@@ -408,7 +456,8 @@ class CollectorWindowFixture:
     ) -> dict[str, Any] | None:
         """Poll ``accept`` until it answers, recording each poll in a timeline."""
 
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + finite_seconds(timeout_seconds)
+        finite_seconds(poll_seconds, label="poll interval")
         timeline: list[dict[str, Any]] = []
         while True:
             value = accept()
@@ -441,11 +490,16 @@ def open_window_or_rollback(
         return fixture.execute(
             "open-window", "--run-id", run_id, *arguments, timeout=timeout
         )
-    except Exception:
+    except BaseException as exc:
         try:
-            fixture.execute("close-window", "--run-id", run_id, timeout=timeout)
-        except Exception:  # noqa: BLE001 - the open error is the one to raise
-            pass
+            unit = arguments[arguments.index("--unit") + 1]
+            fixture.execute(
+                "close-window", "--run-id", run_id, "--unit", unit, timeout=timeout
+            )
+        except Exception as cleanup_error:
+            exc.add_note(
+                f"collector window rollback failed: {type(cleanup_error).__name__}"
+            )
         raise
 
 
@@ -456,8 +510,11 @@ def read_only_preflight(settings: WindowSettings, case_dir: Path) -> dict[str, A
     node = regional.node_snapshot(settings.node)
     state = regional.store_snapshot(node=settings.node)
     workloads = regional.business_workloads(settings.node)
+    identity = regional.evidence_identity()
     predecessor = (
-        predecessor_evidence(settings.predecessor_path, settings.predecessor_id)
+        predecessor_evidence(
+            settings.predecessor_path, settings.predecessor_id, **identity
+        )
         if settings.predecessor_id is not None and settings.predecessor_path is not None
         else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
     )
@@ -473,7 +530,7 @@ def read_only_preflight(settings: WindowSettings, case_dir: Path) -> dict[str, A
     if (state.get("agent") or {}).get("lifecycle_state") != "ACTIVE":
         errors.append(f"{node['name']} Node Agent is not ACTIVE")
     result = {
-        "release_id": state.get("release_id"),
+        **identity,
         "node": node,
         "store": state,
         "workloads": workloads,
@@ -515,6 +572,8 @@ def run_window_case(
     preflight = read_only_preflight(settings, case_dir)
     if not arguments.execute:
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=not preflight["errors"],
             run_dir=arguments.run_dir,
             case_id=case_id,
             attempt=arguments.attempt,
@@ -543,6 +602,7 @@ def run_window_case(
         image=settings.host_probe_image,
         case_id=case_id,
         run_id=f"{case_id.lower()}-{arguments.attempt}",
+        case_dir=case_dir,
     )
     result: dict[str, Any] = {
         "schema_version": 2,
@@ -553,18 +613,24 @@ def run_window_case(
         "started_at": utc_now().isoformat(),
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
+        **regional.evidence_identity(),
     }
     try:
-        fixture.create()
-        result.update(execute(settings, fixture, case_dir, arguments.attempt, deadline))
+        with action_window(deadline):
+            fixture.create()
+            result.update(
+                execute(settings, fixture, case_dir, arguments.attempt, deadline)
+            )
         if regional.cpu_blast_snapshot() != preflight["cpu_blast"]:
             result.setdefault("errors", []).append(
                 "control-plane EKS state differs from baseline"
             )
             result["verdict"] = "FAIL"
-    except Exception as exc:  # noqa: BLE001 - recorded as the case error
+    except BaseException as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["verdict"] = "FAIL"
+        if not isinstance(exc, Exception):
+            raise
     finally:
         try:
             residuals = fixture.cleanup()
@@ -572,10 +638,10 @@ def run_window_case(
             residuals = {"cleanup_error": True}
             result["cleanup_error"] = f"{type(exc).__name__}: {exc}"
         result["probe_residuals"] = residuals
-        if any(residuals.values()):
+        if not residuals or any(value is not False for value in residuals.values()):
             result["verdict"] = "FAIL"
-    result["ended_at"] = utc_now().isoformat()
-    write_json_atomic(case_evidence_path(arguments.run_dir, case_id), result)
+        result["ended_at"] = utc_now().isoformat()
+        write_json_atomic(case_evidence_path(arguments.run_dir, case_id), result)
     print(json.dumps(result, sort_keys=True, default=str))
     return 0 if result["verdict"] == "PASS" else 1
 

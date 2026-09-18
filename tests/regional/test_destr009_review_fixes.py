@@ -114,6 +114,7 @@ class FakeWorkload:
 
     def __init__(self, _regional: Any, _settings: Any) -> None:
         self.deleted = 0
+        self.restart_authorizations: list[dict[str, Any]] = []
 
     def submit(self) -> dict[str, Any]:
         return {"submitted": True}
@@ -126,9 +127,13 @@ class FakeWorkload:
             ]
         }
 
+    def authorize_restart(self, state: dict[str, Any]) -> None:
+        self.restart_authorizations.append(state)
+
     def wait_restarted(
         self, _uids: set[str], *, timeout_seconds: int
     ) -> dict[str, Any]:
+        assert self.restart_authorizations
         return {
             "pods": [
                 {"name": f"dst-{i}", "uid": f"dst-{i}", "node": item["name"]}

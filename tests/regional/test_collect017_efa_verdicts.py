@@ -379,7 +379,7 @@ def test_restore_efa_failure_never_masks_the_case_error(
 
 
 def test_gpu_plugin_daemonset_is_restored_exactly_once(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     restores = {"count": 0}
 
@@ -410,7 +410,7 @@ def test_gpu_plugin_daemonset_is_restored_exactly_once(
     )
     monkeypatch.setattr(collect017.base, "latest_node_workflow", lambda *_, **__: good)
 
-    result = collect017.run_gpu_plugin(_settings(), Regional())  # type: ignore[arg-type]
+    result = collect017.run_gpu_plugin(_settings(), Regional(), tmp_path)  # type: ignore[arg-type]
     assert result["errors"] == []
     assert restores["count"] == 1, "no second rollout wait on the success path"
 
@@ -419,5 +419,5 @@ def test_gpu_plugin_daemonset_is_restored_exactly_once(
 
     monkeypatch.setattr(collect017, "_wait_planned_workflow", never_planned)
     with pytest.raises(collect017.RegionalFixtureError):
-        collect017.run_gpu_plugin(_settings(), Regional())  # type: ignore[arg-type]
+        collect017.run_gpu_plugin(_settings(), Regional(), tmp_path)  # type: ignore[arg-type]
     assert restores["count"] == 2, "the finally restores when the success path did not"

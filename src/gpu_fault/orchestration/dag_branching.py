@@ -21,6 +21,11 @@ from gpu_fault.orchestration.arbitration import (
     RecoveryArbiter,
     fault_scope_covered,
 )
+from gpu_fault.workflow_quarantine import (
+    inherit_terminal_quarantine,
+    suppress_readmission,
+    terminal_quarantine_nodes,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +130,16 @@ class DagBrancher:
             index
             for index, step in enumerate(workflow.official_steps)
             if step.branch_id in branch_ids
+            and step.operation not in self.arbiter.WORKLOAD_SCOPED_OPERATIONS
+        ]
+
+    def branch_step_indexes(
+        self, workflow: WorkflowRequest, branch_id: str
+    ) -> list[int]:
+        return [
+            index
+            for index, step in enumerate(workflow.official_steps)
+            if step.branch_id == branch_id
             and step.operation not in self.arbiter.WORKLOAD_SCOPED_OPERATIONS
         ]
 
@@ -290,41 +305,55 @@ class DagBrancher:
         list[WorkflowStepSpec],
         list[str],
         str,
-        bool,
+        frozenset[str],
     ]:
+        superseded = set(candidate.superseded_step_indexes)
         stop_index = next(
             (
                 index
                 for index, step in enumerate(candidate.official_steps)
                 if step.operation is WorkflowOperation.STOP_WORKLOADS
+                and index not in superseded
             ),
             None,
         )
         indexed = [
             (index, step)
             for index, step in enumerate(candidate.official_steps)
-            if step.operation not in self._SHARED_OPERATIONS
+            if step.operation not in self._SHARED_OPERATIONS and index not in superseded
         ]
         steps = [step for _, step in indexed]
         nodes = sorted({node for step in steps for node in step.node_ids})
         branch_id = mint_branch_id(
-            nodes,
+            {
+                node
+                for step in steps
+                for node in (step.branch_node_ids or step.node_ids)
+            },
             successor_revision=(
                 revision + 1 if predecessor_step_index is not None else None
             ),
         )
-        operations = {step.operation for step in candidate.official_steps}
+        operations = {
+            step.operation
+            for index, step in enumerate(candidate.official_steps)
+            if index not in superseded
+        }
         # A candidate that isolates the node or hands it to support ends the
         # node's part in the job; the branch it replaces owes no release and
         # the job restart is retired only where this node was all of it
         # (F-C5).
-        terminal = (
-            bool(
-                operations
-                & {WorkflowOperation.QUARANTINE, WorkflowOperation.ESCALATE_SUPPORT}
-            )
+        terminal = terminal_quarantine_nodes(candidate)
+        if (
+            WorkflowOperation.ESCALATE_SUPPORT in operations
             and WorkflowOperation.RESTART_WORKLOAD not in operations
-        )
+        ):
+            terminal |= frozenset(
+                node
+                for _, step in indexed
+                if step.operation is WorkflowOperation.ESCALATE_SUPPORT
+                for node in step.node_ids
+            )
         return (
             stop_index,
             indexed,
@@ -401,25 +430,19 @@ class DagBrancher:
         superseded = set(replaced)
         if not terminal:
             return superseded
-        nodes = set(branch_nodes)
-        for index, step in enumerate(steps):
-            if step.operation not in {
-                WorkflowOperation.RESTART_WORKLOAD,
-                WorkflowOperation.RESTORE_SCHEDULING,
-            }:
-                continue
-            # Only a step the isolated node wholly owns goes with it: a
-            # release shared with another node must still uncordon that
-            # node, and a job restart the other nodes still need must still
-            # run (F-C5). A step that already ran is history either way.
-            if not set(step.node_ids) <= nodes:
-                continue
-            if index in existing.completed_step_indexes or any(
-                execution.step_index == index and execution.operation is step.operation
-                for execution in existing.step_executions
-            ):
-                continue
-            superseded.add(index)
+        updated, retired = suppress_readmission(
+            existing.model_copy(
+                update={
+                    "superseded_step_indexes": sorted(
+                        set(existing.superseded_step_indexes) | set(replaced)
+                    )
+                }
+            ),
+            steps,
+            frozenset(branch_nodes),
+        )
+        steps[:] = updated
+        superseded.update(retired)
         return superseded
 
     @staticmethod
@@ -548,6 +571,7 @@ class DagBrancher:
         predecessor_step_index: int | None = None,
         replaced_step_indexes: frozenset[int] = frozenset(),
     ) -> WorkflowRequest:
+        candidate = inherit_terminal_quarantine(existing, candidate)
         steps, stop_index, stop_is_open = self._normalize_existing(existing)
         (
             candidate_stop,
@@ -581,9 +605,9 @@ class DagBrancher:
         superseded = self._terminal_superseded(
             existing,
             steps,
-            branch_nodes,
+            sorted(terminal),
             replaced_step_indexes,
-            terminal,
+            bool(terminal),
         )
         appended: list[int] = []
         tail = self._attach_candidate_branch(
@@ -744,8 +768,14 @@ class DagBrancher:
         existing: WorkflowRequest,
         candidate: WorkflowRequest,
         node_id: str,
+        *,
+        branch_id: str | None = None,
     ) -> WorkflowRequest:
-        indexes = self.node_branch_step_indexes(existing, node_id)
+        indexes = (
+            self.branch_step_indexes(existing, branch_id)
+            if branch_id is not None
+            else self.node_branch_step_indexes(existing, node_id)
+        )
         if not indexes:
             return existing
         branch_set = set(indexes)

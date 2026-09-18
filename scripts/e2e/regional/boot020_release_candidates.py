@@ -67,8 +67,74 @@ DRIVER_KEYS = {
     "agent": "agent",
     "full": "full",
 }
-DEFAULT_EXECUTOR_MODULE = "src/gpu_fault/transport_errors.py"
+DEFAULT_EXECUTOR_MODULE = "src/gpu_fault/cluster_executor/metrics.py"
 DEFAULT_NODE_MODULE = "src/gpu_fault/node_agent/common.py"
+
+
+def validate_candidate_modules(
+    snapshot: Path, executor_module: str, node_module: str
+) -> None:
+    """Ask the snapshot's actual import-closure builder, not a path allowlist."""
+    code = (
+        "import json; from scripts.component_wheels import component_modules; "
+        "print(json.dumps({n:sorted(component_modules(n)) "
+        "for n in ('control_plane','executor','node_runtime')}))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=snapshot,
+        env={**os.environ, "PYTHONPATH": f"{snapshot / 'src'}:{snapshot}"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    closures = json.loads(completed.stdout)
+    for path, owner in ((executor_module, "executor"), (node_module, "node_runtime")):
+        relative = Path(path)
+        target = snapshot / relative
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.suffix != ".py"
+            or not target.is_file()
+            or target.is_symlink()
+            or not target.resolve().is_relative_to(snapshot.resolve())
+            or relative.parts[0] != "src"
+        ):
+            raise ValueError(
+                "candidate module must be a regular source file in the snapshot"
+            )
+        module = ".".join(relative.with_suffix("").parts[1:])
+        owners = {name for name, modules in closures.items() if module in modules}
+        if owners != {owner}:
+            raise ValueError(f"candidate module {path} is not exclusive to {owner}")
+
+
+def validate_candidate_delta(
+    previous: dict[str, Any], candidate: dict[str, Any], name: str
+) -> list[str]:
+    expected = {
+        "B": {"executor"},
+        "C": {"node_runtime", "node_bundle"},
+        "D": {"executor", "node_runtime", "node_bundle"},
+    }[name]
+    changed = set()
+    for component in ("control_plane", "executor", "node_runtime", "node_bundle"):
+        field = "bundle_sha256" if component == "node_bundle" else "wheel_sha256"
+        old = (previous.get("components") or {}).get(component, {}).get(field)
+        new = (candidate.get("components") or {}).get(component, {}).get(field)
+        if (
+            not isinstance(old, str)
+            or len(old) != 64
+            or not isinstance(new, str)
+            or len(new) != 64
+        ):
+            raise ValueError(f"candidate {name} lacks complete {component} identity")
+        if old != new:
+            changed.add(component)
+    if changed != expected:
+        raise ValueError(f"candidate {name} component delta differs: {sorted(changed)}")
+    return sorted(changed)
 
 
 def candidate_edits(
@@ -126,13 +192,21 @@ def reusable_candidate(
         manifest = json.loads(manifest_path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if manifest.get("release_id") in (None, base_release_id):
+    if not isinstance(manifest, dict):
+        return False
+    release_id = manifest.get("release_id")
+    if (
+        not isinstance(release_id, str)
+        or not release_id.strip()
+        or release_id == base_release_id
+    ):
         return False
     if not isinstance(recorded, dict):
         return False
-    return recorded.get("edits_sha256") == expected_edits_digest and recorded.get(
-        "release_id"
-    ) == manifest.get("release_id")
+    return (
+        recorded.get("edits_sha256") == expected_edits_digest
+        and recorded.get("release_id") == release_id
+    )
 
 
 def component_summary(manifest: dict[str, Any]) -> dict[str, str]:
@@ -147,10 +221,50 @@ def _git(cwd: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", *arguments],
         cwd=cwd,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        },
         check=True,
         text=True,
         capture_output=True,
     ).stdout.strip()
+
+
+def copy_candidate_repository(snapshot: Path, checkout: Path) -> None:
+    """Copy source bytes without sharing a worktree's HEAD, index or objects."""
+    base = _git(snapshot, "rev-parse", "HEAD")
+    _git(
+        checkout.parent,
+        "clone",
+        "--no-local",
+        "--no-hardlinks",
+        "--no-checkout",
+        "--config",
+        "core.hooksPath=/dev/null",
+        str(snapshot),
+        str(checkout),
+    )
+    candidate_git = Path(
+        _git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    source_git = Path(
+        _git(snapshot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    if (
+        _git(checkout, "rev-parse", "HEAD") != base
+        or candidate_git == source_git
+        or not candidate_git.is_relative_to(checkout.resolve())
+    ):
+        raise ValueError("candidate Git metadata is not independent of its source")
+
+    def ignore(directory: str, _names: list[str]) -> set[str]:
+        return {".git"} if Path(directory).resolve() == snapshot.resolve() else set()
+
+    shutil.copytree(
+        snapshot, checkout, symlinks=True, ignore=ignore, dirs_exist_ok=True
+    )
 
 
 def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -159,6 +273,9 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
 
     snapshot = arguments.snapshot_repo.resolve()
     base = json.loads((snapshot / "dist/current-release.json").read_text("utf-8"))
+    validate_candidate_modules(
+        snapshot, arguments.executor_module, arguments.node_module
+    )
     work = arguments.work_dir.resolve()
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
     summary: dict[str, Any] = {
@@ -170,7 +287,9 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
     previous: dict[str, Any] = {}
     if summary_path.exists():
         try:
-            previous = dict(json.loads(summary_path.read_text("utf-8")))
+            recorded_summary = json.loads(summary_path.read_text("utf-8"))
+            if isinstance(recorded_summary, dict):
+                previous = recorded_summary
         except (OSError, json.JSONDecodeError):
             previous = {}
     recorded_candidates = (
@@ -178,7 +297,10 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
         if previous.get("base_release_id") == base["release_id"]
         else {}
     ) or {}
+    if not isinstance(recorded_candidates, dict):
+        recorded_candidates = {}
     edits = candidate_edits(arguments.executor_module, arguments.node_module)
+    previous_manifest = base
     for name in CANDIDATES:
         checkout = work / f"wt-{name}"
         manifest_path = checkout / "dist/current-release.json"
@@ -193,7 +315,7 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
         else:
             if checkout.exists():
                 shutil.rmtree(checkout)
-            shutil.copytree(snapshot, checkout, symlinks=True)
+            copy_candidate_repository(snapshot, checkout)
             for relative, text in edits[name]:
                 target = checkout / relative
                 target.write_text(target.read_text("utf-8") + "\n" + text, "utf-8")
@@ -205,6 +327,8 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
                 "-c",
                 "user.email=boot020@acceptance.invalid",
                 "commit",
+                "--no-gpg-sign",
+                "--no-verify",
                 "-q",
                 "-m",
                 f"BOOT-020 candidate {name}",
@@ -227,11 +351,14 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
         manifest = json.loads(manifest_path.read_text("utf-8"))
+        changed = validate_candidate_delta(previous_manifest, manifest, name)
+        previous_manifest = manifest
         summary["candidates"][name] = {
             "release_id": manifest["release_id"],
             "components": component_summary(manifest),
             "manifest": str(manifest_path),
             "edits_sha256": digest,
+            "changed_components": changed,
         }
         summary_path.write_text(json.dumps(summary, indent=1), "utf-8")
     return summary
@@ -396,6 +523,10 @@ def write_configs(arguments: argparse.Namespace) -> None:
         path = out / f"{name}.json"
         path.write_text(json.dumps(config, indent=2, sort_keys=True), "utf-8")
         path.chmod(0o600)
+    # BOOT-023 starts after FULL, not at the first NOOP's old baseline.
+    handoff = out / "final-noop.json"
+    handoff.write_text(json.dumps(configs["full"], indent=2, sort_keys=True), "utf-8")
+    handoff.chmod(0o600)
     for manifest in (
         live_manifest,
         *(Path(c["manifest"]) for c in candidates.values()),

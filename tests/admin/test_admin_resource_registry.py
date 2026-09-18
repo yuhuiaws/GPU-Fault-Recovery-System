@@ -245,14 +245,14 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
     assert all(
         resource.ownership is not InstallationResourceOwnership.REUSED
         for resource in snapshot.resources
-    )
+    ), "snapshot must not contain reused ownership"
     assert all(
         "password" not in key.lower()
         and "token" not in key.lower()
         and "secret" not in key.lower()
         for resource in snapshot.resources
         for key in resource.attributes
-    )
+    ), "registry attributes must not contain credential-like keys"
 
 
 LEGACY_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"
@@ -398,21 +398,40 @@ def test_bootstrap_state_is_found_by_site_id(tmp_path) -> None:
     assert find_bootstrap_state(site) == state
 
 
+@pytest.mark.parametrize("allow_empty", [False, True])
 def test_old_control_plane_api_is_detected_before_authorization(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, allow_empty
 ) -> None:
     site = load_site(site_file(tmp_path))
     monkeypatch.setattr(admin_resource_registry, "_cpu_pod", lambda _site: "api-pod")
     monkeypatch.setattr(
-        admin_resource_registry.subprocess,
-        "run",
+        admin_resource_registry,
+        "run_command",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
-            arguments, 44, stdout="", stderr="GPU_FAULT_LEGACY_REGISTRY_API"
+            arguments, 44, stdout="GPU_FAULT_LEGACY_REGISTRY_API", stderr=""
         ),
     )
 
     with pytest.raises(LegacyInstallationRegistryMissing):
+        fetch_installation_resource_registry(site, allow_empty=allow_empty)
+
+
+def test_empty_registry_requires_explicit_readonly_allowance(tmp_path, monkeypatch):
+    site = load_site(site_file(tmp_path))
+    monkeypatch.setattr(admin_resource_registry, "_cpu_pod", lambda _site: "api-pod")
+    monkeypatch.setattr(
+        admin_resource_registry,
+        "run_command",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout="[]", stderr=""
+        ),
+    )
+    with pytest.raises(LegacyInstallationRegistryMissing, match="empty"):
         fetch_installation_resource_registry(site)
+    snapshot = fetch_installation_resource_registry(site, allow_empty=True)
+    assert snapshot.site_id == site.registry_site_id
+    assert snapshot.resources == []
+    snapshot.require_source_binding()
 
 
 def test_registry_sync_retries_store_io_503(tmp_path, monkeypatch) -> None:
@@ -421,17 +440,22 @@ def test_registry_sync_retries_store_io_503(tmp_path, monkeypatch) -> None:
     results = iter(
         [
             subprocess.CompletedProcess(
-                ["kubectl"], 1, stdout="", stderr="HTTP Error 503"
+                ["kubectl"], 75, stdout="GPU_FAULT_REGISTRY_UNAVAILABLE", stderr=""
             ),
-            subprocess.CompletedProcess(["kubectl"], 0, stdout="[]", stderr=""),
+            subprocess.CompletedProcess(
+                ["kubectl"],
+                0,
+                stdout=json.dumps(
+                    [item.model_dump(mode="json") for item in snapshot.resources]
+                ),
+                stderr="",
+            ),
         ]
     )
     sleeps = []
     monkeypatch.setattr(admin_resource_registry, "_cpu_pod", lambda _site: "api-pod")
     monkeypatch.setattr(
-        admin_resource_registry.subprocess,
-        "run",
-        lambda *_args, **_kwargs: next(results),
+        admin_resource_registry, "run_command", lambda *_args, **_kwargs: next(results)
     )
     monkeypatch.setattr(
         admin_resource_registry.time, "sleep", lambda value: sleeps.append(value)
@@ -454,10 +478,10 @@ def test_registry_sync_falls_back_to_direct_aurora_upsert(
     def unavailable(*_args, **_kwargs):
         attempts.append(True)
         return subprocess.CompletedProcess(
-            ["kubectl"], 1, stdout="", stderr="HTTP Error 503"
+            ["kubectl"], 75, stdout="GPU_FAULT_REGISTRY_UNAVAILABLE", stderr=""
         )
 
-    monkeypatch.setattr(admin_resource_registry.subprocess, "run", unavailable)
+    monkeypatch.setattr(admin_resource_registry, "run_command", unavailable)
     monkeypatch.setattr(admin_resource_registry.time, "sleep", lambda _value: None)
     monkeypatch.setattr(
         admin_resource_registry,
@@ -541,9 +565,7 @@ def test_join_registry_delta_refuses_a_key_naming_another_resource() -> None:
         registry_delta(before, [], site_id="other-site")
 
 
-def test_join_registry_delta_replaces_a_previous_life_left_in_a_terminal_status() -> (
-    None
-):
+def test_join_registry_delta_revives_the_same_terminal_resource_identity() -> None:
     """Live 2026-09-13: remove-cluster leaves the cluster's rows DETACHED/DELETED
     in the registry; the re-join's before snapshot therefore held
     ``cluster/<id>/hyperpod`` with no ARN (the bootstrap never recorded one) and
@@ -552,23 +574,40 @@ def test_join_registry_delta_replaces_a_previous_life_left_in_a_terminal_status(
     detached = _row("cluster/gpu-b/hyperpod", "gpu-b").model_copy(
         update={"status": InstallationResourceStatus.DETACHED}
     )
-    deleted = _row("aws/iam/executor/gpu-b/role", "gpu-b-old").model_copy(
+    deleted = _row("aws/iam/executor/gpu-b/role", "gpu-b-role").model_copy(
         update={"status": InstallationResourceStatus.DELETED}
     )
     joined = [
         _row("cluster/gpu-b/hyperpod", "gpu-b", arn="arn:aws:sagemaker:::cluster/b"),
-        _row("aws/iam/executor/gpu-b/role", "gpu-b-new"),
+        _row("aws/iam/executor/gpu-b/role", "gpu-b-role"),
     ]
 
     delta, merged = registry_delta(
         _before(detached, deleted), joined, site_id="test-site"
     )
 
-    assert delta.resources == sorted(joined, key=lambda item: item.resource_key)
+    from gpu_fault.store import InMemoryStore
+
+    store = InMemoryStore()
+    for row in (detached, deleted):
+        store.save_installation_resource(row)
+    for row in delta.resources:
+        store.save_installation_resource(row)
+        assert store.get_installation_resource(row.site_id, row.resource_key) == row
+        assert row.status is InstallationResourceStatus.ACTIVE
     assert {item.resource_key: item.resource_id for item in merged.resources} == {
         "cluster/gpu-b/hyperpod": "gpu-b",
-        "aws/iam/executor/gpu-b/role": "gpu-b-new",
-    }, "the previous life is replaced, not kept beside the new rows"
+        "aws/iam/executor/gpu-b/role": "gpu-b-role",
+    }
+    by_key = {row.resource_key: row for row in delta.resources}
+    assert (
+        by_key[detached.resource_key].immutable_identity()
+        == detached.immutable_identity()
+    )
+    assert (
+        by_key[deleted.resource_key].immutable_identity()
+        == deleted.immutable_identity()
+    )
 
 
 def test_join_registry_delta_accepts_a_live_row_that_recorded_no_arn() -> None:
@@ -580,10 +619,40 @@ def test_join_registry_delta_accepts_a_live_row_that_recorded_no_arn() -> None:
         site_id="test-site",
     )
 
-    assert delta.resources[0].resource_arn == "arn:aws:sagemaker:::cluster/b", (
-        "same type and id: the row with the ARN wins"
+    assert delta.resources[0].resource_arn is None, (
+        "a rejoin must preserve the nullable ARN in the immutable stored identity"
     )
     with pytest.raises(BootstrapError, match="cluster/gpu-b/hyperpod"):
         registry_delta(
             before, [_row("cluster/gpu-b/hyperpod", "gpu-c")], site_id="test-site"
         )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        InstallationResourceStatus.DELETED,
+        InstallationResourceStatus.DETACHED,
+        InstallationResourceStatus.PRESERVED,
+    ],
+)
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"resource_id": "another-role"},
+        {"account_id": "111122223333"},
+        {"region": "us-west-2"},
+        {"dependencies": ["foreign-resource"]},
+    ],
+)
+def test_terminal_registry_status_never_authorizes_a_different_identity(
+    status, changed
+):
+    previous = _row("aws/iam/executor/gpu-b/role", "gpu-b-role").model_copy(
+        update={"status": status}
+    )
+    desired = previous.model_copy(
+        update={**changed, "status": InstallationResourceStatus.ACTIVE}
+    )
+    with pytest.raises(BootstrapError, match="different resource"):
+        registry_delta(_before(previous), [desired], site_id="test-site")

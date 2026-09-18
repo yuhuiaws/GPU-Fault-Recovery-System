@@ -26,6 +26,7 @@ from typing import Any
 
 from gpu_fault.env import env_bool
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
+from gpu_fault.execution.node_action_uncertainty import pending_remote_action_details
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
@@ -220,9 +221,25 @@ def covered_step_outcome(command: Any, step_index: int) -> WorkflowStepOutcome |
                 },
             )
     if command.status in OPEN_REMOTE_COMMAND_STATUSES:
+        step = next(
+            (
+                item.step
+                for item in command.batched_steps
+                if item.step_index == step_index
+            ),
+            command.step,
+        )
+        pending_details = (
+            entry.get("details", {}) if entry is not None else command.result_details
+        )
         return WorkflowStepOutcome.waiting(
             operation_id=operation_id,
             details={
+                **pending_remote_action_details(
+                    step.operation,
+                    command.status,
+                    pending_details if isinstance(pending_details, dict) else {},
+                ),
                 "remote_command_id": command.command_id,
                 "remote_cluster_id": command.cluster_id,
                 "remote_status": command.status.value,

@@ -788,7 +788,7 @@ def test_a_refused_creation_degrades_to_a_warning_and_the_deploy_continues(
 
     result = _ensure(runner, _settings(), tmp_path)
 
-    assert result["status"] == "FAILED"
+    assert result["status"] == "DEGRADED"
     assert "No IAM Identity Center instance" in result["reason"]
     err = capsys.readouterr().err
     assert "WARNING" in err and "deploy continues" in err
@@ -893,18 +893,15 @@ def test_a_provisioned_step_records_the_workspace_and_the_imports_not_the_token(
     assert runner.token_key not in json.dumps(result)
 
 
-def test_an_ambiguous_region_fails_soft_with_a_loud_warning(
+def test_an_ambiguous_region_refuses_unproved_workspace_selection(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     second = {**HYPERPOD_WORKSPACE, "id": "g-second0002", "name": "team-grafana"}
     runner = Runner([HYPERPOD_WORKSPACE, second])
 
-    result = _ensure(runner, _settings(), tmp_path)
-
-    assert result["status"] == "FAILED"
-    assert "g-second0002" in result["reason"]
-    err = capsys.readouterr().err
-    assert "WARNING" in err and "Grafana" in err and "g-second0002" in err
+    with pytest.raises(BootstrapError, match="g-second0002"):
+        _ensure(runner, _settings(), tmp_path)
+    assert "tag-resource" not in runner.operations()
 
 
 def test_a_wrong_operator_workspace_id_fails_the_deploy(tmp_path: Path) -> None:
@@ -921,7 +918,7 @@ def test_a_persisted_workspace_id_that_vanished_fails_soft(tmp_path: Path) -> No
 
     result = _ensure(runner, settings, tmp_path)
 
-    assert result["status"] == "FAILED"
+    assert result["status"] == "DEGRADED"
     assert "g-gone" in result["reason"]
 
 
@@ -936,7 +933,7 @@ def test_a_refused_http_call_fails_soft_but_keeps_the_created_workspace(
 
     result = _ensure(runner, _settings(), tmp_path, http=http)
 
-    assert result["status"] == "FAILED"
+    assert result["status"] == "DEGRADED"
     assert result["workspace_id"] == "g-created01"
     assert result["ownership"] == "CREATED"
     assert "401" in result["reason"]

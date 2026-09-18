@@ -292,8 +292,12 @@ class CompletionPodParsingMixin:
                 for item in (spec.get("containers") or [])
                 if item.get("name") == name
             ),
-            {},
+            None,
         )
+        if container_spec is None:
+            raise CompletionControllerError(
+                f"Pod {metadata.get('name')} training container {name!r} is not present"
+            )
         resources = container_spec.get("resources") or {}
         requests = resources.get("requests") or {}
         limits = resources.get("limits") or {}

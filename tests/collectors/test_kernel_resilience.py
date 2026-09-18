@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import errno
 import signal
+import sys
 import threading
 import time
+from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from gpu_fault.channel_registry import COLLECTOR_HEALTH_PATH
 
@@ -34,6 +37,54 @@ SECOND = "3,43,2000002,-;NVRM: Xid (PCI:0000:b9:00): 79\n"
 THIRD = "3,44,2000003,-;NVRM: Xid (PCI:0000:b9:00): 74\n"
 FOURTH = "3,45,2000004,-;NVRM: Xid (PCI:0000:b9:00): 31\n"
 FIFTH = "3,46,2000005,-;NVRM: Xid (PCI:0000:b9:00): 13\n"
+
+
+@pytest.fixture
+def isolated_collector_signals(monkeypatch) -> Iterator[None]:
+    """Exercise signal ownership without invoking coverage's process handler."""
+    real_signal = signal
+    process_handlers = {
+        number: real_signal.getsignal(number)
+        for number in (real_signal.SIGTERM, real_signal.SIGINT)
+    }
+    initial = {
+        real_signal.SIGTERM: real_signal.SIG_DFL,
+        real_signal.SIGINT: real_signal.default_int_handler,
+    }
+    handlers = dict(initial)
+
+    def install(number, handler):
+        previous = handlers[number]
+        handlers[number] = handler
+        return previous
+
+    isolated = SimpleNamespace(
+        SIGTERM=real_signal.SIGTERM,
+        SIGINT=real_signal.SIGINT,
+        SIG_DFL=real_signal.SIG_DFL,
+        SIG_IGN=real_signal.SIG_IGN,
+        getsignal=lambda number: handlers[number],
+        signal=install,
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr("gpu_fault.collectors.logs.kernel.signal", isolated)
+            patch.setattr(sys.modules[__name__], "signal", isolated)
+            yield
+    finally:
+        changed = [
+            number
+            for number, handler in process_handlers.items()
+            if real_signal.getsignal(number) is not handler
+        ]
+        for number in changed:
+            real_signal.signal(number, process_handlers[number])
+        assert not changed, (
+            f"synthetic collector signals changed real process handlers: {changed}"
+        )
+        assert handlers == initial, (
+            "the collector did not restore its isolated signal dispositions"
+        )
 
 
 class _RejectFirstSink:
@@ -436,6 +487,7 @@ class _ReplayBufferingSink(_SlowSink):
         return True
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
     monkeypatch,
 ) -> None:
@@ -669,6 +721,7 @@ class _ThreadNamingSink:
         return {"accepted": True}
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_the_health_summary_is_not_posted_from_the_read_loop(monkeypatch) -> None:
     """The summary posted synchronously from the reader.
 
@@ -936,6 +989,7 @@ class _SignalWatchingSink(_SlowSink):
         return True
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_a_second_stop_signal_does_not_kill_the_drain(monkeypatch) -> None:
     """The handlers were restored before the drain ran.
 
@@ -978,6 +1032,7 @@ def test_a_second_stop_signal_does_not_kill_the_drain(monkeypatch) -> None:
     )
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_an_ignored_stop_signal_stays_ignored(monkeypatch) -> None:
     """A signal the parent set to ``SIG_IGN`` must not be re-armed.
 
@@ -1020,6 +1075,7 @@ def test_an_ignored_stop_signal_stays_ignored(monkeypatch) -> None:
     )
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_a_dropped_health_summary_is_not_counted_as_a_lost_record(
     monkeypatch, caplog
 ) -> None:
@@ -1170,6 +1226,7 @@ def test_the_shutdown_drain_gives_each_unbuffered_record_one_attempt_not_the_lad
     )
 
 
+@pytest.mark.usefixtures("isolated_collector_signals")
 def test_a_health_summary_never_evicts_a_queued_xid(monkeypatch, caplog) -> None:
     """A full queue drops the *summary*, not the oldest XID record.
 

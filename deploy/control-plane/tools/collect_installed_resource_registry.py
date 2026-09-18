@@ -4,30 +4,99 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from sync_installed_resource_registry import (
     DEFAULT_INVENTORY,
     Kubectl,
+    RegistryError,
+    ResourceIdentity,
+    resource_identity,
+    resource_list,
+    stamp_provenance,
     synchronize,
 )
 
 NAMESPACED_DISCOVERY_KINDS = (
-    "deployment,daemonset,statefulset,cronjob,"
+    "deployment,daemonset,statefulset,cronjob,job,"
     "poddisruptionbudget,role,rolebinding,"
     "serviceaccount,service"
 )
 CLUSTER_DISCOVERY_KINDS = "clusterrole,clusterrolebinding"
-# The release engine renders a Role/RoleBinding pair per allowed workload
-# namespace and owns them by this label (`regional_release_gpu_rollout`);
-# they are not registry entries and `remove-cluster` deletes them by label.
-WORKLOAD_NAMESPACE_RBAC_LABEL = "gpu-fault.io/workload-namespace-rbac"
 
 
-def _identity(resource: dict[str, Any]) -> tuple[str, str]:
-    return resource["kind"], resource["name"]
+def attach_workload_rbac(
+    kubectl: Kubectl,
+    config: dict[str, Any],
+    target: dict[str, Any],
+    document: dict[str, Any],
+) -> None:
+    """Add live-proven renderer grants to this context's cleanup snapshot."""
+    from gpu_fault.admin.cluster_removal_rbac import inspect_workload_namespace_rbac
+
+    prefix = ["kubectl", "--context", target["context"]]
+
+    def run(
+        arguments: list[str], *, timeout_seconds: float = 20
+    ) -> subprocess.CompletedProcess[str]:
+        if arguments[: len(prefix)] != prefix:
+            raise RegistryError("workload RBAC proof crossed its selected context")
+        return kubectl.run(
+            arguments[len(prefix) :], check=False, timeout_seconds=timeout_seconds
+        )
+
+    proof = inspect_workload_namespace_rbac(config, target, run=run, kubectl=prefix)
+    if not proof:
+        return
+    existing = {
+        resource_identity(resource, config["namespace"])
+        for resource in document["resources"]
+    }
+    for item in proof["documents"]:
+        metadata = item["metadata"]
+        resource = {
+            "kind": item["kind"].lower(),
+            "name": metadata["name"],
+            "namespace": metadata["namespace"],
+            "scope": "namespaced",
+            "phase": "support",
+            "order": 20 if item["kind"] == "RoleBinding" else 30,
+            "clean": "delete",
+            "guarded_delete": "workload-rbac",
+        }
+        identity = resource_identity(resource, config["namespace"])
+        if identity in existing:
+            raise RegistryError("workload RBAC duplicates a registered resource")
+        existing.add(identity)
+        document["resources"].append(stamp_provenance(resource))
+    document["workload_rbac"] = proof
+
+
+def _scoped_registered(
+    registered: set[ResourceIdentity] | set[tuple[str, str]], namespace: str
+) -> set[ResourceIdentity]:
+    result: set[ResourceIdentity] = set()
+    for identity in registered:
+        if len(identity) == 2:
+            # Legacy callers have only the selected namespace's registrations.
+            # Their name-only keys must never match another namespace.
+            kind, name = identity
+            cluster_scope = kind in {*CLUSTER_DISCOVERY_KINDS.split(","), "namespace"}
+            result.add(
+                (
+                    "cluster" if cluster_scope else "namespaced",
+                    kind,
+                    None if cluster_scope else namespace,
+                    name,
+                )
+            )
+        else:
+            result.add(identity)
+    return result
 
 
 def discover_unregistered(
@@ -36,9 +105,10 @@ def discover_unregistered(
     plane: str,
     context: str,
     namespace: str,
-    registered: set[tuple[str, str]],
+    registered: set[ResourceIdentity] | set[tuple[str, str]],
 ) -> list[dict[str, Any]]:
     found = []
+    scoped_registered = _scoped_registered(registered, namespace)
     namespaced = kubectl.run(
         [
             "get",
@@ -46,9 +116,44 @@ def discover_unregistered(
             "-A",
             "-o",
             "json",
+            "--request-timeout=15s",
         ]
     )
-    for item in json.loads(namespaced.stdout)["items"]:
+    items = resource_list(namespaced.stdout)
+    for item in items:
+        metadata = item["metadata"]
+        if (
+            item["kind"].lower() not in NAMESPACED_DISCOVERY_KINDS.split(",")
+            or not isinstance(metadata.get("namespace"), str)
+            or not metadata["namespace"]
+        ):
+            raise RegistryError(
+                "namespaced discovery returned an invalid scope or kind"
+            )
+    registered_cronjobs = {
+        (
+            item.get("apiVersion"),
+            item["metadata"]["name"],
+            item["metadata"].get("uid"),
+            item["metadata"].get("namespace"),
+        )
+        for item in items
+        if item.get("kind") == "CronJob"
+        and isinstance(item.get("apiVersion"), str)
+        and item["apiVersion"]
+        and isinstance(item.get("metadata"), dict)
+        and (
+            "namespaced",
+            "cronjob",
+            item["metadata"].get("namespace"),
+            item["metadata"].get("name"),
+        )
+        in scoped_registered
+        and item["metadata"].get("namespace") == namespace
+        and isinstance(item["metadata"].get("uid"), str)
+        and item["metadata"]["uid"]
+    }
+    for item in items:
         metadata = item.get("metadata") or {}
         name = metadata.get("name", "")
         resource_namespace = metadata.get("namespace", "")
@@ -59,13 +164,29 @@ def discover_unregistered(
             "gf-regional-"
         ):
             continue
-        if (kind, name) in registered:
-            continue
-        labels = metadata.get("labels") or {}
-        if (
-            kind in ("role", "rolebinding")
-            and str(labels.get(WORKLOAD_NAMESPACE_RBAC_LABEL, "")).lower() == "true"
-        ):
+        if kind == "job":
+            owners = metadata.get("ownerReferences") or []
+            if (
+                isinstance(owners, list)
+                and len(owners) == 1
+                and isinstance(owners[0], dict)
+                and owners[0].get("kind") == "CronJob"
+                and all(
+                    isinstance(owners[0].get(key), str) and owners[0][key]
+                    for key in ("apiVersion", "name", "uid")
+                )
+                and (
+                    owners[0].get("apiVersion"),
+                    owners[0].get("name"),
+                    owners[0].get("uid"),
+                    resource_namespace,
+                )
+                in registered_cronjobs
+            ):
+                # Exact parent UID covers transient Jobs through garbage collection.
+                # Orphans, recreated parents and multiple owners remain visible.
+                continue
+        if ("namespaced", kind, resource_namespace, name) in scoped_registered:
             continue
         found.append(
             {
@@ -83,13 +204,22 @@ def discover_unregistered(
             CLUSTER_DISCOVERY_KINDS,
             "-o",
             "json",
+            "--request-timeout=15s",
         ]
     )
-    for item in json.loads(cluster.stdout)["items"]:
+    for item in resource_list(cluster.stdout):
         metadata = item.get("metadata") or {}
         name = metadata.get("name", "")
         kind = str(item.get("kind", "")).lower()
-        if not name.startswith("gpu-fault-") or (kind, name) in registered:
+        if (
+            kind not in CLUSTER_DISCOVERY_KINDS.split(",")
+            or metadata.get("namespace") is not None
+        ):
+            raise RegistryError("cluster discovery returned an invalid scope or kind")
+        if (
+            not name.startswith("gpu-fault-")
+            or ("cluster", kind, None, name) in scoped_registered
+        ):
             continue
         found.append(
             {
@@ -101,10 +231,17 @@ def discover_unregistered(
                 "namespace": None,
             }
         )
-    namespaces = kubectl.run(["get", "namespace", "-o", "json"])
-    for item in json.loads(namespaces.stdout)["items"]:
+    namespaces = kubectl.run(
+        ["get", "namespace", "-o", "json", "--request-timeout=15s"]
+    )
+    for item in resource_list(namespaces.stdout):
         name = (item.get("metadata") or {}).get("name", "")
-        if not name.startswith("gf-regional-"):
+        if item["kind"] != "Namespace" or item["metadata"].get("namespace") is not None:
+            raise RegistryError("namespace discovery returned an invalid scope or kind")
+        if (
+            not name.startswith("gf-regional-")
+            or ("cluster", "namespace", None, name) in scoped_registered
+        ):
             continue
         found.append(
             {
@@ -127,71 +264,94 @@ def collect(
 ) -> dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     source = json.loads(inventory_path.read_text(encoding="utf-8"))
+    clusters = config.get("clusters")
+    if (
+        not isinstance(clusters, list)
+        or any(
+            not isinstance(cluster, dict)
+            or not isinstance(cluster.get("context"), str)
+            or not cluster["context"]
+            for cluster in clusters
+        )
+        or len({cluster["context"] for cluster in clusters}) != len(clusters)
+    ):
+        raise RegistryError("GPU registry contexts are missing or ambiguous")
     namespace = config.get("namespace", "gpu-fault-system")
+    config["namespace"] = namespace
     release = config.get("release") or {}
     release_id = str(
         release.get("id") or Path(str(release.get("manifest") or "unknown")).stem
     )
-    cpu_kubectl = Kubectl(
-        kubeconfig=config["cpu_kubeconfig"],
-        context=None,
-        reuse_exec_credential=True,
-    )
-    cpu = synchronize(
-        cpu_kubectl,
-        plane="cpu",
-        namespace=namespace,
-        inventory_path=inventory_path,
-        release_id=release_id,
-        apply=apply,
-    )
-    unregistered = discover_unregistered(
-        cpu_kubectl,
-        plane="cpu",
-        context=config["cpu_kubeconfig"],
-        namespace=namespace,
-        registered={_identity(resource) for resource in cpu["resources"]},
-    )
-    gpu_documents = []
-    for cluster in config["clusters"]:
-        gpu_kubectl = Kubectl(
-            kubeconfig=None,
-            context=cluster["context"],
+    with closing(
+        Kubectl(
+            kubeconfig=config["cpu_kubeconfig"],
+            context=None,
             reuse_exec_credential=True,
         )
-        document = synchronize(
-            gpu_kubectl,
-            plane="gpu",
+    ) as cpu_kubectl:
+        cpu = synchronize(
+            cpu_kubectl,
+            plane="cpu",
             namespace=namespace,
             inventory_path=inventory_path,
             release_id=release_id,
             apply=apply,
         )
-        gpu_documents.append(document)
-        unregistered.extend(
-            discover_unregistered(
+        unregistered = discover_unregistered(
+            cpu_kubectl,
+            plane="cpu",
+            context=config["cpu_kubeconfig"],
+            namespace=namespace,
+            registered={
+                resource_identity(resource, namespace) for resource in cpu["resources"]
+            },
+        )
+    gpu_documents: dict[str, dict[str, Any]] = {}
+    for cluster in clusters:
+        with closing(
+            Kubectl(
+                kubeconfig=None,
+                context=cluster["context"],
+                reuse_exec_credential=True,
+            )
+        ) as gpu_kubectl:
+            document = synchronize(
                 gpu_kubectl,
                 plane="gpu",
-                context=cluster["context"],
                 namespace=namespace,
-                registered={_identity(resource) for resource in document["resources"]},
+                inventory_path=inventory_path,
+                release_id=release_id,
+                apply=apply,
             )
-        )
+            attach_workload_rbac(gpu_kubectl, config, cluster, document)
+            gpu_documents[cluster["context"]] = document
+            unregistered.extend(
+                discover_unregistered(
+                    gpu_kubectl,
+                    plane="gpu",
+                    context=cluster["context"],
+                    namespace=namespace,
+                    registered={
+                        resource_identity(resource, namespace)
+                        for resource in document["resources"]
+                    },
+                )
+            )
     gpu_resources: dict[
-        tuple[str, str],
+        ResourceIdentity,
         dict[str, Any],
     ] = {}
-    for document in gpu_documents:
+    for document in gpu_documents.values():
         for resource in document["resources"]:
-            identity = _identity(resource)
+            identity = resource_identity(resource, namespace)
             existing = gpu_resources.get(identity)
             if existing is not None and existing != resource:
-                raise RuntimeError(
-                    f"GPU installed registries disagree for {identity[0]}/{identity[1]}"
+                raise RegistryError(
+                    "GPU installed registries disagree for a scoped identity"
                 )
             gpu_resources[identity] = resource
 
-    result = {
+    result: dict[str, Any] = {
         "schema_version": 1,
         "generated_by": (
             "deploy/control-plane/tools/collect_installed_resource_registry.py"
@@ -207,6 +367,7 @@ def collect(
                 key: value for key, value in source["gpu"].items() if key != "resources"
             },
             "resources": list(gpu_resources.values()),
+            "by_context": gpu_documents,
         },
         "unregistered_resources": unregistered,
     }
@@ -246,4 +407,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RegistryError as exc:
+        raise SystemExit(f"installed registry collection refused: {exc}") from None

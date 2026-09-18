@@ -39,11 +39,23 @@ class FakeReleaseRollingBackend:
                 }
             },
         }
-        self.cpu_generations = {"gpu-fault-api-ha": 1, "gpu-fault-worker": 1}
+        self.cpu_generations = {
+            "gpu-fault-api-ha": 1,
+            "gpu-fault-control-worker": 1,
+            "gpu-fault-telemetry-spool-worker": 1,
+        }
         # Keyed by the real Deployment names: the executor stage asserts the
         # generation changes are exactly {GPU_EXECUTOR_DEPLOYMENT} per cluster.
         self.gpu_generations = {
-            "cluster-a": {EXECUTOR_DEPLOYMENT: 1, "gpu-fault-completion-watcher": 1}
+            "cluster-a": {
+                name: 1
+                for name in (
+                    EXECUTOR_DEPLOYMENT,
+                    "gpu-fault-completion-watcher",
+                    "gpu-fault-kubernetes-node-resource-collector",
+                    "gpu-fault-node-installer-reconciler",
+                )
+            }
         }
         self.calls = []
         # Every live snapshot costs 20-30 s of kubectl reads, so the runner is
@@ -62,7 +74,13 @@ class FakeReleaseRollingBackend:
                 "full": "FULL",
             }[scenario]
         )
-        return {"kind": kind, "changed": [] if kind == "NOOP" else [scenario]}
+        fields = {
+            "control_plane": "admin_config_worker",
+            "executor": "executor_wheel",
+            "agent": "node_bundle",
+            "full": "runtime_profile",
+        }
+        return {"kind": kind, "changed": [] if kind == "NOOP" else [fields[scenario]]}
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict:
         self.snapshots.append(scenario)
@@ -150,13 +168,15 @@ class FakeReleaseRollingBackend:
             }
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
-            self.cpu_generations = {"gpu-fault-api-ha": 2, "gpu-fault-worker": 2}
+            self.cpu_generations["gpu-fault-control-worker"] = 2
         elif scenario == "executor":
             # The interrupted attempt already staged the CPU side; the resume
             # rolls the executor Deployment and then finalizes the pins, which
             # is the one further CPU rollout (cpu-finalized) every release makes.
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
-            self.gpu_generations["cluster-a"][EXECUTOR_DEPLOYMENT] = 2
+            self.gpu_generations["cluster-a"] = dict.fromkeys(
+                self.gpu_generations["cluster-a"], 2
+            )
             if resume:
                 self.cpu_generations = {
                     name: value + 1 for name, value in self.cpu_generations.items()
@@ -177,7 +197,7 @@ class FakeReleaseRollingBackend:
                     }
                 },
             }
-            self.cpu_generations = {"gpu-fault-api-ha": 3, "gpu-fault-worker": 3}
+            self.cpu_generations = dict.fromkeys(self.cpu_generations, 3)
             self.gpu_generations = {
                 "cluster-a": {EXECUTOR_DEPLOYMENT: 3, "gpu-fault-completion-watcher": 3}
             }
@@ -243,7 +263,10 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
     before = stages["executor_before"]["gpu_generations"]["cluster-a"]
     after = stages["executor_after"]["gpu_generations"]["cluster-a"]
     assert {name for name in after if after[name] != before[name]} == {
-        EXECUTOR_DEPLOYMENT
+        EXECUTOR_DEPLOYMENT,
+        "gpu-fault-completion-watcher",
+        "gpu-fault-kubernetes-node-resource-collector",
+        "gpu-fault-node-installer-reconciler",
     }
     assert stages["control_plane_injected_failure_and_rollback"]["rollback_plan"][
         "global_components"
@@ -411,13 +434,11 @@ def test_boot020_generations_come_from_one_list_per_context() -> None:
     gpu = deployment_generations(
         release,
         _context_args(release.config.clusters[0].context),
-        ("gpu-fault-cluster-action-executor", "gpu-fault-missing"),
+        ("gpu-fault-cluster-action-executor",),
     )
 
     assert cpu == {"gpu-fault-api-ha": 7, "gpu-fault-control-worker": 3}
-    # A Deployment absent from the list reads as generation 0, the same value
-    # the old per-name read fell back to when kubectl returned nothing.
-    assert gpu == {"gpu-fault-cluster-action-executor": 5, "gpu-fault-missing": 0}
+    assert gpu == {"gpu-fault-cluster-action-executor": 5}
     # Exactly one list read per kube context, with the argv the engine's own
     # `prime_deployment_snapshot` uses so a warm read cache answers it.
     assert release.reads == [
@@ -449,11 +470,13 @@ def test_boot020_live_snapshot_reads_once_per_context_inside_one_snapshot(
     ]
     gpu_items = [
         _deployment_item(name, index + 10)
-        for index, name in enumerate(inventory.DEPLOYMENTS)
+        for index, name in enumerate(
+            (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT)
+        )
     ]
     state = {"phase": "complete", "release_id": "rel-1", "previous": {}}
     release = FakeRelease(
-        {"/cpu.kubeconfig": cpu_items, "ctx-a": gpu_items, "ctx-b": gpu_items[:-1]},
+        {"/cpu.kubeconfig": cpu_items, "ctx-a": gpu_items, "ctx-b": gpu_items},
         load_state=lambda: state,
         capture_previous=lambda: {
             "release_id": "rel-1",
@@ -485,13 +508,16 @@ def test_boot020_live_snapshot_reads_once_per_context_inside_one_snapshot(
         },
         "gpu_generations": {
             "cluster-a": {
-                name: index + 10 for index, name in enumerate(inventory.DEPLOYMENTS)
+                name: index + 10
+                for index, name in enumerate(
+                    (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT)
+                )
             },
             "cluster-b": {
-                **{
-                    name: index + 10 for index, name in enumerate(inventory.DEPLOYMENTS)
-                },
-                inventory.DEPLOYMENTS[-1]: 0,
+                name: index + 10
+                for index, name in enumerate(
+                    (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT)
+                )
             },
         },
         "next_deploy": {"kind": "NOOP", "changed": []},
@@ -510,8 +536,17 @@ def test_boot020_live_snapshot_keeps_next_deploy_none_when_it_fails(
     ``next_deploy_error`` and the snapshot recorded ``None``; the direct call
     keeps that recorded value."""
 
+    from gpu_fault_release import regional_deployment_inventory as inventory
+
+    cpu_items = [
+        _deployment_item(name, 1) for name in inventory.CPU_RUNTIME_DEPLOYMENTS
+    ]
+    gpu_items = [
+        _deployment_item(name, 1)
+        for name in (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT)
+    ]
     release = FakeRelease(
-        {"/cpu.kubeconfig": [], "ctx-a": [], "ctx-b": []},
+        {"/cpu.kubeconfig": cpu_items, "ctx-a": gpu_items, "ctx-b": gpu_items},
         load_state=lambda: {"phase": "complete", "release_id": "rel-1"},
         capture_previous=lambda: {"clusters": {}},
     )
@@ -711,3 +746,20 @@ def test_boot020_auto_resume_over_completed_evidence_touches_nothing(
 
     assert result["status"] == "COMPLETED"
     assert second.calls == [], "a completed run must not touch the site to resume"
+
+
+def test_boot020_start_stage_cannot_skip_an_unpassed_terminal_assertion(
+    tmp_path: Path,
+) -> None:
+    recorder = EvidenceRecorder(
+        tmp_path / "case.json",
+        case_id="GF-REGIONAL-BOOT-020",
+        inputs={"configs": "test"},
+    )
+    recorder.stage("noop_after", lambda: {"live": "observed-but-not-validated"})
+    backend = FakeReleaseRollingBackend()
+
+    with pytest.raises(RuntimeError, match="earlier stages"):
+        run_release_rolling(backend, recorder, start_stage="control_plane")
+
+    assert backend.calls == [], "a snapshot without its PASS marker authorizes nothing"

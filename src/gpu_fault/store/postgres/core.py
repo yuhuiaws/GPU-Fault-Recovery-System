@@ -5,6 +5,13 @@ from typing import Any, Iterator, cast
 
 from pydantic import BaseModel
 
+from gpu_fault.store.postgres.state_table_storage import (
+    ENABLED_STATE_KINDS,
+    get_state_payload,
+    list_state_payloads,
+    put_state_fields,
+    put_state_record,
+)
 from gpu_fault.store.shared.errors import (
     NotFoundError,
     StaleWriteError,
@@ -69,6 +76,9 @@ class PostgresCoreMixin:
         deleted -- raises :class:`StaleWriteError` instead of landing.
         """
 
+        if kind in ENABLED_STATE_KINDS:
+            put_state_record(self._db, kind, key, value, expected=expected)
+            return
         if expected is None:
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -128,6 +138,12 @@ class PostgresCoreMixin:
                 raise StaleWriteError(f"{kind}/{key} changed since it was read")
 
     def _delete(self, kind: str, key: str) -> None:
+        if kind in ENABLED_STATE_KINDS:
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    "SELECT gpu_fault_delete_control_state(%s, %s)", (kind, key)
+                )
+            return
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -142,7 +158,21 @@ class PostgresCoreMixin:
             return self._models[kind].model_validate_json(payload)
         return self._models[kind].model_validate(payload)
 
+    def _put_fields(
+        self,
+        kind: str,
+        key: str,
+        value: BaseModel,
+        fields: frozenset[str],
+    ) -> None:
+        if kind in ENABLED_STATE_KINDS:
+            put_state_fields(self._db, kind, key, value, fields)
+        else:
+            self._put(kind, key, value)
+
     def _get(self, kind: str, key: str) -> Any:
+        if kind in ENABLED_STATE_KINDS:
+            return self._decode(kind, get_state_payload(self._db, kind, key))
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -163,6 +193,10 @@ class PostgresCoreMixin:
             raise TransactionRequiredError(
                 f"_get_for_update({kind}/{key}) requires an enclosing transaction"
             )
+        if kind in ENABLED_STATE_KINDS:
+            return self._decode(
+                kind, get_state_payload(self._db, kind, key, for_update=True)
+            )
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -178,6 +212,11 @@ class PostgresCoreMixin:
         return self._decode(kind, row[0])
 
     def _list(self, kind: str) -> list[Any]:
+        if kind in ENABLED_STATE_KINDS:
+            return [
+                self._decode(kind, payload)
+                for payload in list_state_payloads(self._db, kind)
+            ]
         with self._db.cursor() as cursor:
             cursor.execute(
                 """

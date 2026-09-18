@@ -44,8 +44,8 @@ RELATION_LOCKS_SQL = """
 @pytest.fixture(autouse=True)
 def current_schema():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 

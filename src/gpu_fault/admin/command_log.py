@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Iterator, NamedTuple, Sequence, TypeVar
 
+from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
+
 ADMIN_LOG_DIRECTORY = Path("logs")
 ADMIN_LOG_ENVIRONMENT = "GPU_FAULT_ADMIN_LOG"
 ADMIN_LOG_RETAINED = 100
@@ -173,7 +175,7 @@ def command_label(arguments: Sequence[str], *, sensitive: bool = False) -> str:
 
     if sensitive or not arguments:
         return Path(arguments[0]).name if arguments else "<no command>"
-    shown = " ".join(arguments[:COMMAND_LABEL_TOKENS])
+    shown = diagnostic_command(arguments[:COMMAND_LABEL_TOKENS])
     return shown + (" ..." if len(arguments) > COMMAND_LABEL_TOKENS else "")
 
 
@@ -208,7 +210,7 @@ def child_failure(
         message = f"command failed ({returncode}): "
         message += command_label(arguments, sensitive=sensitive)
         if detail:
-            message += f": {detail}"
+            message += f": {diagnostic_text(detail, sensitive=sensitive)}"
         error = error_type(message)
     setattr(error, FAILURE_EXIT_CODE_ATTRIBUTE, int(returncode))
     return error

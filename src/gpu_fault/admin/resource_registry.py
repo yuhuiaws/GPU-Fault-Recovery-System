@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
-import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
@@ -15,6 +13,8 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     tag_map,
 )
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import current_deadline, run_command
 from gpu_fault.admin.grafana import grafana_installation_resources
 from gpu_fault.admin.resource_records import (
     foundation_ownership as _foundation_ownership,
@@ -25,6 +25,14 @@ from gpu_fault.admin.resource_records import record as _record
 from gpu_fault.admin.resource_records import (
     release_repository_resources as _release_repository_resources,
 )
+from gpu_fault.admin.resource_registry_dns import vpc_association_resources
+from gpu_fault.admin.resource_registry_scripts import (
+    DIRECT_SYNC_SCRIPT,
+    FETCH_SCRIPT,
+    LEGACY_REGISTRY_MARKER,
+    SYNC_SCRIPT,
+    UNAVAILABLE_REGISTRY_MARKER,
+)
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -32,85 +40,6 @@ from gpu_fault.installation_resources import (
     InstallationResourceOwnership,
     InstallationResourceSnapshot,
 )
-
-SYNC_SCRIPT = r"""
-import base64
-import json
-import os
-import sys
-import urllib.request
-
-with urllib.request.urlopen(
-    "http://127.0.0.1:8080/openapi.json",
-    timeout=30,
-) as response:
-    paths = json.load(response).get("paths", {})
-if "/v1/installation-resources/sync" not in paths:
-    print("GPU_FAULT_LEGACY_REGISTRY_API", file=sys.stderr)
-    raise SystemExit(44)
-payload = base64.b64decode(os.environ["GPU_FAULT_INSTALLATION_SNAPSHOT"])
-request = urllib.request.Request(
-    "http://127.0.0.1:8080/v1/installation-resources/sync",
-    data=payload,
-    method="POST",
-    headers={
-        "Content-Type": "application/json",
-        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-    },
-)
-with urllib.request.urlopen(request, timeout=30) as response:
-    print(json.dumps(json.load(response), separators=(",", ":")))
-"""
-FETCH_SCRIPT = r"""
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-with urllib.request.urlopen(
-    "http://127.0.0.1:8080/openapi.json",
-    timeout=30,
-) as response:
-    paths = json.load(response).get("paths", {})
-if "/v1/installation-resources" not in paths:
-    print("GPU_FAULT_LEGACY_REGISTRY_API", file=sys.stderr)
-    raise SystemExit(44)
-site = urllib.parse.quote(os.environ["GPU_FAULT_INSTALLATION_SITE_ID"], safe="")
-request = urllib.request.Request(
-    "http://127.0.0.1:8080/v1/installation-resources?site_id=" + site,
-    headers={
-        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-    },
-)
-with urllib.request.urlopen(request, timeout=30) as response:
-    print(json.dumps(json.load(response), separators=(",", ":")))
-"""
-DIRECT_SYNC_SCRIPT = r'''
-import base64
-import json
-import os
-
-import psycopg
-
-resources = json.loads(
-    base64.b64decode(os.environ["GPU_FAULT_INSTALLATION_SNAPSHOT"])
-)
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
-    with connection.cursor() as cursor:
-        for resource in resources["resources"]:
-            key = resource["site_id"] + "/" + resource["resource_key"]
-            cursor.execute(
-                """
-                INSERT INTO gpu_fault_objects(kind, key, payload)
-                VALUES ('installation_resource', %s, %s::jsonb)
-                ON CONFLICT(kind, key)
-                DO UPDATE SET payload=excluded.payload
-                """,
-                (key, json.dumps(resource, separators=(",", ":"))),
-            )
-print(len(resources["resources"]))
-'''
 
 
 class LegacyInstallationRegistryMissing(BootstrapError):
@@ -371,11 +300,20 @@ def _pki_resources(
     account_id: str,
     config: Mapping[str, Any],
     state: Mapping[str, Any],
+    existing_resources: list[InstallationResource],
 ) -> list[InstallationResource]:
     resources: list[InstallationResource] = []
     pki = state.get("pki") or {}
     dns = config.get("dns") or {}
+    if not isinstance(pki, Mapping) or not isinstance(dns, Mapping):
+        raise BootstrapError("Route53 checkpoint or site DNS configuration is invalid")
     zone_id = pki.get("hosted_zone_id") or dns.get("hosted_zone_id")
+    if (
+        pki.get("hosted_zone_id")
+        and dns.get("hosted_zone_id")
+        and pki["hosted_zone_id"] != dns["hosted_zone_id"]
+    ):
+        raise BootstrapError("Route53 checkpoint hosted zone differs from the site")
     zone_ownership = _ownership(
         pki.get("zone_ownership"),
         default=(
@@ -417,37 +355,16 @@ def _pki_resources(
                 },
             )
         )
-    for index, association in enumerate(pki.get("vpc_associations") or (), 1):
-        ownership = _ownership(
-            association.get("ownership"),
-            default=InstallationResourceOwnership.CREATED,
+    resources.extend(
+        vpc_association_resources(
+            site_id=site_id,
+            region=region,
+            account_id=account_id,
+            hosted_zone_id=zone_id,
+            state=state,
+            existing_resources=existing_resources,
         )
-        if zone_ownership is InstallationResourceOwnership.CREATED:
-            continue
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key=f"aws/route53/vpc-association/{index}",
-                resource_type="route53_vpc_association",
-                resource_id=(
-                    f"{zone_id}:{association.get('vpc_region')}:"
-                    f"{association.get('vpc_id')}"
-                ),
-                region=region,
-                account_id=account_id,
-                ownership=ownership,
-                delete_policy=_policy(
-                    ownership,
-                    created=InstallationResourceDeletePolicy.DETACH,
-                ),
-                dependencies=["aws/route53/zone"],
-                attributes={
-                    "hosted_zone_id": zone_id,
-                    "vpc_id": association.get("vpc_id"),
-                    "vpc_region": association.get("vpc_region"),
-                },
-            )
-        )
+    )
     certificate = pki.get("certificate_arn") or config["nlb"].get("certificate_arn")
     if certificate:
         ownership = _ownership(
@@ -960,12 +877,26 @@ def build_installation_snapshot(
     site: RenderedSite,
     bootstrap: Mapping[str, Any] | None,
     runtime: Mapping[str, Any] | None = None,
+    *,
+    existing: InstallationResourceSnapshot | None = None,
 ) -> InstallationResourceSnapshot:
     config = site.release_config
-    site_id = str(config["site_name"])
+    site_id = site.registry_site_id
     region = str(config["aws_region"])
     account_id = Arn.parse(str(config["cpu_eks_arn"])).account
     state = (bootstrap or {}).get("resources") or {}
+    if not isinstance(state, Mapping) or not isinstance(
+        state.get("pki") or {}, Mapping
+    ):
+        raise BootstrapError("bootstrap resource inventory is invalid")
+    if existing is not None:
+        existing.require_source_binding()
+        if existing.site_id != site_id:
+            raise BootstrapError("installation registry belongs to another site")
+    if (state.get("pki") or {}).get("vpc_associations") and (
+        (bootstrap or {}).get("site_id") != config["site_name"]
+    ):
+        raise BootstrapError("Route53 bootstrap inventory is not bound to this site")
     runtime_resources = runtime or {}
     resources = _external_clusters(
         site,
@@ -998,6 +929,7 @@ def build_installation_snapshot(
             account_id=account_id,
             config=config,
             state=state,
+            existing_resources=existing.resources if existing is not None else [],
         )
     )
     resources.extend(
@@ -1035,25 +967,28 @@ def build_installation_snapshot(
         )
     )
     snapshot = InstallationResourceSnapshot(site_id=site_id, resources=resources)
-    return cast(
-        InstallationResourceSnapshot,
-        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
-    )
+    return snapshot.model_copy(update={"source_sha256": snapshot.digest()})
 
 
 def _aws_json(region: str, *arguments: str) -> dict[str, Any]:
-    completed = subprocess.run(
+    completed = run_command(
         ["aws", *arguments, "--region", region, "--output", "json"],
-        text=True,
-        capture_output=True,
     )
     if completed.returncode:
         operation = " ".join(arguments[:2])
         raise BootstrapError(
             f"failed to discover deployed AWS resource ({operation}): "
-            f"{completed.stderr.strip()}"
+            f"{diagnostic_text(completed.stderr.strip())}"
         )
-    return cast(dict[str, Any], json.loads(completed.stdout or "{}"))
+    try:
+        value = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise BootstrapError(
+            "deployed AWS resource discovery returned invalid JSON"
+        ) from None
+    if not isinstance(value, dict):
+        raise BootstrapError("deployed AWS resource discovery returned no object")
+    return value
 
 
 def discover_runtime_resources(site: RenderedSite) -> dict[str, Any]:
@@ -1103,7 +1038,7 @@ def discover_runtime_resources(site: RenderedSite) -> dict[str, Any]:
 
 
 def _cpu_pod(site: RenderedSite) -> str:
-    result = subprocess.run(
+    result = run_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -1118,8 +1053,7 @@ def _cpu_pod(site: RenderedSite) -> str:
             "-o",
             "jsonpath={.items[0].metadata.name}",
         ],
-        text=True,
-        capture_output=True,
+        timeout_seconds=30,
     )
     pod = (result.stdout or "").strip()
     if result.returncode or not pod:
@@ -1140,6 +1074,8 @@ def write_installation_resource_snapshot(
     *,
     path: Path | None = None,
 ) -> Path:
+    if snapshot.site_id != site.registry_site_id:
+        raise BootstrapError("installation registry snapshot belongs to another site")
     target = path or site.source.parent / "installation-resources.json"
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     payload = json.dumps(
@@ -1162,39 +1098,61 @@ def load_installation_resource_snapshot(path: Path) -> InstallationResourceSnaps
     digest_path = path.with_suffix(path.suffix + ".sha256")
     if not path.is_file() or not digest_path.is_file():
         raise BootstrapError(f"installation registry snapshot is incomplete: {path}")
-    expected = digest_path.read_text(encoding="utf-8").split()[0]
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    fields = digest_path.read_text(encoding="utf-8").split()
+    if not fields:
+        raise BootstrapError(f"installation registry snapshot digest is empty: {path}")
+    expected = fields[0]
+    payload = path.read_bytes()
+    actual = hashlib.sha256(payload).hexdigest()
     if actual != expected:
         raise BootstrapError(f"installation registry snapshot digest mismatch: {path}")
-    snapshot = cast(
-        InstallationResourceSnapshot,
-        InstallationResourceSnapshot.model_validate_json(
-            path.read_text(encoding="utf-8")
-        ),
-    )
-    # M-12: the on-disk digest above proves the file is intact; this proves the
-    # snapshot's own provenance seal matches its payload, so an unsealed or
-    # reseated snapshot can never be trusted as installed state.
-    snapshot.require_source_binding()
+    try:
+        snapshot = InstallationResourceSnapshot.model_validate_json(payload)
+        snapshot.require_source_binding()
+    except ValueError:
+        raise BootstrapError("installation registry snapshot is invalid") from None
+    # These digests detect corruption; callers must also bind the snapshot to
+    # the intended site and verify live ownership before destructive actions.
     return snapshot
 
 
 def find_bootstrap_state(site: RenderedSite) -> dict[str, Any] | None:
     site_id = str(site.release_config["site_name"])
     candidates = [site.source.parent / "bootstrap-state.json"]
-    candidates.extend(
-        sorted((Path.home() / ".gpu-fault/bootstrap").glob("*/bootstrap-state.json"))
-    )
+    if site.registry_site_id != site_id:
+        if not candidates[0].is_file():
+            raise BootstrapError("current installation bootstrap inventory is missing")
+    else:
+        candidates.extend(
+            sorted(
+                (Path.home() / ".gpu-fault/bootstrap").glob("*/bootstrap-state.json")
+            )
+        )
     matches = []
     for path in candidates:
         if not path.is_file():
             continue
-        document = cast(
-            dict[str, Any],
-            json.loads(path.read_text(encoding="utf-8")),
-        )
-        if document.get("site_id") == site_id:
-            matches.append((path.resolve(), document))
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise BootstrapError("bootstrap state must be an object")
+        if document.get("site_id") != site_id:
+            if path == candidates[0]:
+                raise BootstrapError("local bootstrap state belongs to another site")
+            continue
+        resources = document.get("resources")
+        if not isinstance(resources, dict):
+            raise BootstrapError("bootstrap state resource inventory is invalid")
+        target = resources.get("initial_deploy_target")
+        if target is not None:
+            cpu = target.get("cpu") if isinstance(target, dict) else None
+            if (
+                not isinstance(cpu, dict)
+                or cpu.get("eks_arn") != site.release_config["cpu_eks_arn"]
+                or cpu.get("hyperpod_name")
+                != site.release_config["cpu_hyperpod_cluster_name"]
+            ):
+                raise BootstrapError("bootstrap state CPU identity does not match site")
+        matches.append((path.resolve(), document))
     unique = {path: document for path, document in matches}
     if not unique:
         return None
@@ -1356,7 +1314,9 @@ def sync_installation_resource_snapshot(
     site: RenderedSite,
     snapshot: InstallationResourceSnapshot,
 ) -> None:
-    encoded = base64.b64encode(_snapshot_payload(snapshot)).decode()
+    snapshot.require_source_binding()
+    if snapshot.site_id != site.registry_site_id:
+        raise BootstrapError("installation registry snapshot belongs to another site")
     command = [
         "kubectl",
         "--kubeconfig",
@@ -1364,40 +1324,46 @@ def sync_installation_resource_snapshot(
         "-n",
         site.release_config["namespace"],
         "exec",
+        "-i",
         _cpu_pod(site),
         "--",
-        "env",
-        f"GPU_FAULT_INSTALLATION_SNAPSHOT={encoded}",
         "python",
         "-c",
         SYNC_SCRIPT,
     ]
     delays = (2, 4, 8)
     for attempt in range(len(delays) + 1):
-        result = subprocess.run(
+        result = run_command(
             command,
-            text=True,
-            capture_output=True,
-            check=False,
+            input_text=_snapshot_payload(snapshot).decode(),
+            timeout_seconds=90,
         )
         if result.returncode == 0:
+            saved = _read_registry_snapshot(site, result.stdout)
+            if {item.resource_key: item for item in saved.resources} != {
+                item.resource_key: item for item in snapshot.resources
+            }:
+                raise BootstrapError(
+                    "installation registry synchronization proof differs"
+                )
             return
-        message = (result.stdout or "") + "\n" + (result.stderr or "")
-        if (
-            "GPU_FAULT_LEGACY_REGISTRY_API" in message
-            or "HTTP Error 404" in message
-            or "404 Not Found" in message
-        ):
+        if result.returncode == 44 and result.stdout.strip() == LEGACY_REGISTRY_MARKER:
             raise LegacyInstallationRegistryMissing(
                 "control plane predates the installation resource registry API"
             )
-        if "HTTP Error 503" not in message:
+        if (
+            result.returncode != 75
+            or result.stdout.strip() != UNAVAILABLE_REGISTRY_MARKER
+        ):
             raise BootstrapError(
                 "installation registry synchronization failed: "
-                + (result.stderr or "").strip()
+                + diagnostic_text((result.stderr or "").strip())
             )
         if attempt < len(delays):
-            time.sleep(delays[attempt])
+            budget = current_deadline()
+            time.sleep(
+                min(delays[attempt], budget.remaining()) if budget else delays[attempt]
+            )
     sync_installation_resource_snapshot_direct(site, snapshot)
 
 
@@ -1405,8 +1371,10 @@ def sync_installation_resource_snapshot_direct(
     site: RenderedSite,
     snapshot: InstallationResourceSnapshot,
 ) -> None:
-    encoded = base64.b64encode(_snapshot_payload(snapshot)).decode()
-    result = subprocess.run(
+    snapshot.require_source_binding()
+    if snapshot.site_id != site.registry_site_id:
+        raise BootstrapError("installation registry snapshot belongs to another site")
+    result = run_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -1414,41 +1382,70 @@ def sync_installation_resource_snapshot_direct(
             "-n",
             site.release_config["namespace"],
             "exec",
+            "-i",
             _cpu_pod(site),
             "--",
-            "env",
-            f"GPU_FAULT_INSTALLATION_SNAPSHOT={encoded}",
             "python",
             "-c",
             DIRECT_SYNC_SCRIPT,
         ],
-        text=True,
-        capture_output=True,
+        input_text=_snapshot_payload(snapshot).decode(),
+        timeout_seconds=900,
     )
     if result.returncode:
         raise BootstrapError(
             "direct Aurora registry synchronization failed: "
-            + (result.stderr or "").strip()
+            + diagnostic_text((result.stderr or "").strip())
         )
+    if result.stdout.strip() != str(len(snapshot.resources)):
+        raise BootstrapError("direct Aurora registry synchronization proof is invalid")
 
 
 def sync_installation_resource_registry(site: RenderedSite) -> Path:
     bootstrap = find_bootstrap_state(site)
+    existing = None
+    if (((bootstrap or {}).get("resources") or {}).get("pki") or {}).get(
+        "vpc_associations"
+    ):
+        existing = fetch_installation_resource_registry(site, allow_empty=True)
     snapshot = build_installation_snapshot(
         site,
         bootstrap,
         discover_runtime_resources(site),
+        existing=existing,
     )
     sync_installation_resource_snapshot(site, snapshot)
     return write_installation_resource_snapshot(site, snapshot)
+
+
+def _read_registry_snapshot(
+    site: RenderedSite, output: str
+) -> InstallationResourceSnapshot:
+    try:
+        rows = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        raise BootstrapError("installation registry returned invalid JSON") from None
+    if not isinstance(rows, list):
+        raise BootstrapError("installation registry returned no resource list")
+    try:
+        snapshot = InstallationResourceSnapshot(
+            site_id=site.registry_site_id,
+            resources=[InstallationResource.model_validate(item) for item in rows],
+        )
+    except ValueError:
+        raise BootstrapError(
+            "installation registry returned invalid resources"
+        ) from None
+    return snapshot.model_copy(update={"source_sha256": snapshot.digest()})
 
 
 def fetch_installation_resource_registry(
     site: RenderedSite,
     *,
     output: Path | None = None,
+    allow_empty: bool = False,
 ) -> InstallationResourceSnapshot:
-    result = subprocess.run(
+    result = run_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -1459,43 +1456,26 @@ def fetch_installation_resource_registry(
             _cpu_pod(site),
             "--",
             "env",
-            ("GPU_FAULT_INSTALLATION_SITE_ID=" + str(site.release_config["site_name"])),
+            ("GPU_FAULT_INSTALLATION_SITE_ID=" + site.registry_site_id),
             "python",
             "-c",
             FETCH_SCRIPT,
         ],
-        text=True,
-        capture_output=True,
-        check=False,
+        timeout_seconds=90,
     )
     if result.returncode:
-        message = (result.stdout or "") + "\n" + (result.stderr or "")
-        if (
-            "GPU_FAULT_LEGACY_REGISTRY_API" in message
-            or "HTTP Error 404" in message
-            or "404 Not Found" in message
-        ):
+        if result.returncode == 44 and result.stdout.strip() == LEGACY_REGISTRY_MARKER:
             raise LegacyInstallationRegistryMissing(
                 "control plane predates the installation resource registry API"
             )
         raise BootstrapError(
-            "installation registry fetch failed: " + (result.stderr or "").strip()
+            "installation registry fetch failed: "
+            + diagnostic_text((result.stderr or "").strip())
         )
-    resources = [
-        InstallationResource.model_validate(item)
-        for item in json.loads(result.stdout or "[]")
-    ]
-    if not resources:
+    snapshot = _read_registry_snapshot(site, result.stdout)
+    if not snapshot.resources and not allow_empty:
         raise LegacyInstallationRegistryMissing(
             "Aurora installation resource registry is empty"
         )
-    snapshot = InstallationResourceSnapshot(
-        site_id=str(site.release_config["site_name"]),
-        resources=resources,
-    )
-    snapshot = cast(
-        InstallationResourceSnapshot,
-        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
-    )
     write_installation_resource_snapshot(site, snapshot, path=output)
     return snapshot

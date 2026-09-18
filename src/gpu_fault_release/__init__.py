@@ -27,6 +27,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
+import yaml  # type: ignore[import-untyped,unused-ignore]
+
 REPOSITORY_ROOT_ENV = "GPU_FAULT_REPOSITORY_ROOT"
 STATE_DIR_BINDING = "gpu-fault-managed-state-dir.json"
 _ANCHORS = ("deploy/control-plane/regional", "scripts")
@@ -36,13 +38,30 @@ def _is_repository(path: Path) -> bool:
     return all((path / anchor).is_dir() for anchor in _ANCHORS)
 
 
+def containing_repository_root(path: Path) -> Path | None:
+    """Locate the canonical source tree containing a manifest or other path.
+
+    Require the rollout entrypoint, as site loading does, not just directory
+    names. This locates inputs; it does not authenticate a release.
+    """
+
+    path = path.resolve()
+    for candidate in (path, *path.parents):
+        entrypoint = (
+            candidate / "deploy/control-plane/regional/rollout-regional-release.sh"
+        )
+        if _is_repository(candidate) and entrypoint.is_file():
+            return candidate
+    return None
+
+
 def _bound_repository_root(prefix: Path) -> Path | None:
     """The bound site's ``spec.repositoryRoot`` for an installed copy.
 
     The deploy-host install binds its venv to one managed state directory
     (``<prefix>/gpu-fault-managed-state-dir.json``); that directory's
-    ``site.yaml`` names the release snapshot the site runs. Read with the
-    standard library only: this runs at import time, before anything else.
+    ``site.yaml`` names the release snapshot the site runs. Read only that
+    locator here; full site validation belongs to the administrator entry point.
     """
 
     binding = prefix / STATE_DIR_BINDING
@@ -54,15 +73,21 @@ def _bound_repository_root(prefix: Path) -> Path | None:
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    site = state_dir / "site.yaml"
-    if not site.is_file():
+    try:
+        site = (state_dir / "site.yaml").resolve()
+        if not site.is_file():
+            return None
+        document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
         return None
-    for line in site.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("repositoryRoot:"):
-            value = stripped.split(":", 1)[1].strip().strip("'\"")
-            return Path(value) if value else None
-    return None
+    spec = document.get("spec") if isinstance(document, dict) else None
+    if not isinstance(spec, dict):
+        return None
+    value = spec.get("repositoryRoot")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = Path(value.strip()).expanduser()
+    return candidate if candidate.is_absolute() else site.parent / candidate
 
 
 def resolve_repository_root(

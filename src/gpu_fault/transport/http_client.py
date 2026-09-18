@@ -134,6 +134,9 @@ class _KeepAliveConnectionPool:
         if reused is not None:
             try:
                 return self._exchange(reused, request, key, path, headers, timeout)
+            except HTTPError:
+                # A received response is not a broken keep-alive connection.
+                raise
             except (HTTPException, OSError) as exc:
                 reused.close()
                 if not self._retryable_request(request, headers):
@@ -149,6 +152,8 @@ class _KeepAliveConnectionPool:
         )
         try:
             return self._exchange(connection, request, key, path, headers, timeout)
+        except HTTPError:
+            raise
         except HTTPException as exc:
             connection.close()
             raise URLError(exc) from exc

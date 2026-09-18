@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_images import (
+    capture_previous_image_identity,
+    previous_node_installer_image,
+    require_consistent_images as require_consistent_images,
+    require_digest_pinned_image as require_digest_pinned_image,
+)
+
 import copy
 import hashlib
 import json
@@ -10,6 +17,7 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,20 +37,21 @@ from gpu_fault.release_state_snapshot import (
     validate_snapshot_config_map,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_observability_rollback import (
+    capture_previous_monitoring,
+)
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
 )
 from gpu_fault_release.regional_release_history import record_release_history
-from gpu_fault_release.regional_release_images import (
-    previous_node_installer_image,
-    require_consistent_images,
-)
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
+from gpu_fault_release.regional_release_node_snapshot import capture_installer_snapshot
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 PREVIOUS_SNAPSHOT_LABEL = "gpu-fault.io/release-previous-snapshot"
@@ -328,9 +337,11 @@ def prime_deployment_snapshot(
             )
         )
     with ThreadPoolExecutor(max_workers=min(8, len(commands))) as executor:
-        for future in (
-            executor.submit(release._get_json, command) for command in commands
-        ):
+        futures = [
+            executor.submit(copy_context().run, release._get_json, command)
+            for command in commands
+        ]
+        for future in futures:
             future.result()
 
 
@@ -493,23 +504,6 @@ def template_container_image(
                 image = str(container.get("image") or "").strip()
                 return image or None
     return None
-
-
-def require_digest_pinned_image(description: str, image: str | None) -> str:
-    """Reject any image reference that is not pinned to an immutable digest.
-
-    A mutable tag (`:latest`, `:v1`, ...) can be re-pointed after a plan is
-    approved, so every image that reaches a release/rollback/resume sink must
-    carry a `...@sha256:<64hex>` digest. Returns the stripped, verified value.
-    """
-
-    text = str(image or "").strip()
-    if not DIGEST_IMAGE.fullmatch(text):
-        raise ReleaseError(
-            f"{description} image is not digest-pinned "
-            f"(expected ...@sha256:<64 hex chars>): {text or '<empty>'}"
-        )
-    return text
 
 
 def config_map_binary_key(
@@ -675,8 +669,13 @@ def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
 def capture_gpu_cluster_snapshot(
     release: Any,
     target: ClusterTarget,
+    *,
+    live_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str | None], str | None]:
-    template = release._deployment_template_name(target)
+    if live_state is None:
+        live_state = _live_truth_state(dict(release.state))
+    installer = capture_installer_snapshot(release, target, live_state)
+    bundle_name = installer.bundle
     executor_wheel = release._deployment_wheel(
         release._gpu(target),
         inventory.GPU_EXECUTOR_DEPLOYMENT,
@@ -684,36 +683,6 @@ def capture_gpu_cluster_snapshot(
     reconciler_wheel = release._deployment_wheel(
         release._gpu(target),
         inventory.GPU_RECONCILER_DEPLOYMENT,
-    )
-    bundle_name = release._template_bundle(target, template) if template else None
-    template_sha256 = deployment_env_value(
-        release,
-        release._gpu(target),
-        inventory.GPU_RECONCILER_DEPLOYMENT,
-        "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
-    )
-    template_text = None
-    if template:
-        template_value = release._get_json(
-            release._gpu(
-                target,
-                "-n",
-                release.config.namespace,
-                "get",
-                "configmap",
-                template,
-            )
-        )
-        template_text = (template_value.get("data") or {}).get("job.yaml")
-        if template_text and not template_sha256:
-            template_sha256 = hashlib.sha256(template_text.encode()).hexdigest()
-    installer_image = (
-        template_container_image(
-            template_text,
-            container_name="installer",
-        )
-        if template_text
-        else None
     )
     runtime_images = {
         f"{target.cluster_id}/{deployment}": deployment_image(
@@ -739,6 +708,10 @@ def capture_gpu_cluster_snapshot(
         if bundle_name
         else None
     )
+    if installer.bundle_pin is not None and installer.bundle_pin != bundle_sha256:
+        raise ReleaseError(
+            f"{target.cluster_id} previous bundle disagrees with Reconciler trusted pin"
+        )
     snapshot = {
         "wheel": executor_wheel,
         "wheel_key": release._config_map_binary_key(
@@ -750,8 +723,9 @@ def capture_gpu_cluster_snapshot(
             release._gpu(target),
             reconciler_wheel,
         ),
-        "template": template,
-        "template_sha256": template_sha256,
+        "template": installer.template,
+        "template_sha256": installer.template_sha256,
+        "template_content_sha256": installer.template_content_sha256,
         "bundle": bundle_name,
         "bundle_key": bundle_key,
         "bundle_sha256": bundle_sha256,
@@ -773,7 +747,7 @@ def capture_gpu_cluster_snapshot(
             .get("image")
         ),
     }
-    return snapshot, runtime_images, installer_image
+    return snapshot, runtime_images, installer.installer_image
 
 
 def _map_clusters(
@@ -795,7 +769,10 @@ def _map_clusters(
     with ThreadPoolExecutor(
         max_workers=min(MAX_CAPTURE_WORKERS, len(selected))
     ) as pool:
-        futures = [(target, pool.submit(read, target)) for target in selected]
+        futures = [
+            (target, pool.submit(copy_context().run, read, target))
+            for target in selected
+        ]
         results: list[tuple[ClusterTarget, Any]] = []
         errors: list[tuple[str, Exception]] = []
         for target, future in futures:
@@ -821,6 +798,11 @@ _ROLLED_BACK_TRUTH_KEYS = (
     "release_delivery_sha256",
     "rendered_manifest_sha256",
     "node_template_sha256",
+    "release_manifest_schema_version",
+    "runtime_image",
+    "executor_image",
+    "node_dependencies",
+    "aurora_refresh_manifest_sha256",
 )
 
 
@@ -871,56 +853,44 @@ def _capture_previous(
         for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
     }
     node_installer_images: dict[str, str | None] = {}
+    executor_images: dict[str, str | None] = {}
     # Every cluster snapshot is read-only and scoped to its own GPU cluster, so
     # the captures run concurrently and the results are merged in cluster order
     # to keep the snapshot byte-stable.
     for target, (snapshot, target_images, installer_image) in _map_clusters(
         release,
-        lambda target: capture_gpu_cluster_snapshot(release, target),
+        lambda target: capture_gpu_cluster_snapshot(
+            release, target, live_state=live_state
+        ),
         targets=release.config.clusters if capture_gpu else (),
         failure="previous-state capture",
     ):
         clusters[target.cluster_id] = snapshot
-        runtime_images.update(target_images)
+        executor_images.update(target_images)
         node_installer_images[target.cluster_id] = installer_image
-    live_runtime_image = require_consistent_images("runtime", runtime_images)
-    runtime_image = live_runtime_image
-    adopted_live_runtime_image = str(
-        live_state.get("adopted_live_runtime_image") or ""
-    ).strip()
-    rollback_runtime_image = str(live_state.get("runtime_image") or "").strip()
-    if adopted_live_runtime_image:
-        if live_runtime_image != adopted_live_runtime_image:
-            raise ReleaseError(
-                "live runtime image drifted after legacy release-state adoption"
-            )
-        if not DIGEST_IMAGE.fullmatch(rollback_runtime_image):
-            raise ReleaseError(
-                "legacy release-state adoption has no immutable rollback runtime image"
-            )
-        runtime_image = rollback_runtime_image
+    live_runtime_image, runtime_image, executor_image = capture_previous_image_identity(
+        live_state,
+        cpu_images=runtime_images,
+        executor_images=executor_images,
+        capture_gpu=capture_gpu,
+    )
     node_installer_image = previous_node_installer_image(
         capture_gpu=capture_gpu,
         images=node_installer_images,
         recorded=str(live_state.get("node_installer_image") or ""),
         configured=str(getattr(release, "node_installer_image", "") or ""),
     )
-    adot_image = (
-        deployment_image(
-            release,
-            release._cpu(),
-            "gpu-fault-adot",
-            container_name="collector",
-        )
-        if capture_observability_state
-        else str(live_state.get("adot_image") or release.adot_image)
+    observability, adot_image = capture_previous_monitoring(
+        release,
+        live_state,
+        capture=capture_observability_state,
+        cpu_image=lambda: deployment_image(
+            release, release._cpu(), "gpu-fault-adot", container_name="collector"
+        ),
+        pinned_image=require_digest_pinned_image,
     )
-    if not adot_image:
-        raise ReleaseError(
-            "cannot capture previous ADOT image from deployment/gpu-fault-adot"
-        )
     agent_identities: dict[str, dict[str, Any]] = {}
-    if capture_gpu:
+    if capture_gpu and release.config.clusters:
         capture_identities = getattr(release, "_capture_agent_identities", None)
         agent_identities = (
             capture_identities()
@@ -952,25 +922,18 @@ def _capture_previous(
         if capture_cpu
         else AdminConfig.from_mapping(live_state.get("admin_config") or {})
     )
-    capture_observability_fn = getattr(
-        release,
-        "_capture_observability_snapshot",
-        None,
-    )
-    observability = (
-        capture_observability_fn()
-        if capture_observability_fn is not None and capture_observability_state
-        else None
-    )
-    # The endpoint has to be read before the endpoint component overwrites it:
-    # the previous NLB Service only exists as a file in the previous checkout,
-    # and the Route53 record is gone the moment `ensure_control_plane_dns`
-    # UPSERTs the candidate's. Captured here, beside the observability snapshot,
-    # for the same reason and at the same point.
+    # Capture versioned resources before applying candidate manifests.
     capture_endpoint_fn = getattr(release, "_capture_endpoint_snapshot", None)
     endpoint = (
         capture_endpoint_fn()
         if capture_endpoint_fn is not None and capture_endpoint_state
+        else None
+    )
+    capture_refresh = getattr(release, "_capture_aurora_refresh_snapshot", None)
+    aurora_refresh = (
+        capture_refresh()
+        if capture_refresh is not None
+        and (plan is None or plan.has(ReleaseComponent.AURORA_REFRESH))
         else None
     )
     cpu_wheel = (
@@ -1012,14 +975,23 @@ def _capture_previous(
             remote.get("executor_internal_error_total", 0) or 0
         ),
         "release_delivery_sha256": live_state.get("release_delivery_sha256"),
+        "aurora_refresh_manifest_sha256": live_state.get(
+            "aurora_refresh_manifest_sha256"
+        ),
         "rendered_manifest_sha256": live_state.get("rendered_manifest_sha256"),
         "node_template_sha256": live_state.get("node_template_sha256"),
         "live_runtime_image": live_runtime_image,
         "runtime_image": runtime_image,
+        "executor_image": executor_image,
+        "release_manifest_schema_version": int(
+            live_state.get("release_manifest_schema_version") or 3
+        ),
+        "node_dependencies": copy.deepcopy(live_state.get("node_dependencies")),
         "node_installer_image": node_installer_image,
         "adot_image": adot_image,
         "observability": observability,
         "endpoint": endpoint,
+        "aurora_refresh": aurora_refresh,
         "clusters": clusters,
     }
     timestamp_field = "executor_internal_error_last_seen_timestamp_seconds"
@@ -1077,18 +1049,18 @@ def ensure_previous_snapshot(
             chunks,
             strict=True,
         ):
-            exists = release.runner.probe(
-                release._cpu(
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "configmap",
-                    name,
-                ),
-            )
-            if exists:
-                current = _snapshot_config_map(release, name)
-                annotations = (current.get("metadata") or {}).get("annotations") or {}
+            current = probe_resource(
+                release.runner,
+                release._cpu(),
+                ResourceRef("configmap", "ConfigMap", name, release.config.namespace),
+            ).require_readable()
+            if current is not None:
+                metadata = current.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise ReleaseError("previous snapshot metadata is invalid")
+                annotations = metadata.get("annotations") or {}
+                if not isinstance(annotations, dict):
+                    raise ReleaseError("previous snapshot annotations are invalid")
                 if (
                     current.get("immutable") is not True
                     or annotations.get(PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION)
@@ -1360,44 +1332,28 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
                 "rollback_parallel_min_nodes": 6,
             },
             "release_delivery_sha256": (release.config.release_delivery_sha256),
-            "cpu_manifest_sha256": (
-                release.config.delivery_component_digests.get("cpu")
-            ),
-            "cpu_ingress_manifest_sha256": (
-                release.config.delivery_component_digests.get("cpu_ingress")
-            ),
-            "cpu_worker_manifest_sha256": (
-                release.config.delivery_component_digests.get("cpu_worker")
-            ),
-            "cpu_spool_manifest_sha256": (
-                release.config.delivery_component_digests.get("cpu_spool")
-            ),
-            "executor_manifest_sha256": (
-                release.config.delivery_component_digests.get("executor")
-            ),
-            "watcher_manifest_sha256": (
-                release.config.delivery_component_digests.get("watcher")
-            ),
-            "collector_manifest_sha256": (
-                release.config.delivery_component_digests.get("collector")
-            ),
-            "dcgm_manifest_sha256": (
-                release.config.delivery_component_digests.get("dcgm")
-            ),
-            "node_manifest_sha256": (
-                release.config.delivery_component_digests.get("node")
-            ),
-            "observability_manifest_sha256": (
-                release.config.delivery_component_digests.get("observability")
-            ),
+            **{
+                f"{name}_manifest_sha256": release.config.delivery_component_digests.get(
+                    name
+                )
+                for name in (
+                    "aurora_refresh",
+                    "cpu",
+                    "cpu_ingress",
+                    "cpu_worker",
+                    "cpu_spool",
+                    "executor",
+                    "watcher",
+                    "collector",
+                    "dcgm",
+                    "node",
+                    "observability",
+                    "schema",
+                    "endpoint",
+                )
+            },
             "observability_rules_sha256": release.observability_rules_digest,
             "observability_adot_sha256": release.observability_adot_digest,
-            "schema_manifest_sha256": (
-                release.config.delivery_component_digests.get("schema")
-            ),
-            "endpoint_manifest_sha256": (
-                release.config.delivery_component_digests.get("endpoint")
-            ),
             "rendered_manifest_sha256": release.rendered_manifest_digest,
             # The rendered-manifest digest the in-progress transaction was first
             # planned against (M-23). Sticky across resume checkpoints: the
@@ -1412,6 +1368,12 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
             ),
             "node_template_sha256": release.node_template_sha,
             "runtime_image": release.runtime_image,
+            "executor_image": release.executor_image,
+            "node_dependencies": copy.deepcopy(
+                release.config.release_delivery_identity.get("images", {}).get(
+                    "node_dependencies"
+                )
+            ),
             "node_installer_image": release.node_installer_image,
             "dcgm_image": release.dcgm_exporter_image,
             "adot_image": release.adot_image,

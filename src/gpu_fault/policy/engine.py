@@ -753,21 +753,21 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             if decode.xid != event.xid:
                 continue
             pattern = decode.v1_pattern if is_v1 else decode.v2_pattern
-            if not self._pattern_matches(event.intr_info, pattern):
+            action2_pattern = (
+                decode.action2_v1_pattern if is_v1 else decode.action2_v2_pattern
+            )
+            secondary = (
+                action2_pattern
+                and self._pattern_matches(event.intr_info, action2_pattern)
+                and decode.action2
+            )
+            if not (secondary or self._pattern_matches(event.intr_info, pattern)):
                 continue
             if not self._error_status_matches(event.error_status, decode.error_status):
                 continue
             matched.append(decode)
-            action2_pattern = (
-                decode.action2_v1_pattern if is_v1 else decode.action2_v2_pattern
-            )
-            if (
-                decode.action2
-                and action2_pattern
-                and self._pattern_matches(event.intr_info, action2_pattern)
-            ):
-                action2.append(decode.action2)
-
+            if secondary:
+                action2.append(secondary)
         if not matched:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,

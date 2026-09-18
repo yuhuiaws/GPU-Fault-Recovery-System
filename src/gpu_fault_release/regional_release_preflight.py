@@ -1,17 +1,178 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease, Runner
+
+from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release.regional_observability_rollback import (
+    AMP_FAILED_STATUSES,
+    AMP_SETTLING_STATUSES,
+    AmpDefinition,
+    amp_definition_status,
+    describe_amp_definition,
+)
 from gpu_fault_release.regional_release_config import (
     EKS_ARN_PATTERN,
+    ClusterTarget,
     ReleaseError,
 )
+from gpu_fault_release.regional_release_state import aws_json
 
 
-def _context_eks_arn(runner: Any, kubectl: list[str], *, label: str) -> str:
+def require_cpu_namespace_anchor(
+    release: RegionalRelease, *, bootstrap: bool = False
+) -> None:
+    """Absence is useful only in a proved CPU namespace, never on a read error."""
+    namespace = release.config.namespace
+    anchor = release._get_json(
+        release._cpu("get", "namespace", namespace)
+        if bootstrap
+        else release._cpu("-n", namespace, "get", "deployment", "gpu-fault-api-ha")
+    )
+    metadata = anchor.get("metadata") or {}
+    if (
+        anchor.get("kind") != ("Namespace" if bootstrap else "Deployment")
+        or metadata.get("name") != (namespace if bootstrap else "gpu-fault-api-ha")
+        or (not bootstrap and metadata.get("namespace") != namespace)
+        or metadata.get("deletionTimestamp")
+    ):
+        raise ReleaseError("missing resource has no verified CPU namespace anchor")
+
+
+def monitoring_repair_preflight(
+    release: RegionalRelease, *, bootstrap: bool = False
+) -> dict[str, Any]:
+    """Verify infrastructure and readable versioned definitions before repair."""
+    health = release.config.health
+    if not health.amp_workspace_id or not health.sns_topic_arn:
+        raise ReleaseError("AMP workspace or SNS topic is not configured")
+    workspace = (
+        aws_json(
+            release,
+            ["amp", "describe-workspace", "--workspace-id", health.amp_workspace_id],
+        ).get("workspace")
+        or {}
+    )
+    if workspace.get("workspaceId") != health.amp_workspace_id:
+        raise ReleaseError("AMP workspace identity differs")
+    if (workspace.get("status") or {}).get("statusCode") != "ACTIVE":
+        raise ReleaseError("AMP workspace must be ACTIVE before release repair")
+    missing: list[str] = []
+    for operation, root, suffix in (
+        (
+            "describe-rule-groups-namespace",
+            "ruleGroupsNamespace",
+            ("--name", health.amp_rule_namespace),
+        ),
+        ("describe-alert-manager-definition", "alertManagerDefinition", ()),
+    ):
+        definition = describe_amp_definition(
+            release,
+            AmpDefinition(
+                describe=(
+                    "aws",
+                    "amp",
+                    operation,
+                    "--workspace-id",
+                    health.amp_workspace_id,
+                    "--region",
+                    release.config.aws_region,
+                    *suffix,
+                ),
+                root=root,
+                label=root,
+            ),
+        )
+        if definition is None:
+            missing.append(root)
+            continue
+        if amp_definition_status(definition) not in {
+            "ACTIVE",
+            *AMP_FAILED_STATUSES,
+            *AMP_SETTLING_STATUSES,
+        }:
+            raise ReleaseError("cannot validate an unknown AMP definition status")
+        if (
+            root == "ruleGroupsNamespace"
+            and definition.get("name") != health.amp_rule_namespace
+        ):
+            raise ReleaseError("AMP rule namespace identity differs")
+        try:
+            text = base64.b64decode(definition["data"], validate=True).decode("utf-8")
+        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+            raise ReleaseError("cannot read the AMP definition data") from exc
+        if root == "alertManagerDefinition" and health.sns_topic_arn not in text:
+            raise ReleaseError(
+                "AMP Alertmanager does not reference the configured SNS topic"
+            )
+    if missing:
+        require_cpu_namespace_anchor(release, bootstrap=bootstrap)
+    subscriptions = (
+        aws_json(
+            release,
+            ["sns", "list-subscriptions-by-topic", "--topic-arn", health.sns_topic_arn],
+        ).get("Subscriptions")
+        or []
+    )
+    email_summary = monitoring_safety.email_subscription_summary(
+        subscriptions, release.config.notifications.admin_email
+    )
+    return {
+        "workspace_id": health.amp_workspace_id,
+        "rule_namespace": health.amp_rule_namespace,
+        "missing": missing,
+        "email_subscription": email_summary,
+    }
+
+
+def preflight_retired_collectors(
+    release: RegionalRelease, target: ClusterTarget
+) -> None:
+    names = frozenset(
+        resource["name"]
+        for resource in inventory.GPU_RESOURCES
+        if resource.get("retired")
+        and resource["kind"] == "deployment"
+        and resource["phase"] == "producer"
+    )
+    if not names:
+        return
+    listing = release._get_json(
+        release._gpu(
+            target,
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployments",
+        )
+    )
+    items = listing.get("items") if isinstance(listing, dict) else None
+    if not isinstance(items, list):
+        raise ReleaseError("cannot establish whether retired collectors remain")
+    present: set[str] = set()
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if not isinstance(name, str) or not name or name != name.strip():
+            raise ReleaseError("cannot establish whether retired collectors remain")
+        present.add(name)
+    remaining = sorted(names & present)
+    if remaining:
+        raise ReleaseError(
+            f"{target.cluster_id}: retired HMA collectors remain. Stop upstream "
+            "forwarding, drain queued events with the previous release and retire "
+            f"{', '.join(remaining)} before deploying; no resources were deleted."
+        )
+
+
+def _context_eks_arn(runner: Runner, kubectl: list[str], *, label: str) -> str:
     cluster = runner.run(
         kubectl
         + [
@@ -32,7 +193,7 @@ def _context_eks_arn(runner: Any, kubectl: list[str], *, label: str) -> str:
 
 
 def _validate_hyperpod_cluster(
-    runner: Any,
+    runner: Runner,
     *,
     region: str,
     cluster_name: str,
@@ -68,7 +229,7 @@ def _validate_hyperpod_cluster(
 
 
 def _validate_agent_endpoint_cidrs(
-    runner: Any,
+    runner: Runner,
     kubectl: list[str],
     *,
     cluster_id: str,
@@ -114,7 +275,7 @@ def _validate_agent_endpoint_cidrs(
         )
 
 
-def ensure_region_contexts(release: Any) -> None:
+def ensure_region_contexts(release: RegionalRelease) -> None:
     config = release.config
     runner = release.runner
     cpu_command = release._cpu
@@ -133,7 +294,7 @@ def ensure_region_contexts(release: Any) -> None:
     )
     runner.run(cpu_command("get", "--raw=/readyz"), capture=True)
 
-    def validate_cluster(target: Any) -> None:
+    def validate_cluster(target: ClusterTarget) -> None:
         gpu_eks_arn = _context_eks_arn(
             runner,
             gpu_command(target),
@@ -160,6 +321,7 @@ def ensure_region_contexts(release: Any) -> None:
             configured_cidrs=target.agent_endpoint_allowed_cidrs,
         )
         release._validate_executor_iam_role(target)
+        preflight_retired_collectors(release, target)
 
     if not config.clusters:
         return

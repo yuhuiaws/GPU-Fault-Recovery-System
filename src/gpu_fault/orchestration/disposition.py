@@ -29,6 +29,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher, plan_digest
+from gpu_fault.workflow_quarantine import inherit_terminal_quarantine
 
 AggregationDeadlines = Callable[[datetime, WorkflowRequest], tuple[datetime, datetime]]
 PrepareSuccessor = Callable[[WorkflowRequest, WorkflowRequest], WorkflowRequest]
@@ -161,6 +162,10 @@ class DispositionApplier:
         now: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident]:
         verdict = Disposition(disposition)  # ValueError on an unknown value
+        if verdict not in {Disposition.ABSORB, Disposition.ABSORB_RECORD_ONLY}:
+            candidate_workflow = inherit_terminal_quarantine(
+                existing_workflow, candidate_workflow
+            )
         match verdict:
             case Disposition.ABSORB_RECORD_ONLY:
                 # The caller's incident merge records the event; the

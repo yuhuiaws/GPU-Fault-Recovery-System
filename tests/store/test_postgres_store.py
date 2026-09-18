@@ -64,6 +64,7 @@ from tests.store._blocked_backlog_support import (
     break_one_clause,
     restore,
 )
+from tests.store._postgres_processor_claim_support import _truncate
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
@@ -76,6 +77,7 @@ def initialized_postgres_schema():
     if POSTGRES_URL is None:
         yield
         return
+    _truncate()
     store = PostgresStore(POSTGRES_URL)
     store.close()
     yield

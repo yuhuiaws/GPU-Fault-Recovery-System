@@ -5,8 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable, Collection, Iterable
 
-from gpu_fault.models import WorkflowRequest, WorkflowStatus, workflow_is_open
-from gpu_fault.store.shared.time import utc_text
+from gpu_fault.models import (
+    WorkflowRequest,
+    WorkflowStatus,
+    datetime_json_text,
+    workflow_is_open,
+)
 
 OPEN_WORKFLOW_STATUSES = frozenset(
     {
@@ -67,7 +71,11 @@ def dispatch_order_key(workflow: WorkflowRequest) -> tuple[str, str]:
     the Python-filtered backends must page identically, cursor included.
     """
 
-    return utc_text(dispatch_eligible_at(workflow)), workflow.request_id
+    # Preserve offset-less JSON too: adding Z moves a cursor past tied naive rows.
+    eligible = datetime_json_text(workflow.created_at)
+    if workflow.not_before is not None:
+        eligible = max(eligible, datetime_json_text(workflow.not_before))
+    return eligible, workflow.request_id
 
 
 def recent_workflow_slice(
@@ -92,16 +100,16 @@ def recent_workflow_slice(
     def newest_first(rows: Iterable[WorkflowRequest]) -> list[WorkflowRequest]:
         return sorted(
             rows,
-            key=lambda item: (utc_text(item.updated_at), item.request_id),
+            key=lambda item: (datetime_json_text(item.updated_at), item.request_id),
             reverse=True,
         )
 
-    since = None if updated_since is None else utc_text(updated_since)
+    since = None if updated_since is None else datetime_json_text(updated_since)
     open_rows = newest_first(item for item in workflows if item.status in open_statuses)
     recent_rows = newest_first(
         item
         for item in workflows
         if item.status not in open_statuses
-        and (since is None or utc_text(item.updated_at) >= since)
+        and (since is None or datetime_json_text(item.updated_at) >= since)
     )
     return (open_rows + recent_rows)[:limit]

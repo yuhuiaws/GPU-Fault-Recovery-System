@@ -1,14 +1,13 @@
 """The BOOT-001..010 shell runner's verdict contract.
 
-The shell cannot be run here (it needs a cluster), so the contract is pinned
-by syntax-checking every script and reading the runner for the structures the
-2026-09-07 review asked for: one ``VERDICT`` line per case, an ERR trap that
-writes ``VERDICT FAIL``, a resume gate on the last line, no silent ``[[ ]]``
-checks, and a Deployment wait before any Pod name is read.
+The complete live entry is never invoked. Syntax and verdict structure checks
+are supplemented by an extracted Pod lookup function with a mocked transport.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -62,15 +61,127 @@ def test_no_silent_test_expressions_remain() -> None:
     assert _runner().count("fail_case ") >= 8
 
 
-def test_pod_names_are_read_after_the_deployment_is_available() -> None:
-    runner = _runner()
+POD_LOOKUP_TRANSPORT = r"""
+kubectl() {
+  printf '%s\n' "$*" >>"${TEST_CALLS}"
+  case "$*" in
+    "--kubeconfig /dev/null -n unit-ns rollout status deployment probe --timeout=600s")
+      return "${TEST_ROLLOUT_STATUS}" ;;
+    "--kubeconfig /dev/null -n unit-ns get pod -l app=probe -o json")
+      printf '%s\n' "${TEST_PODS}"
+      return "${TEST_INVENTORY_STATUS}" ;;
+    *) printf 'unexpected mocked kubectl invocation\n' >&2; return 90 ;;
+  esac
+}
+fail_case() { printf '%s\n' "$*" >&2; exit 1; }
+"""
 
-    assert 'wait deployment "${PROBE}" --for=condition=Available' in runner
-    assert runner.count('probe_pod="$(probe_pod_name)"') == 3
-    # BOOT-001 re-reads Ready one readiness period after the guard fired; that is
-    # the single remaining .items[0] read and it happens after assert.sh matched.
-    assert runner.count(".items[0].metadata.name") == 1
-    assert 'sleep "${readiness_period}"' in runner
+
+def pod_lookup(
+    tmp_path: Path,
+    pods: list[dict],
+    *,
+    rollout_status: int = 0,
+    inventory_status: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    source = _runner()
+    start = source.index("\nprobe_pod_name() {") + 1
+    end = source.index("\n}\n", start) + 3
+    calls_file = tmp_path / "kubectl-calls.txt"
+    harness = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            POD_LOOKUP_TRANSPORT,
+            source[start:end],
+            'probe_pod="$(probe_pod_name)"',
+            'printf "POD=%s\\n" "${probe_pod}"',
+        ]
+    )
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        env={
+            **os.environ,
+            "CPU_KUBECONFIG": "/dev/null",
+            "NAMESPACE": "unit-ns",
+            "PROBE": "probe",
+            "TEST_CALLS": str(calls_file),
+            "TEST_PODS": json.dumps({"items": pods}),
+            "TEST_ROLLOUT_STATUS": str(rollout_status),
+            "TEST_INVENTORY_STATUS": str(inventory_status),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    calls = calls_file.read_text(encoding="utf-8").splitlines()
+    return result, calls
+
+
+def test_pod_lookup_waits_for_current_rollout_and_ignores_terminating_pods(
+    tmp_path: Path,
+) -> None:
+    result, calls = pod_lookup(
+        tmp_path,
+        [
+            {
+                "metadata": {
+                    "name": "previous",
+                    "deletionTimestamp": "2026-09-01T00:00:00Z",
+                }
+            },
+            {"metadata": {"name": "current"}},
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "POD=current\n", (
+        "a terminating Pod from the prior rollout must not be selected"
+    )
+    assert calls == [
+        "--kubeconfig /dev/null -n unit-ns rollout status deployment probe --timeout=600s",
+        "--kubeconfig /dev/null -n unit-ns get pod -l app=probe -o json",
+    ], "the bound current rollout must finish before Pod inventory is read"
+
+
+@pytest.mark.parametrize("failure", ["rollout", "inventory"])
+def test_failed_probe_read_cannot_return_a_pod_from_command_substitution(
+    failure: str, tmp_path: Path
+) -> None:
+    result, calls = pod_lookup(
+        tmp_path,
+        [{"metadata": {"name": "stale-pod"}}],
+        rollout_status=1 if failure == "rollout" else 0,
+        inventory_status=1 if failure == "inventory" else 0,
+    )
+    assert result.returncode != 0, (
+        f"{failure} failure must propagate through the caller's command substitution"
+    )
+    assert "POD=" not in result.stdout, "failed reads must not yield a usable Pod name"
+    assert len(calls) == (1 if failure == "rollout" else 2), (
+        "rollout failure must stop before inventory; inventory must be read only once"
+    )
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        [],
+        [{"metadata": {"name": "a"}}, {"metadata": {"name": "b"}}],
+        [{"metadata": {"name": "old", "deletionTimestamp": "2026-09-01T00:00:00Z"}}],
+    ],
+    ids=["empty", "multiple", "terminating-only"],
+)
+def test_probe_lookup_requires_one_nonterminating_pod(
+    pods: list[dict], tmp_path: Path
+) -> None:
+    result, _calls = pod_lookup(tmp_path, pods)
+    assert result.returncode != 0, (
+        "ambiguous or absent probe inventory must fail closed"
+    )
+    assert "expected exactly one probe Pod" in result.stderr, (
+        "invalid inventory must include a useful refusal diagnostic"
+    )
+    assert "POD=" not in result.stdout, "invalid inventory must not yield a Pod name"
 
 
 def test_case_specific_additions_are_present() -> None:

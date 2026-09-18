@@ -116,14 +116,14 @@ def test_labels_read_by_annotations_exist_on_every_expression_branch() -> None:
 
 
 def test_the_periodic_service_alert_names_the_branch_that_fired() -> None:
-    """The lease branch has no ``job`` label, so the text must not assume one."""
+    """The lease branch has no task label, so the text must not assume one."""
 
     rule = next(
         rule for _, alert, rule in _rules() if alert == "GpuFaultPeriodicServiceErrors"
     )
     description = str(rule["annotations"]["description"])  # type: ignore[index]
 
-    assert "{{ if $labels.job }}" in description
+    assert "{{ if $labels.periodic_job }}" in description
     assert "{{ else }}" in description and "{{ end }}" in description
     assert (
         "task lease" in description.split("{{ else }}", 1)[1].split("{{ end }}", 1)[0]

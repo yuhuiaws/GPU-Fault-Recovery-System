@@ -20,6 +20,7 @@ import pytest
 from scripts.e2e.regional import destr020_verdicts as verdicts
 from scripts.e2e.regional import run_destr020_identity_mismatch_isolation as destr020
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_ID = "destr020-abc123-a1"
@@ -694,5 +695,4 @@ def test_the_runner_is_executable_with_a_shebang_and_no_site_topology() -> None:
     assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
     source = path.read_text(encoding="utf-8")
     assert source.splitlines()[0] == "#!/usr/bin/env python3", source.splitlines()[0]
-    for token in ("/secure/gpu-fault-bootstrap", "514385905925", "gpu-fault-gpu-1-"):
-        assert token not in source, token
+    assert not site_topology_leaks(source), site_topology_leaks(source)

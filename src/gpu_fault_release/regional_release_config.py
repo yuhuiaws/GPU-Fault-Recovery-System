@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -11,7 +12,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
-from gpu_fault_release import repository_root
+from gpu_fault_release import containing_repository_root, repository_root
 
 ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -20,6 +21,7 @@ DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
     r"cluster/(?P<name>[^/]+)$"
@@ -64,6 +66,15 @@ def required_text(value: object, field: str) -> str:
     return normalized
 
 
+def amp_writer_role_name(site_name: str) -> str:
+    """The existing bootstrap/installation-registry identity, shared by release."""
+    from gpu_fault.admin.bootstrap_common import safe_name
+
+    return safe_name(
+        f"gpu-fault-{required_text(site_name, 'site_name')}-amp-writer", maximum=64
+    )
+
+
 def required_email(value: object, field: str) -> str:
     normalized = required_text(value, field)
     if not EMAIL_PATTERN.fullmatch(normalized):
@@ -86,6 +97,18 @@ def email_subject_prefix(value: object, field: str) -> str:
     normalized = str(value or "").strip()
     if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
         raise ReleaseError(f"{field} must be a single line of at most 64 characters")
+    return normalized
+
+
+def ses_configuration_set(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not SES_CONFIGURATION_SET_PATTERN.fullmatch(normalized):
+        raise ReleaseError(
+            f"{field} must be an SES configuration set name: "
+            "1-64 letters, digits, hyphens or underscores"
+        )
     return normalized
 
 
@@ -325,6 +348,7 @@ class RegionalNotificationConfig:
     the key existed carries an ``email_sender`` and stays on ``ses``, so a
     rollback onto such a record keeps the channel it shipped with; anything
     else is ``sns``. On ``sns`` only ``admin_email`` is required.
+    An absent ``ses_configuration_set`` preserves the legacy notification digest.
     """
 
     allow_email: bool = False
@@ -334,6 +358,7 @@ class RegionalNotificationConfig:
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
     channel: str = NOTIFICATION_CHANNEL_SNS
+    ses_configuration_set: str | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
@@ -375,6 +400,10 @@ class RegionalNotificationConfig:
             value.get("email_subject_prefix"),
             "notifications.email_subject_prefix",
         )
+        configuration_set = ses_configuration_set(
+            value.get("ses_configuration_set"),
+            "notifications.ses_configuration_set",
+        )
         if not allow_email and not acknowledge:
             raise ReleaseError(
                 "notifications must allow email or acknowledge an external alert channel"
@@ -398,6 +427,7 @@ class RegionalNotificationConfig:
             email_recipients=email_recipients,
             email_subject_prefix=subject_prefix,
             channel=channel,
+            ses_configuration_set=configuration_set,
         )
 
 
@@ -445,7 +475,10 @@ def _resolved_artifact_paths(
     *,
     base: Path,
 ) -> tuple[Path, Path, Path, Path]:
-    resolved = tuple(value if value.is_absolute() else base / value for value in values)
+    # Validate, hash and return the same canonical paths even if aliases change.
+    resolved = tuple(
+        (value if value.is_absolute() else base / value).resolve() for value in values
+    )
     return resolved[0], resolved[1], resolved[2], resolved[3]
 
 
@@ -496,6 +529,7 @@ def _parse_delivery_identity(
     if set(raw_components) not in {
         frozenset(legacy_components),
         frozenset({*legacy_components, *role_components}),
+        frozenset({*legacy_components, *role_components, "aurora_refresh"}),
     }:
         raise ReleaseError("release delivery components are incomplete")
     component_digests = {
@@ -517,6 +551,38 @@ def _parse_delivery_identity(
         "dcgm_exporter",
         "adot",
     }
+    if manifest.get("schema_version") == 4:
+        if delivery.get("image_layout") != "split-v1":
+            raise ReleaseError("schema v4 release requires split-v1 image identities")
+        expected_images.update(("executor", "node_dependencies"))
+        node_dependencies = raw_images.get("node_dependencies") or {}
+        if any(
+            not re.fullmatch(r"[0-9a-f]{64}", str(node_dependencies.get(field) or ""))
+            for field in (
+                "wheelhouse_sha256",
+                "dependency_lock_sha256",
+                "tools_lock_sha256",
+            )
+        ):
+            raise ReleaseError("release offline node dependency identity is incomplete")
+        for image_name, component_name in (
+            ("runtime", "control_plane"),
+            ("executor", "executor"),
+        ):
+            image_components = (raw_images.get(image_name) or {}).get(
+                "components"
+            ) or {}
+            expected_component = components.get(component_name) or {}
+            actual_component = image_components.get(component_name) or {}
+            if set(image_components) != {component_name} or any(
+                actual_component.get(field) != expected_component.get(field)
+                for field in ("wheel_sha256", "module_digest")
+            ):
+                raise ReleaseError(
+                    "release split image does not match its component wheel"
+                )
+    elif manifest.get("schema_version", 3) != 3:
+        raise ReleaseError("unsupported release manifest schema version")
     if set(raw_images) != expected_images:
         raise ReleaseError("release image identity is incomplete")
     locked_images = {
@@ -587,6 +653,7 @@ def load_release_artifacts(
         manifest_path = Path(str(release_manifest))
         if not manifest_path.is_absolute():
             manifest_path = config_path.parent / manifest_path
+        manifest_path = manifest_path.resolve()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest_schema_version = int(manifest.get("schema_version", 1))
         components = dict(manifest.get("components") or {})
@@ -600,7 +667,8 @@ def load_release_artifacts(
                 Path(str(node_component.get("wheel") or manifest["wheel"])),
                 Path(str(manifest["bundle"])),
             ),
-            base=ROOT,
+            # In-process callers can run from a different checkout than the site.
+            base=containing_repository_root(manifest_path) or ROOT,
         )
         _require_artifact_files((wheel, executor_wheel, node_wheel, bundle))
         release_id = required_text(
@@ -694,10 +762,10 @@ def load_release_artifacts(
         raise ReleaseError("release protocol versions must be positive")
     return ReleaseArtifacts(
         release_id=release_id,
-        wheel=wheel.resolve(),
-        executor_wheel=executor_wheel.resolve(),
-        node_wheel=node_wheel.resolve(),
-        bundle=bundle.resolve(),
+        wheel=wheel,
+        executor_wheel=executor_wheel,
+        node_wheel=node_wheel,
+        bundle=bundle,
         database_schema_version=database_schema_version,
         agent_protocol_version=agent_protocol_version,
         executor_protocol_version=executor_protocol_version,
@@ -824,6 +892,8 @@ class ReleaseConfig:
     # failure-domain ConfigMap render and by the fleet rollout's per-domain cap.
     failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
     retention: RegionalRetentionConfig = RegionalRetentionConfig()
+    installation_id: str | None = None
+    retained_database_handoff: Path | None = None
 
     def for_rollback(
         self,
@@ -858,6 +928,21 @@ class ReleaseConfig:
     @classmethod
     def load(cls, path: Path) -> ReleaseConfig:
         value = json.loads(path.read_text(encoding="utf-8"))
+        installation_id = value.get("installation_id")
+        handoff = value.get("retained_database_handoff")
+        if installation_id is not None and (
+            not isinstance(installation_id, str)
+            or re.fullmatch(r"[a-f0-9]{32}", installation_id) is None
+        ):
+            raise ReleaseError("installation_id must identify one installation")
+        if handoff is not None and (
+            installation_id is None
+            or not isinstance(handoff, str)
+            or not Path(handoff).is_absolute()
+        ):
+            raise ReleaseError(
+                "retained_database_handoff requires a bound absolute path"
+            )
         aws_region = validate_aws_region(value.get("aws_region"))
         cpu_eks_arn = validate_eks_arn(
             value.get("cpu_eks_arn"),
@@ -1031,6 +1116,8 @@ class ReleaseConfig:
             failure_domain_labels=failure_domain_labels(
                 value.get("failure_domain_labels")
             ),
+            installation_id=installation_id,
+            retained_database_handoff=Path(handoff) if handoff is not None else None,
             retention=RegionalRetentionConfig.from_mapping(
                 dict(value.get("retention") or {})
             ),
@@ -1071,3 +1158,38 @@ def render_nlb_manifest(config: ReleaseConfig, text: str) -> str:
     if "REPLACE_WITH" in text:
         raise ReleaseError("NLB manifest still contains a placeholder")
     return text
+
+
+def resolve_release_image(
+    config: ReleaseConfig,
+    name: str,
+    environment_name: str,
+    legacy_default: str,
+) -> str:
+    """Resolve a release image without allowing the environment to change its pin."""
+
+    configured = os.getenv(environment_name, "").strip()
+    image = configured or legacy_default
+    if config.release_manifest_schema_version >= 3:
+        locked = config.locked_images.get(name, "")
+        if not DIGEST_IMAGE_PATTERN.fullmatch(locked):
+            raise ReleaseError(f"release {name} image lock is missing or invalid")
+        source = str(
+            config.release_delivery_identity.get("images", {})
+            .get(name, {})
+            .get("source")
+            or ""
+        )
+        if not configured or configured in {source, locked}:
+            image = locked
+        elif not configured.endswith("@" + locked.rsplit("@", 1)[-1]):
+            raise ReleaseError(
+                f"{environment_name} does not match the schema "
+                f"v{config.release_manifest_schema_version} image lock"
+            )
+    if not image or any(character.isspace() or character == "#" for character in image):
+        raise ReleaseError(
+            f"{environment_name} must be a non-empty OCI image reference "
+            "without whitespace or #"
+        )
+    return image

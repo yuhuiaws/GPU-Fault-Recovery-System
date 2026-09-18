@@ -85,6 +85,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "add_marker",
         "amend_workflow",
         "apply_efa_traffic_admin_action",
+        "cancel_orphaned_remote_commands",
         "cleanup_stale_regional_registry_members",
         "complete_active_processor_requests_batch",
         "complete_notification_delivery",
@@ -196,6 +197,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "add_marker",
         "amend_workflow",
         "apply_efa_traffic_admin_action",
+        "cancel_orphaned_remote_commands",
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
@@ -355,6 +357,7 @@ POSTGRES_PROCESSOR_PUBLIC = {
 
 TRANSACTIONAL_WORKFLOW_PUBLIC = frozenset(
     {
+        "cancel_orphaned_remote_commands",
         "create_incident_workflow_if_absent",
         "merge_attempt_fault_workflow",
         "merge_replacement_workflow",
@@ -565,7 +568,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
-        if migration.version <= 13
+        if migration.version <= 17
     }
 
     assert historical == {
@@ -582,13 +585,17 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         11: "3cc0c8918c4fae0fec4c294d21af06a43b552e3387a6936efae7331b5c8d1b57",
         12: "4b0e0447339441e31d0da248472dc0d025e0441ea48ac072850eb779d885aba7",
         13: "c7a4f950bfde00579b0ecb7a8d55890e6205cebcefa3efbd6cce8dbe0c50f186",
+        14: "70b9c294a2e9dee490083577aa631edc12f7cefdfdc303e5217c8fdcacdb69fc",
+        15: "e162d1b97f9ec7b68c33b9b8bce6b2c9ecf8379deda7364442878e8a127cc973",
+        16: "5096a0783d4ee74e31e8173d93d73840b5c245f8d76c81ab7a1f1fba6690cdac",
+        17: "1f52a13df018c9e017ffa908dd1fa907e03d62c626c334b6301838a48a06e875",
     }, (
-        "a published migration's checksum changed: do not edit v1-v13 (not even "
+        "a frozen migration's checksum changed: do not edit v1-v17 (not even "
         "a comment inside its apply callback); append a new migration instead"
     )
-    # v14 (the gpu_fault_objects wakeup trigger) is pinned here once it has
-    # been released to production; until then its checksum follows the DDL.
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 14
+    # v17 is frozen before implementing v18. The final unpublished migration
+    # follows the current DDL until this schema release is finalized.
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 18
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:

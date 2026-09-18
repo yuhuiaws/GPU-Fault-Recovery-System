@@ -3,11 +3,12 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from typing import Any, Iterator
 
 SITE_OPERATION_LOCK = ".gpu-fault-site-operation.lock"
@@ -15,10 +16,29 @@ SITE_OPERATION_LOCK_FD_ENV = "GPU_FAULT_SITE_OPERATION_LOCK_FD"
 _HOLDER_COMMAND_MAX_CHARS = 200
 _THREAD_LOCKS_GUARD = Lock()
 _THREAD_LOCKS: dict[Path, Lock] = {}
+_THREAD_OWNERS: dict[Path, int] = {}
 
 
 class SiteOperationBusy(RuntimeError):
     pass
+
+
+def _holds_exclusive_lock(descriptor: int) -> bool:
+    if descriptor < 3:
+        return False
+    try:
+        information = Path(f"/proc/self/fdinfo/{descriptor}").read_text(
+            encoding="ascii"
+        )
+    except (OSError, ValueError):
+        return False
+    # fdinfo reports locks on this open file description, not another open of
+    # the same inode. Checking the inode alone accepts unrelated, unlocked FDs.
+    return any(
+        fields[:1] == ["lock:"] and fields[2:5] == ["FLOCK", "ADVISORY", "WRITE"]
+        for line in information.splitlines()
+        if (fields := line.split())
+    )
 
 
 def inherited_site_operation_lock_fd(state_dir: Path) -> int | None:
@@ -33,7 +53,7 @@ def inherited_site_operation_lock_fd(state_dir: Path) -> int | None:
         return None
     if (inherited.st_dev, inherited.st_ino) != (expected.st_dev, expected.st_ino):
         return None
-    return descriptor
+    return descriptor if _holds_exclusive_lock(descriptor) else None
 
 
 def inherited_lock_pass_fds() -> tuple[int, ...]:
@@ -45,7 +65,7 @@ def inherited_lock_pass_fds() -> tuple[int, ...]:
         os.fstat(descriptor)
     except (OSError, ValueError):
         return ()
-    return (descriptor,)
+    return (descriptor,) if _holds_exclusive_lock(descriptor) else ()
 
 
 def _holder_record() -> dict[str, Any]:
@@ -97,20 +117,31 @@ def site_operation_lock(state_dir: Path, *, wait: bool) -> Iterator[int]:
 
     root = state_dir.expanduser().resolve()
     inherited = inherited_site_operation_lock_fd(root)
-    if inherited is not None:
-        yield inherited
-        return
     lock_file = root / SITE_OPERATION_LOCK
     with _THREAD_LOCKS_GUARD:
         thread_lock = _THREAD_LOCKS.setdefault(root, Lock())
+        reentrant = _THREAD_OWNERS.get(root) == get_ident()
+    if inherited is not None and reentrant:
+        yield inherited
+        return
     acquired = thread_lock.acquire(blocking=wait)
     if not acquired:
         raise _busy(lock_file)
     descriptor: int | None = None
     try:
+        with _THREAD_LOCKS_GUARD:
+            _THREAD_OWNERS[root] = get_ident()
+        inherited = inherited_site_operation_lock_fd(root)
+        if inherited is not None:
+            yield inherited
+            return
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
-        descriptor = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = os.open(
+            lock_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SiteOperationBusy("site operation lock is not a regular file")
         os.fchmod(descriptor, 0o600)
         flags = fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB)
         try:
@@ -125,4 +156,6 @@ def site_operation_lock(state_dir: Path, *, wait: bool) -> Iterator[int]:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+        with _THREAD_LOCKS_GUARD:
+            _THREAD_OWNERS.pop(root, None)
         thread_lock.release()

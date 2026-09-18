@@ -22,7 +22,10 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store import InMemoryStore, SqliteStore
-from gpu_fault.store.shared.health_signals import finding_health_signal_key
+from gpu_fault.store.shared.health_signals import (
+    finding_health_signal_fingerprint,
+    finding_health_signal_key,
+)
 from tests._builders import (
     asgi_client,
     build_store,
@@ -312,7 +315,9 @@ def test_metric_policy_emits_only_active_transition() -> None:
     # The claim no longer latches ``notified``; the deliverer does, after commit
     # (F-D11 P0-38B), so the test plays the delivery half here.
     store.mark_health_signal_notified(
-        finding_health_signal_key(initial[0]), notified_at=NOW
+        finding_health_signal_key(initial[0]),
+        notified_at=NOW,
+        semantic_fingerprint=finding_health_signal_fingerprint(initial[0]),
     )
     repeated = second.evaluate_metrics(
         telemetry("batch-2", "filesystem_used_percent", 99, NOW + timedelta(seconds=15))
@@ -403,7 +408,9 @@ def test_sustained_host_resource_risk_emits_once_and_rearms(
     assert finding[0].policy_source == "SITE_HOST_RESOURCE_HEALTH"
     assert finding[0].recommended_action is RecoveryAction.RUN_DIAGNOSTICS
     policy.store.mark_health_signal_notified(
-        finding_health_signal_key(finding[0]), notified_at=NOW + timedelta(seconds=15)
+        finding_health_signal_key(finding[0]),
+        notified_at=NOW + timedelta(seconds=15),
+        semantic_fingerprint=finding_health_signal_fingerprint(finding[0]),
     )
     assert not policy.evaluate_metrics(
         batch("duplicate", value, NOW + timedelta(seconds=30))

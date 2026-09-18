@@ -61,9 +61,7 @@ def test_upload_config_map_compresses_wheels_and_verifies_the_wheel_digest(
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system"),
         runner=SimpleNamespace(
-            probe_output=lambda _command: (1, "", 'configmaps "cm" not found NotFound'),
-            run=run,
-            dry_run=False,
+            probe_output=lambda _command, **_kw: (0, "", ""), run=run, dry_run=False
         ),
         _get_json=lambda _command: store["cm"],
     )
@@ -93,7 +91,7 @@ def test_upload_config_map_keeps_bundles_raw(tmp_path: Path) -> None:
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system"),
         runner=SimpleNamespace(
-            probe_output=lambda _command: (1, "", "NotFound"),
+            probe_output=lambda _command, **_kw: (0, "", ""),
             run=lambda command: created.append(command),
             dry_run=False,
         ),

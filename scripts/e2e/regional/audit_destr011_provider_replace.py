@@ -323,9 +323,14 @@ def run_case(run_dir: Path, attempt: int) -> int:
             "verdict": "FAIL",
             "error": f"{type(exc).__name__}: {exc}",
         }
+    result["diagnostic_verdict"] = result["verdict"]
+    result["verdict"] = "SUPERSEDED"
+    result["superseded_by"] = "GF-REGIONAL-DESTR-013"
+    result["formal_sequence_satisfied"] = False
+    result["diagnostic_only"] = True
     write_json(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
-    return 0 if result["verdict"] == "PASS" else 1
+    return 0 if result["diagnostic_verdict"] == "PASS" else 1
 
 
 def main() -> int:

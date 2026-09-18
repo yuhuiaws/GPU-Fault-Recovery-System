@@ -183,7 +183,7 @@ def test_a_refused_close_exits_non_zero_and_names_the_reason(
     assert incident_close.exit_code(result) == 1
     assert incident_close.result_lines(result)[1].startswith(
         "inc-q: refused(incident inc-q is QUARANTINED"
-    )
+    ), "refused close output must include the incident and reason"
     assert result["refused_incident_ids"] == ["inc-q"]
     assert result["closed_incident_ids"] == ["inc-a"]
 
@@ -876,8 +876,8 @@ def test_close_quarantined_dry_run_reads_node_evidence_and_judges_each_incident(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         _kubectl_nodes(
             _node("node-a"),
             _node(
@@ -974,7 +974,7 @@ def test_close_quarantined_applied_closes_and_archives_the_evidence(
             calls,
         ),
     )
-    monkeypatch.setattr(reconcile.subprocess, "run", _kubectl_nodes(_node("node-a")))
+    monkeypatch.setattr(reconcile, "run_command", _kubectl_nodes(_node("node-a")))
 
     result = incident_close.run_incident_close(
         _gpu_site(tmp_path),
@@ -1029,7 +1029,7 @@ def test_an_explicit_quarantined_id_gets_the_same_evidence_pass(
             calls,
         ),
     )
-    monkeypatch.setattr(reconcile.subprocess, "run", _kubectl_nodes(_node("node-a")))
+    monkeypatch.setattr(reconcile, "run_command", _kubectl_nodes(_node("node-a")))
 
     result = incident_close.run_incident_close(
         _gpu_site(tmp_path),
@@ -1069,8 +1069,8 @@ def test_without_a_gpu_kubeconfig_the_quarantined_close_is_refused_not_guessed(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         lambda *_a, **_k: pytest.fail("the default kubeconfig must never be read"),
     )
 
@@ -1102,7 +1102,7 @@ def test_a_missing_node_is_reported_as_evidence_the_service_refuses(
             {"results": [_quarantined_pending("inc-q1", "node-gone")]}, calls
         ),
     )
-    monkeypatch.setattr(reconcile.subprocess, "run", _kubectl_nodes(_node("node-a")))
+    monkeypatch.setattr(reconcile, "run_command", _kubectl_nodes(_node("node-a")))
 
     incident_close.run_incident_close(
         _gpu_site(tmp_path),

@@ -5,6 +5,7 @@ from typing import Any
 
 from gpu_fault.store.postgres import ddl_processor_retry
 from gpu_fault.store.postgres.ddl_control_plane_review import create_v13_stage
+from gpu_fault.store.postgres.ddl_control_state_stage import create_control_state_stage
 from gpu_fault.store.postgres.ddl_helpers import (
     _CREATE_INDEX,
     _add_column_if_missing,
@@ -35,12 +36,11 @@ def create_postgres_schema(cursor) -> None:
     control plane for the DDL duration, or fail on ``lock_timeout``. The
     helpers below (``_declare_index``, ``_add_column_if_missing``,
     ``_ensure_trigger``, ...) read the catalog first and issue the DDL only
-    when the object is actually missing or different; the two legacy
-    partition sweeps are gated on the recorded schema version. A routine
-    deploy therefore holds only AccessShareLock on the catalogs and the
-    schema-version table.
+    when missing or different. Versioned legacy sweeps run only during migration.
+    Routine deploys avoid strong locks on unchanged application tables.
     """
     _create_base_tables(cursor)
+    create_control_state_stage(cursor)
     _create_base_indexes(cursor)
     _create_domain_indexes_one(cursor)
     _create_dispatcher_indexes(cursor)

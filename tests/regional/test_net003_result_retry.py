@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import io
+import json
+import sys
+from contextlib import redirect_stdout
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import WorkflowLeaseError
 from scripts.e2e.regional import run_net003_result_retry as net003
+from scripts.e2e.regional import seeded_command_fixture as seeded
+from tests._builders import build_store
 
 T0 = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
 NOTIFICATION_ID = "notification-net003-x"
@@ -21,6 +33,7 @@ def _ready(**overrides: Any) -> dict[str, Any]:
         "response_quiet_seconds": net003.RESPONSE_QUIET_SECONDS,
         "replay_delay_seconds": net003.REPLAY_DELAY_SECONDS,
         "terminal_result_replays": 1,
+        "result_retry_owner": "product-executor",
     }
     ready.update(overrides)
     return ready
@@ -29,27 +42,48 @@ def _ready(**overrides: Any) -> dict[str, Any]:
 def _evidence(**overrides: Any) -> dict[str, Any]:
     committed_at = T0 + timedelta(seconds=7)
     replay_sent_at = committed_at + timedelta(seconds=net003.REPLAY_DELAY_SECONDS)
+    identity = {
+        "command_id": "remote-net003",
+        "workflow_request_id": "workflow-net003",
+        "incident_id": "incident-net003",
+        "cluster_id": "cluster-net003",
+        "idempotency_key": "workflow/0/FREEZE_EVIDENCE",
+    }
+    committed = {
+        **identity,
+        "status": "SUCCEEDED",
+        "lease_expires_at": None,
+        "updated_at": committed_at.isoformat(),
+        "result_details": {"cached": False, "notification_id": NOTIFICATION_ID},
+    }
     evidence: dict[str, Any] = {
         "ready": _ready(),
         "leased": {
+            **identity,
             "status": "LEASED",
-            "lease_expires_at": (T0 + timedelta(seconds=60)).isoformat(),
+            "lease_expires_at": (
+                T0 + timedelta(seconds=net003.LEASE_SECONDS)
+            ).isoformat(),
         },
-        "committed": {"status": "SUCCEEDED", "lease_expires_at": None},
-        "final": {
-            "status": "SUCCEEDED",
-            "updated_at": committed_at.isoformat(),
-            "result_details": {"cached": False, "notification_id": NOTIFICATION_ID},
-        },
+        "committed": deepcopy(committed),
+        "final": deepcopy(committed),
         "result_interrupted": {
+            "command_id": identity["command_id"],
             "first_post_succeeded": False,
             "exception": "RemoteDisconnected",
+            "status_code": None,
         },
         "result_replays": {
+            "command_id": identity["command_id"],
             "count": 1,
+            "retry_owner": "product-executor",
             "replay_sent_at_epoch": replay_sent_at.timestamp(),
             "responses": [
-                {"status": "SUCCEEDED", "updated_at": committed_at.isoformat()}
+                {
+                    "command_id": identity["command_id"],
+                    "status": "SUCCEEDED",
+                    "updated_at": committed_at.isoformat(),
+                }
             ],
         },
         "executor_state": {
@@ -57,6 +91,7 @@ def _evidence(**overrides: Any) -> dict[str, Any]:
             "reported_failures": 0,
             "unexpected_failures": 0,
             "lease_renewal_failures": 0,
+            "transport_retries_total": 1,
         },
         "ledger": {"physical_count": 1, "keys": ["workflow/0/FREEZE_EVIDENCE"]},
         "logs": f"WARNING {net003.LOST_RESPONSE_LOG}: RemoteDisconnected: closed",
@@ -203,7 +238,7 @@ def test_timing_keeps_the_exchange_inside_the_first_renewal_interval() -> None:
         + net003.RESPONSE_QUIET_SECONDS
         + net003.REPLAY_DELAY_SECONDS
     )
-    assert exchange + 5 < net003.renewal_interval_seconds(net003.LEASE_SECONDS)
+    assert exchange + 10 < net003.renewal_interval_seconds(net003.LEASE_SECONDS)
 
 
 def test_a_twenty_second_lease_cannot_fit_the_exchange() -> None:
@@ -223,18 +258,57 @@ def test_plan_details_carry_the_predecessor_and_the_loss_mode() -> None:
     assert details["terminal_result_replays"] == 1
 
 
-def test_the_private_seed_leases_the_workflow_to_the_probe(monkeypatch) -> None:
-    """NET-003 seeds its own workflow (a notification rides along too); it must
-    carry the same probe-owned execution lease as the shared seed, or the
-    deployed dispatcher claims and fails it on the save-triggered wakeup within
-    the second, then the orphan sweep cancels the command."""
-    from scripts.e2e.regional import seeded_command_fixture as seeded
-
-    calls: list[tuple[Any, ...]] = []
+@pytest.mark.parametrize("lease_seconds", [1800, 2100])
+def test_the_private_seed_leases_the_workflow_to_the_probe(
+    lease_seconds: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = build_store()
+    monkeypatch.setattr(seeded, "SEED_LEASE_SECONDS", lease_seconds)
     monkeypatch.setattr(
-        net003.fixture, "cpu_python", lambda script, *args: calls.append(args) or {}
+        ApplicationContext,
+        "from_environment",
+        classmethod(lambda _cls: SimpleNamespace(store=store)),
     )
-    net003.seed_command("run")
-    assert calls[-1][-1] == str(seeded.SEED_LEASE_SECONDS)
-    assert 'execution_owner_id=f"{owner}-seed"' in net003._SEED_COMMAND
-    assert "execution_lease_expires_at=" in net003._SEED_COMMAND
+    observed = []
+    original_ensure = store.ensure_remote_command
+
+    def ensure(command: Any) -> Any:
+        workflow = store.get_workflow(command.workflow_request_id)
+        observed.append(workflow)
+        assert workflow.execution_owner_id == f"{net003.OWNER}-seed"
+        assert workflow.execution_epoch == 1
+        with pytest.raises(WorkflowLeaseError, match="leased by another"):
+            store.claim_workflow(
+                workflow.request_id, "competing-dispatcher", workflow.fencing_token
+            )
+        return original_ensure(command)
+
+    monkeypatch.setattr(store, "ensure_remote_command", ensure)
+
+    def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
+        output = io.StringIO()
+        with monkeypatch.context() as child:
+            child.setattr(sys, "argv", ["unit-seed", *arguments])
+            with redirect_stdout(output):
+                exec(script, {})
+        return json.loads(output.getvalue())
+
+    monkeypatch.setattr(net003.fixture, "cpu_python", cpu_python)
+    before = datetime.now(timezone.utc)
+    result = net003.seed_command("net003-unit")
+    after = datetime.now(timezone.utc)
+    workflow = store.get_workflow(result["workflow_id"])
+    command = store.get_remote_command(result["command_id"])
+    assert len(observed) == 1
+    assert workflow.execution_lease_expires_at is not None
+    assert (
+        before + timedelta(seconds=lease_seconds)
+        <= workflow.execution_lease_expires_at
+        <= after + timedelta(seconds=lease_seconds)
+    )
+    assert command.workflow.execution_owner_id == workflow.execution_owner_id
+    assert command.workflow.execution_epoch == workflow.execution_epoch
+    assert (
+        command.workflow.execution_lease_expires_at
+        == workflow.execution_lease_expires_at
+    )

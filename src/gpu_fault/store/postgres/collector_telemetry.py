@@ -213,8 +213,23 @@ class PostgresCollectorTelemetryMixin:
             )
             for status in statuses
         ]
-        unique_keys = list(dict.fromkeys(storage_keys))
-        with self._db.cursor() as cursor:
+        unique_keys = sorted(set(storage_keys))
+        with self._db.transaction(), self._db.cursor() as cursor:
+            # Lock absent keys too; the latest timestamp alone cannot protect
+            # sticky history merged from a snapshot read before another writer.
+            cursor.execute(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended('collector_status/' || value, 0)
+                )
+                FROM (
+                    SELECT value
+                    FROM unnest(%s::text[]) AS value
+                    ORDER BY value
+                ) AS ordered
+                """,
+                (unique_keys,),
+            )
             cursor.execute(
                 """
                 SELECT key, payload
@@ -228,20 +243,19 @@ class PostgresCollectorTelemetryMixin:
                 key: self._decode("collector_status", payload)
                 for key, payload in cursor.fetchall()
             }
-        results = []
-        final_by_key = {}
-        for storage_key, status in zip(storage_keys, statuses, strict=True):
-            merged = merge_collector_status(current_by_key.get(storage_key), status)
-            if merged is None:
-                results.append(False)
-                continue
-            current_by_key[storage_key] = merged
-            final_by_key[storage_key] = merged
-            results.append(True)
-        if final_by_key:
-            keys = list(final_by_key)
-            payloads = [final_by_key[key].model_dump_json() for key in keys]
-            with self._db.cursor() as cursor:
+            results = []
+            final_by_key = {}
+            for storage_key, status in zip(storage_keys, statuses, strict=True):
+                merged = merge_collector_status(current_by_key.get(storage_key), status)
+                if merged is None:
+                    results.append(False)
+                    continue
+                current_by_key[storage_key] = merged
+                final_by_key[storage_key] = merged
+                results.append(True)
+            if final_by_key:
+                keys = list(final_by_key)
+                payloads = [final_by_key[key].model_dump_json() for key in keys]
                 cursor.execute(
                     """
                     INSERT INTO gpu_fault_objects(kind, key, payload)

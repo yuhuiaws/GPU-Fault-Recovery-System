@@ -14,6 +14,35 @@ from scripts.e2e.regional import run_ha006_executor_takeover as ha006
 from scripts.e2e.regional.probes import ha006_executor
 
 
+def test_probe_manifest_grants_only_nonroot_state_volume_writes() -> None:
+    manifest = ha006.pod_manifest(
+        "gpu-fault-ha006-a",
+        "runtime@sha256:" + "a" * 64,
+        {
+            "executor_artifact_sha256": "b" * 64,
+            "executor_compatibility_digest": "c" * 64,
+        },
+        "ha006-permissions",
+    )
+    spec = manifest["spec"]
+    security = spec["securityContext"]
+    assert security["runAsNonRoot"] is True
+    assert (
+        security["runAsUser"] == security["runAsGroup"] == security["fsGroup"] == 1001
+    )
+    assert security["fsGroupChangePolicy"] == "OnRootMismatch"
+    container = spec["containers"][0]
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+    mounts = {item["name"]: item for item in container["volumeMounts"]}
+    assert mounts["state"] == {"name": "state", "mountPath": "/state"}
+    assert all(mounts[name]["readOnly"] is True for name in ("script", "tokens", "tls"))
+    assert spec["activeDeadlineSeconds"] == 600
+    assert not spec.get("hostPID") and not spec.get("hostNetwork")
+
+
 def _context(key: str = "workflow/0/RUN_DCGM_DIAGNOSTIC"):
     return SimpleNamespace(
         idempotency_key=key,
@@ -152,6 +181,7 @@ def test_waiting_branch_is_read_from_the_pre_kill_timeline() -> None:
 
 def test_takeover_errors_judge_the_summed_counter_not_a_constant() -> None:
     final = {
+        "status": "SUCCEEDED",
         "last_lease_owner": "gpu-fault-ha006-b",
         "updated_at": "2026-09-07T12:00:31+00:00",
         "result_details": {
@@ -194,6 +224,9 @@ def test_pod_manifest_carries_poll_backoff_and_waiting_round_settings() -> None:
         "image@sha256:x",
         {"executor_artifact_sha256": "a", "executor_compatibility_digest": "b"},
         "run-a",
+    )
+    assert manifest["spec"]["containers"][0]["command"][0] == ha006.component_python(
+        "gpu"
     )
     env = {
         item["name"]: item.get("value")

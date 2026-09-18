@@ -409,6 +409,8 @@ def _await_ready(
             include_observed_capacity=require_observed_capacity,
             aws_json=caller,
         )
+        if time.monotonic() >= deadline:
+            break
         stable = (
             stable + 1
             if _ready(

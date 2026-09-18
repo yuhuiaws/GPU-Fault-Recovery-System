@@ -37,6 +37,7 @@ def marker(
 ) -> NodeMarker:
     return NodeMarker(
         marker_id=marker_id,
+        cluster_id="cluster-a",
         source="test-agent",
         trusted=True,
         incident_id="inc-existing",

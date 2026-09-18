@@ -133,8 +133,8 @@ def test_gpu_deployments_apply_once_and_wait_together(
             return ""
 
         def probe_output(self, _arguments, **_kwargs):
-            # The Completion Watcher outbox ConfigMap does not exist yet.
-            return 1, "", 'Error from server (NotFound): configmaps "x" not found'
+            # --ignore-not-found reports an absent state object as an empty read.
+            return 0, "", ""
 
     release = SimpleNamespace(
         runner=Runner(),
@@ -205,6 +205,10 @@ def test_reconciler_deploy_uses_progress_aware_wait(
     sequence: list[str] = []
     environments: list[dict[str, str]] = []
     waited: list[tuple[str, int]] = []
+    rendered_identity = {
+        "GPU_FAULT_INSTALLER_BUNDLE_SHA256": "e" * 64,
+        "GPU_FAULT_INSTALLER_TEMPLATE_SHA256": "f" * 64,
+    }
 
     class Runner:
         dry_run = True
@@ -217,12 +221,14 @@ def test_reconciler_deploy_uses_progress_aware_wait(
     release = SimpleNamespace(
         runner=Runner(),
         bundle_sha="b" * 64,
-        node_template_sha="t" * 64,
+        node_template_sha="d" * 64,
         config=SimpleNamespace(upgrade_max_unavailable=0),
         _settle_installer_jobs=lambda _target: sequence.append("settle"),
     )
     monkeypatch.setattr(
-        FLEET_ROLLOUT, "build_reconciler_environment", lambda *_a, **_k: {}
+        FLEET_ROLLOUT,
+        "build_reconciler_environment",
+        lambda *_a, **_k: dict(rendered_identity),
     )
 
     def wait(_release, _target, deployment, *, timeout_seconds):
@@ -232,7 +238,7 @@ def test_reconciler_deploy_uses_progress_aware_wait(
 
     monkeypatch.setattr(FLEET_ROLLOUT, "wait_deployment_rollout", wait)
 
-    FLEET_ROLLOUT.deploy_reconciler(
+    identity = FLEET_ROLLOUT.deploy_reconciler(
         release,
         SimpleNamespace(cluster_id="gpu-a", fleet_master_file=None),
         wheel_cm="wheel",
@@ -242,8 +248,11 @@ def test_reconciler_deploy_uses_progress_aware_wait(
     )
 
     assert sequence == ["settle", "run:deploy-node-installer-reconciler.sh", "wait"]
-    assert environments == [{"GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false"}]
+    assert environments == [
+        {**rendered_identity, "GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false"}
+    ]
     assert waited == [(FLEET_ROLLOUT.inventory.GPU_RECONCILER_DEPLOYMENT, 600)]
+    assert identity == ("e" * 64, "f" * 64)
 
 
 def test_wave_safety_waits_for_agent_lease_margin(monkeypatch) -> None:
@@ -527,7 +536,7 @@ class WatchRunner:
         self.consume = consume
         self.waits: list[tuple[list[str], float]] = []
 
-    def probe(self, args, *, timeout_seconds=None):
+    def condition(self, args, *, timeout_seconds=None):
         self.waits.append((list(args), self.clock.now))
         met = self.verdicts.pop(0) if self.verdicts else False
         if not met and self.consume:
@@ -719,7 +728,7 @@ def test_bounded_wait_treats_a_killed_kubectl_as_not_yet(monkeypatch) -> None:
     class HungRunner:
         dry_run = False
 
-        def probe(self, _args, *, timeout_seconds=None):
+        def condition(self, _args, *, timeout_seconds=None):
             clock.now += 1.0
             raise WAIT.ReleaseError("probe timed out after 35s: kubectl")
 

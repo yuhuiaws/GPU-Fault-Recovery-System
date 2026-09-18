@@ -123,11 +123,8 @@ def happy_workflow() -> dict[str, Any]:
             10,
             "RESTART_NODE",
             "FAILED",
-            error=(
-                "step 10/RESTART_NODE stayed non-terminal for 305s, past the "
-                "300s per-step cap"
-            ),
-            details={"step_waiting_seconds": 305, "step_waiting_timeout_seconds": 300},
+            error=("provider explicitly refused this reboot before submission"),
+            details={"node_action_not_started": True},
         ),
         _execution(
             16,
@@ -288,12 +285,12 @@ def test_the_agreed_escalation_counts_are_pinned() -> None:
     assert any("branch_escalation_counts" in item for item in errors), errors
 
 
-def test_the_sibling_reboot_must_fail_by_bounded_waiting() -> None:
+def test_the_sibling_reboot_must_have_a_confirmed_failure_before_replacement() -> None:
     workflow = happy_workflow()
     workflow["step_executions"][7]["details"] = {}
     workflow["step_executions"][7]["error"] = "HyperPod preflight failed"
     errors = _errors(workflow, happy_incident())
-    assert any("step_waiting_timeout_seconds" in item for item in errors), errors
+    assert any("confirmed no-start" in item for item in errors), errors
 
 
 def test_the_sibling_replacement_must_fail_for_want_of_a_spare() -> None:
@@ -766,7 +763,14 @@ def _happy_preflight_kwargs() -> dict[str, Any]:
         "fault": _warm_node(FAULT),
         "sibling": _warm_node(SIBLING),
         "fault_agent": {"lifecycle_state": "ACTIVE", "boot_id": "boot-b-1"},
-        "sibling_agent": {"lifecycle_state": "ACTIVE", "boot_id": "boot-c-1"},
+        "sibling_agent": {
+            "lifecycle_state": "ACTIVE",
+            "boot_id": "boot-c-1",
+            "node_instance_id": f"uid-{SIBLING}",
+            "runtime_profile_version": "profile-test",
+            "artifact_sha256": "a" * 64,
+            "installer_bundle_sha256": "b" * 64,
+        },
         "spare_nodes": [],
         "cluster": {"status": "InService", "node_recovery": "None"},
         "executor_env": [_executor_pod("exec-0"), _executor_pod("exec-1")],
@@ -789,8 +793,13 @@ def _happy_preflight_kwargs() -> dict[str, Any]:
     }
 
 
-def test_preflight_happy_shape_passes() -> None:
+def test_preflight_refuses_without_a_reboot_surviving_recovery_safeguard() -> None:
     assert destr014.preflight_errors(**_happy_preflight_kwargs()) == []
+    kwargs = _happy_preflight_kwargs()
+    kwargs["sibling_agent"].pop("installer_bundle_sha256")
+    assert destr014.preflight_errors(**kwargs) == [
+        "sibling Node Agent recovery identity is incomplete or mismatched"
+    ]
 
 
 def test_preflight_refuses_a_stray_spare_label() -> None:
@@ -985,19 +994,19 @@ def test_parser_accepts_the_documented_arguments() -> None:
             "--managed-recovery-timeout-seconds",
             "900",
             "--variant",
-            "sibling-exhausted",
+            "unknown-reboot",
             "--maintenance-window-end",
             "2026-09-06T12:00:00Z",
         ]
     )
     assert arguments.execute is False
     assert arguments.plan is True
-    assert arguments.variant == "sibling-exhausted"
+    assert arguments.variant == "unknown-reboot"
     assert arguments.verify_max_attempts == 6
     assert arguments.managed_recovery_timeout_seconds == 900
     defaults = destr014.parser().parse_args(["--run-dir", "/tmp/destr014-run"])
     assert defaults.execute is False
-    assert defaults.variant == "sibling-exhausted"
+    assert defaults.variant == "unknown-reboot"
     assert defaults.verify_max_attempts == 6
     assert defaults.managed_recovery_timeout_seconds == 600
     assert hasattr(defaults, "predecessor_evidence"), defaults

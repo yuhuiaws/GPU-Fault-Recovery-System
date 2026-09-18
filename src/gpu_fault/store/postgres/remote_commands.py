@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from gpu_fault.regional_compatibility import (
+    ACTIVATION_INHIBITION_PROTOCOL_VERSION,
+    LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+    command_protocol_eligible,
+)
+
 import secrets
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable
@@ -40,8 +46,9 @@ class PostgresRemoteCommandMixin:
     ``remote_command/<command_id>`` (store review 2026-09-07, item A): the
     single-row paths through ``_state_transaction`` and the bulk paths
     (claim, unclaimed expiry) through ``pg_advisory_xact_lock`` taken in
-    ``command_id`` order. Each path reads the row and writes it back whole,
-    so two writers on different keys are a lost update: the cancel paths
+    ``command_id`` order. Transitions read a complete record; dedicated
+    renewals persist only changed lease fields. Writers on different lock
+    keys would still lose updates: the cancel paths
     used ``.../timeout`` and ``.../cancel`` suffixes, and a cancel that
     overlapped a completion could put a SUCCEEDED command back to LEASED.
     The only writer outside the key is the terminal-row cleanup, which
@@ -71,7 +78,7 @@ class PostgresRemoteCommandMixin:
     ) -> list[RemoteActionCommand]:
         query = """
             SELECT payload
-            FROM gpu_fault_objects
+            FROM gpu_fault_remote_command_records
             WHERE kind='remote_command'
         """
         parameters: list[Any] = []
@@ -81,9 +88,9 @@ class PostgresRemoteCommandMixin:
             # field, so the whole command history was decoded to answer a
             # question about a bounded set. Narrowing here is equivalent and
             # keeps the read proportional to the reconcile scope.
-            query += " AND payload->>'workflow_request_id' = ANY(%s)"
+            query += " AND workflow_request_id = ANY(%s)"
             parameters.append(sorted(set(workflow_request_ids)))
-        query += " ORDER BY payload->>'created_at', key"
+        query += " ORDER BY created_at, key"
         with self._db.cursor() as cursor:
             cursor.execute(query, parameters)
             rows = cursor.fetchall()
@@ -108,13 +115,13 @@ class PostgresRemoteCommandMixin:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT payload FROM gpu_fault_objects
+                SELECT payload FROM gpu_fault_remote_command_records
                 WHERE kind='remote_command'
-                  AND payload->>'workflow_request_id'=%s
-                  AND (payload->>'step_index')::int=%s
-                  AND payload->>'status' IN ('PENDING', 'LEASED', 'WAITING')
+                  AND workflow_request_id=%s
+                  AND step_index=%s
+                  AND status IN ('PENDING', 'LEASED', 'WAITING')
                   AND key IS DISTINCT FROM %s
-                ORDER BY payload->>'created_at', key
+                ORDER BY created_at, key
                 """,
                 (workflow_request_id, step_index, exclude_command_id),
             )
@@ -144,10 +151,10 @@ class PostgresRemoteCommandMixin:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT payload FROM gpu_fault_objects
+                SELECT payload FROM gpu_fault_remote_command_records
                 WHERE kind='remote_command'
-                  AND payload->>'workflow_request_id'=%s
-                  AND (payload->>'fencing_token')::int=%s
+                  AND workflow_request_id=%s
+                  AND fencing_token=%s
                   AND jsonb_typeof(payload->'batched_steps')='array'
                 """,
                 (workflow_request_id, fencing_token),
@@ -166,29 +173,29 @@ class PostgresRemoteCommandMixin:
             cursor.execute(
                 """
                 SELECT
-                    payload->>'cluster_id',
-                    payload->>'status',
+                    cluster_id,
+                    status,
                     count(*),
                     count(*) FILTER (
-                        WHERE payload->>'status_source'=
+                        WHERE status_source=
                               'executor-internal-error'
                           AND NOT (
-                              COALESCE(payload->>'error', '')=ANY(%s)
+                              COALESCE(error, '')=ANY(%s)
                           )
                     ),
                     max(
-                        (payload->>'updated_at')::timestamptz
+                        updated_at::timestamptz
                     ) FILTER (
-                        WHERE payload->>'status_source'=
+                        WHERE status_source=
                               'executor-internal-error'
                           AND NOT (
-                              COALESCE(payload->>'error', '')=ANY(%s)
+                              COALESCE(error, '')=ANY(%s)
                           )
                     ),
                     min(
-                        (payload->>'created_at')::timestamptz
+                        created_at::timestamptz
                     ) FILTER (
-                        WHERE payload->>'status'='PENDING'
+                        WHERE status='PENDING'
                     ),
                     -- The dead-letter counter has to be aggregated
                     -- here too: /metrics reads it unconditionally, so
@@ -196,13 +203,13 @@ class PostgresRemoteCommandMixin:
                     -- one gauge, it makes the whole endpoint 500 and
                     -- takes every other metric with it.
                     count(*) FILTER (
-                        WHERE payload->>'status_source'=%s
+                        WHERE status_source=%s
                     )
-                FROM gpu_fault_objects
+                FROM gpu_fault_remote_command_records
                 WHERE kind='remote_command'
                 GROUP BY
-                    payload->>'cluster_id',
-                    payload->>'status'
+                    cluster_id,
+                    status
                 """,
                 (
                     sorted(LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS),
@@ -292,18 +299,18 @@ class PostgresRemoteCommandMixin:
 
         owners = sorted(execution_owners) if execution_owners is not None else None
         query = """
-            SELECT payload FROM gpu_fault_objects
+            SELECT payload FROM gpu_fault_remote_command_records
             WHERE kind='remote_command'
-              AND payload->>'cluster_id'=%s
-              AND payload->>'status' IN (
+              AND cluster_id=%s
+              AND status IN (
                   'PENDING', 'WAITING', 'LEASED'
               )
         """
         params: list = [cluster_id]
         if owners is not None:
-            query += "  AND payload->'step'->>'execution_owner' = ANY(%s)\n"
+            query += "  AND execution_owner = ANY(%s)\n"
             params.append(owners)
-        query += "            ORDER BY payload->>'created_at', key\n"
+        query += "            ORDER BY created_at, key\n"
         with self._db.cursor() as cursor:
             cursor.execute(query, tuple(params))
             rows = cursor.fetchall()
@@ -318,6 +325,7 @@ class PostgresRemoteCommandMixin:
         lease_seconds: int,
         execution_owners: set[str] | None = None,
         accept_batched_steps: bool = True,
+        executor_protocol_version: int = LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
     ):
         """Lease a batch of commands inside a single transaction.
 
@@ -339,37 +347,49 @@ class PostgresRemoteCommandMixin:
         owners = sorted(execution_owners) if execution_owners is not None else None
         query = """
             SELECT cmd.key
-            FROM gpu_fault_objects AS cmd
+            FROM gpu_fault_remote_command_records AS cmd
             WHERE cmd.kind='remote_command'
-              AND cmd.payload->>'cluster_id'=%s
-              AND cmd.payload->>'status' IN (
+              AND cmd.cluster_id=%s
+              AND cmd.status IN (
                   'PENDING', 'WAITING', 'LEASED'
               )
               AND (
-                  cmd.payload->>'status' IN ('PENDING', 'WAITING')
-                  OR (cmd.payload->>'lease_expires_at')::timestamptz
+                  cmd.status IN ('PENDING', 'WAITING')
+                  OR cmd.lease_expires_at::timestamptz
                      <= %s
               )
-              AND cmd.payload->>'cancellation_requested_at' IS NULL
+              AND cmd.cancellation_requested_at IS NULL
         """
         params: list = [cluster_id, now]
         if owners is not None:
-            query += "  AND cmd.payload->'step'->>'execution_owner' = ANY(%s)\n"
+            query += "  AND cmd.execution_owner = ANY(%s)\n"
             params.append(owners)
         if not accept_batched_steps:
             # Compound rows are the only ones that carry the key (性能 C).
             query += "  AND cmd.payload->'batched_steps' IS NULL\n"
+        if (
+            type(executor_protocol_version) is not int
+            or executor_protocol_version < ACTIVATION_INHIBITION_PROTOCOL_VERSION
+        ):
+            # Key existence includes false/null markers: old executors must not
+            # ignore malformed inhibition. Filter before LIMIT to avoid starvation.
+            query += """
+              AND NOT (cmd.payload @? '$.step.parameters.activation_forbidden')
+              AND NOT (
+                  cmd.payload @? '$.batched_steps[*].step.parameters.activation_forbidden'
+              )
+            """
         query += """
               AND NOT EXISTS (
-                  SELECT 1 FROM gpu_fault_objects AS flow
+                  SELECT 1 FROM gpu_fault_workflow_records AS flow
                   WHERE flow.kind='workflow'
                     AND flow.key
-                        = cmd.payload->>'workflow_request_id'
-                    AND flow.payload->>'fencing_token'
+                        = cmd.workflow_request_id
+                    AND flow.fencing_token
                         IS DISTINCT FROM
-                        cmd.payload->>'fencing_token'
+                        cmd.fencing_token
               )
-            ORDER BY cmd.payload->>'created_at', cmd.key
+            ORDER BY cmd.created_at, cmd.key
             LIMIT %s
         """
         params.append(limit)
@@ -396,9 +416,9 @@ class PostgresRemoteCommandMixin:
                 )
                 cursor.execute(
                     """
-                    SELECT payload FROM gpu_fault_objects
+                    SELECT payload FROM gpu_fault_remote_command_records
                     WHERE kind='remote_command' AND key=ANY(%s)
-                    ORDER BY payload->>'created_at', key
+                    ORDER BY created_at, key
                     """,
                     (keys,),
                 )
@@ -427,6 +447,7 @@ class PostgresRemoteCommandMixin:
                         and command.step.execution_owner not in execution_owners
                     )
                     or (not accept_batched_steps and command.batched_steps)
+                    or not command_protocol_eligible(command, executor_protocol_version)
                     or (
                         command.status
                         not in {
@@ -472,10 +493,10 @@ class PostgresRemoteCommandMixin:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT key FROM gpu_fault_objects
+                SELECT key FROM gpu_fault_remote_command_records
                 WHERE kind='remote_command'
-                  AND payload->>'workflow_request_id'=%s
-                  AND payload->>'status' NOT IN (
+                  AND workflow_request_id=%s
+                  AND status NOT IN (
                       'SUCCEEDED', 'FAILED'
                   )
                 ORDER BY key
@@ -580,35 +601,45 @@ class PostgresRemoteCommandMixin:
         backlog. Here the ordering and the limit stay in SQL.
         """
 
-        # The one writer that does not take ``remote_command/<id>`` (store
-        # review 2026-09-07, item A): it only deletes SUCCEEDED/FAILED rows,
-        # which no other path writes once terminal, and ``FOR UPDATE SKIP
-        # LOCKED`` steps around any row a reader still holds. The bulk key
-        # serialises concurrent sweepers against each other, nothing more.
+        # Hold the database mode barrier while locking authoritative rows.
+        # Lock skipping must precede LIMIT so a locked oldest row cannot starve
+        # the rest of the terminal backlog.
         with self._state_transaction("remote_command/cleanup"):
             with self._db.cursor() as cursor:
                 cursor.execute(
-                    """
-                    WITH victims AS (
-                        SELECT key
-                        FROM gpu_fault_objects
-                        WHERE kind='remote_command'
-                          AND payload->>'status' IN (
-                              'SUCCEEDED', 'FAILED'
-                          )
-                          AND payload->>'updated_at' <= %s
-                        ORDER BY payload->>'updated_at', key
+                    "SELECT gpu_fault_control_state_lock_mode('remote_command')"
+                )
+                if cursor.fetchone()[0] == "dedicated":
+                    table = "gpu_fault_remote_commands AS command"
+                    key = "command_id"
+                    payload = "gpu_fault_remote_command_payload(command)"
+                    predicate = ""
+                    status = "status"
+                    updated_at = (
+                        "gpu_fault_state_datetime_text(updated_at, updated_at_naive)"
+                    )
+                else:
+                    table = "gpu_fault_objects"
+                    key, payload = "key", "payload"
+                    predicate = "kind='remote_command' AND"
+                    status = "payload->>'status'"
+                    updated_at = "payload->>'updated_at'"
+                cursor.execute(
+                    f"""
+                    WITH victims AS MATERIALIZED (
+                        SELECT {key} AS key, {payload} AS payload
+                        FROM {table}
+                        WHERE {predicate} {status} IN ('SUCCEEDED', 'FAILED')
+                          AND {updated_at} <= %s
+                        ORDER BY {updated_at}, {key}
                         LIMIT %s
                         FOR UPDATE SKIP LOCKED
-                    ),
-                    deleted AS (
-                        DELETE FROM gpu_fault_objects AS objects
-                        USING victims
-                        WHERE objects.kind='remote_command'
-                          AND objects.key=victims.key
-                        RETURNING objects.key
                     )
-                    SELECT key FROM deleted ORDER BY key
+                    SELECT key FROM victims
+                    WHERE gpu_fault_delete_control_state(
+                        'remote_command', key, payload, true
+                    )
+                    ORDER BY key
                     """,
                     (_utc_text(older_than), limit),
                 )
@@ -641,11 +672,11 @@ class PostgresRemoteCommandMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT key FROM gpu_fault_objects
+                    SELECT key FROM gpu_fault_remote_command_records
                     WHERE kind='remote_command'
-                      AND payload->>'status'='PENDING'
-                      AND payload->>'created_at' <= %s
-                    ORDER BY payload->>'created_at', key
+                      AND status='PENDING'
+                      AND created_at <= %s
+                    ORDER BY created_at, key
                     LIMIT %s
                     """,
                     (_utc_text(older_than), limit),
@@ -706,18 +737,17 @@ class PostgresRemoteCommandMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT cmd.key FROM gpu_fault_objects AS cmd
+                    SELECT cmd.key FROM gpu_fault_remote_command_records AS cmd
                     WHERE cmd.kind='remote_command'
-                      AND cmd.payload->>'status'='LEASED'
-                      AND (cmd.payload->>'lease_expires_at')::timestamptz <= %s
+                      AND cmd.status='LEASED'
+                      AND cmd.lease_expires_at::timestamptz <= %s
                       AND EXISTS (
-                          SELECT 1 FROM gpu_fault_objects AS flow
+                          SELECT 1 FROM gpu_fault_workflow_records AS flow
                           WHERE flow.kind='workflow'
-                            AND flow.key = cmd.payload->>'workflow_request_id'
-                            AND flow.payload->>'fencing_token'
-                                IS DISTINCT FROM cmd.payload->>'fencing_token'
+                            AND flow.key = cmd.workflow_request_id
+                            AND flow.fencing_token IS DISTINCT FROM cmd.fencing_token
                       )
-                    ORDER BY cmd.payload->>'created_at', cmd.key
+                    ORDER BY cmd.created_at, cmd.key
                     LIMIT %s
                     """,
                     (lease_expired_before, limit),

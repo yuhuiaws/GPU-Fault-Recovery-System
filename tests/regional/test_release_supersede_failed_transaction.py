@@ -30,6 +30,7 @@ from gpu_fault_release import regional_release_automatic_rollback as AUTOMATIC_R
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_schema_change as SCHEMA_CHANGE
 from gpu_fault_release.regional_release_config import ReleaseError, canonical_sha256
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ENV = "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION"
 FLAG = "--supersede-failed-transaction"
@@ -38,7 +39,10 @@ CANDIDATE_ID = "f3c00c116538"
 
 
 def _previous() -> dict[str, Any]:
+    from tests.regional._release_orchestrator_support import aurora_refresh_snapshot
+
     return {
+        "aurora_refresh": aurora_refresh_snapshot(),
         "release_id": "committed-release",
         "cpu_wheel": "gpu-fault-wheel-committed",
         "metadata": {
@@ -107,7 +111,11 @@ def _deploy_release(
             clusters=(SimpleNamespace(cluster_id="gpu-a"),),
         ),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: state is not None),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(
+                args, present=state is not None
+            )
+        ),
         _load_state=lambda: dict(state or {}),
         pin_approved_manifest_plan=lambda digest: calls.append(("pin", digest)),
         upgrade=lambda **kwargs: calls.append(("upgrade", kwargs)),
@@ -369,6 +377,7 @@ def _engine_release(
         _save_state=save_state,
         config=SimpleNamespace(
             auto_rollback=auto_rollback,
+            namespace="gpu-fault-system",
             schema_rollback_compatible=False,
             database_schema_version=database_schema_version,
             clusters=(SimpleNamespace(cluster_id="gpu-a"),),
@@ -401,6 +410,9 @@ def test_a_superseding_transaction_inherits_the_failed_baseline(
     monkeypatch.delenv(SCHEMA_CHANGE.ACCEPT_SCHEMA_CHANGE_ENV, raising=False)
     monkeypatch.setattr(
         ORCHESTRATION, "run_upgrade_phases", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION, "prepare_upgrade_credentials", lambda *_args, **_kwargs: None
     )
     release, saved = _engine_release()
     failed = _failed_state()

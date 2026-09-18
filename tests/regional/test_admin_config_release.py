@@ -43,6 +43,7 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
     runner = RecordingRunner()
     release = MODULE.RegionalRelease(config, runner)
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_get_json", lambda _arguments: {"items": []})
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
@@ -51,7 +52,9 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
     )
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
-        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+        release,
+        "_capture_previous",
+        lambda **_kwargs: {"metadata": {}, "aurora_refresh": None},
     )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)

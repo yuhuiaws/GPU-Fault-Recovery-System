@@ -189,6 +189,9 @@ def test_client_replays_once_after_a_lost_response(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(net003_executor.RegionalExecutorClient, "complete", complete)
 
+    with pytest.raises(ConnectionResetError):
+        client.complete(SimpleNamespace(command_id="remote-x"), result=None)
+    assert calls == ["remote-x"], "the probe must not implement its own retry"
     replay = client.complete(SimpleNamespace(command_id="remote-x"), result=None)
 
     assert calls == ["remote-x", "remote-x"]
@@ -198,8 +201,72 @@ def test_client_replays_once_after_a_lost_response(tmp_path: Path, monkeypatch) 
     assert interrupted["first_post_succeeded"] is False
     replays = json.loads(net003_executor.RESULT_REPLAYS.read_text())
     assert replays["count"] == 1
+    assert replays["retry_owner"] == "product-executor"
     assert replays["responses"][0]["updated_at"] == "2026-09-07T10:00:07+00:00"
     assert replays["replay_sent_at_epoch"] > interrupted["observed_at_epoch"] - 1
+
+
+def test_net003_probe_uses_the_production_executors_retry_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_fault.cluster_executor import ClusterActionExecutor
+    from tests.execution.test_cluster_executor_lease_and_report import (
+        FakeExecutorClient,
+        RecordingAdapter,
+        remote_command,
+    )
+
+    client = _client(tmp_path, monkeypatch)
+    client.cluster_id = "cluster-a"
+    command = remote_command("remote-x")
+    lease_client = FakeExecutorClient([command])
+    calls: list[str] = []
+    delays: list[float] = []
+
+    def complete(self: Any, current: Any, result: Any) -> SimpleNamespace:
+        calls.append(current.command_id)
+        if len(calls) == 1:
+            raise ConnectionResetError("response lost")
+        return _terminal_command()
+
+    monkeypatch.setattr(net003_executor.RegionalExecutorClient, "complete", complete)
+    monkeypatch.setattr(client, "claim", lease_client.claim)
+    monkeypatch.setattr(client, "renew", lease_client.renew)
+    adapter = RecordingAdapter()
+    admission_at_entry: list[list[tuple[str, str, int]]] = []
+    execute = adapter.execute
+
+    def record_entry(context: Any) -> Any:
+        admission_at_entry.append(list(lease_client.renewals))
+        return execute(context)
+
+    monkeypatch.setattr(adapter, "execute", record_entry)
+    executor = ClusterActionExecutor(
+        client,
+        [adapter],
+        executor_id="review-executor",
+        allowed_namespaces={"training"},
+        lease_seconds=60,
+        claim_state_path=str(tmp_path / "claim-state.json"),
+        liveness_state_path=str(tmp_path / "liveness.json"),
+        sleep=delays.append,
+    )
+    assert executor.run_once() == 1
+    assert calls == ["remote-x", "remote-x"]
+    assert len(adapter.contexts) == 1
+    assert admission_at_entry == [[("remote-x", "review-executor", 60)]], (
+        "the server lease must be renewed before the one adapter execution"
+    )
+    assert len(delays) == 1
+    assert executor.metrics_snapshot()["transport_retries_total"] == 1
+    assert executor.metrics_snapshot()["reported_failures"] == 0
+    assert executor.metrics_snapshot()["lease_lost_total"] == 0, (
+        "the retry must run under a valid lease"
+    )
+    assert executor.metrics_snapshot()["results_withheld_total"] == 0, (
+        "both result posts must be authorized"
+    )
+    assert json.loads(net003_executor.RESULT_REPLAYS.read_text())["count"] == 1
 
 
 def test_a_control_plane_rejection_is_not_a_lost_response(
@@ -275,7 +342,7 @@ def test_later_completes_pass_straight_through(tmp_path: Path, monkeypatch) -> N
 def test_net003_ready_contract_constants() -> None:
     assert net003_executor.TERMINAL_RESULT_REPLAYS == 1
     assert net003_executor.RESPONSE_LOSS_MODE == "forward-then-reset"
-    assert net003_executor.LEASE_SECONDS == 60
+    assert net003_executor.LEASE_SECONDS == 90
 
 
 # --------------------------------------------------------------------------- #

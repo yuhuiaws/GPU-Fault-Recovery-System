@@ -306,11 +306,11 @@ def _start_identity_worker(registries, stop):
 
     def refresh() -> None:
         while not stop.is_set():
-            try:
-                for registry in registries:
+            for registry in registries:
+                try:
                     registry.refresh()
-            except Exception:
-                LOGGER.exception("HyperPod identity refresh failed")
+                except Exception:
+                    LOGGER.exception("HyperPod identity refresh failed")
             if stop.wait(interval):
                 break
 

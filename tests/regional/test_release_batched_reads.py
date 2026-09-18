@@ -1,4 +1,4 @@
-"""The release engine batches same-kind reads and caches the history document.
+"""The release engine batches same-kind reads within each observation.
 
 Every ``kubectl`` call from the deploy host costs about 1.2 s (exec-plugin auth
 plus the API round trip), so a release's duration is its kubectl call count. A
@@ -10,10 +10,8 @@ were pure repetition:
   with a missing name still failing the capture and naming every absent one;
 * a batched read inside a ``read_snapshot`` files each item under its per-name
   key too, so a later ``config_map_data`` for one of them is a cache hit;
-* every checkpoint re-read ``gpu-fault-release-history`` (an existence probe
-  plus the read) before appending -- now the process reads it once, lazily, and
-  appends in memory; a failed apply leaves the cache untouched so the next
-  checkpoint reads again rather than trusting a line the cluster never saw.
+* every history checkpoint reads once, accepting only confirmed absence and
+  retaining any intervening writer's entries rather than a process-wide cache.
 """
 
 from __future__ import annotations
@@ -193,7 +191,7 @@ def test_cpu_role_config_maps_uses_the_batched_reader() -> None:
 
 
 # --------------------------------------------------------------------------
-# Release history: read once per process
+# Release history: read once per checkpoint
 # --------------------------------------------------------------------------
 
 
@@ -203,6 +201,8 @@ class _HistoryRunner:
     def __init__(self, *, fail_applies: int = 0) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self.fail_applies = fail_applies
+        self.existing: list[dict] = []
+        self.reads: list[list[str]] = []
 
     def run(self, arguments: list[str], **kwargs: Any) -> str:
         if arguments[-3:] == ["apply", "-f", "-"] and self.fail_applies:
@@ -210,22 +210,43 @@ class _HistoryRunner:
             raise RuntimeError("apiserver unavailable")
         # Only what the cluster accepted is recorded, as the cluster would.
         self.calls.append((list(arguments), kwargs))
+        if arguments[-3:] == ["apply", "-f", "-"]:
+            data = json.loads(kwargs["input_text"])["data"]
+            self.existing = [
+                json.loads(line)
+                for line in data[HISTORY.HISTORY_KEY].splitlines()
+                if line
+            ]
         return ""
 
     def probe(self, _arguments: list[str], **_kwargs: Any) -> bool:
         raise AssertionError("the history read must not pay a separate probe")
 
+    def probe_output(self, arguments: list[str], **_kwargs):
+        self.reads.append(list(arguments))
+        return (
+            0,
+            json.dumps(
+                {
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": HISTORY.HISTORY_CONFIG_MAP,
+                        "namespace": NAMESPACE,
+                        "uid": "history-uid",
+                    },
+                    "data": {
+                        HISTORY.HISTORY_KEY: "\n".join(
+                            json.dumps(item) for item in self.existing
+                        )
+                    },
+                }
+            ),
+            "",
+        )
+
 
 def _history_release(runner: _HistoryRunner, existing: list[dict]) -> SimpleNamespace:
-    reads: list[list[str]] = []
-
-    def get_json(arguments: list[str]) -> dict[str, Any]:
-        reads.append(list(arguments))
-        return {
-            "data": {
-                HISTORY.HISTORY_KEY: "\n".join(json.dumps(item) for item in existing)
-            }
-        }
+    runner.existing = list(existing)
 
     release = SimpleNamespace(
         runner=runner,
@@ -233,9 +254,8 @@ def _history_release(runner: _HistoryRunner, existing: list[dict]) -> SimpleName
         config=SimpleNamespace(namespace=NAMESPACE),
         state={"phase": "cpu-staged", "execution_plan": None},
         _cpu=lambda *arguments: list(arguments),
-        _get_json=get_json,
     )
-    release.reads = reads
+    release.reads = runner.reads
     return release
 
 
@@ -263,17 +283,18 @@ def _no_aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(HISTORY.HISTORY_DIR_ENV, raising=False)
 
 
-def test_history_is_read_once_across_checkpoints_and_appended_in_memory() -> None:
+def test_history_is_read_once_per_checkpoint_and_preserves_intervening_writes() -> None:
     runner = _HistoryRunner()
     release = _history_release(runner, [{"release_id": "rel-41", "phase": "complete"}])
 
     HISTORY.record_release_history(release, phase="preflight", state_text="{}")
+    runner.existing.append({"release_id": "other", "phase": "external"})
     HISTORY.record_release_history(release, phase="cpu-staged", state_text="{}")
 
-    assert len(release.reads) == 1, (
-        f"the history ConfigMap is read once per process, got {release.reads}"
+    assert len(release.reads) == 2, (
+        f"the history ConfigMap must be read once per checkpoint, got {release.reads}"
     )
-    assert release.reads[0][-1] == "--ignore-not-found", (
+    assert "--ignore-not-found" in release.reads[0], (
         "the one read tolerates a site without history instead of probing first"
     )
     assert len(runner.calls) == 2, (
@@ -286,11 +307,12 @@ def test_history_is_read_once_across_checkpoints_and_appended_in_memory() -> Non
     assert [item["phase"] for item in second] == [
         "complete",
         "preflight",
+        "external",
         "cpu-staged",
-    ], "the second checkpoint appends to the in-memory copy, not a re-read"
+    ], "the second checkpoint must not overwrite intervening history"
 
 
-def test_history_cache_holds_the_truncated_document() -> None:
+def test_history_persists_the_truncated_document() -> None:
     runner = _HistoryRunner()
     existing = [
         {"release_id": f"rel-{index}", "phase": "complete"}
@@ -311,7 +333,7 @@ def test_history_cache_holds_the_truncated_document() -> None:
     )
 
 
-def test_a_failed_apply_does_not_poison_the_cache(
+def test_a_failed_apply_is_not_recorded_as_a_successful_history_write(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runner = _HistoryRunner(fail_applies=1)

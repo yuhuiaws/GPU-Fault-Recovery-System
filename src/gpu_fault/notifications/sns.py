@@ -7,14 +7,16 @@ are plain text from ``no-reply@sns.amazonaws.com`` with an ASCII subject under
 100 characters -- which is why the full subject is repeated as the first line
 of the message and why SES stays available as ``channel: ses``.
 
-Same contract as :class:`gpu_fault.notifications.ses.SesEmailNotifier`: one
-``send`` per deduplication key per process, ``SKIPPED`` while sending is
-disabled, and any exception left to the outbox dispatcher's retry.
+Same contract as :class:`gpu_fault.notifications.ses.SesEmailNotifier`: a
+bounded process-local deduplication hint, ``SKIPPED`` while sending is
+disabled, and any exception left to the outbox dispatcher's retry. Store
+results remain the durable deduplication authority.
 """
 
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 
 from gpu_fault.env import env_bool
 from gpu_fault.notifications.common import (
@@ -112,7 +114,12 @@ class SnsNotificationConfig(StrictModel):
 
 
 class SnsNotifier:
-    """Publishes each notification once to the site topic."""
+    """SNS delivery with bounded transport and a process-local deduplication hint."""
+
+    RESULT_CACHE_LIMIT = 1024
+    CONNECT_TIMEOUT_SECONDS = 5
+    READ_TIMEOUT_SECONDS = 20
+    MAX_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -121,16 +128,25 @@ class SnsNotifier:
     ) -> None:
         self.config = config
         self.client = client or self._create_client(config)
-        self._results: dict[str, NotificationResult] = {}
+        self._results: OrderedDict[str, NotificationResult] = OrderedDict()
         self._lock = RLock()
 
-    @staticmethod
-    def _create_client(config: SnsNotificationConfig) -> Any:
+    @classmethod
+    def _create_client(cls, config: SnsNotificationConfig) -> Any:
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise RuntimeError("install gpu-fault-control-plane[hyperpod]") from exc
-        return boto3.client("sns", region_name=config.region_name)
+        return boto3.client(
+            "sns",
+            region_name=config.region_name,
+            config=Config(
+                connect_timeout=cls.CONNECT_TIMEOUT_SECONDS,
+                read_timeout=cls.READ_TIMEOUT_SECONDS,
+                retries={"max_attempts": cls.MAX_ATTEMPTS, "mode": "standard"},
+            ),
+        )
 
     def _subject(self, notification: AdvisoryNotification) -> str:
         return subject_with_context(
@@ -175,4 +191,7 @@ class SnsNotifier:
                 provider_message_id=response.get("MessageId"),
             )
             self._results[notification.deduplication_key] = result
+            self._results.move_to_end(notification.deduplication_key)
+            while len(self._results) > self.RESULT_CACHE_LIMIT:
+                self._results.popitem(last=False)
             return result

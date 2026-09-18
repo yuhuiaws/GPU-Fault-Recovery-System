@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
+import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from gpu_fault.node_agent import GpuServiceQuiesceManager
+
+STARTUP_TIMEOUT_SECONDS = 5.0
+STARTUP_MAX_BYTES = 4096
 
 
 HELPER = r"""
@@ -34,6 +40,60 @@ finally:
 """
 
 
+def close_streams(process: subprocess.Popen[str]) -> None:
+    with ExitStack() as cleanup:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                cleanup.callback(stream.close)
+
+
+def wait_ready(process: subprocess.Popen[str], name: str, device: str) -> None:
+    expected = f"ready:{process.pid}:{device}\n".encode("utf-8")
+    output = bytearray()
+    errors = bytearray()
+    stdout_closed = False
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    prefix = f"holder {name} failed to start"
+    with selectors.DefaultSelector() as selector:
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                raise RuntimeError(f"{prefix}: startup pipe is missing")
+            selector.register(stream, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{prefix}: readiness timed out")
+            events = selector.select(remaining)
+            if not events:
+                raise RuntimeError(f"{prefix}: readiness timed out")
+            for key, _ in events:
+                # This is the only reader; a ready pipe permits a bounded raw read
+                # even when the child has not finished a line.
+                chunk = os.read(
+                    key.fd, STARTUP_MAX_BYTES + 1 - len(output) - len(errors)
+                )
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    if key.fileobj is process.stdout:
+                        stdout_closed = True
+                    continue
+                buffer = output if key.fileobj is process.stdout else errors
+                buffer.extend(chunk)
+                if len(output) + len(errors) > STARTUP_MAX_BYTES:
+                    raise RuntimeError(f"{prefix}: startup output limit exceeded")
+            if b"\n" in output:
+                if output != expected:
+                    raise RuntimeError(f"{prefix}: readiness identity mismatch")
+                if process.poll() is not None:
+                    raise RuntimeError(f"{prefix}: holder already exited")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"{prefix}: readiness timed out")
+                return
+            if stdout_closed:
+                detail = errors.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"{prefix}: stdout ended before readiness: {detail}")
+
+
 def start_holder(name: str, device: str) -> subprocess.Popen[str]:
     process = subprocess.Popen(
         [sys.executable, "-c", HELPER, name, device],
@@ -41,10 +101,12 @@ def start_holder(name: str, device: str) -> subprocess.Popen[str]:
         stderr=subprocess.PIPE,
         text=True,
     )
-    ready = process.stdout.readline().strip() if process.stdout else ""
-    if not ready.startswith("ready:"):
-        error = process.stderr.read() if process.stderr else ""
-        raise RuntimeError(f"holder {name} failed to start: {ready} {error}")
+    with ExitStack() as cleanup:
+        cleanup.callback(close_streams, process)
+        cleanup.callback(process.wait, timeout=5)
+        cleanup.callback(process.kill)
+        wait_ready(process, name, device)
+        cleanup.pop_all()
     return process
 
 
@@ -80,14 +142,17 @@ def settled(process: subprocess.Popen[str], timeout: float = 5.0) -> bool:
 
 
 def stop(process: subprocess.Popen[str]) -> None:
-    if not alive(process):
-        return
-    process.send_signal(signal.SIGTERM)
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+        if not alive(process):
+            return
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    finally:
+        close_streams(process)
 
 
 def main() -> None:
@@ -104,10 +169,13 @@ def main() -> None:
         proc_root="/proc",
         restore_command="/bin/true",
     )
-    whitelist = start_holder("nvidia-persiste", target)
-    same_gpu = start_holder("unrelated-gpu", target)
-    other_gpu = start_holder("unrelated-gpu", other)
-    try:
+    with ExitStack() as cleanup:
+        whitelist = start_holder("nvidia-persiste", target)
+        cleanup.callback(stop, whitelist)
+        same_gpu = start_holder("unrelated-gpu", target)
+        cleanup.callback(stop, same_gpu)
+        other_gpu = start_holder("unrelated-gpu", other)
+        cleanup.callback(stop, other_gpu)
         swept, skipped = manager._sweep_device_holders(
             target_device_paths={target},
             workload_cgroup_paths=set(),
@@ -153,10 +221,7 @@ def main() -> None:
             raise AssertionError(second)
         if second["same_gpu_alive"] or not second["other_gpu_alive"]:
             raise AssertionError(second)
-        print(json.dumps({"first": first, "second": second}, sort_keys=True))
-    finally:
-        for process in (whitelist, same_gpu, other_gpu):
-            stop(process)
+    print(json.dumps({"first": first, "second": second}, sort_keys=True))
 
 
 if __name__ == "__main__":

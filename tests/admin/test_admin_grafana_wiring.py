@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,18 +61,24 @@ def _gpu(name: str) -> ClusterIdentity:
 # --- bootstrap task plumbing ---------------------------------------------------------
 
 
-def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
+def test_platform_tasks_start_grafana_without_waiting_for_the_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     received: list[dict[str, Any]] = []
     settings = GrafanaSettings(workspace_id="g-5b81a13d97")
 
-    def install_monitoring(_runner: Any, **keywords: Any) -> dict[str, Any]:
+    grafana_started = threading.Event()
+
+    def ensure_grafana(_runner: Any, **keywords: Any) -> dict[str, Any]:
         received.append(keywords)
-        return {}
+        grafana_started.set()
+        return {"status": "PROVISIONED"}
 
     monkeypatch.setattr(
-        admin_bootstrap_services, "install_monitoring", install_monitoring
+        admin_bootstrap_services, "ensure_grafana_dashboards", ensure_grafana
+    )
+    monkeypatch.setattr(
+        admin_bootstrap_services, "install_monitoring", lambda *_a, **_k: {}
     )
     monkeypatch.setattr(
         admin_bootstrap_services, "install_aurora_refresh", lambda *_a, **_k: {}
@@ -90,6 +97,14 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
     state.complete("monitoring_resources")
     state.record("aurora", {})
     state.complete("aurora")
+
+    def release() -> dict[str, Any]:
+        assert grafana_started.wait(timeout=5), "Grafana waited for the image build"
+        return {
+            "manifest": str(tmp_path / "release.json"),
+            "images": {"adot": "adot@sha256:bbb", "runtime": "runtime@sha256:aaa"},
+        }
+
     bootstrap_tasks.platform_task_graph(
         runner=CommandRunner(),
         state=state,
@@ -101,23 +116,28 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
         namespace="gpu-fault-system",
         site_id=SITE,
         alert_email="ops@example.com",
-        release=lambda: {
-            "manifest": str(tmp_path / "release.json"),
-            "images": {"adot": "adot@sha256:bbb", "runtime": "runtime@sha256:aaa"},
-        },
+        release=release,
         fleet_master_file=tmp_path / "fleet-master",
         ensure_aurora_ready=lambda *_a, **_k: {},
         grafana=settings,
     ).run(state=state)
 
-    assert received and received[0]["grafana"] == settings
+    assert received and received[0]["settings"] == settings
+    assert "grafana_install" in state.value["completed_tasks"]
 
 
+@pytest.mark.parametrize(
+    ("probe_only", "runtime_managed_by_release"),
+    [(True, False), (True, True), (False, True)],
+)
 def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_only: bool,
+    runtime_managed_by_release: bool,
 ) -> None:
-    """The step runs after the installer converged, inside the same task, so its
-    result is checkpointed with ``monitoring_install`` and re-proved with it."""
+    """Direct monitoring callers retain Grafana support; the bootstrap graph
+    schedules Grafana separately so its work can overlap the image build."""
 
     cpu = _cluster()
     endpoint = (
@@ -125,6 +145,7 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
         "workspaces/ws-a/api/v1/remote_write"
     )
     received: list[dict[str, Any]] = []
+    runtime_reads: list[list[str]] = []
 
     def ensure_grafana_dashboards(runner: Any, **keywords: Any) -> dict[str, Any]:
         received.append(
@@ -142,6 +163,15 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
         def run(self, arguments, **kwargs):
             if kwargs.get("mutate"):
                 raise AssertionError("probe mutated live state")
+            if any(
+                value in arguments
+                for value in (
+                    "deployment",
+                    "list-rule-groups-namespaces",
+                    "describe-alert-manager-definition",
+                )
+            ):
+                runtime_reads.append(arguments)
             if "jsonpath={.spec.template.spec.containers[0].image}" in arguments:
                 return "adot@sha256:bbb"
             if "jsonpath={.status.availableReplicas}" in arguments:
@@ -220,16 +250,19 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
             "workspace_id": "ws-a",
             "sns_topic_arn": "arn:aws:sns:us-east-1:123456789012:gpu-fault-site-a",
         },
-        adot_image="adot@sha256:bbb",
+        adot_image="adot@sha256:candidate"
+        if runtime_managed_by_release
+        else "adot@sha256:bbb",
         alert_email="ops@example.com",
-        probe_only=True,
+        probe_only=probe_only,
         grafana=settings,
+        runtime_managed_by_release=runtime_managed_by_release,
     )
 
     assert result["grafana"] == {"status": "PROBED"}
     (call,) = received
     assert call["read_only"] is True, "the probe reached Grafana with a writing runner"
-    assert call["probe_only"] is True
+    assert call["probe_only"] is probe_only
     assert call["settings"] == settings
     assert call["amp_workspace_id"] == "ws-a"
     assert call["site_id"] == SITE
@@ -238,6 +271,12 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
     assert call["admin_email"] == "ops@example.com", (
         "the step did not receive the administrator email the ADMIN grant derives from"
     )
+    if runtime_managed_by_release:
+        assert runtime_reads == [], (
+            "bootstrap inspected candidate runtime instead of deferring to release"
+        )
+    else:
+        assert runtime_reads, "first bootstrap did not validate the monitoring runtime"
 
 
 def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
@@ -298,13 +337,12 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
         admin_bootstrap, "_initial_secure_files", lambda **_k: ({}, tmp_path / "secure")
     )
     monkeypatch.setattr(
-        admin_bootstrap, "_ensure_base_secrets", lambda *_a, **_k: tmp_path / "master"
+        admin_bootstrap,
+        "_ensure_base_secrets",
+        lambda *_a, **_k: tmp_path / "secure/fleet-master",
     )
     monkeypatch.setattr(
         admin_bootstrap_services, "_ensure_pod_identity_agent", lambda *_a: {}
-    )
-    monkeypatch.setattr(
-        admin_bootstrap, "revalidate_pod_identity_agent", lambda *_a, **_k: None
     )
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
@@ -315,13 +353,16 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
     monkeypatch.setattr(
         admin_bootstrap,
         "run_bootstrap_tasks",
-        lambda **_k: {
-            "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
-            "aurora": {},
-            "monitoring_resources": {},
-            "nlb_network": {},
-            "pki": {},
-        },
+        lambda **keywords: (
+            keywords["access"].run(state=keywords["state"]),
+            {
+                "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
+                "aurora": {},
+                "monitoring_resources": {},
+                "nlb_network": {},
+                "pki": {},
+            },
+        )[1],
     )
     monkeypatch.setattr(admin_bootstrap, "_site_document", record_document)
     monkeypatch.setattr(
@@ -396,9 +437,7 @@ def _bind(
     return dict(state.value["task_input_sha256"])
 
 
-def test_monitoring_install_reruns_when_a_dashboard_or_the_grafana_options_change(
-    tmp_path: Path,
-) -> None:
+def test_grafana_task_reruns_without_reinstalling_monitoring(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     dashboards = root / "deploy/observability/dashboards"
     dashboards.mkdir(parents=True)
@@ -417,17 +456,22 @@ def test_monitoring_install_reruns_when_a_dashboard_or_the_grafana_options_chang
         tmp_path, root, request_overrides={"grafana_workspace_id": "g-5b81a13d97"}
     )
 
-    assert baseline["monitoring_install"] == unchanged["monitoring_install"]
-    assert baseline["monitoring_install"] != edited["monitoring_install"], (
-        "monitoring_install ignores a changed dashboard"
+    assert baseline["grafana_install"] == unchanged["grafana_install"]
+    assert baseline["grafana_install"] != edited["grafana_install"], (
+        "grafana_install ignores a changed dashboard"
     )
-    assert edited["monitoring_install"] != viewer["monitoring_install"], (
-        "monitoring_install ignores a new --grafana-viewer"
+    assert edited["grafana_install"] != viewer["grafana_install"], (
+        "grafana_install ignores a new --grafana-viewer"
     )
-    assert edited["monitoring_install"] != pinned["monitoring_install"], (
-        "monitoring_install ignores a new --grafana-workspace-id"
+    assert edited["grafana_install"] != pinned["grafana_install"], (
+        "grafana_install ignores a new --grafana-workspace-id"
     )
-    for name in ("aurora_refresh", "node_keys:gpu-a", "monitoring_resources"):
+    for name in (
+        "aurora_refresh",
+        "node_keys:gpu-a",
+        "monitoring_resources",
+        "monitoring_install",
+    ):
         assert baseline[name] == edited[name], f"{name} re-runs on a dashboard edit"
 
 
@@ -645,8 +689,8 @@ def test_the_inner_deploy_builds_the_bootstrap_request_from_the_options(
         ),
     )
     monkeypatch.setattr(
-        admin_cli.subprocess,
-        "run",
+        admin_cli,
+        "run_driver",
         lambda arguments, **_k: subprocess.CompletedProcess(arguments, 0),
     )
     # The release that follows the bootstrap is not under test here.

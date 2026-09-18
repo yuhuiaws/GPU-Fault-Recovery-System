@@ -34,6 +34,12 @@ from gpu_fault.collectors import (
     HttpEventSink,
     KernelLogCollector,
 )
+from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS
+from gpu_fault.channel_registry import (
+    FABRIC_MANAGER_PATH,
+    GPU_METRICS_PATH,
+    NVIDIA_KERNEL_PATH,
+)
 from gpu_fault.models import CapabilityName
 
 
@@ -65,6 +71,20 @@ FM_LOG_PATH = DB_PATH.with_name(f"{DB_PATH.stem}-fabricmanager.log")
 FM_STATE_PATH = DB_PATH.with_name(f"{DB_PATH.stem}-fabricmanager-state.json")
 
 
+def metric_text(replay: float) -> str:
+    defaults = {
+        "gpu_temperature_c": 45,
+        "memory_temperature_c": 50,
+        "power_limit_w": 700,
+        "pcie_replay_total": replay,
+    }
+    return "".join(
+        f'{name}{{gpu="0",UUID="{GPU_UUID}",pci_bus_id="{GPU_BDF}"}} '
+        f"{defaults.get(canonical, 0)}\n"
+        for name, (canonical, _unit) in DCGM_METRICS.items()
+    )
+
+
 class MetricsHandler(BaseHTTPRequestHandler):
     value = 0.0
     lock = threading.Lock()
@@ -75,13 +95,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
             return
         with self.lock:
             value = self.value
-        body = (
-            "# HELP DCGM_FI_DEV_PCIE_REPLAY_COUNTER synthetic counter\n"
-            "# TYPE DCGM_FI_DEV_PCIE_REPLAY_COUNTER counter\n"
-            "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
-            f'{{gpu="0",UUID="{GPU_UUID}",'
-            f'pci_bus_id="{GPU_BDF}"}} {value}\n'
-        ).encode()
+        body = metric_text(value).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.send_header("Content-Length", str(len(body)))
@@ -101,6 +115,11 @@ class RecordingSink(HttpEventSink):
         response = super().post(path, payload)
         self.responses.append({"path": path, "payload": payload, "response": response})
         return response
+
+    def single_response(self, path: str, *, after: int = 0) -> dict[str, Any]:
+        matches = [item for item in self.responses[after:] if item["path"] == path]
+        assert len(matches) == 1, f"expected exactly one current response on {path}"
+        return matches[0]
 
 
 def request_json(
@@ -194,35 +213,50 @@ def dcgm_collector(sink: RecordingSink) -> DcgmMetricsCollector:
         node_id=NODE_ID,
         metrics_url=MOCK_URL,
     )
-    # The test endpoint validates exporter parsing; the bounded temperature-limit
-    # probe runs against the host's nvidia-smi and yields no samples without it.
     return collector
 
 
-def run_concurrent_collectors() -> dict[str, Any]:
-    dcgm_sink = RecordingSink()
+def scrape(dcgm: DcgmMetricsCollector) -> Any:
+    # This is an isolated exporter fixture, not a query of the host's GPU inventory.
+    with urlopen(MOCK_URL, timeout=10) as response:
+        return dcgm.collect_text(response.read().decode("utf-8"))
+
+
+def run_concurrent_collectors(
+    dcgm: DcgmMetricsCollector, dcgm_sink: RecordingSink
+) -> dict[str, Any]:
     kernel_sink = RecordingSink()
     fabric_sink = RecordingSink()
-    dcgm = dcgm_collector(dcgm_sink)
+    dcgm_start = len(dcgm_sink.responses)
     kernel = KernelLogCollector(
         kernel_sink,
         collector_context(),
         node_id=NODE_ID,
         boot_id="three-source-e2e-boot",
     )
-    FM_LOG_PATH.write_text(
-        "nvidia-nvswitch3: "
-        "SXid (PCI:0000:c1:00.0): 12020, Fatal, "
-        "Link 46 egress sequence ID error\n"
-    )
+    if FM_LOG_PATH.exists() or FM_STATE_PATH.exists():
+        raise RuntimeError("three-source fixture requires fresh private FM files")
+    FM_LOG_PATH.touch(exist_ok=False)
     fabric = FabricManagerLogCollector(
         fabric_sink,
         collector_context(),
         node_id=NODE_ID,
+        boot_id="three-source-e2e-boot",
         journal_enabled=False,
         log_paths=[str(FM_LOG_PATH)],
         state_path=str(FM_STATE_PATH),
     )
+    initial_fabric = fabric.collect_once()
+    assert initial_fabric.observed == initial_fabric.delivered == 0
+    assert not any(
+        item["path"] == FABRIC_MANAGER_PATH for item in fabric_sink.responses
+    )
+    with FM_LOG_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "nvidia-nvswitch3: "
+            "SXid (PCI:0000:c1:00.0): 12020, Fatal, "
+            "Link 46 egress sequence ID error\n"
+        )
     with MetricsHandler.lock:
         MetricsHandler.value = 100
     kmsg = (
@@ -234,7 +268,7 @@ def run_concurrent_collectors() -> dict[str, Any]:
 
     def collect_dcgm() -> Any:
         barrier.wait()
-        return dcgm.collect_once().model_dump(mode="json")
+        return scrape(dcgm).model_dump(mode="json")
 
     def collect_kernel() -> Any:
         barrier.wait()
@@ -254,9 +288,9 @@ def run_concurrent_collectors() -> dict[str, Any]:
         collector_results = {name: future.result() for name, future in futures.items()}
     finished_at = datetime.now(timezone.utc)
     responses = {
-        "dcgm": dcgm_sink.responses[-1],
-        "kernel": kernel_sink.responses[-1],
-        "fabric_manager": fabric_sink.responses[-1],
+        "dcgm": dcgm_sink.single_response(GPU_METRICS_PATH, after=dcgm_start),
+        "kernel": kernel_sink.single_response(NVIDIA_KERNEL_PATH),
+        "fabric_manager": fabric_sink.single_response(FABRIC_MANAGER_PATH),
     }
     return {
         "started_at": started_at.isoformat(),
@@ -298,11 +332,11 @@ def validate(
     kernel = responses["kernel"]["response"]
     fabric = responses["fabric_manager"]["response"]
 
-    assert responses["dcgm"]["path"] == ("/v1/collector-events/gpu-metrics")
-    assert responses["kernel"]["path"] == ("/v1/collector-events/nvidia-kernel")
-    assert responses["fabric_manager"]["path"] == (
-        "/v1/collector-events/fabric-manager"
-    )
+    assert responses["dcgm"]["path"] == GPU_METRICS_PATH
+    assert responses["kernel"]["path"] == NVIDIA_KERNEL_PATH
+    assert responses["fabric_manager"]["path"] == FABRIC_MANAGER_PATH
+    assert not responses["dcgm"]["payload"]["collection_errors"]
+    assert concurrent["collector_results"]["fabric_manager"]["delivered"] == 1
     assert metric["new_findings"][0]["canonical_name"] == ("pcie_replay_total")
     assert metric["new_findings"][0]["automatic_action"] == ("RUN_DIAGNOSTICS")
     xid_event = kernel["normalized"]["xid_events"][0]
@@ -408,6 +442,7 @@ def main() -> int:
                 "FREEZE_EVIDENCE,COLLECT_DIAGNOSTIC_BUNDLE,"
                 "MARK_UNSCHEDULABLE,QUARANTINE,STOP_WORKLOADS,"
                 "RESTART_WORKLOAD,QUIESCE_GPU_SERVICES,"
+                "RESTART_NODE,"
                 "VERIFY_NO_GPU_CLIENTS,RESET_ALL_GPUS_NVSWITCHES,"
                 "RESTORE_GPU_SERVICES,VALIDATE_GPU,VALIDATE_FABRIC,"
                 "RESTORE_SCHEDULING"
@@ -431,6 +466,7 @@ def main() -> int:
         "job_id": JOB_ID,
         "attempt_id": ATTEMPT_ID,
         "dispatcher_enabled": False,
+        "evidence_scope": "synthetic three-source ingestion and unexecuted recovery plan",
         "verdict": "FAIL",
         "status": "FAILED",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -452,10 +488,12 @@ def main() -> int:
         baseline = dcgm_collector(baseline_sink)
         with MetricsHandler.lock:
             MetricsHandler.value = 0
-        baseline.collect_once()
-        assert not baseline_sink.responses[-1]["response"]["new_findings"]
+        baseline_batch = scrape(baseline)
+        assert not baseline_batch.collection_errors, "DCGM baseline must be complete"
+        baseline_response = baseline_sink.single_response(GPU_METRICS_PATH)
+        assert not baseline_response["response"]["new_findings"]
 
-        concurrent = run_concurrent_collectors()
+        concurrent = run_concurrent_collectors(baseline, baseline_sink)
         stop_isolated_api(api)
         state = load_state()
         report["concurrent_collection"] = {

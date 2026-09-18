@@ -51,14 +51,18 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     run_standard_case,
 )
+from scripts.e2e.regional.regional_case_contract import predecessor_path  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python,
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    predecessor_evidence,
     required,
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.seeded_command_fixture import delete_owned_resource  # noqa: E402
 
 CASE_ID = verdicts.CASE_ID
 CONFIRMATION = verdicts.CONFIRMATION
@@ -66,29 +70,9 @@ EXECUTOR_DEPLOYMENT = "gpu-fault-cluster-executor"
 MIN_SERVER_MINOR_FOR_MATCH_CONDITIONS = 30
 SAMPLE_INTERVAL_SECONDS = 5.0
 
-# Runs inside the deadman Job with the executor image, which carries the
-# kubernetes client. It deletes the webhook when its deadline passes and
-# treats an already-deleted webhook (the runner did its job) as success.
-DEADMAN_SCRIPT = r"""
-import os
-import time
-
-from kubernetes import client, config
-
-deadline = time.monotonic() + float(os.environ["NET007_DEADMAN_SECONDS"])
-name = os.environ["NET007_WEBHOOK_NAME"]
-while time.monotonic() < deadline:
-    time.sleep(5)
-config.load_incluster_config()
-api = client.AdmissionregistrationV1Api()
-try:
-    api.delete_validating_webhook_configuration(name)
-    print("deadman deleted", name, flush=True)
-except client.exceptions.ApiException as exc:
-    if exc.status != 404:
-        raise
-    print("deadman found nothing to delete", name, flush=True)
-"""
+DEADMAN_SCRIPT = (Path(__file__).with_name("probes") / "net007_deadman.py").read_text(
+    encoding="utf-8"
+)
 
 
 @dataclass(frozen=True)
@@ -98,6 +82,7 @@ class Settings:
     site_file: Path
     host_probe_image: str
     outage_seconds: int
+    predecessor_file: Path | None = None
 
     def environment(self) -> dict[str, str]:
         return {
@@ -134,6 +119,11 @@ def configure(arguments: argparse.Namespace) -> Settings:
             "host probe image",
         ),
         outage_seconds=outage,
+        predecessor_file=(
+            Path(arguments.predecessor_evidence).expanduser().resolve()
+            if getattr(arguments, "predecessor_evidence", "")
+            else None
+        ),
     )
 
 
@@ -206,7 +196,7 @@ def executor_has_classifier(regional: RegionalLiveFixture) -> bool:
         "exec",
         f"deployment/{EXECUTOR_DEPLOYMENT}",
         "--",
-        "python",
+        component_python("gpu"),
         "-c",
         CLASSIFIER_PROBE,
         timeout=60,
@@ -307,8 +297,31 @@ def preflight_errors(
     return errors
 
 
+def case_binding(
+    regional: RegionalLiveFixture, run_dir: Path, predecessor_file: Path | None = None
+) -> dict[str, Any]:
+    identity = regional.evidence_identity()
+    if any(
+        not isinstance(identity.get(key), str) or not identity[key].strip()
+        for key in ("release_id", "cluster_id")
+    ):
+        raise RegionalFixtureError("NET-007 release and cluster identity are required")
+    previous, path = predecessor_path(run_dir, CASE_ID, predecessor_file)
+    if previous is None or path is None:
+        raise RegionalFixtureError("NET-007 formal predecessor is unknown")
+    proof = predecessor_evidence(path, previous, **identity)
+    return {
+        "identity": identity,
+        "predecessor": proof,
+        "errors": []
+        if proof.get("valid") is True
+        else ["NET-007 predecessor is not PASS for this release and cluster"],
+    }
+
+
 def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
+    binding = case_binding(regional, case_dir.parent.parent, settings.predecessor_file)
     node = {
         **regional.node_snapshot(settings.node),
         # The objectSelector pins the node by its hostname label; the snapshot
@@ -361,7 +374,9 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         tests_passed=tests["passed"],
     )
     result = {
-        "release_id": state.get("release_id") or regional.release_id(),
+        **binding["identity"],
+        "identity": binding["identity"],
+        "predecessor": binding["predecessor"],
         "node": node,
         "business_workloads": workloads,
         "store": state,
@@ -371,7 +386,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "permissions": permissions,
         "focused_tests": tests,
         "cpu_blast": regional.cpu_blast_snapshot(),
-        "errors": errors,
+        "errors": [*errors, *binding["errors"]],
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
@@ -393,6 +408,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "executor": preflight.get("executor"),
         "preflight_identity": {
             "release_id": preflight.get("release_id"),
+            "cluster_id": preflight.get("cluster_id"),
             "node_uid": (preflight.get("node") or {}).get("uid"),
             "executor_image": (preflight.get("executor") or {}).get("image"),
         },
@@ -464,6 +480,7 @@ def deadman_manifest(
     image: str,
     deadman_seconds: int,
     run_id: str,
+    restore_at: float,
 ) -> dict[str, Any]:
     return {
         "apiVersion": "batch/v1",
@@ -488,16 +505,21 @@ def deadman_manifest(
                         {
                             "name": "deadman",
                             "image": image,
-                            "command": ["python", "-c", DEADMAN_SCRIPT],
+                            "command": [
+                                "/opt/gpu-fault/executor/bin/python",
+                                "-c",
+                                DEADMAN_SCRIPT,
+                            ],
                             "env": [
                                 {
-                                    "name": "NET007_DEADMAN_SECONDS",
-                                    "value": str(deadman_seconds),
+                                    "name": "NET007_RESTORE_AT",
+                                    "value": str(restore_at),
                                 },
                                 {
                                     "name": "NET007_WEBHOOK_NAME",
                                     "value": names["webhook"],
                                 },
+                                {"name": "NET007_RUN_ID", "value": run_id},
                             ],
                             "resources": {
                                 "requests": {"cpu": "50m", "memory": "128Mi"},
@@ -533,28 +555,35 @@ class OutageFixture:
         self.run_id = run_id
         self.deadman_seconds = deadman_seconds
         self.webhook_created = False
+        self.webhook_uid: str | None = None
+        self.deadman_armed = False
+        self.restore_at = 0.0
+        self.attempted: list[tuple[str, str]] = []
 
     @property
     def namespace(self) -> str:
         return self.regional.settings.namespace
 
-    def _apply(self, manifest: dict[str, Any]) -> None:
+    def _create(self, manifest: dict[str, Any]) -> None:
+        self.attempted.append((manifest["kind"].lower(), manifest["metadata"]["name"]))
         self.regional.kubectl(
-            "gpu", "apply", "-f", "-", input_text=json.dumps(manifest)
+            "gpu", "create", "-f", "-", input_text=json.dumps(manifest)
         )
 
     def arm_deadman(self) -> None:
+        self.restore_at = time.time() + self.deadman_seconds
         for manifest in rbac_manifests(
             self.names, namespace=self.namespace, run_id=self.run_id
         ):
-            self._apply(manifest)
-        self._apply(
+            self._create(manifest)
+        self._create(
             deadman_manifest(
                 self.names,
                 namespace=self.namespace,
                 image=self.image,
                 deadman_seconds=self.deadman_seconds,
                 run_id=self.run_id,
+                restore_at=self.restore_at,
             )
         )
         # The deadman must be running before the webhook exists.
@@ -568,9 +597,30 @@ class OutageFixture:
             "--timeout=180s",
             timeout=210,
         )
+        expected = {
+            "state": "ARMED",
+            "run_id": self.run_id,
+            "restore_at": self.restore_at,
+        }
+        acknowledged = False
+        for line in self.deadman_log().splitlines():
+            try:
+                acknowledged = json.loads(line) == expected or acknowledged
+            except ValueError:
+                continue
+        if not acknowledged or self.restore_at <= time.time() + 30:
+            raise RegionalFixtureError(
+                "deadman did not acknowledge a usable restoration deadline"
+            )
+        self.deadman_armed = True
 
     def open(self) -> dict[str, Any]:
-        self._apply(
+        if not self.deadman_armed or self.restore_at <= time.time() + 30:
+            raise RegionalFixtureError(
+                "webhook outage requires an armed, unexpired deadman"
+            )
+        self.webhook_created = True
+        self._create(
             verdicts.webhook_manifest(
                 name=self.names["webhook"],
                 node=self.node,
@@ -579,7 +629,6 @@ class OutageFixture:
                 run_id=self.run_id,
             )
         )
-        self.webhook_created = True
         applied = json.loads(
             self.regional.kubectl(
                 "gpu",
@@ -593,6 +642,15 @@ class OutageFixture:
         errors = verdicts.webhook_errors(
             applied, node=self.node, username=self.username
         )
+        metadata = applied.get("metadata") or {}
+        if (
+            not metadata.get("uid")
+            or (metadata.get("labels") or {}).get("gpu-fault.io/acceptance-run")
+            != self.run_id
+        ):
+            errors.append("webhook run ownership or UID is unknown")
+        else:
+            self.webhook_uid = metadata["uid"]
         if errors:
             self.close()
             raise RegionalFixtureError(
@@ -602,18 +660,23 @@ class OutageFixture:
         return cast(dict[str, Any], applied)
 
     def close(self) -> str:
-        output = self.regional.kubectl(
-            "gpu",
-            "delete",
+        if not self.webhook_created:
+            return "not opened"
+        delete_owned_resource(
             "validatingwebhookconfiguration",
             self.names["webhook"],
-            "--ignore-not-found",
-            "--wait=true",
-            check=False,
-            timeout=120,
+            self.run_id,
+            client=self.gpu,
+            namespace=self.namespace,
+            expected_uid=self.webhook_uid,
         )
         self.webhook_created = False
-        return output.strip()
+        return "removal confirmed"
+
+    def gpu(self, *args: str, stdin: bytes | None = None, **kwargs: Any) -> str:
+        return self.regional.kubectl(
+            "gpu", *args, input_text=None if stdin is None else stdin.decode(), **kwargs
+        )
 
     def deadman_log(self) -> str:
         return self.regional.kubectl(
@@ -622,28 +685,24 @@ class OutageFixture:
             "-l",
             f"job-name={self.names['job']}",
             "--tail=20",
-            check=False,
             timeout=60,
         ).strip()
 
     def cleanup(self) -> dict[str, bool]:
         self.close()
-        for kind, name in (
-            ("job", self.names["job"]),
-            ("clusterrolebinding", self.names["cluster_role_binding"]),
-            ("clusterrole", self.names["cluster_role"]),
-            ("serviceaccount", self.names["service_account"]),
-        ):
-            self.regional.kubectl(
-                "gpu",
-                "delete",
-                kind,
-                name,
-                "--ignore-not-found",
-                "--wait=true",
-                check=False,
-                timeout=120,
-            )
+        errors: list[str] = []
+        for kind, name in reversed(self.attempted):
+            if kind == "validatingwebhookconfiguration":
+                continue
+            try:
+                delete_owned_resource(
+                    kind, name, self.run_id, client=self.gpu, namespace=self.namespace
+                )
+            except Exception as exc:
+                errors.append(f"{kind} cleanup: {type(exc).__name__}")
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
+        self.deadman_armed = False
         deadline = time.monotonic() + 60
         residuals = self.residuals()
         while any(residuals.values()) and time.monotonic() < deadline:
@@ -668,7 +727,6 @@ class OutageFixture:
                 "--ignore-not-found",
                 "-o",
                 "name",
-                check=False,
             ).strip()
             result[f"{kind}/{name}"] = bool(present)
         return result
@@ -796,6 +854,30 @@ def _hold_outage(run: _Run) -> None:
     evidence_deadline = time.monotonic() + verdicts.EVIDENCE_TIMEOUT_SECONDS
     hold_until: float | None = None
     while True:
+        applied = json.loads(
+            run.regional.kubectl(
+                "gpu",
+                "get",
+                "validatingwebhookconfiguration",
+                run.outage.names["webhook"],
+                "-o",
+                "json",
+            )
+        )
+        if (
+            verdicts.webhook_errors(
+                applied, node=run.settings.node, username=run.outage.username
+            )
+            or not run.outage.webhook_uid
+            or (applied.get("metadata") or {}).get("uid") != run.outage.webhook_uid
+            or (applied.get("metadata") or {})
+            .get("labels", {})
+            .get("gpu-fault.io/acceptance-run")
+            != run.run_id
+        ):
+            raise RegionalFixtureError(
+                "the owned webhook scope changed during the outage"
+            )
         sample = _sample(run)
         run.samples.append(sample)
         write_json_atomic(
@@ -814,8 +896,10 @@ def _hold_outage(run: _Run) -> None:
             # after); holding the outage longer cannot produce evidence.
             break
         time.sleep(SAMPLE_INTERVAL_SECONDS)
-    run.webhook_closed_at = datetime.now(timezone.utc)
+    if hold_until is None or time.monotonic() < hold_until:
+        raise RegionalFixtureError("the configured outage hold was not proven")
     run.outage.close()
+    run.webhook_closed_at = datetime.now(timezone.utc)
 
 
 def _inject_and_observe(run: _Run) -> dict[str, Any]:
@@ -826,20 +910,20 @@ def _inject_and_observe(run: _Run) -> dict[str, Any]:
     run.bdf = str(bound[0]["pci_bdf"])
     run.baseline_inventory = baseline
     run.injected_at = datetime.now(timezone.utc)
-    injection = run.collector.execute(
-        "unbind-efa",
-        "--run-id",
-        run.run_id,
-        "--pci-bdf",
-        run.bdf,
-        "--restore-seconds",
-        str(verdicts.EFA_RESTORE_SECONDS),
-    )
-    write_json_atomic(run.case_dir / "injection.json", injection)
     unbound: dict[str, Any] = {}
     recovered: dict[str, Any] = {}
     bundle: dict[str, Any] = {}
     try:
+        injection = run.collector.execute(
+            "unbind-efa",
+            "--run-id",
+            run.run_id,
+            "--pci-bdf",
+            run.bdf,
+            "--restore-seconds",
+            str(verdicts.EFA_RESTORE_SECONDS),
+        )
+        write_json_atomic(run.case_dir / "injection.json", injection)
         unbound = _wait_efa_inventory(
             run.collector,
             discovered_count=int(baseline["discovered_count"]) - 1,
@@ -875,18 +959,23 @@ def _inject_and_observe(run: _Run) -> dict[str, Any]:
                 **run.regional.cpu_python(c017.REMOTE_COMMANDS, request_id),
             }
     finally:
-        if run.outage.webhook_created:
-            run.webhook_closed_at = run.webhook_closed_at or datetime.now(timezone.utc)
-            run.outage.close()
-        restore = run.collector.execute(
-            "restore-efa", "--run-id", run.run_id, "--pci-bdf", run.bdf
-        )
+        try:
+            if run.outage.webhook_created:
+                run.webhook_closed_at = run.webhook_closed_at or datetime.now(
+                    timezone.utc
+                )
+                run.outage.close()
+        finally:
+            restore = run.collector.execute(
+                "restore-efa", "--run-id", run.run_id, "--pci-bdf", run.bdf
+            )
     write_json_atomic(run.case_dir / "workflow-state.json", bundle)
     errors = list(verdicts.outage_errors(run.samples))
     errors.extend(
         verdicts.recovery_errors(
             bundle,
             waited_operation=(run.evidence or {}).get("operation"),
+            waited_evidence=run.evidence or {},
         )
     )
     errors.extend(
@@ -924,14 +1013,41 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
-    if preflight["errors"]:
-        raise RegionalFixtureError(
-            "preflight failed: " + "; ".join(preflight["errors"])
-        )
-    if datetime.now(timezone.utc) >= maintenance_window_end:
-        raise RegionalFixtureError("approved maintenance window has ended")
-    regional = RegionalLiveFixture(settings.regional)
+    preflight: dict[str, Any] = {}
+    try:
+        preflight = read_only_preflight(settings, case_dir)
+        if preflight["errors"]:
+            raise RegionalFixtureError(
+                "preflight failed: " + "; ".join(preflight["errors"])
+            )
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("approved maintenance window has ended")
+        regional = RegionalLiveFixture(settings.regional)
+        binding = case_binding(regional, run_dir, settings.predecessor_file)
+        if (
+            binding["errors"]
+            or binding["identity"] != preflight.get("identity")
+            or binding["predecessor"].get("case_id")
+            != preflight.get("predecessor", {}).get("case_id")
+        ):
+            raise RegionalFixtureError(
+                "NET-007 identity or predecessor changed before execution"
+            )
+    except Exception as exc:
+        result = {
+            "schema_version": 1,
+            "report_type": "fault-acceptance",
+            "case_id": CASE_ID,
+            "attempt": attempt,
+            "verdict": "FAIL",
+            "status": "COMPLETED",
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+            **preflight.get("identity", {}),
+            "predecessor": preflight.get("predecessor", {}),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        write_json_atomic(case_dir / f"{CASE_ID}.json", result)
+        return 1
     run_id = run_identity(run_dir, attempt)
     names = resource_names(run_id)
     executor = preflight["executor"]
@@ -948,6 +1064,7 @@ def execute_case(
             image=settings.host_probe_image,
             case_id=CASE_ID,
             run_id=run_id,
+            case_dir=case_dir,
         ),
         outage=OutageFixture(
             regional,
@@ -967,12 +1084,16 @@ def execute_case(
     )
     run.base_settings = _base_settings(settings)
     result: dict[str, Any] = {
+        "schema_version": 1,
+        "report_type": "fault-acceptance",
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
         "errors": [],
         "resources": names,
         "executor": executor,
+        **binding["identity"],
+        "predecessor": binding["predecessor"],
     }
     try:
         run.collector.create()
@@ -989,6 +1110,9 @@ def execute_case(
         cleanup: dict[str, Any] = {"errors": []}
         try:
             cleanup["deadman_log"] = run.outage.deadman_log()
+        except Exception as exc:
+            cleanup["errors"].append(f"deadman log: {type(exc).__name__}: {exc}")
+        try:
             residuals = run.outage.cleanup()
             cleanup["outage_residuals"] = residuals
             cleanup["errors"].extend(verdicts.residual_errors(residuals))
@@ -1015,10 +1139,19 @@ def execute_case(
             cleanup["errors"].extend(verdicts.provider_errors(events))
         except Exception as exc:
             cleanup["errors"].append(f"provider events: {type(exc).__name__}: {exc}")
+        try:
+            if regional.evidence_identity() != binding["identity"]:
+                raise RegionalFixtureError(
+                    "NET-007 release or cluster changed during execution"
+                )
+        except Exception as exc:
+            cleanup["errors"].append(f"final identity: {type(exc).__name__}: {exc}")
         result["cleanup"] = cleanup
         if cleanup["errors"]:
             result["errors"].extend(cleanup["errors"])
             result["verdict"] = "FAIL"
+    result["status"] = "COMPLETED"
+    result["executed_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True, default=str))
     return 0 if result["verdict"] == "PASS" else 1
@@ -1041,6 +1174,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--node", default="")
     value.add_argument("--site-file", default="")
     value.add_argument("--host-probe-image", default="")
+    value.add_argument("--predecessor-evidence", default="")
     value.add_argument(
         "--outage-seconds",
         type=int,

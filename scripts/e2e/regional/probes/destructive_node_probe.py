@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -119,14 +120,34 @@ def compute_clients() -> list[dict[str, str]]:
     for line in completed.stdout.splitlines():
         values = [value.strip() for value in line.split(",", 2)]
         if len(values) == 3 and values[1].isdigit():
-            result.append(
-                {
-                    "gpu_uuid": values[0],
-                    "pid": values[1],
-                    "process_name": values[2],
-                }
-            )
+            client = {
+                "gpu_uuid": values[0],
+                "pid": values[1],
+                "process_name": values[2],
+            }
+            pod_uid = client_pod_uid(values[1])
+            if pod_uid is not None:
+                client["pod_uid"] = pod_uid
+            result.append(client)
     return result
+
+
+def client_pod_uid(pid: str, *, proc_root: Path = Path("/proc")) -> str | None:
+    if not pid.isdigit() or int(pid) < 1:
+        return None
+    try:
+        cgroup = (proc_root / pid / "cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    matches = {
+        item.replace("_", "-").lower()
+        for item in re.findall(
+            r"(?:^|[-/])pod([0-9a-fA-F]{8}[-_][0-9a-fA-F]{4}[-_]"
+            r"[0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{12})(?:[/.]|$)",
+            cgroup,
+        )
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def service_snapshot() -> dict[str, dict[str, str]]:
@@ -166,7 +187,8 @@ def ledger_rows() -> list[dict[str, Any]]:
         rows = connection.execute(
             """
             SELECT command_id, completed_at, attempt, state,
-                   operation, started_at
+                   operation, started_at, incident_id, workflow_request_id,
+                   fencing_token, agent_generation, gpu_uuids, payload
             FROM results
             WHERE operation IN (
                 'QUIESCE_GPU_SERVICES',
@@ -189,6 +211,12 @@ def ledger_rows() -> list[dict[str, Any]]:
             "state": row[3],
             "operation": row[4],
             "started_at": row[5],
+            "incident_id": row[6],
+            "workflow_request_id": row[7],
+            "fencing_token": row[8],
+            "agent_generation": row[9],
+            "gpu_uuids": json.loads(row[10]) if row[10] else [],
+            "error": (json.loads(row[11]) or {}).get("error"),
         }
         for row in rows
     ]
@@ -227,6 +255,11 @@ def quiesce_states() -> list[dict[str, Any]]:
                 "phase": value.get("phase"),
                 "active_services": value.get("active_services", []),
                 "timer_unit": value.get("timer_unit"),
+                "incident_id": value.get("incident_id"),
+                "workflow_request_id": value.get("workflow_request_id"),
+                "boot_id": value.get("boot_id"),
+                "target_device_paths": value.get("target_device_paths"),
+                "reset_issued": value.get("reset_issued"),
             }
         )
     return result
@@ -329,8 +362,17 @@ def sampler_summary(run_id: str) -> dict[str, Any]:
     counts = [
         int(item["gpu_count"])
         for item in samples
-        if isinstance(item.get("gpu_count"), int)
+        if type(item.get("gpu_count")) is int and item.get("returncode") == 0
     ]
+    uuid_sets = sorted(
+        {
+            tuple(sorted(item["gpu_uuids"]))
+            for item in samples
+            if item.get("returncode") == 0
+            and isinstance(item.get("gpu_uuids"), list)
+            and all(isinstance(value, str) for value in item["gpu_uuids"])
+        }
+    )
     encoded = path.read_bytes() if path.is_file() else b""
     active = (
         run(
@@ -346,6 +388,15 @@ def sampler_summary(run_id: str) -> dict[str, Any]:
         "sample_count": len(samples),
         "min_gpu_count": min(counts) if counts else None,
         "max_gpu_count": max(counts) if counts else None,
+        "observed_gpu_uuid_sets": uuid_sets,
+        "identity_samples": [
+            {
+                "observed_at": item.get("observed_at"),
+                "returncode": item.get("returncode"),
+                "gpu_uuids": item.get("gpu_uuids"),
+            }
+            for item in samples
+        ],
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "first": samples[0] if samples else None,
         "last": samples[-1] if samples else None,
@@ -383,6 +434,17 @@ def write_xid(
     xid: int,
     description: str,
 ) -> None:
+    deadline_text = getattr(arguments, "maintenance_window_end", "")
+    if deadline_text:
+        try:
+            deadline = datetime.fromisoformat(deadline_text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ProbeError("invalid maintenance window deadline") from exc
+        if deadline.tzinfo is None or datetime.now(timezone.utc) >= deadline:
+            raise ProbeError("maintenance window ended before kmsg injection")
+    authorization = getattr(arguments, "barrier_authorization", "")
+    if authorization:
+        check_barrier(json.loads(authorization))
     marker = safe_id(arguments.marker, "marker")
     drill_id = safe_id(arguments.drill_id, "drill ID")
     if SAFE_BDF.fullmatch(arguments.pci_bdf) is None:
@@ -406,6 +468,104 @@ def write_xid(
             "bytes_written": written,
         }
     )
+
+
+def check_barrier(proof: dict[str, Any]) -> None:
+    """Recheck controller authorization against the current local ledger/state."""
+
+    now = datetime.now(timezone.utc)
+    if not isinstance(proof, dict) or proof.get("waiting") is not True:
+        raise ProbeError("destructive action has no WAITING barrier authorization")
+    try:
+        observed = datetime.fromisoformat(proof["observed_at"])
+        expires = min(
+            datetime.fromisoformat(proof["window_expires_at"]),
+            datetime.fromisoformat(proof["maintenance_window_end"]),
+        )
+        if observed.tzinfo is None or expires.tzinfo is None:
+            raise ValueError("naive time")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProbeError("barrier authorization has no valid deadline") from exc
+    if not observed <= now < expires or (now - observed).total_seconds() > 90:
+        raise ProbeError("barrier authorization expired or is future-dated")
+    current_boot = boot_id()
+    if not proof.get("boot_id") or proof["boot_id"] != current_boot:
+        raise ProbeError("barrier authorization belongs to another boot")
+    identity_keys = (
+        "incident_id",
+        "workflow_request_id",
+        "fencing_token",
+        "agent_generation",
+    )
+    if (
+        any(not proof.get(key) for key in identity_keys)
+        or type(proof["fencing_token"]) is not int
+        or type(proof["agent_generation"]) is not int
+        or not proof.get("run_id")
+        or not proof.get("node_id")
+        or not proof.get("drill_id")
+    ):
+        raise ProbeError("barrier authorization identity is incomplete")
+    rows = ledger_rows()
+    for operation, status in (
+        ("QUIESCE_GPU_SERVICES", "SUCCEEDED"),
+        ("VERIFY_NO_GPU_CLIENTS", "FAILED"),
+    ):
+        command_id = (proof.get("command_ids") or {}).get(operation)
+        matching = [
+            row for row in rows if command_id and row.get("command_id") == command_id
+        ]
+        if not matching:
+            raise ProbeError(f"barrier has no exact {operation} ledger row")
+        row = max(matching, key=lambda item: int(item.get("attempt") or 0))
+        if (
+            row.get("operation") != operation
+            or row.get("state") != status
+            or any(row.get(key) != proof[key] for key in identity_keys)
+        ):
+            raise ProbeError("barrier ledger identity or outcome changed")
+        if operation == "VERIFY_NO_GPU_CLIENTS":
+            try:
+                completed = datetime.fromisoformat(row["completed_at"])
+                age = (now - completed).total_seconds()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ProbeError("barrier verification timestamp is unknown") from exc
+            if not 0 <= age <= 30 or "clients are still active" not in str(
+                row.get("error")
+            ):
+                raise ProbeError("barrier no longer has a fresh GPU-client refusal")
+    if any(
+        row.get("workflow_request_id") == proof["workflow_request_id"]
+        and row.get("operation")
+        in {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTORE_GPU_SERVICES"}
+        for row in rows
+    ):
+        raise ProbeError("barrier already advanced beyond client verification")
+    states = [
+        item
+        for item in quiesce_states()
+        if item.get("incident_id") == proof["incident_id"]
+    ]
+    if len(states) != 1:
+        raise ProbeError("barrier quiesce state is missing or ambiguous")
+    state = states[0]
+    if (
+        state.get("workflow_request_id") != proof["workflow_request_id"]
+        or state.get("boot_id") != current_boot
+        or state.get("phase") != "QUIESCED"
+        or state.get("reset_issued")
+        or proof.get("device") not in (state.get("target_device_paths") or [])
+    ):
+        raise ProbeError("barrier quiesce scope or ownership changed")
+
+
+def check_barrier_command(arguments: argparse.Namespace) -> None:
+    check_barrier(json.loads(arguments.barrier_authorization))
+    emit({"barrier_verified": True})
+
+
+def boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
 def write_xid46(arguments: argparse.Namespace) -> None:
@@ -447,24 +607,33 @@ def gpu_sample() -> dict[str, Any]:
 
     observed_at = datetime.now(timezone.utc).isoformat()
     try:
-        completed = run(["nvidia-smi", "-L"], check=False, timeout=10)
+        completed = run(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader,nounits"],
+            check=False,
+            timeout=10,
+        )
     except subprocess.TimeoutExpired:
         return {
             "observed_at": observed_at,
             "returncode": None,
             "gpu_count": None,
+            "gpu_uuids": None,
             "timed_out": True,
             "sha256": hashlib.sha256(b"").hexdigest(),
         }
-    lines = [
-        line.strip()
-        for line in completed.stdout.splitlines()
-        if line.strip().startswith("GPU ")
-    ]
+    rows = list(csv.reader(completed.stdout.splitlines()))
+    uuids = [row[0].strip() for row in rows if len(row) == 1]
+    valid = (
+        completed.returncode == 0
+        and len(uuids) == len(rows)
+        and len(set(uuids)) == len(uuids)
+        and all(re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid) for uuid in uuids)
+    )
     return {
         "observed_at": observed_at,
         "returncode": completed.returncode,
-        "gpu_count": len(lines),
+        "gpu_count": len(uuids) if valid else None,
+        "gpu_uuids": uuids if valid else None,
         "timed_out": False,
         "sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
     }
@@ -551,10 +720,18 @@ def restore_quiesce(arguments: argparse.Namespace) -> None:
     incident_id = safe_id(arguments.incident_id, "incident ID")
     digest = hashlib.sha256(incident_id.encode()).hexdigest()[:20]
     state_path = QUIESCE_STATE_DIR / f"quiesce-{digest}.json"
-    from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
-
-    result = GpuServiceQuiesceManager.restore_state_file(state_path)
-    emit(result)
+    if state_path.exists() or state_path.is_symlink():
+        raise ProbeError(
+            "quiesce state remains product-owned; automatic host restore is disabled; "
+            "retain the existing failsafe and require operator reconciliation"
+        )
+    emit(
+        {
+            "restore_attempted": False,
+            "state_absent": True,
+            "physical_outcome_proven": False,
+        }
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -575,6 +752,8 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--marker", required=True)
         command.add_argument("--drill-id", required=True)
         command.add_argument("--pci-bdf", required=True)
+        command.add_argument("--maintenance-window-end", default="")
+        command.add_argument("--barrier-authorization", default="")
         command.set_defaults(handler=handler, case_id=case_id)
 
     generic = commands.add_parser("write-xid")
@@ -582,12 +761,18 @@ def parser() -> argparse.ArgumentParser:
     generic.add_argument("--marker", required=True)
     generic.add_argument("--drill-id", required=True)
     generic.add_argument("--pci-bdf", required=True)
+    generic.add_argument("--maintenance-window-end", default="")
+    generic.add_argument("--barrier-authorization", default="")
     generic.add_argument(
         "--description",
         default="regional destructive collector acceptance event",
     )
     generic.add_argument("--case-id", default="GF-REGIONAL-COLLECT")
     generic.set_defaults(handler=write_generic_xid)
+
+    barrier = commands.add_parser("check-barrier")
+    barrier.add_argument("--barrier-authorization", required=True)
+    barrier.set_defaults(handler=check_barrier_command)
 
     start = commands.add_parser("start-reset-sampler")
     start.add_argument("--run-id", required=True)

@@ -29,7 +29,23 @@ class RecordingCursor:
         # the CREATE TRIGGER is recorded (item J made the DDL ask first).
         if self.statements and "pg_get_triggerdef" in self.statements[-1]:
             return None
+        if self.statements and self.statements[-1].startswith(
+            "SELECT to_regclass('gpu_fault_control_state_modes'),"
+        ):
+            return (None, None, None, False)
+        if self.statements and self.statements[-1].startswith(
+            "SELECT legacy_purged FROM gpu_fault_control_state_modes"
+        ):
+            return None
         return (True,)
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        if (
+            self.statements[-1]
+            == "SELECT kind, mode FROM gpu_fault_control_state_modes"
+        ):
+            return []
+        raise AssertionError("unexpected rowset query in the DDL recording cursor")
 
     def __enter__(self) -> RecordingCursor:
         return self

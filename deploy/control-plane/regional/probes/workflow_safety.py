@@ -43,8 +43,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
-from gpu_fault.operation_registry import DESTRUCTIVE_OPERATIONS
+from gpu_fault.models import (
+    IncidentState,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
+from gpu_fault.operation_registry import (
+    DESTRUCTIVE_OPERATIONS,
+    NODE_MUTATING_OPERATIONS,
+)
 from gpu_fault.remote_command_models import RemoteCommandStatus
 
 STATUSES = {
@@ -55,12 +63,109 @@ STATUSES = {
 }
 
 
+def has_unresolved_node_action(workflow: Any) -> bool:
+    # Older deployed releases do not have the uncertainty helper. Match its
+    # latest-result-per-step rule without importing a candidate-only module.
+    seen = set()
+    for execution in reversed(workflow.step_executions):
+        identity = (
+            getattr(execution, "phase", None),
+            execution.step_index,
+            execution.operation,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        details = execution.details
+        if (
+            execution.status is WorkflowStepStatus.SUCCEEDED
+            or execution.operation not in NODE_MUTATING_OPERATIONS
+            or (
+                execution.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+                and details.get("restore_gpu_services_withheld") is True
+            )
+        ):
+            continue
+        if (
+            any(
+                details.get(name) is True
+                for name in (
+                    "outcome_unknown",
+                    "node_action_interrupted",
+                    "node_action_response_unknown",
+                    "ownership_permit_delivery_unknown",
+                )
+            )
+            or (
+                details.get("node_action_state") == "PENDING"
+                and isinstance(details.get("node_action_command_id"), str)
+                and details["node_action_command_id"]
+            )
+            or (
+                details.get("manual_confirmation_required") is True
+                and details.get("node_action_not_started") is not True
+            )
+        ):
+            return True
+    return False
+
+
+def occupies_nodes(workflow: Any) -> bool:
+    kind = str(getattr(workflow, "blocked_kind", None) or "")
+    if kind in {"", "SAFETY_SETTLED"}:
+        return False
+    if kind == "NEEDS_OPERATOR" and (
+        not workflow.step_executions
+        and not workflow.completed_step_indexes
+        and not workflow.superseded_step_indexes
+        and workflow.execution_owner_id is None
+    ):
+        return False
+    return True
+
+
+def no_open_commands(store: Any, workflow: Any) -> bool:
+    try:
+        commands = store.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+    except Exception:
+        return False
+    return not any(
+        command.status
+        in (
+            RemoteCommandStatus.PENDING,
+            RemoteCommandStatus.LEASED,
+            RemoteCommandStatus.WAITING,
+        )
+        for command in commands
+    )
+
+
 def main() -> None:
     context = ApplicationContext.from_environment()
     store = context.store
+    now = datetime.now(timezone.utc)
+
+    def unsettled_execution(workflow: Any) -> bool:
+        return (
+            workflow.execution_owner_id is not None
+            or (
+                workflow.execution_lease_expires_at is not None
+                and workflow.execution_lease_expires_at > now
+            )
+            or occupies_nodes(workflow)
+            or has_unresolved_node_action(workflow)
+            or any(
+                execution.status is WorkflowStepStatus.WAITING
+                for execution in workflow.step_executions
+            )
+        )
 
     def resolved_by_restore(workflow: Any) -> bool:
-        if workflow.status is not WorkflowStatus.BLOCKED:
+        if workflow.status is not WorkflowStatus.BLOCKED or unsettled_execution(
+            workflow
+        ):
             return False
         try:
             incident = store.get_incident(workflow.incident_id)
@@ -78,11 +183,13 @@ def main() -> None:
         except Exception:
             return False
         return bool(
-            successor.status is WorkflowStatus.SUCCEEDED
+            successor.incident_id == workflow.incident_id
+            and successor.fencing_token == workflow.fencing_token
+            and incident.fencing_token == workflow.fencing_token
+            and successor.status is WorkflowStatus.SUCCEEDED
             and WorkflowOperation.RESTORE_SCHEDULING in successor.completed_operations
+            and no_open_commands(store, workflow)
         )
-
-    now = datetime.now(timezone.utc)
 
     def abandoned_generation(workflow: Any) -> bool:
         if (
@@ -135,7 +242,8 @@ def main() -> None:
             or workflow.step_executions
             or workflow.completed_step_indexes
             or workflow.completed_operations
-            or workflow.execution_owner_id
+            or workflow.execution_owner_id is not None
+            or workflow.execution_lease_expires_at is not None
             or workflow.source_plan_id
             or workflow.remediation_budget_claims
         ):
@@ -146,27 +254,14 @@ def main() -> None:
             return False
         if incident.state not in (IncidentState.RECOVERED, IncidentState.ESCALATED):
             return False
-        try:
-            commands = store.list_remote_commands(
-                workflow_request_ids=[workflow.request_id]
-            )
-        except Exception:
-            return False
-        return not any(
-            command.status
-            in (
-                RemoteCommandStatus.PENDING,
-                RemoteCommandStatus.LEASED,
-                RemoteCommandStatus.WAITING,
-            )
-            for command in commands
-        )
+        return no_open_commands(store, workflow)
 
     def settled_incident_blocked(workflow: Any) -> bool:
         # A BLOCKED record whose incident is already RECOVERED: nothing waits
         # on it (an operator close refuses while a workflow is open, so this is
         # what a close leaves behind) and nothing on it is live -- no execution
-        # owner, no budget claim, no open remote command. The dispatcher sweep
+        # owner, live lease, occupying kind, unresolved action or open command.
+        # The dispatcher sweep
         # ends it (``gpu_fault.compile_blocked``, second shape); the gate sets
         # it aside for the same reason as the compile-time shape: the record
         # blocked the very release that carried its close. ESCALATED stays a
@@ -176,7 +271,7 @@ def main() -> None:
         # releases them with the close, so they do not keep the record here.
         if (
             workflow.status is not WorkflowStatus.BLOCKED
-            or workflow.execution_owner_id
+            or unsettled_execution(workflow)
             or workflow.source_plan_id  # plan-driven: the restore reconcile's
         ):
             return False
@@ -186,21 +281,7 @@ def main() -> None:
             return False
         if incident.state is not IncidentState.RECOVERED:
             return False
-        try:
-            commands = store.list_remote_commands(
-                workflow_request_ids=[workflow.request_id]
-            )
-        except Exception:
-            return False
-        return not any(
-            command.status
-            in (
-                RemoteCommandStatus.PENDING,
-                RemoteCommandStatus.LEASED,
-                RemoteCommandStatus.WAITING,
-            )
-            for command in commands
-        )
+        return no_open_commands(store, workflow)
 
     blockers: list[str] = []
     resolved: list[str] = []
@@ -208,6 +289,9 @@ def main() -> None:
     compile_time: list[str] = []
     settled: list[str] = []
     for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
+        if has_unresolved_node_action(workflow):
+            blockers.append(workflow.request_id)
+            continue
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in workflow.official_steps
         ):

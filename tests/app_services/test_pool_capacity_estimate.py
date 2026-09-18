@@ -82,7 +82,7 @@ def test_the_worker_role_counts_its_processor_and_dispatcher_threads(
     assert estimate.headroom == 8 - 46
     # The LISTEN connection is real but bypasses the pool: reported, not
     # folded into the pool ratio.
-    assert estimate.unpooled_connections == 1
+    assert estimate.unpooled_connections == 3
     assert any(
         "46" in record.getMessage() and "processor_workers" in record.getMessage()
         for record in caplog.records
@@ -202,7 +202,7 @@ def test_the_ratio_reaches_metrics(worker_environment):
         'gpu_fault_postgres_pool_demand_connections{consumer="processor_workers"} 24'
         in lines
     )
-    assert "gpu_fault_postgres_unpooled_connections 1" in lines
+    assert "gpu_fault_postgres_unpooled_connections 3" in lines
 
 
 def test_metrics_stay_quiet_without_an_estimate():

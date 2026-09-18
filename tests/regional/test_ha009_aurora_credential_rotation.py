@@ -10,14 +10,17 @@ in its log (H1-5).
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from scripts.e2e.regional import ha009_verdicts as verdicts
 from scripts.e2e.regional import run_ha005_rollout_continuity as ha005
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
 
@@ -51,34 +54,91 @@ def test_refresh_watchdog_runs_detached_and_is_disarmed_by_process_group(
     )
     monkeypatch.setattr(ha009.BASE._registry, "CONTROL_NAMESPACE", "gpu-fault-system")
 
-    process = ha009.start_refresh_watchdog(tmp_path, "job-w", delay_seconds=600)
-    try:
-        assert os.getpgid(process.pid) == process.pid, "watchdog must own its session"
-        record = (tmp_path / "refresh-watchdog.json").read_text()
-        assert '"job": "job-w"' in record
-        assert process.poll() is None
-    finally:
-        outcome = ha009.stop_refresh_watchdog(process)
+    calls = []
+    created = []
+    monkeypatch.setattr(
+        ha009.BASE,
+        "control",
+        lambda *a, **kw: json.dumps(
+            {
+                "kind": "Job",
+                "metadata": {"name": "job-w", "namespace": "unit"},
+                "spec": {"template": {"metadata": {}}},
+            }
+        ),
+    )
+    process = SimpleNamespace(pid=12345, returncode=None)
+    process.poll = lambda: process.returncode
+    process.wait = lambda **kw: setattr(process, "returncode", -signal.SIGTERM)
+    monkeypatch.setattr(
+        ha009.subprocess,
+        "Popen",
+        lambda command, **kw: calls.append((command, kw)) or process,
+    )
+    monkeypatch.setattr(ha009.os, "killpg", lambda *a: calls.append(a))
+    resources = SimpleNamespace(
+        create=lambda value: created.append(value),
+        owned=lambda *a: {"metadata": {"uid": "watchdog-uid"}},
+    )
+    monkeypatch.setattr(
+        ha009,
+        "aurora_guard",
+        lambda: SimpleNamespace(
+            refresh_job=lambda *a: json.loads(ha009.BASE.control())
+        ),
+    )
+    assert (
+        ha009.start_refresh_watchdog(
+            tmp_path,
+            "job-w",
+            resources,
+            run_id="unit-run",
+            delay_seconds=600,
+            binding={"unit": "proof"},
+        )
+        is process
+    ), "arming must return the detached watchdog process"
+    assert calls[0][1]["start_new_session"] is True, "watchdog must own its session"
+    assert created[0]["spec"]["suspend"] is True, (
+        "watchdog Job must not execute before its delay"
+    )
+    assert (
+        created[0]["metadata"]["labels"]["gpu-fault.io/acceptance-run"] == "unit-run"
+    ), "watchdog Job must retain the acceptance run identity"
+    record = json.loads((tmp_path / "refresh-watchdog.json").read_text())
+    assert record["job"] == "job-w", (
+        "watchdog evidence must identify its precreated Job"
+    )
+    outcome = ha009.stop_refresh_watchdog(process)
+    assert calls[1] == (process.pid, signal.SIGTERM), (
+        "disarm must target the watchdog process group"
+    )
     assert outcome["disarmed"] is True
     assert process.poll() is not None
     assert ha009.stop_refresh_watchdog(None) == {"armed": False}
 
 
-def test_refresh_job_command_creates_from_the_cronjob(
+def test_refresh_job_command_resumes_only_the_owned_suspended_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(ha009, "CRONJOB", "cron-x")
     monkeypatch.setattr(ha009.BASE._registry, "CONTROL_KUBECONFIG", "/k")
     monkeypatch.setattr(ha009.BASE._registry, "CONTROL_NAMESPACE", "ns")
-    command = ha009.refresh_job_command("job-1")
+    command = ha009.refresh_job_command("job-1", "job-uid")
     assert command[:5] == ["kubectl", "--kubeconfig", "/k", "-n", "ns"]
-    assert command[5:] == ["create", "job", "job-1", "--from=cronjob/cron-x"]
+    assert command[5:10] == ["patch", "job", "job-1", "--type=json", "-p"]
+    assert json.loads(command[-1]) == [
+        {"op": "test", "path": "/metadata/uid", "value": "job-uid"},
+        {"op": "test", "path": "/spec/suspend", "value": True},
+        {"op": "replace", "path": "/spec/suspend", "value": False},
+    ]
 
 
 def _deployment(
     generation: int, uids: list[str], replicas: int = 3, *, complete: bool = True
 ) -> dict:
     return {
+        "uid": "deployment-uid",
         "generation": generation,
         "observed_generation": generation,
         "replicas": replicas,
@@ -102,21 +162,23 @@ def test_deployments_rolled_requires_updated_replicas_and_new_uids() -> None:
         "gpu-fault-control-worker": _deployment(2, ["x1", "x2", "x3"]),
         "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
     }
-    assert ha009.deployments_rolled(before, rolled) is True, (
+    assert verdicts.deployments_rolled(before, rolled) is True, (
         "a replicas=0 role must not block completion"
     )
     half = {**rolled, "gpu-fault-control-worker": _deployment(2, ["x1", "x2", "w3"])}
-    assert ha009.deployments_rolled(before, half) is False, "an old UID still present"
+    assert verdicts.deployments_rolled(before, half) is False, (
+        "an old UID still present"
+    )
     not_updated = {
         **rolled,
         "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"], complete=False),
     }
-    assert ha009.deployments_rolled(before, not_updated) is False, (
+    assert verdicts.deployments_rolled(before, not_updated) is False, (
         "ready == replicas with updatedReplicas short is mid-rollout"
     )
     # deployments_rolled stays for the refresher's --restart-deployments
     # compatibility mode; the catalog status for path A is STEADY.
-    assert ha009.role_status(before) == {
+    assert verdicts.role_status(before) == {
         "gpu-fault-api-ha": "STEADY",
         "gpu-fault-control-worker": "STEADY",
         "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
@@ -129,27 +191,27 @@ def test_deployments_steady_requires_same_generation_uids_and_restarts() -> None
         "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w3"]),
         "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
     }
-    assert ha009.deployments_steady(before, before) == []
+    assert verdicts.deployments_steady(before, before) == []
 
     rolled = {**before, "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"])}
     assert any(
-        "generation" in item for item in ha009.deployments_steady(before, rolled)
+        "generation" in item for item in verdicts.deployments_steady(before, rolled)
     ), "a generation bump must be reported as a rollout"
 
     replaced = {
         **before,
         "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w9"]),
     }
-    assert any("Pod" in item for item in ha009.deployments_steady(before, replaced)), (
-        "a replaced Pod uid must be reported"
-    )
+    assert any(
+        "Pod" in item for item in verdicts.deployments_steady(before, replaced)
+    ), "a replaced Pod uid must be reported"
 
     restarted = {**before, "gpu-fault-api-ha": _deployment(1, ["a1", "a2", "a3"])}
     restarted["gpu-fault-api-ha"]["pods"][0][1]["restarts"] = 1
     assert any(
-        "restart" in item for item in ha009.deployments_steady(before, restarted)
+        "restart" in item for item in verdicts.deployments_steady(before, restarted)
     ), "a container restart must be reported"
-    assert ha009.role_status(before) == {
+    assert verdicts.role_status(before) == {
         "gpu-fault-api-ha": "STEADY",
         "gpu-fault-control-worker": "STEADY",
         "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
@@ -176,7 +238,8 @@ def test_pool_metric_samples_are_parsed_from_the_exposition_text() -> None:
 
 def test_idle_wait_is_max_idle_plus_margin_and_never_past_the_budget() -> None:
     assert ha009.idle_wait_seconds(300, budget=480) == 360
-    assert ha009.idle_wait_seconds(900, budget=480) == 480
+    with pytest.raises(ha009.CaseError, match="idle-window budget"):
+        ha009.idle_wait_seconds(900, budget=480)
 
 
 def _observation(
@@ -189,6 +252,8 @@ def _observation(
             pod: [
                 {
                     "healthz_status": healthz,
+                    "metrics_status": 200,
+                    "fresh_connection": True,
                     "metrics": {
                         "gpu_fault_postgres_pool_size": 2.0,
                         "gpu_fault_postgres_pool_connections_errors_total": errors,
@@ -211,23 +276,10 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
     # Path A: nothing rolls. The snapshot after the case equals the baseline.
     after = before
     pods = ["p-a1", "p-a2", "p-a3", "p-w1", "p-w2", "p-w3"]
-    probe = {
-        "counters": {
-            "event_attempts": 10,
-            "event_accepted": 9,
-            "event_failures": 1,
-            "event_buffered": 1,
-        },
-        "outbox": {"records": 0, "replayable": 0},
-        "error_types": {},
-        "accepted_request_ids": ["r1"],
-    }
-    receipts = {
-        "requests": [
-            {"request_id": "r1", "status": "COMPLETED", "response_status": 200}
-        ],
-        "missing": [],
-    }
+    from tests.regional.test_acceptance_alignment_ha_telemetry import telemetry_proof
+
+    probe, receipts = telemetry_proof(spooled=False)
+    probe["accepted_request_ids"] = ["processor-unit"]
     runtime = {
         "command": {"status": "SUCCEEDED"},
         "notification": {
@@ -254,12 +306,12 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         before_noop=after,
         after_noop=after,
     )
-    assert ha009.rotation_errors(final_probe=probe, **common) == []
+    assert verdicts.rotation_errors(final_probe=probe, **common) == []
 
     broken_probe = {**probe, "error_types": {"http-500": 1}}
-    errors = ha009.rotation_errors(final_probe=broken_probe, **common)
+    errors = verdicts.rotation_errors(final_probe=broken_probe, **common)
     assert errors == ha005.continuity_errors(
-        broken_probe, receipts, accepted_ids=["r1"]
+        broken_probe, receipts, accepted_ids=["processor-unit"]
     ), "HA-009 must report exactly what HA-005's shared evaluation reports"
 
     # The refresher must not have rolled anything (the old PASS shape).
@@ -271,7 +323,7 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         },
         "first_job": {"logs": ["rotated=True restarted=True"]},
     }
-    errors = ha009.rotation_errors(final_probe=probe, **rolled)
+    errors = verdicts.rotation_errors(final_probe=probe, **rolled)
     assert any("generation" in item for item in errors), (
         "the api-ha rollout must surface as a generation error"
     )
@@ -288,18 +340,19 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         },
     }
     assert any(
-        "p-w3" in item for item in ha009.rotation_errors(final_probe=probe, **stale)
+        "p-w3" in item for item in verdicts.rotation_errors(final_probe=probe, **stale)
     ), "the lagging Pod must be named in the propagation error"
 
     # H1-5: after max_idle every Pod still serves and no reconnect was refused.
     sick = {**common, "idle_observation": _observation(pods, healthz=503)}
     assert any(
-        "healthz" in item for item in ha009.rotation_errors(final_probe=probe, **sick)
+        "healthz" in item
+        for item in verdicts.rotation_errors(final_probe=probe, **sick)
     ), "a 503 healthz after max_idle must fail the case"
     refused = {**common, "idle_observation": _observation(pods, auth_failures=2)}
     assert any(
         "authentication" in item
-        for item in ha009.rotation_errors(final_probe=probe, **refused)
+        for item in verdicts.rotation_errors(final_probe=probe, **refused)
     ), "refused reconnects must fail the case"
     unrendered = {**common, "idle_observation": _observation(pods)}
     for samples in unrendered["idle_observation"]["samples"].values():
@@ -307,7 +360,7 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
             sample["metrics"].pop("gpu_fault_postgres_pool_connections_errors_total")
     assert any(
         "connections_errors_total" in item
-        for item in ha009.rotation_errors(final_probe=probe, **unrendered)
+        for item in verdicts.rotation_errors(final_probe=probe, **unrendered)
     ), "a missing pool error counter must fail the case"
 
 
@@ -430,38 +483,108 @@ def test_the_background_poll_collects_new_ids_and_records_its_errors(
     ledger.stop()
 
     assert ledger.settled_count() == 1, "the poll never collected the receipt"
-    assert ledger.last_error == "RuntimeError: probe exec hiccup"
+    assert ledger.last_error == "RuntimeError"
+    assert "probe exec hiccup" not in ledger.last_error, (
+        "background probe diagnostics must not leak arbitrary command output"
+    )
 
 
+@pytest.mark.parametrize(
+    ("app", "port"), tuple(zip(ha009.DEPLOYMENTS, (8080, 8081, 8082), strict=True))
+)
 def test_probe_pod_reads_the_pods_own_port_instead_of_assuming_8080(
-    monkeypatch: pytest.MonkeyPatch,
+    app: str, port: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Attempt 6 read every control-worker as /healthz 0: the probe was pinned
-    to 8080 while that role serves 8081. The port comes from the Pod spec."""
-
+    """The validated replica snapshot supplies the role port for every sample."""
     calls: list[tuple[str, ...]] = []
+    pod_name = f"{app}-x"
 
     def control(*arguments: str, **_keywords: object) -> str:
         calls.append(arguments)
-        if arguments[0] == "get":
-            return "8081\n"
-        return '{"healthz_status": 200, "metrics_status": 200, "metrics_text": ""}\n'
+        if arguments[:2] == ("get", "deployment"):
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": app,
+                                "uid": "deployment-uid",
+                                "generation": 1,
+                            },
+                            "spec": {
+                                "replicas": 1,
+                                "template": {
+                                    "spec": {
+                                        "containers": [
+                                            {
+                                                "name": "api",
+                                                "ports": [
+                                                    {
+                                                        "name": "http",
+                                                        "containerPort": port,
+                                                    }
+                                                ],
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                            "status": {
+                                "observedGeneration": 1,
+                                "readyReplicas": 1,
+                                "updatedReplicas": 1,
+                                "availableReplicas": 1,
+                            },
+                        }
+                    ]
+                }
+            )
+        if arguments[:2] == ("get", "pod"):
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": pod_name, "uid": "pod-uid"},
+                            "spec": {"containers": [{"name": "api"}]},
+                            "status": {
+                                "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
+                                "containerStatuses": [
+                                    {"name": "api", "ready": True, "restartCount": 0}
+                                ],
+                            },
+                        }
+                    ]
+                }
+            )
+        assert arguments[:2] == ("exec", pod_name)
+        assert arguments[-1] == str(port)
+        return json.dumps(
+            {
+                "healthz_status": 200,
+                "metrics_status": 200,
+                "metrics_text": "",
+                "fresh_connection": True,
+            }
+        )
 
     monkeypatch.setattr(ha009.BASE, "control", control)
-    ha009.POD_PORTS.clear()
-
-    first = ha009.probe_pod("gpu-fault-control-worker-x")
-    second = ha009.probe_pod("gpu-fault-control-worker-x")
+    snapshot = ha009.deployment_snapshot()
+    observed = dict(snapshot[app]["pods"])[pod_name]
+    assert observed["uid"] == "pod-uid" and observed["ready"] is True
+    assert observed["port"] == port
+    first = ha009.probe_pod(pod_name, observed["port"])
+    second = ha009.probe_pod(pod_name, observed["port"])
 
     assert first["healthz_status"] == 200 and second["healthz_status"] == 200, (
         first,
         second,
     )
-    scripts = [call[-1] for call in calls if call[0] == "exec"]
-    assert len(scripts) == 2 and all("127.0.0.1:8081" in s for s in scripts), scripts
-    assert sum(1 for call in calls if call[0] == "get") == 1, (
-        "the port was re-read per sample"
-    )
+    assert sum(1 for call in calls if call[0] == "exec") == 2
+    assert [call[:2] for call in calls if call[0] == "get"] == [
+        ("get", "deployment"),
+        ("get", "pod"),
+    ], "the role port must come from one complete snapshot, not a name-only cache"
 
 
 def test_secret_versions_follows_next_token_so_the_newest_version_is_seen(
@@ -508,3 +631,65 @@ def test_secret_versions_follows_next_token_so_the_newest_version_is_seen(
     assert ha009.managed_rotation_complete(
         result, old_current="prev", cluster_status="available"
     ), "the rotation on the second page was not recognised"
+
+
+@pytest.mark.parametrize("token", [False, 0, 1, [], {}, " "])
+def test_secret_versions_rejects_malformed_continuation_tokens(
+    token: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ha009, "aws", lambda *_a: {"Versions": [], "NextToken": token})
+    with pytest.raises(ha009.CaseError, match="pagination token"):
+        ha009.secret_versions("unit-secret-reference")
+
+
+def test_secret_versions_cannot_loop_on_a_repeated_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def aws(*arguments):
+        calls.append(arguments)
+        return {"Versions": [], "NextToken": "same-page"}
+
+    monkeypatch.setattr(ha009, "aws", aws)
+    with pytest.raises(ha009.CaseError, match="pagination token"):
+        ha009.secret_versions("unit-secret-reference")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        None,
+        {},
+        [None],
+        [{}],
+        [{"VersionId": "a", "VersionStages": None}],
+        [{"VersionId": "a", "VersionStages": [""]}],
+        [{"VersionId": "a", "VersionStages": []}] * 2,
+        [{"VersionId": "a", "VersionStages": ["AWSCURRENT", "AWSCURRENT"]}],
+        [
+            {"VersionId": "a", "VersionStages": ["AWSCURRENT"]},
+            {"VersionId": "b", "VersionStages": ["AWSCURRENT"]},
+        ],
+    ],
+)
+def test_secret_versions_rejects_ambiguous_or_incomplete_history(
+    versions: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ha009, "aws", lambda *_a: {"Versions": versions})
+    with pytest.raises(ha009.CaseError):
+        ha009.secret_versions("unit-secret-reference")
+
+
+def test_secret_version_pagination_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def aws(*arguments):
+        calls.append(arguments)
+        return {"Versions": [], "NextToken": f"page-{len(calls)}"}
+
+    monkeypatch.setattr(ha009, "aws", aws)
+    with pytest.raises(ha009.CaseError, match="did not terminate"):
+        ha009.secret_versions("unit-secret-reference")
+    assert len(calls) == 100

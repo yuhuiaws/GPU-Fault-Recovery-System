@@ -12,6 +12,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 
 from tools.regional_acceptance_plan import (
+    EnvironmentMode,
     ExecutorKind,
     FailureScope,
     LockMode,
@@ -59,11 +60,7 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    # 190 catalogued cases (COLLECT-021 added 2026-09-08, the BOOT-024..028
-    # admin lifecycle chain and the BOOT-029 lifecycle sequence added
-    # 2026-09-12); 10 are DO_NOT_RUN (two retired earlier, seven folded into
-    # their supersets on 2026-09-07, plus BOOT-006 deleted with quick triage),
-    # so 180 run.
+    # Historical and forbidden cases stay outside the formal execution sequence.
     retired = (
         "GF-REGIONAL-BOOT-006",
         "GF-REGIONAL-DESTR-004",
@@ -71,15 +68,14 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-AUTH-010",
         "GF-REGIONAL-NOTIFY-002",
         "GF-REGIONAL-DESTR-011",
-        "GF-REGIONAL-HA-005",
         "GF-REGIONAL-PREEMPT-013",
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 180
-    assert len(plan.cases) == 190
-    assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
-    assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
+    assert len(plan.execution_order) == 188
+    assert len(plan.cases) == 197
+    assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-016", "GF-REGIONAL-BOOT-011")
+    assert plan.execution_order[-1] == "GF-REGIONAL-BOOT-032"
     assert plan.do_not_run_case_ids == retired
     assert plan.case_ids == (*plan.execution_order, *retired)
 
@@ -123,6 +119,30 @@ def test_formal_plan_merges_catalog_metadata_and_execution() -> None:
         "test_regional_context_rejects_local_kubernetes_adapter"
     )
     assert related.executor is ExecutorKind.HUMAN
+
+
+def test_formal_local_tests_default_to_credential_isolation() -> None:
+    plan = compile_regional_acceptance_plan()
+    local = [
+        case
+        for case in plan.cases
+        if case.risk == "non-destructive"
+        and case.executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
+        and not case.catalog_execution.configured_in_catalog
+    ]
+    assert local, "the default-policy branch must cover real catalog tests"
+    assert all(
+        case.execution.environment is EnvironmentMode.ISOLATED for case in local
+    ), (
+        "formal sequencing does not authorize local tests to inherit cloud or database credentials"
+    )
+    assert all(case.execution.parallel_safe is False for case in local), (
+        "isolating a formal test's environment must not parallelize the formal sequence"
+    )
+    assert (
+        plan.case("GF-REGIONAL-CAP-005").execution.environment
+        is EnvironmentMode.INHERIT
+    )
 
 
 def _referenced_pytest_node_ids() -> dict[str, list[str]]:
@@ -246,16 +266,24 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         if case.executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
         and not case.blocked
     ]
-    # pytest + command cases plus the live-non-destructive manual cases whose
-    # related_pytest is a local proxy (NET-006, CMD-017, DESTR-020, ...) of the
-    # 183 cases. The number only moves when a case gains or loses a local
-    # answer, so it is stated rather than derived. 112 -> 106 on 2026-09-07:
-    # PREEMPT-013/023/034 (pytest wrappers) and AUTH-010/NOTIFY-002/DESTR-011
-    # (local-proxy manual cases) were folded into the cases that already ran
-    # their assertions and are DO_NOT_RUN; HA-007 and CMD-011 moved from
-    # local-proxy manual to command, which is count-neutral. 106 -> 105 when
-    # BOOT-006 (automated guard) was deleted with quick diagnostics.
-    assert len(automated) == 105
+    # HA-011 and NOTIFY-008 add local regression proxies; BOOT-032 stays destructive.
+    assert len(automated) == 110, "local proxy eligibility changed unexpectedly"
+    for case_id in (
+        "GF-REGIONAL-BOOT-030",
+        "GF-REGIONAL-BOOT-031",
+        "GF-REGIONAL-COLLECT-022",
+        "GF-REGIONAL-HA-011",
+        "GF-REGIONAL-NOTIFY-008",
+    ):
+        assert plan.case(case_id).local_proxy is True, case_id
+    for case_id in (
+        "GF-REGIONAL-ISO-007",
+        "GF-REGIONAL-HA-005",
+        "GF-REGIONAL-BOOT-032",
+        *(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(24, 30)),
+    ):
+        assert plan.case(case_id).executor is ExecutorKind.HUMAN, case_id
+        assert plan.case(case_id).blocked is True, case_id
     assert all(
         case.risk == "non-destructive" or case.local_proxy for case in automated
     ), [case.id for case in automated]
@@ -476,11 +504,10 @@ def test_order_rejects_duplicate_unknown_and_missing_cases(tmp_path: Path) -> No
 
     missing_value = _read_yaml(ORDER)
     missing_phases = cast(list[dict[str, Any]], missing_value["phases"])
-    final_entries = cast(list[dict[str, Any]], missing_phases[-1]["entries"])
-    assert final_entries.pop() == {
-        "case": "GF-REGIONAL-COLLECT-015",
-        "predecessor": "GF-REGIONAL-COLLECT-017",
-    }
+    final_entries = cast(list[dict[str, Any]], missing_phases.pop()["entries"])
+    assert final_entries == [
+        {"case": "GF-REGIONAL-BOOT-032", "predecessor": "GF-REGIONAL-COLLECT-015"}
+    ]
     missing_order = _write_yaml(tmp_path / "missing.yaml", missing_value)
     with pytest.raises(ValueError, match="missing from execution order"):
         compile_regional_acceptance_plan(order_path=missing_order)

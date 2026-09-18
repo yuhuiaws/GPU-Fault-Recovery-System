@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from gpu_fault.adapters import ManagedRecoveryObserverAdapter
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     AgentLifecycleState,
     AgentRecord,
     FleetCompatibilityPolicy,
@@ -84,7 +85,7 @@ def agent(
         cluster_id="hp-cluster",
         node_id=node_id,
         endpoint=f"http://{node_id}:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="1.0.0",
         artifact_sha256="a" * 64,
         policy_version="catalog",

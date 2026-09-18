@@ -13,6 +13,7 @@ to keep that file under the size ratchet.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.admin import incident_close
 from gpu_fault.admin import workflow_reconcile as reconcile
+from gpu_fault.admin.bootstrap_common import BootstrapError
 
 
 def _gpu_site(tmp_path: Path) -> SimpleNamespace:
@@ -114,6 +116,9 @@ def _two_pass_runner(first: dict[str, Any], calls: list[dict[str, Any]]):
                     "incident_id": incident_id,
                     "outcome": "would-close" if payload["dry_run"] else "closed",
                     "state": "QUARANTINED" if payload["dry_run"] else "RECOVERED",
+                    "cluster_id": "gpu-a",
+                    "node_ids": sorted(item["node_id"] for item in evidence),
+                    "open_workflow_id": None,
                     "isolation_nodes": sorted(item["node_id"] for item in evidence),
                 }
             )
@@ -135,6 +140,7 @@ def _orphaned_node(incident_id: str, name: str = "node-a") -> dict[str, Any]:
             "gpu-fault.io/previous-unschedulable": "false",
         },
     )
+    node["metadata"]["uid"] = f"uid-{name}"
     node["metadata"]["resourceVersion"] = "4242"
     return node
 
@@ -205,8 +211,8 @@ def test_close_quarantined_dry_run_judges_orphaned_annotations_as_stripped_untou
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
     )
 
@@ -257,8 +263,8 @@ def test_close_quarantined_strips_orphaned_annotations_with_a_resource_version_f
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
     )
 
@@ -282,6 +288,7 @@ def test_close_quarantined_strips_orphaned_annotations_with_a_resource_version_f
     assert patch[5:11] == ["patch", "node", "node-a", "--type", "merge", "-p"]
     assert json.loads(patch[11]) == {
         "metadata": {
+            "uid": "uid-node-a",
             "resourceVersion": "4242",
             "annotations": {
                 "gpu-fault.io/incident-id": None,
@@ -291,8 +298,10 @@ def test_close_quarantined_strips_orphaned_annotations_with_a_resource_version_f
         }
     }, "the patch removes exactly the isolation record, fenced on resourceVersion"
     assert (
-        calls[1]["payload"]["evidence"]["inc-q1"][0]["isolation_annotations"] == {}
+        calls[-1]["payload"]["evidence"]["inc-q1"][0]["isolation_annotations"] == {}
     ), "the Pod is handed the node as re-read after the strip"
+    assert calls[1]["payload"]["dry_run"] is True
+    assert calls[-1]["payload"]["dry_run"] is False
     assert incident_close.result_lines(result) == [
         "discovered 1 QUARANTINED incident(s) across 1 cluster(s): gpu-a",
         "inc-q1: closed (isolation absent on node-a; orphaned isolation annotations "
@@ -325,8 +334,8 @@ def test_close_quarantined_leaves_another_incidents_annotations_alone(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         _kubectl_strip_double(_orphaned_node("inc-other"), kubectl),
     )
 
@@ -368,8 +377,8 @@ def test_close_incident_by_id_strips_the_same_orphaned_annotations(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess,
-        "run",
+        reconcile,
+        "run_command",
         _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
     )
 
@@ -384,9 +393,216 @@ def test_close_incident_by_id_strips_the_same_orphaned_annotations(
 
     assert "selector" not in calls[0]["payload"]
     assert [call for call in kubectl if "patch" in call], "no strip happened"
-    assert calls[1]["payload"]["evidence"]["inc-q1"][0]["isolation_annotations"] == {}
+    assert calls[-1]["payload"]["evidence"]["inc-q1"][0]["isolation_annotations"] == {}
     assert incident_close.result_lines(result) == [
         "inc-q1: closed (isolation absent on node-a; orphaned isolation annotations "
         "stripped on node-a)"
     ]
     assert result["stripped_isolation_nodes"] == {"inc-q1": ["node-a"]}
+
+
+def _apply_close(tmp_path: Path) -> dict[str, Any]:
+    return incident_close.run_incident_close(
+        _gpu_site(tmp_path),
+        tmp_path,
+        incident_ids=["inc-q1"],
+        reason="verified orphaned annotation cleanup",
+        reference="CHG-guard",
+        dry_run=False,
+        actor="unit-operator",
+    )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "uid",
+        "incident",
+        "fence",
+        "previous-cordon",
+        "cordon",
+        "own-taint",
+        "foreign-taint",
+        "deleting",
+        "missing-uid",
+        "missing-rv",
+        "malformed-taints",
+    ],
+)
+def test_second_node_read_cannot_authorize_changed_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    kubectl: list[list[str]] = []
+    original = _orphaned_node("inc-q1")
+    changed = deepcopy(original)
+    changed["metadata"]["resourceVersion"] = "4243"
+    if drift == "uid":
+        changed["metadata"]["uid"] = "replacement-node"
+    elif drift == "incident":
+        changed["metadata"]["annotations"]["gpu-fault.io/incident-id"] = "inc-other"
+    elif drift == "fence":
+        changed["metadata"]["annotations"]["gpu-fault.io/fencing-token"] = "2"
+    elif drift == "previous-cordon":
+        changed["metadata"]["annotations"]["gpu-fault.io/previous-unschedulable"] = (
+            "true"
+        )
+    elif drift == "cordon":
+        changed["spec"]["unschedulable"] = True
+    elif drift in {"own-taint", "foreign-taint"}:
+        changed["spec"]["taints"] = [
+            {
+                "key": reconcile.QUARANTINE_TAINT,
+                "value": quarantine_taint_value(
+                    "inc-q1" if drift == "own-taint" else "inc-other"
+                ),
+                "effect": "NoSchedule",
+            }
+        ]
+    elif drift == "deleting":
+        changed["metadata"]["deletionTimestamp"] = "2026-09-14T00:00:00Z"
+    elif drift == "missing-uid":
+        del changed["metadata"]["uid"]
+    elif drift == "missing-rv":
+        del changed["metadata"]["resourceVersion"]
+    else:
+        changed["spec"]["taints"] = {}
+    reads = iter([original, changed])
+
+    def command(arguments, **kwargs):
+        kubectl.append(list(arguments))
+        assert "patch" not in arguments, "drift must refuse before a node mutation"
+        assert kwargs["timeout_seconds"] == 120
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"items": [next(reads)]}), stderr=""
+        )
+
+    monkeypatch.setattr(
+        incident_close,
+        "_run_reconcile",
+        _two_pass_runner(
+            {"results": [_quarantined_pending("inc-q1", "node-a")]}, calls
+        ),
+    )
+    monkeypatch.setattr(reconcile, "run_command", command)
+
+    result = _apply_close(tmp_path)
+
+    assert result["refused_incident_ids"] == ["inc-q1"], drift
+    assert result["closed_incident_ids"] == []
+    assert result["stripped_isolation_nodes"] == {}
+    assert len(calls) == 2 and calls[-1]["payload"]["dry_run"] is True
+    assert len(kubectl) == 2
+
+
+@pytest.mark.parametrize("refusal", ["uncertain-work", "cluster-drift", "node-drift"])
+def test_cpu_preview_refusal_prevents_annotation_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    kubectl: list[list[str]] = []
+    ordinary = _two_pass_runner(
+        {"results": [_quarantined_pending("inc-q1", "node-a")]}, calls
+    )
+
+    def preview(site, payload, *, script):
+        result = ordinary(site, payload, script=script)
+        if payload.get("evidence"):
+            assert payload["dry_run"] is True, "the blocked incident must not be closed"
+            row = result["results"][0]
+            if refusal == "uncertain-work":
+                row.update(
+                    outcome="refused",
+                    open_workflow_id="unresolved-workflow",
+                    reason="physical action remains unresolved",
+                )
+            elif refusal == "cluster-drift":
+                row["cluster_id"] = "gpu-other"
+            else:
+                row["node_ids"] = ["node-other"]
+        return result
+
+    monkeypatch.setattr(incident_close, "_run_reconcile", preview)
+    monkeypatch.setattr(
+        reconcile,
+        "run_command",
+        _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
+    )
+
+    result = _apply_close(tmp_path)
+
+    assert result["refused_incident_ids"] == ["inc-q1"]
+    assert result["stripped_isolation_nodes"] == {}
+    assert all("patch" not in arguments for arguments in kubectl), (
+        "an ineligible incident must not lose its node ownership annotations"
+    )
+
+
+def test_incomplete_cpu_preview_fails_before_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+    kubectl: list[list[str]] = []
+    ordinary = _two_pass_runner(
+        {"results": [_quarantined_pending("inc-q1", "node-a")]}, calls
+    )
+
+    def preview(site, payload, *, script):
+        return (
+            {"results": []}
+            if payload.get("evidence")
+            else ordinary(site, payload, script=script)
+        )
+
+    monkeypatch.setattr(incident_close, "_run_reconcile", preview)
+    monkeypatch.setattr(
+        reconcile,
+        "run_command",
+        _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
+    )
+
+    with pytest.raises(BootstrapError, match="preview identities"):
+        _apply_close(tmp_path)
+    assert all("patch" not in arguments for arguments in kubectl), (
+        "an incomplete closure preview must prevent every annotation patch"
+    )
+
+
+@pytest.mark.parametrize("readback", ["new-node", "annotations-remain"])
+def test_patch_ack_without_bound_readback_does_not_close_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, readback: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    original = _orphaned_node("inc-q1")
+    patches: list[list[str]] = []
+
+    def command(arguments, **kwargs):
+        assert kwargs["timeout_seconds"] == 120
+        if "patch" in arguments:
+            patches.append(list(arguments))
+            return SimpleNamespace(returncode=0, stdout="patched", stderr="")
+        current = deepcopy(original)
+        if patches and readback == "new-node":
+            current["metadata"].update(uid="replacement", annotations={})
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"items": [current]}), stderr=""
+        )
+
+    monkeypatch.setattr(
+        incident_close,
+        "_run_reconcile",
+        _two_pass_runner(
+            {"results": [_quarantined_pending("inc-q1", "node-a")]}, calls
+        ),
+    )
+    monkeypatch.setattr(reconcile, "run_command", command)
+
+    result = _apply_close(tmp_path)
+
+    assert len(patches) == 1
+    assert result["refused_incident_ids"] == ["inc-q1"]
+    assert result["closed_incident_ids"] == []
+    assert result["stripped_isolation_nodes"] == {"inc-q1": ["node-a"]}, (
+        "a failed verification must not erase the acknowledged mutation audit"
+    )
+    assert len(calls) == 2 and calls[-1]["payload"]["dry_run"] is True

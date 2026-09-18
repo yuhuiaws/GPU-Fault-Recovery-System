@@ -272,6 +272,7 @@ def _executor_from_settings(
     node_ids, operations, proc_root, quiesce_enabled, quiesce_manager
 ):
     return NodeActionExecutor(
+        require_final_ownership=True,
         secret=os.getenv("GPU_FAULT_NODE_ACTION_SECRET", ""),
         node_action_key_version=int(
             os.getenv("GPU_FAULT_NODE_ACTION_KEY_VERSION", "1")

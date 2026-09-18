@@ -1,0 +1,7 @@
+ARG NODE_INSTALLER_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux@sha256:5d271dd33b628252c31c15f5449e50d7c4e9f93badf9342f9b1e2a8d326fbe84
+FROM ${NODE_INSTALLER_BASE_IMAGE}
+
+COPY wheelhouse /opt/gpu-fault/wheelhouse
+USER 65534
+ENTRYPOINT []
+CMD ["/bin/false"]

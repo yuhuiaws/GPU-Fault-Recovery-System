@@ -1,0 +1,240 @@
+"""Controller intent and ACK handling for the DESTR-014 host recovery window."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import time
+from pathlib import Path
+from typing import Any
+
+from gpu_fault.admin.atomic_json import write_json_atomic
+from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
+from scripts.e2e.regional.probes import destr014_recovery_probe as host
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+PROBE = Path(host.__file__)
+RECOVERY_SECONDS = host.RECOVERY_SECONDS
+
+
+def require_report(
+    value: dict[str, Any], binding: dict[str, Any], phases: set[str]
+) -> None:
+    if (
+        value.get("binding_sha256") != host.binding_key(binding)
+        or value.get("phase") not in phases
+        or type(value.get("disable_started")) is not bool
+        or type(value.get("start_requested")) is not bool
+        or value.get("record_kind")
+        != (
+            "FORENSIC_TOMBSTONE"
+            if value.get("phase") == "CLOSED"
+            else "UNFINISHED_RECOVERY"
+        )
+    ):
+        raise RegionalFixtureError("DESTR-014 recovery ACK is unbound or incomplete")
+
+
+class RunJournal:
+    """One private, locked attempt; an existing record authorizes cleanup only."""
+
+    def __init__(self, path: Path, scope: dict[str, Any]) -> None:
+        self.path = path
+        self.scope = scope
+        self.fd: int | None = None
+        self.data: dict[str, Any] = {}
+        self.resumed = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(
+            self.path.with_suffix(".lock"),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o077
+            ):
+                raise RegionalFixtureError("DESTR-014 recovery journal lock is invalid")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self.path.exists() or self.path.is_symlink():
+                info = self.path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077
+                    or info.st_nlink != 1
+                ):
+                    raise RegionalFixtureError(
+                        "DESTR-014 recovery journal is not private"
+                    )
+                data = json.loads(self.path.read_text())
+                if (
+                    not isinstance(data, dict)
+                    or data.get("schema_version") != 1
+                    or data.get("scope") != self.scope
+                    or data.get("phase") not in {"OPEN", "RECOVERY_REQUIRED", "CLOSED"}
+                    or not isinstance(data.get("run"), dict)
+                ):
+                    raise RegionalFixtureError(
+                        "DESTR-014 recovery journal identity changed"
+                    )
+                if data.get("supervision_lost"):
+                    raise RegionalFixtureError(
+                        "DESTR-014 lost supervision; independent review required"
+                    )
+                self.data = data
+                self.resumed = True
+            else:
+                self.data = {
+                    "schema_version": 1,
+                    "scope": self.scope,
+                    "phase": "OPEN",
+                    "run": {},
+                }
+                self.save()
+            self.fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def save(self) -> None:
+        write_json_atomic(self.path, self.data)
+        host.sync_directory(self.path.parent)
+
+    def checkpoint(self, **fields: Any) -> None:
+        self.data["run"].update(fields)
+        self.save()
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def make_binding(
+    *,
+    scope: dict[str, Any],
+    owner: str,
+    agent: dict[str, Any],
+    restore_at: int,
+    expires_at: int,
+) -> dict[str, Any]:
+    binding = {
+        "case_id": host.CASE,
+        "run_id": scope["run_id"],
+        "owner": owner,
+        "release_id": scope["release_id"],
+        "plan_sha256": scope["plan_sha256"],
+        "helper_sha256": hashlib.sha256(PROBE.read_bytes()).hexdigest(),
+        "cluster_id": scope["cluster_id"],
+        "node": scope["node"],
+        "node_uid": scope["node_uid"],
+        "boot_id": scope["boot_id"],
+        "artifact_sha256": agent.get("artifact_sha256"),
+        "bundle_sha256": agent.get("installer_bundle_sha256"),
+        "profile_version": agent.get("runtime_profile_version"),
+        "restore_at": restore_at,
+        "expires_at": expires_at,
+    }
+    host.binding_key(binding)
+    if agent.get("node_instance_id") != binding["node_uid"]:
+        raise RegionalFixtureError("DESTR-014 Agent and Node UID differ")
+    return binding
+
+
+class AgentRecoveryWindow:
+    def __init__(self, journal: RunJournal, probe: HostProbeFixture) -> None:
+        self.journal = journal
+        self.probe = probe
+
+    @property
+    def binding(self) -> dict[str, Any]:
+        value = self.journal.data.get("host_binding")
+        if not isinstance(value, dict):
+            raise RegionalFixtureError("DESTR-014 has no durable host recovery binding")
+        host.binding_key(value)
+        return value
+
+    def request(self, command: str, phases: set[str]) -> dict[str, Any]:
+        binding = self.binding
+        self.journal.data["host_request"] = command
+        self.journal.save()
+        self.probe.create()
+        result = self.probe.execute(
+            command,
+            "--binding",
+            json.dumps(binding, sort_keys=True),
+            timeout=120,
+        )
+        require_report(result, binding, phases)
+        self.journal.data["host_ack"] = result
+        self.journal.save()
+        return result
+
+    def arm(self, binding: dict[str, Any]) -> dict[str, Any]:
+        if "host_binding" in self.journal.data:
+            raise RegionalFixtureError(
+                "DESTR-014 recovery already started; cleanup only"
+            )
+        host.binding_key(binding)
+        self.journal.data["host_binding"] = binding
+        self.journal.save()
+        self.request("prepare", {"INSTALLED"})
+        deadline = time.monotonic() + 60
+        while True:
+            result = self.request("status", {"INSTALLED", "ARMED"})
+            if result["phase"] == "ARMED":
+                ack = result.get("ack") or {}
+                at = ack.get("at")
+                if (
+                    ack.get("boot_id") != binding["boot_id"]
+                    or not isinstance(ack.get("invocation_id"), str)
+                    or not ack["invocation_id"]
+                    or not isinstance(at, (int, float))
+                    or isinstance(at, bool)
+                    or not 0 <= time.time() - at <= host.ACK_SECONDS
+                ):
+                    raise RegionalFixtureError(
+                        "DESTR-014 independent arm proof is stale"
+                    )
+                return result
+            if time.monotonic() >= deadline:
+                raise RegionalFixtureError(
+                    "DESTR-014 independent arm ACK was not observed"
+                )
+            time.sleep(1)
+
+    def disable(self) -> dict[str, Any]:
+        require_report(self.journal.data.get("host_ack", {}), self.binding, {"ARMED"})
+        result = self.request("disable", {"DISABLED"})
+        if result["disable_started"] is not True:
+            raise RegionalFixtureError("DESTR-014 Agent disable was not acknowledged")
+        return result
+
+    def restore(self) -> dict[str, Any]:
+        result = self.request("restore", {"RESTORED"})
+        if result.get("restore_reason") != "controller":
+            raise RegionalFixtureError(
+                "DESTR-014 automatic safeguard fired before scenario completion"
+            )
+        return result
+
+    def cleanup(self) -> dict[str, Any]:
+        if "host_binding" not in self.journal.data:
+            return {"phase": "NOT_CREATED"}
+        result = self.request("cleanup", {"CLOSED"})
+        residuals = self.probe.cleanup()
+        if not isinstance(residuals, dict) or any(residuals.values()):
+            raise RegionalFixtureError("DESTR-014 recovery probe cleanup is incomplete")
+        self.journal.data["host_cleanup"] = result
+        self.journal.save()
+        return result

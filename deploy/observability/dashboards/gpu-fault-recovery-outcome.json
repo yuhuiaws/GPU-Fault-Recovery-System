@@ -702,7 +702,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Workflow creation to successful containment.\n\nAlert GpuFaultClosedLoopSlow (warning, for 15m, > 900): docs/管理员日常运维.md#gpufaultclosedloopslow",
+      "description": "Creation to first successful containment in the event-time window. Empty, incomplete or stale windows have no mean.\n\nAlert GpuFaultClosedLoopSlow (warning, for 15m, > 900): docs/管理员日常运维.md#gpufaultclosedloopslow",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -736,11 +736,18 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
         "y": 28
       },
       "id": 14,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultClosedLoopSlow",
+          "url": "docs/管理员日常运维.md#gpufaultclosedloopslow"
+        }
+      ],
       "options": {
         "legend": {
           "displayMode": "list",
@@ -758,7 +765,7 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "delta((max by (control_plane_cluster, region) (gpu_fault_closed_loop_milestone_seconds_sum{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}))[6h:5m]) / clamp_min(delta((max by (control_plane_cluster, region) (gpu_fault_closed_loop_milestone_seconds_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}))[6h:5m]), 1)",
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_closed_loop_milestone_window_mean_seconds{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} and (gpu_fault_closed_loop_milestone_window_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and ((gpu_fault_closed_loop_milestone_window_complete{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1) and ((gpu_fault_closed_loop_milestone_window_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 0) or ((gpu_fault_closed_loop_milestone_window_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_closed_loop_milestone_window_mean_seconds{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))) and ignoring (milestone) ((time() - gpu_fault_closed_loop_window_end_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (time() - gpu_fault_closed_loop_window_end_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= 120))))",
           "instant": false,
           "legendFormat": "{{control_plane_cluster}} {{region}}",
           "range": true,
@@ -773,7 +780,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultNotificationDeliveryFailing (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing",
+      "description": "Workers lacking a complete, fresh containment window. A missing latency mean does not establish healthy recovery.\n\nAlert GpuFaultClosedLoopWindowIncomplete (warning, for 5m): docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -785,7 +792,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "thresholdsStyle": {
-              "mode": "line"
+              "mode": "off"
             }
           },
           "thresholds": {
@@ -794,10 +801,6 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 0.0
               }
             ]
           },
@@ -807,11 +810,18 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 8,
         "y": 28
       },
       "id": 15,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultClosedLoopWindowIncomplete",
+          "url": "docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete"
+        }
+      ],
       "options": {
         "legend": {
           "displayMode": "list",
@@ -829,14 +839,14 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "delta((max by (control_plane_cluster, region) (gpu_fault_notification_total{status=\"FAILED\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}))[15m:1m])",
+          "expr": "count by (control_plane_cluster, region) ((gpu_fault_workflow_scan_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} or (up{job=\"gpu-fault-control-plane\",service_role=\"gpu-fault-control-worker\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1)) unless on (control_plane_cluster, region, job, namespace, pod, instance) ((gpu_fault_closed_loop_milestone_window_complete{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1) and ((gpu_fault_closed_loop_milestone_window_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 0) or ((gpu_fault_closed_loop_milestone_window_count{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} > 0) and (gpu_fault_closed_loop_milestone_window_mean_seconds{milestone=\"containment\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0))) and ignoring (milestone) ((time() - gpu_fault_closed_loop_window_end_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} >= 0) and (time() - gpu_fault_closed_loop_window_end_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} <= 120)))) or (0 * max by (control_plane_cluster, region) ((gpu_fault_workflow_scan_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} or (up{job=\"gpu-fault-control-plane\",service_role=\"gpu-fault-control-worker\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} == 1))))",
           "instant": false,
           "legendFormat": "{{control_plane_cluster}} {{region}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Notification deliveries FAILED (15m)",
+      "title": "Unavailable containment windows",
       "type": "timeseries"
     },
     {
@@ -844,7 +854,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultNotificationDeliveryFailing (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing",
+      "description": "1 after a recorded terminal delivery failure in the last 15 minutes. Deleting older failures or retaining DEAD rows does not create an event.\n\nAlert GpuFaultNotificationDeliveryFailing (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -878,11 +888,85 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
+        "w": 8,
+        "x": 16,
         "y": 28
       },
       "id": 16,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultNotificationDeliveryFailing",
+          "url": "docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "((time() - max by (control_plane_cluster, region) (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[15m]))) < bool 900) * (max by (control_plane_cluster, region) (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[15m])) > bool 0)",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Terminal notification failure seen (15m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "id": 17,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -945,11 +1029,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 28
+        "w": 12,
+        "x": 12,
+        "y": 36
       },
-      "id": 17,
+      "id": 18,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -983,9 +1067,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 44
       },
-      "id": 18,
+      "id": 19,
       "panels": [],
       "title": "Remediation budget",
       "type": "row"
@@ -1031,9 +1115,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 37
+        "y": 45
       },
-      "id": 19,
+      "id": 20,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1098,9 +1182,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 37
+        "y": 45
       },
-      "id": 20,
+      "id": 21,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1156,9 +1240,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       },
-      "id": 21,
+      "id": 22,
       "panels": [],
       "title": "Completion and incidents",
       "type": "row"
@@ -1200,9 +1284,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 46
+        "y": 54
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1271,9 +1355,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 46
+        "y": 54
       },
-      "id": 23,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1342,9 +1426,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 46
+        "y": 54
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1378,9 +1462,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 62
       },
-      "id": 25,
+      "id": 26,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1426,9 +1510,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 63
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1497,9 +1581,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 63
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1568,9 +1652,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 63
       },
-      "id": 28,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1639,9 +1723,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 71
       },
-      "id": 29,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1721,9 +1805,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 63
+        "y": 71
       },
-      "id": 30,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",

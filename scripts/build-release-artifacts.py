@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -236,23 +237,26 @@ def prepare_component_artifacts(
             module_counts=cached.module_counts,
         )
 
-    built = {
-        name: build_component(
-            python=python,
-            name=name,
-            build_root=BUILD / "components",
-            output=staging,
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            name: executor.submit(
+                build_component,
+                python=python,
+                name=name,
+                build_root=BUILD / "components",
+                output=staging,
+            )
+            for name in ("control_plane", "executor", "node_runtime")
+        }
+        node_wheel = futures["node_runtime"].result()[0]
+        run(
+            [
+                str(ROOT / "deploy/node/build-node-installer-bundle.sh"),
+                str(staging),
+            ],
+            env={**os.environ, "GPU_FAULT_NODE_WHEEL": str(node_wheel)},
         )
-        for name in ("control_plane", "executor", "node_runtime")
-    }
-    node_wheel = built["node_runtime"][0]
-    run(
-        [
-            str(ROOT / "deploy/node/build-node-installer-bundle.sh"),
-            str(staging),
-        ],
-        env={**os.environ, "GPU_FAULT_NODE_WHEEL": str(node_wheel)},
-    )
+        built = {name: future.result() for name, future in futures.items()}
     bundles = sorted(staging.glob("gpu-fault-node-installer-*.tar.gz"))
     if len(bundles) != 1:
         raise RuntimeError(
@@ -421,7 +425,7 @@ def build(
         )
         published = Path("dist") / release_id
         manifest: dict[str, object] = {
-            "schema_version": 3,
+            "schema_version": 4 if delivery.get("image_layout") == "split-v1" else 3,
             "component_build_identity_sha256": component_build_identity(ROOT),
             "deployable": bool(delivery["runtime_prebuilt"]),
             "staging_only": staging_only,

@@ -23,12 +23,32 @@ def test_the_load_suites_label_every_synthetic_fault_as_a_drill() -> None:
     notifications for faults that did not happen.
     """
 
-    from gpu_fault.hma import HyperPodHmaNormalizer
+    from gpu_fault.nvidia_logs import (
+        FabricManagerLogEvent,
+        NvidiaKernelLogEvent,
+        NvidiaLogNormalizer,
+    )
     from scripts.perf import benchmark_mixed_control_plane as suite
 
     for kind in ("NVIDIA_KERNEL", "FABRIC_MANAGER_LOG"):
-        payload = suite.stamp({}, kind, "cluster-a", "node-a", 1)
-        assert HyperPodHmaNormalizer._drill_id(payload["message"]) == suite.DRILL_ID
+        payload = suite.stamp(
+            {"record_id": "synthetic", "observed_at": "2026-07-20T10:00:00Z"},
+            kind,
+            "cluster-a",
+            "node-a",
+            1,
+        )
+        normalizer = NvidiaLogNormalizer()
+        normalized = (
+            normalizer.normalize_kernel(NvidiaKernelLogEvent.model_validate(payload))
+            if kind == "NVIDIA_KERNEL"
+            else normalizer.normalize_fabric_manager(
+                FabricManagerLogEvent.model_validate(payload)
+            )
+        )
+        events = [*normalized.xid_events, *normalized.sxid_events]
+        assert events, "a synthetic fault must pass through production normalization"
+        assert all(event.drill_id == suite.DRILL_ID for event in events)
 
 
 def test_the_bulk_resend_scan_is_bounded_and_says_when_it_truncated() -> None:

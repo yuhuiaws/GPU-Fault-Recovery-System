@@ -77,16 +77,19 @@ def _parse(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
 def freshness_seconds(coverage: dict[str, Any]) -> float:
-    return float(coverage.get("freshness_seconds") or 0.0)
+    value = _finite_number(coverage.get("freshness_seconds"))
+    return value if value is not None else 0.0
 
 
 def heartbeat_observed_at(coverage: dict[str, Any]) -> datetime | None:
-    heartbeat = coverage.get("heartbeat") or {}
+    heartbeat = coverage.get("heartbeat")
+    if not isinstance(heartbeat, dict):
+        return None
     return _parse(heartbeat.get("observed_at"))
 
 
@@ -107,8 +110,17 @@ def heartbeat_saw_work(coverage: dict[str, Any]) -> bool:
 
 
 def _age(coverage: dict[str, Any], key: str) -> float | None:
-    value = coverage.get(key)
-    return None if value is None else float(value)
+    return _finite_number(coverage.get(key))
+
+
+def _finite_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def coverage_supported_errors(coverage: dict[str, Any]) -> list[str]:
@@ -120,7 +132,7 @@ def coverage_supported_errors(coverage: dict[str, Any]) -> list[str]:
     rather than "the watcher is dead".
     """
 
-    if not coverage.get("heartbeat_supported"):
+    if coverage.get("heartbeat_supported") is not True:
         return [
             "control plane has no workload coverage heartbeat "
             "(store.get_workload_coverage_heartbeat missing); deploy the "
@@ -128,7 +140,66 @@ def coverage_supported_errors(coverage: dict[str, Any]) -> list[str]:
         ]
     if freshness_seconds(coverage) <= 0:
         return ["coverage probe reports no freshness window"]
-    return []
+    errors = []
+    probed = _parse(coverage.get("probed_at"))
+    if probed is None:
+        errors.append("coverage probe has no valid probed_at timestamp")
+    count = coverage.get("observation_count")
+    if type(count) is not int or count < 0:
+        errors.append("coverage probe has no valid observation_count")
+    for key in (
+        "heartbeat",
+        "heartbeat_age_seconds",
+        "latest_observation_at",
+        "latest_observation_age_seconds",
+    ):
+        if key not in coverage:
+            errors.append(f"coverage probe is missing {key}")
+    for key in ("heartbeat_age_seconds", "latest_observation_age_seconds"):
+        if coverage.get(key) is not None and _age(coverage, key) is None:
+            errors.append(f"coverage probe reports an unusable {key}")
+    heartbeat = coverage.get("heartbeat")
+    if heartbeat is not None:
+        if not isinstance(heartbeat, dict):
+            return [*errors, "coverage heartbeat is not an object"]
+        observed = heartbeat_observed_at(coverage)
+        if observed is None:
+            errors.append("coverage heartbeat has no valid observed_at timestamp")
+        if observed is not None and probed is not None and observed > probed:
+            errors.append("coverage heartbeat is dated after the probe")
+        age = _age(coverage, "heartbeat_age_seconds")
+        if age is None:
+            errors.append("coverage heartbeat age is unknown")
+        elif (
+            observed is not None
+            and probed is not None
+            and not math.isclose((probed - observed).total_seconds(), age, abs_tol=0.01)
+        ):
+            errors.append("coverage heartbeat age disagrees with its timestamp")
+        for key in ("watched_pods", "watched_attempts"):
+            value = heartbeat.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"coverage heartbeat has no valid {key} count")
+    elif coverage.get("heartbeat_age_seconds") is not None:
+        errors.append("coverage heartbeat age exists without a heartbeat")
+    latest = _parse(coverage.get("latest_observation_at"))
+    age = _age(coverage, "latest_observation_age_seconds")
+    if type(count) is int and count > 0:
+        if latest is None or age is None:
+            errors.append(
+                "attempt observations exist but their timestamp or age is unknown"
+            )
+        elif probed is not None and (
+            latest > probed
+            or not math.isclose((probed - latest).total_seconds(), age, abs_tol=0.01)
+        ):
+            errors.append("attempt observation age disagrees with its timestamp")
+    elif count == 0 and (
+        coverage.get("latest_observation_at") is not None
+        or coverage.get("latest_observation_age_seconds") is not None
+    ):
+        errors.append("zero attempt observations have a latest timestamp or age")
+    return errors
 
 
 def fresh_coverage_errors(
@@ -226,6 +297,9 @@ def expiry_wait_seconds(
     sit through.
     """
 
+    errors = coverage_supported_errors(coverage)
+    if errors:
+        raise ValueError("; ".join(errors))
     window = freshness_seconds(coverage)
     if window > MAX_EXPIRY_WAIT_SECONDS:
         raise ValueError(
@@ -289,27 +363,54 @@ def idle_cluster_errors(
 def deployment_summary(value: dict[str, Any]) -> dict[str, Any]:
     metadata = value.get("metadata") or {}
     spec = value.get("spec") or {}
+    status = value.get("status") or {}
     return {
         "uid": metadata.get("uid"),
+        "resource_version": metadata.get("resourceVersion"),
         "generation": metadata.get("generation"),
-        "replicas": int(spec.get("replicas") or 0),
-        "ready_replicas": int((value.get("status") or {}).get("readyReplicas") or 0),
+        "deleting": bool(metadata.get("deletionTimestamp")),
+        "observed_generation": status.get("observedGeneration"),
+        "replicas": spec.get("replicas"),
+        "status_replicas": status.get("replicas", 0),
+        "updated_replicas": status.get("updatedReplicas", 0),
+        "ready_replicas": status.get("readyReplicas", 0),
+        "available_replicas": status.get("availableReplicas", 0),
+        "unavailable_replicas": status.get("unavailableReplicas", 0),
         "strategy": ((spec.get("strategy") or {}).get("type")),
     }
 
 
 def watcher_errors(summary: dict[str, Any], *, expected_replicas: int = 1) -> list[str]:
     errors = []
-    if int(summary.get("replicas") or 0) != expected_replicas:
-        errors.append(
-            f"{WATCHER_DEPLOYMENT} has replicas={summary.get('replicas')}, "
-            f"expected {expected_replicas}"
-        )
-    if int(summary.get("ready_replicas") or 0) != expected_replicas:
-        errors.append(
-            f"{WATCHER_DEPLOYMENT} has ready_replicas={summary.get('ready_replicas')}, "
-            f"expected {expected_replicas}"
-        )
+    if not summary.get("uid") or summary.get("deleting") is not False:
+        errors.append("watcher Deployment identity is missing or terminating")
+    generation = summary.get("generation")
+    observed = summary.get("observed_generation")
+    if (
+        type(generation) is not int
+        or generation < 1
+        or type(observed) is not int
+        or observed != generation
+    ):
+        errors.append("watcher Deployment generation is not fully observed")
+    for key in (
+        "replicas",
+        "status_replicas",
+        "updated_replicas",
+        "ready_replicas",
+        "available_replicas",
+        "unavailable_replicas",
+    ):
+        expected = 0 if key == "unavailable_replicas" else expected_replicas
+        if type(summary.get(key)) is not int or summary[key] != expected:
+            errors.append(
+                f"{WATCHER_DEPLOYMENT} has {key}={summary.get(key)}, expected {expected}"
+            )
+    if "pod_count" in summary and (
+        summary["pod_count"] != expected_replicas
+        or len(summary.get("ready_pods") or []) != expected_replicas
+    ):
+        errors.append("watcher Pod population is not exactly Ready")
     return errors
 
 

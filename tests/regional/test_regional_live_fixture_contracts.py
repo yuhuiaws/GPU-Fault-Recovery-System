@@ -103,10 +103,12 @@ def test_pod_python_never_retries_a_timeout(
 def test_run_converts_a_subprocess_timeout_into_a_fixture_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from scripts.e2e.regional import regional_commands
+
     def hang(command: list[str], **_kwargs: Any) -> None:
         raise subprocess.TimeoutExpired(command, 7)
 
-    monkeypatch.setattr(live_fixture_module.subprocess, "run", hang)
+    monkeypatch.setattr(regional_commands, "run_command", hang)
 
     with pytest.raises(RegionalCommandTimeout, match="timed out after 7s") as raised:
         RegionalLiveFixture.run(["kubectl", "get", "pod"], timeout=7)
@@ -289,13 +291,28 @@ class _FakeStore:
         return 0
 
     def list_xid_events(self, _cluster: str, _node: str, *, observed_after: Any):
-        return [_Record(event_id="event-a", raw_message="marker-a", xid=79)]
+        return [
+            _Record(
+                event_id="event-a",
+                cluster_id="cluster-a",
+                node_id="node-a",
+                observed_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+                raw_message="marker-a",
+                xid=79,
+            )
+        ]
 
     def get_xid_policy_decision(self, _event_id: str):
         raise NotFoundError("no decision")
 
     def get_incident_by_event(self, _event_id: str):
-        return _Record(incident_id="incident-a", workflow_request_id="workflow-a")
+        return _Record(
+            incident_id="incident-a",
+            event_id=_event_id,
+            cluster_id="cluster-a",
+            node_ids=["node-a"],
+            workflow_request_id="workflow-a",
+        )
 
     def get_workflow(self, _request_id: str):
         return self.workflow

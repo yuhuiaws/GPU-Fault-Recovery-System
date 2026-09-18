@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 # How many failed replays a spooled sample gets before it is dropped.
@@ -34,7 +34,7 @@ Composite findings reuse the shape with ``canonical_name`` set to
 
 @dataclass(frozen=True)
 class SpooledTelemetry:
-    """One claimed telemetry sample, on its way to be replayed."""
+    """One replay claim; payload revision and lease token are independent fences."""
 
     spool_key: str
     revision: int
@@ -45,3 +45,4 @@ class SpooledTelemetry:
     created_at: datetime
     payload: dict
     payload_bytes: int
+    lease_token: str | None = field(default=None, repr=False)

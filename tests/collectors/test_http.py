@@ -5,9 +5,7 @@ from gpu_fault.collectors.sinks import DeliveryStatus
 from ._support import (
     CollectorError,
     HttpEventSink,
-    RecordingSink,
     SqsEventSink,
-    SqsHmaConsumer,
     _LocalControlPlane,
     io,
     json,
@@ -514,36 +512,26 @@ def test_a_receipt_path_retry_after_a_lost_202_still_polls_the_receipt(
     assert calls[2][1] == "https://control/v1/processor/requests/p-same"
 
 
-def test_sqs_sink_and_consumer_private_delivery() -> None:
+def test_sqs_sink_serializes_the_requested_channel_and_payload() -> None:
     class FakeSqs:
         def __init__(self) -> None:
             self.messages = []
-            self.deleted = []
 
         def send_message(self, **kwargs):
-            self.messages.append(
-                {"Body": kwargs["MessageBody"], "ReceiptHandle": "receipt-1"}
-            )
+            self.messages.append(kwargs)
             return {"MessageId": "message-1"}
-
-        def receive_message(self, **_kwargs):
-            return {"Messages": list(self.messages)}
-
-        def delete_message(self, **kwargs):
-            self.deleted.append(kwargs["ReceiptHandle"])
 
     sqs = FakeSqs()
     queue = SqsEventSink("https://sqs/queue", sqs)
-    queue.post("/v1/provider-events/hyperpod-hma/cloudwatch", {"node_id": "worker-1"})
-    sink = RecordingSink()
+    result = queue.post("/v1/collector-events/nvidia-kernel", {"node_id": "worker-1"})
 
-    delivered = SqsHmaConsumer(sink, "https://sqs/queue", sqs).run_once(
-        wait_time_seconds=0
-    )
-
-    assert delivered.delivered == 1, f"the queued event was not delivered: {delivered}"
-    assert sink.requests[0][1]["node_id"] == "worker-1"
-    assert sqs.deleted == ["receipt-1"]
+    assert result == {"message_id": "message-1"}
+    assert len(sqs.messages) == 1
+    assert sqs.messages[0]["QueueUrl"] == "https://sqs/queue"
+    assert json.loads(sqs.messages[0]["MessageBody"]) == {
+        "path": "/v1/collector-events/nvidia-kernel",
+        "payload": {"node_id": "worker-1"},
+    }
 
 
 class _StubResponse:
@@ -737,7 +725,7 @@ def test_http_event_sink_caps_retry_after(monkeypatch) -> None:
             "node/worker-1/42",
         ),
     ],
-    ids=["gpu-inventory-snapshot", "cloudwatch-log-event", "hma-node-event"],
+    ids=["gpu-inventory-snapshot", "legacy-log-event", "legacy-node-event"],
 )
 def test_http_event_sink_retries_every_keyed_collector_payload(
     monkeypatch, payload, expected_key

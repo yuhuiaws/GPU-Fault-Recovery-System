@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from gpu_fault.admin.aurora_capacity import (
     CAPACITY_SETTLE_STABLE_POLLS,
@@ -25,9 +26,16 @@ from gpu_fault.admin.config import (
     AuroraCapacityConfig,
     load_desired_admin_config,
 )
+from gpu_fault.admin.execution import command_timeout, deadline_scope
 
 CAPACITY_SETTLE_POLL_SECONDS = 10.0
 CAPACITY_SETTLE_TIMEOUT_SECONDS = 1800.0
+# Both RDS availability waiters poll every 30s for up to 60 attempts. Allow
+# five more minutes for CLI/API overhead; run_command still caps this at the
+# caller's remaining task/deployment deadline.
+RDS_AVAILABILITY_TIMEOUT_SECONDS = 2100.0
+PRIMARY_MEMBERSHIP_ATTEMPTS = 6
+PRIMARY_MEMBERSHIP_POLL_SECONDS = 5.0
 # The Kubernetes Secret the control plane reads its DSN from.
 AURORA_SECRET_NAME = "gpu-fault-aurora"
 # RDS reports the managed master secret's ARN before Secrets Manager can serve
@@ -293,124 +301,258 @@ def _capacity_is_quiet(
     )
 
 
-def serverless_instance_ids(
-    cluster_id: str, *, safe_name: Callable[..., str]
-) -> list[str]:
-    """The writer's and the reader's identifiers, in that order."""
+def _await_replica_source(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_id: str,
+    initial_writer_id: str,
+) -> None:
+    """RDS requires an available cluster and primary before adding a replica."""
 
-    return [
-        safe_name(f"{cluster_id}-{suffix}", maximum=63)
-        for suffix in ("writer", "reader")
+    def cluster_state() -> dict[str, Any]:
+        clusters = runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-clusters",
+            "--db-cluster-identifier",
+            cluster_id,
+        ).get("DBClusters")
+        if (
+            not isinstance(clusters, list)
+            or len(clusters) != 1
+            or clusters[0].get("DBClusterIdentifier") != cluster_id
+            or not isinstance(clusters[0].get("DBClusterMembers"), list)
+        ):
+            raise BootstrapError("cannot determine Aurora replica source cluster")
+        return dict(clusters[0])
+
+    def initial_primary_pending(value: dict[str, Any]) -> bool:
+        members = value["DBClusterMembers"]
+        return value.get("Status") in {"creating", "available"} and (
+            not members
+            or len(members) == 1
+            and members[0].get("DBInstanceIdentifier") == initial_writer_id
+            and members[0].get("IsClusterWriter") is False
+        )
+
+    cluster = cluster_state()
+    if initial_primary_pending(cluster):
+        if not cluster["DBClusterMembers"] and instance_id == initial_writer_id:
+            return
+        # RDS can list the first instance before designating it as the writer.
+        # An available instance without a primary is not creation progress.
+        if (
+            cluster["DBClusterMembers"]
+            and serverless_instance_statuses(
+                runner, aws_region=aws_region, cluster_id=cluster_id
+            ).get(initial_writer_id)
+            != "creating"
+        ):
+            raise BootstrapError("cannot determine Aurora replica source primary")
+        await_serverless_instances(
+            runner, aws_region=aws_region, instance_ids=[initial_writer_id]
+        )
+        for attempt in range(PRIMARY_MEMBERSHIP_ATTEMPTS):
+            cluster = cluster_state()
+            if not initial_primary_pending(cluster):
+                break
+            if attempt + 1 == PRIMARY_MEMBERSHIP_ATTEMPTS:
+                raise BootstrapError("cannot determine Aurora replica source primary")
+            time.sleep(
+                command_timeout(
+                    ["aws", "rds", "describe-db-clusters"],
+                    PRIMARY_MEMBERSHIP_POLL_SECONDS,
+                )
+            )
+    writers = [
+        member.get("DBInstanceIdentifier")
+        for member in cluster["DBClusterMembers"]
+        if member.get("IsClusterWriter") is True
     ]
+    if len(writers) != 1 or not isinstance(writers[0], str) or not writers[0]:
+        raise BootstrapError("cannot determine Aurora replica source primary")
+    writer_id = writers[0]
+    pending = pending_serverless_instances(
+        runner, aws_region=aws_region, cluster_id=cluster_id, instance_ids=[writer_id]
+    )
+    await_serverless_instances(runner, aws_region=aws_region, instance_ids=pending)
+    if cluster.get("Status") != "available":
+        _await_rds_available(
+            runner,
+            aws_region=aws_region,
+            kind="cluster",
+            identifier=cluster_id,
+        )
+    cluster = cluster_state()
+    current_writers = [
+        member.get("DBInstanceIdentifier")
+        for member in cluster["DBClusterMembers"]
+        if member.get("IsClusterWriter") is True
+    ]
+    if (
+        cluster.get("Status") != "available"
+        or current_writers != [writer_id]
+        or pending_serverless_instances(
+            runner,
+            aws_region=aws_region,
+            cluster_id=cluster_id,
+            instance_ids=[writer_id],
+        )
+    ):
+        raise BootstrapError("Aurora replica source changed or is not available")
 
 
-def ensure_serverless_writer(
+def ensure_serverless_instances(
     runner: CommandRunner,
     *,
     aws_region: str,
     cluster_id: str,
     availability_zones: Sequence[str],
     safe_name: Callable[..., str],
+    wait: bool = True,
 ) -> list[str]:
-    """Create the writer when it is missing, without waiting; returns both ids.
+    """Create the writer and the reader that are missing; returns both ids.
 
-    Only the writer is created here. RDS refuses a replica while the cluster or
-    its primary is still ``creating`` (``InvalidDBClusterStateFault``), and the
-    first instance to finish creating becomes the writer whatever it is named,
-    so the reader is created by ``await_aurora_ready`` once the writer is
-    available. The foundation ``aurora`` task therefore only issues one create;
-    the waits belong to ``aurora_ready``, which runs alongside the platform
-    tasks that need no database. ``availability_zones`` is positional: the
-    writer takes the first, the reader the second.
+    ``wait=False`` defers final readiness to ``aurora_ready``, but never skips
+    the available-primary/cluster barrier before a replica create. The whole
+    Aurora chain runs alongside tasks that need no database.
     """
 
-    instance_ids = serverless_instance_ids(cluster_id, safe_name=safe_name)
-    if len(availability_zones) < len(instance_ids):
-        raise BootstrapError(
-            f"Aurora cluster {cluster_id} needs {len(instance_ids)} availability "
-            f"zones, got {list(availability_zones)}"
+    instance_ids = [
+        safe_name(f"{cluster_id}-{suffix}", maximum=63)
+        for suffix in ("writer", "reader")
+    ]
+    placements = list(zip(instance_ids, availability_zones, strict=True))
+    for instance_id, availability_zone in placements:
+        existing = describe_or_absent(
+            runner,
+            aws_region,
+            "rds",
+            "describe-db-instances",
+            "--db-instance-identifier",
+            instance_id,
+            not_found=("DBInstanceNotFound",),
         )
-    writer_id = instance_ids[0]
-    existing = describe_or_absent(
-        runner,
-        aws_region,
-        "rds",
-        "describe-db-instances",
-        "--db-instance-identifier",
-        writer_id,
-        not_found=("DBInstanceNotFound",),
-    )
-    if existing is None:
-        create_serverless_instance(
+        if existing is not None:
+            continue
+        _await_replica_source(
             runner,
             aws_region=aws_region,
             cluster_id=cluster_id,
-            instance_id=writer_id,
-            availability_zone=availability_zones[0],
+            instance_id=instance_id,
+            initial_writer_id=instance_ids[0],
+        )
+        runner.run(
+            [
+                "aws",
+                "rds",
+                "create-db-instance",
+                "--region",
+                aws_region,
+                "--db-instance-identifier",
+                instance_id,
+                "--db-cluster-identifier",
+                cluster_id,
+                "--engine",
+                "aurora-postgresql",
+                "--db-instance-class",
+                "db.serverless",
+                "--availability-zone",
+                availability_zone,
+                "--promotion-tier",
+                "0",
+            ],
+            mutate=True,
+            capture=False,
+        )
+    if wait:
+        await_serverless_instances(
+            runner, aws_region=aws_region, instance_ids=instance_ids
         )
     return instance_ids
 
 
-def create_serverless_instance(
+def _await_rds_available(
     runner: CommandRunner,
     *,
     aws_region: str,
-    cluster_id: str,
-    instance_id: str,
-    availability_zone: str,
+    kind: Literal["instance", "cluster"],
+    identifier: str,
 ) -> None:
-    """One ``create-db-instance`` for a Serverless v2 member; does not wait."""
+    # Load only local models. All transport stays on the budgeted runner, never
+    # an SDK client, and no API slot is held between individual describe calls.
+    from botocore import xform_name
+    from botocore.loaders import Loader
+    from botocore.waiter import WaiterModel
 
-    runner.run(
-        [
-            "aws",
-            "rds",
-            "create-db-instance",
-            "--region",
-            aws_region,
-            "--db-instance-identifier",
-            instance_id,
-            "--db-cluster-identifier",
-            cluster_id,
-            "--engine",
-            "aurora-postgresql",
-            "--db-instance-class",
-            "db.serverless",
-            "--availability-zone",
-            availability_zone,
-            "--promotion-tier",
-            "0",
-        ],
-        mutate=True,
-        capture=False,
-    )
-
-
-def await_cluster_available(
-    runner: CommandRunner, *, aws_region: str, cluster_id: str
-) -> None:
-    """Block until the cluster reads ``available``.
-
-    A replica may only be added to an available cluster with an available
-    primary; the writer wait covers the primary, this covers the cluster. Like
-    the instance waits it is a mutation to the read-only probe runner: a probe
-    must answer in seconds.
-    """
-
-    runner.run(
-        [
-            "aws",
-            "rds",
-            "wait",
-            "db-cluster-available",
-            "--region",
-            aws_region,
-            "--db-cluster-identifier",
-            cluster_id,
-        ],
-        mutate=True,
-        capture=False,
-    )
+    resource = f"DB{kind.capitalize()}"
+    waiter_name = f"{resource}Available"
+    try:
+        with deadline_scope(f"RDS {waiter_name}", RDS_AVAILABILITY_TIMEOUT_SECONDS):
+            config = WaiterModel(
+                Loader().load_service_model("rds", "waiters-2")
+            ).get_waiter(waiter_name)
+            acceptors = config.acceptors
+            arguments = [
+                "aws",
+                "rds",
+                xform_name(config.operation, "-"),
+                "--region",
+                aws_region,
+                f"--db-{kind}-identifier",
+                identifier,
+                "--output",
+                "json",
+            ]
+            for attempt in range(1, config.max_attempts + 1):
+                raw = runner.run(
+                    arguments,
+                    # Probes must reject a long readiness wait even though
+                    # each request is an ordinary read.
+                    mutate=True,
+                    timeout_seconds=command_timeout(arguments, None),
+                )
+                command_timeout(arguments, None)
+                try:
+                    response = json.loads(raw)
+                except ValueError:
+                    raise BootstrapError(
+                        f"RDS {waiter_name} returned invalid JSON"
+                    ) from None
+                if not isinstance(response, dict) or "Error" in response:
+                    raise BootstrapError(
+                        f"RDS {waiter_name} returned an invalid or error response"
+                    )
+                entries = response.get(f"{resource}s")
+                if (
+                    not isinstance(entries, list)
+                    or len(entries) > 1
+                    or any(
+                        not isinstance(entry, dict)
+                        or entry.get(f"{resource}Identifier") != identifier
+                        for entry in entries
+                    )
+                ):
+                    raise BootstrapError(f"RDS {waiter_name} response identity differs")
+                for acceptor in acceptors:
+                    if acceptor.matcher_func(response):
+                        if acceptor.state == "success":
+                            return
+                        if acceptor.state != "retry":
+                            raise BootstrapError(
+                                f"RDS {waiter_name} encountered a terminal failure "
+                                f"state: {acceptor.explanation}"
+                            )
+                        break
+                if attempt < config.max_attempts:
+                    time.sleep(command_timeout(arguments, float(config.delay)))
+            raise BootstrapError(
+                f"RDS {waiter_name} exceeded {config.max_attempts} attempts"
+            )
+    except TimeoutError:
+        raise BootstrapError(f"RDS {waiter_name} exceeded its time budget") from None
 
 
 def await_serverless_instances(
@@ -421,38 +563,38 @@ def await_serverless_instances(
 ) -> None:
     """Block until every instance reads ``available``, waiting for all at once.
 
-    Two ``rds wait`` calls back to back cost the sum of both creations; issued
-    together they cost the slower one. The wait is a mutation to the read-only
-    probe runner on purpose: a probe must answer in seconds, not block on RDS.
+    These waits only observe existing instances; they do not make dependent
+    creates concurrent. The read-only probe runner rejects long waits so a
+    probe answers in seconds instead of blocking on RDS.
     """
 
     def wait_for(instance_id: str) -> None:
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "wait",
-                "db-instance-available",
-                "--region",
-                aws_region,
-                "--db-instance-identifier",
-                instance_id,
-            ],
-            mutate=True,
-            capture=False,
+        _await_rds_available(
+            runner,
+            aws_region=aws_region,
+            kind="instance",
+            identifier=instance_id,
         )
 
     if not instance_ids:
         return
     with ThreadPoolExecutor(max_workers=min(2, len(instance_ids))) as pool:
-        futures = [pool.submit(wait_for, instance_id) for instance_id in instance_ids]
+        # Copy separately so concurrent waiters retain the task deadline.
+        futures = [
+            pool.submit(copy_context().run, wait_for, instance_id)
+            for instance_id in instance_ids
+        ]
         failures = [
             failure
             for failure in (future.exception() for future in futures)
             if failure is not None
         ]
     if failures:
-        raise failures[0]
+        # Lost supervision or interruption must not become a recoverable failure.
+        raise next(
+            (failure for failure in failures if not isinstance(failure, Exception)),
+            failures[0],
+        )
 
 
 def serverless_instance_statuses(
@@ -594,54 +736,24 @@ def await_aurora_ready(
     aws_region: str,
     cluster_id: str,
     instance_ids: Sequence[str],
-    availability_zones: Sequence[str] = (),
 ) -> AuroraReadiness:
-    """Bring both instances to ``available`` in the order RDS accepts, then read
-    the credentials.
+    """Wait for the instances the foundation created, then read the credentials.
 
-    One describe decides what is left to do, so a rerun against an available
-    cluster issues no wait at all. On a first deploy the writer the foundation
-    created is waited for; only then is the reader created -- RDS answers
-    ``InvalidDBClusterStateFault`` to a replica while the cluster or its primary
-    is still creating, and whichever instance finishes first becomes the writer
-    -- and waited for in turn. ``availability_zones`` is positional like the
-    ids; a reader the listing does not know and no zone recorded for it (a
-    checkpoint from before the reader moved here) is waited for as before, and
-    that wait fails closed on an instance that never appears.
+    One describe decides which instances still need polling, so a rerun
+    against an available cluster issues no wait at all; the writer and reader
+    still transitioning on a resumed deploy are waited for together.
     """
 
-    writer_id, *reader_ids = instance_ids
-    statuses = serverless_instance_statuses(
-        runner, aws_region=aws_region, cluster_id=cluster_id
+    pending = pending_serverless_instances(
+        runner,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
     )
-    if statuses.get(writer_id) != "available":
-        await_serverless_instances(
-            runner, aws_region=aws_region, instance_ids=[writer_id]
-        )
-    zones = dict(zip(instance_ids, availability_zones))
-    to_create = [
-        instance_id
-        for instance_id in reader_ids
-        if instance_id not in statuses and instance_id in zones
-    ]
-    if to_create:
-        await_cluster_available(runner, aws_region=aws_region, cluster_id=cluster_id)
-        for instance_id in to_create:
-            create_serverless_instance(
-                runner,
-                aws_region=aws_region,
-                cluster_id=cluster_id,
-                instance_id=instance_id,
-                availability_zone=zones[instance_id],
-            )
     await_serverless_instances(
         runner,
         aws_region=aws_region,
-        instance_ids=[
-            instance_id
-            for instance_id in reader_ids
-            if statuses.get(instance_id) != "available"
-        ],
+        instance_ids=pending,
     )
     return read_master_secret(runner, aws_region=aws_region, cluster_id=cluster_id)
 

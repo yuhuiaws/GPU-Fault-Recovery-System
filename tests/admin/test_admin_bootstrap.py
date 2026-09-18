@@ -28,7 +28,29 @@ from gpu_fault.admin.bootstrap_common import (
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.release_repositories import ensure_release_repositories
+from tests._builders import supply_chain_tools_venv
 from tests.admin._bootstrap_support import _cluster
+
+
+@pytest.fixture(autouse=True)
+def site_toolchain(tmp_path, monkeypatch):
+    """Every release build here binds the gates to the state dir's own toolchain.
+
+    The 2026-09-18 deploy exported SUPPLY_CHAIN_PYTHON into the gate environment
+    and three of these tests then depended on the operator's venv layout instead
+    of their fixture; neither the shell's variable nor the developer host's
+    ``/tmp`` default may reach the code under test.
+    """
+
+    monkeypatch.delenv(admin_release_artifacts.SUPPLY_CHAIN_PYTHON_ENV, raising=False)
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "SUPPLY_CHAIN_TOOLS_DEFAULT",
+        tmp_path / "absent-default-tools",
+    )
+    return supply_chain_tools_venv(
+        tmp_path / admin_release_artifacts.SITE_TOOLCHAIN_DIRECTORY
+    )
 
 
 def _cache_lifecycle_policy(*, retention_days: int = 7) -> dict:
@@ -52,7 +74,7 @@ def _cache_lifecycle_policy(*, retention_days: int = 7) -> dict:
     }
 
 
-def test_bootstrap_dependencies_require_docker_buildx(monkeypatch) -> None:
+def test_bootstrap_dependencies_require_docker_buildx(monkeypatch, tmp_path) -> None:
     commands = []
     monkeypatch.setattr(
         admin_bootstrap_dependencies,
@@ -69,15 +91,17 @@ def test_bootstrap_dependencies_require_docker_buildx(monkeypatch) -> None:
             ],
         },
     )
+    tool = tmp_path / "tool"
+    tool.write_text("fake-tool")
     monkeypatch.setattr(
-        admin_bootstrap_dependencies.shutil, "which", lambda _name: "/usr/bin/tool"
+        admin_bootstrap_dependencies, "resolve_tool", lambda _name: str(tool)
     )
 
     def missing_buildx(arguments, **_kwargs):
         commands.append(arguments)
         return __import__("subprocess").CompletedProcess(arguments, 1, "", "missing")
 
-    monkeypatch.setattr(admin_bootstrap_dependencies.subprocess, "run", missing_buildx)
+    monkeypatch.setattr(admin_bootstrap_dependencies, "run_command", missing_buildx)
 
     with pytest.raises(BootstrapError, match="docker-buildx"):
         admin_bootstrap_dependencies.validate_bootstrap_dependencies()
@@ -460,7 +484,7 @@ def test_release_repositories_are_created_with_separate_mutability(monkeypatch) 
         )
         return __import__("subprocess").CompletedProcess(arguments, 254, "", error)
 
-    monkeypatch.setattr(admin_release_repositories.subprocess, "run", missing)
+    monkeypatch.setattr(admin_release_repositories, "run_command", missing)
 
     repositories = ensure_release_repositories(
         Runner(), cpu=_cluster(), site_id="site-a"
@@ -555,7 +579,7 @@ def test_release_repositories_reuse_matching_site_resources(monkeypatch) -> None
                 ]
             }
 
-    monkeypatch.setattr(admin_release_repositories.subprocess, "run", describe)
+    monkeypatch.setattr(admin_release_repositories, "run_command", describe)
 
     first = ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
     second = ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
@@ -615,7 +639,7 @@ def test_cache_repository_rejects_lifecycle_policy_drift(monkeypatch) -> None:
                 ]
             }
 
-    monkeypatch.setattr(admin_release_repositories.subprocess, "run", describe)
+    monkeypatch.setattr(admin_release_repositories, "run_command", describe)
 
     with pytest.raises(BootstrapError, match="lifecycle policy differs"):
         ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
@@ -834,7 +858,7 @@ def test_admin_release_prefers_promoted_main_candidate(tmp_path, monkeypatch) ->
     )
     monkeypatch.setattr(
         admin_release_artifacts,
-        "isolated_postgres_url",
+        "isolated_postgres_allocation",
         lambda *_args, **_kwargs: pytest.fail(
             "promoted candidate started local PostgreSQL"
         ),
@@ -930,10 +954,25 @@ def test_runtime_image_existence_is_checked(
     monkeypatch, returncode, stderr, expected
 ) -> None:
     monkeypatch.setattr(
-        admin_release_artifacts.subprocess,
-        "run",
+        admin_release_artifacts,
+        "bounded_command",
         lambda command, **_kwargs: subprocess.CompletedProcess(
-            command, returncode, "", stderr
+            command,
+            returncode,
+            json.dumps(
+                {
+                    "imageDetails": [
+                        {
+                            "registryId": "123456789012",
+                            "repositoryName": "gpu-fault/runtime",
+                            "imageDigest": "sha256:" + "a" * 64,
+                        }
+                    ]
+                }
+            )
+            if returncode == 0
+            else "",
+            stderr,
         ),
     )
 
@@ -946,7 +985,7 @@ def test_runtime_image_existence_is_checked(
             ),
         )
         is expected
-    )
+    ), "runtime image existence did not follow the verified registry inventory"
 
 
 def test_admin_release_rejects_dirty_source_before_reuse(tmp_path, monkeypatch) -> None:

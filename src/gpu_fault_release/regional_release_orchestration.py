@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_rollback_target import (
+    rollback_target,
+    validate_rollback_node_template,
+)
+
+from gpu_fault_release.regional_release_images import previous_executor_image
+
+from gpu_fault.admin.execution import recovery_deadline
+
 import json
 import tempfile
 import threading
@@ -8,11 +17,12 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
+from gpu_fault_release.regional_aurora_credentials import read_aurora_refresh_cronjob
 from gpu_fault_release.regional_dataplane_observability import (
     phase_failure_details,
     restore_control_plane_observability,
@@ -20,6 +30,21 @@ from gpu_fault_release.regional_dataplane_observability import (
 )
 from gpu_fault_release.regional_release_automatic_rollback import (
     recover_failed_upgrade,
+)
+from gpu_fault_release.regional_release_aurora_refresh import (
+    require_aurora_refresh_snapshot,
+    restore_aurora_refresh_snapshot,
+    validate_aurora_refresh_snapshot,
+    verify_aurora_refresh_snapshot,
+)
+from gpu_fault_release.regional_release_prerequisite_repair import (
+    REPAIR_KEY,
+    adopted_refresher_snapshot,
+    checkpoint_prerequisite_adoption,
+    has_prerequisite_repair,
+    prepare_upgrade_credentials,
+    restore_prerequisite_repair,
+    restore_standalone_prerequisite,
 )
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
@@ -38,9 +63,17 @@ from gpu_fault_release.regional_release_diff import (
     control_plane_role_targets,
 )
 from gpu_fault_release.regional_release_gpu_stage import stage_gpu_prerequisites
+from gpu_fault_release.regional_release_gpu_rollout import ProgressSelection
+from gpu_fault_release.regional_release_interfaces import (
+    CpuRollout,
+    GpuRollout,
+    RollbackCheckpoint,
+    RollbackPhaseRunner,
+    RollbackTargetArguments,
+    Snapshot,
+)
 from gpu_fault_release.regional_release_legacy import (
     rollback_controller_config,
-    validate_rollback_agent_identity,
 )
 from gpu_fault_release.regional_release_preflight_concurrency import (
     run_rollback_preflight,
@@ -53,10 +86,12 @@ from gpu_fault_release.regional_release_narration import narrate_phase, narrate_
 from gpu_fault_release.regional_release_progress import (
     PROGRESS_COMPLETED,
     PROGRESS_FAILED,
+    PROGRESS_SCHEMA_VERSION,
     PROGRESS_STARTED,
     RollbackCompensationPlan,
     build_rollback_compensation_plan,
     cluster_attempts_with,
+    take_phase_checkpoint,
     update_component_progress,
     update_components_progress,
 )
@@ -108,6 +143,12 @@ from gpu_fault_release.regional_schema_change import (
     recorded_acceptance,
     resolve_acceptance,
 )
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
+
+PhaseParameters = ParamSpec("PhaseParameters")
+PhaseResult = TypeVar("PhaseResult")
 
 ROOT = repository_root()
 # Changes whose previous state nothing captures, so a rollback that claimed to
@@ -162,27 +203,17 @@ def _default_release_diff() -> ReleaseDiff:
 
 
 def _validate_upgrade_transaction(
-    self: Any,
+    self: Snapshot,
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
     *,
     resume: bool = False,
     supersede: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Refuse before mutation, or return the schema-change acceptance to record.
+    """Validate mutation policy and return approved fail-forward schema metadata.
 
-    A schema change under ``autoRollback: true`` used to be refused outright;
-    the operator had to edit the site to fail-forward. It is now refused unless
-    the command carried ``--accept-schema-change``, in which case the acceptance
-    (mode, time, later the snapshot) is returned for the transaction state and
-    the transaction runs fail-forward without touching the site
-    (``regional_schema_change``).
-
-    A transaction that supersedes a failed one inherits that transaction's
-    acceptance when it covers the same schema version: the schema already moved
-    and cannot be un-moved, so re-asking would only teach operators to pass the
-    flag by habit. A candidate that moves the schema again is a new schema
-    change and needs its own acceptance.
+    Supersede inherits acceptance only for the same schema target; a new target
+    still requires explicit consent.
     """
 
     acceptance = resolve_acceptance(
@@ -201,18 +232,10 @@ def _validate_upgrade_transaction(
 
 
 def _require_compensable_observability_snapshot(
-    self: Any,
+    self: Snapshot,
     previous: dict[str, Any],
 ) -> None:
-    """Refuse before mutation when the snapshot cannot restore the collector.
-
-    A snapshot captured by a release engine that predates ADOT compensation has
-    no collector objects, and a resumed transaction keeps the snapshot it was
-    started with. Automatic rollback would then get as far as the observability
-    restore and fail there, after it had already put other components back. The
-    operator is told the same thing the other non-transactional changes tell
-    them, at the same point: before anything moves.
-    """
+    """Refuse automatic compensation without the original collector objects."""
 
     observability = previous.get("observability")
     if not self.config.auto_rollback or not isinstance(observability, dict):
@@ -225,23 +248,11 @@ def _require_compensable_observability_snapshot(
 
 
 def _require_compensable_endpoint_snapshot(
-    self: Any,
+    self: Snapshot,
     previous: dict[str, Any],
     plan: ReleaseExecutionPlan,
 ) -> None:
-    """Refuse before mutation when the snapshot cannot restore the endpoint.
-
-    Same failure mode as the observability guard, and the same reason to check it
-    here: a snapshot taken by an engine that predates endpoint capture has no
-    ``endpoint`` key at all, and a resumed transaction keeps the snapshot it was
-    started with. Rollback would then reach the endpoint restore -- after the
-    data plane and the control plane had already been put back -- and fail with
-    the Route53 record still pointing at the candidate load balancer.
-
-    A present ``endpoint`` of ``None`` is not that case: it is what a plan
-    without the endpoint component records, and such a plan has no endpoint
-    mutation to compensate.
-    """
+    """Reject pre-capture snapshots when endpoint compensation is planned."""
 
     if not self.config.auto_rollback or not plan.has(ReleaseComponent.ENDPOINT):
         return
@@ -253,7 +264,7 @@ def _require_compensable_endpoint_snapshot(
 
 
 def inherit_superseded_previous(
-    self: Any,
+    self: Snapshot,
     failed: dict[str, Any],
 ) -> dict[str, Any]:
     """The baseline a superseding transaction rolls back to: the failed one's.
@@ -326,7 +337,7 @@ def superseded_transaction_record(failed: dict[str, Any]) -> dict[str, Any]:
 
 
 def _upgrade_context(
-    self: Any,
+    self: RegionalRelease,
     *,
     resume: bool,
     diff: ReleaseDiff,
@@ -357,6 +368,9 @@ def _upgrade_context(
                 if captured_previous is not None
                 else self._capture_previous(plan=plan)
             )
+            repaired_snapshot = adopted_refresher_snapshot(self)
+            if repaired_snapshot is not None:
+                previous["aurora_refresh"] = repaired_snapshot
             previous["secret_backups"] = self._backup_release_secrets()
         completed_phases = set()
         completed_clusters = set()
@@ -365,6 +379,7 @@ def _upgrade_context(
         raise ReleaseError("previous release state is unavailable")
     _require_compensable_observability_snapshot(self, previous)
     _require_compensable_endpoint_snapshot(self, previous, plan)
+    require_aurora_refresh_snapshot(self, previous, plan)
     if resume:
         expected_previous_sha = str(loaded.get("previous_snapshot_sha256") or "")
         if not expected_previous_sha:
@@ -385,7 +400,7 @@ def _upgrade_context(
 
 
 def upgrade_gpu_clusters(
-    self: Any,
+    self: GpuRollout,
     *,
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
@@ -406,7 +421,7 @@ def upgrade_gpu_clusters(
 
     def record_progress(
         cluster_id: str,
-        selection: ReleaseComponent | tuple[ReleaseComponent, ...],
+        selection: ProgressSelection,
         status: str,
         details: dict[str, Any] | None,
     ) -> None:
@@ -463,6 +478,14 @@ def upgrade_gpu_clusters(
 
     def roll_cluster(target: ClusterTarget) -> None:
         cluster_id = target.cluster_id
+
+        def progress(
+            component: ProgressSelection,
+            status: str,
+            details: dict[str, Any] | None,
+        ) -> None:
+            record_progress(cluster_id, component, status, details)
+
         with state_transaction(self):
             if abort.is_set():
                 return
@@ -473,17 +496,7 @@ def upgrade_gpu_clusters(
                 target,
                 diff,
                 plan,
-                progress=(
-                    lambda component,
-                    status,
-                    details,
-                    active_cluster_id=cluster_id: record_progress(
-                        active_cluster_id,
-                        component,
-                        status,
-                        details,
-                    )
-                ),
+                progress=progress,
                 candidate_preflighted=True,
             )
         except Exception as exc:
@@ -583,7 +596,7 @@ def upgrade_gpu_clusters(
     raise error_type(message) from error
 
 
-def bootstrap_gpu_target(self: Any, target: ClusterTarget) -> None:
+def bootstrap_gpu_target(self: RegionalRelease, target: ClusterTarget) -> None:
     self._ensure_gpu_namespace(target)
     self._ensure_connection_secret(target)
     self._quiesce_gpu_executor(target)
@@ -601,10 +614,10 @@ def bootstrap_gpu_target(self: Any, target: ClusterTarget) -> None:
 
 
 def bootstrap_gpu_clusters(
-    self: Any,
+    self: RegionalRelease,
     completed_cluster_ids: set[str],
     *,
-    bootstrap: Callable[[Any, ClusterTarget], None] = bootstrap_gpu_target,
+    bootstrap: Callable[[RegionalRelease, ClusterTarget], None] = bootstrap_gpu_target,
 ) -> None:
     pending = [
         target
@@ -649,6 +662,7 @@ def bootstrap_gpu_clusters(
 UPGRADE_PHASE_ORDER = (
     "uploaded",
     "candidate-preflight-ready",
+    "aurora-refresh-ready",
     "schema-ready",
     "registry-staged",
     "cpu-staged",
@@ -660,18 +674,16 @@ UPGRADE_PHASE_ORDER = (
     "verified",
     "complete",
 )
-# One worker per phase that may run beside the others: the candidate node
-# preflight, the control-plane endpoint, and the observability install. Each
-# touches a cluster or an AWS resource none of the others do, and each is joined
-# at the phase that genuinely depends on it. The pool is sized so no submit can
-# ever queue behind a peer -- a queued future joined before its queue-mate
-# finishes would be a deadlock that only shows up under a slow phase.
+# Candidate preflight is joined before any DDL or runtime mutation; endpoint
+# and monitoring configuration can overlap after CPU staging. These workers
+# never write checkpoints themselves.
 UPGRADE_PHASE_WORKERS = 3
 # The component whose work a phase checkpoint attests to. A release whose plan
 # omits the component has nothing to do for the phase and writes no checkpoint
 # for it, so every downstream gate has to read "not planned" as satisfied
 # (`phase_done`) rather than waiting for a stamp that will never arrive.
 PHASE_COMPONENT_GATES = {
+    "aurora-refresh-ready": ReleaseComponent.AURORA_REFRESH,
     "schema-ready": ReleaseComponent.SCHEMA,
     "registry-staged": ReleaseComponent.REGISTRY,
     "cpu-staged": ReleaseComponent.CPU_STAGE,
@@ -709,8 +721,33 @@ def _annotate_with_background_failures(
     error.args = (f"{head}; {suffix}" if head else suffix,) + tuple(error.args[1:])
 
 
+def _apply_upgrade_cpu(
+    release: CpuRollout,
+    *,
+    diff: ReleaseDiff,
+    previous: dict[str, Any],
+    finalize: bool,
+    force_restart: bool = False,
+) -> None:
+    ingress = "ingress" in control_plane_role_targets(diff)
+    expected_agents = (
+        (previous.get("agent_identities") or release._capture_active_agent_node_sets())
+        if ingress
+        else {}
+    )
+    if finalize and ingress:
+        # Prove candidate Agents before closing the compatibility window.
+        release._wait_candidate_cpu_agent_heartbeats(
+            expected_agents,
+            required_identity=release._candidate_agent_pin_identity(),
+        )
+    release._apply_cpu(finalize=finalize, force_restart=force_restart, diff=diff)
+    if ingress:
+        release._wait_candidate_cpu_agent_heartbeats(expected_agents)
+
+
 def run_upgrade_phases(
-    self: Any,
+    self: RegionalRelease,
     *,
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
@@ -718,6 +755,7 @@ def run_upgrade_phases(
     completed_phases: set[str],
     completed_clusters: set[str],
     registry_staged: bool,
+    credentials_proved: bool = False,
 ) -> bool:
     # Phases that have completed but are not in the ConfigMap yet, oldest first.
     # Nothing is allowed to depend on a phase being *durable* until the next
@@ -725,45 +763,10 @@ def run_upgrade_phases(
     pending_phases: dict[str, dict[str, Any]] = {}
 
     def phase_done(name: str) -> bool:
-        """True when this release has nothing left to do for `name`."""
-
         if name in completed_phases:
             return True
         gate = PHASE_COMPONENT_GATES.get(name)
         return gate is not None and not plan.has(gate)
-
-    def write_state(stamp: str, **updates: Any) -> None:
-        merged: dict[str, Any] = {}
-        carried = sorted(
-            (
-                phase
-                for phase in pending_phases
-                if phase != stamp and phase in UPGRADE_PHASE_ORDER
-            ),
-            key=UPGRADE_PHASE_ORDER.index,
-        )
-        for values in pending_phases.values():
-            merged.update(values)
-        pending_phases.clear()
-        merged.update(updates)
-        self._save_state(
-            stamp,
-            previous=previous,
-            release_diff=diff.as_dict(),
-            execution_plan=plan.as_dict(),
-            completed_phases=sorted(completed_phases),
-            completed_cluster_ids=sorted(completed_clusters),
-            registry_staged=registry_staged,
-            **merged,
-        )
-        # `save_state` narrates the stamp and nothing else, so the phases this
-        # one write also made durable would have no line at all -- and those are
-        # exactly the phases an operator reads the log to time. They follow the
-        # stamp because the write is what makes them true, and they carry
-        # `elapsed=0.0` for the same reason: the interval they were reached in is
-        # charged to the checkpoint that persisted all of them.
-        for phase in carried:
-            narrate_phase(self, phase)
 
     def phase_complete(name: str, **updates: Any) -> None:
         """Mark `name` complete; the next state write is what persists it."""
@@ -773,24 +776,26 @@ def run_upgrade_phases(
 
     def flush_phases(**updates: Any) -> None:
         with state_transaction(self):
-            current = str(self.state.get("phase") or "")
-            # The phase already on record counts towards the stamp, not just the
-            # phases this write carries. Without it a write whose only pending
-            # phase is an early one (the candidate preflight, joined late) would
-            # move the recorded phase *backwards*, and a phase outside
-            # `RESUMABLE_PHASES` -- or simply an earlier one -- makes a crash
-            # here look like a release that must start over.
-            ranked = [
-                phase
-                for phase in {*pending_phases, current}
-                if phase in UPGRADE_PHASE_ORDER
-            ]
-            stamp = (
-                max(ranked, key=UPGRADE_PHASE_ORDER.index)
-                if ranked
-                else (current or "preflight")
+            stamp, merged, carried = take_phase_checkpoint(
+                pending_phases,
+                current=str(self.state.get("phase") or ""),
+                order=UPGRADE_PHASE_ORDER,
+                updates=updates,
             )
-            write_state(stamp, **updates)
+            self._save_state(
+                stamp,
+                previous=previous,
+                release_diff=diff.as_dict(),
+                execution_plan=plan.as_dict(),
+                completed_phases=sorted(completed_phases),
+                completed_cluster_ids=sorted(completed_clusters),
+                registry_staged=registry_staged,
+                **merged,
+            )
+            # Narrate carried phases only after the write made them durable.
+            # Their elapsed time belongs to the checkpoint that persisted them.
+            for phase in carried:
+                narrate_phase(self, phase)
 
     def checkpoint(phase: str, **updates: Any) -> None:
         with state_transaction(self):
@@ -821,10 +826,15 @@ def run_upgrade_phases(
     # The phases running in the pool, by name, until the main thread joins one.
     # A future nobody joins is a failure nobody sees: its exception is never
     # retrieved, so it never reaches the log or the failure record.
-    pending_futures: dict[str, Future[Any]] = {}
+    pending_futures: dict[str, Future[object]] = {}
 
-    def submit_phase(name: str, action: Callable[..., Any], *args: Any) -> None:
-        pending_futures[name] = pool.submit(action, *args)
+    def submit_phase(
+        name: str,
+        action: Callable[PhaseParameters, object],
+        *args: PhaseParameters.args,
+        **kwargs: PhaseParameters.kwargs,
+    ) -> None:
+        pending_futures[name] = pool.submit(action, *args, **kwargs)
 
     def join_phase(name: str) -> None:
         pending_futures.pop(name).result()
@@ -856,25 +866,24 @@ def run_upgrade_phases(
         component: ReleaseComponent,
         name: str,
         completes_phase: str,
+        after_join: Callable[[], object] | None = None,
         **phase_updates: Any,
     ) -> None:
-        """Wait for a component that ran in the pool and record its outcome.
-
-        The STARTED marker was written before the future was submitted, so a
-        crash while it ran is already compensated by the rollback plan; this is
-        where the same component becomes COMPLETED or FAILED, on the main thread,
-        inside the transaction that is about to depend on it.
-        """
+        """Complete the durably started component after its writer has joined."""
 
         try:
             join_phase(name)
+            if after_join is not None:
+                after_join()
         except Exception:
             fail_component(component)
             raise
         finish_component(component)
         phase_complete(completes_phase, **phase_updates)
 
-    def run_component(component: ReleaseComponent, action: Callable[[], Any]) -> Any:
+    def run_component(
+        component: ReleaseComponent, action: Callable[[], PhaseResult]
+    ) -> PhaseResult:
         start_component(component)
         try:
             result = action()
@@ -884,11 +893,8 @@ def run_upgrade_phases(
         finish_component(component)
         return result
 
-    # A phase that runs in the pool never writes state from its own thread:
-    # it is joined at the phase that depends on it, and the join is what
-    # checkpoints it. Leaving the pool waits for whatever is still running, so
-    # a failure on the main thread cannot be recorded while a mutation from
-    # this transaction is still in flight.
+    # Workers do not checkpoint. Join every writer before recording a failure
+    # or compensating, including when the foreground branch fails.
     with ThreadPoolExecutor(
         max_workers=UPGRADE_PHASE_WORKERS,
         thread_name_prefix="gpu-fault-release-phase",
@@ -898,11 +904,25 @@ def run_upgrade_phases(
                 self._upload_release(diff)
                 checkpoint("uploaded")
             if not phase_done("data-converged"):
-                # Read-only Jobs on GPU nodes; nothing the control-plane phases
-                # below touch, and nothing that writes release state.
                 submit_phase(
                     PHASE_CANDIDATE_PREFLIGHT, preflight_upgrade_mutations, self, plan
                 )
+                # Candidate failures must precede DDL and runtime mutations.
+                # Parallelism lives inside the bounded, read-only preflight.
+                join_phase(PHASE_CANDIDATE_PREFLIGHT)
+                if not phase_done("candidate-preflight-ready"):
+                    phase_complete("candidate-preflight-ready")
+            if not phase_done("aurora-refresh-ready"):
+                run_component(
+                    ReleaseComponent.AURORA_REFRESH, self._apply_aurora_refresh
+                )
+                phase_complete("aurora-refresh-ready")
+            elif plan.has(ReleaseComponent.AURORA_REFRESH) and not credentials_proved:
+                # A durable checkpoint proves ordering, not current credentials
+                # or a template that may have drifted while the deploy stopped.
+                if self._aurora_refresh_drift():
+                    raise ReleaseError("resumed Aurora refresher has drifted")
+                self._refresh_aurora_credentials(required=True)
             if not phase_done("schema-ready"):
                 # The one backward path of an accepted schema change is a
                 # database restore, so the snapshot is taken here, before the
@@ -940,31 +960,16 @@ def run_upgrade_phases(
                 )
                 phase_complete("registry-staged")
             if not phase_done("cpu-staged"):
-
-                def apply_staged_cpu() -> None:
-                    ingress_rollout = "ingress" in control_plane_role_targets(diff)
-                    expected_agents = (
-                        previous.get("agent_identities")
-                        or self._capture_active_agent_node_sets()
-                        if ingress_rollout
-                        else {}
-                    )
-                    # One apply, every role, on the main thread. The role split
-                    # cannot be invoked per role while the image changes: its
-                    # post-apply verifier checks all three tiers against the
-                    # candidate image and compares the ingress and spool
-                    # ConfigMaps against each other, and the first invocation
-                    # consumes the pin-metadata change that tells the *other*
-                    # roles to restart onto the new compatibility window.
-                    self._apply_cpu(
+                run_component(
+                    ReleaseComponent.CPU_STAGE,
+                    lambda: _apply_upgrade_cpu(
+                        self,
+                        diff=diff,
+                        previous=previous,
                         finalize=False,
                         force_restart=registry_staged,
-                        diff=diff,
-                    )
-                    if ingress_rollout:
-                        self._wait_candidate_cpu_agent_heartbeats(expected_agents)
-
-                run_component(ReleaseComponent.CPU_STAGE, apply_staged_cpu)
+                    ),
+                )
                 phase_complete("cpu-staged", release_lifecycle="CPU_STAGED")
             if not phase_done("profile-ready"):
                 run_component(
@@ -973,32 +978,21 @@ def run_upgrade_phases(
                 )
                 phase_complete("profile-ready")
             if not phase_done("endpoint-ready"):
-                # Submitted only once the staged apply and its heartbeat barrier
-                # have returned: the endpoint wait counts *healthy NLB targets*,
-                # and the ingress Pods are cycling for the whole staged restart,
-                # so overlapping the two would let the wait pass on a target set
-                # that is about to be replaced. What it does overlap is whatever
-                # is left of the candidate node preflight, and the data plane
-                # still waits for it -- every cluster verifies the control-plane
-                # endpoint before it is mutated.
+                # Target health is meaningful only after the staged ingress
+                # restart and its heartbeat barrier have completed.
                 start_component(ReleaseComponent.ENDPOINT)
                 submit_phase(PHASE_ENDPOINT, self._apply_nlb)
             if not phase_done("observability-ready"):
-                # Nothing in the rollout reads what the monitoring install
-                # writes, so it rolls beside the clusters; it is joined before
-                # the finalize, which is the step no rollback can undo.
+                # Monitoring configuration can overlap GPU rollout. Join it
+                # before CPU finalization and the strict verification gates.
                 start_component(ReleaseComponent.OBSERVABILITY)
-                submit_phase(PHASE_OBSERVABILITY, self._apply_observability)
+                submit_phase(
+                    PHASE_OBSERVABILITY, self._apply_control_plane_observability
+                )
             if PHASE_ENDPOINT in pending_futures:
                 join_component(
                     ReleaseComponent.ENDPOINT, PHASE_ENDPOINT, "endpoint-ready"
                 )
-            if PHASE_CANDIDATE_PREFLIGHT in pending_futures:
-                # The join, not the submit, is the gate: no GPU cluster may be
-                # mutated until the candidate has been proven usable on its nodes.
-                join_phase(PHASE_CANDIDATE_PREFLIGHT)
-                if not phase_done("candidate-preflight-ready"):
-                    phase_complete("candidate-preflight-ready")
             if not phase_done("data-converged"):
                 flush_phases(release_lifecycle="ROLLING_CLUSTERS")
             upgrade_gpu_clusters(
@@ -1015,6 +1009,7 @@ def run_upgrade_phases(
                     ReleaseComponent.OBSERVABILITY,
                     PHASE_OBSERVABILITY,
                     "observability-ready",
+                    after_join=self._apply_dataplane_expected_rules,
                 )
             if not phase_done("data-converged"):
                 phase_complete("data-converged", release_lifecycle="FINALIZING")
@@ -1024,32 +1019,14 @@ def run_upgrade_phases(
                         previous.get("runtime_profile_version")
                     )
 
-                def apply_final_cpu() -> None:
-                    if "ingress" not in control_plane_role_targets(diff):
-                        self._apply_cpu(finalize=True, diff=diff)
-                        return
-                    expected_agents = (
-                        previous.get("agent_identities")
-                        or self._capture_active_agent_node_sets()
-                    )
-                    # Closing the compatibility window is the transaction's one
-                    # irreversible step: afterwards the control plane rejects every Agent
-                    # still on the previous pin, and neither rollback nor a staged resume
-                    # can reopen it. So prove the whole fleet already reports the
-                    # candidate identity *before* promoting, the way
-                    # deploy/hyperpod/deploy.sh does. A failure here leaves the window
-                    # open and the transaction still compensable.
-                    self._wait_candidate_cpu_agent_heartbeats(
-                        expected_agents,
-                        required_identity=self._candidate_agent_pin_identity(),
-                    )
-                    self._apply_cpu(finalize=True, diff=diff)
-                    # And prove the cutover itself did not cost us the fleet.
-                    self._wait_candidate_cpu_agent_heartbeats(expected_agents)
-
                 run_component(
                     ReleaseComponent.CPU_FINALIZE,
-                    apply_final_cpu,
+                    lambda: _apply_upgrade_cpu(
+                        self,
+                        diff=diff,
+                        previous=previous,
+                        finalize=True,
+                    ),
                 )
                 phase_complete("cpu-finalized", release_lifecycle="FINALIZING")
             if not phase_done("verified"):
@@ -1068,47 +1045,42 @@ def run_upgrade_phases(
 
 
 def upgrade_release(
-    self: Any,
+    self: RegionalRelease,
     *,
     resume: bool = False,
     diff: ReleaseDiff | None = None,
     supersede: dict[str, Any] | None = None,
 ) -> None:
-    """Run one upgrade transaction: new, resumed, or superseding a failed one.
-
-    ``supersede`` is the loaded state of a fail-forward transaction that
-    stopped in ``failed``/``partial-convergence`` and whose candidate is not
-    this release. The new transaction then starts from that transaction's
-    ``previous`` (the last committed release, see
-    ``inherit_superseded_previous``) instead of capturing the mixed live state,
-    records the transaction it replaced under ``superseded_transaction``, and
-    carries the earlier schema-change acceptance when it still applies. It is
-    otherwise an ordinary new transaction: fresh checkpoints, ``autoRollback``
-    from the site, the manifest plan digest originated here (M-23) rather than
-    pinned to the failed transaction's.
-    """
+    """Upgrade, resume, or supersede while preserving the last committed baseline."""
 
     if resume and supersede is not None:
         raise ReleaseError("a superseding transaction cannot also be a resume")
     self._ensure_contexts()
     self._require_cpu_secrets()
-    # Ensure the RDS CA bundle ConfigMap exists (M-6) before re-applying the
-    # control-plane roles (or a schema-ensure Job) that mount it verify-full;
-    # on the first upgrade after this change an existing cluster has no bundle
-    # yet, so an un-wired apply would wedge in CreateContainerConfigError.
-    # The Aurora refresh Job mounts it too: ahead of the preflight lanes.
-    self._apply_rds_ca_bundle()
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
-    # Refresh, store probes and validate-then-capture run at once; the first
-    # failure in that order is raised (``regional_release_preflight_concurrency``).
+    acceptance = _validate_upgrade_transaction(
+        self, active_diff, plan, resume=resume, supersede=supersede
+    )
+    # Only the refresher may move before Store gates. Its separate journal
+    # preserves the baseline while a rotated password makes Store reads fail.
+    repair = prepare_upgrade_credentials(
+        self,
+        diff=active_diff,
+        plan=plan,
+        resume=resume,
+        previous_override=(
+            inherit_superseded_previous(self, supersede)
+            if supersede is not None
+            else None
+        ),
+    )
+    snapshot: Snapshot = self
     preflight = run_upgrade_preflight(
         self,
-        validate=lambda: _validate_upgrade_transaction(
-            self, active_diff, plan, resume=resume, supersede=supersede
-        ),
+        validate=lambda: acceptance,
         capture=(
-            (lambda: self._capture_previous(plan=plan))
+            (lambda: snapshot._capture_previous(plan=plan))
             if not resume and supersede is None
             else None
         ),
@@ -1126,6 +1098,9 @@ def upgrade_release(
         supersede=supersede,
         captured_previous=preflight.previous,
     )
+    if repair is not None:
+        completed_phases.add("aurora-refresh-ready")
+        self.state.pop(REPAIR_KEY, None)
     if not resume:
         # A new transaction must not inherit rollback checkpoints or failure
         # fields from the currently deployed release.
@@ -1147,12 +1122,21 @@ def upgrade_release(
             fleet_rollout_transaction=uuid.uuid4().hex[:12],
             release_diff=active_diff.as_dict(),
             execution_plan=plan.as_dict(),
-            completed_phases=[],
+            completed_phases=sorted(completed_phases),
             completed_cluster_ids=[],
             registry_staged=False,
             previous_snapshot_sha256=canonical_sha256(previous),
             transaction_committed=False,
             release_lifecycle="PREPARING",
+            component_progress={
+                "schema_version": PROGRESS_SCHEMA_VERSION,
+                "global": (
+                    {"aurora-refresh": {"status": PROGRESS_COMPLETED}}
+                    if repair is not None
+                    else {}
+                ),
+                "clusters": {},
+            },
             **(
                 {SCHEMA_CHANGE_ACCEPTANCE_KEY: preflight.acceptance}
                 if preflight.acceptance is not None
@@ -1167,6 +1151,8 @@ def upgrade_release(
                 for target in self.config.clusters
             },
         )
+    elif repair is not None:
+        checkpoint_prerequisite_adoption(self, completed_phases)
     try:
         run_upgrade_phases(
             self,
@@ -1176,6 +1162,7 @@ def upgrade_release(
             completed_phases=completed_phases,
             completed_clusters=completed_clusters,
             registry_staged=registry_staged,
+            credentials_proved=repair is not None,
         )
     except Exception as upgrade_error:
         recover_failed_upgrade(
@@ -1191,7 +1178,7 @@ def upgrade_release(
 
 
 def _rollback_context(
-    self: Any,
+    self: RegionalRelease,
     state: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     loaded = dict(self.state)
@@ -1232,7 +1219,7 @@ def _rollback_context(
 
 
 def _restore_rollback_cpu(
-    self: Any,
+    self: RegionalRelease,
     *,
     previous: dict[str, Any],
     metadata: dict[str, Any],
@@ -1311,31 +1298,11 @@ def _restore_rollback_cpu(
             previous_container_env_file=container_env_file,
         )
         _apply_rollback_cpu_environment(self, environment)
-    refresh_exists = self.runner.probe(
-        self._cpu(
-            "-n",
-            self.config.namespace,
-            "get",
-            "cronjob",
-            "gpu-fault-aurora-credential-refresh",
-        ),
-    )
-    if refresh_exists:
-        self.runner.run(
-            self._cpu(
-                "-n",
-                self.config.namespace,
-                "set",
-                "image",
-                "cronjob/gpu-fault-aurora-credential-refresh",
-                f"refresh={runtime_image}",
-            )
-        )
     return details
 
 
 def _stage_rollback_controller(
-    self: Any,
+    self: RegionalRelease,
     *,
     previous: dict[str, Any],
     metadata: dict[str, Any],
@@ -1393,148 +1360,14 @@ def _stage_rollback_controller(
     _apply_rollback_cpu_environment(self, environment)
 
 
-def rollback_target(
-    self: Any,
-    target: ClusterTarget,
-    *,
-    previous: dict[str, Any],
-    artifact: str,
-    config_digest: str,
-    runtime_profile_version: str,
-    executor_artifact: str,
-    executor_compatibility: str,
-    node_compatibility: str,
-    runtime_image: str,
-    node_installer_image: str,
-    components: frozenset[ReleaseComponent],
-) -> None:
-    old = (previous.get("clusters") or {}).get(target.cluster_id, {})
-    if ReleaseComponent.ENDPOINT in components:
-        secret = ((previous.get("secret_backups") or {}).get("clusters") or {}).get(
-            target.cluster_id
-        ) or {}
-        if not secret.get("backup") or not secret.get("source"):
-            raise ReleaseError(
-                f"{target.cluster_id} rollback connection Secret backup is missing"
-            )
-        self._restore_secret(
-            self._gpu(target),
-            source=str(secret["source"]),
-            backup=str(secret["backup"]),
-        )
-    wheel = old.get("wheel")
-    if ReleaseComponent.ENDPOINT in components:
-        self._verify_gpu_control_plane_endpoint(target)
-    if ReleaseComponent.DCGM in components:
-        if not old.get("dcgm_image"):
-            raise ReleaseError(
-                f"{target.cluster_id} previous DCGM image is unavailable"
-            )
-        self._apply_gpu_dcgm_exporter(
-            target,
-            image=old["dcgm_image"],
-        )
-    deployment_names = {
-        deployment
-        for component, deployment in (
-            (ReleaseComponent.EXECUTOR, inventory.GPU_EXECUTOR_DEPLOYMENT),
-            (ReleaseComponent.WATCHER, inventory.GPU_WATCHER_DEPLOYMENT),
-            (ReleaseComponent.COLLECTOR, inventory.GPU_COLLECTOR_DEPLOYMENT),
-        )
-        if component in components
-    }
-    if deployment_names:
-        if not wheel:
-            raise ReleaseError(
-                f"{target.cluster_id} previous Executor wheel is unavailable"
-            )
-        rollback_artifact = executor_artifact or self._config_map_sha(
-            self._gpu(target),
-            wheel,
-            old.get("wheel_key") or self.config.executor_wheel.name,
-        )
-        self._apply_gpu_deployments(
-            target,
-            wheel,
-            deployment_names=frozenset(deployment_names),
-            runtime_profile_version=runtime_profile_version,
-            executor_wheel_filename=old.get("wheel_key"),
-            executor_artifact_sha=rollback_artifact,
-            executor_compatibility_digest=(executor_compatibility or rollback_artifact),
-            runtime_image=runtime_image,
-        )
-    if ReleaseComponent.AGENT in components:
-        missing = [name for name in ("reconciler_wheel", "bundle") if not old.get(name)]
-        if missing:
-            raise ReleaseError(
-                f"{target.cluster_id} previous Agent rollback resources are "
-                "missing: " + ", ".join(missing)
-            )
-        agent_identity = (previous.get("agent_identities") or {}).get(
-            target.cluster_id
-        ) or {}
-        legacy_agent_identity = validate_rollback_agent_identity(
-            target.cluster_id,
-            agent_identity,
-            metadata=previous.get("metadata") or {},
-            artifact=artifact,
-            compatibility=node_compatibility,
-            config_digest=config_digest,
-            runtime_profile_version=runtime_profile_version,
-        )
-        self._roll_node_runtime(
-            target,
-            phase="rollback",
-            wheel_cm=old["reconciler_wheel"],
-            bundle_cm=old["bundle"],
-            artifact_sha=artifact,
-            config_digest=config_digest,
-            runtime_profile_version=runtime_profile_version,
-            executor_wheel_filename=old.get("reconciler_wheel_key"),
-            node_compatibility_digest=node_compatibility,
-            bundle_sha256=old.get("bundle_sha256"),
-            template_sha256=old.get("template_sha256"),
-            template_config_map=None,
-            runtime_image=self.runtime_image,
-            steady_runtime_image=runtime_image,
-            steady_template_config_map=old.get("template"),
-            node_installer_image=node_installer_image,
-            allow_legacy_identity=legacy_agent_identity,
-            agent_identity=agent_identity,
-        )
-    elif ReleaseComponent.RECONCILER in components:
-        missing = [name for name in ("reconciler_wheel", "bundle") if not old.get(name)]
-        if missing:
-            raise ReleaseError(
-                f"{target.cluster_id} previous Reconciler resources are "
-                "missing: " + ", ".join(missing)
-            )
-        self._deploy_reconciler(
-            target,
-            wheel_cm=old["reconciler_wheel"],
-            bundle_cm=old["bundle"],
-            artifact_sha=artifact,
-            config_digest=config_digest,
-            runtime_profile_version=runtime_profile_version,
-            executor_wheel_filename=old.get("reconciler_wheel_key"),
-            node_compatibility_digest=node_compatibility,
-            bundle_sha256=old.get("bundle_sha256"),
-            template_sha256=old.get("template_sha256"),
-            template_config_map=old.get("template"),
-            allowed_node_names=None,
-            runtime_image=runtime_image,
-            node_installer_image=node_installer_image,
-        )
-
-
 def _rollback_gpu_clusters(
-    self: Any,
+    self: RegionalRelease,
     *,
     previous: dict[str, Any],
     loaded: dict[str, Any],
     completed_phases: set[str],
     completed_clusters: set[str],
-    target_arguments: dict[str, Any],
+    target_arguments: RollbackTargetArguments,
     compensation: RollbackCompensationPlan,
     timing: dict[str, Any],
 ) -> None:
@@ -1637,7 +1470,7 @@ def _rollback_gpu_clusters(
 
 
 def _retain_valid_rollback_clusters(
-    self: Any,
+    self: RegionalRelease,
     *,
     loaded: dict[str, Any],
     previous: dict[str, Any],
@@ -1678,7 +1511,7 @@ def _retain_valid_rollback_clusters(
 
 
 def _verify_and_complete_rollback(
-    self: Any,
+    self: RegionalRelease,
     *,
     previous: dict[str, Any],
     loaded: dict[str, Any],
@@ -1686,7 +1519,7 @@ def _verify_and_complete_rollback(
     completed_phases: set[str],
     completed_clusters: set[str],
     timing: dict[str, Any],
-    run_phase: Callable[[str, str, str, Callable[[], None]], None],
+    run_phase: RollbackPhaseRunner,
 ) -> None:
     run_phase(
         "verify",
@@ -1710,11 +1543,11 @@ def _verify_and_complete_rollback(
 
 
 def _restore_regional_singletons(
-    self: Any,
+    self: RegionalRelease,
     *,
     previous: dict[str, Any],
     compensation: RollbackCompensationPlan,
-    run_phase: Callable[[str, str, str, Callable[[], object]], None],
+    run_phase: RollbackPhaseRunner,
 ) -> None:
     """Put back the components there is exactly one of for the whole region.
 
@@ -1743,19 +1576,19 @@ def _restore_regional_singletons(
 
 
 def _rollback_phase_runner(
-    self: Any,
+    self: RegionalRelease,
     *,
     timing: dict[str, Any],
     previous: dict[str, Any],
     loaded: dict[str, Any],
-    compensation: Any,
+    compensation: RollbackCompensationPlan,
     completed_phases: set[str],
     completed_clusters: set[str],
 ) -> tuple[
     Callable[[str, str], None],
     Callable[[str, str, Exception], None],
-    Callable[..., None],
-    Callable[[str, str, str, Callable[[], object]], None],
+    RollbackCheckpoint,
+    RollbackPhaseRunner,
 ]:
     """The rollback's phase bookkeeping: start, fail, checkpoint, run.
 
@@ -1833,33 +1666,39 @@ def _rollback_phase_runner(
 
 
 def rollback_release(
-    self: Any,
+    self: RegionalRelease,
     *,
     state: dict[str, Any] | None = None,
     automatic: bool = False,
 ) -> None:
-    # A rollback follows an arbitrary failure, including one inside the CPU
-    # role apply that replaced every ingress Pod. Whatever Pod name the upgrade
-    # memoised is suspect here; the first exec re-resolves it.
+    with recovery_deadline("release rollback"):
+        _rollback_release(self, state=state, automatic=automatic)
+
+
+def _rollback_release(
+    self: RegionalRelease,
+    *,
+    state: dict[str, Any] | None = None,
+    automatic: bool = False,
+) -> None:
     forget_cpu_ingress_pod(self)
+    if state is None:
+        restore_standalone_prerequisite(self)
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return
-    # Fresh Aurora credentials beside the in-flight install gate, before any
-    # restore is planned (``regional_release_preflight_concurrency``); the
-    # verdict rides in the state so ``rollback-started`` persists the check.
-    verdict = run_rollback_preflight(
-        self,
-        check_installs="rollback-cpu-restored"
-        not in set(loaded.get("rollback_completed_phases") or []),
-        automatic=automatic,
-    )
-    if isinstance(verdict, dict):
-        self.state["inflight_installs"] = verdict
     compensation = build_rollback_compensation_plan(
         loaded,
         (target.cluster_id for target in self.config.clusters),
     )
+    completed_clusters = set(loaded.get("rollback_completed_cluster_ids") or [])
+    for target in self.config.clusters:
+        if target.cluster_id not in completed_clusters and compensation.for_cluster(
+            target.cluster_id
+        ).intersection({ReleaseComponent.AGENT, ReleaseComponent.RECONCILER}):
+            validate_rollback_node_template(self, target, previous=previous)
+    if has_prerequisite_repair(self.state):
+        restore_prerequisite_repair(self)
     (
         metadata,
         cpu_wheel,
@@ -1870,11 +1709,44 @@ def rollback_release(
         executor_compatibility,
         runtime_image,
     ) = _rollback_identity_context(self, previous, compensation)
+    if compensation.restores_cpu and "aurora_refresh" not in previous:
+        if read_aurora_refresh_cronjob(self) is not None:
+            raise ReleaseError(
+                "previous snapshot predates full Aurora refresher capture; rollback requires a verified snapshot"
+            )
     completed_phases = set(loaded.get("rollback_completed_phases") or [])
-    completed_clusters = set(loaded.get("rollback_completed_cluster_ids") or [])
     timing = initialize_rollback_timing(loaded)
-    if not hasattr(self, "_rollback_wave_timings"):
-        self._rollback_wave_timings = {}
+    restores_refresh = compensation.global_has(ReleaseComponent.AURORA_REFRESH)
+    if restores_refresh:
+        validate_aurora_refresh_snapshot(self, previous.get("aurora_refresh"))
+    start_phase, fail_phase, checkpoint, run_phase = _rollback_phase_runner(
+        self,
+        timing=timing,
+        previous=previous,
+        loaded=loaded,
+        compensation=compensation,
+        completed_phases=completed_phases,
+        completed_clusters=completed_clusters,
+    )
+    # Restore the previous refresher before using it. Never restore the old
+    # password: that program must read AWSCURRENT before any CPU Pod restarts.
+    if restores_refresh:
+        if "rollback-aurora-refresh-restored" in completed_phases:
+            verify_aurora_refresh_snapshot(self, previous["aurora_refresh"])
+        run_phase(
+            "aurora_refresh_restore",
+            "rollback-aurora-refresh-restoring",
+            "rollback-aurora-refresh-restored",
+            lambda: restore_aurora_refresh_snapshot(self, previous["aurora_refresh"]),
+        )
+    verdict = run_rollback_preflight(
+        self,
+        check_installs="rollback-cpu-restored" not in completed_phases,
+        automatic=automatic,
+    )
+    if isinstance(verdict, dict):
+        self.state["inflight_installs"] = verdict
+    self._rollback_wave_timings = getattr(self, "_rollback_wave_timings", {})
     if "rollback-restored" not in completed_phases:
         start_timed_entry(
             timing,
@@ -1897,17 +1769,7 @@ def rollback_release(
         self,
         loaded=loaded,
         previous=previous,
-        runtime_image=runtime_image,
-        compensation=compensation,
-        completed_phases=completed_phases,
-        completed_clusters=completed_clusters,
-    )
-
-    start_phase, fail_phase, checkpoint, run_phase = _rollback_phase_runner(
-        self,
-        timing=timing,
-        previous=previous,
-        loaded=loaded,
+        runtime_image=previous_executor_image(previous),
         compensation=compensation,
         completed_phases=completed_phases,
         completed_clusters=completed_clusters,

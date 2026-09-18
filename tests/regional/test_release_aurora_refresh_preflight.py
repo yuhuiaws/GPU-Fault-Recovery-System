@@ -18,6 +18,7 @@ upgrade nor a rollback starts on a stale password.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,21 +42,50 @@ class RecordingRunner:
 
     dry_run = False
 
-    def __init__(self, *, cronjob_exists: bool = True, fail_on: str | None = None):
+    def __init__(
+        self,
+        *,
+        cronjob_exists: bool = True,
+        fail_on: str | None = None,
+        read_error: str | None = None,
+    ):
         self.cronjob_exists = cronjob_exists
         self.fail_on = fail_on
         self.commands: list[list[str]] = []
         self.kwargs: list[dict] = []
         self.probes: list[list[str]] = []
+        self.read_error = read_error
 
     def probe(self, args, **_kwargs) -> bool:
         self.probes.append(list(args))
         return self.cronjob_exists
 
+    def probe_output(self, args, **kwargs) -> tuple[int, str, str]:
+        self.probes.append(list(args))
+        assert kwargs["timeout_seconds"] == REFRESH.CRONJOB_READ_TIMEOUT_SECONDS
+        if self.read_error:
+            return 1, "", self.read_error
+        if not self.cronjob_exists:
+            return 0, "", ""
+        return (
+            0,
+            json.dumps(
+                {
+                    "kind": "CronJob",
+                    "metadata": {
+                        "name": CRONJOB,
+                        "namespace": NAMESPACE,
+                        "uid": "refresher-uid",
+                    },
+                }
+            ),
+            "",
+        )
+
     def run(self, args, **kwargs) -> str:
         self.commands.append(list(args))
         self.kwargs.append(dict(kwargs))
-        verb = args[args.index("-n") + 2]
+        verb = command_verb(args)
         if verb == self.fail_on:
             raise MODULE.ReleaseError(f"command failed (1): {args[0]}")
         return ""
@@ -70,7 +100,13 @@ def _release(runner: RecordingRunner) -> SimpleNamespace:
 
 
 def _verbs(runner: RecordingRunner) -> list[str]:
-    return [args[args.index("-n") + 2] for args in runner.commands]
+    return [command_verb(args) for args in runner.commands]
+
+
+def command_verb(args: list[str]) -> str:
+    if any(argument.endswith("/wait-for-kubernetes-job.sh") for argument in args):
+        return "wait"
+    return args[args.index("-n") + 2]
 
 
 # --- the hook itself ---------------------------------------------------------
@@ -102,9 +138,60 @@ def test_an_absent_cronjob_is_skipped_without_creating_anything() -> None:
             "get",
             "cronjob",
             CRONJOB,
+            "--ignore-not-found",
+            "-o",
+            "json",
+            "--request-timeout=15s",
         ]
     ]
     assert runner.commands == [], "nothing may be created when the CronJob is absent"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Forbidden",
+        "Unauthorized",
+        "connection reset",
+        "NotFound",
+        "unexpected response",
+    ],
+)
+def test_a_failed_cronjob_read_never_authorizes_skipping_refresh(error: str) -> None:
+    runner = RecordingRunner(read_error=error)
+    with pytest.raises(MODULE.ReleaseError, match="state is unknown"):
+        REFRESH.refresh_aurora_credentials(_release(runner))
+    assert runner.commands == [], "an unproved CronJob read entered a mutation"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "not-json",
+        "[]",
+        "{}",
+        json.dumps(
+            {
+                "kind": "CronJob",
+                "metadata": {"name": CRONJOB, "namespace": "other", "uid": "uid"},
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "CronJob",
+                "metadata": {"name": CRONJOB, "namespace": NAMESPACE, "uid": ""},
+            }
+        ),
+    ],
+)
+def test_malformed_or_foreign_cronjob_never_authorizes_refresh(
+    output: str, monkeypatch
+) -> None:
+    runner = RecordingRunner()
+    monkeypatch.setattr(runner, "probe_output", lambda *_a, **_k: (0, output, ""))
+    with pytest.raises(MODULE.ReleaseError, match="CronJob"):
+        REFRESH.refresh_aurora_credentials(_release(runner))
+    assert runner.commands == []
 
 
 def test_a_present_cronjob_is_run_once_waited_for_and_deleted(monkeypatch) -> None:
@@ -121,10 +208,16 @@ def test_a_present_cronjob_is_run_once_waited_for_and_deleted(monkeypatch) -> No
     assert len(job) <= 63, "a Job name must stay a valid DNS-1123 label"
     assert create[create.index("-n") + 1] == NAMESPACE
     assert create[-3:] == ["job", f"--from=cronjob/{CRONJOB}", job]
-    assert wait[-3:] == [
-        "--for=condition=complete",
-        f"--timeout={REFRESH.DEFAULT_REFRESH_WAIT_SECONDS}s",
-        f"job/{job}",
+    assert wait == [
+        "bash",
+        str(ROOT / "deploy/control-plane/tools/wait-for-kubernetes-job.sh"),
+        str(REFRESH.DEFAULT_REFRESH_WAIT_SECONDS),
+        job,
+        "kubectl",
+        "--kubeconfig",
+        "/secure/cpu",
+        "-n",
+        NAMESPACE,
     ]
     # The runner's own timeout backstops a hung kubectl and must outlast the
     # server-side wait so the Job, not the client, decides the verdict.
@@ -169,7 +262,7 @@ def test_the_wait_is_an_env_override_and_refuses_garbage(monkeypatch) -> None:
 
     REFRESH.refresh_aurora_credentials(_release(runner))
 
-    assert "--timeout=45s" in runner.commands[1]
+    assert runner.commands[1][2] == "45"
 
     for garbage in ("0", "-5", "soon"):
         monkeypatch.setenv(REFRESH.REFRESH_WAIT_SECONDS_ENV, garbage)
@@ -184,12 +277,10 @@ class _Reached(RuntimeError):
     pass
 
 
-def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
-    """After the CA bundle (the refresher mounts it) and before anything is
-    written: a stale password must stop the transaction before it has anything
-    to roll back. The refresh, the idle check and the read-only capture run as
-    concurrent lanes, so their mutual order is not fixed; what is fixed is that
-    all three sit behind the CA bundle and ahead of the Secret backups."""
+def test_unchanged_refresher_runs_before_store_gates_and_snapshot() -> None:
+    """After the CA bundle (the refresher mounts it), before the idle check and
+    before the previous release is captured: a stale password must stop the
+    transaction before it has anything to roll back."""
 
     calls: list[str] = []
     release = SimpleNamespace(
@@ -208,7 +299,7 @@ def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
     with pytest.raises(_Reached):
@@ -223,9 +314,7 @@ def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
 
 
 def test_a_failed_refresh_stops_the_upgrade_before_anything_is_written() -> None:
-    """The idle check and the capture may run beside the refresh, but a refresh
-    that fails still stops the transaction with its own error before the Secret
-    backups and before the first state write."""
+    """A failed refresh prevents dependent Store reads, capture and backups."""
 
     release = SimpleNamespace(
         config=SimpleNamespace(
@@ -250,7 +339,7 @@ def test_a_failed_refresh_stops_the_upgrade_before_anything_is_written() -> None
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
     with pytest.raises(MODULE.ReleaseError, match="credential refresh"):
@@ -274,13 +363,10 @@ def _rollback_double(calls: list[str], *, refresh=None, **stubs) -> SimpleNamesp
     )
 
 
-def test_rollback_refreshes_credentials_before_planning_any_restore(
+def test_rollback_plans_refresher_restore_before_running_its_candidate(
     monkeypatch,
 ) -> None:
-    """The compensating rollback restarts control-worker; on 2026-09-07 it did so
-    into the rotated password and turned a recoverable failure into
-    ``rollback-failed``. The refresh has to come before the compensation plan,
-    which is what every restore phase is derived from."""
+    """The pure plan must identify a changed refresher before that program runs."""
 
     calls: list[str] = []
 
@@ -295,15 +381,15 @@ def test_rollback_refreshes_credentials_before_planning_any_restore(
             _rollback_double(calls), state={"metadata": {}, "cpu_wheel": "w"}
         )
 
-    assert calls == ["aurora-refresh", "compensation-plan"]
+    assert calls == ["compensation-plan"]
 
 
 def test_a_failed_refresh_stops_the_rollback_before_any_restore(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         ORCHESTRATION,
-        "build_rollback_compensation_plan",
-        lambda *_a, **_k: pytest.fail("the rollback was planned on a stale password"),
+        "_rollback_identity_context",
+        lambda *_a, **_k: ({}, "", "", "", "", "", "", ""),
     )
 
     def refresh():
@@ -311,7 +397,8 @@ def test_a_failed_refresh_stops_the_rollback_before_any_restore(monkeypatch) -> 
 
     with pytest.raises(MODULE.ReleaseError, match="credential refresh"):
         ORCHESTRATION.rollback_release(
-            _rollback_double(calls, refresh=refresh), state={"metadata": {}}
+            _rollback_double(calls, refresh=refresh),
+            state={"metadata": {}, "aurora_refresh": None},
         )
     assert calls == []
 

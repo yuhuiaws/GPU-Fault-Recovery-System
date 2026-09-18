@@ -10,16 +10,18 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 PHASES = (
     "PREFLIGHT",
+    "CLUSTERS_DRAINING",
     "GPU_DATA_PLANE_SOURCES_STOPPED",
-    "INGRESS_STOPPED",
     "QUEUES_DRAINED",
     "CONTROL_CONSUMERS_STOPPED",
+    "INGRESS_STOPPED",
     "GPU_EXECUTORS_STOPPED",
+    "NODE_RUNTIMES_STOPPED",
     "CPU_AUXILIARIES_STOPPED",
     "APPLICATION_OBJECTS_DELETED",
     "NAMESPACES_DELETED",
@@ -53,8 +55,9 @@ def content_digest(document: dict[str, Any]) -> str:
 
 
 def verify_document(document: dict[str, Any]) -> None:
-    if document.get("schema_version") != 1:
-        raise CleanupStateError("unsupported cleanup state schema")
+    if not isinstance(document, dict):
+        raise CleanupStateError("cleanup state must be an object")
+    require_current_order(document)
     expected = document.get("content_sha256")
     actual = content_digest(document)
     if expected != actual:
@@ -63,6 +66,120 @@ def verify_document(document: dict[str, Any]) -> None:
         raise CleanupStateError("invalid cleanup phase")
     if document.get("status") not in STATUSES:
         raise CleanupStateError("invalid cleanup status")
+    history = document.get("history")
+    if not isinstance(history, list) or not history:
+        raise CleanupStateError("cleanup state lacks phase history")
+    previous = -1
+    for entry in history:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("phase") not in PHASE_INDEX
+            or entry.get("status") not in STATUSES
+            or PHASE_INDEX[entry["phase"]] < previous
+        ):
+            raise CleanupStateError("invalid cleanup phase history")
+        previous = PHASE_INDEX[entry["phase"]]
+    if any(history[-1].get(key) != document.get(key) for key in ("phase", "status")):
+        raise CleanupStateError("cleanup phase differs from history")
+    if PHASE_INDEX[document["phase"]] >= PHASE_INDEX["CLEANUP_COMPLETED"]:
+        if not set(required_phases(document)).issubset(completed_phases(document)):
+            raise CleanupStateError("cleanup evidence lacks completed lifecycle phases")
+
+
+def require_current_order(document: dict[str, Any]) -> None:
+    if (
+        type(document.get("schema_version")) is not int
+        or document["schema_version"] != 2
+    ):
+        raise CleanupStateError(
+            "unsupported cleanup state schema; legacy phase order requires reconciliation"
+        )
+    if document.get("phase_order") != list(PHASES):
+        raise CleanupStateError(
+            "cleanup phase order differs; legacy phase order requires reconciliation"
+        )
+
+
+def completed_phases(document: dict[str, Any]) -> list[str]:
+    latest = {entry["phase"]: entry["status"] for entry in document["history"]}
+    return [phase for phase in PHASES if latest.get(phase) == "COMPLETED"]
+
+
+def required_phases(document: dict[str, Any]) -> list[str]:
+    required = {
+        "PREFLIGHT",
+        "GPU_DATA_PLANE_SOURCES_STOPPED",
+        "QUEUES_DRAINED",
+        "NODE_RUNTIMES_STOPPED",
+        "GPU_EXECUTORS_STOPPED",
+    }
+    if document["scope"] == "all":
+        required.update(
+            {
+                "CLUSTERS_DRAINING",
+                "INGRESS_STOPPED",
+                "CONTROL_CONSUMERS_STOPPED",
+                "CPU_AUXILIARIES_STOPPED",
+            }
+        )
+    if document["mode"] in {"clean", "reset"}:
+        required.add("APPLICATION_OBJECTS_DELETED")
+    if document["mode"] == "reset":
+        required.add("NAMESPACES_DELETED")
+    return [phase for phase in PHASES if phase in required]
+
+
+def request_targets(
+    config: dict[str, Any], *, scope: str, cluster_ids: list[str]
+) -> dict[str, Any]:
+    clusters = config.get("clusters")
+    if not isinstance(clusters, list):
+        raise CleanupStateError("cleanup clusters must be a list")
+    by_id = {cluster["cluster_id"]: cluster for cluster in clusters}
+    if len(by_id) != len(clusters):
+        raise CleanupStateError("duplicate cleanup cluster identity")
+    if scope == "gpu" and (
+        not cluster_ids
+        or not set(cluster_ids).issubset(by_id)
+        or len(cluster_ids) != len(set(cluster_ids))
+    ):
+        raise CleanupStateError("cleanup requires distinct, known GPU cluster IDs")
+    if scope not in {"all", "gpu"} or scope == "all" and cluster_ids:
+        raise CleanupStateError("invalid cleanup scope")
+    selected = [by_id[key] for key in cluster_ids] if scope == "gpu" else clusters
+    return {
+        "namespace": config.get("namespace", "gpu-fault-system"),
+        "cpu_kubeconfig": config.get("cpu_kubeconfig"),
+        "clusters": [
+            {"cluster_id": cluster["cluster_id"], "context": cluster["context"]}
+            for cluster in selected
+        ],
+    }
+
+
+def validate_request(
+    document: dict[str, Any],
+    *,
+    config_path: Path,
+    scope: str,
+    mode: str,
+    node_mode: str,
+    cluster_ids: list[str],
+) -> None:
+    verify_document(document)
+    config_text = config_path.read_text(encoding="utf-8")
+    expected = {
+        "config_sha256": hashlib.sha256(config_text.encode()).hexdigest(),
+        "scope": scope,
+        "mode": mode,
+        "node_mode": node_mode,
+        "targets": request_targets(
+            json.loads(config_text), scope=scope, cluster_ids=cluster_ids
+        ),
+    }
+    for key, value in expected.items():
+        if document.get(key) != value:
+            raise CleanupStateError(f"cleanup request differs on {key}")
 
 
 def read_state(path: Path) -> dict[str, Any]:
@@ -71,7 +188,7 @@ def read_state(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise CleanupStateError(f"cannot read cleanup state: {exc}") from exc
     verify_document(document)
-    return document
+    return cast(dict[str, Any], document)
 
 
 def atomic_write(
@@ -125,6 +242,7 @@ def initialize(
     scope: str,
     mode: str,
     node_mode: str,
+    cluster_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     if path.exists():
         raise CleanupStateError(f"cleanup state already exists: {path}")
@@ -134,7 +252,8 @@ def initialize(
     inventory = json.loads(inventory_text)
     created_at = now()
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "phase_order": list(PHASES),
         "run_id": f"cleanup-{uuid4()}",
         "created_at": created_at,
         "updated_at": created_at,
@@ -145,20 +264,7 @@ def initialize(
         "status": "IN_PROGRESS",
         "config_sha256": hashlib.sha256(config_text.encode()).hexdigest(),
         "inventory_sha256": hashlib.sha256(inventory_text.encode()).hexdigest(),
-        "targets": {
-            "namespace": config.get(
-                "namespace",
-                "gpu-fault-system",
-            ),
-            "cpu_kubeconfig": config.get("cpu_kubeconfig"),
-            "clusters": [
-                {
-                    "cluster_id": cluster["cluster_id"],
-                    "context": cluster["context"],
-                }
-                for cluster in config["clusters"]
-            ],
-        },
+        "targets": request_targets(config, scope=scope, cluster_ids=cluster_ids or []),
         "inventory_snapshot": inventory,
         "fleet_snapshot": None,
         "fleet_snapshot_sha256": None,
@@ -239,10 +345,21 @@ def transition(
         raise CleanupStateError(f"unknown cleanup phase: {phase}")
     if status not in STATUSES:
         raise CleanupStateError(f"unknown cleanup status: {status}")
+    require_current_order(document)
     current_phase = document["phase"]
     current_status = document["status"]
     if PHASE_INDEX[phase] < PHASE_INDEX[current_phase]:
         raise CleanupStateError("cleanup phase cannot move backwards")
+    if phase == "CLEANUP_COMPLETED" and status == "COMPLETED":
+        if not set(required_phases(document)).issubset(completed_phases(document)):
+            raise CleanupStateError(
+                "cleanup completion requires completed lifecycle phases"
+            )
+    if phase == "READY_TO_DELETE_AURORA" and (
+        current_phase not in {"CLEANUP_COMPLETED", "READY_TO_DELETE_AURORA"}
+        or current_status != "COMPLETED"
+    ):
+        raise CleanupStateError("Aurora handoff requires completed CLEANUP_COMPLETED")
     if phase == "AURORA_DELETED" and (
         current_phase
         not in {
@@ -279,6 +396,7 @@ def main() -> int:
     init.add_argument("--scope", required=True)
     init.add_argument("--mode", required=True)
     init.add_argument("--node-mode", required=True)
+    init.add_argument("--cluster-id", action="append", default=[])
 
     record = subparsers.add_parser("record")
     record.add_argument("--path", type=Path, required=True)
@@ -296,9 +414,7 @@ def main() -> int:
         required=True,
     )
 
-    # A reset resumed over a control plane an earlier run already stopped has
-    # no Pod left to export the fleet inventory; the earlier run's record,
-    # moved aside as <state>.failed-<stamp>.json, still carries the export.
+    # Retain a clear refusal for older callers; another journal is not authority.
     reuse = subparsers.add_parser("reuse-fleet")
     reuse.add_argument("--path", type=Path, required=True)
     reuse.add_argument("--from", dest="source", type=Path, required=True)
@@ -319,6 +435,22 @@ def main() -> int:
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--path", type=Path, required=True)
+    verify.add_argument("--config", type=Path)
+    verify.add_argument("--scope", choices=("all", "gpu"))
+    verify.add_argument("--mode", choices=("stop", "clean", "reset"))
+    verify.add_argument("--node-mode", choices=("stop", "uninstall", "skip"))
+    verify.add_argument("--cluster-id", action="append", default=[])
+
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("--path", type=Path, required=True)
+    resume.add_argument("--config", type=Path, required=True)
+    resume.add_argument("--scope", choices=("all", "gpu"), required=True)
+    resume.add_argument("--mode", choices=("stop", "clean", "reset"), required=True)
+    resume.add_argument(
+        "--node-mode", choices=("stop", "uninstall", "skip"), required=True
+    )
+    resume.add_argument("--cluster-id", action="append", default=[])
+    resume.add_argument("--inventory-output", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "init":
@@ -329,10 +461,33 @@ def main() -> int:
             scope=args.scope,
             mode=args.mode,
             node_mode=args.node_mode,
+            cluster_ids=args.cluster_id,
         )
     else:
         document = read_state(args.path)
-        if args.command == "record":
+        if args.command in {"verify", "resume"} and args.config is not None:
+            if not all((args.scope, args.mode, args.node_mode)):
+                raise CleanupStateError(
+                    "cleanup request verification needs scope and modes"
+                )
+            validate_request(
+                document,
+                config_path=args.config,
+                scope=args.scope,
+                mode=args.mode,
+                node_mode=args.node_mode,
+                cluster_ids=args.cluster_id,
+            )
+            if args.command == "resume":
+                if PHASE_INDEX[document["phase"]] > PHASE_INDEX["CLEANUP_COMPLETED"]:
+                    raise CleanupStateError(
+                        "cleanup cannot resume after Aurora handoff"
+                    )
+                args.inventory_output.write_text(
+                    json.dumps(document["inventory_snapshot"]), encoding="utf-8"
+                )
+                args.inventory_output.chmod(0o600)
+        elif args.command == "record":
             record_resource(
                 document,
                 resource_scope=args.resource_scope,
@@ -349,17 +504,9 @@ def main() -> int:
             attach_fleet_snapshot(document, snapshot)
             atomic_write(args.path, document)
         elif args.command == "reuse-fleet":
-            previous = json.loads(args.source.read_text(encoding="utf-8"))
-            snapshot = (
-                previous.get("fleet_snapshot") if isinstance(previous, dict) else None
+            raise CleanupStateError(
+                "fleet reuse across cleanup journals is unsupported; resume the original bound journal"
             )
-            if not isinstance(snapshot, list):
-                raise CleanupStateError(
-                    f"earlier cleanup record {args.source} carries no fleet snapshot"
-                )
-            attach_fleet_snapshot(document, snapshot)
-            atomic_write(args.path, document)
-            print(len(snapshot))
         elif args.command == "transition":
             transition(
                 document,
@@ -375,6 +522,7 @@ def main() -> int:
                 "phase": document["phase"],
                 "status": document["status"],
                 "content_sha256": document["content_sha256"],
+                "completed_phases": completed_phases(document),
             },
             sort_keys=True,
         )

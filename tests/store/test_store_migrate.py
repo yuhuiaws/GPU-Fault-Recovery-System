@@ -7,8 +7,12 @@ import sys
 import pytest
 
 from gpu_fault import store_migrate
+from tests.regional.test_bootstrap_store_proof_postgres import (
+    database as temporary_database_fixture,
+)
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
+diagnostics_database = temporary_database_fixture
 
 
 def test_store_migrate_can_initialize_schema(monkeypatch, capsys) -> None:
@@ -83,7 +87,11 @@ def test_store_migrate_can_backfill_hot_state(monkeypatch, capsys) -> None:
     assert body["backfill"]["gpu_metric_latest"] == 3
     assert body["status"]["gpu_metric_latest"]["missing_or_mismatched"] == 0
     assert calls == [
-        ("open", "postgresql://db/gpu_fault", {"hot_state_mode": "dual"}),
+        (
+            "open",
+            "postgresql://db/gpu_fault",
+            {"hot_state_mode": "dual", "initialize_schema": False},
+        ),
         ("close", None),
     ]
 
@@ -116,7 +124,10 @@ def test_store_migrate_can_finalize_counter_shards(monkeypatch, capsys) -> None:
     store_migrate.main()
 
     assert json.loads(capsys.readouterr().out) == {"mode": "partitioned", "ready": True}
-    assert calls == [("open", "postgresql://db/gpu_fault", {}), ("close", None)]
+    assert calls == [
+        ("open", "postgresql://db/gpu_fault", {"initialize_schema": False}),
+        ("close", None),
+    ]
 
 
 def test_store_migrate_can_restore_legacy_counters(monkeypatch, capsys) -> None:
@@ -179,20 +190,15 @@ def test_store_migrate_refuses_unsafe_legacy_purge(monkeypatch) -> None:
 
 
 @pytest.fixture
-def without_pg_stat_statements():
-    """Leave the extension state as the other tests found it."""
+def without_pg_stat_statements(diagnostics_database: str) -> str:
+    """Change extensions only in the temporary database, never the shared one."""
 
     psycopg = pytest.importorskip("psycopg")
-    assert POSTGRES_URL is not None
 
-    def drop() -> None:
-        with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("DROP EXTENSION IF EXISTS pg_stat_statements")
-
-    drop()
-    yield
-    drop()
+    with psycopg.connect(diagnostics_database, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP EXTENSION IF EXISTS pg_stat_statements")
+    return diagnostics_database
 
 
 @pytest.mark.skipif(
@@ -212,7 +218,7 @@ def test_store_migrate_ensure_diagnostics_installs_pg_stat_statements(
             "gpu-fault-store-migrate",
             "--ensure-diagnostics",
             "--postgres-url",
-            POSTGRES_URL,
+            without_pg_stat_statements,
         ],
     )
 

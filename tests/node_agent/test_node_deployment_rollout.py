@@ -5,12 +5,13 @@ regional installer Job and its reconciler (preflight-only mode, node
 action key derivation, connection Secret, event-driven Job wait), the
 content-addressed runtime slots and legacy venv, ``deploy.sh`` ordering
 around the agent pin migration, the default-off collector flags (node log,
-training-health, Kubernetes HMA, nvidia-smi metrics) and the failsafe
+training-health, nvidia-smi metrics) and the failsafe
 quiesce configuration the production installer carries.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 
@@ -20,6 +21,12 @@ from gpu_fault.env_validation import (
     TRAINING_HEALTH_MONITOR_ENV,
     training_health_monitor_enabled,
 )
+from gpu_fault.node_action_keys import derive_node_action_secret
+from gpu_fault_release import regional_node_batch
+from tests.deploy._node_action_key_api import node_list
+from tests.deploy.test_node_action_key_provisioning import run_script
+from tests.deploy.test_node_batch_rendering import Runner
+from tests.deploy.test_node_batch_rendering import rendered_batch as rendered_batch
 from tests.node_agent._deployment_support import NODE_SCRIPTS, ROOT
 
 
@@ -60,6 +67,16 @@ def test_node_installer_help_does_not_require_root() -> None:
     assert "--quiesce-failsafe-seconds SEC" in result.stdout
     assert "--fabric-manager-log-paths GLOBS" in result.stdout
     assert "--allow-driver-remediation" in result.stdout
+    assert (
+        "--allow-efa-driver-remediation  Allow EFA PCI driver rebind after "
+        "workload stop; default"
+    ) in result.stdout, "help must identify the default-on EFA permission"
+    assert "--disable-efa-driver-remediation Do not allow EFA PCI driver rebind" in (
+        result.stdout
+    ), "help must expose the EFA opt-out"
+    assert (
+        "--node-action-retention-seconds SEC Ledger retention; default: 2592000"
+    ) in result.stdout, "help must match the actual 30-day ledger retention"
     assert "--firmware-verify-sha256 HEX" in result.stdout
     assert "--allow-field-diagnostic" in result.stdout
     assert "--field-diagnostic-sha256 HEX" in result.stdout
@@ -92,16 +109,36 @@ def test_node_installer_exposes_config_digest_environment() -> None:
     }
 
 
-def test_node_rollout_preflight_is_read_only_and_server_validated() -> None:
+def test_node_rollout_preflight_is_read_only_and_server_validated(request) -> None:
     deploy = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
     job = (ROOT / "deploy/node/run-hyperpod-installer-job.sh").read_text()
     preflight = (ROOT / "deploy/node/preflight-gpu-fault-node.sh").read_text()
 
     assert 'PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"' in deploy
     assert 'if [[ "${PREFLIGHT_ONLY}" == "true" ]]' in deploy
-    assert deploy.count("apply --dry-run=server") >= 3
-    assert "--preflight-only --render-only" in deploy
-    assert 'render_installer_job "${node}" --preflight-only' in deploy
+    assert "gpu_fault_release.regional_node_batch" in deploy
+    assert "--run-preflights" in deploy
+    source, template, output, scope, identity = request.getfixturevalue(
+        "rendered_batch"
+    )
+    nodes = regional_node_batch.prepare_node_batch(
+        source, template, output, scope, identity
+    )
+    runner = Runner()
+    regional_node_batch.run_node_preflights(nodes, scope, identity, runner, workers=1)
+    first_create = next(
+        index for index, args in enumerate(runner.commands) if "create" in args
+    )
+    assert first_create == len(runner.admission_batches)
+    assert len(runner.admitted) == 2 * len(nodes)
+    assert {item["metadata"]["name"] for item in runner.admitted} == {
+        json.loads(path.read_text())["metadata"]["name"]
+        for node in nodes
+        for path in (node.install_manifest, node.preflight_manifest)
+    }
+    assert all("--dry-run=server" in args for args in runner.commands[:first_create]), (
+        "every install and preflight manifest must pass admission before creating any Job"
+    )
     preflight_section = deploy.split('if [[ "${PREFLIGHT_ONLY}" == "true" ]]', 1)[1]
     assert "provision-node-action-keys.sh" not in preflight_section.split("fi", 1)[0]
     assert "GPU_FAULT_RECONCILER_PREFLIGHT_ONLY" not in job
@@ -120,11 +157,10 @@ def test_node_rollout_preflight_is_read_only_and_server_validated() -> None:
 
 
 def test_reconciler_product_reuse_is_gated_and_reports_no_key_material() -> None:
-    """The hints an earlier run of the release leaves are advisory: the live
-    node set must still hash to the recorded digest, the reused template must
-    still carry the content its name promises, the preflight never reuses, and
-    the product report names digests and objects only. The behaviour itself is
-    exercised end to end in ``test_release_installer_product_reuse``."""
+    """Product hints do not bypass live key proof or trusted template pins.
+
+    The end-to-end behavior is exercised in test_release_installer_product_reuse.
+    """
 
     deploy = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
 
@@ -134,12 +170,11 @@ def test_reconciler_product_reuse_is_gated_and_reports_no_key_material() -> None
     )
     assert "invalid GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256" in deploy
     assert "invalid GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP" in deploy
-    assert (
-        '"${PREFLIGHT_ONLY}" != "true" && -n "${REUSE_NODE_SET_SHA256}" &&\n'
-        '    "${REUSE_NODE_SET_SHA256}" == "${NODE_SET_SHA256}"'
-    ) in deploy, "reuse needs the live node set and never applies to a preflight"
-    assert '"gpu-fault-node-installer-template-${reused_sha256:0:12}"' in deploy, (
-        "a reused template must still hash to its content-addressed name"
+    assert 'REUSE_PRODUCTS="true"' not in deploy, (
+        "an advisory node-name digest must not enable a proof bypass"
+    )
+    assert "template_config_map_content_sha256" not in deploy, (
+        "a mutable ConfigMap must not supply its own trusted content pin"
     )
     report = deploy.split('if [[ -n "${PRODUCTS_FILE}" ]]; then', 1)[1]
     report = report.split("\nfi\n", 1)[0]
@@ -201,17 +236,31 @@ def test_hyperpod_installer_supports_regional_connection_secret() -> None:
     assert '--ca-certificate "${CONTROL_PLANE_CA_CERTIFICATE}"' in installer
 
 
-def test_regional_node_keys_are_derived_before_the_job() -> None:
+def test_regional_node_keys_are_derived_before_the_job(tmp_path) -> None:
     provision = (ROOT / "deploy/node/provision-node-action-keys.sh").read_text()
     installer = (ROOT / "deploy/node/run-hyperpod-installer-job.sh").read_text()
     reconciler = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
 
-    assert "derive_node_action_secret" in provision
+    result, state = run_script(
+        tmp_path,
+        {"nodes": node_list("node-current"), "secrets": {"gpu": None, "cpu": None}},
+    )
+    assert result.returncode == 0, result.stderr
+    expected = derive_node_action_secret(
+        "fixture-only-master-" * 4, "fixture-cluster", "node-current"
+    )
+    for scope in ("gpu", "cpu"):
+        assert (
+            base64.b64decode(
+                state["secrets"][scope]["data"]["node-current"], validate=True
+            ).decode()
+            == expected
+        )
+    assert not any("job" in command for command in state["calls"]), (
+        "key provisioning must not issue Job commands"
+    )
     assert "GPU_FAULT_FLEET_MASTER_FILE" in provision
     assert "GPU_FAULT_HYPERPOD_CLUSTER" in provision
-    assert "cluster-name=${HYPERPOD_CLUSTER}" in provision
-    assert '"${MASTER_FILE}" "${CLUSTER_ID}" "${node}"' in provision
-    assert '--from-file="${key_dir}"' in provision
     assert "GPU_FAULT_FLEET_MASTER_FILE" in reconciler
     assert "GPU_FAULT_HYPERPOD_CLUSTER" in reconciler
     assert "cluster-name=${HYPERPOD_CLUSTER}" in reconciler
@@ -253,11 +302,9 @@ def test_runtime_profile_placeholder_is_rendered_for_data_plane_collectors() -> 
     resource_collector = (
         ROOT / "deploy/dataplane/kubernetes-node-resource-collector.yaml"
     ).read_text()
-    hma_watcher = (ROOT / "deploy/dataplane/optional/hma-watcher.yaml").read_text()
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text()
 
     assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in resource_collector
-    assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in hma_watcher
     assert (
         deploy.count("s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g") >= 5
     )
@@ -303,6 +350,7 @@ def test_explicit_fabric_manager_log_paths_take_priority() -> None:
 
 def test_node_runtime_uses_content_addressed_atomic_slots() -> None:
     installer = NODE_SCRIPTS[0].read_text()
+    slots = (ROOT / "deploy/node/runtime-slot.sh").read_text()
     runtime_units = (
         "gpu-fault-kernel-collector.service",
         "gpu-fault-metrics-collector.service",
@@ -312,15 +360,14 @@ def test_node_runtime_uses_content_addressed_atomic_slots() -> None:
         "gpu-fault-node-agent.service",
     )
 
-    assert 'RUNTIME_RELEASE_DIR="${RUNTIME_RELEASES_DIR}/${WHEEL_SHA256}"' in installer
-    assert (
-        'prepare_runtime_slot "${RUNTIME_RELEASE_DIR}" "${WHEEL_SHA256}"' in installer
-    )
+    assert "\nprepare_node_runtime\n" in installer
+    assert 'RUNTIME_RELEASE_DIR="$(runtime_slot_directory)"' in slots
+    assert 'prepare_runtime_slot "${RUNTIME_RELEASE_DIR}" "${WHEEL_SHA256}"' in slots
     assert (
         'atomic_symlink "${RUNTIME_RELEASE_DIR}" "${RUNTIME_CURRENT_LINK}"' in installer
     )
-    assert 'touch "${release_dir}/.complete"' in installer
-    assert "runtime_record_digest" in installer
+    assert 'source "${REPO_DIR}/deploy/node/runtime-slot.sh"' in installer
+    assert 'RUNTIME_DEPENDENCY_SHA256="$(runtime_dependency_identity)"' in slots
     assert '"${PYTHON_COMMAND}" -m venv /opt/gpu-fault/venv' not in installer
     assert 'PREVIOUS_CURRENT_TARGET="$(readlink -f "${RUNTIME_CURRENT_LINK}")"' in (
         installer
@@ -409,34 +456,30 @@ def test_training_progress_monitor_is_disabled_by_default() -> None:
         assert 'value: "false"' in setting
 
 
-def test_kubernetes_hma_collector_is_disabled_by_default() -> None:
+def test_legacy_hma_cleanup_preserves_required_local_collectors() -> None:
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text()
     installer = NODE_SCRIPTS[0].read_text()
     verifier = NODE_SCRIPTS[1].read_text()
 
-    assert (
-        "normalize_bool GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR "
-        '"${GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false}"'
-    ) in deploy
-    assert 'if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]' in deploy
+    assert "GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR" not in deploy
     assert (
         "delete deployment \\\n"
-        "            gpu-fault-hma-watcher --ignore-not-found --wait=true" in deploy
+        "        gpu-fault-hma-watcher --ignore-not-found --wait=true" in deploy
     )
     assert (
         "delete clusterrolebinding \\\n"
-        "            gpu-fault-hma-watcher --ignore-not-found" in deploy
+        "        gpu-fault-hma-watcher --ignore-not-found" in deploy
     )
     assert (
         "delete clusterrole \\\n"
-        "            gpu-fault-hma-watcher --ignore-not-found" in deploy
+        "        gpu-fault-hma-watcher --ignore-not-found" in deploy
     )
     assert (
         "delete serviceaccount \\\n"
-        "            gpu-fault-hma-watcher --ignore-not-found" in deploy
+        "        gpu-fault-hma-watcher --ignore-not-found" in deploy
     )
     validation = deploy.split("validate_platform() {", 1)[1]
-    assert "Kubernetes HMA Node collector (disabled" in validation
+    assert "deployment/gpu-fault-hma-watcher" not in validation
     assert "systemctl enable gpu-fault-kernel-collector.service" in installer
     assert "systemctl enable gpu-fault-fabric-manager-collector.service" in installer
     assert "kernel XID/SXID collector service" in verifier

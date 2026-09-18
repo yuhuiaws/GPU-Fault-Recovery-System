@@ -610,34 +610,32 @@ def build_component(
         data_files=component_data_files(name),
     )
     _write_project(project, component)
-    before = set(output.glob("*.whl"))
-    previous_umask = os.umask(0o022)
-    try:
-        completed = subprocess.run(
-            [
-                python,
-                "-m",
-                "build",
-                "--wheel",
-                "--no-isolation",
-                "--outdir",
-                str(output),
-            ],
-            cwd=project,
-            env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    finally:
-        os.umask(previous_umask)
+    pattern = component.distribution.replace("-", "_") + "-*.whl"
+    before = set(output.glob(pattern))
+    completed = subprocess.run(
+        [
+            python,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(output),
+        ],
+        cwd=project,
+        env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
+        text=True,
+        capture_output=True,
+        check=False,
+        umask=0o022,
+    )
     if completed.returncode:
         raise RuntimeError(
             f"{name} wheel build failed with status {completed.returncode}:\n"
             + (completed.stdout or "")
             + (completed.stderr or "")
         )
-    wheels = sorted(set(output.glob("*.whl")) - before)
+    wheels = sorted(set(output.glob(pattern)) - before)
     if len(wheels) != 1:
         raise RuntimeError(f"{name} build produced {len(wheels)} wheels")
     repack_wheel_stored(wheels[0])

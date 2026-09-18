@@ -4,8 +4,7 @@ import json
 import os
 import sqlite3
 import threading
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -28,11 +27,13 @@ else:
         wait_for_isolated_api,
     )
 from gpu_fault.collectors import (
-    DCGM_METRICS,
     CollectorContext,
     DcgmMetricsCollector,
     HttpEventSink,
 )
+from gpu_fault.channel_registry import GPU_METRICS_PATH
+from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS
+from gpu_fault.collectors.scheduling import next_stable_phase
 
 
 CLUSTER_ID = os.getenv("GPU_FAULT_CLUSTER_ID", "dcgm-e2e-cluster")
@@ -94,11 +95,74 @@ class MetricsHandler(BaseHTTPRequestHandler):
 class RecordingSink(HttpEventSink):
     def __init__(self, base_url: str) -> None:
         super().__init__(base_url)
-        self.last_response: dict[str, Any] = {}
+        self.responses: dict[tuple[str, str], dict[str, Any]] = {}
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.last_response = super().post(path, payload)
-        return self.last_response
+        response = super().post(path, payload)
+        self.responses[(path, str(payload.get("batch_id") or ""))] = response
+        return response
+
+
+class MetricSeries:
+    """One persistent software collector and an explicit 15-second sample clock."""
+
+    def __init__(self, node_id: str, *, edge_filter_enabled: bool = True) -> None:
+        self.sink = RecordingSink(API_URL)
+        self.collector = DcgmMetricsCollector(
+            self.sink,
+            CollectorContext(
+                cluster_id=CLUSTER_ID,
+                runtime_profile_version="dcgm-e2e-v1",
+                product="H200",
+                driver_branch=570,
+                cuda_version="12.8",
+            ),
+            node_id=node_id,
+            metrics_url=MOCK_URL,
+            edge_filter_enabled=edge_filter_enabled,
+            edge_confirmation_samples=3,
+            health_summary_seconds=86_400,
+        )
+        self.observed_at = next_stable_phase(
+            datetime.now(timezone.utc),
+            cluster_id=CLUSTER_ID,
+            node_id=node_id,
+            channel="gpu-metrics",
+            interval_seconds=86_400,
+        ) - timedelta(seconds=1800)
+
+    def collect(
+        self,
+        values: dict[str, float],
+        *,
+        second_gpu: dict[str, float] | None = None,
+    ) -> dict[str, Any] | None:
+        payloads = [(values, GPU0)]
+        if second_gpu is not None:
+            payloads.append((second_gpu, GPU1))
+        set_metrics(*payloads)
+        with urlopen(MOCK_URL, timeout=10) as response:
+            text = response.read().decode("utf-8")
+        batch = self.collector.collect_text(text, observed_at=self.observed_at)
+        self.observed_at += timedelta(seconds=15)
+        result = self.sink.responses.get((GPU_METRICS_PATH, batch.batch_id))
+        if result is None:
+            assert not batch.edge_filter_reasons, (
+                "a delivery edge did not produce its own GPU metrics response"
+            )
+            return None
+        assert result.get("batch_id") == batch.batch_id, (
+            "GPU metrics receipt belongs to a different sample"
+        )
+        return {
+            **result,
+            "collector_batch_id": batch.batch_id,
+            "collector_sample_count": len(batch.samples),
+            "collector_edge_filter_reasons": batch.edge_filter_reasons,
+        }
+
+
+POLICY_SERIES: dict[str, MetricSeries] = {}
 
 
 def metric_text(values: dict[str, float], gpu: dict[str, str] = GPU0) -> str:
@@ -134,29 +198,12 @@ def collect(
     *,
     second_gpu: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    payloads = [(values, GPU0)]
-    if second_gpu is not None:
-        payloads.append((second_gpu, GPU1))
-    set_metrics(*payloads)
-    sink = RecordingSink(API_URL)
-    collector = DcgmMetricsCollector(
-        sink,
-        CollectorContext(
-            cluster_id=CLUSTER_ID,
-            runtime_profile_version="dcgm-e2e-v1",
-            product="H200",
-            driver_branch=570,
-            cuda_version="12.8",
-        ),
-        node_id=node_id,
-        metrics_url=MOCK_URL,
-    )
-    # The test endpoint validates exporter parsing; the bounded temperature-limit
-    # probe runs against the host's nvidia-smi and yields no samples without it.
-    batch = collector.collect_once()
-    result = sink.last_response
-    result["collector_batch_id"] = batch.batch_id
-    result["collector_sample_count"] = len(batch.samples)
+    if node_id not in POLICY_SERIES:
+        # Correlation cases require every sample; the separate persistent-edge
+        # case below verifies the production filter and its three-sample debounce.
+        POLICY_SERIES[node_id] = MetricSeries(node_id, edge_filter_enabled=False)
+    result = POLICY_SERIES[node_id].collect(values, second_gpu=second_gpu)
+    assert result is not None, "unfiltered policy sample was not acknowledged"
     return result
 
 
@@ -175,6 +222,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         "batch_id": result["batch_id"],
         "accepted_samples": result["accepted_samples"],
         "collector_sample_count": result["collector_sample_count"],
+        "collector_edge_filter_reasons": result["collector_edge_filter_reasons"],
         "findings": [
             {
                 "metric": item["canonical_name"],
@@ -230,12 +278,12 @@ def _baseline_and_limit_cases(cases: list[dict[str, Any]]) -> str:
         "DCGM_FI_DEV_GPU_TEMP": 86,
         "DCGM_FI_DEV_MEMORY_TEMP": 91,
         "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS": 0x20,
-        "DCGM_FI_DEV_THERMAL_VIOLATION": 1,
+        "DCGM_FI_DEV_THERMAL_VIOLATION": 1_000_000_000,
         "DCGM_FI_DEV_SM_CLOCK": 900,
         "DCGM_FI_DEV_MEM_CLOCK": 1600,
     }
     first = collect(thermal_node, thermal_values)
-    thermal_values["DCGM_FI_DEV_THERMAL_VIOLATION"] = 2
+    thermal_values["DCGM_FI_DEV_THERMAL_VIOLATION"] = 2_000_000_000
     second = collect(thermal_node, thermal_values)
     assert_rule(first, "THERMAL_STRESS", "WARNING")
     assert_rule(second, "THERMAL_STRESS", "CRITICAL")
@@ -257,7 +305,7 @@ def _baseline_and_limit_cases(cases: list[dict[str, Any]]) -> str:
             "DCGM_FI_DEV_POWER_USAGE": 690,
             "DCGM_FI_DEV_POWER_MGMT_LIMIT": 700,
             "DCGM_FI_DEV_GPU_UTIL": 95,
-            "DCGM_FI_DEV_POWER_VIOLATION": 100,
+            "DCGM_FI_DEV_POWER_VIOLATION": 1_000_000_000,
         },
     )
     assert_rule(power, "POWER_LIMIT_THROTTLING", "WARNING")
@@ -364,7 +412,6 @@ def _memory_cases(cases: list[dict[str, Any]]) -> None:
 def _link_cases(cases: list[dict[str, Any]]) -> None:
     pcie_node = "dcgm-e2e-pcie-xid"
     collect(pcie_node, {})
-    time.sleep(1)
     pcie = collect(
         pcie_node,
         {
@@ -459,12 +506,57 @@ def _recovery_case(
 
 
 def run_cases() -> list[dict[str, Any]]:
+    POLICY_SERIES.clear()
     cases: list[dict[str, Any]] = []
     thermal_node = _baseline_and_limit_cases(cases)
     _memory_cases(cases)
     _link_cases(cases)
     _recovery_case(cases, thermal_node)
+    persistent_temperature_case(cases)
     return cases
+
+
+def persistent_temperature_case(cases: list[dict[str, Any]]) -> None:
+    series = MetricSeries("dcgm-e2e-persistent-temperature")
+    baseline = series.collect({})
+    assert baseline is not None and not baseline["new_findings"]
+    transitions = []
+    for value, severity, action in (
+        (86, "WARNING", "RUN_DIAGNOSTICS"),
+        (91, "CRITICAL", "DRAIN"),
+    ):
+        values = {"DCGM_FI_DEV_GPU_TEMP": value}
+        assert series.collect(values) is None, "first sample is not confirmation"
+        assert series.collect(values) is None, "second sample is not confirmation"
+        result = series.collect(values)
+        assert result is not None, "confirmed temperature action was suppressed"
+        findings = [
+            item
+            for item in result["new_findings"]
+            if item["canonical_name"] == "gpu_temperature_c"
+        ]
+        assert len(findings) == 1, findings
+        assert (findings[0]["severity"], findings[0]["automatic_action"]) == (
+            severity,
+            action,
+        ), findings
+        assert result["collector_edge_filter_reasons"] == ["candidate-confirmed"]
+        assert series.collect(values) is None, "stable semantics must stay filtered"
+        transitions.append(summarize(result))
+    recovered = series.collect({})
+    assert recovered is not None
+    assert recovered["collector_edge_filter_reasons"] == ["candidate-recovered"]
+    assert not recovered["findings"], recovered
+    cases.append(
+        {
+            "id": "DCGM-E2E-013",
+            "name": "persistent temperature action edges and stable suppression",
+            "status": "PASSED",
+            "edge_confirmation_samples": 3,
+            "transitions": transitions,
+            "recovered": summarize(recovered),
+        }
+    )
 
 
 def sqlite_counts() -> dict[str, Any]:
@@ -534,6 +626,10 @@ def main() -> int:
         "mock_endpoint": MOCK_URL,
         "control_plane": API_URL,
         "dispatcher_enabled": False,
+        "evidence_scope": "synthetic exporter parsing and isolated control-plane policy",
+        "sample_clock": "synthetic 15-second intervals; exporter durations are nanoseconds",
+        "policy_cases_edge_filter_enabled": False,
+        "persistent_edge_case": "DCGM-E2E-013",
         "supported_exporter_metric_count": len(DCGM_METRICS),
         "verdict": "FAIL",
         "status": "FAILED",

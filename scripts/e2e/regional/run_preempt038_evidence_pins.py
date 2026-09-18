@@ -22,12 +22,14 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import preempt038_verdicts as verdicts  # noqa: E402
+from scripts.e2e.regional.audit_raw_evidence_periodic_cleanup import audit_identity  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     utc_now,
     write_json_atomic,
@@ -80,7 +82,6 @@ def control_worker_logs(regional: RegionalLiveFixture) -> str:
                 str(pod["name"]),
                 f"--since={LOG_WINDOW_SECONDS}s",
                 "--all-containers=true",
-                check=False,
                 timeout=120,
             )
         )
@@ -88,12 +89,40 @@ def control_worker_logs(regional: RegionalLiveFixture) -> str:
 
 
 def execute(regional: RegionalLiveFixture, case_dir: Path) -> dict[str, Any]:
-    report = regional.pod_python(
-        "cpu",
-        CONTROL_WORKER_APP,
-        AUDIT.read_text(encoding="utf-8"),
-        timeout=LOG_WINDOW_SECONDS,
-    )
+    run_id = f"p038-{uuid4().hex}"
+    identity = audit_identity(run_id)
+    write_json_atomic(case_dir / "seed-identity.json", identity)
+    source = AUDIT.read_text(encoding="utf-8")
+    report: dict[str, Any] = {}
+    cleanup: dict[str, Any] = {}
+    try:
+        report = regional.pod_python(
+            "cpu",
+            CONTROL_WORKER_APP,
+            source,
+            run_id,
+            timeout=LOG_WINDOW_SECONDS,
+            attempts=1,
+        )
+    finally:
+        if report.get("cleanup_permitted") is not False:
+            try:
+                cleanup = regional.pod_python(
+                    "cpu",
+                    CONTROL_WORKER_APP,
+                    source,
+                    run_id,
+                    "--cleanup-only",
+                    timeout=120,
+                    attempts=1,
+                )
+            except Exception as exc:
+                cleanup = {
+                    "verdict": "FAIL",
+                    **identity,
+                    "error": f"independent cleanup failed: {type(exc).__name__}",
+                }
+            write_json_atomic(case_dir / "seed-cleanup.json", cleanup)
     write_json_atomic(case_dir / "audit.json", report)
     logs = control_worker_logs(regional)
     (case_dir / "control-worker.log").write_text(logs, encoding="utf-8")
@@ -105,6 +134,17 @@ def execute(regional: RegionalLiveFixture, case_dir: Path) -> dict[str, Any]:
             unrelated_key=str(report.get("unrelated_key") or ""),
             pinned_key=str(report.get("pinned_key") or ""),
         ),
+        "cleanup": []
+        if (
+            cleanup.get("verdict") == "PASS"
+            and type(cleanup.get("residual_rows")) is int
+            and cleanup["residual_rows"] == 0
+            and all(cleanup.get(key) == value for key, value in identity.items())
+        )
+        else ["independent audit cleanup is unproven"],
+        "identity": []
+        if all(report.get(key) == value for key, value in identity.items())
+        else ["audit run identity changed"],
     }
     return {
         "verdict": verdicts.case_verdict(stages),
@@ -158,6 +198,8 @@ def main() -> int:
     environment = {**settings.environment(), "GPU_FAULT_EVIDENCE_CASE": CASE_ID}
     if not arguments.execute:
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=predecessor.get("valid") is True,
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,
@@ -187,8 +229,12 @@ def main() -> int:
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
+    regional = RegionalLiveFixture(settings)
+    identity = regional.evidence_identity()
     try:
-        outcome = execute(RegionalLiveFixture(settings), case_dir)
+        outcome = execute(regional, case_dir)
+        if regional.evidence_identity() != identity:
+            raise RegionalFixtureError("release identity changed during evidence audit")
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         outcome = {"verdict": "FAIL", "error": f"{type(exc).__name__}: {exc}"}
     result = {
@@ -199,6 +245,7 @@ def main() -> int:
         "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
+        **identity,
         **{key: value for key, value in outcome.items() if key != "verdict"},
     }
     write_json_atomic(case_evidence_path(arguments.run_dir, CASE_ID), result)

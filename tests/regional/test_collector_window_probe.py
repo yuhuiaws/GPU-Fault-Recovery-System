@@ -254,3 +254,14 @@ def test_the_shadow_counter_lives_in_the_units_private_tmp() -> None:
     assert not str(paths["shadow_state"]).startswith(str(paths["root"])), (
         "the window root under /run is read-only for the unit"
     )
+
+
+def test_corrupt_shadow_counter_passes_through_without_hiding_a_gpu(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "calls.json"
+    state.write_text("incomplete-counter", encoding="utf-8")
+    result = _run_shadow(_shadow(tmp_path, state))
+    assert result.returncode == 0
+    assert "GPU-aaaa" in result.stdout and "GPU-bbbb" in result.stdout
+    assert "call counter unavailable" in result.stderr

@@ -7,30 +7,32 @@ from typing import Any, Callable
 from gpu_fault_release.regional_release_config import (
     NOTIFICATION_CHANNEL_SES,
     NOTIFICATION_CHANNEL_SNS,
+    RegionalNotificationConfig,
     ReleaseError,
 )
 
 EMAIL_SECRET_NAME = "gpu-fault-email"
 
 
-def notification_digest(config: Any) -> str:
+def notification_digest(config: RegionalNotificationConfig) -> str:
+    payload: dict[str, object] = {
+        "schema_version": 4,
+        "channel": config.channel,
+        "allow_email": config.allow_email,
+        "acknowledge_external_alert_channel": (
+            config.acknowledge_external_alert_channel
+        ),
+        "admin_email": config.admin_email,
+        "email_sender": config.email_sender,
+        "email_recipients": list(config.email_recipients),
+        "email_subject_prefix": config.email_subject_prefix,
+    }
+    # Omit the new field when absent so existing annotations remain valid.
+    configuration_set = getattr(config, "ses_configuration_set", None)
+    if configuration_set is not None:
+        payload["ses_configuration_set"] = configuration_set
     return hashlib.sha256(
-        json.dumps(
-            {
-                "schema_version": 4,
-                "channel": config.channel,
-                "allow_email": config.allow_email,
-                "acknowledge_external_alert_channel": (
-                    config.acknowledge_external_alert_channel
-                ),
-                "admin_email": config.admin_email,
-                "email_sender": config.email_sender,
-                "email_recipients": list(config.email_recipients),
-                "email_subject_prefix": config.email_subject_prefix,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -160,6 +162,21 @@ def _check_ses_channel(
     account = aws_json(["sesv2", "get-account"])
     if not bool(account.get("SendingEnabled")):
         raise ReleaseError("SES sending is disabled")
+    configuration_set = getattr(config, "ses_configuration_set", None)
+    if configuration_set is not None:
+        configured = aws_json(
+            [
+                "sesv2",
+                "get-configuration-set",
+                "--configuration-set-name",
+                configuration_set,
+            ]
+        )
+        if configured.get("ConfigurationSetName") != configuration_set:
+            raise ReleaseError("SES configuration set identity does not match")
+        sending = configured.get("SendingOptions")
+        if not isinstance(sending, dict) or sending.get("SendingEnabled") is not True:
+            raise ReleaseError("SES configuration set sending is disabled or unknown")
     values = _secret_text(
         read_secret(EMAIL_SECRET_NAME).get("data") or {},
         SES_SECRET_KEYS,
@@ -186,6 +203,11 @@ def _check_ses_channel(
             "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
             "recipient_count": len(recipients),
             "site_id": values["site-id"],
+            **(
+                {"ses_configuration_set": configuration_set}
+                if configuration_set is not None
+                else {}
+            ),
         },
     )
 

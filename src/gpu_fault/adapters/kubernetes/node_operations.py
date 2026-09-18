@@ -22,6 +22,7 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.adapters.kubernetes.primitives import (
     NodePatchConflict,
+    node_name,
     node_scheduling_snapshot,
     patch_node_with_retry,
 )
@@ -32,10 +33,14 @@ from gpu_fault.execution import (
 from gpu_fault.models import (
     IncidentState,
     WorkflowOperation,
-    WorkflowRequest,
     WorkflowStatus,
 )
 from gpu_fault.store import NotFoundError
+from gpu_fault.workflow_quarantine import (
+    has_terminal_quarantine_hold,
+    preserves_terminal_quarantine,
+    terminal_quarantine_nodes,
+)
 
 # The warm-spare pool's declaration (``hyperpod_spares``): a labeled node whose
 # pool state is not ALLOCATED is an unreserved spare and must stay cordoned.
@@ -579,6 +584,24 @@ class KubernetesNodeOperationsMixin:
         }
 
     def _restore(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        try:
+            held = terminal_quarantine_nodes(context.workflow).intersection(
+                context.step.node_ids
+            )
+        except ValueError:
+            return WorkflowStepOutcome.failed(
+                "terminal quarantine scope is malformed",
+                details={"safety_rejection": True},
+            )
+        if held:
+            return WorkflowStepOutcome.failed(
+                "terminal quarantine forbids readmission of the failed node",
+                details={
+                    "safety_rejection": True,
+                    "reason": "TERMINAL_QUARANTINE_HOLD",
+                    "node_ids": sorted(held),
+                },
+            )
         already_restored: list[str] = []
         absent: list[str] = []
         conflicts: list[str] = []
@@ -689,11 +712,7 @@ class KubernetesNodeOperationsMixin:
             }
             quarantine_hold = (
                 incident.state is IncidentState.QUARANTINED
-                or (
-                    WorkflowOperation.QUARANTINE in workflow.completed_operations
-                    and WorkflowOperation.RESTORE_SCHEDULING
-                    not in workflow.completed_operations
-                )
+                or has_terminal_quarantine_hold(workflow)
                 or any(
                     execution.operation is WorkflowOperation.REPLACE_NODE
                     and execution.details.get("action") == "SPARE_FAILOVER"
@@ -722,16 +741,6 @@ class KubernetesNodeOperationsMixin:
         except Exception:
             return False, False
 
-    @staticmethod
-    def _workflow_preserves_quarantine(
-        workflow: WorkflowRequest,
-    ) -> bool:
-        operations = {step.operation for step in workflow.official_steps}
-        return (
-            WorkflowOperation.QUARANTINE in operations
-            and WorkflowOperation.RESTORE_SCHEDULING not in operations
-        )
-
     def _can_take_over_node_isolation(
         self,
         node: Any,
@@ -739,8 +748,13 @@ class KubernetesNodeOperationsMixin:
         context: WorkflowStepContext,
     ) -> bool:
         terminal, quarantine_hold = self._incident_ownership(incident_id)
-        return terminal and (
-            not quarantine_hold or self._workflow_preserves_quarantine(context.workflow)
+        if not terminal:
+            return False
+        if not quarantine_hold:
+            return True
+        node_id = node_name(node)
+        return node_id is not None and preserves_terminal_quarantine(
+            context.workflow, node_id
         )
 
     def _node_isolation_patch(

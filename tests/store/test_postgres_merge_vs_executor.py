@@ -32,8 +32,8 @@ GROUP = '["cluster-a","job-a","job-a-a001"]'
 @pytest.fixture(autouse=True)
 def clean_tables():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 
@@ -174,7 +174,9 @@ def test_postgres_claim_workflow_takes_budget_locks_before_the_row_lock():
         advisory = next(
             i for i, q in enumerate(statements) if "pg_advisory_xact_lock" in q
         )
-        row_lock = next(i for i, q in enumerate(statements) if "FOR UPDATE" in q)
+        row_lock = next(
+            i for i, q in enumerate(statements) if "gpu_fault_lock_control_state" in q
+        )
 
         assert advisory < row_lock, statements
     finally:

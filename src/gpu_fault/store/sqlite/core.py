@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from threading import RLock
 from typing import Any, Iterator
@@ -27,6 +29,8 @@ _WORKFLOW_WAKEUP_PREVIOUS_SQL = (
     + " FROM objects WHERE kind='workflow' AND key=?"
 )
 
+QueryRows = Callable[[str, Sequence[object]], list[tuple[Any, ...]]]
+
 
 class SqliteCoreMixin:
     """The SQLite half of :class:`gpu_fault.store.shared.primitives.StorePrimitives`.
@@ -35,7 +39,7 @@ class SqliteCoreMixin:
     """
 
     # Attributes supplied by the composed concrete implementation.
-    _db: Any
+    _db: sqlite3.Connection
     _lock: RLock
     _models: dict[str, type[BaseModel]]
     _wakeup_hub: WakeupHub
@@ -50,7 +54,8 @@ class SqliteCoreMixin:
     # makes the mixins above them checkable.
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()
 
     def _statement_guard(self) -> AbstractContextManager[object]:
         """One connection shared by every thread: a statement outside a
@@ -58,20 +63,37 @@ class SqliteCoreMixin:
 
         return self._lock
 
+    def _query_rows(
+        self, statement: str, parameters: Sequence[object]
+    ) -> list[tuple[Any, ...]]:
+        """Materialize rows before another thread can reuse the shared connection."""
+        with self._lock:
+            return self._db.execute(statement, parameters).fetchall()
+
     def _put(self, kind: str, key: str, value: BaseModel) -> None:
-        wakeup = self._wakeup_for_write(kind, key, value)
-        self._db.execute(
-            """
-            INSERT INTO objects(kind, key, payload) VALUES (?, ?, ?)
-            ON CONFLICT(kind, key) DO UPDATE SET payload=excluded.payload
-            """,
-            (kind, key, value.model_dump_json()),
-        )
-        if wakeup is not None:
-            if self._db.in_transaction:
-                self._pending_wakeups.append(wakeup)
-            else:
-                self._wakeup_hub.publish(*wakeup)
+        with self._lock:
+            wakeup = self._wakeup_for_write(kind, key, value)
+            self._db.execute(
+                """
+                INSERT INTO objects(kind, key, payload) VALUES (?, ?, ?)
+                ON CONFLICT(kind, key) DO UPDATE SET payload=excluded.payload
+                """,
+                (kind, key, value.model_dump_json()),
+            )
+            if wakeup is not None:
+                if self._db.in_transaction:
+                    self._pending_wakeups.append(wakeup)
+                else:
+                    self._wakeup_hub.publish(*wakeup)
+
+    def _put_fields(
+        self,
+        kind: str,
+        key: str,
+        value: BaseModel,
+        fields: frozenset[str],
+    ) -> None:
+        self._put(kind, key, value)
 
     def _wakeup_for_write(
         self, kind: str, key: str, value: BaseModel
@@ -104,42 +126,47 @@ class SqliteCoreMixin:
         return None if payload is None else (channel, payload)
 
     def _delete(self, kind: str, key: str) -> None:
-        self._db.execute(
-            "DELETE FROM objects WHERE kind=? AND key=?",
-            (kind, key),
-        )
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM objects WHERE kind=? AND key=?",
+                (kind, key),
+            )
 
     def _get(self, kind: str, key: str) -> Any:
-        row = self._db.execute(
-            "SELECT payload FROM objects WHERE kind=? AND key=?",
-            (kind, key),
-        ).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM objects WHERE kind=? AND key=?",
+                (kind, key),
+            ).fetchone()
         if row is None:
             raise NotFoundError(key)
         return self._models[kind].model_validate_json(row[0])
 
     def _list(self, kind: str) -> list[Any]:
-        rows = self._db.execute(
-            "SELECT payload FROM objects WHERE kind=?",
-            (kind,),
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT payload FROM objects WHERE kind=?",
+                (kind,),
+            ).fetchall()
         model = self._models[kind]
         return [model.model_validate_json(row[0]) for row in rows]
 
     def _link(self, kind: str, key: str, value: str) -> None:
-        self._db.execute(
-            """
-            INSERT INTO links(kind, key, value) VALUES (?, ?, ?)
-            ON CONFLICT(kind, key) DO UPDATE SET value=excluded.value
-            """,
-            (kind, key, value),
-        )
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO links(kind, key, value) VALUES (?, ?, ?)
+                ON CONFLICT(kind, key) DO UPDATE SET value=excluded.value
+                """,
+                (kind, key, value),
+            )
 
     def _get_link(self, kind: str, key: str) -> str | None:
-        row = self._db.execute(
-            "SELECT value FROM links WHERE kind=? AND key=?",
-            (kind, key),
-        ).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT value FROM links WHERE kind=? AND key=?",
+                (kind, key),
+            ).fetchone()
         return row[0] if row else None
 
     # How many ``_state_transaction`` entries are nested inside the open
@@ -163,13 +190,15 @@ class SqliteCoreMixin:
             if self._db.in_transaction:
                 name = f"gpu_fault_sp_{self._savepoint_depth}"
                 self._savepoint_depth += 1
+                pending_start = len(self._pending_wakeups)
                 self._db.execute(f"SAVEPOINT {name}")
                 try:
                     yield
                     self._db.execute(f"RELEASE SAVEPOINT {name}")
-                except Exception:
+                except BaseException:
                     self._db.execute(f"ROLLBACK TO SAVEPOINT {name}")
                     self._db.execute(f"RELEASE SAVEPOINT {name}")
+                    del self._pending_wakeups[pending_start:]
                     raise
                 finally:
                     self._savepoint_depth -= 1
@@ -178,14 +207,13 @@ class SqliteCoreMixin:
             try:
                 yield
                 self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                self._pending_wakeups.clear()
+            except BaseException:
+                try:
+                    self._db.execute("ROLLBACK")
+                finally:
+                    self._pending_wakeups.clear()
                 raise
-            # Committed: publish what the writes inside decided, in order. A
-            # savepoint that rolled back leaves its wakeups here too; that is
-            # one spurious "scan now" for a row that did not change, which
-            # the hint contract allows.
+            # Only committed writes may publish a wakeup after the outer commit.
             pending, self._pending_wakeups = self._pending_wakeups, []
             for channel, payload in pending:
                 self._wakeup_hub.publish(channel, payload)

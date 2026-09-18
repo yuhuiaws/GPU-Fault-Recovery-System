@@ -120,6 +120,7 @@ rules:
     paths:
       - src/gpu_fault/schema_migrations.py
       - src/gpu_fault/store_migrate.py
+      - src/gpu_fault/state_table_*.py
       - src/gpu_fault/store/postgres/**
       - src/gpu_fault/store/shared/transactional_workflows.py
       - src/gpu_fault/store/shared/processor_helpers.py
@@ -131,6 +132,7 @@ rules:
       - tests/store/test_postgres_processor_claim.py
       - tests/store/test_postgres_reconnect.py
     regional_cases:
+      - GF-REGIONAL-BOOT-030..031
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-003
       - GF-REGIONAL-HA-008..009
@@ -168,6 +170,8 @@ rules:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_repair.py
+      - tests/_staging_deploy_support.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
       - tests/regional/test_boot020_runner.py
@@ -177,6 +181,7 @@ rules:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_repair.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
       - tests/regional/test_boot020_runner.py
@@ -238,6 +243,8 @@ rules:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_*.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_repair.py
+      - tests/_staging_deploy_support.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
       - tests/test_restore_ci_candidate.py
@@ -249,6 +256,7 @@ rules:
       - tests/admin/test_admin_cluster_join.py
       - tests/admin/test_admin_cluster_removal.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_repair.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
       - tests/test_restore_ci_candidate.py
@@ -259,11 +267,13 @@ rules:
       - GF-REGIONAL-BOOT-016
       - GF-REGIONAL-BOOT-019
       - GF-REGIONAL-BOOT-024..029
+      - GF-REGIONAL-BOOT-032
       - GF-REGIONAL-ISO-001..006
       - GF-REGIONAL-E2E-002
     approval_cases:
       - GF-REGIONAL-BOOT-019
       - GF-REGIONAL-BOOT-024..029
+      - GF-REGIONAL-BOOT-032
       - GF-REGIONAL-ISO-006
       - GF-REGIONAL-E2E-002
     checks:
@@ -431,7 +441,7 @@ rules:
       - src/gpu_fault/collector_requirements.py
       - src/gpu_fault/collectors_cli.py
       - src/gpu_fault/policy/**
-      - src/gpu_fault/hma.py
+      - src/gpu_fault/nvidia_logs.py
       - src/gpu_fault/xid_*.py
       - src/gpu_fault/dcgm_*.py
       - src/gpu_fault/gpu_*.py
@@ -448,11 +458,11 @@ rules:
       - deploy/dataplane/optional/**
       - tests/collectors/**
       - tests/policy/**
-      - tests/hma/**
+      - tests/nvidia_logs/**
     pytest:
       - tests/collectors
       - tests/policy
-      - tests/hma
+      - tests/nvidia_logs
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:

@@ -80,7 +80,11 @@ def test_a_failed_schema_job_stops_the_stage_without_sitting_out_the_timeout(
         f'printf "%s\\n" "$*" >> "{calls}"\n'
         'case " $* " in\n'
         '  *" apply -f - "*) cat >/dev/null; echo "job.batch/x created" ;;\n'
-        '  *" get job/"*) printf "Failed=True "; ;;\n'
+        "  *\" get job/\"*) printf '%s\\n' '"
+        '{"apiVersion":"batch/v1","kind":"Job",'
+        '"metadata":{"name":"gpu-fault-postgres-index-build","uid":"schema-job-uid"},'
+        '"status":{"conditions":[{"type":"Failed","status":"True",'
+        '"reason":"BackoffLimitExceeded"}]}}\' ;;\n'
         '  *" logs job/"*) echo "relation does not exist" ;;\n'
         "esac\n"
         "exit 0\n",
@@ -105,7 +109,10 @@ def test_a_failed_schema_job_stops_the_stage_without_sitting_out_the_timeout(
     )
 
     assert completed.returncode != 0
-    assert "postgres job gpu-fault-postgres-index-build failed" in completed.stderr
+    assert (
+        "Job gpu-fault-postgres-index-build failed: BackoffLimitExceeded"
+        in completed.stderr
+    ), "the waiter must observe a valid failed Job, not reject malformed fixture JSON"
     assert "did not complete; its log follows" in completed.stderr
     recorded = calls.read_text(encoding="utf-8")
     assert "job/gpu-fault-postgres-schema-ensure" not in recorded, (

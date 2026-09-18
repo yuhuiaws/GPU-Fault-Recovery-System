@@ -4,6 +4,7 @@ import fnmatch
 import json
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -513,16 +514,21 @@ def ensure_cname_points_at(release: Any, hostname: str) -> None:
 
 
 def ensure_control_plane_dns(release: Any) -> None:
+    if not release.config.nlb:
+        return
     hostname = wait_service_hostname(release)
     if release.runner.dry_run and not hostname:
         return
     load_balancer_arn = _wait_nlb_active(release, hostname)
-    _wait_raw_nlb_dns(release, hostname)
-    _wait_targets_healthy(release, load_balancer_arn)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        dns = executor.submit(_wait_raw_nlb_dns, release, hostname)
+        targets = executor.submit(_wait_targets_healthy, release, load_balancer_arn)
+        dns.result()
+        targets.result()
     ensure_cname_points_at(release, hostname)
 
 
-def apply_control_plane_nlb(release: Any) -> None:
+def prepare_control_plane_nlb(release: Any) -> None:
     if not release.config.nlb:
         return
     verify_control_plane_dns_prerequisites(release)
@@ -531,4 +537,8 @@ def apply_control_plane_nlb(release: Any) -> None:
     ).read_text(encoding="utf-8")
     text = render_nlb_manifest(release.config, text)
     release.runner.run(release._cpu("apply", "-f", "-"), input_text=text)
+
+
+def apply_control_plane_nlb(release: Any) -> None:
+    prepare_control_plane_nlb(release)
     ensure_control_plane_dns(release)

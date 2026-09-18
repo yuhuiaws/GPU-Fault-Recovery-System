@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import audit_warm_spare_guardrails as warm_spare
+from tools.pytest_result_identity import PytestReceipt, normalized_pytest_nodeid
 
 MANAGED_GUARD = {
     "status": "FAILED",
@@ -38,6 +39,23 @@ EXECUTOR_GUARDS = {
         "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
     ),
 }
+
+
+def pytest_receipt(
+    nodeids: list[str], *, failed: tuple[str, ...] = ()
+) -> PytestReceipt:
+    records: dict[str, object] = {
+        normalized_pytest_nodeid(nodeid, root=warm_spare.ROOT): {
+            "status": "FAIL" if nodeid in failed else "PASS",
+            "phases": {
+                "setup": "passed",
+                "call": "failed" if nodeid in failed else "passed",
+                "teardown": "passed",
+            },
+        }
+        for nodeid in nodeids
+    }
+    return PytestReceipt(records, frozenset(records))
 
 
 def _gpu_node(name: str) -> dict[str, Any]:
@@ -69,7 +87,9 @@ def _healthy_env() -> list[dict[str, Any]]:
 def _patch_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline = [_gpu_node("node-a")]
     monkeypatch.setattr(warm_spare, "node_snapshot", lambda: list(baseline))
-    monkeypatch.setattr(warm_spare, "run_pytest", lambda _dir, _nodeids: True)
+    monkeypatch.setattr(
+        warm_spare, "run_pytest", lambda _dir, nodeids: pytest_receipt(nodeids)
+    )
     monkeypatch.setattr(
         warm_spare,
         "cluster_recovery",
@@ -151,12 +171,12 @@ def test_the_focused_tests_run_in_one_process_and_are_attributed_per_case(
     definitions = warm_spare.case_definitions()
     failing = definitions["GF-REGIONAL-DESTR-007"][0]
 
-    def one_run(log_dir: Path, nodeids: list[str]) -> bool:
+    def one_run(log_dir: Path, nodeids: list[str]) -> PytestReceipt:
         calls.append(list(nodeids))
         (log_dir / "pytest.log").write_text(
-            f"FAILED {failing} - AssertionError: boom\n1 failed, 3 passed\n"
+            "all tests passed according to unreliable prose\n"
         )
-        return False
+        return pytest_receipt(nodeids, failed=(failing,))
 
     monkeypatch.setattr(warm_spare, "run_pytest", one_run)
 
@@ -174,13 +194,16 @@ def test_the_focused_tests_run_in_one_process_and_are_attributed_per_case(
     assert five["focused_pytest_log"] == str(tmp_path / "cases" / "pytest.log")
 
 
-def test_failed_nodeids_read_pytests_short_summary_only() -> None:
-    # A usage error is not a test failure the log can attribute to a case.
-    assert warm_spare.failed_nodeids("ERROR: usage: pytest [options]\n") == set()
-    assert warm_spare.failed_nodeids(
-        "FAILED tests/a.py::test_x - AssertionError\nERROR tests/b.py::test_y\n"
-        "PASSED tests/c.py::test_z\n"
-    ) == {"tests/a.py::test_x", "tests/b.py::test_y"}
+def test_prose_cannot_substitute_for_a_complete_pytest_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing_receipt(log_dir: Path, _ids: list[str]) -> None:
+        (log_dir / "pytest.log").write_text("all tests PASSED\n0 failed\n")
+
+    monkeypatch.setattr(warm_spare, "run_pytest", missing_receipt)
+    assert warm_spare.run_focused_pytest(
+        tmp_path, {"guard": ["tests/a.py::test_guard"]}
+    ) == {"guard": False}, "exit prose cannot stand in for source-bound test evidence"
 
 
 def test_run_focused_pytest_attribution_shapes(
@@ -188,15 +211,14 @@ def test_run_focused_pytest_attribution_shapes(
 ) -> None:
     definitions = {"a": ["t.py::x"], "b": ["t.py::y", "t.py::z"]}
 
-    monkeypatch.setattr(warm_spare, "run_pytest", lambda _dir, _ids: True)
+    monkeypatch.setattr(warm_spare, "run_pytest", lambda _dir, ids: pytest_receipt(ids))
     assert warm_spare.run_focused_pytest(tmp_path, definitions) == {
         "a": True,
         "b": True,
     }
 
-    def failing_unattributed(log_dir: Path, _ids: list[str]) -> bool:
+    def failing_unattributed(log_dir: Path, _ids: list[str]) -> None:
         (log_dir / "pytest.log").write_text("collection error\n")
-        return False
 
     monkeypatch.setattr(warm_spare, "run_pytest", failing_unattributed)
     assert warm_spare.run_focused_pytest(tmp_path, definitions) == {
@@ -204,9 +226,9 @@ def test_run_focused_pytest_attribution_shapes(
         "b": False,
     }
 
-    def failing_b(log_dir: Path, _ids: list[str]) -> bool:
+    def failing_b(log_dir: Path, ids: list[str]) -> PytestReceipt:
         (log_dir / "pytest.log").write_text("FAILED t.py::z - boom\n")
-        return False
+        return pytest_receipt(ids, failed=("t.py::z",))
 
     monkeypatch.setattr(warm_spare, "run_pytest", failing_b)
     assert warm_spare.run_focused_pytest(tmp_path, definitions) == {
@@ -214,6 +236,42 @@ def test_run_focused_pytest_attribution_shapes(
         "b": False,
     }
     assert warm_spare.run_focused_pytest(tmp_path, {}) == {}
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [None],
+        [{"name": [], "uid": "uid-a"}],
+        [{"name": "node-a", "uid": {}}],
+        [{"name": " ", "uid": "uid-a"}],
+    ],
+)
+def test_nonstring_or_missing_node_identity_is_not_comparable_evidence(rows) -> None:
+    assert warm_spare.node_preflight_errors(rows), (
+        "malformed identities must be refused before reading node health fields"
+    )
+    assert warm_spare.node_state_drift(rows, rows), (
+        "two equally malformed snapshots cannot establish unchanged identity"
+    )
+
+
+def test_identity_checks_do_not_introduce_a_new_node_health_policy() -> None:
+    node = _gpu_node("business-node")
+    node.update(
+        ready="False",
+        unschedulable=True,
+        taints=[{"key": "business.example/reserved", "effect": "NoSchedule"}],
+    )
+    assert warm_spare.node_preflight_errors([node]) == [], (
+        "complete identity must preserve the existing business-taint and readiness policy"
+    )
+    assert warm_spare.node_state_drift([node], [dict(node)]) == [], (
+        "unchanged preexisting node health state remains comparable"
+    )
+    assert warm_spare.node_state_drift([], []) == [], (
+        "identity validation must preserve existing empty membership comparison"
+    )
 
 
 def test_a_negative_cloudtrail_read_is_provisional_inside_the_delivery_lag(
@@ -295,3 +353,92 @@ def test_the_negative_cluster_is_read_from_the_recorded_snapshot_not_described_t
         "status": None,
         "node_recovery": None,
     }
+
+
+def test_the_isolated_node_reader_carries_the_probes_past_the_isolation_fence() -> None:
+    from types import SimpleNamespace
+
+    from gpu_fault.adapters.hyperpod.lifecycle import HyperPodLifecycleStepAdapter
+    from gpu_fault.execution import WorkflowStepContext
+    from gpu_fault.models import (
+        FaultIncident,
+        IncidentState,
+        WorkflowExecutionRequest,
+        WorkflowOperation,
+        WorkflowRequest,
+        WorkflowStatus,
+        WorkflowStepSpec,
+    )
+
+    namespace: dict[str, Any] = {}
+    exec(warm_spare.ISOLATED_NODE_READER, namespace)
+    kubernetes, reader = namespace["isolated_kubernetes_adapter"](
+        "incident-probe", 1, ["audit-node"]
+    )
+    now = datetime.now(timezone.utc)
+    step = WorkflowStepSpec(
+        operation=WorkflowOperation.REPLACE_NODE,
+        execution_owner="gpu-fault-hyperpod-adapter",
+        node_ids=["audit-node"],
+        parameters={"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"},
+    )
+    incident = FaultIncident(
+        incident_id="incident-probe",
+        event_id="event-probe",
+        event_type="REGIONAL_ACCEPTANCE",
+        cluster_id="cluster",
+        node_ids=["audit-node"],
+        policy_version="probe/v1",
+        policy_source="ACCEPTANCE",
+        state=IncidentState.ACTION_PENDING,
+        workflow_request_id="workflow-probe",
+        fencing_token=1,
+        created_at=now,
+        updated_at=now,
+    )
+    workflow = WorkflowRequest(
+        request_id="workflow-probe",
+        incident_id="incident-probe",
+        status=WorkflowStatus.RUNNING,
+        official_action="REPLACE_NODE",
+        fencing_token=1,
+        official_steps=[step],
+        completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
+        created_at=now,
+        updated_at=now,
+    )
+    context = WorkflowStepContext(
+        workflow=workflow,
+        incident=incident,
+        step=step,
+        step_index=0,
+        request=WorkflowExecutionRequest(
+            expected_fencing_token=1,
+            confirm_cluster_name="cluster",
+            isolation_verified_nodes=["audit-node"],
+        ),
+        idempotency_key="workflow-probe/0/REPLACE_NODE",
+    )
+
+    def preflight(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            safe_to_submit=True, gate_failures=[], node_recovery="None"
+        )
+
+    without = HyperPodLifecycleStepAdapter(object())
+    without.dispatcher.preflight = preflight
+    refused = without.execute(context)
+    assert "observe node isolation" in str(refused.error), refused
+    carried = HyperPodLifecycleStepAdapter(object(), kubernetes_adapter=kubernetes)
+    carried.dispatcher.preflight = preflight
+    outcome = carried.execute(context)
+    assert outcome.error == (
+        "healthy warm-spare replacement is required but the spare coordinator is disabled"
+    ), outcome
+    assert reader.reads == ["audit-node"]
+    assert not hasattr(kubernetes.core, "patch_node"), (
+        "the isolation-only fake must not expose a node mutation API"
+    )
+    with pytest.raises(KeyError, match="unrelated node"):
+        reader.read_node("another-node")
+    assert reader.reads == ["audit-node"], "foreign identities cannot satisfy the probe"

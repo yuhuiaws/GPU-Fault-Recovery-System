@@ -254,6 +254,10 @@ def write_xid45(arguments: argparse.Namespace) -> None:
     descriptor = os.open("/dev/kmsg", os.O_WRONLY | os.O_CLOEXEC)
     try:
         written = os.write(descriptor, message)
+        if written != len(message):
+            raise ProbeError(
+                f"short kernel record write: {written}/{len(message)} bytes"
+            )
     finally:
         os.close(descriptor)
     emit(

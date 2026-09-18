@@ -37,6 +37,10 @@ from scripts.e2e.regional import collect020_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    bounded_window_case,
+    require_action_time,
+)
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     collector_setting,
 )
@@ -48,7 +52,7 @@ from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
     run_window_case,
     utc_now,
 )
-from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalFixtureError,
 )
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
@@ -120,6 +124,7 @@ def _restore(
     return results
 
 
+@bounded_window_case
 def execute(
     settings: WindowSettings,
     fixture: CollectorWindowFixture,
@@ -127,7 +132,7 @@ def execute(
     attempt: int,
     deadline: datetime,
 ) -> dict[str, Any]:
-    del deadline
+    require_action_time(180)
     run_id = f"c020-a{attempt}-{int(time.time())}"
     baseline = fixture.snapshot()
     write_json_atomic(case_dir / "host-baseline.json", baseline)
@@ -199,7 +204,9 @@ def execute(
         # never overlaps the diagnostic workflow's own nvidia-smi reads.
         closed: dict[str, Any] = {}
         if window_open:
-            closed = fixture.execute("close-window", "--run-id", run_id, timeout=300)
+            closed = fixture.execute(
+                "close-window", "--run-id", run_id, "--unit", verdicts.UNIT, timeout=300
+            )
             write_json_atomic(case_dir / "window-close.json", closed)
         stages["closed"] = (
             []
@@ -246,6 +253,7 @@ def execute(
         activity.get("evidence") or [],
         dropped_uuid=dropped_uuid,
         expected_count=expected_count,
+        expected_uuids={str(item["uuid"]) for item in inventory},
     )
     stages["identity_finding"] = verdicts.identity_finding_errors(
         activity, dropped_uuid=dropped_uuid

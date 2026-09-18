@@ -36,15 +36,15 @@ def parse_endpoint_networks(
 
 
 class ClusterEndpointNetworks(dict[str, EndpointNetworks]):
-    """Per-cluster allow-list that resolves unseen clusters on first sight.
+    """Per-cluster allow-list resolved on every indexed lookup.
 
-    Built once at start-up from the store, the plain dict refused every cluster
-    joined online until the Pods restarted (review H4). The resolver reads the
-    registry runtime's current snapshot, so a committed or PENDING revision is
-    honoured immediately; a cluster the snapshot does not contain resolves to
-    ``None`` and the caller fails closed exactly as before. Nothing is cached:
-    a later revision that changes a cluster's CIDRs must win on the next
-    heartbeat, and a snapshot lookup is one lock and one dict read.
+    The resolver reads the registry runtime's current snapshot on every lookup,
+    including clusters present at startup. CIDR changes and removals therefore
+    take effect on the next heartbeat; a missing cluster resolves to ``None``
+    and the caller fails closed. Resolved values are not cached.
+
+    Policy readers must use indexing or ``endpoint_networks_for_cluster``:
+    inherited dict methods such as ``get`` and ``copy`` expose startup data.
     """
 
     def __init__(
@@ -57,17 +57,6 @@ class ClusterEndpointNetworks(dict[str, EndpointNetworks]):
         self.resolver = resolver
 
     def __getitem__(self, cluster_id: str) -> EndpointNetworks:
-        # The registry the runtime serves is the truth; the start-up copy is
-        # only a fallback for a cluster the runtime cannot answer for. A
-        # cluster removed and re-joined while this process ran would
-        # otherwise keep its old allow-list (live 2026-09-12: EKS subnets
-        # only) and every re-installed agent's heartbeat would be refused.
-        networks = self.resolver(cluster_id)
-        if networks is not None:
-            return networks
-        return super().__getitem__(cluster_id)
-
-    def __missing__(self, cluster_id: str) -> EndpointNetworks:
         networks = self.resolver(cluster_id)
         if networks is None:
             raise KeyError(cluster_id)

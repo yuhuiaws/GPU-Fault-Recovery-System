@@ -12,9 +12,16 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for _path in (ROOT, ROOT / "src"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
+from gpu_fault.admin.deadlines import (  # noqa: E402
+    DeploymentDeadlineExceeded,
+    deadline_scope,
+)
+from gpu_fault.models import Environment  # noqa: E402
+from gpu_fault.watcher import AttemptObservation, WorkloadPhase  # noqa: E402
 from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
@@ -25,7 +32,17 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
 )
-from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    WINDOW,
+    bounded_collector_case,
+    finite_seconds,
+    require_action_time,
+)
+from scripts.e2e.regional.collect021_passive import (  # noqa: E402
+    completion_chain_errors,
+    wait_passive_completion,
+    wait_passive_restart,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
 )
@@ -39,8 +56,8 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
@@ -202,8 +219,11 @@ def node_reads_idle(observation: dict[str, Any], node: str) -> bool:
     late XID lands after, and the node then resolves as IDLE.
     """
 
-    if observation.get("workload_phase") not in {"PENDING", "RUNNING"}:
+    phase = observation.get("workload_phase")
+    if phase in {"FAILED", "STOPPED", "SUCCEEDED"}:
         return True
+    if phase not in {"PENDING", "RUNNING"}:
+        return False
     return not any(
         container.get("node_id") == node and not container.get("terminated")
         for container in observation.get("containers") or []
@@ -258,10 +278,8 @@ def node_untouched_errors(
     return errors
 
 
-def proactive_errors(
+def proactive_policy_errors(
     state: dict[str, Any],
-    node_before: dict[str, Any],
-    node_after: dict[str, Any],
     *,
     xid: int,
 ) -> list[str]:
@@ -330,8 +348,20 @@ def proactive_errors(
         errors.append("a workflow exists for the MONITOR_ONLY decision")
     if state.get("commands"):
         errors.append("a remote command was dispatched for the MONITOR_ONLY decision")
-    errors.extend(node_untouched_errors(node_before, node_after, label="proactive"))
     return errors
+
+
+def proactive_errors(
+    state: dict[str, Any],
+    node_before: dict[str, Any],
+    node_after: dict[str, Any],
+    *,
+    xid: int,
+) -> list[str]:
+    return [
+        *proactive_policy_errors(state, xid=xid),
+        *node_untouched_errors(node_before, node_after, label="proactive"),
+    ]
 
 
 def passive_errors(
@@ -343,30 +373,35 @@ def passive_errors(
     source_uids: set[str],
     pod_uid: str,
     attempt_id: str,
+    node: str | None = None,
+    job_id: str | None = None,
 ) -> list[str]:
     """The passive judgement: the attempt's own failure still restarts the job.
 
-    The XID incident is MONITOR_ONLY and inactive, so the terminal event goes
-    to quick triage and its PASS restarts the attempt -- the restart the old
-    quarantine made impossible.
+    The inactive MONITOR_ONLY XID leaves the source terminal event to the
+    no-hardware-evidence restart plan and any required containment predecessor.
     """
 
     errors: list[str] = []
+    errors.extend(
+        completion_chain_errors(
+            restart_state,
+            cluster_id=str((death or {}).get("cluster_id") or ""),
+            job_id=job_id or "",
+            attempt_id=attempt_id,
+        )
+    )
     if not kill.get("killed"):
         errors.append("kill-workload reported no killed processes")
-    phase = death.get("workload_phase")
-    if phase not in {"FAILED", "STOPPED"}:
-        errors.append(f"death observation phase={phase!r}, expected FAILED/STOPPED")
-    for container in death.get("containers") or []:
-        if container.get("pod_uid") != pod_uid:
-            continue
-        if not container.get("terminated"):
-            errors.append("killed container is not terminated in the observation")
-        elif container.get("exit_code") in (None, 0):
-            errors.append(
-                f"killed container exit_code={container.get('exit_code')!r}, "
-                "expected non-zero"
-            )
+    errors.extend(
+        death_observation_errors(
+            death,
+            node=node,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            pod_uid=pod_uid,
+        )
+    )
     pods = restarted.get("pods") or []
     if len(pods) != 3:
         errors.append(f"restart did not bring up three Running pods: {len(pods)}")
@@ -374,17 +409,57 @@ def passive_errors(
         errors.append("a source pod uid survived the restart")
     if any(item.get("attempt_id") == attempt_id for item in pods):
         errors.append("restarted pods kept the failed attempt id")
+    new_attempts = {item.get("attempt_id") for item in pods}
+    if len(new_attempts) != 1 or not all(new_attempts):
+        errors.append("restarted pods do not identify one nonempty new attempt")
+    if any(item.get("phase") != "Running" for item in pods):
+        errors.append("restarted pods are not all Running")
     budget = restart_state.get("restart_budget") or {}
     if budget.get("restart_count") != 1:
         errors.append(
             f"restart budget restart_count={budget.get('restart_count')!r}, expected 1"
         )
     if not any(
-        item.get("attempt_id") != attempt_id
-        and item.get("workload_phase") in {"RUNNING", "PENDING"}
+        item.get("attempt_id") in new_attempts
+        and item.get("attempt_id") != attempt_id
+        and item.get("workload_phase") == "RUNNING"
+        and (job_id is None or item.get("job_id") == job_id)
         for item in restart_state.get("observations") or []
     ):
         errors.append("no new attempt observation appeared after the restart")
+    return errors
+
+
+def death_observation_errors(
+    observation: dict[str, Any],
+    *,
+    node: str | None,
+    job_id: str | None,
+    attempt_id: str,
+    pod_uid: str,
+) -> list[str]:
+    errors = []
+    if job_id is not None and observation.get("job_id") != job_id:
+        errors.append("death observation belongs to another job")
+    if observation.get("attempt_id") != attempt_id:
+        errors.append("death observation belongs to another attempt")
+    if observation.get("workload_phase") != "FAILED":
+        errors.append("death observation phase is not FAILED")
+    containers = [
+        item
+        for item in observation.get("containers") or []
+        if item.get("pod_uid") == pod_uid
+        and (node is None or item.get("node_id") == node)
+    ]
+    if not containers:
+        errors.append("death observation does not contain the killed Pod on its node")
+    elif any(item.get("terminated") is not True for item in containers):
+        errors.append("killed container is not terminated in the observation")
+    if containers and not any(
+        type(item.get("exit_code")) is int and item["exit_code"] != 0
+        for item in containers
+    ):
+        errors.append("killed container has no non-zero exit code")
     return errors
 
 
@@ -410,7 +485,15 @@ def wait_death_observation(
             queue_attempts=1,
         )
         for observation in state.get("observations") or []:
-            if node_reads_idle(observation, node):
+            if not isinstance(observation, dict):
+                continue
+            if not death_observation_errors(
+                observation,
+                node=node,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                pod_uid=pod_uid,
+            ):
                 return observation
             last = observation
         if time.monotonic() >= deadline:
@@ -419,6 +502,181 @@ def wait_death_observation(
     raise RegionalFixtureError(
         f"the killed attempt observation never went FAILED: {last}"
     )
+
+
+def node_attempt_blockers(
+    state: object,
+    *,
+    cluster_id: str,
+    node: str,
+    own_job_id: str,
+    own_attempt_id: str,
+    own_must_be_idle: bool = False,
+) -> list[dict[str, str]]:
+    """Validate the complete cluster read before exempting the owned attempt."""
+
+    if not isinstance(state, dict) or not isinstance(state.get("observations"), list):
+        raise RegionalFixtureError("node attempt observation report is missing")
+    own_key = (own_job_id, own_attempt_id)
+    seen: set[tuple[str, str]] = set()
+    blockers = []
+    for value in state["observations"]:
+        try:
+            item = AttemptObservation.model_validate_json(
+                json.dumps(value), strict=True
+            )
+        except (TypeError, ValueError):
+            raise RegionalFixtureError(
+                "node attempt observation is malformed"
+            ) from None
+        key = (item.job_id, item.attempt_id)
+        if (
+            item.cluster_id != cluster_id
+            or not all(part.strip() for part in (*key, item.runtime_profile_version))
+            or item.environment
+            not in {Environment.KUBERNETES, Environment.EKS, Environment.HYPERPOD_EKS}
+            or item.observed_at.utcoffset() is None
+            or key in seen
+            or "containers" not in item.model_fields_set
+            or len({container.observation_key for container in item.containers})
+            != len(item.containers)
+            or any(
+                not {"terminated", "critical"} <= container.model_fields_set
+                or not all(
+                    part.strip()
+                    for part in (
+                        container.pod_uid,
+                        container.pod_name,
+                        container.container_name,
+                        container.role,
+                    )
+                )
+                for container in item.containers
+            )
+        ):
+            raise RegionalFixtureError(
+                "node attempt observation identity is incomplete"
+            )
+        seen.add(key)
+        if key == own_key:
+            if own_must_be_idle and not node_reads_idle(item.model_dump(), node):
+                raise RegionalFixtureError(
+                    "owned attempt became active before late XID"
+                )
+            continue
+        if item.workload_phase not in {WorkloadPhase.PENDING, WorkloadPhase.RUNNING}:
+            continue
+        incomplete = len(
+            {container.rank for container in item.containers if container.critical}
+        ) < item.expected_critical_ranks or any(
+            not container.terminated
+            and (not container.node_id or not container.node_id.strip())
+            for container in item.containers
+        )
+        if incomplete or not node_reads_idle(item.model_dump(), node):
+            blockers.append({"job_id": item.job_id, "attempt_id": item.attempt_id})
+    if own_key not in seen:
+        raise RegionalFixtureError("node attempt report omits the owned attempt")
+    return blockers
+
+
+def read_node_attempt_blockers(
+    regional: RegionalLiveFixture,
+    *,
+    node: str,
+    own_job_id: str,
+    own_attempt_id: str,
+    own_must_be_idle: bool = False,
+) -> list[dict[str, str]]:
+    timeout = 60.0
+    if (window := WINDOW.get()) is not None:
+        timeout = finite_seconds(min(timeout, window.remaining()))
+    with deadline_scope("COLLECT-021 node attempt read", timeout) as deadline:
+        require_action_time()
+        state = regional.store_snapshot(node=node, queue_attempts=1)
+        deadline.remaining()
+        require_action_time()
+        blockers = node_attempt_blockers(
+            state,
+            cluster_id=regional.settings.cluster_id,
+            node=node,
+            own_job_id=own_job_id,
+            own_attempt_id=own_attempt_id,
+            own_must_be_idle=own_must_be_idle,
+        )
+        deadline.remaining()
+        require_action_time()
+        return blockers
+
+
+def wait_node_clear_of_foreign_attempts(
+    regional: RegionalLiveFixture,
+    *,
+    node: str,
+    own_job_id: str,
+    own_attempt_id: str,
+    case_dir: Path,
+    timeout_seconds: int = 420,
+    poll_seconds: int = 10,
+) -> dict[str, Any]:
+    """Drain preceding attempts before killing the workload used by this case."""
+
+    cluster_id = regional.settings.cluster_id
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (cluster_id, node, own_job_id, own_attempt_id)
+    ):
+        raise RegionalFixtureError("foreign-attempt drain identity is missing")
+    timeout = finite_seconds(timeout_seconds)
+    poll = finite_seconds(poll_seconds)
+    if (window := WINDOW.get()) is not None:
+        timeout = finite_seconds(min(timeout, window.remaining()))
+    proof: dict[str, Any] = {
+        "cluster_id": cluster_id,
+        "node": node,
+        "job_id": own_job_id,
+        "attempt_id": own_attempt_id,
+        "clear": False,
+        "entries": [],
+    }
+    path = case_dir / "foreign-attempts-before-kill.json"
+    write_json_atomic(path, proof)
+    try:
+        with deadline_scope(
+            "COLLECT-021 predecessor attempt drain", timeout
+        ) as deadline:
+            while True:
+                deadline.remaining()
+                require_action_time()
+                blockers = read_node_attempt_blockers(
+                    regional,
+                    node=node,
+                    own_job_id=own_job_id,
+                    own_attempt_id=own_attempt_id,
+                )
+                deadline.remaining()
+                require_action_time()
+                proof["entries"].append(
+                    {
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "blockers": blockers,
+                    }
+                )
+                proof["clear"] = not blockers
+                write_json_atomic(path, proof)
+                deadline.remaining()
+                require_action_time()
+                if not blockers:
+                    return proof
+                time.sleep(min(poll, deadline.remaining()))
+    except Exception as exc:
+        proof.update(clear=False, error_type=type(exc).__name__)
+        write_json_atomic(path, proof)
+        if isinstance(exc, DeploymentDeadlineExceeded):
+            raise RegionalFixtureError(
+                "foreign attempt observations did not drain within the total deadline"
+            ) from None
+        raise
 
 
 def wait_for_decision(
@@ -479,6 +737,7 @@ def run_late_xid_section(
     *,
     workloads: list[ManagedWorkloadFixture],
     fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
+    cleanup: base.CaseCleanup | None = None,
 ) -> dict[str, Any]:
     """Submit, kill the process before any XID, then judge both sides.
 
@@ -487,6 +746,7 @@ def run_late_xid_section(
     Pod (the COLLECT-016 ownership lesson).
     """
 
+    cleanup = cleanup or base.CaseCleanup()
     job_id = f"c021-{suffix}"
     attempt_id = f"{job_id}-a001"
     manifest = base.render_named_training_manifest(
@@ -500,6 +760,7 @@ def run_late_xid_section(
         attempt_id=attempt_id,
     )
     workloads.append(workload)
+    require_action_time(180)
     workload.submit()
     source = workload.wait_running(timeout_seconds=900)
     source_uids = {str(item["uid"]) for item in source["pods"]}
@@ -520,13 +781,22 @@ def run_late_xid_section(
         image=settings.host_probe_image,
         case_id=CASE_ID,
         run_id=f"c021-{suffix}",
+        case_dir=case_dir,
     )
     fixtures.append(collector)
     collector.create()
     inventory = collector.snapshot()["gpu_inventory"]
 
+    foreign_drain = wait_node_clear_of_foreign_attempts(
+        regional,
+        node=target_node,
+        own_job_id=job_id,
+        own_attempt_id=attempt_id,
+        case_dir=case_dir,
+    )
     # Kill the process before any XID exists, so the container exits non-zero
     # and the Pod object survives (a deleted Pod reads as a user stop).
+    require_action_time(120)
     kill = collector.execute("kill-workload", "--pod-uid", target_uid, timeout=120)
     death = wait_death_observation(
         regional,
@@ -536,39 +806,84 @@ def run_late_xid_section(
         pod_uid=target_uid,
     )
 
-    marker = f"c021-{int(time.time())}"
-    injected_at = datetime.now(timezone.utc)
-    bdf = target_bdf(death, inventory, pod_uid=target_uid)
-    collector.execute(
-        "write-xid",
-        "--xid",
-        str(LATE_XID),
-        "--marker",
-        marker,
-        "--pci-bdf",
-        bdf,
-        "--message",
-        "Graphics Exception after process death",
-    )
+    # A long grace wait belongs before the kill; afterward the late-XID window
+    # must still be open, not overtaken by a new passive restart or foreign job.
+    with deadline_scope("COLLECT-021 late-XID proof and submission", 60) as deadline:
+        require_action_time()
+        blockers = read_node_attempt_blockers(
+            regional,
+            node=target_node,
+            own_job_id=job_id,
+            own_attempt_id=attempt_id,
+            own_must_be_idle=True,
+        )
+        require_action_time()
+        write_json_atomic(
+            case_dir / "foreign-attempts-before-xid.json",
+            {
+                **foreign_drain,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "clear": not blockers,
+                "blockers": blockers,
+            },
+        )
+        deadline.remaining()
+        require_action_time()
+        if blockers:
+            raise RegionalFixtureError("node ownership changed before the late XID")
+        marker = f"c021-{int(time.time())}"
+        injected_at = datetime.now(timezone.utc)
+        bdf = target_bdf(death, inventory, pod_uid=target_uid)
+        cleanup.register_seed(collector, marker)
+        collector.execute(
+            "write-xid",
+            "--xid",
+            str(LATE_XID),
+            "--marker",
+            marker,
+            "--pci-bdf",
+            bdf,
+            "--message",
+            "Graphics Exception after process death",
+        )
     state = wait_for_decision(
         regional,
         node=target_node,
         marker=marker,
-        observed_after=marker_observed_after(marker, injected_at),
+        observed_after=injected_at,
         case_dir=case_dir / "proactive",
         timeout_seconds=600,
         job_id=job_id,
         attempt_id=attempt_id,
     )
+    policy_errors = proactive_policy_errors(state, xid=LATE_XID)
+    if policy_errors:
+        raise RegionalFixtureError(
+            "late XID policy failed: " + "; ".join(policy_errors)
+        )
+
+    restart_proof = wait_passive_restart(
+        regional,
+        job_id=job_id,
+        attempt_id=attempt_id,
+    )
+    workload.authorize_restart(
+        {
+            **restart_proof,
+            "workflow": restart_proof["recovery_workflow"],
+            "incident": restart_proof["recovery_incident"],
+        }
+    )
+    restarted = workload.wait_restarted(source_uids, timeout_seconds=900)
+    restart_state = wait_passive_completion(
+        regional,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        restarted=restarted,
+    )
+    write_json_atomic(case_dir / "passive-completion.json", restart_state)
     node_after = regional.node_snapshot(target_node)
     errors = proactive_errors(state, node_before, node_after, xid=LATE_XID)
-
-    restarted = workload.wait_restarted(source_uids, timeout_seconds=900)
-    restart_state = regional.store_snapshot(
-        node=target_node,
-        job_id=job_id,
-        queue_attempts=1,
-    )
     errors.extend(
         passive_errors(
             kill=kill,
@@ -578,12 +893,15 @@ def run_late_xid_section(
             source_uids=source_uids,
             pod_uid=target_uid,
             attempt_id=attempt_id,
+            node=target_node,
+            job_id=job_id,
         )
     )
     return {
         "errors": errors,
         "marker": marker,
         "job_id": job_id,
+        "foreign_attempt_drain": foreign_drain,
         "target_node": target_node,
         "killed_pod_uid": target_uid,
         "kill": kill,
@@ -629,6 +947,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
 
 
+@bounded_collector_case
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -656,7 +975,9 @@ def execute_case(
         "errors": [],
         **regional.evidence_identity(),
     }
+    cleanup = base.CaseCleanup()
     try:
+        require_action_time(180)
         prewarm.create(candidates)
         suffix = f"{int(time.time())}-{attempt}"
         section = run_late_xid_section(
@@ -666,6 +987,7 @@ def execute_case(
             suffix,
             workloads=workloads,
             fixtures=fixtures,
+            cleanup=cleanup,
         )
         result["errors"].extend(section["errors"])
         result["late_xid"] = section
@@ -673,6 +995,20 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if cleanup.seed_markers or cleanup.incident_states:
+            try:
+                state = regional.store_snapshot()
+                released = cleanup.finish(
+                    profile_version=str(
+                        (state.get("profile") or {}).get("profile_version") or ""
+                    ),
+                    reason="COLLECT-021 validated cleanup",
+                )
+                result["errors"].extend(released["errors"])
+            except Exception as exc:
+                result["errors"].append(
+                    f"incident cleanup failed: {type(exc).__name__}: {exc}"
+                )
         for workload in workloads:
             try:
                 workload.delete()

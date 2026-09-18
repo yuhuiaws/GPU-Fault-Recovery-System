@@ -99,6 +99,7 @@ MEMORY_FIELD_DIAGNOSTIC_COMMAND=""
 MEMORY_FIELD_DIAGNOSTIC_SHA256=""
 FIELD_DIAGNOSTIC_TIMEOUT_SECONDS="1800"
 ALLOW_DRIVER_REMEDIATION="false"
+# Default-on; keep it out of the opt-in --enable-node-agent mutation guard.
 ALLOW_EFA_DRIVER_REMEDIATION="true"
 DRIVER_REMEDIATION_COMMAND=""
 DRIVER_REMEDIATION_SHA256=""
@@ -216,7 +217,8 @@ usage() {
         "  --field-diagnostic-sha256 HEX   Pinned executable SHA-256" \
         "  --field-diagnostic-timeout SEC  60-7200; default: 1800" \
         "  --allow-driver-remediation      Allow explicitly mapped SXID driver repair" \
-        "  --allow-efa-driver-remediation  Allow EFA PCI driver rebind after workload stop" \
+        "  --allow-efa-driver-remediation  Allow EFA PCI driver rebind after workload stop; default, explicit confirmation" \
+        "  --disable-efa-driver-remediation Do not allow EFA PCI driver rebind; drops REMEDIATE_EFA_DRIVER" \
         "  --driver-remediation-command CMD  Absolute, preinstalled command; {target} allowed" \
         "  --driver-remediation-sha256 HEX Pinned executable SHA-256" \
         "  --target-driver-branch INTEGER  Required driver branch after repair" \
@@ -241,7 +243,7 @@ usage() {
         "  --node-agent-tls-client-ca PATH Require a client certificate from this CA" \
         "  --node-heartbeat-interval SEC   Default: 30" \
         "  --node-inflight-wait-timeout SEC Duplicate command wait; default: 2100" \
-        "  --node-action-retention-seconds SEC Ledger retention; default: 604800" \
+        "  --node-action-retention-seconds SEC Ledger retention; default: 2592000" \
         "  --node-action-max-results N     Ledger row cap; default: 10000" \
         "  --node-instance-id ID           Stable VM or Kubernetes Node UID" \
         "  --no-start                      Install and enable without starting" \
@@ -571,6 +573,7 @@ while [[ $# -gt 0 ]]; do
         --field-diagnostic-timeout) require_value "$@"; FIELD_DIAGNOSTIC_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --allow-driver-remediation) ALLOW_DRIVER_REMEDIATION="true"; shift ;;
         --allow-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="true"; shift ;;
+        --disable-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="false"; shift ;;
         --driver-remediation-command) require_value "$@"; DRIVER_REMEDIATION_COMMAND="$2"; shift 2 ;;
         --driver-remediation-sha256) require_value "$@"; DRIVER_REMEDIATION_SHA256="$2"; shift 2 ;;
         --target-driver-branch) require_value "$@"; TARGET_DRIVER_BRANCH="$2"; shift 2 ;;
@@ -1335,123 +1338,12 @@ if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
     docker info >/dev/null || die "Docker daemon is unavailable"
 fi
 
-runtime_record_digest() {
-    local release_dir="$1"
-    "${release_dir}/venv/bin/python" -c '
-import hashlib
-from importlib.metadata import distribution
-
-record = distribution("gpu-fault-node-runtime").read_text("RECORD")
-if not record:
-    raise SystemExit("node runtime RECORD is unavailable")
-print(hashlib.sha256(record.encode()).hexdigest())
-'
-}
-
-validate_runtime_slot() {
-    local release_dir="$1"
-    local expected_artifact="$2"
-    local observed_record
-
-    [[ -f "${release_dir}/.complete" ]] || return 1
-    [[ -f "${release_dir}/artifact.sha256" ]] || return 1
-    [[ -f "${release_dir}/record.sha256" ]] || return 1
-    [[ "$(<"${release_dir}/artifact.sha256")" == "${expected_artifact}" ]] ||
-        return 1
-    [[ -x "${release_dir}/venv/bin/gpu-fault-collector" ]] || return 1
-    [[ -x "${release_dir}/venv/bin/gpu-fault-node-agent" ]] || return 1
-    [[ -x "${release_dir}/venv/bin/gpu-fault-restore-gpu-services" ]] ||
-        return 1
-    "${release_dir}/venv/bin/python" -m pip check >/dev/null || return 1
-    "${release_dir}/venv/bin/python" -c 'import gpu_fault' || return 1
-    observed_record="$(runtime_record_digest "${release_dir}")" || return 1
-    [[ "$(<"${release_dir}/record.sha256")" == "${observed_record}" ]]
-}
-
-prepare_runtime_slot() {
-    local release_dir="$1"
-    local expected_artifact="$2"
-    local record_digest
-    local release_resolved
-    local current_resolved
-
-    if [[ -d "${release_dir}" ]]; then
-        if validate_runtime_slot "${release_dir}" "${expected_artifact}"; then
-            printf 'Reusing node runtime slot %s\n' "${expected_artifact}"
-            return
-        fi
-        if [[ -n "${PREVIOUS_CURRENT_TARGET}" ]]; then
-            release_resolved="$(readlink -f "${release_dir}")"
-            current_resolved="$(readlink -f "${PREVIOUS_CURRENT_TARGET}")"
-            if [[ "${release_resolved}" == "${current_resolved}" ]]; then
-                die "active node runtime slot failed integrity validation"
-            fi
-        fi
-        rm -rf "${release_dir}"
-    fi
-    install -d -m 0755 "${release_dir}"
-    "${PYTHON_COMMAND}" -m venv "${release_dir}/venv"
-    # The dependency closure comes from the hash lock only: --require-hashes
-    # makes pip refuse any file whose digest is not pinned, and --no-deps
-    # stops it from resolving anything the lock does not name. The wheel
-    # itself was digest-checked above and installs with no index at all.
-    PIP_ARGS=(
-        install --require-hashes --no-deps
-        --requirement "${DEPENDENCY_LOCK}"
-    )
-    if [[ -n "${WHEELHOUSE}" ]]; then
-        [[ -d "${WHEELHOUSE}" ]] || die "wheelhouse does not exist: ${WHEELHOUSE}"
-        PIP_ARGS+=(--no-index --find-links "${WHEELHOUSE}")
-    fi
-    "${release_dir}/venv/bin/python" -m pip "${PIP_ARGS[@]}"
-    "${release_dir}/venv/bin/python" -m pip install \
-        --no-index --no-deps "${WHEEL}"
-    record_digest="$(runtime_record_digest "${release_dir}")" ||
-        die "node runtime RECORD validation failed"
-    printf '%s\n' "${expected_artifact}" > "${release_dir}/artifact.sha256"
-    printf '%s\n' "${record_digest}" > "${release_dir}/record.sha256"
-    chmod 0644 "${release_dir}/artifact.sha256" \
-        "${release_dir}/record.sha256"
-    touch "${release_dir}/.complete"
-    chmod 0644 "${release_dir}/.complete"
-    validate_runtime_slot "${release_dir}" "${expected_artifact}" ||
-        die "candidate node runtime slot validation failed"
-}
-
-prepare_py_spy() {
-    local tool_dir="$1"
-    local binary="${tool_dir}/venv/bin/py-spy"
-    local observed_sha
-
-    if [[ -f "${tool_dir}/.complete" && -x "${binary}" ]]; then
-        observed_sha="$(sha256sum "${binary}" | cut -d' ' -f1)"
-        if [[ "${observed_sha}" == "${PY_SPY_BINARY_SHA256}" ]]; then
-            "${binary}" --version >/dev/null ||
-                die "py-spy installation verification failed"
-            return
-        fi
-        die "existing py-spy tool slot failed integrity validation"
-    fi
-    if [[ -e "${tool_dir}" ]]; then
-        rm -rf "${tool_dir}"
-    fi
-    install -d -m 0755 "${tool_dir}"
-    "${PYTHON_COMMAND}" -m venv "${tool_dir}/venv"
-    "${tool_dir}/venv/bin/python" -m pip install \
-        --force-reinstall --no-deps --only-binary=:all: \
-        "py-spy==${PY_SPY_VERSION}"
-    observed_sha="$(sha256sum "${binary}" | cut -d' ' -f1)"
-    [[ "${observed_sha}" == "${PY_SPY_BINARY_SHA256}" ]] ||
-        die "py-spy binary SHA-256 mismatch"
-    "${binary}" --version >/dev/null || die "py-spy installation verification failed"
-    touch "${tool_dir}/.complete"
-    chmod 0644 "${tool_dir}/.complete"
-}
+# shellcheck source=deploy/node/runtime-slot.sh
+source "${REPO_DIR}/deploy/node/runtime-slot.sh"
 
 install -d -m 0755 "${RUNTIME_ROOT}" "${RUNTIME_RELEASES_DIR}" \
     "${RUNTIME_ROOT}/tools" /etc/gpu-fault /var/lib/gpu-fault
-RUNTIME_RELEASE_DIR="${RUNTIME_RELEASES_DIR}/${WHEEL_SHA256}"
-prepare_runtime_slot "${RUNTIME_RELEASE_DIR}" "${WHEEL_SHA256}"
+prepare_node_runtime
 PY_SPY_COMMAND=""
 if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
     PY_SPY_DIR="${RUNTIME_ROOT}/tools/py-spy-${PY_SPY_VERSION}-${PY_SPY_BINARY_SHA256:0:12}"

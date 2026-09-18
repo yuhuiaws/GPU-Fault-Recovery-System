@@ -7,6 +7,7 @@ sender identity to verify and is told about both.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from gpu_fault.admin import notification_precheck as PRECHECK
@@ -59,7 +60,29 @@ class Runner:
                 "VerificationStatus": "SUCCESS" if self.ses_verified else "PENDING",
             }
         if (service, action) == ("sns", "get-topic-attributes"):
-            return {"Attributes": {"TopicArn": TOPIC_ARN}}
+            cpu = _cpu()
+            return {
+                "Attributes": {
+                    "TopicArn": TOPIC_ARN,
+                    "Owner": cpu.account_id,
+                    "Policy": json.dumps(
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Sid": "AllowTopicOwner",
+                                    "Effect": "Allow",
+                                    "Principal": {
+                                        "AWS": f"arn:aws:iam::{cpu.account_id}:root"
+                                    },
+                                    "Action": "sns:*",
+                                    "Resource": TOPIC_ARN,
+                                }
+                            ],
+                        }
+                    ),
+                }
+            }
         if (service, action) == ("sns", "list-tags-for-resource"):
             return {
                 "Tags": [

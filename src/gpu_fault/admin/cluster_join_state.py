@@ -9,7 +9,8 @@ from typing import Any, Protocol, cast
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_join_evidence import site_non_membership_sha256
-from gpu_fault.admin.site import RenderedSite
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.site import RenderedSite, load_site
 
 
 class JoinStateRequest(Protocol):
@@ -29,13 +30,59 @@ class JoinStateRequest(Protocol):
     def state_dir(self) -> Path | None: ...
 
 
-# Attempts that are over: the drift guard protects an attempt still being
-# built against the site it started from. A rolled-back one starts fresh, a
-# failed rollback is undone against the site as it is now, and a COMPLETED one
-# either still describes a managed cluster (ALREADY_MANAGED) or a cluster the
-# site has since dropped (fresh attempt) -- the site moving on is expected
-# in every case (live 2026-09-12: remove-cluster + two deploys after a join).
-FINISHED_ATTEMPT_PHASES = frozenset({"ROLLED_BACK", "ROLLBACK_FAILED", "COMPLETED"})
+RECOVERABLE_ATTEMPT_PHASES = frozenset(
+    {"ROLLED_BACK", "ROLLBACK_STARTED", "ROLLBACK_FAILED", "COMPLETED"}
+)
+JOIN_RELEASE_STEPS = ("JOIN_STARTED", "RELEASE_STARTED", "JOINED")
+
+
+def join_release_started(state: dict[str, Any]) -> bool:
+    return any(step_done(state, step) for step in JOIN_RELEASE_STEPS)
+
+
+def recovery_scope_sha256(site: RenderedSite) -> str:
+    """Bind every site-level destination compensation can still mutate."""
+    scope = {
+        key: site.release_config.get(key)
+        for key in (
+            "site_name",
+            "aws_region",
+            "cpu_eks_arn",
+            "cpu_hyperpod_cluster_name",
+            "cpu_kubeconfig",
+            "namespace",
+            "nlb",
+            "dns",
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _require_recovery_scope(
+    request: JoinStateRequest, state_dir: Path, state: dict[str, Any]
+) -> None:
+    expected = state.get("source_site_recovery_sha256")
+    if expected is None:
+        evidence = state.get("evidence") or {}
+        candidate_file = (evidence.get("CANDIDATE_READY") or {}).get("site_file")
+        candidate = Path(
+            str(
+                candidate_file
+                or state_dir
+                / f"candidate-site-{int(state.get('attempt') or 1):03d}.yaml"
+            )
+        )
+        if not candidate.is_file() or candidate.is_symlink():
+            raise BootstrapError(
+                "join retry lacks its original site recovery binding; "
+                "legacy evidence requires reconciliation"
+            )
+        previous = load_site(candidate, repository_root=request.site.repository_root)
+        expected = recovery_scope_sha256(previous)
+    if expected != recovery_scope_sha256(request.site):
+        raise BootstrapError("join-cluster recovery site identity drifted")
 
 
 def load_join_state(
@@ -69,14 +116,12 @@ def load_join_state(
         if (
             recorded_non_membership
             and recorded_non_membership != current_non_membership
-            and value.get("phase") not in FINISHED_ATTEMPT_PHASES
         ):
-            # An attempt still in flight was built against the old site; a
-            # rolled-back one is over (the caller starts a fresh attempt) and a
-            # failed rollback is undone against the site as it is now.
-            raise BootstrapError(
-                "join-cluster source site non-membership fields drifted"
-            )
+            if value.get("phase") not in RECOVERABLE_ATTEMPT_PHASES:
+                raise BootstrapError(
+                    "join-cluster source site non-membership fields drifted"
+                )
+            _require_recovery_scope(request, state_dir, value)
         if not recorded_non_membership:
             value["source_site_non_membership_sha256"] = current_non_membership
             write_json_atomic(path, value)
@@ -86,6 +131,7 @@ def load_join_state(
         **expected,
         "attempt": 1,
         "source_site_sha256": request.site.source_sha256,
+        "source_site_recovery_sha256": recovery_scope_sha256(request.site),
         "source_site_non_membership_sha256": site_non_membership_sha256(
             request.site.source
         ),
@@ -116,6 +162,31 @@ def completed_state_is_current(
     )
 
 
+def note_join_failure(state: dict[str, Any], error: BaseException) -> None:
+    """Retain the sanitized cause through rollback; a new attempt archives it."""
+    completed_at = state.get("step_completed_at")
+    completed = state.get("completed_steps")
+    timestamps: dict[str, datetime] = {}
+    if isinstance(completed_at, dict) and isinstance(completed, list):
+        for step in completed:
+            raw = completed_at.get(step) if isinstance(step, str) else None
+            if not isinstance(raw, str):
+                continue
+            try:
+                timestamp = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if timestamp.tzinfo is not None:
+                timestamps[step] = timestamp
+    state["failure"] = {
+        "error": f"{type(error).__name__}: {diagnostic_text(str(error))}",
+        "after_step": (
+            max(timestamps, key=timestamps.__getitem__) if timestamps else None
+        ),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def reset_completed_state(
     request: JoinStateRequest,
     *,
@@ -124,6 +195,7 @@ def reset_completed_state(
     state: dict[str, Any],
 ) -> None:
     previous_attempt = int(state.get("attempt") or 1)
+    retained_token = state.get("retained_cluster_token")
     archive = state_dir / f"state.attempt-{previous_attempt:03d}.json"
     if not archive.exists():
         write_json_atomic(archive, dict(state))
@@ -137,6 +209,7 @@ def reset_completed_state(
             "allowed_namespaces": sorted(request.allowed_namespaces),
             "attempt": previous_attempt + 1,
             "source_site_sha256": request.site.source_sha256,
+            "source_site_recovery_sha256": recovery_scope_sha256(request.site),
             "source_site_non_membership_sha256": site_non_membership_sha256(
                 request.site.source
             ),
@@ -146,6 +219,8 @@ def reset_completed_state(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+    if isinstance(retained_token, dict):
+        state["retained_cluster_token"] = dict(retained_token)
     write_json_atomic(state_path, state)
 
 

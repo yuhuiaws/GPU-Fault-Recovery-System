@@ -1,15 +1,31 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, cast
+from typing import Any, Iterable
 
-from gpu_fault.admin.aws_cleanup_helpers import (
-    aurora_instance_deleting_or_absent,
-    delete_certificate_once_released,
-    ordered_aurora_instances,
+from gpu_fault.admin.aws_cleanup_clusters import (
+    aurora_snapshot,
+    cpu_eks_identity,
+    delete_aurora_cluster,
+    delete_eks_cluster,
+    delete_hyperpod_cluster,
+    prepare_aurora_deletion,
+    prepare_cpu_deletion,
 )
+from gpu_fault.admin.aws_cleanup_helpers import (
+    delete_certificate_once_released,
+    object_field,
+    objects,
+    oidc_provider_users,
+    ordered_aurora_instances as ordered_aurora_instances,
+    single_object,
+    sqs_policy,
+    sqs_topic_statements,
+)
+from gpu_fault.admin.aws_cleanup_ownership import CleanupOwnership
 from gpu_fault.admin.aws_commands import (
     FinalSnapshotPolicy,
+    helm_release_absent,
 )
 from gpu_fault.admin.aws_commands import (
     checked_command as _checked,
@@ -27,6 +43,7 @@ from gpu_fault.admin.aws_commands import (
     wait_until as _wait_until,
 )
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.installation_resources import InstallationResource
 
@@ -120,6 +137,7 @@ class ResourceProbe:
         self.site = site
         self.region = str(site.release_config["aws_region"])
         self.cpu_kubeconfig = str(site.release_config["cpu_kubeconfig"])
+        self._ownership = CleanupOwnership(site)
 
     def validate_supported(self, resources: Iterable[InstallationResource]) -> None:
         unsupported = sorted(
@@ -151,7 +169,7 @@ class ResourceProbe:
             return False
         raise BootstrapError(
             f"resource verification failed: {' '.join(arguments[:3])}: "
-            f"{result.stderr.strip()}"
+            f"{diagnostic_text(result.stderr.strip())}"
         )
 
     def _route53_records(self, resource: InstallationResource) -> list[dict[str, Any]]:
@@ -166,12 +184,13 @@ class ResourceProbe:
         )
         if document is None:
             return []
-        name = resource.resource_id.rstrip(".") + "."
+        name = resource.resource_id.rstrip(".").casefold() + "."
         record_type = resource.attributes.get("record_type", "CNAME")
+        records = objects(document, "ResourceRecordSets", required=("Name", "Type"))
         return [
             item
-            for item in document.get("ResourceRecordSets", [])
-            if item.get("Name") == name and item.get("Type") == record_type
+            for item in records
+            if item["Name"].casefold() == name and item["Type"] == record_type
         ]
 
     def _exists_network(self, resource: InstallationResource) -> bool | None:
@@ -256,7 +275,7 @@ class ResourceProbe:
                     ),
                 )
             )
-            return bool(document and document.get("RouteTables"))
+            return bool(objects(document or {}, "RouteTables"))
         if resource_type == "internet_gateway":
             return self._exists_command(
                 self._aws(
@@ -301,7 +320,7 @@ class ResourceProbe:
                     str(item.get("VPCRegion") or ""),
                     str(item.get("VPCId") or ""),
                 )
-                for item in document.get("VPCs", [])
+                for item in objects(document, "VPCs", required=("VPCRegion", "VPCId"))
             }
         if resource_type == "acm_certificate":
             return self._exists_command(
@@ -343,10 +362,15 @@ class ResourceProbe:
                 ),
                 not_found=("ResourceNotFoundException",),
             )
-            return any(
-                str(item.get("id")) == identifier
-                for item in (document or {}).get("serviceAccounts", [])
-            )
+            if document is None:
+                return False
+            accounts = objects(document, "serviceAccounts")
+            if any(
+                not isinstance(item.get("id"), (int, str)) or not str(item["id"])
+                for item in accounts
+            ):
+                raise BootstrapError("Grafana service account identity is unavailable")
+            return any(str(item["id"]) == identifier for item in accounts)
         if resource_type == "sns_topic":
             return self._exists_command(
                 self._aws(
@@ -396,8 +420,8 @@ class ResourceProbe:
                 return False
             if resource_type == "sqs_queue":
                 return True
-            policy = (document.get("Attributes") or {}).get("Policy", "")
-            return resource.attributes["topic_arn"] in policy
+            policy = sqs_policy(object_field(document, "Attributes").get("Policy"))
+            return bool(sqs_topic_statements(policy, resource.attributes["topic_arn"]))
         return None
 
     def _exists_identity_and_runtime(
@@ -466,10 +490,10 @@ class ResourceProbe:
             )
             if result.returncode == 0:
                 return True
-            if "release: not found" in result.stderr.lower():
+            if helm_release_absent(result):
                 return False
             raise BootstrapError(
-                f"Helm release verification failed: {result.stderr.strip()}"
+                f"Helm release verification failed: {diagnostic_text(result.stderr.strip())}"
             )
         if resource_type == "ecr_repository":
             return self._exists_command(
@@ -530,15 +554,14 @@ class ResourceProbe:
                 not_found=("DBInstanceNotFound",),
             )
         if resource_type == "rds_snapshot":
-            return self._exists_command(
-                self._aws(
-                    "rds",
-                    "describe-db-cluster-snapshots",
-                    "--db-cluster-snapshot-identifier",
-                    identifier,
-                ),
-                not_found=("DBClusterSnapshotNotFoundFault",),
+            self._ownership.validate_scope(resource)
+            snapshot = aurora_snapshot(
+                self,
+                identifier,
+                cluster_id=str(self.site.release_config["health"]["aurora_cluster_id"]),
+                cluster_resource_id=resource.attributes.get("db_cluster_resource_id"),
             )
+            return snapshot is not None and snapshot["Status"] == "available"
         if resource_type in {"cpu_eks", "gpu_eks"}:
             return self._exists_command(
                 self._aws("eks", "describe-cluster", "--name", identifier),
@@ -585,15 +608,12 @@ class ResourceDeletion(ResourceProbe):
             )
         )
         foreign = []
-        for route_table in cast(
-            list[dict[str, Any]],
-            (document or {}).get("RouteTables", []),
-        ):
+        for route_table in objects(document or {}, "RouteTables"):
             tags = {
                 str(item.get("Key") or ""): str(item.get("Value") or "")
                 for item in route_table.get("Tags", [])
             }
-            if tags.get("gpu-fault:site-id") != resource.site_id:
+            if tags.get("gpu-fault:site-id") != self._ownership.site_id:
                 foreign.append(str(route_table.get("RouteTableId") or "unknown"))
         if foreign:
             raise BootstrapError(
@@ -604,15 +624,7 @@ class ResourceDeletion(ResourceProbe):
     def _assert_oidc_provider_unused(self, resource: InstallationResource) -> None:
         document = _json(["aws", "iam", "list-roles"])
         provider = resource.resource_arn or resource.resource_id
-        users = [
-            str(role.get("RoleName") or "unknown")
-            for role in cast(list[dict[str, Any]], (document or {}).get("Roles", []))
-            if provider
-            in json.dumps(
-                role.get("AssumeRolePolicyDocument") or {},
-                sort_keys=True,
-            )
-        ]
+        users = oidc_provider_users(document or {}, provider)
         if users:
             raise BootstrapError(
                 "OIDC provider is now trusted by remaining IAM roles: "
@@ -629,7 +641,7 @@ class ResourceDeletion(ResourceProbe):
             ),
             not_found=("ResourceNotFoundException",),
         )
-        associations = (document or {}).get("associations", [])
+        associations = objects(document, "associations") if document is not None else []
         if associations:
             raise BootstrapError(
                 "Pod Identity Agent is now used by remaining associations"
@@ -651,7 +663,7 @@ class ResourceDeletion(ResourceProbe):
                 f"{item.get('metadata', {}).get('namespace', 'default')}/"
                 f"{item.get('metadata', {}).get('name', 'unknown')}"
             )
-            for item in cast(list[dict[str, Any]], (document or {}).get("items", []))
+            for item in objects(document or {}, "items")
             if item.get("spec", {}).get("type") == "LoadBalancer"
         ]
         if users:
@@ -659,31 +671,145 @@ class ResourceDeletion(ResourceProbe):
                 "Load Balancer Controller is now used by remaining Services: "
                 + ", ".join(sorted(users))
             )
+        ingresses = _json(
+            [
+                "kubectl",
+                "--kubeconfig",
+                self.cpu_kubeconfig,
+                "get",
+                "ingress",
+                "--all-namespaces",
+            ]
+        )
+        items = objects(ingresses or {}, "items")
+        if not items:
+            return
+        classes = _json(
+            ["kubectl", "--kubeconfig", self.cpu_kubeconfig, "get", "ingressclass"]
+        )
+        controllers = {
+            str(object_field(item, "metadata").get("name") or ""): object_field(
+                item, "spec"
+            ).get("controller")
+            for item in objects(classes or {}, "items")
+        }
+        for item in items:
+            metadata = object_field(item, "metadata")
+            name = object_field(item, "spec").get("ingressClassName") or metadata.get(
+                "annotations", {}
+            ).get("kubernetes.io/ingress.class")
+            if name == "alb" or controllers.get(name) in {
+                None,
+                "",
+                "ingress.k8s.aws/alb",
+            }:
+                users.append(
+                    f"{metadata.get('namespace', 'default')}/{metadata.get('name', 'unknown')}"
+                )
+        if users:
+            raise BootstrapError(
+                "Load Balancer Controller may be used by remaining Ingresses: "
+                + ", ".join(sorted(users))
+            )
+
+    def _route53_nlb_binding(
+        self, resource: InstallationResource
+    ) -> dict[str, str] | None:
+        document = _json(
+            self._aws(
+                "elbv2",
+                "describe-load-balancers",
+                "--names",
+                str(self.site.release_config["nlb"]["name"]),
+            ),
+            not_found=("LoadBalancerNotFound",),
+        )
+        if document is None:
+            return None
+        details = single_object(document, "LoadBalancers")
+        target = str(details.get("DNSName") or "")
+        if (
+            not target
+            or details.get("LoadBalancerName")
+            != self.site.release_config["nlb"]["name"]
+        ):
+            raise BootstrapError("Route53 record has no unique owned NLB target")
+        nlb = resource.model_copy(
+            update={
+                "resource_type": "nlb",
+                "resource_id": str(self.site.release_config["nlb"]["name"]),
+                "resource_arn": str(details.get("LoadBalancerArn") or ""),
+            }
+        )
+        self._ownership.assert_tags(nlb, self._ownership._nlb_tags(nlb) or {})
+        return {"nlb_arn": str(details["LoadBalancerArn"]), "dns_name": target}
+
+    def prepare_dns_delete(self, resource: InstallationResource) -> dict[str, Any]:
+        if resource.resource_type != "route53_record":
+            raise BootstrapError("DNS cleanup binding requires a Route53 record")
+        if self._ownership.before_delete(resource, self.exists) is None:
+            return {"record": None}
+        records = self._route53_records(resource)
+        target = self._route53_nlb_binding(resource)
+        if len(records) != 1 or target is None:
+            raise BootstrapError("Route53 record has no unique owned NLB target")
+        record = records[0]
+        values = objects(record, "ResourceRecords")
+        if (
+            record.get("Type") != "CNAME"
+            or len(values) != 1
+            or str(values[0].get("Value") or "").rstrip(".").casefold()
+            != target["dns_name"].rstrip(".").casefold()
+            or set(record) != {"Name", "Type", "TTL", "ResourceRecords"}
+        ):
+            raise BootstrapError("Route53 record target or routing policy has drifted")
+        return {"record": record, **target}
 
     def _delete_route53_record(self, resource: InstallationResource) -> None:
-        for record in self._route53_records(resource):
-            batch = json.dumps(
-                {
-                    "Changes": [
-                        {
-                            "Action": "DELETE",
-                            "ResourceRecordSet": record,
-                        }
-                    ]
-                },
-                separators=(",", ":"),
+        records = self._route53_records(resource)
+        if not records:
+            return
+        encoded = resource.attributes.get("uninstall_dns_binding")
+        try:
+            binding = (
+                json.loads(encoded)
+                if encoded is not None
+                else self.prepare_dns_delete(resource)
             )
-            _checked(
-                self._aws(
-                    "route53",
-                    "change-resource-record-sets",
-                    "--hosted-zone-id",
-                    resource.attributes["hosted_zone_id"],
-                    "--change-batch",
-                    batch,
-                ),
-                not_found=("NoSuchHostedZone",),
+        except (TypeError, ValueError):
+            raise BootstrapError("invalid saved DNS cleanup binding") from None
+        if (
+            not isinstance(binding, dict)
+            or len(records) != 1
+            or records[0] != binding.get("record")
+            or any(
+                not isinstance(binding.get(key), str) or not binding[key]
+                for key in ("nlb_arn", "dns_name")
             )
+        ):
+            raise BootstrapError("Route53 record differs from its cleanup binding")
+        target = self._route53_nlb_binding(resource)
+        if target is not None and target != {
+            key: binding[key] for key in ("nlb_arn", "dns_name")
+        }:
+            raise BootstrapError("Route53 NLB target identity has drifted")
+        # The Service finalizer can remove the NLB before AWS cleanup. Only an
+        # unchanged record with a previously proven target permits that absence.
+        batch = json.dumps(
+            {"Changes": [{"Action": "DELETE", "ResourceRecordSet": records[0]}]},
+            separators=(",", ":"),
+        )
+        _checked(
+            self._aws(
+                "route53",
+                "change-resource-record-sets",
+                "--hosted-zone-id",
+                resource.attributes["hosted_zone_id"],
+                "--change-batch",
+                batch,
+            ),
+            not_found=("NoSuchHostedZone",),
+        )
 
     def _detach_sqs_policy(self, resource: InstallationResource) -> None:
         document = _json(
@@ -702,15 +828,14 @@ class ResourceDeletion(ResourceProbe):
         )
         if document is None:
             return
-        raw = (document.get("Attributes") or {}).get("Policy")
-        if not raw:
+        policy = sqs_policy(object_field(document, "Attributes").get("Policy"))
+        matched = sqs_topic_statements(policy, resource.attributes["topic_arn"])
+        if not matched:
             return
-        policy = json.loads(raw)
-        topic_arn = resource.attributes["topic_arn"]
         statements = [
             statement
-            for statement in policy.get("Statement", [])
-            if topic_arn not in json.dumps(statement, sort_keys=True)
+            for statement in objects(policy, "Statement")
+            if statement not in matched
         ]
         policy["Statement"] = statements
         policy_value = json.dumps(policy, separators=(",", ":")) if statements else ""
@@ -734,6 +859,16 @@ class ResourceDeletion(ResourceProbe):
 
     def _delete_iam_role(self, resource: InstallationResource) -> None:
         role_name = resource.resource_id
+        profiles = _json(
+            ["aws", "iam", "list-instance-profiles-for-role", "--role-name", role_name],
+            not_found=("NoSuchEntity",),
+        )
+        if profiles is None:
+            return
+        if objects(profiles, "InstanceProfiles"):
+            raise BootstrapError(
+                "IAM role remains attached to instance profiles outside the cleanup registry"
+            )
         inline = _json(
             ["aws", "iam", "list-role-policies", "--role-name", role_name],
             not_found=("NoSuchEntity",),
@@ -767,29 +902,6 @@ class ResourceDeletion(ResourceProbe):
                     role_name,
                     "--policy-arn",
                     policy["PolicyArn"],
-                ],
-                not_found=("NoSuchEntity",),
-            )
-        profiles = _json(
-            [
-                "aws",
-                "iam",
-                "list-instance-profiles-for-role",
-                "--role-name",
-                role_name,
-            ],
-            not_found=("NoSuchEntity",),
-        )
-        for profile in (profiles or {}).get("InstanceProfiles", []):
-            _checked(
-                [
-                    "aws",
-                    "iam",
-                    "remove-role-from-instance-profile",
-                    "--instance-profile-name",
-                    profile["InstanceProfileName"],
-                    "--role-name",
-                    role_name,
                 ],
                 not_found=("NoSuchEntity",),
             )
@@ -849,7 +961,7 @@ class ResourceDeletion(ResourceProbe):
             return
         remaining = [
             item
-            for item in document.get("ResourceRecordSets", [])
+            for item in objects(document, "ResourceRecordSets")
             if item.get("Type") not in {"NS", "SOA"}
         ]
         if remaining:
@@ -943,33 +1055,10 @@ class ResourceDeletion(ResourceProbe):
                 not_found=("ListenerNotFound",),
             )
         elif resource_type == "nlb":
-            if self.exists(resource):
-                resolved_arn = resource.resource_arn
-                if not resolved_arn:
-                    document = _json(
-                        self._aws(
-                            "elbv2",
-                            "describe-load-balancers",
-                            "--names",
-                            identifier,
-                        ),
-                        not_found=("LoadBalancerNotFound",),
-                    )
-                    load_balancers = (document or {}).get("LoadBalancers", [])
-                    resolved_arn = (
-                        load_balancers[0]["LoadBalancerArn"] if load_balancers else None
-                    )
-                if resolved_arn:
-                    _checked(
-                        self._aws(
-                            "elbv2",
-                            "delete-load-balancer",
-                            "--load-balancer-arn",
-                            resolved_arn,
-                        ),
-                        not_found=("LoadBalancerNotFound",),
-                    )
-            self.wait_absent(resource)
+            _checked(
+                self._aws("elbv2", "delete-load-balancer", "--load-balancer-arn", arn),
+                not_found=("LoadBalancerNotFound",),
+            )
         elif resource_type == "nlb_target_group":
             _checked(
                 self._aws(
@@ -1193,6 +1282,10 @@ class ResourceDeletion(ResourceProbe):
         return True
 
     def delete(self, resource: InstallationResource) -> None:
+        current = self._ownership.before_delete(resource, self.exists)
+        if current is None:
+            return
+        resource = current
         handled = any(
             handler(resource)
             for handler in (
@@ -1235,201 +1328,46 @@ class ClusterDeletion(ResourceDeletion):
         )
         if document is None:
             return None
-        clusters = cast(list[dict[str, Any]], document.get("DBClusters", []))
-        return clusters[0] if clusters else None
+        return single_object(document, "DBClusters")
 
     def _snapshot_available(self, identifier: str) -> bool:
-        document = _json(
-            self._aws(
-                "rds",
-                "describe-db-cluster-snapshots",
-                "--db-cluster-snapshot-identifier",
-                identifier,
-            ),
-            not_found=("DBClusterSnapshotNotFoundFault",),
+        snapshot = aurora_snapshot(
+            self,
+            identifier,
+            cluster_id=str(self.site.release_config["health"]["aurora_cluster_id"]),
         )
-        if document is None:
-            return False
-        snapshots = cast(
-            list[dict[str, Any]],
-            document.get("DBClusterSnapshots", []),
-        )
-        return bool(
-            snapshots and str(snapshots[0].get("Status") or "").lower() == "available"
-        )
+        return snapshot is not None and snapshot.get("Status") == "available"
 
-    def _delete_hyperpod(self, name: str) -> None:
-        if not self._exists_command(
-            self._aws(
-                "sagemaker",
-                "describe-cluster",
-                "--cluster-name",
-                name,
-            ),
-            not_found=("ResourceNotFound",),
-        ):
-            return
-        _checked(
-            self._aws("sagemaker", "delete-cluster", "--cluster-name", name),
-            not_found=("ResourceNotFound",),
-        )
-        _wait_until(
-            lambda: not self._exists_command(
-                self._aws(
-                    "sagemaker",
-                    "describe-cluster",
-                    "--cluster-name",
-                    name,
-                ),
-                not_found=("ResourceNotFound",),
-            ),
-            description=f"HyperPod cluster {name} deletion",
-            timeout_seconds=3600,
-            interval_seconds=15,
-        )
+    def _delete_hyperpod(self, name: str, *, expected_arn: str | None = None) -> None:
+        delete_hyperpod_cluster(self, name, expected_arn=expected_arn)
 
-    def _delete_eks(self, name: str) -> None:
-        if not self._exists_command(
-            self._aws("eks", "describe-cluster", "--name", name),
-            not_found=("ResourceNotFoundException",),
-        ):
-            return
-        associations = _json(
-            self._aws(
-                "eks",
-                "list-pod-identity-associations",
-                "--cluster-name",
-                name,
-            ),
-            not_found=("ResourceNotFoundException",),
-        )
-        for association in (associations or {}).get("associations", []):
-            _checked(
-                self._aws(
-                    "eks",
-                    "delete-pod-identity-association",
-                    "--cluster-name",
-                    name,
-                    "--association-id",
-                    association["associationId"],
-                ),
-                not_found=("ResourceNotFoundException",),
-            )
-        nodegroups = _json(
-            self._aws("eks", "list-nodegroups", "--cluster-name", name),
-            not_found=("ResourceNotFoundException",),
-        )
-        for nodegroup in cast(
-            list[str],
-            (nodegroups or {}).get("nodegroups", []),
-        ):
-            _checked(
-                self._aws(
-                    "eks",
-                    "delete-nodegroup",
-                    "--cluster-name",
-                    name,
-                    "--nodegroup-name",
-                    nodegroup,
-                ),
-                not_found=("ResourceNotFoundException",),
-            )
-
-            def nodegroup_absent() -> bool:
-                return not self._exists_command(
-                    self._aws(
-                        "eks",
-                        "describe-nodegroup",
-                        "--cluster-name",
-                        name,
-                        "--nodegroup-name",
-                        nodegroup,
-                    ),
-                    not_found=("ResourceNotFoundException",),
-                )
-
-            _wait_until(
-                nodegroup_absent,
-                description=f"EKS nodegroup {nodegroup} deletion",
-                timeout_seconds=3600,
-                interval_seconds=15,
-            )
-        profiles = _json(
-            self._aws("eks", "list-fargate-profiles", "--cluster-name", name),
-            not_found=("ResourceNotFoundException",),
-        )
-        for profile in cast(
-            list[str],
-            (profiles or {}).get("fargateProfileNames", []),
-        ):
-            _checked(
-                self._aws(
-                    "eks",
-                    "delete-fargate-profile",
-                    "--cluster-name",
-                    name,
-                    "--fargate-profile-name",
-                    profile,
-                ),
-                not_found=("ResourceNotFoundException",),
-            )
-
-            def profile_absent() -> bool:
-                return not self._exists_command(
-                    self._aws(
-                        "eks",
-                        "describe-fargate-profile",
-                        "--cluster-name",
-                        name,
-                        "--fargate-profile-name",
-                        profile,
-                    ),
-                    not_found=("ResourceNotFoundException",),
-                )
-
-            _wait_until(
-                profile_absent,
-                description=f"EKS Fargate profile {profile} deletion",
-                timeout_seconds=3600,
-                interval_seconds=15,
-            )
-        addons = _json(
-            self._aws("eks", "list-addons", "--cluster-name", name),
-            not_found=("ResourceNotFoundException",),
-        )
-        for addon in (addons or {}).get("addons", []):
-            _checked(
-                self._aws(
-                    "eks",
-                    "delete-addon",
-                    "--cluster-name",
-                    name,
-                    "--addon-name",
-                    addon,
-                ),
-                not_found=("ResourceNotFoundException",),
-            )
-        _checked(
-            self._aws("eks", "delete-cluster", "--name", name),
-            not_found=("ResourceNotFoundException",),
-        )
-        _wait_until(
-            lambda: not self._exists_command(
-                self._aws("eks", "describe-cluster", "--name", name),
-                not_found=("ResourceNotFoundException",),
-            ),
-            description=f"EKS cluster {name} deletion",
-            timeout_seconds=3600,
-            interval_seconds=15,
-        )
+    def _delete_eks(self, name: str, *, expected_created_at: object = None) -> None:
+        delete_eks_cluster(self, name, expected_created_at=expected_created_at)
 
     def delete_cpu_cluster(
         self,
         cpu_hyperpod: InstallationResource,
         cpu_eks: InstallationResource,
     ) -> None:
-        self._delete_hyperpod(cpu_hyperpod.resource_id)
-        self._delete_eks(cpu_eks.resource_id)
+        self._ownership.validate_cpu_pair(cpu_hyperpod, cpu_eks)
+        eks = cpu_eks_identity(
+            self,
+            cpu_eks.resource_id,
+            expected_created_at=cpu_eks.attributes.get("cpu_eks_created_at"),
+        )
+        self._delete_hyperpod(
+            cpu_hyperpod.resource_id,
+            expected_arn=cpu_hyperpod.attributes.get(
+                "cpu_hyperpod_arn", cpu_hyperpod.resource_arn
+            ),
+        )
+        if eks is not None:
+            self._delete_eks(cpu_eks.resource_id, expected_created_at=eks["createdAt"])
+
+    def prepare_cpu_delete(
+        self, cpu_hyperpod: InstallationResource, cpu_eks: InstallationResource
+    ) -> dict[str, Any]:
+        return prepare_cpu_deletion(self, cpu_hyperpod, cpu_eks)
 
     def delete_aurora(
         self,
@@ -1438,108 +1376,26 @@ class ClusterDeletion(ResourceDeletion):
         final_snapshot_policy: FinalSnapshotPolicy,
         final_snapshot_identifier: str,
     ) -> str | None:
-        database = self._aurora_cluster(cluster.resource_id)
-        retained = (
-            final_snapshot_identifier if final_snapshot_policy == "retain" else None
+        return delete_aurora_cluster(
+            self,
+            cluster,
+            final_snapshot_policy=final_snapshot_policy,
+            final_snapshot_identifier=final_snapshot_identifier,
         )
-        if database is None:
-            if retained and not self._snapshot_available(retained):
-                raise BootstrapError(
-                    "Aurora cluster is absent but its required final snapshot "
-                    f"is not available: {retained}"
-                )
-            return retained
-        # Deletion protection first, while the cluster is still available.
-        if database.get("DeletionProtection"):
-            _checked(
-                self._aws(
-                    "rds",
-                    "modify-db-cluster",
-                    "--db-cluster-identifier",
-                    cluster.resource_id,
-                    "--no-deletion-protection",
-                    "--apply-immediately",
-                ),
-                not_found=("DBClusterNotFoundFault",),
-            )
-            _wait_until(
-                lambda: (
-                    (current := self._aurora_cluster(cluster.resource_id)) is None
-                    or not current.get("DeletionProtection")
-                ),
-                description=(
-                    f"Aurora cluster {cluster.resource_id} "
-                    "deletion protection disablement"
-                ),
-                timeout_seconds=900,
-                interval_seconds=10,
-            )
-        document = _json(
-            self._aws(
-                "rds",
-                "describe-db-instances",
-                "--filters",
-                f"Name=db-cluster-id,Values={cluster.resource_id}",
-            )
+
+    def prepare_aurora_delete(
+        self,
+        cluster: InstallationResource,
+        *,
+        final_snapshot_policy: FinalSnapshotPolicy,
+        final_snapshot_identifier: str,
+    ) -> dict[str, str]:
+        return prepare_aurora_deletion(
+            self,
+            cluster,
+            final_snapshot_policy=final_snapshot_policy,
+            final_snapshot_identifier=final_snapshot_identifier,
         )
-        # Readers first, writer last (AWS: a writer deleted under a live reader
-        # fails over to it). Each instance only has to *enter* ``deleting``: the
-        # cluster delete is accepted then, and one wait on the cluster covers
-        # them all (waiting for each to disappear cost 18 min live, 2026-09-12).
-        for instance in ordered_aurora_instances(
-            database,
-            cast(
-                list[dict[str, Any]],
-                (document or {}).get("DBInstances", []),
-            ),
-        ):
-            instance_id = instance["DBInstanceIdentifier"]
-            if str(instance.get("DBInstanceStatus") or "") != "deleting":
-                _checked(
-                    self._aws(
-                        "rds",
-                        "delete-db-instance",
-                        "--db-instance-identifier",
-                        instance_id,
-                        "--skip-final-snapshot",
-                        "--delete-automated-backups",
-                    ),
-                    not_found=("DBInstanceNotFound",),
-                )
-            _wait_until(
-                lambda: aurora_instance_deleting_or_absent(self, instance_id),
-                description=f"Aurora instance {instance_id} entering deletion",
-                timeout_seconds=600,
-                interval_seconds=5,
-            )
-        database = self._aurora_cluster(cluster.resource_id)
-        if database is not None and database.get("Status") != "deleting":
-            arguments = self._aws(
-                "rds",
-                "delete-db-cluster",
-                "--db-cluster-identifier",
-                cluster.resource_id,
-                "--delete-automated-backups",
-            )
-            if retained:
-                arguments.extend(
-                    [
-                        "--final-db-snapshot-identifier",
-                        retained,
-                    ]
-                )
-            else:
-                arguments.append("--skip-final-snapshot")
-            _checked(arguments, not_found=("DBClusterNotFoundFault",))
-        self.wait_absent(cluster, timeout_seconds=3600)
-        if retained:
-            _wait_until(
-                lambda: self._snapshot_available(retained),
-                description=f"Aurora final snapshot {retained} availability",
-                timeout_seconds=3600,
-                interval_seconds=15,
-            )
-        return retained
 
 
 class ResourceCleaner(ClusterDeletion):

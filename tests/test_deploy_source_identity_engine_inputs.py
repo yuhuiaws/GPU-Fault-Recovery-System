@@ -22,7 +22,7 @@ def test_engine_probes_scripts_and_tools_are_deploy_host_orchestration_inputs() 
     for expected in (
         "deploy/control-plane/regional/probes/gpu_endpoint_gate.py",
         "deploy/control-plane/regional/prepare-clean-redeploy.sh",
-        "deploy/control-plane/regional/prepare-clean-redeploy-delete.sh",
+        "deploy/control-plane/tools/cleanup_kubernetes.py",
         "deploy/control-plane/regional/rollout-regional-release.sh",
         "deploy/control-plane/tools/ensure-postgres-schema.sh",
         "deploy/control-plane/tools/cleanup_state.py",

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault.admin.site import load_site
+from gpu_fault_release import regional_deployment_inventory as inventory
 from scripts.e2e.regional.boot_acceptance_common import (
     ROOT,
     BootAcceptanceError,
@@ -44,6 +45,8 @@ agents = [
         "node_id": item.node_id,
         "artifact_sha256": item.artifact_sha256,
         "compatibility_digest": item.compatibility_digest or item.artifact_sha256,
+        "config_digest": item.config_digest,
+        "node_action_key_version": item.node_action_key_version,
     }
     for item in ApplicationContext.from_environment().store.list_agents()
     if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
@@ -102,21 +105,42 @@ def failure_outcome(exc: BaseException, *, limitation: str) -> dict[str, Any]:
 
 
 def site_identity(site_file: Path) -> dict[str, Any] | None:
-    """``release_id``/``cluster_id`` of a managed site, or ``None`` if unreadable.
-
-    Every case result carries the identity so the next case can bind its
-    predecessor check to the same deployment; a site whose control plane cannot
-    be reached yields nothing rather than a guessed identity.
-    """
+    """Require a current identity before reusing a managed site's evidence."""
 
     try:
         site = load_site(site_file, repository_root=ROOT)
         clusters = [str(item["cluster_id"]) for item in site.release_config["clusters"]]
         if not clusters:
-            return None
+            raise BootAcceptanceError("managed BOOT site has no GPU cluster identity")
         return dict(SiteFixture(site_file, clusters[0]).regional.evidence_identity())
-    except Exception:  # noqa: BLE001 - identity is best effort, never a verdict
-        return None
+    except Exception as exc:
+        raise BootAcceptanceError("managed BOOT site identity is unavailable") from exc
+
+
+def deployment_generation_snapshot(value: Any) -> dict[str, int]:
+    """Require usable observations before deployment equality can prove a NOOP."""
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("items"), list)
+        or not value["items"]
+    ):
+        raise BootAcceptanceError("deployment generation inventory is missing")
+    generations: dict[str, int] = {}
+    for item in value["items"]:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        if not isinstance(metadata, dict):
+            raise BootAcceptanceError("deployment generation identity is missing")
+        name, generation = metadata.get("name"), metadata.get("generation")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in generations
+            or type(generation) is not int
+            or generation < 1
+        ):
+            raise BootAcceptanceError("deployment generation observation is invalid")
+        generations[name] = generation
+    return generations
 
 
 def deployment_generations(site_file: Path) -> dict[str, Any]:
@@ -134,6 +158,7 @@ def deployment_generations(site_file: Path) -> dict[str, Any]:
             "json",
         )
     )
+    cpu_generations = deployment_generation_snapshot(cpu)
     gpu = {}
     for cluster_id in cluster_ids:
         target = SiteFixture(site_file, cluster_id)
@@ -146,15 +171,9 @@ def deployment_generations(site_file: Path) -> dict[str, Any]:
                 "json",
             )
         )
-        gpu[cluster_id] = {
-            item["metadata"]["name"]: item["metadata"].get("generation")
-            for item in value.get("items", [])
-        }
+        gpu[cluster_id] = deployment_generation_snapshot(value)
     return {
-        "cpu": {
-            item["metadata"]["name"]: item["metadata"].get("generation")
-            for item in cpu.get("items", [])
-        },
+        "cpu": cpu_generations,
         "gpu": gpu,
     }
 
@@ -178,6 +197,44 @@ def _boot016_deploy_command(
         ]
     )
     return command
+
+
+def registry_precedes_business_deployments(
+    registry: dict[str, Any],
+    cpu: list[dict[str, Any]],
+    gpu: dict[str, list[dict[str, Any]]],
+) -> bool:
+    if not gpu:
+        return False
+    expected_cpu = set(inventory.CPU_RUNTIME_DEPLOYMENTS)
+    expected_gpu = {name for _manifest, name in inventory.GPU_ROLLOUT_DEPLOYMENTS}
+    try:
+        created = datetime.fromisoformat(
+            registry["metadata"]["creationTimestamp"].replace("Z", "+00:00")
+        )
+        if created.tzinfo is None:
+            return False
+        for items, expected in [
+            (cpu, expected_cpu),
+            *((items, expected_gpu) for items in gpu.values()),
+        ]:
+            selected = [
+                item
+                for item in items
+                if item.get("metadata", {}).get("name") in expected
+            ]
+            names = [item["metadata"]["name"] for item in selected]
+            if len(names) != len(expected) or set(names) != expected:
+                return False
+            for item in selected:
+                timestamp = datetime.fromisoformat(
+                    item["metadata"]["creationTimestamp"].replace("Z", "+00:00")
+                )
+                if timestamp.tzinfo is None or timestamp < created:
+                    return False
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    return True
 
 
 def _boot016_verified_site(
@@ -259,40 +316,27 @@ def _boot016_verified_site(
             "json",
         )
     )
-    gpu_deployment_items = []
+    gpu_deployment_items = {}
     for cluster_id in clusters:
         target_fixture = SiteFixture(site_file, cluster_id)
-        gpu_deployment_items.extend(
-            json.loads(
-                target_fixture.regional.kubectl(
-                    "gpu",
-                    "get",
-                    "deployment",
-                    "-o",
-                    "json",
-                )
-            ).get("items", [])
-        )
-    registry_created = datetime.fromisoformat(
-        str(registry["metadata"]["creationTimestamp"]).replace("Z", "+00:00")
-    )
-    workload_created = [
-        datetime.fromisoformat(
-            str(item["metadata"]["creationTimestamp"]).replace("Z", "+00:00")
-        )
-        for item in [
-            *cpu_deployments.get("items", []),
-            *gpu_deployment_items,
-        ]
-    ]
+        gpu_deployment_items[cluster_id] = json.loads(
+            target_fixture.regional.kubectl(
+                "gpu",
+                "get",
+                "deployment",
+                "-o",
+                "json",
+            )
+        ).get("items", [])
     checks = {
         "state_dir_mode_0700": state_dir.stat().st_mode & 0o777 == 0o700,
         "site_mode_0600": site_file.stat().st_mode & 0o777 == 0o600,
         "site_clusters_nonempty": bool(clusters),
         "empty_bootstrap_guard": empty_guard.returncode == 0,
         "registry_matches_site": registry_clusters == sorted(clusters),
-        "registry_created_before_workloads": bool(workload_created)
-        and all(registry_created <= item for item in workload_created),
+        "registry_created_before_workloads": registry_precedes_business_deployments(
+            registry, cpu_deployments.get("items", []), gpu_deployment_items
+        ),
         "release_state_completed": str(state.get("phase", "")).lower()
         in {"complete", "completed"},
         "status_passed": status.returncode == 0,
@@ -304,6 +348,7 @@ def _boot016_verified_site(
         "checks": checks,
         "state_dir": str(state_dir),
         "cluster_count": len(clusters),
+        "registry_timing_scope": "business CPU/GPU Deployments only; parallel foundations allowed",
         **(site_identity(site_file) or {}),
         "limitations": [
             "The runner uses only caller-approved existing EKS/HyperPod ARNs; "
@@ -324,8 +369,9 @@ def cleanup_isolated_site(
 
     Returns the record the case stores beside its checks: whether a site was
     there to remove, whether it was retained, and the uninstall exit code. A
-    missing ``site.yaml`` means the deploy never committed a site, so there is
-    nothing gpu-fault-admin could remove.
+    Missing ``site.yaml`` does not prove resource absence: foundations and the
+    parallel release build may already have created resources. Preserve their
+    checkpoint for explicit reconciliation; never synthesize a cleanup site.
     """
 
     site_present = (state_dir / "site.yaml").is_file()
@@ -334,13 +380,39 @@ def cleanup_isolated_site(
         "retained": retain,
         "uninstall_ran": False,
         "uninstall_returncode": None,
+        "disposition": "RETAINED" if retain else "PENDING",
+        "cleanup_verified": False,
     }
-    if not site_present or retain:
+    if retain:
+        return record
+    if not site_present:
+        checkpoints = [
+            path.name
+            for path in (
+                state_dir / "bootstrap-state.json",
+                state_dir / "installation-resources.json",
+                state_dir / "source-deploy.json",
+            )
+            if path.exists()
+        ]
+        record.update(
+            disposition="RECONCILIATION_REQUIRED",
+            resource_state="UNKNOWN",
+            checkpoints=checkpoints,
+            reason=(
+                "No committed site authorizes uninstall. Preserve the original "
+                "state directory and reconcile possible foundation/build resources."
+            ),
+        )
         return record
     completed = (uninstall or uninstall_site)(state_dir)
     write_log(case_dir / log_name, completed)
     record["uninstall_ran"] = True
     record["uninstall_returncode"] = completed.returncode
+    record["cleanup_verified"] = completed.returncode == 0
+    record["disposition"] = (
+        "UNINSTALLED" if completed.returncode == 0 else "RECONCILIATION_REQUIRED"
+    )
     return record
 
 
@@ -421,13 +493,16 @@ def boot016_reuse(
     if document.get("case_id") != "GF-REGIONAL-BOOT-016":
         result["reason"] = "evidence does not belong to BOOT-016"
         return result
+    if document.get("verdict") != "PASS":
+        result["reason"] = "BOOT-016 evidence no longer has verdict PASS"
+        return result
     recorded = document.get("state_dir")
     if not recorded or Path(str(recorded)).resolve() != expected_state_dir.resolve():
         result["reason"] = "BOOT-016 state_dir differs from --bootstrap-state-dir"
         return result
     checks = document.get("checks") or {}
     result["reused"] = True
-    result["status_passed"] = bool(checks.get("status_passed"))
+    result["status_passed"] = checks.get("status_passed") is True
     return result
 
 
@@ -682,6 +757,14 @@ def runtime_identity_matches_release(
         elif actual != expected:
             reasons.append(f"release metadata {key} differs from the manifest")
 
+    config_digest = str(metadata.get("required-agent-config-digest") or "")
+    key_version = str(metadata.get("required-node-action-key-version") or "")
+    if len(config_digest) != 64:
+        reasons.append("release metadata lacks a valid required-agent-config-digest")
+    if not key_version.isdigit() or int(key_version) < 1:
+        reasons.append(
+            "release metadata lacks a valid required-node-action-key-version"
+        )
     if not agents:
         reasons.append("no ACTIVE Agent identity to compare")
     for agent in agents:
@@ -690,6 +773,10 @@ def runtime_identity_matches_release(
             reasons.append(f"agent {label} artifact pin differs from the manifest")
         if str(agent.get("compatibility_digest") or "") != node_digest:
             reasons.append(f"agent {label} compatibility digest differs")
+        if str(agent.get("config_digest") or "") != config_digest:
+            reasons.append(f"agent {label} config digest differs")
+        if str(agent.get("node_action_key_version") or "") != key_version:
+            reasons.append(f"agent {label} key version differs")
 
     return {
         "passed": not reasons,
@@ -804,10 +891,7 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
     )
     write_log(case_dir / "live-status-full.log", status)
     live = _live_release_identity(state_dir)
-    # The expected identity is what THIS source produced a moment ago -- the
-    # reproducible build's manifest -- not whatever dist/current-release.json
-    # the checkout happens to hold (a candidate build written there by another
-    # procedure made the comparison meaningless, live 2026-09-13).
+    # Compare the source-bound rebuild to live pins, not a mutable checkout manifest.
     identity = runtime_identity_matches_release(
         parse_status_report(status.stdout),
         manifest=right,
@@ -816,7 +900,8 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
     )
     checks = {
         "wheel_and_bundle_hashes_identical": identical,
-        "tamper_negative_failed": tamper.returncode != 0,
+        "rebuilt_artifacts_match_live_release": identity["passed"],
+        "tamper_negative_failed": tamper.returncode == 1,
         "live_status_passed": status.returncode == 0,
         "live_runtime_identity_matches_release": identity["passed"],
     }
@@ -865,7 +950,7 @@ def run_boot018(
         outcome["cleanup"] = cleanup
         checks = outcome.setdefault("checks", {})
         checks["bootstrap_site_cleanup"] = (
-            not cleanup["uninstall_ran"] or cleanup["uninstall_returncode"] == 0
+            cleanup["retained"] or cleanup["cleanup_verified"]
         )
         if outcome.get("verdict") == "PASS" and not checks["bootstrap_site_cleanup"]:
             outcome["verdict"] = "FAIL"

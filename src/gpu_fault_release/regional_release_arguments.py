@@ -10,6 +10,38 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from gpu_fault_release.regional_release_config import ReleaseError
+
+
+def validate_cluster_arguments(arguments: argparse.Namespace) -> None:
+    """Normalize selectors without silently dropping a repeated cluster ID."""
+
+    cluster_ids = getattr(arguments, "cluster_ids", None)
+    if cluster_ids is None:
+        previous = getattr(arguments, "cluster_id", None)
+        cluster_ids = [] if previous is None else [previous]
+    if not isinstance(cluster_ids, list) or any(
+        not isinstance(value, str) or not value.strip() for value in cluster_ids
+    ):
+        raise ReleaseError("--cluster-id values must be non-empty strings")
+    if arguments.mode != "drain-cluster" and len(cluster_ids) > 1:
+        raise ReleaseError(f"{arguments.mode} takes exactly one --cluster-id")
+    if (
+        arguments.mode
+        in {
+            "join-cluster",
+            "activate-cluster",
+            "fail-cluster",
+            "rollback-cluster",
+            "drain-cluster",
+            "remove-cluster",
+        }
+        and not cluster_ids
+    ):
+        raise ReleaseError("--cluster-id is required")
+    arguments.cluster_ids = cluster_ids
+    arguments.cluster_id = cluster_ids[0] if len(cluster_ids) == 1 else None
+
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
@@ -42,7 +74,9 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     value.add_argument("--config", required=True, type=Path)
-    value.add_argument("--cluster-id")
+    value.add_argument(
+        "--cluster-id", action="append", dest="cluster_ids", metavar="CLUSTER_ID"
+    )
     value.add_argument(
         "--plan-mode",
         choices=(
@@ -62,6 +96,7 @@ def parser() -> argparse.ArgumentParser:
     # It lets the in-flight install check proceed (logging) when no
     # control-plane Pod can answer the store read.
     value.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
+    value.add_argument("--for-deploy", action="store_true", help=argparse.SUPPRESS)
     # `status`: every health check instead of the cheap two. `preflight`: the
     # passing checks' details instead of their names. GPU_FAULT_FULL_REPORT=1
     # does the same for a wrapper that cannot add the flag.

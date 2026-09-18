@@ -62,6 +62,12 @@ def test_net003_ledger_is_exactly_once(tmp_path: Path, monkeypatch) -> None:
     adapter = net003_executor.LedgerAdapter("notification-a")
     context = _context("workflow/0/FREEZE_EVIDENCE")
     monkeypatch.setattr(net003_executor.time, "sleep", lambda _seconds: None)
+    block = tmp_path / "block"
+    block.touch()
+    monkeypatch.setattr(net003_executor, "BLOCK", block)
+    monkeypatch.setattr(
+        net003_executor, "ACTION_GATE_OBSERVED", tmp_path / "action-gate-observed.json"
+    )
 
     first = adapter.execute(context)
     second = adapter.execute(context)

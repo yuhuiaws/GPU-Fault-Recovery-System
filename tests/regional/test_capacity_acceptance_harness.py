@@ -8,6 +8,7 @@ AWS call with a script and records the order in which evidence is written.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -109,6 +110,10 @@ def _bare_cases(tmp_path: Path) -> cases.CapacityAcceptanceCases:
     harness = cases.CapacityAcceptanceCases.__new__(cases.CapacityAcceptanceCases)
     harness.run_dir = tmp_path
     harness.tokens = ["t"] * 20
+    harness.run_id = "cap-unit"
+    harness.scrape_source_binding = {"source_sha256": "a" * 64}
+    harness.maintenance_deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    harness.cap002_scrape_stopped = True
     return harness
 
 
@@ -131,11 +136,24 @@ def test_cap002_alert_phase_holds_four_slots(tmp_path: Path, monkeypatch) -> Non
         lambda _url: [
             ("gpu_fault_store_io_in_flight", {}, 4.0),
             ("gpu_fault_store_io_max_in_flight", {}, 4.0),
-            ("gpu_fault_store_io_rejections_total", {}, 3.0),
+            ("gpu_fault_store_io_rejections_total", {"reason": "capacity"}, 3.0),
         ],
     )
     monkeypatch.setattr(
-        harness, "amp_request", lambda *_a, **_k: {"data": {"result": [1]}}
+        harness,
+        "amp_request",
+        lambda *_a, **_k: {
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {"pod": probe.pod, "capacity_run": harness.run_id},
+                        "value": [cases.time.time(), "1"],
+                    }
+                ],
+            },
+        },
     )
     monkeypatch.setattr(harness, "alert_states", lambda _name: ["firing"])
     monkeypatch.setattr(cases.time, "sleep", lambda _seconds: None)
@@ -147,7 +165,12 @@ def test_cap002_alert_phase_holds_four_slots(tmp_path: Path, monkeypatch) -> Non
         "store_io_rejections": 3.0,
     }
 
-    result, passed = harness.cap002_alert(probe, tmp_path, behavior)
+    result, passed = harness.cap002_alert(
+        probe,
+        tmp_path,
+        behavior,
+        selector=f'pod="{probe.pod}",capacity_run="{harness.run_id}"',
+    )
 
     assert passed is True
     assert holds == [
@@ -166,7 +189,38 @@ def test_cap002_waits_for_the_alert_to_resolve_before_deleting_the_probe(
     monkeypatch.setattr(harness, "deploy_probe", lambda _case, _env: probe)
     monkeypatch.setattr(harness, "_cap002_behavior", lambda _p, _d: {"passed": True})
     monkeypatch.setattr(
-        harness, "cap002_alert", lambda _p, _d, _b: ({"status": "PASS"}, True)
+        harness, "cap002_alert", lambda _p, _d, _b, **_kw: ({"status": "PASS"}, True)
+    )
+    monkeypatch.setattr(
+        cases,
+        "ScrapeCompanion",
+        lambda *_a, **_kw: SimpleNamespace(
+            selector=f'pod="{probe.pod}",capacity_run="{harness.run_id}"',
+            start=lambda: {"started": True},
+            stop=lambda: events.append(("scrape-stop",))
+            or {"cleanup_complete": True, "process_termination_proven": True},
+        ),
+    )
+    monkeypatch.setattr(
+        harness,
+        "amp_request",
+        lambda _method, _path, params: {
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {"pod": probe.pod, "capacity_run": harness.run_id},
+                        "value": [
+                            cases.time.time(),
+                            str(cases.time.time())
+                            if params["query"].startswith("timestamp(up{")
+                            else "1",
+                        ],
+                    }
+                ],
+            },
+        },
     )
 
     def probe_control(
@@ -175,7 +229,7 @@ def test_cap002_waits_for_the_alert_to_resolve_before_deleting_the_probe(
         events.append(("release", payload["tag"]))
         return {}
 
-    def wait_resolved(_case_dir: Any, *, attempts: int = 0) -> bool:
+    def wait_resolved(_probe: Any, _case_dir: Any, **kwargs: Any) -> bool:
         events.append(("wait_resolved",))
         return True
 
@@ -190,6 +244,11 @@ def test_cap002_waits_for_the_alert_to_resolve_before_deleting_the_probe(
     result = harness.case_002_v2()
 
     assert events.index(("wait_resolved",)) < events.index(("cleanup_probe",)), events
+    assert (
+        events.index(("wait_resolved",))
+        < events.index(("scrape-stop",))
+        < events.index(("cleanup_probe",))
+    ), events
     assert ("release", "alert") in events[: events.index(("wait_resolved",))]
     assert result["alert_resolved_after_release"] is True
 
@@ -264,6 +323,10 @@ class _ScriptedHarness(base.CapHarnessBase):
         self.run_dir = run_dir
         self.case_id = "GF-REGIONAL-CAP-001"
         self.predecessor = {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
+        self.evidence_identity = {
+            "release_id": "unit-release",
+            "cluster_id": "unit-cpu-eks",
+        }
         self.region = "region"
         self.cpu_kubeconfig = "kubeconfig"
         self.namespace = "namespace"
@@ -335,6 +398,8 @@ def test_harness_writes_pending_first_and_the_verdict_last(
     )
     assert names[-2:] == ["GF-REGIONAL-CAP-001.json", "phase-partial-summary.json"]
     assert _case_document(tmp_path)["production_unchanged"] is True
+    assert _case_document(tmp_path)["release_id"] == "unit-release"
+    assert _case_document(tmp_path)["cluster_id"] == "unit-cpu-eks"
 
 
 def test_a_changed_production_baseline_never_leaves_a_pass_on_disk(
@@ -389,7 +454,10 @@ def test_a_baseline_read_failure_does_not_mask_the_case_error(tmp_path: Path) ->
 def test_verdict_is_pass_only_when_everything_held() -> None:
     assert (
         base.CapHarnessBase.verdict(
-            result={}, error=None, cleanup_errors=[], production_unchanged=True
+            result={"status": "PASS"},
+            error=None,
+            cleanup_errors=[],
+            production_unchanged=True,
         )
         == "PASS"
     )
@@ -418,8 +486,12 @@ def test_b_latency_factor_below_one_is_refused(tmp_path: Path) -> None:
         )
 
 
+class _RolloutReached(RuntimeError):
+    pass
+
+
 class _ManifestHarness(base.CapProbeHarness):
-    """A probe harness that records the manifests it would apply."""
+    """Record public deployment until rollout, then exercise failure cleanup."""
 
     def __init__(  # noqa: D107 - bypasses CapCoreHarness.__init__ on purpose
         self, live_worker: dict[str, Any]
@@ -427,12 +499,34 @@ class _ManifestHarness(base.CapProbeHarness):
         self.live_worker = live_worker
         self.namespace = "namespace"
         self.run_id = "cap000000"
+        self.resource_prefix = f"gpu-fault-{self.run_id}"
         self.runtime_image = "image@sha256:0"
         self.configmap_name = "gpu-fault-cap000000-scripts"
         self.applied: list[dict[str, Any]] = []
+        self.active_probe = None
+        self.cleaned: base.Probe | None = None
 
     def apply(self, value: Any) -> None:
         self.applied.append(dict(value))
+
+    def kubectl_json(self, *args: str) -> Any:
+        assert args == ("get", "services", "-o", "json")
+        return {"items": []}
+
+    def base_environment(self, case: str) -> list[dict[str, Any]]:
+        suffix = case.lower().replace("-", "")
+        return [
+            {"name": "CAP_DATABASE_NAME", "value": f"gpu_fault_{self.run_id}_{suffix}"}
+        ]
+
+    def kubectl(self, *args: str, **kwargs: Any) -> Any:
+        assert args[:2] == ("rollout", "status")
+        raise _RolloutReached("unit rollout boundary reached")
+
+    def cleanup_probe(self, probe: base.Probe) -> dict[str, Any]:
+        self.cleaned = probe
+        self.active_probe = None
+        return {}
 
 
 def _live_worker(*volume_names: str) -> dict[str, Any]:
@@ -465,12 +559,11 @@ def _live_worker(*volume_names: str) -> dict[str, Any]:
 
 
 def _probe_pod_spec(harness: _ManifestHarness) -> dict[str, Any]:
-    harness._apply_probe_resources(
-        suffix="cap001",
-        deployment="gpu-fault-cap000000-cap001",
-        service="gpu-fault-cap000000-cap001",
-        environment=[],
-    )
+    with pytest.raises(_RolloutReached):
+        harness.deploy_probe("CAP-001", {})
+    assert harness.cleaned is not None
+    assert harness.cleaned.database == "gpu_fault_cap000000_cap001"
+    assert harness.active_probe is None
     (deployment,) = [m for m in harness.applied if m["kind"] == "Deployment"]
     return dict(deployment["spec"]["template"]["spec"])
 
@@ -489,16 +582,14 @@ def test_probe_inherits_the_workers_rds_ca_bundle_verbatim() -> None:
         "readOnly": True,
     } in pod["containers"][0]["volumeMounts"]
     # Only the TLS material is carried; the worker's artifact stays behind.
-    assert [v["name"] for v in pod["volumes"]] == ["scripts", "work", "rds-ca-bundle"]
+    assert [v["name"] for v in pod["volumes"]] == ["rds-ca-bundle", "scripts", "work"]
 
 
-def test_probe_carries_nothing_when_the_release_mounts_no_ca_bundle() -> None:
-    pod = _probe_pod_spec(_ManifestHarness(_live_worker("artifact")))
-    assert [v["name"] for v in pod["volumes"]] == ["scripts", "work"]
-    assert [m["name"] for m in pod["containers"][0]["volumeMounts"]] == [
-        "scripts",
-        "work",
-    ]
+def test_probe_rejects_a_missing_ca_before_creating_any_resource() -> None:
+    harness = _ManifestHarness(_live_worker("artifact"))
+    with pytest.raises(base.CapError, match="requires the production public RDS CA"):
+        _probe_pod_spec(harness)
+    assert not harness.applied, "a missing trusted RDS CA must block resource creation"
 
 
 class _BaselineHarness(base.CapHarnessBase):
@@ -510,31 +601,49 @@ class _BaselineHarness(base.CapHarnessBase):
         self._pods = pods
 
     def kubectl_json(self, *args: str) -> Any:
-        return {"items": self._pods if args[1] == "pods" else []}
+        if args[1] == "pods":
+            return {"items": self._pods}
+        return {
+            "items": [
+                {
+                    "metadata": {"name": app, "generation": 1},
+                    "spec": {"replicas": 1},
+                    "status": {"readyReplicas": 1},
+                }
+                for app in sorted(base.PRODUCTION_APPS)
+            ]
+        }
 
 
 def _pod(name: str, labels: dict[str, str]) -> dict[str, Any]:
     return {
         "metadata": {"name": name, "uid": f"uid-{name}", "labels": labels},
-        "status": {"phase": "Running", "containerStatuses": [{"restartCount": 0}]},
+        "spec": {"containers": [{"name": "api"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "api", "ready": True, "restartCount": 0}],
+        },
     }
 
 
-def test_baseline_ignores_capacity_probes_wearing_the_worker_label() -> None:
-    # A probe left behind by another run wears app=gpu-fault-control-worker;
-    # its later removal must not turn a passing case into "baseline changed".
+@pytest.mark.parametrize(
+    "app", ["gpu-fault-control-worker", "gpu-fault-capacity-probe"]
+)
+def test_baseline_ignores_capacity_probes_wearing_the_worker_label(app: str) -> None:
+    # Both legacy and isolated probe labels remain outside the production baseline.
+    production = [
+        _pod(f"{app}-1", {"app": app}) for app in sorted(base.PRODUCTION_APPS)
+    ]
     harness = _BaselineHarness(
         [
-            _pod("gpu-fault-control-worker-1", {"app": "gpu-fault-control-worker"}),
+            *production,
             _pod(
                 "gpu-fault-cap000000-cap001-1",
-                {
-                    "app": "gpu-fault-control-worker",
-                    "gpu-fault.io/capacity-probe": "cap000000-cap001",
-                },
+                {"app": app, "gpu-fault.io/capacity-probe": "cap000000-cap001"},
             ),
         ]
     )
     assert [p["name"] for p in harness.production_baseline()["pods"]] == [
-        "gpu-fault-control-worker-1"
+        p["metadata"]["name"] for p in production
     ]

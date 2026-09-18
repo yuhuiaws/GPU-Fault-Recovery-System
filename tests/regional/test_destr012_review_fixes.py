@@ -90,6 +90,7 @@ class FakeWorkload:
         self.log = log
         self.name = name
         self.resource = "job"
+        self.restart_authorizations: list[dict[str, Any]] = []
 
     def delete(self) -> None:
         self.log.entries.append(f"workload:{self.name}:delete")
@@ -113,9 +114,14 @@ class FakeWorkload:
             "workload": {"annotations": {}, "suspend": False},
         }
 
+    def authorize_restart(self, state: dict[str, Any]) -> None:
+        self.log.entries.append(f"workload:{self.name}:authorize_restart")
+        self.restart_authorizations.append(state)
+
     def wait_restarted(
         self, source_uids: set[str], timeout_seconds: int = 900
     ) -> dict[str, Any]:
+        assert self.restart_authorizations
         return {"pods": [{"uid": "uid-new"}]}
 
 
@@ -422,6 +428,14 @@ def _group_fakes(
 
     monkeypatch.setattr(destr012, "delete_after_quiescence", delete_after_quiescence)
     monkeypatch.setattr(destr012, "ManagedWorkloadFixture", lambda _r, _s: workload)
+
+    def wait_out_duplicate_window(_first_at: Any, **_kwargs: Any) -> float:
+        log.entries.append("wait_out_duplicate_window")
+        return 0.0
+
+    monkeypatch.setattr(
+        destr012, "wait_out_duplicate_window", wait_out_duplicate_window
+    )
     monkeypatch.setattr(
         destr009,
         "wait_observation",
@@ -553,6 +567,17 @@ def test_group_d_deletes_its_workload_only_through_the_quiescence_gate(
     assert log.entries.index("workload:training-d:annotate=None") < log.entries.index(
         "delete_after_quiescence"
     )
+    retry = [
+        entry
+        for entry in log.entries
+        if entry.startswith("regional:post_xid:destr012-d-retry-")
+    ]
+    assert len(retry) == 1
+    assert (
+        log.entries.index("workload:training-d:annotate=None")
+        < log.entries.index("wait_out_duplicate_window")
+        < log.entries.index(retry[0])
+    ), log.entries
 
 
 # --- executor logs share the DESTR-009 inconclusive rule ----------------------------
@@ -571,9 +596,10 @@ def test_executor_log_snapshot_is_inconclusive_without_lines(tmp_path: Path) -> 
         "gpu-fault-cluster-executor/gpu-fault-cluster-executor-pod-a"
     ]
     assert logs["suspicious"] == []
-    # Only the GPU-plane executor Pods are read, nothing on the CPU plane.
+    # Empty windows need a Pod identity/history proof on the same GPU plane.
     assert log.entries == [
-        "regional:kubectl:logs gpu-fault-cluster-executor-pod-a --since-time"
+        "regional:kubectl:logs gpu-fault-cluster-executor-pod-a --since-time",
+        "regional:kubectl:get pod gpu-fault-cluster-executor-pod-a",
     ]
 
 
@@ -616,3 +642,127 @@ def test_group_d_fails_on_inconclusive_executor_logs(
         (tmp_path / "case" / "group-d-executor-logs.json").read_text(encoding="utf-8")
     )
     assert written["verdict"] == "INCONCLUSIVE"
+
+
+def test_group_d_never_reinjects_after_the_negative_guard_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _Log()
+    workload = FakeWorkload(log, "training-d")
+    quiescence = _group_fakes(monkeypatch, log=log, workload=workload)
+    wrong = _blocked_state()
+    wrong["workflow"]["status"] = "SUCCEEDED"
+    regional = FakeRegional(
+        log,
+        workflow_states=[wrong, {"workflow": {"status": "SUCCEEDED"}}],
+        executor_logs="executor idle\n",
+    )
+
+    result = destr012.run_group_d(
+        _settings(tmp_path), cast(Any, regional), tmp_path / "case", _window_end()
+    )
+
+    assert result["verdict"] == "FAIL", result
+    assert (
+        len([item for item in log.entries if item.startswith("regional:post_xid:")])
+        == 1
+    )
+    assert len(quiescence) == 1
+    assert quiescence[0]["workflow_request_ids"] == ["wf-blocked"]
+
+
+def test_group_d_rechecks_the_window_before_the_remediated_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _Log()
+    workload = FakeWorkload(log, "training-d")
+    quiescence = _group_fakes(monkeypatch, log=log, workload=workload)
+    end = _window_end()
+    now = [end - timedelta(seconds=60)]
+
+    class Clock:
+        @staticmethod
+        def now(_timezone: Any) -> datetime:
+            return now[0]
+
+    regional = FakeRegional(
+        log,
+        workflow_states=[_blocked_state(), {"workflow": {"status": "SUCCEEDED"}}],
+        executor_logs="executor idle\n",
+    )
+    original_wait = regional.wait_for_workflow
+
+    def wait(**kwargs: Any) -> dict[str, Any]:
+        value = original_wait(**kwargs)
+        now[0] = end + timedelta(seconds=1)
+        return value
+
+    monkeypatch.setattr(destr012, "datetime", Clock)
+    monkeypatch.setattr(regional, "wait_for_workflow", wait)
+
+    result = destr012.run_group_d(
+        _settings(tmp_path), cast(Any, regional), tmp_path / "case", end
+    )
+
+    assert result["verdict"] == "FAIL", result
+    assert "window" in result["error"], result
+    assert (
+        len([item for item in log.entries if item.startswith("regional:post_xid:")])
+        == 1
+    )
+    assert len(quiescence) == 1
+    assert "workload:training-d:annotate=None" in log.entries
+
+
+def test_the_retry_waits_out_the_coordinator_duplicate_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(destr012.time, "sleep", slept.append)
+    first_at = datetime(2026, 9, 14, 12, 43, 1, tzinfo=timezone.utc)
+    waited = destr012.wait_out_duplicate_window(
+        first_at, now=first_at + timedelta(seconds=10)
+    )
+    assert destr012.SAME_SOURCE_DUPLICATE_WINDOW_SECONDS == 30
+    assert waited == 35.0 and slept == [35.0], (waited, slept)
+    late = destr012.wait_out_duplicate_window(
+        first_at, now=first_at + timedelta(seconds=60)
+    )
+    assert late == 0.0 and slept == [35.0], (late, slept)
+
+
+def test_group_d_rechecks_maintenance_after_the_duplicate_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _Log()
+    workload = FakeWorkload(log, "training-d")
+    quiescence = _group_fakes(monkeypatch, log=log, workload=workload)
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+    now = [end - timedelta(seconds=50)]
+
+    class Clock:
+        @staticmethod
+        def now(_timezone: Any) -> datetime:
+            return now[0]
+
+    def wait(_first: datetime, **kwargs: Any) -> float:
+        assert kwargs["maintenance_window_end"] == end
+        now[0] = end + timedelta(seconds=1)
+        return 45.0
+
+    regional = FakeRegional(
+        log, workflow_states=[_blocked_state()], executor_logs="idle\n"
+    )
+    monkeypatch.setattr(destr012, "datetime", Clock)
+    monkeypatch.setattr(destr012, "wait_out_duplicate_window", wait)
+    result = destr012.run_group_d(
+        _settings(tmp_path), cast(Any, regional), tmp_path / "case", end
+    )
+    assert result["verdict"] == "FAIL", result
+    assert "window ended" in result["error"]
+    assert (
+        len([entry for entry in log.entries if entry.startswith("regional:post_xid:")])
+        == 1
+    )
+    assert quiescence[0]["workflow_request_ids"] == ["wf-blocked"]
+    assert "workload:training-d:annotate=None" in log.entries

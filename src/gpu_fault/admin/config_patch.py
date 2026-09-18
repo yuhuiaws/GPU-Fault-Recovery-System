@@ -57,18 +57,29 @@ def preset_admin_config(name: str) -> AdminConfig:
             )
     managed_nodes: int = clusters * PRESET_NODES_PER_CLUSTER
     min_acu: float = aurora_min_acu_floor(managed_nodes)
-    config = AdminConfig(
-        capacity=CapacityConfig(
-            control_worker_replicas=DEFAULT_CONTROL_WORKER_REPLICAS,
-            telemetry_spool=spool,
-            remediation=RemediationCapacity(
-                max_active_region=clusters * 4,
-                max_active_per_cluster=4,
-                max_active_per_resource_class=4,
-            ),
-            largest_cluster_node_count=PRESET_NODES_PER_CLUSTER,
-            managed_node_count=managed_nodes,
+    capacity = CapacityConfig(
+        control_worker_replicas=DEFAULT_CONTROL_WORKER_REPLICAS,
+        telemetry_spool=spool,
+        remediation=RemediationCapacity(
+            max_active_region=clusters * 4,
+            max_active_per_cluster=4,
+            max_active_per_resource_class=4,
         ),
+        largest_cluster_node_count=PRESET_NODES_PER_CLUSTER,
+        managed_node_count=managed_nodes,
+    )
+    # A named preset chooses its default; an explicit worker override is still
+    # validated later and is never silently reduced.
+    while (
+        capacity.control_worker_replicas > 1
+        and capacity.postgres_connection_ceiling()
+        > capacity.postgres_fleet_connection_budget()
+    ):
+        capacity = replace(
+            capacity, control_worker_replicas=capacity.control_worker_replicas - 1
+        )
+    config = AdminConfig(
+        capacity=capacity,
         aurora=AuroraCapacityConfig(
             min_acu=min_acu,
             max_acu=max(PRESET_MAX_ACU, min_acu),

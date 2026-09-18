@@ -28,6 +28,8 @@ python tools/generate_nvidia_xid_policy.py \
 
 摘要不匹配时生成过程直接失败，禁止静默接受上游变化。
 `--expected-sha256` 即使省略也默认使用上述固定 XLSX 摘要。
+整数单元格拒绝布尔值，不能把 `TRUE`/`FALSE` 当成 XID 编号；整数、整值浮点和整数文本
+保留原规范化行为。只读工作簿在成功及解析失败后都会关闭，避免重复生成时累积文件句柄。
 
 无需 XLSX 的常驻门禁：
 
@@ -101,7 +103,13 @@ GB300 属于 GB200 列。
 - XID 154：驱动报告动作优先并原样映射。
 - XID 159 `CHECK_UVM`：显式确认使用 UVM/vGPU 时 reset，否则 ignore；缺少证据阻塞。
 - XID 144-150：按驱动 R575 边界选择 V1/V2 `IntrInfo` pattern，同时匹配
-  Error Status 和 Action 2；无官方表项匹配时阻塞，不猜测动作。
+  Error Status 和 Action 2。主动作与 Action 2 可以使用不同的位模式，分别匹配；
+  RXPIPE 次级模式命中仍须满足同一表项的 Error Status，不能先要求主模式也命中。
+  无官方表项匹配时阻塞，不猜测动作。
+
+关联原文达到保留期限后重投同一事件，必须复用尚存的最终决策及 incident 绑定。
+原文被清理不代表事件从未处理，不能用未关联的策略缓存结果覆盖最终决策；
+仍处于 `PENDING_CORRELATION` 的记录继续按原窗口修复流程处理。
 
 ## SXID
 

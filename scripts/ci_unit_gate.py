@@ -8,14 +8,24 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-if __package__:
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "scripts"
+
+from scripts.ci_gate_artifacts import CoverageGateError
+from scripts.ci_coverage_config import SHARDS, load_config
+from scripts.ci_pytest_evidence import aggregate_pytest_results
+from tools.coverage_objectives import SCOPES, require_ci_coverage
+from tools.pytest_result_identity import parse_pytest_receipt, source_identity
+
+if TYPE_CHECKING or __package__:
     from scripts.ci_coverage_gate import (
         BUNDLE_NAME as SHARD_BUNDLE_NAME,
         GATE_NAME as SHARD_GATE_NAME,
-        SHARDS,
-        load_config,
+        current_shard_identity,
+        parse_combined_pytest_receipt,
         verify_current_shards,
         verify_shard_gate,
     )
@@ -32,8 +42,8 @@ else:
     from ci_coverage_gate import (
         BUNDLE_NAME as SHARD_BUNDLE_NAME,
         GATE_NAME as SHARD_GATE_NAME,
-        SHARDS,
-        load_config,
+        current_shard_identity,
+        parse_combined_pytest_receipt,
         verify_current_shards,
         verify_shard_gate,
     )
@@ -49,7 +59,7 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 GATE_NAME = "unit-gate.json"
 BUNDLE_NAME = "unit-gate.bundle.json"
 PYTEST_RESULTS_NAME = "pytest-case-results.json"
@@ -59,6 +69,8 @@ DURATIONS_NAME = "test-durations.json"
 ARTIFACT_PREFIX = "gpu-fault-unit-gate-"
 QUALITY_GATES = {
     "coverage": "PASSED",
+    "production_coverage_95": "PASSED",
+    "runner_coverage_95": "PASSED",
     "fault_catalog": "PASSED",
     "postgres_contract": "PASSED",
     "postgres_stress": "PASSED",
@@ -89,6 +101,9 @@ def unit_identity(
     coverage_payload = {
         "branch": bool(config["coverage"]["branch"]),
         "floor": int(config["coverage"]["floor"]),
+        "objective_floor": config["coverage"]["objective_floor"],
+        "objective_scopes": {name: list(roots) for name, roots in SCOPES.items()},
+        "module_floors": config["coverage"]["module_floors"],
         "shards": shards,
         "sources": [str(item) for item in config["coverage"]["sources"]],
     }
@@ -114,24 +129,34 @@ def _load_json(path: Path, message: str) -> dict[str, Any]:
 
 def _verify_coverage_summary(path: Path, *, root: Path = ROOT) -> dict[str, Any]:
     value = _load_json(path, "unit coverage summary is invalid")
-    totals = value.get("totals")
-    meta = value.get("meta")
-    floor = float(load_config(root)["coverage"]["floor"])
-    if (
-        not isinstance(meta, dict)
-        or meta.get("branch_coverage") is not True
-        or not isinstance(totals, dict)
-        or float(totals.get("percent_covered") or 0.0) < floor
-        or not isinstance(value.get("files"), dict)
-    ):
-        raise UnitGateError("unit coverage floor did not pass")
+    try:
+        require_ci_coverage(path, root=root, config=load_config(root))
+    except CoverageGateError as exc:
+        raise UnitGateError(str(exc)) from exc
     return value
 
 
-def _verify_pytest_results(path: Path) -> dict[str, Any]:
+def _verify_pytest_results(
+    path: Path,
+    *,
+    root: Path,
+    gates: Mapping[str, tuple[Path, dict[str, Any]]],
+) -> dict[str, Any]:
     value = _load_json(path, "unit pytest evidence is invalid")
-    if value.get("schema_version") != 1 or not isinstance(value.get("records"), dict):
-        raise UnitGateError("unit pytest evidence is invalid")
+    try:
+        parse_pytest_receipt(
+            value,
+            root=root,
+            expected_identity=source_identity(root),
+            require_passed=True,
+            aggregate_parser=parse_combined_pytest_receipt,
+        )
+        if value != aggregate_pytest_results(
+            root, gates, resolve_identity=current_shard_identity
+        ):
+            raise ValueError("unit pytest aggregate differs from its original shards")
+    except ValueError as exc:
+        raise UnitGateError(str(exc)) from exc
     return value
 
 
@@ -218,7 +243,7 @@ def build_unit_gate(
         require_trusted=True,
     )
     _verify_coverage_summary(coverage_summary, root=root)
-    _verify_pytest_results(pytest_results)
+    _verify_pytest_results(pytest_results, root=root, gates=gates)
     _verify_fault_report(fault_report)
     _verify_durations(durations)
     resolved_artifact_root.mkdir(parents=True, exist_ok=True)
@@ -357,13 +382,11 @@ def verify_unit_gate(
     )
     _verify_durations(artifact_root / str(verified_evidence["durations"]["path"]))
     _verify_fault_report(artifact_root / str(verified_evidence["fault_report"]["path"]))
-    _verify_pytest_results(
-        artifact_root / str(verified_evidence["pytest_results"]["path"])
-    )
     shards = gate.get("shards")
     if not isinstance(shards, dict) or set(shards) != set(SHARDS):
         raise UnitGateError("unit gate shard inventory is invalid")
     verified_shards: dict[str, dict[str, Any]] = {}
+    shard_paths: dict[str, tuple[Path, dict[str, Any]]] = {}
     for shard, raw in shards.items():
         if not isinstance(raw, dict):
             raise UnitGateError(f"unit gate shard entry is invalid: {shard}")
@@ -398,6 +421,12 @@ def verify_unit_gate(
         ):
             raise UnitGateError(f"unit gate shard producer does not match: {shard}")
         verified_shards[shard] = shard_gate
+        shard_paths[shard] = (shard_gate_path, shard_gate)
+    _verify_pytest_results(
+        artifact_root / str(verified_evidence["pytest_results"]["path"]),
+        root=source_root,
+        gates=shard_paths,
+    )
     if unit_identity(verified_shards, root=source_root) != identity:
         raise UnitGateError("unit gate aggregate identity does not match shards")
     reuse = gate.get("reuse")

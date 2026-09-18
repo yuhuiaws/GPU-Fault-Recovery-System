@@ -340,14 +340,33 @@ def capture_adot_objects(release: Any) -> dict[str, Any]:
         label="live ADOT object",
     )
     if not any(str(item.get("kind")) == "Deployment" for item in captured["objects"]):
-        # The collector Deployment exists on every converged site -- the same
-        # capture already fails closed when it cannot read its image. Missing
-        # here means this snapshot is reading the wrong namespace, and a
-        # rollback built on it would silently compensate nothing.
-        raise ReleaseError(
-            "live ADOT collector Deployment is missing from namespace "
-            f"{captured['namespace']}"
+        # Absence can be drift, but must not turn a wrong namespace into an
+        # empty rollback. Prove the CPU anchor before recording that absence.
+        get_json = getattr(release, "_get_json", None)
+        anchor = (
+            get_json(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "deployment",
+                    "gpu-fault-api-ha",
+                )
+            )
+            if callable(get_json)
+            else {}
         )
+        metadata = anchor.get("metadata") or {}
+        if (
+            anchor.get("kind") != "Deployment"
+            or metadata.get("name") != "gpu-fault-api-ha"
+            or metadata.get("namespace") != captured["namespace"]
+        ):
+            raise ReleaseError(
+                "live ADOT collector Deployment is missing and its CPU namespace "
+                "cannot be verified"
+            )
+        captured["absence_verified"] = True
     return captured
 
 
@@ -360,7 +379,15 @@ def _snapshot_parts(snapshot: object) -> tuple[str, list[Any], list[Any]]:
         snapshot["adot"],
         label="previous ADOT collector snapshot",
     )
-    if not objects:
+    verified_absence = (
+        snapshot["adot"].get("absence_verified") is True
+        and {
+            "resource": "deployment.apps",
+            "name": "gpu-fault-adot",
+        }
+        in absent
+    )
+    if not objects and not verified_absence:
         raise ReleaseError("previous ADOT collector snapshot is empty")
     return namespace, objects, absent
 
@@ -392,46 +419,64 @@ def restore_adot_objects(release: Any, snapshot: object) -> bool:
 
 
 def capture_observability_snapshot(release: Any) -> dict[str, Any]:
-    common = [
-        "--region",
-        release.config.aws_region,
-        "--workspace-id",
-        release.config.health.amp_workspace_id,
-    ]
-    rules = json.loads(
-        release.runner.run(
-            [
-                "aws",
-                "amp",
-                "describe-rule-groups-namespace",
-                *common,
-                "--name",
-                release.config.health.amp_rule_namespace,
-                "--output",
-                "json",
-            ],
-            capture=True,
-        )
-    )["ruleGroupsNamespace"]
-    alertmanager = json.loads(
-        release.runner.run(
-            [
-                "aws",
-                "amp",
-                "describe-alert-manager-definition",
-                *common,
-                "--output",
-                "json",
-            ],
-            capture=True,
-        )
-    )["alertManagerDefinition"]
+    rules = describe_amp_definition(
+        release,
+        _rule_namespace_definition(release, release.config.health.amp_rule_namespace),
+    )
+    alertmanager = describe_amp_definition(release, _alertmanager_definition(release))
     return {
         "rule_namespace": release.config.health.amp_rule_namespace,
-        "rules_data_base64": str(rules["data"]),
-        "alertmanager_data_base64": str(alertmanager["data"]),
+        "rules_present": rules is not None,
+        "alertmanager_present": alertmanager is not None,
+        "rules_data_base64": str(rules["data"]) if rules is not None else "",
+        "alertmanager_data_base64": str(alertmanager["data"])
+        if alertmanager is not None
+        else "",
         "adot": capture_adot_objects(release),
     }
+
+
+def capture_previous_monitoring(
+    release: Any,
+    live_state: dict[str, Any],
+    *,
+    capture: bool,
+    cpu_image: Callable[[], str | None],
+    pinned_image: Callable[[str, str | None], str],
+) -> tuple[dict[str, Any] | None, str]:
+    capture_fn = getattr(release, "_capture_observability_snapshot", None)
+    snapshot = capture_fn() if capture_fn is not None and capture else None
+    adot = (snapshot or {}).get("adot")
+    absent = (
+        isinstance(adot, dict)
+        and adot.get("absence_verified") is True
+        and {"resource": "deployment.apps", "name": "gpu-fault-adot"}
+        in adot.get("absent", [])
+    )
+    image: str | None
+    if absent:
+        # No live image exists. Metadata is used only for legacy GPU rollback;
+        # the CPU snapshot explicitly restores absence, never candidate input.
+        image = pinned_image(
+            "previous ADOT metadata", str(live_state.get("adot_image") or "")
+        )
+    elif capture:
+        image = cpu_image()
+    else:
+        image = str(live_state.get("adot_image") or release.adot_image)
+    if not image:
+        raise ReleaseError(
+            "cannot capture previous ADOT image from deployment/gpu-fault-adot"
+        )
+    return snapshot, image
+
+
+def _restore_absent_definition(
+    release: Any, definition: AmpDefinition, *, delete: str, arguments: list[str]
+) -> None:
+    if wait_for_amp_definition_settled(release, definition):
+        release.runner.run(["aws", "amp", delete, *_amp_common(release), *arguments])
+        wait_for_amp_definition_gone(release, definition)
 
 
 def restore_observability_snapshot(
@@ -450,6 +495,11 @@ def restore_observability_snapshot(
 
     if not isinstance(snapshot, dict):
         raise ReleaseError("previous observability snapshot is unavailable")
+    present = [
+        snapshot.get(f"{name}_present", True) for name in ("rules", "alertmanager")
+    ]
+    if any(type(value) is not bool for value in present):
+        raise ReleaseError("previous observability presence flags are invalid")
     try:
         rules = base64.b64decode(
             str(snapshot["rules_data_base64"]),
@@ -472,18 +522,34 @@ def restore_observability_snapshot(
         alertmanager_path = root / "alertmanager.yaml"
         rules_path.write_bytes(rules)
         alertmanager_path.write_bytes(alertmanager)
-        _put_amp_definition(
-            release,
-            _rule_namespace_definition(release, rule_namespace),
-            put="put-rule-groups-namespace",
-            create="create-rule-groups-namespace",
-            arguments=["--name", rule_namespace, "--data", f"fileb://{rules_path}"],
-        )
-        _put_amp_definition(
-            release,
-            _alertmanager_definition(release),
-            put="put-alert-manager-definition",
-            create="create-alert-manager-definition",
-            arguments=["--data", f"fileb://{alertmanager_path}"],
-        )
+        if present[0]:
+            _put_amp_definition(
+                release,
+                _rule_namespace_definition(release, rule_namespace),
+                put="put-rule-groups-namespace",
+                create="create-rule-groups-namespace",
+                arguments=["--name", rule_namespace, "--data", f"fileb://{rules_path}"],
+            )
+        else:
+            _restore_absent_definition(
+                release,
+                _rule_namespace_definition(release, rule_namespace),
+                delete="delete-rule-groups-namespace",
+                arguments=["--name", rule_namespace],
+            )
+        if present[1]:
+            _put_amp_definition(
+                release,
+                _alertmanager_definition(release),
+                put="put-alert-manager-definition",
+                create="create-alert-manager-definition",
+                arguments=["--data", f"fileb://{alertmanager_path}"],
+            )
+        else:
+            _restore_absent_definition(
+                release,
+                _alertmanager_definition(release),
+                delete="delete-alert-manager-definition",
+                arguments=[],
+            )
     return restore_adot_objects(release, snapshot)

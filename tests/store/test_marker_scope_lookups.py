@@ -178,6 +178,7 @@ def test_terminal_correlation_uses_the_scoped_read(
     store.add_marker(
         marker(
             marker_id="gpu-scoped",
+            cluster_id="cluster-a",
             scope=MarkerScope(gpu_uuids=["GPU-b"]),
             action=RecoveryAction.RESTART_WORKLOAD,
             observed_at=ended_at - timedelta(seconds=10),
@@ -213,9 +214,14 @@ def test_expired_marker_does_not_correlate_with_a_later_event(
     assert decision.matched_marker_ids == []
 
 
-def _seed_incident_workflow(store, *, status: WorkflowStatus | None) -> str:
+def _seed_incident_workflow(
+    store, *, status: WorkflowStatus | None, cluster_id: str = "cluster-a"
+) -> str:
     incident = fault_incident(
-        incident_id="inc-existing", event_id="event-1", node_ids=["node-a"]
+        incident_id="inc-existing",
+        event_id="event-1",
+        cluster_id=cluster_id,
+        node_ids=["node-a"],
     )
     if status is None:
         store.save_incident(copy_model(incident, workflow_request_id=None))
@@ -223,7 +229,10 @@ def _seed_incident_workflow(store, *, status: WorkflowStatus | None) -> str:
     store.save_incident(copy_model(incident, workflow_request_id="wf-1"))
     store.save_workflow(
         workflow_request(
-            request_id="wf-1", incident_id=incident.incident_id, status=status
+            request_id="wf-1",
+            incident_id=incident.incident_id,
+            status=status,
+            fencing_token=1,
         )
     )
     return "inc-existing"
@@ -245,7 +254,11 @@ def test_recovery_history_decides_whether_a_marker_still_blocks(
 
     store = build_store()
     _seed_incident_workflow(store, status=status)
-    blocking = marker(marker_id="blocking", scope=MarkerScope(node_ids=["node-a"]))
+    blocking = marker(
+        marker_id="blocking",
+        cluster_id="cluster-a",
+        scope=MarkerScope(node_ids=["node-a"]),
+    )
     store.add_marker(blocking)
 
     assert marker_blocks_spare(store, blocking, now=NOW) is blocks, (
@@ -320,7 +333,7 @@ def test_markers_do_not_cross_tenant_boundaries() -> None:
     """
 
     store = build_store()
-    _seed_incident_workflow(store, status=WorkflowStatus.BLOCKED)
+    _seed_incident_workflow(store, status=WorkflowStatus.BLOCKED, cluster_id="alpha")
     store.add_marker(
         marker(
             marker_id="alpha-blocking",

@@ -21,8 +21,8 @@ ownership -- because those need the store and the cluster; the admin verb
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Sequence
 from uuid import uuid4
 
 from gpu_fault.models import (
@@ -60,25 +60,56 @@ def restore_reason(operator: str, reference: str | None) -> str:
 
 
 def validated_restore_steps(
-    node_ids: Sequence[str], gpu_uuids: Sequence[str] = ()
+    node_ids: Sequence[str],
+    gpu_uuids: Sequence[str] = (),
+    *,
+    node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
 ) -> list[WorkflowStepSpec]:
-    """The four steps over ``node_ids``; ``gpu_uuids`` scopes the validation."""
+    """Validate all targets before restoring scheduling, retaining every named GPU."""
 
     nodes = list(node_ids)
     gpus = list(gpu_uuids)
-    return [
-        WorkflowStepSpec(
-            operation=operation,
-            execution_owner=(
-                KUBERNETES_OWNER
-                if operation is WorkflowOperation.RESTORE_SCHEDULING
-                else VALIDATION_OWNER
-            ),
-            node_ids=nodes,
-            gpu_uuids=gpus,
-        )
-        for operation in VALIDATED_RESTORE_OPERATIONS
-    ]
+    scopes: dict[str, list[str]] = {}
+    if gpus and len(nodes) > 1 and node_gpu_uuids is not None:
+        inventories = [node_gpu_uuids.get(node) for node in nodes]
+        if all(
+            isinstance(values, Sequence)
+            and not isinstance(values, (str, bytes))
+            and values
+            and all(isinstance(value, str) and value for value in values)
+            for values in inventories
+        ):
+            owners = {
+                gpu: [node for node in nodes if gpu in node_gpu_uuids[node]]
+                for gpu in gpus
+            }
+            if all(len(gpu_nodes) == 1 for gpu_nodes in owners.values()):
+                scopes = {
+                    node: [gpu for gpu in gpus if owners[gpu] == [node]]
+                    for node in nodes
+                }
+    steps = []
+    for operation in VALIDATED_RESTORE_OPERATIONS:
+        targets = [(nodes, gpus)]
+        if scopes and operation in {
+            WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_FABRIC,
+        }:
+            targets = [([node], scopes[node]) for node in nodes]
+        for step_nodes, step_gpus in targets:
+            steps.append(
+                WorkflowStepSpec(
+                    operation=operation,
+                    execution_owner=(
+                        KUBERNETES_OWNER
+                        if operation is WorkflowOperation.RESTORE_SCHEDULING
+                        else VALIDATION_OWNER
+                    ),
+                    node_ids=step_nodes,
+                    gpu_uuids=step_gpus,
+                )
+            )
+    return steps
 
 
 def build_validated_restore_workflow(
@@ -90,6 +121,7 @@ def build_validated_restore_workflow(
     node_ids: Sequence[str] | None = None,
     runtime_profile_version: str | None = None,
     reason: str | None = None,
+    node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[FaultIncident, WorkflowRequest]:
     """The ``(incident, workflow)`` pair of a validated restore of ``incident``.
 
@@ -100,8 +132,13 @@ def build_validated_restore_workflow(
     incident's nodes). The incident's GPU scope goes on the steps only when
     the steps cover exactly the incident's nodes: a restore of some other node
     (the fixture restoring a spare) must not name GPUs that node does not have
-    (DESTR-003, 2026-09-08). The incident moves to ACTION_PENDING, points at
-    the workflow, and records ``reason`` (default ``restore_reason``).
+    (DESTR-003, 2026-09-08). ``node_gpu_uuids`` can split GPU/fabric validation
+    into single-node steps when every incident GPU has exactly one target owner
+    and every target has inventory. It never removes an incident GPU: absence
+    from inventory may be the hardware failure being validated. Unknown,
+    incomplete or ambiguous ownership keeps the original scope and its per-GPU
+    telemetry requirement. The incident moves to ACTION_PENDING, points at the
+    workflow, and records ``reason`` (default ``restore_reason``).
     """
 
     step_nodes = sorted(set(node_ids if node_ids is not None else incident.node_ids))
@@ -117,7 +154,9 @@ def build_validated_restore_workflow(
         status=WorkflowStatus.PENDING,
         official_action=RESTORE_OFFICIAL_ACTION,
         fencing_token=incident.fencing_token,
-        official_steps=validated_restore_steps(step_nodes, gpu_uuids),
+        official_steps=validated_restore_steps(
+            step_nodes, gpu_uuids, node_gpu_uuids=node_gpu_uuids
+        ),
         created_at=now,
         updated_at=now,
     )

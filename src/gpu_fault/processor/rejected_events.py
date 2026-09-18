@@ -146,7 +146,8 @@ def record_replay_completion(
 
     fault_rejection = 400 <= status < 500 and is_fault_layer_request(item)
     with coordinator._state_lock:
-        by_status = coordinator._completions_by_path_status.setdefault(item.path, {})
+        path = coordinator._metric_path(item.path)
+        by_status = coordinator._completions_by_path_status.setdefault(path, {})
         by_status[status_class(status)] = by_status.get(status_class(status), 0) + 1
         if fault_rejection:
             coordinator._fault_rejections_total += 1

@@ -14,6 +14,18 @@ from gpu_fault.gpu_collection_errors import (
     collection_error_finding,
     collection_error_key,
 )
+from gpu_fault.gpu_composites import (
+    PCIE_XID_RULE,
+    composite_finding,
+    composite_update_time,
+    correlate_kernel_xid,
+    kernel_xid_events,
+    metric_counter_delta,
+    pcie_xid_link_failure,
+)
+from gpu_fault.gpu_composites import (
+    SITE_CORRELATION_POLICY_VERSION as SITE_CORRELATION_POLICY_VERSION,
+)
 from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
     GpuHealthSeverity,
@@ -29,6 +41,10 @@ from gpu_fault.gpu_power_policy import (
     NVIDIA_DCGM_POLICY_VERSION,
     power_violation_decision,
 )
+from gpu_fault.gpu_temperature_policy import temperature_decision
+from gpu_fault.gpu_temperature_policy import (
+    NVIDIA_NVML_TEMPERATURE_REFERENCE as NVIDIA_NVML_TEMPERATURE_REFERENCE,
+)
 from gpu_fault.models import RecoveryAction, StrictModel, WorkloadState
 from gpu_fault.policy import FaultPolicyDecision, XidEvent
 
@@ -40,10 +56,6 @@ NVIDIA_ROW_REMAP_RMA_REFERENCE = (
     "https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/"
     "rma-policy-thresholds-for-row-remapping.html"
 )
-NVIDIA_NVML_TEMPERATURE_REFERENCE = (
-    "https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html"
-)
-SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v1"
 THERMAL_CLOCK_THROTTLE_MASK = 0x20 | 0x40
 # One minute of violation per minute, plus a margin for sampling skew. A
 # violation-duration counter cannot exceed this without meaning something other
@@ -314,7 +326,7 @@ class GpuMetricsService:
         "THERMAL_STRESS",
         "POWER_LIMIT_THROTTLING",
         "GPU_MEMORY_DEGRADATION",
-        "PCIE_XID_LINK_FAILURE",
+        PCIE_XID_RULE,
         "NVLINK_LINK_DEGRADATION",
         "MULTI_GPU_NVLINK_FABRIC_FAILURE",
         "CORRECTABLE_MEMORY_DEGRADATION",
@@ -444,20 +456,15 @@ class GpuMetricsService:
             ):
                 accepted += 1
                 touched_gpu_keys.add(gpu_key)
-                previous = (
-                    previous_latest.sample.value
-                    if isinstance(previous_latest, GpuMetricLatest)
-                    else None
-                )
                 elapsed_seconds = (
                     (batch.observed_at - previous_latest.observed_at).total_seconds()
                     if isinstance(previous_latest, GpuMetricLatest)
                     else None
                 )
-                delta = (
-                    max(0.0, sample.value - previous)
-                    if previous is not None and sample.canonical_name in self._COUNTERS
-                    else None
+                delta = metric_counter_delta(
+                    sample,
+                    previous_latest,
+                    is_counter=sample.canonical_name in self._COUNTERS,
                 )
                 rate_per_minute = (
                     delta * 60.0 / elapsed_seconds
@@ -552,6 +559,13 @@ class GpuMetricsService:
             result.setdefault(gpu_key, {})[item.canonical_name] = item.value
         return result
 
+    def correlate_kernel_xid(self, event: XidEvent) -> list[GpuHealthFinding]:
+        node_lock = self._node_locks[
+            hash((event.cluster_id, event.node_id)) % len(self._node_locks)
+        ]
+        with node_lock:
+            return correlate_kernel_xid(self, event)
+
     @staticmethod
     def _finding_gpu_key(finding: GpuHealthFinding) -> str:
         return finding.gpu_uuid or finding.pci_bdf or "node"
@@ -567,6 +581,11 @@ class GpuMetricsService:
     ]:
         if not touched_gpu_keys:
             return [], [], []
+        pcie_gpu_keys = touched_gpu_keys.intersection(
+            sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
+            for sample in batch.samples
+            if sample.canonical_name in {"pcie_replay_total", "xid_last_error"}
+        )
         composite_scopes = sorted({*touched_gpu_keys, "node"})
         composite_keys = [
             self._composite_key(batch, scope_key, rule_id)
@@ -614,6 +633,15 @@ class GpuMetricsService:
             )
             latest_by_gpu.setdefault(gpu_key, {})[item.sample.canonical_name] = item
 
+        kernel_events = kernel_xid_events(
+            self,
+            batch,
+            [
+                finding
+                for finding in active_components
+                if self._finding_gpu_key(finding) in pcie_gpu_keys
+            ],
+        )
         candidates: dict[tuple[str, str], GpuHealthFinding] = {}
         node_nvlink_components = [
             finding
@@ -626,24 +654,22 @@ class GpuMetricsService:
             {finding.gpu_uuid for finding in node_nvlink_components if finding.gpu_uuid}
         )
         if len(nvlink_gpu_uuids) >= 2:
-            candidates[("node", "MULTI_GPU_NVLINK_FABRIC_FAILURE")] = (
-                self._composite_finding(
-                    batch,
-                    scope_key="node",
-                    rule_id="MULTI_GPU_NVLINK_FABRIC_FAILURE",
-                    components=node_nvlink_components,
-                    component_metrics=sorted(
-                        {finding.canonical_name for finding in node_nvlink_components}
-                    ),
-                    severity=GpuHealthSeverity.CRITICAL,
-                    action=RecoveryAction.DRAIN,
-                    reason=(
-                        "correlated NVLink errors affected multiple GPUs; "
-                        "treat as a node fabric or NVSwitch failure"
-                    ),
-                    affected_gpu_uuids=nvlink_gpu_uuids,
-                    confidence="HIGH",
-                )
+            candidates[("node", "MULTI_GPU_NVLINK_FABRIC_FAILURE")] = composite_finding(
+                batch,
+                scope_key="node",
+                rule_id="MULTI_GPU_NVLINK_FABRIC_FAILURE",
+                components=node_nvlink_components,
+                component_metrics=sorted(
+                    {finding.canonical_name for finding in node_nvlink_components}
+                ),
+                severity=GpuHealthSeverity.CRITICAL,
+                action=RecoveryAction.DRAIN,
+                reason=(
+                    "correlated NVLink errors affected multiple GPUs; "
+                    "treat as a node fabric or NVSwitch failure"
+                ),
+                affected_gpu_uuids=nvlink_gpu_uuids,
+                confidence="HIGH",
             )
 
         for gpu_key in sorted(touched_gpu_keys):
@@ -655,6 +681,8 @@ class GpuMetricsService:
                 previous_composite_states,
                 nvlink_gpu_uuids,
                 candidates,
+                kernel_events,
+                evaluate_pcie=gpu_key in pcie_gpu_keys,
             )
 
         composite_findings = []
@@ -665,12 +693,23 @@ class GpuMetricsService:
         candidate_updates = []
         for scope_key in composite_scopes:
             for rule_id in ordered_rule_ids:
+                # Only PCIe/XID inputs share the cross-replica correlation lock.
+                # An unrelated scrape is not evidence that a PCIe episode cleared.
+                if rule_id == PCIE_XID_RULE and scope_key not in pcie_gpu_keys:
+                    continue
                 key = self._composite_key(batch, scope_key, rule_id)
                 candidate = candidates.get((scope_key, rule_id))
                 previous = previous_composite_states.get(key)
                 if candidate is None and (previous is None or previous.finding is None):
                     continue
-                updates.append((key, candidate, batch.observed_at))
+                observed_at = composite_update_time(
+                    batch,
+                    candidate,
+                    previous,
+                    latest_by_gpu.get(scope_key, {}),
+                    findings_by_gpu.get(scope_key, {}),
+                )
+                updates.append((key, candidate, observed_at))
                 if candidate is not None:
                     candidate_updates.append((key, candidate))
         activated_values = self.store.update_gpu_findings(updates)
@@ -704,6 +743,9 @@ class GpuMetricsService:
         previous_composite_states,
         nvlink_gpu_uuids,
         candidates,
+        kernel_events,
+        *,
+        evaluate_pcie: bool,
     ) -> None:
         self._add_thermal_composite(
             batch,
@@ -720,7 +762,20 @@ class GpuMetricsService:
             previous_composite_states,
             candidates,
         )
-        self._add_pcie_composite(batch, gpu_key, components, metrics, candidates)
+        if evaluate_pcie:
+            pcie = pcie_xid_link_failure(
+                self,
+                batch,
+                gpu_key,
+                components,
+                metrics,
+                previous_composite_states.get(
+                    self._composite_key(batch, gpu_key, PCIE_XID_RULE)
+                ),
+                kernel_events,
+            )
+            if pcie is not None:
+                candidates[(gpu_key, PCIE_XID_RULE)] = pcie
         self._add_power_composite(batch, gpu_key, components, metrics, candidates)
         self._add_nvlink_composite(
             batch,
@@ -765,7 +820,7 @@ class GpuMetricsService:
                 else 1
             )
             critical = consecutive >= self.thresholds.composite_consecutive_samples
-            candidates[(gpu_key, "THERMAL_STRESS")] = self._composite_finding(
+            candidates[(gpu_key, "THERMAL_STRESS")] = composite_finding(
                 batch,
                 scope_key=gpu_key,
                 rule_id="THERMAL_STRESS",
@@ -843,7 +898,7 @@ class GpuMetricsService:
             if name in components
         ]
         if memory_errors and memory_repair:
-            candidates[(gpu_key, "GPU_MEMORY_DEGRADATION")] = self._composite_finding(
+            candidates[(gpu_key, "GPU_MEMORY_DEGRADATION")] = composite_finding(
                 batch,
                 scope_key=gpu_key,
                 rule_id="GPU_MEMORY_DEGRADATION",
@@ -901,7 +956,7 @@ class GpuMetricsService:
                     gpu_key,
                     "CORRECTABLE_MEMORY_DEGRADATION",
                 )
-            ] = self._composite_finding(
+            ] = composite_finding(
                 batch,
                 scope_key=gpu_key,
                 rule_id="CORRECTABLE_MEMORY_DEGRADATION",
@@ -923,35 +978,6 @@ class GpuMetricsService:
                     f"{consecutive} consecutive samples"
                 ),
                 confidence="MEDIUM",
-            )
-
-    def _add_pcie_composite(
-        self,
-        batch,
-        gpu_key,
-        components,
-        metrics,
-        candidates,
-    ) -> None:
-        pcie = components.get("pcie_replay_total")
-        xid = metrics.get("xid_last_error")
-        if pcie is not None and xid is not None and int(xid.sample.value) in {32, 79}:
-            candidates[(gpu_key, "PCIE_XID_LINK_FAILURE")] = self._composite_finding(
-                batch,
-                scope_key=gpu_key,
-                rule_id="PCIE_XID_LINK_FAILURE",
-                components=[pcie],
-                component_metrics=[
-                    "pcie_replay_total",
-                    "xid_last_error",
-                ],
-                severity=GpuHealthSeverity.CRITICAL,
-                action=RecoveryAction.DRAIN,
-                reason=(
-                    "PCIe replay threshold was correlated with "
-                    f"XID {int(xid.sample.value)}"
-                ),
-                confidence="HIGH",
             )
 
     def _add_power_composite(
@@ -987,7 +1013,7 @@ class GpuMetricsService:
             >= self.thresholds.power_correlation_min_utilization_percent
             and not has_temperature_finding
         ):
-            candidates[(gpu_key, "POWER_LIMIT_THROTTLING")] = self._composite_finding(
+            candidates[(gpu_key, "POWER_LIMIT_THROTTLING")] = composite_finding(
                 batch,
                 scope_key=gpu_key,
                 rule_id="POWER_LIMIT_THROTTLING",
@@ -1025,7 +1051,7 @@ class GpuMetricsService:
             len({item.canonical_name for item in nvlink}) >= 2
             and len(nvlink_gpu_uuids) < 2
         ):
-            candidates[(gpu_key, "NVLINK_LINK_DEGRADATION")] = self._composite_finding(
+            candidates[(gpu_key, "NVLINK_LINK_DEGRADATION")] = composite_finding(
                 batch,
                 scope_key=gpu_key,
                 rule_id="NVLINK_LINK_DEGRADATION",
@@ -1050,68 +1076,6 @@ class GpuMetricsService:
             batch.node_id,
             scope_key,
             f"composite:{rule_id}",
-        )
-
-    def _composite_finding(
-        self,
-        batch: GpuMetricBatch,
-        *,
-        scope_key: str,
-        rule_id: str,
-        components: list[GpuHealthFinding],
-        component_metrics: list[str],
-        severity: GpuHealthSeverity,
-        action: RecoveryAction,
-        reason: str,
-        confidence: str,
-        affected_gpu_uuids: list[str] | None = None,
-    ) -> GpuHealthFinding:
-        gpu_uuids = sorted(
-            {
-                *(affected_gpu_uuids if affected_gpu_uuids is not None else []),
-                *(component.gpu_uuid for component in components if component.gpu_uuid),
-            }
-        )
-        gpu_uuid = gpu_uuids[0] if len(gpu_uuids) == 1 else None
-        pci_bdf = next(
-            (component.pci_bdf for component in components if component.pci_bdf),
-            None,
-        )
-        evidence_refs = list(
-            dict.fromkeys(
-                component.evidence_ref
-                for component in components
-                if component.evidence_ref
-            )
-        )
-        return GpuHealthFinding(
-            finding_id=(f"{batch.batch_id}-{scope_key}-composite-{rule_id}"),
-            cluster_id=batch.cluster_id,
-            node_id=batch.node_id,
-            observed_at=batch.observed_at,
-            severity=severity,
-            reason=reason,
-            canonical_name=f"composite:{rule_id}",
-            value=1,
-            gpu_uuid=gpu_uuid,
-            pci_bdf=pci_bdf,
-            evidence_ref=(
-                evidence_refs[0] if len(evidence_refs) == 1 else batch.evidence_ref
-            ),
-            automatic_action=action.value,
-            policy_source="SITE_DCGM_CORRELATION",
-            policy_version=SITE_CORRELATION_POLICY_VERSION,
-            policy_reference=NVIDIA_DCGM_HEALTH_REFERENCE,
-            runtime_profile_version=batch.runtime_profile_version,
-            workload_state=batch.workload_state,
-            affected_workload_ids=batch.affected_workload_ids,
-            finding_kind="COMPOSITE",
-            correlation_rule_id=rule_id,
-            component_finding_ids=[component.finding_id for component in components],
-            component_metrics=component_metrics,
-            component_evidence_refs=evidence_refs,
-            affected_gpu_uuids=gpu_uuids,
-            confidence=confidence,
         )
 
     def latest(self, cluster_id: str, node_id: str) -> list[GpuMetricLatest]:
@@ -1198,74 +1162,7 @@ class GpuMetricsService:
         )
 
     def _temperature_decision(self, sample, _delta, _rate, limits, _previous):
-        name = sample.canonical_name
-        if name not in {
-            "gpu_temperature_c",
-            "memory_temperature_c",
-        }:
-            return None
-        if name == "gpu_temperature_c":
-            slowdown = limits.get("gpu_slowdown_temperature_c")
-            shutdown = limits.get("gpu_shutdown_temperature_c")
-            maximum = limits.get("gpu_max_operating_temperature_c")
-            critical = (
-                slowdown
-                or maximum
-                or (
-                    shutdown - self.thresholds.gpu_temperature_shutdown_margin_c
-                    if shutdown is not None
-                    else None
-                )
-            )
-            fallback_warning = self.thresholds.gpu_temperature_warning_c
-            fallback_critical = self.thresholds.gpu_temperature_critical_c
-            margin = self.thresholds.gpu_temperature_warning_margin_c
-            label = "GPU"
-        else:
-            maximum = limits.get("memory_max_operating_temperature_c")
-            critical = maximum
-            fallback_warning = self.thresholds.memory_temperature_warning_c
-            fallback_critical = self.thresholds.memory_temperature_critical_c
-            margin = self.thresholds.memory_temperature_warning_margin_c
-            label = "GPU memory"
-        if critical is not None:
-            warning = min(
-                critical - margin,
-                maximum if maximum is not None else critical,
-            )
-            source = "NVIDIA_DEVICE_LIMIT"
-            policy = {
-                "policy_source": "SITE_NVIDIA_DEVICE_LIMIT_DERIVED",
-                "policy_reference": NVIDIA_NVML_TEMPERATURE_REFERENCE,
-            }
-        else:
-            warning, critical, source, policy = (
-                fallback_warning,
-                fallback_critical,
-                "CONFIGURED_FALLBACK",
-                {},
-            )
-        severity = (
-            GpuHealthSeverity.CRITICAL
-            if sample.value >= critical
-            else GpuHealthSeverity.WARNING
-            if sample.value >= warning
-            else None
-        )
-        if severity is None:
-            return None
-        return {
-            "severity": severity,
-            "reason": f"{label} temperature exceeded {source.lower()} threshold",
-            "automatic_action": RecoveryAction.DRAIN.value
-            if severity is GpuHealthSeverity.CRITICAL
-            else RecoveryAction.RUN_DIAGNOSTICS.value,
-            "threshold_value": critical
-            if severity is GpuHealthSeverity.CRITICAL
-            else warning,
-            "threshold_source": source,
-            **policy,
-        }
+        return temperature_decision(self.thresholds, sample, limits)
 
     def _memory_decision(self, sample, delta, _rate, _limits, _previous):
         name = sample.canonical_name

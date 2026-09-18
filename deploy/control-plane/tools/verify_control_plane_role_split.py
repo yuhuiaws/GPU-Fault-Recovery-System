@@ -56,6 +56,7 @@ from gpu_fault.container_env_snapshot import (  # noqa: E402
     load_container_env_snapshot,
     pod_container_env,
 )
+from gpu_fault.logging_setup import environment_secrets, redact  # noqa: E402
 
 NAMESPACE = os.getenv("GPU_FAULT_NAMESPACE", "gpu-fault-system")
 # Set by the release engine on a verbatim rollback and read by the renderer
@@ -92,16 +93,17 @@ def kubectl_get(
 ) -> tuple[dict[str, dict[str, Any]] | None, str]:
     """One ``kubectl get <kind> <name>... -o json`` for every name at once.
 
-    Each kubectl call from the deploy host costs about 1.2 s (exec-plugin auth
-    plus the API round trip), and this verifier runs after every role apply;
-    per-object gets made it a 28 s step. ``--ignore-not-found`` turns a
-    missing name into an omission from the returned ``List`` instead of an
-    exit-1 with the found items still on stdout, so absence is the set
-    difference and a non-zero exit is a real read failure: the result is
-    ``(found-by-name, "")`` or ``(None, stderr)``. One name comes back as the
-    object itself, several as a ``List``, none as empty output.
+    Only a successful, valid result can prove absence. Nonzero exits and
+    malformed or duplicate members fail the batch, including optional maps.
     """
 
+    expected_kind = {"deployment": "Deployment", "configmap": "ConfigMap"}.get(kind)
+    if (
+        expected_kind is None
+        or not names
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+    ):
+        return None, "explicit supported resource names are required"
     result = subprocess.run(
         [
             "kubectl",
@@ -119,19 +121,41 @@ def kubectl_get(
         check=False,
     )
     if result.returncode != 0:
-        return None, (result.stderr or "").strip() or (
-            f"kubectl exited {result.returncode}"
-        )
+        return None, redact((result.stderr or "").strip(), environment_secrets())[
+            :4096
+        ] or (f"kubectl exited {result.returncode}")
     text = (result.stdout or "").strip()
     if not text:
         return {}, ""
-    document = json.loads(text)
-    items = document.get("items") if document.get("kind") == "List" else [document]
-    return {
-        str(item["metadata"]["name"]): item
-        for item in items or []
-        if isinstance(item, dict) and (item.get("metadata") or {}).get("name")
-    }, ""
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "kubectl returned invalid JSON"
+    if not isinstance(document, dict):
+        return None, "kubectl returned a non-object document"
+    items = (
+        document.get("items")
+        if document.get("kind") in {"List", f"{expected_kind}List"}
+        else [document]
+    )
+    if not isinstance(items, list):
+        return None, "kubectl returned an invalid resource list"
+    found: dict[str, dict[str, Any]] = {}
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        if not isinstance(metadata, dict):
+            return None, "kubectl returned a resource without metadata"
+        name = metadata.get("name")
+        if (
+            not isinstance(name, str)
+            or name not in names
+            or name in found
+            or item.get("kind", expected_kind) != expected_kind
+            or metadata.get("namespace", NAMESPACE) != NAMESPACE
+        ):
+            return None, "kubectl returned duplicate or mismatched resource identities"
+        found[name] = item
+    return found, ""
 
 
 def container(item: dict, name: str) -> dict:
@@ -156,9 +180,21 @@ def load_config_maps(names: Iterable[str]) -> None:
     found, error = kubectl_get("configmap", wanted)
     if found is None:
         raise SystemExit(f"ConfigMap {', '.join(wanted)} could not be read: {error}")
+    values: dict[str, dict[str, str] | None] = {}
     for name in wanted:
         item = found.get(name)
-        _CONFIG_MAP_CACHE[name] = None if item is None else (item.get("data") or {})
+        if item is None:
+            values[name] = None
+            continue
+        raw = item.get("data")
+        data = {} if raw is None else raw
+        if not isinstance(data, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in data.items()
+        ):
+            raise SystemExit(f"ConfigMap {name} has invalid string data")
+        values[name] = data
+    _CONFIG_MAP_CACHE.update(values)
 
 
 def referenced_config_maps(items: Iterable[dict[str, Any]]) -> list[str]:
@@ -376,12 +412,13 @@ def report(problems: list[str]) -> int:
 def role_deployments() -> tuple[dict[str, dict[str, Any]], list[str]]:
     """The three role Deployments by name, and a problem for each missing one."""
 
-    live, _error = kubectl_get("deployment", ROLE_DEPLOYMENTS)
+    live, error = kubectl_get("deployment", ROLE_DEPLOYMENTS)
+    if live is None:
+        return {}, [f"role Deployments could not be read: {error}"]
     found: dict[str, dict[str, Any]] = {}
     problems: list[str] = []
     for name in ROLE_DEPLOYMENTS:
-        # A failed read reports every role missing, as the per-name reads did.
-        item = (live or {}).get(name)
+        item = live.get(name)
         if item is None:
             problems.append(f"{name} is missing{MISSING_ROLE_CONSEQUENCE[name]}")
         else:

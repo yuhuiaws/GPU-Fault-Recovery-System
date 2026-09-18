@@ -3,14 +3,16 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import math
-import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import httpx
 
+from gpu_fault.cluster_executor import RegionalExecutorClient, ClusterExecutorError
 from scripts.e2e.regional.capacity_acceptance_base import (
     CapError,
     CapHarnessBase,
@@ -18,6 +20,16 @@ from scripts.e2e.regional.capacity_acceptance_base import (
     utc_now,
     write_json,
 )
+from scripts.e2e.regional.capacity_acceptance_traffic import cap001_monitor, cap001_send
+from scripts.e2e.regional.capacity_acceptance_executor import (
+    run_executor_proof,
+)
+from scripts.e2e.regional.capacity_wire import (
+    CapacityThreadsRunning as Cap004ThreadsRunning,
+)
+from scripts.e2e.regional.probes import cap004_commands
+from scripts.e2e.regional.capacity_acceptance_retry import run_claim_retry_proof
+from scripts.e2e.regional.capacity_scrape_companion import ScrapeCompanion
 
 # CAP-001: cluster A's per-cluster queue cap and the slack B's trickle adds.
 CAP001_A_QUEUE_CAP = 20
@@ -41,6 +53,46 @@ CAP002_RESOLVE_POLL_SECONDS = 15
 CAP003_KNEE_P95_MS = 1000.0
 CAP003_TARGET_CLUSTERS = 20
 CAP003_HEADROOM = 2.0
+CAP003_WAIT_FIELDS = (
+    "requested_wait_seconds",
+    "request_budget_seconds",
+    "claim_wait_reserve_seconds",
+    "server_max_wait_seconds",
+    "effective_wait_seconds",
+)
+
+
+def cap003_wait_configuration(
+    observed: Mapping[str, Any], requested: float
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for key in CAP003_WAIT_FIELDS:
+        value = observed.get(key)
+        if (
+            value is None
+            or type(value) not in {int, float}
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise CapError("CAP003 effective wait configuration is missing or invalid")
+        values[key] = float(value)
+    budget = values["request_budget_seconds"]
+    reserve = values["claim_wait_reserve_seconds"]
+    maximum = values["server_max_wait_seconds"]
+    effective = values["effective_wait_seconds"]
+    expected = min(
+        requested,
+        maximum,
+        max(0.0, budget - reserve) if budget > 0 else requested,
+    )
+    if (
+        values["requested_wait_seconds"] != requested
+        or maximum <= 0
+        or effective <= 0
+        or not math.isclose(effective, expected, rel_tol=0, abs_tol=1e-9)
+    ):
+        raise CapError("CAP003 effective wait does not match the deployed budget")
+    return values
 
 
 def cap001_failures(result: Mapping[str, Any]) -> list[str]:
@@ -60,15 +112,31 @@ def cap001_failures(result: Mapping[str, Any]) -> list[str]:
         failures.append("cluster B baseline was not accepted end to end")
     if result["b_status_counts"] != {202: CAP001_STORM_B_REQUESTS}:
         failures.append("cluster B was not accepted end to end during the storm")
-    if any(isinstance(status, int) and status >= 500 for status in a_status):
-        failures.append("cluster A saw a 5xx")
+    if any(type(status) is not int or status not in {202, 429} for status in a_status):
+        failures.append("cluster A saw an unexpected HTTP or transport status")
+    if sum(a_status.values()) != 3000:
+        failures.append("cluster A request accounting is incomplete")
     if baseline_p95 is None or storm_p95 is None:
         failures.append("cluster B latency percentiles are missing")
+    elif (
+        not all(math.isfinite(value) for value in (baseline_p95, storm_p95, factor))
+        or baseline_p95 <= 0
+        or storm_p95 < 0
+        or factor < 1
+    ):
+        failures.append("cluster B latency evidence is invalid")
     elif storm_p95 > factor * baseline_p95:
         failures.append(
             f"cluster B storm p95 {storm_p95:.1f}ms exceeds {factor:g}x the "
             f"B-only baseline p95 {baseline_p95:.1f}ms"
         )
+    if any(
+        type(maxima.get(key)) not in {int, float}
+        or not math.isfinite(maxima[key])
+        or maxima[key] < 0
+        for key in ("queue_depth", "a_rejections", "b_rejections")
+    ):
+        failures.append("capacity metric maxima are missing or invalid")
     if maxima.get("queue_depth", 0) > result["queue_depth_bound"]:
         failures.append(
             f"queue depth {maxima.get('queue_depth', 0):g} exceeded the bound "
@@ -78,13 +146,15 @@ def cap001_failures(result: Mapping[str, Any]) -> list[str]:
         failures.append("no admission rejections were counted for cluster A")
     if maxima.get("b_rejections", 0) != 0:
         failures.append("cluster B was rejected")
-    if not result["queue_drained"]:
+    if result.get("metric_errors"):
+        failures.append("capacity monitoring lost required metric samples")
+    if result["queue_drained"] is not True:
         failures.append("the processor queue did not drain")
     return failures
 
 
 def cap002_saturation_error(ratio: float) -> str | None:
-    if ratio > CAP002_SATURATION_RATIO:
+    if math.isfinite(ratio) and CAP002_SATURATION_RATIO < ratio <= 1:
         return None
     return (
         f"CAP-002 alert hold did not saturate Store I/O: in_flight/max = "
@@ -110,7 +180,12 @@ def cap003_knee(results: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                 "status_counts": row["status_counts"],
                 "p95_ms": p95,
             }
-        if p95 is None or p95 >= CAP003_KNEE_P95_MS:
+        if (
+            p95 is None
+            or not math.isfinite(p95)
+            or p95 < 0
+            or p95 >= CAP003_KNEE_P95_MS
+        ):
             return {
                 "cluster_count": row["cluster_count"],
                 "reason": f"claim p95 >= {CAP003_KNEE_P95_MS:g}ms",
@@ -118,6 +193,86 @@ def cap003_knee(results: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                 "p95_ms": p95,
             }
     return None
+
+
+def cap004_progression_errors(
+    commands: Sequence[Mapping[str, Any]],
+    progressions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    expected = [item.get("command_id") for item in commands]
+    observed = [item.get("command_id") for item in progressions]
+    if (
+        not expected
+        or any(not isinstance(item, str) or not item for item in [*expected, *observed])
+        or len(set(expected)) != len(expected)
+        or len(set(observed)) != len(observed)
+        or set(expected) != set(observed)
+    ):
+        return ["lease progressions do not cover the exact unique command set"]
+    errors = []
+    for item in progressions:
+        try:
+            initial = datetime.fromisoformat(
+                str(item["initial"]).replace("Z", "+00:00")
+            )
+            latest = datetime.fromisoformat(str(item["latest"]).replace("Z", "+00:00"))
+            renewed = (
+                initial.tzinfo is not None
+                and latest.tzinfo is not None
+                and latest > initial
+                and type(item["renewal_count"]) is int
+                and item["renewal_count"] > 0
+            )
+        except (KeyError, ValueError, TypeError):
+            renewed = False
+        if not renewed:
+            errors.append(f"lease expiry did not advance for {item['command_id']}")
+    return errors
+
+
+def cap002_target_value(
+    result: Any,
+    *,
+    not_before: float = 0,
+    expected_labels: Mapping[str, str] | None = None,
+) -> float | None:
+    """Validate one AMP evaluation; callers must also prove source freshness."""
+    if (
+        not isinstance(result, list)
+        or len(result) != 1
+        or not isinstance(result[0], dict)
+    ):
+        return None
+    if expected_labels is not None:
+        labels = result[0].get("metric")
+        if not isinstance(labels, dict) or any(
+            labels.get(key) != value for key, value in expected_labels.items()
+        ):
+            return None
+    value = result[0].get("value")
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(isinstance(item, bool) for item in value)
+    ):
+        return None
+    try:
+        timestamp, sample = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if (
+        math.isfinite(timestamp)
+        and timestamp >= not_before
+        and 0 <= time.time() - timestamp <= 90
+        and math.isfinite(sample)
+    ):
+        return sample
+    return None
+
+
+def cap002_target_saturated(result: Any) -> bool:
+    ratio = cap002_target_value(result)
+    return ratio is not None and cap002_saturation_error(ratio) is None
 
 
 def cap003_recommendations(
@@ -186,112 +341,15 @@ class CapacityAcceptanceCases(CapHarnessBase):
         monitor_stop = threading.Event()
         maxima: dict[str, float] = {}
         metrics_samples: list[dict[str, Any]] = []
+        metric_errors: list[str] = []
 
-        def monitor() -> None:
-            while not monitor_stop.wait(1):
-                try:
-                    values = self.metrics(probe.url)
-                except Exception:
-                    continue
-                sample = {
-                    "observed_at": utc_now(),
-                    "queue_depth": self.metric_value(
-                        values, "gpu_fault_processor_queue_depth"
-                    ),
-                    "a_depth": self.metric_value(
-                        values,
-                        "gpu_fault_processor_cluster_queue_depth",
-                        cluster_id="cap-cluster-000",
-                    ),
-                    "b_depth": self.metric_value(
-                        values,
-                        "gpu_fault_processor_cluster_queue_depth",
-                        cluster_id="cap-cluster-001",
-                    ),
-                    "a_rejections": sum(
-                        value
-                        for name, labels, value in values
-                        if name
-                        == "gpu_fault_processor_admission_rejections_by_cluster_total"
-                        and labels.get("cluster_id") == "cap-cluster-000"
-                    ),
-                    "b_rejections": sum(
-                        value
-                        for name, labels, value in values
-                        if name
-                        == "gpu_fault_processor_admission_rejections_by_cluster_total"
-                        and labels.get("cluster_id") == "cap-cluster-001"
-                    ),
-                }
-                metrics_samples.append(sample)
-                for key, value in sample.items():
-                    if isinstance(value, (int, float)):
-                        maxima[key] = max(maxima.get(key, 0.0), float(value))
-
-        monitor_thread = threading.Thread(target=monitor, daemon=True)
+        monitor_thread = threading.Thread(
+            target=cap001_monitor,
+            args=(self, probe, monitor_stop, maxima, metrics_samples, metric_errors),
+            daemon=True,
+        )
         client = httpx.Client(base_url=probe.url, timeout=20)
-
-        def send(
-            phase: str, cluster_index: int, sequence: int, scheduled: float
-        ) -> dict[str, Any]:
-            delay = scheduled - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            observed = datetime.now(timezone.utc)
-            begin = time.perf_counter()
-            payload = {
-                "batch_id": f"cap001-{phase}-c{cluster_index:03d}-{sequence:05d}",
-                "cluster_id": f"cap-cluster-{cluster_index:03d}",
-                "node_id": f"node-{phase}-c{cluster_index:03d}-{sequence:05d}",
-                "observed_at": observed.isoformat(),
-                "samples": [
-                    {
-                        "name": "network_link_up",
-                        "value": 1,
-                        "device": "eth0",
-                    }
-                ],
-                "runtime_profile_version": "hyperpod-v1",
-                "edge_filter_reasons": ["capacity-test"],
-            }
-            headers = self.cluster_headers(
-                f"cap-cluster-{cluster_index:03d}", self.tokens[cluster_index]
-            )
-            # The probe is reached through kubectl port-forward and a pooled
-            # client whose idle connections the server closes after its
-            # keep-alive timeout; a dropped connection is the transport's
-            # doing, not the admission decision under test. Retry it on a fresh
-            # connection and keep count, so the judgement still sees every
-            # request's real status (live 2026-09-07: one drop aborted the case).
-            transport_retries = 0
-            for attempt in range(3):
-                try:
-                    response = client.post(
-                        "/v1/collector-events/host-telemetry",
-                        headers=headers,
-                        json=payload,
-                    )
-                    break
-                except httpx.TransportError as exc:
-                    transport_retries += 1
-                    if attempt == 2:
-                        return {
-                            "phase": phase,
-                            "cluster": cluster_index,
-                            "status": f"transport-error:{type(exc).__name__}",
-                            "retry_after": None,
-                            "latency_ms": (time.perf_counter() - begin) * 1000,
-                            "transport_retries": transport_retries,
-                        }
-                    time.sleep(0.05)
-            return {
-                "phase": phase,
-                "cluster": cluster_index,
-                "status": response.status_code,
-                "retry_after": response.headers.get("Retry-After"),
-                "latency_ms": (time.perf_counter() - begin) * 1000,
-                "transport_retries": transport_retries,
-            }
+        send = partial(cap001_send, self, client)
 
         drained = False
         try:
@@ -340,7 +398,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
                 time.sleep(1)
         finally:
             monitor_stop.set()
-            monitor_thread.join(timeout=3)
+            monitor_thread.join()
             client.close()
         write_json(case_dir / "metrics-samples.json", metrics_samples)
 
@@ -355,13 +413,22 @@ class CapacityAcceptanceCases(CapHarnessBase):
         result: dict[str, Any] = {
             "elapsed_seconds": round(elapsed, 3),
             "a_status_counts": dict(
-                sorted(Counter(item["status"] for item in by_cluster[0]).items())
+                sorted(
+                    Counter(item["status"] for item in by_cluster[0]).items(),
+                    key=lambda item: str(item[0]),
+                )
             ),
             "b_status_counts": dict(
-                sorted(Counter(item["status"] for item in by_cluster[1]).items())
+                sorted(
+                    Counter(item["status"] for item in by_cluster[1]).items(),
+                    key=lambda item: str(item[0]),
+                )
             ),
             "b_baseline_status_counts": dict(
-                sorted(Counter(item["status"] for item in baseline_responses).items())
+                sorted(
+                    Counter(item["status"] for item in baseline_responses).items(),
+                    key=lambda item: str(item[0]),
+                )
             ),
             "a_retry_after_values": sorted(
                 {item["retry_after"] for item in by_cluster[0] if item["status"] == 429}
@@ -384,6 +451,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             ),
             "queue_depth_bound": CAP001_A_QUEUE_CAP + CAP001_QUEUE_SLACK,
             "metric_maxima": maxima,
+            "metric_errors": metric_errors,
             "queue_drained": drained,
             "transport_retries": sum(
                 int(item.get("transport_retries", 0)) for item in responses
@@ -433,20 +501,31 @@ class CapacityAcceptanceCases(CapHarnessBase):
                     range(20),
                 )
             )
-        self.probe_control(probe, "/__cap__/release", {"tag": "behavior"})
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            retry_results = list(
-                pool.map(
-                    lambda index: self._cap002_claim(probe, index, "retry"),
-                    range(20),
-                )
+
+        def release_behavior_hold() -> None:
+            self.probe_control(probe, "/__cap__/release", {"tag": "behavior"})
+
+        try:
+            executor_retry = run_claim_retry_proof(
+                probe.url,
+                self.tokens[0],
+                case_dir,
+                release_behavior_hold,
             )
+        finally:
+            release_behavior_hold()
         metrics = self.metrics(probe.url)
         status_counts = dict(
             sorted(Counter(item["status"] for item in initial_results).items())
         )
         retry_status_counts = dict(
-            sorted(Counter(item["status"] for item in retry_results).items())
+            sorted(
+                Counter(
+                    item["status"]
+                    for item in executor_retry["attempts"]
+                    if item["status"] == 200
+                ).items()
+            )
         )
         retry_after_values = sorted(
             {item["retry_after"] for item in initial_results if item["status"] == 503}
@@ -456,6 +535,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             "initial_status_counts": status_counts,
             "retry_after_values": retry_after_values,
             "retry_status_counts": retry_status_counts,
+            "executor_retry": executor_retry,
             "store_io_rejections": self.metric_value(
                 metrics, "gpu_fault_store_io_rejections_total", reason="capacity"
             ),
@@ -463,9 +543,10 @@ class CapacityAcceptanceCases(CapHarnessBase):
         behavior["passed"] = all(
             (
                 status_counts.get(503, 0) > 0,
-                not any(status == 500 for status in status_counts),
+                set(status_counts) <= {200, 503},
                 retry_after_values == ["2"],
-                retry_status_counts == {200: 20},
+                retry_status_counts == {200: 1},
+                executor_retry["passed"] is True,
                 behavior["store_io_rejections"] > 0,
             )
         )
@@ -474,12 +555,121 @@ class CapacityAcceptanceCases(CapHarnessBase):
             raise CapError("CAP-002 503 behavior phase failed")
         return behavior
 
+    def _cap002_remaining(self) -> float:
+        deadline = self.maintenance_deadline
+        if not isinstance(deadline, datetime) or deadline.utcoffset() is None:
+            raise CapError("CAP-002 requires an aware maintenance deadline")
+        remaining = deadline.timestamp() - time.time()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise CapError("CAP-002 maintenance deadline has expired")
+        return remaining
+
+    def _cap002_poll_sleep(self) -> None:
+        time.sleep(min(CAP002_RESOLVE_POLL_SECONDS, self._cap002_remaining()))
+        self._cap002_remaining()
+
+    def _cap002_query(
+        self,
+        probe: Any,
+        query: str,
+        *,
+        not_before: float,
+        query_time: float | None = None,
+    ) -> float | None:
+        remaining = self._cap002_remaining()
+        params = {"query": query, "timeout": f"{min(30, remaining):g}s"}
+        if query_time is not None:
+            params["time"] = str(query_time)
+        response = self.amp_request(
+            "POST",
+            "/api/v1/query",
+            params,
+        )
+        self._cap002_remaining()
+        if not isinstance(response, dict) or response.get("status") != "success":
+            return None
+        data = response.get("data")
+        if not isinstance(data, dict) or data.get("resultType") != "vector":
+            return None
+        return cap002_target_value(
+            data.get("result"),
+            not_before=not_before,
+            expected_labels={"pod": probe.pod, "capacity_run": self.run_id},
+        )
+
+    def _cap002_wait_scrape_ready(
+        self, probe: Any, case_dir: Path, *, selector: str, not_before: float
+    ) -> bool:
+        polls = []
+        for attempt in range(1, CAP002_RESOLVE_ATTEMPTS + 1):
+            query_time = time.time()
+            up = self._cap002_query(
+                probe,
+                f"up{{{selector}}}",
+                not_before=not_before,
+                query_time=query_time,
+            )
+            scraped_at = (
+                self._cap002_query(
+                    probe,
+                    f"timestamp(up{{{selector}}})",
+                    not_before=not_before,
+                    query_time=query_time,
+                )
+                if up == 1
+                else None
+            )
+            ready = (
+                up == 1
+                and scraped_at is not None
+                and scraped_at >= not_before
+                and 0 <= time.time() - scraped_at <= 90
+            )
+            polls.append(
+                {
+                    "attempt": attempt,
+                    "observed_at": utc_now(),
+                    "target_up": up,
+                    "scraped_at": scraped_at,
+                    "ready": ready,
+                }
+            )
+            write_json(case_dir / "scrape-ready-poll.json", polls)
+            if ready:
+                return True
+            if attempt < CAP002_RESOLVE_ATTEMPTS:
+                self._cap002_poll_sleep()
+        return False
+
+    def _cap002_target_ratio(
+        self, probe: Any, *, selector: str, not_before: float
+    ) -> float | None:
+        in_flight = f"gpu_fault_store_io_in_flight{{{selector}}}"
+        maximum = f"gpu_fault_store_io_max_in_flight{{{selector}}}"
+        query = f"{in_flight} / {maximum}"
+        # Arithmetic samples carry evaluation time, not source scrape time.
+        # Filter both inputs before accepting a fresh saturation or zero proof.
+        for source in (in_flight, maximum):
+            query += (
+                f" and (timestamp({source}) >= {not_before})"
+                f" and (time() - timestamp({source}) >= 0)"
+                f" and (time() - timestamp({source}) <= 90)"
+            )
+        return self._cap002_query(probe, query, not_before=not_before)
+
     def cap002_alert(
         self,
         probe: Any,
         case_dir: Any,
         behavior: dict[str, Any],
+        *,
+        selector: str,
     ) -> tuple[dict[str, Any], bool]:
+        if self._cap002_remaining() < CAP002_ALERT_HOLD_SECONDS:
+            raise CapError(
+                "CAP-002 maintenance time is insufficient for the alert hold"
+            )
+        hold_started = time.time()
         alert_hold = self.probe_control(
             probe,
             "/__cap__/hold",
@@ -509,30 +699,27 @@ class CapacityAcceptanceCases(CapHarnessBase):
         alert_poll = []
         fired = False
         started = time.monotonic()
-        for attempt in range(1, 33):
-            time.sleep(15)
-            query = self.amp_request(
-                "POST",
-                "/api/v1/query",
-                {
-                    "query": (
-                        "max(gpu_fault_store_io_in_flight"
-                        f'{{pod="{probe.pod}"}} / '
-                        "gpu_fault_store_io_max_in_flight"
-                        f'{{pod="{probe.pod}"}})'
-                    )
-                },
-            )["data"]["result"]
+        for attempt in range(1, CAP002_RESOLVE_ATTEMPTS + 1):
+            self._cap002_poll_sleep()
+            target_ratio = self._cap002_target_ratio(
+                probe, selector=selector, not_before=hold_started
+            )
+            target_saturated = (
+                target_ratio is not None
+                and cap002_saturation_error(target_ratio) is None
+            )
             states = self.alert_states("GpuFaultStoreIoSaturated")
+            self._cap002_remaining()
             alert_poll.append(
                 {
                     "attempt": attempt,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
-                    "target_ratio_present": bool(query),
+                    "target_ratio_present": target_ratio is not None,
+                    "target_saturated": target_saturated,
                     "states": states,
                 }
             )
-            if "firing" in states:
+            if target_saturated and "firing" in states:
                 fired = True
                 break
         write_json(case_dir / "alert-poll.json", alert_poll)
@@ -549,11 +736,17 @@ class CapacityAcceptanceCases(CapHarnessBase):
         }
         passed = bool(behavior["passed"] and ratio > CAP002_SATURATION_RATIO and fired)
         result["status"] = "PASS" if passed else "FAIL"
-        write_json(case_dir / "summary.json", result)
+        write_json(case_dir / "summary.json", {**result, "status": "PENDING"})
         return result, passed
 
     def _cap002_wait_resolved(
-        self, case_dir: Any, *, attempts: int = CAP002_RESOLVE_ATTEMPTS
+        self,
+        probe: Any,
+        case_dir: Path,
+        *,
+        selector: str,
+        not_before: float,
+        attempts: int = CAP002_RESOLVE_ATTEMPTS,
     ) -> bool:
         """Wait for the alert to clear *while the probe is still scraped*.
 
@@ -565,20 +758,37 @@ class CapacityAcceptanceCases(CapHarnessBase):
 
         resolved_poll = []
         for attempt in range(1, attempts + 1):
-            states = self.alert_states("GpuFaultStoreIoSaturated")
-            resolved_poll.append(
-                {"attempt": attempt, "observed_at": utc_now(), "states": states}
+            ratio = self._cap002_target_ratio(
+                probe, selector=selector, not_before=not_before
             )
-            if "firing" not in states:
-                write_json(case_dir / "alert-resolve-poll.json", resolved_poll)
+            states = self.alert_states("GpuFaultStoreIoSaturated")
+            self._cap002_remaining()
+            resolved_poll.append(
+                {
+                    "attempt": attempt,
+                    "observed_at": utc_now(),
+                    "target_ratio": ratio,
+                    "target_zero": ratio == 0,
+                    "states": states,
+                }
+            )
+            write_json(case_dir / "alert-resolve-poll.json", resolved_poll)
+            if ratio == 0 and states == []:
                 return True
-            time.sleep(CAP002_RESOLVE_POLL_SECONDS)
-        write_json(case_dir / "alert-resolve-poll.json", resolved_poll)
+            if attempt < attempts:
+                self._cap002_poll_sleep()
         return False
 
     def case_002_v2(self) -> dict[str, Any]:
+        if self.cap002_scrape_stopped is not True:
+            raise CapError("CAP-002 previous scrape shutdown is unverified")
+        if not self.scrape_source_binding:
+            raise CapError("CAP-002 requires the plan-bound scrape source")
+        self._cap002_remaining()
+        started_at = time.time()
         if self.alert_states("GpuFaultStoreIoSaturated"):
             raise CapError("CAP-002 target alert is already active before the probe")
+        self._cap002_remaining()
         probe = self.deploy_probe(
             "CAP002",
             {
@@ -591,27 +801,113 @@ class CapacityAcceptanceCases(CapHarnessBase):
         )
         case_dir = self.run_dir / "CAP-002"
         case_dir.mkdir(mode=0o700, exist_ok=True)
-        result: dict[str, Any] = {}
+        result: dict[str, Any] = {"status": "FAIL", "scrape_ready": False}
         passed = False
         resolved = False
+        companion: ScrapeCompanion | None = None
+        scrape_started = False
+        error: BaseException | None = None
+        cleanup_errors: list[str] = []
+
+        def cleanup_failed(stage: str, exc: BaseException) -> None:
+            nonlocal error
+            cleanup_errors.append(f"{stage}: {type(exc).__name__}")
+            if error is None and not isinstance(exc, Exception):
+                error = exc
+
         try:
+            write_json(case_dir / "summary.json", result)
+            deadline = self.maintenance_deadline
+            if deadline is None:
+                raise CapError("CAP-002 requires an aware maintenance deadline")
+            companion = ScrapeCompanion(
+                self,
+                probe,
+                expected_source=dict(self.scrape_source_binding),
+                deadline=deadline,
+            )
+            self.cap002_scrape_stopped = False
+            start = companion.start()
+            scrape_started = True
+            if not isinstance(start, dict):
+                raise CapError("CAP-002 scrape start evidence is invalid")
+            write_json(case_dir / "scrape-start.json", start)
+            result["scrape_ready"] = self._cap002_wait_scrape_ready(
+                probe,
+                case_dir,
+                selector=companion.selector,
+                not_before=started_at,
+            )
+            if result["scrape_ready"] is not True:
+                raise CapError("CAP-002 fresh exact AMP scrape readiness is unproven")
+            self._cap002_remaining()
             behavior = self._cap002_behavior(probe, case_dir)
-            result, passed = self.cap002_alert(probe, case_dir, behavior)
-            for tag in ("behavior", "alert"):
-                self.probe_control(probe, "/__cap__/release", {"tag": tag})
-            # Released but still running: the resolve is observed against a
-            # live target, not against a stale sample of a deleted one.
-            resolved = self._cap002_wait_resolved(case_dir)
+            alert_result, passed = self.cap002_alert(
+                probe, case_dir, behavior, selector=companion.selector
+            )
+            result.update(alert_result)
+        except BaseException as exc:
+            error = exc
+            result["error_type"] = type(exc).__name__
         finally:
-            for tag in ("behavior", "alert"):
+            if scrape_started and companion is not None:
+                for tag in ("behavior", "alert"):
+                    try:
+                        self.probe_control(probe, "/__cap__/release", {"tag": tag})
+                    except BaseException as exc:
+                        cleanup_failed(f"release {tag}", exc)
                 try:
-                    self.probe_control(probe, "/__cap__/release", {"tag": tag})
-                except Exception:
-                    pass
-            write_json(case_dir / "cleanup.json", self.cleanup_probe(probe))
+                    resolved = self._cap002_wait_resolved(
+                        probe,
+                        case_dir,
+                        selector=companion.selector,
+                        not_before=time.time(),
+                    )
+                except BaseException as exc:
+                    cleanup_failed("alert resolution", exc)
+            if companion is not None:
+                try:
+                    stop = companion.stop()
+                    if (
+                        not isinstance(stop, dict)
+                        or stop.get("cleanup_complete") is not True
+                        or stop.get("process_termination_proven") is not True
+                    ):
+                        raise CapError("CAP-002 scrape stop evidence is invalid")
+                    self.cap002_scrape_stopped = True
+                    write_json(case_dir / "scrape-stop.json", stop)
+                except BaseException as exc:
+                    cleanup_failed("scrape companion stop", exc)
+            cleanup: dict[str, Any] = {"passed": False}
+            if self.cap002_scrape_stopped:
+                try:
+                    cleanup = self.cleanup_probe(probe)
+                except BaseException as exc:
+                    cleanup_failed("probe cleanup", exc)
+            else:
+                cleanup["resources_retained"] = True
+            try:
+                write_json(
+                    case_dir / "cleanup.json", {**cleanup, "errors": cleanup_errors}
+                )
+            except BaseException as exc:
+                cleanup_failed("cleanup evidence", exc)
+        passed = passed and resolved and not cleanup_errors and error is None
+        result["status"] = "PASS" if passed else "FAIL"
+        result["cleanup_errors"] = cleanup_errors
         result["alert_resolved_after_release"] = resolved
-        write_json(case_dir / "summary.json", result)
-        if not passed or not resolved:
+        result["scrape_stopped"] = self.cap002_scrape_stopped
+        try:
+            write_json(case_dir / "summary.json", result)
+        except BaseException as exc:
+            if error is None:
+                raise
+            error.add_note(f"CAP-002 summary write failed: {type(exc).__name__}")
+        if error is not None:
+            for cleanup_error in cleanup_errors:
+                error.add_note(cleanup_error)
+            raise error
+        if not passed:
             raise CapError("GF-REGIONAL-CAP-002 failed")
         return result
 
@@ -627,8 +923,169 @@ class CapacityAcceptanceCases(CapHarnessBase):
         case_dir = self.run_dir / "CAP-003"
         case_dir.mkdir(mode=0o700, exist_ok=True)
         started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        try:
+            with httpx.Client(base_url=probe.url, timeout=20) as client:
+                results = self.cap003_samples(probe, client, case_dir)
+            long_poll = self.cap003_long_poll_samples(probe, case_dir)
+            ended_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+            budget = self.connection_budget()
+            cloudwatch = self.cloudwatch_window(started_at, ended_at)
+            write_json(case_dir / "connection-budget.json", budget)
+            write_json(case_dir / "aurora.json", cloudwatch)
+            knee = cap003_knee(results)
+            passed = knee is None and all(row["passed"] for row in long_poll)
+            result: dict[str, Any] = {
+                "status": "PASS" if passed else "FAIL",
+                "scenarios": results,
+                "production_long_poll": long_poll,
+                "connection_budget": budget,
+                "knee": knee,
+                "recommendations": cap003_recommendations(results, budget),
+            }
+            write_json(case_dir / "summary.json", result)
+        finally:
+            cleanup = self.cleanup_probe(probe)
+            write_json(case_dir / "cleanup.json", cleanup)
+        if not passed:
+            raise CapError("GF-REGIONAL-CAP-003 failed")
+        return result
+
+    def cap003_long_poll_samples(
+        self, probe: Any, case_dir: Path
+    ) -> list[dict[str, Any]]:
+        wait_seconds = 20
+        replicas = 2
+        results = []
+        # A first long poll starts the production hub's lazy LISTEN connection.
+        warmup = RegionalExecutorClient(
+            probe.url, "cap-cluster-000", self.tokens[0], timeout_seconds=15
+        )
+        if warmup.claim(
+            "cap003-warmup",
+            max_commands=1,
+            lease_seconds=10,
+            execution_owners=["gpu-fault-kubernetes-adapter"],
+            wait_seconds=wait_seconds,
+        ):
+            raise CapError(
+                "CAP003 warmup found commands in the isolated empty database"
+            )
+        for cluster_count in (1, 5, 10, 20):
+            listener_before = self.probe_control(
+                probe,
+                "/__cap__/claim-wakeups",
+                {"tag": "cap003", "wait_seconds": wait_seconds},
+            )
+            wait_configuration = cap003_wait_configuration(
+                listener_before, wait_seconds
+            )
+            effective_wait = wait_configuration["effective_wait_seconds"]
+            cpu_before = self.pod_cpu_usage_usec(probe.pod)
+            connections_before = self.isolated_db_connections(probe.pod)
+            started = time.perf_counter()
+
+            def poll(index: int) -> list[dict[str, Any]]:
+                cluster_index = index // replicas
+                client = RegionalExecutorClient(
+                    probe.url,
+                    f"cap-cluster-{cluster_index:03d}",
+                    self.tokens[cluster_index],
+                    timeout_seconds=15,
+                )
+                samples = []
+                for _ in range(3):
+                    begin = time.perf_counter()
+                    status = 200
+                    try:
+                        commands = client.claim(
+                            f"cap003-long-{cluster_count}-{index}",
+                            max_commands=1,
+                            lease_seconds=10,
+                            wait_seconds=wait_seconds,
+                            execution_owners=["gpu-fault-kubernetes-adapter"],
+                        )
+                        if commands:
+                            raise CapError(
+                                "CAP003 long poll returned unexpected commands"
+                            )
+                    except ClusterExecutorError as exc:
+                        status = exc.status_code or 0
+                    elapsed = time.perf_counter() - begin
+                    samples.append(
+                        {
+                            "status": status,
+                            "elapsed_seconds": elapsed,
+                            "overhead_ms": max(0, elapsed - effective_wait) * 1000,
+                        }
+                    )
+                return samples
+
+            with ThreadPoolExecutor(max_workers=cluster_count * replicas) as pool:
+                samples = [
+                    sample
+                    for rows in pool.map(poll, range(cluster_count * replicas))
+                    for sample in rows
+                ]
+            elapsed = time.perf_counter() - started
+            listener_after = self.probe_control(
+                probe,
+                "/__cap__/claim-wakeups",
+                {"tag": "cap003", "wait_seconds": wait_seconds},
+            )
+            final_wait_configuration = cap003_wait_configuration(
+                listener_after, wait_seconds
+            )
+            cpu_after = self.pod_cpu_usage_usec(probe.pod)
+            connections_after = self.isolated_db_connections(probe.pod)
+            overhead = {
+                key: percentile([item["overhead_ms"] for item in samples], quantile)
+                for key, quantile in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))
+            }
+            passed = (
+                all(
+                    row["status"] == 200
+                    and row["elapsed_seconds"] >= max(0, effective_wait - 1)
+                    for row in samples
+                )
+                and final_wait_configuration == wait_configuration
+                and overhead["p95"] is not None
+                and overhead["p95"] < CAP003_KNEE_P95_MS
+                and all(
+                    item.get("listener_connected") is True
+                    and item.get("listener_alive") is True
+                    for item in (listener_before, listener_after)
+                )
+                and listener_after.get("disconnects_total")
+                == listener_before.get("disconnects_total")
+                and elapsed > 0
+                and cpu_after >= cpu_before
+                and min(connections_before, connections_after) > 0
+            )
+            row = {
+                "cluster_count": cluster_count,
+                "executor_replicas_per_cluster": replicas,
+                "wait_seconds": wait_seconds,
+                "effective_wait_seconds": effective_wait,
+                "wait_configuration": wait_configuration,
+                "requests": len(samples),
+                "passed": passed,
+                "status_counts": dict(Counter(item["status"] for item in samples)),
+                "hold_overhead_ms": overhead,
+                "samples": samples,
+                "listener_before": listener_before,
+                "listener_after": listener_after,
+                "database_connections_before": connections_before,
+                "database_connections_after": connections_after,
+                "api_average_cpu_cores": (cpu_after - cpu_before) / 1_000_000 / elapsed,
+            }
+            results.append(row)
+            write_json(case_dir / f"long-poll-n-{cluster_count}.json", row)
+        return results
+
+    def cap003_samples(
+        self, probe: Any, client: httpx.Client, case_dir: Path
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        client = httpx.Client(base_url=probe.url, timeout=20)
         for cluster_count in (1, 5, 10, 20):
             before_cpu = self.pod_cpu_usage_usec(probe.pod)
             before_connections = self.isolated_db_connections(probe.pod)
@@ -657,6 +1114,13 @@ class CapacityAcceptanceCases(CapHarnessBase):
                             "lease_seconds": 10,
                         },
                     )
+                    if (
+                        response.status_code == 200
+                        and response.json().get("commands") != []
+                    ):
+                        raise CapError(
+                            "CAP-003 empty claim returned missing or nonempty commands"
+                        )
                     rows.append(
                         {
                             "status": response.status_code,
@@ -670,6 +1134,12 @@ class CapacityAcceptanceCases(CapHarnessBase):
             wall = time.perf_counter() - wall_started
             after_cpu = self.pod_cpu_usage_usec(probe.pod)
             after_connections = self.isolated_db_connections(probe.pod)
+            if (
+                wall <= 0
+                or after_cpu < before_cpu
+                or min(before_connections, after_connections) < 1
+            ):
+                raise CapError("CAP-003 CPU/connection measurements are invalid")
             flat = [item for document in documents for item in document]
             metrics = self.metrics(probe.url)
             row: dict[str, Any] = {
@@ -694,213 +1164,36 @@ class CapacityAcceptanceCases(CapHarnessBase):
             }
             results.append(row)
             write_json(case_dir / f"n-{cluster_count}.json", row)
-        client.close()
-        ended_at = datetime.now(timezone.utc) + timedelta(minutes=1)
-        budget = self.connection_budget()
-        cloudwatch = self.cloudwatch_window(started_at, ended_at)
-        write_json(case_dir / "connection-budget.json", budget)
-        write_json(case_dir / "aurora.json", cloudwatch)
-        knee = cap003_knee(results)
-        passed = knee is None
-        result: dict[str, Any] = {
-            "status": "PASS" if passed else "FAIL",
-            "scenarios": results,
-            "connection_budget": budget,
-            "knee": knee,
-            "recommendations": cap003_recommendations(results, budget),
-        }
-        write_json(case_dir / "summary.json", result)
-        cleanup = self.cleanup_probe(probe)
-        write_json(case_dir / "cleanup.json", cleanup)
-        if not passed:
-            raise CapError("GF-REGIONAL-CAP-003 failed")
+        return results
+
+    def cap004_store(self, probe: Any, mode: str) -> dict[str, Any]:
+        import json
+
+        response = self.kubectl(
+            "exec",
+            "-i",
+            probe.pod,
+            "--",
+            "/opt/gpu-fault/control-plane/bin/python",
+            "-",
+            mode,
+            self.run_id,
+            probe.database,
+            input_text=Path(cap004_commands.__file__).read_text(encoding="utf-8"),
+        )
+        result = json.loads(response.stdout)
+        if not isinstance(result, dict) or result.get("run_id") != self.run_id:
+            raise CapError("CAP004 Store probe returned an invalid identity")
         return result
 
-    def _cap004_execute_claimed(
-        self,
-        probe: Any,
-        client: httpx.Client,
-        headers: dict[str, str],
-        commands: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        competitor_stop = threading.Event()
-        competitor_claimed: list[str] = []
-        competitor_errors = 0
-        counters_lock = threading.Lock()
-        active = 0
-        max_active = 0
-        renewals = 0
-        renewal_failures = 0
-        injected_failure_status: int | None = None
-        injected = False
-        durations: list[float] = []
-        lease_progressions: list[dict[str, Any]] = []
-        result_statuses: list[int] = []
-        renewal_stops: dict[str, threading.Event] = {}
-        renewal_threads: dict[str, threading.Thread] = {}
-        renewal_expiries: dict[str, list[Any]] = {}
-
-        def renew(item: Mapping[str, Any]) -> None:
-            nonlocal renewals, renewal_failures
-            nonlocal injected_failure_status, injected
-            command_id = str(item["command_id"])
-            lease_token = str(item["lease_token"])
-            stop_renew = renewal_stops[command_id]
-            with httpx.Client(base_url=probe.url, timeout=20) as renew_client:
-                while not stop_renew.wait(3):
-                    token = lease_token
-                    use_bad = False
-                    with counters_lock:
-                        if not injected:
-                            injected = True
-                            use_bad = True
-                    if use_bad:
-                        token = secrets.token_urlsafe(32)
-                    try:
-                        response = renew_client.post(
-                            f"/v1/regional/executors/{command_id}/renew",
-                            headers=headers,
-                            json={
-                                "executor_id": "cap004-primary",
-                                "lease_token": token,
-                                "lease_seconds": 10,
-                            },
-                        )
-                    except Exception:
-                        with counters_lock:
-                            renewal_failures += 1
-                        continue
-                    with counters_lock:
-                        if response.status_code == 200:
-                            renewals += 1
-                            renewal_expiries[command_id].append(
-                                response.json().get("lease_expires_at")
-                            )
-                        else:
-                            renewal_failures += 1
-                            if use_bad:
-                                injected_failure_status = response.status_code
-
-        for item in commands:
-            command_id = str(item["command_id"])
-            renewal_stops[command_id] = threading.Event()
-            renewal_expiries[command_id] = [item.get("lease_expires_at")]
-            thread = threading.Thread(
-                target=renew,
-                args=(item,),
-                name=f"cap004-renew-{command_id}",
-                daemon=True,
-            )
-            renewal_threads[command_id] = thread
-            thread.start()
-
-        def competitor() -> None:
-            nonlocal competitor_errors
-            with httpx.Client(base_url=probe.url, timeout=20) as competitor_client:
-                while not competitor_stop.wait(0.25):
-                    try:
-                        response = competitor_client.post(
-                            "/v1/regional/executors/claim",
-                            headers=headers,
-                            json={
-                                "executor_id": "cap004-competitor",
-                                "execution_owners": ["gpu-fault-node-agent"],
-                                "max_commands": 25,
-                                "lease_seconds": 10,
-                            },
-                        )
-                    except Exception:
-                        with counters_lock:
-                            competitor_errors += 1
-                        continue
-                    if response.status_code == 200:
-                        competitor_claimed.extend(
-                            command["command_id"]
-                            for command in response.json().get("commands") or []
-                        )
-
-        competitor_thread = threading.Thread(target=competitor, daemon=True)
-        competitor_thread.start()
-
-        def execute(item: Mapping[str, Any]) -> None:
-            nonlocal active, max_active
-            command_id = str(item["command_id"])
-            initial_expiry = item.get("lease_expires_at")
-            with counters_lock:
-                active += 1
-                max_active = max(max_active, active)
-            begin = time.perf_counter()
-            try:
-                time.sleep(12)
-                with httpx.Client(base_url=probe.url, timeout=20) as result_client:
-                    response = result_client.post(
-                        f"/v1/regional/executors/{command_id}/result",
-                        headers=headers,
-                        json={
-                            "lease_token": str(item["lease_token"]),
-                            "status": "SUCCEEDED",
-                            "status_source": "cap004-simulator",
-                            "details": {
-                                "simulated": True,
-                                "operation": item["step"]["operation"],
-                            },
-                        },
-                    )
-                with counters_lock:
-                    result_statuses.append(response.status_code)
-            finally:
-                renewal_stops[command_id].set()
-                renewal_threads[command_id].join(timeout=5)
-                with counters_lock:
-                    active -= 1
-                    durations.append(time.perf_counter() - begin)
-                    expiries = renewal_expiries[command_id]
-                    lease_progressions.append(
-                        {
-                            "command_id": command_id,
-                            "initial": initial_expiry,
-                            "latest": expiries[-1],
-                            "renewal_count": max(0, len(expiries) - 1),
-                        }
-                    )
-
-        wall_started = time.perf_counter()
-        try:
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                list(pool.map(execute, commands))
-        finally:
-            for stop_renew in renewal_stops.values():
-                stop_renew.set()
-            for thread in renewal_threads.values():
-                thread.join(timeout=5)
-            competitor_stop.set()
-            competitor_thread.join(timeout=5)
-        final_claim = client.post(
-            "/v1/regional/executors/claim",
-            headers=headers,
-            json={
-                "executor_id": "cap004-final",
-                "execution_owners": ["gpu-fault-node-agent"],
-                "max_commands": 25,
-                "lease_seconds": 10,
-            },
-        )
-        final_claim.raise_for_status()
-        return {
-            "max_active": max_active,
-            "durations": durations,
-            "renewals": renewals,
-            "renewal_failures": renewal_failures,
-            "injected_failure_status": injected_failure_status,
-            "competitor_claimed": competitor_claimed,
-            "competitor_errors": competitor_errors,
-            "result_statuses": result_statuses,
-            "lease_progressions": lease_progressions,
-            "wall": time.perf_counter() - wall_started,
-            "final_commands": final_claim.json().get("commands") or [],
-        }
-
     def case_004(self) -> dict[str, Any]:
+        case_dir = self.run_dir / "CAP-004"
+        case_dir.mkdir(mode=0o700, exist_ok=True)
+        result: dict[str, Any] = {
+            "status": "FAIL",
+            "production_executor_verified": False,
+        }
+        write_json(case_dir / "summary.json", result)
         probe = self.deploy_probe(
             "CAP004",
             {
@@ -908,82 +1201,81 @@ class CapacityAcceptanceCases(CapHarnessBase):
                 "GPU_FAULT_STORE_IO_MAX_IN_FLIGHT": "64",
             },
         )
-        case_dir = self.run_dir / "CAP-004"
-        case_dir.mkdir(mode=0o700, exist_ok=True)
-        seed = self.kubectl(
-            "exec",
-            probe.pod,
-            "--",
-            "/opt/gpu-fault/control-plane/bin/python",
-            "/opt/cap/cap_seed_commands.py",
-        )
-        (case_dir / "seed.json").write_text(seed.stdout, encoding="utf-8")
-        (case_dir / "seed.json").chmod(0o600)
-        client = httpx.Client(base_url=probe.url, timeout=30)
-        headers = self.cluster_headers("cap-cluster-000", self.tokens[0])
-        claim_started = time.perf_counter()
-        claim_response = client.post(
-            "/v1/regional/executors/claim",
-            headers=headers,
-            json={
-                "executor_id": "cap004-primary",
-                "execution_owners": ["gpu-fault-node-agent"],
-                "max_commands": 25,
-                "lease_seconds": 10,
-            },
-        )
-        claim_latency = time.perf_counter() - claim_started
-        claim_bytes = len(claim_response.content)
-        claim_response.raise_for_status()
-        commands = claim_response.json().get("commands") or []
-        if len(commands) != 25:
-            raise CapError(f"CAP-004 claimed {len(commands)} commands, expected 25")
-        stats = self._cap004_execute_claimed(probe, client, headers, commands)
-        client.close()
-        result: dict[str, Any] = {
-            "claim_response_bytes": claim_bytes,
-            "claim_latency_ms": claim_latency * 1000,
-            "commands_claimed": len(commands),
-            "max_concurrent_commands": stats["max_active"],
-            "lease_seconds": 10,
-            "long_commands": sum(item >= 10 for item in stats["durations"]),
-            "renewals": stats["renewals"],
-            "renewal_failures": stats["renewal_failures"],
-            "injected_renewal_failure_status": stats["injected_failure_status"],
-            "competitor_duplicate_claims": len(stats["competitor_claimed"]),
-            "competitor_transport_errors": stats["competitor_errors"],
-            "result_status_counts": dict(
-                sorted(Counter(stats["result_statuses"]).items())
-            ),
-            "final_open_claims": len(stats["final_commands"]),
-            "command_latency_ms": {
-                "p50": percentile([value * 1000 for value in stats["durations"]], 0.50),
-                "p95": percentile([value * 1000 for value in stats["durations"]], 0.95),
-                "p99": percentile([value * 1000 for value in stats["durations"]], 0.99),
-            },
-            "batch_wall_seconds": stats["wall"],
-            "lease_progressions": stats["lease_progressions"],
-            "recommended_batch_size": 25,
-            "recommended_max_concurrent_commands": 5,
-        }
-        passed = all(
-            (
-                len(commands) == 25,
-                stats["max_active"] == 5,
-                result["long_commands"] >= 5,
-                stats["renewals"] > 0,
-                stats["renewal_failures"] >= 1,
-                stats["injected_failure_status"] in {403, 409},
-                not stats["competitor_claimed"],
-                stats["competitor_errors"] == 0,
-                result["result_status_counts"] == {200: 25},
-                not stats["final_commands"],
-                all(item["renewal_count"] > 0 for item in stats["lease_progressions"]),
+        error: BaseException | None = None
+        cleanup_errors: list[str] = []
+        self.cap004_executor_stopped = True
+        try:
+            seed = self.cap004_store(probe, "seed")
+            write_json(case_dir / "seed.json", seed)
+            self.cap004_executor_stopped = False
+            try:
+                result.update(
+                    run_executor_proof(
+                        probe.url,
+                        self.tokens[0],
+                        self.run_id,
+                        case_dir,
+                    )
+                )
+            except Cap004ThreadsRunning:
+                raise
+            except BaseException:
+                self.cap004_executor_stopped = True
+                raise
+            else:
+                self.cap004_executor_stopped = True
+            final = self.cap004_store(probe, "inspect")
+            write_json(case_dir / "terminal-commands.json", final)
+            progression_errors = cap004_progression_errors(
+                seed["commands"], result["lease_progressions"]
             )
-        )
-        result["status"] = "PASS" if passed else "FAIL"
-        write_json(case_dir / "summary.json", result)
-        write_json(case_dir / "cleanup.json", self.cleanup_probe(probe))
+            terminal_errors = cap004_commands.terminal_errors(final, self.run_id)
+            result["lease_progression_errors"] = progression_errors
+            result["terminal_errors"] = terminal_errors
+            result["production_executor_verified"] = not (
+                result["problems"] or progression_errors or terminal_errors
+            )
+        except BaseException as exc:
+            error = exc
+            result["error_type"] = type(exc).__name__
+        finally:
+            if self.cap004_executor_stopped:
+                try:
+                    closed = self.cap004_store(probe, "cleanup")
+                    if any(
+                        row["status"] not in {"SUCCEEDED", "FAILED"}
+                        or row["lease_present"] is not False
+                        for row in closed["commands"]
+                    ):
+                        raise CapError("CAP004 cleanup left nonterminal commands")
+                    write_json(case_dir / "command-cleanup.json", closed)
+                except Exception as exc:
+                    cleanup_errors.append(f"command cleanup: {type(exc).__name__}")
+                try:
+                    write_json(case_dir / "cleanup.json", self.cleanup_probe(probe))
+                except Exception as exc:
+                    cleanup_errors.append(f"probe cleanup: {type(exc).__name__}")
+            else:
+                cleanup_errors.append(
+                    "Executor threads still running; cleanup withheld"
+                )
+            passed = (
+                error is None
+                and not cleanup_errors
+                and result["production_executor_verified"] is True
+            )
+            result["status"] = "PASS" if passed else "FAIL"
+            result["cleanup_errors"] = cleanup_errors
+            result["limitations"] = [
+                "Executor scheduling and lease handling use a nonphysical ledger; "
+                "no Node Agent, Kubernetes or provider action is exercised."
+            ]
+            write_json(case_dir / "summary.json", result)
+        if error is not None:
+            raise error
         if not passed:
-            raise CapError("GF-REGIONAL-CAP-004 failed")
+            problems = result.get("problems") or [
+                "lease progression, terminal state or cleanup proof failed"
+            ]
+            raise CapError("GF-REGIONAL-CAP-004 failed: " + "; ".join(problems))
         return result

@@ -5,9 +5,11 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.command_log import FAILURE_EXIT_CODE_ATTRIBUTE
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 BASE_RUNTIME_PATH = (
     "/opt/app-root/bin:/opt/app-root/src/.local/bin:"
@@ -19,7 +21,7 @@ CONTROL_PLANE_PYTHON = "python"
 EXECUTOR_PYTHON = "python"
 EXECUTOR_READINESS = "gpu-fault-cluster-executor-readiness"
 MODULE_DIGEST_SCRIPT = "from gpu_fault import module_digest; print(module_digest())"
-MAX_RUNTIME_IDENTITY_WORKERS = 8
+MAX_RUNTIME_IDENTITY_WORKERS = DEPLOY_CONCURRENCY.read_only_checks
 CPU_INGRESS_POD_ATTRIBUTE = "_cpu_ingress_pod"
 
 
@@ -148,38 +150,24 @@ def cpu_ingress_pod_if_running(release: Any) -> str:
 
 
 def cpu_ingress_deployment_installed(release: Any) -> bool:
-    """Whether the CPU ingress Deployment exists and is meant to run.
-
-    A first bootstrap runs its preflight before the control plane is
-    installed: the namespace holds only the bootstrap's Secrets and Jobs, so
-    "no Running ingress Pod" means "nothing installed", not "outage". A failed
-    bootstrap's cleanup leaves the same picture with the Deployments present
-    but scaled to zero (live 2026-09-13: the retry's preflight then asked a
-    Pod that could not exist). Callers that need a Pod to answer a question
-    use this to tell the two apart: absent or scaled to zero, the answer is
-    decided by the absence; present with replicas but no Running Pod, the
-    resolvers above still raise.
-    """
-
-    returncode, stdout, stderr = release.runner.probe_output(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
+    """Whether ingress is installed, never a proof that durable work is absent."""
+    document = probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef(
             "deployment",
+            "Deployment",
             inventory.CPU_INGRESS_DEPLOYMENT,
-            "-o",
-            "jsonpath={.spec.replicas}",
-        )
-    )
-    if returncode == 0:
-        return str(stdout).strip() not in {"", "0"}
-    if "NotFound" in str(stderr):
+            release.config.namespace,
+        ),
+    ).require_readable()
+    if document is None:
         return False
-    raise ReleaseError(
-        "could not read the CPU ingress Deployment: "
-        + (str(stderr).strip() or f"kubectl exited {returncode}")
-    )
+    spec = document.get("spec")
+    replicas = spec.get("replicas", 1) if isinstance(spec, dict) else None
+    if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 0:
+        raise ReleaseError("CPU ingress Deployment replica count is invalid")
+    return replicas > 0
 
 
 def forget_cpu_ingress_pod(release: Any) -> None:
@@ -250,26 +238,18 @@ def exec_cpu_ingress(
             return str(output or "")
         except ReleaseError as exc:
             error = exc
-            # A container killed with SIGKILL/SIGTERM exits 137/143: the Pod is
-            # being reaped by the rollout even if its object still lingers as
-            # Terminating, so the `get pod` below would still find it. Treat
-            # the kill itself as the replacement signal, which also spares the
-            # extra round trip.
+            # Only read-only probes may retry a container killed mid-exec.
             killed_in_flight = getattr(exc, FAILURE_EXIT_CODE_ATTRIBUTE, None) in (
                 137,
                 143,
             )
             replaced = replacement_attempts_left > 0 and (
                 killed_in_flight
-                or not release.runner.probe(
-                    release._cpu(
-                        "-n",
-                        release.config.namespace,
-                        "get",
-                        "pod",
-                        pod,
-                    )
-                )
+                or not probe_resource(
+                    release.runner,
+                    release._cpu(),
+                    ResourceRef("pod", "Pod", pod, release.config.namespace),
+                ).exists()
             )
             forget_cpu_ingress_pod(release)
             refresh = True
@@ -355,6 +335,7 @@ def _running_pods(
     release: Any,
     kubectl: list[str],
     deployment: str,
+    expected_image: str | None = None,
 ) -> list[str]:
     value = release._get_json(
         kubectl
@@ -385,6 +366,15 @@ def _running_pods(
         if not (item.get("metadata") or {}).get("deletionTimestamp")
     )
     names = [name for name in names if name]
+    if expected_image is not None:
+        for item in pods.get("items", []):
+            if (item.get("metadata") or {}).get("deletionTimestamp"):
+                continue
+            containers = (item.get("spec") or {}).get("containers") or []
+            if not containers or containers[0].get("image") != expected_image:
+                raise ReleaseError(
+                    f"{deployment} Pod OCI image differs from the release"
+                )
     if len(names) != replicas:
         raise ReleaseError(
             f"{deployment} runtime identity has {len(names)}/{replicas} Running Pods"
@@ -392,61 +382,38 @@ def _running_pods(
     return names
 
 
-def _deployment_digests(
+def _pod_digest(
     release: Any,
     kubectl: list[str],
     deployment: str,
+    pod: str,
     *,
     python: str,
     path: str,
     expected: str,
-) -> dict[str, str]:
-    pods = _running_pods(release, kubectl, deployment)
-
-    def read_digest(pod: str) -> tuple[str, str]:
-        digest = release.runner.run(
-            kubectl
-            + [
-                "-n",
-                release.config.namespace,
-                "exec",
-                pod,
-                "--",
-                "env",
-                f"PATH={path}",
-                python,
-                "-c",
-                MODULE_DIGEST_SCRIPT,
-            ],
-            capture=True,
-        ).strip()
-        if digest != expected:
-            raise ReleaseError(
-                f"{deployment}/{pod} module digest {digest!r} "
-                f"does not match release component {expected}"
-            )
-        return pod, digest
-
-    digests: dict[str, str] = {}
-    errors: dict[str, str] = {}
-    with ThreadPoolExecutor(
-        max_workers=min(MAX_RUNTIME_IDENTITY_WORKERS, max(1, len(pods)))
-    ) as executor:
-        futures = {executor.submit(read_digest, pod): pod for pod in pods}
-        for future in as_completed(futures):
-            pod = futures[future]
-            try:
-                name, digest = future.result()
-            except Exception as exc:
-                errors[pod] = f"{type(exc).__name__}: {exc}"
-            else:
-                digests[name] = digest
-    if errors:
-        details = "; ".join(
-            f"{deployment}/{pod}: {error}" for pod, error in sorted(errors.items())
+) -> str:
+    digest = release.runner.run(
+        kubectl
+        + [
+            "-n",
+            release.config.namespace,
+            "exec",
+            pod,
+            "--",
+            "env",
+            f"PATH={path}",
+            python,
+            "-c",
+            MODULE_DIGEST_SCRIPT,
+        ],
+        capture=True,
+    ).strip()
+    if digest != expected:
+        raise ReleaseError(
+            f"{deployment}/{pod} module digest {digest!r} "
+            f"does not match release component {expected}"
         )
-        raise ReleaseError(f"runtime component identity failed: {details}")
-    return dict(sorted(digests.items()))
+    return str(digest)
 
 
 def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
@@ -455,47 +422,115 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
     if len(control_digest) != 64 or len(executor_digest) != 64:
         raise ReleaseError("release component module digests are unavailable")
 
-    errors: dict[str, str] = {}
-    cpu = {}
-    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
-        try:
-            cpu[deployment] = _deployment_digests(
-                release,
-                release._cpu(),
-                deployment,
-                python=CONTROL_PLANE_PYTHON,
-                path=CONTROL_PLANE_PATH,
-                expected=control_digest,
-            )
-        except Exception as exc:
-            errors[f"control-plane/{deployment}"] = f"{type(exc).__name__}: {exc}"
-    gpu = {}
+    targets = [
+        (
+            "control-plane",
+            deployment,
+            release._cpu(),
+            CONTROL_PLANE_PYTHON,
+            CONTROL_PLANE_PATH,
+            control_digest,
+        )
+        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+    ]
     for target in release.config.clusters:
-        deployments = {}
-        for deployment in (
-            *inventory.DEPLOYMENTS,
-            inventory.GPU_RECONCILER_DEPLOYMENT,
-        ):
+        targets.extend(
+            (
+                target.cluster_id,
+                deployment,
+                release._gpu(target),
+                EXECUTOR_PYTHON,
+                EXECUTOR_PATH,
+                executor_digest,
+            )
+            for deployment in (
+                *inventory.DEPLOYMENTS,
+                inventory.GPU_RECONCILER_DEPLOYMENT,
+            )
+        )
+    results: dict[tuple[str, str], dict[str, str]] = {
+        (scope, deployment): {} for scope, deployment, *_rest in targets
+    }
+    errors: dict[str, str] = {}
+    # Listings and Pod execs share one pool; nested per-Deployment pools would
+    # multiply the bound as clusters and replicas grow.
+    with ThreadPoolExecutor(max_workers=MAX_RUNTIME_IDENTITY_WORKERS) as executor:
+        listings = {
+            executor.submit(
+                _running_pods,
+                release,
+                kubectl,
+                deployment,
+                (
+                    release.runtime_image
+                    if scope == "control-plane"
+                    else release.executor_image
+                )
+                if release.config.release_manifest_schema_version >= 4
+                else None,
+            ): (
+                scope,
+                deployment,
+                kubectl,
+                python,
+                path,
+                expected,
+            )
+            for scope, deployment, kubectl, python, path, expected in targets
+        }
+        probes = {}
+        for listing in as_completed(listings):
+            scope, deployment, kubectl, python, path, expected = listings[listing]
             try:
-                deployments[deployment] = _deployment_digests(
-                    release,
-                    release._gpu(target),
-                    deployment,
-                    python=EXECUTOR_PYTHON,
-                    path=EXECUTOR_PATH,
-                    expected=executor_digest,
-                )
+                pods = listing.result()
             except Exception as exc:
-                errors[f"executor/{target.cluster_id}/{deployment}"] = (
-                    f"{type(exc).__name__}: {exc}"
-                )
-        gpu[target.cluster_id] = deployments
+                errors[f"{scope}/{deployment}"] = f"{type(exc).__name__}: {exc}"
+                continue
+            for pod in pods:
+                probes[
+                    executor.submit(
+                        _pod_digest,
+                        release,
+                        kubectl,
+                        deployment,
+                        pod,
+                        python=python,
+                        path=path,
+                        expected=expected,
+                    )
+                ] = (scope, deployment, pod)
+        for probe in as_completed(probes):
+            scope, deployment, pod = probes[probe]
+            try:
+                results[scope, deployment][pod] = probe.result()
+            except Exception as exc:
+                errors[f"{scope}/{deployment}/{pod}"] = f"{type(exc).__name__}: {exc}"
     if errors:
         details = "; ".join(
             f"{scope}: {error}" for scope, error in sorted(errors.items())
         )
         raise ReleaseError(f"runtime component identity validation failed: {details}")
     return {
-        "control_plane": {"expected": control_digest, "deployments": cpu},
-        "executor": {"expected": executor_digest, "clusters": gpu},
+        "control_plane": {
+            "expected": control_digest,
+            "deployments": {
+                deployment: dict(sorted(results["control-plane", deployment].items()))
+                for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+            },
+        },
+        "executor": {
+            "expected": executor_digest,
+            "clusters": {
+                target.cluster_id: {
+                    deployment: dict(
+                        sorted(results[target.cluster_id, deployment].items())
+                    )
+                    for deployment in (
+                        *inventory.DEPLOYMENTS,
+                        inventory.GPU_RECONCILER_DEPLOYMENT,
+                    )
+                }
+                for target in release.config.clusters
+            },
+        },
     }

@@ -38,8 +38,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def store():
     assert POSTGRES_URL is not None
-    instance = PostgresStore(POSTGRES_URL)
     _truncate()
+    instance = PostgresStore(POSTGRES_URL)
     try:
         yield instance
     finally:

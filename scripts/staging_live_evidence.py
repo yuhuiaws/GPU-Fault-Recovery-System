@@ -89,6 +89,7 @@ def read_live_status(
     state_dir: Path,
     venv: Path,
     lock_fd: int | None = None,
+    allow_unhealthy: bool = False,
 ) -> dict[str, object]:
     """The quick ``gpu-fault-admin status`` report of the managed site, as read.
 
@@ -120,14 +121,8 @@ def read_live_status(
         capture_output=True,
         pass_fds=(lock_fd,) if lock_fd is not None else (),
     )
-    # ``status`` exits 1 when the site is not healthy and still prints the full
-    # report; that report is exactly what a deploy over a failed transaction
-    # needs (the consent refusals read ``live_release`` from it, and the
-    # classification must see that the live transaction is not committed).
-    # Live 2026-09-11: ``--supersede-failed-transaction`` could never start
-    # because the failed transaction's open compatibility window made the
-    # control-API check fail, and that exit code was treated as "no report".
-    if completed.returncode not in (0, 1):
+    # Unhealthy reports guide repair/resume; only healthy reports prove a NOOP.
+    if completed.returncode and not (allow_unhealthy and completed.returncode == 1):
         raise LiveEvidenceError(
             f"status failed ({completed.returncode}): "
             + (completed.stderr or "").strip()
@@ -143,6 +138,10 @@ def read_live_status(
         raise LiveEvidenceError("live deployment status is invalid") from exc
     if not isinstance(report, dict):
         raise LiveEvidenceError("live deployment status must be a JSON object")
+    if completed.returncode and (
+        report.get("mode") != "status" or report.get("healthy") is not False
+    ):
+        raise LiveEvidenceError("failed status did not return a valid unhealthy report")
     return report
 
 

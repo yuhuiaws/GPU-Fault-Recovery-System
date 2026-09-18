@@ -41,6 +41,7 @@ from gpu_fault_release import rollout as MODULE
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_rendering import DATAPLANE_ADOT_DEPLOYMENT
 from tests.regional._release_orchestrator_support import config_file
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE_ARN = "arn:aws:iam::123456789012:role/gpu-fault-adot-writer"
@@ -389,6 +390,7 @@ class _Rollback:
             "adot_image": PREVIOUS_ADOT_IMAGE,
             "agent_identities": {t.cluster_id: _identity() for t in self.clusters},
             "observability": {"adot": [], **observability},
+            "aurora_refresh": None,
         }
         ORCHESTRATION.rollback_release(self.release, state=previous)
 
@@ -1144,9 +1146,11 @@ class _Runner:
         self.calls.append((list(arguments), kwargs))
         return ""
 
-    def probe(self, arguments: list[str], **_kwargs: Any) -> bool:
+    def probe_output(
+        self, arguments: list[str], **_kwargs: Any
+    ) -> tuple[int, str, str]:
         self.probes.append(list(arguments))
-        return True
+        return resource_probe_result(arguments)
 
 
 def _config(tmp_path: Path, *, adot_irsa_role_arn: str | None = None) -> Path:
@@ -1186,6 +1190,10 @@ def test_the_apply_skip_branch_scales_a_leftover_collector_to_zero(
             "get",
             "deployment",
             DATAPLANE_ADOT_DEPLOYMENT,
+            "--ignore-not-found",
+            "-o",
+            "json",
+            "--request-timeout=15s",
         ]
     ]
     scale = [arguments for arguments, _ in release.runner.calls if "scale" in arguments]

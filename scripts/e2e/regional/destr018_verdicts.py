@@ -32,6 +32,8 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.destr016_verdicts import barrier_commands
+
 CASE_ID = "GF-REGIONAL-DESTR-018"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-010"
 EXPECTED_XID = 46
@@ -140,12 +142,9 @@ SHIPPED_STEP_WAITING_CAP_SECONDS = 600
 # cadence a WAITING step can be redispatched at. A measured cadence below it
 # means the site is not the one this arithmetic was computed for.
 CADENCE_FLOOR_SECONDS = 5
-# Wall clock the workflow spends before it first reaches the verify step
-# (MARK_UNSCHEDULABLE + QUIESCE_GPU_SERVICES on an idle node). Subtracted from
-# the lifetime, the remainder is the window the verify step can burn attempts
-# in. Deliberately small, because a *shorter* containment means *more* verify
-# attempts, so the worst case is the pessimistic one.
-CONTAINMENT_ALLOWANCE_SECONDS = 90
+# No positive lower bound on containment is proved. Give verify the whole
+# lifetime when checking that its attempt budget cannot expire first.
+CONTAINMENT_ALLOWANCE_SECONDS = 0
 # Attempts that must still be unspent when the lifetime fires. Without a
 # margin an attempt-budget failure and a lifetime failure are indistinguishable.
 ATTEMPT_MARGIN = 15
@@ -168,7 +167,7 @@ def parse_time(value: Any) -> datetime | None:
         except ValueError:
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -186,8 +185,8 @@ def worst_case_verify_attempts(
     """
 
     window = max(lifetime_seconds - containment_allowance_seconds, 0)
-    if cadence_seconds <= 0:
-        raise ValueError("cadence must be positive")
+    if not math.isfinite(cadence_seconds) or cadence_seconds <= 0:
+        raise ValueError("cadence must be finite and positive")
     return math.ceil(window / cadence_seconds)
 
 
@@ -238,7 +237,7 @@ def lifetime_margin_errors(
             "computed, so the drill is refused rather than guessed"
         )
         return errors
-    if cadence_seconds < CADENCE_FLOOR_SECONDS:
+    if not math.isfinite(cadence_seconds) or cadence_seconds < CADENCE_FLOOR_SECONDS:
         errors.append(
             f"measured redispatch cadence {cadence_seconds:.3f}s is below the "
             f"deployed floor {CADENCE_FLOOR_SECONDS}s; recompute the window "
@@ -487,13 +486,19 @@ def remote_command_errors(
     """Every in-flight command must end FAILED with a cancellation source."""
 
     errors: list[str] = []
-    waiting = [
-        command
-        for command in commands
-        if (command.get("step") or {}).get("operation") == WAITING_STEP
-    ]
+    waiting = barrier_commands(commands)
     if not waiting:
         errors.append(f"no remote command was issued for {WAITING_STEP}")
+    elif len(waiting) != 1:
+        errors.append(f"multiple remote commands carry {WAITING_STEP}")
+    for command in waiting:
+        if (
+            command.get("status") != "FAILED"
+            or command.get("status_source") not in CANCELLATION_STATUS_SOURCES
+        ):
+            errors.append(
+                "the waiting barrier command was not cancelled by the deadline"
+            )
     cancelled = [
         command
         for command in commands
@@ -521,8 +526,14 @@ def remote_command_errors(
     for command in commands:
         operation = (command.get("step") or {}).get("operation")
         completed = parse_time(command.get("updated_at"))
+        if command.get("status") not in {"SUCCEEDED", "FAILED"}:
+            errors.append(f"remote command {operation} is still nonterminal")
         if command.get("status") != "SUCCEEDED":
             continue
+        if completed is None:
+            errors.append(
+                f"successful remote command {operation} has no valid update time"
+            )
         if completed is not None and completed > t_cancel:
             if operation != COMPENSATION_STEP:
                 errors.append(
@@ -841,6 +852,39 @@ def straddling_rows(
     return result
 
 
+def ledger_command_matches(row: dict[str, Any], command: dict[str, Any]) -> bool:
+    row_id = row.get("command_id")
+    if not row_id:
+        return False
+    if any(
+        row.get(key) is not None and row[key] != command.get(key)
+        for key in ("workflow_request_id", "incident_id", "fencing_token")
+    ):
+        return False
+    generation = row.get("agent_generation")
+    for entry in [command, *(command.get("batched_steps") or [])]:
+        step = entry.get("step") or {}
+        if step.get("operation") != row.get("operation"):
+            continue
+        if row_id in {
+            command.get("command_id"),
+            (command.get("result_details") or {}).get("node_action_command_id"),
+        }:
+            return True
+        key = entry.get("idempotency_key")
+        if (
+            key
+            and type(generation) is int
+            and generation > 0
+            and any(
+                row_id == f"{key}/{node}/agent-{generation}"
+                for node in step.get("node_ids") or []
+            )
+        ):
+            return True
+    return False
+
+
 def straddling_row_errors(
     rows: list[dict[str, Any]],
     *,
@@ -905,35 +949,14 @@ def straddling_row_errors(
             f"the straddling {operation} row is {state}; the device holder was "
             "meant to make every attempt fail"
         )
-    # The ledger row and the remote command share the command id; that is the
-    # only match that says "the same dispatch". Matching on the operation would
-    # pick any VERIFY attempt of the workflow and judge the wrong command.
-    row_id = row.get("command_id")
-    if row_id:
-        command = next(
-            (item for item in commands if item.get("command_id") == row_id), None
-        )
-    else:
-        command = next(
-            (
-                item
-                for item in commands
-                if (item.get("step") or {}).get("operation") == operation
-            ),
-            None,
-        )
-        if command is not None:
-            errors.append(
-                f"the straddling {operation} ledger row has no command_id; the "
-                f"remote command {command.get('command_id')} was matched by "
-                "operation only, which cannot prove it is the same dispatch"
-            )
-    if command is None:
+    matches = [item for item in commands if ledger_command_matches(row, item)]
+    if len(matches) != 1:
         errors.append(
-            f"no remote command matches the straddling ledger row "
-            f"{row.get('command_id')}"
+            "no remote command matches the straddling ledger row uniquely: "
+            f"{row.get('command_id')} ({len(matches)} matches)"
         )
         return errors
+    command = matches[0]
     if command.get("status") != "FAILED":
         errors.append(
             f"the remote command for the straddling {operation} row is "
@@ -990,6 +1013,10 @@ def compensation_row_errors(
         errors.append(
             f"the {COMPENSATION_STEP} ledger row has no started_at, so the "
             "compensation cannot be placed after the cancellation"
+        )
+    elif started < t_cancel:
+        errors.append(
+            f"the {COMPENSATION_STEP} ledger row started before the cancellation"
         )
     return errors
 
@@ -1082,9 +1109,8 @@ def metric_evidence(before: list[str], after: list[str]) -> dict[str, Any]:
 def metric_errors(evidence: dict[str, Any]) -> list[str]:
     """Counters are optional evidence: judged only when both samples exist.
 
-    A worker restart between the samples resets the counters, and the scrape
-    that answers may not be the replica that failed the workflow, so a missing
-    or negative delta is recorded rather than failed.
+    An observed counter reset or unusable number makes the evidence
+    inconclusive, never a successful increment.
     """
 
     errors: list[str] = []
@@ -1096,7 +1122,12 @@ def metric_errors(evidence: dict[str, Any]) -> list[str]:
         delta = sample.get("delta")
         if delta is None:
             continue
-        if delta < 0:
+        if (
+            isinstance(delta, bool)
+            or not isinstance(delta, (int, float))
+            or (not math.isfinite(delta) or delta < 0)
+        ):
+            errors.append(f"{name} has an unusable or decreasing counter delta")
             continue
         if delta == 0:
             errors.append(

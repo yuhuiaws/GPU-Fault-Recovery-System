@@ -307,7 +307,9 @@ def test_the_join_must_start_after_both_branches_released_their_nodes() -> None:
     )
 
 
-def test_serialized_branches_are_reported_as_not_parallel() -> None:
+def test_dispatch_intervals_cannot_prove_physical_parallelism() -> None:
+    from scripts.e2e.regional.destr015_physical_evidence import physical_overlap_errors
+
     workflow = happy_workflow()
     steps = workflow["official_steps"]
     for item in workflow["step_executions"]:
@@ -318,8 +320,9 @@ def test_serialized_branches_are_reported_as_not_parallel() -> None:
             item["updated_at"] = _at(offset, 30)
     workflow["step_executions"][-1]["started_at"] = _at(16, 0)
     workflow["step_executions"][-1]["updated_at"] = _at(17, 0)
-    assert any("parallel" in item for item in _errors(workflow)), (
-        "expected any('parallel' in item for item in _errors(workflow)) to be true"
+    assert _errors(workflow) == [], "dispatch timing only checks the DAG's dependencies"
+    assert physical_overlap_errors({}, scopes={}, workflow=workflow, hosts={}), (
+        "neither serialized nor overlapping branches replace physical witnesses"
     )
 
 
@@ -1043,6 +1046,7 @@ def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
         raise AssertionError("pytest must not run when the plan's result is reusable")
 
     monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
+    monkeypatch.setattr(live_driver_guard, "source_digest", lambda: "1" * 64)
     recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
     details: dict[str, Any] = {}
     live_driver_guard.record_focused_tests(details, recorded)

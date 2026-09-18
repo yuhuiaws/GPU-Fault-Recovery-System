@@ -22,6 +22,14 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
 )
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    bounded_collector_case,
+    require_action_time,
+)
+from scripts.e2e.regional.collect017_training import (  # noqa: E402
+    incident_attempt_errors,
+    wait_training_progress,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -32,8 +40,8 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
@@ -392,19 +400,20 @@ def run_efa_unbind(
     bdf = str(bound[0]["pci_bdf"])
     base_settings = _base_settings(settings, settings.node)
     started_at = datetime.now(timezone.utc)
-    injection = collector.execute(
-        "unbind-efa",
-        "--run-id",
-        f"c017-a-{attempt}",
-        "--pci-bdf",
-        bdf,
-        "--restore-seconds",
-        str(EFA_RESTORE_SECONDS),
-    )
+    injection: dict[str, Any] = {}
     unbound: dict[str, Any] = {}
     recovered: dict[str, Any] = {}
     bundle: dict[str, Any] = {}
     try:
+        injection = collector.execute(
+            "unbind-efa",
+            "--run-id",
+            f"c017-a-{attempt}",
+            "--pci-bdf",
+            bdf,
+            "--restore-seconds",
+            str(EFA_RESTORE_SECONDS),
+        )
         unbound = wait_efa_inventory(
             collector,
             discovered_count=int(baseline["discovered_count"]) - 1,
@@ -578,6 +587,7 @@ def plugin_workflow_errors(
 def run_gpu_plugin(
     settings: Settings,
     regional: RegionalLiveFixture,
+    case_dir: Path,
 ) -> dict[str, Any]:
     baseline = int(regional.node_snapshot(settings.node)["gpu_allocatable"])
     plugin = base.DevicePluginFixture(
@@ -585,6 +595,7 @@ def run_gpu_plugin(
         token="nvidia-device-plugin",
         node=settings.node,
         resource="nvidia.com/gpu",
+        case_dir=case_dir,
     )
     info = plugin.discover()
     started_at = datetime.now(timezone.utc)
@@ -656,6 +667,7 @@ def run_training_plugin(
     plugin_restored = False
     result: dict[str, Any] = {"errors": []}
     try:
+        require_action_time(180)
         prewarm.create(candidates)
         suffix = f"{int(time.time())}-{attempt}"
         manifest = base.render_named_training_manifest(
@@ -676,6 +688,7 @@ def run_training_plugin(
                 expected_gpu_count=24,
             ),
         )
+        require_action_time(180)
         workload.submit()
         source = workload.wait_running(timeout_seconds=900)
         uids = {str(item["uid"]) for item in source["pods"]}
@@ -687,6 +700,7 @@ def run_training_plugin(
             token="efa-k8s-device-plugin",
             node=target,
             resource="vpc.amazonaws.com/efa",
+            case_dir=case_dir,
         )
         info = plugin.discover()
         started_at = datetime.now(timezone.utc)
@@ -702,7 +716,7 @@ def run_training_plugin(
             operation="RESTART_EFA_DEVICE_PLUGIN",
             observed_after=started_at,
         )
-        during = workload.snapshot()
+        during = wait_training_progress(workload, source)
         if {str(item["uid"]) for item in during["pods"]} != uids:
             result["errors"].append("EFA plugin loss recreated training Pods")
         plugin.restore()
@@ -723,7 +737,17 @@ def run_training_plugin(
         result["errors"].extend(
             plugin_workflow_errors(workflow, steps=EFA_PLUGIN_STEPS, label="EFA plugin")
         )
-        after = workload.snapshot()
+        result["errors"].extend(
+            incident_attempt_errors(
+                workflow,
+                cluster_id=settings.regional.cluster_id,
+                node=target,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                workflow_id=str(planned.get("request_id") or ""),
+            )
+        )
+        after = wait_training_progress(workload, during)
         if {str(item["uid"]) for item in after["pods"]} != uids:
             result["errors"].append("training Pods changed after EFA plugin recovery")
         result.update(
@@ -733,6 +757,10 @@ def run_training_plugin(
                 "plugin": info,
                 "planned_workflow_id": planned.get("request_id"),
                 "workflow": workflow,
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "progress_during_loss": during["progress_evidence"],
+                "progress_after_restore": after["progress_evidence"],
             }
         )
     finally:
@@ -769,6 +797,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "unbind one EFA function with a 900s bind fail-safe, exclude one "
             "node from NVIDIA/EFA plugin DaemonSets, and verify allocatable recovery"
         ),
+        "deployment_prerequisites": {
+            "plugin_update_strategy": "OnDelete",
+            "strategy_must_be_explicitly_supported_by_deployment_policy": True,
+            "runner_changes_update_strategy": False,
+            "gpu_local_watchdog_image_source": "installed immutable gpu-fault-cluster-executor/executor image",
+        },
         "preflight_identity": {
             "release_id": preflight["release_id"],
             "node_uid": preflight["node"]["uid"],
@@ -779,16 +813,19 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "EFA bind fail-safe cannot be armed",
             "allocatable or training Pod UID assertions fail",
             "DaemonSet affinity cannot be restored exactly",
+            "plugin OnDelete prerequisite or durable watchdog acknowledgement is absent",
         ],
         "rollback": {
             "EFA_has_host_side_auto_bind": True,
             "restore_original_DaemonSet_affinity": True,
+            "gpu_local_uid_fenced_watchdog_before_exclusion": True,
             "delete_managed_training_workload": True,
         },
         "preflight": preflight,
     }
 
 
+@bounded_collector_case
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -811,6 +848,7 @@ def execute_case(
         image=settings.host_probe_image,
         case_id=CASE_ID,
         run_id=f"c017-{attempt}",
+        case_dir=case_dir,
     )
     result: dict[str, Any] = {
         "case_id": CASE_ID,
@@ -824,15 +862,26 @@ def execute_case(
         a = run_efa_unbind(settings, regional, collector, attempt)
         result["errors"].extend(a["errors"])
         result["a"] = a
-        b = run_gpu_plugin(settings, regional)
+        if result["errors"]:
+            raise RegionalFixtureError("EFA recovery failed; refusing plugin mutations")
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("approved maintenance window has ended")
+        b = run_gpu_plugin(settings, regional, case_dir)
         result["errors"].extend(b["errors"])
         result["b"] = b
+        if result["errors"]:
+            raise RegionalFixtureError("GPU plugin recovery failed; refusing training")
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("approved maintenance window has ended")
         c = run_training_plugin(settings, regional, case_dir, attempt)
         result["errors"].extend(c["errors"])
         result["c"] = c
+        if regional.cpu_blast_snapshot() != preflight["cpu_blast"]:
+            result["errors"].append("control-plane EKS state differs from baseline")
         result["verdict"] = "PASS" if not result["errors"] else "FAIL"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
     finally:
         try:
             residuals = collector.cleanup()

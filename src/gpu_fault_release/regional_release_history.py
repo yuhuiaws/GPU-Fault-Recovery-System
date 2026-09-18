@@ -13,14 +13,9 @@ against which plan". Every `save_state` now also appends one entry here:
 Entries carry digests, never content: the state and plan documents live in
 the state ConfigMap, and the command line is redacted before it is recorded.
 
-The ConfigMap is read once per process, on the first checkpoint that needs it,
-and appended to in memory from then on: the site operation lock guarantees one
-mutating engine process at a time, so nothing else writes the document while
-this process holds it, and every kubectl call from the deploy host costs about
-1.2 s -- re-reading before each of a release's ~15 checkpoints paid that twice
-(an existence probe and the read) for an answer this process had just written.
-The one read tolerates absence itself (`--ignore-not-found`), so a first
-release does not pay a separate existence probe either.
+The ConfigMap is read once per checkpoint, without a separate existence probe.
+It is not cached across writes: the local site lock does not exclude an
+independent deployment host or an external writer.
 A failed history write is announced on stderr and does not fail the release --
 the checkpoint that matters was already persisted, and blocking a rollback on
 an audit ConfigMap would be a new outage.
@@ -42,6 +37,7 @@ from gpu_fault.admin.operator_identity import (
     local_operator_identity,
     resolve_operator_identity,
 )
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 HISTORY_CONFIG_MAP = "gpu-fault-release-history"
 HISTORY_KEY = "history.ndjson"
@@ -125,32 +121,22 @@ def build_history_entry(
 
 
 def _existing_entries(release: Any) -> list[str]:
-    """The history lines as this process last knew them.
-
-    Served from the release object after the first read; `record_release_history`
-    updates that copy only once its apply has succeeded, so a failed write leaves
-    the next checkpoint reading the ConfigMap again rather than trusting a line
-    the cluster never saw. A dry run never gets here (nothing is recorded), so
-    the first read stays lazy.
-    """
-
-    cached = getattr(release, "_release_history_lines", None)
-    if cached is not None:
-        return list(cached)
-    # `--ignore-not-found`: a first release has no history yet, and that answer
-    # is an empty document rather than a failed read (or a separate probe).
-    value = release._get_json(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "configmap",
-            HISTORY_CONFIG_MAP,
-            "--ignore-not-found",
-        )
-    )
-    raw = (value.get("data") or {}).get(HISTORY_KEY) or ""
-    return [line for line in str(raw).splitlines() if line.strip()]
+    value = probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef(
+            "configmap", "ConfigMap", HISTORY_CONFIG_MAP, release.config.namespace
+        ),
+    ).require_readable()
+    if value is None:
+        return []
+    data = value.get("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("release history ConfigMap data is invalid")
+    raw = data.get(HISTORY_KEY, "")
+    if not isinstance(raw, str):
+        raise ValueError("release history is not text")
+    return [line for line in raw.splitlines() if line.strip()]
 
 
 def _mirror(entry_line: str) -> None:
@@ -178,7 +164,6 @@ def record_release_history(release: Any, *, phase: str, state_text: str) -> None
         )
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"))
         lines = [*_existing_entries(release), line][-HISTORY_MAX_ENTRIES:]
-        # One `kubectl apply` per checkpoint; the read happened once per process.
         release.runner.run(
             release._cpu("apply", "-f", "-"),
             input_text=json.dumps(
@@ -194,7 +179,6 @@ def record_release_history(release: Any, *, phase: str, state_text: str) -> None
                 }
             ),
         )
-        release._release_history_lines = lines
         _mirror(line)
     except Exception as exc:
         print(

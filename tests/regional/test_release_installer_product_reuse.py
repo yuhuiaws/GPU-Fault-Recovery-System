@@ -1,17 +1,7 @@
-"""The reconciler deploy script's products are made once per release and reused.
+"""Installer product reports cannot replace key proof or trusted template pins.
 
-Live 2026-09-12 (join, 4 nodes): ``deploy-node-installer-reconciler.sh`` ran
-three times in one release, and the two mutating runs each provisioned the node
-action keys again, rendered the template again and synced the Secret again.
-The first mutating run now reports what it produced; ``deploy_reconciler``
-hands that back to the later runs as hints, and the script re-checks every hint
-against the live cluster before trusting it.
-
-Two layers are exercised: the Python side (scope of the hints, state record,
-what an explicit override or a foreign release does to them) and the script
-itself, run end to end against a fake ``kubectl`` and fake sibling scripts so
-that the reuse decision, its fallbacks and the read-only preflight are observed
-rather than grepped for.
+The Python driver records diagnostics but emits no name/hash reuse hints.
+Script contracts are exercised with isolated fake tools, never live resources.
 """
 
 from __future__ import annotations
@@ -27,10 +17,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
 from gpu_fault_release import regional_release_rendering as RENDERING
 from gpu_fault_release import regional_release_state as STATE
+from tests.deploy.test_installer_template_identity import template_job
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy/node/deploy-node-installer-reconciler.sh"
@@ -129,7 +121,7 @@ def _deploy(release: Any, *, artifact: str = "a" * 64, **keywords: Any) -> None:
     )
 
 
-def test_first_deploy_records_products_and_the_next_one_hands_them_back(
+def test_product_reports_do_not_authorize_reuse_on_the_next_deploy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_reconciler_seams(monkeypatch)
@@ -150,8 +142,8 @@ def test_first_deploy_records_products_and_the_next_one_hands_them_back(
     assert record["template_content_sha256"] == PRODUCTS["template_content_sha256"]
     assert record["node_action_keys_provisioned"] is True
     assert record["inputs_sha256"] == RENDERING.installer_product_inputs_digest(first)
-    assert second[RENDERING.INSTALLER_REUSE_NODE_SET_ENV] == NODE_SET
-    assert second[RENDERING.INSTALLER_REUSE_TEMPLATE_ENV] == TEMPLATE_CM
+    assert RENDERING.INSTALLER_REUSE_NODE_SET_ENV not in second
+    assert RENDERING.INSTALLER_REUSE_TEMPLATE_ENV not in second
     products_files = {
         env[RENDERING.INSTALLER_PRODUCTS_FILE_ENV] for env in environments
     }
@@ -285,7 +277,15 @@ case "${verb}" in
     get)
         case "${positional[1]}" in
             nodes)
-                for node in ${FAKE_NODES}; do printf '%s\n' "${node}"; done ;;
+                python3 -c '
+import json, os
+print(json.dumps({"items": [
+    {"metadata": {"name": node, "uid": "uid-" + node,
+                  "labels": {"node.kubernetes.io/instance-type": "ml.p5.48xlarge"}},
+     "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0." + str(index + 1)}]}}
+    for index, node in enumerate(os.environ["FAKE_NODES"].split())
+]}))
+' ;;
             configmap)
                 name="${positional[2]}"
                 wants_json || exit 0
@@ -322,9 +322,27 @@ print(json.dumps({"data": {k: base64.b64encode(v.encode()).decode() for k, v in 
                     *) printf '{}\n' ;;
                 esac ;;
             jobs) printf '{"items":[]}\n' ;;
+            job|job/*)
+                name="${positional[1]#job/}"
+                [[ "${positional[1]}" != job ]] || name="${positional[2]}"
+                if [[ -f "${FAKE_JOB_DIR}/${name}" ]]; then
+                    cat "${FAKE_JOB_DIR}/${name}"
+                fi ;;
             *) printf '{}\n' ;;
         esac ;;
     create)
+        if [[ "${positional[1]}" == "-f" ]]; then
+            python3 -c '
+import json, os, sys
+from pathlib import Path
+job = json.load(open(sys.argv[1]))
+job["metadata"]["uid"] = "uid-" + job["metadata"]["name"]
+job["status"] = {"conditions": [{"type": "Complete", "status": "True"}]}
+(Path(os.environ["FAKE_JOB_DIR"]) / job["metadata"]["name"]).write_text(json.dumps(job))
+print(json.dumps(job))
+' "${positional[2]}"
+            exit 0
+        fi
         name="${positional[2]}"
         source="${positional[3]#--from-file=job.yaml=}"
         cp "${source}" "${FAKE_TEMPLATE_DIR}/${name}.pending"
@@ -335,6 +353,18 @@ print(json.dumps({"data": {k: base64.b64encode(v.encode()).decode() for k, v in 
             [[ -e "${pending}" ]] && mv "${pending}" "${pending%.pending}"
         done
         printf 'applied\n' ;;
+    delete)
+        if [[ "${positional[1]}" == "--raw" ]]; then
+            python3 -c '
+import json, os, sys
+from pathlib import Path
+path = Path(os.environ["FAKE_JOB_DIR"]) / sys.argv[1].rsplit("/", 1)[-1]
+options = json.load(sys.stdin)
+job = json.loads(path.read_text())
+assert options["preconditions"]["uid"] == job["metadata"]["uid"]
+path.unlink()
+' "${positional[2]}"
+        fi ;;
     *) exit 0 ;;
 esac
 """
@@ -352,7 +382,7 @@ while (($#)); do
     esac
 done
 if [[ "${render}" == "true" ]]; then
-    printf 'apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: fake-install-%s\n' "${node}"
+    cat "${FAKE_RENDERED_TEMPLATE}"
 fi
 """
 
@@ -381,6 +411,18 @@ class ScriptHarness:
         self._write(bin_dir / "kubectl", FAKE_KUBECTL)
         self.template_dir = tmp_path / "templates"
         self.template_dir.mkdir()
+        job_dir = tmp_path / "jobs"
+        job_dir.mkdir()
+        job = template_job(offline=False)
+        job["spec"]["template"]["spec"]["containers"][0]["image"] = (
+            "registry.example/installer@sha256:" + "1" * 64
+        )
+        job["spec"]["template"]["spec"]["volumes"][-1]["configMap"]["name"] = (
+            "gpu-fault-node-installer-0100"
+        )
+        self.rendered_template = yaml.safe_dump(job)
+        rendered = tmp_path / "rendered.yaml"
+        rendered.write_text(self.rendered_template)
         self.kubectl_log = tmp_path / "kubectl.log"
         self.render_log = tmp_path / "render.log"
         self.provision_log = tmp_path / "provision.log"
@@ -389,10 +431,13 @@ class ScriptHarness:
         master.write_text("master\n", encoding="utf-8")
         self.environment = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PYTHONPATH": str(ROOT / "src"),
             "FAKE_KUBECTL_LOG": str(self.kubectl_log),
             "FAKE_RENDER_LOG": str(self.render_log),
             "FAKE_PROVISION_LOG": str(self.provision_log),
             "FAKE_TEMPLATE_DIR": str(self.template_dir),
+            "FAKE_JOB_DIR": str(job_dir),
+            "FAKE_RENDERED_TEMPLATE": str(rendered),
             "FAKE_NODES": "node-b node-a",
             "FAKE_CLUSTER_ID": "gpu-a",
             "FAKE_WHEEL_CM": "gpu-fault-executor-wheel-test",
@@ -472,10 +517,7 @@ def test_the_first_mutating_run_provisions_renders_and_reports(
     assert harness.provision_count() == 1
     assert harness.render_count() == 1
     products = harness.products()
-    rendered = (
-        "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: fake-install-node-b\n"
-    )
-    content_sha = hashlib.sha256(rendered.encode()).hexdigest()
+    content_sha = hashlib.sha256(harness.rendered_template.encode()).hexdigest()
     assert products == {
         "node_set_sha256": NODE_SET,
         "node_action_keys_provisioned": True,
@@ -488,7 +530,7 @@ def test_the_first_mutating_run_provisions_renders_and_reports(
     )
 
 
-def test_a_later_run_with_true_hints_reuses_keys_and_template(
+def test_a_later_run_with_hints_still_provisions_keys_and_renders_the_template(
     harness: ScriptHarness,
 ) -> None:
     first = harness.run()
@@ -498,20 +540,20 @@ def test_a_later_run_with_true_hints_reuses_keys_and_template(
     second = harness.run(**hints)
 
     assert second.returncode == 0, second.stdout + second.stderr
-    assert harness.provision_count() == 1, "keys were not provisioned a second time"
-    assert harness.render_count() == 0, "the template was not rendered a second time"
-    assert "reusing node action keys" in second.stdout
-    assert "reusing template ConfigMap" in second.stdout
+    assert harness.provision_count() == 2, "name-only hints must not bypass key proof"
+    assert harness.render_count() == 1, "the candidate template has local provenance"
+    assert "reusing node action keys" not in second.stdout
+    assert "reusing template ConfigMap" not in second.stdout
     products = harness.products()
-    assert products["node_action_keys_provisioned"] is False
-    assert products["template_rendered"] is False
+    assert products["node_action_keys_provisioned"] is True
+    assert products["template_rendered"] is True
     assert (
         products["template_config_map"]
         == hints["GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP"]
     )
     lines = harness.kubectl_lines()
-    assert not any(" create configmap " in f" {line} " for line in lines), (
-        "a reused template is not re-created"
+    assert any(" create configmap " in f" {line} " for line in lines), (
+        "the release renders and publishes its own template"
     )
     assert any(
         "get secret gpu-fault-node-action-keys -o json" in line for line in lines
@@ -551,7 +593,8 @@ def test_a_template_whose_content_no_longer_matches_its_name_is_rerendered(
     second = harness.run(**hints)
 
     assert second.returncode == 0, second.stdout + second.stderr
-    assert "reusing node action keys" in second.stdout, "the node set still matches"
+    assert "reusing node action keys" not in second.stdout
+    assert harness.provision_count() == 2
     assert "reusing template ConfigMap" not in second.stdout
     assert harness.render_count() == 1
     products = harness.products()
@@ -565,7 +608,9 @@ def test_a_template_whose_content_no_longer_matches_its_name_is_rerendered(
     )
 
 
-def test_the_preflight_never_reuses_and_never_writes(harness: ScriptHarness) -> None:
+def test_preflight_never_reuses_or_publishes_installer_products(
+    harness: ScriptHarness,
+) -> None:
     first = harness.run()
     assert first.returncode == 0, first.stdout + first.stderr
     hints = harness.hints()

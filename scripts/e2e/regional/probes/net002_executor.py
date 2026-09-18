@@ -7,12 +7,19 @@ import os
 from pathlib import Path
 import select
 import socket
+import tempfile
 from threading import Lock, Thread
 import time
+from typing import Any
 from urllib.parse import urlsplit
 
-from gpu_fault.cluster_executor import ClusterActionExecutor, RegionalExecutorClient
+from gpu_fault.cluster_executor import (
+    ClusterActionExecutor,
+    ClusterExecutorError,
+    RegionalExecutorClient,
+)
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.transport.http_client import CONNECTION_POOL
 
 
 STATE = Path("/state")
@@ -27,15 +34,58 @@ RESULT_SUBMIT_WAITING = STATE / "result-submit-waiting.json"
 RESULT_SUBMIT_RELEASED = STATE / "result-submit-released.json"
 OWNER = os.getenv("EXECUTOR_OWNER", "gpu-fault-net-test")
 BLOCK_ROLLBACK_SECONDS = int(os.getenv("BLOCK_ROLLBACK_SECONDS", "100"))
-# Deliberately far above the production client's 15s: the gated proxy *holds*
-# a connection while the block is on rather than refusing it, so the result
-# post and the hanging lease renewal both reach the control plane the moment
-# the block lifts -- after the lease has expired server-side -- and are refused
-# with 409. A 15s timeout would turn them into local timeouts and the case
-# would never observe the stale-lease rejection it exists to prove. The
-# runner records this as a limitation of the case, not as a pass condition.
+# Deliberately above the production client's 15s so held traffic can outlast
+# the server-side lease. The result also waits behind an application gate,
+# then uses a fresh caller connection to prove its own 409. A held renewal
+# can fail on an expired keepalive and cannot supply that proof. The runner
+# records the extended timeout and caller-pool reset as fixture limitations.
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "180"))
 LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "60"))
+STALE_LEASE_DETAILS = (
+    "remote command lease is missing, stale, or changed",
+    "remote command lease is stale",
+)
+
+
+def stale_lease_reason(error: ClusterExecutorError) -> str | None:
+    if type(error.status_code) is not int or error.status_code != 409:
+        return None
+    prefix = "regional control plane rejected request (409): "
+    message = str(error)
+    if not message.startswith(prefix):
+        return None
+    body = message[len(prefix) :]
+    try:
+        response = json.loads(body)
+    except ValueError:
+        detail = body
+    else:
+        detail = response.get("detail") if isinstance(response, dict) else None
+    return detail if isinstance(detail, str) and detail in STALE_LEASE_DETAILS else None
+
+
+def record_first_result_submission(receipt: dict[str, Any]) -> None:
+    path = RESULT_SUBMIT_RELEASED.with_name("first-result-submission.json")
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(receipt, output, sort_keys=True, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
+            try:
+                # Publish a complete receipt without replacing an earlier attempt.
+                os.link(temporary, path)
+            except FileExistsError:
+                return
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 class LedgerAdapter:
@@ -102,7 +152,13 @@ class LedgerAdapter:
 
 
 class GatedRegionalExecutorClient(RegionalExecutorClient):
+    _first_result_started = False
+
     def complete(self, command, result):
+        first_submission = not self._first_result_started
+        self._first_result_started = True
+        released_at = None
+        caller_transport_pool_closed = False
         if BLOCK.exists():
             RESULT_SUBMIT_WAITING.write_text(
                 json.dumps(
@@ -116,17 +172,46 @@ class GatedRegionalExecutorClient(RegionalExecutorClient):
             )
             while BLOCK.exists():
                 time.sleep(0.1)
+            released_at = time.time()
             RESULT_SUBMIT_RELEASED.write_text(
                 json.dumps(
                     {
                         "command_id": command.command_id,
-                        "observed_at_epoch": time.time(),
+                        "observed_at_epoch": released_at,
                     },
                     sort_keys=True,
                 ),
                 encoding="utf-8",
             )
-        return super().complete(command, result)
+            # A held keepalive can expire upstream. Close only this caller's
+            # thread-local cache; renewal threads and TLS settings are untouched.
+            CONNECTION_POOL.close()
+            caller_transport_pool_closed = True
+        receipt = {
+            "command_id": command.command_id,
+            "submission_index": 1,
+            "submitted_at_epoch": time.time(),
+            "gate_released_at_epoch": released_at,
+            "caller_transport_pool_closed": caller_transport_pool_closed,
+            "status_code": None,
+            "stale_lease_reason": None,
+        }
+        try:
+            completed = super().complete(command, result)
+        except Exception as exc:
+            if isinstance(exc, ClusterExecutorError):
+                code = exc.status_code
+                if type(code) is int and 100 <= code <= 599:
+                    receipt["status_code"] = code
+                receipt["stale_lease_reason"] = stale_lease_reason(exc)
+            raise
+        else:
+            receipt["status_code"] = 200
+            return completed
+        finally:
+            if first_submission:
+                receipt["observed_at_epoch"] = time.time()
+                record_first_result_submission(receipt)
 
 
 class GateProxy:
@@ -138,14 +223,20 @@ class GateProxy:
     def _relay(client: socket.socket, upstream: socket.socket) -> None:
         sockets = [client, upstream]
         while True:
+            while BLOCK.exists():
+                time.sleep(0.1)
             readable, _, _ = select.select(sockets, [], [], 30)
             if not readable:
                 continue
             for source in readable:
+                while BLOCK.exists():
+                    time.sleep(0.1)
                 data = source.recv(65536)
                 if not data:
                     return
                 target = upstream if source is client else client
+                while BLOCK.exists():
+                    time.sleep(0.1)
                 target.sendall(data)
 
     def _handle(self, client: socket.socket) -> None:
@@ -280,6 +371,8 @@ def main() -> None:
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
                 "lease_seconds": LEASE_SECONDS,
                 "result_submission_gate": True,
+                "first_result_submission_receipt": True,
+                "result_gate_closes_caller_transport_pool": True,
                 "action_requires_network_block": True,
             },
             sort_keys=True,

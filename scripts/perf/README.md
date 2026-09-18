@@ -43,7 +43,19 @@ updates publish one CAS revision and wait for all CPU process ACKs without
 restarting CPU Deployments. Cleanup is retried and verified against both the
 bootstrap Secret and runtime registry. A standalone
 `register` command requires `--keep-registration`, a shared `--suite-id`, and
-must be followed by `run` or `teardown`.
+must be followed by `run` or `teardown`. Separate `run`, `purge`, and `teardown`
+commands require both the original `--suite-id` and `--run-dir`; the directory
+contains the registration intent, exact cluster inventory, release identity,
+and resource ownership receipts. A new directory or a cluster-name prefix is
+not sufficient authorization to resume or delete a previous run.
+
+Kubernetes resources are created with run ownership, and deletion requires the
+observed UID. An unacknowledged create remains unresolved until its identity
+can be proved; cleanup never treats an unknown resource as absent. Database
+cleanup resolves the current projected credentials inside the CPU component,
+checks run ownership and terminal state, and handles the active legacy, dual,
+or dedicated workflow/remote-command representation. It does not remove another
+run's records or publish a successful verdict after an incomplete cleanup.
 
 Supported entry points:
 
@@ -171,6 +183,10 @@ is split by responsibility:
   registry metadata, residual detection and verified cleanup.
 - `regional_capacity_results.py`: metric parsing, aggregation and artifact
   lifecycle.
+- `regional_capacity_resources.py`: durable resource receipts and UID-fenced
+  creation/cleanup.
+- `regional_capacity_data.py`: run-scoped database census and terminal cleanup
+  using current projected credentials.
 
 Additional focused utilities:
 

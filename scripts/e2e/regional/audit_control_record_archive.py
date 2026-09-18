@@ -36,15 +36,22 @@ def load_module(path: str):
 
 
 def store_dsn() -> str:
+    configured = os.environ.get("GPU_FAULT_STORE_URL_FILE")
     path = (
-        os.environ.get("GPU_FAULT_STORE_URL_FILE")
-        or "/etc/gpu-fault/aurora/postgres-url"
+        configured if configured is not None else "/etc/gpu-fault/aurora/postgres-url"
     )
+    if not path:
+        raise RuntimeError("configured store DSN file path is empty")
     try:
         with open(path, encoding="utf-8") as handle:
-            return handle.read().strip()
-    except OSError:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        if configured is not None:
+            raise
         return os.environ["GPU_FAULT_STORE_URL"]
+    if not value:
+        raise RuntimeError("store DSN file is empty")
+    return value
 
 
 def main(module_path: str, archive_uri: str) -> None:
@@ -152,7 +159,7 @@ def main(module_path: str, archive_uri: str) -> None:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT count(*) FROM gpu_fault_objects
+                    SELECT count(*) FROM gpu_fault_control_records
                     WHERE key=ANY(%s)
                     """,
                     ([incident_id, workflow_id, marker_id, notification_id],),
@@ -176,8 +183,9 @@ def main(module_path: str, archive_uri: str) -> None:
                     (f"%{suffix}%", f"%{suffix}%"),
                 )
                 cursor.execute(
-                    "DELETE FROM gpu_fault_objects WHERE key LIKE %s "
-                    "OR payload::text LIKE %s",
+                    "WITH victims AS MATERIALIZED (SELECT kind,key,payload FROM gpu_fault_control_records "
+                    "WHERE key LIKE %s OR payload::text LIKE %s) "
+                    "SELECT key FROM victims WHERE gpu_fault_delete_control_state(kind,key,payload)",
                     (f"%{suffix}%", f"%{suffix}%"),
                 )
         if archive_key:

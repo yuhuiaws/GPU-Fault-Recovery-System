@@ -22,6 +22,7 @@ from scripts.e2e.regional import ha010_verdicts as verdicts
 from scripts.e2e.regional import run_ha010_aurora_blackout_liveness as ha010
 from scripts.e2e.regional.probes import ha010_probe as probe
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 T0 = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
@@ -599,6 +600,7 @@ def test_a_plan_that_drifted_from_its_preflight_is_refused(tmp_path: Path) -> No
         encoding="utf-8",
     )
     preflight = {
+        "aurora_binding": {"unit": "proof"},
         "release_id": "rel-1",
         "rds": _rds(),
         "pods": _pods(),
@@ -682,12 +684,7 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         ROOT / "scripts/e2e/regional/ha010_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for topology in (
-            "/secure/gpu-fault-bootstrap",
-            "514385905925",
-            "gpu-fault-gpu-1-",
-        ):
-            assert topology not in source, (path.name, topology)
+        assert not site_topology_leaks(source), (path.name, site_topology_leaks(source))
         if path.name.endswith("_verdicts.py"):
             continue
         mode = path.stat().st_mode & 0o777
@@ -723,15 +720,24 @@ def test_the_failover_step_unpacks_ha003s_document_and_samples(
     )
     run = SimpleNamespace(
         settings=SimpleNamespace(
-            rds_cluster_id="c", regional=SimpleNamespace(region="r")
+            rds_cluster_id="c", regional=SimpleNamespace(region="r", namespace="unit")
         ),
         case_dir=tmp_path,
-        preflight={"rds": {"writer": "db-1"}, "pods": {}},
+        preflight={
+            "aurora_binding": {"unit": "proof"},
+            "rds": {"writer": "db-1"},
+            "pods": {
+                "gpu-fault-api-ha": [{"name": "gpu-fault-api-ha-a", "uid": "unit-uid"}]
+            },
+        },
         regional=SimpleNamespace(kubectl=lambda *a, **_k: calls.append(a[1]) or ""),
         failover_requested_at=None,
         deleted_pod=None,
         deleted_at=None,
         rds_available_at=None,
+    )
+    monkeypatch.setattr(
+        ha010, "regional_binding", lambda *a: SimpleNamespace(read=lambda *a: {})
     )
 
     rds_after = ha010.request_failover(run)

@@ -56,6 +56,11 @@ def coverage(
         "heartbeat": heartbeat,
         "heartbeat_age_seconds": heartbeat_age,
         "observation_count": 0 if observation_age is None else 1,
+        "latest_observation_at": (
+            (NOW - timedelta(seconds=observation_age)).isoformat()
+            if observation_age is not None
+            else None
+        ),
         "latest_observation_age_seconds": observation_age,
         "workload_state": state,
     }
@@ -131,7 +136,7 @@ def node(
         "taints": [{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}]
         if tainted
         else [],
-        "ownership_annotations": {"gpu-fault.io/owner": "inc"} if owned else {},
+        "ownership_annotations": {"gpu-fault.io/incident-id": "inc"} if owned else {},
     }
 
 
@@ -238,8 +243,10 @@ def test_containment_must_have_cordoned_the_node() -> None:
 
 def test_the_node_must_be_isolated_after_the_block() -> None:
     assert verdicts.node_isolated_errors(node()) == []
-    assert verdicts.node_isolated_errors(node(unschedulable=False, owned=False)) == []
-    assert "not isolated" in _text(
+    assert verdicts.node_isolated_errors(node(unschedulable=False, owned=False)), (
+        "a taint alone is not the required cordon and owned quarantine"
+    )
+    assert "not fully isolated" in _text(
         verdicts.node_isolated_errors(
             node(unschedulable=False, tainted=False, owned=False)
         )
@@ -286,7 +293,9 @@ def test_a_changed_inventory_or_stopped_service_fails() -> None:
 # Watcher scale, watchdog, heartbeat recovery
 # --------------------------------------------------------------------------- #
 def test_the_watcher_must_be_gone_before_the_wait_starts() -> None:
-    absent = {"replicas": 0, "ready_replicas": 0}
+    from tests.regional.test_destr023_idle_cluster_reset import deployment
+
+    absent = coverage_verdicts.deployment_summary(deployment(replicas=0, ready=0))
     assert verdicts.watcher_absent_errors(absent, []) == []
     assert "replicas" in _text(
         verdicts.watcher_absent_errors({"replicas": 1, "ready_replicas": 0}, [])
@@ -328,26 +337,37 @@ def test_heartbeat_recovery_needs_a_newer_fresh_heartbeat_and_idle() -> None:
         != []
     )
     same = coverage(heartbeat_age=700.0, state="UNKNOWN")
-    assert "did not advance" in _text(verdicts.heartbeat_recovered_errors(stale, same))
+    assert "advance" in _text(verdicts.heartbeat_recovered_errors(stale, same))
     still_unknown = coverage(heartbeat_age=5.0, state="UNKNOWN")
     assert "IDLE" in _text(verdicts.heartbeat_recovered_errors(stale, still_unknown))
 
 
-def test_recovery_from_no_heartbeat_at_all_only_needs_the_fresh_one() -> None:
-    assert (
-        verdicts.heartbeat_recovered_errors(
-            coverage(heartbeat_age=None, state="UNKNOWN"), coverage(heartbeat_age=5.0)
-        )
-        == []
+def test_recovery_without_a_baseline_heartbeat_needs_an_independent_time_witness() -> (
+    None
+):
+    errors = verdicts.heartbeat_recovered_errors(
+        coverage(heartbeat_age=None, state="UNKNOWN"), coverage(heartbeat_age=5.0)
     )
+    assert errors, "a fresh-looking value alone does not establish recovery"
 
 
 # --------------------------------------------------------------------------- #
 # Validated restore
 # --------------------------------------------------------------------------- #
 def test_the_restore_must_succeed_and_release_the_node() -> None:
+    from gpu_fault.orchestration.validated_restore import VALIDATED_RESTORE_OPERATIONS
+
     clean = node(unschedulable=False, tainted=False, owned=False)
-    assert verdicts.restore_errors({"status": "SUCCEEDED"}, clean) == []
+    operations = [item.value for item in VALIDATED_RESTORE_OPERATIONS]
+    restored = {
+        "status": "SUCCEEDED",
+        "completed_operations": operations,
+        "step_executions": [_execution(operation) for operation in operations],
+    }
+    assert verdicts.restore_errors(restored, clean) == []
+    assert verdicts.restore_errors({"status": "SUCCEEDED"}, clean), (
+        "a terminal status alone does not prove validation-first recovery"
+    )
     assert "restore workflow" in _text(
         verdicts.restore_errors({"status": "FAILED"}, clean)
     )

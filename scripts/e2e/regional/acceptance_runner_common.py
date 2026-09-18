@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -41,11 +42,27 @@ class EvidenceRecorder:
         self.path = path
         if path.exists():
             document = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(document, dict)
+                or document.get("schema_version") != 1
+                or document.get("status") not in {"RUNNING", "COMPLETED", "FAILED"}
+                or not isinstance(document.get("stages"), dict)
+                or any(
+                    not isinstance(value, dict) for value in document["stages"].values()
+                )
+            ):
+                raise RuntimeError("evidence document is malformed")
             if document.get("case_id") != case_id:
                 raise RuntimeError("evidence file belongs to another case")
             if document.get("inputs") != inputs:
                 raise RuntimeError("evidence inputs differ from the existing run")
             self.document = document
+            self.document["status"] = "RUNNING"
+            self.document.pop("completed_at", None)
+            if self.document.get("verdict") == "PASS":
+                self.document["verdict"] = "NOT_RUN"
+            self.document["updated_at"] = utc_now()
+            write_json_atomic(self.path, self.document)
         else:
             self.document = {
                 "schema_version": 1,
@@ -67,6 +84,8 @@ class EvidenceRecorder:
         if existing is not None:
             return dict(existing)
         result = operation()
+        if not isinstance(result, dict):
+            raise RuntimeError("evidence stage did not return an object")
         self.document["stages"][name] = result
         self.document["updated_at"] = utc_now()
         write_json_atomic(self.path, self.document)
@@ -115,6 +134,8 @@ class EvidenceRecorder:
 
     def fail(self, exc: BaseException) -> None:
         self.document["status"] = "FAILED"
+        self.document["verdict"] = "FAIL"
+        self.document.pop("completed_at", None)
         self.document["updated_at"] = utc_now()
         self.document["error"] = f"{type(exc).__name__}: {exc}"
         write_json_atomic(self.path, self.document)
@@ -134,10 +155,15 @@ def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
     snapshot without the reading falls back to total depth.
     """
 
-    values = queue or {}
-    if "fault_backlog_depth" in values:
-        return int(values.get("fault_backlog_depth") or 0)
-    return int(values.get("depth") or 0)
+    if not isinstance(queue, dict):
+        raise ValueError("processor queue snapshot is missing or malformed")
+    field = "fault_backlog_depth" if "fault_backlog_depth" in queue else "depth"
+    value = queue.get(field)
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        value = int(value)
+    if type(value) is not int or value < 0:
+        raise ValueError(f"processor queue {field} must be a nonnegative integer")
+    return value
 
 
 # What ``kubectl exec`` prints when its target stopped being a running replica
@@ -147,13 +173,14 @@ def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
 # Deployment, so a survey taken during the roll meets these routinely
 # (control-worker 2026-09-08 attempts 7/8, cluster-executor 2026-09-08
 # DESTR-014 attempt 3).
-VANISHED_REPLICA_MARKERS = (
-    "not found",
-    "notfound",
-    "completed pod",
-    "is not running",
-    "not running",
-    "terminating",
+_VANISHED_REPLICA = re.compile(
+    r'^(?:error from server \(notfound\):\s*)?pods? "[^"\n]+" not found$'
+    r"|^(?:error:\s*)?cannot exec into a container in a completed pod;"
+    r" current phase is (?:Succeeded|Failed)$"
+    r'|^unable to upgrade connection: container not found \("[^"\n]+"\)$'
+    r"|^(?:error: Internal error occurred: error executing command in container: )?"
+    r"container is not running$",
+    re.I,
 )
 
 
@@ -161,5 +188,11 @@ def replica_vanished(error: BaseException) -> bool:
     """Whether an exec failed because its Pod is no longer a running replica,
     as opposed to the read itself failing."""
 
-    text = str(error).lower()
-    return any(marker in text for marker in VANISHED_REPLICA_MARKERS)
+    classified = getattr(error, "replica_disappeared", None)
+    if type(classified) is bool:
+        return classified
+    prefix, separator, stderr = str(error).partition("stderr=")
+    text = (stderr if separator else prefix).strip()
+    if re.search(r"forbidden|unauthorized|permission denied|accessdenied", text, re.I):
+        return False
+    return _VANISHED_REPLICA.fullmatch(text) is not None

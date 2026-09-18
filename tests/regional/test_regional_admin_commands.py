@@ -9,6 +9,7 @@ import pytest
 from gpu_fault_release import regional_admin_checks as CHECKS
 from gpu_fault_release import regional_admin_commands as ADMIN
 from gpu_fault_release import regional_release_state as STATE
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -216,7 +217,9 @@ def test_deploy_only_resumes_an_unrolled_back_release(
         release_id="previous-candidate",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: {"phase": phase, "release_id": "previous-candidate"},
         pin_approved_manifest_plan=lambda _digest: None,
         upgrade=lambda **kwargs: calls.append(kwargs),
@@ -260,7 +263,9 @@ def test_deploy_and_resume_continue_the_existing_rollback(
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: {"phase": phase, "release_id": "candidate-release"},
         rollback=lambda: calls.append("rollback"),
     )
@@ -278,7 +283,9 @@ def test_deploy_reports_completed_rollback_cleanup_as_recovery(monkeypatch) -> N
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: {
             "phase": "rolled-back",
             "rollback_cleanup_completed": False,
@@ -378,7 +385,11 @@ def test_deploy_rejects_empty_cluster_set_during_bootstrap(
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: state_exists),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(
+                args, present=state_exists
+            )
+        ),
         _load_state=lambda: {"phase": phase},
         bootstrap=lambda: calls.append("bootstrap"),
     )
@@ -398,7 +409,9 @@ def test_deploy_allows_empty_cluster_set_after_completed_state(monkeypatch) -> N
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: {"phase": "complete"},
         noop=lambda _diff: calls.append("noop"),
     )
@@ -610,7 +623,9 @@ def test_a_different_candidate_commits_the_live_release_then_upgrades(
         release_id="candidate-release",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: dict(states.pop(0)),
         pin_approved_manifest_plan=lambda _digest: events.append(("pin", _digest)),
         upgrade=lambda **kwargs: events.append(("upgrade", kwargs)),
@@ -641,7 +656,9 @@ def test_the_same_candidate_still_resumes_into_its_own_commit(monkeypatch) -> No
         release_id="live-release",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(
+            probe_output=lambda args, **_kw: resource_probe_result(args)
+        ),
         _load_state=lambda: _pending_commit_state(),
         pin_approved_manifest_plan=lambda _digest: None,
         upgrade=lambda **kwargs: events.append(("upgrade", kwargs)),
@@ -697,7 +714,7 @@ def test_deploy_leaves_an_uncommitted_bootstrap_for_verify_and_commit() -> None:
         release_id="release-a",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(probe_output=_deployment_probe(installed=True)),
         _load_state=lambda: {
             "phase": "complete",
             "release_id": "release-a",
@@ -736,7 +753,7 @@ def test_a_resumed_bootstrap_pins_the_plan_only_for_the_same_candidate(
         release_id="candidate-release",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=lambda _args: True),
+        runner=SimpleNamespace(probe_output=_deployment_probe(installed=True)),
         _load_state=lambda: {
             "phase": "bootstrap-started",
             "release_id": recorded_release,
@@ -753,10 +770,10 @@ def test_a_resumed_bootstrap_pins_the_plan_only_for_the_same_candidate(
 
 
 def _deployment_probe(installed: bool):
-    def probe(args):
-        if "deployment" in args:
-            return installed
-        return True
+    def probe(args, **_kwargs):
+        return resource_probe_result(
+            args, present=installed if "deployment" in args else True
+        )
 
     return probe
 
@@ -782,7 +799,7 @@ def test_a_complete_state_over_an_uninstalled_control_plane_bootstraps(
         release_id="candidate-release",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=_deployment_probe(installed=False)),
+        runner=SimpleNamespace(probe_output=_deployment_probe(installed=False)),
         _load_state=lambda: dict(state),
         pin_approved_manifest_plan=lambda _digest: calls.append("pin"),
         bootstrap=lambda: calls.append("bootstrap"),
@@ -820,7 +837,7 @@ def test_a_complete_state_over_an_installed_control_plane_is_not_a_bootstrap(
         release_id="candidate-release",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
-        runner=SimpleNamespace(probe=_deployment_probe(installed=True)),
+        runner=SimpleNamespace(probe_output=_deployment_probe(installed=True)),
     )
     state = {
         "phase": "complete",

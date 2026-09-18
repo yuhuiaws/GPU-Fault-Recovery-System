@@ -525,7 +525,7 @@ def test_regional_alerting_verifier_accepts_repository_contract(tmp_path: Path) 
 
 def test_incident_purge_stops_and_restores_every_writer() -> None:
     text = manual()
-    section = text.split("### 8.4 手工删除无 TTL 的 incident 审计记录", 1)[1].split(
+    section = text.split("### 8.4 提前手工删除 incident 审计记录", 1)[1].split(
         "## 9. 数据迁移", 1
     )[0]
 
@@ -568,7 +568,7 @@ def test_manual_parameter_tables_have_headers() -> None:
 
     assert ("| 环境变量 | 默认值 |\n|---|---|\n| `GPU_FAULT_LOG_STATE_PATH`") in text
     assert (
-        "| 环境变量 | 默认值 | 说明 |\n|---|---|---|\n| `GPU_FAULT_HMA_QUEUE_URL`"
+        "| 环境变量 | 默认值 | 说明 |\n|---|---|---|\n| `GPU_FAULT_FABRIC_MANAGER_JOURNAL`"
     ) in text
 
 

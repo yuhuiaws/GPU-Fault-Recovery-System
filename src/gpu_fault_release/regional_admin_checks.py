@@ -1,27 +1,49 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
+
 import base64
 import fnmatch
-import hashlib
 import json
 import os
 import re
 import shutil
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_adot_self_metrics import adot_self_metrics_report
+from gpu_fault_release.regional_aurora_credentials import (
+    REFRESH_STATUS_KEY as AURORA_REFRESH_STATUS_KEY,
+)
+from gpu_fault_release.regional_aurora_credentials import (
+    REFRESH_STATUS_MAX_AGE_SECONDS as AURORA_REFRESH_STATUS_MAX_AGE_SECONDS,
+)
+from gpu_fault_release.regional_aurora_credentials import (
+    aurora_refresh_status as _aurora_refresh_status,
+)
+from gpu_fault_release.regional_aurora_credentials import (
+    refresh_status_supersedes_failure,
+)
 from gpu_fault_release.regional_notifications import check_notification_channel
+from gpu_fault_release.regional_release_aurora_refresh import (
+    aurora_refresh_preflight,
+)
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_diff import (
+    ReleaseComponent,
+    ReleaseExecutionPlan,
+)
+from gpu_fault_release.regional_release_preflight import monitoring_repair_preflight
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
@@ -43,6 +65,9 @@ from gpu_fault_release.regional_validation_evidence import (
 
 ROOT = repository_root()
 REQUIRED_TOOLS = ("aws", "kubectl", "helm", "jq", "openssl", "sha256sum", "python3")
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 
 
 class CheckSkipped(RuntimeError):
@@ -106,9 +131,11 @@ def report_exit_code(report: dict[str, Any]) -> int:
     return 0 if report.get("healthy") else 1
 
 
-def _read_snapshot(release: Any):
+def _read_snapshot(release: Any) -> AbstractContextManager[Any]:
     factory = getattr(release, "_read_snapshot", None)
-    return factory() if callable(factory) else nullcontext()
+    if callable(factory):
+        return cast(AbstractContextManager[Any], factory())
+    return nullcontext()
 
 
 def _prime_deployment_snapshot(release: Any) -> None:
@@ -319,7 +346,7 @@ def _check_cpu_capacity(release: Any) -> CheckValue:
     )
 
 
-def _secret(release: Any, name: str) -> dict[str, Any]:
+def _secret(release: RegionalRelease, name: str) -> dict[str, Any]:
     return release._get_json(
         release._cpu(
             "-n",
@@ -332,36 +359,14 @@ def _secret(release: Any, name: str) -> dict[str, Any]:
 
 
 def check_cpu_secrets(release: Any) -> CheckValue:
-    aurora = _secret(release, "gpu-fault-aurora").get("data") or {}
-    active = _secret(release, "gpu-fault-control-plane-active").get("data") or {}
-    node_keys = _secret(release, "gpu-fault-node-action-keys").get("data") or {}
-    required_aurora = {"postgres-url", "master-secret-arn"}
-    required_active = {
-        "execution-token",
-        "processor-replay-secret",
-        "node-action-secret",
-    }
-    if missing := sorted(required_aurora - set(aurora)):
-        raise ReleaseError("gpu-fault-aurora is missing: " + ", ".join(missing))
-    if missing := sorted(required_active - set(active)):
-        raise ReleaseError(
-            "gpu-fault-control-plane-active is missing: " + ", ".join(missing)
-        )
-    decoded = {name: _decode_secret(active[name]) for name in required_active}
-    if any(len(value) < 32 for value in decoded.values()):
-        raise ReleaseError("control-plane active secrets must be at least 32 bytes")
-    digests = {hashlib.sha256(value).hexdigest() for value in decoded.values()}
-    if len(digests) != len(required_active):
-        raise ReleaseError("control-plane active secrets must be pairwise distinct")
-    if release.config.clusters and not node_keys:
-        raise ReleaseError("gpu-fault-node-action-keys is empty")
     return CheckValue(
         "required CPU secrets exist without exposing their values",
-        {
-            "aurora_keys": sorted(aurora),
-            "active_keys": sorted(active),
-            "node_action_key_count": len(node_keys),
-        },
+        cpu_secret_shapes(
+            [_secret(release, name) for name in CPU_SECRET_NAMES],
+            context=release._cpu(),
+            namespace=release.config.namespace,
+            requires_node_keys=bool(release.config.clusters),
+        ),
     )
 
 
@@ -788,10 +793,7 @@ def _check_monitoring(release: Any) -> CheckValue:
         for item in subscriptions
         if item.get("SubscriptionArn") not in {None, "PendingConfirmation"}
     ]
-    # The confirmation gate moved to the first minute of ``gpu-fault-admin
-    # deploy`` (``notification_precheck``), where the operator can act on it.
-    # Here it is a warning: the report still names the topic nobody listens to,
-    # but a subscription that lapsed after the deploy does not fail ``verify``.
+    # Initial deploy handles SNS confirmation; report later lapses as warnings.
     unconfirmed = health.require_confirmed_sns_subscription and not confirmed
     email_summary = monitoring_safety.email_subscription_summary(
         subscriptions,
@@ -839,75 +841,12 @@ def _check_monitoring(release: Any) -> CheckValue:
     )
 
 
-# The refresher writes this key into the gpu-fault-aurora Secret on every run
-# (aurora_credential_refresh.write_refresh_status); the Pods' mount makes it
-# /etc/gpu-fault/aurora/last-refresh-status.json.
-AURORA_REFRESH_STATUS_KEY = "last-refresh-status.json"
-# Hourly schedule: three missed ticks without a status write means the
-# refresher is not running, whatever lastSuccessfulTime still says.
-AURORA_REFRESH_STATUS_MAX_AGE_SECONDS = 3 * 3600
-
-
-def _aurora_refresh_status(release: Any) -> dict[str, Any] | None:
-    """Decode the refresher's last status from the Secret, or ``None`` when an
-    older refresher build never wrote one. Only that key is read."""
-
-    data = _secret(release, "gpu-fault-aurora").get("data") or {}
-    encoded = data.get(AURORA_REFRESH_STATUS_KEY)
-    if not encoded:
-        return None
-    try:
-        payload = json.loads(_decode_secret(encoded).decode())
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise ReleaseError(
-            f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} is not JSON: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ReleaseError(
-            f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} is not an object"
-        )
-    finished_at = payload.get("finished_at")
-    age_seconds: float | None = None
-    if isinstance(finished_at, str) and finished_at:
-        try:
-            finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ReleaseError(
-                f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} finished_at is not a "
-                f"timestamp: {finished_at!r}"
-            ) from exc
-        if finished.tzinfo is None:
-            finished = finished.replace(tzinfo=timezone.utc)
-        age_seconds = max(0.0, (datetime.now(timezone.utc) - finished).total_seconds())
-    return {
-        "status": payload.get("status"),
-        "finished_at": finished_at,
-        "age_seconds": age_seconds,
-        "stale": age_seconds is None
-        or age_seconds > AURORA_REFRESH_STATUS_MAX_AGE_SECONDS,
-        "error": payload.get("error"),
-        "rotated": payload.get("rotated"),
-        "restarted": payload.get("restarted"),
-        "reason": payload.get("reason"),
-    }
-
-
 def check_aurora_refresh(
     release: Any,
     *,
     require_success: bool = False,
 ) -> CheckValue:
-    """The credential refresher is installed, allowed to do its job, and its
-    last run went well.
-
-    CP-3: running Pods reload the mounted Secret, so the refresher no longer
-    rolls any Deployment and nothing here expects a generation to advance.
-    The verdict comes from the status the refresher writes into the Secret on
-    every run: a ``failed`` status is fatal even at preflight (H1-3's intent:
-    the root cause surfaces before the transaction), and ``require_success``
-    (post-deploy verify, after the orchestrator ran the refresh Job itself)
-    demands a fresh ``ok``.
-    """
+    """Require installed identity and RBAC; verification also needs fresh success."""
 
     cronjob = release._get_json(
         release._cpu(
@@ -980,6 +919,7 @@ def check_aurora_refresh(
             f"targets={sorted(targets)}, allowed={sorted(allowed_targets)}"
         )
     last_successful = cronjob.get("status", {}).get("lastSuccessfulTime")
+    status = _aurora_refresh_status(release)
     jobs = (
         release._get_json(
             release._cpu(
@@ -1010,12 +950,12 @@ def check_aurora_refresh(
             item.get("type") == "Complete" and item.get("status") == "True"
             for item in conditions
         )
-        if failed and not complete:
+        recovered = refresh_status_supersedes_failure(status, conditions)
+        if failed and not complete and not recovered:
             raise ReleaseError(
                 "latest Aurora credential refresh Job failed: "
                 + latest.get("metadata", {}).get("name", "unknown")
             )
-    status = _aurora_refresh_status(release)
     if status is not None and status["status"] != "ok":
         raise ReleaseError(
             "latest Aurora credential refresh failed"
@@ -1023,8 +963,7 @@ def check_aurora_refresh(
             + f": {status['error'] or status['status']}"
         )
     if require_success:
-        # Not lastSuccessfulTime: the controller records only its own scheduled
-        # runs (a fresh site's first is an hour away); the Jobs write this status.
+        # One-shot Jobs do not update lastSuccessfulTime; require fresh Secret status.
         if status is None:
             raise ReleaseError(
                 "Aurora credential refresh has never recorded a status in the "
@@ -1098,7 +1037,19 @@ def check_adot_self_metrics(release: Any) -> CheckValue:
     return CheckValue(*adot_self_metrics_report(release))
 
 
-def build_preflight_report(release: Any) -> dict[str, Any]:
+def build_preflight_report(
+    release: Any,
+    *,
+    repair_plan: ReleaseExecutionPlan | None = None,
+    bootstrap: bool = False,
+    include_workflow: bool = True,
+) -> dict[str, Any]:
+    repair_refresh = repair_plan is not None and repair_plan.has(
+        ReleaseComponent.AURORA_REFRESH
+    )
+    repair_monitoring = repair_plan is not None and repair_plan.has(
+        ReleaseComponent.OBSERVABILITY
+    )
     specifications = [
         ("tools", _check_tools),
         ("local_inputs", lambda: _check_local_inputs(release)),
@@ -1112,13 +1063,35 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ),
         ("nlb_inputs", lambda: _check_nlb_inputs(release)),
         ("aurora", lambda: _check_aurora(release)),
-        ("aurora_credential_refresh", lambda: check_aurora_refresh(release)),
+        (
+            "aurora_credential_refresh",
+            lambda: (
+                CheckValue(
+                    "Aurora refresher repair requires fresh AWSCURRENT proof",
+                    aurora_refresh_preflight(release, bootstrap=bootstrap),
+                    status="WARN",
+                )
+                if repair_refresh
+                else check_aurora_refresh(release)
+            ),
+        ),
         (
             "control_record_archive_bucket",
             lambda: check_control_record_archive_bucket(release),
         ),
         ("email_notifications", lambda: check_email_notifications(release)),
-        ("monitoring", lambda: _check_monitoring(release)),
+        (
+            "monitoring",
+            lambda: (
+                CheckValue(
+                    "verified AMP definitions are scheduled for release repair",
+                    monitoring_repair_preflight(release, bootstrap=bootstrap),
+                    status="WARN",
+                )
+                if repair_monitoring
+                else _check_monitoring(release)
+            ),
+        ),
         (
             "workflow_safety",
             lambda: CheckValue(
@@ -1132,6 +1105,7 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
             futures = [
                 executor.submit(_check, name, function)
                 for name, function in specifications
+                if include_workflow or name != "workflow_safety"
             ]
             checks = [future.result() for future in futures]
     return _report("preflight", release, checks)
@@ -1272,7 +1246,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
         expected_nodes[target.cluster_id] = sorted(
             item["metadata"]["name"] for item in _ready_nodes(nodes)
         )
-    return json.loads(
+    result = json.loads(
         exec_cpu_ingress(
             release,
             arguments=(
@@ -1293,6 +1267,9 @@ def _control_api_report(release: Any) -> dict[str, Any]:
             interactive=False,
         )
     )
+    if not isinstance(result, dict):
+        raise ReleaseError("control API report returned non-object evidence")
+    return result
 
 
 def _check_control_api(release: Any) -> CheckValue:
@@ -1693,7 +1670,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
     specifications.extend(
         (
             f"gpu_cluster:{target.cluster_id}",
-            lambda target=target: _check_gpu_cluster(release, target),
+            partial(_check_gpu_cluster, release, target),
         )
         for target in release.config.clusters
     )

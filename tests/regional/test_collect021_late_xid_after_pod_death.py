@@ -108,6 +108,7 @@ def test_probe_parser_exposes_kill_workload() -> None:
 
 def _observation(**overrides: Any) -> dict[str, Any]:
     observation = {
+        "cluster_id": "cluster-a",
         "job_id": JOB_ID,
         "attempt_id": ATTEMPT_ID,
         "workload_phase": "RUNNING",
@@ -320,13 +321,14 @@ def _restarted() -> dict[str, Any]:
 
 
 def _restart_state() -> dict[str, Any]:
-    return {
-        "restart_budget": {"budget": 1, "restart_count": 1},
-        "observations": [
-            _death(),
-            _observation(attempt_id="c021-1-a002", workload_phase="RUNNING"),
-        ],
-    }
+    from tests.regional._collect021_passive_support import completed_passive_state
+
+    return completed_passive_state(
+        job_id=JOB_ID,
+        attempt_id=ATTEMPT_ID,
+        new_attempt_id="c021-1-a002",
+        pods=_restarted()["pods"],
+    )
 
 
 def test_passive_side_passes_on_the_documented_readings() -> None:
@@ -339,6 +341,7 @@ def test_passive_side_passes_on_the_documented_readings() -> None:
             source_uids={"s1", "s2", "s3"},
             pod_uid=POD_UID,
             attempt_id=ATTEMPT_ID,
+            job_id=JOB_ID,
         )
         == []
     )
@@ -392,9 +395,7 @@ def test_each_passive_reading_is_checked(field: str, mutate, fragment: str) -> N
     assert any(fragment in item for item in errors), (fragment, errors)
 
 
-def test_death_without_the_killed_container_still_counts_by_phase() -> None:
-    """After STOP_WORKLOADS the Pods are gone; the phase alone proves the death."""
-
+def test_stopped_phase_without_the_killed_container_is_not_process_death() -> None:
     death = _observation(workload_phase="STOPPED", containers=[])
     errors = collect021.passive_errors(
         kill={"killed": [{"pid": 1, "comm": "python"}]},
@@ -405,7 +406,8 @@ def test_death_without_the_killed_container_still_counts_by_phase() -> None:
         pod_uid=POD_UID,
         attempt_id=ATTEMPT_ID,
     )
-    assert errors == []
+    assert any("phase is not FAILED" in item for item in errors), errors
+    assert any("killed Pod" in item for item in errors), errors
 
 
 # --- runner: resources are owned before their first wait ---------------------

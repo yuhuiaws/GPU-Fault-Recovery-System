@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.fleet_compatibility import CURRENT_AGENT_PROTOCOL_VERSION
 from gpu_fault.hyperpod_spares import SpareHealthPending
 from tests._builders import (
     active_workflow_executor,
@@ -902,7 +903,7 @@ def test_hyperpod_step_waits_for_external_confirmation() -> None:
         cluster_id="cluster-a",
         node_id="node-a",
         endpoint="http://node-a:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="0.10.0",
         artifact_sha256="a" * 64,
         policy_version="610",

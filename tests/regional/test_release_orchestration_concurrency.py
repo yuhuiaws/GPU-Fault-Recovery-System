@@ -59,32 +59,20 @@ def run_phases(release, *, plan, diff, previous=None, completed_phases=None):
     )
 
 
-def test_candidate_preflight_overlaps_cpu_stage(
+def test_candidate_preflight_gates_schema_and_cpu_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The read-only node preflight must not hold up the CPU cluster.
-
-    The preflight runs Jobs on GPU nodes (100-170 s in production) and reads
-    nothing the schema, the registry or the CPU roles write, so the only reason
-    it ever ran first was that the phases were a single list.
-    """
+    """An unusable candidate must be detected before DDL or Pod mutations."""
 
     calls: list[str] = []
-    cpu_staged = threading.Event()
 
     def preflight(_release, _plan) -> None:
-        if not cpu_staged.wait(timeout=OVERLAP_TIMEOUT):
-            raise AssertionError(
-                "the candidate preflight never overlapped the CPU stage"
-            )
         calls.append("preflight")
 
     monkeypatch.setattr(ORCHESTRATION, "preflight_upgrade_mutations", preflight)
     saves: list[dict] = []
     release = phase_release(
-        calls,
-        saves,
-        _apply_cpu=lambda **_kwargs: (calls.append("cpu-stage"), cpu_staged.set()),
+        calls, saves, _apply_cpu=lambda **_kwargs: calls.append("cpu-stage")
     )
 
     run_phases(
@@ -93,16 +81,16 @@ def test_candidate_preflight_overlaps_cpu_stage(
         diff=full_diff("database_schema", "control_plane_wheel"),
     )
 
-    assert calls.index("cpu-stage") < calls.index("preflight")
+    assert calls.index("preflight") < calls.index("schema") < calls.index("cpu-stage")
     assert release.state["phase"] == "complete"
-    # The preflight is still a durable phase, and the write that first records it
-    # is the one that opens the data plane: nothing between the two can lose it.
+    # The proof is persisted by the STARTED checkpoint, before schema mutation.
     first = next(
         item
         for item in saves
         if "candidate-preflight-ready" in item["completed_phases"]
     )
-    assert first["release_lifecycle"] == "ROLLING_CLUSTERS"
+    assert first["phase"] == "candidate-preflight-ready"
+    assert first["component_progress"]["global"]["schema"]["status"] == "STARTED"
 
 
 def test_gpu_rollout_waits_for_candidate_preflight(
@@ -148,28 +136,20 @@ def test_gpu_rollout_waits_for_candidate_preflight(
     assert calls.index("preflight") < calls.index("gpu:gpu-a")
 
 
-def test_preflight_failure_after_cpu_stage_still_records_the_stage(
+def test_preflight_failure_leaves_schema_and_cpu_untouched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A background failure must not lose the mutations already made.
-
-    The CPU stage has run to completion by the time the preflight future is
-    joined, so the failure record has to carry both: `original_failure` for the
-    operator and `cpu-staged` for the rollback plan, which is what tells it to
-    compensate the control-plane roles that were really applied.
-    """
+    """The failure is durable, but no unstarted runtime component is compensated."""
 
     calls: list[str] = []
-    cpu_staged = threading.Event()
 
     def preflight(_release, _plan) -> None:
-        if not cpu_staged.wait(timeout=OVERLAP_TIMEOUT):
-            raise AssertionError(
-                "the candidate preflight never overlapped the CPU stage"
-            )
         raise ORCHESTRATION.ReleaseError("candidate preflight rejected node-a")
 
     monkeypatch.setattr(ORCHESTRATION, "preflight_upgrade_mutations", preflight)
+    monkeypatch.setattr(
+        ORCHESTRATION, "prepare_upgrade_credentials", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         ORCHESTRATION, "_validate_upgrade_transaction", lambda *_args, **_kwargs: None
     )
@@ -180,7 +160,8 @@ def test_preflight_failure_after_cpu_stage_still_records_the_stage(
     )
     release = phase_release(
         calls,
-        _apply_cpu=lambda **_kwargs: (calls.append("cpu-stage"), cpu_staged.set()),
+        _apply_cpu=lambda **_kwargs: pytest.fail("CPU moved before candidate proof"),
+        _ensure_schema=lambda: pytest.fail("DDL ran before candidate proof"),
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
         _remote_commands_are_idle=lambda: True,
@@ -195,17 +176,14 @@ def test_preflight_failure_after_cpu_stage_still_records_the_stage(
             release,
             # `agent_config` is what puts the CPU stage in the plan: the stage
             # exists to hold the compatibility window open across a pin change.
-            diff=full_diff("control_plane_wheel", "agent_config"),
+            diff=full_diff("control_plane_wheel", "agent_config", "database_schema"),
         )
 
-    assert "cpu-stage" in calls
+    assert "cpu-stage" not in calls
     assert release.state["phase"] == "failed"
     assert "candidate preflight rejected node-a" in release.state["original_failure"]
-    assert "cpu-staged" in release.state["completed_phases"]
-    assert (
-        release.state["component_progress"]["global"]["cpu-stage"]["status"]
-        == "COMPLETED"
-    )
+    assert "cpu-staged" not in release.state["completed_phases"]
+    assert release.state["component_progress"]["global"] == {}
 
 
 def test_endpoint_waits_for_the_staged_ingress_restart(
@@ -223,13 +201,9 @@ def test_endpoint_waits_for_the_staged_ingress_restart(
 
     calls: list[str] = []
     barrier_done = threading.Event()
-    endpoint_started = threading.Event()
     endpoint_done = threading.Event()
 
     def preflight(_release, _plan) -> None:
-        assert endpoint_started.wait(timeout=OVERLAP_TIMEOUT), (
-            "the endpoint did not overlap the candidate preflight"
-        )
         calls.append("preflight")
 
     monkeypatch.setattr(ORCHESTRATION, "preflight_upgrade_mutations", preflight)
@@ -238,7 +212,6 @@ def test_endpoint_waits_for_the_staged_ingress_restart(
         assert barrier_done.is_set(), (
             "the endpoint wait started while the ingress role was still restarting"
         )
-        endpoint_started.set()
         calls.append("endpoint")
         endpoint_done.set()
 
@@ -279,12 +252,7 @@ def test_endpoint_waits_for_the_staged_ingress_restart(
 
 
 def test_observability_overlaps_data_plane(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Monitoring installs while the clusters roll, and is joined before finalize.
-
-    `install-amp-monitoring.sh` takes ~118 s and nothing in the rollout reads what
-    it writes; what must not happen is closing the compatibility window while it
-    is still in flight, because the finalize is the step no rollback can undo.
-    """
+    """Configure monitoring concurrently, then publish expectations after both join."""
 
     monkeypatch.setattr(
         ORCHESTRATION, "preflight_upgrade_mutations", lambda _self, _plan: None
@@ -306,7 +274,7 @@ def test_observability_overlaps_data_plane(monkeypatch: pytest.MonkeyPatch) -> N
     release = phase_release(
         calls,
         clusters=(SimpleNamespace(cluster_id="gpu-a"),),
-        _apply_observability=apply_observability,
+        _apply_control_plane_observability=apply_observability,
         _upgrade_gpu_target=upgrade_target,
     )
 
@@ -317,7 +285,11 @@ def test_observability_overlaps_data_plane(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
     assert calls.index("gpu:gpu-a") < calls.index("observability")
-    assert calls.index("observability") < calls.index("cpu-finalize")
+    assert (
+        max(calls.index("observability"), calls.index("gpu:gpu-a"))
+        < calls.index("expected-rules")
+        < calls.index("cpu-finalize")
+    ), "expected collectors were published before both installation branches joined"
     assert "observability-ready" in release.state["completed_phases"]
 
 
@@ -469,7 +441,7 @@ def test_background_failure_is_reported_with_the_error_that_stopped_the_release(
     release = phase_release(
         calls,
         clusters=(SimpleNamespace(cluster_id="gpu-a"),),
-        _apply_observability=apply_observability,
+        _apply_control_plane_observability=apply_observability,
         _upgrade_gpu_target=upgrade_target,
     )
 
@@ -484,6 +456,9 @@ def test_background_failure_is_reported_with_the_error_that_stopped_the_release(
     assert "gpu-a agents did not converge" in message
     assert "observability also failed" in message
     assert "amp workspace rejected the rules" in message
+    assert "expected-rules" not in calls, (
+        "a failed GPU/monitoring join still published collector expectations"
+    )
     # The type decides pause-versus-rollback, so it must survive the annotation:
     # one cluster's convergence timeout is not a reason to revert the fleet.
     assert not isinstance(failure.value, ORCHESTRATION.ReleaseError) or isinstance(
@@ -543,6 +518,5 @@ def test_a_merged_checkpoint_narrates_every_phase_it_carried(
         if phase not in stamps and phase not in narrated
     ]
     assert silent == [], silent
-    # The phase that motivated this: joined last, carried by a write stamped with
-    # a later phase, and therefore never narrated by `save_state`.
-    assert "candidate-preflight-ready" in narrated, narrated
+    # Candidate proof is now its own early stamp, before the first CPU mutation.
+    assert "candidate-preflight-ready" in stamps, stamps

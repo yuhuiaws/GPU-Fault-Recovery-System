@@ -404,3 +404,23 @@ def test_postgres_fault_claim_paths_match_channel_registry() -> None:
         checked += 1
         assert found == expected
     assert checked >= 2
+
+
+def test_device_plugin_restarts_are_the_only_device_holder_safe_mutations() -> None:
+    """Restarting a device plugin re-registers devices; nothing else mutates a node
+    without touching what running containers hold, so the STOP-ownership guard
+    exempts exactly these two operations in a workflow that stopped nothing."""
+    from gpu_fault.operation_registry import (
+        DEVICE_PLUGIN_RESTART_OPERATIONS,
+        NODE_MUTATING_OPERATIONS,
+    )
+
+    assert DEVICE_PLUGIN_RESTART_OPERATIONS == frozenset(
+        {
+            WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
+            WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        }
+    ), "only the two device-plugin restarts are device-holder safe"
+    assert DEVICE_PLUGIN_RESTART_OPERATIONS < NODE_MUTATING_OPERATIONS, (
+        "they stay node-mutating for every other rule (merge, budget, busy holds)"
+    )

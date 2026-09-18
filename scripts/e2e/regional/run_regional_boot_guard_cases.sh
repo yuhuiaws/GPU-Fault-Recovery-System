@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 FIXTURE_DIR="${ROOT}/scripts/e2e/regional/boot_guard"
 PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
+CPU_PYTHON="/opt/gpu-fault/control-plane/bin/python"
 
 : "${CPU_KUBECONFIG:?}"
 : "${NAMESPACE:=gpu-fault-system}"
@@ -12,8 +14,7 @@ PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
 : "${AWS_REGION:?}"
 : "${BOOT_GUARD_START_CASE:=1}"
 # Optional: the IAM role name the control-plane Pods run as. When set, the
-# BOOT-005 CloudTrail read is filtered to that principal; when unset, every
-# HyperPod mutation in the window is reported.
+# BOOT-005 records this principal hint without filtering out other mutations.
 : "${CONTROL_PLANE_ROLE_NAME:=}"
 
 if [[ "${BOOT_GUARD_START_CASE}" != "1" &&
@@ -25,11 +26,19 @@ fi
 
 PROBE="gpu-fault-api-guard-probe"
 BASE="${GUARD_PROBE_BASE:-/tmp/guard-probe-base.json}"
+export GUARD_PROBE_BASE="${BASE}"
+export CPU_KUBECONFIG NAMESPACE PROBE PYTHON RUN_DIR AWS_REGION CPU_HYPERPOD_CLUSTER BOOT_GUARD_START_CASE
+GUARD_ARGUMENTS=("$@")
+authorization="$("${PYTHON}" "${ROOT}/scripts/e2e/regional/boot_guard_control.py" "${GUARD_ARGUMENTS[@]}")"
+if [[ "${authorization}" != "EXECUTION_AUTHORIZED" ]]; then
+  printf '%s\n' "${authorization}"
+  exit 0
+fi
 RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CASE_DIR="${RUN_DIR}/cases"
 
 install -d -m 0700 "${CASE_DIR}"
-export CPU_KUBECONFIG NAMESPACE PROBE
+export CPU_KUBECONFIG NAMESPACE PROBE PYTHON
 
 # ---------------------------------------------------------------------------
 # Verdict contract. Every case file ends in exactly one line
@@ -42,14 +51,23 @@ export CPU_KUBECONFIG NAMESPACE PROBE
 # ---------------------------------------------------------------------------
 CURRENT_EVIDENCE=""
 
+record_case() {
+  BOOT_GUARD_RECORD_CASE="${case_id}" BOOT_GUARD_RECORD_VERDICT="$1" \
+    "${PYTHON}" "${ROOT}/scripts/e2e/regional/boot_guard_control.py" \
+    "${GUARD_ARGUMENTS[@]}" >/dev/null
+}
+
 begin_case() {
   printf -v case_id 'GF-REGIONAL-BOOT-%03d' "$1"
   CURRENT_EVIDENCE="${CASE_DIR}/${case_id}.txt"
   : >"${CURRENT_EVIDENCE}"
+  record_case FAIL
   echo "== ${case_id}"
 }
 
 pass_case() {
+  "${FIXTURE_DIR}/reset.sh"
+  record_case PASS
   echo "VERDICT PASS" | tee -a "${CURRENT_EVIDENCE}"
   CURRENT_EVIDENCE=""
 }
@@ -58,6 +76,7 @@ fail_case() {
   echo "FAIL: $*" >&2
   if [[ -n "${CURRENT_EVIDENCE}" ]]; then
     printf 'FAIL: %s\nVERDICT FAIL\n' "$*" >>"${CURRENT_EVIDENCE}"
+    record_case FAIL || true
   fi
   exit 1
 }
@@ -67,6 +86,7 @@ on_error() {
   if [[ -n "${CURRENT_EVIDENCE}" ]]; then
     printf 'FAIL: command exited %s\nVERDICT FAIL\n' "${status}" \
       >>"${CURRENT_EVIDENCE}"
+    record_case FAIL || true
   fi
 }
 trap on_error ERR
@@ -100,67 +120,28 @@ fi
 latest_ready_api_pod() {
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     get pod -l app=gpu-fault-api-ha -o json |
-    jq -r '
+    jq -er '
       [
         .items[]
         | select(.metadata.deletionTimestamp == null)
-        | select(any(
-            .status.conditions[]?;
-            .type == "Ready" and .status == "True"
-          ))
+        | select(.status.phase == "Running")
+        | select([.status.conditions[]? | select(.type == "Ready") | .status] == ["True"])
+        | select((.spec.containers | length) > 0)
+        | select(([.spec.containers[].name] | sort) == ([.status.containerStatuses[]? | select(.ready == true) | .name] | sort))
       ]
       | sort_by(.metadata.creationTimestamp)
       | last
       | .metadata.name
+      | select(type == "string" and length > 0)
     '
 }
 
 reset_probe() {
   "${FIXTURE_DIR}/reset.sh"
-}
-
-# BOOT-007/008 依赖各自的 env 注册表成为**运行时权威**，但产品的区域注册表运行时
-# 遵循 "durable head wins"：首个 bootstrap 的探针把 gen-1 从 list_regional_clusters()
-# 固化为 durable head，此后 env Secret 只写漂移日志、不再改写 store（见
-# regional_registry.py 的 sync：head 已存在就直接返回 durable revision；以及
-# regional_registry_runtime._bootstrap_once：head NotFound 才 publish gen-1）。
-# 整批共用一个 gpu_fault_guardprobe 库，于是 BOOT-002 的空注册表 [] 会把 durable
-# head 钉死为空；BOOT-007 的 32、BOOT-008 的 64 disabled 随后被忽略，BOOT-008 的
-# claim 打到未注册集群、返回 403 "regional cluster is not registered"（而非用例
-# 期望的 "authentication failed"），造成与用例顺序相关的假失败（完整跑失败、
-# START=7 因跳过 BOOT-002 而侥幸通过）。这是 runner/fixture 缺陷，非产品缺陷。
-# 每次换注册表起探针前清掉 guardprobe 的 durable registry 行，让本用例 env 重新
-# bootstrap 成 gen-1，用例判定即与顺序无关。reset_probe 已等到 0 个探针 Pod，
-# 删除时无探针连着该 head；api Pod 只连线上 /gpu_fault，不受影响。裸
-# psycopg.connect 自建 DSN、不经 StoreCredentials，但仍显式清空
-# GPU_FAULT_STORE_URL_FILE 与 baseline 初始化保持一致（防误读挂载文件）。
-reset_durable_registry() {
-  local pod
-  pod="$(latest_ready_api_pod)"
+  # Reset only after all probe Pods have stopped; no durable head crosses cases.
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    exec -i "${pod}" -- env GPU_FAULT_STORE_URL_FILE= python - <<'PY'
-import os
-import urllib.parse
-
-import psycopg
-
-parts = urllib.parse.urlsplit(os.environ["GPU_FAULT_STORE_URL"])
-assert parts.path == "/gpu_fault", parts.path
-probe = urllib.parse.urlunsplit(parts._replace(path="/gpu_fault_guardprobe"))
-with psycopg.connect(probe, autocommit=True) as connection:
-    deleted = connection.execute(
-        """
-        DELETE FROM gpu_fault_objects
-        WHERE kind IN (
-            'regional_cluster',
-            'regional_registry_head',
-            'regional_registry_revision',
-            'regional_registry_member'
-        )
-        """
-    ).rowcount
-print("guardprobe durable registry reset, rows deleted:", deleted)
-PY
+    exec -i "$(latest_ready_api_pod)" -- "${CPU_PYTHON}" - reset \
+    <"${ROOT}/scripts/e2e/regional/boot_guard_isolation.py"
 }
 
 assert_probe() {
@@ -187,14 +168,15 @@ apply_mutation() {
 # returns once a Pod is Ready (readiness is GET /healthz on :8080, i.e. the app
 # is actually serving).
 probe_pod_name() {
+  # Command substitution disables errexit; propagate each failed read explicitly.
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    rollout status deployment "${PROBE}" --timeout=600s >/dev/null
+    rollout status deployment "${PROBE}" --timeout=600s >/dev/null || return
   local pods
   pods="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
       get pod -l "app=${PROBE}" -o json |
       jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | .[]'
-  )"
+  )" || return
   if [[ "$(wc -l <<<"${pods}")" != "1" || -z "${pods}" ]]; then
     fail_case "expected exactly one probe Pod, got: ${pods//$'\n'/ }"
   fi
@@ -203,9 +185,6 @@ probe_pod_name() {
 
 probe_registry() {
   reset_probe
-  # 探针已全部消失，此刻清掉 guardprobe 的 durable registry，
-  # 让下面这套 env 注册表成为新探针 bootstrap 的 gen-1 权威。
-  reset_durable_registry
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     create secret generic gpu-fault-regional-clusters-probe \
     --from-literal=clusters.json="$(
@@ -219,10 +198,18 @@ probe_registry() {
 }
 
 cleanup_all() {
-  set +e
-  "${FIXTURE_DIR}/cleanup.sh" --drop-database \
-    >"${CASE_DIR}/GF-REGIONAL-BOOT-001-010-cleanup.txt" 2>&1
+  local status=$?
+  trap - EXIT
+  if ! "${FIXTURE_DIR}/cleanup.sh" --drop-database \
+    >"${CASE_DIR}/GF-REGIONAL-BOOT-001-010-cleanup.txt" 2>&1; then
+    status=1
+    if [[ -n "${CURRENT_EVIDENCE}" ]]; then
+      printf 'FAIL: cleanup incomplete\nVERDICT FAIL\n' >>"${CURRENT_EVIDENCE}"
+      record_case FAIL || true
+    fi
+  fi
   shred -u "${BASE}" 2>/dev/null || true
+  exit "${status}"
 }
 trap cleanup_all EXIT
 
@@ -235,100 +222,20 @@ printf 'baseline=%s\n' "${baseline}" |
   tee "${CASE_DIR}/GF-REGIONAL-BOOT-001-010-baseline.txt"
 
 api_pod="$(latest_ready_api_pod)"
-# 必须清空 GPU_FAULT_STORE_URL_FILE 再跑这段初始化：CP-3 起 StoreCredentials
-# 会在每次连接时优先读挂载的 DSN 文件（api Pod 里指向线上 gpu_fault 库），
-# 覆盖我们显式传给 PostgresStore 的 guardprobe URL。若不清空，下面
-# initialize_schema=True 实际会去初始化**线上 gpu_fault**（幂等、无新表），
-# 而 gpu_fault_guardprobe 始终保持空 schema——探针 App（derive.sh 已把它
-# 隔离到 guardprobe）随后校验 schema 失败并崩溃，BOOT-002 的空注册表 []
-# 正向用例会因探针一直不 Ready、rollout 超过 progressDeadline 而假失败。
-# CREATE DATABASE 走 psycopg.connect(admin) 直连 URL、不经 StoreCredentials，
-# 清空该变量对它无影响。
+# The helper reads the fresh DSN, isolates overrides and verifies the target database.
 database_output="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    exec -i "${api_pod}" -- env GPU_FAULT_STORE_URL_FILE= python - <<'PY'
-import os
-import urllib.parse
-
-import psycopg
-
-from gpu_fault.store import PostgresStore
-
-parts = urllib.parse.urlsplit(os.environ["GPU_FAULT_STORE_URL"])
-assert parts.path == "/gpu_fault", parts.path
-admin = urllib.parse.urlunsplit(parts._replace(path="/postgres"))
-with psycopg.connect(admin, autocommit=True) as connection:
-    exists = connection.execute(
-        "SELECT 1 FROM pg_database WHERE datname='gpu_fault_guardprobe'"
-    ).fetchone()
-    if not exists:
-        connection.execute("CREATE DATABASE gpu_fault_guardprobe")
-probe = urllib.parse.urlunsplit(
-    parts._replace(path="/gpu_fault_guardprobe")
-)
-store = PostgresStore(
-    probe,
-    pool_min_size=0,
-    pool_max_size=1,
-    pool_timeout_seconds=10,
-    initialize_schema=True,
-    hot_state_mode="legacy",
-)
-store.close()
-# 防御性核验：确认 schema 真的落在 guardprobe 库。initialize_schema 在已初始化
-# 的库上是幂等的，一旦 DSN 被挂载文件覆盖到线上库，这段会“成功”却不建任何表，
-# 探针随后才在启动时暴露出来。这里当场失败，把根因固定在初始化步骤。
-with psycopg.connect(probe, autocommit=True) as verify:
-    if (
-        verify.execute(
-            "SELECT to_regclass('gpu_fault_schema_version')"
-        ).fetchone()[0]
-        is None
-    ):
-        raise SystemExit(
-            "guardprobe schema init no-op: gpu_fault_schema_version 缺失，"
-            "疑似 GPU_FAULT_STORE_URL_FILE 把 DSN 指回了线上库"
-        )
-print("guardprobe schema initialized")
-PY
+    exec -i "${api_pod}" -- "${CPU_PYTHON}" - initialize \
+    <"${ROOT}/scripts/e2e/regional/boot_guard_isolation.py"
 )"
 printf '%s\n' "${database_output}" |
   tee "${CASE_DIR}/GF-REGIONAL-BOOT-001-010-database.txt"
 unset database_output
 
-secret_manifest="$(
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    exec -i "${api_pod}" -- python - <<'PY'
-import base64
-import json
-import os
-import urllib.parse
-
-parts = urllib.parse.urlsplit(os.environ["GPU_FAULT_STORE_URL"])
-assert parts.path == "/gpu_fault", parts.path
-probe = urllib.parse.urlunsplit(
-    parts._replace(path="/gpu_fault_guardprobe")
-)
-print(
-    json.dumps(
-        {
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {"name": "gpu-fault-aurora-guardprobe"},
-            "type": "Opaque",
-            "data": {
-                "postgres-url": base64.b64encode(
-                    probe.encode()
-                ).decode()
-            },
-        }
-    )
-)
-PY
-)"
-printf '%s\n' "${secret_manifest}" |
+kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+  exec -i "${api_pod}" -- "${CPU_PYTHON}" - secret \
+  <"${ROOT}/scripts/e2e/regional/boot_guard_isolation.py" |
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" apply -f -
-unset secret_manifest
 
 "${FIXTURE_DIR}/derive.sh" "${BASE}"
 export GUARD_PROBE_BASE="${BASE}"
@@ -370,8 +277,8 @@ if (( BOOT_GUARD_START_CASE <= 1 )); then
   )"
   printf 'ready_after_%ss=%s\n' "${readiness_period}" "${ready_again}" |
     tee -a "${CURRENT_EVIDENCE}"
-  if [[ "${ready_again}" == "True" ]]; then
-    fail_case "probe became Ready one readiness period after the guard fired"
+  if [[ "${ready_again}" != "False" ]]; then
+    fail_case "probe readiness is True or unknown one period after the guard fired"
   fi
   pass_case
 fi
@@ -413,7 +320,7 @@ if (( BOOT_GUARD_START_CASE <= 2 )); then
   probe_pod="$(probe_pod_name)"
   empty_registry_output="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      exec -i "${probe_pod}" -- python - <<'PY'
+      exec -i "${probe_pod}" -- "${CPU_PYTHON}" - <<'PY'
 import json
 import os
 import urllib.request
@@ -469,7 +376,7 @@ if (( BOOT_GUARD_START_CASE <= 5 )); then
   # CloudTrail is eventually consistent (delivery within 15 minutes), so a
   # lookup seconds after the action cannot prove absence. The positive
   # evidence for this case is the guard exit above; the CloudTrail read is
-  # recorded as provisional, filtered to the control-plane role when known.
+  # recorded as provisional. No principal-name substring may hide a mutation.
   # shellcheck disable=SC2016 # The expression is AWS CLI JMESPath.
   mutations="$(
     aws cloudtrail lookup-events \
@@ -478,15 +385,11 @@ if (( BOOT_GUARD_START_CASE <= 5 )); then
     --lookup-attributes \
       AttributeKey=EventSource,AttributeValue=sagemaker.amazonaws.com \
     --query \
-      'Events[?EventName==`RebootClusterNodes` || EventName==`BatchDeleteClusterNodes` || EventName==`BatchReplaceClusterNodes` || EventName==`UpdateClusterSoftware`].[EventTime,EventName,Username]' \
+      'Events[?EventName==`RebootClusterNodes` || EventName==`BatchRebootClusterNodes` || EventName==`BatchDeleteClusterNodes` || EventName==`BatchReplaceClusterNodes` || EventName==`UpdateClusterSoftware`].[EventTime,EventName,Username]' \
     --output json
   )"
   if [[ -n "${CONTROL_PLANE_ROLE_NAME}" ]]; then
-    mutations="$(
-      jq --arg role "${CONTROL_PLANE_ROLE_NAME}" \
-        '[.[] | select((.[2] // "") | contains($role))]' <<<"${mutations}"
-    )"
-    printf 'cloudtrail_filter=role:%s\n' "${CONTROL_PLANE_ROLE_NAME}" |
+    printf 'cloudtrail_principal_hint=%s; all_mutations_retained=true\n' "${CONTROL_PLANE_ROLE_NAME}" |
       tee -a "${CURRENT_EVIDENCE}"
   else
     printf 'cloudtrail_filter=none\n' | tee -a "${CURRENT_EVIDENCE}"
@@ -519,7 +422,7 @@ if (( BOOT_GUARD_START_CASE <= 7 )); then
   # its own health endpoint from inside the Pod.
   healthz_output="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      exec -i "${probe_pod}" -- python - <<'PY'
+      exec -i "${probe_pod}" -- "${CPU_PYTHON}" - <<'PY'
 import urllib.request
 
 with urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=10) as response:
@@ -545,7 +448,7 @@ probe_registry 64 disabled
 probe_pod="$(probe_pod_name)"
 disabled_output="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    exec -i "${probe_pod}" -- python - <<'PY'
+    exec -i "${probe_pod}" -- "${CPU_PYTHON}" - <<'PY'
 import json
 import sys
 import urllib.error
@@ -630,10 +533,18 @@ for pod in $(
 ); do
   output="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      exec "${pod}" -- printenv |
-      grep -E \
-        '^GPU_FAULT_(DEPLOYMENT_MODE|ENABLE_KUBERNETES_ADAPTER|ENABLE_NODE_ACTION_ADAPTER|ENABLE_HYPERPOD_ADAPTER|ENABLE_HYPERPOD_SPARE_FAILOVER|ENABLE_HYPERPOD_MANAGED_OBSERVER|ENABLE_AGENT_REGISTRY|HYPERPOD_CLUSTER|PROCESSOR_MODE)=' |
-      sort
+      exec -i "${pod}" -- "${CPU_PYTHON}" - <<'PY'
+import os
+names = (
+    "DEPLOYMENT_MODE", "ENABLE_KUBERNETES_ADAPTER", "ENABLE_NODE_ACTION_ADAPTER",
+    "ENABLE_HYPERPOD_ADAPTER", "ENABLE_HYPERPOD_SPARE_FAILOVER",
+    "ENABLE_HYPERPOD_MANAGED_OBSERVER", "ENABLE_AGENT_REGISTRY",
+    "HYPERPOD_CLUSTER", "PROCESSOR_MODE",
+)
+for name in sorted("GPU_FAULT_" + name for name in names):
+    if name in os.environ:
+        print(name + "=" + os.environ[name])
+PY
   )"
   printf '== %s\n%s\n' "${pod}" "${output}" |
     tee -a "${CURRENT_EVIDENCE}"
@@ -664,30 +575,30 @@ fi
 # The registry is loaded: every registered cluster answers the read-only
 # collector-status side channel with 200 (not 404/500). Read from inside one
 # replica so the execution token never leaves the Pod.
-cluster_ids="$(
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    get secret gpu-fault-regional-clusters -o jsonpath='{.data.clusters\.json}' |
-    base64 -d | jq -r '.[].cluster_id'
-)"
-if [[ -z "${cluster_ids}" ]]; then
-  fail_case "production registry names no clusters"
-fi
 api_pod="$(latest_ready_api_pod)"
 collector_status_output="$(
-  CLUSTER_IDS="${cluster_ids}" kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" \
     -n "${NAMESPACE}" exec -i "${api_pod}" -- \
-    env "PROBE_CLUSTER_IDS=${cluster_ids}" python - <<'PY'
+    "${CPU_PYTHON}" - <<'PY'
+import json
 import os
 import urllib.error
 import urllib.request
 
 failures = []
-for cluster_id in os.environ["PROBE_CLUSTER_IDS"].split():
+headers = {"X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"]}
+request = urllib.request.Request(
+    "http://127.0.0.1:8080/v1/regional/clusters", headers=headers,
+)
+with urllib.request.urlopen(request, timeout=10) as response:
+    clusters = json.load(response)
+if not isinstance(clusters, list) or not clusters:
+    raise SystemExit("production registry names no clusters")
+for cluster in clusters:
+    cluster_id = cluster["cluster_id"]
     request = urllib.request.Request(
         f"http://127.0.0.1:8080/v1/collector-status/{cluster_id}",
-        headers={
-            "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"]
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -717,4 +628,4 @@ if [[ "${node_count}" != "3" ]]; then
 fi
 pass_case
 
-echo "GF-REGIONAL-BOOT-001..010 PASS"
+echo "GF-REGIONAL-BOOT-001..005,007..010 PASS (006 retired)"

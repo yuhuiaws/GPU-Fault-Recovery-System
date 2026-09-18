@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -26,6 +27,7 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
     claim_sample,
 )
+from scripts.e2e.regional.iso006_primary_recovery import PrimaryRecovery  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -42,13 +44,14 @@ from scripts.e2e.regional.multi_cluster_fixture import (  # noqa: E402
     registration_snapshot,
     registrations_are_distinct_physical_clusters,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
     predecessor_evidence,
     required,
     run_case_main,
 )
+from scripts.e2e.regional.run_workload_acceptance import derived_identity  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-ISO-006"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-013"
@@ -79,6 +82,8 @@ VALIDATION_LIMITATIONS = [
     "A-cluster claim latency is sampled from one Ready executor Pod with the "
     "acceptance probe owner; it measures the authenticated claim path, not "
     "the executor's own poll loop.",
+    "A recovery uses authenticated software XID11 replay and run-owned training "
+    "workloads, not hardware damage or hardware-origin fault evidence.",
 ]
 
 
@@ -89,6 +94,9 @@ class Settings:
     control_plane_cidrs: tuple[str, ...]
     duration_seconds: int
     predecessor_path: Path
+    site_file: Path
+    job_id: str = ""
+    attempt_id: str = ""
 
     def environment(self) -> dict[str, str]:
         return {
@@ -97,6 +105,9 @@ class Settings:
             "GPU_FAULT_CONTROL_PLANE_CIDRS": ",".join(self.control_plane_cidrs),
             "GPU_FAULT_ISO006_DURATION_SECONDS": str(self.duration_seconds),
             "GPU_FAULT_PREDECESSOR_EVIDENCE": str(self.predecessor_path),
+            "GPU_FAULT_SITE_FILE": str(self.site_file),
+            "GPU_FAULT_SHARED_JOB_ID": self.job_id,
+            "GPU_FAULT_SHARED_ATTEMPT_ID": self.attempt_id,
         }
 
     @property
@@ -155,6 +166,8 @@ def configure(arguments: argparse.Namespace) -> Settings:
         raise RegionalFixtureError("duration seconds is outside 60..1800")
     if not arguments.control_plane_cidr:
         raise RegionalFixtureError("at least one control-plane CIDR is required")
+    job_id, attempt_id = derived_identity(arguments.run_dir, arguments.attempt, CASE_ID)
+    configured_job = arguments.job_id.strip() or job_id
     return Settings(
         multi=multi,
         host_probe_image=required(
@@ -164,6 +177,17 @@ def configure(arguments: argparse.Namespace) -> Settings:
         control_plane_cidrs=tuple(arguments.control_plane_cidr),
         duration_seconds=arguments.duration_seconds,
         predecessor_path=predecessor,
+        site_file=Path(
+            required(
+                arguments.site_file or os.getenv("GPU_FAULT_SITE_FILE", ""),
+                "regional site file",
+            )
+        )
+        .expanduser()
+        .resolve(),
+        job_id=configured_job,
+        attempt_id=arguments.attempt_id.strip()
+        or (f"{configured_job}-a001" if arguments.job_id else attempt_id),
     )
 
 
@@ -237,6 +261,12 @@ def read_only_preflight(
         errors.append("cluster registrations do not identify two physical clusters")
     if not nodes_a or not nodes_b:
         errors.append("both clusters require GPU nodes")
+    if len(nodes_a) < 3:
+        errors.append("A requires three GPU nodes for the managed recovery workload")
+    if a.gpu_workloads() or b.gpu_workloads():
+        errors.append("both clusters must be free of preexisting GPU workloads")
+    if not settings.site_file.is_file():
+        errors.append("A recovery requires an existing site file")
     if any(item["ready"] != "True" for item in [*nodes_a, *nodes_b]):
         errors.append("a GPU node is not Ready")
     if claim_a.get("status") != 200 or claim_b.get("status") != 200:
@@ -262,7 +292,7 @@ def read_only_preflight(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     details = {
-        "risk": "live-non-destructive",
+        "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
         "cluster_a": settings.multi.cluster_a.cluster_id,
         "cluster_b": settings.multi.cluster_b.cluster_id,
@@ -270,8 +300,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": (
             "block cluster B node egress (OUTPUT and FORWARD) to explicit "
             "control-plane CIDRs on TCP 443 for "
-            f"{settings.duration_seconds}s; cluster A remains an unmodified control"
+            f"{settings.duration_seconds}s; recover one run-owned A workload "
+            "from software XID11 while the B cut is held"
         ),
+        "shared_job_id": settings.job_id,
+        "shared_attempt_id": settings.attempt_id,
         "preflight_identity": {
             "release_id": preflight["release_id"],
             "cluster_a_node_uids": sorted(
@@ -288,6 +321,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the cut cannot be proven from a B executor Pod",
             "cluster A readiness or control-plane Pods regress",
             "rules cannot be removed or B does not recover",
+            "A recovery lacks causal terminal, restart, budget or notification evidence",
         ],
         "rollback": {
             "host_restore_seconds": settings.restore_seconds,
@@ -305,7 +339,11 @@ def latency_p95(samples: list[dict[str, Any]]) -> float | None:
         float(item["latency_seconds"])
         for item in samples
         if isinstance(item.get("latency_seconds"), (int, float))
-        and item.get("status") is not None
+        and not isinstance(item["latency_seconds"], bool)
+        and math.isfinite(item["latency_seconds"])
+        and item["latency_seconds"] >= 0
+        and type(item.get("status")) is int
+        and item["status"] == 200
     )
     if not values:
         return None
@@ -324,26 +362,50 @@ def latency_errors(
     during = latency_p95(window)
     if base is None or during is None:
         errors.append("claim latency could not be measured in both phases")
-    elif during > base * (1 + LATENCY_P95_MAX_INCREASE):
+    elif during >= base * (1 + LATENCY_P95_MAX_INCREASE):
         errors.append(
             f"A claim p95 rose from {base:.3f}s to {during:.3f}s "
-            f"(> {LATENCY_P95_MAX_INCREASE:.0%})"
+            f"(>= {LATENCY_P95_MAX_INCREASE:.0%})"
         )
-    for item in window:
-        status = item.get("status")
-        if status is None:
-            errors.append("A claim failed at transport level during the block")
-            break
-        if int(status) >= 500:
-            errors.append(f"A claim returned {status} during the block")
-            break
+    for phase, samples in (("baseline", baseline), ("block", window)):
+        for item in samples:
+            status = item.get("status")
+            latency = item.get("latency_seconds")
+            if type(status) is not int or status != 200:
+                errors.append(f"A claim returned {status} during the {phase}")
+                break
+            if (
+                not isinstance(latency, (float, int))
+                or isinstance(latency, bool)
+                or not math.isfinite(latency)
+                or latency < 0
+            ):
+                errors.append(f"A claim latency is invalid during the {phase}")
+                break
     return errors
 
 
 def pressure_errors(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     errors = []
-    for name, value in after.get("rejections", {}).items():
-        if float(value) > float(before.get("rejections", {}).get(name, 0.0)):
+    previous = before.get("rejections")
+    current = after.get("rejections")
+    if (
+        not isinstance(previous, dict)
+        or not isinstance(current, dict)
+        or not previous
+        or previous.keys() != current.keys()
+    ):
+        return ["rejection counters were not measured in both phases"]
+    for name, value in current.items():
+        earlier = previous[name]
+        if any(
+            type(item) not in {int, float} or not math.isfinite(item) or item < 0
+            for item in (earlier, value)
+        ):
+            errors.append(f"{name} is not a valid rejection counter")
+        elif value < earlier:
+            errors.append(f"{name} reset during the block")
+        elif value > earlier:
             errors.append(f"{name} increased during the block")
     return errors
 
@@ -351,7 +413,20 @@ def pressure_errors(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
 def cut_proven(sample: dict[str, Any]) -> bool:
     """A blocked cluster's claim must fail at the transport, not with an HTTP status."""
 
-    return sample.get("status") is None and bool(sample.get("transport_error"))
+    return (
+        sample.get("status") is None
+        and bool(sample.get("transport_error"))
+        and sample.get("transport_failure_kind") == "network"
+    )
+
+
+def unblock_proven(receipt: dict[str, Any]) -> bool:
+    return (
+        receipt.get("blocked") is False
+        and receipt.get("residual") is False
+        and receipt.get("chain_present") is False
+        and receipt.get("jumps") == {"OUTPUT": False, "FORWARD": False}
+    )
 
 
 def block_arguments(settings: Settings, run_id: str) -> list[str]:
@@ -367,6 +442,82 @@ def block_arguments(settings: Settings, run_id: str) -> list[str]:
         "--restore-seconds",
         str(settings.restore_seconds),
     ]
+
+
+def observe_recovery_during_cut(
+    *,
+    a: RegionalLiveFixture,
+    b: RegionalLiveFixture,
+    primary: PrimaryRecovery,
+    settings: Settings,
+    preflight: dict[str, Any],
+    pressure_before: dict[str, Any],
+    result: dict[str, Any],
+    maintenance_window_end: datetime,
+) -> list[str]:
+    cluster_b = settings.multi.cluster_b.cluster_id
+    containers_before = preflight["cpu_containers"]
+    window_started = time.monotonic()
+    deadline = window_started + settings.duration_seconds
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        a_recovery = pool.submit(
+            primary.recover,
+            deadline,
+            cut_is_active=lambda: cut_proven(claim_sample(b)),
+        )
+        while time.monotonic() < deadline:
+            if datetime.now(timezone.utc) >= maintenance_window_end:
+                raise RegionalFixtureError(
+                    "approved maintenance window ended during block"
+                )
+            if a_recovery.done():
+                result["a_recovery"] = a_recovery.result()
+            sample: dict[str, Any] = {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "a_claim": claim_sample(a),
+                "a_ready_executors": len(
+                    a.ready_pods("gpu", "gpu-fault-cluster-executor")
+                ),
+                "b_pressure": control_plane_pressure(a, cluster_b),
+                "cpu_pods": cpu_pod_snapshot(a),
+                "cpu_containers": control_plane_container_statuses(a),
+                "b_claim": claim_sample(b),
+            }
+            result["samples"].append(sample)
+            if not sample["a_ready_executors"]:
+                raise RegionalFixtureError("cluster A executor lost readiness")
+            if (
+                not cut_proven(sample["b_claim"])
+                or container_status_errors(containers_before, sample["cpu_containers"])
+                or sample["cpu_pods"] != preflight["cpu_pods"]
+            ):
+                raise RegionalFixtureError(
+                    "network cut or CPU readiness changed during observation"
+                )
+            time.sleep(
+                max(0.0, min(SAMPLE_INTERVAL_SECONDS, deadline - time.monotonic()))
+            )
+        result["a_recovery"] = a_recovery.result()
+    result["a_recovery_exercised"] = True
+    containers_after = control_plane_container_statuses(a)
+    pressure_after = result["samples"][-1]["b_pressure"] if result["samples"] else {}
+    errors = latency_errors(
+        result["baseline_samples"],
+        [item["a_claim"] for item in result["samples"]],
+    )
+    errors.extend(pressure_errors(pressure_before, pressure_after))
+    errors.extend(container_status_errors(containers_before, containers_after))
+    result["pressure_before"] = pressure_before
+    result["pressure_after"] = pressure_after
+    result["b_queue_depth_delta"] = float(
+        pressure_after.get("cluster_queue_depth", 0.0)
+    ) - float(pressure_before.get("cluster_queue_depth", 0.0))
+    result["cpu_containers_after"] = containers_after
+    result["a_claim_p95_baseline_seconds"] = latency_p95(result["baseline_samples"])
+    result["a_claim_p95_window_seconds"] = latency_p95(
+        [item["a_claim"] for item in result["samples"]]
+    )
+    return errors
 
 
 def execute_case(
@@ -391,6 +542,7 @@ def execute_case(
     probes = [
         HostProbeFixture(
             HostProbeSettings(
+                state_directory=case_dir / "host-probes",
                 kubeconfig=settings.multi.cluster_b.gpu_kubeconfig,
                 context=settings.multi.cluster_b.gpu_context,
                 namespace=settings.multi.namespace,
@@ -416,8 +568,19 @@ def execute_case(
         "validation_limitations": VALIDATION_LIMITATIONS,
     }
     blocked = False
+    created: list[HostProbeFixture] = []
+    default_job, default_attempt = derived_identity(run_dir, attempt, CASE_ID)
+    primary = PrimaryRecovery(
+        a,
+        site_file=settings.site_file,
+        case_dir=case_dir / "cluster-a",
+        job_id=settings.job_id or default_job,
+        attempt_id=settings.attempt_id or default_attempt,
+        attempt=attempt,
+        maintenance_window_end=maintenance_window_end,
+    )
     try:
-        containers_before = preflight["cpu_containers"]
+        primary.prepare()
         pressure_before = control_plane_pressure(a, cluster_b)
         for _ in range(BASELINE_SAMPLES):
             result["baseline_samples"].append(
@@ -427,16 +590,38 @@ def execute_case(
                 }
             )
             time.sleep(BASELINE_INTERVAL_SECONDS)
+        if latency_errors(result["baseline_samples"], result["baseline_samples"]):
+            raise RegionalFixtureError("claim baseline is incomplete or unhealthy")
         # Every probe Pod Ready first, then the blocks back to back: each
         # node's restore timer is armed from its own block time, so the
         # blocks must not be spread over the Pod scheduling of the others.
         with ThreadPoolExecutor(max_workers=max(1, len(probes))) as pool:
-            list(pool.map(lambda probe: probe.create(), probes))
+
+            def create(probe: HostProbeFixture) -> None:
+                created.append(probe)
+                probe.create()
+
+            list(pool.map(create, probes))
+        remaining = (
+            maintenance_window_end - datetime.now(timezone.utc)
+        ).total_seconds()
+        if remaining < settings.restore_seconds:
+            raise RegionalFixtureError(
+                "maintenance window cannot cover block and restoration"
+            )
+        if {(item["name"], item["uid"]) for item in b.gpu_nodes()} != {
+            (item["name"], item["uid"]) for item in preflight["nodes_b"]
+        }:
+            raise RegionalFixtureError("cluster B node identities changed before block")
         first_block = time.monotonic()
         blocks = []
         for probe in probes:
-            blocks.append(probe.execute(*block_arguments(settings, run_id)))
+            # The remote block may have committed even when its receipt is lost.
             blocked = True
+            receipt = probe.execute(*block_arguments(settings, run_id))
+            if receipt.get("blocked") is not True:
+                raise RegionalFixtureError("network block has no verified receipt")
+            blocks.append(receipt)
         block_span = time.monotonic() - first_block
         result["blocks"] = blocks
         result["block_span_seconds"] = block_span
@@ -452,48 +637,21 @@ def execute_case(
             raise RegionalFixtureError(
                 f"cluster B still reaches the control plane after the block: {cut}"
             )
-        window_started = time.monotonic()
-        deadline = window_started + settings.duration_seconds
-        while time.monotonic() < deadline:
-            sample = {
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "a_claim": claim_sample(a),
-                "a_ready_executors": len(
-                    a.ready_pods("gpu", "gpu-fault-cluster-executor")
-                ),
-                "b_pressure": control_plane_pressure(a, cluster_b),
-                "cpu_pods": cpu_pod_snapshot(a),
-            }
-            result["samples"].append(sample)
-            if not sample["a_ready_executors"]:
-                raise RegionalFixtureError("cluster A executor lost readiness")
-            time.sleep(
-                max(0.0, min(SAMPLE_INTERVAL_SECONDS, deadline - time.monotonic()))
-            )
-        containers_after = control_plane_container_statuses(a)
-        pressure_after = (
-            result["samples"][-1]["b_pressure"] if result["samples"] else {}
-        )
-        errors = latency_errors(
-            result["baseline_samples"],
-            [item["a_claim"] for item in result["samples"]],
-        )
-        errors.extend(pressure_errors(pressure_before, pressure_after))
-        errors.extend(container_status_errors(containers_before, containers_after))
-        result["pressure_before"] = pressure_before
-        result["pressure_after"] = pressure_after
-        result["b_queue_depth_delta"] = float(
-            pressure_after.get("cluster_queue_depth", 0.0)
-        ) - float(pressure_before.get("cluster_queue_depth", 0.0))
-        result["cpu_containers_after"] = containers_after
-        result["a_claim_p95_baseline_seconds"] = latency_p95(result["baseline_samples"])
-        result["a_claim_p95_window_seconds"] = latency_p95(
-            [item["a_claim"] for item in result["samples"]]
+        errors = observe_recovery_during_cut(
+            a=a,
+            b=b,
+            primary=primary,
+            settings=settings,
+            preflight=preflight,
+            pressure_before=pressure_before,
+            result=result,
+            maintenance_window_end=maintenance_window_end,
         )
         # Unblock inside the window's accounting so B's recovery is measured
         # from the moment the rules left, not from the end of cleanup.
         for probe in probes:
-            probe.execute("unblock", "--run-id", run_id)
+            if not unblock_proven(probe.execute("unblock", "--run-id", run_id)):
+                raise RegionalFixtureError("network rule removal is unproven")
         blocked = False
         unblocked_at = time.monotonic()
         recovery: dict[str, Any] | None = None
@@ -512,16 +670,20 @@ def execute_case(
             errors.append(
                 f"cluster B did not claim within {RECOVERY_TIMEOUT_SECONDS}s of unblock"
             )
+        if b.gpu_nodes() != preflight["nodes_b"]:
+            errors.append("cluster B node identity/state changed across the cut")
+        result["claim_path_component_verdict"] = "PASS" if not errors else "FAIL"
         result["errors"] = errors
         result["verdict"] = "PASS" if not errors else "FAIL"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         residuals = {}
-        for index, probe in enumerate(probes):
+        for index, probe in enumerate(created):
             if blocked:
                 try:
-                    probe.execute("unblock", "--run-id", run_id)
+                    if not unblock_proven(probe.execute("unblock", "--run-id", run_id)):
+                        raise RegionalFixtureError("network rule removal is unproven")
                 except Exception as exc:
                     result.setdefault("cleanup_errors", []).append(
                         f"unblock {index}: {type(exc).__name__}: {exc}"
@@ -529,6 +691,11 @@ def execute_case(
                     result["verdict"] = "FAIL"
             try:
                 residuals[str(index)] = probe.cleanup()
+                if not residuals[str(index)] or any(residuals[str(index)].values()):
+                    result.setdefault("cleanup_errors", []).append(
+                        f"probe {index}: cleanup is incomplete"
+                    )
+                    result["verdict"] = "FAIL"
             except Exception as exc:
                 residuals[str(index)] = {"cleanup_error": True}
                 result.setdefault("cleanup_errors", []).append(
@@ -536,6 +703,13 @@ def execute_case(
                 )
                 result["verdict"] = "FAIL"
         result["probe_residuals"] = residuals
+        try:
+            cleanup_errors = primary.cleanup(result)
+        except Exception as exc:
+            cleanup_errors = [f"A cleanup: {type(exc).__name__}"]
+        if cleanup_errors:
+            result.setdefault("cleanup_errors", []).extend(cleanup_errors)
+            result["verdict"] = "FAIL"
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -549,6 +723,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--cpu-kubeconfig", default="")
     value.add_argument("--namespace", default="gpu-fault-system")
     value.add_argument("--region", default="")
+    value.add_argument("--site-file", default="")
+    value.add_argument("--job-id", default="")
+    value.add_argument("--attempt-id", default="")
     value.add_argument("--cluster-a", required=True)
     value.add_argument("--gpu-a-kubeconfig", required=True)
     value.add_argument("--gpu-a-context", required=True)

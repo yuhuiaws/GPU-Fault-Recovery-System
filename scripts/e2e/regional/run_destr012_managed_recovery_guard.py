@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -40,7 +40,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     predecessor_evidence,
+    read_predecessor_evidence,
     required,
     run_case_main,
     runtime_identity_errors,
@@ -63,6 +65,9 @@ MANAGED_WORKLOAD_OWNER = "gpu-fault-kubernetes-adapter"
 GROUP_A_OWNER_OPERATIONS = ("STOP_WORKLOADS", "RESTART_WORKLOAD")
 GROUP_A_EVIDENCE_SOURCE = f"{PREDECESSOR_CASE_ID} evidence"
 GROUP_A_WORKLOAD_SOURCE = "rerun 24-GPU workload restart"
+# The remediated event must outlive the coordinator's same-source merge window.
+SAME_SOURCE_DUPLICATE_WINDOW_SECONDS = 30
+DUPLICATE_WINDOW_MARGIN_SECONDS = 15
 
 
 PROFILE_REPLICA_PROBE = r"""
@@ -223,7 +228,7 @@ def pod_python(
         "-i",
         pod,
         "--",
-        "python3",
+        component_python(plane),
         "-",
         *arguments,
         input_text=script,
@@ -509,24 +514,53 @@ def delete_after_quiescence(
         result["verdict"] = "FAIL"
 
 
+def wait_out_duplicate_window(
+    first_at: datetime,
+    *,
+    now: datetime | None = None,
+    maintenance_window_end: datetime | None = None,
+) -> float:
+    """Wait for a new fault without extending the approved maintenance window."""
+
+    current = now or datetime.now(timezone.utc)
+    if first_at.tzinfo is None or current.tzinfo is None or first_at > current:
+        raise RegionalFixtureError("duplicate window timestamps are invalid")
+    ready_at = first_at + timedelta(
+        seconds=SAME_SOURCE_DUPLICATE_WINDOW_SECONDS + DUPLICATE_WINDOW_MARGIN_SECONDS
+    )
+    if maintenance_window_end is not None and (
+        maintenance_window_end.tzinfo is None
+        or max(current, ready_at) >= maintenance_window_end
+    ):
+        raise RegionalFixtureError("maintenance window cannot fit group D retry")
+    remaining = max((ready_at - current).total_seconds(), 0.0)
+    if remaining:
+        time.sleep(remaining)
+    return remaining
+
+
 def group_a_owner_errors(steps: list[dict[str, Any]]) -> list[str]:
+    if any(not isinstance(item, dict) for item in steps):
+        return ["group A recorded a malformed workflow step"]
     owners = {
         item.get("operation"): item.get("execution_owner")
         for item in steps
         if isinstance(item, dict)
     }
-    return [
-        f"group A {operation} owner is not Kubernetes adapter"
-        for operation in GROUP_A_OWNER_OPERATIONS
-        if owners.get(operation) != MANAGED_WORKLOAD_OWNER
-    ]
+    errors = []
+    for operation in GROUP_A_OWNER_OPERATIONS:
+        if sum(item.get("operation") == operation for item in steps) != 1:
+            errors.append(f"group A does not contain exactly one {operation}")
+        if owners.get(operation) != MANAGED_WORKLOAD_OWNER:
+            errors.append(f"group A {operation} owner is not Kubernetes adapter")
+    return errors
 
 
 def group_a_from_evidence(
     predecessor_path: Path,
     predecessor: dict[str, Any],
 ) -> dict[str, Any]:
-    """Group A read from the DESTR-009 evidence this run already validated.
+    """Validate and consume one bound DESTR-009 document, without rereading it.
 
     The old group A restarted a second 24-GPU PyTorchJob to look at two owner
     fields DESTR-009 had just produced. The predecessor evidence carries the
@@ -545,16 +579,29 @@ def group_a_from_evidence(
         "rerun DESTR-009 on this release with the current runner, or pass "
         "--rerun-group-a-workload"
     )
-    if not predecessor.get("evidence_valid"):
+    release_id = predecessor.get("expected_release_id")
+    cluster_id = predecessor.get("expected_cluster_id")
+    if not all(isinstance(value, str) and value for value in (release_id, cluster_id)):
         result["error"] = (
-            "DESTR-009 evidence is not a PASS bound to this release/cluster "
-            f"({predecessor.get('error') or predecessor.get('verdict')}); {remedy}"
+            "DESTR-009 evidence has no expected release/cluster binding "
+            f"({predecessor.get('evidence_error') or predecessor.get('verdict')}); {remedy}"
         )
         return result
-    try:
-        value = json.loads(predecessor_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        result["error"] = f"cannot read DESTR-009 evidence: {exc}; {remedy}"
+    value, facts = read_predecessor_evidence(
+        predecessor_path,
+        PREDECESSOR_CASE_ID,
+        release_id=release_id,
+        cluster_id=cluster_id,
+    )
+    result["predecessor_evidence_sha256"] = facts.get("evidence_sha256")
+    if facts.get("evidence_valid") is not True or value is None:
+        result["error"] = (
+            "DESTR-009 evidence is not a PASS bound to this release/cluster "
+            f"({facts.get('evidence_error')}); {remedy}"
+        )
+        return result
+    if predecessor.get("evidence_sha256") not in (None, facts.get("evidence_sha256")):
+        result["error"] = f"DESTR-009 evidence changed since preflight; {remedy}"
         return result
     steps = value.get("workflow_official_steps") if isinstance(value, dict) else None
     if not isinstance(steps, list) or not steps:
@@ -606,6 +653,10 @@ def run_group_a(
     injected_at: datetime | None = None
     workflow_request_ids: list[str] = []
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before group A submission"
+            )
         submission = workload.submit()
         write_json_atomic(case_dir / "group-a-submission.json", submission)
         source = workload.wait_running(timeout_seconds=900)
@@ -659,6 +710,7 @@ def run_group_a(
         )
         official_steps = workload_restart.workflow_official_steps(state)
         errors.extend(group_a_owner_errors(official_steps))
+        workload.authorize_restart(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "group-a-target.json", target)
         result.update(
@@ -718,6 +770,14 @@ def group_d_failure_errors(
     return errors
 
 
+def remediate_group_d_workload(workload: ManagedWorkloadFixture) -> list[str]:
+    workload.annotate_auto_resume(None)
+    annotations = workload.snapshot()["workload"]["annotations"]
+    if AUTO_RESUME_ANNOTATION in annotations:
+        return ["group D auto-resume annotation was not removed"]
+    return []
+
+
 def run_group_d(
     settings: Settings,
     regional: RegionalLiveFixture,
@@ -745,6 +805,10 @@ def run_group_d(
     quiescence_after: datetime | None = None
     workflow_request_ids: list[str] = []
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before group D submission"
+            )
         submission = workload.submit()
         write_json_atomic(case_dir / "group-d-submission.json", submission)
         source = workload.wait_running(timeout_seconds=900)
@@ -755,6 +819,10 @@ def run_group_d(
             node=target_node,
             expected_gpu_count=1,
         )
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before group D annotation"
+            )
         workload.annotate_auto_resume("true")
         violating = workload.snapshot()
         write_json_atomic(case_dir / "group-d-violating-baseline.json", violating)
@@ -809,15 +877,20 @@ def run_group_d(
         logs = executor_log_snapshot(regional, first_at, workload.name)
         write_json_atomic(case_dir / "group-d-executor-logs.json", logs)
         errors.extend(workload_restart.log_write_errors(logs, "group D executor"))
-        workload.annotate_auto_resume(None)
-        remediated = workload.snapshot()
-        if (
-            str(
-                remediated["workload"]["annotations"].get(AUTO_RESUME_ANNOTATION) or ""
-            ).lower()
-            == "true"
-        ):
-            errors.append("group D auto-resume annotation was not removed")
+        result["errors"] = errors
+        if errors:
+            return result
+        errors.extend(remediate_group_d_workload(workload))
+        if errors:
+            return result
+        result["duplicate_window_wait_seconds"] = round(
+            wait_out_duplicate_window(
+                first_at, maintenance_window_end=maintenance_window_end
+            ),
+            3,
+        )
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before group D retry")
         second_marker = f"destr012-d-retry-{int(time.time())}"
         second_at = datetime.now(timezone.utc)
         quiescence_marker, quiescence_after = second_marker, second_at
@@ -863,6 +936,7 @@ def run_group_d(
                 expected_gpu_count=1,
             )
         )
+        workload.authorize_restart(remediated_state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "group-d-target.json", target)
         result.update(
@@ -886,8 +960,9 @@ def run_group_d(
     finally:
         try:
             workload.annotate_auto_resume(None)
-        except Exception:
-            pass
+        except Exception as exc:
+            result["annotation_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+            result["verdict"] = "FAIL"
         delete_after_quiescence(
             regional,
             workload,
@@ -995,6 +1070,54 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     return details
 
 
+def audit_workload_residuals(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    result: dict[str, Any],
+) -> None:
+    # Each group deletes its own workload behind the quiescence gate; a
+    # second unconditional delete here would race that gate. What remains
+    # for the case is to prove nothing was left behind.
+    workload_residuals: dict[str, bool] = {}
+    for group in ("A", "D"):
+        if group == "A" and not settings.rerun_group_a_workload:
+            continue
+        case_settings = workload_settings(settings, group=group)
+        fixture = ManagedWorkloadFixture(
+            regional,
+            ManagedWorkloadSettings(
+                manifest=case_settings.manifest,
+                site_file=case_settings.site_file,
+                job_id=case_settings.job_id,
+                attempt_id=case_settings.attempt_id,
+                restart_budget=1,
+                expected_pods=3 if group == "A" else 1,
+                expected_gpu_count=24 if group == "A" else 1,
+            ),
+        )
+        try:
+            workload_residuals[group] = bool(
+                regional.kubectl(
+                    "gpu",
+                    "get",
+                    fixture.resource,
+                    fixture.name,
+                    "--ignore-not-found",
+                    "-o",
+                    "name",
+                    check=True,
+                ).strip()
+            )
+        except Exception as exc:
+            workload_residuals[group] = True
+            result[f"group_{group.lower()}_residual_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+    result["workload_residuals"] = workload_residuals
+    if any(workload_residuals.values()):
+        result["verdict"] = "FAIL"
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -1058,6 +1181,8 @@ def execute_case(
             raise RegionalFixtureError(
                 "group B failed: " + "; ".join(group_b_before["errors"])
             )
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before image prewarm")
         candidate_names = [str(item["name"]) for item in preflight["candidate_nodes"]]
         prewarmed = prewarm.create(candidate_names)
         cached = prewarm.cached_nodes()
@@ -1168,47 +1293,7 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        # Each group deletes its own workload behind the quiescence gate; a
-        # second unconditional delete here would race that gate. What remains
-        # for the case is to prove nothing was left behind.
-        workload_residuals: dict[str, bool] = {}
-        for group in ("A", "D"):
-            if group == "A" and not settings.rerun_group_a_workload:
-                continue
-            case_settings = workload_settings(settings, group=group)
-            fixture = ManagedWorkloadFixture(
-                regional,
-                ManagedWorkloadSettings(
-                    manifest=case_settings.manifest,
-                    site_file=case_settings.site_file,
-                    job_id=case_settings.job_id,
-                    attempt_id=case_settings.attempt_id,
-                    restart_budget=1,
-                    expected_pods=3 if group == "A" else 1,
-                    expected_gpu_count=24 if group == "A" else 1,
-                ),
-            )
-            try:
-                workload_residuals[group] = bool(
-                    regional.kubectl(
-                        "gpu",
-                        "get",
-                        fixture.resource,
-                        fixture.name,
-                        "--ignore-not-found",
-                        "-o",
-                        "name",
-                        check=False,
-                    ).strip()
-                )
-            except Exception as exc:
-                workload_residuals[group] = True
-                result[f"group_{group.lower()}_residual_error"] = (
-                    f"{type(exc).__name__}: {exc}"
-                )
-        result["workload_residuals"] = workload_residuals
-        if any(workload_residuals.values()):
-            result["verdict"] = "FAIL"
+        audit_workload_residuals(settings, regional, result)
         try:
             prewarm_residuals = prewarm.cleanup()
         except Exception as exc:

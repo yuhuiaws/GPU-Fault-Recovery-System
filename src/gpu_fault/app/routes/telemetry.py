@@ -106,9 +106,8 @@ async def collector_readiness(
                 pending_first_report = (
                     last is None and unit_running and agent_age <= thresholds[kind]
                 )
-                ready = (
-                    age is not None and age <= thresholds[kind] and unit_running
-                ) or pending_first_report
+                # Warmup is diagnostic, not a successful collection receipt.
+                ready = age is not None and age <= thresholds[kind] and unit_running
                 collectors[kind.value] = {
                     "unit": unit,
                     "unit_state": unit_state,

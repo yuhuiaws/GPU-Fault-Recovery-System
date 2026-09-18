@@ -32,6 +32,7 @@ from gpu_fault.models import (
     WorkflowEventKind,
     WorkflowOperation,
     WorkflowStatus,
+    WorkflowStepStatus,
 )
 from gpu_fault.orchestration.families.conflicts import NodeConflictService
 from gpu_fault.orchestration.incident_closure import (
@@ -48,6 +49,7 @@ from tests._builders import (
     copy_model,
     workflow_request,
     workflow_step,
+    workflow_step_execution,
 )
 from tests.orchestration._incident_closure_support import (
     COLLECT,
@@ -813,3 +815,38 @@ def test_closing_an_incident_supersedes_the_blocked_workflow_it_leaves_behind(
         settled.preemption_reason or ""
     )
     assert f"{OPERATOR} reconciliation CHG-2" in (settled.preemption_reason or "")
+
+
+@pytest.mark.parametrize("blocked_kind", [None, *BlockedKind])
+def test_physical_uncertainty_refuses_operator_and_restore_closure(
+    store, blocked_kind: BlockedKind | None
+) -> None:
+    incident, workflow = _escalated_reset(store, workflow_status=WorkflowStatus.BLOCKED)
+    workflow = copy_model(
+        workflow,
+        blocked_kind=blocked_kind,
+        step_executions=[
+            workflow_step_execution(
+                3, RESET, WorkflowStepStatus.FAILED, details={"outcome_unknown": True}
+            )
+        ],
+    )
+    store.save_workflow(workflow)
+    service = IncidentClosureService(store)
+
+    preview = service.preview(incident.incident_id)
+    assert preview["closable"] is False
+    assert preview["open_workflow_id"] == workflow.request_id
+    with pytest.raises(IncidentNotClosable, match="open workflow"):
+        service.close_incident(
+            incident.incident_id, reason="operator disposition", operator=OPERATOR
+        )
+
+    restorer = _restore_workflow("inc-restorer")
+    recovered = _recovered("inc-restorer", restorer)
+    assert service.on_terminal(restorer, recovered, restorer.official_steps) == []
+    assert store.get_incident(incident.incident_id) == incident
+    assert store.get_workflow(workflow.request_id) == workflow
+    assert store.list_markers_for_incident(incident.incident_id)[0].active, (
+        "unresolved physical work must retain the incident's active marker"
+    )

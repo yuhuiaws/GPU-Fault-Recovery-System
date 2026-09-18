@@ -37,6 +37,9 @@ class FakeStore:
     def _delete(self, kind: str, key: str) -> None:
         self.deleted.append((kind, key))
 
+    def _get_optional(self, kind: str, key: str) -> None:
+        return None
+
 
 def bare_audit(
     *,
@@ -64,12 +67,14 @@ def bare_audit(
     audit.created_commands = set()
     audit.created_workflows = set()
     audit.created_incidents = set()
+    audit.created_event_links = {}
+    audit.created_auxiliary = set()
     audit.results = {}
     audit.preflight_result = {}
     return audit
 
 
-def test_a_failing_case_is_recorded_and_the_remaining_cases_still_run(
+def test_a_failing_case_is_recorded_and_stops_the_remaining_cases(
     tmp_path: Path,
 ) -> None:
     store = FakeStore()
@@ -95,10 +100,10 @@ def test_a_failing_case_is_recorded_and_the_remaining_cases_still_run(
 
     summary = audit.run()
 
-    assert order == list(AUDITED_CASE_IDS), "a failing case aborted the rest"
+    assert order == list(AUDITED_CASE_IDS[:2])
     assert summary["verdict"] == "FAIL"
     assert summary["verdicts"]["GF-REGIONAL-CMD-002"] == "FAIL"
-    assert summary["verdicts"]["GF-REGIONAL-CMD-003"] == "PASS"
+    assert summary["not_run"] == list(AUDITED_CASE_IDS[2:])
     assert (
         "lease_seconds=9 answered 200"
         in summary["results"]["GF-REGIONAL-CMD-002"]["error"]
@@ -110,11 +115,11 @@ def test_a_failing_case_is_recorded_and_the_remaining_cases_still_run(
         (tmp_path / "cases/GF-REGIONAL-CMD-002/GF-REGIONAL-CMD-002.json").read_text()
     )
     passed = json.loads(
-        (tmp_path / "cases/GF-REGIONAL-CMD-016/GF-REGIONAL-CMD-016.json").read_text()
+        (tmp_path / "cases/GF-REGIONAL-CMD-001/GF-REGIONAL-CMD-001.json").read_text()
     )
     assert failed["verdict"] == "FAIL" and "lease_seconds" in failed["error"]
     assert passed["verdict"] == "PASS"
-    assert passed["case_id"] == "GF-REGIONAL-CMD-016"
+    assert passed["case_id"] == "GF-REGIONAL-CMD-001"
     assert passed["cluster_id"] == "cluster-a"
     assert passed["release_id"] == "release-1"
     assert passed["details"] == {"observed": True}
@@ -152,7 +157,7 @@ def test_cmd001_hands_back_every_lease_as_waiting_and_seeds_only_its_owner() -> 
     audit = bare_audit()
     seeded_owners: list[str | None] = []
     returned: list[dict[str, Any]] = []
-    backlog = [f"cmd-audit-test-cmd001-{index}-command" for index in range(3)]
+    backlog = [f"cmd-audit-test-cmd001-{index}-command" for index in range(26)]
 
     def seed(suffix: str, **kwargs: Any) -> SimpleNamespace:
         seeded_owners.append(kwargs.get("owner"))
@@ -180,17 +185,16 @@ def test_cmd001_hands_back_every_lease_as_waiting_and_seeds_only_its_owner() -> 
 
     audit.run_001()
 
-    assert seeded_owners == [None, None, None], (
+    assert seeded_owners == [None] * 26, (
         "CMD-001 must seed with the audit's test-only owner, not a real adapter"
     )
-    # 1 -> 1 lease, 25 -> 3 leases, "5" -> 3 leases; every one came back WAITING.
-    assert len(returned) == 7
+    assert len(returned) == 31
     assert all(item["status"] == "WAITING" for item in returned), (
         "a leased command must be handed back as WAITING, never completed"
     )
-    assert {item["command_id"] for item in returned} == set(backlog)
+    assert {item["command_id"] for item in returned} == set(backlog[:25])
     recorded = audit.results["GF-REGIONAL-CMD-001"]
-    assert recorded["leased_and_returned"] == 7
+    assert recorded["leased_and_returned"] == 31
     assert recorded["statuses"] == {
         "0": 422,
         "1": 200,
@@ -248,7 +252,11 @@ def test_cmd007_records_the_replay_statuses_it_observed_and_fails_on_a_rewrite()
         )
         audit.claim = lambda **kwargs: (  # type: ignore[method-assign]
             200,
-            {"commands": [{"command_id": "c", "lease_token": "t"}]},
+            {
+                "commands": [
+                    {"command_id": "cmd-audit-test-cmd007-command", "lease_token": "t"}
+                ]
+            },
         )
         audit.complete = lambda *args, **kwargs: next(answers)  # type: ignore[method-assign]
         return audit

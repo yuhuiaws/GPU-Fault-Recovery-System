@@ -79,10 +79,8 @@ IDEMPOTENCY_ID_FIELDS = (
     "observation_id",
     "summary_id",
     "record_id",
-    # gpu-inventory snapshots and CloudWatch HMA log events used to fall
-    # through to the single-attempt path, so every idle-closed connection
-    # sent them straight to the outbox with no server-side dedup key.
     "snapshot_id",
+    # Preserve idempotency for historical log records still in an outbox.
     "log_event_id",
 )
 
@@ -156,8 +154,7 @@ def event_idempotency_key(payload: dict[str, Any]) -> str | None:
         )
         if event_time is not None:
             return f"{payload['attempt_id']}/{event_time}"
-    # An HMA node event carries no id field of its own; the Kubernetes object's
-    # name plus its ``resourceVersion`` names exactly one observed revision.
+    # Historical Node records carry the identity in the Kubernetes object.
     node = payload.get("node")
     metadata = node.get("metadata") if isinstance(node, dict) else None
     if isinstance(metadata, dict):
@@ -969,6 +966,10 @@ class HttpEventSink:
                     self._compact_outbox_locked(outbox)
             return True
         except OSError as exc:
+            # A failed fsync can leave a complete append in the file. Recount
+            # before the next write instead of underestimating the backlog.
+            with self._outbox_lock:
+                self._outbox_line_count = None
             failures = _bump(_OUTBOX_WRITE_FAILURES, str(self.outbox_path))
             if failures == 1:
                 LOGGER.exception("cannot persist collector outbox event")

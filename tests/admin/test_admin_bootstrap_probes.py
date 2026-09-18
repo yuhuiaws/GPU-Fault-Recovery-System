@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -7,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 from gpu_fault.admin import bootstrap_checkpoint as admin_bootstrap_checkpoint
 from gpu_fault.admin import bootstrap_load_balancer as admin_bootstrap_load_balancer
@@ -19,10 +22,18 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapRequest,
     BootstrapState,
     ClusterIdentity,
+    CommandRunner,
     ReadOnlyProbeRunner,
     compute_agent_config_digest,
     run_parallel,
 )
+from gpu_fault.admin.monitoring_policy import amp_sns_publish_statement
+from gpu_fault_release.regional_release_diff import (
+    ReleaseComponent,
+    build_execution_plan,
+    diff_from_changed,
+)
+from scripts.release_identity import file_set_identity
 
 
 def _cluster() -> ClusterIdentity:
@@ -332,12 +343,56 @@ def test_monitoring_resources_create_no_alerts_queue(
     topic_arn = "arn:aws:sns:us-east-1:123456789012:gpu-fault-site-a-alerts"
     calls: list[list[str]] = []
 
-    class Runner:
+    class Runner(CommandRunner):
         dry_run = False
 
         def run(self, arguments, **kwargs):
             del kwargs
             calls.append(list(arguments))
+            if "describe-workspace" in arguments:
+                return json.dumps(
+                    {
+                        "workspace": {
+                            "workspaceId": "ws-a",
+                            "arn": f"arn:aws:aps:{cpu.region}:{cpu.account_id}:workspace/ws-a",
+                            "alias": "gpu-fault-site-a",
+                            "status": {"statusCode": "ACTIVE"},
+                        }
+                    }
+                )
+            if "get-topic-attributes" in arguments:
+                return json.dumps(
+                    {
+                        "Attributes": {
+                            "TopicArn": topic_arn,
+                            "Owner": cpu.account_id,
+                            "Policy": json.dumps(
+                                {
+                                    "Version": "2012-10-17",
+                                    "Statement": [
+                                        amp_sns_publish_statement(
+                                            cpu=cpu,
+                                            site_id="site-a",
+                                            workspace_id="ws-a",
+                                            topic_arn=topic_arn,
+                                        )
+                                    ],
+                                }
+                            ),
+                        }
+                    }
+                )
+            if "list-tags-for-resource" in arguments:
+                if arguments[1] == "amp":
+                    return json.dumps({"tags": {"gpu-fault:site-id": "site-a"}})
+                return json.dumps(
+                    {
+                        "Tags": [
+                            {"Key": "gpu-fault:site-id", "Value": "site-a"},
+                            {"Key": "gpu-fault:topic-generation", "Value": "a" * 32},
+                        ]
+                    }
+                )
             if "list-subscriptions-by-topic" in arguments:
                 return json.dumps({"Subscriptions": []})
             raise AssertionError(arguments)
@@ -437,6 +492,13 @@ def _gpu_cluster() -> ClusterIdentity:
     )
 
 
+def _observability_input_patterns(root: Path) -> tuple[str, ...]:
+    document = yaml.safe_load(
+        (root / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    return tuple(str(value) for value in document["component_inputs"]["observability"])
+
+
 def _mirror_repository_root(tmp_path: Path, name: str) -> Path:
     """Copy the files the input digests read into a writable repository root.
 
@@ -447,13 +509,20 @@ def _mirror_repository_root(tmp_path: Path, name: str) -> Path:
 
     root = tmp_path / name
     real = Path(__file__).resolve().parents[2]
-    for relative in (
-        *admin_bootstrap_checkpoint.BOOTSTRAP_RECONCILE_SOURCES,
-        *admin_bootstrap_checkpoint.BOOTSTRAP_TASK_ASSETS,
-    ):
-        destination = root / relative
+    paths = {
+        real / relative
+        for relative in (
+            *admin_bootstrap_checkpoint.BOOTSTRAP_RECONCILE_SOURCES,
+            *admin_bootstrap_checkpoint.BOOTSTRAP_TASK_ASSETS,
+            "config/release-identity.yaml",
+        )
+    }
+    for pattern in _observability_input_patterns(real):
+        paths.update(path for path in real.glob(pattern) if path.is_file())
+    for source in sorted(paths):
+        destination = root / source.relative_to(real)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes((real / relative).read_bytes())
+        destination.write_bytes(source.read_bytes())
     return root
 
 
@@ -471,7 +540,14 @@ def _bind_release_inputs(
     wheel.write_bytes(wheel_bytes)
     manifest = state_dir / "release.json"
     manifest.write_text(
-        json.dumps({"release_id": release_id, "wheel": str(wheel)}), encoding="utf-8"
+        json.dumps(
+            {
+                "release_id": release_id,
+                "wheel": str(wheel),
+                "wheel_sha256": hashlib.sha256(wheel_bytes).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
     )
     state = BootstrapState(state_dir / "bootstrap-state.json", site_id="site-a")
     request = BootstrapRequest(
@@ -528,11 +604,23 @@ PROBE_COVERED_TASKS = (
 # The tasks with no probe: the digest is their only re-convergence trigger, so it
 # still binds the bytes of `bootstrap.py`.
 UNPROBED_TASKS = ("nlb_network", "pki")
+IDENTITY_IMPLEMENTATION_TASKS = {
+    "src/gpu_fault/admin/bootstrap_services.py": (
+        "monitoring_install",
+        "aurora_refresh",
+    ),
+    "src/gpu_fault/admin/monitoring_policy.py": ("monitoring_resources",),
+    "src/gpu_fault/admin/node_key_proof.py": ("node_keys:gpu-a",),
+    "src/gpu_fault/admin/resource_registry_dns.py": ("pki",),
+}
 
 
 def _refactored_repository_root(tmp_path: Path, name: str) -> Path:
     root = _mirror_repository_root(tmp_path, name)
     for relative in admin_bootstrap_checkpoint.BOOTSTRAP_RECONCILE_SOURCES:
+        if relative in IDENTITY_IMPLEMENTATION_TASKS:
+            # Owned IAM/SNS implementations have separate positive pin tests.
+            continue
         source = root / relative
         source.write_text(
             source.read_text(encoding="utf-8") + "\n# a refactor\n", encoding="utf-8"
@@ -541,15 +629,7 @@ def _refactored_repository_root(tmp_path: Path, name: str) -> Path:
 
 
 def test_task_digests_ignore_orchestration_source_edits(tmp_path: Path) -> None:
-    """Editing the bootstrap code must not re-run what a probe already re-proves.
-
-    Every task digest embedded the bytes of `bootstrap.py` and its siblings, so
-    any refactor of the orchestration re-ran the heavy ensure paths -- an
-    unconditional `rds modify-db-subnet-group` and its `rds wait`, a PKI
-    regeneration, an NLB reconcile -- on a deploy where no desired resource
-    changed. For a task that `bootstrap_tasks.py` revalidates, the read-only probe
-    is the re-convergence trigger and the module bytes are noise.
-    """
+    """Orchestration-only edits do not invalidate probe-covered identities."""
 
     baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
     edited_root = _refactored_repository_root(tmp_path, "repository-edited-source")
@@ -574,6 +654,26 @@ def test_task_digests_ignore_orchestration_source_edits(tmp_path: Path) -> None:
             assert baseline[name] == refactored[name], (
                 f"a code edit alone re-runs {name}, which a probe re-proves"
             )
+
+
+@pytest.mark.parametrize("source,tasks", IDENTITY_IMPLEMENTATION_TASKS.items())
+def test_identity_implementation_changes_invalidate_their_owning_tasks(
+    tmp_path: Path, source: str, tasks: tuple[str, ...]
+) -> None:
+    baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
+    edited_root = _mirror_repository_root(tmp_path, "repository-edited-identity")
+    implementation = edited_root / source
+    implementation.write_bytes(
+        implementation.read_bytes() + b"\n# changed identity implementation\n"
+    )
+    changed = _bind_release_inputs(
+        tmp_path, release_id="0100-a", repository_root=edited_root
+    )
+    assert {name for name in baseline if baseline[name] != changed[name]} == set(
+        tasks
+    ), (
+        "identity implementation changes lost their owning task pins or invalidated unrelated tasks"
+    )
 
 
 def test_unprobed_task_digests_still_track_the_code_that_converges_them(
@@ -614,8 +714,11 @@ def test_each_task_has_its_own_digest(tmp_path: Path) -> None:
 
 
 def test_monitoring_install_digest_tracks_its_amp_assets(tmp_path: Path) -> None:
+    """AMP asset bytes belong to the release, not the IAM-only bootstrap task."""
     baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
     edited_root = _mirror_repository_root(tmp_path, "repository-edited-rules")
+    patterns = _observability_input_patterns(edited_root)
+    before = file_set_identity(edited_root, patterns)
     rules = edited_root / "deploy/observability/amp-rules.yaml"
     rules.write_text(
         rules.read_text(encoding="utf-8") + "\n# an edited capacity rule\n",
@@ -625,19 +728,35 @@ def test_monitoring_install_digest_tracks_its_amp_assets(tmp_path: Path) -> None
         tmp_path, release_id="0100-a", repository_root=edited_root
     )
 
-    assert baseline["monitoring_install"] != shifted_digests["monitoring_install"], (
-        "monitoring_install ignores a change to the AMP rules it publishes"
+    after = file_set_identity(edited_root, patterns)
+    assert before["sha256"] != after["sha256"], (
+        "the release observability identity ignored changed AMP rule bytes"
+    )
+    assert baseline["monitoring_install"] == shifted_digests["monitoring_install"], (
+        "versioned AMP rules invalidated the bootstrap IAM checkpoint"
+    )
+    plan = build_execution_plan(diff_from_changed({"observability_manifests"}))
+    assert plan.has(ReleaseComponent.OBSERVABILITY), (
+        "changed observability identity did not schedule the release-owned runtime"
     )
 
 
 def test_aurora_refresh_digest_tracks_the_wheel_bytes(tmp_path: Path) -> None:
+    """Wheel changes bind the release candidate while refresher IAM stays stable."""
     baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
     rebuilt = _bind_release_inputs(
         tmp_path, release_id="0100-a", wheel_bytes=b"rebuilt-wheel-bytes"
     )
 
-    assert baseline["aurora_refresh"] != rebuilt["aurora_refresh"], (
-        "aurora_refresh ignores a rebuilt control-plane wheel"
+    assert baseline["aurora_refresh"] == rebuilt["aurora_refresh"], (
+        "versioned refresher wheel bytes invalidated the bootstrap IAM checkpoint"
+    )
+    assert baseline["release"] != rebuilt["release"], (
+        "rebuilt wheel bytes did not invalidate the candidate release identity"
+    )
+    plan = build_execution_plan(diff_from_changed({"control_plane_wheel"}))
+    assert plan.has(ReleaseComponent.AURORA_REFRESH), (
+        "a rebuilt control-plane wheel did not schedule the versioned refresher"
     )
 
 
@@ -892,7 +1011,12 @@ def test_aurora_refresh_probe_requires_ensure_on_drift(
 
 
 def _node_key_probe_runner(
-    nodes: tuple[str, ...], gpu_keys: tuple[str, ...], cpu_keys: tuple[str, ...]
+    nodes: tuple[str, ...],
+    gpu_keys: tuple[str, ...],
+    cpu_keys: tuple[str, ...],
+    *,
+    pending: bool = False,
+    changed_cpu: str | None = None,
 ):
     calls: list[list[str]] = []
 
@@ -905,14 +1029,42 @@ def _node_key_probe_runner(
                 return "\n".join(nodes)
             if "--kubeconfig" in arguments:
                 index = arguments.index("--kubeconfig") + 1
-                keys = gpu_keys if "gpu" in arguments[index] else cpu_keys
-                return "\n".join(keys)
+                gpu = "gpu" in arguments[index]
+                keys = gpu_keys if gpu else cpu_keys
+                assert kwargs.get("sensitive") is True
+                data = {}
+                for node in keys:
+                    material = hashlib.sha256(node.encode()).hexdigest()
+                    if not gpu and node == changed_cpu:
+                        material = "x" * 64
+                    data[node] = base64.b64encode(material.encode()).decode()
+                return json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "type": "Opaque",
+                        "metadata": {
+                            "name": "gpu-fault-node-action-keys",
+                            "namespace": "gpu-fault-system",
+                            "uid": "gpu-keys" if gpu else "cpu-keys",
+                            "resourceVersion": "1",
+                            "annotations": (
+                                {"gpu-fault.io/node-action-key-rotation": "pending"}
+                                if pending and gpu
+                                else {}
+                            ),
+                        },
+                        "data": data,
+                    }
+                )
             raise AssertionError(arguments)
 
     return Runner(), calls
 
 
-def test_healthy_node_action_key_probe_reads_only_key_names(tmp_path: Path) -> None:
+def test_healthy_node_action_key_probe_compares_private_material(
+    tmp_path: Path,
+) -> None:
     nodes = ("hyperpod-node-a", "hyperpod-node-b")
     runner, calls = _node_key_probe_runner(nodes, nodes, nodes)
 
@@ -935,11 +1087,42 @@ def test_healthy_node_action_key_probe_reads_only_key_names(tmp_path: Path) -> N
     assert len(secret_reads) == 2, (
         "node key probe did not compare both the GPU Secret and the CPU mirror"
     )
-    assert all(
-        call[call.index("-o") + 1].startswith("go-template=")
-        and "$_" in call[call.index("-o") + 1]
-        for call in secret_reads
-    ), "node key probe read Secret values instead of key names"
+    assert all(call[call.index("-o") + 1] == "json" for call in secret_reads), (
+        "node key probe must read both Secrets as JSON"
+    )
+
+
+@pytest.mark.parametrize("drift", ["none", "value", "pending"])
+def test_node_key_probe_preserves_other_clusters_and_detects_partial_rotation(
+    tmp_path: Path, drift: str
+) -> None:
+    nodes = ("hyperpod-node-a",)
+    runner, _calls = _node_key_probe_runner(
+        nodes,
+        nodes,
+        (*nodes, "other-cluster-node"),
+        changed_cpu=nodes[0] if drift == "value" else None,
+        pending=drift == "pending",
+    )
+
+    def probe() -> None:
+        admin_bootstrap_services.provision_node_action_keys(
+            ReadOnlyProbeRunner(runner),
+            repository_root=tmp_path,
+            cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+            gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+            namespace="gpu-fault-system",
+            cluster=_gpu_cluster(),
+            cluster_id="gpu-a",
+            fleet_master_file=tmp_path / "fleet-master",
+            probe_only=True,
+        )
+
+    if drift == "none":
+        probe()
+    else:
+        with pytest.raises(BootstrapMutationRequired):
+            probe()
 
 
 def test_node_action_key_probe_requires_ensure_for_a_new_node(tmp_path: Path) -> None:

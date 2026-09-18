@@ -7,15 +7,15 @@ response before returning typed results.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import json
 import math
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, cast
 
 if __package__:
@@ -956,7 +956,10 @@ def _parse_analysis_results(
         frozenset({"schema_version", "results"}),
         "analysis output",
     )
-    if root.get("schema_version") != SCHEMA_VERSION:
+    if (
+        isinstance(root.get("schema_version"), bool)
+        or root.get("schema_version") != SCHEMA_VERSION
+    ):
         raise InvalidCodexOutput("analysis output has unsupported schema_version")
     raw_results = root.get("results")
     if not isinstance(raw_results, list):
@@ -1053,7 +1056,10 @@ def _parse_review(decoded: object, case_id: str) -> EvidenceReview:
         frozenset({"schema_version", "review"}),
         "review output",
     )
-    if root.get("schema_version") != SCHEMA_VERSION:
+    if (
+        isinstance(root.get("schema_version"), bool)
+        or root.get("schema_version") != SCHEMA_VERSION
+    ):
         raise InvalidCodexOutput("review output has unsupported schema_version")
     review = _require_mapping(root.get("review"), "review output review")
     _require_exact_keys(review, _REVIEW_FIELDS, "review output review")
@@ -1167,7 +1173,10 @@ def _parse_dependency_proposal(
         frozenset({"schema_version", "trusted", "results"}),
         "dependency output",
     )
-    if root.get("schema_version") != SCHEMA_VERSION:
+    if (
+        isinstance(root.get("schema_version"), bool)
+        or root.get("schema_version") != SCHEMA_VERSION
+    ):
         raise InvalidCodexOutput("dependency output has unsupported schema_version")
     if root.get("trusted") is not False:
         raise InvalidCodexOutput("dependency output must be marked trusted=false")
@@ -1205,7 +1214,12 @@ def _parse_dependency_proposal(
             (int, float),
         ):
             raise InvalidCodexOutput(f"{context}.confidence must be a number")
-        confidence = float(confidence_value)
+        try:
+            confidence = float(confidence_value)
+        except OverflowError as exc:
+            raise InvalidCodexOutput(
+                f"{context}.confidence must be between 0 and 1"
+            ) from exc
         if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             raise InvalidCodexOutput(f"{context}.confidence must be between 0 and 1")
         parsed[case_id] = CaseDependencyProposal(
@@ -1441,6 +1455,10 @@ class CodexAcceptanceBackend:
                 raw_output = output_path.read_text(encoding="utf-8")
         except CodexAcceptanceError:
             raise
+        except UnicodeDecodeError as exc:
+            raise InvalidCodexOutput(
+                f"codex exec returned non-UTF-8 structured output during {label}"
+            ) from exc
         except OSError as exc:
             raise CodexInvocationError(
                 f"temporary structured output handling failed during {label}"

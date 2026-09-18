@@ -88,6 +88,8 @@ def build_release_status(release: Any) -> dict[str, Any]:
             "node_template_sha256": release.node_template_sha,
             "images": {
                 "runtime": release.runtime_image,
+                "executor": release.executor_image,
+                "node_dependencies": config.locked_images.get("node_dependencies"),
                 "node_installer": release.node_installer_image,
                 "dcgm_exporter": release.dcgm_exporter_image,
                 "adot": release.adot_image,

@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import yaml
+
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import RuntimeProfile
 from gpu_fault_release import regional_dns as DNS_MODULE
@@ -24,6 +26,7 @@ __all__ = [
     "ingress_pod_list_json",
     "manifest_config_file",
     "phase_release",
+    "aurora_refresh_snapshot",
 ]
 
 
@@ -54,6 +57,25 @@ REGION = "us-east-1"
 SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:gpu-fault"
 CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
 GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+
+
+def aurora_refresh_snapshot(namespace: str = "gpu-fault-system") -> dict[str, Any]:
+    from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refresh
+
+    return {
+        "namespace": namespace,
+        "objects": list(
+            yaml.safe_load_all(
+                render_aurora_refresh(
+                    namespace=namespace,
+                    runtime_image="registry/runtime@sha256:" + "1" * 64,
+                    wheel_config_map="previous-wheel",
+                    master_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!test",
+                )
+            )
+        ),
+        "absent": [],
+    }
 
 
 def config_file(
@@ -217,6 +239,7 @@ def phase_release(
         "_upload_release": lambda _diff: calls.append("upload"),
         "_apply_rds_ca_bundle": lambda: calls.append("rds-ca-bundle"),
         "_refresh_aurora_credentials": lambda: calls.append("aurora-refresh"),
+        "_apply_aurora_refresh": lambda: calls.append("aurora-refresh-apply"),
         "_require_no_inflight_installs": lambda **_kwargs: None,
         "_capture_previous": lambda **_kwargs: {"metadata": {}},
         "_ensure_schema": lambda: calls.append("schema"),
@@ -227,6 +250,8 @@ def phase_release(
         ),
         "_apply_nlb": lambda: calls.append("endpoint"),
         "_apply_observability": lambda: calls.append("observability"),
+        "_apply_control_plane_observability": lambda: calls.append("observability"),
+        "_apply_dataplane_expected_rules": lambda: calls.append("expected-rules"),
         "_ensure_profile_transition_safe": lambda _version: None,
         "_capture_active_agent_node_sets": lambda: {"gpu-a": {"node_ids": ["node-a"]}},
         "_wait_candidate_cpu_agent_heartbeats": (

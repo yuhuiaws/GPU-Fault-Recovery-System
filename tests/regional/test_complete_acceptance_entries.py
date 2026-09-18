@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -9,13 +10,19 @@ from pathlib import Path
 
 import yaml
 
+from scripts.e2e.regional import notify008_runner as notification_ambiguity
 from scripts.e2e.regional import run_blast_acceptance as blast
+from scripts.e2e.regional import run_boot032_full_uninstall as full_uninstall
 from scripts.e2e.regional import run_boot_acceptance as boot
 from scripts.e2e.regional import run_capacity_acceptance as capacity
+from scripts.e2e.regional import run_collect022_fm_cursor_recovery as cursor_recovery
+from scripts.e2e.regional import run_ha011_busy_cpu_takeover as busy_takeover
 from scripts.e2e.regional import run_identity_acceptance as identity
+from scripts.e2e.regional import run_iso007_failed_recovery_isolation as failed_recovery
 from scripts.e2e.regional import run_notification_acceptance as notification
 from scripts.e2e.regional import run_preempt012_acceptance as preempt012
 from scripts.e2e.regional import run_preemption_contracts as preemption
+from scripts.e2e.regional import run_state_table_acceptance as state_tables
 from scripts.e2e.regional import run_workload_acceptance as workload
 from scripts.e2e.regional.regional_case_contract import (
     case_metadata,
@@ -30,7 +37,14 @@ SPEC = ROOT / "docs/区域模式端到端验收测试用例.md"
 
 REQUESTED_CASES = {
     *(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(11, 19)),
+    "GF-REGIONAL-BOOT-021",
+    "GF-REGIONAL-BOOT-030",
+    "GF-REGIONAL-BOOT-031",
+    "GF-REGIONAL-BOOT-032",
+    "GF-REGIONAL-HA-011",
+    "GF-REGIONAL-NOTIFY-008",
     "GF-REGIONAL-AUTH-007",
+    "GF-REGIONAL-AUTH-008",
     "GF-REGIONAL-AUTH-010",
     # AUTH-012 is SUPERSEDED by AUTH-016 and has no driver.
     *(f"GF-REGIONAL-AUTH-{number:03d}" for number in range(13, 17)),
@@ -40,6 +54,8 @@ REQUESTED_CASES = {
     "GF-REGIONAL-ISO-003",
     "GF-REGIONAL-ISO-004",
     "GF-REGIONAL-ISO-005",
+    "GF-REGIONAL-ISO-007",
+    "GF-REGIONAL-COLLECT-022",
     *(f"GF-REGIONAL-PREEMPT-{number:03d}" for number in range(1, 10)),
     "GF-REGIONAL-PREEMPT-012",
     "GF-REGIONAL-E2E-001",
@@ -60,6 +76,12 @@ def test_requested_cases_have_complete_reusable_entries() -> None:
         *blast.CASE_IDS,
         *notification.CASE_IDS,
         *capacity.CASE_IDS,
+        *state_tables.CASES,
+        failed_recovery.CASE_ID,
+        cursor_recovery.CASE_ID,
+        full_uninstall.CASE.case_id,
+        busy_takeover.CASE_ID,
+        notification_ambiguity.CASE.case_id,
         "GF-REGIONAL-NET-001",
     }
 
@@ -67,7 +89,8 @@ def test_requested_cases_have_complete_reusable_entries() -> None:
 
 
 def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
-    assert formal_predecessor("GF-REGIONAL-BOOT-011") is None
+    assert formal_predecessor("GF-REGIONAL-BOOT-016") is None
+    assert formal_predecessor("GF-REGIONAL-BOOT-011") == "GF-REGIONAL-BOOT-016"
     assert formal_predecessor("GF-REGIONAL-AUTH-007") == "GF-REGIONAL-AUTH-006"
     # AUTH-012 is skipped in the execution order, so AUTH-013 follows AUTH-011.
     assert formal_predecessor("GF-REGIONAL-AUTH-013") == "GF-REGIONAL-AUTH-011"
@@ -78,6 +101,15 @@ def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
     assert formal_predecessor("GF-REGIONAL-PREEMPT-012") == ("GF-REGIONAL-PREEMPT-009")
     assert formal_predecessor("GF-REGIONAL-E2E-001") == ("GF-REGIONAL-PREEMPT-038")
     assert formal_predecessor("GF-REGIONAL-NET-001") == "GF-REGIONAL-CAP-005"
+    assert formal_predecessor("GF-REGIONAL-HA-011") == "GF-REGIONAL-HA-010"
+    assert formal_predecessor("GF-REGIONAL-NOTIFY-008") == "GF-REGIONAL-NOTIFY-007"
+    assert formal_predecessor("GF-REGIONAL-BOOT-030") == "GF-REGIONAL-BOOT-023", (
+        "remote-command audit must retain the release-history predecessor"
+    )
+    assert formal_predecessor("GF-REGIONAL-BOOT-031") == "GF-REGIONAL-BOOT-030", (
+        "workflow audit must follow the separate remote-command audit"
+    )
+    assert formal_predecessor("GF-REGIONAL-BOOT-032") == "GF-REGIONAL-COLLECT-015"
     # AUTH-010 and NOTIFY-002 are still driver entries but are DO_NOT_RUN
     # (superseded by AUTH-014 / NOTIFY-001), so they have no formal predecessor.
     retired = do_not_run_case_ids()
@@ -86,6 +118,35 @@ def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
         case_metadata(case_id).predecessor == formal_predecessor(case_id)
         for case_id in REQUESTED_CASES - retired
     ), "case metadata predecessor drifted from the formal execution order"
+
+
+def test_boot_identity_merge_keeps_public_lifecycle_and_unpublished_cases_distinct() -> (
+    None
+):
+    assert state_tables.CASES == {
+        "GF-REGIONAL-BOOT-030": "remote_command",
+        "GF-REGIONAL-BOOT-031": "workflow",
+    }, "table audit identities must not overlap the public lifecycle cases"
+    assert full_uninstall.CASE.case_id == "GF-REGIONAL-BOOT-032", (
+        "full isolated uninstall must have its own case identity"
+    )
+    assert (
+        full_uninstall.CASE.confirmation == "BOOT032_DELETE_SACRIFICIAL_CONTROL_PLANE"
+    ), "destructive confirmation must bind the relocated uninstall identity"
+    for number in range(24, 30):
+        case_id = f"GF-REGIONAL-BOOT-{number:03d}"
+        metadata = case_metadata(case_id)
+        assert metadata.risk == "live-service-action", case_id
+        assert metadata.automation == "manual", case_id
+        assert metadata.predecessor == f"GF-REGIONAL-BOOT-{number - 1:03d}", case_id
+        assert metadata.procedure.endswith(f"#gf-regional-boot-{number:03d}"), case_id
+        assert case_id not in state_tables.CASES, case_id
+        assert case_id != full_uninstall.CASE.case_id, case_id
+    for case_id in state_tables.CASES:
+        assert case_metadata(case_id).risk == "read-only-signal-replay", case_id
+    assert case_metadata(full_uninstall.CASE.case_id).risk == "destructive", (
+        "relocation must not weaken full-uninstall risk"
+    )
 
 
 def test_preempt_001_to_009_are_real_command_entries() -> None:
@@ -206,6 +267,10 @@ def test_new_public_entrypoints_expose_safety_help() -> None:
         completed = subprocess.run(
             [sys.executable, str(REGIONAL / name), "--help"],
             cwd=ROOT,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join((str(ROOT / "src"), str(ROOT))),
+            },
             text=True,
             capture_output=True,
             check=True,

@@ -21,7 +21,7 @@ from gpu_fault.schema_migrations import (
     POSTGRES_SCHEMA_MIGRATIONS,
 )
 from gpu_fault.store.postgres import ddl
-from gpu_fault.store.postgres.ddl import declared_index_names
+from gpu_fault.store.postgres.ddl_helpers import CONTROL_STATE_INDEX_KIND
 
 # The DDL source is checksummed into the migration registry, so the statement
 # scraper lives here, next to its only consumer, rather than in ddl.py.
@@ -52,10 +52,30 @@ def declared_index_statements() -> dict[str, str]:
     return statements
 
 
+def required_index_statements(connection: Any) -> dict[str, str]:
+    statements = declared_index_statements()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass('gpu_fault_control_state_modes')")
+        if cursor.fetchone()[0] is None:
+            return statements
+        cursor.execute(
+            "SELECT kind FROM gpu_fault_control_state_modes WHERE mode='dedicated' AND legacy_purged"
+        )
+        retired = {row[0] for row in cursor.fetchall()}
+    return {
+        name: statement
+        for name, statement in statements.items()
+        if not (
+            (match := CONTROL_STATE_INDEX_KIND.search(statement))
+            and match.group(1) in retired
+        )
+    }
+
+
 def index_health(connection: Any) -> list[dict[str, Any]]:
     """Presence and validity of every declared index, sorted by name."""
 
-    names = sorted(declared_index_names())
+    names = sorted(required_index_statements(connection))
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -103,7 +123,7 @@ def index_definition_defects(cursor: Any) -> list[str]:
     transaction on one connection.
     """
 
-    statements = declared_index_statements()
+    statements = required_index_statements(cursor.connection)
     cursor.execute(
         "SELECT indexname, indexdef FROM pg_indexes WHERE indexname = ANY(%s)",
         (sorted(statements),),
@@ -151,9 +171,34 @@ def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
     indexes still not valid afterwards.
     """
 
-    if not getattr(connection, "autocommit", False):
-        raise RuntimeError("concurrent index builds need an autocommit connection")
-    statements = declared_index_statements()
+    from psycopg.pq import TransactionStatus
+
+    if (
+        not getattr(connection, "autocommit", False)
+        or connection.info.transaction_status is not TransactionStatus.IDLE
+    ):
+        raise RuntimeError("concurrent index builds need an idle autocommit connection")
+    # Keep the required-index inventory stable through the final DDL. Schema
+    # ensure and legacy retirement use this same maintenance barrier.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended('gpu_fault_schema_bootstrap', 0))"
+        )
+        if not cursor.fetchone()[0]:
+            raise RuntimeError(
+                "schema maintenance is already running; retry the index build"
+            )
+    try:
+        return _build_missing_indexes_concurrently(connection)
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(hashtextextended('gpu_fault_schema_bootstrap', 0))"
+            )
+
+
+def _build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
+    statements = required_index_statements(connection)
     built: list[str] = []
     dropped: list[str] = []
     awaiting_table: list[str] = []
@@ -180,6 +225,7 @@ def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
     return {
         "built": built,
         "dropped_invalid": dropped,
+        "deferred_until_schema": list(awaiting_table),
         "awaiting_table": awaiting_table,
         "present": [row["name"] for row in after if row["present"]],
         "invalid_after": [
@@ -236,9 +282,15 @@ def _schema_preflight_report(
             if migration.version <= registered
         ]
         history_ok = [tuple(row) for row in rows] == expected
+    cursor.execute("SELECT to_regclass('gpu_fault_control_records')")
+    records = (
+        "gpu_fault_control_records"
+        if cursor.fetchone()[0] is not None
+        else "gpu_fault_objects"
+    )
     cursor.execute(
-        """
-        SELECT count(*) FROM gpu_fault_objects
+        f"""
+        SELECT count(*) FROM {records}
         WHERE kind='workflow'
           AND payload->>'status' IN ('RUNNING', 'SAFETY_PENDING')
           AND jsonb_array_length(coalesce(payload->'blocked_reasons', '[]'::jsonb)) > 0

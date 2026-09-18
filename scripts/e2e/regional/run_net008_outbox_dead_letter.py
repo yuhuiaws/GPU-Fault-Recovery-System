@@ -118,6 +118,7 @@ class _Run:
     window_open: bool = False
     blocked: bool = False
     seeded: bool = False
+    unit_stopped: bool = False
 
     def ip_arguments(self) -> list[str]:
         ips = list(self.resolved.get("endpoint_ipv4") or [])
@@ -132,7 +133,8 @@ class _Run:
         return self.fixture.node_activity(self.started, evidence_kind="NVIDIA_KERNEL")
 
     def stop_unit(self) -> dict[str, Any]:
-        return self.fixture.execute(
+        self.unit_stopped = True
+        stopped = self.fixture.execute(
             "stop-unit",
             "--unit",
             verdicts.UNIT,
@@ -141,11 +143,23 @@ class _Run:
             "--restore-seconds",
             "300",
         )
+        if (
+            stopped.get("unit") != verdicts.UNIT
+            or (stopped.get("after") or {}).get("ActiveState") != "inactive"
+        ):
+            raise RegionalFixtureError("collector stop was not confirmed")
+        return stopped
 
     def start_unit(self) -> None:
-        self.fixture.execute(
+        started = self.fixture.execute(
             "start-unit", "--unit", verdicts.UNIT, "--run-id", self.run_id
         )
+        if (
+            started.get("unit") != verdicts.UNIT
+            or (started.get("after") or {}).get("ActiveState") != "active"
+        ):
+            raise RegionalFixtureError("collector restart was not confirmed")
+        self.unit_stopped = False
 
 
 def _kept_records(kernel: dict[str, Any]) -> list[dict[str, Any]]:
@@ -168,8 +182,9 @@ def _prepare_run(
     marker_base = f"net008-{int(time.time())}-a{attempt}"
     baseline = fixture.snapshot(marker_base)
     write_json_atomic(case_dir / "host-baseline.json", baseline)
-    if int((_kernel(baseline).get("stats") or {}).get("depth") or 0):
-        raise RegionalFixtureError("kernel outbox is not empty at baseline")
+    depth = (_kernel(baseline).get("stats") or {}).get("depth")
+    if type(depth) is not int or depth != 0:
+        raise RegionalFixtureError("kernel outbox baseline is not proven empty")
     if not settings.endpoint_host:
         raise RegionalFixtureError(
             "--endpoint-host (or GPU_FAULT_NET_ENDPOINT_HOST) is required"
@@ -198,6 +213,7 @@ def _prepare_run(
 def _phase_transient_403(run: _Run) -> None:
     """Phase A: a wrong token makes every record replayable, never dead."""
 
+    run.window_open = True
     run.opened = open_window_or_rollback(
         run.fixture,
         run.run_id,
@@ -208,9 +224,10 @@ def _phase_transient_403(run: _Run) -> None:
         "--restore-seconds",
         str(verdicts.WINDOW_RESTORE_SECONDS),
     )
-    run.window_open = True
     write_json_atomic(run.case_dir / "window-open.json", run.opened)
     run.stages["window"] = verdicts.window_errors(run.opened)
+    if run.stages["window"]:
+        return
     # open-window restarts the unit, and the restarted collector reopens
     # /dev/kmsg at the live tail: a line written before its reader is up is
     # never seen (attempt 1, 2026-09-10: the first transient marker vanished
@@ -255,6 +272,7 @@ def _phase_seed_dead_letter(run: _Run) -> None:
     stopped by close-window's cycle; then a live post wakes the replay."""
 
     stopped = run.stop_unit()
+    run.seeded = True
     seed = run.fixture.execute(
         "seed-outbox-record",
         "--collector",
@@ -262,7 +280,6 @@ def _phase_seed_dead_letter(run: _Run) -> None:
         "--marker",
         run.marker_base,
     )
-    run.seeded = True
     run.evidence["seed"] = seed
     closed = run.fixture.execute("close-window", "--run-id", run.run_id, timeout=300)
     run.window_open = False
@@ -271,6 +288,7 @@ def _phase_seed_dead_letter(run: _Run) -> None:
         run.case_dir / "window-close.json", {"stopped": stopped, "closed": closed}
     )
     # A live post wakes the replay (NET-001 step 7).
+    time.sleep(verdicts.COLLECTOR_SETTLE_SECONDS)
     run.write_kmsg(f"{run.marker_base}-wake")
 
 
@@ -296,7 +314,7 @@ def _phase_replay_404_dead_letter(run: _Run) -> None:
         if verdicts.delivered_errors(
             activity.get("evidence") or [],
             _kept_records(kernel),
-            {**(kernel.get("stats") or {}), "replayable": 0},
+            kernel.get("stats") or {},
             markers=run.transient_markers,
         ):
             return None
@@ -319,12 +337,15 @@ def _phase_replay_404_dead_letter(run: _Run) -> None:
     run.stages["delivered"] = verdicts.delivered_errors(
         converged["activity"].get("evidence") or [],
         _kept_records(kernel),
-        {**(kernel.get("stats") or {}), "replayable": 0},
+        kernel.get("stats") or {},
         markers=run.transient_markers,
     )
     run.stages["dead_letter"] = verdicts.dead_letter_errors(
         records, kernel.get("stats") or {}, marker=run.marker_base
     )
+    run.evidence["dead_letter"] = {"records": records, "stats": kernel.get("stats")}
+    if run.stages["delivered"] or run.stages["dead_letter"]:
+        return
     listing = run.fixture.execute(
         "outbox",
         "--collector",
@@ -335,6 +356,9 @@ def _phase_replay_404_dead_letter(run: _Run) -> None:
         run.marker_base,
     )
     run.stages["listing"] = verdicts.listing_errors(listing.get("lines") or [])
+    run.evidence["dead_letter"]["listing"] = listing.get("lines")
+    if run.stages["listing"]:
+        return
     requeued = run.fixture.execute(
         "outbox", "--collector", verdicts.COLLECTOR, "--action", "requeue-dead"
     )
@@ -357,6 +381,7 @@ def _phase_blackout_stream(run: _Run) -> None:
     if not ip_arguments:
         raise RegionalFixtureError("the control-plane endpoint resolved to no IPv4")
     before_stream = run.fixture.snapshot(run.marker_base)["kmsg_stream"]
+    run.blocked = True
     block = run.fixture.execute(
         "block",
         "--tag",
@@ -365,15 +390,19 @@ def _phase_blackout_stream(run: _Run) -> None:
         str(verdicts.BLOCK_TTL_SECONDS),
         *ip_arguments,
     )
-    run.blocked = True
+    block_errors = verdicts.block_errors(block)
+    if block_errors:
+        raise RegionalFixtureError("; ".join(block_errors))
     blackout_marker = f"{run.marker_base}-blackout"
     time.sleep(5)
     run.write_kmsg(blackout_marker)
     time.sleep(verdicts.BLOCK_SECONDS)
     during_stream = run.fixture.snapshot(run.marker_base)["kmsg_stream"]
     unblock = run.fixture.execute("unblock", "--tag", run.tag, *ip_arguments)
-    run.blocked = False
     run.stages["blackout"] = verdicts.blackout_errors(block, unblock)
+    if run.stages["blackout"]:
+        raise RegionalFixtureError("; ".join(run.stages["blackout"]))
+    run.blocked = False
     run.write_kmsg(f"{run.marker_base}-wake2")
 
     def blackout_delivered() -> dict[str, Any] | None:
@@ -403,7 +432,7 @@ def _phase_blackout_stream(run: _Run) -> None:
     run.stages["blackout_delivered"] = verdicts.delivered_errors(
         after_activity.get("evidence") or [],
         _kept_records(_kernel(after_snapshot)),
-        {"replayable": 0},
+        _kernel(after_snapshot).get("stats") or {},
         markers=[blackout_marker],
     )
     run.stages["service_final"] = verdicts.service_errors(
@@ -421,22 +450,48 @@ def _cleanup(run: _Run) -> None:
     firewall reject, env window, seeded record (unit stopped around the
     purge with a fail-safe start)."""
 
+    errors = run.stages.setdefault("cleanup", [])
     if run.blocked:
-        run.fixture.execute("unblock", "--tag", run.tag, *run.ip_arguments())
+        try:
+            unblocked = run.fixture.execute(
+                "unblock", "--tag", run.tag, *run.ip_arguments()
+            )
+            unblock_errors = verdicts.unblock_errors(unblocked)
+            errors.extend(unblock_errors)
+            if not unblock_errors:
+                run.blocked = False
+        except Exception as exc:
+            errors.append(f"unblock: {type(exc).__name__}: {exc}")
     if run.window_open:
-        run.fixture.execute("close-window", "--run-id", run.run_id, timeout=300)
+        try:
+            run.fixture.execute("close-window", "--run-id", run.run_id, timeout=300)
+            run.window_open = False
+        except Exception as exc:
+            errors.append(f"close-window: {type(exc).__name__}: {exc}")
     if run.seeded:
-        run.stop_unit()
-        purged = run.fixture.execute(
-            "purge-outbox-record",
-            "--collector",
-            verdicts.COLLECTOR,
-            "--marker",
-            run.marker_base,
-        )
-        run.start_unit()
-        run.stages["purge"] = verdicts.purge_errors(purged)
-        run.evidence["purge"] = purged
+        try:
+            run.stop_unit()
+            purged = run.fixture.execute(
+                "purge-outbox-record",
+                "--collector",
+                verdicts.COLLECTOR,
+                "--marker",
+                run.marker_base,
+            )
+            run.stages["purge"] = verdicts.purge_errors(purged)
+            run.evidence["purge"] = purged
+        except Exception as exc:
+            errors.append(f"purge: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                run.start_unit()
+            except Exception as exc:
+                errors.append(f"start-unit: {type(exc).__name__}: {exc}")
+    elif getattr(run, "unit_stopped", False):
+        try:
+            run.start_unit()
+        except Exception as exc:
+            errors.append(f"start-unit: {type(exc).__name__}: {exc}")
 
 
 def _result(run: _Run) -> dict[str, Any]:
@@ -468,13 +523,21 @@ def execute(
     attempt: int,
     deadline: datetime,
 ) -> dict[str, Any]:
-    del deadline
     run = _prepare_run(settings, fixture, case_dir, attempt)
     try:
-        _phase_transient_403(run)
-        _phase_seed_dead_letter(run)
-        _phase_replay_404_dead_letter(run)
-        _phase_blackout_stream(run)
+        for phase in (
+            _phase_transient_403,
+            _phase_seed_dead_letter,
+            _phase_replay_404_dead_letter,
+            _phase_blackout_stream,
+        ):
+            if utc_now() >= deadline:
+                raise RegionalFixtureError("approved maintenance window has ended")
+            phase(run)
+            if any(run.stages.values()):
+                break
+    except Exception as exc:
+        run.stages["execution"] = [f"{type(exc).__name__}: {exc}"]
     finally:
         _cleanup(run)
     return _result(run)

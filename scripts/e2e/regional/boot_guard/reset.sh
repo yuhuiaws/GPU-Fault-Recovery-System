@@ -6,7 +6,7 @@
 # BOOT-008 分支 1 因此报了个假 FAIL——assert 用 `logs -l` 跨 Pod 聚合
 # 匹配文本、readiness 却只读 .items[0]，于是文本命中来自新 Pod、
 # readiness 读到上一轮那个已 Ready 的旧 Pod。同一缺陷反向能产生假 PASS。
-set -uo pipefail
+set -euo pipefail
 
 : "${CPU_KUBECONFIG:?}"
 : "${NAMESPACE:?}"
@@ -14,11 +14,12 @@ SEL="app=gpu-fault-api-guard-probe"
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   delete deployment gpu-fault-api-guard-probe \
-  --ignore-not-found --wait=true >/dev/null
+  --ignore-not-found --cascade=foreground --wait=true --timeout=120s >/dev/null
 
 for _ in $(seq 1 60); do
-  n="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    get pod -l "${SEL}" --no-headers 2>/dev/null | wc -l)"
+  pods="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    get pod -l "${SEL}" -o json)"
+  n="$(jq -er 'if (.items | type) == "array" then .items | length else error("invalid Pod inventory") end' <<<"${pods}")"
   if [[ "${n}" == "0" ]]; then
     echo "probe reset: 0 pods"
     exit 0

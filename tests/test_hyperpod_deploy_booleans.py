@@ -76,7 +76,6 @@ def test_the_switches_the_manual_documents_all_go_through_the_helper() -> None:
     for name in (
         "GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR",
         "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR",
-        "GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR",
         "GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR",
         "GPU_FAULT_ENABLE_FIRMWARE_UPDATE",
         "GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC",

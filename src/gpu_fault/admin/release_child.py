@@ -10,10 +10,10 @@ it, release-deploy refused its own parent as "another administrator mutation").
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
+from gpu_fault.admin.execution import run_driver
 from gpu_fault.admin.operation_lock import (
     SITE_OPERATION_LOCK_FD_ENV,
     inherited_lock_pass_fds,
@@ -53,7 +53,7 @@ def run_automatic_release(
             {*inherited_lock_pass_fds(), *([lock_fd] if lock_fd is not None else [])}
         )
     )
-    completed = subprocess.run(
+    completed = run_driver(
         command,
         cwd=repository_root,
         env={

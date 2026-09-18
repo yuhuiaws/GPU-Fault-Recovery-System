@@ -439,7 +439,7 @@ def _take_call() -> int:
             handle.truncate()
             handle.write(str(count + 1))
             return count
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         sys.stderr.write(f"acceptance shadow: call counter unavailable ({exc}); passing through\n")
         return 1 << 30
 
@@ -510,7 +510,7 @@ def dropin_path(unit: str, run_id: str) -> Path:
     return Path("/run/systemd/system") / f"{unit}.d" / dropin_name(run_id)
 
 
-def open_window(arguments: argparse.Namespace) -> None:
+def _open_window(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     unit = checked_unit(arguments.unit)
     restore_seconds = checked_restore_seconds(arguments.restore_seconds)
@@ -542,6 +542,51 @@ def open_window(arguments: argparse.Namespace) -> None:
         raise ProbeError(f"{unit} is not active at baseline")
 
     paths["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    dropin = dropin_path(unit, run_id)
+    if dropin.exists():
+        raise ProbeError("an untracked collector drop-in already exists")
+    shutil.copyfile(Path(__file__).resolve(), paths["probe_copy"])
+    paths["probe_copy"].chmod(0o700)
+    state = {
+        "run_id": run_id,
+        "unit": unit,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "overrides": sorted(overrides),
+        "unset": unset,
+        "shadow": list(shadow) if shadow is not None else None,
+        "dropin": str(dropin),
+        "before": before,
+        "deadman_unit": deadman_unit(run_id),
+        "restore_seconds": restore_seconds,
+        "restore_needed": False,
+    }
+    paths["state"].write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    paths["state"].chmod(0o600)
+    unit_name = deadman_unit(run_id)
+    run(["systemctl", "stop", f"{unit_name}.timer"], check=False)
+    run(["systemctl", "reset-failed", f"{unit_name}.service"], check=False)
+    run(
+        [
+            "systemd-run",
+            f"--unit={unit_name}",
+            f"--on-active={restore_seconds}s",
+            "--timer-property=AccuracySec=1s",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=30s",
+            "--property=StartLimitIntervalSec=0",
+            str(VENV_PYTHON),
+            str(paths["probe_copy"]),
+            "close-window",
+            "--run-id",
+            run_id,
+            "--unit",
+            unit,
+        ]
+    )
+    if unit_state(f"{unit_name}.timer").get("ActiveState") != "active":
+        raise ProbeError("collector window deadman timer is not active")
+    state["restore_needed"] = True
+    paths["state"].write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
     lines = ["[Service]"]
     if overrides:
         paths["override_env"].write_text(
@@ -559,43 +604,8 @@ def open_window(arguments: argparse.Namespace) -> None:
             f"Environment=PATH={shadow_dir}:/usr/local/sbin:/usr/local/bin:"
             "/usr/sbin:/usr/bin:/sbin:/bin"
         )
-    dropin = dropin_path(unit, run_id)
     dropin.parent.mkdir(parents=True, exist_ok=True)
     dropin.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # The deadman closes the window from a copy of this probe: the runner's
-    # own copy under /run is replaced on every call and removed at cleanup.
-    shutil.copyfile(Path(__file__).resolve(), paths["probe_copy"])
-    paths["probe_copy"].chmod(0o700)
-    state = {
-        "run_id": run_id,
-        "unit": unit,
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-        "overrides": sorted(overrides),
-        "unset": unset,
-        "shadow": list(shadow) if shadow is not None else None,
-        "dropin": str(dropin),
-        "before": before,
-        "deadman_unit": deadman_unit(run_id),
-        "restore_seconds": restore_seconds,
-    }
-    paths["state"].write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-    paths["state"].chmod(0o600)
-    unit_name = deadman_unit(run_id)
-    run(["systemctl", "stop", f"{unit_name}.timer"], check=False)
-    run(["systemctl", "reset-failed", f"{unit_name}.service"], check=False)
-    run(
-        [
-            "systemd-run",
-            f"--unit={unit_name}",
-            f"--on-active={restore_seconds}s",
-            "--timer-property=AccuracySec=1s",
-            str(VENV_PYTHON),
-            str(paths["probe_copy"]),
-            "close-window",
-            "--run-id",
-            run_id,
-        ]
-    )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "restart", unit], timeout=120)
     after = unit_state(unit)
@@ -611,32 +621,84 @@ def open_window(arguments: argparse.Namespace) -> None:
     )
 
 
+def open_window(arguments: argparse.Namespace) -> None:
+    paths = window_paths(arguments.run_id)
+    if paths["root"].exists():
+        raise ProbeError("a collector window for this run already exists")
+    unit = checked_unit(arguments.unit)
+    if dropin_path(unit, arguments.run_id).exists():
+        raise ProbeError("an untracked collector drop-in already exists")
+    try:
+        _open_window(arguments)
+    except BaseException as exc:
+        if paths["state"].is_file():
+            try:
+                close_window(argparse.Namespace(run_id=arguments.run_id, unit=unit))
+            except Exception as cleanup_error:
+                exc.add_note(
+                    f"collector window rollback failed: {type(cleanup_error).__name__}"
+                )
+        elif paths["root"].is_dir():
+            shutil.rmtree(paths["root"])
+        raise
+
+
 def close_window(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     paths = window_paths(run_id)
+    requested_unit = getattr(arguments, "unit", "")
     if not paths["state"].is_file():
-        raise ProbeError("no collector window is open for this run")
+        if not requested_unit or paths["root"].exists():
+            raise ProbeError("no collector window state is available for this run")
+        unit = checked_unit(requested_unit)
+        if any(dropin_path(item, run_id).exists() for item in ALLOWED_UNITS):
+            raise ProbeError("collector drop-in remains without recovery state")
+        after = unit_state(unit)
+        if after.get("ActiveState") != "active":
+            raise ProbeError(f"{unit} is not active after the window closed")
+        emit(
+            {
+                "run_id": run_id,
+                "unit": unit,
+                "already_closed": True,
+                "dropin_removed": True,
+                "window_root_removed": True,
+                "after": after,
+            }
+        )
+        return
     state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    if not isinstance(state, dict) or state.get("run_id") != run_id:
+        raise ProbeError("collector window run identity mismatch")
     unit = checked_unit(str(state["unit"]))
-    Path(str(state["dropin"])).unlink(missing_ok=True)
+    if requested_unit and requested_unit != unit:
+        raise ProbeError("collector window unit identity mismatch")
+    dropin = dropin_path(unit, run_id)
+    if state.get("dropin") != str(dropin):
+        raise ProbeError("collector window drop-in identity mismatch")
+    dropin.unlink(missing_ok=True)
     unit_name = deadman_unit(run_id)
-    run(["systemctl", "stop", f"{unit_name}.timer"], check=False)
+    if state.get("restore_needed", True):
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "restart", unit], timeout=120)
+    after = unit_state(unit)
+    if after.get("ActiveState") != "active":
+        raise ProbeError(f"{unit} is not active after the window closed")
+    # Keep the recovery script and watchdog until the original unit is healthy.
+    run(["systemctl", "stop", f"{unit_name}.timer"])
+    if unit_state(f"{unit_name}.service").get("MainPID") != str(os.getpid()):
+        run(["systemctl", "stop", f"{unit_name}.service"], check=False)
     run(
         ["systemctl", "reset-failed", f"{unit_name}.service", f"{unit_name}.timer"],
         check=False,
     )
-    run(["systemctl", "daemon-reload"])
-    run(["systemctl", "restart", unit], timeout=120)
-    after = unit_state(unit)
-    shutil.rmtree(paths["root"], ignore_errors=True)
-    if after.get("ActiveState") != "active":
-        raise ProbeError(f"{unit} is not active after the window closed")
+    shutil.rmtree(paths["root"])
     emit(
         {
             "run_id": run_id,
             "unit": unit,
             "closed_at": datetime.now(timezone.utc).isoformat(),
-            "dropin_removed": not Path(str(state["dropin"])).exists(),
+            "dropin_removed": not dropin.exists(),
             "window_root_removed": not paths["root"].exists(),
             "after": after,
             "deadman_timer": unit_state(f"{unit_name}.timer"),
@@ -1119,6 +1181,7 @@ def parser() -> argparse.ArgumentParser:
 
     closed = commands.add_parser("close-window")
     closed.add_argument("--run-id", required=True)
+    closed.add_argument("--unit", choices=ALLOWED_UNITS, default="")
     closed.set_defaults(handler=close_window)
 
     kmsg = commands.add_parser("write-kmsg")

@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -18,14 +19,38 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
-from scripts.e2e.regional.kmsg_evidence_records import (  # noqa: E402
-    kmsg_record_errors,
-)
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     STORE_POLL_SECONDS,
     CollectorAcceptanceFixture,
     collector_setting,
-    select_workflow,
+)
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    bounded_collector_case,
+    finite_seconds,
+    require_action_time,
+)
+from scripts.e2e.regional.collector_case_cleanup import CaseCleanup as CaseCleanup  # noqa: E402
+from scripts.e2e.regional.collector_delivery_evidence import (  # noqa: E402
+    completed_round_end,
+    delivery_window_errors,
+    original_anchor,
+)
+from scripts.e2e.regional.collector_kernel_evidence import (  # noqa: E402
+    kernel_event_identity_errors,
+    kmsg_record_errors as kmsg_record_errors,
+)
+from scripts.e2e.regional.collector_inventory_evidence import (  # noqa: E402
+    run_collect003 as run_collect003,
+)
+from scripts.e2e.regional.collector_power_delivery import delivery_evidence  # noqa: E402
+from scripts.e2e.regional.collector_negative_evidence import (  # noqa: E402
+    COLLECT011_SXIDS,
+    SCOPE_DEPENDENT_ACTIONS as SCOPE_DEPENDENT_ACTIONS,
+    firmware_negative_errors,
+    firmware_premise,
+    nvswitch_pci_bdf as nvswitch_pci_bdf,
+    run_scope_negative_variant as run_scope_negative_variant,
+    service_state_errors as service_state_errors,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseSurface,
@@ -34,8 +59,9 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     reusable_focused_tests,
     run_selected_case,
 )
+from scripts.e2e.regional.regional_case_contract import formal_predecessor  # noqa: E402
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
@@ -55,14 +81,9 @@ CASE_IDS = (
     "GF-REGIONAL-COLLECT-012",
 )
 PREDECESSORS = {
-    "GF-REGIONAL-COLLECT-001": "GF-REGIONAL-E2E-002",
-    "GF-REGIONAL-COLLECT-002": "GF-REGIONAL-COLLECT-001",
-    "GF-REGIONAL-COLLECT-003": "GF-REGIONAL-COLLECT-002",
-    "GF-REGIONAL-COLLECT-005": "GF-REGIONAL-COLLECT-004",
-    "GF-REGIONAL-COLLECT-009": "GF-REGIONAL-COLLECT-007",
-    "GF-REGIONAL-COLLECT-010": "GF-REGIONAL-COLLECT-009",
-    "GF-REGIONAL-COLLECT-011": "GF-REGIONAL-COLLECT-010",
-    "GF-REGIONAL-COLLECT-012": "GF-REGIONAL-COLLECT-011",
+    case_id: predecessor
+    for case_id in CASE_IDS
+    if (predecessor := formal_predecessor(case_id)) is not None
 }
 CONFIRMATIONS = {
     case_id: case_id.replace("GF-REGIONAL-", "").replace("-", "") + "_EXECUTE"
@@ -72,22 +93,24 @@ NODE_COUNTS = {
     **{case_id: 1 for case_id in CASE_IDS},
     "GF-REGIONAL-COLLECT-011": 2,
 }
-# COLLECT-011 injects a fatal SXID whose reset scope the control plane cannot
-# trust; the BLOCKED workflow is the one that decided one of these, not "the
-# latest for the node" (a restore or an unrelated finding may be newer).
-SCOPE_DEPENDENT_ACTIONS = frozenset(
-    {"RESET_PARTICIPATING_GPUS", "RESET_ALL_GPUS_AND_NVSWITCHES"}
-)
 # COLLECT-009: the wrong acknowledgement must be *observed* to be refused. The
 # dispatcher re-reads the annotation every ~5s, so three cycles is the least
 # that proves the step looked and did not complete.
 WRONG_ACKNOWLEDGEMENT_OBSERVATION_SECONDS = 15
 # COLLECT-005: how the replay claim is sampled after the collector restart.
-# One read right after the restart only proves the collector had not yet
-# re-read the file; the count has to stay put over more than one cycle.
+# In addition to two actual completed producer rounds, sample the inclusive
+# journal window for late attempts; Store row counts only check persistence.
 REPLAY_OBSERVATION_SAMPLES = 3
 REPLAY_OBSERVATION_SECONDS = 10
 FM_CURSOR_TIMEOUT_SECONDS = 60
+FM_DELIVERY_TIMEOUT_SECONDS = 120
+FM_PENDING_RECEIPT_ERRORS = frozenset(
+    {
+        "FM receipt window ends with an unmatched attempt",
+        "FM original record lacks exactly one delivery and completed round",
+        "FM restart lacks two completed producer rounds",
+    }
+)
 
 
 RECENT_EVIDENCE = r"""
@@ -221,6 +244,8 @@ FOCUSED_TESTS = {
         "test_efa_inventory_ignores_non_efa_rdma_devices",
         "tests/collectors/test_gpu.py::"
         "test_host_collector_reports_persistent_gpu_and_efa_card_loss",
+        "tests/regional/test_alignment_collector_inventory.py::"
+        "test_control_plane_probe_reads_actual_scoped_state_and_keeps_recovered_signals",
     ],
     "GF-REGIONAL-COLLECT-005": [
         "tests/collectors/test_logs.py::"
@@ -239,6 +264,8 @@ FOCUSED_TESTS = {
     "GF-REGIONAL-COLLECT-011": [
         "tests/orchestration/test_sxid_topology.py::"
         "test_conflicting_or_untrusted_topology_fails_closed",
+        "tests/regional/test_alignment_collector_sxid.py::"
+        "test_code_specific_scope_variants_use_parser_and_policy",
     ],
     "GF-REGIONAL-COLLECT-012": [
         "tests/orchestration/test_misc.py::"
@@ -309,6 +336,14 @@ def read_only_preflight(
             errors.append(f"{node['name']} has pre-existing workflow ownership")
         if (state.get("agent") or {}).get("lifecycle_state") != "ACTIVE":
             errors.append(f"{node['name']} Node Agent is not ACTIVE")
+        if settings.case_id not in {
+            "GF-REGIONAL-COLLECT-001",
+            "GF-REGIONAL-COLLECT-003",
+        }:
+            if node.get("unschedulable") or node.get("taints"):
+                errors.append(f"{node['name']} is not clean and schedulable")
+            if regional.business_workloads(str(node["name"])):
+                errors.append(f"{node['name']} has a non-system workload")
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
@@ -361,135 +396,6 @@ def evidence_kinds(records: list[dict[str, Any]]) -> dict[str, list[dict[str, An
 
 def parse_stamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def service_state_errors(
-    baseline: dict[str, Any],
-    after: dict[str, Any],
-) -> list[str]:
-    """Every unit that was active before the injection is active after it.
-
-    The fail-closed cases promise "zero side effects beyond the quarantine";
-    a collector or agent unit that died along the way is a side effect the
-    boot-ID check cannot see.
-    """
-
-    errors = []
-    for unit, before in sorted((baseline.get("services") or {}).items()):
-        if before.get("ActiveState") != "active":
-            continue
-        current = (after.get("services") or {}).get(unit) or {}
-        if current.get("ActiveState") != "active":
-            errors.append(
-                f"{unit} is {current.get('ActiveState') or 'absent'} after the "
-                "case, active before it"
-            )
-    return errors
-
-
-@dataclass
-class CaseCleanup:
-    """What a case took hold of, so ``execute_case`` can let go of it on every path.
-
-    Handlers register a state the moment the store shows a workflow for their
-    injection, and an annotation the moment they write it; the success path
-    restores through the same registry (``restore``/``remove_annotation``) and
-    marks the item done. Whatever is still registered when the case ends --
-    because an assertion raised, a wait timed out, or a handler forgot -- is
-    restored best-effort by ``finish`` and its failures are recorded as
-    cleanup errors, which fail the case.
-    """
-
-    incident_states: list[tuple[CollectorAcceptanceFixture, dict[str, Any]]] = field(
-        default_factory=list
-    )
-    annotations: list[tuple[CollectorAcceptanceFixture, str]] = field(
-        default_factory=list
-    )
-    restore_workflows: list[list[dict[str, Any]]] = field(default_factory=list)
-
-    def register_state(
-        self,
-        fixture: CollectorAcceptanceFixture,
-        state: dict[str, Any],
-    ) -> None:
-        self.incident_states.append((fixture, state))
-
-    def register_annotation(
-        self,
-        fixture: CollectorAcceptanceFixture,
-        annotation: str,
-    ) -> None:
-        self.annotations.append((fixture, annotation))
-
-    def restore(
-        self,
-        fixture: CollectorAcceptanceFixture,
-        state: dict[str, Any],
-        *,
-        profile_version: str,
-        reason: str,
-    ) -> list[dict[str, Any]]:
-        result = fixture.restore_incidents(
-            state,
-            profile_version=profile_version,
-            reason=reason,
-        )
-        # A validated restore that returned proved the node holds no ownership
-        # or quarantine taint at all (restore_incidents raises otherwise), so
-        # every state registered for this node is released, not only ``state``.
-        self.incident_states = [
-            item for item in self.incident_states if item[0] is not fixture
-        ]
-        self.restore_workflows.append(result)
-        return result
-
-    def remove_annotation(
-        self,
-        fixture: CollectorAcceptanceFixture,
-        annotation: str,
-    ) -> None:
-        fixture.regional.kubectl(
-            "gpu",
-            "annotate",
-            "node",
-            fixture.node,
-            f"{annotation}-",
-            check=False,
-        )
-        self.annotations = [
-            item for item in self.annotations if item != (fixture, annotation)
-        ]
-
-    def finish(self, *, profile_version: str, reason: str) -> dict[str, Any]:
-        """Release everything still registered; never raises, always reports."""
-
-        errors: list[str] = []
-        restored: list[list[dict[str, Any]]] = []
-        for fixture, annotation in list(self.annotations):
-            try:
-                self.remove_annotation(fixture, annotation)
-            except Exception as exc:
-                errors.append(
-                    f"{fixture.node}: annotation {annotation} removal failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-        for fixture, state in list(reversed(self.incident_states)):
-            try:
-                restored.append(
-                    self.restore(
-                        fixture,
-                        state,
-                        profile_version=profile_version,
-                        reason=reason,
-                    )
-                )
-            except Exception as exc:
-                errors.append(
-                    f"{fixture.node}: validated restore failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-        return {"restore_workflows": restored, "errors": errors}
 
 
 def run_collect001(
@@ -683,6 +589,55 @@ def seconds_until_next_summary(
     return max(0.0, min(float(summary), (due - current).total_seconds()))
 
 
+def power_load_started_at(
+    injection: dict[str, Any],
+    *,
+    run_id: str,
+    requested_at: datetime,
+    received_at: datetime,
+) -> datetime:
+    receipt = injection.get("load_start")
+    if not isinstance(receipt, dict):
+        raise RegionalFixtureError("GPU load start receipt is missing")
+    identity = {
+        "run_id": run_id,
+        "boot_id": injection.get("boot_id"),
+        "intent_sha256": injection.get("intent_sha256"),
+        "gpu_index": injection.get("gpu_index"),
+    }
+    targets = [
+        item
+        for item in injection.get("baseline") or []
+        if item.get("index") == identity["gpu_index"]
+    ]
+    if (
+        not isinstance(identity["boot_id"], str)
+        or not identity["boot_id"]
+        or not isinstance(identity["intent_sha256"], str)
+        or len(identity["intent_sha256"]) != 64
+        or type(identity["gpu_index"]) is not int
+        or any(
+            receipt.get(key) != value or type(receipt.get(key)) is not type(value)
+            for key, value in identity.items()
+        )
+        or len(targets) != 1
+        or not targets[0].get("uuid")
+        or receipt.get("gpu_uuid") != targets[0]["uuid"]
+    ):
+        raise RegionalFixtureError("GPU load start receipt identity differs")
+    try:
+        started = datetime.fromisoformat(
+            str(receipt["started_at"]).replace("Z", "+00:00")
+        )
+    except (KeyError, ValueError):
+        raise RegionalFixtureError("GPU load start timestamp is invalid") from None
+    if started.tzinfo is None or not requested_at <= started <= received_at:
+        raise RegionalFixtureError(
+            "GPU load start timestamp is outside the request window"
+        )
+    return started
+
+
 def run_collect002(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -695,7 +650,16 @@ def run_collect002(
     confirmation = collector_setting(env, "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES")
     if not baseline.get("gpu_power"):
         raise RegionalFixtureError("host probe could not read GPU power limits")
-    run_id = f"collect002-a{attempt}"
+    identity = f"{case_dir.resolve()}\0{attempt}".encode()
+    run_id = f"collect002-{hashlib.sha256(identity).hexdigest()[:24]}-a{attempt}"
+    write_json_atomic(
+        case_dir / f"power-operation-a{attempt}.json",
+        {
+            "case_id": "GF-REGIONAL-COLLECT-002",
+            "attempt": attempt,
+            "run_id": run_id,
+        },
+    )
     # Step one of the procedure: begin from a delivery that just happened, so the
     # next health summary is a whole summary period away. Injecting just before a
     # summary would let the periodic delivery masquerade as the anomaly edge.
@@ -721,24 +685,40 @@ def run_collect002(
     # Anything past that is the filter waiting for its summary, which is the P0.
     allowed_latency = interval * (confirmation + 1)
     load_seconds = interval * (confirmation + 6)
-    started_at = datetime.now(timezone.utc)
-    injection = fixture.execute(
-        "throttle-gpu",
-        "--run-id",
-        run_id,
-        "--gpu-index",
-        str(int(baseline["gpu_power"][0]["index"])),
-        "--load-seconds",
-        str(load_seconds),
-        "--restore-seconds",
-        str(load_seconds + interval * 8),
-        timeout=300,
-    )
+    requested_at = datetime.now(timezone.utc)
+    started_at = requested_at
+    injection: dict[str, Any] = {}
     timeline: list[dict[str, Any]] = []
     delivered_at: str | None = None
     restore: dict[str, Any] = {}
     cleanup_error: str | None = None
     try:
+        require_action_time(load_seconds + max(60, interval * 8))
+        injection = fixture.execute(
+            "throttle-gpu",
+            "--run-id",
+            run_id,
+            "--gpu-index",
+            str(int(baseline["gpu_power"][0]["index"])),
+            "--load-seconds",
+            str(load_seconds),
+            "--restore-seconds",
+            str(load_seconds + max(60, interval * 8)),
+            timeout=300,
+        )
+        if any(
+            injection.get(key) is not True
+            for key in ("mutation_started", "timer_armed", "load_unit_active")
+        ):
+            raise RegionalFixtureError(
+                "GPU power mutation or recovery proof is incomplete"
+            )
+        started_at = power_load_started_at(
+            injection,
+            run_id=run_id,
+            requested_at=requested_at,
+            received_at=datetime.now(timezone.utc),
+        )
         deadline = time.monotonic() + load_seconds
         while True:
             current = gpu_metrics_stamp(fixture)
@@ -772,6 +752,16 @@ def run_collect002(
             restore = fixture.execute(
                 "restore-gpu-power-limit", "--run-id", run_id, timeout=300
             )
+            if any(
+                restore.get(key) is not True
+                for key in (
+                    "restored",
+                    "load_stopped",
+                    "timer_disarmed",
+                    "cleanup_verified",
+                )
+            ):
+                raise RegionalFixtureError("GPU power restoration proof is incomplete")
         except Exception as exc:  # noqa: BLE001 - recorded as a case failure
             cleanup_error = f"{type(exc).__name__}: {exc}"
     records = recent_evidence(
@@ -788,7 +778,23 @@ def run_collect002(
             for reason in item.get("payload", {}).get("edge_filter_reasons") or []
         )
     ]
+    sampled_status_at = delivered_at
+    target = next(
+        item
+        for item in injection["baseline"]
+        if item["index"] == injection["load_start"]["gpu_index"]
+    )
+    delivery = delivery_evidence(
+        records,
+        cluster_id=fixture.regional.settings.cluster_id,
+        node_id=fixture.node,
+        load_start=injection["load_start"],
+        expected_power_limit_w=float(target["power_min_limit_w"]),
+        observed_until=datetime.now(timezone.utc),
+    )
+    delivered_at = delivery["delivered_at"]
     errors = []
+    errors.extend(delivery["errors"])
     if cleanup_error:
         errors.append(f"GPU power limit restore failed: {cleanup_error}")
     latency: float | None = None
@@ -799,7 +805,7 @@ def run_collect002(
         )
     else:
         latency = (parse_stamp(delivered_at) - started_at).total_seconds()
-        if latency > allowed_latency:
+        if not 0 <= latency <= allowed_latency:
             errors.append(
                 f"the anomaly took {latency:.1f}s to deliver, more than the "
                 f"{allowed_latency}s that {confirmation} confirmation samples at "
@@ -828,35 +834,16 @@ def run_collect002(
         "restore": restore,
         "cleanup_error": cleanup_error,
         "allowed_latency_seconds": allowed_latency,
+        "requested_at": requested_at.isoformat(),
+        "load_started_at": started_at.isoformat(),
+        "preparation_seconds": (started_at - requested_at).total_seconds(),
         "summary_seconds": summary,
         "delivered_at": delivered_at,
+        "sampled_status_at": sampled_status_at,
+        "delivery_evidence": delivery,
         "delivery_latency_seconds": latency,
         "candidate_records": candidate,
         "gpu_power_after": after.get("gpu_power"),
-    }
-
-
-def run_collect003(
-    fixture: CollectorAcceptanceFixture,
-) -> dict[str, Any]:
-    snapshot = fixture.snapshot()
-    env = snapshot["collector_env"]
-    gpu_actual = len(snapshot["gpu_inventory"])
-    efa = snapshot["efa_inventory"]
-    expected_gpu = collector_setting(env, "GPU_FAULT_EXPECTED_GPU_COUNT")
-    expected_efa = collector_setting(env, "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT")
-    errors = []
-    if gpu_actual != expected_gpu:
-        errors.append("actual GPU count differs from collector configuration")
-    if int(efa["active_count"]) != expected_efa:
-        errors.append("active EFA count differs from collector configuration")
-    return {
-        "verdict": "PASS" if not errors else "FAIL",
-        "errors": errors,
-        "gpu_actual": gpu_actual,
-        "gpu_expected": expected_gpu,
-        "efa_inventory": efa,
-        "efa_expected": expected_efa,
     }
 
 
@@ -940,10 +927,22 @@ def run_collect005(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
     attempt: int,
+    *,
+    cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
     before = fixture.snapshot()
     gpu = before["gpu_inventory"][0]
+    scope = {
+        "cluster_id": fixture.regional.settings.cluster_id,
+        "node": fixture.node,
+        "boot_id": str(before.get("boot_id") or ""),
+    }
+    producer_before = fixture.execute("fm-delivery-evidence")
+    anchor = original_anchor(producer_before, **scope)
     marker = f"c005-{int(time.time())}-a{attempt}"
+    if cleanup is not None:
+        cleanup.register_seed(fixture, marker)
+    require_action_time(180)
     fixture.execute(
         "append-sxid",
         "--sxid",
@@ -959,25 +958,73 @@ def run_collect005(
     )
     first = fixture.wait_marker(marker, case_dir=case_dir, timeout_seconds=120)
     count = len(first.get("evidence") or [])
-    fixture.execute(
+    if count != 1 or first.get("workflows"):
+        raise RegionalFixtureError(
+            "initial FM collection failed; refusing collector restart"
+        )
+    record_id = (first["evidence"][0].get("payload") or {}).get("record_id")
+    if not isinstance(record_id, str) or not record_id:
+        raise RegionalFixtureError("FM evidence has no producer record identity")
+    original_delivery = wait_fm_delivery(
+        fixture,
+        anchor,
+        record_id=record_id,
+        cluster_id=scope["cluster_id"],
+        node=scope["node"],
+        boot_id=scope["boot_id"],
+    )
+    cursor_before_restart = wait_fm_cursor(fixture)
+    require_action_time(180)
+    restart = fixture.execute(
         "restart-service",
         "--service",
         "gpu-fault-fabric-manager-collector.service",
     )
+    old_invocation = anchor["receipt"]["systemd_invocation_id"]
+    new_invocation = (restart.get("after") or {}).get("InvocationID")
+    if (
+        (restart.get("before") or {}).get("InvocationID") != old_invocation
+        or not isinstance(new_invocation, str)
+        or not new_invocation
+        or new_invocation == old_invocation
+    ):
+        raise RegionalFixtureError("FM service restart did not bind a new invocation")
     cursor_after_restart = wait_fm_cursor(fixture)
-    # The replay claim is sampled over more than one collector cycle; a single
-    # read right after the restart could precede the re-read that would replay.
-    replay_counts = []
+    delivery_after_restart = wait_fm_delivery(
+        fixture,
+        anchor,
+        record_id=record_id,
+        restarted_invocation=new_invocation,
+        cluster_id=scope["cluster_id"],
+        node=scope["node"],
+        boot_id=scope["boot_id"],
+    )
+    persisted_counts = []
+    delivery_samples = []
+    errors = []
     for index in range(REPLAY_OBSERVATION_SAMPLES):
         if index:
             time.sleep(REPLAY_OBSERVATION_SECONDS)
-        replay_counts.append(len(fixture.store_snapshot(marker).get("evidence") or []))
+        current = fixture.execute("fm-delivery-evidence", "--cursor", anchor["cursor"])
+        delivery_samples.append(current)
+        errors.extend(
+            delivery_window_errors(
+                anchor,
+                current,
+                record_id=record_id,
+                restarted_invocation=new_invocation,
+                **scope,
+            )
+        )
+        persisted_counts.append(
+            len(fixture.store_snapshot(marker).get("evidence") or [])
+        )
+        if errors:
+            break
     second = fixture.store_snapshot(marker)
-    errors = []
-    if count != 1 or any(item != 1 for item in replay_counts):
+    if any(item != 1 for item in persisted_counts):
         errors.append(
-            f"Fabric Manager event was lost or replayed: first {count}, "
-            f"after restart {replay_counts}"
+            "Fabric Manager persisted evidence changed during restart observation"
         )
     if first.get("workflows") or second.get("workflows"):
         errors.append("unknown non-fatal SXID created a workflow")
@@ -988,11 +1035,56 @@ def run_collect005(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "marker": marker,
-        "replay_counts": replay_counts,
+        "persisted_record_counts": persisted_counts,
+        "producer_before": producer_before,
+        "producer_original_delivery": original_delivery,
+        "producer_after_restart": delivery_after_restart,
+        "producer_observation_samples": delivery_samples,
+        "no_replay_proof_scope": "production-source-sink-boundary-in-observed-window",
+        "no_replay_proven_through_monotonic_us": (
+            completed_round_end(delivery_samples[-1], new_invocation)
+            if not errors
+            else None
+        ),
+        "cursor_before_restart": cursor_before_restart,
         "cursor_after_restart": cursor_after_restart,
         "before": before,
         "after": after,
     }
+
+
+def wait_fm_delivery(
+    fixture: CollectorAcceptanceFixture,
+    anchor: dict[str, Any],
+    *,
+    record_id: str,
+    cluster_id: str,
+    node: str,
+    boot_id: str,
+    restarted_invocation: str | None = None,
+    timeout_seconds: int = FM_DELIVERY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + finite_seconds(timeout_seconds)
+    while True:
+        projection = fixture.execute(
+            "fm-delivery-evidence", "--cursor", anchor["cursor"]
+        )
+        errors = delivery_window_errors(
+            anchor,
+            projection,
+            record_id=record_id,
+            cluster_id=cluster_id,
+            node=node,
+            boot_id=boot_id,
+            restarted_invocation=restarted_invocation,
+        )
+        if not errors:
+            return projection
+        if set(errors) - FM_PENDING_RECEIPT_ERRORS or time.monotonic() >= deadline:
+            raise RegionalFixtureError(
+                "FM producer delivery proof failed: " + "; ".join(errors)
+            )
+        time.sleep(3)
 
 
 def waiting_workflow(
@@ -1001,7 +1093,7 @@ def waiting_workflow(
     *,
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.monotonic() + finite_seconds(timeout_seconds)
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = fixture.store_snapshot(marker, scan_evidence=False)
@@ -1024,7 +1116,8 @@ def observe_marker(
 ) -> list[dict[str, Any]]:
     """Light store reads over ``seconds``; every one is returned, not just the last."""
 
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + finite_seconds(seconds)
+    finite_seconds(poll_seconds, label="poll interval")
     samples = [fixture.store_snapshot(marker, scan_evidence=False)]
     while time.monotonic() < deadline:
         time.sleep(max(1, min(poll_seconds, int(deadline - time.monotonic()) + 1)))
@@ -1096,6 +1189,8 @@ def run_collect009(
     gpu = baseline["gpu_inventory"][0]
     marker = f"c009-{int(time.time())}-a{attempt}"
     started_at = datetime.now(timezone.utc)
+    cleanup.register_seed(fixture, marker)
+    require_action_time(180)
     fixture.execute(
         "write-xid",
         "--xid",
@@ -1132,6 +1227,7 @@ def run_collect009(
     if not annotation or not expected:
         raise RegionalFixtureError("CHECK_MECHANICALS omitted annotation details")
     cleanup.register_annotation(fixture, annotation)
+    require_action_time(180)
     fixture.regional.kubectl(
         "gpu",
         "annotate",
@@ -1146,6 +1242,7 @@ def run_collect009(
         marker,
         seconds=WRONG_ACKNOWLEDGEMENT_OBSERVATION_SECONDS,
     )
+    require_action_time(180)
     fixture.regional.kubectl(
         "gpu",
         "annotate",
@@ -1247,6 +1344,13 @@ def run_collect010(
     cleanup = cleanup or CaseCleanup()
     baseline = fixture.snapshot()
     marker = f"c010-{int(time.time())}-a{attempt}"
+    premise = firmware_premise(
+        fixture.regional,
+        fixture.execute("firmware-premise"),
+        node=fixture.node,
+    )
+    cleanup.register_seed(fixture, marker)
+    require_action_time(180)
     state = inject_blocked_xid(
         fixture,
         case_dir,
@@ -1255,17 +1359,7 @@ def run_collect010(
         message="GPU firmware update required",
     )
     cleanup.register_state(fixture, state)
-    errors = []
-    workflows = state.get("workflows") or []
-    if not workflows or workflows[0].get("status") != "BLOCKED":
-        errors.append("UPDATE_SWFW workflow is not BLOCKED")
-    operations = {
-        item.get("operation")
-        for workflow in workflows
-        for item in workflow.get("official_steps", [])
-    }
-    if "UPDATE_SOFTWARE_FIRMWARE" in operations:
-        errors.append("blocked workflow contains firmware mutation")
+    errors = firmware_negative_errors(state)
     after = fixture.snapshot()
     if baseline["boot_id"] != after["boot_id"]:
         errors.append("blocked firmware case rebooted the node")
@@ -1280,26 +1374,9 @@ def run_collect010(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "marker": marker,
+        "negative_premise": premise,
         "restore_workflows": restore,
     }
-
-
-def nvswitch_pci_bdf(gpu_inventory: list[dict[str, Any]]) -> str:
-    """A PCI address for the injected SXid line that is not one of the node's GPUs.
-
-    The acceptance text uses `0000:ab:00.0`, the NVSwitch address NVIDIA's own
-    examples carry. It is only usable while no GPU sits in that slot, so the
-    live inventory is checked and the next free bus taken otherwise.
-    """
-
-    taken = {
-        str(item.get("pci_bdf") or "").lower().split(".")[0] for item in gpu_inventory
-    }
-    for bus in ("ab", "ac", "ad", "ae", "af", "ba", "bb", "bc"):
-        candidate = f"0000:{bus}:00"
-        if candidate not in taken:
-            return candidate + ".0"
-    raise RegionalFixtureError("no PCI slot free of GPUs for the SXid line")
 
 
 def run_collect011(
@@ -1310,80 +1387,45 @@ def run_collect011(
     *,
     cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
+    if len(fixtures) != 2:
+        raise RegionalFixtureError("COLLECT-011 requires two scoped nodes")
     cleanup = cleanup or CaseCleanup()
-    markers = [
-        f"c011-access-{int(time.time())}-a{attempt}",
-        f"c011-unknown-{int(time.time())}-a{attempt}",
-    ]
-    baselines = []
-    states = []
-    for index, (fixture, marker) in enumerate(zip(fixtures, markers, strict=True)):
-        baseline = fixture.snapshot()
-        baselines.append(baseline)
-        inventory = baseline["gpu_inventory"]
-        # The SXid line names the NVSwitch, never a GPU. With a GPU's own BDF
-        # here the control plane resolves the ACCESS scope to that GPU
-        # (`FaultIngestionService._enrich_sxid_scope`), the reset becomes
-        # executable, and the case that exists to prove the fail-closed gate
-        # instead resets a production GPU (observed 2026-09-06 02:13Z).
-        switch_bdf = nvswitch_pci_bdf(inventory)
-        injected_at = datetime.now(timezone.utc)
-        fixture.execute(
-            "append-sxid",
-            "--sxid",
-            "11001",
-            "--marker",
-            marker,
-            "--pci-bdf",
-            switch_bdf,
-            "--classification",
-            "Fatal",
-            "--message",
-            "NVLINK_FATAL_ERROR",
-            "--include-switch" if index == 0 else "--no-include-switch",
-        )
-        state = fixture.wait_marker(
-            marker,
-            case_dir=case_dir / f"direction-{index + 1}",
-            timeout_seconds=300,
-            terminal_workflow=True,
-            observed_after=injected_at,
-        )
-        cleanup.register_state(fixture, state)
-        states.append(state)
+    variants = []
     errors = []
-    selected = []
-    for fixture, baseline, state in zip(fixtures, baselines, states, strict=True):
-        workflow = select_workflow(
-            state.get("workflows") or [],
-            official_actions=SCOPE_DEPENDENT_ACTIONS,
-        )
-        selected.append(workflow)
-        if workflow is None:
-            errors.append(
-                f"{fixture.node}: no workflow decided a scope-dependent reset"
+    stamp = int(time.time())
+    for sxid in COLLECT011_SXIDS:
+        for fixture, scope in zip(fixtures, ("ACCESS", "UNKNOWN"), strict=True):
+            variant = run_scope_negative_variant(
+                fixture,
+                case_dir / f"sxid-{sxid}-{scope.lower()}",
+                f"c011-{sxid}-{scope.lower()}-{stamp}-a{attempt}",
+                profile_version,
+                sxid=sxid,
+                scope=scope,
+                cleanup=cleanup,
             )
-        elif workflow.get("status") != "BLOCKED":
-            errors.append(f"{fixture.node}: scope-dependent SXID did not fail closed")
-        after = fixture.snapshot()
-        if after["boot_id"] != baseline["boot_id"]:
-            errors.append(f"{fixture.node}: node rebooted during the fail-closed SXID")
-        errors.extend(service_state_errors(baseline, after))
-    restores = [
-        cleanup.restore(
-            fixture,
-            state,
-            profile_version=profile_version,
-            reason="COLLECT-011 validated cleanup",
-        )
-        for fixture, state in zip(fixtures, states, strict=True)
-    ]
+            variants.append(variant)
+            errors.extend(variant["errors"])
+            if variant["verdict"] != "PASS":
+                errors.append(
+                    f"SXID{sxid} {scope} did not pass; later variants not run"
+                )
+                break
+        if errors:
+            break
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
-        "markers": markers,
-        "selected_workflow_ids": [(item or {}).get("request_id") for item in selected],
-        "restore_workflows": restores,
+        "markers": [item["marker"] for item in variants],
+        "negative_premises": [item["negative_premise"] for item in variants],
+        "selected_workflow_ids": [item["selected_workflow_id"] for item in variants],
+        "restore_workflows": [item["restore_workflows"] for item in variants],
+        "variants": variants,
+        "required_variants": [
+            {"sxid": sxid, "scope": scope}
+            for sxid in COLLECT011_SXIDS
+            for scope in ("ACCESS", "UNKNOWN")
+        ],
     }
 
 
@@ -1507,16 +1549,26 @@ def run_collect012(
 ) -> dict[str, Any]:
     baseline = fixture.snapshot()
     boot_id = str(baseline.get("boot_id") or "")
+    if not (baseline.get("kernel_collector") or {}).get("kmsg_fds"):
+        raise RegionalFixtureError(
+            "kernel collector does not hold the real kmsg stream"
+        )
+    gpu = baseline["gpu_inventory"][0]
+    if not boot_id or not gpu.get("uuid"):
+        raise RegionalFixtureError("kernel injection has no current boot/GPU identity")
+    software = fixture.execute("gpu-identity")
+    if not all(
+        software.get(key) for key in ("product", "driver_branch", "cuda_version")
+    ):
+        raise RegionalFixtureError(
+            "kernel injection has no current GPU software identity"
+        )
+    cleanup = cleanup or CaseCleanup()
     markers = []
     states: list[dict[str, Any]] = []
     errors: list[str] = []
-    # Samples 1 and 2 are the same XID 13 text written twice under one marker,
-    # so the kernel lines are byte-identical: the second write must earn its
-    # own kmsg sequence (distinct evidence). Sample 3 is the second XID (31),
-    # the most common MMU fault. Since a RESTART_APP on an idle node no longer
-    # quarantines it (55272a0), the node is never isolated between the two
-    # XIDs -- there is no ownership fence to restore around, so both inject
-    # straight through without a restore step.
+    # Identical XID13 text must acquire two real kernel sequences. XID31 then
+    # checks the other representative without repeating an invalid first phase.
     stamp = int(time.time())
     for offset, xid in enumerate((13, 13, 31), start=1):
         marker = (
@@ -1525,8 +1577,9 @@ def run_collect012(
             else f"c012-31-{stamp}-a{attempt}"
         )
         markers.append(marker)
-        gpu = fixture.snapshot()["gpu_inventory"][0]
         injected_at = datetime.now(timezone.utc)
+        cleanup.register_seed(fixture, marker)
+        require_action_time(180)
         fixture.execute(
             "write-xid",
             "--xid",
@@ -1546,6 +1599,28 @@ def run_collect012(
             observed_after=injected_at,
         )
         states.append(state)
+        if state.get("workflows"):
+            cleanup.register_state(fixture, state)
+        errors.extend(
+            kernel_event_identity_errors(
+                state,
+                node=fixture.node,
+                cluster_id=fixture.regional.settings.cluster_id,
+                boot_id=boot_id,
+                gpu_uuid=str(gpu["uuid"]),
+                software=software,
+                xid=xid,
+            )
+        )
+        errors.extend(
+            restart_app_monitor_only_errors(
+                state.get("decisions") or [],
+                state.get("workflows") or [],
+                state.get("incidents") or [],
+            )
+        )
+        if errors:
+            break
     record_ids = {
         item.get("record_id")
         for state in states
@@ -1553,19 +1628,14 @@ def run_collect012(
     }
     if len(record_ids) < 3:
         errors.append("distinct kmsg sequences did not create distinct evidence")
-    errors.extend(
-        kmsg_record_errors(
-            states[0].get("evidence") or [],
-            states[1].get("evidence") or [],
-            boot_id=boot_id,
-        )
-    )
-    for state in states:
+    if len(states) >= 2:
         errors.extend(
-            restart_app_monitor_only_errors(
-                state.get("decisions") or [],
-                state.get("workflows") or [],
-                state.get("incidents") or [],
+            kmsg_record_errors(
+                states[0].get("evidence") or [],
+                states[1].get("evidence") or [],
+                boot_id=boot_id,
+                node=fixture.node,
+                cluster_id=fixture.regional.settings.cluster_id,
             )
         )
     after = fixture.snapshot()
@@ -1605,7 +1675,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "GF-REGIONAL-COLLECT-005": "append one unknown non-fatal SXID and restart collector",
             "GF-REGIONAL-COLLECT-009": "inject XID54 and write exact acknowledgement annotation",
             "GF-REGIONAL-COLLECT-010": "inject XID78 fail-closed quarantine only",
-            "GF-REGIONAL-COLLECT-011": "append scope-dependent SXID on two nodes",
+            "GF-REGIONAL-COLLECT-011": (
+                "append SXID11001/12001/24007 in ACCESS and UNKNOWN directions "
+                "on two idle nodes; validate and restore each before continuing"
+            ),
             "GF-REGIONAL-COLLECT-012": (
                 "inject XID13/31 via real kmsg; idle node reads MONITOR_ONLY, "
                 "no workflow, node untouched"
@@ -1628,10 +1701,23 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    if settings.case_id == "GF-REGIONAL-COLLECT-011":
+        details["sxid_proof_obligations"] = {
+            "live_log_variants": [
+                {"sxid": sxid, "scope": scope, "node": node}
+                for sxid in COLLECT011_SXIDS
+                for scope, node in zip(
+                    ("ACCESS", "UNKNOWN"), settings.nodes, strict=True
+                )
+            ],
+            "physical_fault_injection": False,
+            "component_tests_are_physical_evidence": False,
+        }
     record_focused_tests(details, preflight["focused_tests"])
     return details
 
 
+@bounded_collector_case
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -1659,6 +1745,7 @@ def execute_case(
             image=settings.host_probe_image,
             case_id=settings.case_id,
             run_id=f"{settings.case_id.lower()}-{attempt}-{index}",
+            case_dir=case_dir,
         )
         for index, node in enumerate(settings.nodes)
     ]
@@ -1682,7 +1769,7 @@ def execute_case(
             ),
             "GF-REGIONAL-COLLECT-003": lambda: run_collect003(fixtures[0]),
             "GF-REGIONAL-COLLECT-005": lambda: run_collect005(
-                fixtures[0], case_dir, attempt
+                fixtures[0], case_dir, attempt, cleanup=cleanup
             ),
             "GF-REGIONAL-COLLECT-009": lambda: run_collect009(
                 fixtures[0], case_dir, attempt, cleanup=cleanup
@@ -1706,6 +1793,7 @@ def execute_case(
             result["verdict"] = "FAIL"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
     finally:
         # Whatever the case still holds -- a quarantine its assertions never
         # got to release, an acknowledgement annotation -- goes back through

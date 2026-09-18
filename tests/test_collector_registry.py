@@ -24,6 +24,7 @@ import pytest
 from gpu_fault import collector_requirements, collectors_cli, telemetry
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
 from gpu_fault.collector_registry import (
+    COLLECTOR_KINDS,
     COLLECTOR_PRODUCER_BY_CHANNEL,
     COLLECTOR_REGISTRY,
     COLLECTOR_SYSTEMD_UNITS,
@@ -65,9 +66,7 @@ EXPECTED_SILENT_DEFAULTS = {
 }
 EXPECTED_COMMAND_KINDS = {
     "kernel": (CollectorKind.NVIDIA_KERNEL,),
-    "kubernetes-hma": (CollectorKind.HMA_NODE,),
     "kubernetes-node-resources": (CollectorKind.HOST_TELEMETRY,),
-    "sqs-hma": (CollectorKind.HMA_CLOUDWATCH,),
     "dcgm": (CollectorKind.GPU_METRICS, CollectorKind.GPU_INVENTORY),
     "nvidia-smi": (CollectorKind.GPU_METRICS, CollectorKind.GPU_INVENTORY),
     "host": (CollectorKind.HOST_TELEMETRY,),
@@ -209,9 +208,25 @@ def test_command_key_and_descriptor_must_agree() -> None:
 
 def test_product_discovery_needs_a_node_context() -> None:
     registry = dict(COLLECTOR_REGISTRY)
-    registry["sqs-hma"] = replace(registry["sqs-hma"], needs_product_discovery=True)
+    registry["kubernetes-node-resources"] = replace(
+        registry["kubernetes-node-resources"], needs_product_discovery=True
+    )
 
-    with pytest.raises(RuntimeError, match="sqs-hma"):
+    with pytest.raises(RuntimeError, match="kubernetes-node-resources"):
+        validate_collector_registry(registry)
+
+
+@pytest.mark.parametrize("kind", [CollectorKind.HMA_NODE, CollectorKind.HMA_CLOUDWATCH])
+def test_retired_kinds_decode_but_cannot_be_registered(kind: CollectorKind) -> None:
+    assert CollectorKind(kind.value) is kind
+    assert COLLECTOR_KINDS[kind].retired
+    assert COLLECTOR_KINDS[kind].systemd_unit is None
+    assert kind not in collector_silent_thresholds()
+    registry = dict(COLLECTOR_REGISTRY)
+    registry["retired-producer"] = replace(
+        FAKE_PLUGIN, cli_command="retired-producer", kinds=(kind,)
+    )
+    with pytest.raises(RuntimeError, match="retired"):
         validate_collector_registry(registry)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.fleet_compatibility import CURRENT_AGENT_PROTOCOL_VERSION
 from tests._builders import (
     active_workflow_executor,
     build_store,
@@ -90,7 +91,7 @@ def test_hyperpod_reboot_auto_confirms_new_ready_agent_incarnation(
         cluster_id="cluster-a",
         node_id="node-a",
         endpoint="http://node-a:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="0.10.0",
         artifact_sha256="a" * 64,
         policy_version="610",
@@ -225,7 +226,7 @@ def test_hyperpod_replace_auto_confirms_and_rebinds_ready_new_instance() -> None
         cluster_id="cluster-a",
         node_id="node-a",
         endpoint="http://node-a:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="0.10.0",
         artifact_sha256="a" * 64,
         policy_version="610",
@@ -324,7 +325,7 @@ def test_hyperpod_reboot_waits_for_post_reboot_stabilization() -> None:
         cluster_id="cluster-a",
         node_id="node-a",
         endpoint="http://node-a:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="0.10.0",
         artifact_sha256="a" * 64,
         policy_version="610",

@@ -323,6 +323,10 @@ class EvidenceOperationService:
         incident = self.store.get_incident(incumbent.incident_id)
         if not incident.job_id or not incident.attempt_id:
             return None
+        if getattr(event, "job_id", None) not in (None, incident.job_id) or getattr(
+            event, "attempt_id", None
+        ) not in (None, incident.attempt_id):
+            return None
         if (
             event_gpu_uuids
             and incident.gpu_uuids
@@ -333,11 +337,15 @@ class EvidenceOperationService:
             self.utc(incumbent.created_at) - timedelta(seconds=30)
         ):
             return None
+        workload_ids = set(event.affected_workload_ids)
         candidates = [
             observation
             for observation in self.store.list_attempt_observations(event.cluster_id)
             if observation.job_id == incident.job_id
             and observation.attempt_id == incident.attempt_id
+            and (
+                not workload_ids or workload_ids.intersection(observation.workload_ids)
+            )
             and self.observation_is_fresh(
                 observation,
                 self.event_freshness_reference(event),

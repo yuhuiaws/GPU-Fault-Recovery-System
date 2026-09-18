@@ -100,10 +100,11 @@ def replace_password(dsn: str, password: str) -> str:
         raise ValueError("DSN has no host")
     if not parts.username:
         raise ValueError("DSN has no username")
-    userinfo = f"{quote(parts.username, safe='')}:{quote(password, safe='')}"
-    netloc = f"{userinfo}@{parts.hostname}"
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
+    # Validate the port without normalizing escaped userinfo or the host authority.
+    _ = parts.port
+    userinfo = f"{parts.username}:{quote(password, safe='')}"
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    netloc = f"{userinfo}@{authority}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
@@ -145,7 +146,7 @@ def read_current_password(secret_arn: str, region_name: str) -> str:
     """
     try:
         import boto3
-    except ImportError as exc:  # pragma: no cover - packaging guard
+    except ImportError as exc:
         raise RuntimeError("install gpu-fault-control-plane[hyperpod]") from exc
     client = boto3.client("secretsmanager", region_name=region_name)
     response = client.get_secret_value(SecretId=secret_arn, VersionStage="AWSCURRENT")
@@ -160,7 +161,7 @@ def verify_dsn(dsn: str, connect_timeout: int = 10) -> None:
     """Open ``dsn`` once, so a bad candidate never reaches the Secret."""
     try:
         import psycopg
-    except ImportError as exc:  # pragma: no cover - packaging guard
+    except ImportError as exc:
         raise RuntimeError("install gpu-fault-control-plane[postgres]") from exc
     with psycopg.connect(dsn, connect_timeout=connect_timeout) as conn:
         with conn.cursor() as cursor:
@@ -496,7 +497,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         finally:
             raise RuntimeError(
                 "aurora credential refresh failed after retries"
-            ) from last_error
+            ) from None
     write_refresh_status(
         core,
         namespace=namespace,

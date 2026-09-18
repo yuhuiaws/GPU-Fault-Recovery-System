@@ -6,17 +6,23 @@
 # 否则探针会被已占满 3 个节点的生产 Pod 挤成 Pending——
 # "Pod 不 Ready" 是负向用例的判定条件，Pending 会被误判为 PASS。
 set -euo pipefail
+umask 077
 
 : "${CPU_KUBECONFIG:?}"
 : "${NAMESPACE:?}"
 OUT="${1:-/tmp/guard-probe-base.json}"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+PYTHON="${PYTHON:-python3}"
 
 CPU_KUBECONFIG="${CPU_KUBECONFIG}" NAMESPACE="${NAMESPACE}" \
-python3 - "${OUT}" <<'PY'
+"${PYTHON}" - "${OUT}" "${ROOT}" <<'PY'
 import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, sys.argv[2])
+from scripts.e2e.regional.boot_guard_isolation import isolate_probe_store
 
 
 def kubectl_json(*args):
@@ -85,14 +91,6 @@ overrides = {
     "GPU_FAULT_ALLOW_EMAIL": "false",
     "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED": "false",
     "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": "true",
-    # 停用挂载的 DSN 文件（CP-3 凭据轮转把 DSN 从 Secret 文件按连接读取，
-    # StoreCredentials 里文件优先于 GPU_FAULT_STORE_URL 环境变量）。生产
-    # Deployment 通过 GPU_FAULT_STORE_URL_FILE=/etc/gpu-fault/aurora/postgres-url
-    # + aurora-credentials 卷把线上 gpu_fault DSN 投影成文件；若不清空该变量，
-    # 下面对 GPU_FAULT_STORE_URL 的独立库改写会被文件覆盖，探针实际连到线上
-    # gpu_fault 库，BOOT-002 的空注册表（[]）断言就会读到线上真实集群而失败。
-    # 置空后 StoreCredentials.path=None，环境变量指向的独立 guardprobe 库生效。
-    "GPU_FAULT_STORE_URL_FILE": "",
 }
 by_name = {
     entry["name"]: index
@@ -105,9 +103,7 @@ for name, value in overrides.items():
     else:
         container.setdefault("env", []).append(entry)
 
-for e in container["env"]:
-    if e["name"] == "GPU_FAULT_STORE_URL":
-        e["valueFrom"]["secretKeyRef"]["name"] = "gpu-fault-aurora-guardprobe"
+isolate_probe_store(spec["template"]["spec"])
 for c in spec["template"]["spec"].get("topologySpreadConstraints", []):
     c["labelSelector"]["matchLabels"]["app"] = probe
 aff = spec["template"]["spec"].get("affinity", {}).get("podAntiAffinity", {})
@@ -120,7 +116,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(out, handle, indent=2)
 PY
 
-python3 - "${OUT}" <<'PY'
+"${PYTHON}" - "${OUT}" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 s = d["spec"]
@@ -134,11 +130,12 @@ assert requests["cpu"] == "250m"
 assert requests["memory"] == "1Gi"
 assert env["GPU_FAULT_STORE_URL"]["valueFrom"]["secretKeyRef"]["name"] \
     == "gpu-fault-aurora-guardprobe", "探针必须挂独立库（手册 §4.0 风险 3）"
-# 文件优先级：GPU_FAULT_STORE_URL_FILE 非空时，StoreCredentials 会从挂载的
-# 线上 Secret 文件读 DSN 并覆盖上面的独立库改写，探针会连到线上 gpu_fault 库。
-# 置空后文件路径失效，环境变量指向的 guardprobe 库才真正生效。
-assert env["GPU_FAULT_STORE_URL_FILE"]["value"] == "", \
-    "探针必须停用挂载 DSN 文件，否则文件优先级会让探针连回线上库"
+assert env["GPU_FAULT_STORE_URL_FILE"]["value"] \
+    == "/etc/gpu-fault/guardprobe/postgres-url"
+assert all(
+    volume.get("secret", {}).get("secretName") != "gpu-fault-aurora"
+    for volume in s["template"]["spec"]["volumes"]
+)
 # EXECUTOR_MODE 必须保持 active：api.py:331-332 在 config.enabled 为假时
 # 直接 return，后面所有区域守卫都不执行，9 个负向用例会集体假绿。
 assert env["GPU_FAULT_EXECUTOR_MODE"]["value"] == "active"

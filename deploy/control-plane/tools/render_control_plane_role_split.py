@@ -257,6 +257,12 @@ def restore_previous_container_env(
                 f"{deployment_name} has no container named "
                 + ", ".join(unknown_containers)
             )
+        missing_containers = sorted(set(by_name) - set(containers))
+        if missing_containers:
+            raise _invalid_container_env(
+                f"{deployment_name} snapshot does not cover containers: "
+                + ", ".join(missing_containers)
+            )
         for container_name, spec in containers.items():
             container = by_name[container_name]
             container["env"] = copy.deepcopy(spec["env"])
@@ -782,11 +788,10 @@ def main() -> None:
     # process never creates. The worker tier sets all five below.
     for consumer_only in PROCESSOR_POOL_ENV:
         unset_env(ingress, consumer_only)
-    # The 40-connection process budget is split into three explicit
-    # admission lanes: 24 general API, eight striped cross-cluster spool
-    # batches and eight fault. The pool pre-opens sixteen connections,
-    # enough for every spool and fault lane, while general traffic grows
-    # into the remaining headroom on demand.
+    # At most 40 Aurora connections per ingress process; the store-I/O
+    # admission lanes are sized independently: 28 general API, eight fault,
+    # four evidence and eight telemetry-spool workers. The pool pre-opens
+    # and retains a minimum of two connections, growing on demand.
     set_env(ingress, "GPU_FAULT_POSTGRES_POOL_MIN_SIZE", "2")
     set_env(ingress, "GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "40")
     set_env(ingress, "GPU_FAULT_STORE_IO_WORKERS", "28")

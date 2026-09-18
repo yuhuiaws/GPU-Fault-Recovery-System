@@ -167,6 +167,28 @@ def test_workflow_scan_passes_the_open_set_and_the_window_edge_to_the_store() ->
     assert store.workflow_open_statuses == [frozenset(OPEN_WORKFLOW_STATUSES)]
     assert store.workflow_since == [NOW - timedelta(hours=1)]
     assert scan.window_seconds == 3600
+    assert scan.observed_at == NOW
+
+
+def test_workflow_cache_hits_do_not_move_the_event_window_end() -> None:
+    store = CountingStore(workflows=1)
+    monotonic = [0.0]
+    wall_clock = [NOW]
+    cache = MetricScanCache(
+        store, ttl_seconds=60, monotonic=lambda: monotonic[0], now=lambda: wall_clock[0]
+    )
+    first = cache.workflows()
+    wall_clock[0] += timedelta(seconds=30)
+    monotonic[0] = 30
+
+    assert cache.workflows().observed_at == first.observed_at == NOW
+    assert store.workflow_calls == 1
+
+    wall_clock[0] += timedelta(seconds=31)
+    monotonic[0] = 61
+
+    assert cache.workflows().observed_at == NOW + timedelta(seconds=61)
+    assert store.workflow_calls == 2
 
 
 def test_window_zero_places_no_recency_bound() -> None:

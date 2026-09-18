@@ -19,6 +19,7 @@ snapshots and the writer's report. Nothing touches a cluster.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -424,9 +425,11 @@ def restore_errors(
 def writer_achieved_interval(report: dict[str, Any]) -> float | None:
     """Seconds between two landed patches, from the writer's own elapsed time."""
 
-    patches = int(report.get("patches") or 0)
-    elapsed = float(report.get("elapsed_seconds") or 0.0)
-    if patches <= 0 or elapsed <= 0:
+    patches = report.get("patches")
+    elapsed = report.get("elapsed_seconds")
+    if type(patches) is not int or type(elapsed) not in (int, float):
+        return None
+    if patches <= 0 or not math.isfinite(elapsed) or elapsed <= 0:
         return None
     return elapsed / patches
 
@@ -440,14 +443,16 @@ def writer_errors(
     """The concurrent writer really ran: dense enough, bounded, cleared."""
 
     errors: list[str] = []
-    patches = int(report.get("patches") or 0)
-    if patches < min_patches:
+    patches = report.get("patches")
+    if type(patches) is not int or patches < min_patches:
         errors.append(
             f"the annotation writer issued only {patches} patches (< {min_patches}); "
             "the race was not real"
         )
     achieved = writer_achieved_interval(report)
-    if achieved is not None and achieved > max_achieved_interval:
+    if achieved is None:
+        errors.append("the annotation writer has no usable elapsed-time evidence")
+    elif achieved > max_achieved_interval:
         errors.append(
             f"the annotation writer landed a patch every {achieved:.2f} s "
             f"(> {max_achieved_interval} s); the executor's node writes could "
@@ -455,6 +460,10 @@ def writer_errors(
         )
     if report.get("stopped") is not True:
         errors.append("the annotation writer did not stop")
+    if report.get("running") is not False:
+        errors.append("the annotation writer thread is running or its state is unknown")
+    if report.get("error"):
+        errors.append(f"the annotation writer failed: {report['error']}")
     if report.get("cleared") is not True:
         errors.append("the tick annotation was not cleared")
     if report.get("exceeded_max_seconds"):

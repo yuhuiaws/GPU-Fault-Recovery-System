@@ -26,6 +26,7 @@ def identity_root(tmp_path: Path) -> Path:
     (tmp_path / "deploy/image").mkdir(parents=True)
     (tmp_path / "requirements").mkdir()
     (tmp_path / "manifests/cpu.yaml").write_text("kind: Deployment\n")
+    (tmp_path / "manifests/aurora.yaml").write_text("kind: CronJob\n")
     (tmp_path / "manifests/gpu.yaml").write_text("kind: DaemonSet\n")
     (tmp_path / "renderers/render.py").write_text("print('render')\n")
     (tmp_path / "rendered/cpu.yaml").write_text("kind: Deployment\n")
@@ -60,6 +61,7 @@ def identity_root(tmp_path: Path) -> Path:
         "runtime_image_inputs": ["renderers/*.py", "manifests/*.yaml"],
         "node_template_inputs": ["node/*.sh"],
         "component_inputs": {
+            "aurora_refresh": ["manifests/aurora.yaml"],
             "collector": ["manifests/gpu.yaml"],
             "cpu": ["manifests/cpu.yaml"],
             "cpu_ingress": ["manifests/cpu.yaml"],
@@ -171,6 +173,23 @@ def test_application_release_identity_excludes_deploy_host_inputs() -> None:
         not in config["renderer_inputs"]
     )
     assert "src/gpu_fault_release/rollout.py" not in config["renderer_inputs"]
+
+
+def test_refresher_manifest_has_an_independent_delivery_identity(
+    tmp_path: Path,
+) -> None:
+    root = identity_root(tmp_path)
+    before = build_release_identity(root)
+    (root / "manifests/aurora.yaml").write_text("kind: CronJob\nspec: {}\n")
+    after = build_release_identity(root)
+    changed = {
+        name
+        for name, value in before["components"].items()
+        if value["sha256"] != after["components"][name]["sha256"]
+    }
+    assert changed == {"aurora_refresh"}, (
+        "a refresher-only edit invalidated unrelated runtime components"
+    )
 
 
 def test_release_identity_includes_file_modes(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from gpu_fault.processor import (
     ProcessorPoolSettings,
     ProcessorRequest,
     ProcessorRequestStatus,
+    ProcessorSpoolSettings,
 )
 from gpu_fault.processor.batching import telemetry_batch_size
 from tests._builders import copy_model, processor_request
@@ -208,7 +209,7 @@ def test_control_plane_actions_are_the_first_tier(path) -> None:
     "path",
     [
         "/v1/gpu-events/nvidia-kernel",
-        "/v1/provider-events/hyperpod-hma/health",
+        "/v1/gpu-events/sxid",
         "/v1/collector-events/nvidia-kernel",
         "/v1/collector-events/fabric-manager",
     ],
@@ -262,29 +263,27 @@ def test_routine_aging_bounds_priority_fifty_starvation(
     assert claimed[0].queue_priority() == expected_priority
 
 
-def test_fault_pressure_caps_but_does_not_stop_evidence_pools(stores) -> None:
+@pytest.mark.parametrize("queued_inventory", [False, True])
+@pytest.mark.parametrize("queued_node_logs", [False, True])
+def test_fault_pressure_caps_but_does_not_stop_evidence_pools(
+    stores, queued_inventory: bool, queued_node_logs: bool
+) -> None:
     store, _peer = stores
+    inventory_path = "/v1/collector-events/gpu-inventory"
+    metrics_path = "/v1/collector-events/gpu-metrics"
+    logs_path = "/v1/collector-events/node-logs"
+    host_path = "/v1/collector-events/host-telemetry"
     fault = processor_request(
         "/v1/collector-events/nvidia-kernel", body=b'{"node_id":"node-fault"}'
     )
     store.enqueue_processor_request(fault)
-    for index in range(20):
-        store.enqueue_processor_request(
-            _telemetry(f"gpu-{index}", index, reasons=["threshold:synthetic"])
-        )
-        store.enqueue_processor_request(
-            _telemetry(
-                f"host-{index}",
-                index,
-                path="/v1/collector-events/host-telemetry",
-                reasons=["threshold:synthetic"],
-            )
-        )
     processor = ProcessorCoordinator(
         store,
         owner_id="pod-pressure",
         internal_token="pressure-token",
         active_consumers=True,
+        # These are queue rows, not routine inventory diverted to the spool.
+        spool=ProcessorSpoolSettings(telemetry_spool_enabled=False),
         pools=ProcessorPoolSettings(
             fault_worker_count=1,
             observation_worker_count=0,
@@ -293,24 +292,68 @@ def test_fault_pressure_caps_but_does_not_stop_evidence_pools(stores) -> None:
             fault_pressure_evidence_workers=1,
         ),
     )
-
-    claimed = processor._claim_active_by_pool(
-        {"fault": 1, "gpu": 4, "host": 4}, lease_duration=REQUEST_LEASE
+    gpu_turns: list[str] = []
+    host_turns: list[str] = []
+    paths = [metrics_path, host_path]
+    if queued_inventory:
+        paths.append(inventory_path)
+    if queued_node_logs:
+        paths.append(logs_path)
+    for round_index in range(12):
+        for path in paths:
+            for index in range(20):
+                request = _telemetry(
+                    f"{path.rsplit('/', 1)[-1]}-{round_index}-{index}",
+                    index,
+                    path=path,
+                    reasons=["threshold:synthetic"],
+                )
+                store.enqueue_processor_request(request)
+                assert store.get_processor_request(request.request_id).status is (
+                    ProcessorRequestStatus.PENDING
+                ), "the fairness fixture must actually reside in the ordered queue"
+        # An occupied pressure slot must admit nothing and not consume a turn.
+        free_slots = 4 if round_index % 2 == 0 else 3
+        claimed = processor._claim_active_by_pool(
+            {
+                "fault": 1 if round_index == 0 else 0,
+                "gpu": free_slots,
+                "host": free_slots,
+            },
+            lease_duration=REQUEST_LEASE,
+        )
+        if round_index == 0:
+            assert claimed[0].request_id == fault.request_id
+        by_path: dict[str, list[ProcessorRequest]] = {}
+        for item in claimed:
+            if item.request_id == fault.request_id:
+                continue
+            by_path.setdefault(item.path, []).append(item)
+            store.complete_active_processor_request(
+                item.request_id,
+                processor.owner_id,
+                item.leader_epoch,
+                item.lease_token,
+                response_status=200,
+                response_content_type="application/json",
+                response_body_base64="e30=",
+            )
+        if free_slots == 3:
+            assert not by_path, "an occupied pressure slot must not be exceeded"
+            continue
+        gpu_paths = set(by_path) & {inventory_path, metrics_path}
+        host_paths = set(by_path) & {logs_path, host_path}
+        assert len(gpu_paths) == len(host_paths) == 1
+        gpu_turns.extend(gpu_paths)
+        host_turns.extend(host_paths)
+        for path, items in by_path.items():
+            cap = 1 if path == logs_path else telemetry_batch_size(path)
+            assert 1 <= len(items) <= cap, "each pool may use only one pressure slot"
+    assert gpu_turns == (
+        [inventory_path, metrics_path] * 3 if queued_inventory else [metrics_path] * 6
     )
-
-    by_path: dict[str, list[ProcessorRequest]] = {}
-    for item in claimed:
-        by_path.setdefault(item.path, []).append(item)
-    assert len(by_path["/v1/collector-events/nvidia-kernel"]) == 1
-    assert (
-        1
-        <= len(by_path["/v1/collector-events/gpu-metrics"])
-        <= telemetry_batch_size("/v1/collector-events/gpu-metrics")
-    )
-    assert (
-        1
-        <= len(by_path["/v1/collector-events/host-telemetry"])
-        <= telemetry_batch_size("/v1/collector-events/host-telemetry")
+    assert host_turns == (
+        [logs_path, host_path] * 3 if queued_node_logs else [host_path] * 6
     )
     pressure = processor.metrics_snapshot()["fault_pressure"]
     assert pressure == {"active": 1, "evidence_workers": 1, "activations_total": 1}

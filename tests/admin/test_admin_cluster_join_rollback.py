@@ -20,9 +20,9 @@ import yaml
 
 from gpu_fault.admin import cluster_join as admin_cluster_join
 from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
-from gpu_fault.admin import cluster_join_network as admin_cluster_join_network
+from gpu_fault.admin import cluster_join_context as join_context
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
-from gpu_fault.admin.cluster_join import JoinClusterRequest, join_cluster
+from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution, join_cluster
 from gpu_fault.admin.site import load_site
 from tests.admin.test_admin_site import site_file
 
@@ -65,6 +65,9 @@ class Commands:
         self.failures = tuple(failures)
         self.outputs = tuple(outputs)
         self.calls: list[list[str]] = []
+        self.namespace_deleted = False
+        self.contexts = {"gpu-fault-gpu-2-gpu-b"}
+        self.node_annotations: dict[str, str] = {}
 
     def __call__(self, arguments: Sequence[Any], **_keywords: Any) -> SimpleNamespace:
         argv = [str(item) for item in arguments]
@@ -76,6 +79,56 @@ class Commands:
         for fragment, stdout in self.outputs:
             if fragment in line:
                 return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "get" in argv and "nodes" in argv:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "items": [
+                            {
+                                "kind": "Node",
+                                "metadata": {
+                                    "name": "node-b",
+                                    "uid": "uid-node-b",
+                                    "resourceVersion": "1",
+                                    "annotations": dict(self.node_annotations),
+                                    "labels": {
+                                        "sagemaker.amazonaws.com/cluster-name": "hp-gpu-b"
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if "get" in argv and "namespace" in argv:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=""
+                if self.namespace_deleted
+                else json.dumps(
+                    {
+                        "kind": "Namespace",
+                        "metadata": {"name": "gpu-fault-system", "uid": "namespace-b"},
+                    }
+                ),
+                stderr="",
+            )
+        if "--raw" in argv and "/api/v1/namespaces/gpu-fault-system" in argv:
+            self.namespace_deleted = True
+        if "update-kubeconfig" in argv:
+            self.contexts.add(argv[argv.index("--alias") + 1])
+        if "delete-context" in argv:
+            self.contexts.discard(argv[-1])
+        if "get-contexts" in argv:
+            return SimpleNamespace(
+                returncode=0, stdout="\n".join(sorted(self.contexts)), stderr=""
+            )
+        if "get" in argv and "pods" in argv:
+            return SimpleNamespace(
+                returncode=0, stdout='{"kind":"PodList","items":[]}', stderr=""
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def matching(self, fragment: str) -> list[list[str]]:
@@ -107,6 +160,11 @@ class Attempt:
         self.membership: list[bool] = []
         self.cleared: list[list[str]] = []
         self.joined = True
+        self.prepare_error: BaseException | None = BootstrapError(
+            "cluster deploy failed"
+        )
+        self.extra_steps: list[str] = []
+        self.extra_evidence: dict[str, Any] = {}
         self.released = False
 
     def _write_candidate(self) -> Path:
@@ -149,6 +207,9 @@ class Attempt:
                 "fleet_master_file": str(self.fleet_master_file),
                 "ca_file": self.site.release_config["clusters"][0]["ca_file"],
                 "nodes": ["node-b"],
+                "node_uids": {"node-b": "uid-node-b"},
+                "namespace_creation_started": True,
+                "namespace_uid": "namespace-b",
             },
             "PREREQUISITES_READY": {
                 "executor_role": {
@@ -167,6 +228,13 @@ class Attempt:
                 "node_keys": {"cluster_id": "hp-gpu-b"},
             },
             "CANDIDATE_READY": {"site_file": str(self.candidate_path)},
+            "NODE_NAMES_VERIFIED": {
+                "cluster_id": "hp-gpu-b",
+                "eks_arn": GPU_B_ARN,
+                "nodes": ["node-b"],
+                "node_uids": {"node-b": "uid-node-b"},
+                "expected_key_sha256": {"node-b": "a" * 64},
+            },
         }
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,11 +246,24 @@ class Attempt:
                 "LOCAL_INPUTS_READY",
                 "PREREQUISITES_READY",
                 "CANDIDATE_READY",
+                "NODE_NAMES_VERIFIED",
+                "NODE_KEYS_STARTED",
                 *(["RELEASE_STARTED"] if self.released or self.joined else []),
                 *(["JOINED"] if self.joined else []),
+                *self.extra_steps,
             ]
-            state["evidence"] = self.evidence()
-            raise BootstrapError("cluster deploy failed")
+            state["evidence"] = {**self.evidence(), **self.extra_evidence}
+            if self.prepare_error is not None:
+                raise self.prepare_error
+            record = state["evidence"]
+            return JoinExecution(
+                target=_target(),
+                cluster_id="hp-gpu-b",
+                discovery=record["DISCOVERED"],
+                local=record["LOCAL_INPUTS_READY"],
+                prerequisites=record["PREREQUISITES_READY"],
+                candidate=load_site(self.candidate_path),
+            )
 
         monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
         monkeypatch.setattr(
@@ -203,16 +284,25 @@ class Attempt:
             lambda *_args, **_keywords: None,
         )
         monkeypatch.setattr(
-            admin_cluster_join_network,
-            "_wait_vpc_association_absent",
-            lambda **_keywords: None,
+            admin_cluster_join, "_wait_vpc_association_absent", lambda **_keywords: None
+        )
+        monkeypatch.setattr(
+            admin_cluster_join,
+            "probe_join_namespace",
+            lambda *_args, **_keywords: "namespace-b",
+        )
+        monkeypatch.setattr(
+            admin_cluster_join,
+            "membership_runtime_snapshot",
+            lambda _site: {"registry_cluster_states": {"hp-gpu-b": "PENDING"}},
         )
         monkeypatch.setattr(
             admin_cluster_join_commit,
             "rollback_membership",
             lambda _request, *, execution, joined: self.membership.append(joined),
         )
-        monkeypatch.setattr(admin_cluster_join.subprocess, "run", self.commands)
+        monkeypatch.setattr(admin_cluster_join, "run_command", self.commands)
+        monkeypatch.setattr(admin_cluster_join, "run_driver", self.commands)
 
     def run(self, monkeypatch: pytest.MonkeyPatch, *, error: str) -> None:
         self.install(monkeypatch)
@@ -265,8 +355,8 @@ def test_a_failure_before_activation_undoes_everything_the_attempt_created(
     assert attempt.commands.matching("delete-context"), (
         "the kubeconfig context for the candidate cluster was left behind"
     )
-    namespace = attempt.commands.matching("delete namespace")
-    assert namespace and "--ignore-not-found" in namespace[0]
+    namespace = attempt.commands.matching("delete --raw")
+    assert namespace and "/api/v1/namespaces/gpu-fault-system" in namespace[0]
     assert not attempt.token_file.exists(), "the join token file was left on disk"
     assert not attempt.fleet_master_file.exists(), (
         "the fleet master secret was left on disk"
@@ -286,12 +376,13 @@ def test_a_rollback_repoints_the_current_context_it_left_dangling(
     """
 
     attempt = Attempt(tmp_path)
+    surviving = attempt.site.release_config["clusters"][0]["context"]
     attempt.commands = Commands(
         outputs=(
-            ("config current-context", "gpu-fault-gpu-2-gpu-b\n"),
+            ("config view -o jsonpath={.current-context}", "gpu-fault-gpu-2-gpu-b\n"),
             (
                 "config get-contexts -o name",
-                "gpu-fault-gpu-2-gpu-b\ngpu-fault-gpu-1-gpu-a\n",
+                "gpu-fault-gpu-2-gpu-b\n" + surviving + "\n",
             ),
         )
     )
@@ -301,7 +392,7 @@ def test_a_rollback_repoints_the_current_context_it_left_dangling(
     assert attempt.commands.matching("delete-context gpu-fault-gpu-2-gpu-b"), (
         "the candidate context was not deleted"
     )
-    assert attempt.commands.matching("use-context gpu-fault-gpu-1-gpu-a"), (
+    assert attempt.commands.matching("use-context " + surviving), (
         "current-context was left pointing at the deleted context"
     )
 
@@ -312,7 +403,7 @@ def test_a_rollback_unsets_the_current_context_when_no_context_remains(
     attempt = Attempt(tmp_path)
     attempt.commands = Commands(
         outputs=(
-            ("config current-context", "gpu-fault-gpu-2-gpu-b\n"),
+            ("config view -o jsonpath={.current-context}", "gpu-fault-gpu-2-gpu-b\n"),
             ("config get-contexts -o name", "gpu-fault-gpu-2-gpu-b\n"),
         )
     )
@@ -370,11 +461,19 @@ def test_a_join_that_never_reached_joined_does_not_fail_the_cluster(
 @pytest.mark.parametrize(
     "failure",
     [
-        ("delete-role-policy", 254, "NoSuchEntity: cannot be found"),
-        ("delete-role", 254, "NoSuchEntity: cannot be found"),
+        (
+            "delete-role-policy",
+            254,
+            "An error occurred (NoSuchEntity) when calling the DeleteRolePolicy operation",
+        ),
+        (
+            "delete-role",
+            254,
+            "An error occurred (NoSuchEntity) when calling the DeleteRole operation",
+        ),
         ("revoke-security-group-ingress", 254, "InvalidPermission.NotFound"),
         ("disassociate-vpc-from-hosted-zone", 254, "VPCAssociationNotFound"),
-        ("delete-context", 1, 'context "gpu-fault-gpu-2-gpu-b" not found'),
+        ("get-contexts", 0, ""),
     ],
 )
 def test_a_resource_that_is_already_gone_is_not_a_rollback_failure(
@@ -403,7 +502,7 @@ def test_a_resource_that_is_already_gone_is_not_a_rollback_failure(
             "kubernetes/control rollback",
         ),
         (
-            ("delete namespace", 1, "Error from server: etcdserver: timeout"),
+            ("delete --raw", 1, "Error from server: etcdserver: timeout"),
             "namespace rollback",
         ),
         (("revoke-security-group-ingress", 254, "AccessDenied"), "network rollback"),
@@ -439,8 +538,18 @@ def test_an_undo_that_really_failed_is_reported_and_keeps_the_evidence(
         f"the failed undo was not named in rollback_errors: {state['rollback_errors']}"
     )
     assert "PREREQUISITES_READY" in state["evidence"]
-    assert attempt.membership == [], (
-        "membership rollback ran on top of a failed resource rollback"
+    if failure[0] == "delete-context":
+        assert attempt.membership == [True]
+        assert "REMOTE_ROLLBACK_COMPLETED" in state["completed_steps"]
+    else:
+        assert attempt.membership == [], (
+            "membership rollback ran on top of a failed resource rollback"
+        )
+    assert attempt.token_file.is_file(), (
+        "failed rollback must retain the join token for recovery"
+    )
+    assert attempt.fleet_master_file.is_file(), (
+        "failed rollback must retain the fleet master file for recovery"
     )
 
 
@@ -501,17 +610,10 @@ EMPTY_REGISTRY = json.dumps(
 )
 
 
-def test_a_release_that_installed_nothing_needs_no_gpu_cleanup(
+def test_a_release_with_empty_gpu_inventory_finishes_membership_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cleanup script refuses an empty inventory; do not ask it to clean one.
-
-    Live, 2026-09-12: the release failed at the endpoint gate, before any GPU
-    resource existed, and the rollback then failed on "cleanup resource
-    inventory gpu.resources is empty" -- leaving the attempt ROLLBACK_FAILED
-    and the membership undo skipped. When the installed-resource registry
-    shows nothing on the GPU plane, the rollback skips the script.
-    """
+    """Empty inventories use the validated cleanup path, never an unbound skip."""
 
     attempt = Attempt(tmp_path)
     attempt.commands = Commands(
@@ -521,11 +623,8 @@ def test_a_release_that_installed_nothing_needs_no_gpu_cleanup(
     attempt.run(monkeypatch, error="cluster deploy failed")
 
     assert attempt.state()["phase"] == "ROLLED_BACK", "the rollback must complete"
-    assert attempt.commands.matching("collect_installed_resource_registry.py"), (
-        "the registry was not consulted"
-    )
-    assert not attempt.commands.matching("prepare-clean-redeploy.sh"), (
-        "the cleanup script was run against an empty inventory"
+    assert attempt.commands.matching("prepare-clean-redeploy.sh"), (
+        "an empty GPU inventory must still use the validated cleanup path"
     )
     assert attempt.membership == [True], "the membership undo must still run"
 
@@ -559,16 +658,14 @@ def test_a_retry_after_a_failed_rollback_finishes_the_undo_first(
 
     # The first rollback already deleted the kubeconfig context; the retry
     # must put it back before it can undo anything on the cluster.
-    attempt.commands = Commands(
-        failures=[
-            (
-                "config get-contexts gpu-fault-gpu-2-gpu-b",
-                1,
-                'error: context "gpu-fault-gpu-2-gpu-b" not found',
-            )
-        ]
-    )
+    attempt.commands = Commands()
+    attempt.commands.contexts.clear()
     attempt.install(monkeypatch)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_discover_join_target",
+        lambda *_args: (_target(), "hp-gpu-b", None),
+    )
     seen: list[dict[str, Any]] = []
 
     def prepare(_request: Any, **keywords: Any) -> Any:
@@ -608,6 +705,11 @@ def test_a_retry_whose_undo_still_fails_stops_there(
     attempt.run(monkeypatch, error="cleanup refused")
 
     attempt.install(monkeypatch)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_discover_join_target",
+        lambda *_args: (_target(), "hp-gpu-b", None),
+    )
     monkeypatch.setattr(
         admin_cluster_join,
         "_prepare_execution",
@@ -740,27 +842,39 @@ def test_stale_installer_annotations_are_cleared_only_without_a_reconciler(
     go; a cluster with a Reconciler keeps its live annotations."""
 
     attempt = Attempt(tmp_path)
-    from gpu_fault.admin import cluster_join_rollback
-
-    absent = Commands(
-        failures=[
-            ("get deployment gpu-fault-node-installer-reconciler", 1, "not found")
-        ]
-    )
-    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", absent)
-    cluster_join_rollback.clear_stale_installer_annotations(
-        attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
-    )
-    assert absent.matching("annotate node node-b"), (
+    target = {
+        "context": "gpu-fault-gpu-2-gpu-b",
+        "hyperpod_cluster_name": "hp-gpu-b",
+        "expected_node_uids": {"node-b": "uid-node-b"},
+    }
+    absent = Commands()
+    absent.node_annotations["gpu-fault.io/installer-state"] = "Retrying"
+    monkeypatch.setattr(admin_cluster_join, "run_command", absent)
+    join_context.clear_stale_installer_annotations(attempt.site, target, ["node-b"])
+    assert absent.matching("patch node node-b"), (
         "leftover installer annotations must go when no Reconciler owns them"
     )
 
-    present = Commands()
-    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", present)
-    cluster_join_rollback.clear_stale_installer_annotations(
-        attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
+    present = Commands(
+        outputs=(
+            (
+                "get deployment gpu-fault-node-installer-reconciler",
+                json.dumps(
+                    {
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "gpu-fault-node-installer-reconciler",
+                            "namespace": "gpu-fault-system",
+                            "uid": "reconciler-uid",
+                        },
+                    }
+                ),
+            ),
+        )
     )
-    assert not present.matching("annotate"), (
+    monkeypatch.setattr(admin_cluster_join, "run_command", present)
+    join_context.clear_stale_installer_annotations(attempt.site, target, ["node-b"])
+    assert not present.matching("patch"), (
         "a live Reconciler's annotations must not be touched"
     )
 
@@ -769,8 +883,9 @@ def test_stale_installer_annotations_are_cleared_only_without_a_reconciler(
             ("get deployment gpu-fault-node-installer-reconciler", 1, "Unauthorized")
         ]
     )
-    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", broken)
-    with pytest.raises(BootstrapError, match="cannot tell whether"):
-        cluster_join_rollback.clear_stale_installer_annotations(
-            attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
-        )
+    monkeypatch.setattr(admin_cluster_join, "run_command", broken)
+    with pytest.raises(BootstrapError, match="cannot prove"):
+        join_context.clear_stale_installer_annotations(attempt.site, target, ["node-b"])
+    assert not broken.matching("patch"), (
+        "unreadable Reconciler ownership must not authorize annotation patches"
+    )

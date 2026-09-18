@@ -17,9 +17,16 @@ from scripts.component_wheels import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _release() -> SimpleNamespace:
+def _release(
+    *, drift: bool = False, probes: list[str] | None = None
+) -> SimpleNamespace:
     admin_config = default_admin_config()
     return SimpleNamespace(
+        _observability_drift=lambda: (
+            probes.append("read-only-probe") if probes is not None else None,
+            drift,
+        )[1],
+        _aurora_refresh_drift=lambda: False,
         wheel_sha="a" * 64,
         executor_wheel_sha="b" * 64,
         node_wheel_sha="c" * 64,
@@ -37,6 +44,7 @@ def _release() -> SimpleNamespace:
         rendered_manifest_digest="7" * 64,
         node_template_sha="8" * 64,
         runtime_image="runtime@sha256:" + "1" * 64,
+        executor_image="runtime@sha256:" + "1" * 64,
         node_installer_image="installer@sha256:" + "2" * 64,
         dcgm_exporter_image="dcgm@sha256:" + "3" * 64,
         adot_image="adot@sha256:" + "4" * 64,
@@ -52,6 +60,7 @@ def _release() -> SimpleNamespace:
                 "node_runtime": "c" * 64,
             },
             release_delivery_sha256="9" * 64,
+            release_delivery_identity={},
             delivery_component_digests={
                 "cpu": "a" * 64,
                 "cpu_ingress": "5" * 64,
@@ -132,6 +141,59 @@ def _state() -> dict:
     }
 
 
+def test_cpu_image_change_does_not_roll_any_gpu_component() -> None:
+    release = _release()
+    state = _state()
+    release.runtime_image = "runtime@sha256:" + "a" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.changed == frozenset({"runtime_image"})
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    plan = DIFF.build_execution_plan(diff)
+    assert plan.has(DIFF.ReleaseComponent.CPU_FINALIZE), (
+        "CPU image changes must update the CPU runtime"
+    )
+    assert not plan.has(
+        DIFF.ReleaseComponent.EXECUTOR,
+        DIFF.ReleaseComponent.RECONCILER,
+        DIFF.ReleaseComponent.AGENT,
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.COLLECTOR,
+    ), "a CPU-only image change selected a GPU rollout"
+
+
+def test_executor_image_change_does_not_roll_cpu_or_node_runtime() -> None:
+    release = _release()
+    release.executor_image = "executor@sha256:" + "b" * 64
+    diff = DIFF.classify_release(release, _state())
+    assert diff.changed == frozenset({"executor_image"})
+    plan = DIFF.build_execution_plan(diff)
+    assert plan.has(DIFF.ReleaseComponent.EXECUTOR, DIFF.ReleaseComponent.RECONCILER), (
+        "Executor image changes must update its consumers"
+    )
+    assert not plan.has(
+        DIFF.ReleaseComponent.CPU_FINALIZE, DIFF.ReleaseComponent.AGENT
+    ), "unchanged CPU and host runtimes were selected"
+
+
+def test_rebinding_same_node_dependency_image_to_new_source_does_not_roll_nodes() -> (
+    None
+):
+    release = _release()
+    state = _state()
+    dependency = {
+        "reference": "registry.example/node@sha256:" + "c" * 64,
+        "wheelhouse_sha256": "d" * 64,
+        "source_identity_sha256": "e" * 64,
+    }
+    state["node_dependencies"] = dependency
+    release.config.release_delivery_identity = {
+        "images": {
+            "node_dependencies": {**dependency, "source_identity_sha256": "f" * 64}
+        }
+    }
+    assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.NOOP
+
+
 def test_release_diff_classifies_noop_and_component_scopes() -> None:
     release = _release()
     state = _state()
@@ -141,6 +203,22 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
     assert (
         DIFF.classify_release(release, state).kind
         is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    )
+
+
+def test_live_monitoring_drift_selects_repair_even_with_unchanged_artifacts() -> None:
+    calls: list[str] = []
+    release = _release(drift=True, probes=calls)
+
+    diff = DIFF.classify_release(release, _state())
+    plan = DIFF.build_execution_plan(diff)
+
+    assert calls == ["read-only-probe"]
+    assert diff.changed == {"observability_drift"}
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    assert plan.has(DIFF.ReleaseComponent.OBSERVABILITY), "drift has no repair node"
+    assert not plan.has(DIFF.ReleaseComponent.CPU_STAGE, DIFF.ReleaseComponent.AGENT), (
+        "monitoring-only repair unnecessarily restarts CPU or nodes"
     )
 
 

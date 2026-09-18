@@ -11,6 +11,11 @@ export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= $(shell $(PYTHON) -c "import os;print(max(4,min(16,(os.cpu_count() or 4)//4)))")
 PYTEST_XDIST_DIST ?= worksteal
 PYTEST_DURATIONS ?= 50
+# Independent PG16 shards for the local PostgreSQL gate: the same quarter-of-
+# the-cores derivation as PYTEST_XDIST_WORKERS (4..16). Four shards left the
+# gate as the release build's long pole (792 s on a 64-core host, 2026-09-17).
+POSTGRES_TEST_WORKERS ?= $(shell $(PYTHON) -c "import os;print(max(4,min(16,(os.cpu_count() or 4)//4)))")
+POSTGRES_TEST_PARALLEL ?= 0
 FAULT_TEST_WORKERS ?= 1
 PARALLEL_FAULT_TEST_WORKERS ?= 4
 FAULT_TEST_PYTEST_RESULTS ?= artifacts/fault/pytest-case-results.json
@@ -22,6 +27,8 @@ COVERAGE_SHARDS_ROOT ?= artifacts/coverage-shards
 COVERAGE_COMBINED_ROOT ?= artifacts/coverage-combined
 COVERAGE_LOCAL_JSON ?= artifacts/coverage-local.json
 COVERAGE_INCLUDE_STRESS ?= 0
+COVERAGE_POSTGRES_CONTAINER ?=
+COVERAGE_POSTGRES_IMAGE ?=
 BASE ?= origin/main
 COSIGN ?= cosign
 RUNTIME_IMAGE_PLATFORM ?= linux/amd64
@@ -36,30 +43,35 @@ COMPONENT_ARTIFACT_CACHE_ROOT ?=
 # here; ci.yml installs them through `make ci-supply-chain-tools`, so the
 # workflow cannot drift from the Makefile. They live in their own venv so
 # their transitive dependencies never touch the hash-locked environment the
-# other gates run in. `$(CI)` decides strictness: GitHub sets CI=true, so a
-# missing tool is a hard failure there and a printed skip on a laptop.
+# other gates run in. Audit/SBOM tools are advisory outside CI; promtool is
+# mandatory whenever local tests include PromQL.
 PIP_AUDIT_VERSION ?= 2.10.1
-CFN_LINT_VERSION ?= 1.56.0
 CYCLONEDX_BOM_VERSION ?= 7.3.1
 # promtool is a Go binary from the Prometheus release tarball, not a pip
 # package: pinned by version AND by the tarball's published sha256 so the gate
 # runs the bytes it was written against.
 PROMTOOL_VERSION ?= 3.14.0
 PROMTOOL_SHA256_LINUX_AMD64 ?= f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d
+ifeq ($(origin SUPPLY_CHAIN_PYTHON),undefined)
 SUPPLY_CHAIN_TOOLS_VENV ?= /tmp/gpu-fault-supply-chain-tools
-SUPPLY_CHAIN_PYTHON ?= $(firstword $(wildcard $(SUPPLY_CHAIN_TOOLS_VENV)/bin/python) $(PYTHON))
-SUPPLY_CHAIN_BIN = $(dir $(SUPPLY_CHAIN_PYTHON))
+else
+SUPPLY_CHAIN_TOOLS_VENV ?= $(shell dirname -- "$$(dirname -- "$(SUPPLY_CHAIN_PYTHON)")")
+endif
+SUPPLY_CHAIN_PYTHON ?= $(SUPPLY_CHAIN_TOOLS_VENV)/bin/python
+SUPPLY_CHAIN_BIN = $(shell dirname -- "$(SUPPLY_CHAIN_PYTHON)")/
+PROMTOOL ?= $(SUPPLY_CHAIN_BIN)promtool
+export PROMTOOL
 # Every lock a shipped artifact is installed from: runtime.lock builds the
 # runtime image, build.lock and deploy-host.lock go into the deploy-host bundle,
 # and node-runtime.lock is what the node installer hash-pins onto every GPU node.
-SHIPPED_LOCKS = requirements/build.lock requirements/runtime.lock requirements/deploy-host.lock requirements/node-runtime.lock
+SHIPPED_LOCKS = requirements/build.lock requirements/runtime.lock requirements/deploy-host.lock requirements/node-runtime.lock requirements/node-tools.lock
 PIP_AUDIT_IGNORE_FILE = requirements/pip-audit-ignore.txt
-CFN_TEMPLATES = deploy/aws/lambda/*.yaml
 SBOM_DIR = dist/sbom
 DEPLOY_HOST_PLATFORM ?= $(shell $(PYTHON) -c "from scripts.deploy_host_bundle import bundle_platform_id; print(bundle_platform_id())")
 DEPLOY_HOST_ARCHIVE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).tar.gz
 DEPLOY_HOST_SIGNATURE_BUNDLE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).sigstore.json
 DEPLOY_HOST_VENV ?= .venv
+DEPLOY_HOST_BOOTSTRAP_PYTHON ?= python3.12
 QUALITY_SCRIPTS = scripts tools
 QUALITY_SHELL_ROOTS = deploy scripts tools
 YAMLLINT_CONFIG = .yamllint
@@ -68,6 +80,11 @@ YAMLLINT_CONFIG = .yamllint
 # what makes the config load-bearing: without it yamllint reports every
 # rule in .yamllint as a warning and still exits 0.
 YAMLLINT_ROOTS = deploy examples testcases config scripts/e2e scripts/perf
+PROMQL_TESTS = \
+	tests/metrics/test_closed_loop_promql.py \
+	tests/metrics/test_observability_evidence_promql.py \
+	tests/metrics/test_review_dashboard_promql.py \
+	tests/test_alert_rules_promtool.py
 DOCUMENTATION_TESTS = \
 	tests/test_documentation_contracts.py \
 	tests/test_deployment_manual_contracts.py \
@@ -84,42 +101,78 @@ DOCUMENTATION_TESTS = \
 CI_TOOLING_TESTS = \
 	tests/test_script_assets.py \
 	tests/test_ci_gate.py \
+	tests/test_ci_pytest_evidence.py \
+	tests/test_ci_postgres_grant.py \
 	tests/test_ci_unit_gate.py
 POSTGRES_TESTS = \
+	tests/admin/test_registry_sync_postgres.py \
+	tests/admin/test_uninstall_probe_postgres.py \
 	tests/app_services/test_cleanup_unbounded_kinds.py \
 	tests/app_services/test_collector_ingestion_transaction.py \
+	tests/completion/test_cov95_withdrawal_postgres.py \
 	tests/execution/test_branch_settlement.py \
 	tests/execution/test_workload_withdrawal.py \
+	tests/metrics/test_kernel_pcie_composite_postgres.py \
 	tests/metrics/test_processor_counter_mode_metric.py \
 	tests/notifications/test_delivery_state.py \
+	tests/notifications/test_cov95_commit_window_postgres.py \
 	tests/orchestration/test_incident_closure.py \
+	tests/orchestration/test_provider_correlation_postgres.py \
+	tests/processor/test_cov95_busy_takeover_postgres.py \
 	tests/processor/test_observation_interlock_liveness.py \
 	tests/processor/test_queue_priority_tiers.py \
 	tests/processor/test_routine_coalescing_boundaries.py \
 	tests/processor/test_telemetry_spool.py \
+	tests/regional/test_acceptance_alignment_store_lifecycle_postgres.py \
+	tests/regional/test_bootstrap_store_proof_postgres.py \
+	tests/regional/test_boot_cap_postgres_isolation.py \
+	tests/regional/test_cap004_executor_postgres.py \
+	tests/regional/test_cov95_ha011_postgres.py \
+	tests/regional/test_cov95_notify008_postgres.py \
+	tests/regional/test_postgres_main_integration_seeds.py \
+	tests/regional/test_postgres_runtime_action_uncertainty.py \
+	tests/regional/test_retained_store_schema_postgres.py \
+	tests/regional/test_state_table_acceptance_postgres.py \
 	tests/regional/test_stuck_workflow_baseline.py \
 	tests/store/test_active_workflow_incidents_bound.py \
 	tests/store/test_cleanup_logging.py \
 	tests/store/test_completion_decision_reads.py \
 	tests/store/test_control_record_archive.py \
+	tests/store/test_cov95_migration_postgres.py \
+	tests/store/test_cov95_runtime_postgres_contracts.py \
+	tests/store/test_cov95_runtime_postgres_control_records.py \
+	tests/store/test_cov95_runtime_postgres_migrations.py \
+	tests/store/test_cov95_runtime_postgres_orphan_audit.py \
+	tests/store/test_cov95_runtime_postgres_queue.py \
+	tests/store/test_cov95_runtime_postgres_spool_fencing.py \
+	tests/store/test_cov95_runtime_postgres_telemetry.py \
 	tests/store/test_duplicate_event_fast_path.py \
 	tests/store/test_evidence_pinned_to_incident.py \
 	tests/store/test_health_signal_notified_latch.py \
 	tests/store/test_incident_state_counts.py \
+	tests/store/test_job_recovery_history.py \
 	tests/store/test_lease_renewal_half_life.py \
 	tests/store/test_marker_retirement_history.py \
 	tests/store/test_merge_duplicate_event_contract.py \
 	tests/store/test_merge_executor_isolation.py \
 	tests/store/test_operator_event_recording.py \
 	tests/store/test_orphan_workflow_inspection.py \
+	tests/store/test_postgres_activation_inhibition.py \
 	tests/store/test_postgres_admission_vs_claim.py \
+	tests/store/test_postgres_claim_progress.py \
+	tests/store/test_postgres_claim_scope_indexes.py \
 	tests/store/test_postgres_claim_window.py \
+	tests/store/test_postgres_collector_status_concurrency.py \
 	tests/store/test_postgres_core_guards.py \
 	tests/store/test_postgres_dedicated_hot_state_startup.py \
 	tests/store/test_postgres_ensure_schema_locks.py \
 	tests/store/test_postgres_find_open_remote_command.py \
 	tests/store/test_postgres_health_signal_claim_isolation.py \
+	tests/store/test_postgres_health_signal_semantics.py \
 	tests/store/test_postgres_index_builder.py \
+	tests/store/test_postgres_incident_audit_contents.py \
+	tests/store/test_postgres_incident_audit_plans.py \
+	tests/store/test_postgres_incident_audit_scripts.py \
 	tests/store/test_postgres_lane_claim_guard.py \
 	tests/store/test_postgres_merge_vs_executor.py \
 	tests/store/test_postgres_notification_delivery_lock.py \
@@ -128,17 +181,29 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_processor_counters.py \
 	tests/store/test_postgres_processor_expired_leases.py \
 	tests/store/test_postgres_processor_legacy_paths.py \
+	tests/store/test_postgres_raw_evidence_refresh.py \
 	tests/store/test_postgres_reconnect.py \
+	tests/store/test_postgres_regional_protocol.py \
 	tests/store/test_postgres_remote_claim_cancellation.py \
 	tests/store/test_postgres_remote_command_lock_key.py \
+	tests/store/test_postgres_remote_runtime.py \
 	tests/store/test_postgres_remote_sweeper.py \
+	tests/store/test_postgres_retention_refresh.py \
 	tests/store/test_postgres_spool_notify_trigger.py \
+	tests/store/test_postgres_state_table_lock_order.py \
+	tests/store/test_postgres_state_tables.py \
+	tests/store/test_state_table_schema_safety.py \
+	tests/store/test_state_table_migration_safety.py \
 	tests/store/test_postgres_store.py \
 	tests/store/test_postgres_store_review_indexes.py \
 	tests/store/test_postgres_stuck_workflow_audit.py \
+	tests/store/test_postgres_terminal_quarantine.py \
 	tests/store/test_postgres_wakeup_triggers.py \
 	tests/store/test_postgres_workflow_indexes.py \
+	tests/store/test_postgres_workflow_audit_reads.py \
 	tests/store/test_postgres_workflow_lock_order.py \
+	tests/store/test_postgres_workflow_runtime.py \
+	tests/store/test_postgres_workflow_state_tables.py \
 	tests/store/test_preemption_pending_marker.py \
 	tests/store/test_processor_batch_completion_contract.py \
 	tests/store/test_processor_release_cas.py \
@@ -164,9 +229,11 @@ POSTGRES_TESTS = \
 # scripts/ci_coverage_config.pytest_targets(root, "postgres") by
 # tests/test_ci_unit_gate.py. Regenerate with
 #   .venv/bin/python -c 'from pathlib import Path; from scripts.ci_coverage_config import pytest_targets; print("\n".join(pytest_targets(Path("."), "postgres")))'
-COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
+COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(PROMQL_TESTS) tests/test_artifact_consistency.py $(POSTGRES_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check cfn-lint-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promtool-check grafana-dashboards grafana-dashboards-check
+.PHONY: test test-postgres test-postgres-stress test-postgres-parallel test-postgres-stress-parallel test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promql-test-files promtool-preflight promtool-check grafana-dashboards grafana-dashboards-check
+
+test test-shuffled test-parallel test-parallel-release: promtool-preflight
 
 test:
 	$(PYTHON) -m pytest
@@ -193,6 +260,30 @@ test-parallel:
 		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
 			--dist=$(PYTEST_XDIST_DIST) \
 			--durations=$(PYTEST_DURATIONS)
+
+.PHONY: collect004-check collector-recovery-check collector-platform-check
+
+# These focused layers never run a live acceptance command.
+collect004-check:
+	GPU_FAULT_TEST_POSTGRES_URL= $(PYTHON) -m pytest -q \
+		-n $(PYTEST_XDIST_WORKERS) --dist=$(PYTEST_XDIST_DIST) \
+		tests/regional/test_collector_inventory_sampling.py \
+		tests/regional/test_alignment_collector_inventory.py \
+		tests/regional/test_collector_inventory_reboot_runner.py \
+		tests/regional/test_cov95_collect_recovery_evidence.py
+
+collector-recovery-check:
+	GPU_FAULT_TEST_POSTGRES_URL= $(PYTHON) -m pytest -q \
+		-n $(PYTEST_XDIST_WORKERS) --dist=$(PYTEST_XDIST_DIST) \
+		tests/regional/test_collector_env_safety.py \
+		tests/regional/test_collector_filesystem_identity.py \
+		tests/regional/test_collector_reboot_response_integration.py \
+		tests/regional/test_collector_restore_transport.py \
+		tests/regional/test_collector_missing_response.py
+
+collector-platform-check:
+	GPU_FAULT_TEST_POSTGRES_URL= $(PYTHON) -m pytest -q -n 0 \
+		tests/regional/collector_platform_checks.py
 
 test-parallel-release:
 	GPU_FAULT_TEST_POSTGRES_URL= \
@@ -226,19 +317,23 @@ coverage:
 		-p tools.pytest_case_reporter \
 		$(COVERAGE_IGNORE_ARGS) \
 		--cov=src/gpu_fault --cov=src/gpu_fault_release --cov=deploy/control-plane/tools \
+		--cov=scripts/e2e/regional --cov=tools \
 		--cov-branch \
 		--cov-report= \
 		--durations=$(PYTEST_DURATIONS)
-	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
+	$(PYTHON) -m pytest -n 0 $(POSTGRES_TESTS) \
 		--cov=src/gpu_fault --cov=src/gpu_fault_release --cov=deploy/control-plane/tools \
+		--cov=scripts/e2e/regional --cov=tools \
 		--cov-branch \
 		--cov-append \
-		--cov-fail-under=$(COVERAGE_FLOOR) \
 		--cov-report=term-missing \
 		--cov-report=html \
 		--cov-report=json:$(COVERAGE_LOCAL_JSON) \
 		--durations=$(PYTEST_DURATIONS)
-	$(PYTHON) scripts/ci_coverage_gate.py module-floors \
+	$(PYTHON) -m coverage report \
+		--include='src/gpu_fault/*,src/gpu_fault_release/*,deploy/control-plane/tools/*' \
+		--fail-under=$(COVERAGE_FLOOR)
+	$(PYTHON) scripts/ci_coverage_gate.py floors \
 		--coverage-json "$(COVERAGE_LOCAL_JSON)"
 
 coverage-shard:
@@ -251,6 +346,8 @@ coverage-shard:
 		--workers "$(PYTEST_XDIST_WORKERS)" \
 		--dist "$(PYTEST_XDIST_DIST)" \
 		--durations "$(PYTEST_DURATIONS)" \
+		$(if $(COVERAGE_POSTGRES_CONTAINER),--postgres-container "$(COVERAGE_POSTGRES_CONTAINER)",) \
+		$(if $(COVERAGE_POSTGRES_IMAGE),--postgres-image "$(COVERAGE_POSTGRES_IMAGE)",) \
 		$(if $(filter true yes 1,$(COVERAGE_INCLUDE_STRESS)),--include-stress,)
 
 coverage-combine:
@@ -260,21 +357,29 @@ coverage-combine:
 		--output-root "$(COVERAGE_COMBINED_ROOT)" \
 		$(if $(GITHUB_RUN_ID),--require-run-id "$(GITHUB_RUN_ID)",)
 
-# One database per xdist worker (tests/conftest.py rewrites the URL on each
-# worker), so the Postgres shard runs as wide as the in-memory suite instead of
-# serially against a single truncated database.
+# External PostgreSQL tests share destructive fixtures and server-level guards.
+# Keep this entrypoint serial regardless of the ordinary-test worker budget.
 test-postgres:
 	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
 		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
 	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
-		-n $(PYTEST_XDIST_WORKERS) \
-		--dist=$(PYTEST_XDIST_DIST) \
+		-n 0 \
 		--durations=$(PYTEST_DURATIONS)
 
 test-postgres-stress:
 	GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS=8 \
 	GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS=40 \
-		$(MAKE) test-postgres PYTHON="$(PYTHON)"
+		$(MAKE) $(if $(filter 1,$(POSTGRES_TEST_PARALLEL)),test-postgres-parallel,test-postgres) PYTHON="$(PYTHON)"
+
+test-postgres-parallel:
+	$(PYTHON) scripts/run_postgres_shards.py \
+		--python "$(PYTHON)" \
+		--workers "$(POSTGRES_TEST_WORKERS)" \
+		--durations "$(PYTEST_DURATIONS)" \
+		--tests $(POSTGRES_TESTS)
+
+test-postgres-stress-parallel:
+	$(MAKE) test-postgres-stress POSTGRES_TEST_PARALLEL=1 PYTHON="$(PYTHON)"
 
 fault-test-cases:
 	$(PYTHON) tools/run_fault_test_cases.py \
@@ -352,7 +457,6 @@ check-static-sequential:
 	$(MAKE) deploy-check
 	$(MAKE) artifacts-safety-check
 	$(MAKE) yaml-check
-	$(MAKE) cfn-lint-check
 	$(MAKE) shell-check
 
 check:
@@ -483,32 +587,11 @@ release-preflight:
 	$(MAKE) artifact-check
 
 runtime-image-check:
-	@tmp_dir="$$(mktemp -d)"; trap 'rm -rf "$$tmp_dir"' EXIT; \
+	@set -eu; tmp_dir="$$(mktemp -d)"; trap 'rm -rf "$$tmp_dir"' EXIT; \
 		$(PYTHON) scripts/build-release-runtime-image.py \
 			--repository gpu-fault-runtime-local \
 			--output "$$tmp_dir/descriptor.json"; \
-		tag="$$(jq -r '.tag' "$$tmp_dir/descriptor.json")"; \
-		control_digest="$$(jq -r '.components.control_plane.module_digest' \
-			"$$tmp_dir/descriptor.json")"; \
-		executor_digest="$$(jq -r '.components.executor.module_digest' \
-			"$$tmp_dir/descriptor.json")"; \
-		docker run --rm "$$tag" /bin/sh -c \
-			'! python -c "import gpu_fault" >/dev/null 2>&1 && \
-			/opt/gpu-fault/control-plane/bin/python -c "import pydantic" && \
-			/opt/gpu-fault/executor/bin/python -c "import pydantic" && \
-			! test -e /opt/gpu-fault/control-plane/bin/gpu-fault-admin && \
-			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-api && \
-			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-store-migrate && \
-			test -x /opt/gpu-fault/executor/bin/gpu-fault-cluster-executor && \
-			test -x /opt/gpu-fault/executor/bin/gpu-fault-completion-watcher && \
-			test -x /opt/gpu-fault/executor/bin/gpu-fault-collector && \
-			test -x /opt/gpu-fault/executor/bin/gpu-fault-node-installer-reconciler'; \
-		test "$$control_digest" = "$$(docker run --rm "$$tag" \
-			/opt/gpu-fault/control-plane/bin/python -c \
-			'from gpu_fault import module_digest; print(module_digest())')"; \
-		test "$$executor_digest" = "$$(docker run --rm "$$tag" \
-			/opt/gpu-fault/executor/bin/python -c \
-			'from gpu_fault import module_digest; print(module_digest())')"
+		test -s "$$tmp_dir/descriptor.json"
 
 release-build:
 	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
@@ -706,8 +789,16 @@ deploy-host-setup:
 		--bundle "$(DEPLOY_HOST_ARCHIVE)" \
 		--signature-bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" $(if $(DEPLOY_HOST_COSIGN_KEY),--cosign-key "$(DEPLOY_HOST_COSIGN_KEY)",) $(if $(CERTIFICATE_IDENTITY),--certificate-identity "$(CERTIFICATE_IDENTITY)",) $(if $(CERTIFICATE_OIDC_ISSUER),--certificate-oidc-issuer "$(CERTIFICATE_OIDC_ISSUER)",)
 
+# Validate before either environment changes; Make joins both independent jobs.
 deploy-host-setup-online:
-	PYTHON=python3.12 scripts/setup-deploy-host.sh \
+	$(MAKE) ci-supply-chain-tools PYTHON="$(DEPLOY_HOST_BOOTSTRAP_PYTHON)" \
+		_SUPPLY_CHAIN_SETUP_VALIDATE_ONLY=1
+	$(MAKE) --jobs=2 _deploy-host-python-online ci-supply-chain-tools \
+		PYTHON="$(DEPLOY_HOST_BOOTSTRAP_PYTHON)" _SUPPLY_CHAIN_SETUP_VALIDATE_ONLY=0
+
+.PHONY: _deploy-host-python-online
+_deploy-host-python-online:
+	PYTHON="$(DEPLOY_HOST_BOOTSTRAP_PYTHON)" scripts/setup-deploy-host.sh \
 		--venv "$(DEPLOY_HOST_VENV)" \
 		--allow-network
 
@@ -738,45 +829,32 @@ shell-check:
 # Pinned supply-chain tools in a venv of their own (see the variables at the
 # top). CI and the release workflow run this before the checks below.
 ci-supply-chain-tools:
-	$(PYTHON) -m venv "$(SUPPLY_CHAIN_TOOLS_VENV)"
-	"$(SUPPLY_CHAIN_TOOLS_VENV)/bin/python" -m pip install --quiet --upgrade pip
-	"$(SUPPLY_CHAIN_TOOLS_VENV)/bin/python" -m pip install --quiet \
-		pip-audit==$(PIP_AUDIT_VERSION) \
-		cfn-lint==$(CFN_LINT_VERSION) \
-		cyclonedx-bom==$(CYCLONEDX_BOM_VERSION)
-	curl -sSfL --retry 3 -o "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" \
-		"https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/prometheus-$(PROMTOOL_VERSION).linux-amd64.tar.gz"
-	printf '%s  %s\n' "$(PROMTOOL_SHA256_LINUX_AMD64)" "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" | sha256sum -c -
-	tar -xzf "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" -C "$(SUPPLY_CHAIN_TOOLS_VENV)/bin" \
-		--strip-components=1 "prometheus-$(PROMTOOL_VERSION).linux-amd64/promtool"
+	env -u COSIGN_PASSWORD "$(PYTHON)" scripts/setup_supply_chain_tools.py \
+		--python "$(PYTHON)" --venv "$(SUPPLY_CHAIN_TOOLS_VENV)" \
+		--host-venv "$(DEPLOY_HOST_VENV)" --tools-python "$(SUPPLY_CHAIN_PYTHON)" \
+		--pip-audit-version "$(PIP_AUDIT_VERSION)" \
+		--cyclonedx-bom-version "$(CYCLONEDX_BOM_VERSION)" \
+		--promtool "$(PROMTOOL)" --promtool-version "$(PROMTOOL_VERSION)" \
+		--promtool-sha256 "$(PROMTOOL_SHA256_LINUX_AMD64)" \
+		$(if $(filter 1,$(_SUPPLY_CHAIN_SETUP_VALIDATE_ONLY)),--validate-only,)
+
+# Selection metadata only; reading it must not require an installed promtool.
+promql-test-files:
+	@env -u COSIGN_PASSWORD $(PYTHON) -c \
+		'import json, sys; print(json.dumps(sys.argv[1:]))' $(PROMQL_TESTS)
+
+# Tool-only: no downloads, rule checks, test collection or receipt generation.
+promtool-preflight:
+	@env -u COSIGN_PASSWORD $(PYTHON) scripts/check-alert-rules.py \
+		--promtool "$(PROMTOOL)" --version "$(PROMTOOL_VERSION)" --tool-only
 
 # verify-regional-alerting.py proves runbooks, annotations and aggregation;
-# promtool proves the PromQL itself parses and type-checks. The Kubernetes
-# PrometheusRule envelope is unwrapped by the script before promtool sees it.
+# promtool checks syntax and evaluates the behavioral fixtures. These tests are
+# static-owned: coverage shards never claim results from an unbound native tool.
 promtool-check:
-	@if [ -x "$(SUPPLY_CHAIN_BIN)promtool" ]; then \
-		$(PYTHON) scripts/check-alert-rules.py \
-			--promtool "$(SUPPLY_CHAIN_BIN)promtool" --version "$(PROMTOOL_VERSION)"; \
-	elif [ -n "$(CI)" ]; then \
-		printf 'promtool is required in CI: run make ci-supply-chain-tools\n' >&2; \
-		exit 2; \
-	else \
-		printf 'promtool is not installed; PromQL check skipped, CI runs promtool %s\n' \
-			"$(PROMTOOL_VERSION)"; \
-	fi
-
-# yamllint proves the Lambda templates are YAML; cfn-lint proves they are
-# CloudFormation (resource schemas, intrinsic functions, property types).
-cfn-lint-check:
-	@if [ -x "$(SUPPLY_CHAIN_BIN)cfn-lint" ]; then \
-		"$(SUPPLY_CHAIN_BIN)cfn-lint" $(CFN_TEMPLATES); \
-	elif [ -n "$(CI)" ]; then \
-		printf 'cfn-lint is required in CI: run make ci-supply-chain-tools\n' >&2; \
-		exit 2; \
-	else \
-		printf 'cfn-lint is not installed; CloudFormation lint skipped, CI runs cfn-lint==%s\n' \
-			"$(CFN_LINT_VERSION)"; \
-	fi
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/check-alert-rules.py \
+		--promtool "$(PROMTOOL)" --version "$(PROMTOOL_VERSION)" \
+		--pytest-files $(PROMQL_TESTS)
 
 # Known-vulnerability audit of every shipped lock, hash-pinned so the audited
 # set is exactly what installs. Accepted findings live in

@@ -230,21 +230,28 @@ deleted = {}
 with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
+        "SELECT key FROM gpu_fault_control_records WHERE kind='remote_command' "
+        "AND payload->>'workflow_request_id'=%s "
+        "AND payload->>'incident_id'=%s AND payload->>'cluster_id'=%s",
+        (workflow_id, incident_id, "perf-cap-000"),
+    )
+    command_ids = [row[0] for row in cursor.fetchall()]
+    cursor.execute(
         "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' AND key=%s AND value=%s",
         (event_id, incident_id),
     )
     deleted[f"incident_by_event/{event_id}"] = cursor.rowcount
     for command_id in command_ids:
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind='remote_command' AND key=%s",
+            "SELECT gpu_fault_delete_control_state('remote_command',%s)",
             (command_id,),
         )
-        deleted[f"remote_command/{command_id}"] = cursor.rowcount
+        deleted[f"remote_command/{command_id}"] = int(cursor.fetchone()[0])
     for kind, key in (("workflow", workflow_id), ("incident", incident_id)):
-        cursor.execute("DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s", (kind, key))
-        deleted[f"{kind}/{key}"] = cursor.rowcount
+        cursor.execute("SELECT gpu_fault_delete_control_state(%s,%s)", (kind, key))
+        deleted[f"{kind}/{key}"] = int(cursor.fetchone()[0])
     cursor.execute(
-        "SELECT count(*) FROM gpu_fault_objects WHERE kind='remote_command' "
+        "SELECT count(*) FROM gpu_fault_control_records WHERE kind='remote_command' "
         "AND payload->>'workflow_request_id'=%s",
         (workflow_id,),
     )
@@ -323,9 +330,11 @@ def _run_case(
         raise seeded.SeededCommandError("approved maintenance window has ended")
     seeded.require_environment()
     seeded.preflight_residuals(probe, case_dir)
+    state["registry_started"] = True
     seeded.register_synthetic_cluster(case_dir, run_id)
     stages: dict[str, list[str]] = {}
 
+    state["seed"] = seeded.seed_identity(run_id)
     dispatch = seeded.cpu_python(
         _DISPATCH_AND_HOLD,
         run_id,
@@ -336,6 +345,7 @@ def _run_case(
         str(verdicts.SEED_LEASE_SECONDS),
     )
     state["seed"] = dispatch
+    state["command_ids"] = list(dispatch.get("all_command_ids") or [])
     seeded.write_json(case_dir / "dispatch.json", dispatch)
     stages["dispatch"] = verdicts.dispatch_errors(dispatch)
     first_id = str((dispatch.get("first") or {}).get("remote_command_id") or "")
@@ -344,7 +354,8 @@ def _run_case(
             "dispatch contract: " + "; ".join(stages["dispatch"])
         )
 
-    ready = seeded.create_probe_pod(probe, case_dir)
+    state["probe_started"] = True
+    ready = seeded.create_probe_pod(probe, case_dir, run_id=run_id)
     completed = seeded.wait_command(
         first_id,
         lambda item: item.get("status") in {"SUCCEEDED", "FAILED"},
@@ -365,7 +376,13 @@ def _run_case(
     )
     # Stop the only claimant before minting anything else: B must never be
     # claimed, its purpose is to show the hold lifted.
-    seeded.dataplane("delete", "pod", probe.pod, "--ignore-not-found", check=False)
+    seeded.delete_owned_resource(
+        "pod",
+        probe.pod,
+        run_id,
+        require_uid=True,
+        expected_uid=seeded.probe_resource_uid(case_dir, "pod", probe.pod, run_id),
+    )
     release = seeded.cpu_python(
         _RELEASE_AND_CANCEL,
         str(dispatch["workflow_id"]),
@@ -426,7 +443,7 @@ def _control_plane_metrics() -> list[str]:
                 "-i",
                 pod,
                 "--",
-                "python3",
+                seeded.component_python("cpu"),
                 "-",
                 stdin=script.encode(),
                 timeout=120,
@@ -437,10 +454,12 @@ def _control_plane_metrics() -> list[str]:
     return texts
 
 
-def _purge(state: dict[str, Any], result: dict[str, Any], case_dir: Path) -> None:
+def _purge(
+    state: dict[str, Any], result: dict[str, Any], case_dir: Path
+) -> dict[str, Any]:
     seed = state.get("seed") or {}
     if not seed:
-        return
+        return {}
     try:
         purged = seeded.cpu_python(
             _PURGE,
@@ -451,11 +470,13 @@ def _purge(state: dict[str, Any], result: dict[str, Any], case_dir: Path) -> Non
         )
         seeded.write_json(case_dir / "seed-cleanup.json", purged)
         result["seed_cleanup"] = purged
-        if purged.get("remaining_commands"):
+        if purged.get("remaining_commands") != 0:
             raise seeded.SeededCommandError(f"commands remain after purge: {purged}")
+        return purged
     except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded
         result["cleanup_error"] = f"seed cleanup: {type(exc).__name__}: {exc}"
         result["verdict"] = "FAIL"
+        raise
 
 
 def run_case(run_dir: Path, attempt: int, maintenance_window_end: datetime) -> int:
@@ -472,13 +493,26 @@ def run_case(run_dir: Path, attempt: int, maintenance_window_end: datetime) -> i
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _purge(state, result, case_dir)
-        # The shared cleanup purges nothing of ours (seed={}) but tears down the
-        # Pod, ConfigMap and registry entry and runs the three postflights.
-        seeded.cleanup(probe, case_dir, run_id, result, {})
+        seeded.cleanup(
+            probe,
+            case_dir,
+            run_id,
+            result,
+            state["seed"],
+            state=state,
+            purge=lambda seed: _purge(state, result, case_dir),
+        )
     seeded.write_json(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
+
+
+from scripts.e2e.regional.live_driver_guard import environment_snapshot  # noqa: E402
+from scripts.e2e.regional.plain_case_identity import (  # noqa: E402
+    add_plain_identity_arguments,
+    configure_plain_case,
+    plain_case_preflight,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -489,6 +523,7 @@ def parser() -> argparse.ArgumentParser:
         )
     )
     add_live_arguments(value, confirmation=CONFIRMATION)
+    add_plain_identity_arguments(value)
     return value
 
 
@@ -498,6 +533,12 @@ CASE = PlainCaseRunner(
     parser=parser,
     plan_details=plan_details,
     run_case=run_case,
+    configure=configure_plain_case,
+    read_only_preflight=lambda settings, case_dir: plain_case_preflight(
+        settings,
+        case_dir,
+        read_environment=environment_snapshot,
+    ),
 )
 
 

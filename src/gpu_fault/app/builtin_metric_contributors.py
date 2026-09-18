@@ -4,6 +4,10 @@ from collections import Counter, defaultdict
 from collections.abc import Container, Sequence
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.app.closed_loop_metrics import (
+    MILESTONE_OPERATIONS,
+    closed_loop_window_metric_lines,
+)
 from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.collector_requirements import agent_is_current
@@ -14,7 +18,6 @@ from gpu_fault.models import (
     IncidentState,
     NotificationDeliveryStatus,
     NotificationStatus,
-    WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
@@ -478,7 +481,10 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         ]
     )
     for job, count in sorted(snapshot.get("periodic_job_errors_total", {}).items()):
-        lines.append(f'gpu_fault_periodic_job_errors_total{{job="{job}"}} {count}')
+        lines.append(
+            "gpu_fault_periodic_job_errors_total"
+            f'{{periodic_job="{_escape_label(job)}"}} {count}'
+        )
     lines.extend(_periodic_liveness_lines(snapshot))
     for name, help_text in (
         (
@@ -502,7 +508,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         )
         for job, count in sorted(snapshot.get(name, {}).items()):
             lines.append(
-                f'gpu_fault_periodic_{name}{{job="{_escape_label(job)}"}} {count}'
+                f'gpu_fault_periodic_{name}{{periodic_job="{_escape_label(job)}"}} {count}'
             )
     return lines
 
@@ -586,6 +592,10 @@ def _notification_dispatch_lines(service: object) -> list[str]:
         "# TYPE gpu_fault_notification_delivery_error_last_seen_timestamp_seconds gauge",
         "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds "
         f"{read('delivery_error_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds Unix time of this process's newest recorded terminal FAILED notification, inline or outbox; retries and re-reading an old DEAD row do not refresh it.",
+        "# TYPE gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds gauge",
+        "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds "
+        f"{read('terminal_failure_last_seen_timestamp_seconds', 0.0):.3f}",
     ]
 
 
@@ -699,7 +709,7 @@ def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
             if isinstance(value, (int, float)):
                 lines.append(
                     "gpu_fault_periodic_job_last_run_timestamp_seconds"
-                    f'{{job="{_escape_label(str(job))}"}} {value:.3f}'
+                    f'{{periodic_job="{_escape_label(str(job))}"}} {value:.3f}'
                 )
     lease_error = snapshot.get("lease_error_last_seen_timestamp_seconds", 0.0)
     lines.extend(
@@ -718,7 +728,7 @@ def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
             if isinstance(value, (int, float)):
                 lines.append(
                     "gpu_fault_periodic_job_error_last_seen_timestamp_seconds"
-                    f'{{job="{_escape_label(str(job))}"}} {value:.3f}'
+                    f'{{periodic_job="{_escape_label(str(job))}"}} {value:.3f}'
                 )
     return lines
 
@@ -732,6 +742,10 @@ def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
         value = snapshot.get(name, 0)
         return value if isinstance(value, int) else 0
 
+    def number(name: str, default: float) -> float:
+        value = snapshot.get(name, default)
+        return float(value) if isinstance(value, (int, float)) else float("nan")
+
     return [
         "# HELP gpu_fault_processor_expired_leases_reclaimed_total LEASED processor requests whose lease had lapsed and were handed back to PENDING by the periodic reclaim (F-D5).",
         "# TYPE gpu_fault_processor_expired_leases_reclaimed_total counter",
@@ -742,6 +756,14 @@ def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
         "# HELP gpu_fault_processor_counter_mismatched_clusters Clusters whose processor counter disagrees with their queue rows, as of the last drift scan (F-D10).",
         "# TYPE gpu_fault_processor_counter_mismatched_clusters gauge",
         f"gpu_fault_processor_counter_mismatched_clusters {read('processor_counter_mismatched_clusters')}",
+        "# HELP gpu_fault_processor_counter_drift_scan_timestamp_seconds Unix time of this process's last successful counter drift scan, not its last metric publication; 0 before a successful scan.",
+        "# TYPE gpu_fault_processor_counter_drift_scan_timestamp_seconds gauge",
+        "gpu_fault_processor_counter_drift_scan_timestamp_seconds "
+        f"{number('processor_counter_drift_scan_timestamp_seconds', 0.0):.6f}",
+        "# HELP gpu_fault_processor_counter_drift_scan_max_age_seconds Maximum age of this process's counter drift measurement: three scan intervals, with a 120 second minimum.",
+        "# TYPE gpu_fault_processor_counter_drift_scan_max_age_seconds gauge",
+        "gpu_fault_processor_counter_drift_scan_max_age_seconds "
+        f"{number('processor_counter_drift_scan_max_age_seconds', 120.0):.6f}",
     ]
 
 
@@ -1155,7 +1177,8 @@ def _orphan_inspection_counts(
 
 def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     store = runtime.context.store
-    scan = metric_scan_cache(runtime).workflows()
+    cache = metric_scan_cache(runtime)
+    scan = cache.workflows()
     workflows = scan.workflows
     # The status gauge is a server-side aggregate, so it stays exact even when
     # the detail scan below only covers the newest slice of the table.
@@ -1166,7 +1189,6 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     # the status gauge counts every workflow ever persisted, so its BLOCKED
     # bucket never falls just because the node came back.
     blocked_unreconciled = store.blocked_workflows_without_verified_restore()
-    cache = metric_scan_cache(runtime)
     orphan_workflows, dangling_incident_pointers = _orphan_inspection_counts(
         runtime, cache
     )
@@ -1190,15 +1212,6 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         WorkflowStatus.RUNNING,
         WorkflowStatus.SAFETY_PENDING,
     }
-    milestone_operations = {
-        WorkflowOperation.MARK_UNSCHEDULABLE: "containment",
-        WorkflowOperation.QUARANTINE: "containment",
-        WorkflowOperation.VALIDATE_GPU: "validation",
-        WorkflowOperation.VALIDATE_HOST: "validation",
-        WorkflowOperation.VALIDATE_FABRIC: "validation",
-        WorkflowOperation.RESTORE_SCHEDULING: "readmission",
-        WorkflowOperation.RESTART_WORKLOAD: "workload_restart",
-    }
     for workflow in workflows:
         if workflow.status in terminal:
             terminal_durations[workflow.status.value].append(
@@ -1212,7 +1225,7 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
                     execution.status.value,
                 )
             ] += 1
-            milestone = milestone_operations.get(execution.operation)
+            milestone = MILESTONE_OPERATIONS.get(execution.operation)
             if milestone is None or milestone in seen_milestones:
                 continue
             if execution.status.value != "SUCCEEDED":
@@ -1323,7 +1336,9 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         )
     lines.extend(
         [
-            "# HELP gpu_fault_closed_loop_milestone_seconds Time from workflow creation to a successful closed-loop milestone.",
+            "# HELP gpu_fault_closed_loop_milestone_seconds Legacy retained-scan "
+            "snapshot of workflow creation-to-milestone durations; not monotonic, "
+            "so do not use rate, increase or delta for an event mean.",
             "# TYPE gpu_fault_closed_loop_milestone_seconds summary",
         ]
     )
@@ -1334,6 +1349,12 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             values,
             milestone=milestone,
         )
+    archiver = runtime.context.control_record_archiver
+    lines.extend(
+        closed_loop_window_metric_lines(
+            scan, retention=None if archiver is None else archiver.retention
+        )
+    )
     lines.extend(
         _remediation_budget_lines(
             active_by_scope_type=budget_scope_types,
@@ -1388,27 +1409,20 @@ def _notification_lines(store: ControlPlaneStore, cache: MetricScanCache) -> lis
             f'gpu_fault_notification_total{{status="{status_value.value}"}} '
             f"{statuses[status_value.value]}"
         )
-    pending = sum(
-        statuses[status]
-        for status in {
-            NotificationStatus.QUEUED.value,
-            NotificationStatus.FAILED.value,
-        }
+    delivery = cache.shared(
+        "notification_delivery_stats", store.notification_delivery_stats
     )
     lines.extend(
         [
             "# HELP gpu_fault_notification_outbox_depth Notifications without a terminal delivery result.",
             "# TYPE gpu_fault_notification_outbox_depth gauge",
-            f"gpu_fault_notification_outbox_depth {pending}",
+            f"gpu_fault_notification_outbox_depth {delivery['pending']}",
         ]
     )
     # ARCH-E E1: the outbox state machine itself. ``gpu_fault_notification_total``
     # reads the result rows, which are terminal verdicts; a notification being
     # retried has none, so the queue the dispatcher is actually working was
     # invisible and its age unmeasured.
-    delivery = cache.shared(
-        "notification_delivery_stats", store.notification_delivery_stats
-    )
     lines.extend(
         [
             "# HELP gpu_fault_notification_delivery_total Notification outbox rows by delivery state as the outbox treats them: a row whose result is already SENT counts as SENT, a SKIPPED verdict on an undelivered row counts as DEAD (ARCH-E E1).",

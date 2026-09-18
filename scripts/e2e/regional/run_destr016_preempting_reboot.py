@@ -152,7 +152,7 @@ from gpu_fault.app import ApplicationContext
 request_id = sys.argv[1]
 store = ApplicationContext.from_environment().store
 commands = [
-    item.model_dump(mode="json")
+    item.model_dump(mode="json", exclude={"lease_token"})
     for item in store.list_remote_commands()
     if item.workflow_request_id == request_id
 ]
@@ -338,14 +338,23 @@ def markers(base: str) -> dict[str, str]:
 
 
 def target_bdf(explicit: str, inventory: list[dict[str, Any]]) -> str:
-    if explicit:
-        return explicit
     if not inventory:
         raise RegionalFixtureError("the host probe found no GPU inventory")
+    if explicit:
+        matches = [
+            item
+            for item in inventory
+            if str(item.get("pci_bdf") or "").lower() == explicit.lower()
+        ]
+        if len(matches) != 1:
+            raise RegionalFixtureError("the target BDF is not unique in GPU inventory")
+        return str(matches[0]["pci_bdf"])
     return str(inventory[0]["pci_bdf"])
 
 
-def holder_device(explicit: str, inventory: list[dict[str, Any]]) -> str:
+def holder_device(
+    explicit: str, inventory: list[dict[str, Any]], *, pci_bdf: str = ""
+) -> str:
     """The ``/dev/nvidiaN`` node the holder opens.
 
     Derived from the inventory index of the faulted GPU when not given, so the
@@ -353,12 +362,33 @@ def holder_device(explicit: str, inventory: list[dict[str, Any]]) -> str:
     than of an arbitrary device on the node.
     """
 
-    if explicit:
-        return explicit
     if not inventory:
         raise RegionalFixtureError("the host probe found no GPU inventory")
-    index = inventory[0].get("index")
-    return f"/dev/nvidia{int(index) if index is not None else 0}"
+    matches = [
+        item
+        for item in inventory
+        if not pci_bdf or str(item.get("pci_bdf") or "").lower() == pci_bdf.lower()
+    ]
+    if not matches or (pci_bdf and len(matches) != 1):
+        raise RegionalFixtureError("the holder BDF is not unique in GPU inventory")
+    selected = matches[0]
+    if explicit and not pci_bdf:
+        matches = [
+            item
+            for item in inventory
+            if item.get("index") is not None
+            and f"/dev/nvidia{int(item['index'])}" == explicit
+        ]
+        if len(matches) != 1:
+            raise RegionalFixtureError("the holder device is not in GPU inventory")
+        selected = matches[0]
+    index = selected.get("index")
+    if index is None:
+        raise RegionalFixtureError("the target GPU has no device index")
+    device = f"/dev/nvidia{int(index)}"
+    if explicit and explicit != device:
+        raise RegionalFixtureError("the holder device does not match the faulted GPU")
+    return device
 
 
 # --------------------------------------------------------------------------- #
@@ -612,9 +642,11 @@ def _probe(
     script: Path,
     case_id: str,
     run_id: str,
+    case_dir: Path,
 ) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -685,13 +717,18 @@ def _prepare_live_run(
         warm=WarmSpareLiveFixture(regional, settings.hyperpod_cluster),
         run_id=run_id,
         holder_probe=_probe(
-            settings, script=HOLDER_PROBE, case_id=CASE_ID, run_id=run_id
+            settings,
+            script=HOLDER_PROBE,
+            case_id=CASE_ID,
+            run_id=run_id,
+            case_dir=case_dir,
         ),
         inject_probe=_probe(
             settings,
             script=INJECT_PROBE,
             case_id=f"{CASE_ID}-inject",
             run_id=f"{run_id}-x",
+            case_dir=case_dir,
         ),
     )
 
@@ -734,7 +771,9 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
     if baseline.get("quiesce_states"):
         raise RegionalFixtureError("the node has a pre-existing GPU quiesce state")
     run.bdf = target_bdf(settings.pci_bdf, baseline.get("gpu_inventory") or [])
-    run.device = holder_device(settings.device, baseline.get("gpu_inventory") or [])
+    run.device = holder_device(
+        settings.device, baseline.get("gpu_inventory") or [], pci_bdf=run.bdf
+    )
     window = window_errors(
         now=datetime.now(timezone.utc),
         maintenance_window_end=run.maintenance_window_end,
@@ -742,6 +781,7 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
     if window:
         raise RegionalFixtureError("; ".join(window))
     run.marker = markers(f"destr016-{int(time.time())}-a{run.attempt}")
+    run.holder_armed = True
     armed = run.holder_probe.execute(
         "arm-holder",
         "--device",
@@ -752,6 +792,8 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
         "QUIESCE_GPU_SERVICES",
         "--max-hold-seconds",
         str(settings.max_hold_seconds),
+        "--maintenance-window-end",
+        run.maintenance_window_end.isoformat(),
         "--run-id",
         run_id,
         "--probe-script",
@@ -773,7 +815,6 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
         "--escalate-after-seconds",
         str(ESCALATE_DELAY_SECONDS),
     )
-    run.holder_armed = True
     write_json_atomic(case_dir / "holder-armed.json", armed)
     run.started_at = datetime.now(timezone.utc)
     injection = run.inject_probe.execute(
@@ -809,12 +850,17 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
             # command; the first WAITING record is just a pointer to a PENDING
             # node action, so keep polling until the reason is on record.
             errors = waiting_boundary_errors(workflow) + barrier_reason_errors(
-                last.get("commands") or []
+                last.get("commands") or [], workflow
             )
             if not errors:
                 write_json_atomic(run.case_dir / "barrier-state.json", last)
                 return last
-            if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED"}:
+            if workflow.get("status") in {
+                "SUCCEEDED",
+                "FAILED",
+                "BLOCKED",
+                "SUPERSEDED",
+            }:
                 break
         time.sleep(5)
     write_json_atomic(run.case_dir / "barrier-state.json", last)
@@ -833,8 +879,7 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
 def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     """Phase A: a second same-rank XID 46 must merge into the parked workflow."""
 
-    # The write itself was scheduled on the node by arm-holder; kubelet is
-    # stopped behind the quiesce, so the only way to see it land is the store.
+    _authorize_injection(run, barrier, "absorb")
     deadline = time.monotonic() + ABSORB_BUDGET_SECONDS
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -867,7 +912,12 @@ def _escalate(
     case_dir = run.case_dir
     run.predecessor_id = str((barrier.get("workflow") or {}).get("request_id") or "")
     run.incident_id = str((barrier.get("incident") or {}).get("incident_id") or "")
-    # Scheduled on the node by arm-holder (see ESCALATE_DELAY_SECONDS).
+    current = _wait_for_barrier(run)
+    if (current.get("workflow") or {}).get("request_id") != run.predecessor_id:
+        raise RegionalFixtureError(
+            "reset workflow changed before escalation authorization"
+        )
+    _authorize_injection(run, current, "escalate")
     successor: dict[str, Any] = {}
     deadline = time.monotonic() + PREEMPTION_BUDGET_SECONDS
     while time.monotonic() < deadline:
@@ -912,9 +962,37 @@ def _escalate(
     errors.extend(successor_step_graph_errors(adopted))
     errors.extend(superseded_predecessor_errors(predecessor))
     errors.extend(
-        cancelled_command_errors(commands, successor_request_id=run.successor_id)
+        cancelled_command_errors(
+            commands, successor_request_id=run.successor_id, workflow=predecessor
+        )
     )
     return errors, adopted
+
+
+def _authorize_injection(run: _LiveRun, state: dict[str, Any], phase: str) -> None:
+    from scripts.e2e.regional.destr_barrier_authorization import barrier_authorization
+
+    proof = barrier_authorization(
+        state,
+        run_id=run.run_id,
+        node=run.settings.node,
+        boot_id=str(run.baseline.get("boot_id") or ""),
+        device=run.device,
+        drill_id=f"{run.run_id}-r",
+        maintenance_window_end=run.maintenance_window_end,
+    )
+    # If quiesce makes this transport unavailable, fail closed. A relative
+    # timer armed before the barrier is not a substitute for authorization.
+    report = run.holder_probe.execute(
+        "authorize-injection",
+        "--run-id",
+        run.run_id,
+        "--phase",
+        phase,
+        "--authorization",
+        json.dumps(proof, sort_keys=True),
+    )
+    write_json_atomic(run.case_dir / f"authorization-{phase}.json", report)
 
 
 def _wait_for(
@@ -1048,15 +1126,26 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
         barrier = _arm_and_park(run)
         errors = reset_workflow_errors(
             barrier.get("workflow") or {},
             barrier.get("incident") or {},
             barrier.get("decision") or {},
         )
-        errors.extend(barrier_reason_errors(barrier.get("commands") or []))
+        errors.extend(
+            barrier_reason_errors(
+                barrier.get("commands") or [], barrier.get("workflow") or {}
+            )
+        )
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
+        run.incident_id = str((barrier.get("incident") or {}).get("incident_id") or "")
         absorb, absorbed = _absorb(run, barrier)
         errors.extend(absorb)
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
         escalation, adopted = _escalate(run, absorbed if absorbed else barrier)
         errors.extend(escalation)
         node_after_boot = run.regional.wait_node_ready(

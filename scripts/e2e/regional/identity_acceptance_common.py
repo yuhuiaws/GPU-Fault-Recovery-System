@@ -18,11 +18,17 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import load_site  # noqa: E402
-from gpu_fault.regional import cluster_token_sha256  # noqa: E402
+from gpu_fault.regional import RegionalClusterRegistration, cluster_token_sha256  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandFailed,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
 )
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 EXECUTOR_APP = "gpu-fault-cluster-executor"
 CPU_APPS = ("gpu-fault-api-ha", "gpu-fault-control-worker")
@@ -179,23 +185,14 @@ def run(
     cwd: Path = ROOT,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    return run_fixture_command(
         command,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        input_text=input_text,
+        check=check,
         timeout=timeout,
         cwd=cwd,
         env=env,
     )
-    if check and completed.returncode:
-        raise IdentityAcceptanceError(
-            f"command failed ({completed.returncode}): {' '.join(command[:5])}; "
-            f"stderr={completed.stderr[-1000:]}"
-        )
-    return completed
 
 
 @dataclass(frozen=True)
@@ -248,6 +245,7 @@ class IdentitySite:
         # to be measured instead, and it reads a head that is already applied:
         # one status call, ~1 s, whatever the propagation actually took.
         self.last_registry_ready_seconds: float | None = None
+        self.last_registry_payload: list[dict[str, Any]] | None = None
 
     def target(self, cluster_id: str) -> ClusterTarget:
         if not cluster_id:
@@ -294,39 +292,13 @@ class IdentitySite:
                 "json",
             )
         )
-        result = []
-        for item in value.get("items", []):
-            conditions = item.get("status", {}).get("conditions", [])
-            if item.get("status", {}).get("phase") != "Running":
-                continue
-            if not any(
-                condition.get("type") == "Ready" and condition.get("status") == "True"
-                for condition in conditions
-            ):
-                continue
-            result.append(str(item["metadata"]["name"]))
-        return sorted(result)
+        return [str(item["name"]) for item in ready_pod_records(value)]
 
     def any_executor_pod(self, target: ClusterTarget) -> str:
-        value = json.loads(
-            self.gpu(
-                target,
-                "get",
-                "pod",
-                "-l",
-                f"app={EXECUTOR_APP}",
-                "-o",
-                "json",
-            )
-        )
-        names = sorted(
-            str(item["metadata"]["name"])
-            for item in value.get("items", [])
-            if item.get("status", {}).get("phase") == "Running"
-        )
+        names = self.ready_pods("gpu", EXECUTOR_APP, target)
         if not names:
             raise IdentityAcceptanceError(
-                f"no Running executor Pod for {target.cluster_id}"
+                f"no Ready executor Pod for {target.cluster_id}"
             )
         return names[0]
 
@@ -345,7 +317,7 @@ class IdentitySite:
             "-i",
             pod,
             "--",
-            "python3",
+            component_python(plane),
             "-",
             *arguments,
             input_text=script,
@@ -387,8 +359,10 @@ class IdentitySite:
         target = next(iter(self.targets.values()))
         try:
             return self.pod_json("cpu", target, self._api_pod(), script, *arguments)
-        except Exception:
+        except Exception as exc:
             self._api_pod_name = None
+            if not (isinstance(exc, RegionalCommandFailed) and exc.replica_disappeared):
+                raise
             return self.pod_json("cpu", target, self._api_pod(), script, *arguments)
 
     def registry_api(
@@ -460,16 +434,31 @@ class IdentitySite:
         entries: list[dict[str, Any]],
         *,
         reason: str = "regional acceptance registry change",
+        expected_entries: list[dict[str, Any]] | None = None,
     ) -> None:
         generation = self.registry_generation()
+        if expected_entries is not None:
+            if generation is None:
+                raise IdentityAcceptanceError(
+                    "acceptance mutations require a durable registry"
+                )
+            snapshot = self.api_pod_json(REGISTRY_REVISION_PROBE)
+            if snapshot.get("generation") != generation or registry_content(
+                snapshot.get("registrations") or []
+            ) != registry_content(expected_entries):
+                raise IdentityAcceptanceError(
+                    "registry changed outside this acceptance window"
+                )
         if generation is not None:
+            payload = durable_registry_payload(entries)
+            self.last_registry_payload = payload
             posted = time.monotonic()
             response = self.registry_api(
                 "POST",
                 f"{REGISTRY_API_PREFIX}/revisions",
                 {
                     "expected_generation": generation,
-                    "registrations": durable_registry_payload(entries),
+                    "registrations": payload,
                     "reason": reason,
                 },
             )
@@ -493,6 +482,23 @@ class IdentitySite:
             "--patch-file=/dev/stdin",
             input_text=json.dumps(patch, separators=(",", ":")),
         )
+
+    def restore_registry(
+        self,
+        original: list[dict[str, Any]],
+        *,
+        reason: str = "acceptance registry restore",
+    ) -> None:
+        current = self.registry()
+        if registry_content(current) == registry_content(original):
+            return
+        if self.last_registry_payload is None or (
+            registry_content(current) != registry_content(self.last_registry_payload)
+        ):
+            raise IdentityAcceptanceError(
+                "registry restoration refused concurrent drift"
+            )
+        self.write_registry(original, reason=reason, expected_entries=current)
 
     def rollout_control(self) -> float:
         """Make a registry change effective on the control plane.
@@ -521,6 +527,7 @@ class IdentitySite:
 
 
 CLAIM_PROBE = r"""
+import errno
 import json
 import os
 import ssl
@@ -528,10 +535,15 @@ import time
 import urllib.error
 import urllib.request
 
+from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
+
 payload = {
     "executor_id": "regional-identity-acceptance",
     "executor_protocol_version": int(
-        os.getenv("GPU_FAULT_EXECUTOR_PROTOCOL_VERSION", "2")
+        os.getenv(
+            "GPU_FAULT_EXECUTOR_PROTOCOL_VERSION",
+            str(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
+        )
     ),
     "executor_artifact_sha256": os.environ[
         "GPU_FAULT_EXECUTOR_ARTIFACT_SHA256"
@@ -573,11 +585,18 @@ except urllib.error.HTTPError as exc:
         "detail": exc.read().decode()[:500],
     }))
 except Exception as exc:
-    # URLError, socket timeout, TLS failure: a transport-level outcome, which
-    # is exactly what ISO-006 has to observe from the blocked cluster.
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    network_failure = (
+        isinstance(reason, (TimeoutError, ConnectionRefusedError, ConnectionResetError))
+        or isinstance(reason, OSError)
+        and reason.errno in {
+            errno.ECONNREFUSED, errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH
+        }
+    )
     print(json.dumps({
         "status": None,
         "transport_error": type(exc).__name__,
+        "transport_failure_kind": "network" if network_failure else "unclassified",
         "latency_seconds": time.monotonic() - started,
     }))
 """.replace("__PROBE_OWNER__", ACCEPTANCE_PROBE_OWNER)
@@ -603,6 +622,25 @@ def secret_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def secret_document(
+    site: IdentitySite,
+    plane: str,
+    target: ClusterTarget,
+    name: str,
+) -> dict[str, Any]:
+    value = json.loads(
+        site.regional(target).kubectl(
+            plane,
+            "get",
+            "secret",
+            name,
+            "-o",
+            "json",
+        )
+    )
+    return cast(dict[str, Any], value)
+
+
 def read_cluster_token(site: IdentitySite, target: ClusterTarget) -> str:
     value = json.loads(
         site.gpu(
@@ -621,20 +659,57 @@ def write_cluster_token(
     site: IdentitySite,
     target: ClusterTarget,
     token: str,
+    *,
+    expected_token: str,
+    expected_uid: str,
 ) -> None:
-    patch = {
-        "stringData": {
-            "cluster-token": token,
+    current = json.loads(
+        site.gpu(target, "get", "secret", CONNECTION_SECRET, "-o", "json")
+    )
+    metadata = current.get("metadata") or {}
+    encoded = (current.get("data") or {}).get("cluster-token")
+    if (
+        not expected_uid
+        or metadata.get("uid") != expected_uid
+        or not metadata.get("resourceVersion")
+        or not isinstance(encoded, str)
+        or base64.b64decode(encoded, validate=True).decode().strip() != expected_token
+    ):
+        raise IdentityAcceptanceError(
+            "cluster-token Secret changed outside this rotation"
+        )
+    patch = [
+        {"op": "test", "path": "/metadata/uid", "value": expected_uid},
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": metadata["resourceVersion"],
         },
-    }
+        {"op": "test", "path": "/data/cluster-token", "value": encoded},
+        {
+            "op": "replace",
+            "path": "/data/cluster-token",
+            "value": base64.b64encode(token.encode()).decode(),
+        },
+    ]
     site.gpu(
         target,
         "patch",
         "secret",
         CONNECTION_SECRET,
-        "--type=merge",
+        "--type=json",
         "--patch-file=/dev/stdin",
         input_text=json.dumps(patch, separators=(",", ":")),
+    )
+
+
+def registry_content(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            RegionalClusterRegistration.model_validate(item).model_dump(mode="json")
+            for item in entries
+        ],
+        key=lambda item: item["cluster_id"],
     )
 
 

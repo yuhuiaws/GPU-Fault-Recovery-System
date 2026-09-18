@@ -60,6 +60,11 @@ def coverage(
         "heartbeat": heartbeat,
         "heartbeat_age_seconds": heartbeat_age,
         "observation_count": 0 if observation_age is None else 1,
+        "latest_observation_at": (
+            (NOW - timedelta(seconds=observation_age)).isoformat()
+            if observation_age is not None
+            else None
+        ),
         "latest_observation_age_seconds": observation_age,
         "workload_state": state,
     }
@@ -118,7 +123,13 @@ def deployment(*, replicas: int = 1, ready: int = 1) -> dict[str, Any]:
     return {
         "metadata": {"uid": "dep-1", "generation": 3},
         "spec": {"replicas": replicas, "strategy": {"type": "Recreate"}},
-        "status": {"readyReplicas": ready},
+        "status": {
+            "observedGeneration": 3,
+            "replicas": replicas,
+            "updatedReplicas": replicas,
+            "readyReplicas": ready,
+            "availableReplicas": ready,
+        },
     }
 
 

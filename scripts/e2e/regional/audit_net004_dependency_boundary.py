@@ -4,15 +4,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-if __package__:
-    from .acceptance_scope import scoped_case_evidence
-else:
-    from acceptance_scope import scoped_case_evidence
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
+    current_acceptance_scope,
+    scoped_case_evidence,
+)
+from scripts.e2e.regional.ha_evidence import chain_preflight, require_chain  # noqa: E402
+from scripts.e2e.regional.regional_case_contract import case_evidence_path  # noqa: E402
+from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 
 CPU_KUBECONFIG = Path()
@@ -72,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-app", default="gpu-fault-api-ha")
     parser.add_argument("--executor-app", default="gpu-fault-cluster-executor")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--cluster-id", default=os.getenv("GPU_FAULT_CLUSTER_ID", ""))
+    parser.add_argument("--predecessor-evidence", default="")
     return parser
 
 
@@ -126,20 +139,12 @@ def run(
     stdin: str | None = None,
     timeout: int = 120,
 ) -> str:
-    result = subprocess.run(
+    return run_fixture_command(
         argv,
-        input=stdin,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        input_text=stdin,
         timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise CaseError(
-            f"command failed ({result.returncode}): {' '.join(argv)}; "
-            f"stderr={result.stderr.strip()}"
-        )
-    return result.stdout
+        cwd=ROOT,
+    ).stdout
 
 
 def cpu(*args: str, stdin: str | None = None, timeout: int = 120) -> str:
@@ -405,15 +410,19 @@ print(json.dumps({{
 """
     probes = []
     for pod in pods:
-        output = gpu("exec", "-i", pod, "--", "python", "-", stdin=script)
+        output = gpu(
+            "exec", "-i", pod, "--", component_python("gpu"), "-", stdin=script
+        )
         probes.append(json.loads(output.splitlines()[-1]))
     return probes
 
 
-def cpu_credential_boundary(eks: dict) -> dict:
-    pod = first_running_pod(f"app={CONTROL_APP}", control=True)
-    pod_spec = json.loads(cpu("get", "pod", pod, "-o", "json"))
-    containers = pod_spec["spec"]["containers"]
+def cpu_pod_credential_boundary(eks: dict, pod_spec: dict) -> dict:
+    pod = pod_spec["metadata"]["name"]
+    containers = [
+        *pod_spec["spec"]["containers"],
+        *pod_spec["spec"].get("initContainers", []),
+    ]
     env_names = sorted(
         {
             str(item.get("name"))
@@ -427,6 +436,18 @@ def cpu_credential_boundary(eks: dict) -> dict:
             str(volume["secret"]["secretName"])
             for volume in pod_spec["spec"].get("volumes", [])
             if volume.get("secret", {}).get("secretName")
+        }
+        | {
+            str(source["secretRef"]["name"])
+            for container in containers
+            for source in container.get("envFrom", [])
+            if (source.get("secretRef") or {}).get("name")
+        }
+        | {
+            str((item.get("valueFrom") or {})["secretKeyRef"]["name"])
+            for container in containers
+            for item in container.get("env", [])
+            if ((item.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name")
         }
     )
     mount_paths = sorted(
@@ -456,11 +477,26 @@ print(json.dumps({
     ],
 }, sort_keys=True))
 """
-    runtime = json.loads(
-        cpu("exec", "-i", pod, "--", "python3", "-", stdin=runtime_script).splitlines()[
-            -1
-        ]
-    )
+    runtimes = {}
+    for container in pod_spec["spec"]["containers"]:
+        name = container["name"]
+        runtimes[name] = json.loads(
+            cpu(
+                "exec",
+                "-i",
+                pod,
+                "-c",
+                name,
+                "--",
+                component_python("cpu"),
+                "-",
+                stdin=runtime_script,
+            ).splitlines()[-1]
+        )
+    runtime = {
+        key: sorted({value for sample in runtimes.values() for value in sample[key]})
+        for key in ("kubeconfig_env_names", "kubeconfig_files_present")
+    }
 
     unauthenticated_script = f"""
 import base64
@@ -494,8 +530,10 @@ print(json.dumps({{
             "exec",
             "-i",
             pod,
+            "-c",
+            pod_spec["spec"]["containers"][0]["name"],
             "--",
-            "python3",
+            component_python("cpu"),
             "-",
             stdin=unauthenticated_script,
         ).splitlines()[-1]
@@ -517,12 +555,82 @@ print(json.dumps({{
     ]
     return {
         "pod": pod,
+        "pod_uid": pod_spec["metadata"]["uid"],
         "service_account": pod_spec["spec"].get("serviceAccountName"),
         "suspect_env_names": suspect_env_names,
         "suspect_secret_names": suspect_secret_names,
         "suspect_mount_paths": suspect_mount_paths,
         "runtime": runtime,
+        "container_runtimes": runtimes,
         "gpu_eks_unauthenticated_request": unauthenticated,
+    }
+
+
+def cpu_credential_boundary(eks: dict) -> dict:
+    roles = (
+        CONTROL_APP,
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+    )
+    if len(set(roles)) != len(roles):
+        raise CaseError("CPU role inventory repeats a Deployment")
+    evidence = []
+    deployments = []
+    for app in roles:
+        before = json.loads(cpu("get", "deployment", app, "-o", "json"))
+        uid = before["metadata"].get("uid")
+        generation = before["metadata"].get("generation")
+        replicas = before["spec"].get("replicas")
+        if (
+            not uid
+            or type(generation) is not int
+            or type(replicas) is not int
+            or replicas < 0
+            or (app != roles[-1] and replicas == 0)
+        ):
+            raise CaseError(f"{app} has no valid CPU Deployment identity")
+        inventory = json.loads(cpu("get", "pods", "-l", f"app={app}", "-o", "json"))
+        ready = ready_pod_records(inventory)
+        if len(ready) != replicas or len(inventory["items"]) != replicas:
+            raise CaseError(f"{app} has missing, changing or unready replicas")
+        by_name = {item["metadata"]["name"]: item for item in inventory["items"]}
+        for record in ready:
+            pod = by_name[record["name"]]
+            result = cpu_pod_credential_boundary(eks, pod)
+            after = json.loads(cpu("get", "pod", record["name"], "-o", "json"))
+            if (
+                after.get("metadata", {}).get("uid") != record["uid"]
+                or after.get("spec") != pod["spec"]
+                or after.get("status", {}).get("containerStatuses")
+                != pod.get("status", {}).get("containerStatuses")
+                or len(ready_pod_records({"items": [after]})) != 1
+            ):
+                raise CaseError("CPU replica changed during credential boundary proof")
+            evidence.append({"deployment": app, **result})
+        after = json.loads(cpu("get", "deployment", app, "-o", "json"))
+        if (
+            after.get("metadata", {}).get("uid") != uid
+            or after.get("metadata", {}).get("generation") != generation
+            or after.get("spec", {}).get("replicas") != replicas
+        ):
+            raise CaseError("CPU Deployment changed during credential boundary proof")
+        deployments.append({"deployment": app, "uid": uid, "replicas": replicas})
+    return {
+        "replicas": evidence,
+        "deployments": deployments,
+        "complete_inventory": True,
+        **{
+            key: sorted({value for item in evidence for value in item[key]})
+            for key in (
+                "suspect_env_names",
+                "suspect_secret_names",
+                "suspect_mount_paths",
+            )
+        },
+        "runtime": {
+            key: sorted({value for item in evidence for value in item["runtime"][key]})
+            for key in ("kubeconfig_env_names", "kubeconfig_files_present")
+        },
     }
 
 
@@ -559,7 +667,7 @@ def evaluate_checks(
         and f"{probe['egress_ip']}/32" in load_balancer["inbound_443_cidrs"]
         for probe in probes
     )
-    eks_request = credential_boundary["gpu_eks_unauthenticated_request"]
+    boundaries = credential_boundary.get("replicas") or []
     idle_timeout = float(load_balancer["idle_timeout_seconds"])
     return {
         "nlb_is_active_tls": (
@@ -591,21 +699,31 @@ def evaluate_checks(
             for probe in probes
         ),
         "cpu_has_no_gpu_kubeconfig": (
-            not credential_boundary["suspect_env_names"]
+            credential_boundary.get("complete_inventory") is True
+            and bool(boundaries)
+            and not credential_boundary["suspect_env_names"]
             and not credential_boundary["suspect_secret_names"]
             and not credential_boundary["suspect_mount_paths"]
             and not credential_boundary["runtime"]["kubeconfig_env_names"]
             and not credential_boundary["runtime"]["kubeconfig_files_present"]
         ),
         "gpu_eks_reverse_boundary_is_enforced": (
-            eks["endpoint_public_access"] is True
-            and eks_request["reachable"] is True
-            and eks_request["accepted_boundary"] is True
-        )
-        or (
-            eks["endpoint_public_access"] is False
-            and eks["endpoint_private_access"] is True
-            and eks_request["reachable"] is False
+            credential_boundary.get("complete_inventory") is True
+            and bool(boundaries)
+            and all(
+                (
+                    eks["endpoint_public_access"] is True
+                    and item["gpu_eks_unauthenticated_request"]["reachable"] is True
+                    and item["gpu_eks_unauthenticated_request"]["accepted_boundary"]
+                    is True
+                )
+                or (
+                    eks["endpoint_public_access"] is False
+                    and eks["endpoint_private_access"] is True
+                    and item["gpu_eks_unauthenticated_request"]["reachable"] is False
+                )
+                for item in boundaries
+            )
         ),
     }
 
@@ -660,15 +778,46 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     os.umask(0o077)
+    binding: dict[str, Any] = {
+        "validation_scope": "deployed-readonly-analysis",
+        "identity_source": "not bound",
+        "formal_sequence_satisfied": False,
+    }
     try:
         configure(args)
+        if args.run_dir is not None:
+            chain = chain_preflight(args, CASE_ID)
+            binding = {
+                **current_acceptance_scope().result_fields(),
+                **chain["identity"],
+                "predecessor": chain["predecessor"],
+                "validation_scope": "deployed-readonly",
+                "identity_source": "deployed-control-plane",
+            }
+            if chain["errors"] or chain["predecessor"].get("valid") is not True:
+                raise CaseError(
+                    "NET-004 predecessor does not match this release and cluster"
+                )
         result = audit()
+        if args.run_dir is not None:
+            require_chain(chain, chain_preflight(args, CASE_ID))
     except Exception as exc:
         result = {
             "case_id": CASE_ID,
             "verdict": "FAIL",
             "error": f"{type(exc).__name__}: {exc}",
         }
+    result.update(binding)
+    result.update(
+        {
+            "schema_version": 1,
+            "report_type": "fault-acceptance",
+            "status": "COMPLETED",
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if args.run_dir is not None:
+        write_json(case_evidence_path(args.run_dir, CASE_ID), result)
     if args.output is not None:
         write_json(args.output, result)
     print(json.dumps(result, indent=2, sort_keys=True))

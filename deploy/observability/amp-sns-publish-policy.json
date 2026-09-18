@@ -1,0 +1,17 @@
+{
+  "Sid": "AllowAmpAlertmanagerPublish",
+  "Effect": "Allow",
+  "Principal": {
+    "Service": "aps.amazonaws.com"
+  },
+  "Action": "sns:Publish",
+  "Resource": "REPLACE_WITH_SNS_TOPIC_ARN",
+  "Condition": {
+    "StringEquals": {
+      "AWS:SourceAccount": "REPLACE_WITH_AWS_ACCOUNT_ID"
+    },
+    "ArnEquals": {
+      "AWS:SourceArn": "REPLACE_WITH_AMP_WORKSPACE_ARN"
+    }
+  }
+}

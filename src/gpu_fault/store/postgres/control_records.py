@@ -272,16 +272,13 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         fabric_partitions: set[str],
         observed_from: datetime,
         observed_to: datetime,
+        cluster_id: str | None = None,
         limit: int = 1000,
     ) -> list[NodeMarker]:
-        """Actionable markers whose scope touches an allocation, newest first.
+        """Actionable markers touching an allocation, newest first.
 
-        The terminal-event correlator asks this once per completed training
-        attempt. It matches on GPU UUID and fabric partition as well as node ID,
-        because a marker raised by a fabric-level fault names the partition, not
-        the nodes attached to it. An empty scope list is passed as an empty array
-        rather than skipped, so ``?|`` simply never matches that branch and the
-        SQL stays one statement.
+        Cluster-bound reads exclude foreign and unbound markers before LIMIT.
+        Scope matches node IDs, GPU UUIDs or fabric partitions in one SQL query.
         """
         if limit < 1 or not (node_ids or gpu_uuids or fabric_partitions):
             return []
@@ -296,6 +293,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                   AND payload->>'recommended_action' IS NOT NULL
                   AND (payload->>'observed_at')::timestamptz >= %s
                   AND (payload->>'observed_at')::timestamptz <= %s
+                  AND (%s::text IS NULL OR payload->>'cluster_id'=%s)
                   AND (
                       payload->'scope'->'node_ids' ?| %s
                       OR payload->'scope'->'gpu_uuids' ?| %s
@@ -308,6 +306,8 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 (
                     observed_from,
                     observed_to,
+                    cluster_id,
+                    cluster_id,
                     sorted(node_ids),
                     sorted(gpu_uuids),
                     sorted(fabric_partitions),
@@ -322,9 +322,9 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             cursor.execute(
                 """
                 SELECT EXISTS (
-                    SELECT 1 FROM gpu_fault_objects
+                    SELECT 1 FROM gpu_fault_workflow_records
                     WHERE kind='workflow'
-                      AND payload->>'predecessor_workflow_id'=%s
+                      AND predecessor_workflow_id=%s
                 )
                 """,
                 (predecessor_workflow_id,),
@@ -338,14 +338,14 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             cursor.execute(
                 """
                 SELECT payload
-                FROM gpu_fault_objects
+                FROM gpu_fault_workflow_records
                 WHERE kind='workflow'
-                  AND payload->>'predecessor_workflow_id'=%s
-                  AND payload->>'preempt_predecessor'='true'
-                  AND payload->>'status' IN (
+                  AND predecessor_workflow_id=%s
+                  AND preempt_predecessor='true'
+                  AND status IN (
                       'PENDING', 'SAFETY_PENDING'
                   )
-                ORDER BY payload->>'created_at', key
+                ORDER BY created_at, key
                 LIMIT 1
                 """,
                 (predecessor_workflow_id,),
@@ -439,9 +439,8 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         limit: int = 1000,
     ) -> int:
         observed = now or datetime.now(timezone.utc)
-        # Records an open incident still needs are skipped, not deleted
-        # (architecture review 2026-09-07, item D6; see ``evidence_pins`` for
-        # the two bindings). The candidate walk is the expiry index; the
+        # Skip records pinned to open incidents (see evidence_pins).
+        # The candidate walk uses the expiry index; the
         # NOT EXISTS probe touches only non-RECOVERED incidents through
         # ``gpu_fault_incident_state_count``, and the LIMIT counts rows that
         # will actually be deleted, so pinned rows cannot starve the sweep.
@@ -482,6 +481,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                           )
                         ORDER BY e.payload->>'expires_at', e.key
                         LIMIT %s
+                        FOR UPDATE OF e SKIP LOCKED
                     ),
                     deleted AS (
                         DELETE FROM gpu_fault_objects AS target
@@ -752,6 +752,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                           AND payload->>'observed_at' <= %s
                         ORDER BY payload->>'observed_at', key
                         LIMIT %s
+                        FOR UPDATE SKIP LOCKED
                     ),
                     deleted AS (
                         DELETE FROM gpu_fault_objects AS target
@@ -846,6 +847,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                             WHERE {condition}
                             ORDER BY {timestamp_column}, key
                             LIMIT %s
+                            FOR UPDATE SKIP LOCKED
                         ),
                         deleted AS (
                             DELETE FROM {table} AS target
@@ -892,6 +894,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                           AND ({condition})
                         ORDER BY payload->'observation'->>'observed_at', key
                         LIMIT %s
+                        FOR UPDATE SKIP LOCKED
                     ),
                     deleted AS (
                         DELETE FROM gpu_fault_objects AS target

@@ -1,40 +1,8 @@
-"""Run the independent preflight checks of a transaction at the same time.
+"""Overlap read-only preflight work after journaled credential preparation.
 
-Every kubectl call costs about a second from the deploy host, and the upgrade
-preflight used to spend them one after another: the Aurora credential refresh
-Job (create, ``wait``, delete: 8-10 s), the remote-command idle probe (an exec
-in the ingress Pod, 2-3 s), the in-flight install gate (another exec, 2-3 s)
-and the previous-state capture (about thirty reads). Live, the whole
-``preflight`` phase of a control-plane-only config release took 79 s.
-
-The steps are independent of each other, so they run as *lanes* on a small
-thread pool:
-
-* ``aurora-refresh`` rewrites the ``gpu-fault-aurora`` Secret and nothing
-  else. It exists because RDS rotates the master password every 7 days and a
-  release is a burst of new Pods (2026-09-07: an automatic rollback restarted
-  control-worker into a rotated-out password and the transaction landed in
-  ``rollback-failed``). It fails closed. It stays behind ``_apply_rds_ca_bundle``
-  because the refresh Job mounts the bundle.
-* ``store-probes`` reads the store through the memoised ingress Pod: the idle
-  probe first, then the in-flight install gate, in their original order and on
-  one thread, so the two never race each other for the memoised Pod name.
-* ``previous-capture`` validates the transaction and then snapshots the live
-  release (ConfigMaps, Deployments, the release-metadata and state ConfigMaps,
-  the AMP/Route53 objects). It reads no Secret the refresh writes -- the only
-  Secrets it touches are the ones it backs up, and that backup is a mutation
-  that still happens *after* every lane has passed (``_upgrade_context``).
-
-Failure semantics are the serial ones: every lane runs to its own end (a
-half-finished ``kubectl create job`` cannot be taken back by killing it), then
-the first failure in declared order is raised unchanged and the others are
-printed. Nothing here saves state; the caller's first ``_save_state`` still
-comes after everything has passed. A dry run keeps the serial order so its
-trace stays readable, as the GPU stage does (``regional_release_gpu_stage``).
-
-The rollback's pair -- the same refresh, then the in-flight install gate before
-any restore is planned (the previous release's control plane would re-submit a
-PENDING/WAITING install) -- uses the same runner.
+Aurora repair and refresh must finish before Store reads or previous capture.
+Only independent reads overlap; all workers inherit the caller's deadline and
+finish before the first application mutation or compensation starts.
 """
 
 from __future__ import annotations
@@ -43,9 +11,12 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
+from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_narration import narrate_step
 
@@ -103,12 +74,15 @@ def run_preflight_lanes(
     if len(lanes) == 1 or _dry_run(release):
         for lane in lanes:
             results[lane.name] = _timed(lane, durations)
-    else:
+    elif lanes:
         with ThreadPoolExecutor(
-            max_workers=len(lanes),
+            max_workers=min(DEPLOY_CONCURRENCY.read_only_checks, len(lanes)),
             thread_name_prefix=f"{phase}-lane",
         ) as pool:
-            futures = [(lane, pool.submit(_timed, lane, durations)) for lane in lanes]
+            futures = [
+                (lane, pool.submit(copy_context().run, _timed, lane, durations))
+                for lane in lanes
+            ]
             for lane, future in futures:
                 try:
                     results[lane.name] = future.result()
@@ -128,7 +102,8 @@ def run_preflight_lanes(
         return results
     for lane, error in failures[1:]:
         print(
-            f"{phase}: {lane.name} also failed while the lanes ran: {error}",
+            f"{phase}: {lane.name} also failed while the lanes ran: "
+            f"{diagnostic_text(str(error))}",
             file=sys.stderr,
             flush=True,
         )
@@ -156,7 +131,7 @@ def run_upgrade_preflight(
     validate: Callable[[], dict[str, Any] | None],
     capture: Callable[[], dict[str, Any]] | None,
 ) -> UpgradePreflight:
-    """The upgrade's preflight: refresh, store probes, validate-then-capture.
+    """The upgrade's read-only Store probes and validated previous capture.
 
     ``validate`` is the transaction validation that used to run after the
     probes; it stays ahead of ``capture`` on the same lane so a refused
@@ -172,7 +147,6 @@ def run_upgrade_preflight(
     results = run_preflight_lanes(
         release,
         (
-            PreflightLane("aurora-refresh", release._refresh_aurora_credentials),
             PreflightLane(
                 "store-probes",
                 lambda: store_preflight_probes(release, action="upgrade"),
@@ -195,7 +169,7 @@ def run_rollback_preflight(
     check_installs: bool,
     automatic: bool,
 ) -> Any:
-    """The rollback's preflight: the refresh beside the in-flight install gate.
+    """Refresh with the restored program, then read the in-flight install gate.
 
     The gate is skipped once the control plane is already restored (a cleanup
     re-entry). An automatic rollback proceeds only when no Running control-plane
@@ -204,16 +178,10 @@ def run_rollback_preflight(
     the gate's verdict (``None`` when it did not run) for the caller to persist.
     """
 
-    lanes = [PreflightLane("aurora-refresh", release._refresh_aurora_credentials)]
-    if check_installs:
-        lanes.append(
-            PreflightLane(
-                "inflight-installs",
-                lambda: release._require_no_inflight_installs(
-                    action="rollback",
-                    unreadable="proceed" if automatic else "refuse",
-                ),
-            )
-        )
-    results = run_preflight_lanes(release, lanes, phase="rollback-preflight")
-    return results.get("inflight-installs")
+    release._refresh_aurora_credentials()
+    if not check_installs:
+        return None
+    return release._require_no_inflight_installs(
+        action="rollback",
+        unreadable="proceed" if automatic else "refuse",
+    )

@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 from gpu_fault.store.shared.cleanup_log import log_cleanup
+from gpu_fault.store.sqlite.core import QueryRows
 
 if TYPE_CHECKING:
     from gpu_fault.fleet_deployment import FleetDeployment
@@ -12,23 +13,22 @@ if TYPE_CHECKING:
 class SqliteFleetMixin:
     # Attributes supplied by the composed concrete implementation.
     _agent_key: Callable[..., Any]
-    _db: Any
     _delete: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _list: Callable[..., Any]
     _models: Any
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
+    _query_rows: QueryRows
 
     def _regional_cluster_region(self, cluster_id: str) -> str | None:
-        row = self._db.execute(
-            """
+        query = """
             SELECT json_extract(payload, '$.region')
             FROM objects
             WHERE kind='regional_cluster' AND key=?
-            """,
-            (cluster_id,),
-        ).fetchone()
+            """
+        rows = self._query_rows(query, (cluster_id,))
+        row = rows[0] if rows else None
         return str(row[0]) if row and row[0] is not None else None
 
     def list_regional_clusters(self):
@@ -38,14 +38,13 @@ class SqliteFleetMixin:
         )
 
     def list_regional_cluster_ids(self) -> list[str]:
-        rows = self._db.execute(
-            """
+        query = """
             SELECT key
             FROM objects
             WHERE kind='regional_cluster'
             ORDER BY key
             """
-        ).fetchall()
+        rows = self._query_rows(query, ())
         return [str(row[0]) for row in rows]
 
     def replace_agent_if_matches(self, replacement, expected) -> bool:
@@ -101,8 +100,7 @@ class SqliteFleetMixin:
         )
 
     def list_active_fleet_deployments(self, cluster_id: str):
-        rows = self._db.execute(
-            """
+        query = """
             SELECT payload
             FROM objects
             WHERE kind='fleet_deployment'
@@ -110,9 +108,8 @@ class SqliteFleetMixin:
               AND json_extract(payload, '$.status')
                   NOT IN ('SUCCEEDED', 'FAILED')
             ORDER BY json_extract(payload, '$.created_at'), key
-            """,
-            (cluster_id,),
-        ).fetchall()
+            """
+        rows = self._query_rows(query, (cluster_id,))
         model = self._models["fleet_deployment"]
         return [model.model_validate_json(row[0]) for row in rows]
 

@@ -205,7 +205,7 @@ def test_the_observability_install_hands_the_rendered_rules_to_the_installer(
     (arguments, kwargs, handed), *rest = release.runner.calls
     assert rest == []
     assert arguments[:2] == ["bash", str(DATAPLANE.AMP_MONITORING_INSTALLER)]
-    assert "--dataplane-expected-rules" in arguments
+    assert arguments[2:-1] == ["--runtime-only", "--dataplane-expected-rules"]
     assert handed == DATAPLANE.render_dataplane_expected_rules(release)
     assert kwargs["env"] == {"AMP_WORKSPACE_ID": "ws-a"}
 
@@ -219,7 +219,9 @@ def test_the_observability_install_asks_for_deletion_when_nothing_is_expected(
 
     (arguments, _kwargs, handed), *rest = release.runner.calls
     assert rest == []
-    assert arguments[2:] == ["--no-dataplane-expected-rules"], arguments
+    assert arguments[2:] == ["--runtime-only", "--no-dataplane-expected-rules"], (
+        arguments
+    )
     assert handed is None
 
 

@@ -367,7 +367,9 @@ def test_destr001_stops_the_sampler_after_the_post_reset_snapshot(
     snapshots = [i for i, entry in enumerate(log.entries) if entry == "host:snapshot"]
     assert snapshots[-1] < log.index("host:stop-reset-sampler")
     assert log.index("host:stop-reset-sampler") < log.index("regional:provider_events")
-    assert log.index("host:stop-reset-sampler") < log.index("host:restore-quiesce")
+    assert "host:restore-quiesce" not in log.entries, (
+        "sampler cleanup must never authorize an unconditional GPU service restore"
+    )
     result = json.loads(
         (run_dir / "cases" / destr001.CASE_ID / f"{destr001.CASE_ID}.json").read_text()
     )
@@ -444,7 +446,13 @@ def test_wait_restarted_reads_logs_once_after_the_pods_are_replaced(
 
         def workload(self) -> dict[str, Any]:
             return {
-                "metadata": {"uid": "w", "annotations": {}, "labels": {}},
+                "kind": "Job",
+                "metadata": {
+                    "name": self.name,
+                    "uid": "w",
+                    "annotations": {},
+                    "labels": {},
+                },
                 "spec": {},
             }
 
@@ -458,6 +466,8 @@ def test_wait_restarted_reads_logs_once_after_the_pods_are_replaced(
     result = fixture.wait_restarted({"old"}, timeout_seconds=30, poll_seconds=0)
 
     assert result["pods"] == [new_pod]
+    assert result["workload"]["kind"] == "Job"
+    assert result["workload"]["name"] == "training-a"
     assert calls["pods"] >= 4
     assert calls["logs"] == 1, "logs are read once the UIDs changed, not per poll"
 
@@ -470,6 +480,7 @@ def test_image_prewarm_skips_nodes_that_already_hold_the_image(
     digest = prewarm.image.rsplit("@", 1)[-1]
     applied: list[str] = []
     waited: list[str] = []
+    pods: dict[str, dict[str, Any]] = {}
 
     def kubectl(_plane: str, *arguments: str, **kwargs: Any) -> str:
         if arguments[:2] == ("get", "node"):
@@ -484,8 +495,13 @@ def test_image_prewarm_skips_nodes_that_already_hold_the_image(
                     ]
                 }
             )
-        if arguments[0] == "apply":
-            applied.append(json.loads(kwargs["input_text"])["spec"]["nodeName"])
+        if arguments[:2] == ("get", "pod"):
+            return json.dumps(pods[arguments[2]]) if arguments[2] in pods else ""
+        if arguments[0] == "create":
+            pod = json.loads(kwargs["input_text"])
+            pod["metadata"].update(uid="owned-pod-uid", resourceVersion="1")
+            pods[pod["metadata"]["name"]] = pod
+            applied.append(pod["spec"]["nodeName"])
             return ""
         if arguments[0] == "wait":
             waited.append(arguments[2])
@@ -626,7 +642,18 @@ def test_destr012_group_a_reads_the_owners_from_destr009_evidence(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "GF-REGIONAL-DESTR-009.json"
-    predecessor = {"evidence_valid": True, "verdict": "PASS"}
+    predecessor = {
+        "evidence_valid": True,
+        "verdict": "PASS",
+        "expected_release_id": "release-a",
+        "expected_cluster_id": "cluster-a",
+    }
+    identity = {
+        "case_id": "GF-REGIONAL-DESTR-009",
+        "verdict": "PASS",
+        "release_id": "release-a",
+        "cluster_id": "cluster-a",
+    }
     steps = [
         {"operation": "FREEZE_EVIDENCE", "execution_owner": "gpu-fault-control-plane"},
         {
@@ -641,9 +668,7 @@ def test_destr012_group_a_reads_the_owners_from_destr009_evidence(
     path.write_text(
         json.dumps(
             {
-                "case_id": "GF-REGIONAL-DESTR-009",
-                "verdict": "PASS",
-                "release_id": "release-a",
+                **identity,
                 "workflow_request_id": "wf-9",
                 "workflow_official_steps": steps,
             }
@@ -658,14 +683,13 @@ def test_destr012_group_a_reads_the_owners_from_destr009_evidence(
 
     steps[2]["execution_owner"] = "gpu-fault-hyperpod-adapter"
     path.write_text(
-        json.dumps({"verdict": "PASS", "workflow_official_steps": steps}),
-        encoding="utf-8",
+        json.dumps({**identity, "workflow_official_steps": steps}), encoding="utf-8"
     )
     assert destr012.group_a_from_evidence(path, predecessor)["errors"] == [
         "group A RESTART_WORKLOAD owner is not Kubernetes adapter"
     ]
 
-    path.write_text(json.dumps({"verdict": "PASS"}), encoding="utf-8")
+    path.write_text(json.dumps(identity), encoding="utf-8")
     stale = destr012.group_a_from_evidence(path, predecessor)
     assert stale["verdict"] == "FAIL"
     assert "lacks workflow_official_steps" in stale["error"]
@@ -676,6 +700,14 @@ def test_destr012_group_a_reads_the_owners_from_destr009_evidence(
     )
     assert skipped["verdict"] == "FAIL"
     assert "SKIPPED_BY_OPERATOR" in skipped["error"]
+
+
+def test_cleanup_budget_outlives_the_watcher_missing_pod_grace() -> None:
+    slack = destr009.CLEANUP_QUIET_SECONDS + 2 * destr009.CLEANUP_POLL_SECONDS
+    assert destr009.ATTEMPT_MISSING_GRACE_SECONDS == 300
+    assert destr009.CLEANUP_TIMEOUT_SECONDS >= (
+        destr009.ATTEMPT_MISSING_GRACE_SECONDS + slack + 60
+    ), destr009.CLEANUP_TIMEOUT_SECONDS
 
 
 def test_destr012_rerun_flag_keeps_the_workload_group_a(tmp_path: Path) -> None:

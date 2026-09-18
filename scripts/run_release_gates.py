@@ -11,9 +11,22 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING or __package__:
+    from scripts.run_static_gates import isolated_gate_environment
+else:
+    from run_static_gates import isolated_gate_environment
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from gpu_fault.admin.postgres_grant import (  # noqa: E402
+    ALLOCATION_ENV,
+    PostgresGrantError,
+    postgres_test_environment,
+)
+
 # How much of the failing gate's output is repeated after the noise. Twenty
 # lines hold a pytest summary or the static runner's own aggregate line with
 # the failing check above it; the whole thing is still in the log.
@@ -42,8 +55,11 @@ def gate_parallelism() -> int:
 
 
 def _gate_environment(name: str, cache_root: Path) -> dict[str, str]:
+    base = isolated_gate_environment(os.environ)
+    if name == "postgres":
+        base = postgres_test_environment(base)
     return {
-        **os.environ,
+        **base,
         "PYTHONPYCACHEPREFIX": str(cache_root / name / "pycache"),
         "PYTEST_ADDOPTS": (
             (
@@ -255,11 +271,25 @@ def _raise_failures(failures: dict[str, int], *, description: str) -> None:
         )
 
 
+def preflight_promtool(python: str, *, cache_root: Path) -> None:
+    """Use Make's tool path/version before any static, test or artifact gate."""
+
+    environment = _gate_environment("promtool", cache_root)
+    environment.pop("COSIGN_PASSWORD", None)
+    subprocess.run(
+        ["make", "promtool-preflight", f"PYTHON={python}"],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+    )
+
+
 def run_release_gates(python: str) -> None:
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL", "").strip():
         raise ReleaseGateError("GPU_FAULT_TEST_POSTGRES_URL is required")
     with tempfile.TemporaryDirectory(prefix="gpu-fault-release-gates-") as directory:
         cache_root = Path(directory)
+        preflight_promtool(python, cache_root=cache_root)
         # The static gate is the one that fails on a fresh tree and it takes a
         # minute; the other two take nearly three. Running it alone first means
         # a lint or architecture failure costs one minute, not three, and its
@@ -270,24 +300,19 @@ def run_release_gates(python: str) -> None:
             max_workers=1,
         )
         _raise_failures(failures, description="static release gate failed")
+        postgres_command = ["make", "test-postgres-stress"]
+        if ALLOCATION_ENV in os.environ:
+            postgres_command.append("POSTGRES_TEST_PARALLEL=1")
         failures = _run_parallel(
             {
-                "postgres": ["make", "test-postgres-stress", f"PYTHON={python}"],
+                "postgres": [*postgres_command, f"PYTHON={python}"],
                 "pytest": ["make", "test-parallel-release", f"PYTHON={python}"],
+                "artifact": ["make", "artifact-check", f"PYTHON={python}"],
             },
             cache_root=cache_root,
             max_workers=gate_parallelism(),
         )
         _raise_failures(failures, description="parallel release gate failed")
-        subprocess.run(
-            ["make", "artifact-check", f"PYTHON={python}"],
-            cwd=ROOT,
-            env={
-                **os.environ,
-                "PYTHONPYCACHEPREFIX": str(cache_root / "artifact"),
-            },
-            check=True,
-        )
         subprocess.run(
             ["make", "python-cache-clean", f"PYTHON={python}"],
             cwd=ROOT,
@@ -298,6 +323,7 @@ def run_release_gates(python: str) -> None:
 def run_check_gates(python: str) -> None:
     with tempfile.TemporaryDirectory(prefix="gpu-fault-check-gates-") as directory:
         cache_root = Path(directory)
+        preflight_promtool(python, cache_root=cache_root)
         subprocess.run(
             ["make", "check-static", f"PYTHON={python}"],
             cwd=ROOT,
@@ -330,7 +356,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
             run_check_gates(options.python)
         else:
             run_release_gates(options.python)
-    except (OSError, ReleaseGateError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        PostgresGrantError,
+        ReleaseGateError,
+        subprocess.SubprocessError,
+    ) as exc:
         print(f"release-gates: {exc}", file=sys.stderr)
         return 2
     return 0

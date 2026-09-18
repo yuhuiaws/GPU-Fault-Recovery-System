@@ -46,9 +46,10 @@ reads every open workflow whatever its age, plus the terminal workflows whose
 the budget). The budget stays the hard cap on that union, and ``truncated``
 means the cap cut rows *inside* the window or the open set -- more workflows
 open or updated within the window than the budget -- never that old terminal
-rows fell outside it. The step, duration and milestone families are recomputed
-from the slice on every scrape, so the window is also their population: they
-describe the last seven days of closed loops, not the lifetime table.
+rows fell outside it. The step, duration and legacy milestone families describe
+that retained slice, not lifetime counters. Event-time milestone windows also
+use the scan's timestamp and coverage; a delta of retained sums/counts is not
+an event mean.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any, Callable, TypeVar, cast
 
-from gpu_fault.models import WorkflowStatus
+from gpu_fault.models import WorkflowRequest, WorkflowStatus
 
 T = TypeVar("T")
 
@@ -88,10 +89,11 @@ class WorkflowScan:
     open set, never because older terminal rows fell outside it.
     """
 
-    workflows: tuple[Any, ...]
+    workflows: tuple[WorkflowRequest, ...]
     limit: int
     truncated: bool
     window_seconds: int = 0
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -190,7 +192,7 @@ class MetricScanCache:
         # families describe those and the set is small by construction -- then
         # the terminal workflows updated inside the window, newest first, so
         # the duration and milestone summaries keep describing recent history
-        # (GpuFaultClosedLoopSlow takes a 6 h delta over them) without the read
+        # without the read
         # growing with the terminal rows retention has yet to reclaim. One row
         # over the budget is requested so truncation is observed rather than
         # inferred from a full page, which cannot distinguish "exactly the
@@ -199,7 +201,8 @@ class MetricScanCache:
         # cap cut something that belonged in the census.
         limit = self.workflow_limit
         window = self.workflow_window_seconds
-        updated_since = None if window <= 0 else self._now() - timedelta(seconds=window)
+        observed_at = self._now()
+        updated_since = None if window <= 0 else observed_at - timedelta(seconds=window)
         rows = list(
             self._store.list_recent_workflows(
                 set(OPEN_WORKFLOW_STATUSES),
@@ -212,6 +215,7 @@ class MetricScanCache:
             limit=limit,
             truncated=len(rows) > limit,
             window_seconds=window,
+            observed_at=observed_at,
         )
 
     def shared(self, key: str, produce: Callable[[], T]) -> T:

@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import regional_commands
+from scripts.e2e.regional import regional_live_fixture as live
 from scripts.e2e.regional import run_net001_collector_replay as net001
 
 SERVICES_OK = {
@@ -17,7 +19,9 @@ SERVICES_OK = {
 }
 
 
-def _runner(tmp_path: Path, *, window_minutes: int = 60) -> net001.Runner:
+def _runner(
+    tmp_path: Path, *, window_minutes: int = 60, namespace: str = "gpu-fault-system"
+) -> net001.Runner:
     cpu = tmp_path / "cpu.kubeconfig"
     gpu = tmp_path / "gpu.kubeconfig"
     cpu.write_text("{}", encoding="utf-8")
@@ -27,7 +31,7 @@ def _runner(tmp_path: Path, *, window_minutes: int = 60) -> net001.Runner:
         cpu_context="",
         gpu_kubeconfig=gpu,
         gpu_context="gpu",
-        namespace="gpu-fault-system",
+        namespace=namespace,
         cluster_id="cluster-a",
         region="us-west-2",
         target_node="node-a",
@@ -74,10 +78,10 @@ def test_every_kubectl_verb_gets_a_deadline() -> None:
 
 def test_a_hung_kubectl_becomes_a_case_error(monkeypatch) -> None:
     def hang(argv: list[str], **kwargs: Any) -> None:
-        assert kwargs["timeout"] == 120
-        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        assert kwargs["timeout_seconds"] == 120
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout_seconds"])
 
-    monkeypatch.setattr(net001.subprocess, "run", hang)
+    monkeypatch.setattr(regional_commands, "run_command", hang)
 
     with pytest.raises(net001.CaseError, match="timed out after 120s"):
         net001.command(["kubectl", "exec", "pod", "--", "sleep"])
@@ -272,45 +276,63 @@ def test_resource_cleanup_failure_is_recorded_not_raised(
     assert "resource cleanup failed" in document["error"]
 
 
-# --------------------------------------------------------------------------- #
-# Business workload preflight
-# --------------------------------------------------------------------------- #
-
-
-def _pod(namespace: str, name: str, gpus: int = 0) -> dict[str, Any]:
-    requests = {"nvidia.com/gpu": str(gpus)} if gpus else {}
+def _pod(
+    namespace: str, name: str, *, gpus: int = 0, resource_kind: str = "requests"
+) -> dict[str, Any]:
+    resources = {resource_kind: {"nvidia.com/gpu": str(gpus)}} if gpus else {}
     return {
         "metadata": {"namespace": namespace, "name": name},
-        "spec": {"containers": [{"resources": {"requests": requests}}]},
+        "spec": {"containers": [{"resources": resources}]},
     }
 
 
+@pytest.mark.parametrize("namespace", ["gpu-fault-system", "acceptance-system"])
+@pytest.mark.parametrize("resource_kind", ["requests", "limits"])
 def test_business_workloads_share_the_fleet_wide_definition(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, namespace: str, resource_kind: str
 ) -> None:
-    # Cluster infrastructure and the solution's own GPU-less Pods are not a
-    # business workload; a training Pod and a GPU job in the solution's
-    # namespace are. NET-001 used to keep a shorter private allowlist.
-    runner = _runner(tmp_path)
+    runner = _runner(tmp_path, namespace=namespace)
     pods = [
         _pod("kube-system", "coredns"),
         _pod("cert-manager", "cainjector"),
         _pod("hyperpod-inference-system", "router"),
         _pod("kubeflow", "training-operator"),
         _pod("aws-hyperpod", "controller"),
-        _pod("gpu-fault-system", "executor"),
-        _pod("gpu-fault-system", "notify005-worker-0", gpus=8),
-        _pod("training", "megatron-worker-0", gpus=8),
+        _pod(namespace, "executor"),
+        _pod(namespace, "acceptance-worker", gpus=8, resource_kind=resource_kind),
+        _pod("training", "training-worker", gpus=8, resource_kind=resource_kind),
+        _pod("training", "cpu-business-worker"),
     ]
-    monkeypatch.setattr(
-        runner,
-        "gpu",
-        lambda *args: subprocess.CompletedProcess(
-            args, 0, json.dumps({"items": pods}), ""
-        ),
+    payload = json.dumps({"items": pods})
+
+    def gpu(*args: str) -> subprocess.CompletedProcess[str]:
+        assert "spec.nodeName=node-a,status.phase=Running" in args
+        assert "-A" in args
+        return subprocess.CompletedProcess(args, 0, payload, "")
+
+    monkeypatch.setattr(runner, "gpu", gpu)
+    regional = live.RegionalLiveFixture(
+        live.RegionalLiveSettings(
+            cpu_kubeconfig=runner.settings.cpu_kubeconfig,
+            gpu_kubeconfig=runner.settings.gpu_kubeconfig,
+            gpu_context=runner.settings.gpu_context,
+            namespace=namespace,
+            cluster_id=runner.settings.cluster_id,
+            region=runner.settings.region,
+        )
     )
 
-    assert runner.active_business_workloads() == [
-        {"namespace": "gpu-fault-system", "name": "notify005-worker-0"},
-        {"namespace": "training", "name": "megatron-worker-0"},
+    def kubectl(*args: str, **kwargs: Any) -> str:
+        assert args[:3] == ("gpu", "get", "pod")
+        assert "spec.nodeName=node-a,status.phase=Running" in args
+        assert kwargs["all_namespaces"] is True
+        return payload
+
+    monkeypatch.setattr(regional, "kubectl", kubectl)
+    expected = [
+        {"namespace": namespace, "name": "acceptance-worker"},
+        {"namespace": "training", "name": "training-worker"},
+        {"namespace": "training", "name": "cpu-business-worker"},
     ]
+    assert runner.active_business_workloads() == expected
+    assert regional.business_workloads("node-a") == expected

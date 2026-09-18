@@ -8,13 +8,12 @@ VERIFY_NO_GPU_CLIENTS succeeds); its branch escalates in place to a *real*
 HyperPod reboot that succeeds and the branch ends normally. node-c's branch
 resolves RESTART_NODE, but its Node Agent is disabled (without --now) before the
 reboot so no new boot id is reported: RESTART_NODE waits to its managed-recovery
-timeout, escalates to REPLACE_NODE, and -- with no warm spare declared -- FAILs
-``warm-spare replacement is required; provider node replacement API fallback is
-disabled`` (the zero-spare branch; ``insufficient healthy HyperPod spares`` is
-the labelled-but-unhealthy branch this case never reaches), exhausting the
-branch. The join never
-runs; the workflow ends FAILED, the incident QUARANTINED, and the job is not
-restarted.
+timeout and retains BLOCKED/NEEDS_OPERATOR. A timeout does not authorize a
+replacement rung. The join never runs and the job is not restarted.
+Confirmed no-start failure and replacement exhaustion are separate local
+contracts; this live drill proves an unknown-reboot hold. Even when that
+safety assertion passes, final acceptance remains BLOCKED until operator
+reconciliation and cleanup are complete.
 
 Two env windows shorten the wait. The managed-recovery timeout is a
 control-worker setting (``execution/config.py`` derives the RESTART_NODE and
@@ -35,12 +34,14 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -49,6 +50,14 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional import control_plane_env_window as control_window  # noqa: E402
 from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
 from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018  # noqa: E402
+from gpu_fault.admin.process_supervisor import ProcessSupervisionLost  # noqa: E402
+from scripts.e2e.regional import destr014_recovery as recovery  # noqa: E402
+from scripts.e2e.regional.destr014_cleanup import (  # noqa: E402
+    _cleanup as _cleanup,
+    _ledger as _ledger,
+    _restore_isolated_nodes as _restore_isolated_nodes,
+    recreate_probe as recreate_probe,
+)
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     replica_vanished,
     write_json_atomic,
@@ -71,6 +80,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     predecessor_evidence,
     required,
     run_case_main,
@@ -79,7 +89,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     INSTANCE_GROUP_LABEL,
     instance_type,
-    QUARANTINE_TAINT,
+    QUARANTINE_TAINT as QUARANTINE_TAINT,
     SPARE_LABEL,
     WarmSpareLiveFixture,
 )
@@ -96,9 +106,14 @@ DEFAULT_MANIFEST = (
 CASE_ID = "GF-REGIONAL-DESTR-014"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-008"
 CONFIRMATION = "DESTR014_EXECUTE"
-VARIANTS = ("sibling-exhausted",)
+VARIANTS = ("unknown-reboot",)
 
 from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
+    canonical_digest as _digest,
+    case_digest as case_digest,
+    evidence_components as evidence_components,
+    identity_digest as identity_digest,
+    plan_identity as plan_identity,
     CONTAINMENT_ALLOWANCE_SECONDS,
     EXHAUSTION_PREFIX,
     FORBIDDEN_EVENTS,
@@ -117,6 +132,7 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     lifetime_errors,
     quarantine_taint_value,
     reset_reached_commit,
+    recovery_cleanup_hold,
     schedulability_errors,
     step_transitions,
     workflow_errors,
@@ -227,6 +243,18 @@ def preflight_errors(
     managed_recovery_timeout_seconds: int,
 ) -> list[str]:
     errors: list[str] = list(reboot_probe_errors)
+    if (
+        not sibling.get("uid")
+        or sibling_agent.get("node_instance_id") != sibling["uid"]
+        or not sibling_agent.get("runtime_profile_version")
+        or any(
+            not re.fullmatch(r"[0-9a-f]{64}", str(sibling_agent.get(key) or ""))
+            for key in ("artifact_sha256", "installer_bundle_sha256")
+        )
+    ):
+        errors.append(
+            "sibling Node Agent recovery identity is incomplete or mismatched"
+        )
     if fault_node == sibling_node:
         errors.append("fault and sibling nodes are identical")
     if not predecessor.get("valid"):
@@ -293,46 +321,6 @@ def preflight_errors(
         )
     )
     return errors
-
-
-def _digest(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, default=str).encode()
-    ).hexdigest()
-
-
-def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
-    store = preflight.get("store") or {}
-    return {
-        "release_id": preflight.get("release_id"),
-        "fault_node_uid": (preflight.get("fault_node") or {}).get("uid"),
-        "fault_node_boot_id": (preflight.get("fault_node") or {}).get("boot_id"),
-        "sibling_node_uid": (preflight.get("sibling_node") or {}).get("uid"),
-        "sibling_node_boot_id": (preflight.get("sibling_node") or {}).get("boot_id"),
-        "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
-        "provider_inventory_sha256": (preflight.get("provider_inventory") or {}).get(
-            "sha256"
-        ),
-        "executor_env_baseline_sha256": (
-            preflight.get("executor_env_window") or {}
-        ).get("baseline_sha256"),
-    }
-
-
-def identity_digest(identity: dict[str, Any]) -> str:
-    return _digest(identity)
-
-
-def evidence_components(details: dict[str, Any]) -> dict[str, str]:
-    return {
-        name: _digest(details.get(name))
-        for name in ("preflight_identity", "workflow", "incident", "provider_events")
-        if name in details
-    }
-
-
-def case_digest(components: dict[str, str]) -> str:
-    return _digest(components)
 
 
 def render_two_node_manifest(
@@ -489,14 +477,27 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "manifest": str(settings.manifest),
         "verify_max_attempts": settings.verify_max_attempts,
         "managed_recovery_timeout_seconds": settings.managed_recovery_timeout_seconds,
+        "recovery_safeguard": {
+            "kind": "persistent-host-systemd",
+            "helper_sha256": hashlib.sha256(recovery.PROBE.read_bytes()).hexdigest(),
+            "recovery_seconds": recovery.RECOVERY_SECONDS,
+            "hold_seconds": recovery_hold_seconds(settings, preflight),
+            "requires_independent_arm_ack_before_disable": True,
+            "resume": "cleanup-only",
+        },
         "mutation": (
             "submit one two-node 16-GPU PyTorchJob, fault both nodes into one job "
             "DAG; node-b RESET_GPU is held to failure and escalates to a real "
             "reboot that succeeds; node-c reboots but its Agent is disabled so "
-            "RESTART_NODE times out to REPLACE_NODE with no declared spare and the "
-            "branch is exhausted; the workflow fails safely and the job is not "
-            "restarted"
+            "RESTART_NODE reaches its confirmation timeout; the physical outcome "
+            "remains unknown, no replacement is authorized, and the workflow "
+            "retains BLOCKED/NEEDS_OPERATOR without restarting the job"
         ),
+        "proof_scope": {
+            "live": "unconfirmed reboot retains operator hold, not replacement exhaustion",
+            "confirmed_failure_replacement": "separate deterministic contract",
+            "formal_pass_requires_operator_reconciliation_and_complete_cleanup": True,
+        },
         "preflight_identity": identity,
         "preflight_identity_digest": identity_digest(identity),
         "stop_conditions": [
@@ -506,7 +507,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "a target node is busy, tainted, or carries a GPU workload",
             "the estimated duration does not fit the job workflow lifetime",
             "the two XID injections do not join one DAG workflow",
-            "workflow does not end FAILED with the branch exhaustion reason",
+            "independent recovery arm is absent, stale, or changed",
+            "automatic Agent recovery fires before the scenario is complete",
+            "workflow does not retain BLOCKED/NEEDS_OPERATOR for unknown reboot",
             "CloudTrail shows other than two reboots or any replace/delete",
             "cleanup cannot disarm the holder, restore the agent, un-quarantine "
             "the sibling, or close the executor env window",
@@ -514,7 +517,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "rollback": {
             "disarm_the_gpu_device_holder": True,
             "restore_the_sibling_node_agent_to_its_baseline": True,
-            "un_quarantine_the_sibling_via_a_validation_first_workflow": True,
+            "prove_recovery_stopped_before_removing_owned_units": True,
+            "unknown_physical_outcomes_forbid_automatic_isolation_restore": True,
             "close_the_executor_env_window_to_baseline": True,
             "close_the_control_plane_env_window_to_baseline": True,
             "delete_the_test_workload_after_async_quiescence": True,
@@ -535,7 +539,7 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
                 "exec",
                 str(pod["name"]),
                 "--",
-                "python3",
+                component_python("gpu"),
                 "-c",
                 (
                     "import json,os;"
@@ -588,7 +592,7 @@ def executor_env_snapshot(regional: RegionalLiveFixture) -> list[dict[str, Any]]
                 "exec",
                 str(pod["name"]),
                 "--",
-                "python3",
+                component_python("gpu"),
                 "-c",
                 (
                     "import json,os;"
@@ -634,6 +638,15 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         ),
         "control_env": control_env,
         "budget": budget_headroom(regional, settings),
+        "recovery_agent": {
+            key: (agent_by_node(state, settings.sibling_node) or {}).get(key)
+            for key in (
+                "node_instance_id",
+                "artifact_sha256",
+                "installer_bundle_sha256",
+                "runtime_profile_version",
+            )
+        },
     }
     result["errors"] = preflight_errors(
         fault_node=settings.fault_node,
@@ -686,13 +699,16 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--predecessor-evidence", default="")
     value.add_argument("--verify-max-attempts", type=int, default=6)
     value.add_argument("--managed-recovery-timeout-seconds", type=int, default=600)
-    value.add_argument("--variant", choices=VARIANTS, default="sibling-exhausted")
+    value.add_argument("--variant", choices=VARIANTS, default="unknown-reboot")
     return value
 
 
-def _host_probe(settings: Settings, node: str, run_id: str) -> HostProbeFixture:
+def _host_probe(
+    settings: Settings, node: str, run_id: str, case_dir: Path
+) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -706,9 +722,12 @@ def _host_probe(settings: Settings, node: str, run_id: str) -> HostProbeFixture:
     )
 
 
-def _destructive_probe(settings: Settings, node: str, run_id: str) -> HostProbeFixture:
+def _destructive_probe(
+    settings: Settings, node: str, run_id: str, case_dir: Path
+) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -719,6 +738,38 @@ def _destructive_probe(settings: Settings, node: str, run_id: str) -> HostProbeF
             probe_script=DESTRUCTIVE_PROBE,
             active_deadline_seconds=3600,
         )
+    )
+
+
+def _recovery_probe(
+    settings: Settings, run_id: str, case_dir: Path
+) -> HostProbeFixture:
+    return HostProbeFixture(
+        HostProbeSettings(
+            state_directory=case_dir / "host-probes",
+            kubeconfig=settings.regional.gpu_kubeconfig,
+            context=settings.regional.gpu_context,
+            namespace=settings.regional.namespace,
+            node=settings.sibling_node,
+            image=settings.host_probe_image,
+            case_id=CASE_ID,
+            run_id=run_id,
+            probe_script=recovery.PROBE,
+            active_deadline_seconds=7200,
+        )
+    )
+
+
+def recovery_hold_seconds(settings: Settings, preflight: dict[str, Any]) -> int:
+    return (
+        estimated_duration_seconds(
+            verify_max_attempts=settings.verify_max_attempts,
+            poll_interval_seconds=float(
+                (preflight.get("control_env") or {}).get("poll_interval_seconds") or 5
+            ),
+            managed_recovery_timeout_seconds=settings.managed_recovery_timeout_seconds,
+        )
+        + 120
     )
 
 
@@ -756,6 +807,27 @@ class _LiveRun:
     fault_baseline: dict[str, Any] = field(default_factory=dict)
     sibling_baseline: dict[str, Any] = field(default_factory=dict)
     sibling_agent_during: dict[str, Any] = field(default_factory=dict)
+    journal: recovery.RunJournal | None = None
+    recovery_window: recovery.AgentRecoveryWindow | None = None
+    resumed: bool = False
+    injection_started: bool = False
+    physical_outcome_unknown: bool = False
+
+
+def _checkpoint(run: _LiveRun) -> None:
+    if run.journal is not None:
+        run.journal.checkpoint(
+            env_opened=run.env_opened,
+            control_env_opened=run.control_env_opened,
+            holder_armed=run.holder_armed,
+            agent_disabled=run.agent_disabled,
+            injection_started=run.injection_started,
+            physical_outcome_unknown=run.physical_outcome_unknown,
+            incident_id=run.incident_id,
+            follow_up_incident_id=run.follow_up_incident_id,
+            marker=run.marker,
+            started_at=run.started_at.isoformat(),
+        )
 
 
 def _prepare_live_run(
@@ -766,24 +838,74 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
-    if preflight["errors"]:
-        raise RegionalFixtureError(
-            "preflight failed: " + "; ".join(preflight["errors"])
-        )
     planned = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
-    current = identity_digest(plan_identity(preflight))
-    if planned["details"]["preflight_identity_digest"] != current:
-        raise RegionalFixtureError("DESTR-014 plan identity drifted before execution")
-
-    regional = RegionalLiveFixture(settings.regional)
     run_id = f"destr014-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    pinned = render_two_node_manifest(
-        settings.manifest,
-        case_dir / "pinned-workload.yaml",
-        master_node=settings.fault_node,
-        worker_node=settings.sibling_node,
+    identity = planned["details"]["preflight_identity"]
+    journal = recovery.RunJournal(
+        case_dir / "destr014-recovery-journal.json",
+        {
+            "environment": settings.environment(),
+            "run_id": run_id,
+            "attempt": attempt,
+            "release_id": identity["release_id"],
+            "plan_sha256": _digest(planned),
+            "cluster_id": settings.regional.cluster_id,
+            "node": settings.sibling_node,
+            "node_uid": identity["sibling_node_uid"],
+            "boot_id": identity["sibling_node_boot_id"],
+        },
     )
+    journal.acquire()
+    try:
+        if journal.resumed:
+            preflight = journal.data["run"].get("preflight")
+            if not isinstance(preflight, dict):
+                raise RegionalFixtureError("DESTR-014 setup journal is incomplete")
+        else:
+            preflight = read_only_preflight(settings, case_dir)
+            if preflight["errors"]:
+                raise RegionalFixtureError(
+                    "preflight failed: " + "; ".join(preflight["errors"])
+                )
+            if planned["details"]["preflight_identity_digest"] != identity_digest(
+                plan_identity(preflight)
+            ):
+                raise RegionalFixtureError(
+                    "DESTR-014 plan identity drifted before execution"
+                )
+            journal.checkpoint(preflight=preflight)
+        return _build_live_run(
+            settings,
+            case_dir,
+            attempt,
+            maintenance_window_end,
+            preflight,
+            run_id,
+            journal,
+        )
+    except BaseException:
+        journal.close()
+        raise
+
+
+def _build_live_run(
+    settings: Settings,
+    case_dir: Path,
+    attempt: int,
+    maintenance_window_end: datetime,
+    preflight: dict[str, Any],
+    run_id: str,
+    journal: recovery.RunJournal,
+) -> _LiveRun:
+    regional = RegionalLiveFixture(settings.regional)
+    pinned = case_dir / "pinned-workload.yaml"
+    if not journal.resumed:
+        render_two_node_manifest(
+            settings.manifest,
+            pinned,
+            master_node=settings.fault_node,
+            worker_node=settings.sibling_node,
+        )
     workload = ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
@@ -796,7 +918,7 @@ def _prepare_live_run(
             expected_gpu_count=16,
         ),
     )
-    return _LiveRun(
+    run = _LiveRun(
         settings=settings,
         case_dir=case_dir,
         attempt=attempt,
@@ -809,13 +931,49 @@ def _prepare_live_run(
         prewarm=ImagePrewarmFixture(regional, case_id=CASE_ID, run_id=run_id),
         env_baseline=case_dir / "executor-env-window.json",
         control_env_baseline=case_dir / "control-plane-env-window.json",
-        fault_probe=_host_probe(settings, settings.fault_node, run_id),
-        sibling_probe=_host_probe(settings, settings.sibling_node, run_id),
-        inject_fault=_destructive_probe(settings, settings.fault_node, f"{run_id}-b"),
-        inject_sibling=_destructive_probe(
-            settings, settings.sibling_node, f"{run_id}-c"
+        fault_probe=_host_probe(settings, settings.fault_node, run_id, case_dir),
+        sibling_probe=_host_probe(settings, settings.sibling_node, run_id, case_dir),
+        inject_fault=_destructive_probe(
+            settings, settings.fault_node, f"{run_id}-b", case_dir
         ),
+        inject_sibling=_destructive_probe(
+            settings, settings.sibling_node, f"{run_id}-c", case_dir
+        ),
+        journal=journal,
+        recovery_window=recovery.AgentRecoveryWindow(
+            journal,
+            _recovery_probe(settings, run_id, case_dir),
+        ),
+        resumed=journal.resumed,
     )
+    if journal.resumed:
+        saved = journal.data["run"]
+        for name in (
+            "env_opened",
+            "control_env_opened",
+            "holder_armed",
+            "agent_disabled",
+            "injection_started",
+            "physical_outcome_unknown",
+        ):
+            value = saved.get(
+                name,
+                bool(saved.get("injection_started"))
+                if name == "physical_outcome_unknown"
+                else False,
+            )
+            if type(value) is not bool:
+                raise RegionalFixtureError("DESTR-014 cleanup intent is malformed")
+            setattr(run, name, value)
+        for name in ("incident_id", "follow_up_incident_id", "marker"):
+            value = saved.get(name, "")
+            if not isinstance(value, str):
+                raise RegionalFixtureError("DESTR-014 cleanup identity is malformed")
+            setattr(run, name, value)
+        run.started_at = datetime.fromisoformat(
+            saved.get("started_at") or run.started_at.isoformat()
+        )
+    return run
 
 
 def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -827,6 +985,10 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     # The managed-recovery window is read by the control-worker (it derives the
     # RESTART_NODE/REPLACE_NODE waiting caps from it); opening it rolls every
     # worker replica, so it goes first and before anything is injected.
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before configuration")
+    run.control_env_opened = True
+    _checkpoint(run)
     control_report = control_window.open_window(
         control_window.Settings(
             baseline=run.control_env_baseline, rollout_timeout_seconds=600
@@ -839,11 +1001,16 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
             )
         },
     )
-    run.control_env_opened = True
     write_json_atomic(
         case_dir / "control-plane-env-window-open.json",
         control_window.without_survey(control_report),
     )
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError(
+            "maintenance window ended before executor configuration"
+        )
+    run.env_opened = True
+    _checkpoint(run)
     env_report = env_window.open_window(
         env_window.Settings(baseline=run.env_baseline, rollout_timeout_seconds=300),
         run.regional,
@@ -854,7 +1021,6 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
             ),
         },
     )
-    run.env_opened = True
     write_json_atomic(case_dir / "env-window-open.json", env_report)
     run.prewarm.create([settings.fault_node, settings.sibling_node])
     run.workload.submit()
@@ -871,9 +1037,30 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     write_json_atomic(case_dir / "sibling-baseline.json", run.sibling_baseline)
     if datetime.now(timezone.utc) >= run.maintenance_window_end:
         raise RegionalFixtureError("maintenance window ended before injection")
-    run.sibling_probe.execute("disable-agent-restart", "--run-id", run_id)
+    if run.recovery_window is None or run.journal is None:
+        raise RegionalFixtureError(
+            "independent Node Agent recovery safeguard is missing"
+        )
+    restore_at = int(time.time()) + recovery_hold_seconds(settings, run.preflight)
+    expires_at = restore_at + recovery.RECOVERY_SECONDS
+    if expires_at > run.maintenance_window_end.timestamp():
+        raise RegionalFixtureError(
+            "maintenance window cannot contain bounded Agent recovery"
+        )
+    binding = recovery.make_binding(
+        scope=run.journal.scope,
+        owner=uuid4().hex,
+        agent=run.preflight["recovery_agent"],
+        restore_at=restore_at,
+        expires_at=expires_at,
+    )
+    run.recovery_window.arm(binding)
     run.agent_disabled = True
+    _checkpoint(run)
+    run.recovery_window.disable()
     run.sibling_agent_during = run.sibling_probe.execute("snapshot", "--run-id", run_id)
+    run.holder_armed = True
+    _checkpoint(run)
     run.fault_probe.execute(
         "arm-holder",
         "--device",
@@ -889,9 +1076,11 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         "--probe-script",
         run.fault_probe.host_script,
     )
-    run.holder_armed = True
     run.started_at = datetime.now(timezone.utc)
     run.marker = f"destr014-{int(time.time())}-a{run.attempt}"
+    run.injection_started = True
+    run.physical_outcome_unknown = True
+    _checkpoint(run)
     run.inject_sibling.execute(
         "write-xid79",
         "--marker",
@@ -930,6 +1119,8 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         hyperpod_cluster=settings.hyperpod_cluster,
         terminal=False,
     )
+    run.incident_id = str((fault_state.get("incident") or {}).get("incident_id") or "")
+    _checkpoint(run)
     return fault_state, sibling_state
 
 
@@ -981,6 +1172,12 @@ def _control_plane_errors(
         sibling_node=settings.sibling_node,
         failure_reason=workflow.get("terminal_failure_reason")
         or state.get("workflow_failure_reason"),
+        reboot_outcome="unknown",
+    )
+    # A missing/partial read is not a known failure. Persist the hold before
+    # any cleanup, including a cleanup-only restart of this runner.
+    run.physical_outcome_unknown = (
+        run.physical_outcome_unknown or recovery_cleanup_hold(state)
     )
     # The support escalation that follows an exhausted branch lives on its own
     # incident/workflow pair keyed by the failed workflow's id; read that pair
@@ -992,16 +1189,12 @@ def _control_plane_errors(
     run.follow_up_incident_id = str(
         (follow_up.get("incident") or {}).get("incident_id") or ""
     )
-    errors.extend(
-        follow_up_errors(
-            {
-                "incident": follow_up.get("incident"),
-                "workflow": follow_up.get("workflow"),
-            },
-            fault_node=settings.fault_node,
-            sibling_node=settings.sibling_node,
-        )
-    )
+    _checkpoint(run)
+    if any(
+        step.get("operation") in {"RESTART_NODE", "REPLACE_NODE", "RESTART_WORKLOAD"}
+        for step in (follow_up.get("workflow") or {}).get("official_steps") or []
+    ):
+        errors.append("unknown reboot generated an executable recovery successor")
     return errors, workflow, incident
 
 
@@ -1042,8 +1235,12 @@ def _data_plane_errors(
     holder = run.fault_probe.execute("holder-status", "--run-id", run_id)
     fault_after = run.fault_probe.execute("snapshot", "--run-id", run_id)
     sibling_after = run.sibling_probe.execute("snapshot", "--run-id", run_id)
-    run.sibling_probe.execute("restore-agent", "--run-id", run_id)
+    if run.recovery_window is None:
+        raise RegionalFixtureError("independent Agent recovery binding is missing")
+    restored = run.recovery_window.restore()
+    write_json_atomic(run.case_dir / "sibling-recovery-restored.json", restored)
     run.agent_disabled = False
+    _checkpoint(run)
     # ``systemctl start`` returns before the unit reports active; judge the
     # settled state, not the first sample (attempt 9, 2026-09-09).
     sibling_agent_after = _wait_agent_unit(run.sibling_probe, run_id)
@@ -1112,8 +1309,7 @@ def execute_case(
     attempt: int,
     maintenance_window_end: datetime,
 ) -> int:
-    """Drive the live case. Not exercised by the unit suite; the verdicts it
-    calls are. Every cleanup failure downgrades the verdict to FAIL."""
+    """Drive one attempt; any existing journal resumes cleanup, never injection."""
 
     run = _prepare_live_run(settings, run_dir, attempt, maintenance_window_end)
     result: dict[str, Any] = {
@@ -1123,7 +1319,19 @@ def execute_case(
         "variant": settings.variant,
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
+    journal = getattr(run, "journal", None)
+    cleanup_permitted = True
+    supervision_lost = False
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
+        if run.resumed:
+            cleanup_permitted = False
+            _resume_identity_guard(run)
+            cleanup_permitted = True
+            raise RegionalFixtureError(
+                "resumed DESTR-014 attempt is cleanup-only; scenario was not rerun"
+            )
         fault_state, sibling_state = _arm_and_inject(run)
         errors = injection_errors(fault_state, sibling_state)
         state = _observe_until_terminal(run, fault_state)
@@ -1140,235 +1348,113 @@ def execute_case(
         components = evidence_components(details)
         result.update(
             {
-                "verdict": "PASS" if not errors else "FAIL",
+                "verdict": "BLOCKED" if not errors else "FAIL",
+                "scenario_verdict": "PASS" if not errors else "FAIL",
+                "operator_review_required": run.physical_outcome_unknown,
+                "proof_scope": "unknown-reboot-hold",
                 "errors": errors,
                 "incident_id": run.incident_id,
                 "case_digest": case_digest(components),
                 "components": components,
             }
         )
+    except ProcessSupervisionLost:
+        supervision_lost = True
+        cleanup_permitted = False
+        result["error"] = (
+            "command supervision lost; independent recovery and review required"
+        )
+        if journal is not None:
+            journal.data["supervision_lost"] = True
+            journal.data["phase"] = "RECOVERY_REQUIRED"
+            journal.save()
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup = _cleanup(
-            regional=run.regional,
-            warm=run.warm,
-            workload=run.workload,
-            prewarm=run.prewarm,
-            fault_probe=run.fault_probe,
-            sibling_probe=run.sibling_probe,
-            inject_fault=run.inject_fault,
-            inject_sibling=run.inject_sibling,
-            settings=settings,
-            run_id=run.run_id,
-            incident_id=run.incident_id,
-            env_baseline=run.env_baseline,
-            env_opened=run.env_opened,
-            control_env_baseline=run.control_env_baseline,
-            control_env_opened=run.control_env_opened,
-            holder_armed=run.holder_armed,
-            agent_disabled=run.agent_disabled,
-            profile_version=str(
-                (run.preflight["store"].get("profile") or {}).get("profile_version")
-                or ""
-            ),
-        )
+        if journal is not None and journal.data["phase"] == "CLOSED":
+            cleanup: dict[str, Any] = {"errors": [], "already_closed": True}
+        elif not cleanup_permitted:
+            cleanup = {
+                "errors": ["cleanup deferred: identity or supervision is unproven"]
+            }
+        else:
+            try:
+                cleanup = _cleanup(
+                    regional=run.regional,
+                    warm=run.warm,
+                    workload=run.workload,
+                    prewarm=run.prewarm,
+                    fault_probe=run.fault_probe,
+                    sibling_probe=run.sibling_probe,
+                    inject_fault=run.inject_fault,
+                    inject_sibling=run.inject_sibling,
+                    settings=settings,
+                    run_id=run.run_id,
+                    incident_id=run.incident_id,
+                    env_baseline=run.env_baseline,
+                    env_opened=run.env_opened,
+                    control_env_baseline=run.control_env_baseline,
+                    control_env_opened=run.control_env_opened,
+                    holder_armed=run.holder_armed,
+                    agent_disabled=run.agent_disabled,
+                    recovery_window=getattr(run, "recovery_window", None),
+                    operator_hold=getattr(run, "physical_outcome_unknown", False),
+                    profile_version=str(
+                        (run.preflight["store"].get("profile") or {}).get(
+                            "profile_version"
+                        )
+                        or ""
+                    ),
+                )
+            except ProcessSupervisionLost:
+                supervision_lost = True
+                cleanup = {"errors": ["cleanup stopped: command supervision lost"]}
+                if journal is not None:
+                    journal.data["supervision_lost"] = True
         result["cleanup"] = cleanup
         if cleanup["errors"]:
-            result["verdict"] = "FAIL"
+            result["verdict"] = (
+                "BLOCKED"
+                if result.get("scenario_verdict") == "PASS"
+                and cleanup.get("operator_hold_preserved")
+                else "FAIL"
+            )
+        if journal is not None:
+            try:
+                journal.data["phase"] = (
+                    "CLOSED"
+                    if not cleanup["errors"] and not supervision_lost
+                    else "RECOVERY_REQUIRED"
+                )
+                journal.save()
+            finally:
+                journal.close()
     write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def _ledger(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    state = snapshot.get("state") or {}
-    return cast(
-        list[dict[str, Any]], state.get("ledger") or snapshot.get("ledger") or []
-    )
-
-
-def recreate_probe(probe: HostProbeFixture) -> None:
-    """Replace a host probe Pod after the node it ran on rebooted.
-
-    A RESTART_NODE takes the probe down with its node and leaves it Failed;
-    ``kubectl exec`` into a Failed Pod is refused, so deleting and re-applying
-    is the only way back to a Pod that can still read and restore the host
-    (same rule as ``CollectorAcceptanceFixture.recreate``).
-    """
-
-    probe.cleanup()
-    probe.create()
-
-
-def _cleanup(
-    *,
-    regional: RegionalLiveFixture,
-    warm: WarmSpareLiveFixture,
-    workload: ManagedWorkloadFixture,
-    prewarm: ImagePrewarmFixture,
-    fault_probe: HostProbeFixture,
-    sibling_probe: HostProbeFixture,
-    inject_fault: HostProbeFixture,
-    inject_sibling: HostProbeFixture,
-    settings: Settings,
-    run_id: str,
-    incident_id: str,
-    env_baseline: Path,
-    env_opened: bool,
-    control_env_baseline: Path,
-    control_env_opened: bool,
-    holder_armed: bool,
-    agent_disabled: bool,
-    profile_version: str,
-) -> dict[str, Any]:
-    result: dict[str, Any] = {"errors": []}
-
-    def guard(label: str, action: Any) -> None:
-        try:
-            result[label] = action()
-        except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
-            result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
-
-    if holder_armed:
-        guard("fault_probe_recreate", lambda: recreate_probe(fault_probe))
-        guard(
-            "holder_disarm",
-            lambda: fault_probe.execute("disarm-holder", "--run-id", run_id),
-        )
-    if agent_disabled:
-        guard("sibling_probe_recreate", lambda: recreate_probe(sibling_probe))
-        guard(
-            "agent_restore",
-            lambda: sibling_probe.execute("restore-agent", "--run-id", run_id),
-        )
-    guard("workload_delete", workload.delete)
-    if incident_id:
-        guard(
-            "sibling_agent_reactivate",
-            lambda: warm.reactivate_agent(settings.sibling_node),
-        )
-        guard(
-            "isolation_restore",
-            lambda: _restore_isolated_nodes(
-                regional, warm, settings, incident_id, profile_version
-            ),
-        )
-    if env_opened:
-        guard(
-            "env_window_close",
-            lambda: env_window.close_window(
-                env_window.Settings(baseline=env_baseline, rollout_timeout_seconds=300),
-                regional,
-                env_window.survey(regional),
-            ),
-        )
-    if control_env_opened:
-        guard(
-            "control_env_window_close",
-            lambda: control_window.without_survey(
-                control_window.close_window(
-                    control_window.Settings(
-                        baseline=control_env_baseline, rollout_timeout_seconds=600
-                    ),
-                    regional,
-                    control_window.survey(regional),
-                )
-            ),
-        )
-    guard("prewarm_cleanup", prewarm.cleanup)
-    for name, probe in (
-        ("fault_probe", fault_probe),
-        ("sibling_probe", sibling_probe),
-        ("inject_fault", inject_fault),
-        ("inject_sibling", inject_sibling),
+def _resume_identity_guard(run: _LiveRun) -> None:
+    if run.regional.release_id() != run.preflight["release_id"]:
+        raise RegionalFixtureError("DESTR-014 cleanup release identity changed")
+    for snapshot_name, node in (
+        ("fault_node", run.settings.fault_node),
+        ("sibling_node", run.settings.sibling_node),
     ):
-        guard(f"{name}_cleanup", probe.cleanup)
-    return result
-
-
-def _restore_isolated_nodes(
-    regional: RegionalLiveFixture,
-    warm: WarmSpareLiveFixture,
-    settings: Settings,
-    incident_id: str,
-    profile_version: str,
-) -> dict[str, Any]:
-    """Release every node the case -- or the product's own escalation -- left
-    isolated, through the incident that owns the isolation.
-
-    The exhaustion escalation opens a support-after incident that re-quarantines
-    the node and owns its taint, so a restore through the case's own incident
-    is refused (attempt 8, 2026-09-09: "sibling restore workflow did not
-    succeed" and both nodes stayed quarantined). Same rule as the DESTR-003/008
-    cleanups: read each node's owner annotation, validated-restore through it,
-    record the owner, then close the case incident if it is still open. Never
-    delete a taint or an annotation by hand.
-    """
-
-    report: dict[str, Any] = {"nodes": {}}
-    for node in (settings.sibling_node, settings.fault_node):
-        snapshot = regional.node_snapshot(node)
-        owner = str(
-            (snapshot.get("ownership_annotations") or {}).get(
-                "gpu-fault.io/incident-id"
-            )
-            or ""
+        expected = (run.preflight.get(snapshot_name) or {}).get("uid")
+        if not expected or run.regional.node_snapshot(node).get("uid") != expected:
+            raise RegionalFixtureError("DESTR-014 cleanup Node UID changed")
+    if run.injection_started and not run.incident_id:
+        snapshot = run.regional.store_snapshot(
+            node=run.settings.fault_node,
+            marker=run.marker,
+            observed_after=run.started_at,
+            job_id=run.settings.job_id,
+            attempt_id=run.settings.attempt_id,
+            hyperpod_cluster=run.settings.hyperpod_cluster,
         )
-        isolated = (
-            bool(snapshot.get("unschedulable"))
-            or any(
-                item.get("key") == QUARANTINE_TAINT
-                for item in snapshot.get("taints") or []
-            )
-            or bool(owner)
-        )
-        entry: dict[str, Any] = {
-            "quarantine_owner": owner or None,
-            "isolated": isolated,
-        }
-        if isolated:
-            target = owner or incident_id
-            if owner and owner != incident_id:
-                entry["successor_incident"] = owner
-            warm.wait_incident_idle(target)
-            created = warm.create_restore_workflow(
-                incident_id=target,
-                node=node,
-                profile_version=profile_version,
-                reason="DESTR-014 validated cleanup",
-            )
-            restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
-            entry["restore"] = {
-                "workflow_request_id": created["workflow_request_id"],
-                "status": restored.get("status"),
-                "error": restored.get("error"),
-            }
-            if restored.get("status") != "SUCCEEDED":
-                raise RegionalFixtureError(
-                    f"{node} restore workflow did not succeed: "
-                    f"{restored.get('status')} {restored.get('error')}"
-                )
-        report["nodes"][node] = entry
-    state = warm.incident_by_id(incident_id).get("state")
-    report["incident_state_before_close"] = state
-    if state != "RECOVERED":
-        warm.wait_incident_idle(incident_id)
-        created = warm.create_restore_workflow(
-            incident_id=incident_id,
-            node=settings.sibling_node,
-            profile_version=profile_version,
-            reason="DESTR-014 validated cleanup: close the case incident",
-        )
-        restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
-        report["close"] = {
-            "status": restored.get("status"),
-            "error": restored.get("error"),
-        }
-        if restored.get("status") != "SUCCEEDED":
-            raise RegionalFixtureError("case incident close workflow did not succeed")
-    report["incident_state_after"] = warm.incident_by_id(incident_id).get("state")
-    return report
+        run.incident_id = str((snapshot.get("incident") or {}).get("incident_id") or "")
+        _checkpoint(run)
 
 
 CASE = CaseRunner(

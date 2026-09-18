@@ -18,6 +18,7 @@ from gpu_fault.markers import (
     describe_blocking_marker,
 )
 from gpu_fault.models import AdvisoryNotification
+from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +28,26 @@ SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 HYPERPOD_NODE_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 HYPERPOD_SCHEDULABLE = "Schedulable"
 GPU_RESOURCE_NAME = "nvidia.com/gpu"
+ACTIVATION_NOT_SPECIFIED = object()
+ACTIVATION_FORBIDDEN_REASON = (
+    "ACTIVATION_FORBIDDEN: synthetic replacement cannot activate a warm spare"
+)
+
+
+class SpareActivationForbidden(RuntimeError):
+    pass
+
+
+def require_spare_activation_permitted(
+    activation_forbidden: object = ACTIVATION_NOT_SPECIFIED,
+) -> None:
+    if activation_forbidden is not ACTIVATION_NOT_SPECIFIED:
+        raise SpareActivationForbidden(
+            ACTIVATION_FORBIDDEN_REASON
+            if activation_forbidden is True
+            else "ACTIVATION_FORBIDDEN: invalid activation_forbidden marker"
+        )
+
 
 GpuClientChecker = Callable[[HyperPodNode, str, str], list[str]]
 
@@ -65,10 +86,13 @@ class SpareAllocation:
     reason: str | None = None
     notification_id: str | None = None
     rejected_candidates: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    activation_inhibited: bool = False
 
 
 class HyperPodSpareCoordinator:
     """Atomically activates healthy, topology-compatible warm spares."""
+
+    activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
 
     def __init__(
         self,
@@ -104,6 +128,7 @@ class HyperPodSpareCoordinator:
         fault_node_ids: list[str],
         gpu_client_checker: GpuClientChecker | None = None,
         local_only: bool = False,
+        activation_forbidden: object = ACTIVATION_NOT_SPECIFIED,
     ) -> SpareAllocation:
         nodes = (
             self._kubernetes_nodes()
@@ -217,8 +242,18 @@ class HyperPodSpareCoordinator:
                     node_name,
                     incident_id,
                     gpu_client_checker=gpu_client_checker,
+                    activation_forbidden=activation_forbidden,
                 )
                 activated.append(node_name)
+        except SpareActivationForbidden as exc:
+            # Inhibition precedes the first patch; it is not a capacity alert.
+            return SpareAllocation(
+                applicable=True,
+                sufficient=False,
+                required=len(targets),
+                reason=str(exc),
+                activation_inhibited=True,
+            )
         except SpareHealthPending:
             self._rollback(activated, incident_id)
             raise
@@ -381,6 +416,7 @@ class HyperPodSpareCoordinator:
         incident_id: str,
         *,
         gpu_client_checker: GpuClientChecker | None = None,
+        activation_forbidden: object = ACTIVATION_NOT_SPECIFIED,
     ) -> None:
         """Reserve one spare for ``incident_id`` and uncordon it."""
         self._reserve_and_activate(
@@ -388,6 +424,7 @@ class HyperPodSpareCoordinator:
             node_name,
             incident_id,
             gpu_client_checker=gpu_client_checker,
+            activation_forbidden=activation_forbidden,
         )
 
     def _healthy(
@@ -419,6 +456,8 @@ class HyperPodSpareCoordinator:
         gpu_client_checker: GpuClientChecker | None = None,
     ) -> list[str]:
         reasons = []
+        if not node.instance_group_name or not node.instance_type:
+            reasons.append("HyperPod topology is unknown")
         if node.status != "Running":
             reasons.append(f"HyperPod status is {node.status}")
         kubernetes_node = self.core.read_node(node_name)
@@ -505,12 +544,16 @@ class HyperPodSpareCoordinator:
         incident_id: str,
         *,
         gpu_client_checker: GpuClientChecker | None = None,
+        activation_forbidden: object = ACTIVATION_NOT_SPECIFIED,
     ) -> None:
         node = self.core.read_node(node_name)
         reservation = self._annotation(node)
-        if reservation == incident_id:
+        if (
+            reservation == incident_id
+            and activation_forbidden is ACTIVATION_NOT_SPECIFIED
+        ):
             return
-        if reservation:
+        if reservation and reservation != incident_id:
             raise ValueError(f"node {node_name} is reserved by {reservation}")
         occupancy_reasons = self._active_gpu_pod_reasons(node_name)
         if gpu_client_checker is not None and not occupancy_reasons:
@@ -524,9 +567,11 @@ class HyperPodSpareCoordinator:
             raise ValueError(
                 f"spare {node_name} became occupied: " + "; ".join(occupancy_reasons)
             )
+        require_spare_activation_permitted(activation_forbidden)
         reserved_at = self.now().isoformat()
 
         def body(current: Any) -> dict[str, Any] | None:
+            require_spare_activation_permitted(activation_forbidden)
             current_reservation = self._annotation(current)
             if current_reservation == incident_id:
                 return None

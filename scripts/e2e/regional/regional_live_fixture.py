@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -22,10 +22,24 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 )
 from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
     FORMAL_SCOPE,
+    SELECTIVE_SCOPE,
     current_acceptance_scope,
 )
+from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandTimeout as RegionalCommandTimeout,
+    RegionalFixtureError as RegionalFixtureError,
+    run_fixture_command,
+)
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.regional_store_probe import STORE_PROBE as STORE_PROBE  # noqa: E402
+from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
+    SYSTEM_NAMESPACES as SYSTEM_NAMESPACES,
+    business_workload_items as business_workload_items,
+    pod_gpu_count as pod_gpu_count,
+)
 
-TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED"}
+TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 PROVIDER_MUTATIONS = {
     "BatchDeleteClusterNodes",
     "BatchRebootClusterNodes",
@@ -49,6 +63,15 @@ RUNTIME_IDENTITY_DEPLOYMENTS = {
 # and documented at up to 15. A lookup that returns nothing inside that window
 # has not shown that nothing happened.
 PROVIDER_EVENT_VISIBILITY_SECONDS = 900
+
+
+def component_python(plane: str) -> str:
+    if plane not in {"cpu", "gpu"}:
+        raise ValueError(f"unknown Kubernetes plane: {plane}")
+    component = "control-plane" if plane == "cpu" else "executor"
+    return f"/opt/gpu-fault/{component}/bin/python"
+
+
 RELEASE_STATE_IDENTITY_FIELDS = (
     "release_id",
     "phase",
@@ -114,25 +137,6 @@ def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
             ):
                 errors.append(f"{plane}/{name} is not fully rolled out")
     return errors
-
-
-class RegionalFixtureError(RuntimeError):
-    pass
-
-
-class RegionalCommandTimeout(RegionalFixtureError):
-    """A subprocess hit its wall-clock bound.
-
-    A ``subprocess.TimeoutExpired`` says nothing about whether the command ran:
-    a ``kubectl exec`` that posts an XID and then hangs on the receipt poll has
-    already posted it. Raising this instead of the raw exception lets
-    ``pod_python`` refuse to retry a script whose first attempt may have acted.
-    """
-
-    def __init__(self, command: Sequence[str], timeout: float | None) -> None:
-        super().__init__(f"command timed out after {timeout}s: {' '.join(command)}")
-        self.command = list(command)
-        self.timeout = timeout
 
 
 class RegionalFixtureAbort(BaseException):
@@ -203,11 +207,137 @@ def predecessor_identity_errors(
         if expected is None:
             continue
         actual = value.get(field)
-        if actual in (None, ""):
+        if not isinstance(expected, str) or not expected.strip():
+            errors.append(f"expected {field} is empty or invalid")
+        elif actual in (None, ""):
             errors.append(f"{field} missing from predecessor evidence")
-        elif str(actual) != expected:
+        elif not isinstance(actual, str) or actual != expected:
             errors.append(f"{field} mismatch")
     return errors
+
+
+def _predecessor_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate predecessor evidence field")
+        value[key] = item
+    return value
+
+
+def _invalid_predecessor_constant(_value: str) -> NoReturn:
+    raise ValueError("non-finite predecessor evidence value")
+
+
+def _read_predecessor_evidence(
+    path: Path,
+) -> tuple[dict[str, Any] | None, str, str | None, str | None]:
+    try:
+        if not path.is_file():
+            return None, "MISSING", "predecessor evidence does not exist", None
+        data = path.read_bytes()
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_predecessor_object,
+            parse_constant=_invalid_predecessor_constant,
+        )
+    except (OSError, ValueError, RecursionError) as exc:
+        return (
+            None,
+            "INVALID",
+            f"cannot read predecessor evidence: {type(exc).__name__}",
+            None,
+        )
+    if not isinstance(value, dict):
+        return None, "INVALID", "predecessor evidence is not a JSON object", None
+    return value, "READ", None, hashlib.sha256(data).hexdigest()
+
+
+def read_predecessor_evidence(
+    path: Path,
+    expected_case_id: str,
+    *,
+    release_id: str | None = None,
+    cluster_id: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Return one parsed document and its scope-independent validation facts.
+
+    Consumers reusing recorded steps must check ``facts["evidence_valid"]``
+    before using the returned document; rereading the path would lose that
+    binding. Omitted identity arguments retain the legacy unbound contract.
+    """
+
+    value, code, read_error, digest = _read_predecessor_evidence(path)
+    facts: dict[str, Any] = {
+        "evidence_valid": False,
+        "evidence_case_id": None,
+        "evidence_verdict": None,
+        "evidence_execution_scope": None,
+        "evidence_release_id": None,
+        "evidence_cluster_id": None,
+        "expected_release_id": release_id,
+        "expected_cluster_id": cluster_id,
+        "evidence_error": read_error,
+        "evidence_read_status": code,
+        "evidence_sha256": digest,
+    }
+    if value is None:
+        return None, facts
+    actual_case_id = value.get("case_id")
+    verdict = value.get("verdict")
+    evidence_scope = value.get("execution_scope", FORMAL_SCOPE)
+    completed = "status" not in value or value["status"] == "COMPLETED"
+    identity_errors = predecessor_identity_errors(
+        value,
+        release_id=release_id,
+        cluster_id=cluster_id,
+    )
+    if (
+        not isinstance(expected_case_id, str)
+        or not expected_case_id.strip()
+        or actual_case_id != expected_case_id
+        or verdict != "PASS"
+    ):
+        error: str | None = "predecessor case must have verdict PASS"
+    elif not completed:
+        error = "predecessor execution must be completed"
+    elif identity_errors:
+        error = "; ".join(identity_errors)
+    elif evidence_scope not in (FORMAL_SCOPE, SELECTIVE_SCOPE):
+        error = "predecessor execution scope is invalid"
+    elif "formal_sequence_satisfied" in value and not isinstance(
+        value["formal_sequence_satisfied"], bool
+    ):
+        error = "predecessor formal sequence flag must be a boolean"
+    else:
+        error = None
+    facts.update(
+        {
+            "evidence_valid": error is None,
+            "evidence_case_id": actual_case_id,
+            "evidence_verdict": verdict,
+            "evidence_execution_scope": evidence_scope,
+            "evidence_release_id": value.get("release_id"),
+            "evidence_cluster_id": value.get("cluster_id"),
+            "evidence_error": error,
+        }
+    )
+    return value, facts
+
+
+def predecessor_evidence_facts(
+    path: Path,
+    expected_case_id: str,
+    *,
+    release_id: str | None = None,
+    cluster_id: str | None = None,
+) -> dict[str, Any]:
+    """Describe a completed bound PASS independently of the sequence gate."""
+
+    _value, facts = read_predecessor_evidence(
+        path, expected_case_id, release_id=release_id, cluster_id=cluster_id
+    )
+    return facts
 
 
 def predecessor_evidence(
@@ -217,15 +347,16 @@ def predecessor_evidence(
     release_id: str | None = None,
     cluster_id: str | None = None,
 ) -> dict[str, Any]:
-    """Read a predecessor case's evidence and decide whether it lets this run go.
+    """Apply the sequence gate to the same document that supplies its facts.
 
-    ``release_id``/``cluster_id``, when given, must equal the evidence file's
-    top-level fields of the same name; the successor obtains both from
-    ``RegionalLiveFixture.evidence_identity``. Left as ``None`` the identity is
-    not checked, which is the pre-binding behaviour.
+    Selective scope waives only the sequence gate. It does not make missing,
+    incomplete or foreign predecessor evidence safe to reuse.
     """
 
     scope = current_acceptance_scope()
+    value, facts = read_predecessor_evidence(
+        path, expected_case_id, release_id=release_id, cluster_id=cluster_id
+    )
     if scope.selective:
         return {
             "path": str(path),
@@ -235,89 +366,34 @@ def predecessor_evidence(
             "status": "SKIPPED_BY_OPERATOR",
             "valid": True,
             "execution_allowed": True,
-            "evidence_valid": False,
+            **facts,
             **scope.result_fields(),
             "error": None,
         }
-    if not path.is_file():
-        return {
-            "path": str(path),
-            "case_id": expected_case_id,
-            "verdict": "MISSING",
-            "valid": False,
-            "execution_allowed": False,
-            "evidence_valid": False,
-            **scope.plan_fields(),
-            "formal_sequence_satisfied": False,
-            "error": "predecessor evidence does not exist",
-        }
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {
-            "path": str(path),
-            "case_id": expected_case_id,
-            "verdict": "INVALID",
-            "valid": False,
-            "execution_allowed": False,
-            "evidence_valid": False,
-            **scope.plan_fields(),
-            "formal_sequence_satisfied": False,
-            "error": f"cannot read predecessor evidence: {exc}",
-        }
-    if not isinstance(value, dict):
-        return {
-            "path": str(path),
-            "case_id": expected_case_id,
-            "verdict": "INVALID",
-            "valid": False,
-            "execution_allowed": False,
-            "evidence_valid": False,
-            **scope.plan_fields(),
-            "formal_sequence_satisfied": False,
-            "error": "predecessor evidence is not a JSON object",
-        }
-    actual_case_id = str(value.get("case_id") or "")
-    verdict = str(value.get("verdict") or "")
-    evidence_scope = str(value.get("execution_scope") or FORMAL_SCOPE)
-    formal_sequence_satisfied = bool(
-        value.get(
-            "formal_sequence_satisfied",
-            evidence_scope == FORMAL_SCOPE,
-        )
+    evidence_scope = facts["evidence_execution_scope"]
+    formal_sequence_satisfied = value is not None and (
+        value.get("formal_sequence_satisfied", evidence_scope == FORMAL_SCOPE) is True
     )
-    identity_errors = predecessor_identity_errors(
-        value,
-        release_id=release_id,
-        cluster_id=cluster_id,
+    valid = bool(
+        facts["evidence_valid"]
+        and evidence_scope == FORMAL_SCOPE
+        and formal_sequence_satisfied
     )
-    evidence_valid = (
-        actual_case_id == expected_case_id and verdict == "PASS" and not identity_errors
-    )
-    valid = (
-        evidence_valid and evidence_scope == FORMAL_SCOPE and formal_sequence_satisfied
-    )
-    if actual_case_id != expected_case_id or verdict != "PASS":
-        error = "predecessor case must have verdict PASS"
-    elif identity_errors:
-        error = "; ".join(identity_errors)
-    elif evidence_scope != FORMAL_SCOPE or not formal_sequence_satisfied:
+    error = facts["evidence_error"]
+    if error is None and not valid:
         error = "selective evidence cannot satisfy a formal predecessor"
-    else:
-        error = None
     return {
         "path": str(path),
-        "case_id": actual_case_id,
+        "case_id": facts["evidence_case_id"] if value is not None else expected_case_id,
         "expected_case_id": expected_case_id,
-        "verdict": verdict,
+        "verdict": (
+            facts["evidence_verdict"]
+            if value is not None
+            else facts["evidence_read_status"]
+        ),
         "valid": valid,
         "execution_allowed": valid,
-        "evidence_valid": evidence_valid,
-        "evidence_execution_scope": evidence_scope,
-        "evidence_release_id": value.get("release_id"),
-        "evidence_cluster_id": value.get("cluster_id"),
-        "expected_release_id": release_id,
-        "expected_cluster_id": cluster_id,
+        **facts,
         **scope.plan_fields(),
         "formal_sequence_satisfied": valid,
         "error": error,
@@ -489,246 +565,6 @@ def settings_from_arguments(arguments: Any) -> RegionalLiveSettings:
     )
 
 
-STORE_PROBE = r"""
-import hashlib
-import json
-import os
-import sys
-import time
-from datetime import datetime, timezone
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
-from gpu_fault.store import NotFoundError
-
-
-# The lease token is the credential an executor presents to report a result
-# for the command it holds; a case's evidence directory is not where it
-# belongs. Digest and length still let a verdict say "the same lease" or "a
-# lease was present" without carrying the secret.
-def redacted_command(item):
-    value = item.model_dump(mode="json")
-    token = value.pop("lease_token", None)
-    raw = str(token).encode() if token not in (None, "") else None
-    value["lease_token_sha256"] = (
-        hashlib.sha256(raw).hexdigest() if raw is not None else None
-    )
-    value["lease_token_length"] = len(raw) if raw is not None else None
-    return value
-
-
-# Report the processor queue as a backlog check, not an instant sample.
-#
-# Every destructive preflight refuses to start while the queue is non-empty, and
-# the depth it reads counts PENDING plus LEASED rows. On a live cluster the
-# collectors post continuously, so a healthy queue is almost never observably
-# empty: on 2026-09-04 four consecutive DESTR-012 plans were refused with
-# "processor queue is not empty" on depth=1 whose oldest entry was 0.42 seconds
-# old, while the control-plane gauge read 0 moments later. That is in-flight
-# work, not a backlog, and gating on a single sample turns a normal cluster into
-# an unrunnable one.
-#
-# Sampling until the queue drains keeps the gate's real meaning -- the case's
-# injected event must not queue behind unrelated work -- because a genuine
-# backlog does not clear within the bound and still fails. max_sampled_depth and
-# samples are recorded so the evidence shows a busy queue that drained rather
-# than a queue that happened to look idle.
-def drained_queue_stats(store, attempts=20, pause=0.5):
-    samples = []
-    fault_backlog_depth = 0
-    for index in range(attempts):
-        stats = store.processor_queue_stats()
-        samples.append(stats)
-        fault_backlog_depth = int(store.processor_fault_backlog_depth())
-        # Total depth 0 stays the drain signal for every caller reading
-        # ``depth``; the loop is unchanged for them. ``fault_backlog_depth`` is
-        # recorded alongside for a caller that only cares about roll-unsafe
-        # work: routine telemetry (gpu-inventory, evidence -- priority above the
-        # reserved tier) is idempotent, a control-worker roll cannot harm it,
-        # and one gpu-inventory lane can livelock on a stale fencing token for
-        # ~120s, so total depth may never reach 0 within this window.
-        if not int(stats.get("depth") or 0):
-            break
-        if index + 1 < attempts:
-            time.sleep(pause)
-    result = dict(samples[-1])
-    result["samples"] = len(samples)
-    result["fault_backlog_depth"] = fault_backlog_depth
-    result["max_sampled_depth"] = max(
-        int(item.get("depth") or 0) for item in samples
-    )
-    return result
-
-probe_argv = list(sys.argv[1:])
-# The ninth argument arrived after the eighth; a caller that still passes eight
-# gets today's unfiltered command read.
-if len(probe_argv) == 8:
-    probe_argv.append("")
-(
-    cluster_id,
-    node_id,
-    marker,
-    observed_after_text,
-    job_id,
-    attempt_id,
-    hyperpod_cluster,
-    queue_attempts_text,
-    workflow_request_ids_text,
-) = probe_argv
-# A preflight wants the drained backlog reading above; a wait loop wants the
-# cheapest read that still reports the queue, because the drain sampling alone
-# is ~10s per call and a step's WAITING record can come and go inside that.
-queue_attempts = int(queue_attempts_text or 20)
-explicit_workflow_request_ids = [
-    item for item in workflow_request_ids_text.split(",") if item
-]
-store = ApplicationContext.from_environment().store
-observed_after = (
-    datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
-    if observed_after_text
-    else None
-)
-events = (
-    store.list_xid_events(
-        cluster_id,
-        node_id,
-        observed_after=observed_after,
-    )
-    if node_id
-    else []
-)
-matching_events = [
-    item
-    for item in events
-    if (
-        not marker
-        or marker in str(item.raw_message or "")
-        or marker in str(item.event_id)
-    )
-]
-event = matching_events[-1] if matching_events else None
-decision = None
-if event is not None:
-    try:
-        decision = store.get_xid_policy_decision(event.event_id)
-    except NotFoundError:
-        pass
-incident = store.get_incident_by_event(event.event_id) if event is not None else None
-workflow = (
-    store.get_workflow(incident.workflow_request_id)
-    if incident is not None and incident.workflow_request_id
-    else None
-)
-# Every backend filters remote commands by workflow in the store, so the probe
-# never has to page the whole table through the API Pod. Without an explicit
-# filter this is exactly the old read -- the workflow's own commands, or none
-# when no workflow exists yet -- only cheaper; with one, the caller names the
-# workflows it wants regardless of what the marker resolved to.
-if explicit_workflow_request_ids:
-    commands = store.list_remote_commands(
-        workflow_request_ids=explicit_workflow_request_ids
-    )
-elif workflow is not None:
-    commands = [
-        item
-        for item in store.list_remote_commands(
-            workflow_request_ids=[workflow.request_id]
-        )
-        if item.workflow_request_id == workflow.request_id
-    ]
-else:
-    commands = []
-notifications = []
-if incident is not None:
-    for item in store.list_notifications():
-        if item.incident_id != incident.incident_id:
-            continue
-        result = store.get_notification_result(item.notification_id)
-        notifications.append({
-            "notification": item.model_dump(mode="json"),
-            "result": (
-                result.model_dump(mode="json")
-                if result is not None else None
-            ),
-        })
-observations = [
-    item.model_dump(mode="json")
-    for item in store.list_attempt_observations(cluster_id)
-    if (not job_id or item.job_id == job_id)
-    and (not attempt_id or item.attempt_id == attempt_id)
-]
-restart_budget = None
-if job_id:
-    try:
-        restart_budget = store.get_restart_budget(cluster_id, job_id).model_dump(
-            mode="json"
-        )
-    except NotFoundError:
-        pass
-agent = None
-profile = None
-if node_id:
-    try:
-        agent_model = store.get_agent(cluster_id, node_id)
-        agent = agent_model.model_dump(mode="json")
-        profile = store.get_profile(
-            agent_model.runtime_profile_version
-        ).model_dump(mode="json")
-    except (KeyError, NotFoundError):
-        pass
-submission = None
-if hyperpod_cluster and commands:
-    restart_command = next(
-        (
-            item for item in commands
-            if item.step.operation.value == "RESTART_NODE"
-        ),
-        None,
-    )
-    if restart_command is not None:
-        submission_key = (
-            restart_command.result_details.get("submission_idempotency_key")
-            or hyperpod_submission_idempotency_key(
-                workflow.request_id,
-                restart_command.step_index,
-                restart_command.step.operation,
-            )
-        )
-        try:
-            submission = store.get_hyperpod_submission(
-                hyperpod_cluster,
-                submission_key,
-            )
-        except NotFoundError:
-            pass
-print(json.dumps({
-    "release_id": os.getenv("GPU_FAULT_RELEASE_ID"),
-    "event": event.model_dump(mode="json") if event is not None else None,
-    "decision": (
-        decision.model_dump(mode="json") if decision is not None else None
-    ),
-    "incident": (
-        incident.model_dump(mode="json") if incident is not None else None
-    ),
-    "workflow": (
-        workflow.model_dump(mode="json") if workflow is not None else None
-    ),
-    "commands": [redacted_command(item) for item in commands],
-    "notifications": notifications,
-    "observations": observations,
-    "restart_budget": restart_budget,
-    "agent": agent,
-    "profile": profile,
-    "submission": (
-        submission.model_dump(mode="json")
-        if submission is not None else None
-    ),
-    "queue": drained_queue_stats(store, attempts=queue_attempts),
-    "remote_commands": store.remote_command_stats(),
-}, sort_keys=True, default=str))
-"""
-
-
 EXECUTOR_XID_POST = r"""
 import json
 import os
@@ -787,67 +623,6 @@ print(json.dumps({
 """
 
 
-# Cluster infrastructure a GPU node hosts without it being anyone's training
-# job. Every runner that asks "does this node run a business workload" must
-# share this list: NET-001 kept its own shorter copy and refused a node for
-# hosting cert-manager and the inference router.
-SYSTEM_NAMESPACES = frozenset(
-    {
-        "aws-hyperpod",
-        "cert-manager",
-        "hyperpod-inference-system",
-        "kube-system",
-        "kubeflow",
-    }
-)
-
-
-def pod_gpu_count(item: dict[str, Any]) -> int:
-    """The largest ``nvidia.com/gpu`` request or limit across containers."""
-
-    gpu_count = 0
-    for container in item.get("spec", {}).get("containers", []):
-        resources = container.get("resources", {})
-        for values in (
-            resources.get("requests", {}),
-            resources.get("limits", {}),
-        ):
-            try:
-                gpu_count = max(
-                    gpu_count,
-                    int(values.get("nvidia.com/gpu", 0)),
-                )
-            except (TypeError, ValueError):
-                pass
-    return gpu_count
-
-
-def business_workload_items(
-    items: list[dict[str, Any]], *, namespace: str
-) -> list[dict[str, str]]:
-    """The Pods among ``items`` that count as somebody's business workload.
-
-    Infrastructure namespaces never count; the solution's own namespace counts
-    only for Pods that hold a GPU (the acceptance training jobs), so the
-    executor and agents on a node do not read as a workload.
-    """
-
-    result = []
-    for item in items:
-        pod_namespace = str(item["metadata"].get("namespace", ""))
-        if pod_namespace in SYSTEM_NAMESPACES:
-            continue
-        if pod_namespace == namespace and pod_gpu_count(item) <= 0:
-            continue
-        result.append(
-            {
-                "namespace": pod_namespace,
-                "name": str(item["metadata"].get("name", "")),
-            }
-        )
-    return result
-
-
 class RegionalLiveFixture:
     def __init__(self, settings: RegionalLiveSettings) -> None:
         self.settings = settings
@@ -862,26 +637,14 @@ class RegionalLiveFixture:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        try:
-            completed = subprocess.run(
-                command,
-                input=input_text,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,
-                cwd=cwd,
-                env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RegionalCommandTimeout(command, exc.timeout) from exc
-        if check and completed.returncode:
-            raise RegionalFixtureError(
-                f"command failed ({completed.returncode}): "
-                f"{' '.join(command)}; stderr={completed.stderr.strip()}"
-            )
-        return completed
+        return run_fixture_command(
+            command,
+            input_text=input_text,
+            check=check,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+        )
 
     def kubectl(
         self,
@@ -933,23 +696,7 @@ class RegionalLiveFixture:
                 "json",
             )
         )
-        result = []
-        for item in value.get("items", []):
-            statuses = item.get("status", {}).get("containerStatuses", [])
-            if item.get("status", {}).get("phase") != "Running":
-                continue
-            if not statuses or not all(
-                bool(status.get("ready")) for status in statuses
-            ):
-                continue
-            result.append(
-                {
-                    "name": item["metadata"]["name"],
-                    "uid": item["metadata"]["uid"],
-                    "node": item["spec"].get("nodeName"),
-                }
-            )
-        return sorted(result, key=lambda item: str(item["name"]))
+        return ready_pod_records(value)
 
     def ready_pod(self, plane: str, app: str) -> str:
         pods = self.ready_pods(plane, app)
@@ -966,7 +713,7 @@ class RegionalLiveFixture:
         timeout: int = 180,
         attempts: int = 3,
     ) -> dict[str, Any]:
-        """Run ``script`` under python3 in a Ready Pod and parse its last line.
+        """Run ``script`` under the installed component interpreter in a Ready Pod.
 
         ``attempts`` is the retry budget for transient exec failures. The
         default suits read-only probes; a script that mutates -- posts an event,
@@ -987,7 +734,7 @@ class RegionalLiveFixture:
                     "-i",
                     self.ready_pod(plane, app),
                     "--",
-                    "python3",
+                    component_python(plane),
                     "-",
                     *arguments,
                     input_text=script,
@@ -1065,11 +812,12 @@ class RegionalLiveFixture:
         marker's own workflow's commands, as it always has.
         """
 
+        bound = marker_observed_after(marker, observed_after)
         arguments = [
             self.settings.cluster_id,
             node,
             marker,
-            observed_after.isoformat() if observed_after is not None else "",
+            bound.isoformat() if bound is not None else "",
             job_id,
             attempt_id,
             hyperpod_cluster,
@@ -1516,8 +1264,13 @@ class RegionalLiveFixture:
         self,
         started_at: datetime,
         ended_at: datetime,
-    ) -> list[dict[str, str]]:
-        value = json.loads(
+    ) -> list[dict[str, Any]]:
+        from scripts.e2e.regional.collector_reboot_evidence import (
+            normalize_provider_event,
+            provider_event_page,
+        )
+
+        rows, token = provider_event_page(
             self.run(
                 [
                     "aws",
@@ -1537,29 +1290,19 @@ class RegionalLiveFixture:
                 timeout=180,
             ).stdout
         )
-        result = []
-        for item in value.get("Events", []):
+        if token is not None:
+            raise RegionalFixtureError(
+                "CloudTrail lookup returned an incomplete inventory"
+            )
+        result: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item.get("EventName"), str) or not item["EventName"]:
+                raise RegionalFixtureError(
+                    "CloudTrail event name is missing or malformed"
+                )
             if item.get("EventName") not in PROVIDER_MUTATIONS:
                 continue
-            session_issuer_role_name = ""
-            try:
-                detail = json.loads(str(item.get("CloudTrailEvent") or "{}"))
-            except json.JSONDecodeError:
-                detail = {}
-            identity = detail.get("userIdentity") or {}
-            session_context = identity.get("sessionContext") or {}
-            session_issuer = session_context.get("sessionIssuer") or {}
-            session_issuer_arn = str(session_issuer.get("arn") or "")
-            if ":role/" in session_issuer_arn:
-                session_issuer_role_name = session_issuer_arn.rsplit("/", 1)[-1]
-            result.append(
-                {
-                    "event_name": str(item.get("EventName") or ""),
-                    "event_time": str(item.get("EventTime") or ""),
-                    "username": str(item.get("Username") or ""),
-                    "session_issuer_role_name": session_issuer_role_name,
-                }
-            )
+            result.append(dict(normalize_provider_event(item)))
         return result
 
     def wait_provider_events(
@@ -1571,7 +1314,7 @@ class RegionalLiveFixture:
         ended_at: datetime | None = None,
         timeout_seconds: int = PROVIDER_EVENT_VISIBILITY_SECONDS,
         poll_seconds: int = 60,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Poll CloudTrail until ``expected_count`` of ``event_names`` are visible.
 
         CloudTrail is eventually consistent -- a mutation typically appears
@@ -1589,13 +1332,19 @@ class RegionalLiveFixture:
 
         ``ended_at`` defaults to *now at each poll*, so late-delivered events
         are seen. Returns whatever was visible when it stopped; the caller
-        decides what the count means.
+        decides what the count means. No event is accepted as a successful
+        scoped reboot merely because it is visible; the caller must validate
+        the normalized identity, targets, response and submission interval.
         """
 
-        if expected_count < 0:
-            raise ValueError("expected_count must not be negative")
+        if type(expected_count) is not int or expected_count < 0:
+            raise ValueError("expected_count must be a nonnegative integer")
+        if type(timeout_seconds) is not int or timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be a nonnegative integer")
+        if type(poll_seconds) is not int or poll_seconds < 1:
+            raise ValueError("poll_seconds must be a positive integer")
         deadline = time.monotonic() + timeout_seconds
-        events: list[dict[str, str]] = []
+        events: list[dict[str, Any]] = []
         while True:
             window_end = ended_at or datetime.now(timezone.utc)
             events = [

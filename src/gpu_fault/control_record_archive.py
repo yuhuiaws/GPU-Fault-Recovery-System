@@ -33,14 +33,26 @@ DEFAULT_ARCHIVE_BATCH_SIZE = 200
 # cannot be indexed; the other retention sweeps compare the same way.
 ARCHIVE_CANDIDATE_SQL = """
 SELECT i.key
-FROM gpu_fault_objects i
+FROM gpu_fault_control_records i
 WHERE i.kind='incident'
   AND i.payload->>'updated_at' <= %s
   AND NOT EXISTS (
-    SELECT 1 FROM gpu_fault_objects w
+    SELECT 1 FROM gpu_fault_workflow_records w
     WHERE w.kind='workflow'
-      AND w.payload->>'incident_id'=i.key
-      AND NOT {inactive}
+      AND w.incident_id=i.key
+      AND {inactive} IS NOT TRUE
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM gpu_fault_remote_command_records c
+    WHERE c.incident_id=i.key AND {open_command}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM gpu_fault_workflow_records successor
+    WHERE successor.incident_id<>i.key
+      AND successor.predecessor_workflow_id IN (
+        SELECT key FROM gpu_fault_workflow_records WHERE incident_id=i.key
+      )
+      AND {open_successor}
   )
 ORDER BY i.payload->>'updated_at', i.key
 LIMIT %s
@@ -49,6 +61,21 @@ LIMIT %s
 
 class ArchiveSafetyError(RuntimeError):
     pass
+
+
+def _require_incident_retention(payload: object, cutoff: datetime) -> None:
+    timestamp = payload.get("updated_at") if isinstance(payload, dict) else None
+    if not isinstance(timestamp, str) or "T" not in timestamp:
+        raise ArchiveSafetyError("incident has invalid updated_at")
+    try:
+        updated_at = datetime.fromisoformat(timestamp)
+    except (ValueError, OverflowError):
+        raise ArchiveSafetyError("incident has invalid updated_at") from None
+    if updated_at.tzinfo is None:
+        # Serialized legacy naive datetimes follow the Store's UTC convention.
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    if updated_at > cutoff:
+        raise ArchiveSafetyError("incident is within retention")
 
 
 # Archivable is a whitelist of statuses that will never execute or be acted
@@ -68,10 +95,10 @@ _ARCHIVABLE_STATUS_VALUES = sorted(
 # (``failure_handled_at``); before that an escalation may still be owed
 # (F-B4 (5)). Statuses in the whitelist plus this predicate are "inactive".
 _INACTIVE_WORKFLOW_SQL = """(
-    payload->>'status' = ANY(%s)
+    {alias}status = ANY(%s)
     OR (
-        payload->>'status' = 'FAILED'
-        AND payload->>'failure_handled_at' IS NOT NULL
+        {alias}status = 'FAILED'
+        AND NULLIF({alias}failure_handled_at, '') IS NOT NULL
     )
 )"""
 # A successor holds its predecessor's incident only while it may still read
@@ -80,13 +107,19 @@ _INACTIVE_WORKFLOW_SQL = """(
 # the way ``list_active_workflow_incidents`` spells it. Every passive recovery
 # names its containment workflow as predecessor, so a recovery that ended
 # FAILED/ESCALATED used to pin the containment incident for ever.
+# Unknown statuses cannot prove that a successor released its predecessor.
 _OPEN_WORKFLOW_SQL = """(
-    payload->>'status' = ANY(%s)
+    ({alias}status = ANY(%s)) IS NOT TRUE
+    OR {alias}status = ANY(%s)
     OR (
-        payload->>'status' = 'BLOCKED'
-        AND payload->>'blocked_kind' = ANY(%s)
+        {alias}status = 'BLOCKED'
+        AND {alias}blocked_kind = ANY(%s)
     )
 )"""
+_OPEN_COMMAND_SQL = """(
+    {alias}status IS NULL OR {alias}status NOT IN ('SUCCEEDED','FAILED')
+)"""
+_KNOWN_WORKFLOW_STATUS_VALUES = sorted(status.value for status in WorkflowStatus)
 _EXECUTABLE_STATUS_VALUES = sorted(
     status.value for status in EXECUTABLE_WORKFLOW_STATUSES
 )
@@ -96,19 +129,21 @@ _OCCUPYING_BLOCKED_KIND_VALUES = sorted(kind.value for kind in OCCUPYING_BLOCKED
 RELATED_RECORDS_SQL = """
 WITH
 workflow_ids AS (
-  SELECT key FROM gpu_fault_objects
-  WHERE kind='workflow' AND payload->>'incident_id'=%s
+  SELECT key FROM gpu_fault_workflow_records WHERE incident_id=%s
+),
+remote_command_ids AS (
+  SELECT key FROM gpu_fault_remote_command_records WHERE incident_id=%s
 ),
 notification_ids AS (
-  SELECT key FROM gpu_fault_objects
+  SELECT key FROM gpu_fault_control_records
   WHERE kind='notification' AND payload->>'incident_id'=%s
 ),
 plan_ids AS (
-  SELECT key FROM gpu_fault_objects
+  SELECT key FROM gpu_fault_control_records
   WHERE kind='plan' AND payload->>'incident_id'=%s
 ),
 decision_ids AS (
-  SELECT key,payload FROM gpu_fault_objects
+  SELECT key,payload FROM gpu_fault_control_records
   WHERE kind='decision' AND payload->>'recovery_plan_id'
         IN (SELECT key FROM plan_ids)
 ),
@@ -123,7 +158,7 @@ event_ids AS (
 ),
 objects AS (
   SELECT 'gpu_fault_objects' AS table_name,kind,key,payload,NULL::text value
-  FROM gpu_fault_objects
+  FROM gpu_fault_control_records
   WHERE (kind='incident' AND key=%s)
      OR (kind='workflow' AND key IN (SELECT key FROM workflow_ids))
      OR (kind IN ('notification','notification_delivery',
@@ -138,7 +173,7 @@ objects AS (
      OR (kind IN ('diagnostic','triage')
          AND key IN (SELECT key FROM diagnostic_ids))
      OR (kind='marker' AND payload->>'incident_id'=%s)
-     OR (kind='remote_command' AND payload->>'incident_id'=%s)
+     OR (kind='remote_command' AND key IN (SELECT key FROM remote_command_ids))
      OR (kind IN ('xid_correlation_event','xid_policy_decision',
                   'xid_correlation')
          AND key IN (SELECT key FROM event_ids))
@@ -234,14 +269,16 @@ class ControlRecordArchiver:
                 yield cursor
 
     @staticmethod
-    def _bundle(cursor, incident_id: str) -> tuple[bytes, list[tuple]]:
+    def _bundle(
+        cursor, incident_id: str, *, cutoff: datetime
+    ) -> tuple[bytes, list[tuple]]:
         cursor.execute(
             """
-            SELECT count(*) FROM gpu_fault_objects
-            WHERE kind='workflow' AND payload->>'incident_id'=%s
-              AND NOT """
-            + _INACTIVE_WORKFLOW_SQL
-            + """
+            SELECT count(*) FROM gpu_fault_workflow_records
+            WHERE incident_id=%s
+              AND """
+            + _INACTIVE_WORKFLOW_SQL.format(alias="")
+            + """ IS NOT TRUE
             """,
             (incident_id, _ARCHIVABLE_STATUS_VALUES),
         )
@@ -249,29 +286,29 @@ class ControlRecordArchiver:
             raise ArchiveSafetyError("incident has non-terminal workflow")
         cursor.execute(
             """
-            SELECT count(*) FROM gpu_fault_objects
-            WHERE kind='remote_command' AND payload->>'incident_id'=%s
-              AND payload->>'status' IN ('PENDING','WAITING','LEASED')
-            """,
+            SELECT count(*) FROM gpu_fault_remote_command_records
+            WHERE incident_id=%s
+              AND """
+            + _OPEN_COMMAND_SQL.format(alias=""),
             (incident_id,),
         )
         if cursor.fetchone()[0]:
             raise ArchiveSafetyError("incident has open remote command")
         cursor.execute(
             """
-            SELECT count(*) FROM gpu_fault_objects
-            WHERE kind='workflow' AND payload->>'incident_id'<>%s
-              AND payload->>'predecessor_workflow_id' IN (
-                SELECT key FROM gpu_fault_objects
-                WHERE kind='workflow' AND payload->>'incident_id'=%s
+            SELECT count(*) FROM gpu_fault_workflow_records
+            WHERE incident_id<>%s
+              AND predecessor_workflow_id IN (
+                SELECT key FROM gpu_fault_workflow_records WHERE incident_id=%s
               )
               AND """
-            + _OPEN_WORKFLOW_SQL
+            + _OPEN_WORKFLOW_SQL.format(alias="")
             + """
             """,
             (
                 incident_id,
                 incident_id,
+                _KNOWN_WORKFLOW_STATUS_VALUES,
                 _EXECUTABLE_STATUS_VALUES,
                 _OCCUPYING_BLOCKED_KIND_VALUES,
             ),
@@ -280,8 +317,19 @@ class ControlRecordArchiver:
             raise ArchiveSafetyError("incident has external successor")
         cursor.execute(RELATED_RECORDS_SQL, (incident_id,) * 8)
         rows = cursor.fetchall()
-        if not any(row[1] == "incident" for row in rows):
+        incident = next(
+            (
+                row
+                for row in rows
+                if row[0] == "gpu_fault_objects"
+                and row[1] == "incident"
+                and row[2] == incident_id
+            ),
+            None,
+        )
+        if incident is None:
             raise ArchiveSafetyError("incident does not exist")
+        _require_incident_retention(incident[3], cutoff)
         records = [
             {
                 "table": row[0],
@@ -316,8 +364,11 @@ class ControlRecordArchiver:
         return f"{self.prefix}/{name}" if self.prefix else name
 
     def archive_one(self, incident_id: str) -> str:
+        """Archive an incident only after revalidating its retention and holds."""
+
+        cutoff = datetime.now(timezone.utc) - self.retention
         with self._read_cursor() as cursor:
-            raw, _ = self._bundle(cursor, incident_id)
+            raw, _ = self._bundle(cursor, incident_id, cutoff=cutoff)
         key = self._key(incident_id, raw)
         self.s3.put_object(
             Bucket=self.bucket,
@@ -332,11 +383,21 @@ class ControlRecordArchiver:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                 (f"gpu-fault-incident-archive/{incident_id}",),
             )
-            current, rows = self._bundle(cursor, incident_id)
+            current, rows = self._bundle(cursor, incident_id, cutoff=cutoff)
             if current != raw:
                 raise ArchiveSafetyError("incident changed after archive upload")
             object_pairs = [
                 (row[1], row[2]) for row in rows if row[0] == "gpu_fault_objects"
+            ]
+            state_pairs = [
+                pair
+                for pair in object_pairs
+                if pair[0] in {"remote_command", "workflow"}
+            ]
+            object_pairs = [
+                pair
+                for pair in object_pairs
+                if pair[0] not in {"remote_command", "workflow"}
             ]
             link_pairs = [
                 (row[1], row[2]) for row in rows if row[0] == "gpu_fault_links"
@@ -354,6 +415,15 @@ class ControlRecordArchiver:
                         [item[1] for item in link_pairs],
                     ),
                 )
+            for kind, object_key in state_pairs:
+                cursor.execute(
+                    "SELECT gpu_fault_delete_control_state(%s, %s)",
+                    (kind, object_key),
+                )
+                if not cursor.fetchone()[0]:
+                    raise ArchiveSafetyError(
+                        "control record changed during archive deletion"
+                    )
             if object_pairs:
                 cursor.execute(
                     """
@@ -370,11 +440,13 @@ class ControlRecordArchiver:
         return f"s3://{self.bucket}/{key}"
 
     def candidates(self, *, limit: int | None = None) -> list[str]:
-        """Incident ids past retention with no active workflow, oldest first."""
+        """Eligible incident ids past retention, bounded and oldest first."""
 
         cutoff = datetime.now(timezone.utc) - self.retention
         query = ARCHIVE_CANDIDATE_SQL.format(
-            inactive=_INACTIVE_WORKFLOW_SQL.replace("payload", "w.payload")
+            inactive=_INACTIVE_WORKFLOW_SQL.format(alias="w."),
+            open_command=_OPEN_COMMAND_SQL.format(alias="c."),
+            open_successor=_OPEN_WORKFLOW_SQL.format(alias="successor."),
         )
         with self._read_cursor() as cursor:
             cursor.execute(
@@ -382,6 +454,9 @@ class ControlRecordArchiver:
                 (
                     _utc_text(cutoff),
                     _ARCHIVABLE_STATUS_VALUES,
+                    _KNOWN_WORKFLOW_STATUS_VALUES,
+                    _EXECUTABLE_STATUS_VALUES,
+                    _OCCUPYING_BLOCKED_KIND_VALUES,
                     self.batch_size if limit is None else limit,
                 ),
             )

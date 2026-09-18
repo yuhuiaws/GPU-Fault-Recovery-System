@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import socket
 import ssl
-import time
 from io import BytesIO
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -10,6 +9,7 @@ from urllib.error import HTTPError
 
 import pytest
 
+from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.cluster_executor import (
     ClusterActionExecutor,
     ClusterExecutorError,
@@ -194,6 +194,16 @@ class FakeClient:
         self.claim_kwargs = {"executor_id": executor_id, **kwargs}
         return []
 
+    def renew(self, command, executor_id, lease_seconds):
+        from datetime import datetime, timedelta, timezone
+
+        command.lease_owner = executor_id
+        command.status = RemoteCommandStatus.LEASED
+        command.lease_expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=lease_seconds
+        )
+        return command
+
 
 class FakeAdapter:
     def __init__(self, owner: str) -> None:
@@ -292,6 +302,10 @@ def test_cluster_executor_runs_claimed_commands_concurrently() -> None:
                     command_id=f"command-{index}",
                     cluster_id="cluster-a",
                     lease_token=f"lease-{index}",
+                    lease_owner="executor-a",
+                    status=RemoteCommandStatus.LEASED,
+                    fencing_token=1,
+                    cancellation_requested_at=None,
                     step=SimpleNamespace(operation=WorkflowOperation.VALIDATE_HOST),
                 )
                 for index in range(2)
@@ -300,13 +314,12 @@ def test_cluster_executor_runs_claimed_commands_concurrently() -> None:
 
         def claim(self, executor_id, **kwargs):
             super().claim(executor_id, **kwargs)
+            for command in self.commands:
+                super().renew(command, executor_id, kwargs["lease_seconds"])
             return self.commands
 
         def complete(self, command, result):
             self.completed.append((command.command_id, result.status))
-
-        def renew(self, *_args, **_kwargs):
-            return None
 
     client = ConcurrentClient()
     executor = ClusterActionExecutor(
@@ -326,20 +339,21 @@ def test_cluster_executor_runs_claimed_commands_concurrently() -> None:
             started += 1
             if started == 2:
                 both_started.set()
-        assert both_started.wait(timeout=1)
-        time.sleep(0.1)
+        assert both_started.wait(timeout=5)
         return RemoteCommandResult(
             lease_token=command.lease_token, status=RemoteCommandStatus.SUCCEEDED
         )
 
     executor._execute = execute
-    started_at = time.monotonic()
     count = executor.run_once()
-    elapsed = time.monotonic() - started_at
 
     assert count == 2
-    assert elapsed < 0.3
+    assert started == 2, "both commands must enter execution"
     assert len(client.completed) == 2
+    assert set(client.completed) == {
+        ("command-0", RemoteCommandStatus.SUCCEEDED),
+        ("command-1", RemoteCommandStatus.SUCCEEDED),
+    }, "both commands must complete after observing their concurrent peer"
 
 
 def test_cluster_executor_renews_remote_command_lease() -> None:
@@ -445,10 +459,16 @@ def _remote_command(operation=WorkflowOperation.VALIDATE_HOST):
     a whole incident graph.
     """
 
+    from datetime import datetime, timedelta, timezone
+
     return SimpleNamespace(
         command_id="command-a",
         cluster_id="cluster-a",
         lease_token="lease-a",
+        lease_owner="executor-a",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
+        status=RemoteCommandStatus.LEASED,
+        cancellation_requested_at=None,
         fencing_token=7,
         step_index=0,
         idempotency_key="idem-a",
@@ -741,7 +761,7 @@ def test_executor_does_not_create_spare_coordinator_by_default(monkeypatch) -> N
     _executor_environment(monkeypatch)
     captured = {}
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -780,7 +800,7 @@ def test_hyperpod_executor_requires_independent_confirmation(monkeypatch) -> Non
     _executor_environment(monkeypatch)
     monkeypatch.delenv("GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER", raising=False)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -807,7 +827,7 @@ def test_executor_refuses_hyperpod_adapter_without_aws_credentials(monkeypatch) 
         lambda: "no AWS credentials are resolvable in this pod",
     )
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -844,7 +864,7 @@ def test_executor_starts_without_credentials_when_hyperpod_is_off(monkeypatch) -
         ),
     )
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -864,7 +884,7 @@ def test_executor_starts_without_credentials_when_hyperpod_is_off(monkeypatch) -
 def test_hyperpod_executor_requires_fleet_registry(monkeypatch) -> None:
     _executor_environment(monkeypatch)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -896,7 +916,7 @@ def test_executor_builds_spare_coordinator_when_explicitly_enabled(monkeypatch) 
     monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", "true")
     captured = {}
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -988,7 +1008,7 @@ def test_executor_remote_state_does_not_require_agent_secret(monkeypatch) -> Non
         lambda: pytest.fail("remote state must not open a database"),
     )
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -1017,7 +1037,7 @@ def test_executor_remote_state_does_not_require_agent_secret(monkeypatch) -> Non
 def test_executor_confirms_cluster_from_its_own_configuration(monkeypatch) -> None:
     _executor_environment(monkeypatch)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
         core = object()
 
@@ -1116,9 +1136,6 @@ class _ReclaimingClient(FakeClient):
 
     def complete(self, _command, result) -> None:
         self.completions.append(result.status)
-
-    def renew(self, *_args, **_kwargs) -> None:
-        return None
 
 
 def test_a_held_command_polls_instead_of_spinning(monkeypatch) -> None:

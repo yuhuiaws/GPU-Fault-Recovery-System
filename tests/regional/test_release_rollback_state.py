@@ -1,4 +1,6 @@
 import base64
+import copy
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,6 +32,59 @@ ROOT = Path(__file__).resolve().parents[2]
 # previous release's runtime image reject anything that is not `...@sha256:<hex>`.
 PREVIOUS_RUNTIME_IMAGE = "registry.example/runtime@sha256:" + "e" * 64
 PREVIOUS_INSTALLER_IMAGE = "registry.example/installer@sha256:" + "f" * 64
+
+
+def previous_installer_documents(
+    runtime_image: str, installer_image: str
+) -> tuple[dict, dict]:
+    text = yaml.safe_dump(
+        {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "installer", "image": installer_image}],
+                        "volumes": [
+                            {"name": "installer", "configMap": {"name": "node-bundle"}}
+                        ],
+                    }
+                }
+            },
+        }
+    )
+    deployment = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "reconciler",
+                            "image": runtime_image,
+                            "env": [
+                                {"name": name, "value": value}
+                                for name, value in {
+                                    "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP": "installer-template",
+                                    "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256": hashlib.sha256(
+                                        text.encode()
+                                    ).hexdigest(),
+                                    "GPU_FAULT_INSTALLER_TEMPLATE_SHA256": "3" * 64,
+                                    "GPU_FAULT_INSTALLER_BUNDLE_SHA256": "4" * 64,
+                                }.items()
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {
+                            "name": "installer-template",
+                            "configMap": {"name": "installer-template"},
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    return {"data": {"job.yaml": text}}, deployment
 
 
 def _legacy_agent_identity(node_ids: tuple[str, ...] = ("node-a",)) -> dict:
@@ -289,34 +344,18 @@ def test_previous_release_snapshot_reads_live_images() -> None:
         clusters=(target,),
         bundle=Path("bundle.tar.gz"),
     )
+    template, reconciler = previous_installer_documents(
+        previous_runtime, previous_installer
+    )
 
     def get_json(arguments: list[str]) -> dict:
         resource = arguments[arguments.index("get") + 1]
         name = arguments[arguments.index("get") + 2]
         if resource == "configmap":
             assert name == "installer-template"
-            return {
-                "data": {
-                    "job.yaml": yaml.safe_dump(
-                        {
-                            "apiVersion": "batch/v1",
-                            "kind": "Job",
-                            "spec": {
-                                "template": {
-                                    "spec": {
-                                        "containers": [
-                                            {
-                                                "name": "installer",
-                                                "image": previous_installer,
-                                            }
-                                        ]
-                                    }
-                                }
-                            },
-                        }
-                    )
-                }
-            }
+            return copy.deepcopy(template)
+        if name == "gpu-fault-node-installer-reconciler":
+            return copy.deepcopy(reconciler)
         if resource == "daemonset":
             assert name == "gpu-fault-dcgm-exporter"
             image = previous_dcgm
@@ -581,11 +620,16 @@ def test_previous_snapshot_configmaps_are_immutable_and_content_addressed(
                 documents[document["metadata"]["name"]] = document
             return ""
 
-    def exists(arguments, **_kwargs):
-        return arguments[-1] in documents
+    def observe(arguments, **_kwargs):
+        name = arguments[arguments.index("get") + 2]
+        if name not in documents:
+            return 0, "", ""
+        document = copy.deepcopy(documents[name])
+        document["metadata"].update(uid=f"uid-{name}", namespace="gpu-fault-system")
+        return 0, json.dumps(document), ""
 
     runner = Runner()
-    runner.probe = exists
+    runner.probe_output = observe
     release = SimpleNamespace(
         runner=runner,
         config=SimpleNamespace(
@@ -1016,6 +1060,7 @@ def test_legacy_partial_rollback_omits_new_fleet_identity_fields(
 
 def _rollback_previous(*cluster_ids: str) -> dict:
     return {
+        "aurora_refresh": None,
         "metadata": {
             "required-agent-artifact-sha256": "artifact",
             "required-agent-config-digest": "config",
@@ -1059,6 +1104,9 @@ def stub_rollback_phases(
         "_verify_and_complete_rollback",
     ):
         monkeypatch.setattr(ORCHESTRATION, name, recorder(name))
+    monkeypatch.setattr(
+        ORCHESTRATION, "validate_rollback_node_template", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         ORCHESTRATION,
         "cleanup_candidate_rollout_state",
@@ -1240,31 +1288,17 @@ def _snapshot_release(
         clusters=(target,),
         bundle=Path("bundle.tar.gz"),
     )
+    template, reconciler = previous_installer_documents(
+        previous_runtime, previous_installer
+    )
 
     def get_json(arguments: list[str]) -> dict:
         resource = arguments[arguments.index("get") + 1]
         name = arguments[arguments.index("get") + 2]
         if resource == "configmap":
-            return {
-                "data": {
-                    "job.yaml": yaml.safe_dump(
-                        {
-                            "spec": {
-                                "template": {
-                                    "spec": {
-                                        "containers": [
-                                            {
-                                                "name": "installer",
-                                                "image": previous_installer,
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    )
-                }
-            }
+            return copy.deepcopy(template)
+        if name == "gpu-fault-node-installer-reconciler":
+            return copy.deepcopy(reconciler)
         image = (
             previous_dcgm
             if resource == "daemonset"

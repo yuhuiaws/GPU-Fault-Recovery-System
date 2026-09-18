@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -12,6 +11,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, cast
 
@@ -25,6 +25,9 @@ from scripts.e2e.regional import (  # noqa: E402
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
+)
+from scripts.e2e.regional.collector_kernel_evidence import (  # noqa: E402
+    kmsg_identity_errors,  # noqa: E402
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -53,13 +56,91 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
     predecessor_path,
 )
-from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalFixtureError,
+    run_fixture_command,
+)
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     install_abort_signals,
     predecessor_evidence,
     run_case_main,
+)
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.readme_workload_fixture import (  # noqa: E402
+    ReadmeWorkloadFixture,
+    training_cli,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    LOSS_LINE_PATTERN as LOSS_LINE_PATTERN,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    MAX_RECORDED_SUSPICIOUS_LINES as MAX_RECORDED_SUSPICIOUS_LINES,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    SUCCESS_LINE_PATTERN as SUCCESS_LINE_PATTERN,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    SUSPICIOUS_LOG_PATTERN as SUSPICIOUS_LOG_PATTERN,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    collective_errors as collective_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    command_ids_in_logs as command_ids_in_logs,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    control_plane_blast_errors as control_plane_blast_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    gpu_nodes_clean as gpu_nodes_clean,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    identity_baseline_errors as identity_baseline_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    loss_errors as loss_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    metadata_errors as metadata_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    notification_errors as notification_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    observation_pod_names as observation_pod_names,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    observation_pod_uids as observation_pod_uids,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    observation_rank_errors as observation_rank_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    recovery_identity_errors as recovery_identity_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    source_observation_errors as source_observation_errors,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    suspicious_log_lines as suspicious_log_lines,
+)
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    virtual_isolation_errors as virtual_isolation_errors,
+)
+from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
+    E2E_PREFLIGHT_PROBE as E2E_PREFLIGHT_PROBE,
+)
+from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
+    KMSG_EVIDENCE_PROBE as KMSG_EVIDENCE_PROBE,
+)
+from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
+    OBSERVATION_POST_PROBE as OBSERVATION_POST_PROBE,
+)
+from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
+    WORKLOAD_STORE_PROBE as WORKLOAD_STORE_PROBE,
 )
 
 CASE_IDS = (
@@ -78,13 +159,6 @@ E2E001_PROBE = Path(__file__).with_name("probes") / "e2e001_node_probe.py"
 # The executor-log markers E2E-001 step 3 greps for. Matched on word boundaries
 # so `error_count=0`, a `401`-suffixed request ID or a `403`-byte payload size
 # do not fail the preflight; the case-sensitive spelling is the spec's own.
-SUSPICIOUS_LOG_PATTERN = re.compile(
-    r"\b(?:ERROR|Traceback|401|403|CERTIFICATE_VERIFY_FAILED)\b"
-)
-MAX_RECORDED_SUSPICIOUS_LINES = 20
-LOSS_LINE_PATTERN = re.compile(
-    r"\brank=(\d+)\b.*?\bstep=(\d+)\b.*?\bloss=([-+0-9.eE]+)"
-)
 # `gpu-fault-admin status` costs up to thirty minutes; the group runs it once,
 # on the case that closes it, unless the operator asks otherwise.
 ADMIN_STATUS_CASE = "GF-REGIONAL-WORKLOAD-002"
@@ -134,23 +208,14 @@ def run(
     cwd: Path = ROOT,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    return run_fixture_command(
         command,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        input_text=input_text,
+        check=check,
         timeout=timeout,
         cwd=cwd,
         env=env,
     )
-    if check and completed.returncode:
-        raise WorkloadAcceptanceError(
-            f"command failed ({completed.returncode}): {' '.join(command[:6])}; "
-            f"stderr={completed.stderr[-1000:]}"
-        )
-    return completed
 
 
 @dataclass(frozen=True)
@@ -267,90 +332,29 @@ def managed_fixture(
     )
 
 
-WORKLOAD_STORE_PROBE = r"""
-import json
-import sys
-from gpu_fault.app import ApplicationContext
-from gpu_fault.store import NotFoundError
-
-# The fourth argument arrived after the third; a caller that still passes
-# three gets the job-scoped workflow read below.
-argv = list(sys.argv[1:])
-if len(argv) == 3:
-    argv.append("")
-cluster_id, job_id, attempt_id, workflow_request_ids_text = argv
-store = ApplicationContext.from_environment().store
-observations = [
-    item.model_dump(mode="json")
-    for item in store.list_attempt_observations(cluster_id)
-    if item.job_id == job_id and item.attempt_id == attempt_id
-]
-try:
-    decision = store.get_decision_by_attempt(cluster_id, attempt_id)
-except NotFoundError:
-    # A clean-baseline attempt has no terminal event/decision yet; the
-    # product deliberately raises here (unit-tested), so a missing
-    # decision is None, exactly as get_restart_budget is handled below.
-    decision = None
-try:
-    budget = store.get_restart_budget(cluster_id, job_id).model_dump(mode="json")
-except NotFoundError:
-    budget = None
-# Incidents and workflows the store already scopes to this cluster and job:
-# the ones still acting on the attempt and the ones that restarted into it.
-# Every backend filters both in the store, so this probe never pages the
-# whole workflow table -- or, as it used to, the whole remote-command table
-# every five seconds -- through the API Pod.
-pairs = {}
-for incident, workflow in store.list_active_workflow_incidents(
-    cluster_id, job_id=job_id
-):
-    pairs[workflow.request_id] = (incident, workflow)
-for incident, workflow in store.list_job_recovery_workflow_incidents(
-    cluster_id, job_id, attempt_id
-):
-    pairs[workflow.request_id] = (incident, workflow)
-explicit_ids = [item for item in workflow_request_ids_text.split(",") if item]
-request_ids = sorted(set(pairs) | set(explicit_ids))
-commands = [
-    item.model_dump(mode="json")
-    for item in (
-        store.list_remote_commands(workflow_request_ids=request_ids)
-        if request_ids
-        else []
+def readme_fixture(
+    regional: RegionalLiveFixture,
+    *,
+    manifest: Path,
+    site_file: Path,
+    job_id: str,
+    attempt_id: str,
+    case_dir: Path,
+) -> ReadmeWorkloadFixture:
+    return ReadmeWorkloadFixture(
+        regional,
+        ManagedWorkloadSettings(
+            manifest=manifest,
+            site_file=site_file,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            restart_budget=1,
+            expected_pods=3,
+            expected_gpu_count=24,
+        ),
+        case_dir=case_dir,
+        training_container="pytorch",
     )
-    if any(
-        job_id in workload_id
-        for workload_id in item.step.workload_ids
-    )
-    or item.workflow_request_id in explicit_ids
-]
-print(json.dumps({
-    "cluster_id": cluster_id,
-    "observations": observations,
-    "decision": decision.model_dump(mode="json") if decision else None,
-    "restart_budget": budget,
-    "commands": commands,
-    "incidents": [
-        {
-            "incident_id": incident.incident_id,
-            "cluster_id": incident.cluster_id,
-            "job_id": incident.job_id,
-            "attempt_id": incident.attempt_id,
-            "workflow_request_id": incident.workflow_request_id,
-        }
-        for incident, _workflow in pairs.values()
-    ],
-    "workflows": [
-        {
-            "request_id": workflow.request_id,
-            "incident_id": workflow.incident_id,
-            "status": workflow.status.value,
-        }
-        for _incident, workflow in pairs.values()
-    ],
-}, sort_keys=True, default=str))
-"""
 
 
 def workload_store(
@@ -367,26 +371,6 @@ def workload_store(
                 raise ValueError("workflow request IDs must be non-empty, no comma")
         arguments.append(",".join(workflow_request_ids))
     return regional.cpu_python(WORKLOAD_STORE_PROBE, *arguments)
-
-
-def identity_baseline_errors(state: dict[str, Any]) -> list[str]:
-    """Why ``state`` is not the empty pre-fault baseline for a job/attempt.
-
-    ISO-001 step 5 and E2E-001 both require that nothing has been recorded for
-    the identity yet: a restart budget, a decision or an observation left by an
-    earlier run would be read as this run's isolation result.
-    """
-
-    errors = []
-    if state.get("restart_budget") is not None:
-        errors.append("restart budget already exists")
-    if state.get("decision") is not None:
-        errors.append("attempt decision already exists")
-    if state.get("observations"):
-        errors.append(f"{len(state['observations'])} attempt observations exist")
-    if state.get("incidents") or state.get("workflows"):
-        errors.append("an incident or workflow already references the job")
-    return errors
 
 
 def assert_clean_identity_baseline(
@@ -468,47 +452,6 @@ def wait_finite_workload(
     raise RegionalFixtureError(f"finite workload did not succeed: {last}")
 
 
-def metadata_errors(
-    workload: dict[str, Any],
-    *,
-    job_id: str,
-    attempt_id: str,
-    profile_version: str,
-) -> list[str]:
-    errors = []
-    labels = workload["metadata"].get("labels", {})
-    expected_labels = {
-        "gpu-fault.io/managed": "true",
-        "gpu-fault.io/job-id": job_id,
-        "gpu-fault.io/attempt-id": attempt_id,
-    }
-    for key, value in expected_labels.items():
-        if labels.get(key) != value:
-            errors.append(f"workload label {key} differs")
-    replicas = workload["spec"]["pytorchReplicaSpecs"]
-    for role, expected_offset in (("Master", "0"), ("Worker", "1")):
-        template = replicas[role]["template"]["metadata"]
-        template_labels = template.get("labels", {})
-        annotations = template.get("annotations", {})
-        for key, value in {
-            **expected_labels,
-            "gpu-fault.io/critical": "true",
-        }.items():
-            if template_labels.get(key) != value:
-                errors.append(f"{role} template label {key} differs")
-        if annotations.get("gpu-fault.io/expected-critical-ranks") != "3":
-            errors.append(f"{role} expected critical ranks differs")
-        if annotations.get("gpu-fault.io/rank-offset") != expected_offset:
-            errors.append(f"{role} rank offset differs")
-        if annotations.get("gpu-fault.io/runtime-profile-version") != profile_version:
-            errors.append(f"{role} runtime profile differs")
-        if annotations.get("gpu-fault.io/restart-budget") != "1":
-            errors.append(f"{role} restart budget differs")
-        if annotations.get("gpu-fault.io/training-container") != "pytorch":
-            errors.append(f"{role} training container differs")
-    return errors
-
-
 def watcher_interval_seconds(regional: RegionalLiveFixture) -> int:
     deployment = json.loads(
         regional.kubectl(
@@ -575,167 +518,6 @@ def admin_status_policy(case_id: str, *, skip: bool) -> tuple[bool, str]:
     return True, f"{case_id} closes the WORKLOAD group"
 
 
-def suspicious_log_lines(
-    text: str, *, limit: int = MAX_RECORDED_SUSPICIOUS_LINES
-) -> list[dict[str, Any]]:
-    """Executor log lines that hit a spec marker on a word boundary.
-
-    Returns the marker and the line (truncated) so the evidence shows what
-    matched rather than only that something did.
-    """
-
-    hits: list[dict[str, Any]] = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        match = SUSPICIOUS_LOG_PATTERN.search(line)
-        if match is None:
-            continue
-        hits.append({"line": number, "marker": match.group(0), "text": line[:300]})
-        if len(hits) >= limit:
-            break
-    return hits
-
-
-def loss_errors(logs: dict[str, str]) -> list[str]:
-    """Why the fixture's per-rank ``loss=`` lines do not show a converging model.
-
-    Every rank trains the same Linear(16, 1) on constant data with SGD, so the
-    loss it prints must not increase from one step to the next; a rank whose
-    loss climbs, or a Pod that printed none, is a training defect the SUCCESS
-    line alone would hide.
-    """
-
-    errors = []
-    for pod, text in sorted(logs.items()):
-        series: dict[int, list[tuple[int, float]]] = {}
-        for line in text.splitlines():
-            match = LOSS_LINE_PATTERN.search(line)
-            if match is None:
-                continue
-            try:
-                value = float(match.group(3))
-            except ValueError:
-                errors.append(f"{pod}: unparseable loss line {line[:80]!r}")
-                continue
-            series.setdefault(int(match.group(1)), []).append(
-                (int(match.group(2)), value)
-            )
-        if not series:
-            errors.append(f"{pod}: no loss lines")
-            continue
-        for rank, points in sorted(series.items()):
-            ordered = [value for _step, value in sorted(points)]
-            if any(later > earlier for earlier, later in zip(ordered, ordered[1:])):
-                errors.append(f"{pod}: rank {rank} loss increased: {ordered}")
-    return errors
-
-
-def observation_rank_errors(
-    observation: dict[str, Any],
-    *,
-    expected_ranks: set[int],
-) -> list[str]:
-    """The observation's containers must cover exactly the expected ranks."""
-
-    ranks = [container.get("rank") for container in observation.get("containers") or []]
-    if any(rank is None for rank in ranks):
-        return ["an observed container has no rank"]
-    actual = {int(rank) for rank in ranks if rank is not None}
-    if len(actual) != len(ranks):
-        return [f"duplicate container ranks: {sorted(ranks)}"]
-    if actual != expected_ranks:
-        return [f"container ranks {sorted(actual)} != {sorted(expected_ranks)}"]
-    return []
-
-
-def observation_pod_names(observation: dict[str, Any]) -> set[str]:
-    return {
-        str(container.get("pod_name") or "")
-        for container in observation.get("containers") or []
-    }
-
-
-def observation_pod_uids(observation: dict[str, Any]) -> set[str]:
-    return {
-        str(container.get("pod_uid") or "")
-        for container in observation.get("containers") or []
-    }
-
-
-def virtual_isolation_errors(
-    virtual_states: Sequence[dict[str, Any]],
-    *,
-    sources: Sequence[dict[str, Any]],
-    cluster_ids: Sequence[str],
-    shared_node: str,
-) -> list[str]:
-    """Why the same virtual node name did not stay cluster-scoped.
-
-    Both clusters posted an observation naming ``shared_node``; each store
-    scope must hold exactly one, stamped with its own cluster_id and carrying
-    its own Pods (names, UIDs) and GPUs -- and none of the other side's. A
-    check that only compared node_id sets passed when B's observation had been
-    overwritten by A's, because both said ``shared_node``.
-    """
-
-    errors = []
-    if not (len(virtual_states) == len(sources) == len(cluster_ids) == 2):
-        return ["virtual isolation needs exactly two clusters"]
-    own_uids = [{str(item["uid"]) for item in source["pods"]} for source in sources]
-    own_names = [{str(item["name"]) for item in source["pods"]} for source in sources]
-    observations: list[dict[str, Any]] = []
-    for index, (state, cluster_id) in enumerate(zip(virtual_states, cluster_ids)):
-        items = state.get("observations") or []
-        if len(items) != 1:
-            errors.append(f"{cluster_id}: {len(items)} observations, expected 1")
-            observations.append({})
-            continue
-        observation = items[0]
-        observations.append(observation)
-        if state.get("cluster_id") not in (None, cluster_id):
-            errors.append(f"{cluster_id}: store probe answered for another cluster")
-        if observation.get("cluster_id") != cluster_id:
-            errors.append(
-                f"{cluster_id}: observation cluster_id is {observation.get('cluster_id')!r}"
-            )
-        nodes = {
-            container.get("node_id")
-            for container in observation.get("containers") or []
-        }
-        if nodes != {shared_node}:
-            errors.append(
-                f"{cluster_id}: container node IDs are {sorted(map(str, nodes))}"
-            )
-        if observation_pod_uids(observation) != own_uids[index]:
-            errors.append(f"{cluster_id}: observation Pod UIDs are not its own")
-        if observation_pod_names(observation) != own_names[index]:
-            errors.append(f"{cluster_id}: observation Pod names are not its own")
-        if state.get("decision") is not None:
-            errors.append(f"{cluster_id}: pre-fault decision is not 404")
-        if state.get("restart_budget") is not None:
-            errors.append(f"{cluster_id}: pre-fault restart budget is not 404")
-    if all(observations):
-        a_gpus = workload_case.observation_gpu_uuids(observations[0])
-        b_gpus = workload_case.observation_gpu_uuids(observations[1])
-        if a_gpus & b_gpus:
-            errors.append("GPU UUIDs are shared between the two cluster scopes")
-        if observation_pod_uids(observations[0]) & observation_pod_uids(
-            observations[1]
-        ):
-            errors.append("Pod UIDs are shared between the two cluster scopes")
-    return errors
-
-
-def command_ids_in_logs(command_ids: Sequence[str], logs: dict[str, str]) -> list[str]:
-    """Which of ``command_ids`` appear in any of the executor ``logs``."""
-
-    found = set()
-    for text in logs.values():
-        for command_id in command_ids:
-            if command_id and command_id in text:
-                found.add(command_id)
-    return sorted(found)
-
-
 def executor_logs_since(
     regional: RegionalLiveFixture,
     *,
@@ -746,43 +528,20 @@ def executor_logs_since(
     elapsed = int((datetime.now(timezone.utc) - since).total_seconds())
     window = max(60, min(elapsed + 60, EXECUTOR_LOG_MAX_WINDOW_SECONDS))
     logs = {}
-    for pod in regional.ready_pods("gpu", "gpu-fault-cluster-executor"):
+    pods = regional.ready_pods("gpu", "gpu-fault-cluster-executor")
+    if not pods:
+        raise RegionalFixtureError("no Ready executor for the log window")
+    for pod in pods:
         logs[str(pod["name"])] = regional.kubectl(
             "gpu",
             "logs",
             str(pod["name"]),
             f"--since={window}s",
-            check=False,
             timeout=120,
         )
+        if not logs[str(pod["name"])].strip():
+            raise RegionalFixtureError("executor log window is empty")
     return logs
-
-
-def control_plane_blast_errors(
-    before: dict[str, Any],
-    after: dict[str, Any],
-) -> list[str]:
-    """Why the control-plane EKS is not identical across the fault window.
-
-    Nodes and gpu-fault Jobs must match exactly. Eviction events are judged
-    as "none new": the whole event set was compared before, and it grew
-    whenever an unrelated event aged out of the API server between the two
-    snapshots -- a FAIL with nothing to do with the workflow.
-    """
-
-    errors = []
-    if before.get("nodes") != after.get("nodes"):
-        errors.append("CPU node taints/cordon/gpu-fault metadata changed")
-    if before.get("gpu_fault_jobs") != after.get("gpu_fault_jobs"):
-        errors.append("gpu-fault labelled Jobs on the control plane changed")
-    new_events = [
-        item
-        for item in after.get("eviction_events") or []
-        if item not in (before.get("eviction_events") or [])
-    ]
-    if new_events:
-        errors.append(f"{len(new_events)} new eviction events in the window")
-    return errors
 
 
 def wait_pod_uids_unchanged(
@@ -811,6 +570,34 @@ def wait_pod_uids_unchanged(
     if {str(item["uid"]) for item in snapshot["pods"]} != expected_uids:
         raise RegionalFixtureError("managed workload Pod UIDs changed")
     return snapshot
+
+
+def workload_residuals(
+    regional: RegionalLiveFixture,
+    workload: ManagedWorkloadFixture,
+    job_id: str,
+) -> list[dict[str, Any]]:
+    document = json.loads(
+        regional.kubectl(
+            "gpu",
+            "get",
+            f"pod,{workload.resource}",
+            "-l",
+            f"gpu-fault.io/job-id={job_id}",
+            "-o",
+            "json",
+        )
+    )
+    if not isinstance(document, dict) or not isinstance(document.get("items"), list):
+        raise RegionalFixtureError("workload cleanup query is not a resource list")
+    return [
+        {
+            "kind": item.get("kind"),
+            "name": (item.get("metadata") or {}).get("name"),
+            "uid": (item.get("metadata") or {}).get("uid"),
+        }
+        for item in document["items"]
+    ]
 
 
 def cleanup_workload(
@@ -848,13 +635,45 @@ def cleanup_workload(
                     workflow_request_ids=injection.get("workflow_request_ids"),
                 )
             )
+            if result[f"{label}_cleanup_quiescence"].get("safe_to_delete") is not True:
+                raise RegionalFixtureError("workload quiescence was not proven")
         except Exception as exc:
             result[f"{label}_cleanup_quiescence_error"] = f"{type(exc).__name__}: {exc}"
             result["workload_cleanup_deferred"] = True
             errors.append(f"{label}: workflow not quiescent; workload left in place")
             return errors
+    else:
+        try:
+            state = workload_store(regional, job_id=job_id, attempt_id=attempt_id)
+            commands = state.get("commands")
+            workflows = state.get("workflows")
+            if (
+                not isinstance(commands, list)
+                or not isinstance(workflows, list)
+                or any(
+                    item.get("status")
+                    not in workload_case.CLEANUP_TERMINAL_COMMAND_STATUSES
+                    for item in commands
+                )
+                or any(
+                    item.get("status")
+                    not in workload_case.CLEANUP_TERMINAL_WORKFLOW_STATUSES
+                    for item in workflows
+                )
+            ):
+                raise RegionalFixtureError(
+                    "workload has unknown or active control records"
+                )
+        except Exception as exc:
+            result[f"{label}_cleanup_quiescence_error"] = f"{type(exc).__name__}: {exc}"
+            result["workload_cleanup_deferred"] = True
+            return [f"{label}: control records not quiescent; workload left in place"]
     try:
         workload.delete()
+        residuals = workload_residuals(regional, workload, job_id)
+        result[f"{label}_workload_residuals"] = residuals
+        if residuals:
+            errors.append(f"{label}: workload resources remain after deletion")
     except Exception as exc:
         errors.append(f"{label}: {type(exc).__name__}: {exc}")
     return errors
@@ -880,6 +699,8 @@ def run_workload_baseline(
         raise WorkloadAcceptanceError(
             f"{case_id} requires --state-dir for admin status"
         )
+    baseline = workload_store(regional, job_id=job_id, attempt_id=attempt_id)
+    assert_clean_identity_baseline([baseline], job_id=job_id, attempt_id=attempt_id)
     prewarm = ImagePrewarmFixture(
         regional,
         case_id=case_id,
@@ -887,22 +708,24 @@ def run_workload_baseline(
     )
     source_manifest = BASELINE_MANIFEST
     rendered_manifest = case_dir / "managed-workload.yaml"
-    fixture: ManagedWorkloadFixture | None = None
+    fixture: ReadmeWorkloadFixture | None = None
     result: dict[str, Any] = {"verdict": "FAIL"}
     failure: BaseException | None = None
+    deletion_verified = False
     try:
         prewarm.create(prewarm_nodes(regional))
         not_applicable: dict[str, str] = {}
         submission: dict[str, Any]
         render_equivalence: bool | None = None
+        fixture = readme_fixture(
+            regional,
+            manifest=source_manifest,
+            site_file=site.site_file,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            case_dir=case_dir,
+        )
         if case_id == "GF-REGIONAL-WORKLOAD-001":
-            fixture = managed_fixture(
-                regional,
-                manifest=source_manifest,
-                site_file=site.site_file,
-                job_id=job_id,
-                attempt_id=attempt_id,
-            )
             # `submit` raises on a non-zero exit, so reaching this line is
             # the returncode-0 fact the check below records.
             submission = {**fixture.submit(), "returncode": 0}
@@ -911,22 +734,11 @@ def run_workload_baseline(
                 "annotate/apply render comparison is WORKLOAD-002's check"
             )
         else:
+            submission_arguments = fixture.submission_arguments()
             annotate = run(
                 [
-                    sys.executable,
-                    "-m",
-                    "gpu_fault.workload_annotate_cli",
-                    str(source_manifest),
-                    "--site",
-                    str(site.site_file),
-                    "--job-id",
-                    job_id,
-                    "--attempt-id",
-                    attempt_id,
-                    "--restart-budget",
-                    "1",
-                    "--namespace",
-                    site.namespace,
+                    training_cli("gpu-fault-workload-annotate"),
+                    *submission_arguments,
                     "--output",
                     str(rendered_manifest),
                 ],
@@ -935,20 +747,8 @@ def run_workload_baseline(
             )
             dry_run = run(
                 [
-                    sys.executable,
-                    "-m",
-                    "gpu_fault.training_submit_cli",
-                    str(source_manifest),
-                    "--site",
-                    str(site.site_file),
-                    "--job-id",
-                    job_id,
-                    "--attempt-id",
-                    attempt_id,
-                    "--restart-budget",
-                    "1",
-                    "--namespace",
-                    site.namespace,
+                    training_cli("gpu-training-submit"),
+                    *submission_arguments,
                     "--dry-run",
                 ],
                 env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
@@ -959,63 +759,14 @@ def run_workload_baseline(
             render_equivalence = (
                 rendered_manifest.read_text(encoding="utf-8") == dry_run.stdout
             )
-            server_dry_run = regional.run(
-                [
-                    "kubectl",
-                    "--kubeconfig",
-                    str(regional.settings.gpu_kubeconfig),
-                    "--context",
-                    regional.settings.gpu_context,
-                    "-n",
-                    regional.settings.namespace,
-                    "apply",
-                    "--dry-run=server",
-                    "-f",
-                    str(rendered_manifest),
-                ],
-                cwd=ROOT,
-                check=False,
-            )
-            if server_dry_run.returncode:
-                raise RegionalFixtureError("server-side dry-run rejected manifest")
-            fixture = managed_fixture(
-                regional,
-                manifest=rendered_manifest,
-                site_file=site.site_file,
-                job_id=job_id,
-                attempt_id=attempt_id,
-            )
-            # Spec step 1: a same-named PyTorchJob from an earlier run would
-            # make `apply` an update of the old object rather than a fresh
-            # submission, and its Pods would carry the old attempt.
-            fixture.delete()
-            apply = regional.run(
-                [
-                    "kubectl",
-                    "--kubeconfig",
-                    str(regional.settings.gpu_kubeconfig),
-                    "--context",
-                    regional.settings.gpu_context,
-                    "-n",
-                    regional.settings.namespace,
-                    "apply",
-                    "-f",
-                    str(rendered_manifest),
-                ],
-                cwd=ROOT,
-            )
+            if not render_equivalence:
+                raise RegionalFixtureError("annotate and submit dry-run differ")
+            created = fixture.apply_rendered(rendered_manifest)
             submission = {
-                "pre_apply_delete": True,
+                **created,
+                "preexisting_resource_refused": True,
                 "annotate_returncode": annotate.returncode,
                 "dry_run_returncode": dry_run.returncode,
-                "server_dry_run_returncode": server_dry_run.returncode,
-                "apply_returncode": apply.returncode,
-                "returncode": max(
-                    annotate.returncode,
-                    dry_run.returncode,
-                    server_dry_run.returncode,
-                    apply.returncode,
-                ),
             }
         finite = wait_finite_workload(fixture)
         training_logs = {
@@ -1024,12 +775,12 @@ def run_workload_baseline(
                 "logs",
                 str(item["name"]),
                 "--tail=400",
-                check=False,
                 timeout=60,
             )
             for item in finite["pods"]
         }
         losses = loss_errors(training_logs)
+        collectives = collective_errors(training_logs)
         workload = fixture.workload()
         profile_version = str(site.config["runtime_profile"]["version"])
         metadata = metadata_errors(
@@ -1050,6 +801,9 @@ def run_workload_baseline(
         decision = terminal.get("decision") or {}
         terminal_event_key = f"{target.cluster_id}/{attempt_id}/TrainingAttemptTerminal"
         fixture.delete()
+        if workload_residuals(regional, fixture, job_id):
+            raise RegionalFixtureError("workload resources remain after deletion")
+        deletion_verified = True
         time.sleep(watcher_interval_seconds(regional) * 3)
         after_delete = workload_store(
             regional,
@@ -1062,15 +816,14 @@ def run_workload_baseline(
             "managed_metadata_complete": not metadata,
             "three_pods_on_three_nodes": len(finite["pods"]) == 3
             and len({item["node"] for item in finite["pods"]}) == 3,
-            "nccl_all_reduce_succeeded": all(
-                "all_reduce=300.0"
-                in finite["heartbeat_logs"].get(str(item["name"]), "")
-                for item in finite["pods"]
-            ),
+            "nccl_all_reduce_succeeded": not collectives,
             "per_rank_loss_non_increasing": not losses,
             "terminal_observation_succeeded": (
                 len(terminal["observations"]) == 1
                 and terminal_observation["workload_phase"] == "SUCCEEDED"
+                and terminal_observation.get("expected_critical_ranks") == 3
+                and observation_pod_uids(terminal_observation)
+                == {str(item["uid"]) for item in finite["pods"]}
             ),
             "observation_ranks_are_0_1_2": not rank_errors,
             "terminal_event_key_deterministic": (
@@ -1079,6 +832,9 @@ def run_workload_baseline(
             "deletion_does_not_regress_observation": (
                 len(observations) == 1
                 and observations[0]["workload_phase"] == "SUCCEEDED"
+                and observations[0].get("containers")
+                == terminal_observation.get("containers")
+                and observations[0].get("expected_critical_ranks") == 3
             ),
             "no_remote_mutation_commands": not terminal["commands"],
         }
@@ -1102,6 +858,7 @@ def run_workload_baseline(
             },
             "metadata_errors": metadata,
             "loss_errors": losses,
+            "collective_errors": collectives,
             "observation_rank_errors": rank_errors,
             "workload": finite,
             "terminal": terminal,
@@ -1114,11 +871,19 @@ def run_workload_baseline(
         # Each step in its own guard: a TimeoutExpired from the workload delete
         # used to skip the prewarm cleanup and replace the original error.
         cleanup_errors: list[str] = []
-        if fixture is not None:
-            try:
-                fixture.delete()
-            except Exception as exc:
-                cleanup_errors.append(f"workload: {type(exc).__name__}: {exc}")
+        if fixture is not None and not deletion_verified:
+            cleanup_errors.extend(
+                cleanup_workload(
+                    regional=regional,
+                    workload=fixture,
+                    case_dir=case_dir,
+                    job_id=job_id,
+                    attempt_id=attempt_id,
+                    injection=None,
+                    result=result,
+                    label="workload",
+                )
+            )
         try:
             residuals = prewarm.cleanup()
             result["prewarm_residuals"] = residuals
@@ -1135,25 +900,6 @@ def run_workload_baseline(
         "for the supplied three-node PyTorchJob; it does not inject a fault."
     ]
     return result
-
-
-OBSERVATION_POST_PROBE = r"""
-import json
-import os
-import sys
-from gpu_fault.collectors.sinks import HttpEventSink
-
-payload = json.loads(sys.argv[1])
-os.environ["SSL_CERT_FILE"] = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
-sink = HttpEventSink(
-    os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
-    bearer_token=os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
-    timeout_seconds=15,
-    max_attempts=1,
-)
-result = sink.post("/v1/workload-observations", payload)
-print(json.dumps(result, sort_keys=True))
-"""
 
 
 def post_observation(
@@ -1206,6 +952,143 @@ def refresh_observation(observation: dict[str, Any]) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def iso001_recovery_outcome(
+    *,
+    cluster_ids: list[str],
+    virtual_states: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    shared_node: str,
+    state_a: dict[str, Any],
+    state_b: dict[str, Any],
+    regional_b: RegionalLiveFixture,
+    injected_at: datetime,
+    target_a: dict[str, Any],
+    target_b: dict[str, Any],
+    b_uids: set[str],
+    errors: list[str],
+    baseline_states: list[dict[str, Any]],
+    virtual_results: list[dict[str, Any]],
+    injection: dict[str, Any],
+    job_id: str,
+) -> dict[str, Any]:
+    workflow_a = state_a.get("workflow") or {}
+    virtual_errors = virtual_isolation_errors(
+        virtual_states,
+        sources=sources,
+        cluster_ids=cluster_ids,
+        shared_node=shared_node,
+    )
+    incident_a = state_a.get("incident") or {}
+    # Every command A's workflow issued; none may show up in B's executor
+    # logs, which are read over the window that starts at the injection.
+    command_ids_a = sorted(
+        str(item.get("command_id") or "")
+        for item in state_a.get("commands") or []
+        if item.get("command_id")
+    )
+    b_executor_logs = executor_logs_since(regional_b, since=injected_at)
+    leaked_command_ids = command_ids_in_logs(command_ids_a, b_executor_logs)
+    checks = {
+        "two_physical_registrations": True,
+        "same_virtual_node_is_cluster_scoped": not virtual_errors,
+        "pre_fault_decision_and_budget_absent_on_both": all(
+            item.get("decision") is None and item.get("restart_budget") is None
+            for item in virtual_states
+        ),
+        "primary_workflow_succeeded": not errors,
+        "primary_incident_and_workflow_cluster_scoped": (
+            incident_a.get("cluster_id") == cluster_ids[0]
+            and incident_a.get("job_id") == job_id
+            and bool(workflow_a.get("request_id"))
+        ),
+        "primary_restart_budget_one": (
+            (state_a.get("restart_budget") or {}).get("restart_count") == 1
+        ),
+        "secondary_has_no_restart_budget": state_b["restart_budget"] is None,
+        "secondary_has_no_decision": state_b["decision"] is None,
+        "secondary_has_no_incident_or_workflow": (
+            not state_b.get("incidents")
+            and not state_b.get("workflows")
+            and state_b.get("commands") == []
+        ),
+        "secondary_pod_uids_unchanged": {str(item["uid"]) for item in target_b["pods"]}
+        == b_uids,
+        "secondary_executor_logs_free_of_primary_command_ids": (
+            bool(command_ids_a) and not leaked_command_ids
+        ),
+    }
+    result = {
+        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "errors": errors,
+        "virtual_isolation_errors": virtual_errors,
+        "baseline_states": baseline_states,
+        "virtual_posts": virtual_results,
+        "virtual_states": virtual_states,
+        "injection": injection,
+        "primary_state": state_a,
+        "primary_target": target_a,
+        "primary_command_ids": command_ids_a,
+        "secondary_state": state_b,
+        "secondary_executor_logs": {
+            pod: {
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "lines": len(text.splitlines()),
+            }
+            for pod, text in b_executor_logs.items()
+        },
+        "secondary_leaked_command_ids": leaked_command_ids,
+        "incident_counts": {
+            cluster_ids[0]: len(state_a.get("incidents") or [])
+            or int(bool(incident_a)),
+            cluster_ids[1]: len(state_b.get("incidents") or []),
+        },
+        "workflow_counts": {
+            cluster_ids[0]: len(state_a.get("workflows") or [])
+            or int(bool(workflow_a)),
+            cluster_ids[1]: len(state_b.get("workflows") or []),
+        },
+    }
+    return result
+
+
+def prepare_iso001_workload(
+    item: tuple[RegionalLiveFixture, ManagedWorkloadFixture, ImagePrewarmFixture],
+    *,
+    fixtures: tuple[RegionalLiveFixture, ...],
+    submission_started: list[bool],
+    site_file: Path,
+    job_id: str,
+    attempt_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    regional, workload, prewarm = item
+    prewarm.create(prewarm_nodes(regional))
+    submission_started[fixtures.index(regional)] = True
+    workload.submit()
+    source = workload.wait_running(timeout_seconds=900)
+    observation = workload_case.wait_observation(
+        regional,
+        workload_case_settings(
+            regional=regional,
+            site_file=site_file,
+            manifest=LONG_RUNNING_MANIFEST,
+            job_id=job_id,
+            attempt_id=attempt_id,
+        ),
+        node=str(source["pods"][0]["node"]),
+        expected_gpu_count=24,
+    )
+    if source_observation_errors(
+        observation,
+        source,
+        cluster_id=regional.settings.cluster_id,
+        job_id=job_id,
+        attempt_id=attempt_id,
+    ):
+        raise RegionalFixtureError("source Observation is not fresh and workload-bound")
+    return source, observation
+
+
 def run_iso001(
     *,
     site: WorkloadSite,
@@ -1215,6 +1098,7 @@ def run_iso001(
     job_id: str,
     attempt_id: str,
     attempt: int,
+    maintenance_window_end: datetime,
 ) -> dict[str, Any]:
     multi = site.multi(primary, secondary)
     regional_a = multi.regional(multi.cluster_a)
@@ -1243,8 +1127,11 @@ def run_iso001(
     )
     cluster_ids = [regional.settings.cluster_id for regional in fixtures]
     result: dict[str, Any] = {"verdict": "FAIL", "errors": []}
+    submission_started = [False, False]
     failure: BaseException | None = None
     injection_context: dict[str, Any] | None = None
+    observations: list[dict[str, Any]] = []
+    virtual_pending = [False, False]
     try:
         for regional in fixtures:
             if regional.gpu_workloads():
@@ -1261,28 +1148,14 @@ def run_iso001(
         )
         result["baseline_states"] = baseline_states
 
-        def prepare(
-            item: tuple[
-                RegionalLiveFixture, ManagedWorkloadFixture, ImagePrewarmFixture
-            ],
-        ) -> tuple[dict[str, Any], dict[str, Any]]:
-            regional, workload, prewarm = item
-            prewarm.create(prewarm_nodes(regional))
-            workload.submit()
-            source = workload.wait_running(timeout_seconds=900)
-            observation = workload_case.wait_observation(
-                regional,
-                workload_case_settings(
-                    regional=regional,
-                    site_file=site.site_file,
-                    manifest=LONG_RUNNING_MANIFEST,
-                    job_id=job_id,
-                    attempt_id=attempt_id,
-                ),
-                node=str(source["pods"][0]["node"]),
-                expected_gpu_count=24,
-            )
-            return source, observation
+        prepare = partial(
+            prepare_iso001_workload,
+            fixtures=fixtures,
+            submission_started=submission_started,
+            site_file=site.site_file,
+            job_id=job_id,
+            attempt_id=attempt_id,
+        )
 
         # The two clusters' prewarm/submit/wait chains share nothing, and each
         # is the longest stretch of the case; run them together.
@@ -1294,7 +1167,10 @@ def run_iso001(
         observations = [observation for _source, observation in prepared]
         shared_node = f"iso-collision-node-{attempt}"
         virtual_results = []
-        for regional, observation in zip(fixtures, observations, strict=True):
+        for index, (regional, observation) in enumerate(
+            zip(fixtures, observations, strict=True)
+        ):
+            virtual_pending[index] = True
             virtual_results.append(
                 post_observation(
                     regional,
@@ -1309,8 +1185,20 @@ def run_iso001(
             )
             for regional in fixtures
         ]
-        for regional, observation in zip(fixtures, observations, strict=True):
+        virtual_errors = virtual_isolation_errors(
+            virtual_states,
+            sources=sources,
+            cluster_ids=cluster_ids,
+            shared_node=shared_node,
+        )
+        if virtual_errors:
+            result["virtual_isolation_errors"] = virtual_errors
+            raise RegionalFixtureError("virtual observation isolation failed")
+        for index, (regional, observation) in enumerate(
+            zip(fixtures, observations, strict=True)
+        ):
             post_observation(regional, refresh_observation(observation))
+            virtual_pending[index] = False
         refreshed = [
             workload_case.wait_observation(
                 regional,
@@ -1327,7 +1215,26 @@ def run_iso001(
             for regional, source in zip(fixtures, sources, strict=True)
         ]
         b_uids = {str(item["uid"]) for item in sources[1]["pods"]}
+        if any(
+            source_observation_errors(
+                observation,
+                source,
+                cluster_id=cluster_id,
+                job_id=job_id,
+                attempt_id=attempt_id,
+            )
+            for observation, source, cluster_id in zip(
+                refreshed, sources, cluster_ids, strict=True
+            )
+        ):
+            raise RegionalFixtureError(
+                "physical Observation was not restored before injection"
+            )
         injected_at = datetime.now(timezone.utc)
+        if injected_at >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "approved maintenance window ended before injection"
+            )
         node_a = str(sources[0]["pods"][0]["node"])
         marker = f"iso001-{attempt}-{int(time.time())}"
         payload = workload_case.xid11_payload(
@@ -1365,7 +1272,19 @@ def run_iso001(
         workflow_a = state_a.get("workflow") or {}
         if workflow_a.get("request_id"):
             injection_context["workflow_request_ids"] = [str(workflow_a["request_id"])]
+        workloads[0].authorize_restart(state_a)
         errors = workload_case.workflow_errors(state_a, expected_gpu_count=24)
+        errors.extend(
+            recovery_identity_errors(
+                state_a,
+                cluster_id=cluster_ids[0],
+                job_id=job_id,
+                attempt_id=attempt_id,
+                node=node_a,
+                marker=marker,
+                observed_after=injected_at,
+            )
+        )
         target_a = workloads[0].wait_restarted(
             {str(item["uid"]) for item in sources[0]["pods"]},
             timeout_seconds=900,
@@ -1380,91 +1299,46 @@ def run_iso001(
             job_id=job_id,
             attempt_id=attempt_id,
         )
-        virtual_errors = virtual_isolation_errors(
-            virtual_states,
-            sources=sources,
+        result = iso001_recovery_outcome(
             cluster_ids=cluster_ids,
+            virtual_states=virtual_states,
+            sources=sources,
             shared_node=shared_node,
+            state_a=state_a,
+            state_b=state_b,
+            regional_b=regional_b,
+            injected_at=injected_at,
+            target_a=target_a,
+            target_b=target_b,
+            b_uids=b_uids,
+            errors=errors,
+            baseline_states=baseline_states,
+            virtual_results=virtual_results,
+            injection=injection,
+            job_id=job_id,
         )
-        incident_a = state_a.get("incident") or {}
-        # Every command A's workflow issued; none may show up in B's executor
-        # logs, which are read over the window that starts at the injection.
-        command_ids_a = sorted(
-            str(item.get("command_id") or "")
-            for item in state_a.get("commands") or []
-            if item.get("command_id")
-        )
-        b_executor_logs = executor_logs_since(regional_b, since=injected_at)
-        leaked_command_ids = command_ids_in_logs(command_ids_a, b_executor_logs)
-        checks = {
-            "two_physical_registrations": True,
-            "same_virtual_node_is_cluster_scoped": not virtual_errors,
-            "pre_fault_decision_and_budget_absent_on_both": all(
-                item.get("decision") is None and item.get("restart_budget") is None
-                for item in virtual_states
-            ),
-            "primary_workflow_succeeded": not errors,
-            "primary_incident_and_workflow_cluster_scoped": (
-                incident_a.get("cluster_id") == cluster_ids[0]
-                and incident_a.get("job_id") == job_id
-                and bool(workflow_a.get("request_id"))
-            ),
-            "primary_restart_budget_one": (
-                (state_a.get("restart_budget") or {}).get("restart_count") == 1
-            ),
-            "secondary_has_no_restart_budget": state_b["restart_budget"] is None,
-            "secondary_has_no_decision": state_b["decision"] is None,
-            "secondary_has_no_incident_or_workflow": (
-                not state_b.get("incidents") and not state_b.get("workflows")
-            ),
-            "secondary_pod_uids_unchanged": {
-                str(item["uid"]) for item in target_b["pods"]
-            }
-            == b_uids,
-            "secondary_executor_logs_free_of_primary_command_ids": (
-                bool(command_ids_a) and not leaked_command_ids
-            ),
-        }
-        result = {
-            "verdict": "PASS" if all(checks.values()) else "FAIL",
-            "checks": checks,
-            "errors": errors,
-            "virtual_isolation_errors": virtual_errors,
-            "baseline_states": baseline_states,
-            "virtual_posts": virtual_results,
-            "virtual_states": virtual_states,
-            "injection": injection,
-            "primary_state": state_a,
-            "primary_target": target_a,
-            "primary_command_ids": command_ids_a,
-            "secondary_state": state_b,
-            "secondary_executor_logs": {
-                pod: {
-                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
-                    "lines": len(text.splitlines()),
-                }
-                for pod, text in b_executor_logs.items()
-            },
-            "secondary_leaked_command_ids": leaked_command_ids,
-            "incident_counts": {
-                cluster_ids[0]: len(state_a.get("incidents") or [])
-                or int(bool(incident_a)),
-                cluster_ids[1]: len(state_b.get("incidents") or []),
-            },
-            "workflow_counts": {
-                cluster_ids[0]: len(state_a.get("workflows") or [])
-                or int(bool(workflow_a)),
-                cluster_ids[1]: len(state_b.get("workflows") or []),
-            },
-        }
     except Exception as exc:
         failure = exc
     finally:
         cleanup_errors: list[str] = []
+        if injection_context is None:
+            for index, pending in enumerate(virtual_pending):
+                if not pending:
+                    continue
+                try:
+                    post_observation(
+                        fixtures[index], refresh_observation(observations[index])
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(
+                        f"physical Observation restore: {type(exc).__name__}"
+                    )
         # Cluster A's workflow may still be RUNNING when the body fails; its
         # workload is deleted only once quiescence is proven. Cluster B never
         # had a workflow, so its workload goes straight away.
         for index, (regional, workload) in enumerate(zip(fixtures, workloads)):
+            if not submission_started[index]:
+                continue
             cleanup_errors.extend(
                 cleanup_workload(
                     regional=regional,
@@ -1497,28 +1371,52 @@ def run_iso001(
     return result
 
 
-E2E_PREFLIGHT_PROBE = r"""
-import json
-import sys
-from datetime import datetime, timezone
-from gpu_fault.app import ApplicationContext
-
-cluster_id = sys.argv[1]
-store = ApplicationContext.from_environment().store
-statuses = [
-    item.model_dump(mode="json")
-    for item in store.list_collector_statuses(cluster_id)
-]
-agents = [
-    item.model_dump(mode="json")
-    for item in store.list_agents(cluster_id)
-]
-print(json.dumps({
-    "collector_statuses": statuses,
-    "agents": agents,
-    "observed_at": datetime.now(timezone.utc).isoformat(),
-}, sort_keys=True, default=str))
-"""
+def e2e_executor_pods(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
+    inventory = json.loads(
+        regional.kubectl(
+            "gpu", "get", "pod", "-l", "app=gpu-fault-cluster-executor", "-o", "json"
+        )
+    )
+    pods = ready_pod_records(inventory)
+    if len(pods) != len(inventory["items"]):
+        raise RegionalFixtureError("not every executor Pod is fully Ready")
+    if len({pod["name"] for pod in pods}) != len(pods) or len(
+        {pod["uid"] for pod in pods}
+    ) != len(pods):
+        raise RegionalFixtureError("executor Pod identities are not unique")
+    raw_by_uid = {item["metadata"]["uid"]: item for item in inventory["items"]}
+    for pod in pods:
+        raw = raw_by_uid[pod["uid"]]
+        if (
+            raw["metadata"].get("namespace") != regional.settings.namespace
+            or not isinstance(pod["node"], str)
+            or not pod["node"].strip()
+        ):
+            raise RegionalFixtureError("executor Pod namespace or node is missing")
+        containers = []
+        for status in raw["status"]["containerStatuses"]:
+            running = (status.get("state") or {}).get("running") or {}
+            fields = {
+                "name": status["name"],
+                "container_id": status.get("containerID"),
+                "image_id": status.get("imageID"),
+                "started_at": running.get("startedAt"),
+            }
+            restarts = status.get("restartCount")
+            if (
+                any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in fields.values()
+                )
+                or type(restarts) is not int
+                or restarts < 0
+            ):
+                raise RegionalFixtureError("executor container identity is incomplete")
+            containers.append({**fields, "restart_count": restarts})
+        if not any(item["name"] == "executor" for item in containers):
+            raise RegionalFixtureError("executor container is missing")
+        pod["containers"] = sorted(containers, key=lambda item: item["name"])
+    return pods
 
 
 def e2e_preflight(
@@ -1559,19 +1457,62 @@ def e2e_preflight(
     required_artifact = metadata.get("required-agent-artifact-sha256")
     executor_logs = []
     suspicious: list[dict[str, Any]] = []
-    for pod in regional.ready_pods("gpu", "gpu-fault-cluster-executor"):
+    executor_pods = e2e_executor_pods(regional)
+    claim_probe = (
+        Path(__file__).with_name("probes") / "e2e_executor_readiness.py"
+    ).read_text(encoding="utf-8")
+    for pod in executor_pods:
         text = regional.kubectl(
             "gpu",
             "logs",
             str(pod["name"]),
+            "-c",
+            "executor",
             "--since=10m",
-            check=False,
+            check=True,
+            timeout=120,
         )
+        container = next(
+            item for item in pod["containers"] if item["name"] == "executor"
+        )
+        readiness = json.loads(
+            regional.kubectl(
+                "gpu",
+                "exec",
+                "-i",
+                str(pod["name"]),
+                "-c",
+                "executor",
+                "--",
+                component_python("gpu"),
+                "-",
+                regional.settings.cluster_id,
+                str(pod["name"]),
+                container["started_at"],
+                input_text=claim_probe,
+                check=True,
+                timeout=60,
+            )
+        )
+        if (
+            not isinstance(readiness, dict)
+            or readiness.get("authenticated_ready") is not True
+            or readiness.get("cluster_id") != regional.settings.cluster_id
+            or readiness.get("pod") != pod["name"]
+            or not isinstance(readiness.get("claim_before"), dict)
+            or not isinstance(readiness.get("claim_after"), dict)
+            or not readiness["claim_before"]
+            or not readiness["claim_after"]
+        ):
+            raise RegionalFixtureError("executor readiness evidence is incomplete")
         executor_logs.append(
             {
                 "pod": pod["name"],
+                "uid": pod["uid"],
+                "read_succeeded": True,
                 "sha256": hashlib.sha256(text.encode()).hexdigest(),
                 "lines": len(text.splitlines()),
+                "readiness": readiness,
             }
         )
         # Word-boundary matches with the offending lines recorded: the old
@@ -1580,7 +1521,13 @@ def e2e_preflight(
         suspicious.extend(
             {"pod": pod["name"], **hit} for hit in suspicious_log_lines(text)
         )
+    if e2e_executor_pods(regional) != executor_pods:
+        raise RegionalFixtureError("executor Pod or container identity changed")
     errors = []
+    if not nodes:
+        errors.append("GPU node inventory is empty")
+    if not executor_logs:
+        errors.append("no Ready executor was observed")
     for node in nodes:
         # A spare-pool node is cordoned by design while it waits in the pool
         # (hyperpod_spares keeps spec.unschedulable=True until it is handed
@@ -1590,8 +1537,14 @@ def e2e_preflight(
             errors.append(f"{node['name']} is not Ready and schedulable")
         if not required_kinds <= status_by_node.get(str(node["name"]), set()):
             errors.append(f"{node['name']} lacks required Collector status")
-    if len(active_agents) < len(nodes):
+    expected_nodes = {str(item["name"]) for item in nodes}
+    if (
+        len(active_agents) != len(expected_nodes)
+        or {str(item.get("node_id") or "") for item in active_agents} != expected_nodes
+    ):
         errors.append("not every GPU node has a live ACTIVE Agent")
+    if not required_artifact:
+        errors.append("required Agent artifact is missing from release metadata")
     if any(item.get("artifact_sha256") != required_artifact for item in active_agents):
         errors.append("an ACTIVE Agent artifact differs from release metadata")
     if suspicious:
@@ -1603,30 +1556,142 @@ def e2e_preflight(
         },
         "active_agents": active_agents,
         "required_agent_artifact_sha256": required_artifact,
+        "executor_pods": executor_pods,
         "executor_logs": executor_logs,
         "suspicious_executor_logs": suspicious,
         "errors": errors,
     }
 
 
-def notification_errors(state: dict[str, Any]) -> list[str]:
-    notifications = state.get("notifications") or []
-    categories: dict[str, list[dict[str, Any]]] = {}
-    for item in notifications:
-        notification = item.get("notification") or {}
-        result = item.get("result") or {}
-        categories.setdefault(str(notification.get("category")), []).append(result)
-    errors = []
-    for category in ("FAULT_DETECTED", "ACTION_COMPLETED"):
-        values = categories.get(category) or []
-        if len(values) != 1:
-            errors.append(f"{category} notification count is not one")
-            continue
-        if values[0].get("status") != "SENT":
-            errors.append(f"{category} notification is not SENT")
-        if not values[0].get("provider_message_id"):
-            errors.append(f"{category} notification has no provider message ID")
-    return errors
+def e2e001_recovery_outcome(
+    *,
+    regional: RegionalLiveFixture,
+    target: SiteTarget,
+    preflight: dict[str, Any],
+    blast_before: dict[str, Any],
+    source: dict[str, Any],
+    workload: ManagedWorkloadFixture,
+    observation: dict[str, Any],
+    host: dict[str, Any],
+    injection: dict[str, Any],
+    state: dict[str, Any],
+    injection_context: dict[str, Any],
+    job_id: str,
+    attempt_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    node = str(injection_context["node"])
+    marker = str(injection_context["marker"])
+    injected_at = injection_context["observed_after"]
+    workflow = state.get("workflow") or {}
+    errors = workload_case.workflow_errors(state, expected_gpu_count=24)
+    errors.extend(
+        recovery_identity_errors(
+            state,
+            cluster_id=target.cluster_id,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            node=node,
+            marker=marker,
+            observed_after=injected_at,
+        )
+    )
+    errors.extend(notification_errors(state))
+    event = state.get("event") or {}
+    incident = state.get("incident") or {}
+    if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
+        errors.append("event evidence reference is not a real kmsg reference")
+    if not event.get("source_boot_id") or event.get("source_monotonic_us") is None:
+        errors.append("event lacks real boot ID or monotonic source timestamp")
+    elif event["source_boot_id"] != host.get("boot_id"):
+        errors.append("event boot ID differs from the probed host")
+    if (
+        type(event.get("source_monotonic_us")) is not int
+        or event["source_monotonic_us"] < 0
+        or not event.get("pci_bdf")
+        or str(event["pci_bdf"]).lower().removesuffix(".0")
+        != str(host.get("gpu_bdf") or "").lower().removesuffix(".0")
+        or event.get("gpu_uuid") not in workload_case.observation_gpu_uuids(observation)
+    ):
+        errors.append(
+            "kernel event source clock or GPU identity differs from injection"
+        )
+    evidence = regional.cpu_python(
+        KMSG_EVIDENCE_PROBE, target.cluster_id, str(event.get("evidence_ref") or "")
+    )
+    records = evidence.get("evidence") or []
+    if len(records) != 1:
+        errors.append("injection does not bind exactly one raw kernel evidence record")
+    errors.extend(
+        kmsg_identity_errors(
+            records,
+            boot_id=str(host.get("boot_id") or ""),
+            node=node,
+            cluster_id=target.cluster_id,
+        )
+    )
+    # "Catalog 返回 RESTART_APP 且 incident 与 recovery plan 的 cluster_id
+    # 正确": the plan is the workflow's incident scope.
+    scope_errors = []
+    if incident.get("cluster_id") != target.cluster_id:
+        errors.append("incident cluster_id is not the target cluster")
+        scope_errors.append(f"incident: {incident.get('cluster_id')!r}")
+    if workflow.get("incident_id") != incident.get("incident_id"):
+        errors.append("recovery plan does not belong to the incident")
+        scope_errors.append("workflow.incident_id differs")
+    target_workload = workload.wait_restarted(
+        {str(item["uid"]) for item in source["pods"]},
+        timeout_seconds=900,
+    )
+    source_attempts = {str(item.get("attempt_id") or "") for item in source["pods"]}
+    target_attempts = {
+        str(item.get("attempt_id") or "") for item in target_workload["pods"]
+    }
+    blast_after = regional.cpu_blast_snapshot()
+    blast_errors = control_plane_blast_errors(blast_before, blast_after)
+    nodes_after = regional.gpu_nodes()
+    checks = {
+        "collector_agent_executor_preflight": not preflight["errors"],
+        "real_kmsg_injection": injection["bytes_written"] > 0,
+        "workflow_contract": not errors,
+        "incident_and_plan_cluster_scoped": not scope_errors,
+        "workload_pod_uids_changed": {
+            str(item["uid"]) for item in target_workload["pods"]
+        }.isdisjoint({str(item["uid"]) for item in source["pods"]}),
+        # The new attempt is a different, single, non-empty ID on every
+        # replaced Pod; UID disjointness alone also holds for a plain Pod
+        # restart of the same attempt.
+        "workload_attempt_id_changed": (
+            source_attempts == {attempt_id}
+            and len(target_attempts) == 1
+            and bool(next(iter(target_attempts)))
+            and target_attempts.isdisjoint(source_attempts)
+        ),
+        "control_plane_eks_identical": not blast_errors,
+        "gpu_nodes_restored": gpu_nodes_clean(nodes_after),
+    }
+    result = {
+        **result,
+        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "errors": errors,
+        "scope_errors": scope_errors,
+        "preflight": preflight,
+        "source_workload": source,
+        "target_workload": target_workload,
+        "source_attempt_ids": sorted(source_attempts),
+        "target_attempt_ids": sorted(target_attempts),
+        "injection": injection,
+        "state": state,
+        "kernel_evidence": evidence,
+        "control_plane_eks_diff": "IDENTICAL" if not blast_errors else "CHANGED",
+        "control_plane_eks_errors": blast_errors,
+        "gpu_nodes_after_restart": nodes_after,
+    }
+    # Consumed by BLAST-001 (blast_acceptance_cases_1): maintenance_window
+    # .start/.end and control-plane-current.json's workflows[] with their
+    # official_steps/safety_steps/step_executions. Keep these keys.
+    return result
 
 
 def run_e2e001(
@@ -1641,6 +1706,7 @@ def run_e2e001(
     maintenance_window_end: datetime,
 ) -> dict[str, Any]:
     regional = site.regional(target)
+    identity = regional.evidence_identity()
     preflight = e2e_preflight(regional)
     if preflight["errors"]:
         raise RegionalFixtureError(
@@ -1669,18 +1735,21 @@ def run_e2e001(
     )
     probe: HostProbeFixture | None = None
     result: dict[str, Any] = {
+        **identity,
         "verdict": "FAIL",
         "errors": [],
         "baseline_state": baseline_state,
     }
     failure: BaseException | None = None
     injection_context: dict[str, Any] | None = None
+    submission_started = False
     try:
         prewarm.create(prewarm_nodes(regional))
+        submission_started = True
         workload.submit()
         source = workload.wait_running(timeout_seconds=900)
         node = str(source["pods"][0]["node"])
-        workload_case.wait_observation(
+        observation = workload_case.wait_observation(
             regional,
             workload_case_settings(
                 regional=regional,
@@ -1692,8 +1761,26 @@ def run_e2e001(
             node=node,
             expected_gpu_count=24,
         )
+        if source_observation_errors(
+            observation,
+            source,
+            cluster_id=target.cluster_id,
+            job_id=job_id,
+            attempt_id=attempt_id,
+        ):
+            raise RegionalFixtureError(
+                "source Observation is not fresh and workload-bound"
+            )
+        expected_nodes = {(item["name"], item["uid"]) for item in preflight["nodes"]}
+        if (
+            node not in {name for name, _uid in expected_nodes}
+            or {(item["name"], item["uid"]) for item in regional.gpu_nodes()}
+            != expected_nodes
+        ):
+            raise RegionalFixtureError("GPU node identity changed before injection")
         probe = HostProbeFixture(
             HostProbeSettings(
+                state_directory=case_dir / "host-probes",
                 kubeconfig=regional.settings.gpu_kubeconfig,
                 context=regional.settings.gpu_context,
                 namespace=regional.settings.namespace,
@@ -1714,6 +1801,10 @@ def run_e2e001(
             raise RegionalFixtureError("kernel Collector host preflight failed")
         marker = f"e2e001-{attempt}-{int(time.time())}"
         injected_at = datetime.now(timezone.utc)
+        if injected_at >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "approved maintenance window ended before injection"
+            )
         injection_context = {
             "node": node,
             "marker": marker,
@@ -1736,93 +1827,25 @@ def run_e2e001(
             attempt_id=attempt_id,
         )
         workflow = state.get("workflow") or {}
+        result["state"] = state
         if workflow.get("request_id"):
             injection_context["workflow_request_ids"] = [str(workflow["request_id"])]
-        errors = workload_case.workflow_errors(state, expected_gpu_count=24)
-        errors.extend(notification_errors(state))
-        event = state.get("event") or {}
-        incident = state.get("incident") or {}
-        if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
-            errors.append("event evidence reference is not a real kmsg reference")
-        if not event.get("source_boot_id") or event.get("source_monotonic_us") is None:
-            errors.append("event lacks real boot ID or monotonic source timestamp")
-        # "Catalog 返回 RESTART_APP 且 incident 与 recovery plan 的 cluster_id
-        # 正确": the plan is the workflow's incident scope.
-        scope_errors = []
-        if incident.get("cluster_id") != target.cluster_id:
-            errors.append("incident cluster_id is not the target cluster")
-            scope_errors.append(f"incident: {incident.get('cluster_id')!r}")
-        if workflow.get("incident_id") != incident.get("incident_id"):
-            errors.append("recovery plan does not belong to the incident")
-            scope_errors.append("workflow.incident_id differs")
-        target_workload = workload.wait_restarted(
-            {str(item["uid"]) for item in source["pods"]},
-            timeout_seconds=900,
-        )
-        source_attempts = {str(item.get("attempt_id") or "") for item in source["pods"]}
-        target_attempts = {
-            str(item.get("attempt_id") or "") for item in target_workload["pods"]
-        }
-        blast_after = regional.cpu_blast_snapshot()
-        blast_errors = control_plane_blast_errors(blast_before, blast_after)
-        nodes_after = regional.gpu_nodes()
-        checks = {
-            "collector_agent_executor_preflight": not preflight["errors"],
-            "real_kmsg_injection": injection["bytes_written"] > 0,
-            "workflow_contract": not errors,
-            "incident_and_plan_cluster_scoped": not scope_errors,
-            "workload_pod_uids_changed": {
-                str(item["uid"]) for item in target_workload["pods"]
-            }.isdisjoint({str(item["uid"]) for item in source["pods"]}),
-            # The new attempt is a different, single, non-empty ID on every
-            # replaced Pod; UID disjointness alone also holds for a plain Pod
-            # restart of the same attempt.
-            "workload_attempt_id_changed": (
-                source_attempts == {attempt_id}
-                and len(target_attempts) == 1
-                and bool(next(iter(target_attempts)))
-                and target_attempts.isdisjoint(source_attempts)
-            ),
-            "control_plane_eks_identical": not blast_errors,
-            "gpu_nodes_restored": gpu_nodes_clean(nodes_after),
-        }
-        result = {
-            **result,
-            "verdict": "PASS" if all(checks.values()) else "FAIL",
-            "checks": checks,
-            "errors": errors,
-            "scope_errors": scope_errors,
-            "preflight": preflight,
-            "source_workload": source,
-            "target_workload": target_workload,
-            "source_attempt_ids": sorted(source_attempts),
-            "target_attempt_ids": sorted(target_attempts),
-            "injection": injection,
-            "state": state,
-            "control_plane_eks_diff": "IDENTICAL" if not blast_errors else "CHANGED",
-            "control_plane_eks_errors": blast_errors,
-            "gpu_nodes_after_restart": nodes_after,
-        }
-        # Consumed by BLAST-001 (blast_acceptance_cases_1): maintenance_window
-        # .start/.end and control-plane-current.json's workflows[] with their
-        # official_steps/safety_steps/step_executions. Keep these keys.
-        write_json_atomic(
-            case_dir / "execution-card.json",
-            {
-                "case_id": "GF-REGIONAL-E2E-001",
-                "maintenance_window": {
-                    "start": injected_at.isoformat(),
-                    "end": maintenance_window_end.isoformat(),
-                },
-                "cluster_id": target.cluster_id,
-                "node": node,
-                "job_id": job_id,
-                "attempt_id": attempt_id,
-            },
-        )
-        write_json_atomic(
-            case_dir / "control-plane-current.json",
-            {"workflows": [workflow]},
+        workload.authorize_restart(state)
+        result = e2e001_recovery_outcome(
+            regional=regional,
+            target=target,
+            preflight=preflight,
+            blast_before=blast_before,
+            source=source,
+            workload=workload,
+            observation=observation,
+            host=host,
+            injection=injection,
+            state=state,
+            injection_context=injection_context,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            result=result,
         )
     except Exception as exc:
         failure = exc
@@ -1836,18 +1859,19 @@ def run_e2e001(
                     cleanup_errors.append("host probe resources remain")
             except Exception as exc:
                 cleanup_errors.append(f"probe: {type(exc).__name__}: {exc}")
-        cleanup_errors.extend(
-            cleanup_workload(
-                regional=regional,
-                workload=workload,
-                case_dir=case_dir,
-                job_id=job_id,
-                attempt_id=attempt_id,
-                injection=injection_context,
-                result=result,
-                label="workload",
+        if submission_started:
+            cleanup_errors.extend(
+                cleanup_workload(
+                    regional=regional,
+                    workload=workload,
+                    case_dir=case_dir,
+                    job_id=job_id,
+                    attempt_id=attempt_id,
+                    injection=injection_context,
+                    result=result,
+                    label="workload",
+                )
             )
-        )
         try:
             prewarm_residuals = prewarm.cleanup()
             result["prewarm_residuals"] = prewarm_residuals
@@ -1860,7 +1884,9 @@ def run_e2e001(
         try:
             nodes_after_cleanup = regional.gpu_nodes()
             result["gpu_nodes_after_cleanup"] = nodes_after_cleanup
-            restored = gpu_nodes_clean(nodes_after_cleanup)
+            restored = gpu_nodes_clean(nodes_after_cleanup) and {
+                (item.get("name"), item.get("uid")) for item in nodes_after_cleanup
+            } == {(item.get("name"), item.get("uid")) for item in preflight["nodes"]}
         except Exception as exc:
             cleanup_errors.append(f"node recheck: {type(exc).__name__}: {exc}")
             restored = False
@@ -1869,6 +1895,34 @@ def run_e2e001(
         result["cleanup_errors"] = cleanup_errors
         if cleanup_errors or not restored:
             result["verdict"] = "FAIL"
+        if injection_context is not None:
+            state_path = case_dir / "control-plane-current.json"
+            write_json_atomic(
+                state_path,
+                {"workflows": [(result.get("state") or {}).get("workflow") or {}]},
+            )
+            write_json_atomic(
+                case_dir / "execution-card.json",
+                {
+                    "schema_version": 1,
+                    "case_id": "GF-REGIONAL-E2E-001",
+                    **identity,
+                    "verdict": result["verdict"] if failure is None else "FAIL",
+                    "cleanup_complete": not cleanup_errors and restored,
+                    "maintenance_window": {
+                        "start": injection_context["observed_after"].isoformat(),
+                        "end": datetime.now(timezone.utc).isoformat(),
+                    },
+                    "approved_window_end": maintenance_window_end.isoformat(),
+                    "node": injection_context["node"],
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "baseline_sha256": hashlib.sha256(
+                        (case_dir / "cpu-nodes-before.json").read_bytes()
+                    ).hexdigest(),
+                    "state_sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+                },
+            )
     raise_with_outcome(failure, result)
     result["limitations"] = [
         "The XID line is written by an approved user-space probe into real "
@@ -1878,24 +1932,6 @@ def run_e2e001(
         "event set is unbounded and churns on its own.",
     ]
     return result
-
-
-def gpu_nodes_clean(nodes: Sequence[dict[str, Any]]) -> bool:
-    """Every GPU node Ready, schedulable (spares excepted) and free of our taints."""
-
-    return all(
-        item["ready"] == "True"
-        and (
-            not item["unschedulable"]
-            # spare-pool nodes stay cordoned by design (see e2e_preflight)
-            or (item.get("labels") or {}).get("gpu-fault.io/spare") == "true"
-        )
-        and not any(
-            str(taint.get("key", "")).startswith("gpu-fault.io/")
-            for taint in item.get("taints") or []
-        )
-        for item in nodes
-    )
 
 
 def case_plan(
@@ -2050,6 +2086,8 @@ def main() -> int:
     # have earned its PASS against the same pair, and the result carries it so
     # the next case can demand the same.
     identity = site.regional(primary).evidence_identity()
+    if not identity["release_id"].strip():
+        raise WorkloadAcceptanceError("the deployed release identity is missing")
     predecessor_id, path = predecessor_path(
         arguments.run_dir,
         arguments.case,
@@ -2066,6 +2104,8 @@ def main() -> int:
     environment = {
         "GPU_FAULT_WORKLOAD_CASE": arguments.case,
         "GPU_FAULT_SITE_FILE": str(arguments.site.resolve()),
+        "GPU_FAULT_CONTROL_KUBECONFIG": str(site.cpu_kubeconfig),
+        "KUBECONFIG": str(site.gpu_kubeconfig),
         "GPU_FAULT_PRIMARY_CLUSTER_ID": primary.cluster_id,
         "GPU_FAULT_SECONDARY_CLUSTER_ID": (
             secondary.cluster_id if secondary is not None else ""
@@ -2073,24 +2113,31 @@ def main() -> int:
         "GPU_FAULT_TEST_JOB_ID": job_id,
         "GPU_FAULT_TEST_ATTEMPT_ID": attempt_id,
     }
+    details = {
+        **case_plan(
+            arguments.case,
+            primary=primary,
+            secondary=secondary,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            predecessor=predecessor,
+        ),
+        "site_sha256": hashlib.sha256(arguments.site.read_bytes()).hexdigest(),
+        "release_id": identity["release_id"],
+    }
     if not arguments.execute:
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=predecessor.get("valid") is True,
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
             confirmation=confirmation,
             environment=environment,
-            details=case_plan(
-                arguments.case,
-                primary=primary,
-                secondary=secondary,
-                job_id=job_id,
-                attempt_id=attempt_id,
-                predecessor=predecessor,
-            ),
+            details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if predecessor.get("valid") is True else 1
     if arguments.confirm != confirmation:
         raise WorkloadAcceptanceError(f"confirmation must be exactly {confirmation}")
     deadline = authorize_execution(
@@ -2098,8 +2145,9 @@ def main() -> int:
         case_id=arguments.case,
         confirmation=confirmation,
         environment=environment,
+        details=details,
     )
-    if not predecessor.get("valid", False):
+    if predecessor.get("valid") is not True:
         raise WorkloadAcceptanceError("formal predecessor evidence is not PASS")
     case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2136,6 +2184,7 @@ def main() -> int:
                 job_id=job_id,
                 attempt_id=attempt_id,
                 attempt=arguments.attempt,
+                maintenance_window_end=deadline,
             ),
             "GF-REGIONAL-E2E-001": lambda: run_e2e001(
                 site=site,

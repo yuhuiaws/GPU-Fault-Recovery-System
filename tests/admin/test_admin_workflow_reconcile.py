@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +23,7 @@ import pytest
 from gpu_fault.admin import operator_identity
 from gpu_fault.admin import workflow_reconcile as reconcile
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.execution import deployment_deadline, run_command
 from tests.admin.conftest import TEST_OPERATOR_ARN
 
 
@@ -130,7 +133,7 @@ def pod(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     calls: list[dict] = []
     monkeypatch.setattr(reconcile, "_run_reconcile", _pod(calls))
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
     return calls
 
@@ -194,7 +197,7 @@ def test_a_record_that_moved_between_plan_and_apply_is_named_by_field(
         _pod(calls, [_runtime_plan(), _runtime_plan(_item(fencing_token=8))]),
     )
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
 
     with pytest.raises(BootstrapError, match=r"workflow-blocked.*fencing_token.*7.*8"):
@@ -214,7 +217,7 @@ def test_node_state_that_drifts_between_plan_and_apply_refuses_the_apply(
 ) -> None:
     node_results = iter([_node_result(), _node_result(unschedulable=True)])
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: next(node_results)
+        reconcile, "run_command", lambda *_args, **_kwargs: next(node_results)
     )
 
     with pytest.raises(BootstrapError, match="plan changed before apply"):
@@ -247,7 +250,7 @@ def test_a_restamped_updated_at_is_not_drift(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
 
     result = reconcile.run_workflow_reconcile(
@@ -279,7 +282,7 @@ def test_an_explicitly_named_ineligible_record_refuses_the_whole_apply(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
 
     with pytest.raises(
@@ -318,7 +321,7 @@ def test_discovery_applies_the_eligible_records_and_reports_the_rest(
         ),
     )
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
 
     result = reconcile.run_workflow_reconcile(
@@ -352,7 +355,7 @@ def test_discovery_that_finds_nothing_eligible_applies_nothing(
         _pod(calls, [_runtime_plan(_item(eligible=False, reasons=["still live"]))]),
     )
     monkeypatch.setattr(
-        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
     )
 
     result = reconcile.run_workflow_reconcile(
@@ -381,13 +384,15 @@ def test_discovery_that_finds_nothing_eligible_applies_nothing(
         ),
         ({"max_items": 0, "reference": "CHG-1"}, "at least 1"),
         ({"max_items": 0, "dry_run": True}, "at least 1"),
+        ({"workflow_ids": (" ",), "reference": "CHG-1"}, "must not be blank"),
+        ({"incident_ids": ("",), "reference": "CHG-1"}, "must not be blank"),
     ],
 )
 def test_flag_combinations_that_used_to_be_ignored_are_refused_before_any_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict, message: str
 ) -> None:
     monkeypatch.setattr(reconcile, "_run_reconcile", _no_pod)
-    monkeypatch.setattr(reconcile.subprocess, "run", _no_pod)
+    monkeypatch.setattr(reconcile, "run_command", _no_pod)
 
     with pytest.raises(BootstrapError, match=message):
         reconcile.run_workflow_reconcile(_site(tmp_path), tmp_path, **kwargs)
@@ -397,6 +402,85 @@ def test_dry_run_needs_no_reference(tmp_path: Path, pod: list[dict]) -> None:
     plan = reconcile.run_workflow_reconcile(_site(tmp_path), tmp_path, dry_run=True)
 
     assert plan["dry_run"] is True
+
+
+def test_control_plane_script_uses_explicit_supervised_command_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+    payload = {"mode": "plan", "workflow_ids": ["workflow-a"]}
+
+    def command(arguments, **kwargs):
+        calls.append((arguments, kwargs))
+        return subprocess.CompletedProcess(
+            arguments, 0, "cpu-pod" if "get" in arguments else '{"items":[]}', ""
+        )
+
+    monkeypatch.setattr(reconcile, "run_command", command)
+    result = reconcile.run_control_plane_script(
+        _site(tmp_path, cpu_kubeconfig="/cpu/config", namespace="gpu-fault-system"),
+        payload,
+        script="print('test')",
+    )
+    assert result == {"items": []}
+    assert calls[0][1] == {"timeout_seconds": 120}
+    assert calls[1][1]["timeout_seconds"] == 900
+    assert json.loads(calls[1][1]["input_text"]) == payload
+    assert calls[1][0][-3:] == ["python", "-c", "print('test')"]
+    assert not any(json.dumps(payload) in part for part in calls[1][0]), (
+        "reconcile payload must be sent on stdin, not command arguments"
+    )
+
+
+def test_control_plane_exec_is_stopped_by_the_parent_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def command(arguments, **kwargs):
+        calls.append(arguments)
+        if "get" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, "cpu-pod", "")
+        return run_command(
+            [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs
+        )
+
+    monkeypatch.setattr(reconcile, "run_command", command)
+    with deployment_deadline("admin exec regression", 0.2, recovery_seconds=0):
+        with pytest.raises((TimeoutError, subprocess.TimeoutExpired)):
+            reconcile.run_control_plane_script(
+                _site(
+                    tmp_path, cpu_kubeconfig="/cpu/config", namespace="gpu-fault-system"
+                ),
+                {"mode": "plan"},
+            )
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("operation", ["script", "nodes"])
+def test_kubectl_failures_do_not_expose_credential_helper_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    marker = "synthetic-unstructured-auth-value-13579"
+
+    def command(arguments, **kwargs):
+        if "pod" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, "cpu-pod", "")
+        return subprocess.CompletedProcess(
+            arguments, 1, "", f"Forbidden: exec helper failed\n{marker}"
+        )
+
+    monkeypatch.setattr(reconcile, "run_command", command)
+    site = _site(tmp_path, cpu_kubeconfig="/cpu/config", namespace="gpu-fault-system")
+    with pytest.raises(BootstrapError) as failure:
+        if operation == "script":
+            reconcile.run_control_plane_script(site, {"mode": "plan"})
+        else:
+            reconcile.cluster_nodes(site, "gpu-a")
+    message = str(failure.value)
+    assert marker not in message
+    assert "Forbidden" in message
+    assert "redacted" in message
 
 
 def test_a_failed_sts_lookup_falls_back_to_the_local_operator(
@@ -425,7 +509,7 @@ def test_node_evidence_is_read_through_the_sites_gpu_kubeconfig_only(
         commands.append(list(command))
         return _node_result()
 
-    monkeypatch.setattr(reconcile.subprocess, "run", run)
+    monkeypatch.setattr(reconcile, "run_command", run)
     monkeypatch.setenv("KUBECONFIG", str(tmp_path / "somebody-elses.kubeconfig"))
 
     reconcile.cluster_nodes(_site(tmp_path), "gpu-a")
@@ -448,7 +532,7 @@ def test_node_evidence_is_read_through_the_sites_gpu_kubeconfig_only(
 def test_a_site_without_a_gpu_kubeconfig_fails_closed_instead_of_using_the_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(reconcile.subprocess, "run", _no_pod)
+    monkeypatch.setattr(reconcile, "run_command", _no_pod)
     monkeypatch.setenv("KUBECONFIG", str(tmp_path / "shell.kubeconfig"))
     (Path.home() / ".kube").mkdir(exist_ok=True)
     site = _site(tmp_path)

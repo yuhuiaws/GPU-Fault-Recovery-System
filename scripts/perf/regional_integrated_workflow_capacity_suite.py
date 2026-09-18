@@ -28,6 +28,7 @@ if __package__:
         executor_identity,
         executor_job,
     )
+    from .regional_capacity_resources import RunResources, run_manifest
     from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
         validate_alertmanager_drill_route,
@@ -35,6 +36,7 @@ if __package__:
         STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
+        NAMESPACE,
         control,
         dataplane,
         register,
@@ -43,7 +45,6 @@ if __package__:
     )
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
-        START_GATE_CONFIGMAP,
         aggregate,
         aurora_window,
         build_job,
@@ -57,6 +58,7 @@ if __package__:
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
+        purge_audit_rows,
         queue_drain,
         release_identity,
         release_start_gate,
@@ -74,6 +76,7 @@ else:
         executor_identity,
         executor_job,
     )
+    from regional_capacity_resources import RunResources, run_manifest
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
         validate_alertmanager_drill_route,
@@ -81,6 +84,7 @@ else:
         STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
+        NAMESPACE,
         control,
         dataplane,
         register,
@@ -89,7 +93,6 @@ else:
     )
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
-        START_GATE_CONFIGMAP,
         aggregate,
         aurora_window,
         build_job,
@@ -103,6 +106,7 @@ else:
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
+        purge_audit_rows,
         queue_drain,
         release_identity,
         release_start_gate,
@@ -735,21 +739,21 @@ def percentile(values, ratio):
 with psycopg.connect(store_dsn()) as conn:
     cur=conn.cursor()
     cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_control_records "
         "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
         (pattern,),
     )
     incidents=cur.fetchall()
     incident_ids=[key for key,_ in incidents]
     cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_control_records "
         "WHERE kind='workflow' AND payload->>'incident_id'=ANY(%s::text[])",
         (incident_ids,),
     )
     workflows=cur.fetchall()
     workflow_ids=[key for key,_ in workflows]
     cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_control_records "
         "WHERE kind='remote_command' "
         "AND payload->>'workflow_request_id'=ANY(%s::text[])",
         (workflow_ids,),
@@ -976,56 +980,14 @@ def verdict(
     return ("PASS" if not errors else "FAIL", errors)
 
 
-def purge_integrated_rows(run_id: str) -> None:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    script = f"""
-import os, psycopg
-{STORE_DSN_SNIPPET}
-pattern='%integrated-{run_id}-%'
-node_pattern='integrated-node-{run_id}-%'
-with psycopg.connect(store_dsn(), autocommit=True) as conn:
-    cur=conn.cursor()
-    cur.execute(
-        "SELECT key FROM gpu_fault_objects "
-        "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
-        (pattern,),
-    )
-    incidents=[row[0] for row in cur.fetchall()]
-    cur.execute(
-        "SELECT key FROM gpu_fault_objects "
-        "WHERE kind='workflow' AND payload->>'incident_id'=ANY(%s::text[])",
-        (incidents,),
-    )
-    workflows=[row[0] for row in cur.fetchall()]
-    cur.execute(
-        "DELETE FROM gpu_fault_objects WHERE kind='remote_command' "
-        "AND payload->>'workflow_request_id'=ANY(%s::text[])",
-        (workflows,),
-    )
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='workflow' AND key=ANY(%s::text[])",
-        (workflows,),
-    )
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='incident' AND key=ANY(%s::text[])",
-        (incidents,),
-    )
-    cur.execute(
-        "DELETE FROM gpu_fault_objects WHERE kind='agent' "
-        "AND payload->>'node_id' LIKE %s",
-        (node_pattern,),
-    )
-"""
-    control("exec", pod, "--", "python3", "-c", script, check=False, timeout=180)
+def purge_integrated_rows(run_id: str, *, artifacts: Path) -> None:
+    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
+    if intent.get("run_id") != run_id:
+        raise RuntimeError(
+            "integrated cleanup registration intent belongs to another run"
+        )
+    RunResources(artifacts, run_id, NAMESPACE, dataplane).delete_all()
+    purge_audit_rows(run_id=run_id, artifacts=artifacts)
 
 
 def execute_integrated_jobs(
@@ -1040,7 +1002,8 @@ def execute_integrated_jobs(
     aurora_preflight: dict,
     heartbeat_refresh: Callable[[], None],
 ) -> int:
-    publish_fixtures("burst")
+    resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
+    publish_fixtures("burst", resources=resources)
     upsert_configmap(
         EXECUTOR_CONFIGMAP,
         text={
@@ -1048,8 +1011,9 @@ def execute_integrated_jobs(
                 PERF_DIR / "benchmark_regional_action_executor.py"
             ).read_text()
         },
+        resources=resources,
     )
-    prepare_start_gate()
+    prepare_start_gate(resources=resources)
     load_manifest = build_load_manifest(
         run_id=run_id,
         clusters=args.clusters,
@@ -1068,6 +1032,8 @@ def execute_integrated_jobs(
     executor_manifest["spec"]["template"]["spec"]["volumes"][0]["configMap"]["name"] = (
         EXECUTOR_CONFIGMAP
     )
+    load_manifest = run_manifest(load_manifest, run_id)
+    executor_manifest = run_manifest(executor_manifest, run_id)
     for manifest, name in (
         (load_manifest, "load-job.json"),
         (executor_manifest, "executor-job.json"),
@@ -1075,28 +1041,19 @@ def execute_integrated_jobs(
         (artifacts / name).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
-    for job in (LOAD_JOB, EXECUTOR_JOB):
-        dataplane(
-            "delete",
-            "job",
-            job,
-            "--ignore-not-found",
-            "--wait=true",
-            check=False,
-        )
     pods = control_pods()
     pod_runtime_before = control_pod_runtime_snapshot()
     metrics_before = scrape_metrics(pods)
     cgroup_before = scrape_cgroup(pods)
     postgres_before = postgres_counters()
     target_queue, target_spool = drain_targets(metrics_before)
-    dataplane("apply", "-f", "-", stdin=json.dumps(executor_manifest).encode())
-    dataplane("apply", "-f", "-", stdin=json.dumps(load_manifest).encode())
+    resources.create(executor_manifest)
+    resources.create(load_manifest)
     wait_for_executor_pods(args.clusters)
     wait_for_load_pods(LOAD_JOB, args.clusters, timeout_seconds=600)
     heartbeat_refresh()
     start_epoch = time.time() + args.lead_seconds
-    release_start_gate(start_epoch)
+    release_start_gate(start_epoch, resources=resources)
     ingress_status = wait_for_job(
         LOAD_JOB,
         args.timeout_seconds + args.lead_seconds,
@@ -1339,47 +1296,31 @@ def run(args: argparse.Namespace) -> int:
         failure = exc
     finally:
         with cleanup_signal_guard():
-            for job in (LOAD_JOB, EXECUTOR_JOB):
-                dataplane(
-                    "delete",
-                    "job",
-                    job,
-                    "--ignore-not-found",
-                    "--wait=true",
-                    check=False,
-                    timeout=300,
-                )
-            for configmap in (EXECUTOR_CONFIGMAP, START_GATE_CONFIGMAP):
-                dataplane(
-                    "delete",
-                    "configmap",
-                    configmap,
-                    "--ignore-not-found",
-                    check=False,
-                )
-            purge_integrated_rows(run_id)
             try:
-                teardown(
-                    purge=True,
-                    deregister_clusters=True,
-                    allow_live_registry=args.allow_live_registry,
-                    live_registry_confirmation=args.confirm_live_registry,
-                    artifacts=artifacts,
-                    run_id=run_id,
-                )
-                workload_residuals = wait_for_integrated_workload_cleanup()
-                (artifacts / "cleanup-workloads.json").write_text(
-                    json.dumps(workload_residuals, indent=2, sort_keys=True) + "\n"
-                )
-                residuals = workflow_audit(run_id)
-                (artifacts / "cleanup-residuals.json").write_text(
-                    json.dumps(residuals, indent=2, sort_keys=True) + "\n"
-                )
-                if any(
-                    int(residuals.get(key, 0))
-                    for key in ("incident_count", "workflow_count", "command_count")
-                ):
-                    raise RuntimeError("integrated workflow cleanup left residual rows")
+                if (artifacts / "registry-registration-intent.json").exists():
+                    teardown(
+                        purge=True,
+                        deregister_clusters=True,
+                        allow_live_registry=args.allow_live_registry,
+                        live_registry_confirmation=args.confirm_live_registry,
+                        artifacts=artifacts,
+                        run_id=run_id,
+                    )
+                    workload_residuals = wait_for_integrated_workload_cleanup()
+                    (artifacts / "cleanup-workloads.json").write_text(
+                        json.dumps(workload_residuals, indent=2, sort_keys=True) + "\n"
+                    )
+                    residuals = workflow_audit(run_id)
+                    (artifacts / "cleanup-residuals.json").write_text(
+                        json.dumps(residuals, indent=2, sort_keys=True) + "\n"
+                    )
+                    if any(
+                        int(residuals.get(key, 0))
+                        for key in ("incident_count", "workflow_count", "command_count")
+                    ):
+                        raise RuntimeError(
+                            "integrated workflow cleanup left residual rows"
+                        )
             except Exception as cleanup_error:
                 if failure is None:
                     failure = cleanup_error

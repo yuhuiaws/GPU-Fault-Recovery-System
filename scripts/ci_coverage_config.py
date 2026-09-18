@@ -14,18 +14,26 @@ import ast
 import fnmatch
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-if __package__:
-    from scripts.ci_coverage_floors import validate_module_floors
+if TYPE_CHECKING or __package__:
+    from scripts.ci_coverage_floors import (
+        COVERAGE_SCOPES,
+        OBJECTIVE_TARGET,
+        validate_module_floors,
+    )
     from scripts.ci_gate_artifacts import CoverageGateError, repository_files
 else:
-    from ci_coverage_floors import validate_module_floors
+    from ci_coverage_floors import (
+        COVERAGE_SCOPES,
+        OBJECTIVE_TARGET,
+        validate_module_floors,
+    )
     from ci_gate_artifacts import CoverageGateError, repository_files
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config/ci-unit-gate.json"
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 POSTGRES_TEST_URL_ENV = "GPU_FAULT_TEST_POSTGRES_URL"
 RUNTIME_SHARDS = ("runtime_0", "runtime_1", "runtime_2")
 SHARDS = (*RUNTIME_SHARDS, "deployment", "fault_runner", "postgres")
@@ -42,6 +50,21 @@ IDENTITY_GROUPS = {
     "runtime_tests",
     "shared_tests",
 }
+
+
+def parse_pytest_workers(value: object) -> int | str:
+    if isinstance(value, str):
+        if value in ("auto", "logical"):
+            return value
+        try:
+            value = int(value)
+        except ValueError:
+            pass
+    if type(value) is int and value >= 0:
+        return value
+    raise CoverageGateError(
+        "pytest workers must be a non-negative integer, 'auto' or 'logical'"
+    )
 
 
 def load_config(root: Path = ROOT) -> dict[str, Any]:
@@ -86,13 +109,35 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         raise CoverageGateError("coverage shard config lists are incomplete")
     _validate_coverage_sources(coverage)
     validate_module_floors(coverage["module_floors"])
+    parse_pytest_workers(value["protocol"].get("pytest_workers"))
+    for name, minimum in (
+        ("postgres_stress_workers", 8),
+        ("postgres_stress_rounds", 40),
+    ):
+        if (
+            type(value["protocol"].get(name)) is not int
+            or value["protocol"][name] < minimum
+        ):
+            raise CoverageGateError("PostgreSQL stress protocol is incomplete")
     for shard in SHARDS:
         raw = value["shards"][shard]
+        required_groups = {
+            "dependencies",
+            "protocol",
+            "runtime_source",
+            "fault_runner_source",
+            "shared_tests",
+            f"{logical_test_domain(shard)}_tests",
+        }
+        if shard == "deployment":
+            required_groups.add("deployment_source")
         if (
             not isinstance(raw, dict)
             or not isinstance(raw.get("identity_groups"), list)
             or not isinstance(raw.get("omit_deployment_source"), bool)
             or not set(raw["identity_groups"]) <= IDENTITY_GROUPS
+            or not required_groups <= set(raw["identity_groups"])
+            or raw["omit_deployment_source"] != (shard != "deployment")
         ):
             raise CoverageGateError(f"coverage shard config is invalid: {shard}")
     return value
@@ -101,22 +146,24 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
 def _validate_coverage_sources(coverage: Mapping[str, Any]) -> None:
     """Reject a source declaration the shards could not agree on.
 
-    Schema 2 had one ``source`` string, which is why the release orchestrator
-    under ``deploy/`` sat outside every floor. Schema 3 lists ``sources`` and
-    the ``deployment_only_sources`` subset that runtime shards must not measure;
-    the old key is refused rather than aliased so a stale config fails loudly
-    instead of silently measuring one root.
+    Schema 4 measures both fixed objective scopes. Deployment-only roots stay
+    absent from runtime shards; every measured runner root enters each shard's
+    content identity. Earlier source-only protocols must not reuse these proofs.
     """
 
     sources = coverage["sources"]
     deployment_only = coverage["deployment_only_sources"]
     if (
         "source" in coverage
-        or not sources
-        or any(not isinstance(item, str) or not item for item in sources)
-        or len(set(sources)) != len(sources)
+        or sources != [source for roots in COVERAGE_SCOPES.values() for source in roots]
         or any(item not in sources for item in deployment_only)
         or not set(sources) - set(deployment_only)
+        or set(deployment_only) & set(COVERAGE_SCOPES["runner"])
+        or coverage.get("branch") is not True
+        or type(coverage.get("floor")) is not int
+        or not 78 <= coverage["floor"] <= 100
+        or type(coverage.get("objective_floor")) is not int
+        or coverage["objective_floor"] != OBJECTIVE_TARGET
     ):
         raise CoverageGateError("coverage shard config sources are invalid")
 

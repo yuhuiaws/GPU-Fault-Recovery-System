@@ -41,9 +41,17 @@ def _truncate() -> None:
                   AND tablename LIKE 'gpu\\_fault%'
                   AND tablename <> 'gpu_fault_schema_version'
                   AND tablename <> 'gpu_fault_schema_migrations'
+                  AND tablename <> 'gpu_fault_control_state_modes'
                 """
             )
             tables = [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT to_regclass('gpu_fault_control_state_modes')")
+            if cursor.fetchone()[0] is not None:
+                cursor.execute(
+                    "UPDATE gpu_fault_control_state_modes SET "
+                    "mode='legacy', dedicated_at=NULL, legacy_purged=FALSE, revision=0, "
+                    "backfill_after_key=NULL, backfill_complete=FALSE"
+                )
         if tables:
             with conn.cursor() as cursor:
                 cursor.execute(f"TRUNCATE {', '.join(tables)}")
@@ -64,9 +72,10 @@ def _ensure_postgres_schema() -> None:
 
 def postgres_store_instance() -> Iterator[PostgresStore]:
     assert POSTGRES_URL is not None
+    # Either constructor may validate rows deliberately left by a legacy-mode test.
+    _truncate()
     _ensure_postgres_schema()
     instance = PostgresStore(POSTGRES_URL, initialize_schema=False)
-    _truncate()
     try:
         yield instance
     finally:

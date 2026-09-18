@@ -92,6 +92,8 @@ def resolve_runtime_profile_version(args: argparse.Namespace) -> str:
 
 
 def _positive_int(value: Any, description: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TrainingSubmitError(f"{description} must be an integer")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:

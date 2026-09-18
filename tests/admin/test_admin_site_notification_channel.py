@@ -154,6 +154,7 @@ def test_the_channel_is_rendered_into_the_release_config(site_file: Path) -> Non
         "email_recipients": ["ops@example.com"],
         "email_subject_prefix": "",
         "channel": "sns",
+        "ses_configuration_set": None,
     }
 
 

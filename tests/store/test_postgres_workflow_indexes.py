@@ -21,6 +21,7 @@ from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres.ddl import declared_index_names
 from tests._builders import fault_incident, workflow_request, workflow_step
 from tests.store._postgres_processor_claim_support import _truncate
+from tests.store.test_postgres_state_tables import plan_nodes
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
@@ -32,8 +33,8 @@ NOW = datetime(2026, 9, 5, 21, 0, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def clean_tables():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 
@@ -79,12 +80,16 @@ def _seed(store: PostgresStore, count: int = 30) -> None:
 _PLAN_ONLY_KNOBS = ("enable_seqscan", "enable_sort", "enable_incremental_sort")
 
 
-def _plan(store: PostgresStore, sql: str, params) -> str:
+def _plan(store: PostgresStore, sql: str, params, *, as_json: bool = False):
     with store._db.cursor() as cursor:
         for knob in _PLAN_ONLY_KNOBS:
             cursor.execute(f"SET {knob}=off")
         try:
-            cursor.execute("EXPLAIN " + sql, params)
+            cursor.execute(
+                ("EXPLAIN (FORMAT JSON) " if as_json else "EXPLAIN ") + sql, params
+            )
+            if as_json:
+                return cursor.fetchone()[0]
             return "\n".join(row[0] for row in cursor.fetchall())
         finally:
             for knob in _PLAN_ONLY_KNOBS:
@@ -268,14 +273,20 @@ def test_postgres_paged_dispatch_scan_walks_the_dispatch_order_index_without_a_s
             exclude_request_ids={"wf-retired"},
             after=anchor,
         )
-        plan = _plan(store, sql, params)
-
-        assert (
-            "Index Scan using gpu_fault_executable_workflow_dispatch_order "
-            "on gpu_fault_objects w"
-        ) in plan, plan
-        assert "Sort" not in plan, plan
-        assert "Seq Scan on gpu_fault_objects" not in plan, plan
+        plan = _plan(store, sql, params, as_json=True)
+        nodes = list(plan_nodes(plan))
+        assert any(
+            node.get("Index Name") == "gpu_fault_executable_workflow_dispatch_order"
+            for node in nodes
+        ), plan
+        assert not any(
+            node.get("Node Type") in {"Sort", "Incremental Sort"} for node in nodes
+        ), plan
+        assert not any(
+            node.get("Node Type") == "Seq Scan"
+            and node.get("Relation Name") == "gpu_fault_objects"
+            for node in nodes
+        ), plan
         assert "::timestamptz" not in sql
     finally:
         store.close()

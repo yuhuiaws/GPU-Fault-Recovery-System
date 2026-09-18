@@ -1,7 +1,8 @@
 """The key/value primitives every ``Shared*Mixin`` template is written over.
 
-The SQLite and PostgreSQL stores keep their records in one ``(kind, key) ->
-JSON payload`` table plus one ``(kind, key) -> value`` link table. Everything
+The SQLite and PostgreSQL stores expose ``(kind, key) -> JSON payload``
+records plus ``(kind, key) -> value`` links. PostgreSQL may route a record
+to typed state tables; shared transitions do not choose physical storage. Everything
 a store does that is not a query-planner-specific statement -- fetch one
 record, upsert one record, run a few of those under one lock -- is the same
 on both, and lives in the ``gpu_fault.store.shared`` mixins. Those mixins are
@@ -29,6 +30,7 @@ from gpu_fault.store.shared.errors import NotFoundError
 # is looked up in `_models` at run time from a string kind, so the row type is
 # only knowable at the call site, which states it with a `cast`.
 PutRecord = Callable[[str, str, BaseModel], None]
+PutRecordFields = Callable[[str, str, BaseModel, frozenset[str]], None]
 DeleteRecord = Callable[[str, str], None]
 GetRecord = Callable[[str, str], Any]
 GetOptionalRecord = Callable[[str, str], Any]
@@ -50,6 +52,15 @@ class StorePrimitives(Protocol):
 
     def _delete(self, kind: str, key: str) -> None:
         """Delete one record; a miss is not an error."""
+
+    def _put_fields(
+        self,
+        kind: str,
+        key: str,
+        value: BaseModel,
+        fields: frozenset[str],
+    ) -> None:
+        """Persist an already validated transition with known changed fields."""
 
     def _get(self, kind: str, key: str) -> Any:
         """Fetch one record or raise :class:`NotFoundError`."""

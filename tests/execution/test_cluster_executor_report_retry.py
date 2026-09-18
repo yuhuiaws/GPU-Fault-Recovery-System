@@ -301,13 +301,24 @@ def test_a_lease_lost_during_the_report_backoff_withholds_the_retry(tmp_path) ->
 
 
 class CancellingFlakyClient(FlakyReportClient):
-    """Every renewal answers "the control plane cancelled this command"."""
+    """Cancel after the initial admission and after the adapter has entered."""
+
+    def __init__(self, *args, **kwargs):
+        from threading import Event
+
+        super().__init__(*args, **kwargs)
+        self.adapter_started = Event()
 
     def renew(
         self, command: RemoteActionCommand, executor_id: str, lease_seconds: int
     ) -> RemoteActionCommand:
-        super().renew(command, executor_id, lease_seconds)
-        return command.model_copy(
+        response = super().renew(command, executor_id, lease_seconds)
+        if len(self.renewals) == 1:
+            return response
+        assert self.adapter_started.wait(5), (
+            "cancellation must follow actual adapter admission"
+        )
+        return response.model_copy(
             update={
                 "cancellation_requested_at": datetime.now(timezone.utc),
                 "cancellation_reason": "workflow deadline expired",
@@ -323,9 +334,13 @@ class AfterRenewalAdapter(RecordingAdapter):
         self.client = client
 
     def execute(self, context: Any):
+        from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
+
+        self.client.adapter_started.set()
         deadline = time.monotonic() + 5
-        while not self.client.renewals and time.monotonic() < deadline:
+        while lease_hold_reason() is None and time.monotonic() < deadline:
             time.sleep(0.005)
+        assert lease_hold_reason() is not None
         return super().execute(context)
 
 
@@ -406,9 +421,9 @@ def test_a_command_without_a_lease_token_never_sinks_its_batch(tmp_path) -> None
     assert [command_id for command_id, _ in client.completed] == ["command-b"], (
         "the sibling's result must still be reported"
     )
-    assert executor.unexpected_failures == 1, (
-        "a command the executor cannot even answer is an executor-side defect"
-    )
+    assert executor.unexpected_failures == 0
+    assert executor.lease_lost_total == executor.results_withheld_total == 1
+    assert adapter.executed_command_ids() == ["command-b"]
 
 
 def test_a_malformed_command_in_a_claim_is_failed_without_dropping_its_siblings(

@@ -17,6 +17,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.cluster_executor import (
     ClusterActionExecutor,
     ClusterExecutorError,
@@ -219,8 +220,9 @@ def _executor_environment(monkeypatch) -> None:
     monkeypatch.delenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", raising=False)
     monkeypatch.delenv("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", raising=False)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
+        core = None
 
         def __init__(self, **kwargs) -> None:
             self.owner = kwargs.get("owner", self.owner)

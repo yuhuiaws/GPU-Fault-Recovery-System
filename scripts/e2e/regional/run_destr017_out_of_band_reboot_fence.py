@@ -481,8 +481,8 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     env = control_env(regional)
     run_id = derived_identity(case_dir.parents[1], 1)
-    host = _host_probe(settings, run_id)
-    fence = _fence_probe(settings, run_id)
+    host = _host_probe(settings, run_id, case_dir)
+    fence = _fence_probe(settings, run_id, case_dir)
     try:
         host.create()
         fence.create()
@@ -605,9 +605,10 @@ def parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Live execution
 # --------------------------------------------------------------------------- #
-def _host_probe(settings: Settings, run_id: str) -> HostProbeFixture:
+def _host_probe(settings: Settings, run_id: str, case_dir: Path) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -621,7 +622,7 @@ def _host_probe(settings: Settings, run_id: str) -> HostProbeFixture:
     )
 
 
-def _fence_probe(settings: Settings, run_id: str) -> HostProbeFixture:
+def _fence_probe(settings: Settings, run_id: str, case_dir: Path) -> HostProbeFixture:
     """A second Pod on the same node for this case's own probe.
 
     The fixture names its Pod after (case, run, node), so the fence probe takes
@@ -631,6 +632,7 @@ def _fence_probe(settings: Settings, run_id: str) -> HostProbeFixture:
 
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -707,8 +709,8 @@ def _prepare_live_run(
         regional=regional,
         warm=WarmSpareLiveFixture(regional, ""),
         run_id=run_id,
-        host=_host_probe(settings, run_id),
-        fence=_fence_probe(settings, run_id),
+        host=_host_probe(settings, run_id, case_dir),
+        fence=_fence_probe(settings, run_id, case_dir),
     )
 
 
@@ -751,6 +753,9 @@ def _start_probes(run: _LiveRun) -> None:
     )
     if window_errors:
         raise RegionalFixtureError("; ".join(window_errors))
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before arming")
+    run.holder_armed = True
     armed = run.fence.execute(
         "arm-holder",
         "--device",
@@ -765,16 +770,15 @@ def _start_probes(run: _LiveRun) -> None:
         run.run_id,
         "--reboot-delay-seconds",
         str(settings.reboot_delay_seconds),
+        "--maintenance-window-end",
+        run.maintenance_window_end.isoformat(),
         "--probe-script",
         # The host path: the transient unit runs on the node, where /host does
         # not exist (live: "can't open file '/host/run/...'" and no holder).
         run.fence.host_script,
         timeout=180,
     )
-    run.holder_armed = True
-    # The watcher will place the reboot timer on-node once quiesce lands; from
-    # here on cleanup must be prepared to cancel an unfired reboot.
-    run.reboot_armed = True
+    # The holder may start, but reboot still needs a controller-observed barrier.
     write_json_atomic(run.case_dir / "holder-armed.json", armed)
 
 
@@ -798,6 +802,8 @@ def _holder_device(run: _LiveRun) -> str:
 
 
 def _inject(run: _LiveRun) -> dict[str, Any]:
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before injection")
     run.marker = f"{run.run_id}-{int(time.time())}"
     written = run.host.execute(
         "write-xid",
@@ -882,16 +888,9 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
 
 
 def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
-    """Record the reboot placement; the timer itself is armed on-node.
+    """Authorize only the observed barrier; an unavailable transport refuses."""
 
-    quiesce has already stopped kubelet by the time verify is WAITING, so the
-    reboot cannot be exec'd from here -- the on-node watcher (``arm-holder
-    --reboot-delay-seconds``) placed the transient timer the moment quiesce
-    landed, which is the window start. Confirm the placement against the actual
-    pinned window (defence in depth over the static pre-injection check) and
-    record it; the fired timer and boot-id change are read back through
-    ``reboot-status`` once the node returns and the exec channel is up again.
-    """
+    from scripts.e2e.regional.destr_barrier_authorization import barrier_authorization
 
     now = datetime.now(timezone.utc)
     remaining = window_remaining_seconds(run.pin, now=now)
@@ -904,8 +903,36 @@ def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     )
     if errors:
         raise RegionalFixtureError("; ".join(errors))
+    state = _store_state(run)
+    if (state.get("workflow") or {}).get("request_id") != run.fenced_request_id:
+        raise RegionalFixtureError(
+            "fenced workflow changed before reboot authorization"
+        )
+    proof = barrier_authorization(
+        state,
+        run_id=run.run_id,
+        node=run.settings.node,
+        boot_id=run.baseline_boot_id,
+        device=_holder_device(run),
+        drill_id=run.run_id,
+        maintenance_window_end=run.maintenance_window_end,
+    )
+    run.reboot_armed = True
+    armed = run.fence.execute(
+        "arm-reboot",
+        "--run-id",
+        run.run_id,
+        "--delay-seconds",
+        str(run.settings.reboot_delay_seconds),
+        "--authorization",
+        json.dumps(proof, sort_keys=True),
+        "--barrier-script",
+        run.host.host_script,
+    )
     record = {
-        "armed_on_node_by": "arm-holder --reboot-delay-seconds (watch-ledger)",
+        "armed_on_node_by": "arm-reboot after controller WAITING authorization",
+        "authorization": proof,
+        "armed": armed,
         "reboot_delay_seconds": run.settings.reboot_delay_seconds,
         "window_remaining_seconds": remaining,
         "expected_fence": expected_fence_text(run.pin, node=run.settings.node),
@@ -1020,7 +1047,7 @@ for workflow in store.list_workflows(None, limit=500, newest_first=True):
         successors.append(workflow.model_dump(mode="json"))
 
 commands = [
-    item.model_dump(mode="json")
+    item.model_dump(mode="json", exclude={"lease_token"})
     for item in store.list_remote_commands()
     if item.workflow_request_id == fenced_id
 ]
@@ -1124,6 +1151,8 @@ def execute_case(
         "reconcile_application": "NOT_APPLIED",
     }
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
         _start_probes(run)
         _inject(run)
         _wait_for_maintenance_pin(run)
@@ -1249,7 +1278,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
-    if run.reboot_armed and not run.reboot_fired:
+    if run.reboot_armed or run.holder_armed:
         guard(
             "cancel_reboot",
             lambda: run.fence.execute(
@@ -1285,6 +1314,11 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         else {"skipped": "no incident"},
     )
     guard("host_final", lambda: _host_final(run))
+    if "cancel_reboot" in result and "disarm_holder" in result:
+        guard(
+            "clear_probe_state",
+            lambda: run.fence.execute("clear-state", "--run-id", run.run_id),
+        )
     guard("probe_cleanup_host", lambda: _refuse_residual_map(run.host.cleanup()))
     guard("probe_cleanup_fence", lambda: _refuse_residual_map(run.fence.cleanup()))
     guard(

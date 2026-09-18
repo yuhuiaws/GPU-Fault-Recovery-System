@@ -16,6 +16,7 @@ from gpu_fault.models import (
     Severity,
     StrictModel,
 )
+from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.training_models import (
     TrainingProgressHeartbeat as TrainingProgressHeartbeat,
 )
@@ -366,9 +367,14 @@ class TrainingHealthService:
         ):
             return None
         observation = state.observation if state is not None else None
-        event_id = (
-            f"training-{kind}-{heartbeat.attempt_id}-"
-            f"rank-{heartbeat.rank}-{int(observed_at.timestamp())}"
+        # Keep notification latch keys stable, but bind new event IDs to the tenant.
+        event_id = derived_record_id(
+            f"training-{kind}",
+            "training-health",
+            heartbeat.cluster_id,
+            heartbeat.attempt_id,
+            str(heartbeat.rank),
+            str(int(observed_at.timestamp())),
         )
         return NodeHealthFinding(
             finding_id=f"finding-{event_id}",

@@ -165,7 +165,7 @@ def adapter_marker_errors(marker: dict[str, Any] | None) -> list[str]:
 def final_command_errors(command: dict[str, Any]) -> list[str]:
     """After the probe stopped, the command is still open for purge."""
 
-    if command.get("status") in {"SUCCEEDED", "FAILED"}:
+    if command.get("status") not in {"PENDING", "LEASED", "WAITING"}:
         return [
             f"the barrier command reached {command.get('status')} without a "
             "coordinator; the hold was not fail-closed"

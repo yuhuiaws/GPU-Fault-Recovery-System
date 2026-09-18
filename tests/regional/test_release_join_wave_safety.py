@@ -1,12 +1,9 @@
-"""A join's wave safety protects only nodes that already hold a live agent.
-
-And when no node holds one, there is nothing for a canary wave to protect
-either: the join installs the whole fleet in one wave.
-"""
+"""Join lease checks exclude uninstalled nodes without widening node budgets."""
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,14 +30,24 @@ def _release(live: dict[str, list[str]] | None) -> Any:
 def test_live_agent_node_names_keeps_only_active_leased_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release, probe = _release({"gpu-a": ["node-b", "node-zzz"], "gpu-x": ["node-a"]})
+    release, probe = _release({"gpu-a": ["node-b"], "gpu-x": ["node-a"]})
     monkeypatch.setattr(FLEET, "exec_cpu_ingress_probe", probe)
 
     live = FLEET.live_agent_node_names(
         release, SimpleNamespace(cluster_id="gpu-a"), NODES
     )
 
-    assert live == ("node-b",), "another cluster's node or an unknown name is not ours"
+    assert live == ("node-b",), "another cluster's node is not ours"
+
+
+@pytest.mark.parametrize("listed", [["node-unknown"], ["node-b", "node-b"], {}, None])
+def test_live_agent_inventory_rejects_unknown_or_malformed_members(
+    monkeypatch: pytest.MonkeyPatch, listed
+) -> None:
+    release, probe = _release({"gpu-a": listed})
+    monkeypatch.setattr(FLEET, "exec_cpu_ingress_probe", probe)
+    with pytest.raises(FLEET.ReleaseError, match="Agent inventory is invalid"):
+        FLEET.live_agent_node_names(release, SimpleNamespace(cluster_id="gpu-a"), NODES)
 
 
 def test_live_agent_node_names_accepts_a_cluster_with_no_agents(
@@ -58,19 +65,27 @@ def test_live_agent_node_names_accepts_a_cluster_with_no_agents(
 
 
 def _roll(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, *, phase: str, live: tuple[str, ...]
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    phase: str,
+    live: tuple[str, ...],
+    nodes: tuple[str, ...] = NODES,
+    domain: str = "zone-a",
+    configuration: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Run ``roll_node_runtime`` with every seam stubbed; return what it handed on."""
 
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    config = replace(config, **(configuration or {}))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     target = config.clusters[0]
     seen: dict[str, Any] = {"deploys": [], "live_probes": 0}
-    monkeypatch.setattr(release, "_target_node_names", lambda _target: NODES)
+    monkeypatch.setattr(release, "_target_node_names", lambda _target: nodes)
     monkeypatch.setattr(
         RUNTIME,
         "target_node_failure_domains",
-        lambda *_args: {name: "zone-a" for name in NODES},
+        lambda *_args: {name: domain for name in nodes},
     )
     monkeypatch.setattr(
         RUNTIME, "ensure_pre_node_mutation_barrier", lambda *_args, **_kwargs: None
@@ -143,26 +158,23 @@ def test_the_wave_safety_node_set_depends_on_the_phase(
     )
 
 
-def test_a_join_with_no_live_agent_plans_one_wave_for_the_whole_fleet(
+def test_a_join_with_no_live_agent_preserves_the_configured_canary_budget(
     tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Live 2026-09-12 (join, 4 nodes, no failure-domain labels): a one-node
-    canary wave and then the rest, each wave ~20s of safety polling and
-    hand-off before the install. With no live agent anywhere there is no
-    capacity for a wave to take away, so N waves are exactly as safe as one."""
+    """No Agent lease is not authorization to widen the installer window."""
 
     release, seen = _roll(tmp_path, monkeypatch, phase="join", live=())
 
     policy = seen["policy"]
     assert policy == FLEET.NodeRolloutPolicy(
-        max_unavailable=3,
-        first_wave_max_unavailable=3,
-        max_unavailable_per_failure_domain=3,
-    ), "the fleet record is created with every node in the first wave"
-    assert seen["deploys"][0]["max_unavailable"] == 3, (
+        max_unavailable=1,
+        first_wave_max_unavailable=1,
+        max_unavailable_per_failure_domain=1,
+    ), "the fleet record keeps the configured budget"
+    assert seen["deploys"][0]["max_unavailable"] == 1, (
         "the paused Reconciler is deployed with the same concurrency"
     )
-    assert seen["context"].max_unavailable == 3, (
+    assert seen["context"].max_unavailable == 1, (
         "the wave hand-off patches the same concurrency"
     )
     assert seen["context"].node_names == (), "nothing outside the wave to protect"
@@ -175,14 +187,14 @@ def test_a_join_with_no_live_agent_plans_one_wave_for_the_whole_fleet(
         "phase": "join",
         "reason": RUNTIME.JOIN_SINGLE_WAVE_REASON,
         "node_count": 3,
-        "waves": 1,
-        "max_unavailable": 3,
-        "first_wave_max_unavailable": 3,
-    }, "the state says why this join rolled no canary wave"
+        "max_unavailable": 1,
+        "first_wave_max_unavailable": 1,
+        "max_unavailable_per_failure_domain": 1,
+    }, "the state records the budget without inventing Agent availability"
     narration = capsys.readouterr().err
     assert "fleet-wave-plan" in narration, "the operator is told the plan"
     assert "reason=no-live-agents" in narration
-    assert "waves=1" in narration
+    assert "max_unavailable=1" in narration
 
 
 def test_a_join_with_a_live_agent_keeps_the_canary_policy(
@@ -210,23 +222,29 @@ def test_an_upgrade_never_consults_live_agents_and_keeps_its_policy(
     assert RUNTIME.FLEET_WAVE_PLANS_STATE_KEY not in release.state
 
 
-def test_the_single_wave_policy_respects_the_installer_concurrency_ceiling() -> None:
-    """The ceiling caps installer Jobs, not availability; it holds in a join."""
-
-    assert RUNTIME.join_single_wave_policy(40) == FLEET.NodeRolloutPolicy(
-        max_unavailable=FLEET.MAX_UPGRADE_UNAVAILABLE,
-        first_wave_max_unavailable=FLEET.MAX_UPGRADE_UNAVAILABLE,
-        max_unavailable_per_failure_domain=FLEET.MAX_UPGRADE_UNAVAILABLE,
+@pytest.mark.parametrize("phase", ["join", "bootstrap"])
+def test_join_without_agents_keeps_the_site_installer_budget(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    _, seen = _roll(
+        tmp_path,
+        monkeypatch,
+        phase=phase,
+        live=(),
+        nodes=tuple(f"node-{index}" for index in range(512)),
+        configuration={
+            "upgrade_max_unavailable": 32,
+            "upgrade_max_parallel_clusters": 8,
+        },
     )
-    assert RUNTIME.join_single_wave_policy(1) == FLEET.NodeRolloutPolicy(1, 1, 1)
-    assert RUNTIME.join_single_wave_policy(0) == FLEET.NodeRolloutPolicy(1, 1, 1)
+    assert seen["policy"].max_unavailable == 8
+    assert seen["policy"].first_wave_max_unavailable == 1
+    assert seen["deploys"][0]["max_unavailable"] == 8
 
 
-def test_the_single_wave_policy_plans_one_wave_even_for_unknown_domains() -> None:
-    """The control plane's planner, fed the policy, yields exactly one wave --
-    including for the unlabelled fleet the live join ran on, which the
-    ordinary policy would split into one wave per node."""
-
+def test_a_join_without_agents_keeps_unknown_failure_domains_serial(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     domains = {name: UNKNOWN_FAILURE_DOMAIN for name in NODES}
 
     def request(policy: FLEET.NodeRolloutPolicy) -> FleetDeploymentRequest:
@@ -246,21 +264,16 @@ def test_the_single_wave_policy_plans_one_wave_even_for_unknown_domains() -> Non
             node_failure_domains=domains,
         )
 
-    single = deployment_waves(request(RUNTIME.join_single_wave_policy(len(NODES))))
-    ordinary = deployment_waves(
-        request(
-            FLEET.node_rollout_policy(
-                SimpleNamespace(config=SimpleNamespace(upgrade_max_unavailable=0)),
-                domains,
-                phase="join",
-            )
-        )
+    _, seen = _roll(
+        tmp_path,
+        monkeypatch,
+        phase="join",
+        live=(),
+        domain=UNKNOWN_FAILURE_DOMAIN,
+        configuration={"upgrade_max_unavailable": 0},
     )
 
-    assert single == [list(NODES)]
-    assert ordinary == [[name] for name in NODES], (
-        "the contrast the single wave saves: one safety round trip per node"
-    )
+    assert deployment_waves(request(seen["policy"])) == [[name] for name in NODES]
 
 
 def test_the_wave_plan_record_keeps_only_this_release(tmp_path) -> None:
@@ -275,22 +288,56 @@ def test_the_wave_plan_record_keeps_only_this_release(tmp_path) -> None:
         release,
         config.clusters[0],
         node_count=4,
-        policy=RUNTIME.join_single_wave_policy(4),
+        policy=FLEET.NodeRolloutPolicy(4, 1, 2),
     )
 
     assert set(release.state[RUNTIME.FLEET_WAVE_PLANS_STATE_KEY]) == {"gpu-a", "gpu-z"}
 
 
-def test_a_first_bootstrap_plans_one_wave_like_a_join(
+def test_a_first_bootstrap_excludes_uninstalled_agents_but_keeps_the_canary(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Live 2026-09-12 trace: with an empty store every node is "missing" to the
-    safety probe, so a bootstrap's one-node canary wave could never converge on
-    a cluster larger than one node. Nothing is live, so nothing needs rationing."""
+    """The missing-Agent issue is independent of installer safety budgets."""
 
     release, seen = _roll(tmp_path, monkeypatch, phase="bootstrap", live=())
 
     assert seen["context"].node_names == ()
-    assert seen["context"].max_unavailable == len(NODES)
+    assert seen["context"].max_unavailable == 1
     plan = release.state[RUNTIME.FLEET_WAVE_PLANS_STATE_KEY]["gpu-a"]
-    assert plan["phase"] == "bootstrap" and plan["waves"] == 1
+    assert plan["phase"] == "bootstrap" and plan["first_wave_max_unavailable"] == 1
+
+
+def test_join_protects_newly_converged_agents_on_the_next_wave(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release, seen = _roll(tmp_path, monkeypatch, phase="join", live=())
+    waves = iter((("node-a",), ("node-b",)))
+    current: list[tuple[str, ...]] = []
+    gates: list[tuple[str, ...]] = []
+
+    def next_wave(_deployment):
+        wave = next(waves)
+        current.append(wave)
+        return wave
+
+    def fleet(operation, _payload):
+        if operation == "next-wave":
+            return {"node_ids": current[-1]}
+        return {"status": "SUCCEEDED" if len(current) == 2 else "IN_PROGRESS"}
+
+    monkeypatch.setattr(FLEET, "next_deployment_wave", next_wave)
+    monkeypatch.setattr(
+        FLEET,
+        "ensure_rollout_wave_safe",
+        lambda *_args, **kwargs: gates.append(kwargs["node_names"]),
+    )
+    monkeypatch.setattr(
+        FLEET, "wave_lease_margin_holds", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(FLEET, "hand_wave_to_reconciler", lambda *_args: IDENTITY)
+    monkeypatch.setattr(release, "_fleet_command", fleet)
+    monkeypatch.setattr(release, "_wait_agents", lambda *_args, **_kwargs: None)
+    FLEET.run_fleet_waves(
+        release, release.config.clusters[0], seen["context"], {"status": "PLANNED"}
+    )
+    assert gates == [(), ("node-a",)]

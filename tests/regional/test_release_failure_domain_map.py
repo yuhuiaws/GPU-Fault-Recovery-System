@@ -81,8 +81,8 @@ class FakeRunner:
             return json.dumps({"items": self.nodes[context]})
         return ""
 
-    def probe(self, *_args: Any, **_kwargs: Any) -> bool:
-        return False
+    def probe_output(self, *_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        return 0, "", ""
 
     def node_reads(self) -> list[str]:
         return [
@@ -244,12 +244,7 @@ def test_role_split_stamps_the_digest_on_the_worker_pod_template_only() -> None:
     text = APPLY_SCRIPT.read_text(encoding="utf-8")
 
     assert f'"${{{FD.FAILURE_DOMAIN_MAP_SHA256_ENV}:-}}"' in text
-    assert f'"{FAILURE_DOMAIN_MAP_ANNOTATION}": $sha' in text
-    worker = text.index("apply_worker_role() {")
-    ingress = text.index("apply_ingress_role() {")
-    spool = text.index("apply_spool_role() {")
-    assert worker < text.index("stamp_failure_domain_map\n", worker) < ingress
-    assert "stamp_failure_domain_map\n" not in text[spool:worker]
-    assert "stamp_failure_domain_map\n" not in text[ingress:]
-    stamp = text[text.index("stamp_failure_domain_map() {") :]
-    assert "rollout restart" not in stamp[: stamp.index("\n}\n")]
+    stamp = text[text.index("apply_manifest() {") : text.index("render_manifest() {")]
+    assert f'annotations["{FAILURE_DOMAIN_MAP_ANNOTATION}"] = $domain' in stamp
+    assert 'if $name == "gpu-fault-control-worker" and $domain != ""' in stamp
+    assert "rollout restart" not in stamp

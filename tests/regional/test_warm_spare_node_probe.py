@@ -1,156 +1,115 @@
-"""The warm-spare host probe: a delayed stop, and a failsafe that outlives it.
-
-`kubernetes-not-ready` stops the very service that carries the probe's reply.
-An inline `systemctl stop kubelet.service` therefore cannot answer, and the
-caller only regains the channel once the failsafe restores kubelet -- after the
-NotReady window it wanted to observe has closed. These tests pin the delayed
-stop, the failsafe arming that has to allow for it, and the disarm on restore.
-"""
+"""Behavioral regressions for the now owner-bound warm-spare service probe."""
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from tests._script_loader import lazy_script_module
-
-ROOT = Path(__file__).resolve().parents[2]
-PROBE = lazy_script_module(
-    ROOT / "scripts/e2e/regional/probes/warm_spare_node_probe.py"
-)
-
-ACTIVE = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running"}
-INACTIVE = {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead"}
+from scripts.e2e.regional.probes import warm_spare_node_probe as PROBE
+from tests.regional._destr008_service_window import Host
 
 
-class _Systemctl:
-    """Records the commands the probe runs, and answers `systemctl show`."""
-
-    def __init__(self, states: list[dict[str, str]]) -> None:
-        self.commands: list[list[str]] = []
-        self.states = states
-
-    def snapshot(self, service: str) -> dict[str, str]:
-        self.commands.append(["systemctl", "show", service])
-        return self.states.pop(0) if len(self.states) > 1 else self.states[0]
-
-    def run(self, command: list[str], **_: Any) -> None:
-        self.commands.append(list(command))
-
-    def timers(self) -> list[list[str]]:
-        return [item for item in self.commands if item[0] == "systemd-run"]
+@pytest.fixture
+def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Host:
+    monkeypatch.setenv("INVOCATION_ID", "a" * 32)
+    return Host(tmp_path, monkeypatch)
 
 
-def _install(
-    monkeypatch: pytest.MonkeyPatch, states: list[dict[str, str]]
-) -> _Systemctl:
-    systemctl = _Systemctl(states)
-    monkeypatch.setattr(PROBE, "service_snapshot", systemctl.snapshot)
-    monkeypatch.setattr(PROBE, "run", systemctl.run)
-    return systemctl
-
-
-def _stop_arguments(**overrides: Any) -> argparse.Namespace:
-    values: dict[str, Any] = {
-        "service": "kubelet.service",
-        "run_id": "destr008-kubernetes-not-ready-2",
-        "restore_seconds": 300,
-        "stop_delay_seconds": 15,
-    }
-    values.update(overrides)
-    return argparse.Namespace(**values)
-
-
-def test_a_delayed_stop_answers_before_the_service_goes_down(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    systemctl = _install(monkeypatch, [ACTIVE])
-
-    PROBE.stop_with_failsafe(_stop_arguments())
-
-    emitted = json.loads(capsys.readouterr().out)
-    assert emitted["scheduled"] is True, emitted
-    assert emitted["stop_delay_seconds"] == 15, emitted
-    assert emitted["stop_unit"].endswith(".timer"), emitted
-    # No inline stop: it would have to answer over the channel it just killed.
-    assert ["systemctl", "stop", "kubelet.service"] not in systemctl.commands
-    stop_timer, failsafe = (
-        next(item for item in systemctl.timers() if "stop" in item),
-        next(item for item in systemctl.timers() if "start" in item),
+def test_a_delayed_stop_answers_before_the_service_goes_down(host: Host) -> None:
+    host.arm()
+    report = host.window.schedule_stop()
+    assert report["phase"] == "SCHEDULED" and report["stop_requested"] is False
+    assert host.units["kubelet.service"]["ActiveState"] == "active"
+    assert report["restore_at"] == int(host.now) + 195
+    mutations = host.mutations()
+    arm = (
+        "start",
+        "--no-block",
+        "--job-mode=fail",
+        host.window.units["restore-service"],
     )
-    assert "--on-active=15s" in stop_timer, stop_timer
-    # The failsafe counts from now, so it has to cover the delay as well or the
-    # service would be restored before it is ever stopped.
-    assert "--on-active=315s" in failsafe, failsafe
-
-
-def test_an_inline_stop_still_verifies_the_service_actually_stopped(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    systemctl = _install(monkeypatch, [ACTIVE, INACTIVE])
-
-    PROBE.stop_with_failsafe(
-        _stop_arguments(service="gpu-fault-node-agent.service", stop_delay_seconds=0)
+    schedule = (
+        "start",
+        "--no-block",
+        "--job-mode=fail",
+        host.window.units["stop-timer"],
     )
-
-    emitted = json.loads(capsys.readouterr().out)
-    assert emitted["scheduled"] is False, emitted
-    assert emitted["after"] == INACTIVE, emitted
-    assert ["systemctl", "stop", "gpu-fault-node-agent.service"] in systemctl.commands
-    assert "--on-active=300s" in systemctl.timers()[0], systemctl.timers()
+    assert mutations.index(arm) < mutations.index(schedule)
+    assert ("stop", "--no-block", "--job-mode=fail", "kubelet.service") not in mutations
+    host.fire_stop()
+    assert host.units["kubelet.service"]["ActiveState"] == "inactive"
 
 
-def test_an_inline_stop_that_left_the_service_active_is_an_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install(monkeypatch, [ACTIVE, ACTIVE])
+def test_an_inline_stop_still_verifies_the_service_actually_stopped(host: Host) -> None:
+    # Zero delay also uses the owned service; controller transport never carries
+    # an inline stop, and the actual stopped state is separately observed.
+    service = "gpu-fault-node-agent.service"
+    host.binding = host.make_binding(service, delay=0)
+    host.window = PROBE.ServiceWindow(host.binding)
+    report = host.stopped()
+    assert report["stop_requested"] is True
+    assert PROBE.service_snapshot(service)["ActiveState"] == "inactive"
+    assert host.read()["stop_observation"]["Job"] == "0"
+    assert host.window.restore()["after"]["ActiveState"] == "active"
 
-    with pytest.raises(PROBE.ProbeError, match="did not stop"):
-        PROBE.stop_with_failsafe(_stop_arguments(stop_delay_seconds=0))
+
+def test_an_inline_stop_that_left_the_service_active_is_an_error(host: Host) -> None:
+    host.binding = host.make_binding("gpu-fault-node-agent.service", delay=0)
+    host.window = PROBE.ServiceWindow(host.binding)
+    host.arm()
+    host.window.schedule_stop()
+    service = host.binding["service"]
+    host.fail.add(("stop", "--no-block", "--job-mode=fail", service))
+    with pytest.raises(PROBE.ProbeError, match="systemctl failed"):
+        host.fire_stop()
+    assert host.read()["stop_requested"] is True
+    assert host.window.targets["restore-service"].exists(), host.window.targets
+    assert host.units[service]["ActiveState"] == "active"
 
 
 def test_restore_disarms_the_pending_stop_before_starting_the_service(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    host: Host,
 ) -> None:
-    # A stop timer that has not fired yet would take the service back down
-    # after the restore reported success.
-    systemctl = _install(monkeypatch, [INACTIVE, ACTIVE])
+    host.stopped()
+    # Timer cancellation alone is insufficient if the stop helper is still live.
+    name = host.window.units["stop-service"]
+    host.units[name].update(ActiveState="active", SubState="running", MainPID="55")
+    report = host.window.restore()
+    mutations = host.mutations()
+    start = mutations.index(
+        ("start", "--no-block", "--job-mode=fail", "kubelet.service")
+    )
+    assert mutations.index(("stop", host.window.units["stop-timer"])) < start
+    assert mutations.index(("stop", name)) < start
+    assert report["stop_quiescence"]["timer"]["job_id"] == 0
+    assert report["stop_quiescence"]["service"]["main_pid"] == 0
 
-    PROBE.restore_service(
-        argparse.Namespace(
-            service="kubelet.service", run_id="destr008-kubernetes-not-ready-2"
+
+def test_the_delay_is_bounded(host: Host) -> None:
+    before = list(host.calls)
+    assert (
+        PROBE.main(
+            [
+                "stop-with-failsafe",
+                "--service",
+                "kubelet.service",
+                "--run-id",
+                "test-run",
+                "--stop-delay-seconds",
+                "600",
+            ]
         )
+        == 1
     )
-
-    emitted = json.loads(capsys.readouterr().out)
-    stop_timer = emitted["stop_unit"]
-    disarm = ["systemctl", "stop", stop_timer]
-    start = ["systemctl", "start", "kubelet.service"]
-    assert disarm in systemctl.commands, systemctl.commands
-    assert systemctl.commands.index(disarm) < systemctl.commands.index(start)
-    assert emitted["restore_unit"] != stop_timer, emitted
+    assert host.calls == before
 
 
-def test_the_delay_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install(monkeypatch, [ACTIVE])
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "warm_spare_node_probe.py",
-            "stop-with-failsafe",
-            "--service",
-            "kubelet.service",
-            "--run-id",
-            "run-a",
-            "--restore-seconds",
-            "300",
-            "--stop-delay-seconds",
-            "600",
-        ],
-    )
-
-    assert PROBE.main() == 1
+def test_failed_restore_keeps_the_independent_start_timer(host: Host) -> None:
+    host.stopped()
+    host.pending_start = True
+    with pytest.raises(PROBE.ProbeError, match="quiescent"):
+        host.window.restore()
+    assert host.read()["phase"] == "RESTORING"
+    assert ("stop", host.window.units["restore-service"]) not in host.mutations()
+    assert host.window.targets["restore-service"].exists(), host.window.targets

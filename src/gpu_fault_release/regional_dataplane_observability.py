@@ -17,8 +17,9 @@ exactly the set the observability digest already folds.
    beside a live one produces no series at all, and only a rule that names the
    cluster can see that. The rules are re-put wherever the expected set can
    move: the OBSERVABILITY node of an upgrade, and the engine's own bootstrap,
-   ``join_cluster`` and ``remove_cluster`` (``apply_observability``); the admin
-   bootstrap runs the installer bare and leaves the namespace alone.
+   ``join_cluster`` and ``remove_cluster`` (``apply_observability``). Initial
+   bootstrap configures monitoring with the bare installer, leaving this
+   namespace alone until GPU convergence, then publishes the expected rules.
 
 2. **Rollback compensation.** The first wiring put every configured cluster's
    collector back by rendering the *candidate's* manifest with the previous
@@ -70,6 +71,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_gpu_bootstrap import rollback_gpu_adot_collectors
 from gpu_fault_release.regional_manifest_snapshot import (
     apply_snapshot_objects,
@@ -81,20 +83,26 @@ from gpu_fault_release.regional_manifest_snapshot import (
 )
 from gpu_fault_release.regional_observability_rollback import (
     AmpDefinition,
+    amp_definition_status,
     capture_observability_snapshot,
     describe_amp_definition,
     wait_for_amp_definition_active,
     wait_for_amp_definition_gone,
     wait_for_amp_definition_settled,
 )
-from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_config import (
+    ClusterTarget,
+    ReleaseError,
+    amp_writer_role_name,
+)
 from gpu_fault_release.regional_release_rendering import (
     DATAPLANE_ADOT_DEPLOYMENT,
     DATAPLANE_ADOT_MANIFEST,
     dataplane_adot_skip_reason,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+# Installed deploy-host copies use the bound site's source snapshot for assets.
+ROOT = repository_root()
 AMP_MONITORING_INSTALLER = ROOT / "deploy/observability/install-amp-monitoring.sh"
 #: The rule-groups namespace the rendered per-cluster rules live in. Separate
 #: from ``health.amp_rule_namespace`` (the static file) on purpose: the static
@@ -249,9 +257,9 @@ def amp_installer_arguments(
 
     The rendered document is written into ``directory`` (a temporary directory
     the caller owns for the installer's lifetime) and handed over by path; an
-    empty expected set is an explicit deletion request. Only the admin
-    bootstrap (``bootstrap_services``) runs the installer with no arguments at
-    all, which leaves the namespace alone.
+    empty expected set is an explicit deletion request. Admin bootstrap and
+    initial release monitoring configuration omit these arguments to leave the
+    namespace alone until GPU convergence.
     """
 
     rendered = render_dataplane_expected_rules(release, exclude=exclude)
@@ -267,17 +275,31 @@ def run_amp_monitoring_installer(
     environment: dict[str, str],
     *,
     exclude: frozenset[str] = frozenset(),
+    include_expected_rules: bool = True,
 ) -> None:
     """Run the AMP monitoring installer with this release's expected-rules hand-off.
 
     ``environment`` is the installer's configuration (built by the release from
     its config); the rendered rules file lives only for the installer's run.
+    ``include_expected_rules=False`` uses the installer's leave-as-is mode,
+    never an empty expected set (which would request deletion).
     """
 
+    if (
+        not include_expected_rules
+        and environment.get("RULE_NAMESPACE") == DATAPLANE_EXPECTED_RULE_NAMESPACE
+    ):
+        raise ReleaseError(
+            "control-plane rule namespace must not alias the expected-collector namespace"
+        )
     with tempfile.TemporaryDirectory() as directory:
-        arguments = amp_installer_arguments(release, Path(directory), exclude=exclude)
+        arguments = (
+            amp_installer_arguments(release, Path(directory), exclude=exclude)
+            if include_expected_rules
+            else []
+        )
         release.runner.run(
-            ["bash", str(AMP_MONITORING_INSTALLER), *arguments],
+            ["bash", str(AMP_MONITORING_INSTALLER), "--runtime-only", *arguments],
             env=environment,
         )
 
@@ -293,6 +315,10 @@ def amp_installer_environment(release: Any) -> dict[str, str]:
         "CPU_KUBECONFIG": release.config.cpu_kubeconfig,
         "AMP_WORKSPACE_ID": release.config.health.amp_workspace_id,
         "SNS_TOPIC_NAME": topic_name,
+        # Reuse bootstrap's existing registered identity; never fall back to
+        # the shell installer's region-scoped role or inherit one from the env.
+        "IAM_ROLE_NAME": amp_writer_role_name(release.config.site_name),
+        "SERVICE_ACCOUNT": "gpu-fault-adot",
         "NAMESPACE": release.config.namespace,
         "RULE_NAMESPACE": release.config.health.amp_rule_namespace,
         "GPU_FAULT_ADOT_IMAGE": release.adot_image,
@@ -313,16 +339,17 @@ def apply_observability(
     """The observability component's control-plane step (bound as
     ``RegionalRelease._apply_observability``).
 
-    Runs the AMP monitoring installer -- the IAM writer role, the SNS topic and
-    its policy, the static rule namespace, the Alertmanager definition and the
-    control-plane collector, each short-circuited when already converged -- and
+    Runs the versioned monitoring install against the existing bootstrap-owned
+    IAM role and association: static rules, Alertmanager and the control-plane
+    collector, each short-circuited when already converged. It
     hands it this release's rendered per-cluster expected-collector rules (one
     ``absent()`` per cluster with an IRSA role), or an explicit deletion when no
     cluster is expected to carry a collector. Re-put on every run: the upgrade
     runs this whenever the observability digest moves (the digest folds the
     rendered text, so a rule-template edit reaches AMP through the same node),
-    and the engine's bootstrap, ``join_cluster`` and ``remove_cluster`` run it
-    because each of them changes the expected set without a deploy.
+    and ``join_cluster`` and ``remove_cluster`` run it because each of them
+    changes the expected set without a deploy. Initial bootstrap splits
+    configuration from expected-rule publication until its GPU workers converge.
     ``exclude_cluster_ids`` is ``remove_cluster``'s way of dropping the cluster
     its config still names.
     """
@@ -330,6 +357,41 @@ def apply_observability(
     run_amp_monitoring_installer(
         release, amp_installer_environment(release), exclude=exclude_cluster_ids
     )
+
+
+def apply_control_plane_observability(release: Any) -> None:
+    """Configure initial monitoring without reading or changing expected rules."""
+    run_amp_monitoring_installer(
+        release, amp_installer_environment(release), include_expected_rules=False
+    )
+
+
+def apply_dataplane_expected_rules(release: Any) -> None:
+    """Publish initial expected rules only after GPU bootstrap has converged."""
+    rendered = render_dataplane_expected_rules(release)
+    if release.runner.dry_run:
+        return
+    data = rendered.encode("utf-8") if rendered is not None else None
+    current = _describe_expected_rules_document(release)
+    if current is None and data is None:
+        return
+    if (
+        current is not None
+        and data is not None
+        and amp_definition_status(current) == "ACTIVE"
+    ):
+        encoded = current.get("data")
+        if not isinstance(encoded, str) or not encoded:
+            raise ReleaseError("cannot read the expected-collector rule namespace data")
+        try:
+            existing = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ReleaseError(
+                "cannot read the expected-collector rule namespace data"
+            ) from exc
+        if existing == data:
+            return
+    _write_dataplane_expected_rules(release, data)
 
 
 def _amp_common(release: Any) -> list[str]:
@@ -462,8 +524,13 @@ def restore_dataplane_expected_rules(release: Any, snapshot: object) -> str:
     """
 
     present, data = _expected_rules_parts(snapshot)
+    return _write_dataplane_expected_rules(release, data if present else None)
+
+
+def _write_dataplane_expected_rules(release: Any, data: bytes | None) -> str:
+    """Share the bounded namespace write/settle path with snapshot restoration."""
     exists = _settled_expected_rules_exist(release)
-    if not present:
+    if data is None:
         if not exists:
             return "absent"
         release.runner.run(

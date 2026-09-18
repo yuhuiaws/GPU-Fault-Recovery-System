@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 from urllib import request as urllib_request
+from urllib.parse import quote
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -521,14 +522,18 @@ def main() -> int:
     return 0 if report["valid"] else 1
 
 
-def _collector_readiness_command(args) -> int:
+def _collector_readiness_command(args: argparse.Namespace) -> int:
     if not args.execution_token:
         print(
             "collector readiness requires an execution token",
             file=sys.stderr,
         )
         return 2
-    url = args.url.rstrip("/") + "/v1/collector-readiness/" + args.cluster_id
+    url = (
+        args.url.rstrip("/")
+        + "/v1/collector-readiness/"
+        + quote(args.cluster_id, safe="")
+    )
     request = urllib_request.Request(
         url,
         headers={"X-GPU-Fault-Execution-Token": args.execution_token},
@@ -539,8 +544,28 @@ def _collector_readiness_command(args) -> int:
     except Exception as exc:
         print(f"collector readiness failed: {exc}", file=sys.stderr)
         return 2
+    if (
+        not isinstance(report, dict)
+        or report.get("cluster_id") != args.cluster_id
+        or type(report.get("ready")) is not bool
+        or not isinstance(report.get("nodes"), list)
+        or any(
+            not isinstance(node, dict)
+            or not isinstance(node.get("node_id"), str)
+            or not node["node_id"]
+            or type(node.get("ready")) is not bool
+            for node in report["nodes"]
+        )
+        or report["ready"]
+        != (bool(report["nodes"]) and all(node["ready"] for node in report["nodes"]))
+    ):
+        print(
+            "collector readiness response is incomplete or inconsistent",
+            file=sys.stderr,
+        )
+        return 2
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report.get("ready") else 1
+    return 0 if report["ready"] else 1
 
 
 if __name__ == "__main__":

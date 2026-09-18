@@ -56,6 +56,8 @@ def normalized_cidrs(values: list[str]) -> list[str]:
         raise ProbeError("invalid control-plane CIDR") from exc
     if any(network.prefixlen == 0 for network in networks):
         raise ProbeError("default-route CIDR is prohibited")
+    if not networks or any(network.version != 4 for network in networks):
+        raise ProbeError("the IPv4 iptables probe requires explicit IPv4 CIDRs")
     return sorted(str(network) for network in networks)
 
 
@@ -77,11 +79,43 @@ def restore_unit(run_id: str) -> str:
 HOST_CHAINS = ("OUTPUT", "FORWARD")
 
 
-def remove_chain(chain: str) -> None:
+def remove_chain(chain: str, run_id: str, *, allow_empty: bool = False) -> None:
+    state = chain_state(chain)
+    if state["residual"] and (
+        not state["rules"]
+        and not allow_empty
+        or any(
+            "--comment" not in rule or rule[rule.index("--comment") + 1] != run_id
+            for rule in state["rules"]
+        )
+    ):
+        raise ProbeError("network chain ownership is unknown; refusing cleanup")
     for host_chain in HOST_CHAINS:
         run(["iptables", "-D", host_chain, "-j", chain], check=False)
     run(["iptables", "-F", chain], check=False)
     run(["iptables", "-X", chain], check=False)
+    if chain_state(chain)["residual"]:
+        raise ProbeError("network rules remain; restore timer must stay armed")
+
+
+def chain_state(chain: str) -> dict[str, Any]:
+    listing = run(["iptables", "-S"])
+    rules = [shlex.split(line) for line in listing.stdout.splitlines() if line.strip()]
+    present = any(rule[:2] == ["-N", chain] for rule in rules)
+    jumps = {
+        host: any(
+            rule[:2] == ["-A", host] and rule[-2:] == ["-j", chain] for rule in rules
+        )
+        for host in HOST_CHAINS
+    }
+    own_rules = [rule for rule in rules if rule[:2] == ["-A", chain]]
+    return {
+        "blocked": present and bool(own_rules) and all(jumps.values()),
+        "chain_present": present,
+        "jumps": jumps,
+        "rules": own_rules,
+        "residual": present or bool(own_rules) or any(jumps.values()),
+    }
 
 
 def restore_script(chain: str) -> str:
@@ -97,7 +131,8 @@ def block(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     cidrs = normalized_cidrs(arguments.control_plane_cidr)
     chain = chain_name(run_id)
-    remove_chain(chain)
+    if chain_state(chain)["residual"]:
+        raise ProbeError("network probe chain already exists; refusing to replace it")
     unit = restore_unit(run_id)
     script = restore_script(chain)
     run(
@@ -135,8 +170,10 @@ def block(arguments: argparse.Namespace) -> None:
             )
         for host_chain in HOST_CHAINS:
             run(["iptables", "-I", host_chain, "1", "-j", chain])
+        if not chain_state(chain)["blocked"]:
+            raise ProbeError("network block could not be read back")
     except Exception:
-        remove_chain(chain)
+        remove_chain(chain, run_id, allow_empty=True)
         run(["systemctl", "stop", unit + ".timer"], check=False)
         run(["systemctl", "reset-failed", unit + ".service"], check=False)
         raise
@@ -148,6 +185,7 @@ def block(arguments: argparse.Namespace) -> None:
             "cidrs": cidrs,
             "restore_unit": unit + ".timer",
             "restore_seconds": arguments.restore_seconds,
+            "blocked": True,
         }
     )
 
@@ -155,30 +193,21 @@ def block(arguments: argparse.Namespace) -> None:
 def unblock(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     chain = chain_name(run_id)
-    remove_chain(chain)
+    remove_chain(chain, run_id)
     unit = restore_unit(run_id)
     run(["systemctl", "stop", unit + ".timer"], check=False)
     run(["systemctl", "reset-failed", unit + ".service"], check=False)
-    emit({"run_id": run_id, "chain": chain, "blocked": False})
+    emit({"run_id": run_id, "chain": chain, **chain_state(chain)})
 
 
 def status(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     chain = chain_name(run_id)
-    completed = run(["iptables", "-S", chain], check=False)
-    jumps = {}
-    for host_chain in HOST_CHAINS:
-        listing = run(["iptables", "-S", host_chain], check=False)
-        jumps[host_chain] = any(
-            line.split()[-2:] == ["-j", chain] for line in listing.stdout.splitlines()
-        )
     emit(
         {
             "run_id": run_id,
             "chain": chain,
-            "blocked": completed.returncode == 0 and all(jumps.values()),
-            "jumps": jumps,
-            "rules": completed.stdout.splitlines(),
+            **chain_state(chain),
         }
     )
 

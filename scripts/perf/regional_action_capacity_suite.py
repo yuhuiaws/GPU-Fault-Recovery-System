@@ -6,10 +6,13 @@ import statistics
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from gpu_fault.models import WorkflowOperation
+from scripts.e2e.regional.regional_live_fixture import component_python
 
-if __package__:
+if TYPE_CHECKING or __package__:
+    from .regional_capacity_resources import RunResources, run_manifest
     from .regional_capacity_results import collect_pod_json_logs
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
@@ -19,22 +22,26 @@ if __package__:
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
+        CONTROL_NAMESPACE,
         NAMESPACE,
+        REGISTRY_SECRET,
         TOKEN_SECRET,
         artifact_dir,
         control,
         dataplane,
-        move_to_aborted,
         postgres_counters,
+        purge_audit_rows,
         register,
         release_identity,
         scrape_cgroup,
         scrape_metrics,
         teardown,
         upsert_configmap,
+        validate_registered_resources,
         write_status,
     )
 else:
+    from regional_capacity_resources import RunResources, run_manifest
     from regional_capacity_results import collect_pod_json_logs
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
@@ -44,19 +51,22 @@ else:
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
+        CONTROL_NAMESPACE,
         NAMESPACE,
+        REGISTRY_SECRET,
         TOKEN_SECRET,
         artifact_dir,
         control,
         dataplane,
-        move_to_aborted,
         postgres_counters,
+        purge_audit_rows,
         register,
         release_identity,
         scrape_cgroup,
         scrape_metrics,
         teardown,
         upsert_configmap,
+        validate_registered_resources,
         write_status,
     )
 
@@ -468,7 +478,7 @@ def seed(
         "--",
         "env",
         *environment,
-        "python3",
+        component_python("cpu"),
         "-",
         stdin=script,
         timeout=300,
@@ -494,14 +504,14 @@ with psycopg.connect(store_dsn()) as conn:
     cur = conn.cursor()
     cur.execute(
         "SELECT payload->>'status', count(*) "
-        "FROM gpu_fault_objects "
+        "FROM gpu_fault_control_records "
         "WHERE kind='workflow' AND key LIKE %s GROUP BY 1",
         (pattern,),
     )
     out['workflows'] = dict(cur.fetchall())
     cur.execute(
         "SELECT payload->>'status', count(*) "
-        "FROM gpu_fault_objects "
+        "FROM gpu_fault_control_records "
         "WHERE kind='remote_command' "
         "AND payload->>'workflow_request_id' LIKE %s GROUP BY 1",
         (pattern,),
@@ -510,7 +520,7 @@ with psycopg.connect(store_dsn()) as conn:
     cur.execute(
         "SELECT min((payload->>'created_at')::timestamptz), "
         "max((payload->>'updated_at')::timestamptz) "
-        "FROM gpu_fault_objects "
+        "FROM gpu_fault_control_records "
         "WHERE kind='workflow' AND key LIKE %s",
         (pattern,),
     )
@@ -523,7 +533,7 @@ print(json.dumps(out))
         "exec",
         pod,
         "--",
-        "python3",
+        component_python("cpu"),
         "-c",
         script,
         timeout=120,
@@ -553,7 +563,7 @@ def percentile(values, ratio):
 with psycopg.connect(store_dsn()) as conn:
     cur = conn.cursor()
     cur.execute(
-        "SELECT key, payload FROM gpu_fault_objects "
+        "SELECT key, payload FROM gpu_fault_control_records "
         "WHERE kind='workflow' AND key LIKE %s",
         (pattern,),
     )
@@ -561,7 +571,7 @@ with psycopg.connect(store_dsn()) as conn:
     cur.execute(
         "SELECT payload->>'workflow_request_id', "
         "min((payload->>'created_at')::timestamptz) "
-        "FROM gpu_fault_objects WHERE kind='remote_command' "
+        "FROM gpu_fault_control_records WHERE kind='remote_command' "
         "AND payload->>'workflow_request_id' LIKE %s GROUP BY 1",
         (pattern,),
     )
@@ -603,7 +613,7 @@ print(json.dumps(out))
         "exec",
         pod,
         "--",
-        "python3",
+        component_python("cpu"),
         "-c",
         script,
         timeout=120,
@@ -686,7 +696,7 @@ def aggregate_executor_documents(documents: list[dict]) -> dict:
 
 
 def execute_capacity_run(
-    args,
+    args: argparse.Namespace,
     *,
     run_id: str,
     artifacts: Path,
@@ -694,33 +704,16 @@ def execute_capacity_run(
     expected_commands_per_cluster: int,
     started: float,
     registry_scope: str,
+    resources: RunResources,
 ) -> int:
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        seconds=args.synthetic_ttl_seconds
-    )
-    register(
-        args.clusters,
-        artifacts,
-        run_id=run_id,
-        expires_at=expires_at,
-        allow_live_registry=args.allow_live_registry,
-        live_registry_confirmation=args.confirm_live_registry,
-    )
     upsert_configmap(
         SCRIPT_CONFIGMAP,
+        resources=resources,
         text={
             "benchmark_regional_action_executor.py": (
                 PERF_DIR / "benchmark_regional_action_executor.py"
             ).read_text()
         },
-    )
-    dataplane(
-        "delete",
-        "job",
-        JOB_NAME,
-        "--ignore-not-found",
-        "--wait=true",
-        check=False,
     )
     identity = executor_identity(
         require_dataplane_deployment=registry_scope == "live",
@@ -734,8 +727,9 @@ def execute_capacity_run(
         inject_renew_failure_once=args.inject_renew_failure_once,
         **identity,
     )
+    manifest = run_manifest(manifest, run_id)
     (artifacts / "job.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    dataplane("apply", "-f", "-", stdin=json.dumps(manifest).encode())
+    resources.create(manifest)
     deadline = time.time() + 300
     while time.time() < deadline:
         running = dataplane(
@@ -870,7 +864,7 @@ def execute_capacity_run(
     return 0 if summary["job_status"] == "Complete" else 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clusters", type=int, default=8)
     parser.add_argument("--workflows-per-cluster", type=int, default=2)
@@ -890,7 +884,7 @@ def main() -> int:
     parser.add_argument("--allow-live-registry", action="store_true")
     parser.add_argument("--confirm-live-registry")
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
     try:
@@ -908,6 +902,10 @@ def main() -> int:
         label,
         identity["release_id"] or "unknown-release",
     )
+    if any(artifacts.iterdir()):
+        raise RuntimeError(
+            "action capacity artifacts already exist; preserve the original run receipts"
+        )
     expected_workflows = args.clusters * args.workflows_per_cluster
     expected_commands_per_cluster = args.workflows_per_cluster * 10
     log(f"artifacts: {artifacts}")
@@ -924,6 +922,10 @@ def main() -> int:
                 "inject_renew_failure_once": args.inject_renew_failure_once,
                 "suite_id": run_id,
                 "registry_scope": registry_scope,
+                "control_namespace": CONTROL_NAMESPACE,
+                "dataplane_namespace": NAMESPACE,
+                "registry_secret": REGISTRY_SECRET,
+                "connection_secret": CONNECTION_SECRET,
                 "agent_identity_source": (
                     "release-state" if registry_scope == "isolated" else "live-agent"
                 ),
@@ -938,7 +940,22 @@ def main() -> int:
     started = time.time()
     failure: BaseException | None = None
     result = 1
+    resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
+    registration_pending = True
+    run_validated = False
     try:
+        register(
+            args.clusters,
+            artifacts,
+            run_id=run_id,
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=args.synthetic_ttl_seconds),
+            allow_live_registry=args.allow_live_registry,
+            live_registry_confirmation=args.confirm_live_registry,
+        )
+        registration_pending = False
+        validate_registered_resources(artifacts, run_id, args.clusters)
+        run_validated = True
         result = execute_capacity_run(
             args,
             run_id=run_id,
@@ -947,40 +964,32 @@ def main() -> int:
             expected_commands_per_cluster=expected_commands_per_cluster,
             started=started,
             registry_scope=registry_scope,
+            resources=resources,
         )
     except BaseException as exc:
         failure = exc
     finally:
-        try:
-            dataplane(
-                "delete",
-                "job",
-                JOB_NAME,
-                "--ignore-not-found",
-                check=False,
-            )
-            dataplane(
-                "delete",
-                "configmap",
-                SCRIPT_CONFIGMAP,
-                "--ignore-not-found",
-                check=False,
-            )
-            teardown(
-                purge=True,
-                deregister_clusters=True,
-                allow_live_registry=args.allow_live_registry,
-                live_registry_confirmation=args.confirm_live_registry,
-                artifacts=artifacts,
-                run_id=run_id,
-            )
-        except Exception as cleanup_error:
-            if failure is not None:
-                failure.add_note(
-                    f"action capacity teardown also failed: {cleanup_error}"
+        if (registration_pending or run_validated) and (
+            artifacts / "registry-registration-intent.json"
+        ).exists():
+            try:
+                resources.delete_all()
+                purge_audit_rows(run_id=run_id, artifacts=artifacts)
+                teardown(
+                    purge=True,
+                    deregister_clusters=True,
+                    allow_live_registry=args.allow_live_registry,
+                    live_registry_confirmation=args.confirm_live_registry,
+                    artifacts=artifacts,
+                    run_id=run_id,
                 )
-            else:
-                failure = cleanup_error
+            except Exception as cleanup_error:
+                if failure is not None:
+                    failure.add_note(
+                        f"action capacity teardown also failed: {cleanup_error}"
+                    )
+                else:
+                    failure = cleanup_error
 
     if failure is not None:
         write_status(
@@ -988,8 +997,7 @@ def main() -> int:
             status="aborted",
             reason=f"{type(failure).__name__}: {failure}",
         )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
+        log(f"aborted artifacts: {artifacts}")
         raise failure.with_traceback(failure.__traceback__)
     if result:
         write_status(
@@ -997,8 +1005,7 @@ def main() -> int:
             status="aborted",
             reason="action capacity job did not complete",
         )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
+        log(f"aborted artifacts: {artifacts}")
         return result
     write_status(artifacts, status="ok")
     return 0

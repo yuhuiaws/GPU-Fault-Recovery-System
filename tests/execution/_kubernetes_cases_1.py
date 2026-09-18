@@ -775,6 +775,7 @@ def test_terminal_quarantine_hold_rejects_automatic_reset_takeover() -> None:
     store.save_incident(old_incident)
     store.save_workflow(old_workflow)
     core = FakeCoreApi()
+    core.node["metadata"]["name"] = "node-a"
     core.node["metadata"]["annotations"] = {
         "gpu-fault.io/incident-id": old_incident.incident_id,
         "gpu-fault.io/fencing-token": "3",

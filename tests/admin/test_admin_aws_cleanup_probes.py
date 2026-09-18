@@ -452,6 +452,8 @@ PROBES: list[tuple[str, dict[str, Any], list[str], str]] = [
             REGION,
             "--db-cluster-snapshot-identifier",
             "gpu-fault-final",
+            "--output",
+            "json",
         ],
         "DBClusterSnapshotNotFoundFault",
     ),
@@ -529,7 +531,20 @@ def test_each_resource_type_is_probed_with_its_own_api(
 
     resource_type, keywords, command, _absent = case
     aws = Aws()
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+    if resource_type == "rds_snapshot":
+        aws.stdout = json.dumps(
+            {
+                "DBClusterSnapshots": [
+                    {
+                        "DBClusterSnapshotIdentifier": keywords["resource_id"],
+                        "DBClusterIdentifier": "gpu-fault-aurora",
+                        "SnapshotType": "manual",
+                        "Status": "available",
+                    }
+                ]
+            }
+        )
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
 
     assert cleaner.exists(_resource(resource_type, **keywords)) is True
     assert aws.calls == [command]
@@ -549,8 +564,8 @@ def test_each_api_absent_error_means_absent(
 
     resource_type, keywords, _command, absent = case
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=254, stdout="", stderr=f"An error occurred ({absent}) ..."),
     )
 
@@ -571,8 +586,8 @@ def test_no_probe_reads_an_unexpected_error_as_absent(
 
     resource_type, keywords, _command, _absent = case
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=254, stdout="", stderr="An error occurred (AccessDenied) ..."),
     )
 
@@ -601,7 +616,7 @@ def test_a_route53_record_is_matched_by_name_and_type(
         ]
     }
     aws = Aws(stdout=json.dumps(document))
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
 
     assert cleaner.exists(record) is False
     assert aws.calls[0][-2:] == ["--output", "json"]
@@ -610,7 +625,7 @@ def test_a_route53_record_is_matched_by_name_and_type(
         {"Name": "api.gpu-fault.internal.", "Type": "A"}
     )
     monkeypatch.setattr(
-        admin_aws_commands.subprocess, "run", Aws(stdout=json.dumps(document))
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(document))
     )
 
     assert cleaner.exists(record) is True
@@ -626,8 +641,8 @@ def test_a_missing_zone_makes_its_records_and_associations_absent(
     """
 
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=254, stderr="An error occurred (NoSuchHostedZone) ..."),
     )
 
@@ -673,7 +688,7 @@ def test_a_vpc_association_is_matched_by_vpc_and_region(
     )
     others = {"VPCs": [{"VPCId": "vpc-gpu-a", "VPCRegion": REGION}]}
     monkeypatch.setattr(
-        admin_aws_commands.subprocess, "run", Aws(stdout=json.dumps(others))
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(others))
     )
 
     assert cleaner.exists(association) is False
@@ -685,7 +700,7 @@ def test_a_vpc_association_is_matched_by_vpc_and_region(
         ]
     }
     monkeypatch.setattr(
-        admin_aws_commands.subprocess, "run", Aws(stdout=json.dumps(both))
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(both))
     )
 
     assert cleaner.exists(association) is True
@@ -702,7 +717,7 @@ def test_a_route_table_association_is_looked_up_by_its_own_id(
 
     association = _resource("ec2_route_table_association", "rtbassoc-a")
     aws = Aws(stdout=json.dumps({"RouteTables": []}))
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
 
     assert cleaner.exists(association) is False
     assert (
@@ -726,7 +741,7 @@ def test_an_sqs_policy_binding_is_the_topic_inside_the_queue_policy(
     )
     empty = {"Attributes": {"Policy": ""}}
     monkeypatch.setattr(
-        admin_aws_commands.subprocess, "run", Aws(stdout=json.dumps(empty))
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(empty))
     )
 
     assert cleaner.exists(binding) is False
@@ -737,11 +752,12 @@ def test_an_sqs_policy_binding_is_the_topic_inside_the_queue_policy(
                 {
                     "Statement": [
                         {
+                            "Effect": "Allow",
                             "Condition": {
                                 "ArnEquals": {
                                     "aws:SourceArn": binding.attributes["topic_arn"]
                                 }
-                            }
+                            },
                         }
                     ]
                 }
@@ -749,7 +765,7 @@ def test_an_sqs_policy_binding_is_the_topic_inside_the_queue_policy(
         }
     }
     monkeypatch.setattr(
-        admin_aws_commands.subprocess, "run", Aws(stdout=json.dumps(bound))
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(bound))
     )
 
     assert cleaner.exists(binding) is True
@@ -759,8 +775,8 @@ def test_a_deleted_queue_makes_its_binding_absent(
     cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(
             returncode=254,
             stderr="An error occurred (AWS.SimpleQueueService.NonExistentQueue) ...",
@@ -797,7 +813,7 @@ def test_a_grafana_service_account_is_looked_up_inside_its_workspace(
         }
     )
     aws = Aws(stdout=listed)
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
 
     assert cleaner.exists(_service_account()) is True
     assert aws.calls == [
@@ -817,7 +833,7 @@ def test_a_grafana_service_account_is_looked_up_inside_its_workspace(
     only_theirs = json.dumps(
         {"serviceAccounts": [{"id": "3", "name": "SageMakerObservability"}]}
     )
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", Aws(stdout=only_theirs))
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", Aws(stdout=only_theirs))
     assert cleaner.exists(_service_account()) is False
 
 
@@ -825,8 +841,8 @@ def test_a_deleted_grafana_workspace_makes_our_service_account_absent(
     cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(
             returncode=254,
             stdout="",
@@ -837,8 +853,8 @@ def test_a_deleted_grafana_workspace_makes_our_service_account_absent(
     assert cleaner.exists(_service_account()) is False
 
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=254, stdout="", stderr="An error occurred (AccessDenied) ..."),
     )
     with pytest.raises(BootstrapError, match="AccessDenied"):
@@ -860,7 +876,7 @@ def test_a_helm_release_is_probed_through_the_control_plane_kubeconfig(
         attributes={"namespace": "kube-system"},
     )
     aws = Aws()
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
 
     assert cleaner.exists(release) is True
     assert aws.calls == [
@@ -880,8 +896,8 @@ def test_an_unreadable_helm_release_is_not_reported_absent(
     cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=1, stderr="Error: Kubernetes cluster unreachable"),
     )
     release = _resource("helm_release", "aws-load-balancer-controller")
@@ -890,8 +906,8 @@ def test_an_unreadable_helm_release_is_not_reported_absent(
         cleaner.exists(release)
 
     monkeypatch.setattr(
-        admin_aws_commands.subprocess,
-        "run",
+        admin_aws_commands,
+        "bounded_command",
         Aws(returncode=1, stderr="Error: release: not found"),
     )
 
@@ -907,7 +923,21 @@ def test_every_supported_resource_type_has_a_probe(
     turns adding a resource type without a probe into an immediate failure.
     """
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", Aws())
+    monkeypatch.setattr(
+        admin_aws_commands,
+        "bounded_command",
+        Aws(
+            stdout=json.dumps(
+                {
+                    "RouteTables": [],
+                    "ResourceRecordSets": [],
+                    "VPCs": [],
+                    "serviceAccounts": [],
+                    "Attributes": {},
+                }
+            )
+        ),
+    )
     covered = {resource_type for resource_type, _keywords, _c, _a in PROBES}
     attributes = {
         "cluster_name": "control",
@@ -924,3 +954,100 @@ def test_every_supported_resource_type_has_a_probe(
 
     with pytest.raises(BootstrapError, match="unsupported resource verification"):
         cleaner.exists(_resource("quantum_accelerator", "qa-1"))
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "attributes"),
+    [
+        ("ec2_route_table_association", {}),
+        ("route53_record", {"hosted_zone_id": ZONE}),
+        (
+            "route53_vpc_association",
+            {"hosted_zone_id": ZONE, "vpc_id": "vpc-a", "vpc_region": REGION},
+        ),
+        ("grafana_service_account", {"workspace_id": "g-test"}),
+        (
+            "sqs_policy_binding",
+            {"topic_arn": "arn:aws:sns:us-east-1:123456789012:gpu-fault"},
+        ),
+    ],
+)
+def test_missing_response_fields_are_not_confirmed_absence(
+    cleaner: ResourceCleaner,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_type: str,
+    attributes: dict[str, str],
+) -> None:
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", Aws())
+    with pytest.raises(BootstrapError, match="cleanup response"):
+        cleaner.exists(_resource(resource_type, "identifier", attributes=attributes))
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Error: Kubernetes cluster unreachable; release: not found",
+        "Error: forbidden: release: not found",
+    ],
+)
+def test_helm_transport_failures_cannot_masquerade_as_absence(
+    cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> None:
+    monkeypatch.setattr(
+        admin_aws_commands, "bounded_command", Aws(returncode=1, stderr=stderr)
+    )
+    with pytest.raises(BootstrapError, match="Helm release verification failed"):
+        cleaner.exists(_resource("helm_release", "aws-load-balancer-controller"))
+
+
+@pytest.mark.parametrize("suffix", ["-other", ":other"])
+def test_sqs_topic_arn_prefixes_are_not_the_registered_binding(
+    cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    topic = "arn:aws:sns:us-east-1:123456789012:gpu-fault"
+    policy = {
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Condition": {"ArnEquals": {"aws:SourceArn": topic + suffix}},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        admin_aws_commands,
+        "bounded_command",
+        Aws(stdout=json.dumps({"Attributes": {"Policy": json.dumps(policy)}})),
+    )
+    assert not cleaner.exists(
+        _resource("sqs_policy_binding", "queue-url", attributes={"topic_arn": topic})
+    ), "a topic ARN prefix match was mistaken for the registered SQS binding"
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "attributes", "response"),
+    [
+        ("route53_record", {"hosted_zone_id": ZONE}, {"ResourceRecordSets": [{}]}),
+        (
+            "route53_vpc_association",
+            {"hosted_zone_id": ZONE, "vpc_id": "vpc-a", "vpc_region": REGION},
+            {"VPCs": [{"VPCRegion": REGION}]},
+        ),
+        (
+            "grafana_service_account",
+            {"workspace_id": "g-test"},
+            {"serviceAccounts": [{}]},
+        ),
+    ],
+)
+def test_incomplete_list_entries_do_not_prove_absence(
+    cleaner: ResourceCleaner,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_type: str,
+    attributes: dict[str, str],
+    response: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(
+        admin_aws_commands, "bounded_command", Aws(stdout=json.dumps(response))
+    )
+    with pytest.raises(BootstrapError, match="identit"):
+        cleaner.exists(_resource(resource_type, "identifier", attributes=attributes))

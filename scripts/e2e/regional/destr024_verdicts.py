@@ -25,6 +25,7 @@ never deleted by hand.
 from __future__ import annotations
 
 import shlex
+from datetime import datetime
 from typing import Any
 
 from scripts.e2e.regional.remote_command_shapes import command_operations
@@ -123,9 +124,7 @@ def blocked_workflow_errors(state: dict[str, Any], *, xid: int = 46) -> list[str
     if completed:
         errors.append(f"physical operations completed: {sorted(completed)}")
     executed = physical & {
-        str(item.get("operation"))
-        for item in workflow.get("step_executions") or []
-        if str(item.get("status")) in ACTIVE_STATUSES
+        str(item.get("operation")) for item in workflow.get("step_executions") or []
     }
     if executed:
         errors.append(f"physical step executions exist: {sorted(executed)}")
@@ -163,25 +162,31 @@ def is_isolated(node: dict[str, Any]) -> bool:
 
 
 def node_isolated_errors(node: dict[str, Any]) -> list[str]:
-    if is_isolated(node):
+    if (
+        node.get("unschedulable") is True
+        and any(
+            item.get("key") == "gpu-fault.io/quarantined"
+            and item.get("effect") == "NoSchedule"
+            for item in node.get("taints") or []
+        )
+        and (node.get("ownership_annotations") or {}).get("gpu-fault.io/incident-id")
+    ):
         return []
-    return ["target node is not isolated after the fail-closed plan"]
+    return ["target node is not fully isolated with observed workflow ownership"]
 
 
 def host_untouched_errors(baseline: dict[str, Any], after: dict[str, Any]) -> list[str]:
     errors = []
-    if len(after.get("gpu_inventory") or []) != len(
-        baseline.get("gpu_inventory") or []
-    ):
-        errors.append("GPU inventory count changed on a run that must not reset")
+    if after.get("gpu_inventory") != baseline.get("gpu_inventory"):
+        errors.append("GPU inventory identity changed on a run that must not reset")
     baseline_rows = {
-        (item.get("command_id"), item.get("operation"))
+        (item.get("command_id"), item.get("attempt"))
         for item in baseline.get("ledger") or []
     }
     added = [
         str(item.get("operation"))
         for item in after.get("ledger") or []
-        if (item.get("command_id"), item.get("operation")) not in baseline_rows
+        if (item.get("command_id"), item.get("attempt")) not in baseline_rows
     ]
     physical = sorted(set(added) & set(PHYSICAL_OPERATIONS))
     if physical:
@@ -200,11 +205,9 @@ def host_untouched_errors(baseline: dict[str, Any], after: dict[str, Any]) -> li
 def watcher_absent_errors(
     summary: dict[str, Any], pods: list[dict[str, Any]]
 ) -> list[str]:
-    errors = []
-    if int(summary.get("replicas") or 0) != 0:
-        errors.append(
-            f"{WATCHER_DEPLOYMENT} still has replicas={summary.get('replicas')}"
-        )
+    from scripts.e2e.regional.destr023_verdicts import watcher_errors
+
+    errors = watcher_errors(summary, expected_replicas=0)
     if pods:
         errors.append(
             f"{WATCHER_DEPLOYMENT} Pod(s) still present: "
@@ -247,25 +250,44 @@ def watchdog_delay_seconds(*, expiry_wait_seconds: int) -> int:
 def heartbeat_recovered_errors(
     before: dict[str, Any],
     after: dict[str, Any],
+    *,
+    not_before: datetime | None = None,
 ) -> list[str]:
     """The watcher is back: a heartbeat newer than the stale one, fresh, IDLE."""
 
     errors = fresh_coverage_errors(after, require_stale_observations=False)
     previous = heartbeat_observed_at(before)
     current = heartbeat_observed_at(after)
-    if previous is not None and (current is None or current <= previous):
+    if previous is None or current is None or current <= previous:
         errors.append(
-            f"coverage heartbeat did not advance after the watcher returned "
-            f"(before={previous.isoformat()}, after={current.isoformat() if current else None})"
+            "coverage heartbeat did not provably advance after the watcher returned"
         )
+    if not_before is not None and (current is None or current < not_before):
+        errors.append("coverage heartbeat predates the watcher restoration")
     return errors
 
 
 def restore_errors(restored: dict[str, Any], node: dict[str, Any]) -> list[str]:
+    from gpu_fault.orchestration.validated_restore import VALIDATED_RESTORE_OPERATIONS
+
     errors = []
+    expected = [item.value for item in VALIDATED_RESTORE_OPERATIONS]
     if restored.get("status") != "SUCCEEDED":
         errors.append(
             f"validated restore workflow is {restored.get('status')}, not SUCCEEDED"
+        )
+    if restored.get("completed_operations") != expected:
+        errors.append(
+            "validated restore did not complete the exact validation-first sequence"
+        )
+    succeeded = [
+        item.get("operation")
+        for item in restored.get("step_executions") or []
+        if item.get("status") == "SUCCEEDED"
+    ]
+    if succeeded != expected:
+        errors.append(
+            "validated restore lacks the exact successful validation executions"
         )
     if node.get("ready") != "True":
         errors.append("target node is not Ready after the restore")

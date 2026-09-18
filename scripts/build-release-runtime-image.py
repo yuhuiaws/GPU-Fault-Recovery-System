@@ -4,7 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from release_image import build_runtime_image
+from release_image_set import build_image_set
+from verify_release_images import verify_images
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +39,7 @@ def main() -> None:
         default=ROOT / "dist/release-runtime-image.json",
     )
     arguments = parser.parse_args()
-    descriptor = build_runtime_image(
+    descriptor = build_image_set(
         ROOT,
         repository=arguments.repository,
         platform=arguments.platform,
@@ -53,6 +54,7 @@ def main() -> None:
         ),
         reuse_registry_image=not arguments.force_rebuild,
     )
+    verify_images(descriptor)
     output = arguments.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(

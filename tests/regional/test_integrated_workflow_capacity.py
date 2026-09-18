@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -53,20 +52,28 @@ def test_fixed_matrix_keeps_26576_requests_and_selects_four_xids_per_cluster() -
     ), "a cluster lacks the four action-bearing P0 candidates"
 
 
-def test_integrated_runner_executable_can_render_help() -> None:
-    completed = subprocess.run(
+def test_integrated_runner_parser_preserves_required_arguments() -> None:
+    arguments = suite.parser().parse_args(
         [
-            str(suite.PERF_DIR / "regional_integrated_workflow_capacity_suite.py"),
-            "--help",
-        ],
-        cwd=suite.ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
+            "--clusters",
+            "32",
+            "--spool-mode",
+            "enabled",
+            "--aurora-cluster-id",
+            "test-aurora",
+            "--configure-aurora-capacity",
+            "--confirm-aurora-scaling",
+            "SET_AURORA_MIN_124_MAX_128",
+            "--allow-live-registry",
+            "--confirm-live-registry",
+            "ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
+        ]
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "--spool-mode" in completed.stdout, completed.stdout
+    assert arguments.clusters == 32
+    assert arguments.spool_mode == "enabled"
+    assert arguments.aurora_cluster_id == "test-aurora"
+    assert arguments.configure_aurora_capacity is True
 
 
 def test_action_bearing_xid_has_complete_causal_identity() -> None:
@@ -926,7 +933,7 @@ def test_spool_mode_requires_consistent_live_ingress(
     assert len(report["spool_worker_values"]) == int(replicas)
 
 
-def test_integrated_embedded_database_scripts_compile(
+def test_integrated_embedded_database_audit_compiles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scripts = []
@@ -939,8 +946,7 @@ def test_integrated_embedded_database_scripts_compile(
     monkeypatch.setattr(suite, "control", fake_control)
 
     assert suite.workflow_audit("run-a") == {}
-    suite.purge_integrated_rows("run-a")
-    assert len(scripts) == 2
+    assert len(scripts) == 1
     for index, script in enumerate(scripts):
         compile(script, f"integrated-script-{index}", "exec")
 

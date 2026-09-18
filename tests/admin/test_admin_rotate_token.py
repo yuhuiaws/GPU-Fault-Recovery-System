@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,8 +13,10 @@ import pytest
 
 from gpu_fault.admin import cli
 from gpu_fault.admin import rotate_token as module
+from gpu_fault.admin import rotate_token_acceptance as acceptance_module
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from tests.admin.test_admin_rotate_token_acceptance import LogHost
 
 OLD_TOKEN = "a" * 64
 OLD_DIGEST = hashlib.sha256(OLD_TOKEN.encode()).hexdigest()
@@ -163,6 +167,7 @@ class Harness:
             return {"quiet_seconds": quiet_seconds, "waited_seconds": 1.0}
 
         monkeypatch.setattr(module, "build_release", lambda site: self.release)
+        monkeypatch.setattr(module, "reload_site_for_mutation", lambda site: site)
         monkeypatch.setattr(
             module,
             "live_release_state",
@@ -296,6 +301,202 @@ def test_token_file_stays_old_until_acceptance_and_a_rerun_resumes(
     assert summary["rotation_id"] == state["rotation_id"]
 
 
+def test_resume_after_final_publish_failure_uses_the_committed_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    publish = module.publish_current_revision
+
+    def fail_publish(*args, **kwargs):
+        raise ReleaseError("final registry publish interrupted")
+
+    monkeypatch.setattr(module, "publish_current_revision", fail_publish)
+    with pytest.raises(ReleaseError, match="final registry publish"):
+        harness.rotate()
+
+    committed_digest = hashlib.sha256(harness.token_file.read_bytes()).hexdigest()
+    assert module.STEP_TOKEN_FILE_WRITTEN in harness.state["steps"]
+    before = len(harness.calls)
+    monkeypatch.setattr(module, "publish_current_revision", publish)
+    result = harness.rotate()
+
+    assert result["status"] == module.STATUS_COMPLETED
+    assert result["new_token_sha256"] == committed_digest
+    assert [item[0] for item in harness.calls[before:]] == ["write_registry", "publish"]
+
+
+def test_token_replace_ack_loss_resumes_forward_and_refuses_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    write = module.write_token_file
+
+    def write_then_interrupt(*args, **kwargs):
+        write(*args, **kwargs)
+        raise OSError("token replace acknowledgement lost")
+
+    monkeypatch.setattr(module, "write_token_file", write_then_interrupt)
+    with pytest.raises(OSError, match="acknowledgement lost"):
+        harness.rotate()
+    state = harness.state
+    assert module.STEP_TOKEN_FILE_WRITTEN not in state["steps"]
+    assert (
+        hashlib.sha256(harness.token_file.read_bytes()).hexdigest()
+        == state["new_token_sha256"]
+    )
+    before = len(harness.calls)
+    with pytest.raises(BootstrapError, match="token file"):
+        harness.rotate(rollback=True)
+    assert len(harness.calls) == before
+
+    monkeypatch.setattr(module, "write_token_file", write)
+    result = harness.rotate()
+    assert result["status"] == module.STATUS_COMPLETED
+    assert result["rotation_id"] == state["rotation_id"]
+    assert (
+        hashlib.sha256(Path(result["retired_token_file"]).read_bytes()).hexdigest()
+        == OLD_DIGEST
+    )
+
+
+def test_token_write_intent_is_irreversible_before_the_filesystem_write_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    write = module.write_token_file
+
+    def unavailable_write(*args, **kwargs):
+        raise OSError("filesystem write has not started")
+
+    monkeypatch.setattr(module, "write_token_file", unavailable_write)
+    with pytest.raises(OSError, match="has not started"):
+        harness.rotate()
+    assert hashlib.sha256(harness.token_file.read_bytes()).hexdigest() == OLD_DIGEST
+    assert module.STEP_TOKEN_FILE_WRITTEN in harness.state["started_steps"]
+    assert module.STEP_TOKEN_FILE_WRITTEN not in harness.state["steps"]
+    before = len(harness.calls)
+    with pytest.raises(BootstrapError, match="write intent"):
+        harness.rotate(rollback=True)
+    assert len(harness.calls) == before
+
+    monkeypatch.setattr(module, "write_token_file", write)
+    assert harness.rotate()["status"] == module.STATUS_COMPLETED
+
+
+def test_pending_cleanup_failure_keeps_the_committed_rotation_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    unlink = Path.unlink
+    failures = []
+
+    def fail_pending_once(path, *args, **kwargs):
+        if path.name == module.PENDING_TOKEN_FILE and not failures:
+            failures.append(path)
+            raise OSError("pending cleanup interrupted")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_pending_once)
+    with pytest.raises(OSError, match="pending cleanup"):
+        harness.rotate()
+    state = harness.state
+    assert state["status"] == module.STATUS_COMPLETED
+    assert module.STEP_RETIRING_DROPPED in state["steps"]
+    before = len(harness.calls)
+    result = harness.rotate()
+    assert result["rotation_id"] == state["rotation_id"]
+    assert result["status"] == module.STATUS_COMPLETED
+    assert len(harness.calls) == before
+    assert not failures[0].exists(), (
+        "completed rotation replay must remove the pending token file"
+    )
+
+
+def test_resume_refuses_changed_site_identity_before_another_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    harness.acceptance_error = BootstrapError("quiet proof unavailable")
+    with pytest.raises(BootstrapError, match="quiet proof"):
+        harness.rotate()
+    before = len(harness.calls)
+    harness.site.source_sha256 = "9" * 64
+
+    with pytest.raises(BootstrapError, match="site"):
+        harness.rotate()
+    assert len(harness.calls) == before
+
+
+@pytest.mark.parametrize("membership", ["removed", "rebound"])
+def test_rotation_reloads_membership_inside_the_lock_before_reading_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, membership: str
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    events = []
+    current = SimpleNamespace(**vars(harness.site))
+    current.release_config = {
+        **harness.site.release_config,
+        "clusters": (
+            []
+            if membership == "removed"
+            else [
+                {
+                    **harness.site.release_config["clusters"][0],
+                    "eks_cluster_arn": GPU_ARN.replace("gpu-a", "rebound-gpu"),
+                }
+            ]
+        ),
+    }
+
+    @contextmanager
+    def lock(path):
+        assert path == tmp_path
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def reload(site):
+        assert events == ["lock"]
+        events.append("reload")
+        return current
+
+    monkeypatch.setattr(module, "administrator_operation_lock", lock)
+    monkeypatch.setattr(module, "reload_site_for_mutation", reload)
+    with pytest.raises(
+        BootstrapError, match="unknown cluster_id|target cluster identity"
+    ):
+        harness.rotate()
+    assert events == ["lock", "reload", "unlock"]
+    assert harness.calls == []
+    assert not module.rotation_state_path(harness.site, "gpu-a").exists(), (
+        "rejected membership must not create rotation state"
+    )
+
+
+@pytest.mark.parametrize("updates", [{"status": "UNKNOWN"}, {"schema_version": 999}])
+def test_unknown_rotation_state_is_not_archived_or_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, updates: dict
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    harness.acceptance_error = BootstrapError("still waiting")
+    with pytest.raises(BootstrapError):
+        harness.rotate()
+    path = module.rotation_state_path(harness.site, "gpu-a")
+    state = {**harness.state, **updates}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    before = len(harness.calls)
+
+    with pytest.raises(BootstrapError, match="unknown schema or status"):
+        harness.rotate()
+    assert json.loads(path.read_text()) == state
+    assert len(harness.calls) == before
+    assert not (path.parent / "history").exists(), (
+        "unknown rotation state must not be archived"
+    )
+
+
 def test_failed_overlap_publish_rolls_the_registry_back_to_the_old_token_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -348,6 +549,16 @@ def test_refuses_busy_remote_commands_and_open_release_transactions(
         ({"phase": "bootstrap-cleaned"}, None),
         ({"phase": "rolled-back", "rollback_cleanup_completed": False}, "rolled-back"),
         ({"phase": "rolled-back", "rollback_cleanup_completed": True}, None),
+        (
+            {
+                "phase": "complete",
+                "transaction_committed": True,
+                "commit_cleanup_completed": False,
+            },
+            "complete",
+        ),
+        ({"phase": "unknown-phase"}, "unknown-phase"),
+        ({}, "unknown"),
     ],
 )
 def test_release_transaction_open_uses_the_engine_phase_vocabulary(
@@ -376,6 +587,19 @@ def test_window_bounds_are_enforced(tmp_path: Path) -> None:
     with pytest.raises(BootstrapError, match="between 10 and"):
         module.RotateTokenRequest(
             site=site, cluster_id="gpu-a", window=timedelta(days=8)
+        )
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, 30, 60])
+def test_quiet_period_must_leave_time_for_the_acceptance_probe(
+    tmp_path: Path, timeout_seconds: int
+) -> None:
+    with pytest.raises(BootstrapError, match="quiet"):
+        module.RotateTokenRequest(
+            site=_site(tmp_path),
+            cluster_id="gpu-a",
+            quiet_seconds=60,
+            acceptance_timeout_seconds=timeout_seconds,
         )
 
 
@@ -430,6 +654,96 @@ def test_rollback_walks_the_data_plane_back_before_restoring_the_registry(
     assert not Path(harness.state["pending_token_file"]).exists(), (
         "the pending token is shredded on rollback"
     )
+
+
+def test_rollback_restores_a_secret_whose_update_acknowledgement_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    ensure = module.ensure_connection_secret
+
+    def update_then_interrupt(release, target):
+        ensure(release, target)
+        if Path(target.token_file).name == module.PENDING_TOKEN_FILE:
+            raise ReleaseError("connection secret acknowledgement lost")
+
+    monkeypatch.setattr(module, "ensure_connection_secret", update_then_interrupt)
+    with pytest.raises(ReleaseError, match="acknowledgement lost"):
+        harness.rotate()
+    assert module.STEP_SECRET_UPDATED not in harness.state["steps"]
+    harness.calls.clear()
+
+    result = harness.rotate(rollback=True)
+
+    assert result["status"] == module.STATUS_ROLLED_BACK
+    assert [item[0] for item in harness.calls] == [
+        "connection_secret",
+        "restart_data_plane",
+        "publish",
+    ]
+    assert hashlib.sha256(harness.calls[0][1].encode()).hexdigest() == OLD_DIGEST
+
+
+def test_partial_rollback_resumes_the_original_node_set_and_refuses_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    harness.acceptance_error = BootstrapError("still waiting")
+    with pytest.raises(BootstrapError):
+        harness.rotate()
+    roll = module.roll_node_tokens
+    attempts = []
+
+    def interrupted_roll(release, target, **kwargs):
+        attempts.append(
+            (kwargs["only_nodes"], list(kwargs["progress"]["completed_nodes"]))
+        )
+        if len(attempts) == 1:
+            kwargs["progress"]["completed_nodes"] = ["node-1"]
+            kwargs["record"]()
+            raise ReleaseError("rollback wave interrupted")
+        return roll(release, target, **kwargs)
+
+    monkeypatch.setattr(module, "roll_node_tokens", interrupted_roll)
+    with pytest.raises(ReleaseError, match="rollback wave"):
+        harness.rotate(rollback=True)
+    before = len(harness.calls)
+    with pytest.raises(BootstrapError, match="resume with --rollback"):
+        harness.rotate()
+    assert len(harness.calls) == before
+
+    result = harness.rotate(rollback=True)
+
+    assert result["status"] == module.STATUS_ROLLED_BACK
+    assert attempts == [
+        (frozenset({"node-1", "node-2"}), []),
+        (frozenset({"node-1", "node-2"}), ["node-1"]),
+    ]
+
+
+def test_rollback_includes_a_wave_that_started_without_finishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    roll = module.roll_node_tokens
+    rolled_back = []
+
+    def interrupted_wave(release, target, **kwargs):
+        if kwargs["only_nodes"] is None:
+            kwargs["progress"]["started_nodes"] = ["node-1"]
+            kwargs["record"]()
+            raise ReleaseError("forward wave interrupted")
+        rolled_back.append(kwargs["only_nodes"])
+        return roll(release, target, **kwargs)
+
+    monkeypatch.setattr(module, "roll_node_tokens", interrupted_wave)
+    with pytest.raises(ReleaseError, match="forward wave"):
+        harness.rotate()
+    assert harness.state["node_rollout"]["completed_nodes"] == []
+
+    result = harness.rotate(rollback=True)
+    assert result["status"] == module.STATUS_ROLLED_BACK
+    assert rolled_back == [frozenset({"node-1"})]
 
 
 def test_rollback_is_refused_once_the_token_file_was_rewritten(
@@ -574,6 +888,7 @@ def test_roll_node_tokens_hands_each_wave_marks_it_retrying_then_waits(
     assert handoff_index >= 0
     assert saves[-1] == ["node-1", "node-2", "node-3"]
     assert progress["steady_wave_config"] == wave_config
+    assert progress["started_nodes"] == ["node-2", "node-3"]
     assert result["reinstalled_nodes"] == ["node-1", "node-2", "node-3"]
 
 
@@ -617,6 +932,8 @@ def test_wait_for_new_token_acceptance_needs_a_full_quiet_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     site = _site(tmp_path)
+    host = LogHost(namespace=site.release_config["namespace"])
+    monkeypatch.setattr(acceptance_module, "run_command", host.run)
     observations = [
         ["regional cluster gpu-a authenticated with the retiring token"],
         [],
@@ -662,6 +979,148 @@ def test_wait_for_new_token_acceptance_needs_a_full_quiet_window(
             sleep=sleep,
             monotonic=lambda: clock["now"],
         )
+
+
+def test_acceptance_does_not_accept_a_quiet_result_after_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"now": 0.0}
+    host = LogHost(namespace="gpu-fault-system")
+    monkeypatch.setattr(acceptance_module, "run_command", host.run)
+
+    def sleep(seconds):
+        clock["now"] += seconds
+
+    def late_logs(site, cluster_id, *, since_seconds):
+        clock["now"] += 60
+        return []
+
+    monkeypatch.setattr(module, "retiring_token_authentications", late_logs)
+    with pytest.raises(BootstrapError, match="timeout|timed out|deadline"):
+        module.wait_for_new_token_acceptance(
+            _site(tmp_path),
+            "gpu-a",
+            quiet_seconds=10,
+            timeout_seconds=30,
+            sleep=sleep,
+            monotonic=lambda: clock["now"],
+        )
+
+
+def test_quiet_probe_failure_does_not_expose_credential_helper_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "synthetic-unstructured-auth-value-13579"
+    host = LogHost("cpu-api-pod", namespace="gpu-fault-system")
+
+    def command(arguments, **kwargs):
+        if "logs" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 1, "", f"Forbidden: exec helper failed\n{marker}"
+            )
+        return host.run(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "run_command", command)
+    with pytest.raises(BootstrapError) as failure:
+        module.retiring_token_authentications(
+            _site(tmp_path), "gpu-a", since_seconds=60
+        )
+    message = str(failure.value)
+    assert marker not in message
+    assert "Forbidden" in message
+    assert "redacted" in message
+
+
+@pytest.mark.parametrize("invalid_source", ["empty", "not-ready", "restarted"])
+def test_quiet_probe_refuses_missing_or_incomplete_log_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_source: str
+) -> None:
+    host = LogHost("cpu-api-pod", namespace="gpu-fault-system")
+    pod = host.pods[0]
+    if invalid_source == "not-ready":
+        pod["status"]["conditions"][0]["status"] = "False"
+    if invalid_source == "restarted":
+        pod["status"]["containerStatuses"][0]["state"]["running"]["startedAt"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
+    if invalid_source == "empty":
+        host.pods.clear()
+    commands = []
+
+    def command(arguments, **kwargs):
+        commands.append(arguments)
+        return host.run(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "run_command", command)
+    with pytest.raises(BootstrapError, match="full quiet window"):
+        module.retiring_token_authentications(
+            _site(tmp_path), "gpu-a", since_seconds=60
+        )
+    assert len(commands) == 3
+    assert all("logs" not in arguments for arguments in commands), (
+        "incomplete sources must be rejected before reading logs"
+    )
+
+
+@pytest.mark.parametrize("replace_source", [False, True])
+def test_quiet_probe_binds_the_ready_sources_before_and_after_log_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replace_source: bool
+) -> None:
+    host = LogHost("cpu-api-pod", namespace="gpu-fault-system")
+    commands = []
+    stamp = datetime.now(timezone.utc)
+    old = (stamp - timedelta(minutes=5)).isoformat()
+    prefix = f"{old} startup complete\n"
+    window = (
+        f"{stamp.isoformat()} regional cluster gpu-b "
+        "authenticated with the retiring token\n"
+    )
+
+    def command(arguments, **kwargs):
+        commands.append(arguments)
+        if "logs" in arguments:
+            assert kwargs["timeout_seconds"] == 180
+            assert "--timestamps" in arguments
+            assert "--container=api" in arguments
+            content = (
+                prefix
+                if any(argument.startswith("--limit-bytes=") for argument in arguments)
+                else window
+            )
+            return subprocess.CompletedProcess(
+                arguments, 0, "[pod/cpu-api-pod/api] " + content, ""
+            )
+        assert kwargs["timeout_seconds"] == 120
+        if replace_source and host.gets:
+            host.after_pods[0]["metadata"]["uid"] = "replacement-uid"
+        return host.run(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "run_command", command)
+    if replace_source:
+        with pytest.raises(BootstrapError, match="sources changed"):
+            module.retiring_token_authentications(
+                _site(tmp_path), "gpu-a", since_seconds=60
+            )
+    else:
+        assert (
+            module.retiring_token_authentications(
+                _site(tmp_path), "gpu-a", since_seconds=60
+            )
+            == []
+        )
+    assert ["logs" in arguments for arguments in commands] == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
 
 
 def test_remote_command_losses_reports_only_grown_terminal_counters() -> None:

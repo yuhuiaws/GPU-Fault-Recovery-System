@@ -47,6 +47,12 @@ def test_balanced_distribution_follows_replicas_not_three_nodes() -> None:
     assert ha002.balanced_distribution({}, 0) is True, (
         "zero replicas on zero nodes is trivially balanced"
     )
+    assert not ha002.balanced_distribution(
+        {"a": 3}, 3, eligible_nodes=["a", "b", "c"]
+    ), "eligible nodes without Pods still participate in maxSkew"
+    assert not ha002.balanced_distribution(
+        {"other": 3}, 3, eligible_nodes=["a", "b", "c"]
+    ), "a Pod on an unapproved node cannot prove the planned topology"
 
 
 def test_capacity_assessment_is_derived_from_the_cordon_observation() -> None:
@@ -130,30 +136,47 @@ def test_cleanup_runs_every_step_even_when_uncordon_fails(
     monkeypatch.setattr(
         ha002.COMMON, "probe_resources", lambda: {"count": 0, "resources": {}}
     )
+    node_reads = iter([True, False])
     monkeypatch.setattr(
         ha002,
         "current_node",
-        lambda name: {"name": name, "unschedulable": False, "taints": []},
+        lambda name: {
+            "name": name,
+            "uid": "node-uid",
+            "unschedulable": next(node_reads),
+            "taints": [],
+            "ha_owner": "owned",
+        },
     )
     stopped = []
     monkeypatch.setattr(ha002, "stop_watchdog", lambda p, h: stopped.append(True))
     context = {
         "node_name": "node-a",
         "spool_replicas": 0,
-        "baseline_node": {"taints": []},
+        "baseline_node": {"uid": "node-uid", "unschedulable": False, "taints": []},
+        "node_owner": "owned",
     }
     state = {
         "cordoned": True,
         "watchdog": None,
         "watchdog_handle": None,
         "probe_created": True,
+        "resources": type(
+            "Owned",
+            (),
+            {
+                "delete": lambda self, kind, name: calls.append(
+                    f"gpu delete {kind.lower()}"
+                )
+            },
+        )(),
     }
     result: dict = {}
 
     errors = ha002.cleanup_case(tmp_path, context, state, result)
 
     assert errors == ["uncordon: CaseError: kubectl timed out"], errors
-    assert stopped == [True], "the watchdog step must run after a failed uncordon"
+    assert stopped == [], "failed restoration must not disarm the remaining watchdog"
     assert any(call.startswith("gpu delete") for call in calls), (
         f"the GPU-side delete must still run after a failed uncordon: {calls}"
     )

@@ -4,8 +4,19 @@ import hashlib
 import json
 import sys
 import time
+from collections.abc import Sequence
+from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.regional import (
+    RegionalClusterLifecycle,
+    RegionalClusterRegistration,
+    RegionalRegistryPublishRequest,
+    RegionalRegistryStatus,
+    regional_registry_content_sha256,
+)
+from gpu_fault.regional_registry import regional_registry_config_sha256
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_registry import registry
@@ -17,7 +28,9 @@ def _request(
     method: str,
     path: str,
     payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    *,
+    response_list: bool = False,
+) -> Any:
     # The mutating helper for every method: this drives the registry API, and a
     # GET here is only ever a step of a revision publish, so re-running one on a
     # different replica would read a generation the caller did not write.
@@ -34,8 +47,16 @@ def _request(
         input_text=json.dumps(payload or {}, separators=(",", ":")),
         sensitive=True,
     )
-    value = json.loads(output)
-    if not isinstance(value, dict):
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        raise ReleaseError("regional registry API returned invalid JSON") from None
+    if response_list:
+        if not isinstance(value, list) or any(
+            not isinstance(item, dict) for item in value
+        ):
+            raise ReleaseError("regional registry API returned a non-object list")
+    elif not isinstance(value, dict):
         raise ReleaseError("regional registry API returned a non-object")
     return value
 
@@ -86,21 +107,17 @@ def _registration(
 def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> None:
     """Name the control-plane members that held a publish past its window.
 
-    Convergence is over the control plane's own processes, nothing else: the
-    member rows ``active_registry_member_ids`` counted at publish time (every
-    process that heartbeated within ``GPU_FAULT_REGISTRY_STALE_SECONDS``) must
-    each re-read the new head and heartbeat it before ``converged`` turns true
-    (``regional_registry_runtime.registry_revision_converged``). A GPU cluster
-    has no row -- its executor and agents are not registry members -- so a
-    cluster being joined, purged or rolled back never widens the set, and a
-    publish with no active member at all converges on the probe's first poll.
+    Every currently active CPU process must ACK the exact revision, including
+    arrivals after the immutable publish-time membership snapshot. A required
+    member with a stale row stops blocking a live fleet once its persisted
+    heartbeat no longer authorizes traffic; a missing row remains unresolved.
+    A known fleet needs a live ACK, not universal heartbeat expiry. Only an
+    empty required set with no member rows converges without any ACK. GPU
+    executors and agents are not CPU registry members.
 
-    So when a publish still runs its whole window out, some control-plane
-    process did not ack, and the probe's own exit line names only the
-    generation. This reads the status once more and prints the members that
-    are missing, with the readiness and error each reports, so the next live
-    occurrence is attributable to a process instead of to "the fleet". It is
-    best effort and never masks the failure that brought the caller here.
+    The probe's exit line names only the generation. Read status once more
+    for the unresolved members and their reported readiness/errors. This is
+    best effort and never masks the original publish failure.
     """
 
     try:
@@ -108,7 +125,7 @@ def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> Non
     except ReleaseError as exc:
         print(
             "regional registry status is unavailable after the publish ran out "
-            f"its {timeout_seconds:.0f}s convergence window: {exc}",
+            f"its {timeout_seconds:.0f}s convergence window: {diagnostic_text(str(exc))}",
             file=sys.stderr,
             flush=True,
         )
@@ -132,7 +149,7 @@ def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> Non
             f"ready={member.get('ready')} generation={member.get('generation')} "
             f"last_seen_at={member.get('last_seen_at')} error={member.get('error')}"
         )
-    print("\n".join(lines), file=sys.stderr, flush=True)
+    print(diagnostic_text("\n".join(lines)), file=sys.stderr, flush=True)
 
 
 def publish_registry_revision(
@@ -182,6 +199,34 @@ def publish_current_registry(
     lifecycle_overrides: dict[str, str] | None = None,
     timeout_seconds: float = 300,
 ) -> dict[str, Any]:
+    if lifecycle_overrides:
+        request = _lifecycle_registry_request(release, lifecycle_overrides, reason)
+        result = publish_registry_revision(
+            release,
+            path="/v1/regional/registry/revisions",
+            payload=request.model_dump(mode="json", exclude={"required_member_ids"}),
+            use_current_generation=False,
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            status = RegionalRegistryStatus.model_validate(result)
+        except ValueError:
+            raise ReleaseError(
+                "regional registry publish evidence is invalid"
+            ) from None
+        if (
+            status.generation != request.expected_generation + 1
+            or status.content_sha256
+            != regional_registry_content_sha256(request.registrations)
+            or status.cluster_states
+            != {item.cluster_id: item.lifecycle_state for item in request.registrations}
+            or not status.converged
+            or status.missing_member_ids
+        ):
+            raise ReleaseError(
+                "regional registry did not converge on the lifecycle update"
+            )
+        return result
     return publish_registry_revision(
         release,
         path="/v1/regional/registry/revisions",
@@ -195,6 +240,82 @@ def publish_current_registry(
         use_current_generation=True,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _lifecycle_registry_request(
+    release: Any, overrides: dict[str, str], reason: str
+) -> RegionalRegistryPublishRequest:
+    """Bind a lifecycle-only update to the complete durable registry snapshot."""
+
+    try:
+        status = RegionalRegistryStatus.model_validate(
+            _request(release, "GET", "/v1/regional/registry/status")
+        )
+        configured = [
+            RegionalClusterRegistration.model_validate(item)
+            for item in current_registrations(release, {})
+        ]
+        by_id = {item.cluster_id: item for item in configured}
+        if len(by_id) != len(configured) or set(by_id) != set(status.cluster_states):
+            raise ReleaseError("regional registry membership differs from its Secret")
+        if not set(overrides).issubset(by_id):
+            raise ReleaseError("regional registry lifecycle target is missing")
+        durable: list[RegionalClusterRegistration] = []
+        for source in _request(
+            release, "GET", "/v1/regional/clusters", response_list=True
+        ):
+            item = dict(source)
+            candidate = by_id[item["cluster_id"]]
+            # The API redacts digests. Restore them only from the CPU Secret;
+            # the full revision digest below proves the actual bytes agree.
+            for field in ("token_sha256", "retiring_token_sha256"):
+                digest = getattr(candidate, field)
+                present = item.pop(f"{field}_present")
+                length = item.pop(f"{field}_length")
+                if (
+                    type(present) is not bool
+                    or type(length) is not int
+                    or present != bool(digest)
+                    or length != len(digest or "")
+                ):
+                    raise ReleaseError("regional registry credential identity differs")
+                item[field] = digest
+            durable.append(RegionalClusterRegistration.model_validate(item))
+        if (
+            len(durable) != len(by_id)
+            or {item.cluster_id: item.lifecycle_state for item in durable}
+            != status.cluster_states
+            or regional_registry_content_sha256(durable) != status.content_sha256
+            or regional_registry_config_sha256(durable)
+            != regional_registry_config_sha256(configured)
+        ):
+            raise ReleaseError("regional registry snapshot identity differs")
+        observed = datetime.now(timezone.utc)
+        for registration in durable:
+            if registration.cluster_id not in overrides:
+                continue
+            desired = RegionalClusterLifecycle(overrides[registration.cluster_id])
+            if (
+                desired is RegionalClusterLifecycle.DRAINING
+                and registration.lifecycle_state
+                not in {
+                    RegionalClusterLifecycle.ACTIVE,
+                    RegionalClusterLifecycle.DRAINING,
+                }
+            ):
+                raise ReleaseError(
+                    "regional registry cluster is not active or draining"
+                )
+            if registration.lifecycle_state != desired:
+                registration.lifecycle_state = desired
+                registration.updated_at = observed
+        return RegionalRegistryPublishRequest(
+            expected_generation=status.generation,
+            registrations=durable,
+            reason=reason,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseError("regional registry lifecycle evidence is invalid") from None
 
 
 def publish_staged_registry(release: Any) -> dict[str, Any]:
@@ -265,60 +386,49 @@ def activate_join_registry(release: Any, cluster_id: str) -> None:
     )
 
 
-def _transition_or_warn(
-    release: Any, cluster_id: str, lifecycle_state: str, *, reason: str
-) -> None:
-    """A failed join's terminal transitions are best effort.
-
-    The entry may be absent (the release failed before PENDING) or carry an
-    earlier attempt's token digest, which the API refuses on identity; the
-    purge that follows settles the registry either way.
-    """
-
-    try:
-        transition_join_registry(release, cluster_id, lifecycle_state, reason=reason)
-    except ReleaseError as exc:
-        print(
-            f"{cluster_id}: registry {lifecycle_state} transition skipped: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
 def fail_join_registry(release: Any, cluster_id: str) -> None:
-    _transition_or_warn(
+    transition_join_registry(
         release, cluster_id, "FAILED", reason=f"join {cluster_id} failed"
     )
 
 
 def rollback_join_registry(release: Any, cluster_id: str) -> None:
-    _transition_or_warn(
+    transition_join_registry(
         release, cluster_id, "ROLLED_BACK", reason=f"join {cluster_id} rolled back"
     )
 
 
 def purge_failed_join(release: Any, target: Any) -> None:
-    """Leave nothing of a rolled-back join a later attempt could collide with.
-
-    Live 2026-09-12: a PENDING entry from an earlier attempt (its own token
-    digest) made every retry's PENDING transition fail on identity. The Secret
-    entry goes, and the published revision follows the Secret.
-    """
+    """Purge only after the identity-bound rollback transition succeeds."""
 
     rollback_join_registry(release, target.cluster_id)
     release._update_registry(target, remove=True)
     purge_registry_cluster(release, target.cluster_id)
 
 
-def drain_registry_cluster(release: Any, cluster_id: str) -> None:
-    release._target(cluster_id)
+def drain_registry_clusters(release: Any, cluster_ids: Sequence[str]) -> None:
+    """Drain every selected cluster in one CAS-protected, fleet-ACKed revision."""
+
+    if isinstance(cluster_ids, (str, bytes)) or any(
+        not isinstance(item, str) or not item.strip() for item in cluster_ids
+    ):
+        raise ReleaseError("cluster IDs must be non-empty strings")
+    ordered = list(dict.fromkeys(cluster_ids))
+    if not ordered:
+        raise ReleaseError("--cluster-id is required")
+    for cluster_id in ordered:
+        release._target(cluster_id)
     if not release._remote_commands_are_idle():
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     publish_current_registry(
         release,
-        reason=f"remove {cluster_id} draining",
-        lifecycle_overrides={cluster_id: "DRAINING"},
+        reason=f"remove {', '.join(ordered)} draining",
+        lifecycle_overrides={cluster_id: "DRAINING" for cluster_id in ordered},
     )
+
+
+def drain_registry_cluster(release: Any, cluster_id: str) -> None:
+    drain_registry_clusters(release, [cluster_id])
 
 
 def revoke_registry_cluster(release: Any, cluster_id: str) -> None:

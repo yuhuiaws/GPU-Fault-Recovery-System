@@ -21,19 +21,15 @@ from gpu_fault.collectors import (
     FabricManagerLogCollector,
     HostTelemetryCollector,
     KernelLogCollector,
-    KubernetesHmaNodeCollector,
     KubernetesNodeResourceCollector,
     NodeLogCollector,
     NvidiaSmiMetricsCollector,
-    SqsHmaConsumer,
     TrainingProgressCollector,
 )
 
 COMMANDS = (
     "kernel",
-    "kubernetes-hma",
     "kubernetes-node-resources",
-    "sqs-hma",
     "dcgm",
     "nvidia-smi",
     "host",
@@ -60,7 +56,6 @@ def node_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         "GPU_FAULT_REQUIRED_INTERFACES",
         "GPU_FAULT_TRAINING_LOG_PATHS",
         "GPU_FAULT_FABRIC_MANAGER_LOG_PATHS",
-        "GPU_FAULT_HMA_QUEUE_URL",
         "RANK",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -87,6 +82,13 @@ def test_parser_registers_every_collector_command(command: str) -> None:
     arguments = collectors_cli.parser().parse_args([command])
 
     assert arguments.command == command
+
+
+@pytest.mark.parametrize("command", ["kubernetes-hma", "sqs-hma"])
+def test_retired_commands_are_not_available(command: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        collectors_cli.parser().parse_args([command])
+    assert error.value.code == 2
 
 
 def test_kernel(monkeypatch: pytest.MonkeyPatch, node_environment: Path) -> None:
@@ -306,17 +308,6 @@ def test_training_progress_requires_attempt_and_rank(
         _run_cli(monkeypatch, TrainingProgressCollector, ["training-progress"])
 
 
-def test_kubernetes_hma(
-    monkeypatch: pytest.MonkeyPatch, node_environment: Path
-) -> None:
-    collector = _run_cli(monkeypatch, KubernetesHmaNodeCollector, ["kubernetes-hma"])
-
-    assert isinstance(collector, KubernetesHmaNodeCollector), (
-        "the CLI must build the collector type its registry row names"
-    )
-    assert collector.context.cluster_id == "cluster-a"
-
-
 def test_kubernetes_node_resources(
     monkeypatch: pytest.MonkeyPatch, node_environment: Path
 ) -> None:
@@ -337,27 +328,6 @@ def test_kubernetes_node_resources(
     assert collector.required_consecutive_samples == 4
     assert collector.health_summary_seconds == 60
     assert collector.list_page_size == 50
-
-
-def test_sqs_hma(monkeypatch: pytest.MonkeyPatch, node_environment: Path) -> None:
-    monkeypatch.setenv(
-        "GPU_FAULT_HMA_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/1/hma"
-    )
-    monkeypatch.delenv("GPU_FAULT_CLUSTER_ID")
-
-    collector = _run_cli(monkeypatch, SqsHmaConsumer, ["sqs-hma"])
-
-    assert isinstance(collector, SqsHmaConsumer), (
-        "the CLI must build the collector type its registry row names"
-    )
-    assert collector.queue_url == "https://sqs.us-east-1.amazonaws.com/1/hma"
-
-
-def test_sqs_hma_requires_a_queue_url(
-    monkeypatch: pytest.MonkeyPatch, node_environment: Path
-) -> None:
-    with pytest.raises(SystemExit, match="GPU_FAULT_HMA_QUEUE_URL"):
-        _run_cli(monkeypatch, SqsHmaConsumer, ["sqs-hma"])
 
 
 def test_outbox_path_defaults_to_the_command_name(

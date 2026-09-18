@@ -57,6 +57,8 @@ install -d -m 0755 \
     "${ROOT}/dist" \
     "${ROOT}/requirements"
 install -m 0755 "${SCRIPT_DIR}"/*.sh "${ROOT}/deploy/node/"
+install -m 0644 "${SCRIPT_DIR}/runtime_integrity.py" "${ROOT}/deploy/node/"
+install -m 0644 "${SCRIPT_DIR}/provision_node_action_keys.py" "${ROOT}/deploy/node/"
 # The node installer installs the dependency closure with
 # `pip install --require-hashes -r requirements/node-runtime.lock`, so the
 # narrow node-runtime hash lock ships inside the bundle next to the wheel.
@@ -64,6 +66,8 @@ install -m 0755 "${SCRIPT_DIR}"/*.sh "${ROOT}/deploy/node/"
 # the broad control-plane runtime.lock.
 install -m 0644 "${REPO_DIR}/requirements/node-runtime.lock" \
     "${ROOT}/requirements/node-runtime.lock"
+install -m 0644 "${REPO_DIR}/requirements/node-tools.lock" \
+    "${ROOT}/requirements/node-tools.lock"
 install -m 0755 \
     "${REPO_DIR}/deploy/control-plane/tools/sync_installed_resource_registry.py" \
     "${ROOT}/deploy/control-plane/tools/"

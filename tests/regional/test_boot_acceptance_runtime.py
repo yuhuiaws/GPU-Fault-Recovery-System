@@ -186,6 +186,7 @@ class _Fixture:
     ) -> None:
         self.regional = regional
         self.cluster_id = "cluster-a"
+        self.config = {"runtime_profile": {"version": "profile-a"}}
         self.exec_error = exec_error
         self.exec_calls = 0
 
@@ -262,9 +263,9 @@ def test_boot015_cleanup_records_each_step_and_verifies_deletion_by_listing(
     assert cleanup["synthetic_command_removed"] is True
     assert cleanup["commands_introduced"] == []
     assert cleanup["readiness_recovered"] == {"executor-a": True}
-    # AMP staleness is observed, not a verdict.
+    # A removed command does not by itself prove the alert has resolved.
     assert cleanup["resolve_observed"] == {"matched": False, "timeline": []}
-    assert cleanup["passed"] is True
+    assert cleanup["passed"] is False
     assert fixture.exec_calls == 1, "readiness ran although the delete step failed"
 
 
@@ -301,7 +302,9 @@ def test_boot015_writes_details_and_cleans_up_when_a_probe_raises(
     )
     regional = _Regional(
         {
-            "PROFILE_OWNER_PROBE": {"profiles": []},
+            "PROFILE_OWNER_PROBE": {
+                "profiles": [{"profile_version": "profile-a", "orphan_owners": []}]
+            },
             "REMOTE_BASELINE_PROBE": {"ids": [], "count": 0},
             "REMOTE_INJECT_PROBE": {"command_id": "x", "status": "PENDING"},
             "REMOTE_DELETE_PROBE": {"remaining": 0},
@@ -321,9 +324,10 @@ def test_boot015_writes_details_and_cleans_up_when_a_probe_raises(
         "REMOTE_INJECT_PROBE"
     ), "the injected command is deleted even though the case body raised"
     assert details["cleanup"]["synthetic_command_removed"] is True
-    assert any("observed, not required" in item for item in details["limitations"]), (
-        "the limitations say the alert is observed, not required"
-    )
+    assert any(
+        "requires bounded AMP alert resolution" in item
+        for item in details["limitations"]
+    ), "cleanup must require alert resolution"
 
 
 def test_boot015_metric_gap_is_short_and_windows_are_named() -> None:

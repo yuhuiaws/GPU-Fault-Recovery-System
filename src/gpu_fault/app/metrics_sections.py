@@ -619,7 +619,7 @@ def render_runtime_metrics_two(
     scan_cache=None,
 ):
     for path in sorted(processor_queue_bypass_paths):
-        escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_path = _metrics_label_value(path)
         lines.append(
             "gpu_fault_processor_queue_bypass_total"
             f'{{path="{escaped_path}"}} '
@@ -926,7 +926,7 @@ def render_spool_metrics_two(
         ]
     )
     for path in sorted(telemetry_spool_admitted_by_path):
-        escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_path = _metrics_label_value(path)
         lines.append(
             "gpu_fault_telemetry_spool_admitted_by_path_total"
             f'{{path="{escaped_path}"}} '
@@ -1309,13 +1309,13 @@ def render_runtime_metrics_details(
             f'{{scope="{scope}"}} {count}'
         )
     for path, count in sorted(processor_admission_rejections_by_path.items()):
-        escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_path = _metrics_label_value(path)
         lines.append(
             "gpu_fault_processor_admission_rejections_by_path_total"
             f'{{path="{escaped_path}"}} {count}'
         )
     for path, count in sorted(runtime["stale_superseded_by_path"].items()):
-        escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_path = _metrics_label_value(path)
         lines.append(
             "gpu_fault_processor_stale_superseded_by_path_total"
             f'{{path="{escaped_path}"}} {count}'

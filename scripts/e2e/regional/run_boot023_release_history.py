@@ -47,9 +47,11 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    details_sha256,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python,
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -151,6 +153,26 @@ def cpu_runtime_deployments(modules: dict[str, Any]) -> tuple[str, ...]:
 def release_for(settings: Settings, modules: dict[str, Any], *, dry_run: bool) -> Any:
     rollout = modules["rollout_regional_release"]
     config = modules["regional_release_config"].ReleaseConfig.load(settings.noop_config)
+    target = settings.regional
+    if (
+        Path(config.cpu_kubeconfig).resolve() != target.cpu_kubeconfig.resolve()
+        or config.namespace != target.namespace
+        or config.aws_region != target.region
+        or len(config.clusters) != 1
+        or config.clusters[0].cluster_id != target.cluster_id
+        or config.clusters[0].context != target.gpu_context
+    ):
+        raise RegionalFixtureError(
+            "NOOP release config does not match the approved target"
+        )
+    gpu_kubeconfig = os.getenv("KUBECONFIG", "")
+    if (
+        not gpu_kubeconfig
+        or Path(gpu_kubeconfig).resolve() != target.gpu_kubeconfig.resolve()
+    ):
+        raise RegionalFixtureError(
+            "release GPU kubeconfig differs from the approved target"
+        )
     return rollout.RegionalRelease(config, rollout.Runner(dry_run=dry_run))
 
 
@@ -257,7 +279,7 @@ def registry_probes(
                 "-i",
                 name,
                 "--",
-                "python3",
+                component_python("cpu"),
                 "-",
                 str(pod_http_port(regional, name)),
                 input_text=script,
@@ -339,6 +361,20 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
 
 def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
     classification = preflight["classification"]
+    registry_identity = [
+        {
+            key: item.get(key)
+            for key in (
+                "pod",
+                "app",
+                "secret_config_sha256",
+                "durable_config_sha256",
+                "head_generation",
+                "head_content_sha256",
+            )
+        }
+        for item in preflight["registry_probes"]
+    ]
     return {
         "release_id": preflight["release_id"],
         "classification": classification["kind"],
@@ -350,6 +386,14 @@ def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
                 int(item.get("head_generation") or 0)
                 for item in preflight["registry_probes"]
             }
+        ),
+        "history_sha256": details_sha256({"entries": preflight["history"]}),
+        "snapshot_groups_sha256": details_sha256(
+            {"groups": preflight["snapshot_groups"]}
+        ),
+        "registry_identity_sha256": details_sha256({"probes": registry_identity}),
+        "runtime_identity_sha256": details_sha256(
+            preflight.get("runtime_identity") or {}
         ),
     }
 
@@ -416,7 +460,9 @@ def run_noop_release(
         changed=frozenset(classification["changed"]),
     )
     started = datetime.now(timezone.utc)
-    release.noop(diff)
+    # Older engines reject this keyword before entering noop. Never fall back
+    # to the general NOOP path, which can repair GPU watcher state and RBAC.
+    release.noop(diff, allow_prerequisite_repair=False)
     mirror = history_dir / verdicts.HISTORY_MIRROR_FILE
     return {
         "started_at": started.isoformat(),
@@ -435,11 +481,19 @@ def execute_case(
     attempt: int,
     maintenance_window_end: datetime,
 ) -> int:
-    """Drive the live case. Not exercised by the unit suite; the verdicts it
-    calls are."""
+    """Drive the guarded case and verify its final runtime identity."""
 
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        case_dir / f"{CASE_ID}.json",
+        {
+            "case_id": CASE_ID,
+            "attempt": attempt,
+            "verdict": "FAIL",
+            "stage": "preflight",
+        },
+    )
     preflight = read_only_preflight(settings, case_dir)
     if preflight["errors"]:
         raise RegionalFixtureError(
@@ -451,13 +505,18 @@ def execute_case(
     deployments = cpu_runtime_deployments(modules)
     release_id = str(preflight["release_id"])
     result: dict[str, Any] = {
+        "schema_version": 2,
+        "report_type": "fault-acceptance",
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
         "release_id": release_id,
+        "cluster_id": settings.regional.cluster_id,
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     errors: list[str] = []
+    interrupted: BaseException | None = None
+    previous_history_dir = os.environ.get(HISTORY_DIR_ENV)
     try:
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError("approved maintenance window has ended")
@@ -501,8 +560,10 @@ def execute_case(
                 "rollback_flag_rejection": rejection,
             }
         )
-    except Exception as exc:  # noqa: BLE001 - recorded as the case error
+    except BaseException as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, Exception):
+            interrupted = exc
     finally:
         cleanup: dict[str, Any] = {"errors": []}
         try:
@@ -517,14 +578,21 @@ def execute_case(
                 stage=f"after {CASE_ID} release",
                 mutable_state_fields=("updated_at_epoch",),
             )
-        except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
+        except BaseException as exc:
             cleanup["errors"].append(f"runtime_identity: {type(exc).__name__}: {exc}")
-        os.environ.pop(HISTORY_DIR_ENV, None)
+            if not isinstance(exc, Exception) and interrupted is None:
+                interrupted = exc
+        if previous_history_dir is None:
+            os.environ.pop(HISTORY_DIR_ENV, None)
+        else:
+            os.environ[HISTORY_DIR_ENV] = previous_history_dir
         result["cleanup"] = cleanup
         if cleanup["errors"]:
             result["verdict"] = "FAIL"
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
+    if interrupted is not None:
+        raise interrupted
     return 0 if result["verdict"] == "PASS" else 1
 
 

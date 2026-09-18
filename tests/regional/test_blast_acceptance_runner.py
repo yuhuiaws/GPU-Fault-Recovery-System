@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -15,8 +17,14 @@ from scripts.e2e.regional import blast_acceptance_cases_2 as cases_2
 from scripts.e2e.regional import run_blast_acceptance as entry
 from scripts.e2e.regional.blast_acceptance_cases_1 import BlastCasesOne
 from scripts.e2e.regional.blast_acceptance_cases_2 import BlastCasesTwo
+from tests.regional._blast_containment_support import produce_containment
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def local_source_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "source_digest", lambda: "a" * 64)
 
 
 def _runner(
@@ -25,34 +33,50 @@ def _runner(
     case_id: str = "GF-REGIONAL-BLAST-002",
     cls: type[BlastCasesTwo] | type[BlastCasesOne] = BlastCasesTwo,
 ) -> Any:
-    """A runner with the live-site constructor bypassed."""
+    """Initialize the real runner against an isolated, already parsed site."""
 
-    runner = cls.__new__(cls)
-    runner.site_path = tmp_path / "site.yaml"
-    runner.root_run_dir = tmp_path / "run"
-    runner.case_id = case_id
-    runner.run_dir = runner.root_run_dir / "cases" / case_id
-    runner.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    runner.e2e_dir = runner.root_run_dir / "cases" / base.E2E001_CASE_ID
-    runner.trusted_cpu_baseline = runner.e2e_dir / base.E2E001_CPU_NODES_BEFORE
-    runner.predecessor = {"valid": True}
-    runner.preflight_reuse_seconds = base.PREFLIGHT_REUSE_SECONDS
+    site_path = tmp_path / "site.yaml"
+    site_path.write_text("test site", encoding="ascii")
+    run_dir = tmp_path / "run"
+    e2e_dir = run_dir / "cases" / base.E2E001_CASE_ID
+    for plane in ("cpu", "gpu"):
+        (tmp_path / f"{plane}.kubeconfig").write_text(
+            f"{plane} connection fixture", encoding="ascii"
+        )
+    site = SimpleNamespace(
+        source_sha256=base.sha256_bytes(site_path.read_bytes()),
+        environment={},
+        release_config={
+            "namespace": "gpu-fault-system",
+            "aws_region": "us-west-2",
+            "cpu_kubeconfig": str(tmp_path / "cpu.kubeconfig"),
+            "gpu_kubeconfig": str(tmp_path / "gpu.kubeconfig"),
+            "cpu_eks_arn": "arn:aws:eks:us-west-2:000000000000:cluster/cpu",
+            "clusters": [
+                {
+                    "cluster_id": "cluster-a",
+                    "context": "ctx-a",
+                    "hyperpod_cluster_name": "hp-a",
+                    "eks_cluster_arn": "arn:aws:eks:us-west-2:000000000000:cluster/gpu-a",
+                    "executor_irsa_role_arn": "arn:aws:iam::000000000000:role/executor-a",
+                }
+            ],
+        },
+    )
+    with patch.object(base, "load_site", return_value=site):
+        runner = cls(
+            site_path=site_path,
+            run_dir=run_dir,
+            case_id=case_id,
+            e2e_dir=e2e_dir,
+            trusted_cpu_baseline=e2e_dir / base.E2E001_CPU_NODES_BEFORE,
+            predecessor={"valid": True},
+        )
     # The release-state read is a live call; every case result is bound to it.
     runner.evidence_identity = lambda: {
         "release_id": "release-1",
         "cluster_id": "cluster-a",
     }
-    runner.namespace = "gpu-fault-system"
-    runner.targets = [
-        base.ClusterTarget(
-            cluster_id="cluster-a",
-            context="ctx-a",
-            hyperpod_cluster_name="hp-a",
-            eks_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/gpu-a",
-            executor_role_arn="arn:aws:iam::000000000000:role/executor-a",
-        )
-    ]
-    runner.case_statuses = []
     return runner
 
 
@@ -149,6 +173,7 @@ def test_preflight_is_reused_within_the_window_for_the_same_site(
         "captured_at": base.utc_now(),
         "site": str(runner.site_path),
         "gpu_clusters": [{"cluster_id": "cluster-a"}],
+        "binding": runner.preflight_binding(),
     }
     base.write_json(cache, scope)
 
@@ -224,7 +249,13 @@ def test_expected_executor_role_refuses_a_manifest_without_the_role(
 
 
 def _node(name: str, managed_fields: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"metadata": {"name": name, "managedFields": managed_fields}}
+    return {
+        "metadata": {
+            "name": name,
+            "uid": name + "-uid",
+            "managedFields": managed_fields,
+        }
+    }
 
 
 def test_managed_field_writes_ignore_entries_already_in_the_baseline() -> None:
@@ -267,17 +298,37 @@ def test_managed_field_writes_ignore_entries_already_in_the_baseline() -> None:
 
 
 def _e2e001_handoff(e2e_dir: Path, nodes: dict[str, Any]) -> None:
-    """The files E2E-001 leaves for BLAST-001, in the shape ``run_e2e001`` writes.
-
-    ``run_e2e001`` writes the execution card and ``control-plane-current.json``
-    inline at the end of a live run; the shape here mirrors that write.
-    """
-
     e2e_dir.mkdir(parents=True)
+    state_path = e2e_dir / base.E2E001_CONTROL_PLANE_STATE
+    baseline_path = e2e_dir / base.E2E001_CPU_NODES_BEFORE
+    base.write_json(
+        state_path,
+        {
+            "workflows": [
+                {
+                    "status": "SUCCEEDED",
+                    "step_executions": [
+                        {"operation": operation, "status": "SUCCEEDED"}
+                        for operation in (
+                            "FREEZE_EVIDENCE",
+                            "STOP_WORKLOADS",
+                            "RESTART_WORKLOAD",
+                        )
+                    ],
+                }
+            ]
+        },
+    )
+    base.write_json(baseline_path, nodes)
     base.write_json(
         e2e_dir / base.E2E001_EXECUTION_CARD,
         {
             "case_id": base.E2E001_CASE_ID,
+            "verdict": "PASS",
+            "cleanup_complete": True,
+            "release_id": "release-1",
+            "baseline_sha256": base.sha256_bytes(baseline_path.read_bytes()),
+            "state_sha256": base.sha256_bytes(state_path.read_bytes()),
             "maintenance_window": {
                 "start": "2026-09-07T10:00:00+00:00",
                 "end": "2026-09-07T11:00:00+00:00",
@@ -288,36 +339,27 @@ def _e2e001_handoff(e2e_dir: Path, nodes: dict[str, Any]) -> None:
             "attempt_id": "job-a-a001",
         },
     )
-    base.write_json(
-        e2e_dir / base.E2E001_CONTROL_PLANE_STATE,
-        {
-            "workflows": [
-                {
-                    "official_steps": [
-                        {"operation": "MARK_UNSCHEDULABLE"},
-                        {"operation": "STOP_WORKLOADS"},
-                    ],
-                    "safety_steps": [{"operation": "FREEZE_EVIDENCE"}],
-                    "step_executions": [{"operation": "RESTART_WORKLOAD"}],
-                }
-            ]
-        },
-    )
-    base.write_json(e2e_dir / base.E2E001_CPU_NODES_BEFORE, nodes)
 
 
-def _blast001_run(tmp_path: Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+def _blast001_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     """Run BLAST-001 against a quiet fake CPU cluster; return runner, evidence, analysis."""
 
     runner = _runner(tmp_path, case_id="GF-REGIONAL-BLAST-001", cls=BlastCasesOne)
     nodes = {"items": [_node("cpu-1", [])]}
     _e2e001_handoff(runner.e2e_dir, nodes)
+    runner.predecessor = produce_containment(monkeypatch, runner.root_run_dir, nodes)
     listings = {
         ("get", "nodes", "-o", "json"): nodes,
         ("get", "jobs", "-A", "-o", "json"): {"items": []},
         ("get", "events", "-A", "-o", "json"): {"items": []},
     }
     runner.cpu_json = lambda *args: listings[args]
+    runner.evidence_identity = lambda: {
+        "release_id": "release-1",
+        "cluster_id": "cluster-a",
+    }
 
     runner.blast_001()
 
@@ -331,7 +373,7 @@ def _blast001_run(tmp_path: Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
 
 
 def test_blast001_reads_the_window_and_the_workflow_steps_e2e001_hands_over(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BLAST-001 consumes ``maintenance_window.start/end`` and ``workflows[]`` steps.
 
@@ -340,12 +382,13 @@ def test_blast001_reads_the_window_and_the_workflow_steps_e2e001_hands_over(
     the handoff fixture mirrors from that write.
     """
 
-    _runner_, evidence, analysis = _blast001_run(tmp_path)
+    _runner_, evidence, analysis = _blast001_run(tmp_path, monkeypatch)
 
     assert evidence["verdict"] == "PASS", evidence
     assert analysis["e2e_window_start"] == "2026-09-07T10:00:00+00:00"
     assert analysis["e2e_window_end"] == "2026-09-07T11:00:00+00:00"
-    # Steps are gathered from all three step groups of the handed-over workflow.
+    assert "MARK_UNSCHEDULABLE" not in analysis["workload_operations"]
+    assert analysis["containment_source"]["case_id"] == base.CONTAINMENT_CASE_ID
     assert analysis["workflow_operations"] == [
         "FREEZE_EVIDENCE",
         "MARK_UNSCHEDULABLE",
@@ -356,9 +399,9 @@ def test_blast001_reads_the_window_and_the_workflow_steps_e2e001_hands_over(
 
 
 def test_blast001_limitation_names_the_before_snapshot_it_compares_against(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner, evidence, analysis = _blast001_run(tmp_path)
+    runner, evidence, analysis = _blast001_run(tmp_path, monkeypatch)
 
     assert analysis["trusted_baseline"] == str(runner.trusted_cpu_baseline)
     assert evidence["checks"]["cpu_nodes_identical_to_trusted_baseline"] is True

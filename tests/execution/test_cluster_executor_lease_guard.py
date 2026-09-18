@@ -21,10 +21,12 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
+from threading import Event
 from typing import Any
 
 import pytest
 
+from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
 from gpu_fault.cluster_executor import (
     ClusterActionExecutor,
@@ -92,6 +94,8 @@ class GatedAdapter(RecordingAdapter):
         self.hold_reasons: list[str | None] = []
 
     def execute(self, context: Any) -> WorkflowStepOutcome:
+        if "started" in self.gate:
+            self.gate["started"].set()
         deadline = time.monotonic() + 5
         while not self.gate["ready"]() and time.monotonic() < deadline:
             time.sleep(0.005)
@@ -132,7 +136,9 @@ def test_consecutive_renewal_failures_release_the_command_locally(monkeypatch) -
         [remote_command("command-a")],
         renew_error=ClusterExecutorError("stale lease token", status_code=409),
     )
-    gate: dict[str, Any] = {"ready": lambda: False}
+    started = Event()
+    client.renewal_gate = started
+    gate: dict[str, Any] = {"ready": lambda: False, "started": started}
     adapter = GatedAdapter(gate)
     executor = build_executor(client, [adapter], lease_renewal_failure_limit=1)
     gate["ready"] = lambda: executor.lease_lost_total >= 1
@@ -143,6 +149,7 @@ def test_consecutive_renewal_failures_release_the_command_locally(monkeypatch) -
     assert executor.lease_renewal_failures == 1
     assert executor.lease_lost_total == 1
     assert executor.results_withheld_total == 1
+    assert len(adapter.contexts) == 1, "the fixture must enter before the injected loss"
     assert adapter.hold_reasons[0] is not None
     assert "renewal" in adapter.hold_reasons[0]
     assert executor.last_cycle_advanced is False
@@ -152,7 +159,9 @@ def test_one_renewal_failure_below_the_limit_still_reports(monkeypatch) -> None:
     stop_events(monkeypatch)
     client = FakeExecutorClient(
         [remote_command("command-a")],
-        renew_error=ClusterExecutorError("stale lease token", status_code=409),
+        renew_error=ClusterExecutorError(
+            "temporary store unavailability", status_code=503
+        ),
     )
     gate: dict[str, Any] = {"ready": lambda: False}
     adapter = GatedAdapter(gate)
@@ -199,7 +208,7 @@ def test_a_locally_expired_lease_withholds_the_result(monkeypatch) -> None:
     assert executor.results_withheld_total == 1
 
 
-def test_cancellation_in_the_renew_response_is_seen_and_still_reported(
+def test_cancellation_in_preexecution_renewal_is_seen_without_starting_an_adapter(
     monkeypatch,
 ) -> None:
     stop_events(monkeypatch)
@@ -212,10 +221,8 @@ def test_cancellation_in_the_renew_response_is_seen_and_still_reported(
     executor.run_once()
 
     assert executor.cancellations_observed_total == 1
-    assert adapter.hold_reasons[0] is not None
-    assert "superseded" in adapter.hold_reasons[0]
-    assert client.reported("command-a").status is RemoteCommandStatus.SUCCEEDED
-    assert executor.results_withheld_total == 0
+    assert adapter.contexts == [] and client.completed == []
+    assert executor.results_withheld_total == 1
 
 
 def test_the_failure_limit_is_validated_and_read_from_the_environment(
@@ -230,8 +237,9 @@ def test_the_failure_limit_is_validated_and_read_from_the_environment(
     monkeypatch.delenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", raising=False)
     monkeypatch.delenv("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", raising=False)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
+        core = None
 
         def __init__(self, **_kwargs: Any) -> None:
             pass
@@ -306,8 +314,9 @@ def test_regional_wiring_either_coordinates_or_refuses_barrier_operations(
     monkeypatch.delenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", raising=False)
     monkeypatch.delenv("GPU_FAULT_NODE_AGENT_ENDPOINTS", raising=False)
 
-    class FakeKubernetesAdapter:
+    class FakeKubernetesAdapter(KubernetesWorkflowAdapter):
         owner = "gpu-fault-kubernetes-adapter"
+        core = None
 
         def __init__(self, **_kwargs: Any) -> None:
             pass

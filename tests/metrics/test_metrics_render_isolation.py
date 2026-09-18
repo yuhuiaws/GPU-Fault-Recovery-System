@@ -428,11 +428,15 @@ def test_a_failed_refresh_run_withholds_the_success_age(tmp_path, monkeypatch) -
     )
 
 
-def test_aurora_refresh_metrics_are_absent_without_a_status_file(
+def test_configured_aurora_refresh_without_a_status_file_is_unknown(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("GPU_FAULT_STORE_URL_FILE", str(tmp_path / "postgres-url"))
-    assert aurora_credential_refresh_metric_lines(SimpleNamespace()) == []
+    missing = aurora_credential_refresh_metric_lines(SimpleNamespace())
+    assert "gpu_fault_aurora_credential_refresh_status_unreadable 1" in missing
+    assert not any(line.startswith(AGE + " ") for line in missing), (
+        "a missing configured status file must not publish a success age"
+    )
 
     _status_file(tmp_path, monkeypatch, "{not json")
     lines = aurora_credential_refresh_metric_lines(SimpleNamespace())

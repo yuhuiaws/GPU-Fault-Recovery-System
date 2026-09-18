@@ -26,8 +26,10 @@ from gpu_fault.store.postgres.index_builder import (
     index_health,
     schema_preflight,
 )
+from tests.regional import test_bootstrap_store_proof_postgres as bootstrap_proof
 from tests.store._postgres_processor_claim_support import _truncate
 
+empty_database = bootstrap_proof.database
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
@@ -39,8 +41,8 @@ PROBE_INDEX = "gpu_fault_processor_queue_priority_claim"
 def connection():
     psycopg = pytest.importorskip("psycopg")
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()  # schema present
     _truncate()
+    PostgresStore(POSTGRES_URL).close()  # schema present
     with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
         yield conn
         # Leave the schema whole for the next test.
@@ -73,6 +75,64 @@ def test_a_missing_index_is_reported_then_built_online(connection):
     assert after[PROBE_INDEX] == {"name": PROBE_INDEX, "present": True, "valid": True}
     # Second run is a no-op.
     assert build_missing_indexes_concurrently(connection)["built"] == []
+
+
+def test_empty_database_defers_indexes_until_schema_ensure(empty_database: str) -> None:
+    import psycopg
+
+    with psycopg.connect(empty_database, autocommit=True) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM pg_tables WHERE schemaname='public'"
+        ).fetchone() == (0,), "the regression requires a genuinely empty database"
+
+        report = build_missing_indexes_concurrently(connection)
+
+        assert report["built"] == report["dropped_invalid"] == []
+        assert report["missing_after"] == report["invalid_after"] == []
+        assert sorted(report["awaiting_table"]) == sorted(declared_index_statements())
+        assert report["deferred_until_schema"] == report["awaiting_table"]
+        assert connection.execute(
+            "SELECT count(*) FROM pg_tables WHERE schemaname='public'"
+        ).fetchone() == (0,), "the online builder must not create application tables"
+
+    PostgresStore(empty_database, pool_min_size=1, pool_max_size=1).close()
+    with psycopg.connect(empty_database, autocommit=True) as connection:
+        complete = build_missing_indexes_concurrently(connection)
+        assert complete["built"] == complete["awaiting_table"] == []
+        assert complete["deferred_until_schema"] == complete["missing_after"] == []
+        assert all(row["present"] and row["valid"] for row in index_health(connection))
+
+
+def test_online_build_refuses_an_active_transaction(connection):
+    with connection.transaction():
+        with pytest.raises(RuntimeError, match="idle autocommit"):
+            build_missing_indexes_concurrently(connection)
+
+
+def test_a_failed_online_build_releases_its_maintenance_lock(connection, monkeypatch):
+    import psycopg
+
+    from gpu_fault.store.postgres import index_builder
+
+    def failed_inventory(_connection):
+        raise RuntimeError("index inventory unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(index_builder, "index_health", failed_inventory)
+        with pytest.raises(RuntimeError, match="inventory unavailable"):
+            build_missing_indexes_concurrently(connection)
+    assert POSTGRES_URL is not None
+    with psycopg.connect(POSTGRES_URL, autocommit=True) as other:
+        acquired = other.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended('gpu_fault_schema_bootstrap', 0))"
+        ).fetchone()[0]
+        try:
+            assert acquired is True, "a failed build leaked a session maintenance lock"
+        finally:
+            if acquired:
+                other.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended('gpu_fault_schema_bootstrap', 0))"
+                )
 
 
 def test_the_preflight_passes_on_a_ready_database_and_names_what_blocks(connection):

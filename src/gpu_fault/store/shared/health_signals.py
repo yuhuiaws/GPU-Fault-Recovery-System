@@ -7,7 +7,10 @@ for display only. A node clock that steps backwards is reported, not obeyed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
+import hashlib
+import json
 from typing import TYPE_CHECKING
 
 from gpu_fault.models import HealthSignalState
@@ -45,7 +48,10 @@ def sample_disposition(
 
 
 def latched_health_signal_state(
-    state: HealthSignalState | None, notified_at: datetime
+    state: HealthSignalState | None,
+    notified_at: datetime,
+    *,
+    semantic_fingerprint: str | None = None,
 ) -> HealthSignalState | None:
     """The state with its ``notified`` latch set, or None when there is nothing
     to latch (P0-38B).
@@ -60,7 +66,41 @@ def latched_health_signal_state(
         return None
     if state.active_since is not None and state.active_since > notified_at:
         return None
+    if state.semantic_fingerprint is not None or semantic_fingerprint is not None:
+        if (
+            semantic_fingerprint != state.semantic_fingerprint
+            or state.semantic_since is None
+            or not state.semantic_since <= notified_at <= previous_clock(state)
+        ):
+            return None
     return state.model_copy(update={"notified": True})
+
+
+def signal_semantic_fingerprints(
+    count: int, fingerprints: Sequence[str | None] | None
+) -> tuple[str | None, ...]:
+    """Validate the whole batch before any backend can persist a partial claim."""
+    if fingerprints is None:
+        return (None,) * count
+    values = tuple(fingerprints)
+    if len(values) != count or any(
+        value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 256)
+        for value in values
+    ):
+        raise ValueError("health signal semantics must match the claim batch")
+    return values
+
+
+def finding_health_signal_fingerprint(finding: NodeHealthFinding) -> str:
+    """Stable policy meaning; reading values, timestamps and prose are not identity."""
+    semantics = (
+        finding.recommended_action.value,
+        finding.severity.value,
+        finding.diagnostic_parameters.get("failure_mode"),
+    )
+    return hashlib.sha256(
+        json.dumps(semantics, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def finding_health_signal_key(finding: NodeHealthFinding) -> str:

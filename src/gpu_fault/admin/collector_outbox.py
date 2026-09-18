@@ -33,14 +33,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
+from gpu_fault.admin.execution import (
+    OVERALL_DEPLOY_SECONDS,
+    DeploymentDeadlineExceeded,
+    deadline_scope,
+)
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+)
 from gpu_fault.admin.operator_identity import resolve_operator_identity
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import run_control_plane_script
@@ -52,6 +62,7 @@ from gpu_fault.collectors.outbox_maintenance import (
     OUTBOX_COLLECTORS,
     OutboxMaintenanceRequest,
 )
+from gpu_fault.models import WorkflowStatus
 
 STATE_ROOT = "collector-outbox"
 OPERATION = "COLLECTOR_OUTBOX_MAINTENANCE"
@@ -214,7 +225,11 @@ class CollectorOutboxResult:
 
     @property
     def succeeded(self) -> bool:
-        return self.workflow_status == "SUCCEEDED"
+        return (
+            self.workflow_status == "SUCCEEDED"
+            and self.node_result is not None
+            and self.error is None
+        )
 
     def as_dict(self) -> dict[str, Any]:
         request = self.request
@@ -287,15 +302,39 @@ def wait_for_terminal(
     caller reads ``workflow.status`` to tell the two apart.
     """
 
+    if wait_seconds < 1:
+        raise BootstrapError("--wait-seconds must be at least 1")
     deadline = clock() + wait_seconds
-    while True:
-        document = read_workflow(site, workflow_request_id)
-        workflow = cast(dict[str, Any], document.get("workflow") or {})
-        if str(workflow.get("status")) in TERMINAL_WORKFLOW_STATUSES:
+    document: dict[str, Any] = {}
+    while (remaining := deadline - clock()) > 0:
+        try:
+            with deadline_scope(
+                "collector-outbox status", min(remaining, OVERALL_DEPLOY_SECONDS)
+            ):
+                candidate = read_workflow(site, workflow_request_id)
+        except (DeploymentDeadlineExceeded, subprocess.TimeoutExpired):
+            if clock() < deadline:
+                raise
             return document
         if clock() >= deadline:
             return document
-        sleep(POLL_INTERVAL_SECONDS)
+        workflow = candidate.get("workflow")
+        if (
+            not isinstance(workflow, dict)
+            or workflow.get("request_id") != workflow_request_id
+            or not isinstance(workflow.get("status"), str)
+            or workflow.get("status") not in WorkflowStatus.__members__
+        ):
+            raise BootstrapError(
+                "collector-outbox returned an invalid workflow identity or status"
+            )
+        document = candidate
+        if str(workflow.get("status")) in TERMINAL_WORKFLOW_STATUSES:
+            return document
+        remaining = deadline - clock()
+        if remaining > 0:
+            sleep(min(POLL_INTERVAL_SECONDS, remaining))
+    return document
 
 
 # --------------------------------------------------------------------------
@@ -396,7 +435,11 @@ def interpret(
             f"--wait-seconds or read GET /v1/workflows/{result.workflow_request_id}"
         )
         return result
-    if result.succeeded and isinstance(node_result, dict):
+    if (
+        result.workflow_status == "SUCCEEDED"
+        and isinstance(node_result, dict)
+        and node_result.get("action") == request.action
+    ):
         result.node_result = node_result
         result.message = _describe_result(request, node_result)
         return result
@@ -575,6 +618,8 @@ def run_collector_outbox_command(
         path=cast(str | None, arguments.path),
         wait_seconds=int(arguments.wait_seconds),
     )
-    result = run_collector_outbox(request)
+    with administrator_operation_lock(site.source.parent):
+        request = replace(request, site=reload_site_for_mutation(site))
+        result = run_collector_outbox(request)
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
     return 0 if result.succeeded else 1

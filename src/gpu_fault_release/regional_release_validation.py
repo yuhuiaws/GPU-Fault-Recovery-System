@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_images import previous_executor_image
+
 import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
+from gpu_fault_release.regional_aurora_credentials import read_aurora_refresh_cronjob
+from gpu_fault_release.regional_release_aurora_refresh import (
+    verify_aurora_refresh_snapshot,
+)
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
@@ -52,7 +60,7 @@ CPU_METRIC_PORTS = {
     "gpu-fault-telemetry-spool-worker": 8082,
 }
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
-MAX_VALIDATION_WORKERS = 8
+MAX_VALIDATION_WORKERS = DEPLOY_CONCURRENCY.read_only_checks
 
 
 def _fan_out_clusters(
@@ -203,21 +211,24 @@ def validate_release_components(
     runtime_validator: Callable[[Any], object] = validate_runtime_component_identity,
 ) -> None:
     checks: list[str] = []
+    tasks: list[Callable[[], object]] = []
     if cpu:
-        release.runner.run(
-            [
-                "python3",
-                str(
-                    ROOT
-                    / "deploy/control-plane/tools/verify_control_plane_role_split.py"
-                ),
-            ],
-            env={
-                **os.environ,
-                "KUBECONFIG": release.config.cpu_kubeconfig,
-                "GPU_FAULT_NAMESPACE": release.config.namespace,
-                "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
-            },
+        tasks.append(
+            lambda: release.runner.run(
+                [
+                    "python3",
+                    str(
+                        ROOT
+                        / "deploy/control-plane/tools/verify_control_plane_role_split.py"
+                    ),
+                ],
+                env={
+                    **os.environ,
+                    "KUBECONFIG": release.config.cpu_kubeconfig,
+                    "GPU_FAULT_NAMESPACE": release.config.namespace,
+                    "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
+                },
+            )
         )
         checks.append("control_plane_role_split")
     if data_plane:
@@ -239,18 +250,17 @@ def validate_release_components(
                 },
             )
 
-        _fan_out_clusters(
-            release,
-            verify_data_plane,
-            failure="data-plane executor verification",
+        tasks.extend(
+            partial(verify_data_plane, target) for target in release.config.clusters
         )
         checks.extend(
             f"data_plane_executor:{target.cluster_id}"
             for target in release.config.clusters
         )
     if cpu or data_plane:
-        runtime_validator(release)
+        tasks.append(lambda: runtime_validator(release))
         checks.append("runtime_component_identity")
+    _fan_out_values(release, tasks, lambda task: task())
     _write_quick_validation_evidence(release, checks=checks)
 
 
@@ -258,6 +268,12 @@ def validate_release_quick(
     release: Any,
     plan: ReleaseExecutionPlan,
 ) -> None:
+    if plan.has(ReleaseComponent.OBSERVABILITY) and release._observability_drift():
+        raise ReleaseError("observability remains out of date after its rollout")
+    if plan.has(ReleaseComponent.AURORA_REFRESH) and release._aurora_refresh_drift():
+        raise ReleaseError(
+            "Aurora credential refresher remains out of date after its rollout"
+        )
     validate_release_components(
         release,
         cpu=plan.has(
@@ -382,13 +398,18 @@ def store_io_rejection_series_ready(release: Any) -> dict[str, Any]:
     )
     for (deployment, pod), report in zip(probes, samples):
         key = f"{deployment}/{pod}"
+        if not isinstance(report, dict):
+            errors.append(f"{key} returned an invalid Store I/O metric report")
+            continue
         reports[key] = report
-        if not report.get("all_labeled"):
+        if report.get("complete") is not True:
+            errors.append(f"{key} has incomplete Store I/O metric coverage")
+        if report.get("all_labeled") is not True:
             errors.append(f"{key} has unlabeled Store I/O series")
-        if not report.get("all_zero"):
+        if report.get("all_zero") is not True:
             errors.append(f"{key} has nonzero Store I/O rejections")
     return {
-        "ready": not errors,
+        "ready": bool(reports) and not errors,
         "pods": reports,
         "errors": errors,
     }
@@ -1010,54 +1031,24 @@ def validate_cpu_rollback(
     )
     if _container_image(cpu, "spec", "template", "spec") != expected_runtime_image:
         raise ReleaseError("rollback CPU runtime image did not converge")
-    refresh_exists = release.runner.probe(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "cronjob",
-            "gpu-fault-aurora-credential-refresh",
-        ),
-    )
-    if refresh_exists:
-        refresh_image = _aurora_refresh_image(release)
-        if refresh_image != expected_runtime_image:
-            # `gpu-fault-admin deploy` installs the Aurora refresh CronJob as a
-            # bootstrap task, before it resumes a pending rollback, and does so
-            # with the *candidate* runtime image. A rollback resumed at the
-            # verify phase therefore finds the CronJob re-pointed after its own
-            # cpu-restore already set it back. Restoring is idempotent and is
-            # what the verify is asserting, so restore once, then judge.
-            release.runner.run(
-                release._cpu(
-                    "-n",
-                    release.config.namespace,
-                    "set",
-                    "image",
-                    "cronjob/gpu-fault-aurora-credential-refresh",
-                    f"refresh={expected_runtime_image}",
-                )
+    if previous.get("aurora_refresh") is not None:
+        verify_aurora_refresh_snapshot(release, previous["aurora_refresh"])
+    else:
+        refresh = read_aurora_refresh_cronjob(release)
+        if (
+            refresh is not None
+            and _container_image(
+                refresh, "spec", "jobTemplate", "spec", "template", "spec"
             )
-            refresh_image = _aurora_refresh_image(release)
-        if refresh_image != expected_runtime_image:
-            raise ReleaseError("rollback Aurora refresh image did not converge")
+            != expected_runtime_image
+        ):
+            raise ReleaseError(
+                "rollback Aurora refresh image did not converge; no full snapshot is available"
+            )
 
 
 # Internal callers and the rollback tests reach it by this name.
 _validate_cpu_rollback = validate_cpu_rollback
-
-
-def _aurora_refresh_image(release: Any) -> str | None:
-    refresh = release._get_json(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "cronjob",
-            "gpu-fault-aurora-credential-refresh",
-        )
-    )
-    return _container_image(refresh, "spec", "jobTemplate", "spec", "template", "spec")
 
 
 def validate_agent_rollback_target(
@@ -1292,6 +1283,8 @@ def validate_rollback(
 ) -> None:
     if release.runner.dry_run:
         return
+    if previous.get("aurora_refresh") is not None and not restore_cpu:
+        verify_aurora_refresh_snapshot(release, previous["aurora_refresh"])
     metadata = dict(previous.get("metadata") or {})
     current_metadata = release._config_map_data("gpu-fault-release-metadata")
     for key, expected in metadata.items():
@@ -1324,14 +1317,14 @@ def validate_rollback(
             },
         )
     if cluster_components is None:
-        _validate_gpu_rollback(release, previous, expected_runtime_image)
+        _validate_gpu_rollback(release, previous, previous_executor_image(previous))
         return
     _fan_out_clusters(
         release,
         lambda target: validate_gpu_rollback_target(
             release,
             previous,
-            expected_runtime_image,
+            previous_executor_image(previous),
             target,
             components=cluster_components[target.cluster_id],
         ),

@@ -40,7 +40,7 @@ CONTROL_PLANE_PATHS = [
 DEVICE_EVENT_PATHS = [
     "/v1/gpu-events/xid",
     "/v1/gpu-events/nvidia-kernel",
-    "/v1/provider-events/hyperpod-hma/health",
+    "/v1/gpu-events/sxid",
     "/v1/collector-events/nvidia-kernel",
     "/v1/collector-events/fabric-manager",
 ]

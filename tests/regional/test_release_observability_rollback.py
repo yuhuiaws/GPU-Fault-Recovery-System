@@ -44,7 +44,9 @@ def _live_object(kind: str, name: str) -> dict[str, Any]:
 
 
 def _capture_release(
-    *, absent: frozenset[tuple[str, str]] = frozenset()
+    *,
+    absent: frozenset[tuple[str, str]] = frozenset(),
+    anchor: dict | Exception | None = None,
 ) -> tuple[SimpleNamespace, list[list[str]]]:
     live = {
         (item["resource"], item["name"]): _live_object(item["kind"], item["name"])
@@ -60,10 +62,16 @@ def _capture_release(
         document = live.get(key)
         return json.dumps(document) if document is not None else ""
 
+    def read_anchor(_arguments: list[str]) -> dict:
+        if isinstance(anchor, Exception):
+            raise anchor
+        return anchor or {}
+
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system"),
         runner=SimpleNamespace(run=run),
         _cpu=lambda *args: ["kubectl", "--kubeconfig", "/secure/cpu", *args],
+        _get_json=read_anchor,
     )
     return release, reads
 
@@ -115,6 +123,45 @@ def test_capture_fails_closed_when_the_live_collector_is_not_there() -> None:
     )
 
     with pytest.raises(MODULE.ReleaseError, match="ADOT collector Deployment"):
+        ADOT.capture_adot_objects(release)
+
+
+@pytest.mark.parametrize("all_absent", [False, True])
+def test_deleted_collector_can_be_repaired_only_in_a_verified_cpu_namespace(
+    all_absent: bool,
+) -> None:
+    release, _reads = _capture_release(
+        absent=frozenset(
+            (item["resource"], item["name"])
+            for item in _declared()
+            if all_absent or item["kind"] == "Deployment"
+        ),
+        anchor={
+            "kind": "Deployment",
+            "metadata": {"name": "gpu-fault-api-ha", "namespace": "gpu-fault-system"},
+        },
+    )
+    snapshot = ADOT.capture_adot_objects(release)
+    assert snapshot["absence_verified"] is True
+    assert {"resource": "deployment.apps", "name": "gpu-fault-adot"} in snapshot[
+        "absent"
+    ]
+    restored, calls, _applied = _restore_release()
+    ADOT.restore_adot_objects(restored, {"adot": snapshot})
+    assert any("delete" in call and "deployment.apps" in call for call in calls), (
+        "rollback did not restore the collector's original absence"
+    )
+    assert not any("restart" in call for call in calls), (
+        "an absent collector was restarted"
+    )
+
+
+def test_collector_absence_does_not_hide_a_denied_cpu_anchor_read() -> None:
+    release, _reads = _capture_release(
+        absent=frozenset({("deployment.apps", "gpu-fault-adot")}),
+        anchor=MODULE.ReleaseError("Forbidden"),
+    )
+    with pytest.raises(MODULE.ReleaseError, match="Forbidden"):
         ADOT.capture_adot_objects(release)
 
 
@@ -290,6 +337,53 @@ def test_observability_snapshot_carries_and_restores_the_collector() -> None:
     # the non-transactional refusal used to exist for.
     assert aws_verbs == ["put-rule-groups-namespace", "put-alert-manager-definition"]
     assert kubectl_verbs == ["apply", "rollout", "rollout"]
+
+
+def test_amp_absence_is_captured_and_new_definitions_are_removed_on_rollback() -> None:
+    source, _reads = _capture_release()
+    source.config.aws_region = "us-east-1"
+    source.config.health = SimpleNamespace(
+        amp_workspace_id="workspace", amp_rule_namespace="rules"
+    )
+    source.runner.probe_output = lambda *_args, **_kwargs: (
+        1,
+        "",
+        "ResourceNotFoundException",
+    )
+    snapshot = ADOT.capture_observability_snapshot(source)
+    assert snapshot["rules_present"] is False
+    assert snapshot["alertmanager_present"] is False
+
+    target, calls, _applied = _restore_release()
+    target.config.aws_region = "us-east-1"
+    target.config.health = source.config.health
+    present = {"rules", "manager"}
+    original_run = target.runner.run
+
+    def probe(arguments, **_kwargs):
+        name = "rules" if "--name" in arguments else "manager"
+        if name not in present:
+            return 1, "", "ResourceNotFoundException"
+        key = "ruleGroupsNamespace" if name == "rules" else "alertManagerDefinition"
+        return 0, json.dumps({key: {"status": {"statusCode": "ACTIVE"}}}), ""
+
+    def run(arguments, **kwargs):
+        if arguments[0] == "aws":
+            assert arguments[2] in {
+                "delete-rule-groups-namespace",
+                "delete-alert-manager-definition",
+            }
+            present.remove("rules" if "--name" in arguments else "manager")
+        return original_run(arguments, **kwargs)
+
+    target.runner.probe_output = probe
+    target.runner.run = run
+    ADOT.restore_observability_snapshot(target, snapshot)
+    assert present == set()
+    assert [call[2] for call in calls if call[0] == "aws"] == [
+        "delete-rule-groups-namespace",
+        "delete-alert-manager-definition",
+    ]
 
 
 def test_a_snapshot_without_collector_objects_refuses_before_any_mutation() -> None:

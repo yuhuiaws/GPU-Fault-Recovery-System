@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import threading
+import contextvars
 from pathlib import Path
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +22,8 @@ from gpu_fault.admin.bootstrap_common import (
     tag_map,
 )
 from gpu_fault.admin.release_artifacts import build_signed_release
+from gpu_fault.admin.execution import current_deadline, deadline_scope, run_command
+from gpu_fault.admin.api_budget import api_phase
 
 BUILD_CACHE_UNTAGGED_RETENTION_DAYS = 7
 
@@ -89,7 +91,7 @@ def _ensure_build_cache_lifecycle_policy(
     desired = _build_cache_lifecycle_policy()
     desired_text = _canonical_policy_text(desired)
     desired_sha256 = hashlib.sha256(desired_text.encode()).hexdigest()
-    described = subprocess.run(
+    described = run_command(
         [
             "aws",
             "ecr",
@@ -101,8 +103,6 @@ def _ensure_build_cache_lifecycle_policy(
             "--output",
             "json",
         ],
-        text=True,
-        capture_output=True,
     )
     if described.returncode == 0:
         try:
@@ -161,7 +161,7 @@ def _ensure_ecr_repository(
     name = _release_repository_name(site_id, cache=cache)
     expected_mutability = "MUTABLE" if cache else "IMMUTABLE"
     expected_scan = not cache
-    described = subprocess.run(
+    described = run_command(
         [
             "aws",
             "ecr",
@@ -173,8 +173,6 @@ def _ensure_ecr_repository(
             "--output",
             "json",
         ],
-        text=True,
-        capture_output=True,
     )
     if described.returncode == 0:
         repositories = json.loads(described.stdout).get("repositories", [])
@@ -262,6 +260,7 @@ def ensure_release_repositories(
 ) -> dict[str, dict[str, str]]:
     with ThreadPoolExecutor(max_workers=2) as executor:
         runtime = executor.submit(
+            contextvars.copy_context().run,
             _ensure_ecr_repository,
             runner,
             cpu=cpu,
@@ -269,6 +268,7 @@ def ensure_release_repositories(
             cache=False,
         )
         cache = executor.submit(
+            contextvars.copy_context().run,
             _ensure_ecr_repository,
             runner,
             cpu=cpu,
@@ -290,8 +290,8 @@ class SignedReleaseBuild:
     Bootstrap used to run the two back to back, so on a first deployment the
     ten-minute Aurora wait and the ten-minute cold build added up. Now the
     build starts as soon as the scope is discovered and the graph runs
-    beside it; only the platform tasks that ship an image (``monitoring_install``,
-    ``aurora_refresh``) block on ``result()``, from their own worker threads.
+    beside it. The graph's ``release`` task joins ``result()`` before the image
+    tasks (``monitoring_install``, ``aurora_refresh``) re-prove checkpoints.
 
     ``result()`` re-raises the build's failure to every caller and applies the
     release-consent refusal once, so an unconsented release is refused the
@@ -310,14 +310,26 @@ class SignedReleaseBuild:
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="release-build"
         )
-        self._future = self._executor.submit(prepare, request=request, **arguments)
+        parent = current_deadline()
+
+        def build() -> dict[str, Any]:
+            with (
+                api_phase("release"),
+                deadline_scope("signed release build", 7200, parent=parent),
+            ):
+                return prepare(request=request, **arguments)
+
+        self._future = self._executor.submit(build)
         self._existing_site = existing_site
         self._state_dir = request.state_dir
         self._lock = threading.Lock()
         self._checked = False
 
     def result(self) -> dict[str, Any]:
-        release = self._future.result()
+        deadline = current_deadline()
+        release = self._future.result(
+            timeout=deadline.remaining() if deadline else None
+        )
         with self._lock:
             if not self._checked:
                 refuse_unconsented_release(
@@ -329,7 +341,9 @@ class SignedReleaseBuild:
         return release
 
     def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        # Never abandon a running AWS/build command after the site lock exits.
+        # Cancellation is safe only while the task has not started.
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def prepare_signed_release(

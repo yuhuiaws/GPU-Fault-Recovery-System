@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.adapters.kubernetes.stop_ownership import require_mutation_ownership
+
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -77,7 +79,10 @@ class HyperPodConfirmationMixin:
         context: WorkflowStepContext,
         details: dict[str, Any],
     ) -> dict[str, Any] | None:
+        # Restore the timer only after this poll revalidates every health gate.
+        started_value = details.pop("post_reboot_stabilization_started_at", None)
         if self.registry is None:
+            details.pop("post_replacement_stabilization_started_at", None)
             return None
         if context.step.operation is WorkflowOperation.REPLACE_NODE:
             failover = self._waiting_spare_failover(context, details)
@@ -138,13 +143,13 @@ class HyperPodConfirmationMixin:
             return None
         if self.post_reboot_stabilization_seconds:
             now = self.registry.now()
-            started_value = details.get("post_reboot_stabilization_started_at")
             if started_value is None:
                 details["post_reboot_stabilization_started_at"] = now.isoformat()
                 details["post_reboot_stabilization_seconds"] = (
                     self.post_reboot_stabilization_seconds
                 )
                 return None
+            details["post_reboot_stabilization_started_at"] = started_value
             started_at = datetime.fromisoformat(str(started_value))
             if now - started_at < timedelta(
                 seconds=self.post_reboot_stabilization_seconds
@@ -199,6 +204,7 @@ class HyperPodConfirmationMixin:
     ) -> dict[str, Any] | None:
         activated = list(details.get("activated_spare_nodes") or [])
         if not activated and self.spare_coordinator is not None:
+            require_mutation_ownership(context)
             allocation = self.spare_coordinator.allocate(
                 cluster_id=context.incident.cluster_id,
                 incident_id=context.incident.incident_id,
@@ -338,24 +344,28 @@ class HyperPodConfirmationMixin:
     ) -> dict[str, Any]:
         if len(spare_nodes) != len(context.step.node_ids):
             raise ValueError("warm-spare allocation does not match fault node count")
-        if self.kubernetes_adapter is not None:
-            replacement_context = WorkflowStepContext(
-                workflow=context.workflow,
-                incident=context.incident,
-                step=context.step.model_copy(update={"node_ids": spare_nodes}),
-                step_index=context.step_index,
-                request=context.request,
-                idempotency_key=(context.idempotency_key + "/spare-isolation"),
+        if self.kubernetes_adapter is None:
+            raise ValueError(
+                "warm-spare activation requires a Kubernetes isolation adapter"
             )
-            outcome = self.kubernetes_adapter._isolate(replacement_context)
-            if outcome.status is WorkflowStepStatus.WAITING:
-                # A scheduler write conflict that outlasted the adapter's own
-                # retries: the spares stay reserved and the step comes back.
-                raise SpareHealthPending(
-                    "warm-spare isolation is retrying a scheduler conflict"
-                )
-            if outcome.status is not WorkflowStepStatus.SUCCEEDED:
-                raise ValueError(outcome.error or "warm-spare isolation failed")
+        require_mutation_ownership(context)
+        replacement_context = WorkflowStepContext(
+            workflow=context.workflow,
+            incident=context.incident,
+            step=context.step.model_copy(update={"node_ids": spare_nodes}),
+            step_index=context.step_index,
+            request=context.request,
+            idempotency_key=(context.idempotency_key + "/spare-isolation"),
+        )
+        outcome = self.kubernetes_adapter._isolate(replacement_context)
+        if outcome.status is WorkflowStepStatus.WAITING:
+            # A scheduler write conflict that outlasted the adapter's own
+            # retries: the spares stay reserved and the step comes back.
+            raise SpareHealthPending(
+                "warm-spare isolation is retrying a scheduler conflict"
+            )
+        if outcome.status is not WorkflowStepStatus.SUCCEEDED:
+            raise ValueError(outcome.error or "warm-spare isolation failed")
         rebindings = {}
         for old_node, spare_node in zip(
             context.step.node_ids, spare_nodes, strict=True
@@ -420,6 +430,9 @@ class HyperPodConfirmationMixin:
         context: WorkflowStepContext,
         details: dict[str, Any],
     ) -> dict[str, Any] | None:
+        started_value = details.pop("post_replacement_stabilization_started_at", None)
+        if self.kubernetes_adapter is None:
+            return None
         baselines = details.get("provider_baselines") or {}
         if set(baselines) != set(context.step.node_ids):
             return None
@@ -476,22 +489,19 @@ class HyperPodConfirmationMixin:
             if len(ready_agents) != 1:
                 return None
             agent = ready_agents[0]
-            if self.kubernetes_adapter is not None:
-                replacement_context = WorkflowStepContext(
-                    workflow=context.workflow,
-                    incident=context.incident,
-                    step=context.step.model_copy(
-                        update={"node_ids": [kubernetes_node_name]}
-                    ),
-                    step_index=context.step_index,
-                    request=context.request,
-                    idempotency_key=(
-                        context.idempotency_key + "/replacement-isolation"
-                    ),
-                )
-                isolation = self.kubernetes_adapter._isolate(replacement_context)
-                if isolation.status is not WorkflowStepStatus.SUCCEEDED:
-                    return None
+            replacement_context = WorkflowStepContext(
+                workflow=context.workflow,
+                incident=context.incident,
+                step=context.step.model_copy(
+                    update={"node_ids": [kubernetes_node_name]}
+                ),
+                step_index=context.step_index,
+                request=context.request,
+                idempotency_key=(context.idempotency_key + "/replacement-isolation"),
+            )
+            isolation = self.kubernetes_adapter._isolate(replacement_context)
+            if isolation.status is not WorkflowStepStatus.SUCCEEDED:
+                return None
             for old_identifier in {
                 requested_id,
                 baseline.get("instance_id"),
@@ -512,13 +522,13 @@ class HyperPodConfirmationMixin:
 
         if self.post_reboot_stabilization_seconds:
             now = self.registry.now()
-            started_value = details.get("post_replacement_stabilization_started_at")
             if started_value is None:
                 details["post_replacement_stabilization_started_at"] = now.isoformat()
                 details["post_replacement_stabilization_seconds"] = (
                     self.post_reboot_stabilization_seconds
                 )
                 return None
+            details["post_replacement_stabilization_started_at"] = started_value
             if now - datetime.fromisoformat(str(started_value)) < timedelta(
                 seconds=self.post_reboot_stabilization_seconds
             ):

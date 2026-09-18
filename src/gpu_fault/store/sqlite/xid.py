@@ -13,6 +13,7 @@ from gpu_fault.store.shared.health_signals import (
     latched_health_signal_state,
     sample_disposition,
     signal_clock,
+    signal_semantic_fingerprints,
 )
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -160,7 +161,9 @@ class SqliteXidMixin:
         items: Sequence[tuple[str, bool, datetime, float]],
         *,
         received_at: datetime | None = None,
+        semantic_fingerprints: Sequence[str | None] | None = None,
     ) -> list[bool]:
+        fingerprints = signal_semantic_fingerprints(len(items), semantic_fingerprints)
         with self._state_transaction("health_signal_state/claims"):
             results: list[bool] = []
             for (
@@ -168,7 +171,7 @@ class SqliteXidMixin:
                 active,
                 observed_at,
                 minimum_active_seconds,
-            ) in items:
+            ), fingerprint in zip(items, fingerprints, strict=True):
                 previous = cast(
                     "HealthSignalState | None",
                     self._get_optional("health_signal_state", signal_key),
@@ -191,6 +194,7 @@ class SqliteXidMixin:
                     previous,
                     minimum_active_seconds,
                     clock=signal_clock(observed_at, received_at),
+                    semantic_fingerprint=fingerprint,
                 )
                 self._put(
                     "health_signal_state",
@@ -206,6 +210,9 @@ class SqliteXidMixin:
         active: bool,
         observed_at: datetime,
         minimum_active_seconds: float = 0,
+        *,
+        received_at: datetime | None = None,
+        semantic_fingerprint: str | None = None,
     ) -> bool:
         # The single form is the training-progress path. Like the plural form
         # it only decides to emit; ``TrainingHealthService.mark_notified``
@@ -218,7 +225,9 @@ class SqliteXidMixin:
                     observed_at,
                     minimum_active_seconds,
                 )
-            ]
+            ],
+            received_at=received_at,
+            semantic_fingerprints=[semantic_fingerprint],
         )[0]
 
     def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None:
@@ -228,7 +237,11 @@ class SqliteXidMixin:
         )
 
     def mark_health_signal_notified(
-        self, signal_key: str, *, notified_at: datetime
+        self,
+        signal_key: str,
+        *,
+        notified_at: datetime,
+        semantic_fingerprint: str | None = None,
     ) -> None:
         with self._state_transaction(f"health_signal_state/{signal_key}"):
             latched = latched_health_signal_state(
@@ -237,6 +250,7 @@ class SqliteXidMixin:
                     self._get_optional("health_signal_state", signal_key),
                 ),
                 notified_at,
+                semantic_fingerprint=semantic_fingerprint,
             )
             if latched is not None:
                 self._put("health_signal_state", signal_key, latched)

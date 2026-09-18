@@ -40,6 +40,7 @@ from gpu_fault.operation_registry import (
     NODE_MUTATING_OPERATIONS,
     WORKLOAD_SCOPED_OPERATIONS,
 )
+from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
@@ -56,13 +57,13 @@ ACTOR = "orchestrator-placement-hold"
 # RESTART, including another hold's own STOP) are not repairs of the node.
 REPAIR_OPERATIONS = frozenset(NODE_MUTATING_OPERATIONS - WORKLOAD_SCOPED_OPERATIONS)
 _LIVE_PHASES = frozenset({WorkloadPhase.PENDING, WorkloadPhase.RUNNING})
-_UNSAFE_ID_CHARACTERS = re.compile(r"[^A-Za-z0-9._:-]+")
+_LEGACY_UNSAFE_ID_CHARACTERS = re.compile(r"[^A-Za-z0-9._:-]+")
 
 
 def hold_incident_id(cluster_id: str, attempt_id: str) -> str:
     """Deterministic: one hold per attempt, however often it is observed."""
 
-    return _UNSAFE_ID_CHARACTERS.sub("-", f"hold-{cluster_id}-{attempt_id}")
+    return derived_record_id("hold", "placement-hold", cluster_id, attempt_id)
 
 
 def _restarted_attempt(workflow: WorkflowRequest) -> str | None:
@@ -112,6 +113,8 @@ class PlacementHoldService:
         repairing = self._repairing_workflows(observation.cluster_id, set(nodes))
         if not repairing:
             return None
+        if self._legacy_hold_exists(observation):
+            return None
         incident_id = hold_incident_id(observation.cluster_id, observation.attempt_id)
         step = self._stop_step(observation, nodes, incident_id)
         if step is None:
@@ -131,6 +134,35 @@ class PlacementHoldService:
             {node: repairing[node] for node in sorted(repairing)},
         )
         return pair
+
+    def _legacy_hold_exists(self, observation: AttemptObservation) -> bool:
+        legacy_id = _LEGACY_UNSAFE_ID_CHARACTERS.sub(
+            "-", f"hold-{observation.cluster_id}-{observation.attempt_id}"
+        )
+        incident = self.store.get_incident_by_event(legacy_id)
+        if incident is None:
+            return False
+        # A legacy key can collide; only the stored identity can establish reuse.
+        if (
+            incident.cluster_id,
+            incident.job_id,
+            incident.attempt_id,
+            incident.event_type,
+            incident.policy_source,
+        ) != (
+            observation.cluster_id,
+            observation.job_id,
+            observation.attempt_id,
+            EVENT_TYPE,
+            POLICY_SOURCE,
+        ):
+            return False
+        if not incident.workflow_request_id:
+            raise ValueError("legacy placement hold is missing its workflow identity")
+        workflow = self.store.get_workflow(incident.workflow_request_id)
+        if workflow.incident_id != incident.incident_id or not workflow.placement_hold:
+            raise ValueError("legacy placement hold workflow identity does not match")
+        return True
 
     def _attempt_has_job_workflow(self, observation: AttemptObservation) -> bool:
         for incident, workflow in self.store.list_active_workflow_incidents(

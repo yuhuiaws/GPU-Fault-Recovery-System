@@ -69,6 +69,10 @@ from gpu_fault.orchestration.families import (
 from gpu_fault.orchestration.families.identity import note_stale_event_link
 from gpu_fault.orchestration.node_locks import NodeLocks
 from gpu_fault.orchestration.placement_hold import PlacementHoldService
+from gpu_fault.orchestration.provider_correlation import (
+    covered_correlated_workflow,
+    execution_decision,
+)
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
@@ -309,8 +313,7 @@ class IncidentOrchestrator:
         return NodeLifecycleOperationService(
             self.store,
             self._builder,
-            self._arbiter,
-            self._brancher,
+            self._workflow_merger,
             callbacks,
             aggregation_window_seconds=(self.multi_node_aggregation_window_seconds),
         )
@@ -565,7 +568,7 @@ class IncidentOrchestrator:
         same_source_window: timedelta = timedelta(seconds=30),
         cross_source_window: timedelta = timedelta(minutes=5),
     ) -> FaultPolicyDecision:
-        """Merge provider/raw observations with source-aware clocks."""
+        """Associate markers; ``duplicate`` does not prove execution coverage."""
         marker = decision.marker
         observed_after = self._utc(marker.observed_at) - cross_source_window
         for candidate in self.store.list_recent_markers_for_nodes(
@@ -706,71 +709,21 @@ class IncidentOrchestrator:
                 # C-04: the link says handled but its workflow is gone; the
                 # build path below rebuilds and re-links (the store's own
                 # duplicate check treats the link as dirty the same way).
-            try:
-                correlated = self.store.get_incident(decision.marker.incident_id)
-            except NotFoundError:
-                correlated = None
-            linked = None
-            if correlated is not None:
-                linked = self._linked_workflow(correlated, event.event_id)
-                if linked is None:
-                    # C-04: the correlation target's own workflow is gone.
-                    # Returning it would hand back a pair with no workflow
-                    # for an event that needs one; the build path below
-                    # rebuilds under the same incident id instead.
-                    correlated = None
-            if correlated is not None and linked is not None:
-                workflow = linked[0]
-                observation = self._attempt_observation(event)
-                previous_generation = (
-                    workflow is not None
-                    and observation is not None
-                    and observation.started_at is not None
-                    and self._utc(observation.started_at)
-                    > self._utc(self._event_time(event))
-                )
-                if previous_generation:
-                    (
-                        _,
-                        _,
-                        generation_ignore_reason,
-                    ) = self._generation_fence(
-                        event,
-                        decision,
-                        observation,
-                        correlated,
-                        workflow,
-                    )
-                    if generation_ignore_reason is not None:
-                        read_correlated = correlated
-                        correlated = correlated.model_copy(
-                            update={
-                                "reasons": bounded_reasons(
-                                    [
-                                        *correlated.reasons,
-                                        generation_ignore_reason,
-                                    ]
-                                ),
-                                "updated_at": datetime.now(timezone.utc),
-                            }
-                        )
-                        # Compare-and-set on the copy read above (ARCH-D1):
-                        # ``StaleWriteError`` propagates like the
-                        # ``WorkflowFencingError`` this handler already
-                        # raises, and ingest retries the whole event with a
-                        # fresh read of the correlated incident.
-                        self.store.save_incident(
-                            correlated,
-                            expected=read_correlated,
-                            extra_event_ids=[event.event_id],
-                        )
-                        return correlated, workflow
-                else:
-                    self.store.link_event_to_incident(
-                        event.event_id,
-                        correlated.incident_id,
-                    )
-                    return correlated, workflow
+            companion = covered_correlated_workflow(
+                self.store,
+                event,
+                decision,
+                attempt_observation=self._attempt_observation,
+                linked_workflow=self._linked_workflow,
+                build_candidate=self._candidate_recovery_workflow,
+                merger=self._workflow_merger,
+            )
+            if companion is not None:
+                return companion
+
+            # Marker association is evidence. Store groups choose the incumbent
+            # and arbitrate this event's full candidate atomically.
+            decision = execution_decision(event, decision, existing)
 
             stale = self._fence_stale_generation_without_baseline(event, decision)
             if stale is not None:
@@ -1446,6 +1399,16 @@ class IncidentOrchestrator:
         event: XidEvent | SxidEvent,
         decision: FaultPolicyDecision,
     ) -> tuple[FaultIncident, WorkflowRequest] | None:
+        if (
+            isinstance(event, SxidEvent)
+            and decision.action is None
+            and OFFICIAL_WORKFLOW_OPERATION.get(decision.official_action or "")
+            is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+        ):
+            # The full-fabric policy has no coarse RecoveryAction. It still
+            # needs the same node serialization as RESET_GPU; official_action
+            # continues to select the full-fabric operation and evidence gates.
+            decision = decision.model_copy(update={"action": RecoveryAction.RESET_GPU})
         return self._node_scoped_faults.ingest(event, decision)
 
     def _widen_node_action_scope(

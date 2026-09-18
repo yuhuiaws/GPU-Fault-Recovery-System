@@ -30,6 +30,7 @@ from gpu_fault.store.shared.errors import (
 from gpu_fault.store.shared.primitives import (
     GetOptionalRecord,
     PutRecord,
+    PutRecordFields,
     StateTransaction,
 )
 from gpu_fault.store.shared.remote_helpers import (
@@ -71,10 +72,17 @@ def stale_fence_update(
     """The FAILED row a stale-fenced command settles into.
 
     ``result`` is what the executor reported (kept under ``post_stale_fence_*``
-    so the node-side outcome is not lost); ``swept`` marks a row closed by the
-    sweep because its executor never reported.
+    so the node-side outcome is not lost), but must belong to the issued lease;
+    ``swept`` marks a row closed by the sweep because its executor never reported.
     """
 
+    # A stale generation permits late evidence, never a different lease's evidence.
+    if result is not None and (
+        command.status is not RemoteCommandStatus.LEASED
+        or command.lease_token != result.lease_token
+        or command.lease_expires_at is None
+    ):
+        raise WorkflowLeaseError("remote command lease is missing, stale, or changed")
     details = dict(command.result_details)
     if result is not None:
         details = {
@@ -145,6 +153,7 @@ class SharedRemoteCommandMixin:
     # Attributes supplied by the composed concrete implementation.
     _get_optional: GetOptionalRecord
     _put: PutRecord
+    _put_fields: PutRecordFields
     _state_transaction: StateTransaction
 
     def ensure_remote_command(self, command):
@@ -196,7 +205,7 @@ class SharedRemoteCommandMixin:
                 update["cancellation_requested_at"] = now
                 update["cancellation_reason"] = stale_fence_reason(command, workflow)
             command = command.model_copy(update=update)
-            self._put("remote_command", command_id, command)
+            self._put_fields("remote_command", command_id, command, frozenset(update))
             return command
 
     def record_remote_command_progress(

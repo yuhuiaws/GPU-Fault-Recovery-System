@@ -9,9 +9,9 @@ scheduling) running in parallel, and a single RESTART_WORKLOAD join that runs
 only after both branches released their nodes. The job is restarted exactly
 once, on the same two nodes, with its 16 GPUs; nothing reboots or replaces.
 
-DESTR-014 proves the failure side of this DAG (a branch exhausts, the join
-never runs). This case proves the happy side, which is the system's core
-multi-node promise and had no live evidence.
+DESTR-014 checks the unconfirmed-reboot hold without running the join.
+This case checks the happy path. Independent exec/exit witnesses measure
+overlap of reset process invocations, not GPU silicon operation intervals.
 
 The runner defaults to ``--plan``; ``--execute`` needs ``--confirm
 DESTR015_EXECUTE``. The verdict functions are pure and unit-tested; the runner
@@ -61,6 +61,13 @@ from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
     step_transitions,
     workflow_errors,
     workload_errors,
+)
+from scripts.e2e.regional.destr015_physical_evidence import (  # noqa: E402
+    ResetIntervalScope,
+    physical_overlap_errors,
+)
+from scripts.e2e.regional.destr015_physical_intervals import (  # noqa: E402
+    ResetIntervalWitness,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -270,7 +277,7 @@ def plan_identity(
 ) -> dict[str, Any]:
     snapshots = preflight.get("nodes") or {}
     store = preflight.get("store") or {}
-    return {
+    identity = {
         "release_id": preflight.get("release_id"),
         "node_uids": {node: (snapshots.get(node) or {}).get("uid") for node in nodes},
         "node_boot_ids": {
@@ -279,6 +286,9 @@ def plan_identity(
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
         "runtime_identity": preflight.get("runtime_identity"),
     }
+    if "late_ownership" in preflight:
+        identity["late_ownership"] = preflight["late_ownership"]
+    return identity
 
 
 def identity_digest(identity: dict[str, Any]) -> str:
@@ -419,6 +429,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         ),
         "preflight_identity": identity,
         "preflight_identity_digest": identity_digest(identity),
+        "parallel_proof": {
+            "source": "independent-linux-exec-trace",
+            "bound_to": "node-uid/boot/Agent-process/GPU/workflow/fencing",
+            "clock_bound": "sampled-clock-envelope-and-bounded-monotonic-RPC",
+            "branch_or_command_overlap_is_not_physical_overlap": True,
+        },
         "stop_conditions": [
             "DESTR-012 predecessor evidence is not PASS",
             "either node is busy, tainted, owned, or its Node Agent is not ACTIVE",
@@ -427,6 +443,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the estimated duration does not fit the job workflow lifetime",
             "the two XID injections do not land in one DAG workflow",
             "a branch escalates, a step fails, or any reboot/replace appears",
+            "exec witness cannot attach or loses identity, clock bounds or coverage",
+            "actual reset intervals do not overlap after clock uncertainty",
             "the join runs before both branches released their nodes, or twice",
             "the job is not restarted exactly once on the same two nodes",
             "CloudTrail shows any provider mutation",
@@ -623,7 +641,7 @@ def read_only_preflight(
     return result
 
 
-def parser() -> argparse.ArgumentParser:
+def parser(*, confirmation: str = CONFIRMATION) -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
             "Run the guarded DESTR-015 acceptance: two nodes of one job fault "
@@ -631,7 +649,7 @@ def parser() -> argparse.ArgumentParser:
             "job is restarted once by the single join."
         )
     )
-    add_live_arguments(value, confirmation=CONFIRMATION)
+    add_live_arguments(value, confirmation=confirmation)
     value.add_argument("--cpu-kubeconfig", default="")
     value.add_argument("--gpu-kubeconfig", default="")
     value.add_argument("--gpu-context", default="")
@@ -666,15 +684,23 @@ def parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Live execution
 # --------------------------------------------------------------------------- #
-def _host_probe(settings: Settings, node: str, run_id: str) -> HostProbeFixture:
+def _host_probe(
+    settings: Settings,
+    node: str,
+    run_id: str,
+    case_dir: Path,
+    *,
+    case_id: str = CASE_ID,
+) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
             node=node,
             image=settings.host_probe_image,
-            case_id=CASE_ID,
+            case_id=case_id,
             run_id=run_id,
             probe_script=PROBE_SCRIPT,
             active_deadline_seconds=3600,
@@ -706,6 +732,7 @@ class _LiveRun:
     incident_id: str = ""
     workflow_request_id: str = ""
     workload_submitted: bool = False
+    physical_witnesses: dict[str, ResetIntervalWitness] = field(default_factory=dict)
 
 
 def _prepare_live_run(
@@ -713,10 +740,17 @@ def _prepare_live_run(
     run_dir: Path,
     attempt: int,
     maintenance_window_end: datetime,
+    *,
+    case_id: str = CASE_ID,
+    preflight_result: dict[str, Any] | None = None,
 ) -> _LiveRun:
-    case_dir = run_dir / "cases" / CASE_ID
+    case_dir = run_dir / "cases" / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
+    preflight = (
+        read_only_preflight(settings, case_dir, reuse_focused_tests=True)
+        if preflight_result is None
+        else preflight_result
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -755,8 +789,15 @@ def _prepare_live_run(
         regional=regional,
         run_id=run_id,
         workload=workload,
-        prewarm=ImagePrewarmFixture(regional, case_id=CASE_ID, run_id=run_id),
-        probes={node: _host_probe(settings, node, run_id) for node in settings.nodes},
+        prewarm=ImagePrewarmFixture(regional, case_id=case_id, run_id=run_id),
+        probes={
+            node: (
+                _host_probe(settings, node, run_id, case_dir)
+                if case_id == CASE_ID
+                else _host_probe(settings, node, run_id, case_dir, case_id=case_id)
+            )
+            for node in settings.nodes
+        },
     )
 
 
@@ -772,11 +813,17 @@ def _target_bdf(settings: Settings, node: str, baseline: dict[str, Any]) -> str:
 
 def _start_job_and_probes(run: _LiveRun) -> None:
     settings, case_dir = run.settings, run.case_dir
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before image prewarm")
     run.prewarm.create(list(settings.nodes))
     cached = run.prewarm.cached_nodes()
     write_json_atomic(case_dir / "image-cache.json", {"cached_nodes": cached})
     if not set(settings.nodes) <= set(cached):
         raise RegionalFixtureError("training image is not cached on both nodes")
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError(
+            "maintenance window ended before workload submission"
+        )
     run.workload_submitted = True
     write_json_atomic(case_dir / "submission.json", run.workload.submit())
     source = run.workload.wait_running(timeout_seconds=900)
@@ -869,6 +916,40 @@ def _inject_both(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     return states[0], states[1]
 
 
+def _arm_physical_witnesses(run: _LiveRun) -> None:
+    for node, probe in run.probes.items():
+        if datetime.now(timezone.utc) >= run.maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before physical witness attachment"
+            )
+        baseline = run.baselines[node]
+        targets = [
+            row["uuid"]
+            for row in baseline["gpu_inventory"]
+            if str(row.get("pci_bdf")).lower() == run.bdf[node].lower()
+        ]
+        if len(targets) != 1:
+            raise RegionalFixtureError("physical witness requires one approved GPU")
+        scope = ResetIntervalScope(
+            run_id=run.run_id,
+            cluster_id=run.settings.regional.cluster_id,
+            release_id=run.preflight["release_id"],
+            node=node,
+            node_uid=run.preflight["nodes"][node]["uid"],
+            boot_id=baseline["boot_id"],
+            agent_generation=run.preflight["agents"][node]["generation"],
+            gpu_uuid=targets[0],
+            maintenance_end=run.maintenance_window_end,
+        )
+        witness = ResetIntervalWitness(probe, scope)
+        run.physical_witnesses[node] = witness
+        witness.start()
+        write_json_atomic(
+            run.case_dir / f"physical-witness-start-{node}.json",
+            {"scope": scope.model_dump(mode="json"), **witness.capture},
+        )
+
+
 def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
     settings = run.settings
     transitions: dict[str, str] = {}
@@ -876,6 +957,8 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
     deadline = time.monotonic() + OBSERVATION_BUDGET_SECONDS
     state: dict[str, Any] = {}
     while time.monotonic() < deadline:
+        for witness in run.physical_witnesses.values():
+            witness.poll()
         state = run.regional.store_snapshot(
             node=settings.node_a,
             marker=run.marker,
@@ -908,6 +991,7 @@ def _data_plane_errors(
     settings, case_dir = run.settings, run.case_dir
     errors: list[str] = []
     if (state.get("workflow") or {}).get("status") == "SUCCEEDED":
+        run.workload.authorize_restart(state)
         target = run.workload.wait_restarted(run.source_uids, timeout_seconds=900)
     else:
         # A workflow that did not succeed owes no restart; waiting for one
@@ -936,6 +1020,18 @@ def _data_plane_errors(
     errors.extend(
         host_errors(hosts, nodes=settings.nodes, expected_gpu_count=GPUS_PER_NODE)
     )
+    captures = {
+        node: witness.finish() for node, witness in run.physical_witnesses.items()
+    }
+    write_json_atomic(case_dir / "physical-reset-intervals.json", captures)
+    errors.extend(
+        physical_overlap_errors(
+            captures,
+            scopes={node: item.scope for node, item in run.physical_witnesses.items()},
+            workflow=state.get("workflow") or {},
+            hosts=hosts,
+        )
+    )
     snapshots = {node: run.regional.node_snapshot(node) for node in settings.nodes}
     write_json_atomic(case_dir / "nodes-after.json", snapshots)
     errors.extend(schedulability_errors(snapshots, nodes=settings.nodes))
@@ -953,8 +1049,7 @@ def _data_plane_errors(
         run.regional, run.started_at, run.workload.name
     )
     write_json_atomic(case_dir / "control-plane-logs.json", logs)
-    if logs["suspicious"]:
-        errors.append("control-plane logs show a Kubernetes workload write")
+    errors.extend(workload_case.log_write_errors(logs, "control-plane"))
     cpu_after = run.regional.cpu_blast_snapshot()
     write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
     if cpu_after != run.preflight["cpu_blast"]:
@@ -974,6 +1069,7 @@ def _data_plane_errors(
         for node in settings.nodes
     }
     summary["provider_events"] = {"count": len(provider), "provisional": provisional}
+    summary["physical_reset_intervals"] = captures
     return errors, summary
 
 
@@ -997,7 +1093,10 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
         _start_job_and_probes(run)
+        _arm_physical_witnesses(run)
         first, second = _inject_both(run)
         errors = injection_errors(first, second, nodes=settings.nodes)
         observed = event_observed_at(dict(zip(settings.nodes, (first, second))))
@@ -1078,6 +1177,8 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
+    for node, witness in run.physical_witnesses.items():
+        guard(f"physical_witness_close:{node}", witness.close)
     if run.marker:
         guard(
             "quiescence",
@@ -1091,7 +1192,10 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
                 case_dir=run.case_dir,
             ),
         )
-    if run.workload_submitted:
+    quiescent = "quiescence" in result or not run.marker
+    if run.workload_submitted and not quiescent:
+        result["workload_cleanup_deferred"] = True
+    if run.workload_submitted and quiescent:
         guard("workload_delete", run.workload.delete)
         guard(
             "workload_residual",
@@ -1104,11 +1208,14 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
                     "--ignore-not-found",
                     "-o",
                     "name",
-                    check=False,
+                    check=True,
                 ).strip()
             ),
         )
-    guard("restore_isolated_nodes", lambda: _restore_isolated_nodes(run))
+    if quiescent:
+        guard("restore_isolated_nodes", lambda: _restore_isolated_nodes(run))
+    else:
+        result["isolation_restore_deferred"] = True
     guard("prewarm_cleanup", lambda: _refuse_residual_map(run.prewarm.cleanup()))
     for node, probe in run.probes.items():
         guard(

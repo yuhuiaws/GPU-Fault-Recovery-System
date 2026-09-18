@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
+from gpu_fault.adapters.node_action.reset_outcome import normalize_legacy_reset_failure
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -10,17 +11,20 @@ from gpu_fault.execution import (
 from gpu_fault.fleet import (
     BarrierParticipantState,
     BarrierState,
+    MultiNodeBarrier,
 )
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepStatus,
 )
 from gpu_fault.node_agent.protocol import (
+    NodeActionResult,
     NodeActionStatus,
 )
 from gpu_fault.operation_registry import (
     MAINTENANCE_GENERATION_OPERATIONS,
 )
+from gpu_fault.orchestration.escalation import unknown_outcome_failure
 from gpu_fault.store import NotFoundError
 
 
@@ -191,6 +195,9 @@ class NodeActionBarrierMixin:
             operation=context.step.operation,
             generations=generations,
         )
+        manual_failure = self._manual_barrier_failure(barrier)
+        if manual_failure is not None:
+            return manual_failure
         if barrier.state is BarrierState.PREPARING:
             for participant in barrier.participants:
                 if barrier.state is BarrierState.ABORTED:
@@ -205,6 +212,11 @@ class NodeActionBarrierMixin:
                     command_suffix=(f"barrier/prepare/{participant.node_id}"),
                     agent_generation=(participant.agent_generation),
                 )
+                manual_failure = self._record_unknown_barrier_result(
+                    barrier_id, participant.node_id, result, prepare=True
+                )
+                if manual_failure is not None:
+                    return manual_failure
                 if isinstance(result, WorkflowStepOutcome):
                     barrier = self.barriers.record_prepare(
                         barrier_id,
@@ -272,6 +284,11 @@ class NodeActionBarrierMixin:
                 ),
                 agent_generation=participant.agent_generation,
             )
+            manual_failure = self._record_unknown_barrier_result(
+                barrier_id, participant.node_id, result, prepare=False
+            )
+            if manual_failure is not None:
+                return manual_failure
             if isinstance(result, WorkflowStepOutcome):
                 barrier = self.barriers.record_commit(
                     barrier_id,
@@ -323,6 +340,81 @@ class NodeActionBarrierMixin:
                 "node_results": {
                     item.node_id: item.commit_details for item in barrier.participants
                 },
+            },
+        )
+
+    def _record_unknown_barrier_result(
+        self,
+        barrier_id: str,
+        node_id: str,
+        result: NodeActionResult | WorkflowStepOutcome,
+        *,
+        prepare: bool,
+    ) -> WorkflowStepOutcome | None:
+        if isinstance(result, NodeActionResult):
+            result = normalize_legacy_reset_failure(result)
+        details = dict(result.details or {})
+        if result.status is NodeActionStatus.INTERRUPTED:
+            details["node_action_interrupted"] = True
+        if not unknown_outcome_failure(details):
+            return None
+        details["manual_confirmation_required"] = True
+        error = result.error or "node action outcome is unknown"
+        record = (
+            self.barriers.record_prepare if prepare else self.barriers.record_commit
+        )
+        barrier = record(barrier_id, node_id, details=details, error=error)
+        return self._manual_barrier_failure(
+            barrier, failed_node=node_id, error=error, failed_details=details
+        )
+
+    @staticmethod
+    def _manual_barrier_failure(
+        barrier: MultiNodeBarrier,
+        *,
+        failed_node: str | None = None,
+        error: str | None = None,
+        failed_details: dict[str, Any] | None = None,
+    ) -> WorkflowStepOutcome | None:
+        node_failure_details = {
+            item.node_id: dict(
+                item.commit_details
+                if unknown_outcome_failure(item.commit_details)
+                else item.prepare_details
+            )
+            for item in barrier.participants
+            if unknown_outcome_failure(item.prepare_details)
+            or unknown_outcome_failure(item.commit_details)
+        }
+        failures = {
+            item.node_id: [item.error or "node action outcome is unknown"]
+            for item in barrier.participants
+            if item.node_id in node_failure_details
+        }
+        # Keep the current refusal even if another caller changed the barrier
+        # before record_prepare/record_commit could retain its details.
+        if failed_node is not None:
+            failures[failed_node] = [error or "node action outcome is unknown"]
+            if failed_details is not None:
+                node_failure_details[failed_node] = dict(failed_details)
+        if not failures:
+            return None
+        completed = {
+            item.node_id: item.commit_details
+            for item in barrier.participants
+            if item.state is BarrierParticipantState.COMMITTED
+        }
+        return WorkflowStepOutcome.failed(
+            f"barrier {barrier.barrier_id} requires manual confirmation",
+            details={
+                "barrier_id": barrier.barrier_id,
+                "barrier_state": barrier.state.value,
+                "manual_confirmation_required": True,
+                "failed_nodes": sorted(failures),
+                "node_failures": failures,
+                "node_failure_details": node_failure_details,
+                "node_results": completed,
+                "completed_nodes": sorted(completed),
             },
         )
 

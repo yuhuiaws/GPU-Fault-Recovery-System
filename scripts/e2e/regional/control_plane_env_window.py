@@ -91,6 +91,14 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     replica_vanished,
     write_json_atomic,
 )
+from scripts.e2e.regional.deployment_window_guard import (  # noqa: E402
+    apply_window_variables,
+    complete_population,
+    deployment_snapshot,
+    managed_variables_match,
+    require_window_record,
+    window_scope,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -409,37 +417,15 @@ def deployment_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     value = json.loads(
         regional.kubectl(PLANE, "get", "deployment", DEPLOYMENT, "-o", "json")
     )
-    containers = value["spec"]["template"]["spec"]["containers"]
-    container = next(
-        (item for item in containers if item.get("name") == CONTAINER), None
-    )
-    if container is None:
-        raise RegionalFixtureError(
-            f"{DEPLOYMENT} has no container named {CONTAINER}: "
-            + ", ".join(sorted(str(item.get("name")) for item in containers))
-        )
-    entries = container.get("env") or []
-    variables: dict[str, Any] = {}
-    for name in ALLOWED_VARIABLES:
-        present = [item for item in entries if item.get("name") == name]
-        if any("valueFrom" in item for item in present):
-            raise RegionalFixtureError(
-                f"{name} is set from a reference, not a literal; this helper "
-                "only manages literal values"
-            )
-        variables[name] = {
-            "present": bool(present),
-            "value": present[0].get("value") if present else None,
-        }
     return {
         "observed_at": now(),
-        "plane": PLANE,
-        "deployment": DEPLOYMENT,
-        "container": CONTAINER,
-        "generation": value["metadata"]["generation"],
-        "resource_version": value["metadata"]["resourceVersion"],
-        "replicas": value["spec"].get("replicas"),
-        "variables": variables,
+        **deployment_snapshot(
+            value,
+            plane=PLANE,
+            deployment=DEPLOYMENT,
+            container=CONTAINER,
+            variables=ALLOWED_VARIABLES,
+        ),
     }
 
 
@@ -532,11 +518,23 @@ def converge(
     expected: dict[str, str | None],
     *,
     sleep: Any = time.sleep,
+    expected_uid: str | None = None,
 ) -> list[dict[str, Any]]:
     deadline = time.monotonic() + settings.rollout_timeout_seconds
     while True:
+        before = deployment_env(regional)
+        expected_uid = expected_uid or before["uid"]
+        if before["uid"] != expected_uid:
+            raise RegionalFixtureError("control-worker window Deployment UID changed")
         replicas = replica_values(regional)
-        if converged(replicas, expected):
+        after = deployment_env(regional)
+        if after["uid"] != expected_uid:
+            raise RegionalFixtureError("control-worker window Deployment UID changed")
+        if (
+            before["generation"] == after["generation"]
+            and complete_population(after, replicas)
+            and converged(replicas, expected)
+        ):
             return replicas
         if time.monotonic() >= deadline:
             raise RegionalFixtureError(
@@ -565,40 +563,87 @@ def open_window(
     # The whole timing set is written, recorded and converged on, whatever
     # subset the caller chose; the record must name what the Deployment got.
     assignments = complete_assignments(assignments)
+    errors = assignment_errors(assignments)
+    if errors:
+        raise RegionalFixtureError("; ".join(errors))
+    scope = window_scope(
+        regional, plane=PLANE, deployment=DEPLOYMENT, container=CONTAINER
+    )
     record = read_baseline(settings.baseline) if settings.baseline.is_file() else None
+    if record is not None:
+        require_window_record(record, scope, report["deployment"], ALLOWED_VARIABLES)
     decision = open_decision(record, report["deployment"], assignments)
+    if (
+        record is not None
+        and record.get("state") == "OPENING"
+        and record.get("assignments") == assignments
+        and managed_variables_match(
+            report["deployment"], record["baseline"], assignments
+        )
+    ):
+        decision = "retry"
     if decision == "refuse":
         raise RegionalFixtureError(
             f"refusing to open the control-plane env window: baseline record and "
             f"live env disagree on {sorted(assignments)}; close the record first"
         )
+    if decision in {"open", "retry"} and (
+        not isinstance(report.get("replicas"), list)
+        or not complete_population(report["deployment"], report["replicas"])
+    ):
+        raise RegionalFixtureError(
+            "control-worker window requires the complete healthy replicas"
+        )
     if decision == "open":
         record = {
+            "schema_version": 2,
+            "scope": scope,
+            "state": "OPENING",
             "opened_at": now(),
             "confirmation": OPEN_CONFIRMATION,
             "assignments": assignments,
             "baseline": report["deployment"],
             "pre_window_survey": report,
         }
+    if decision in {"open", "retry"}:
+        if record is None:
+            raise RegionalFixtureError("window open has no bound baseline")
         write_json_atomic(settings.baseline, record)
-        regional.kubectl(
-            PLANE,
-            "set",
-            "env",
-            f"deployment/{DEPLOYMENT}",
-            f"--containers={CONTAINER}",
-            *open_arguments(assignments),
+        apply_window_variables(
+            regional,
+            plane=PLANE,
+            deployment=DEPLOYMENT,
+            container=CONTAINER,
+            expected=record["baseline"],
+            desired=assignments,
         )
         record["rollout"] = wait_rollout(settings, regional)
     else:
         if record is None:
             raise RegionalFixtureError("resume decided without a baseline record")
         record["resumed_at"] = now()
-    record["replicas"] = converge(settings, regional, dict(assignments), sleep=sleep)
+    record["replicas"] = converge(
+        settings,
+        regional,
+        dict(assignments),
+        sleep=sleep,
+        expected_uid=record["baseline"]["uid"],
+    )
     record["opened_state"] = deployment_env(regional)
+    owned = {
+        "variables": {
+            name: {"present": True, "value": value}
+            for name, value in assignments.items()
+        }
+    }
+    if record["opened_state"]["uid"] != record["baseline"][
+        "uid"
+    ] or not managed_variables_match(record["opened_state"], owned, assignments):
+        raise RegionalFixtureError("control-worker window drifted after convergence")
     record["observed"] = {
         name: observed_value(record["replicas"], name) for name in SURVEYED_VARIABLES
     }
+    record["state"] = "OPEN"
     write_json_atomic(settings.baseline, record)
     return record
 
@@ -611,26 +656,50 @@ def close_window(
     sleep: Any = time.sleep,
 ) -> dict[str, Any]:
     record = read_baseline(settings.baseline)
-    if record.get("closed_at"):
-        raise RegionalFixtureError(
-            f"{settings.baseline} was already closed at {record['closed_at']}"
-        )
-    baseline = record["baseline"]
-    regional.kubectl(
-        PLANE,
-        "set",
-        "env",
-        f"deployment/{DEPLOYMENT}",
-        f"--containers={CONTAINER}",
-        *restore_arguments(baseline),
+    live = deployment_env(regional)
+    scope = window_scope(
+        regional, plane=PLANE, deployment=DEPLOYMENT, container=CONTAINER
     )
-    record["closed_at"] = now()
+    require_window_record(record, scope, live, ALLOWED_VARIABLES)
+    baseline = record["baseline"]
+    names = record["assignments"]
+    restored_already = managed_variables_match(live, baseline, names)
+    owned = {
+        "uid": baseline["uid"],
+        "variables": {
+            name: {"present": True, "value": value} for name, value in names.items()
+        },
+    }
+    if not restored_already and not managed_variables_match(live, owned, names):
+        raise RegionalFixtureError(
+            "control-worker window values were changed by another writer"
+        )
+    if record.get("closed_at") and not restored_already:
+        raise RegionalFixtureError("closed control-worker window has drifted")
+    previous_closed_at = record.pop("closed_at", None)
+    record["state"] = "CLOSING"
     record["close_survey"] = report
+    write_json_atomic(settings.baseline, record)
+    if not restored_already:
+        apply_window_variables(
+            regional,
+            plane=PLANE,
+            deployment=DEPLOYMENT,
+            container=CONTAINER,
+            expected=owned,
+            desired={
+                name: item["value"] if item["present"] else None
+                for name, item in baseline["variables"].items()
+                if name in names
+            },
+        )
     record["rollout_after_close"] = wait_rollout(settings, regional)
     restored = deployment_env(regional)
     record["restored_state"] = restored
     write_json_atomic(settings.baseline, record)
-    if restored["variables"] != baseline["variables"]:
+    if restored["uid"] != baseline["uid"] or not managed_variables_match(
+        restored, baseline, names
+    ):
         raise RegionalFixtureError(
             "restored control-worker env does not match the recorded baseline: "
             + json.dumps(
@@ -639,8 +708,18 @@ def close_window(
             )
         )
     record["replicas_after_close"] = converge(
-        settings, regional, restored_expectation(record), sleep=sleep
+        settings,
+        regional,
+        {
+            name: value
+            for name, value in restored_expectation(record).items()
+            if name in names
+        },
+        sleep=sleep,
+        expected_uid=baseline["uid"],
     )
+    record["closed_at"] = previous_closed_at or now()
+    record["state"] = "CLOSED"
     write_json_atomic(settings.baseline, record)
     return record
 

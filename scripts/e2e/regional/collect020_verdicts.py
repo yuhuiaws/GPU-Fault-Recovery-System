@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
+from gpu_fault.models import Severity
 
 CASE_ID = "GF-REGIONAL-COLLECT-020"
 CONFIRMATION = "COLLECT020_EXECUTE"
@@ -94,6 +95,7 @@ def inventory_evidence_errors(
     *,
     dropped_uuid: str,
     expected_count: int,
+    expected_uuids: set[str] | None = None,
 ) -> list[str]:
     """The shortened snapshot was kept, and it knows the expected count."""
 
@@ -111,6 +113,20 @@ def inventory_evidence_errors(
     errors: list[str] = []
     for item in shortened:
         payload = item.get("payload") or {}
+        devices = payload.get("devices") or []
+        uuids = {str(device.get("gpu_uuid") or "") for device in devices}
+        if (
+            len(devices) != expected_count - 1
+            or len(uuids) != len(devices)
+            or "" in uuids
+        ):
+            errors.append(
+                f"snapshot {item.get('record_id')} is not exactly one missing GPU"
+            )
+        if expected_uuids is not None and uuids != expected_uuids - {dropped_uuid}:
+            errors.append(
+                f"snapshot {item.get('record_id')} does not match the baseline UUID set"
+            )
         if payload.get("expected_gpu_count") != expected_count:
             errors.append(
                 f"snapshot {item.get('record_id')} carries expected_gpu_count="
@@ -118,6 +134,29 @@ def inventory_evidence_errors(
                 f"{expected_count}"
             )
     return errors
+
+
+def _metric_record(record: dict[str, Any], metric: str) -> bool:
+    if record.get("metric_name") == metric or record.get("event_type") == metric:
+        return True
+    for field in ("event_id", "marker_id"):
+        value = str(record.get(field) or "")
+        if value.endswith(f"-{metric}") or f"-{metric}-" in value:
+            return True
+    reasons = [*(record.get("reasons") or []), record.get("raw_reason") or ""]
+    return any(metric in str(reason) for reason in reasons)
+
+
+def _identity_incidents(activity: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in activity.get("incidents") or []
+        if _metric_record(item, IDENTITY_METRIC)
+        or any(
+            "GPU inventory identity changed" in str(reason)
+            for reason in item.get("reasons") or []
+        )
+    ]
 
 
 def identity_incident_errors(
@@ -130,13 +169,7 @@ def identity_incident_errors(
     budget on an incident that had already opened.
     """
 
-    incidents = [
-        item
-        for item in activity.get("incidents") or []
-        if "GPU inventory identity changed" in str(item.get("reasons"))
-        or IDENTITY_METRIC in str(item.get("reasons"))
-        or IDENTITY_METRIC in str(item.get("event_type"))
-    ]
+    incidents = _identity_incidents(activity)
     if not incidents:
         return [f"no incident names {IDENTITY_METRIC}"]
     if not any(dropped_uuid in str(item.get("reasons")) for item in incidents):
@@ -150,13 +183,7 @@ def identity_finding_errors(
     """The CRITICAL finding names the UUID; its workflow diagnoses, never reboots."""
 
     errors: list[str] = []
-    incidents = [
-        item
-        for item in activity.get("incidents") or []
-        if "GPU inventory identity changed" in str(item.get("reasons"))
-        or IDENTITY_METRIC in str(item.get("reasons"))
-        or IDENTITY_METRIC in str(item.get("event_type"))
-    ]
+    incidents = _identity_incidents(activity)
     if not incidents:
         return [f"no incident names {IDENTITY_METRIC}"]
     if not any(dropped_uuid in str(item.get("reasons")) for item in incidents):
@@ -164,6 +191,19 @@ def identity_finding_errors(
             f"no identity-changed incident names the removed UUID {dropped_uuid}"
         )
     incident_ids = {str(item.get("incident_id")) for item in incidents}
+    markers = [
+        item
+        for item in activity.get("markers") or []
+        if str(item.get("incident_id")) in incident_ids
+        and _metric_record(item, IDENTITY_METRIC)
+        and dropped_uuid in ((item.get("scope") or {}).get("gpu_uuids") or [])
+    ]
+    if not markers or any(
+        item.get("severity") != Severity.CRITICAL.value for item in markers
+    ):
+        errors.append(
+            "the removed UUID has no matching CRITICAL identity-finding marker"
+        )
     workflows = [
         item
         for item in activity.get("workflows") or []
@@ -175,9 +215,9 @@ def identity_finding_errors(
         operations = {
             str(step.get("operation")) for step in workflow.get("official_steps") or []
         }
-        if not operations & DIAGNOSTIC_OPERATIONS:
+        if not DIAGNOSTIC_OPERATIONS <= operations:
             errors.append(
-                f"workflow {workflow.get('request_id')} runs no DCGM diagnostic or "
+                f"workflow {workflow.get('request_id')} lacks DCGM diagnostic or "
                 f"GPU validation: {sorted(operations)}"
             )
         forbidden = sorted(operations & FORBIDDEN_OPERATIONS)
@@ -202,11 +242,17 @@ def identity_finding_errors(
 def dcgm_notification_errors(activity: dict[str, Any]) -> list[str]:
     """ARCH-E7: the regional DCGM completion mails, whether it passed or failed."""
 
+    incident_ids = {
+        str(item.get("incident_id")) for item in _identity_incidents(activity)
+    }
     matches = [
         item
         for item in activity.get("notifications") or []
-        if "DCGM" in str(item.get("category", "")).upper()
-        or "DCGM" in str(item.get("subject", "")).upper()
+        if str(item.get("incident_id")) in incident_ids
+        and (
+            "DCGM" in str(item.get("category", "")).upper()
+            or "DCGM" in str(item.get("subject", "")).upper()
+        )
     ]
     if not matches:
         return ["no DCGM diagnostic completion notification was created"]
@@ -219,14 +265,17 @@ def no_reboot_errors(
     errors: list[str] = []
     if boot_id_before != boot_id_after:
         errors.append("the node rebooted during the case")
-    for incident in activity.get("incidents") or []:
-        reasons = str(incident.get("reasons"))
-        if MISMATCH_METRIC in reasons:
-            errors.append("the host collector raised gpu_inventory_mismatch")
-        if UNKNOWN_COUNT_METRIC in reasons:
-            errors.append(
-                "gpu_expected_count_unknown fired although the instance type is known"
-            )
+    records = [
+        *(activity.get("incidents") or []),
+        *(activity.get("markers") or []),
+        *(activity.get("findings") or []),
+    ]
+    if any(_metric_record(item, MISMATCH_METRIC) for item in records):
+        errors.append("the host collector raised gpu_inventory_mismatch")
+    if any(_metric_record(item, UNKNOWN_COUNT_METRIC) for item in records):
+        errors.append(
+            "gpu_expected_count_unknown fired although the instance type is known"
+        )
     for workflow in activity.get("workflows") or []:
         operations = {
             str(step.get("operation")) for step in workflow.get("official_steps") or []
@@ -254,6 +303,9 @@ def marker_retirement_errors(activity: dict[str, Any]) -> list[str]:
         for item in activity.get("markers") or []
         if str(item.get("incident_id")) in recovered
     ]
+    marked = {str(item.get("incident_id")) for item in markers}
+    for incident_id in sorted(recovered - marked):
+        errors.append(f"recovered incident {incident_id} has no retirement markers")
     for marker in markers:
         if not marker.get("retired_at"):
             errors.append(f"marker {marker.get('marker_id')} has no retired_at")

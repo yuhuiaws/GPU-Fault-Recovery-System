@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from gpu_fault.execution.models import WorkflowExecutionRequest, WorkflowStepOutcome
 from gpu_fault.models import IncidentState, WorkflowStatus, WorkflowStepStatus
-from gpu_fault.regional import RemoteActionCommand
+from gpu_fault.regional import RemoteActionCommand, RemoteCommandResult
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from tests._builders import active_workflow_executor, build_store
 from tests.execution import test_branch_escalation as branches
@@ -49,13 +49,34 @@ def _in_flight(store, workflow, index: int, status: RemoteCommandStatus) -> str:
             step=step,
             workflow=workflow,
             incident=incident,
-            status=status,
-            lease_owner=(
-                "executor-elsewhere" if status is RemoteCommandStatus.LEASED else None
+            status=(
+                RemoteCommandStatus.PENDING
+                if status is RemoteCommandStatus.LEASED
+                else status
             ),
         )
     )
+    if status is RemoteCommandStatus.LEASED:
+        store.claim_remote_commands(
+            incident.cluster_id, "executor-elsewhere", limit=1, lease_seconds=60
+        )
     return command_id
+
+
+def _settle(store, status: RemoteCommandStatus) -> None:
+    command = store.get_remote_command("cmd-2")
+    assert command.lease_token is not None, "the sibling fixture must have a real lease"
+    store.complete_remote_command(
+        command.cluster_id,
+        command.command_id,
+        RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=status,
+            error="node did not come back"
+            if status is RemoteCommandStatus.FAILED
+            else None,
+        ),
+    )
 
 
 def _waiting(index: int, remote_status: str) -> WorkflowStepOutcome:
@@ -108,6 +129,7 @@ def test_a_leased_sibling_command_defers_the_failure_until_it_settles():
     )
 
     # The node's reboot finishes on a later tick.
+    _settle(store, RemoteCommandStatus.SUCCEEDED)
     adapter.outcomes[REBOOT] = WorkflowStepOutcome.succeeded(
         operation_id="remote/cmd-2"
     )
@@ -141,6 +163,7 @@ def test_a_sibling_that_fails_while_the_verdict_is_parked_does_not_escalate():
     executor.branch_escalator.compile_steps = lambda *_args: []
 
     assert _execute(executor, workflow).status is WorkflowStatus.RUNNING
+    _settle(store, RemoteCommandStatus.FAILED)
     adapter.outcomes[REBOOT] = WorkflowStepOutcome.failed("node did not come back")
     result = _execute(executor, workflow)
 

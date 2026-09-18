@@ -28,12 +28,14 @@ control plane instead of exec'ing into a node that can no longer answer.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,6 +210,9 @@ def injection_plan(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                 "drill_id": drill_id,
                 "pci_bdf": bdf,
                 "after_seconds": delay,
+                "maintenance_window_end": getattr(
+                    arguments, "maintenance_window_end", ""
+                ),
             }
         )
     if (
@@ -217,6 +222,17 @@ def injection_plan(arguments: argparse.Namespace) -> list[dict[str, Any]]:
         raise ProbeError(
             "an injection is scheduled after the holder's bounded lifetime"
         )
+    if plan:
+        try:
+            deadline = datetime.fromisoformat(
+                str(plan[0]["maintenance_window_end"]).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ProbeError(
+                "scheduled injections require a maintenance deadline"
+            ) from exc
+        if deadline.tzinfo is None or datetime.now(timezone.utc) >= deadline:
+            raise ProbeError("maintenance window ended before scheduling injections")
     return plan
 
 
@@ -226,19 +242,118 @@ def injection_command(run_id: str, item: dict[str, Any]) -> list[str]:
         "systemd-run",
         "--unit",
         unit,
-        f"--on-active={int(item['after_seconds'])}",
+        "--on-active=1s",
         "--timer-property=AccuracySec=1s",
         "--property=RuntimeMaxSec=120",
         "/opt/gpu-fault/current/venv/bin/python",
-        str(item["script"]),
-        str(item["subcommand"]),
-        "--marker",
-        str(item["marker"]),
-        "--drill-id",
-        str(item["drill_id"]),
-        "--pci-bdf",
-        str(item["pci_bdf"]),
+        str(Path(__file__).resolve()),
+        "fire-injection",
+        "--run-id",
+        run_id,
+        "--phase",
+        str(item["phase"]),
     ]
+
+
+def authorize_injection(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    proof = json.loads(arguments.authorization)
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        if (
+            state.get("run_id") != run_id
+            or state.get("disarmed_at")
+            or proof.get("run_id") != run_id
+            or proof.get("device") != state.get("device")
+            or proof.get("drill_id") != state.get("drill_id")
+            or proof.get("boot_id") != state.get("boot_id")
+            or state.get("arm_race_lost")
+        ):
+            raise ProbeError("injection authorization does not bind this holder")
+        items = [
+            item
+            for item in state.get("injections") or []
+            if item.get("phase") == arguments.phase
+        ]
+        authorizations = state.get("authorizations") or {}
+        if len(items) != 1 or arguments.phase in authorizations:
+            raise ProbeError("injection phase is missing or already authorized")
+        item = items[0]
+        run(
+            [
+                sys.executable,
+                item["script"],
+                "check-barrier",
+                "--barrier-authorization",
+                json.dumps(proof, sort_keys=True),
+            ]
+        )
+        authorizations[arguments.phase] = {"proof": proof, "fire_requested_at": None}
+        state["authorizations"] = authorizations
+        write_state(path, state)
+        run(injection_command(run_id, item))
+    emit({"run_id": run_id, "phase": arguments.phase, "authorized": True})
+
+
+def fire_injection(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        authorization = (state.get("authorizations") or {}).get(arguments.phase) or {}
+        items = [
+            item
+            for item in state.get("injections") or []
+            if item.get("phase") == arguments.phase
+        ]
+        if (
+            state.get("run_id") != run_id
+            or state.get("disarmed_at")
+            or state.get("boot_id") != _boot_id()
+            or not authorization.get("proof")
+            or authorization.get("fire_requested_at")
+            or len(items) != 1
+        ):
+            raise ProbeError(
+                "injection was not authorized, was cancelled, or was consumed"
+            )
+        item = items[0]
+        proof = authorization["proof"]
+        if hashlib.sha256(Path(item["script"]).read_bytes()).hexdigest() != state.get(
+            "injection_script_sha256"
+        ):
+            raise ProbeError("injection probe script changed")
+        run(
+            [
+                sys.executable,
+                item["script"],
+                "check-barrier",
+                "--barrier-authorization",
+                json.dumps(proof, sort_keys=True),
+            ]
+        )
+        authorization["fire_requested_at"] = datetime.now(timezone.utc).isoformat()
+        write_state(path, state)
+        run(
+            [
+                sys.executable,
+                item["script"],
+                item["subcommand"],
+                "--marker",
+                item["marker"],
+                "--drill-id",
+                item["drill_id"],
+                "--pci-bdf",
+                item["pci_bdf"],
+                "--maintenance-window-end",
+                item["maintenance_window_end"],
+                "--barrier-authorization",
+                json.dumps(proof, sort_keys=True),
+            ]
+        )
 
 
 def unit_name(value: str, run_id: str) -> str:
@@ -447,6 +562,12 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
     if matched is None:
         update_state(path, {"holder_error": "arm ledger row never appeared"})
         return
+    for item in state.get("injections") or []:
+        deadline_at = datetime.fromisoformat(
+            str(item.get("maintenance_window_end") or "").replace("Z", "+00:00")
+        )
+        if deadline_at.tzinfo is None or datetime.now(timezone.utc) >= deadline_at:
+            raise ProbeError("maintenance window ended before starting the holder")
     unit = holder_unit(run_id)
     _clear_unit(unit + ".service", run_id)
     started_at = datetime.now(timezone.utc).isoformat()
@@ -465,39 +586,26 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             str(max_hold),
         ]
     )
-    scheduled = []
-    for item in state.get("injections") or []:
-        injection = injection_unit(run_id, str(item["phase"]))
-        _clear_unit(injection + ".timer", run_id)
-        _clear_unit(injection + ".service", run_id)
-        run(injection_command(run_id, item))
-        scheduled.append(
-            {
-                **item,
-                "unit": injection + ".timer",
-                "scheduled_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+    lost = arm_race_lost(
+        ledger_rows(),
+        baseline_command_ids=set(state.get("verify_baseline_ids") or []),
+        armed_at=armed_at,
+        hold_started_at=started_at,
+    )
     update_state(
         path,
         {
             "matched_row": matched,
             "hold_started_at": started_at,
             "holder_unit": unit + ".service",
-            "scheduled_injections": scheduled,
+            "arm_race_lost": lost,
         },
     )
-    update_state(
-        path,
-        {
-            "arm_race_lost": arm_race_lost(
-                ledger_rows(),
-                baseline_command_ids=set(state.get("verify_baseline_ids") or []),
-                armed_at=armed_at,
-                hold_started_at=started_at,
-            )
-        },
-    )
+    if lost:
+        _clear_unit(unit + ".service", run_id)
+        return
+    # Only the controller can bind the actual WAITING workflow to this drill.
+    # No XID timer exists until its explicit per-phase authorization arrives.
 
 
 def arm_holder(arguments: argparse.Namespace) -> None:
@@ -532,6 +640,12 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "verify_baseline_ids": verify_baseline_ids,
             "armed_at": datetime.now(timezone.utc).isoformat(),
             "injections": injections,
+            "boot_id": _boot_id(),
+            "injection_script_sha256": (
+                hashlib.sha256(Path(injections[0]["script"]).read_bytes()).hexdigest()
+                if injections
+                else None
+            ),
         },
     )
     unit = arm_unit(run_id)
@@ -567,14 +681,16 @@ def disarm_holder(arguments: argparse.Namespace) -> None:
     already took with it, or one that was never armed, is not an error."""
 
     run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    if path.is_file():
+        with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            update_state(path, {"disarmed_at": datetime.now(timezone.utc).isoformat()})
     _clear_unit(arm_unit(run_id) + ".service", run_id)
     _clear_unit(holder_unit(run_id) + ".service", run_id)
     for phase in INJECTION_PHASES:
         _clear_unit(injection_unit(run_id, phase) + ".timer", run_id)
         _clear_unit(injection_unit(run_id, phase) + ".service", run_id)
-    path = state_path(run_id)
-    if path.is_file():
-        update_state(path, {"disarmed_at": datetime.now(timezone.utc).isoformat()})
     emit(
         {
             "run_id": run_id,
@@ -640,6 +756,7 @@ def parser() -> argparse.ArgumentParser:
     # escalation (XID 79) writes N seconds after the holder starts.
     arm.add_argument("--inject-script", default="")
     arm.add_argument("--pci-bdf", default="")
+    arm.add_argument("--maintenance-window-end", default="")
     for phase in INJECTION_PHASES:
         arm.add_argument(f"--{phase}-marker", default="")
         arm.add_argument(f"--{phase}-drill-id", default="")
@@ -649,6 +766,17 @@ def parser() -> argparse.ArgumentParser:
     watch = commands.add_parser("watch-ledger")
     watch.add_argument("--run-id", required=True)
     watch.set_defaults(handler=watch_ledger)
+
+    authorize = commands.add_parser("authorize-injection")
+    authorize.add_argument("--run-id", required=True)
+    authorize.add_argument("--phase", choices=sorted(INJECTION_PHASES), required=True)
+    authorize.add_argument("--authorization", required=True)
+    authorize.set_defaults(handler=authorize_injection)
+
+    fire = commands.add_parser("fire-injection")
+    fire.add_argument("--run-id", required=True)
+    fire.add_argument("--phase", choices=sorted(INJECTION_PHASES), required=True)
+    fire.set_defaults(handler=fire_injection)
 
     disarm = commands.add_parser("disarm-holder")
     disarm.add_argument("--run-id", required=True)

@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
     lease_deadline,
 )
+from gpu_fault.regional_compatibility import (
+    LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+    command_protocol_eligible,
+)
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import (
     NotFoundError,
     WorkflowLeaseError,
+)
+from gpu_fault.store.shared.orphaned_commands import (
+    TERMINAL_WORKFLOW_STATUSES,
+    OrphanedCommandCancellation,
+    cancellation_event,
+    orphaned_cancellation_records,
 )
 from gpu_fault.store.shared.remote_commands import (
     covering_compound_command,
@@ -35,19 +45,68 @@ from gpu_fault.store.shared.remote_helpers import (
 from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
+from gpu_fault.store.shared.transactional_workflows import workflow_matches_expected
 
 if TYPE_CHECKING:
-    from gpu_fault.regional import RemoteActionCommand
+    from gpu_fault.models import WorkflowRequest
+    from gpu_fault.regional import RemoteActionCommand, RemoteCommandResult
 
 
 class MemoryRemoteCommandMixin:
     # Attributes supplied by the composed concrete implementation.
-    _remote_commands: Any
+    _remote_commands: dict[str, RemoteActionCommand]
 
     _lock: Any
     _workflows: Any
+    amend_workflow: Callable[..., WorkflowRequest]
 
-    def ensure_remote_command(self, command):
+    def cancel_orphaned_remote_commands(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        now: datetime,
+        actor: str,
+    ) -> OrphanedCommandCancellation:
+        with self._lock:
+            current: WorkflowRequest | None = self._workflows.get(workflow.request_id)
+            if (
+                current is None
+                or current.status not in TERMINAL_WORKFLOW_STATUSES
+                or not workflow_matches_expected(current, workflow)
+            ):
+                return OrphanedCommandCancellation()
+            records, result = orphaned_cancellation_records(
+                current,
+                self.list_remote_commands(workflow_request_ids=[workflow.request_id]),
+                now=now,
+                actor=actor,
+            )
+            if not result.command_ids:
+                return result
+            pending = {command.command_id: command for command in records}
+            try:
+                self.amend_workflow(
+                    current.request_id,
+                    {},
+                    event=cancellation_event(
+                        current,
+                        result.counters,
+                        result.command_ids,
+                        now=now,
+                        actor=actor,
+                    ),
+                )
+            except BaseException:
+                # No commands have been published. Undo an audit writer that
+                # raised after its write, while readers still wait on the lock.
+                self._workflows[current.request_id] = current
+                raise
+            self._remote_commands.update(pending)
+            return result
+
+    def ensure_remote_command(
+        self, command: RemoteActionCommand
+    ) -> RemoteActionCommand:
         with self._lock:
             existing = self._remote_commands.get(command.command_id)
             if existing is not None:
@@ -64,7 +123,7 @@ class MemoryRemoteCommandMixin:
             command = self._remote_commands.get(command_id)
             if command is None:
                 raise NotFoundError(command_id)
-            return command  # type: ignore[no-any-return]
+            return command
 
     def list_remote_commands(
         self,
@@ -159,7 +218,7 @@ class MemoryRemoteCommandMixin:
         self,
         cluster_id: str,
         execution_owners: set[str] | None,
-    ):
+    ) -> list[RemoteActionCommand]:
         """Narrow the claim to the open backlog of one cluster.
 
         The claim runs once per poll interval per executor, so its cost
@@ -193,7 +252,8 @@ class MemoryRemoteCommandMixin:
         lease_seconds: int,
         execution_owners: set[str] | None = None,
         accept_batched_steps: bool = True,
-    ):
+        executor_protocol_version: int = LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+    ) -> list[RemoteActionCommand]:
         now = datetime.now(timezone.utc)
         claimed = []
         with self._lock:
@@ -225,6 +285,7 @@ class MemoryRemoteCommandMixin:
                     # A compound command is never handed to an executor whose
                     # protocol predates ``batched_steps`` (性能 C).
                     or (not accept_batched_steps and command.batched_steps)
+                    or not command_protocol_eligible(command, executor_protocol_version)
                     or (
                         command.status
                         not in {
@@ -337,7 +398,7 @@ class MemoryRemoteCommandMixin:
         lease_token: str,
         *,
         lease_seconds: int,
-    ):
+    ) -> RemoteActionCommand:
         now = datetime.now(timezone.utc)
         with self._lock:
             command = self._remote_commands.get(command_id)
@@ -406,8 +467,8 @@ class MemoryRemoteCommandMixin:
         self,
         cluster_id: str,
         command_id: str,
-        result,
-    ):
+        result: RemoteCommandResult,
+    ) -> RemoteActionCommand:
         now = datetime.now(timezone.utc)
         with self._lock:
             command = self._remote_commands.get(command_id)
@@ -421,9 +482,11 @@ class MemoryRemoteCommandMixin:
             workflow = self._workflows.get(command.workflow_request_id)
             if stale_fence(command, workflow):
                 # See ``SharedRemoteCommandMixin.complete_remote_command``.
-                command = stale_fence_update(command, workflow, now, result=result)
-                self._remote_commands[command_id] = command
-                return command
+                fenced: RemoteActionCommand = stale_fence_update(
+                    command, workflow, now, result=result
+                )
+                self._remote_commands[command_id] = fenced
+                return fenced
             if (
                 command.status is not RemoteCommandStatus.LEASED
                 or command.lease_token != result.lease_token

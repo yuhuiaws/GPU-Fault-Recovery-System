@@ -47,7 +47,11 @@ from gpu_fault.adapters.common import (
     QUARANTINE_TAINT,
     quarantine_taint_value,
 )
-from gpu_fault.compile_blocked import close_settled_incident_blocked_workflow
+from gpu_fault.compile_blocked import (
+    OPEN_REMOTE_STATUSES,
+    close_settled_incident_blocked_workflow,
+)
+from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
     FaultIncident,
@@ -58,6 +62,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
+    WorkflowStepStatus,
     bounded_reasons,
     record_workflow_event,
     workflow_is_open,
@@ -434,9 +439,33 @@ class IncidentClosureService:
         )
         if not restores_node(workflow):
             return []
-        restored = {node for step in steps for node in step.node_ids} or set(
-            incident.node_ids
+        completed = set(workflow.completed_step_indexes) | {
+            execution.step_index
+            for execution in workflow.step_executions
+            if execution.operation is WorkflowOperation.RESTORE_SCHEDULING
+            and execution.status is WorkflowStepStatus.SUCCEEDED
+        }
+        legacy_completion = not (
+            workflow.dag_enabled
+            or workflow.completed_step_indexes
+            or workflow.step_executions
+            or workflow.superseded_step_indexes
         )
+        # Workload allocation and planned releases do not prove node restoration.
+        restored = {
+            node
+            for index, step in enumerate(steps)
+            if step.operation is WorkflowOperation.RESTORE_SCHEDULING
+            and index not in workflow.superseded_step_indexes
+            and (
+                index in completed
+                or (
+                    legacy_completion
+                    and step.operation in workflow.completed_operations
+                )
+            )
+            for node in step.node_ids
+        }
         if not restored:
             return []
         closed: list[str] = []
@@ -557,9 +586,29 @@ class IncidentClosureService:
             if workflow.request_id in seen:
                 continue
             seen.add(workflow.request_id)
-            if workflow_is_open(
-                workflow.status, workflow.blocked_kind
-            ) and not never_executed_operator_block(workflow):
+            if (
+                has_unresolved_node_action(workflow)
+                or workflow.execution_owner_id is not None
+                or (
+                    workflow.execution_lease_expires_at is not None
+                    and workflow.execution_lease_expires_at > datetime.now(timezone.utc)
+                )
+                or any(
+                    item.status is WorkflowStepStatus.WAITING
+                    for item in workflow.step_executions
+                )
+                or (
+                    workflow_is_open(workflow.status, workflow.blocked_kind)
+                    and not never_executed_operator_block(workflow)
+                )
+            ):
+                return workflow
+            if any(
+                command.status in OPEN_REMOTE_STATUSES
+                for command in self.store.list_remote_commands(
+                    workflow_request_ids=[workflow.request_id]
+                )
+            ):
                 return workflow
         return None
 

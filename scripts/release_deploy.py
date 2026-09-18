@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.admin.execution import run_driver
+
 import argparse
 import json
 import os
@@ -226,6 +228,10 @@ def prepare_site_release(
             "dcgmExporter": "dcgm_exporter",
             "adot": "adot",
         }
+        if int(manifest.get("schema_version", 0)) >= 4:
+            image_fields["executor"] = "executor"
+        else:
+            images.pop("executor", None)
         for site_field, release_field in image_fields.items():
             reference = str(
                 (release_images.get(release_field) or {}).get("reference") or ""
@@ -297,7 +303,7 @@ def _run(
     arguments: Sequence[str], *, cwd: Path, environment: Mapping[str, str]
 ) -> None:
     print("+ " + " ".join(arguments), file=sys.stderr, flush=True)
-    completed = subprocess.run(
+    completed = run_driver(
         list(arguments),
         cwd=cwd,
         env=dict(environment),
@@ -314,7 +320,7 @@ def _run_json(
     arguments: Sequence[str], *, cwd: Path, environment: Mapping[str, str]
 ) -> dict[str, Any]:
     print("+ " + " ".join(arguments), file=sys.stderr, flush=True)
-    completed = subprocess.run(
+    completed = run_driver(
         list(arguments),
         cwd=cwd,
         env=dict(environment),

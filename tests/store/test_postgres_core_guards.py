@@ -49,7 +49,10 @@ def test_a_locked_read_outside_a_transaction_is_refused(store):
     assert store._db.in_transaction is False
 
 
-def test_a_conditional_put_only_lands_on_the_row_it_was_read_from(store):
+@pytest.mark.parametrize("matching_identity", [False, True])
+def test_a_conditional_put_only_lands_on_the_row_it_was_read_from(
+    store, matching_identity: bool
+):
     workflow = _seed(store)
     stored = store.get_workflow("wf-a")
     changed_elsewhere = copy_model(stored, status=WorkflowStatus.RUNNING)
@@ -71,5 +74,8 @@ def test_a_conditional_put_only_lands_on_the_row_it_was_read_from(store):
         expected=changed_elsewhere,
     )
     assert store.get_workflow("wf-a").status is WorkflowStatus.SUCCEEDED
+    missing = (
+        copy_model(workflow, request_id="wf-missing") if matching_identity else workflow
+    )
     with pytest.raises(StaleWriteError):
-        store._put("workflow", "wf-missing", workflow, expected=workflow)
+        store._put("workflow", "wf-missing", missing, expected=missing)

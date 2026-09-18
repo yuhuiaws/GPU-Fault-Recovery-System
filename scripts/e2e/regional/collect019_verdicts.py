@@ -122,6 +122,13 @@ def service_errors(opened_after: dict[str, Any], current: dict[str, Any]) -> lis
     """The unit stayed up on the same PID: erroring is not crash-looping."""
 
     errors: list[str] = []
+    for label, reading in (("opening", opened_after), ("current", current)):
+        pid = str(reading.get("MainPID") or "")
+        restarts = str(reading.get("NRestarts", ""))
+        if not pid.isdecimal() or int(pid) <= 0:
+            errors.append(f"{UNIT} has no valid MainPID in the {label} reading")
+        if not restarts.isdecimal():
+            errors.append(f"{UNIT} has no valid NRestarts in the {label} reading")
     if current.get("ActiveState") != "active":
         errors.append(f"{UNIT} is not active during the hang: {current}")
     if current.get("NRestarts") != opened_after.get("NRestarts"):
@@ -142,11 +149,30 @@ def gauge_errors(before: list[str], during: list[str], *, cluster_id: str) -> li
 
     errors: list[str] = []
     where = {"cluster_id": cluster_id, "channel": HOST_CHANNEL}
-    if (metric_max(during, ERRORING_METRIC, where=where) or 0.0) < 1:
+    for label, texts, family in (
+        ("before", before, SILENT_METRIC),
+        ("during", during, SILENT_METRIC),
+        ("during", during, ERRORING_METRIC),
+    ):
+        if not texts or any(
+            (value := metric_max([text], family, where=where)) is None or value < 0
+            for text in texts
+        ):
+            errors.append(
+                f"{label} {family} has missing or invalid host-channel samples"
+            )
+    if errors:
+        return errors
+    erroring = metric_max(during, ERRORING_METRIC, where=where)
+    if erroring is None or erroring < 1:
         errors.append(f"{ERRORING_METRIC} for the host channel is not at least 1")
-    silent_before = metric_max(before, SILENT_METRIC, where=where) or 0.0
-    silent_during = metric_max(during, SILENT_METRIC, where=where) or 0.0
-    if silent_during > silent_before:
+    silent_before = metric_max(before, SILENT_METRIC, where=where)
+    silent_during = metric_max(during, SILENT_METRIC, where=where)
+    if (
+        silent_before is not None
+        and silent_during is not None
+        and silent_during > silent_before
+    ):
         errors.append(
             f"{SILENT_METRIC} for the host channel rose from {silent_before} to "
             f"{silent_during}; erroring was reported as silence"

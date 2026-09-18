@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib import request as urllib_request
 from datetime import timedelta
 from typing import Any
 
@@ -31,6 +32,8 @@ from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
+from gpu_fault.node_agent.protocol import NodeActionSubmission
+from gpu_fault.transport.http_client import urlopen
 
 
 class NodeActionWorkflowAdapter(
@@ -192,3 +195,45 @@ class NodeActionWorkflowAdapter(
 
     def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         return NodeActionExecutionService(self).execute(context)
+
+    def read_action_result(
+        self, cluster_id: str, node_id: str, command_id: str
+    ) -> NodeActionSubmission | None:
+        """Authenticated read-only drainage; never resubmit an unknown command."""
+        endpoint = self._endpoint(cluster_id, node_id, None)
+        if endpoint is None:
+            raise ValueError("node action result endpoint is unavailable")
+        record = (
+            self._agent_record(cluster_id, node_id)
+            if self.registry is not None
+            else None
+        )
+        secret = self._secret_for_node(cluster_id, node_id, record=record)
+        ssl_context = self._ssl_context(cluster_id, node_id, endpoint, record=record)
+        return self._poll_result(
+            endpoint, command_id, secret=secret, ssl_context=ssl_context
+        )
+
+    def read_ownership_capability(self, cluster_id: str, node_id: str) -> bool:
+        """Read the pinned Agent's capability before a physical acceptance run."""
+        from gpu_fault.node_agent.late_ownership import OWNERSHIP_PROTOCOL
+
+        endpoint = self._endpoint(cluster_id, node_id, None)
+        if endpoint is None:
+            return False
+        record = (
+            self._agent_record(cluster_id, node_id)
+            if self.registry is not None
+            else None
+        )
+        context = self._ssl_context(cluster_id, node_id, endpoint, record=record)
+        with urlopen(
+            urllib_request.Request(endpoint.rstrip("/") + "/healthz"),
+            timeout=self.poll_timeout_seconds,
+            ssl_context=context,
+        ) as response:
+            document = json.loads(response.read())
+        return (
+            isinstance(document, dict)
+            and document.get("ownership_guard_protocol") == OWNERSHIP_PROTOCOL
+        )

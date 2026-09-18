@@ -33,10 +33,41 @@ class _Runner:
 
     def run(self, arguments, **kwargs):
         self.calls.append((list(arguments), kwargs))
+        if arguments[-3:] == ["apply", "-f", "-"]:
+            data = json.loads(kwargs["input_text"])["data"]
+            self.existing = [
+                json.loads(line)
+                for line in data[HISTORY.HISTORY_KEY].splitlines()
+                if line
+            ]
         return ""
 
     def probe(self, arguments, **_kwargs):
         return self.existing is not None
+
+    def probe_output(self, arguments, **_kwargs):
+        self.calls.append((list(arguments), {}))
+        if self.existing is None:
+            return 0, "", ""
+        return (
+            0,
+            json.dumps(
+                {
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": HISTORY.HISTORY_CONFIG_MAP,
+                        "namespace": "gpu-fault-system",
+                        "uid": "history-uid",
+                    },
+                    "data": {
+                        HISTORY.HISTORY_KEY: "\n".join(
+                            json.dumps(item) for item in self.existing
+                        )
+                    },
+                }
+            ),
+            "",
+        )
 
 
 def _release(runner: _Runner, *, state: dict | None = None) -> SimpleNamespace:
@@ -118,6 +149,24 @@ def test_state_transition_appends_an_entry_with_operator_and_digests(
     assert entry["command"] == "upgrade --config /secure/r.json"
     mirrored = (tmp_path / HISTORY.HISTORY_MIRROR_FILE).read_text().splitlines()
     assert json.loads(mirrored[-1]) == entry, "the state-dir mirror must match"
+    assert len(runner.calls) == 2, "a checkpoint repeated the history GET"
+
+
+def test_unreadable_history_is_not_overwritten(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class UnreadableRunner(_Runner):
+        def probe_output(self, arguments, **_kwargs):
+            self.calls.append((list(arguments), {}))
+            return 1, "", "Forbidden"
+
+    runner = UnreadableRunner(existing=[{"release_id": "stable"}])
+    HISTORY.record_release_history(_release(runner), phase="failed", state_text="{}")
+
+    assert not any("apply" in command for command, _ in runner.calls), (
+        "an unreadable audit history was replaced by a fresh history"
+    )
+    assert "cannot read configmap/gpu-fault-release-history" in capsys.readouterr().err
 
 
 def test_history_attributes_the_entry_to_the_release_the_state_records(

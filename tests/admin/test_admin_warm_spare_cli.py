@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -263,9 +264,10 @@ def test_the_read_only_check_exits_one_on_refusals_and_zero_when_ready(
 
 
 def test_declare_through_the_command_takes_the_site_lock_and_writes_the_record(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = FakeCoreApi(_raw_node(NODE))
+    monkeypatch.setattr(warm_spare, "reload_site_for_mutation", lambda site: site)
 
     exit_code = warm_spare.run_config_spare_command(
         _spare_arguments(
@@ -290,6 +292,49 @@ def test_declare_through_the_command_takes_the_site_lock_and_writes_the_record(
     assert api.nodes[NODE]["spec"]["unschedulable"] is True
 
 
+def test_mutating_spare_reloads_the_site_before_selecting_the_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _site()
+    current = _site()
+    current.release_config["clusters"] = []
+    api = FakeCoreApi(_raw_node(NODE))
+    events = []
+
+    @contextmanager
+    def lock(path):
+        assert path == tmp_path
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def reload(site):
+        assert site is original and events == ["lock"]
+        events.append("reload")
+        return current
+
+    monkeypatch.setattr(warm_spare, "administrator_operation_lock", lock)
+    monkeypatch.setattr(warm_spare, "reload_site_for_mutation", reload)
+    with pytest.raises(WarmSpareError, match="0 GPU clusters"):
+        warm_spare.run_config_spare_command(
+            _spare_arguments(
+                tmp_path,
+                "--declare",
+                "--reference",
+                "CHG-1",
+                "--confirm",
+                DECLARE_CONFIRMATION,
+            ),
+            site=original,
+            api=api,
+            agent_lookup=lambda *_: ACTIVE,
+        )
+    assert events == ["lock", "reload", "unlock"]
+    assert api.patches == []
+
+
 def test_a_mutating_spare_action_is_teed_into_the_admin_command_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -299,7 +344,9 @@ def test_a_mutating_spare_action_is_teed_into_the_admin_command_log(
     state_dir = _state_dir(tmp_path)
     monkeypatch.delenv(ADMIN_LOG_ENVIRONMENT, raising=False)
     monkeypatch.setattr(cli, "load_site", lambda *_args, **_kwargs: _site())
-    monkeypatch.setattr(cli, "enforce_deploy_host_state_dir", lambda _arguments: None)
+    monkeypatch.setattr(
+        cli, "enforce_deploy_host_state_dir", lambda _arguments, **_kwargs: None
+    )
     monkeypatch.setattr(
         warm_spare,
         "run_config_spare_command",

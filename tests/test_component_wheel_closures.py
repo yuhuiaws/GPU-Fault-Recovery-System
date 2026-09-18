@@ -53,6 +53,35 @@ def test_the_deploy_host_wheel_carries_the_release_engine_the_admin_cli_imports(
     assert "gpu_fault.admin.deploy_consent" in modules, "the consent module is shipped"
 
 
+def test_deploy_host_carries_the_cleanup_tools_rbac_dependency() -> None:
+    module = "gpu_fault.admin.cluster_removal_rbac"
+    assert module in component_wheels.component_modules("deploy_host"), (
+        "the copied cleanup tools must import their RBAC helper from the installed wheel"
+    )
+    for name in component_wheels.COMPONENTS:
+        assert module not in component_wheels.component_modules(name), (
+            f"{name} must not receive deployment-only cleanup authority"
+        )
+
+
+@pytest.mark.parametrize("component", ["deploy_host", "control_plane"])
+def test_workload_clis_are_delivered_without_removing_cpu_compatibility(
+    component: str,
+) -> None:
+    expected = {
+        "gpu-training-submit": "gpu_fault.training_submit_cli:main",
+        "gpu-fault-workload-annotate": "gpu_fault.workload_annotate_cli:main",
+    }
+    definition = component_wheels.component_definition(component)
+    for command, target in expected.items():
+        assert definition.scripts.get(command) == target, (component, command)
+    modules = component_wheels.component_modules(component)
+    assert {target.partition(":")[0] for target in expected.values()} <= modules
+    assert "gpu_fault.admin.python_environment" in modules, (
+        "site helpers must retain the parent's selected-interpreter binding"
+    )
+
+
 @pytest.mark.parametrize(
     "component", sorted(component_wheels.COMPONENTS) + ["deploy_host"]
 )

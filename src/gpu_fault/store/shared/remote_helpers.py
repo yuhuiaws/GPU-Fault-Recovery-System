@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from gpu_fault.remote_command_models import RemoteCommandStatus
+from gpu_fault.regional_compatibility import activation_inhibition_identity
 
 if TYPE_CHECKING:
     from gpu_fault.models import WorkflowRequest
@@ -49,7 +50,7 @@ LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS = frozenset(
 
 
 def remote_command_identity(command) -> tuple:
-    return (
+    identity = (
         command.cluster_id,
         command.workflow_request_id,
         command.step_index,
@@ -61,6 +62,8 @@ def remote_command_identity(command) -> tuple:
         tuple(command.step.gpu_uuids),
         tuple(command.step.workload_ids),
     )
+    inhibition = activation_inhibition_identity(command)
+    return (*identity, inhibition) if inhibition else identity
 
 
 def unclaimed_expiry_update(command, now: datetime):

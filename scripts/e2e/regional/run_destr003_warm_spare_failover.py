@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
@@ -279,6 +280,15 @@ def preflight_errors(
         if agent is None or agent.get("lifecycle_state") != "ACTIVE":
             errors.append(f"{node} does not have exactly one ACTIVE Agent")
     errors.extend(profile_errors(state.get("profile")))
+    if (state.get("profile") or {}).get("warnings"):
+        errors.append("runtime profile has warnings")
+    if processor_queue_backlog(state.get("queue")):
+        errors.append("processor queue is not empty")
+    commands = state.get("remote_commands")
+    if not isinstance(commands, dict) or "open_by_cluster" not in commands:
+        errors.append("remote command queue state is unknown")
+    elif commands["open_by_cluster"]:
+        errors.append("remote command queue is not empty")
     if cluster.get("status") != "InService" or cluster.get("node_recovery") != "None":
         errors.append("HyperPod cluster is not InService with NodeRecovery=None")
     if len(executor_env) < 1 or any(
@@ -350,6 +360,8 @@ def read_only_preflight(
     state = read["state"]
     state["profile"] = read["fault_state"].get("profile")
     state["release_id"] = read["fault_state"].get("release_id")
+    state["queue"] = read["fault_state"].get("queue")
+    state["remote_commands"] = read["fault_state"].get("remote_commands")
     spare_nodes = read["spare_nodes"]
     cluster = read["cluster"]
     executor_env = read["executor_env"]
@@ -679,8 +691,24 @@ def cleanup_case(
     settings: Settings,
     incident_id: str,
     profile_version: str,
+    trigger_attempted: bool = False,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
+    if incident_id or trigger_attempted:
+        try:
+            if not incident_id:
+                raise RegionalFixtureError(
+                    "replacement outcome has no incident identity"
+                )
+            warm.wait_incident_idle(incident_id)
+        except Exception as exc:
+            result["errors"].append(f"cleanup quiescence: {type(exc).__name__}: {exc}")
+            result["workload_and_spare_cleanup_deferred"] = True
+            try:
+                result["prewarm_residuals"] = prewarm.cleanup()
+            except Exception as cleanup_exc:
+                result["errors"].append(f"prewarm cleanup: {cleanup_exc}")
+            return result
     try:
         workload.delete()
     except Exception as exc:
@@ -796,7 +824,13 @@ def execute_case(
     incident_id = ""
     event_id = ""
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before image prewarm")
         prewarm.create([settings.fault_node, settings.spare_node])
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before workload submission"
+            )
         submission = workload.submit()
         write_json_atomic(case_dir / "submission.json", submission)
         source = workload.wait_running(timeout_seconds=900)
@@ -836,6 +870,7 @@ def execute_case(
         budget = state.get("restart_budget") or {}
         if budget.get("budget") != 1 or budget.get("restart_count") != 1:
             errors.append("restart budget did not advance exactly once")
+        workload.authorize_restart(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "workload-target.json", target)
         if {item["node"] for item in target["pods"]} != {settings.spare_node}:
@@ -923,6 +958,7 @@ def execute_case(
             profile_version=str(
                 (preflight["store"].get("profile") or {}).get("profile_version") or ""
             ),
+            trigger_attempted=bool(event_id),
         )
         result["cleanup"] = cleanup
         if cleanup["errors"]:

@@ -16,7 +16,6 @@ from gpu_fault.store.shared.errors import (
     StaleFencingTokenError,
     StaleWriteError,
     WorkflowLeaseError,
-    WorkflowMergedError,
 )
 from gpu_fault.store.shared.record_guards import (
     record_matches_expected,
@@ -32,6 +31,7 @@ from gpu_fault.store.shared.transactional_workflows import (
     incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
+    validate_leased_workflow_save,
     workflow_matches_expected,
 )
 from gpu_fault.store.shared.workflow_scan import (
@@ -138,7 +138,13 @@ class SqliteWorkflowMixin:
             if after is not None:
                 anchor = dispatch_order_key(after)
                 workflows = [
-                    item for item in workflows if dispatch_order_key(item) > anchor
+                    item
+                    for item in workflows
+                    if (
+                        dispatch_order_key(item) < anchor
+                        if newest_first
+                        else dispatch_order_key(item) > anchor
+                    )
                 ]
         else:
             workflows = sorted(
@@ -208,12 +214,12 @@ class SqliteWorkflowMixin:
         server-side aggregate rather than a by-product of that scan.
         """
 
-        rows = self._db.execute(
-            """
+        query = """
             SELECT json_extract(payload, '$.status') AS status, COUNT(*)
             FROM objects WHERE kind='workflow' GROUP BY status
             """
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(query).fetchall()
         counts = {status: 0 for status in WorkflowStatus}
         for status, count in rows:
             counts[WorkflowStatus(status)] = int(count)
@@ -223,12 +229,12 @@ class SqliteWorkflowMixin:
         """Count every persisted incident by state (server-side aggregate
         for the /metrics incident gauge; ESCALATED is the operator queue)."""
 
-        rows = self._db.execute(
-            """
+        query = """
             SELECT json_extract(payload, '$.state') AS state, COUNT(*)
             FROM objects WHERE kind='incident' GROUP BY state
             """
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(query).fetchall()
         counts = {state: 0 for state in IncidentState}
         for state, count in rows:
             counts[IncidentState(state)] = int(count)
@@ -260,8 +266,7 @@ class SqliteWorkflowMixin:
         lookups.
         """
 
-        row = self._db.execute(
-            """
+        query = """
             SELECT COUNT(*)
             FROM objects w
             WHERE w.kind='workflow'
@@ -292,7 +297,8 @@ class SqliteWorkflowMixin:
                     )
               )
             """
-        ).fetchone()
+        with self._lock:
+            row = self._db.execute(query).fetchone()
         return int(row[0])
 
     def list_orphan_workflows(
@@ -306,8 +312,7 @@ class SqliteWorkflowMixin:
         time order.
         """
 
-        rows = self._db.execute(
-            """
+        query = """
             SELECT w.payload
             FROM objects w
             LEFT JOIN objects i
@@ -330,16 +335,17 @@ class SqliteWorkflowMixin:
               )
             ORDER BY json_extract(w.payload, '$.created_at'), w.key
             LIMIT ?
-            """,
-            (_utc_text(created_before), limit),
-        ).fetchall()
+            """
+        with self._lock:
+            rows = self._db.execute(
+                query, (_utc_text(created_before), limit)
+            ).fetchall()
         return [WorkflowRequest.model_validate_json(row[0]) for row in rows]
 
     def list_incidents_with_missing_workflow(
         self, *, limit: int = 1000
     ) -> list[FaultIncident]:
-        rows = self._db.execute(
-            """
+        query = """
             SELECT i.payload
             FROM objects i
             WHERE i.kind='incident'
@@ -351,9 +357,9 @@ class SqliteWorkflowMixin:
               )
             ORDER BY json_extract(i.payload, '$.created_at'), i.key
             LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+            """
+        with self._lock:
+            rows = self._db.execute(query, (limit,)).fetchall()
         return [FaultIncident.model_validate_json(row[0]) for row in rows]
 
     def list_incidents_by_state(
@@ -384,13 +390,14 @@ class SqliteWorkflowMixin:
                 ")"
             )
             parameters.extend(sorted(node_ids))
-        rows = self._db.execute(
-            "SELECT i.payload FROM objects i WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY json_extract(i.payload, '$.updated_at') DESC, i.key DESC"
-            " LIMIT ?",
-            [*parameters, limit],
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT i.payload FROM objects i WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY json_extract(i.payload, '$.updated_at') DESC, i.key DESC"
+                " LIMIT ?",
+                [*parameters, limit],
+            ).fetchall()
         return [FaultIncident.model_validate_json(row[0]) for row in rows]
 
     def list_unhandled_failed_workflows(
@@ -442,7 +449,7 @@ class SqliteWorkflowMixin:
                 ")"
             )
             parameters.extend(sorted(node_ids))
-        rows = self._db.execute(
+        query = (
             """
             SELECT i.payload, w.payload
             FROM objects w
@@ -452,9 +459,10 @@ class SqliteWorkflowMixin:
             """
             + " AND ".join(clauses)
             + " ORDER BY json_extract(w.payload, '$.updated_at') DESC, "
-            "w.key DESC LIMIT ?",
-            [*parameters, limit],
-        ).fetchall()
+            "w.key DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._db.execute(query, [*parameters, limit]).fetchall()
         return [
             (
                 FaultIncident.model_validate_json(incident),
@@ -470,9 +478,15 @@ class SqliteWorkflowMixin:
         attempt_id: str,
         *,
         limit: int = 100,
+        include_terminal: bool = False,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
-        rows = self._db.execute(
-            """
+        status_predicate = (
+            "1"
+            if include_terminal
+            else "json_extract(w.payload, '$.status') "
+            "IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
+        )
+        query = f"""
             SELECT i.payload, w.payload
             FROM objects w
             JOIN objects i
@@ -483,8 +497,7 @@ class SqliteWorkflowMixin:
               AND json_extract(i.payload, '$.job_id')=?
               AND (
                     (
-                        json_extract(w.payload, '$.status')
-                            IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')
+                        {status_predicate}
                         AND json_extract(i.payload, '$.attempt_id')=?
                     )
                     OR EXISTS (
@@ -504,15 +517,11 @@ class SqliteWorkflowMixin:
             ORDER BY json_extract(w.payload, '$.updated_at') DESC,
                      w.key DESC
             LIMIT ?
-            """,
-            (
-                cluster_id,
-                job_id,
-                attempt_id,
-                attempt_id,
-                limit,
-            ),
-        ).fetchall()
+            """
+        with self._lock:
+            rows = self._db.execute(
+                query, (cluster_id, job_id, attempt_id, attempt_id, limit)
+            ).fetchall()
         return [
             (
                 FaultIncident.model_validate_json(incident),
@@ -656,15 +665,9 @@ class SqliteWorkflowMixin:
         with self._state_transaction(f"workflow/{workflow.request_id}"):
             current = self._get("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._put(
                 "workflow",
                 workflow.request_id,
@@ -684,15 +687,9 @@ class SqliteWorkflowMixin:
             current_incident = self._get_optional("incident", incident.incident_id)
             current = self._get("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._put(
                 "workflow",
                 workflow.request_id,

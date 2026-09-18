@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -48,7 +49,8 @@ OPERATION = "FREEZE_EVIDENCE"
 NODE_IDS = ["net003-synthetic-node"]
 DROP_ROLLBACK_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 30
-LEASE_SECONDS = 60
+# The 30-second renewal interval covers the gate handshake and result exchange.
+LEASE_SECONDS = 90
 ACTION_SECONDS = 5
 RESPONSE_QUIET_SECONDS = 2.0
 REPLAY_DELAY_SECONDS = 5.0
@@ -57,6 +59,10 @@ RESPONSE_LOSS_MODE = "forward-then-reset"
 POD_DEADLINE_SECONDS = 600
 STALE_LEASE_409 = "rejected request (409)"
 LOST_RESPONSE_LOG = "net003 result submission lost its response"
+LIMITATIONS = [
+    "The first result post uses a fresh connection after closing only the probe "
+    "caller's thread-local pool; TLS verification and product-owned retry are unchanged"
+]
 
 CaseError = fixture.NetCommandError
 write_json = fixture.write_json
@@ -100,18 +106,30 @@ def timing_errors(
     replay delay -- has to finish before the executor's first lease renewal,
     because a renewal sent against the now-terminal command is refused with
     409 and would count as a renewal failure the case has no business
-    producing. That is why the lease is not shortened to 20s here: a 20s
-    lease renews every 6.7s and cannot fit the exchange.
+    producing. The margin also reserves time for the leased snapshot/action
+    gate handshake; even a 60s lease renews too soon for that budget.
     """
 
     errors: list[str] = []
+    if (
+        type(lease_seconds) is not int
+        or lease_seconds <= 0
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in (quiet_seconds, replay_delay_seconds, http_timeout_seconds)
+        )
+    ):
+        return ["result exchange timings must be finite and positive"]
     interval = renewal_interval_seconds(lease_seconds)
     exchange = ACTION_SECONDS + quiet_seconds + replay_delay_seconds
-    if exchange + 5 >= interval:
+    if exchange + 10 >= interval:
         errors.append(
-            f"result exchange takes {exchange:.1f}s (+5s margin), not inside the "
-            f"{interval:.1f}s renewal interval of a {lease_seconds}s lease; a "
-            "renewal against the terminal command would be refused"
+            f"result exchange takes {exchange:.1f}s (+10s gate/skew margin), not "
+            f"inside the {interval:.1f}s renewal interval of a {lease_seconds}s "
+            "lease; a renewal against the terminal command would be refused"
         )
     if quiet_seconds + replay_delay_seconds >= http_timeout_seconds:
         errors.append(
@@ -175,6 +193,7 @@ def preflight_metadata(
         "node_ids": NODE_IDS,
         "operation": OPERATION,
         "destructive": False,
+        "limitations": LIMITATIONS,
         "network_scope": (
             "one test-pod result connection reset on loopback proxy, after the "
             "control plane answered"
@@ -212,13 +231,8 @@ from gpu_fault.models import (
 from gpu_fault.regional import RemoteActionCommand
 
 (
-    run_id,
-    cluster_id,
-    owner,
-    notification_id,
-    deduplication_key,
-    raw_node_ids,
-    raw_lease_seconds,
+    run_id, cluster_id, owner, notification_id, deduplication_key,
+    raw_node_ids, raw_lease_seconds,
 ) = sys.argv[1:]
 node_ids = [item for item in raw_node_ids.split(",") if item]
 lease_seconds = int(raw_lease_seconds)
@@ -243,11 +257,6 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
-# Leased to the probe's seed identity exactly like the shared seed
-# (seeded_command_fixture, commit 87c2697): the deployed dispatcher wakes on
-# the workflow save and claims an unleased PENDING row within the second,
-# drives its step against a node no cluster carries, fails it, and the orphan
-# sweep then cancels the command before the probe can claim it.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
@@ -294,6 +303,7 @@ print(json.dumps({
     "event_id": incident.event_id,
     "workflow_id": workflow_id,
     "command_id": command_id,
+    "idempotency_key": command.idempotency_key,
     "cluster_id": cluster_id,
     "notification_id": notification_id,
     "deduplication_key": deduplication_key,
@@ -330,7 +340,7 @@ with psycopg.connect(store_dsn()) as connection:
         cursor.execute(
             '''
             SELECT kind, payload->>'status'
-            FROM gpu_fault_objects
+            FROM gpu_fault_control_records
             WHERE key=%s
               AND kind IN (
                   'notification',
@@ -405,11 +415,11 @@ with psycopg.connect(store_dsn(), autocommit=True) as connection:
     )
     for kind, key in items:
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s", (kind, key)
+            "SELECT gpu_fault_delete_control_state(%s,%s)", (kind, key)
         )
-        deleted[f"{kind}/{key}"] = cursor.rowcount
+        deleted[f"{kind}/{key}"] = int(cursor.fetchone()[0])
     cursor.execute(
-        "SELECT kind, key FROM gpu_fault_objects WHERE (kind, key) IN ("
+        "SELECT kind, key FROM gpu_fault_control_records WHERE (kind, key) IN ("
         "('remote_command', %s), ('workflow', %s), ('incident', %s), "
         "('notification_result', %s), ('notification_delivery', %s), "
         "('notification', %s)) ORDER BY kind, key",
@@ -449,7 +459,11 @@ def purge_seed(seed: dict[str, Any]) -> dict[str, Any]:
         str(seed["deduplication_key"]),
         str(seed["event_id"]),
     )
-    if result.get("remaining") or result.get("remaining_links"):
+    if (
+        result.get("remaining") != []
+        or type(result.get("remaining_links")) is not int
+        or result["remaining_links"] != 0
+    ):
         raise CaseError(f"seed cleanup left residual state: {result}")
     return result
 
@@ -470,6 +484,7 @@ def _run_net003_case(
     preflight = preflight_metadata(attempt, maintenance_window_end)
     write_json(case_dir / "preflight.json", preflight)
     fixture.preflight_residuals(probe, case_dir)
+    state["registry_started"] = True
     fixture.register_synthetic_cluster(case_dir, run_id)
     probe_with_notification = fixture.NetCommandProbe(
         case_id=probe.case_id,
@@ -481,7 +496,13 @@ def _run_net003_case(
         environment={**probe.environment, "NOTIFICATION_ID": notification_id},
         pod_deadline_seconds=probe.pod_deadline_seconds,
     )
-    ready = fixture.create_probe_pod(probe_with_notification, case_dir)
+    state["probe_started"] = True
+    ready = fixture.create_probe_pod(probe_with_notification, case_dir, run_id=run_id)
+    state["seed"] = {
+        **seeded.seed_identity(run_id),
+        "notification_id": notification_id,
+        "deduplication_key": deduplication_key,
+    }
     seed = seed_command(run_id)
     state["seed"] = seed
     write_json(case_dir / "seed.json", seed)
@@ -502,6 +523,22 @@ def _run_net003_case(
     write_json(case_dir / "leased-command.json", leased)
     if leased.get("status") != "LEASED" or not leased.get("lease_expires_at"):
         raise CaseError(f"command was not actively leased before injection: {leased}")
+    gate_errors = leased_gate_errors(leased, seed, now=datetime.now(timezone.utc))
+    if gate_errors:
+        raise CaseError("; ".join(gate_errors))
+    gate_armed_at = datetime.now(timezone.utc)
+    fixture.touch(probe, "/state/block")
+    fixture.wait_file(probe, "/state/action-gate-observed.json", 30)
+    action_gate_observed = fixture.read_state(probe, "/state/action-gate-observed.json")
+    write_json(case_dir / "action-gate-observed.json", action_gate_observed)
+    gate_errors = action_gate_errors(
+        action_gate_observed,
+        seed,
+        armed_at=gate_armed_at,
+        observed_at=datetime.now(timezone.utc),
+    )
+    if gate_errors:
+        raise CaseError("; ".join(gate_errors))
     fixture.wait_file(probe, "/state/result-submit-started.json", 30)
     result_submit_started = fixture.read_state(
         probe, "/state/result-submit-started.json"
@@ -562,9 +599,12 @@ def _run_net003_case(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "preflight": preflight,
+        "limitations": LIMITATIONS,
         "http_timeout_seconds": ready.get("http_timeout_seconds"),
         "network_interruption": {
             "type": "single-result-connection-reset-after-response",
+            "action_gate_armed_at": gate_armed_at.isoformat(),
+            "action_gate_observed": action_gate_observed,
             "result_submit_started": result_submit_started,
             "drop_observed": drop_observed,
             "result_interrupted": result_interrupted,
@@ -590,8 +630,105 @@ def parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
+
+
+def finite_epoch(value: Any) -> TypeGuard[int | float]:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def leased_gate_errors(
+    leased: dict[str, Any], seed: dict[str, Any], *, now: datetime
+) -> list[str]:
+    errors = []
+    for field, source in (
+        ("command_id", "command_id"),
+        ("workflow_request_id", "workflow_id"),
+        ("incident_id", "incident_id"),
+        ("cluster_id", "cluster_id"),
+        ("idempotency_key", "idempotency_key"),
+    ):
+        if (
+            not isinstance(seed.get(source), str)
+            or not seed[source]
+            or (leased.get(field) != seed[source])
+        ):
+            errors.append(f"leased command {field} is not bound to the seed")
+    expires = parse_time(leased.get("lease_expires_at"))
+    if leased.get("status") != "LEASED" or expires is None or expires <= now:
+        errors.append("action gate requires a current unexpired command lease")
+    return errors
+
+
+def action_gate_errors(
+    receipt: dict[str, Any],
+    seed: dict[str, Any],
+    *,
+    armed_at: datetime,
+    observed_at: datetime,
+) -> list[str]:
+    epoch = receipt.get("observed_at_epoch")
+    if (
+        receipt.get("idempotency_key") != seed["idempotency_key"]
+        or not finite_epoch(epoch)
+        or not armed_at.timestamp() - 2 <= epoch <= observed_at.timestamp() + 2
+    ):
+        return ["action gate receipt is not freshly bound to the leased command"]
+    return []
+
+
+def result_identity_errors(
+    leased: dict[str, Any],
+    committed: dict[str, Any],
+    final: dict[str, Any],
+    interrupted: dict[str, Any],
+    replays: dict[str, Any],
+    ledger: dict[str, Any],
+) -> list[str]:
+    errors = []
+    command_id = leased.get("command_id")
+    records = [
+        committed,
+        final,
+        interrupted,
+        replays,
+        *(replays.get("responses") or []),
+    ]
+    if (
+        not isinstance(command_id, str)
+        or not command_id
+        or any(item.get("command_id") != command_id for item in records)
+    ):
+        errors.append("result exchange records do not identify the same command")
+    for field in (
+        "workflow_request_id",
+        "incident_id",
+        "cluster_id",
+        "idempotency_key",
+    ):
+        expected = leased.get(field)
+        if (
+            not isinstance(expected, str)
+            or not expected
+            or any(item.get(field) != expected for item in (committed, final))
+        ):
+            errors.append(f"result exchange changed or omitted {field}")
+    if ledger.get("keys") != [leased.get("idempotency_key")]:
+        errors.append("action ledger is not bound to the leased idempotency key")
+    if final.get("status") != "SUCCEEDED" or final.get("lease_expires_at") is not None:
+        errors.append("final command is not a lease-free success")
+    if any(
+        committed.get(field) != final.get(field)
+        for field in ("updated_at", "status", "status_source", "result_details")
+    ):
+        errors.append("terminal replay changed the first committed result")
+    return errors
 
 
 def net003_errors(
@@ -611,22 +748,43 @@ def net003_errors(
     notification_baseline: dict[str, Any],
     notification_final: dict[str, Any],
 ) -> list[str]:
-    errors: list[str] = []
-    if ledger.get("physical_count") != 1:
+    errors = result_identity_errors(
+        leased, committed, final, result_interrupted, result_replays, ledger
+    )
+    if type(ledger.get("physical_count")) is not int or ledger["physical_count"] != 1:
         errors.append("physical action count is not one")
     if len(ledger.get("keys") or []) != 1:
         errors.append("idempotency ledger does not contain exactly one key")
-    if int(executor_state.get("claimed_total") or 0) != 1:
+    if (
+        type(executor_state.get("claimed_total")) is not int
+        or executor_state["claimed_total"] != 1
+    ):
         errors.append(
             "the committed command was claimed again; the control plane did not "
             "hold the first result"
         )
-    if int(executor_state.get("reported_failures") or 0) != 0:
+    if (
+        type(executor_state.get("reported_failures")) is not int
+        or executor_state["reported_failures"] != 0
+    ):
         errors.append("a result post was rejected; the replay was not idempotent")
-    if int(executor_state.get("unexpected_failures") or 0):
+    if (
+        type(executor_state.get("unexpected_failures")) is not int
+        or executor_state["unexpected_failures"] != 0
+    ):
         errors.append("executor recorded an unexpected failure")
-    if int(executor_state.get("lease_renewal_failures") or 0) != 0:
+    if (
+        type(executor_state.get("lease_renewal_failures")) is not int
+        or executor_state["lease_renewal_failures"] != 0
+    ):
         errors.append("a lease renewal was refused during the result exchange")
+    if (
+        type(executor_state.get("transport_retries_total")) is not int
+        or executor_state["transport_retries_total"] != 1
+    ):
+        errors.append(
+            "the production executor did not perform exactly one report retry"
+        )
     if ready.get("drop_rollback_seconds") != DROP_ROLLBACK_SECONDS:
         errors.append("connection-drop rollback timer is not configured")
     if ready.get("lease_seconds") != LEASE_SECONDS:
@@ -637,12 +795,14 @@ def net003_errors(
         errors.append("probe proxy does not forward the request before the reset")
     if ready.get("terminal_result_replays") != TERMINAL_RESULT_REPLAYS:
         errors.append("terminal result replay count is not configured")
+    if ready.get("result_retry_owner") != "product-executor":
+        errors.append("the test client, not the production executor, owns the retry")
     errors.extend(
         timing_errors(
-            lease_seconds=int(ready.get("lease_seconds") or 0),
-            quiet_seconds=float(ready.get("response_quiet_seconds") or 0),
-            replay_delay_seconds=float(ready.get("replay_delay_seconds") or 0),
-            http_timeout_seconds=float(ready.get("http_timeout_seconds") or 0),
+            lease_seconds=ready.get("lease_seconds", 0),
+            quiet_seconds=ready.get("response_quiet_seconds", 0),
+            replay_delay_seconds=ready.get("replay_delay_seconds", 0),
+            http_timeout_seconds=ready.get("http_timeout_seconds", 0),
         )
     )
     if drop_observed.get("connection_reset") is not True:
@@ -651,8 +811,11 @@ def net003_errors(
         errors.append("proxy reset the client before forwarding the result post")
     if int(drop_observed.get("upstream_response_bytes") or 0) <= 0:
         errors.append("proxy reset the client before the control plane answered")
-    if result_interrupted.get("first_post_succeeded") is not False or not (
-        result_interrupted.get("exception")
+    if (
+        result_interrupted.get("first_post_succeeded") is not False
+        or not (result_interrupted.get("exception"))
+        or "status_code" not in result_interrupted
+        or result_interrupted["status_code"] is not None
     ):
         errors.append("the client did not see a transport error on the first post")
     if rollback_triggered:
@@ -668,7 +831,7 @@ def net003_errors(
         errors.append(f"command was not leased before the result post: {leased}")
     replay_sent_at = result_replays.get("replay_sent_at_epoch")
     updated_at = parse_time(final.get("updated_at"))
-    if not isinstance(replay_sent_at, (int, float)) or updated_at is None:
+    if not finite_epoch(replay_sent_at) or updated_at is None:
         errors.append("replay time or command update time is missing")
     else:
         lead = float(replay_sent_at) - updated_at.timestamp()
@@ -678,6 +841,8 @@ def net003_errors(
                 "the commit is not attributable to the first post"
             )
     responses = result_replays.get("responses") or []
+    if result_replays.get("retry_owner") != "product-executor":
+        errors.append("terminal replay was not observed from the production executor")
     if result_replays.get("count") != TERMINAL_RESULT_REPLAYS or len(responses) != (
         TERMINAL_RESULT_REPLAYS
     ):
@@ -740,7 +905,13 @@ def run_case(
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         fixture.cleanup(
-            probe, case_dir, run_id, result, state["seed"], purge=purge_seed
+            probe,
+            case_dir,
+            run_id,
+            result,
+            state["seed"],
+            purge=purge_seed,
+            state=state,
         )
     result["predecessor"] = predecessor
     try:
@@ -756,6 +927,7 @@ def run_case(
 def plan_details(predecessor: dict[str, Any]) -> dict[str, Any]:
     return {
         "risk": "live-non-destructive",
+        "limitations": LIMITATIONS,
         "predecessor": predecessor,
         "synthetic_cluster_id": fixture.SYNTHETIC_CLUSTER_ID,
         "seeded_operation": OPERATION,
@@ -775,7 +947,7 @@ def plan_details(predecessor: dict[str, Any]) -> dict[str, Any]:
         },
         "mutations": [
             "temporary synthetic registry entry",
-            "controlled CPU registry rollouts",
+            "converged CPU registry revision publication without Deployment rollout",
             "temporary GPU probe Pod and ConfigMap",
         ],
         "hard_stop": (

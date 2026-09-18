@@ -35,8 +35,13 @@ GPU_FAULT_FORCE_ADOT_RESTART="${GPU_FAULT_FORCE_ADOT_RESTART:-false}"
 DATAPLANE_EXPECTED_RULE_NAMESPACE="gpu-fault-dataplane-expected"
 DATAPLANE_EXPECTED_RULES_ACTION=""
 DATAPLANE_EXPECTED_RULES_FILE=""
+RUNTIME_ONLY="false"
 while (($# > 0)); do
     case "$1" in
+    --runtime-only)
+        RUNTIME_ONLY="true"
+        shift
+        ;;
     --dataplane-expected-rules)
         if (($# < 2)) || [[ ! -r "$2" ]]; then
             printf 'ERROR: --dataplane-expected-rules needs a readable file\n' >&2
@@ -74,6 +79,20 @@ fi
     "${ADOT_IMAGE}" != REPLACE_* &&
     "${ADOT_IMAGE}" != *[[:space:]#]* ]] || {
     printf 'ERROR: invalid GPU_FAULT_ADOT_IMAGE\n' >&2
+    exit 2
+}
+[[ "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ &&
+    ${#NAMESPACE} -le 63 ]] || {
+    printf 'ERROR: invalid monitoring namespace\n' >&2
+    exit 2
+}
+if [[ "${RUNTIME_ONLY}" == "true" && "${SERVICE_ACCOUNT}" != "gpu-fault-adot" ]]; then
+    printf 'ERROR: runtime monitoring requires its registered ServiceAccount\n' >&2
+    exit 2
+fi
+[[ "${IAM_ROLE_NAME}" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ &&
+    "${AMP_WORKSPACE_ID}" =~ ^ws-[A-Za-z0-9-]+$ ]] || {
+    printf 'ERROR: invalid monitoring IAM role or workspace identity\n' >&2
     exit 2
 }
 
@@ -231,38 +250,127 @@ cat >"${TMP_DIR}/amp-write-policy.json" <<EOF
 }
 EOF
 
-# `put-role-policy` is an audited IAM mutation, and this installer issued one on
-# every deploy for a document that changes only when the workspace does. Reading
-# the inline policy first also answers whether the role exists at all: on a
-# missing role the read fails the same way, so the create path below is entered
-# without a second `get-role` in the steady state.
-CURRENT_AMP_POLICY="$(
-    aws iam get-role-policy \
-        --role-name "${IAM_ROLE_NAME}" \
-        --policy-name gpu-fault-amp-remote-write \
-        --query PolicyDocument \
-        --output json 2>/dev/null || true
-)"
-AMP_POLICY_CURRENT="false"
-DESIRED_AMP_POLICY="$(jq -S -c . "${TMP_DIR}/amp-write-policy.json")"
-if [[ -n "${CURRENT_AMP_POLICY}" ]]; then
-    LIVE_AMP_POLICY="$(jq -S -c . <<<"${CURRENT_AMP_POLICY}" 2>/dev/null || true)"
-    if [[ "${LIVE_AMP_POLICY}" == "${DESIRED_AMP_POLICY}" ]]; then
-        AMP_POLICY_CURRENT="true"
-        printf 'IAM role %s already grants remote write to this workspace.\n' \
-            "${IAM_ROLE_NAME}"
+canonical_iam_policy() {
+    jq -S -c 'walk(if type == "array" then sort else . end)' \
+        2>"${TMP_DIR}/identity-parse.err"
+}
+
+verify_runtime_identity() {
+    local desired_trust live_trust current_policy desired_policy association_id
+    if ! aws iam get-role --role-name "${IAM_ROLE_NAME}" --output json \
+        >"${TMP_DIR}/runtime-role.json" 2>"${TMP_DIR}/identity-read.err"; then
+        printf 'ERROR: cannot read bootstrap-owned monitoring IAM role\n' >&2
+        return 1
     fi
-elif ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
-    aws iam create-role \
-        --role-name "${IAM_ROLE_NAME}" \
-        --assume-role-policy-document \
-        "file://${TMP_DIR}/pod-identity-trust.json" >/dev/null
-fi
-if [[ "${AMP_POLICY_CURRENT}" != "true" ]]; then
-    aws iam put-role-policy \
-        --role-name "${IAM_ROLE_NAME}" \
-        --policy-name gpu-fault-amp-remote-write \
-        --policy-document "file://${TMP_DIR}/amp-write-policy.json"
+    if ! jq -e --arg arn "${ROLE_ARN}" --arg name "${IAM_ROLE_NAME}" \
+        '.Role.Arn == $arn and .Role.RoleName == $name' \
+        "${TMP_DIR}/runtime-role.json" >/dev/null 2>"${TMP_DIR}/identity-parse.err"; then
+        printf 'ERROR: monitoring IAM role identity differs from bootstrap\n' >&2
+        return 1
+    fi
+    desired_trust="$(
+        jq --arg account "${ACCOUNT_ID}" --arg cluster "${CPU_EKS_ARN}" \
+            '.Statement[0].Condition = {
+                StringEquals: {"aws:SourceAccount": $account},
+                ArnEquals: {"aws:SourceArn": $cluster}
+            }' "${TMP_DIR}/pod-identity-trust.json" | canonical_iam_policy
+    )"
+    live_trust="$(
+        jq '.Role.AssumeRolePolicyDocument |
+            if type == "string" then fromjson else . end' \
+            "${TMP_DIR}/runtime-role.json" 2>"${TMP_DIR}/identity-parse.err" |
+            canonical_iam_policy
+    )" || {
+        printf 'ERROR: monitoring IAM trust response is malformed\n' >&2
+        return 1
+    }
+    if [[ "${live_trust}" != "${desired_trust}" ]]; then
+        printf 'ERROR: monitoring IAM trust differs from the CPU cluster scope\n' >&2
+        return 1
+    fi
+    if ! aws iam get-role-policy --role-name "${IAM_ROLE_NAME}" \
+        --policy-name gpu-fault-amp-remote-write --query PolicyDocument --output json \
+        >"${TMP_DIR}/runtime-policy.json" 2>"${TMP_DIR}/identity-read.err"; then
+        printf 'ERROR: cannot read bootstrap-owned AMP writer policy\n' >&2
+        return 1
+    fi
+    current_policy="$(canonical_iam_policy <"${TMP_DIR}/runtime-policy.json")" || {
+        printf 'ERROR: AMP writer policy response is malformed\n' >&2
+        return 1
+    }
+    desired_policy="$(canonical_iam_policy <"${TMP_DIR}/amp-write-policy.json")"
+    if [[ "${current_policy}" != "${desired_policy}" ]]; then
+        printf 'ERROR: monitoring IAM policy differs from the AMP workspace\n' >&2
+        return 1
+    fi
+    if ! aws eks list-pod-identity-associations --region "${AWS_REGION}" \
+        --cluster-name "${CPU_EKS_CLUSTER}" --namespace "${NAMESPACE}" \
+        --service-account "${SERVICE_ACCOUNT}" --output json \
+        >"${TMP_DIR}/runtime-associations.json" 2>"${TMP_DIR}/identity-read.err"; then
+        printf 'ERROR: cannot read bootstrap-owned monitoring Pod Identity\n' >&2
+        return 1
+    fi
+    association_id="$(
+        jq -er --arg cluster "${CPU_EKS_CLUSTER}" --arg ns "${NAMESPACE}" \
+            --arg sa "${SERVICE_ACCOUNT}" '
+            .associations | select(type == "array" and length == 1) | .[0] |
+            select(.clusterName == $cluster and .namespace == $ns and .serviceAccount == $sa) |
+            .associationId | select(type == "string" and length > 0)
+            ' "${TMP_DIR}/runtime-associations.json" 2>"${TMP_DIR}/identity-parse.err"
+    )" || {
+        printf 'ERROR: monitoring Pod Identity is absent, ambiguous or mismatched\n' >&2
+        return 1
+    }
+    if ! aws eks describe-pod-identity-association --region "${AWS_REGION}" \
+        --cluster-name "${CPU_EKS_CLUSTER}" --association-id "${association_id}" \
+        --output json >"${TMP_DIR}/runtime-association.json" \
+        2>"${TMP_DIR}/identity-read.err"; then
+        printf 'ERROR: cannot verify bootstrap-owned monitoring Pod Identity\n' >&2
+        return 1
+    fi
+    if ! jq -e --arg cluster "${CPU_EKS_CLUSTER}" --arg ns "${NAMESPACE}" \
+        --arg sa "${SERVICE_ACCOUNT}" --arg role "${ROLE_ARN}" --arg id "${association_id}" \
+        '.association | .clusterName == $cluster and .namespace == $ns and
+            .serviceAccount == $sa and .roleArn == $role and .associationId == $id' \
+        "${TMP_DIR}/runtime-association.json" >/dev/null \
+        2>"${TMP_DIR}/identity-parse.err"; then
+        printf 'ERROR: monitoring Pod Identity differs from bootstrap\n' >&2
+        return 1
+    fi
+}
+
+if [[ "${RUNTIME_ONLY}" == "true" ]]; then
+    verify_runtime_identity
+else
+    # The legacy standalone entry owns IAM; release --runtime-only never does.
+    CURRENT_AMP_POLICY="$(
+        aws iam get-role-policy \
+            --role-name "${IAM_ROLE_NAME}" \
+            --policy-name gpu-fault-amp-remote-write \
+            --query PolicyDocument \
+            --output json 2>/dev/null || true
+    )"
+    AMP_POLICY_CURRENT="false"
+    DESIRED_AMP_POLICY="$(jq -S -c . "${TMP_DIR}/amp-write-policy.json")"
+    if [[ -n "${CURRENT_AMP_POLICY}" ]]; then
+        LIVE_AMP_POLICY="$(jq -S -c . <<<"${CURRENT_AMP_POLICY}" 2>/dev/null || true)"
+        if [[ "${LIVE_AMP_POLICY}" == "${DESIRED_AMP_POLICY}" ]]; then
+            AMP_POLICY_CURRENT="true"
+            printf 'IAM role %s already grants remote write to this workspace.\n' \
+                "${IAM_ROLE_NAME}"
+        fi
+    elif ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
+        aws iam create-role \
+            --role-name "${IAM_ROLE_NAME}" \
+            --assume-role-policy-document \
+            "file://${TMP_DIR}/pod-identity-trust.json" >/dev/null
+    fi
+    if [[ "${AMP_POLICY_CURRENT}" != "true" ]]; then
+        aws iam put-role-policy \
+            --role-name "${IAM_ROLE_NAME}" \
+            --policy-name gpu-fault-amp-remote-write \
+            --policy-document "file://${TMP_DIR}/amp-write-policy.json"
+    fi
 fi
 step_done iam-role
 
@@ -277,8 +385,19 @@ read_sns_policy() {
         --query 'Attributes.Policy' \
         --output text
 }
-CURRENT_SNS_POLICY="$(read_sns_policy 2>/dev/null || true)"
+if [[ "${RUNTIME_ONLY}" == "true" ]]; then
+    if ! CURRENT_SNS_POLICY="$(read_sns_policy 2>"${TMP_DIR}/sns-read.err")"; then
+        printf 'ERROR: cannot read bootstrap-owned monitoring SNS topic\n' >&2
+        exit 1
+    fi
+else
+    CURRENT_SNS_POLICY="$(read_sns_policy 2>/dev/null || true)"
+fi
 if [[ -z "${CURRENT_SNS_POLICY}" || "${CURRENT_SNS_POLICY}" == "None" ]]; then
+    if [[ "${RUNTIME_ONLY}" == "true" ]]; then
+        printf 'ERROR: bootstrap-owned monitoring SNS policy is unavailable\n' >&2
+        exit 1
+    fi
     SNS_TOPIC_ARN="$(
         aws sns create-topic \
             --region "${AWS_REGION}" \
@@ -287,26 +406,37 @@ if [[ -z "${CURRENT_SNS_POLICY}" || "${CURRENT_SNS_POLICY}" == "None" ]]; then
     )"
     CURRENT_SNS_POLICY="$(read_sns_policy)"
 fi
-jq \
+if ! jq \
+    --slurpfile template "${REPO_DIR}/deploy/observability/amp-sns-publish-policy.json" \
     --arg account_id "${ACCOUNT_ID}" \
     --arg topic_arn "${SNS_TOPIC_ARN}" \
     --arg workspace_arn "${WORKSPACE_ARN}" \
     '
+      if ($template | length) != 1
+         or $template[0].Sid != "AllowAmpAlertmanagerPublish"
+         or $template[0].Effect != "Allow"
+         or $template[0].Principal != {Service: "aps.amazonaws.com"}
+         or $template[0].Action != "sns:Publish"
+         or $template[0].Resource != "REPLACE_WITH_SNS_TOPIC_ARN"
+         or $template[0].Condition != {
+              StringEquals: {"AWS:SourceAccount": "REPLACE_WITH_AWS_ACCOUNT_ID"},
+              ArnEquals: {"AWS:SourceArn": "REPLACE_WITH_AMP_WORKSPACE_ARN"}
+            }
+      then error("invalid AMP SNS statement asset") else . end
+      | ($template[0]
+          | .Resource = $topic_arn
+          | .Condition.StringEquals["AWS:SourceAccount"] = $account_id
+          | .Condition.ArnEquals["AWS:SourceArn"] = $workspace_arn
+        ) as $statement
+      |
       .Statement = (
-        [.Statement[] | select(.Sid != "AllowAmpAlertmanagerPublish")] +
-        [{
-          Sid: "AllowAmpAlertmanagerPublish",
-          Effect: "Allow",
-          Principal: {Service: "aps.amazonaws.com"},
-          Action: "sns:Publish",
-          Resource: $topic_arn,
-          Condition: {
-            StringEquals: {"AWS:SourceAccount": $account_id},
-            ArnEquals: {"AWS:SourceArn": $workspace_arn}
-          }
-        }]
+        [.Statement[] | select(.Sid != $statement.Sid)] + [$statement]
       )
-    ' <<<"${CURRENT_SNS_POLICY}" >"${TMP_DIR}/sns-policy.json"
+    ' <<<"${CURRENT_SNS_POLICY}" >"${TMP_DIR}/sns-policy.json" \
+    2>"${TMP_DIR}/sns-policy-parse.err"; then
+    printf 'ERROR: monitoring SNS policy or shared statement asset is invalid\n' >&2
+    exit 1
+fi
 SNS_POLICY="$(jq -c . "${TMP_DIR}/sns-policy.json")"
 # The transform above only adds the Alertmanager publish statement, so a topic
 # that already carries it is left alone: rewriting the policy on every deploy
@@ -324,6 +454,9 @@ LIVE_SNS_POLICY="$(canonical_sns_policy <<<"${CURRENT_SNS_POLICY}" 2>/dev/null |
 if [[ "${DESIRED_SNS_POLICY}" == "${LIVE_SNS_POLICY}" ]]; then
     printf 'SNS topic %s already allows Alertmanager to publish.\n' \
         "${SNS_TOPIC_ARN}"
+elif [[ "${RUNTIME_ONLY}" == "true" ]]; then
+    printf 'ERROR: monitoring SNS policy differs from bootstrap prerequisites\n' >&2
+    exit 1
 else
     aws sns set-topic-attributes \
         --region "${AWS_REGION}" \
@@ -337,6 +470,7 @@ sed \
     -e "s/REPLACE_WITH_AMP_WORKSPACE_ID/${AMP_WORKSPACE_ID}/g" \
     -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
     -e "s#REPLACE_WITH_ADOT_IMAGE#${ADOT_IMAGE}#g" \
+    -e "s/gpu-fault-system/${NAMESPACE}/g" \
     "${REPO_DIR}/deploy/observability/adot-control-plane.yaml" \
     >"${TMP_DIR}/adot-control-plane.yaml"
 CURRENT_ADOT_REPLICAS="$(
@@ -382,40 +516,42 @@ if [[ "${GPU_FAULT_ENABLE_ADOT}" != "true" \
 fi
 step_done adot-apply
 
-ASSOCIATION_ID="$(
-    aws eks list-pod-identity-associations \
-        --region "${AWS_REGION}" \
-        --cluster-name "${CPU_EKS_CLUSTER}" \
-        --namespace "${NAMESPACE}" \
-        --service-account "${SERVICE_ACCOUNT}" \
-        --query 'associations[0].associationId' \
-        --output text
-)"
-if [[ "${ASSOCIATION_ID}" == "None" ]]; then
-    aws eks create-pod-identity-association \
-        --region "${AWS_REGION}" \
-        --cluster-name "${CPU_EKS_CLUSTER}" \
-        --namespace "${NAMESPACE}" \
-        --service-account "${SERVICE_ACCOUNT}" \
-        --role-arn "${ROLE_ARN}" >/dev/null
-    # Fresh credentials reach the Pod only through a restart.
-    ADOT_RESTART_REQUIRED="true"
-else
-    CURRENT_ASSOCIATION_ROLE_ARN="$(
-        aws eks describe-pod-identity-association \
+if [[ "${RUNTIME_ONLY}" != "true" ]]; then
+    ASSOCIATION_ID="$(
+        aws eks list-pod-identity-associations \
             --region "${AWS_REGION}" \
             --cluster-name "${CPU_EKS_CLUSTER}" \
-            --association-id "${ASSOCIATION_ID}" \
-            --query 'association.roleArn' \
+            --namespace "${NAMESPACE}" \
+            --service-account "${SERVICE_ACCOUNT}" \
+            --query 'associations[0].associationId' \
             --output text
     )"
-    if [[ "${CURRENT_ASSOCIATION_ROLE_ARN}" != "${ROLE_ARN}" ]]; then
-        aws eks update-pod-identity-association \
+    if [[ "${ASSOCIATION_ID}" == "None" ]]; then
+        aws eks create-pod-identity-association \
             --region "${AWS_REGION}" \
             --cluster-name "${CPU_EKS_CLUSTER}" \
-            --association-id "${ASSOCIATION_ID}" \
+            --namespace "${NAMESPACE}" \
+            --service-account "${SERVICE_ACCOUNT}" \
             --role-arn "${ROLE_ARN}" >/dev/null
+        # Fresh credentials reach the Pod only through a restart.
         ADOT_RESTART_REQUIRED="true"
+    else
+        CURRENT_ASSOCIATION_ROLE_ARN="$(
+            aws eks describe-pod-identity-association \
+                --region "${AWS_REGION}" \
+                --cluster-name "${CPU_EKS_CLUSTER}" \
+                --association-id "${ASSOCIATION_ID}" \
+                --query 'association.roleArn' \
+                --output text
+        )"
+        if [[ "${CURRENT_ASSOCIATION_ROLE_ARN}" != "${ROLE_ARN}" ]]; then
+            aws eks update-pod-identity-association \
+                --region "${AWS_REGION}" \
+                --cluster-name "${CPU_EKS_CLUSTER}" \
+                --association-id "${ASSOCIATION_ID}" \
+                --role-arn "${ROLE_ARN}" >/dev/null
+            ADOT_RESTART_REQUIRED="true"
+        fi
     fi
 fi
 step_done pod-identity

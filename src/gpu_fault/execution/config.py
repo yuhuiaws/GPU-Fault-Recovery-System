@@ -16,6 +16,9 @@ from gpu_fault.models import (
 
 LOGGER = logging.getLogger(__name__)
 
+# Both compilation and execution bound the quadratic DAG validation/ready scans.
+MAX_DAG_STEPS = 256
+
 # The operations whose waiting is owned by ``HyperPodManagedRecoveryObserver``:
 # the control plane submits nothing and watches the provider replace or reboot
 # the node, so the wait is as long as that provider takes.

@@ -39,6 +39,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY
+from scripts.e2e.regional.remote_command_shapes import command_operations
+
 # The reset workflow the first XID 46 must build, in order, exactly once.
 RESET_OPERATIONS = (
     "FREEZE_EVIDENCE",
@@ -239,7 +242,8 @@ def waiting_boundary_errors(workflow: dict[str, Any]) -> list[str]:
         errors.append(f"{BARRIER_OPERATION} is not WAITING: {barrier[0].get('status')}")
     else:
         details = barrier[0].get("details") or {}
-        if details.get("remote_status") != "WAITING":
+        # A retry leases the compound command while its barrier stays WAITING.
+        if details.get("remote_status") not in {"WAITING", "LEASED"}:
             errors.append(
                 "the barrier step's remote command is not WAITING: "
                 f"{details.get('remote_status')}"
@@ -251,7 +255,64 @@ def waiting_boundary_errors(workflow: dict[str, Any]) -> list[str]:
     return errors
 
 
-def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
+def compound_barrier_index(command: dict[str, Any]) -> int | None:
+    """Resolve the reported hold to an actual step, not an arbitrary detail key."""
+
+    details = command.get("result_details") or {}
+    index = details.get("batched_step_index")
+    if type(index) is not int or index < 0:
+        return None
+    matches = [
+        entry
+        for entry in [command, *(command.get("batched_steps") or [])]
+        if entry.get("step_index") == index
+    ]
+    if (
+        len(matches) != 1
+        or (matches[0].get("step") or {}).get("operation") != BARRIER_OPERATION
+        or details.get("batched_operation", BARRIER_OPERATION) != BARRIER_OPERATION
+    ):
+        return None
+    return index
+
+
+def barrier_commands(
+    commands: list[dict[str, Any]], workflow: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Find the pinned barrier command, or recognize its legacy/compound shape."""
+
+    if workflow is not None:
+        executions = executions_of(workflow, BARRIER_OPERATION)
+        if len(executions) != 1:
+            return []
+        command_id = (executions[0].get("details") or {}).get("remote_command_id")
+        if not isinstance(command_id, str) or not command_id:
+            return []
+        return [
+            item
+            for item in commands
+            if item.get("command_id") == command_id
+            and item.get("workflow_request_id") == workflow.get("request_id")
+            and all(
+                key not in workflow or item.get(key) == workflow[key]
+                for key in ("incident_id", "fencing_token")
+            )
+        ]
+    return [
+        item
+        for item in commands
+        if ((item.get("step") or {}).get("operation") or item.get("operation"))
+        == BARRIER_OPERATION
+        or (
+            "gpu_client_quiesce_attempt" in (item.get("result_details") or {})
+            and compound_barrier_index(item) is not None
+        )
+    ]
+
+
+def barrier_reason_errors(
+    commands: list[dict[str, Any]], workflow: dict[str, Any] | None = None
+) -> list[str]:
     """The WAITING command must say *why* it waits, and it must be the holder.
 
     Recorded from ``result_details`` rather than inferred: an empty reason
@@ -259,18 +320,17 @@ def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
     proving a boundary it did not create.
     """
 
-    barrier = [
-        item
-        for item in commands
-        if (item.get("step") or {}).get("operation") == BARRIER_OPERATION
-        or item.get("operation") == BARRIER_OPERATION
-    ]
+    barrier = barrier_commands(commands, workflow)
     if len(barrier) != 1:
         return [f"there is not exactly one barrier remote command: {len(barrier)}"]
     details = barrier[0].get("result_details") or {}
     reason = str(details.get("reason") or "")
     errors: list[str] = []
-    if barrier[0].get("status") != "WAITING":
+    if not barrier_commands(barrier):
+        errors.append("pinned command does not carry the client-verification barrier")
+    if barrier[0].get("batched_steps") and unexecuted_barrier_tail(barrier[0]) is None:
+        errors.append("compound barrier has no complete unadvanced WAITING progress")
+    if barrier[0].get("status") not in {"WAITING", "LEASED"}:
         errors.append(
             f"barrier remote command is not WAITING: {barrier[0].get('status')}"
         )
@@ -278,7 +338,8 @@ def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
         errors.append(
             f"barrier command does not report {WAITING_REASON_SUBSTRING!r}: {reason!r}"
         )
-    if int(details.get("gpu_client_quiesce_attempt") or 0) < 1:
+    attempt = details.get("gpu_client_quiesce_attempt")
+    if type(attempt) is not int or attempt < 1:
         errors.append("barrier command recorded no client-verification attempt")
     return errors
 
@@ -514,29 +575,74 @@ def superseded_predecessor_errors(predecessor: dict[str, Any]) -> list[str]:
     return errors
 
 
+def unexecuted_barrier_tail(command: dict[str, Any]) -> int | None:
+    """Count batched steps proved unstarted by a complete WAITING prefix."""
+
+    index = compound_barrier_index(command)
+    if index is None:
+        return None
+    plan = [command, *(command.get("batched_steps") or [])]
+    indexes = [entry.get("step_index") for entry in plan]
+    if (
+        any(type(value) is not int for value in indexes)
+        or len(set(indexes)) != len(indexes)
+        or indexes != sorted(indexes)
+    ):
+        return None
+    prefix = [value for value in indexes if value <= index]
+    results = (command.get("result_details") or {}).get(BATCHED_RESULTS_KEY)
+    if not isinstance(results, dict) or set(results) != {
+        str(value) for value in prefix
+    }:
+        return None
+    for value in prefix:
+        result = results[str(value)]
+        expected = "WAITING" if value == index else "SUCCEEDED"
+        if not isinstance(result, dict) or result.get("status") != expected:
+            return None
+    held = results[str(index)].get("details") or {}
+    attempt = held.get("gpu_client_quiesce_attempt")
+    if (
+        type(attempt) is not int
+        or attempt < 1
+        or WAITING_REASON_SUBSTRING not in str(held.get("reason") or "")
+        or any(
+            held.get(key) != (command.get("result_details") or {}).get(key)
+            for key in ("gpu_client_quiesce_attempt", "reason")
+        )
+    ):
+        return None
+    return len(indexes) - len(prefix)
+
+
 def cancelled_command_errors(
     commands: list[dict[str, Any]],
     *,
     successor_request_id: str,
+    workflow: dict[str, Any] | None = None,
 ) -> list[str]:
     """The predecessor's WAITING remote command must be cancelled, once, by
-    the preemption -- and no reset command may have been issued at all."""
+    the preemption, with no separately issued or started reset."""
 
     errors: list[str] = []
     for item in commands:
-        operation = (item.get("step") or {}).get("operation")
-        if operation in FORBIDDEN_LEDGER_OPERATIONS:
-            errors.append(f"the superseded reset issued a {operation} command")
-    barrier = [
-        item
-        for item in commands
-        if (item.get("step") or {}).get("operation") == BARRIER_OPERATION
-    ]
+        issued = command_operations(item)
+        unstarted = unexecuted_barrier_tail(item)
+        if unstarted:
+            issued = issued[:-unstarted]
+        for operation in issued:
+            if operation in FORBIDDEN_LEDGER_OPERATIONS:
+                errors.append(f"the superseded reset issued a {operation} command")
+    barrier = barrier_commands(commands, workflow)
     if len(barrier) != 1:
         return errors + [
             f"there is not exactly one barrier remote command: {len(barrier)}"
         ]
     command = barrier[0]
+    if not barrier_commands(barrier):
+        errors.append(
+            "cancelled command does not carry the client-verification barrier"
+        )
     if command.get("status") != "FAILED":
         errors.append(
             f"the barrier remote command is not FAILED: {command.get('status')}"

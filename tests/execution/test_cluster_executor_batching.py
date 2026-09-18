@@ -16,7 +16,7 @@ executor's internals.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event
 from typing import Any
 
@@ -81,18 +81,36 @@ class FakeClient:
         self.before_renew = before_renew
         self.renewed = Event()
 
-    def claim(self, *_args, **_kwargs):
+    def claim(self, executor_id, *, lease_seconds, **_kwargs):
         commands, self.pending = self.pending, []
-        return commands
+        return [
+            command.model_copy(
+                update={
+                    "status": RemoteCommandStatus.LEASED,
+                    "lease_owner": executor_id,
+                    "lease_expires_at": datetime.now(timezone.utc)
+                    + timedelta(seconds=lease_seconds),
+                }
+            )
+            for command in commands
+        ]
 
     def complete(self, command, result):
         self.completed.append(result)
         return command
 
-    def renew(self, command, *_args, **_kwargs):
+    def renew(self, command, executor_id, lease_seconds):
+        command = command.model_copy(
+            update={
+                "lease_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=lease_seconds)
+            }
+        )
+        self.renewals += 1
+        if self.renewals == 1:
+            return command
         if self.before_renew is not None:
             self.before_renew()
-        self.renewals += 1
         if self.cancel_on_renew is not None:
             command = command.model_copy(
                 update={
@@ -378,7 +396,7 @@ def test_a_cancellation_between_steps_stops_before_the_next_one(monkeypatch) -> 
 
     run, result = run_claimed_command(client, adapter)
 
-    assert client.renewals == 1
+    assert client.renewals == 2
     assert run.cancellations_observed_total == 1
     assert result.status is RemoteCommandStatus.WAITING
     assert result.status_source == "executor-stopped-between-batched-steps"
@@ -434,7 +452,9 @@ def test_run_once_reports_the_compound_result_under_one_lease() -> None:
     assert reported.status is RemoteCommandStatus.SUCCEEDED
     assert sorted(reported.details[BATCHED_RESULTS_KEY]) == ["1", "2", "3", "4"]
     assert len(client.progress_posts) == 4
-    assert client.claim() == [], "the command was handed out exactly once"
+    assert client.claim(EXECUTOR, lease_seconds=120) == [], (
+        "the command was handed out exactly once"
+    )
 
 
 def test_a_preflight_defect_on_a_later_step_keeps_the_earlier_results(

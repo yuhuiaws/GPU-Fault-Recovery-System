@@ -35,18 +35,16 @@ def membership_operation_lock(site: RenderedSite) -> Iterator[None]:
         yield
 
 
+def site_mutation_identity(site: RenderedSite) -> dict[str, str]:
+    return {
+        "site_name": str(site.release_config["site_name"]),
+        "aws_region": str(site.release_config["aws_region"]),
+        "cpu_eks_arn": str(site.release_config["cpu_eks_arn"]),
+    }
+
+
 def reload_site_for_mutation(site: RenderedSite) -> RenderedSite:
     current = load_site(site.source, repository_root=site.repository_root)
-    expected = (
-        site.release_config["site_name"],
-        site.release_config["aws_region"],
-        site.release_config["cpu_eks_arn"],
-    )
-    observed = (
-        current.release_config["site_name"],
-        current.release_config["aws_region"],
-        current.release_config["cpu_eks_arn"],
-    )
-    if observed != expected:
+    if site_mutation_identity(current) != site_mutation_identity(site):
         raise BootstrapError("managed site identity changed before mutation lock")
     return current

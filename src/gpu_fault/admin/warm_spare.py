@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,7 +42,12 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from gpu_fault.admin import operator_identity
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
-from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import run_command
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+)
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import REFERENCE_PATTERN
 from gpu_fault.admin.workflow_reconcile import (
@@ -137,22 +141,21 @@ class KubectlNodeApi:
     """``NodeApi`` over ``kubectl``, the client every admin verb already uses."""
 
     def __init__(
-        self, kubectl: Sequence[str], *, run: Callable[..., Any] = subprocess.run
+        self, kubectl: Sequence[str], *, run: Callable[..., Any] | None = None
     ) -> None:
         self.kubectl = list(kubectl)
-        self.run = run
+        self.run = run if run is not None else run_command
 
     def _json(self, *arguments: str) -> Any:
         completed = self.run(
             [*self.kubectl, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
+            timeout_seconds=120,
         )
         if completed.returncode:
+            detail = diagnostic_text(completed.stderr, sensitive=True)
             raise WarmSpareError(
                 f"kubectl {' '.join(arguments[:3])} failed: "
-                f"{(completed.stderr or '').strip() or 'no error output'}"
+                f"{detail or 'no error output'}"
             )
         try:
             return json.loads(completed.stdout)
@@ -400,6 +403,11 @@ def release_refusals(
         refusals.append(
             "node is ALLOCATED by the spare pool; release it through the incident"
         )
+    elif spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) not in {
+        None,
+        "AVAILABLE",
+    }:
+        refusals.append("spare pool state is unknown or unavailable")
     if has_quarantine_ownership(spare):
         refusals.append(
             "node is quarantined; restore the quarantine before releasing the spare"
@@ -466,16 +474,38 @@ def without_survey(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _patch(
-    api: NodeApi, node: str, *, spare_label: str | None, unschedulable: bool
+    api: NodeApi,
+    node: str,
+    *,
+    spare_label: str | None,
+    unschedulable: bool,
+    expected: Mapping[str, Any],
 ) -> dict[str, Any]:
+    uid = expected.get("uid")
+    version = expected.get("resource_version")
+    if (
+        expected.get("name") != node
+        or not isinstance(uid, str)
+        or not uid
+        or not isinstance(version, str)
+        or not version
+    ):
+        raise WarmSpareError("warm-spare node identity or resource version is missing")
     api.patch_node(
         node,
         {
-            "metadata": {"labels": {SPARE_LABEL: spare_label}},
+            "metadata": {
+                "uid": uid,
+                "resourceVersion": version,
+                "labels": {SPARE_LABEL: spare_label},
+            },
             "spec": {"unschedulable": unschedulable},
         },
     )
-    return node_snapshot(api.read_node(node))
+    observed = node_snapshot(api.read_node(node))
+    if observed["name"] != node or observed["uid"] != uid:
+        raise WarmSpareError("warm-spare node identity changed during mutation")
+    return observed
 
 
 def declare(
@@ -512,7 +542,7 @@ def declare(
     # Written before the mutation, so an interrupted declaration still leaves
     # an exact record of what to put back.
     write_json_atomic(record, document)
-    after = _patch(api, node, spare_label="true", unschedulable=True)
+    after = _patch(api, node, spare_label="true", unschedulable=True, expected=before)
     if after["labels"].get(SPARE_LABEL) != "true" or not after["unschedulable"]:
         raise WarmSpareError(
             "declaration did not take effect: the node is not labeled and cordoned"
@@ -545,15 +575,42 @@ def release(
         raise WarmSpareError(
             f"{record} records node {document.get('node')}, not {node}"
         )
+    if not document.get("cluster_id") or document.get("cluster_id") != survey.get(
+        "cluster_id"
+    ):
+        raise WarmSpareError(
+            "warm-spare record belongs to a different or unknown cluster"
+        )
+    declared_node = (document.get("pre_declaration_survey") or {}).get("node") or {}
+    if not declared_node.get("uid") or declared_node["uid"] != survey["node"].get(
+        "uid"
+    ):
+        raise WarmSpareError("warm-spare node UID no longer matches its declaration")
     baseline = document.get("baseline") or {}
+    labels = baseline.get("labels")
+    if (
+        not isinstance(baseline.get("unschedulable"), bool)
+        or not isinstance(labels, dict)
+        or SPARE_LABEL not in labels
+        or (
+            labels[SPARE_LABEL] is not None and not isinstance(labels[SPARE_LABEL], str)
+        )
+    ):
+        raise WarmSpareError("warm-spare declaration baseline is incomplete")
     # Restore against the recorded baseline rather than the node as it is now,
     # so a node that was already cordoned before the declaration stays cordoned.
     restored = _patch(
         api,
         node,
-        spare_label=(baseline.get("labels") or {}).get(SPARE_LABEL),
-        unschedulable=bool(baseline.get("unschedulable", False)),
+        spare_label=labels[SPARE_LABEL],
+        unschedulable=baseline["unschedulable"],
+        expected=survey["node"],
     )
+    if (
+        restored["labels"].get(SPARE_LABEL) != labels[SPARE_LABEL]
+        or restored["unschedulable"] != baseline["unschedulable"]
+    ):
+        raise WarmSpareError("release did not restore the recorded warm-spare baseline")
     document["released_at"] = now()
     document["release_reference"] = reference
     document["release_actor"] = actor
@@ -836,9 +893,12 @@ def run_config_spare_command(
     if request.mode == "check":
         report = run_warm_spare(site, request, api=api, agent_lookup=agent_lookup)
     else:
+        _confirmed(request)
+        _approved_reference(request)
         # The same lock ``config`` and ``deploy`` hold: a cordon during a
         # rollout is exactly the kind of concurrent site change it exists for.
         with administrator_operation_lock(request.state_dir):
+            site = reload_site_for_mutation(site)
             report = run_warm_spare(site, request, api=api, agent_lookup=agent_lookup)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     return 0 if report["ready"] else 1

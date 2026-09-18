@@ -113,8 +113,8 @@ JOB_RECOVERY_SQL = """
 @pytest.fixture(autouse=True)
 def clean_tables():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 
@@ -149,12 +149,22 @@ def _insert_objects(rows: list[tuple[str, str, str]]) -> None:
 _PLAN_ONLY_KNOBS = ("enable_seqscan", "enable_sort", "enable_incremental_sort")
 
 
-def _plan(sql: str, params, knobs: tuple[str, ...] = _PLAN_ONLY_KNOBS) -> str:
+def _plan(
+    sql: str,
+    params,
+    knobs: tuple[str, ...] = _PLAN_ONLY_KNOBS,
+    *,
+    as_json: bool = False,
+):
     with _connect() as connection:
         with connection.cursor() as cursor:
             for knob in knobs:
                 cursor.execute(f"SET {knob}=off")
-            cursor.execute("EXPLAIN " + sql, params)
+            cursor.execute(
+                ("EXPLAIN (FORMAT JSON) " if as_json else "EXPLAIN ") + sql, params
+            )
+            if as_json:
+                return cursor.fetchone()[0]
             return "\n".join(row[0] for row in cursor.fetchall())
 
 
@@ -502,10 +512,16 @@ def test_terminal_workflow_newest_first_scan_walks_the_all_status_updated_index(
         newest_first=True,
     )
 
-    plan = _plan(sql, params)
+    from tests.store.test_postgres_state_tables import plan_nodes
 
-    assert "gpu_fault_workflow_updated_all" in plan, plan
-    assert "Sort" not in plan, plan
+    plan = _plan(sql, params, as_json=True)
+    nodes = list(plan_nodes(plan))
+    assert any(
+        node.get("Index Name") == "gpu_fault_workflow_updated_all" for node in nodes
+    ), plan
+    assert not any(
+        node.get("Node Type") in {"Sort", "Incremental Sort"} for node in nodes
+    ), plan
 
 
 def test_missing_workflow_inspection_reads_incident_pointers_from_the_index():

@@ -29,6 +29,7 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 NOW = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
 INCIDENT_ID = "incident-epoch-cas"
@@ -37,7 +38,15 @@ SUCCESSOR_ID = "workflow-epoch-cas-restored"
 PLAN_ID = "plan-epoch-cas"
 
 
-@pytest.fixture(params=["memory", "sqlite", "postgres"])
+@pytest.fixture(
+    params=[
+        "memory",
+        "sqlite",
+        "postgres-legacy",
+        "postgres-dual",
+        "postgres-dedicated",
+    ]
+)
 def store(request, tmp_path):
     if request.param == "memory":
         yield build_store()
@@ -51,9 +60,19 @@ def store(request, tmp_path):
         return
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
     for postgres in postgres_store_instance():
-        yield postgres
-    _truncate()
+        try:
+            with psycopg.connect(
+                os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+            ) as connection:
+                select_mode(
+                    connection, "workflow", request.param.removeprefix("postgres-")
+                )
+            yield postgres
+        finally:
+            _truncate()
 
 
 def _restored_state(store) -> None:

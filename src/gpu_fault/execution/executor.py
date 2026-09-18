@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -14,9 +14,10 @@ from pydantic import ValidationError
 
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
 import gpu_fault.execution.step_bounds as step_bounds
+from gpu_fault.execution import node_rebinding, terminal_state
 from gpu_fault.execution.branch_escalation import BranchEscalation, BranchEscalator
-from gpu_fault.execution import node_rebinding
 from gpu_fault.execution.config import (
+    MAX_DAG_STEPS as MAX_DAG_STEPS,
     ProductionExecutorConfig,
 )
 from gpu_fault.execution.fleet_preflight import (
@@ -35,12 +36,26 @@ from gpu_fault.execution.models import (
     WorkflowStructureError,
     _failure_details,
 )
+from gpu_fault.execution.node_action_uncertainty import (
+    quiesce_needs_restoration,
+    refresh_remote_action_state,
+    restoration_refusal,
+)
 from gpu_fault.execution.remediation_budget import escalation_budget_claims
 from gpu_fault.execution.transient_errors import (
     retryable_adapter_error,
     transient_store_error,
 )
-from gpu_fault.markers import retire_markers_for_incident
+from gpu_fault.execution.terminal_state import (
+    DIAGNOSTIC_INCONCLUSIVE_REASON as DIAGNOSTIC_INCONCLUSIVE_REASON,
+)
+from gpu_fault.execution.workflow_notifications import (
+    NotificationSender,
+    TerminalHook as TerminalHook,
+    close_inconclusive_diagnostic,
+    notify_terminal_hooks,
+    persist_spare_completion,
+)
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -55,7 +70,6 @@ from gpu_fault.models import (
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
-    bounded_reasons,
     record_workflow_event,
     resolved_step_indexes,
 )
@@ -65,8 +79,6 @@ from gpu_fault.notifications import (
     WarmSpareReplacementEmailBuilder,
 )
 from gpu_fault.operation_registry import (
-    DESTRUCTIVE_OPERATIONS,
-    NODE_WIDE_RECOVERY_OPERATIONS,
     SAFE_REMOTE_WAITING_PREEMPT_OPERATIONS,
 )
 from gpu_fault.orchestration import WorkflowFencingError
@@ -81,15 +93,6 @@ from gpu_fault.store.shared.errors import RemediationBudgetError
 from gpu_fault.workflow_resolution import retirement_fences_out_dispatch
 
 LOGGER = logging.getLogger(__name__)
-
-#: Reason an incident carries when its only workflow observed the node and
-#: failed to conclude; the TERMINAL event and the retired markers say the same.
-DIAGNOSTIC_INCONCLUSIVE_REASON = "diagnostic inconclusive"
-# Upper bound on the steps one DAG may carry. Appended branches and in-place
-# escalation rungs grow the graph; the validator and the ready-set scan are
-# both quadratic in its size, so a graph with no bound is a runaway
-# workflow's way of pinning a dispatcher worker (F-C6).
-MAX_DAG_STEPS = 256
 
 # One vocabulary for "this workflow is waiting on a node someone else is
 # repairing" (review item 4). The dispatcher's busy-node hold and the restart
@@ -120,13 +123,6 @@ WORKFLOW_CANCELLATION_STATUS_SOURCES = frozenset(
 # adapter hit a retryable error (a Kubernetes 5xx, a torn connection). Not a
 # hold: nothing is being waited on but the next dispatcher tick.
 STEP_RETRY_REASON_ADAPTER_ERROR = "RETRYABLE_ADAPTER_ERROR"
-
-# ARCH-B3: called from the one place every terminal write lands, with the
-# workflow as written, the incident as written (``None`` when the incident row
-# is gone or belongs to a successor) and the steps the workflow executed.
-TerminalHook = Callable[
-    [WorkflowRequest, FaultIncident | None, list[WorkflowStepSpec]], None
-]
 
 
 def configured_step_transient_retry_limit(values: Mapping[str, str]) -> int:
@@ -201,7 +197,7 @@ class ProductionWorkflowExecutor:
         adapters: list[WorkflowStepAdapter],
         config: ProductionExecutorConfig,
         *,
-        notification_sender=None,
+        notification_sender: NotificationSender | None = None,
         step_transient_retry_limit: int | None = None,
     ) -> None:
         if config.workflow_execution_timeout_seconds <= 0:
@@ -371,6 +367,10 @@ class ProductionWorkflowExecutor:
                 if workflow.dag_enabled:
                     self._save_leased(workflow, execution_epoch)
                     return self._result(workflow, incident)
+                steps = workflow.safety_steps if is_safety else workflow.official_steps
+                if index in resolved_step_indexes(workflow):
+                    continue
+                step = steps[index]
                 if workflow.workload_withdrawn_at is not None:
                     # Re-read on every step, as the DAG loop does (F-N1 §7): a
                     # stop that landed while the previous step ran must keep
@@ -455,20 +455,8 @@ class ProductionWorkflowExecutor:
                         workflow.safety_steps if is_safety else workflow.official_steps
                     )
 
-                completed_indexes = [
-                    *workflow.completed_step_indexes,
-                    index,
-                ]
-                completed_operations = [
-                    *workflow.completed_operations,
-                    step.operation,
-                ]
-                workflow = workflow.model_copy(
-                    update={
-                        "completed_step_indexes": completed_indexes,
-                        "completed_operations": completed_operations,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
+                workflow = step_bounds.record_completion(
+                    workflow, index, step.operation
                 )
                 if incident_rebound:
                     self._save_leased_state(workflow, incident, execution_epoch)
@@ -578,6 +566,10 @@ class ProductionWorkflowExecutor:
                 )
             batch_failure: tuple[int, WorkflowStepOutcome] | None = None
             for index in ready:
+                if not step_bounds.dag_step_is_current(
+                    workflow, steps, index, validated_revision, is_safety
+                ):
+                    break
                 attempted.add(index)
                 step = steps[index]
                 preempted = self._supersede_if_safe(
@@ -661,18 +653,8 @@ class ProductionWorkflowExecutor:
                     steps = (
                         workflow.safety_steps if is_safety else workflow.official_steps
                     )
-                workflow = workflow.model_copy(
-                    update={
-                        "completed_step_indexes": [
-                            *workflow.completed_step_indexes,
-                            index,
-                        ],
-                        "completed_operations": [
-                            *workflow.completed_operations,
-                            step.operation,
-                        ],
-                        "updated_at": datetime.now(timezone.utc),
-                    }
+                workflow = step_bounds.record_completion(
+                    workflow, index, step.operation
                 )
                 if incident_rebound:
                     self._save_leased_state(workflow, incident, execution_epoch)
@@ -840,12 +822,12 @@ class ProductionWorkflowExecutor:
             workflow, incident, execution_epoch, compensation_error=None
         )
 
-    def _job_failure_still_deferred(self, workflow: WorkflowRequest) -> bool:
-        """Does a parked job-level failure still wait on in-flight siblings?
+    def _job_failure_still_deferred(
+        self, workflow: WorkflowRequest, compensation_index: int
+    ) -> bool:
+        """Hold a parked failure until its in-flight siblings settle.
 
-        Asked by the claim preflight before it resumes the compensation: while
-        a DAG sibling's command is still executing the record goes back into
-        the DAG loop, which polls it and lands the verdict when it settles.
+        The compensation handler polls its selected restore separately.
         """
 
         if not workflow.dag_enabled or workflow.pending_failure_step_index is None:
@@ -853,7 +835,7 @@ class ProductionWorkflowExecutor:
         boundary = preemption_boundary(workflow)
         return bool(
             (boundary.blocking | boundary.malformed)
-            - {workflow.pending_failure_step_index}
+            - {workflow.pending_failure_step_index, compensation_index}
         )
 
     def _escalate_failed_branch(
@@ -1240,55 +1222,15 @@ class ProductionWorkflowExecutor:
         step_index: int,
         outcome: WorkflowStepOutcome,
     ) -> WorkflowStepOutcome:
-        if (
-            outcome.status is not WorkflowStepStatus.SUCCEEDED
-            or step.operation is not WorkflowOperation.REPLACE_NODE
-            or (outcome.details or {}).get("action") != "SPARE_FAILOVER"
-        ):
-            return outcome
-        operation_id = f"{workflow.request_id}/{step_index}/REPLACE_NODE"
-        spare_nodes = list(outcome.details.get("activated_spare_nodes") or [])
-        rebindings = {
-            str(key): str(value)
-            for key, value in (outcome.details.get("node_rebindings") or {}).items()
-        }
-        notification = self.warm_spare_email_builder.build(
-            cluster_id=incident.cluster_id,
-            incident_id=incident.incident_id,
-            workflow_id=workflow.request_id,
-            event_id=incident.event_id,
-            policy_source=incident.policy_source,
-            official_action=incident.official_action,
-            effective_action=(
-                incident.effective_action.value if incident.effective_action else None
-            ),
-            reasons=incident.reasons,
-            operation_id=operation_id,
-            fault_node_ids=step.node_ids,
-            spare_node_ids=spare_nodes,
-            node_rebindings=rebindings,
-            confirmation_source=str(
-                outcome.details.get(
-                    "confirmation_source",
-                    "healthy-running-warm-spare",
-                )
-            ),
-            provider_mutation_submitted=bool(
-                outcome.details.get("provider_mutation_submitted", False)
-            ),
-        )
-        notification = self.store.save_notification_if_absent(notification)
-        if self.notification_sender is not None:
-            self.notification_sender(notification.notification_id)
-        return replace(
+        return persist_spare_completion(
+            self.store,
+            workflow,
+            incident,
+            step,
+            step_index,
             outcome,
-            details={
-                **outcome.details,
-                "notification_id": (
-                    outcome.details.get("notification_id")
-                    or notification.notification_id
-                ),
-            },
+            builder=self.warm_spare_email_builder,
+            sender=self.notification_sender,
         )
 
     def _complete_claimed_workflow(
@@ -1321,42 +1263,11 @@ class ProductionWorkflowExecutor:
         workflow: WorkflowRequest,
         steps: list[WorkflowStepSpec] | None = None,
     ) -> bool:
-        """Is there a completed quiesce whose nodes no later completed restore
-        covers? Judged per node (F-C4): a restore on another node -- or a
-        restore that ran *before* the quiesce -- does not undo it. The step
-        set defaults to the one this record executes."""
-
-        if steps is None:
-            steps = (
-                workflow.safety_steps
-                if workflow.executes_safety_steps
-                else workflow.official_steps
-            )
-        completed = set(workflow.completed_step_indexes)
-        for quiesce_index, quiesce in enumerate(steps):
-            if (
-                quiesce_index not in completed
-                or quiesce.operation is not WorkflowOperation.QUIESCE_GPU_SERVICES
-            ):
-                continue
-            restored: set[str] = set()
-            for restore_index, restore in enumerate(steps):
-                if (
-                    restore_index > quiesce_index
-                    and restore_index in completed
-                    and (
-                        restore.operation is WorkflowOperation.RESTORE_GPU_SERVICES
-                        # A rebooted or replaced node has no quiesced services
-                        # left to restore (F-N1: the rung that replaced the
-                        # branch's RESTORE_GPU_SERVICES settles it).
-                        or restore.operation
-                        in ProductionWorkflowExecutor._QUIESCE_SETTLING_OPERATIONS
-                    )
-                ):
-                    restored.update(restore.node_ids)
-            if set(quiesce.node_ids) - restored:
-                return True
-        return False
+        return quiesce_needs_restoration(
+            workflow,
+            steps,
+            settling_operations=ProductionWorkflowExecutor._QUIESCE_SETTLING_OPERATIONS,
+        )
 
     def _supersede_if_safe(
         self,
@@ -1508,39 +1419,40 @@ class ProductionWorkflowExecutor:
         )
 
     def _quiesce_handoff_evidence(
-        self,
-        workflow: WorkflowRequest,
+        self, workflow: WorkflowRequest, *, unrestored_only: bool = False
     ) -> tuple[int, WorkflowStepSpec, WorkflowStepExecution] | None:
         completed = set(workflow.completed_step_indexes)
-        quiesce_match = next(
-            (
-                (index, step)
-                for index, step in reversed(list(enumerate(workflow.official_steps)))
-                if index in completed
-                and step.operation is WorkflowOperation.QUIESCE_GPU_SERVICES
-            ),
-            None,
-        )
-        if quiesce_match is None:
-            return None
-        quiesce_index, quiesce_step = quiesce_match
-        quiesce_execution = next(
-            (
-                item
-                for item in workflow.step_executions
-                if item.step_index == quiesce_index
-                and item.operation is quiesce_step.operation
-                and item.status is WorkflowStepStatus.SUCCEEDED
-            ),
-            None,
-        )
-        if quiesce_execution is None:
-            return None
-        return (
-            quiesce_index,
-            quiesce_step,
-            quiesce_execution,
-        )
+        settling = self._QUIESCE_SETTLING_OPERATIONS | {
+            WorkflowOperation.RESTORE_GPU_SERVICES
+        }
+        for index, step in reversed(list(enumerate(workflow.official_steps))):
+            if (
+                index not in completed
+                or step.operation is not WorkflowOperation.QUIESCE_GPU_SERVICES
+            ):
+                continue
+            # Historical success is not live proof after these nodes were restored.
+            settled = {
+                node
+                for later, candidate in enumerate(workflow.official_steps)
+                if unrestored_only
+                and later > index
+                and later in completed
+                and candidate.operation in settling
+                for node in candidate.node_ids
+            }
+            remaining = [node for node in step.node_ids if node not in settled]
+            if not remaining:
+                continue
+            for execution in workflow.step_executions:
+                if (
+                    execution.step_index == index
+                    and execution.operation is step.operation
+                    and execution.status is WorkflowStepStatus.SUCCEEDED
+                ):
+                    step = step.model_copy(update={"node_ids": remaining})
+                    return index, step, execution
+        return None
 
     def _can_handoff_quiesce_for_preemption(
         self,
@@ -1550,16 +1462,13 @@ class ProductionWorkflowExecutor:
     ) -> bool:
         if successor.incident_id != incident.incident_id:
             return False
-        evidence = self._quiesce_handoff_evidence(workflow)
+        evidence = self._quiesce_handoff_evidence(workflow, unrestored_only=True)
         if evidence is None:
             return False
         _, quiesce_step, _ = evidence
         successor_operations = {step.operation for step in successor.official_steps}
         if successor_operations.intersection(
-            {
-                WorkflowOperation.RESET_GPU,
-                WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-            }
+            {WorkflowOperation.RESET_GPU, WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES}
         ):
             successor_quiesce = next(
                 (
@@ -1613,17 +1522,18 @@ class ProductionWorkflowExecutor:
             or predecessor.incident_id != incident.incident_id
         ):
             return workflow
-        evidence = self._quiesce_handoff_evidence(predecessor)
+        operations = {step.operation for step in workflow.official_steps}
+        reset = operations.intersection(
+            {WorkflowOperation.RESET_GPU, WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES}
+        )
+        # Reset needs live quiesce; reboot retains its post-reboot restore.
+        evidence = self._quiesce_handoff_evidence(
+            predecessor, unrestored_only=bool(reset)
+        )
         if evidence is None:
             return workflow
         _, quiesce_step, quiesce_execution = evidence
-        operations = {step.operation for step in workflow.official_steps}
-        if operations.intersection(
-            {
-                WorkflowOperation.RESET_GPU,
-                WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-            }
-        ):
+        if reset:
             match = next(
                 (
                     (index, step)
@@ -2013,7 +1923,7 @@ class ProductionWorkflowExecutor:
     def _hung_rank_context(
         self, incident: FaultIncident
     ) -> dict[tuple[str, int], dict[str, Any]]:
-        if not incident.attempt_id:
+        if not incident.job_id or not incident.attempt_id:
             return {}
         states = self.store.list_attempt_observation_states(incident.cluster_id)
         observation = next(
@@ -2021,6 +1931,7 @@ class ProductionWorkflowExecutor:
                 state.observation
                 for state in reversed(states)
                 if state.observation.attempt_id == incident.attempt_id
+                and state.observation.job_id == incident.job_id
             ),
             None,
         )
@@ -2262,91 +2173,39 @@ class ProductionWorkflowExecutor:
         carries; ``actor`` defaults to this executor.
         """
 
-        now = datetime.now(timezone.utc)
-        ended = workflow.model_copy(
-            update={
-                **(dict(updates) if updates else {}),
-                "status": status,
-                "execution_owner_id": None,
-                "execution_lease_expires_at": None,
-                "updated_at": now,
-            }
-        )
-        derived_state = (
-            incident_state
-            if incident_state is not None
-            else self._terminal_incident_state(ended, status)
-        )
-        # A diagnostic-only workflow that failed did not conclude anything
-        # about the node; the derivation closes the incident RECOVERED and the
-        # verdict is spelled out on the incident, the event and the markers.
-        inconclusive = (
-            status is WorkflowStatus.FAILED
-            and incident_state is None
-            and self._diagnostic_only(ended)
-        )
-        if incident is not None:
-            update: dict[str, Any] = {"state": derived_state, "updated_at": now}
-            if inconclusive:
-                update["reasons"] = bounded_reasons(
-                    [*incident.reasons, self._inconclusive_reason(reason)]
-                )
-            incident = incident.model_copy(update=update)
-        details: dict[str, Any] = {
-            "execution_epoch": execution_epoch,
-            "incident_state": derived_state.value,
-        }
-        if inconclusive:
-            details["diagnostic_inconclusive"] = True
-        ended = record_workflow_event(
-            ended,
-            WorkflowEventKind.TERMINAL,
-            code=WorkflowEventCode.TERMINALIZED.value,
-            reason=self._inconclusive_reason(reason) if inconclusive else reason,
+        if updates:
+            workflow = workflow.model_copy(update=dict(updates))
+        workflow = refresh_remote_action_state(self.store, workflow)
+        decision = terminal_state.terminal_decision(
+            workflow,
+            incident,
+            status,
+            execution_epoch,
+            reason=reason,
+            incident_state=incident_state,
             actor=actor or self.config.executor_id,
-            status=status.value,
-            details=details,
-            at=now,
+            now=datetime.now(timezone.utc),
         )
-        incident_written = self._save_terminal(ended, incident, execution_epoch)
-        if inconclusive and incident is not None and incident_written:
-            self._close_inconclusive_diagnostic(ended, incident, reason)
-        return self._result(ended, incident, error=reason)
+        incident_written = self._save_terminal(
+            decision.workflow, decision.incident, execution_epoch
+        )
+        if (
+            decision.diagnostic_inconclusive
+            and decision.incident is not None
+            and incident_written
+        ):
+            self._close_inconclusive_diagnostic(
+                decision.workflow, decision.incident, decision.error
+            )
+        return self._result(decision.workflow, decision.incident, error=decision.error)
 
     @staticmethod
     def _inconclusive_reason(error: str | None) -> str:
-        return (
-            f"{DIAGNOSTIC_INCONCLUSIVE_REASON}: {error}"
-            if error
-            else DIAGNOSTIC_INCONCLUSIVE_REASON
-        )
+        return terminal_state.inconclusive_reason(error)
 
     @staticmethod
     def _diagnostic_only(workflow: WorkflowRequest) -> bool:
-        """Whether every step this workflow planned or ran only observed the node.
-
-        Judged on the plan as well as on what ran: a ``VALIDATE_HOST`` that
-        gates a later reboot is a gate, not a diagnostic, and its failure must
-        keep escalating. The classes come from the operation registry --
-        destructive (including containment) and node-wide operations -- so a
-        new operation cannot be mutating there and diagnostic here.
-        """
-
-        steps = (
-            workflow.safety_steps
-            if workflow.executes_safety_steps
-            else workflow.official_steps
-        )
-        operations = (
-            {step.operation for step in steps}
-            | set(workflow.completed_operations)
-            | {item.operation for item in workflow.step_executions}
-        )
-        if not operations:
-            return False
-        return not (
-            operations & (DESTRUCTIVE_OPERATIONS | NODE_WIDE_RECOVERY_OPERATIONS)
-        )
+        return terminal_state.diagnostic_only(workflow)
 
     def _close_inconclusive_diagnostic(
         self,
@@ -2354,63 +2213,15 @@ class ProductionWorkflowExecutor:
         incident: FaultIncident,
         error: str | None,
     ) -> None:
-        """Retire the incident's markers and file one advisory notification.
-
-        Runs after the terminal write landed and only when this workflow was
-        still the incident's plan. Each half is isolated like an ``on_terminal``
-        hook: a marker or notification failure is logged and must not unwind
-        the terminal state that already landed.
-        """
-
-        try:
-            retire_markers_for_incident(
-                self.store,
-                incident.incident_id,
-                reason=self._inconclusive_reason(error),
-                retired_by=self.config.executor_id,
-            )
-        except Exception:  # noqa: BLE001 - the terminal write already landed
-            LOGGER.exception(
-                "retiring markers of incident %s after inconclusive workflow %s",
-                incident.incident_id,
-                workflow.request_id,
-            )
-        steps = (
-            workflow.safety_steps
-            if workflow.executes_safety_steps
-            else workflow.official_steps
+        close_inconclusive_diagnostic(
+            self.store,
+            workflow,
+            incident,
+            error,
+            actor=self.config.executor_id,
+            builder=self.diagnostic_inconclusive_email_builder,
+            sender=self.notification_sender,
         )
-        failed = [
-            item
-            for item in workflow.step_executions
-            if item.status is WorkflowStepStatus.FAILED
-        ]
-        try:
-            notification = self.diagnostic_inconclusive_email_builder.build(
-                cluster_id=incident.cluster_id,
-                incident_id=incident.incident_id,
-                workflow_id=workflow.request_id,
-                event_id=incident.event_id,
-                node_ids=sorted(
-                    {node for step in steps for node in step.node_ids}
-                    or set(incident.node_ids)
-                ),
-                operations=[step.operation.value for step in steps],
-                failed_operation=failed[-1].operation.value if failed else None,
-                error=error,
-                policy_source=incident.policy_source,
-                official_action=incident.official_action,
-                reasons=incident.reasons,
-            )
-            notification = self.store.save_notification_if_absent(notification)
-            if self.notification_sender is not None:
-                self.notification_sender(notification.notification_id)
-        except Exception:  # noqa: BLE001 - the terminal write already landed
-            LOGGER.exception(
-                "notifying inconclusive diagnostic for incident %s workflow %s",
-                incident.incident_id,
-                workflow.request_id,
-            )
 
     @classmethod
     def _terminal_incident_state(
@@ -2418,31 +2229,7 @@ class ProductionWorkflowExecutor:
         workflow: WorkflowRequest,
         status: WorkflowStatus,
     ) -> IncidentState:
-        """What the incident becomes when its workflow ends in ``status``.
-
-        FAILED keeps the containment verdict (``_failure_incident_state``),
-        except that a diagnostic-only workflow leaves it RECOVERED;
-        BLOCKED is a settled safety phase, so the node stays quarantined; a
-        finished or withdrawn workflow that isolated a node and never released
-        it leaves the incident QUARANTINED, a completed one that escalated to
-        support leaves it ESCALATED, and anything else is RECOVERED.
-        """
-
-        if status is WorkflowStatus.FAILED:
-            return cls._failure_incident_state(workflow)
-        if status is WorkflowStatus.BLOCKED:
-            return IncidentState.QUARANTINED
-        completed = workflow.completed_operations
-        if (
-            status is WorkflowStatus.SUCCEEDED
-            and WorkflowOperation.ESCALATE_SUPPORT in completed
-        ):
-            return IncidentState.ESCALATED
-        isolated = (
-            WorkflowOperation.QUARANTINE in completed
-            and WorkflowOperation.RESTORE_SCHEDULING not in completed
-        )
-        return IncidentState.QUARANTINED if isolated else IncidentState.RECOVERED
+        return terminal_state.terminal_incident_state(workflow, status)
 
     def _save_terminal(
         self,
@@ -2503,30 +2290,7 @@ class ProductionWorkflowExecutor:
         workflow: WorkflowRequest,
         incident: FaultIncident | None,
     ) -> None:
-        """Run every ``on_terminal`` hook, each isolated from the others.
-
-        A hook releases state the workflow held outside the store; a failure
-        there is logged and must neither stop the next hook nor unwind the
-        terminal write that already landed (ARCH-B3).
-        """
-
-        if not self.on_terminal:
-            return
-        steps = (
-            workflow.safety_steps
-            if workflow.executes_safety_steps
-            else workflow.official_steps
-        )
-        for hook in list(self.on_terminal):
-            try:
-                hook(workflow, incident, list(steps))
-            except Exception:  # noqa: BLE001 - one hook must not stop the rest
-                LOGGER.exception(
-                    "on_terminal hook failed: workflow=%s status=%s hook=%s",
-                    workflow.request_id,
-                    workflow.status.value,
-                    getattr(hook, "__qualname__", repr(hook)),
-                )
+        notify_terminal_hooks(self.on_terminal, workflow, incident)
 
     def _execute_step(
         self,
@@ -2558,6 +2322,10 @@ class ProductionWorkflowExecutor:
         step: WorkflowStepSpec,
         index: int,
     ) -> WorkflowStepOutcome:
+        if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES:
+            workflow = refresh_remote_action_state(self.store, workflow)
+        if refused := restoration_refusal(workflow, step):
+            return refused
         if step.operation not in self.config.allowed_operations:
             return WorkflowStepOutcome.failed(
                 f"operation {step.operation.value} is not in "
@@ -2585,7 +2353,7 @@ class ProductionWorkflowExecutor:
                 # the reservation for the adapter rather than reserving again,
                 # and fails closed when it is gone.
                 issued = restart_preflight.issue_restart_authorization(
-                    self.store, incident, step, idempotency_key
+                    self.store, incident, step, idempotency_key, workflow=workflow
                 )
                 if isinstance(issued, WorkflowStepOutcome):
                     return issued
@@ -2764,27 +2532,7 @@ class ProductionWorkflowExecutor:
         cls,
         workflow: WorkflowRequest,
     ) -> IncidentState:
-        """The incident's state behind a FAILED workflow.
-
-        A completed isolation keeps the node QUARANTINED. A workflow that
-        planned nothing but evidence, diagnostics and validation -- the
-        node-health ``RUN_DIAGNOSTICS`` shape -- did not change the node, so
-        its failure is a diagnostic that did not conclude: the incident ends
-        RECOVERED (``_terminalize`` records the reason, retires the markers
-        and notifies), instead of ESCALATED with no follow-up step while its
-        marker keeps the node "under remediation" until the TTL. Everything
-        else is ESCALATED.
-        """
-
-        isolated = {
-            WorkflowOperation.MARK_UNSCHEDULABLE,
-            WorkflowOperation.QUARANTINE,
-        }.intersection(workflow.completed_operations)
-        if isolated:
-            return IncidentState.QUARANTINED
-        if cls._diagnostic_only(workflow):
-            return IncidentState.RECOVERED
-        return IncidentState.ESCALATED
+        return terminal_state.failure_incident_state(workflow)
 
     @staticmethod
     def _result(

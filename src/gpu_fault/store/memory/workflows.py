@@ -24,7 +24,6 @@ from gpu_fault.store.shared.errors import (
     StaleFencingTokenError,
     StaleWriteError,
     WorkflowLeaseError,
-    WorkflowMergedError,
 )
 from gpu_fault.store.shared.preemption import preemption_pending_update
 from gpu_fault.store.shared.record_guards import (
@@ -40,6 +39,7 @@ from gpu_fault.store.shared.transactional_workflows import (
     incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
+    validate_leased_workflow_save,
     workflow_matches_expected,
 )
 from gpu_fault.store.shared.workflow_scan import (
@@ -70,7 +70,6 @@ class MemoryWorkflowMixin:
     _incident_by_event: Any
     _incidents: Any
     _plans: dict[str, RecoveryPlan]
-    _remote_commands: dict[str, RemoteActionCommand]
     _workflows: Any
 
     get_plan: Callable[[str], RecoveryPlan]
@@ -560,7 +559,13 @@ class MemoryWorkflowMixin:
                 if after is not None:
                     anchor = dispatch_order_key(after)
                     workflows = [
-                        item for item in workflows if dispatch_order_key(item) > anchor
+                        item
+                        for item in workflows
+                        if (
+                            dispatch_order_key(item) < anchor
+                            if newest_first
+                            else dispatch_order_key(item) > anchor
+                        )
                     ]
             else:
                 workflows = sorted(
@@ -768,6 +773,7 @@ class MemoryWorkflowMixin:
         attempt_id: str,
         *,
         limit: int = 100,
+        include_terminal: bool = False,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
         active_statuses = {
             WorkflowStatus.PENDING,
@@ -797,7 +803,7 @@ class MemoryWorkflowMixin:
                 )
                 if not (
                     (
-                        workflow.status in active_statuses
+                        (include_terminal or workflow.status in active_statuses)
                         and incident.attempt_id == attempt_id
                     )
                     or restarted_attempt == attempt_id
@@ -806,10 +812,7 @@ class MemoryWorkflowMixin:
                 matches.append((incident, workflow))
             return sorted(
                 matches,
-                key=lambda item: (
-                    item[1].updated_at,
-                    item[1].request_id,
-                ),
+                key=lambda item: (item[1].updated_at, item[1].request_id),
                 reverse=True,
             )[:limit]
 
@@ -937,15 +940,9 @@ class MemoryWorkflowMixin:
         with self._lock:
             current = self.get_workflow(workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
 
@@ -961,15 +958,9 @@ class MemoryWorkflowMixin:
         with self._lock:
             current = self.get_workflow(workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
             current_incident = self._incidents.get(incident.incident_id)

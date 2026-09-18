@@ -83,8 +83,11 @@ def test_a_completed_uninstall_retires_the_site_records_once(tmp_path) -> None:
     assert not (tmp_path / "uninstall" / "state.json").exists(), (
         "the uninstall record is consumed so the next deploy keeps the fresh records"
     )
-    assert list((tmp_path / "uninstall").glob("state.consumed-*.json")), (
-        "the consumed record is kept for the audit trail"
+    assert (archive / "uninstall" / "state.json").is_file(), (
+        "the whole completed transaction is kept for the audit trail"
+    )
+    assert not (tmp_path / "uninstall").exists(), (
+        "old cleanup and registry files cannot become a new uninstall's resume state"
     )
     # A second deploy finds no record and leaves the fresh site alone.
     (tmp_path / "site.yaml").write_text("fresh", encoding="utf-8")

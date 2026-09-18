@@ -110,10 +110,13 @@ class Kubectl:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr=self.error)
         if any(fragment in line for fragment in self.present):
             return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=NOT_FOUND)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     def queries(self) -> list[str]:
-        return [" ".join(argv[argv.index("get") :]) for argv in self.calls]
+        return [
+            " ".join(argv[argv.index("get") : argv.index("--ignore-not-found")])
+            for argv in self.calls
+        ]
 
 
 class Cleaner:
@@ -156,7 +159,7 @@ def test_the_kubernetes_sweep_covers_every_object_on_every_cluster(
 
     site = load_site(site_file(tmp_path))
     kubectl = Kubectl()
-    monkeypatch.setattr(admin_uninstall.subprocess, "run", kubectl)
+    monkeypatch.setattr(admin_uninstall, "bounded_command", kubectl)
 
     result = verify_installed_registry_cleanup(site, _inventory())
 
@@ -175,6 +178,9 @@ def test_the_kubernetes_sweep_covers_every_object_on_every_cluster(
         argv for argv in kubectl.calls if "clusterrole" in " ".join(argv)
     )
     assert "-n" not in cluster_scoped
+    assert all("--request-timeout=30s" in call for call in kubectl.calls), (
+        "cleanup verification calls must have a bounded request timeout"
+    )
 
 
 @pytest.mark.parametrize(
@@ -196,7 +202,7 @@ def test_one_surviving_object_fails_the_whole_sweep(
     """
 
     site = load_site(site_file(tmp_path))
-    monkeypatch.setattr(admin_uninstall.subprocess, "run", Kubectl(present=[present]))
+    monkeypatch.setattr(admin_uninstall, "bounded_command", Kubectl(present=[present]))
 
     with pytest.raises(BootstrapError, match=message):
         verify_installed_registry_cleanup(site, _inventory())
@@ -213,8 +219,8 @@ def test_an_unreadable_cluster_is_not_read_as_a_clean_cluster(
 
     site = load_site(site_file(tmp_path))
     monkeypatch.setattr(
-        admin_uninstall.subprocess,
-        "run",
+        admin_uninstall,
+        "bounded_command",
         Kubectl(error="error: You must be logged in to the server (Unauthorized)"),
     )
 
@@ -262,13 +268,7 @@ def test_verification_records_the_terminal_state_of_each_resource() -> None:
     ]
 
 
-def test_a_reused_resource_is_sealed_as_owned_once_it_is_deleted() -> None:
-    """A reused resource that this solution deleted is no longer reusable.
-
-    Leaving it ``REUSED`` in the sealed registry would tell a later run that the
-    resource is still there to adopt.
-    """
-
+def test_terminal_snapshot_preserves_a_reused_resources_durable_identity() -> None:
     reused = _resource(
         "aws/sqs/notifications",
         "sqs_queue",
@@ -278,8 +278,8 @@ def test_a_reused_resource_is_sealed_as_owned_once_it_is_deleted() -> None:
 
     verified = _verify_resources(Cleaner(), [reused], cpu_disposition="keep")
 
-    assert verified[0].ownership is InstallationResourceOwnership.CREATED
-    assert verified[0].delete_policy is InstallationResourceDeletePolicy.DELETE
+    assert verified[0].immutable_identity() == reused.immutable_identity()
+    assert verified[0].status is InstallationResourceStatus.DELETED
 
 
 @pytest.mark.parametrize(
@@ -332,10 +332,67 @@ def test_resources_bound_to_a_deleted_cpu_cluster_are_not_probed() -> None:
     addon = _resource(key, "eks_addon", "eks-pod-identity-agent")
     cleaner = Cleaner(existing=(key,))
 
-    verified = _verify_resources(cleaner, [addon], cpu_disposition="delete")
+    verified = _verify_resources(
+        cleaner, [addon], cpu_disposition="delete", cpu_deleted=True
+    )
 
     assert cleaner.probed == []
     assert verified[0].status is InstallationResourceStatus.DELETED
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "credential helper not found",
+        "the server could not find the requested resource",
+        NOT_FOUND,
+    ],
+)
+def test_uninstall_requires_successful_empty_kubernetes_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    site = load_site(site_file(tmp_path))
+    monkeypatch.setattr(admin_uninstall, "bounded_command", Kubectl(error=error))
+    with pytest.raises(BootstrapError, match="verification failed"):
+        verify_installed_registry_cleanup(site, _inventory())
+
+
+def test_verification_keeps_namespace_and_context_in_the_resource_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    kubectl = Kubectl()
+    monkeypatch.setattr(admin_uninstall, "bounded_command", kubectl)
+    inventory = _inventory()
+    inventory["inventory_snapshot"]["gpu"]["by_context"] = {
+        "gpu-a": {
+            "resources": [
+                {
+                    "scope": "namespaced",
+                    "kind": "deployment",
+                    "name": "collector",
+                    "namespace": "historical",
+                },
+                {
+                    "scope": "namespaced",
+                    "kind": "deployment",
+                    "name": "collector",
+                    "namespace": "gpu-fault-system",
+                },
+            ]
+        }
+    }
+    verify_installed_registry_cleanup(site, inventory)
+    calls = [
+        call for call in kubectl.calls if "deployment" in call and "collector" in call
+    ]
+    assert {call[call.index("-n") + 1] for call in calls} == {
+        "historical",
+        "gpu-fault-system",
+    }
+    assert all(call[call.index("--context") + 1] == "gpu-a" for call in calls), (
+        "cleanup verification must stay in the resource's GPU context"
+    )
 
 
 def _cpu_snapshot(*, resources: Sequence[InstallationResource]) -> Any:

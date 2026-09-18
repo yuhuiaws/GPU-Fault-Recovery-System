@@ -7,19 +7,22 @@ waited for the slowest foundation task, which is the Aurora instance wait. The
 two builders below now describe one graph: each task names the tasks whose
 results it reads, and ``run_parallel`` starts it the moment those hold.
 
-What follows the graph does not move. The release rollout needs the control
-plane Pods before the NLB Service, TLS and DNS can be reconciled, and the site
-document is built when everything here is done, as before.
+The site document is built after this graph completes. The release rollout
+can then request its NLB Service while the CPU converges, but target health
+and DNS publication still require the control-plane Pods.
 """
 
 from __future__ import annotations
 
+from gpu_fault.admin.bootstrap_task_inputs import TaskInputSpec, task_input_spec
+
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import (
+    BootstrapError,
     BootstrapState,
     ClusterIdentity,
     CommandRunner,
@@ -35,21 +38,94 @@ PLATFORM_READY_PHASE = "platform-prerequisites-ready"
 
 
 @dataclass(frozen=True)
-class TaskGraph:
-    """Ensures, their read-only probes, which are re-proved every run, and
-    what each waits for. ``run`` hands all four to ``run_parallel``."""
+class TaskSpec:
+    ensure: Callable[[], Any]
+    input_policy: TaskInputSpec
+    probe: Callable[[], Any] | None = None
+    revalidate: bool = False
+    dependencies: tuple[str, ...] = ()
+    stop_on_failure: bool = False
 
-    tasks: Mapping[str, Callable[[], Any]]
-    probes: Mapping[str, Callable[[], Any]]
-    revalidate: frozenset[str]
-    dependencies: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class TaskGraph:
+    """Task execution and input policy use the same mandatory declaration."""
+
+    specs: Mapping[str, TaskSpec]
+
+    def __post_init__(self) -> None:
+        for name, spec in self.specs.items():
+            if spec.input_policy.name != name.partition(":")[0]:
+                raise BootstrapError(f"bootstrap task input policy differs: {name}")
+            if spec.input_policy.always_revalidate_reason and not spec.revalidate:
+                raise BootstrapError(
+                    f"bootstrap task must revalidate its inputs: {name}"
+                )
+
+    @property
+    def tasks(self) -> dict[str, Callable[[], Any]]:
+        return {name: spec.ensure for name, spec in self.specs.items()}
+
+    @property
+    def dependencies(self) -> dict[str, tuple[str, ...]]:
+        return {
+            name: spec.dependencies
+            for name, spec in self.specs.items()
+            if spec.dependencies
+        }
+
+    @classmethod
+    def from_parts(
+        cls,
+        *,
+        tasks: Mapping[str, Callable[[], Any]],
+        probes: Mapping[str, Callable[[], Any]],
+        revalidate: frozenset[str],
+        dependencies: Mapping[str, tuple[str, ...]],
+    ) -> TaskGraph:
+        unknown = (set(probes) | set(revalidate) | set(dependencies)) - set(tasks)
+        if unknown:
+            raise BootstrapError(
+                "unknown bootstrap task definitions: " + ", ".join(sorted(unknown))
+            )
+        return cls(
+            {
+                name: TaskSpec(
+                    ensure=ensure,
+                    input_policy=task_input_spec(name),
+                    probe=probes.get(name),
+                    revalidate=name in revalidate,
+                    dependencies=dependencies.get(name, ()),
+                    stop_on_failure=name == "release",
+                )
+                for name, ensure in tasks.items()
+            }
+        )
 
     def merged(self, other: TaskGraph) -> TaskGraph:
+        duplicates = self.specs.keys() & other.specs.keys()
+        if duplicates:
+            raise BootstrapError(
+                "duplicate bootstrap tasks: " + ", ".join(sorted(duplicates))
+            )
+        return TaskGraph({**self.specs, **other.specs})
+
+    def after(self, dependencies: Mapping[str, tuple[str, ...]]) -> TaskGraph:
+        unknown = set(dependencies) - self.specs.keys()
+        if unknown:
+            raise BootstrapError(
+                "unknown bootstrap dependency owners: " + ", ".join(sorted(unknown))
+            )
         return TaskGraph(
-            tasks={**self.tasks, **other.tasks},
-            probes={**self.probes, **other.probes},
-            revalidate=self.revalidate | other.revalidate,
-            dependencies={**self.dependencies, **other.dependencies},
+            {
+                name: replace(
+                    spec,
+                    dependencies=tuple(
+                        dict.fromkeys((*spec.dependencies, *dependencies.get(name, ())))
+                    ),
+                )
+                for name, spec in self.specs.items()
+            }
         )
 
     def run(
@@ -58,13 +134,38 @@ class TaskGraph:
         state: BootstrapState,
         on_complete: Callable[[frozenset[str]], None] | None = None,
     ) -> dict[str, Any]:
+        bindings = self.specs
+        if state.value.get("input_sha256"):
+            declared = state.value.get("task_input_sha256") or {}
+            missing = [
+                name
+                for name, spec in bindings.items()
+                if spec.input_policy.fingerprint is not None
+                and not spec.input_policy.requires_release
+                and name not in declared
+            ]
+            if missing:
+                raise BootstrapError(
+                    "bootstrap task input identities are unbound: "
+                    + ", ".join(sorted(missing))
+                )
         return run_parallel(
             self.tasks,
             state=state,
-            probes=self.probes,
-            revalidate=self.revalidate,
+            probes={
+                name: spec.probe
+                for name, spec in self.specs.items()
+                if spec.probe is not None
+            },
+            revalidate=frozenset(
+                name for name, spec in self.specs.items() if spec.revalidate
+            ),
             dependencies=self.dependencies,
+            stop_on_failure=frozenset(
+                name for name, spec in self.specs.items() if spec.stop_on_failure
+            ),
             on_complete=on_complete,
+            input_policies={name: spec.input_policy for name, spec in bindings.items()},
         )
 
 
@@ -103,41 +204,61 @@ def platform_task_graph(
     fleet_master_file: Path,
     ensure_aurora_ready: Callable[..., Any],
     grafana: GrafanaSettings | None = None,
+    custody_runtime_profile: str = "hyperpod-v1",
+    existing_site: dict[str, Any] | None = None,
 ) -> TaskGraph:
-    """The tasks that used to wait for the whole foundation, with what each one
-    really needs.
+    """Prepare platform identities and credentials, not versioned runtimes.
 
-    ``monitoring_install`` (ADOT, AMP rules, Grafana) reads the AMP workspace
-    and SNS topic from ``monitoring_resources`` and creates its own writer role;
-    ``aurora_ready`` waits for the writer and reader the ``aurora`` task created
-    and hands the control plane its Secret; ``aurora_refresh`` renders that
-    Secret's ARN into the CronJob and its verify Job needs the writer, so it
-    follows ``aurora_ready``; ``node_keys:*`` need only the kubeconfigs and the
-    fleet master the preamble made. Each reads its inputs from ``state`` when it
-    starts, which is after its dependencies were recorded.
+    ``monitoring_install`` retains its registry/checkpoint key and prepares the
+    site-scoped writer role and Pod Identity association. ``aurora_refresh``
+    prepares its IAM access after ``aurora_ready`` supplies the master Secret
+    reference. Neither task consumes a candidate image or waits for the build.
+    The release owns ADOT/AMP and refresher manifests on first install too.
 
-    ``release`` is read lazily, on the task's own thread: the signed release is
-    built beside this graph (``SignedReleaseBuild``), so ``monitoring_install``
-    and ``aurora_refresh`` -- the two that ship an image -- wait for the build
-    while ``aurora_ready`` and ``node_keys:*`` run regardless of it.
+    ``release`` joins ``SignedReleaseBuild`` before the graph can finish and
+    the site can be handed to the release transaction.
 
-    All of them converge live resources whose desired state no static digest
-    can fully describe -- node membership changes on its own, manifests can be
-    edited out of band -- so every completed one is re-proved by a read-only
-    probe that enters ensure only on detected drift.
+    Live-resource tasks are re-proved by read-only probes that enter ensure
+    only on detected drift. The release task always joins the current build.
     """
 
     from gpu_fault.admin.bootstrap_services import (
+        ensure_grafana_dashboards,
         install_aurora_refresh,
         install_monitoring,
         provision_node_action_keys,
     )
+    from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
+    from gpu_fault.admin.node_key_custody_admin_probe import AdminNodeKeyContext
+
+    custody = load_admin_custody(state.path.parent)
+    if custody is not None and existing_site is not None:
+        from gpu_fault.admin.node_key_custody_admin import bootstrap_custody_profile
+
+        custody_runtime_profile = bootstrap_custody_profile(
+            state.path.parent, repository_root, existing_site
+        )
 
     def build_tasks(
         task_runner: CommandRunner,
         probe_only: bool,
     ) -> dict[str, Callable[[], Any]]:
         tasks: dict[str, Callable[[], Any]] = {
+            "release": release,
+            "grafana_install": lambda: {
+                "grafana": ensure_grafana_dashboards(
+                    task_runner,
+                    settings=grafana,
+                    cpu=cpu,
+                    site_id=site_id,
+                    amp_workspace_id=str(
+                        state.result("monitoring_resources")["workspace_id"]
+                    ),
+                    repository_root=repository_root,
+                    probe_only=probe_only,
+                    admin_email=alert_email,
+                )
+            },
             "monitoring_install": lambda: install_monitoring(
                 task_runner,
                 repository_root=repository_root,
@@ -146,10 +267,10 @@ def platform_task_graph(
                 namespace=namespace,
                 site_id=site_id,
                 monitoring=state.result("monitoring_resources"),
-                adot_image=str(release()["images"]["adot"]),
+                adot_image="",
                 alert_email=alert_email,
                 probe_only=probe_only,
-                grafana=grafana,
+                runtime_managed_by_release=True,
             ),
             "aurora_ready": lambda: ensure_aurora_ready(
                 task_runner,
@@ -166,12 +287,13 @@ def platform_task_graph(
                 cpu_kubeconfig=cpu_kubeconfig,
                 namespace=namespace,
                 site_id=site_id,
-                release_manifest=Path(str(release()["manifest"])),
-                runtime_image=str(release()["images"]["runtime"]),
+                release_manifest=repository_root / "dist/current-release.json",
+                runtime_image="",
                 # The readiness result carries the master Secret ARN; a
                 # checkpoint written before the split carries it on ``aurora``.
                 aurora={**state.result("aurora"), **state.result("aurora_ready")},
                 probe_only=probe_only,
+                runtime_managed_by_release=True,
             ),
         }
         for cluster in gpu_clusters:
@@ -181,6 +303,36 @@ def platform_task_graph(
                 cluster: ClusterIdentity = cluster,
                 cluster_id: str = cluster_id,
             ) -> dict[str, str]:
+                custody_arguments: dict[str, Any] = {}
+                if custody is not None:
+                    from gpu_fault.admin.bootstrap_common import (
+                        compute_agent_config_digest,
+                    )
+
+                    verified_release = release()
+                    digest = (
+                        str(verified_release["agent_config_digest"])
+                        if custody_runtime_profile == "hyperpod-v1"
+                        else compute_agent_config_digest(
+                            task_runner,
+                            repository_root=repository_root,
+                            runtime_profile_version=custody_runtime_profile,
+                        )
+                    )
+                    custody_arguments["custody_context"] = AdminNodeKeyContext(
+                        state_dir=state.path.parent,
+                        repository_root=repository_root,
+                        site_id=site_id,
+                        cpu_eks_arn=cpu.eks_arn,
+                        cpu_kubeconfig=cpu_kubeconfig,
+                        gpu_kubeconfig=gpu_kubeconfig,
+                        namespace=namespace,
+                        cluster=cluster,
+                        cluster_id=cluster_id,
+                        release_manifest=Path(str(verified_release["manifest"])),
+                        runtime_profile_version=custody_runtime_profile,
+                        agent_config_digest=digest,
+                    )
                 return provision_node_action_keys(
                     task_runner,
                     repository_root=repository_root,
@@ -191,21 +343,32 @@ def platform_task_graph(
                     cluster_id=cluster_id,
                     fleet_master_file=fleet_master_file,
                     probe_only=probe_only,
+                    **custody_arguments,
                 )
 
             tasks[f"node_keys:{cluster_id}"] = node_key_task
         return tasks
 
     tasks = build_tasks(runner, False)
-    return TaskGraph(
+    probes = build_tasks(ReadOnlyProbeRunner(runner), True)
+    probes.pop("release")
+    dependencies = {
+        "grafana_install": ("monitoring_resources",),
+        "monitoring_install": ("monitoring_resources",),
+        "aurora_ready": ("aurora",),
+        "aurora_refresh": ("aurora_ready",),
+    }
+    if custody is not None:
+        previous_key_task = "release"
+        for name in tasks:
+            if name.startswith("node_keys:"):
+                dependencies[name] = (previous_key_task,)
+                previous_key_task = name
+    return TaskGraph.from_parts(
         tasks=tasks,
-        probes=build_tasks(ReadOnlyProbeRunner(runner), True),
+        probes=probes,
         revalidate=frozenset(tasks),
-        dependencies={
-            "monitoring_install": ("monitoring_resources",),
-            "aurora_ready": ("aurora",),
-            "aurora_refresh": ("aurora_ready",),
-        },
+        dependencies=dependencies,
     )
 
 
@@ -231,8 +394,8 @@ def foundation_task_graph(
 
     The NLB network and the PKI describe the same clusters but read nothing
     from each other (the hostname comes from the hosted zone, not the load
-    balancer); the Aurora task only creates -- the instance wait is
-    ``aurora_ready`` in the platform graph; the roles, the notification
+    balancer); Aurora's serial writer/reader creation is independent of them,
+    with final readiness in ``aurora_ready``; the roles, the notification
     resources and the load balancer controller need only the Pod Identity
     add-on the preamble ensured. So every task here starts at once.
     """
@@ -292,6 +455,7 @@ def foundation_task_graph(
                 gpu_clusters=gpu_clusters,
                 state_dir=state_dir,
                 site_id=site_id,
+                state=active_state,
             ),
             "aurora": lambda: ensure_aurora(
                 active_runner,
@@ -326,7 +490,7 @@ def foundation_task_graph(
     tasks = build_tasks(runner, state)
     executor_tasks = {name for name in tasks if name.startswith("executor_role:")}
     adot_writer_tasks = {name for name in tasks if name.startswith("adot_writer_role:")}
-    return TaskGraph(
+    return TaskGraph.from_parts(
         tasks=tasks,
         probes=build_tasks(ReadOnlyProbeRunner(runner), None),
         revalidate=frozenset(
@@ -335,6 +499,7 @@ def foundation_task_graph(
                 "control_plane_role",
                 "email_notifications",
                 "monitoring_resources",
+                *({"control_record_archive_bucket"} if archive_s3_uri else set()),
                 *executor_tasks,
                 *adot_writer_tasks,
             }
@@ -358,6 +523,7 @@ def run_bootstrap_tasks(
     state: BootstrapState,
     foundation: TaskGraph,
     platform: TaskGraph,
+    access: TaskGraph | None = None,
 ) -> dict[str, Any]:
     """Run both graphs as one, marking the two phases as their subsets complete.
 
@@ -367,6 +533,29 @@ def run_bootstrap_tasks(
     that checkpoint readers and the acceptance evidence know keep their meaning.
     """
 
+    if access is not None:
+        foundation = access.merged(
+            foundation.after(
+                {
+                    "aurora": ("cpu_access",),
+                    "load_balancer_controller": ("cpu_access", "pod_identity_agent"),
+                    "control_plane_role": ("cpu_access", "pod_identity_agent"),
+                    "email_notifications": ("cpu_access",),
+                }
+            )
+        )
+        platform = platform.after(
+            {
+                "monitoring_install": ("cpu_access", "pod_identity_agent"),
+                "aurora_ready": ("cpu_access",),
+                "aurora_refresh": ("pod_identity_agent",),
+                **{
+                    name: ("cpu_access", "gpu_access")
+                    for name in platform.tasks
+                    if name.startswith("node_keys:")
+                },
+            }
+        )
     foundation_names = frozenset(foundation.tasks)
     marked = False
 

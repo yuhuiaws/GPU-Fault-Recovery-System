@@ -53,36 +53,40 @@ def aurora_credential_refresh_metric_lines(_runtime: AppRuntime) -> list[str]:
     dead code. Every run now writes ``{status, finished_at, error, rotated,
     restarted, reason}`` into the Secret. Three facts come out: the age of the
     last run, whether it succeeded, and -- only while the last run succeeded --
-    the age of the last success, so ``absent()`` tells "never ran" from "ran
-    and failed". No file means no refresher is configured for this role, so
-    nothing is published rather than a zero that reads as "just refreshed"; an
-    unparsable file is its own series.
+    the age of the last success. An unconfigured role publishes nothing.
+    A configured role with missing, unreadable, malformed or future-dated
+    evidence publishes status_unreadable=1, never a successful refresh age.
     """
 
-    try:
-        text = aurora_refresh_status_path().read_text(encoding="utf-8")
-    except OSError:
+    if not os.getenv("GPU_FAULT_STORE_URL_FILE", "").strip():
         return []
     lines = [
         "# HELP gpu_fault_aurora_credential_refresh_status_unreadable 1 when the "
-        "mounted last-refresh-status.json exists but cannot be parsed (H1-2).",
+        "configured refresh status is missing, unreadable, malformed or "
+        "future-dated; its last outcome is unknown.",
         "# TYPE gpu_fault_aurora_credential_refresh_status_unreadable gauge",
     ]
     try:
+        text = aurora_refresh_status_path().read_text(encoding="utf-8")
         status = json.loads(text)
-    except ValueError:
+    except (OSError, ValueError):
         status = None
     finished = (
         _parse_status_timestamp(status.get("finished_at"))
         if isinstance(status, dict)
         else None
     )
-    if finished is None:
+    age = (
+        (datetime.now(timezone.utc) - finished).total_seconds()
+        if finished is not None
+        else None
+    )
+    outcome = status.get("status") if isinstance(status, dict) else None
+    if age is None or age < 0 or outcome not in ("ok", "failed"):
         lines.append("gpu_fault_aurora_credential_refresh_status_unreadable 1")
         return lines
     lines.append("gpu_fault_aurora_credential_refresh_status_unreadable 0")
-    age = max(0.0, (datetime.now(timezone.utc) - finished).total_seconds())
-    ok = str(status.get("status") or "").lower() == "ok"
+    ok = outcome == "ok"
     lines.extend(
         [
             "# HELP gpu_fault_aurora_credential_refresh_last_run_age_seconds Seconds since the Aurora credential refresher CronJob last finished a run, successful or not (H1-2).",

@@ -102,6 +102,16 @@ NODE_ANNOTATIONS = [
 ]
 NODE_LABELS = ["gpu-fault.io/spare"]
 
+# Cleanup-only identities survive deletion of their deployable manifests.
+RETIRED_GPU_RESOURCES = (
+    ("Deployment", "gpu-fault-hma-watcher", "producer", 40),
+    ("Deployment", "gpu-fault-hma-cloudwatch-consumer", "producer", 50),
+    ("ClusterRole", "gpu-fault-hma-watcher", "support", 100),
+    ("ClusterRoleBinding", "gpu-fault-hma-watcher", "support", 100),
+    ("ServiceAccount", "gpu-fault-hma-watcher", "support", 100),
+    ("ServiceAccount", "gpu-fault-hma-cloudwatch-consumer", "support", 100),
+)
+
 
 def _documents(
     plane: str,
@@ -247,6 +257,24 @@ def generate() -> dict[str, Any]:
             )
             is not None
         ]
+        if plane == "gpu":
+            active = {(item["kind"], item["name"]) for item in resources}
+            for kind, name, phase, order in RETIRED_GPU_RESOURCES:
+                if (kind.lower(), name) in active:
+                    raise RuntimeError(
+                        f"retired resource has a manifest: {kind}/{name}"
+                    )
+                resources.append(
+                    {
+                        "kind": kind.lower(),
+                        "name": name,
+                        "scope": "cluster" if kind in CLUSTER_KINDS else "namespaced",
+                        "phase": phase,
+                        "order": order,
+                        "clean": "delete",
+                        "retired": True,
+                    }
+                )
         resources.sort(
             key=lambda item: (
                 PHASE_ORDER[plane][item["phase"]],

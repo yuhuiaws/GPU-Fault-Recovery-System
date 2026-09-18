@@ -96,7 +96,7 @@ def test_an_attempt_observed_on_a_node_under_repair_opens_a_hold():
 
     assert held is not None, "a mutating repair on node-a must open a hold"
     incident, workflow = held
-    assert incident.incident_id == "hold-cluster-a-train-1-a1"
+    assert incident.incident_id == "hold-53ec8ed5bb8a3aebd3b7ae60"
     assert incident.event_id == incident.incident_id
     assert incident.event_type == "WORKLOAD_PLACED_ON_REPAIRING_NODE"
     assert incident.policy_source == "SITE_PLACEMENT_HOLD"

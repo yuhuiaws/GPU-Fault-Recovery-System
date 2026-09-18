@@ -15,6 +15,7 @@ from gpu_fault_release import regional_release_registry as REGISTRY_MODULE
 from gpu_fault_release import regional_release_state as STATE_MODULE
 from gpu_fault_release import rollout as ROLLOUT_MODULE
 from tests.regional._release_orchestrator_support import ingress_pod_list_json
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -64,8 +65,15 @@ class RegistrySecret:
         encoded = (self.data or {}).get(key)
         return None if encoded is None else json.loads(base64.b64decode(encoded))
 
-    def probe(self, _arguments) -> bool:
-        return self.data is not None
+    def probe_output(self, arguments, **_kwargs) -> tuple[int, str, str]:
+        code, raw, error = resource_probe_result(
+            arguments, present=self.data is not None
+        )
+        if self.data is None:
+            return code, raw, error
+        document = json.loads(raw)
+        document["data"] = self.data
+        return 0, json.dumps(document), ""
 
     def run(self, arguments, *, input_text=None, capture=False, sensitive=False):
         if "apply" in arguments:
@@ -248,7 +256,7 @@ class IdleProbe:
             return ingress_pod_list_json(self.pod)
         return self.pod
 
-    def probe(self, _arguments) -> bool:
+    def probe_output(self, arguments, **_kwargs) -> tuple[int, str, str]:
         """The memoised Pod is still there, so a failed exec really failed.
 
         A replaced Pod is the other case, and it buys an extra attempt on a
@@ -256,7 +264,7 @@ class IdleProbe:
         that reached the Pod and died, so the Pod has to still exist.
         """
 
-        return True
+        return resource_probe_result(arguments)
 
 
 def idle_release(probe: IdleProbe):

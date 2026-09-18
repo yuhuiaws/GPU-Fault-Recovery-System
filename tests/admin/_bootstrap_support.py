@@ -9,7 +9,28 @@ to run the other.
 
 from __future__ import annotations
 
+import subprocess
+
+from gpu_fault.admin import bootstrap_common
 from gpu_fault.admin.bootstrap_common import ClusterIdentity
+
+
+def patch_bootstrap_commands(monkeypatch, subprocess_fake):
+    """Keep raw legacy probes and the bounded command executor on one fake CLI."""
+    monkeypatch.setattr(subprocess, "run", subprocess_fake)
+
+    def run(arguments, **kwargs):
+        return subprocess_fake(
+            arguments,
+            input=kwargs.get("input_text"),
+            env=kwargs.get("environment"),
+            capture_output=kwargs.get("capture", True),
+            text=True,
+            check=False,
+            cwd=kwargs.get("cwd"),
+        )
+
+    monkeypatch.setattr(bootstrap_common, "run_command", run)
 
 
 def _cluster() -> ClusterIdentity:

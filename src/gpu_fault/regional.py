@@ -21,6 +21,7 @@ from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.execution.node_action_uncertainty import pending_remote_action_details
 from gpu_fault.hyperpod import HyperPodSubmissionRecord
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -806,6 +807,9 @@ class RegionalRemoteWorkflowAdapter:
             return WorkflowStepOutcome.waiting(
                 operation_id=f"remote/{sibling.command_id}",
                 details={
+                    **pending_remote_action_details(
+                        sibling.step.operation, sibling.status, sibling.result_details
+                    ),
                     "reason": "OPEN_SIBLING_COMMAND",
                     "remote_command_id": sibling.command_id,
                     "remote_cluster_id": sibling.cluster_id,
@@ -832,6 +836,7 @@ class RegionalRemoteWorkflowAdapter:
                     context.incident,
                     context.step,
                     context.idempotency_key,
+                    workflow=context.workflow,
                 )
                 if not isinstance(issued, RestartAuthorization):
                     return issued
@@ -882,19 +887,16 @@ class RegionalRemoteWorkflowAdapter:
             )
         # A RESTART_WORKLOAD hold on the data plane says ``restart_submitted``;
         # carried here so the reservation release can judge a live wait.
-        restart_submitted = current.result_details.get("restart_submitted")
         return WorkflowStepOutcome.waiting(
             operation_id=operation_id,
             details={
+                **pending_remote_action_details(
+                    context.step.operation, current.status, current.result_details
+                ),
                 "remote_command_id": current.command_id,
                 "remote_cluster_id": current.cluster_id,
                 "remote_status": current.status.value,
                 "mutation_submitted_by_control_plane": False,
-                **(
-                    {"restart_submitted": restart_submitted}
-                    if restart_submitted is not None
-                    else {}
-                ),
             },
         )
 

@@ -40,9 +40,21 @@ class FakeBackend:
                 }
             },
         }
-        self.cpu_generations = {"gpu-fault-api-ha": 1, "gpu-fault-worker": 1}
+        self.cpu_generations = {
+            "gpu-fault-api-ha": 1,
+            "gpu-fault-control-worker": 1,
+            "gpu-fault-telemetry-spool-worker": 1,
+        }
         self.gpu_generations = {
-            "cluster-a": {EXECUTOR: 1, "gpu-fault-completion-watcher": 1}
+            "cluster-a": {
+                name: 1
+                for name in (
+                    EXECUTOR,
+                    "gpu-fault-completion-watcher",
+                    "gpu-fault-kubernetes-node-resource-collector",
+                    "gpu-fault-node-installer-reconciler",
+                )
+            }
         }
         self.resume_rolls_cpu = False
         self.executor_rolls_watcher = False
@@ -60,13 +72,19 @@ class FakeBackend:
         kind = (
             "NOOP" if scenario in self.completed else boot020.EXPECTED_KINDS[scenario]
         )
-        changed = [] if kind == "NOOP" else [scenario]
+        fields = {
+            "control_plane": "admin_config_worker",
+            "executor": "executor_manifests",
+            "agent": "node_bundle",
+            "full": "runtime_profile",
+        }
+        changed = [] if kind == "NOOP" else [fields[scenario]]
         if (
             scenario == "executor"
             and kind != "NOOP"
             and self.executor_changes_runtime_image
         ):
-            changed.append("runtime_image")
+            changed.append("executor_image")
         return {"kind": kind, "changed": changed}
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]:
@@ -148,12 +166,16 @@ class FakeBackend:
             )
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
-            self.cpu_generations = {"gpu-fault-api-ha": 2, "gpu-fault-worker": 2}
+            self.cpu_generations["gpu-fault-control-worker"] = 2
         elif scenario == "executor":
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
             self.gpu_generations["cluster-a"][EXECUTOR] = 2
             if self.executor_rolls_watcher:
                 self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 2
+            if self.executor_changes_runtime_image:
+                self.gpu_generations["cluster-a"] = dict.fromkeys(
+                    self.gpu_generations["cluster-a"], 2
+                )
             if resume:
                 # cpu-finalized is the one CPU roll every resume still owes;
                 # ``resume_rolls_cpu`` repeats the staged rollout on top of it.
@@ -209,17 +231,14 @@ def test_executor_stage_rejects_non_executor_generation_changes(tmp_path: Path) 
     backend = FakeBackend()
     backend.executor_rolls_watcher = True
 
-    with pytest.raises(boot020.AcceptanceCheckError, match="non-executor Deployments"):
+    with pytest.raises(boot020.AcceptanceCheckError, match="component plan"):
         boot020.run_release_rolling(backend, _recorder(tmp_path))
 
 
 def test_executor_stage_accepts_shared_image_deployments_when_the_image_changed(
     tmp_path: Path,
 ) -> None:
-    """A rebuilt candidate changes the runtime image digest, and the watcher
-    and collector run that image beside the executor: the release engine rolls
-    them by image change (live 2026-09-11, generations +1 on all three). That is
-    within the classification, not beyond it."""
+    """The independent Executor image also selects Watcher/Collector/Reconciler."""
 
     backend = FakeBackend()
     backend.executor_rolls_watcher = True

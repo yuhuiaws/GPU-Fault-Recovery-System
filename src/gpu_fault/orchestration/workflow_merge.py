@@ -20,11 +20,16 @@ from gpu_fault.models import (
     record_workflow_event,
 )
 from gpu_fault.operation_registry import (
+    DESTRUCTIVE_OPERATIONS,
     NODE_MUTATING_OPERATIONS,
     NODE_WIDE_RECOVERY_OPERATIONS,
 )
 from gpu_fault.orchestration.disposition import Disposition
 from gpu_fault.orchestration.preemption_boundary import preemption_boundary
+from gpu_fault.workflow_quarantine import (
+    inherit_terminal_quarantine,
+    terminal_quarantine_covered,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -147,6 +152,18 @@ class WorkflowMergeService:
                 candidate.request_id,
             )
             return Disposition.QUEUE_SUCCESSOR
+        candidate = inherit_terminal_quarantine(existing, candidate)
+        if (
+            candidate.status is WorkflowStatus.PENDING
+            and not terminal_quarantine_covered(existing, candidate)
+        ):
+            if workflow_is_mutable(existing):
+                return Disposition.REPLACE_IN_PLACE
+            if allow_job_branch_merge and self.brancher.dag_join_accepts_new_branch(
+                existing
+            ):
+                return Disposition.QUEUE_BRANCH_SUCCESSOR
+            return Disposition.QUEUE_SUCCESSOR
         if allow_job_branch_merge and self._read_only_branch_window_closed(
             existing, candidate, now
         ):
@@ -255,7 +272,7 @@ class WorkflowMergeService:
         now: datetime | None = None,
     ) -> bool:
         if any(
-            step.operation in NODE_MUTATING_OPERATIONS
+            step.operation in DESTRUCTIVE_OPERATIONS
             for step in candidate.official_steps
         ):
             return False
@@ -537,6 +554,7 @@ class WorkflowMergeService:
         existing: WorkflowRequest,
         candidate: WorkflowRequest,
     ) -> WorkflowRequest:
+        candidate = inherit_terminal_quarantine(existing, candidate)
         if candidate.lifetime_deadline_at is None and existing.lifetime_deadline_at:
             # A successor shares its predecessor's lifetime (F-N1).
             candidate = candidate.model_copy(

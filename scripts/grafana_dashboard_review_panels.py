@@ -1,4 +1,4 @@
-"""Panels added by the control-plane review 2026-09-08.
+"""Panels added by the control-plane and recovery quality reviews.
 
 Kept apart from ``grafana_dashboard_catalog.py`` only because that file sits at
 its size ratchet; the catalog imports these and places them in its rows. Same
@@ -35,6 +35,7 @@ class Panel:
     unit: str = "short"
     kind: str = "timeseries"
     description: str = ""
+    alert_names: tuple[str, ...] | None = None
 
 
 def series(metric: str, *selectors: str) -> str:
@@ -47,17 +48,179 @@ def _panel(
     description: str,
     *,
     unit: str = "short",
+    alert_names: tuple[str, ...] | None = None,
 ) -> Panel:
     return Panel(
         title,
         tuple(Target(expr, legend) for expr, legend in targets),
         unit=unit,
         description=description,
+        alert_names=alert_names,
     )
 
 
 def _increase(metric: str, window: str, by: str, *selectors: str) -> str:
     return f"sum by ({by}) (increase({series(metric, *selectors)}[{window}]))"
+
+
+def _counter_scan_known() -> str:
+    stamp = series("gpu_fault_processor_counter_drift_scan_timestamp_seconds")
+    maximum_age = series("gpu_fault_processor_counter_drift_scan_max_age_seconds")
+    age = f"time() - {stamp}"
+    return (
+        f"({stamp} > 0) and "
+        f"({stamp} == on (control_plane_cluster, region) group_left "
+        f"max {BY_CONTROL_PLANE} ({stamp})) "
+        f"and ({age} >= 0) and ({maximum_age} > 0) "
+        f"and ({age} <= {maximum_age}) "
+        f"and ({series('gpu_fault_processor_counter_drift_abs')} >= 0) "
+        f"and ({series('gpu_fault_processor_counter_mismatched_clusters')} >= 0)"
+    )
+
+
+def _counter_drift(metric: str) -> str:
+    return (
+        f"min_over_time((max {BY_CONTROL_PLANE} "
+        f"({series(metric)} and ({_counter_scan_known()})))[5m:1m]) "
+        "and on (control_plane_cluster, region) "
+        f"max {BY_CONTROL_PLANE} ({_counter_scan_known()})"
+    )
+
+
+def _counter_scan_unavailable() -> str:
+    workers = series(
+        "up", 'job="gpu-fault-control-plane"', 'service_role="gpu-fault-control-worker"'
+    )
+    expected = f"max {BY_CONTROL_PLANE} ({workers} == 1)"
+    return (
+        f"({expected} unless on (control_plane_cluster, region) "
+        f"max {BY_CONTROL_PLANE} ({_counter_scan_known()})) or (0 * {expected})"
+    )
+
+
+COUNTER_DRIFT_PANEL = _panel(
+    "Processor counter drift",
+    (
+        (_counter_drift("gpu_fault_processor_counter_drift_abs"), "drift"),
+        (
+            _counter_drift("gpu_fault_processor_counter_mismatched_clusters"),
+            "mismatched clusters",
+        ),
+    ),
+    "Five-minute minimum from the newest complete, fresh scan. An old task "
+    "owner cannot preserve repaired drift; unavailable scans are shown separately.",
+    alert_names=("GpuFaultProcessorCounterDrift",),
+)
+
+COUNTER_SCAN_PANEL = _panel(
+    "Processor counter scan unavailable",
+    ((_counter_scan_unavailable(), "{{control_plane_cluster}} {{region}}"),),
+    "1 when no current complete counter scan is available; 0 when one is known.",
+    alert_names=("GpuFaultProcessorCounterDriftScanUnavailable",),
+)
+
+_TERMINAL_FAILURE = (
+    f"max {BY_CONTROL_PLANE} (max_over_time("
+    f"{series('gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds')}"
+    "[15m]))"
+)
+NOTIFICATION_FAILURE_PANEL = _panel(
+    "Terminal notification failure seen (15m)",
+    (
+        (
+            f"((time() - {_TERMINAL_FAILURE}) < bool 900) "
+            f"* ({_TERMINAL_FAILURE} > bool 0)",
+            "{{control_plane_cluster}} {{region}}",
+        ),
+    ),
+    "1 after a recorded terminal delivery failure in the last 15 minutes. "
+    "Deleting older failures or retaining DEAD rows does not create an event.",
+    alert_names=("GpuFaultNotificationDeliveryFailing",),
+)
+
+_AGGREGATION_DEGRADED = series("gpu_fault_metrics_aggregation_degraded")
+_SCRAPED_CONTROL_PLANE = series("up", 'job="gpu-fault-control-plane"')
+METRIC_COVERAGE_PANEL = _panel(
+    "Process metric coverage incomplete",
+    (
+        (
+            "max by (control_plane_cluster, region, pod, service_role) ("
+            f"{_AGGREGATION_DEGRADED} or "
+            f"(({_SCRAPED_CONTROL_PLANE} == 1) "
+            "unless on (control_plane_cluster, region, pod, instance, service_role) "
+            f"{_AGGREGATION_DEGRADED}))",
+            "{{pod}} {{service_role}}",
+        ),
+    ),
+    "1 for stale, missing or invalid process publications, or a missing merger "
+    "verdict on a reachable Pod. Unknown process coverage is not zero activity.",
+    alert_names=("GpuFaultMetricsAggregationIncomplete",),
+)
+
+
+def _containment_window_known() -> str:
+    mean = series(
+        "gpu_fault_closed_loop_milestone_window_mean_seconds",
+        'milestone="containment"',
+    )
+    count = series(
+        "gpu_fault_closed_loop_milestone_window_count", 'milestone="containment"'
+    )
+    complete = series(
+        "gpu_fault_closed_loop_milestone_window_complete", 'milestone="containment"'
+    )
+    age = f"time() - {series('gpu_fault_closed_loop_window_end_timestamp_seconds')}"
+    return (
+        f"({complete} == 1) and "
+        f"(({count} == 0) or (({count} > 0) and ({mean} >= 0))) "
+        f"and ignoring (milestone) (({age} >= 0) and ({age} <= 120))"
+    )
+
+
+def _containment_window_mean() -> str:
+    mean = series(
+        "gpu_fault_closed_loop_milestone_window_mean_seconds",
+        'milestone="containment"',
+    )
+    count = series(
+        "gpu_fault_closed_loop_milestone_window_count", 'milestone="containment"'
+    )
+    return (
+        f"max {BY_CONTROL_PLANE} "
+        f"({mean} and ({count} > 0) and ({_containment_window_known()}))"
+    )
+
+
+def _containment_window_unavailable() -> str:
+    workers = series(
+        "up", 'job="gpu-fault-control-plane"', 'service_role="gpu-fault-control-worker"'
+    )
+    expected = f"({series('gpu_fault_workflow_scan_limit')} or ({workers} == 1))"
+    return (
+        f"count {BY_CONTROL_PLANE} ("
+        f"{expected} unless on "
+        "(control_plane_cluster, region, job, namespace, pod, instance) "
+        f"({_containment_window_known()})) "
+        f"or (0 * max {BY_CONTROL_PLANE} ({expected}))"
+    )
+
+
+CONTAINMENT_LATENCY_PANEL = _panel(
+    "Containment latency (6h moving mean)",
+    ((_containment_window_mean(), "{{control_plane_cluster}} {{region}}"),),
+    "Creation to first successful containment in the event-time window. "
+    "Empty, incomplete or stale windows have no mean.",
+    unit="s",
+    alert_names=("GpuFaultClosedLoopSlow",),
+)
+
+CONTAINMENT_WINDOW_PANEL = _panel(
+    "Unavailable containment windows",
+    ((_containment_window_unavailable(), "{{control_plane_cluster}} {{region}}"),),
+    "Workers lacking a complete, fresh containment window. "
+    "A missing latency mean does not establish healthy recovery.",
+    alert_names=("GpuFaultClosedLoopWindowIncomplete",),
+)
 
 
 COLLECTOR_MEMORY_PANEL = _panel(
@@ -197,7 +360,7 @@ POOL_AND_CREDENTIAL_PANELS = (
                 "{{control_plane_cluster}} {{region}} last success age (s)",
             ),
             (
-                f"max {BY_CONTROL_PLANE} ("
+                f"min {BY_CONTROL_PLANE} ("
                 + series("gpu_fault_aurora_credential_refresh_last_run_ok")
                 + ")",
                 "{{control_plane_cluster}} {{region}} last run ok",
@@ -207,6 +370,20 @@ POOL_AND_CREDENTIAL_PANELS = (
         "master password, and whether its latest run succeeded, from the status "
         "file in the mounted Secret (H1-2).",
         unit="s",
+    ),
+    _panel(
+        "Aurora refresh evidence unknown",
+        (
+            (
+                f"max {BY_CONTROL_PLANE} ("
+                + series("gpu_fault_aurora_credential_refresh_status_unreadable")
+                + ")",
+                "{{control_plane_cluster}} {{region}}",
+            ),
+        ),
+        "A configured status projection is missing, unreadable, malformed or "
+        "future-dated. This is unknown evidence, not a successful refresh.",
+        alert_names=("GpuFaultAuroraCredentialRefreshStatusUnknown",),
     ),
 )
 
@@ -219,7 +396,7 @@ REVIEW_COUNTER_PANELS = (
                     "gpu_fault_periodic_cleanup_rows_total",
                     "30m",
                     "control_plane_cluster, region",
-                    'job="stale_fence_remote_commands"',
+                    'periodic_job="stale_fence_remote_commands"',
                 ),
                 "{{control_plane_cluster}} {{region}}",
             ),

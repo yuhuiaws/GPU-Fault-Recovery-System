@@ -1,70 +1,30 @@
-"""Scripts exec'd inside a control-plane Pod must read the Aurora DSN from the file.
-
-``GPU_FAULT_STORE_URL`` is the value at Pod start and goes stale the moment HA-009
-rotates the master password, while ``GPU_FAULT_STORE_URL_FILE`` is re-read on every
-connect; the live HA-009 run failed only because helper scripts read the env var, so
-every script under ``scripts/e2e/regional`` and ``scripts/perf`` is held to
-``store_dsn()``.
-"""
+"""CPU SQL probes use file-aware credentials, including their embedded scripts."""
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
 from scripts.perf.regional_capacity_registry import STORE_DSN_SNIPPET
+from tests.regional._store_dsn_contract import ENV_FILE, ENV_URL, scan_source
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIRS = (ROOT / "scripts" / "e2e" / "regional", ROOT / "scripts" / "perf")
-DIRECT_READ = re.compile(
-    r"""(environ\[|environ\.get\(|getenv\()\s*["']GPU_FAULT_STORE_URL["']"""
-)
-BODY_MARKERS = (
-    "GPU_FAULT_STORE_URL_FILE",
-    "/etc/gpu-fault/aurora/postgres-url",
-    "OSError",
-)
-
-
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip())
+DEFAULT_FILE = "/etc/gpu-fault/aurora/postgres-url"
 
 
 def _scan(path: Path) -> tuple[list[str], list[str]]:
-    """Return (env reads outside a store_dsn body, store_dsn bodies missing the file read)."""
-    outside: list[str] = []
-    incomplete: list[str] = []
-    def_indent: int | None = None
-    body: list[str] = []
-    body_start = 0
-
-    def close_body() -> None:
-        if def_indent is not None and not all(
-            any(marker in line for line in body) for marker in BODY_MARKERS
-        ):
-            incomplete.append(f"{path.relative_to(ROOT)}:{body_start}")
-
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if def_indent is not None and line.strip() and _indent(line) <= def_indent:
-            close_body()
-            def_indent = None
-        if "def store_dsn()" in line:
-            def_indent = _indent(line)
-            body = []
-            body_start = number
-            continue
-        if def_indent is not None:
-            body.append(line)
-        elif DIRECT_READ.search(line):
-            outside.append(f"{path.relative_to(ROOT)}:{number}")
-    close_body()
-    return outside, incomplete
+    return scan_source(
+        path.read_text(encoding="utf-8"),
+        str(path.relative_to(ROOT)),
+        canonical_reader=STORE_DSN_SNIPPET,
+    )
 
 
-def test_every_env_read_sits_inside_a_store_dsn_body() -> None:
-    """A direct env read anywhere else would break again on the next rotation."""
+def test_every_env_read_uses_a_file_aware_credential_flow() -> None:
+    """A recognized flow must bind the FILE input, not merely mention its name."""
     outside: list[str] = []
     incomplete: list[str] = []
     files = sorted(path for root in SCRIPT_DIRS for path in root.rglob("*.py"))
@@ -74,17 +34,16 @@ def test_every_env_read_sits_inside_a_store_dsn_body() -> None:
         outside.extend(found)
         incomplete.extend(missing)
     assert not outside, (
-        "GPU_FAULT_STORE_URL read outside store_dsn(); prepend STORE_DSN_SNIPPET or "
-        "copy its body: " + ", ".join(outside)
+        "startup-only or unrecognized DSN credential reads: " + ", ".join(outside)
     )
     assert not incomplete, (
-        "store_dsn() copies that do not read GPU_FAULT_STORE_URL_FILE first: "
+        "DSN helpers differ from the tested strict reader or probes cannot parse: "
         + ", ".join(incomplete)
     )
 
 
-def _snippet_store_dsn():
-    namespace: dict[str, object] = {}
+def _snippet_store_dsn() -> Callable[[], str]:
+    namespace: dict[str, Any] = {}
     exec(STORE_DSN_SNIPPET, namespace)
     return namespace["store_dsn"]
 
@@ -102,12 +61,163 @@ def test_snippet_reads_the_mounted_file_stripped(
     )
 
 
-def test_snippet_falls_back_to_the_env_var_without_a_file(
+def test_explicit_missing_file_never_falls_back_to_the_env_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A deploy host mounts no file, so the env var stays the fallback there."""
     monkeypatch.setenv("GPU_FAULT_STORE_URL_FILE", str(tmp_path / "missing"))
     monkeypatch.setenv("GPU_FAULT_STORE_URL", "postgresql://env-user@example/db")
-    assert _snippet_store_dsn()() == "postgresql://env-user@example/db", (
-        "store_dsn() must fall back to GPU_FAULT_STORE_URL when the file is absent"
+    with pytest.raises(FileNotFoundError):
+        _snippet_store_dsn()()
+
+
+def test_absent_default_mount_permits_the_legacy_env_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def missing_default(path: str, **kwargs: Any) -> None:
+        calls.append((path, kwargs))
+        raise FileNotFoundError
+
+    monkeypatch.delenv(ENV_FILE, raising=False)
+    monkeypatch.setenv(ENV_URL, "postgresql://legacy.invalid/db")
+    monkeypatch.setattr("builtins.open", missing_default)
+    assert _snippet_store_dsn()() == "postgresql://legacy.invalid/db"
+    assert calls == [(DEFAULT_FILE, {"encoding": "utf-8"})]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_permission_failures_do_not_allow_a_stale_env_fallback(
+    configured: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def denied(path: str, **_kwargs: Any) -> None:
+        assert path == ("/unit/projected" if configured else DEFAULT_FILE)
+        raise PermissionError
+
+    monkeypatch.delenv(ENV_FILE, raising=False)
+    if configured:
+        monkeypatch.setenv(ENV_FILE, "/unit/projected")
+    monkeypatch.setenv(ENV_URL, "postgresql://stale.invalid/db")
+    monkeypatch.setattr("builtins.open", denied)
+    with pytest.raises(PermissionError):
+        _snippet_store_dsn()()
+
+
+def test_explicit_empty_file_path_is_not_a_default_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ENV_FILE, "")
+    monkeypatch.setenv(ENV_URL, "postgresql://stale.invalid/db")
+    monkeypatch.setattr("builtins.open", lambda *_a, **_k: pytest.fail("must not open"))
+    with pytest.raises(RuntimeError, match="file path is empty"):
+        _snippet_store_dsn()()
+
+
+@pytest.mark.parametrize("contents", ["", " \n\t"])
+def test_empty_projected_file_cannot_use_the_startup_dsn(
+    contents: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "projected"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv(ENV_FILE, str(path))
+    monkeypatch.setenv(ENV_URL, "postgresql://stale.invalid/db")
+    with pytest.raises(RuntimeError, match="DSN file is empty"):
+        _snippet_store_dsn()()
+
+
+def test_each_connection_read_follows_rotation_and_subsequent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "projected"
+    monkeypatch.setenv(ENV_FILE, str(path))
+    monkeypatch.setenv(ENV_URL, "postgresql://startup.invalid/db")
+    reader = _snippet_store_dsn()
+    for version in ("first", "rotated"):
+        path.write_text(f"postgresql://{version}.invalid/db\n", encoding="utf-8")
+        assert reader() == f"postgresql://{version}.invalid/db"
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        reader()
+
+
+@pytest.mark.parametrize(
+    ("source", "safe"),
+    [
+        ('dsn = os.environ["GPU_FAULT_STORE_URL"]', False),
+        ('dsn = StoreCredentials(os.getenv("GPU_FAULT_STORE_URL"))', False),
+        (
+            'path = os.getenv("GPU_FAULT_STORE_URL_FILE")\n'
+            'dsn = StoreCredentials(os.getenv("GPU_FAULT_STORE_URL"), path=path)',
+            True,
+        ),
+        (
+            'path = os.getenv("GPU_FAULT_STORE_URL_FILE")\npath = "/other"\n'
+            'dsn = StoreCredentials(os.getenv("GPU_FAULT_STORE_URL"), path=path)',
+            False,
+        ),
+        (
+            'path = os.getenv("GPU_FAULT_STORE_URL_FILE")\n'
+            'os.environ["GPU_FAULT_STORE_URL"] = '
+            'StoreCredentials(os.environ["GPU_FAULT_STORE_URL"], path=path).conninfo()',
+            True,
+        ),
+        (
+            'path = os.environ.get("GPU_FAULT_STORE_URL_FILE", "").strip()\n'
+            "url = Path(path).read_text().strip() if path else "
+            'os.environ["GPU_FAULT_STORE_URL"]',
+            True,
+        ),
+        (
+            'path = os.environ.get("OTHER_PATH", "").strip()\n'
+            "url = Path(path).read_text().strip() if path else "
+            'os.environ["GPU_FAULT_STORE_URL"]',
+            False,
+        ),
+        (
+            'path = os.getenv("GPU_FAULT_STORE_URL_FILE")\n'
+            'url = "fixed" if path else os.environ["GPU_FAULT_STORE_URL"]',
+            False,
+        ),
+        (
+            'dsn_arguments(os.environ["GPU_FAULT_STORE_URL"], expected["database"])',
+            True,
+        ),
+        (
+            'arguments = dsn_arguments(os.environ["GPU_FAULT_STORE_URL"], '
+            'expected["database"])',
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize("embedded", [False, True])
+def test_scanner_accepts_only_the_recognized_file_aware_flow(
+    source: str, safe: bool, embedded: bool
+) -> None:
+    if embedded:
+        source = f"PROBE = {source!r}"
+    outside, incomplete = scan_source(
+        source, "unit", canonical_reader=STORE_DSN_SNIPPET
     )
+    assert (not outside and not incomplete) is safe, (outside, incomplete)
+
+
+def test_scanner_rejects_a_reader_that_mentions_file_but_returns_startup_url() -> None:
+    source = (
+        "def store_dsn():\n"
+        '    path = os.getenv("GPU_FAULT_STORE_URL_FILE")\n'
+        "    with open(path) as handle:\n"
+        "        handle.read()\n"
+        '    return os.environ["GPU_FAULT_STORE_URL"]\n'
+    )
+    outside, incomplete = scan_source(
+        source, "unit", canonical_reader=STORE_DSN_SNIPPET
+    )
+    assert not outside and incomplete
+
+
+def test_scanner_rejects_unparseable_embedded_dsn_reads() -> None:
+    source = "PROBE = 'with os.environ[\"GPU_FAULT_STORE_URL\"] as\\n'"
+    outside, incomplete = scan_source(
+        source, "unit", canonical_reader=STORE_DSN_SNIPPET
+    )
+    assert not outside and incomplete

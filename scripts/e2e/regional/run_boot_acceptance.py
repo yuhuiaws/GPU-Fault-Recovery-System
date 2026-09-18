@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # noqa: E402
 from scripts.e2e.regional.boot_acceptance_common import (  # noqa: E402
     BootAcceptanceError,
     SiteFixture,
@@ -31,6 +32,7 @@ from scripts.e2e.regional.boot_acceptance_runtime import (  # noqa: E402
     run_boot013,
     run_boot014,
     run_boot015,
+    run_boot021,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
@@ -46,8 +48,11 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     predecessor_evidence,
 )
 
-CASE_IDS = tuple(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(11, 19))
 BOOT021_CASE_ID = "GF-REGIONAL-BOOT-021"
+CASE_IDS = (
+    *tuple(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(11, 19)),
+    BOOT021_CASE_ID,
+)
 SITE_CASES = frozenset(
     {
         "GF-REGIONAL-BOOT-011",
@@ -55,6 +60,7 @@ SITE_CASES = frozenset(
         "GF-REGIONAL-BOOT-013",
         "GF-REGIONAL-BOOT-014",
         "GF-REGIONAL-BOOT-015",
+        BOOT021_CASE_ID,
     }
 )
 
@@ -90,9 +96,8 @@ def evidence_identity_for(arguments: argparse.Namespace) -> dict[str, str] | Non
 
     Site cases read it from ``--site``; the lifecycle cases from the managed
     site under ``--bootstrap-state-dir`` when BOOT-016 has already created it.
-    A site that cannot be reached yields ``None``: the predecessor check then
-    runs unbound, as it did before identity binding, rather than failing the
-    plan on a kubectl error.
+    Only a first BOOT-016 deployment has no existing identity. An unreadable
+    existing site must not silently turn into an unbound predecessor check.
     """
 
     site_file: Path | None = None
@@ -102,13 +107,17 @@ def evidence_identity_for(arguments: argparse.Namespace) -> dict[str, str] | Non
         candidate = arguments.bootstrap_state_dir / "site.yaml"
         site_file = candidate if candidate.is_file() else None
     if site_file is None:
-        return None
+        if arguments.case == "GF-REGIONAL-BOOT-016":
+            return None
+        raise BootAcceptanceError("cannot bind BOOT evidence without the target site")
     try:
         return dict(
             SiteFixture(site_file, arguments.cluster_id).regional.evidence_identity()
         )
-    except Exception:  # noqa: BLE001 - identity is best effort, never a verdict
-        return None
+    except Exception as exc:
+        raise BootAcceptanceError(
+            "cannot bind BOOT evidence to the target site"
+        ) from exc
 
 
 def case_plan(case_id: str, arguments: argparse.Namespace) -> dict[str, Any]:
@@ -130,6 +139,7 @@ def case_plan(case_id: str, arguments: argparse.Namespace) -> dict[str, Any]:
         "GF-REGIONAL-BOOT-018": (
             "build two temporary releases and run read-only live verify"
         ),
+        BOOT021_CASE_ID: "run a fresh authenticated readiness matrix in every Executor replica",
     }
     return {
         "risk": "case-defined",
@@ -164,7 +174,7 @@ def case_plan(case_id: str, arguments: argparse.Namespace) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
-        description="Run one guarded regional BOOT-011..018 acceptance case."
+        description="Run one guarded regional BOOT-011..018 or BOOT-021 acceptance case."
     )
     add_live_arguments(value, confirmation="CASE_SPECIFIC_CONFIRMATION")
     value.add_argument("--case", choices=CASE_IDS, required=True)
@@ -177,14 +187,6 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--gpu-cluster-arn", action="append", default=[])
     value.add_argument("--admin-email", default="")
     value.add_argument("--retain-bootstrap-site", action="store_true")
-    value.add_argument(
-        "--also-record-boot021",
-        action="store_true",
-        help=(
-            "BOOT-012 only: also write the executor readiness matrix it ran as "
-            "GF-REGIONAL-BOOT-021 evidence under --run-dir"
-        ),
-    )
     return value
 
 
@@ -194,8 +196,12 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
     if arguments.case == "GF-REGIONAL-BOOT-011":
         if arguments.production_site is None:
             raise BootAcceptanceError("BOOT-011 requires --production-site")
-    if arguments.also_record_boot021 and arguments.case != "GF-REGIONAL-BOOT-012":
-        raise BootAcceptanceError("--also-record-boot021 applies to BOOT-012 only")
+    if (
+        arguments.case == "GF-REGIONAL-BOOT-018"
+        and not current_acceptance_scope().selective
+        and not arguments.retain_bootstrap_site
+    ):
+        raise BootAcceptanceError("formal BOOT-018 requires --retain-bootstrap-site")
     if (
         arguments.case
         in {
@@ -247,6 +253,8 @@ def main() -> int:
     }
     if not arguments.execute:
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=predecessor.get("valid") is True,
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
@@ -258,7 +266,7 @@ def main() -> int:
             },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if predecessor.get("valid") is True else 1
     if arguments.confirm != confirmation:
         raise BootAcceptanceError(f"confirmation must be exactly {confirmation}")
     authorize_execution(
@@ -267,11 +275,20 @@ def main() -> int:
         confirmation=confirmation,
         environment=environment,
     )
-    if not predecessor.get("valid", False):
+    if predecessor.get("valid") is not True:
         raise BootAcceptanceError("formal predecessor evidence is not PASS")
     case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
+    write_json_atomic(
+        case_evidence_path(arguments.run_dir, arguments.case),
+        {
+            "case_id": arguments.case,
+            "verdict": "FAIL",
+            "started_at": started_at,
+            **(identity or {}),
+        },
+    )
     interrupted: BaseException | None = None
     try:
         if arguments.case == "GF-REGIONAL-BOOT-016":
@@ -282,22 +299,12 @@ def main() -> int:
             outcome = run_boot018(arguments, case_dir)
         else:
             fixture = SiteFixture(arguments.site, arguments.cluster_id)
-            boot021_path = (
-                case_evidence_path(arguments.run_dir, BOOT021_CASE_ID)
-                if arguments.also_record_boot021
-                else None
-            )
-            if boot021_path is not None:
-                boot021_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             handlers: dict[str, Callable[[], dict[str, Any]]] = {
                 "GF-REGIONAL-BOOT-011": lambda: run_boot011(
                     fixture,
                     production_site=arguments.production_site,
                 ),
-                "GF-REGIONAL-BOOT-012": lambda: run_boot012(
-                    fixture,
-                    boot021_evidence_path=boot021_path,
-                ),
+                "GF-REGIONAL-BOOT-012": lambda: run_boot012(fixture),
                 "GF-REGIONAL-BOOT-013": lambda: run_boot013(fixture),
                 "GF-REGIONAL-BOOT-014": lambda: run_boot014(fixture),
                 "GF-REGIONAL-BOOT-015": lambda: run_boot015(
@@ -305,6 +312,7 @@ def main() -> int:
                     case_dir=case_dir,
                     attempt=arguments.attempt,
                 ),
+                BOOT021_CASE_ID: lambda: run_boot021(fixture),
             }
             outcome = handlers[arguments.case]()
     except BaseException as exc:

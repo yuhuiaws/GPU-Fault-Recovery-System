@@ -12,6 +12,7 @@ from gpu_fault.store.shared.health_signals import (
     latched_health_signal_state,
     sample_disposition,
     signal_clock,
+    signal_semantic_fingerprints,
 )
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -259,7 +260,9 @@ class PostgresXidMixin:
         items: Sequence[tuple[str, bool, datetime, float]],
         *,
         received_at: datetime | None = None,
+        semantic_fingerprints: Sequence[str | None] | None = None,
     ) -> list[bool]:
+        fingerprints = signal_semantic_fingerprints(len(items), semantic_fingerprints)
         if not items:
             return []
         keys = [item[0] for item in items]
@@ -298,7 +301,10 @@ class PostgresXidMixin:
                     for key, payload in cursor.fetchall()
                 }
             return self._decide_health_signal_transitions(
-                items, current_by_key, received_at=received_at
+                items,
+                current_by_key,
+                received_at=received_at,
+                semantic_fingerprints=fingerprints,
             )
 
     def _decide_health_signal_transitions(
@@ -307,6 +313,7 @@ class PostgresXidMixin:
         current_by_key: dict[str, HealthSignalState],
         *,
         received_at: datetime | None,
+        semantic_fingerprints: Sequence[str | None],
     ) -> list[bool]:
         """The decision and the write, inside the caller's locked transaction."""
 
@@ -317,7 +324,7 @@ class PostgresXidMixin:
             active,
             observed_at,
             minimum_active_seconds,
-        ) in items:
+        ), fingerprint in zip(items, semantic_fingerprints, strict=True):
             previous = current_by_key.get(signal_key)
             accept, regressed = sample_disposition(previous, observed_at, received_at)
             if regressed:
@@ -335,6 +342,7 @@ class PostgresXidMixin:
                 previous,
                 minimum_active_seconds,
                 clock=signal_clock(observed_at, received_at),
+                semantic_fingerprint=fingerprint,
             )
             current_by_key[signal_key] = state
             final_by_key[signal_key] = state
@@ -366,6 +374,9 @@ class PostgresXidMixin:
         active: bool,
         observed_at: datetime,
         minimum_active_seconds: float = 0,
+        *,
+        received_at: datetime | None = None,
+        semantic_fingerprint: str | None = None,
     ) -> bool:
         # The single form is the training-progress path. Like the plural form
         # it only decides to emit; ``TrainingHealthService.mark_notified``
@@ -378,7 +389,9 @@ class PostgresXidMixin:
                     observed_at,
                     minimum_active_seconds,
                 )
-            ]
+            ],
+            received_at=received_at,
+            semantic_fingerprints=[semantic_fingerprint],
         )[0]
 
     def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None:
@@ -386,7 +399,11 @@ class PostgresXidMixin:
         return state if isinstance(state, HealthSignalState) else None
 
     def mark_health_signal_notified(
-        self, signal_key: str, *, notified_at: datetime
+        self,
+        signal_key: str,
+        *,
+        notified_at: datetime,
+        semantic_fingerprint: str | None = None,
     ) -> None:
         with self._state_transaction(f"health_signal_state/{signal_key}"):
             with self._db.cursor() as cursor:
@@ -403,6 +420,8 @@ class PostgresXidMixin:
             current = (
                 self._decode("health_signal_state", row[0]) if row is not None else None
             )
-            latched = latched_health_signal_state(current, notified_at)
+            latched = latched_health_signal_state(
+                current, notified_at, semantic_fingerprint=semantic_fingerprint
+            )
             if latched is not None:
                 self._put("health_signal_state", signal_key, latched)

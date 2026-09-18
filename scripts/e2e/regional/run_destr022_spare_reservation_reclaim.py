@@ -48,6 +48,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     install_abort_signals,
     predecessor_evidence,
     required,
@@ -187,7 +188,7 @@ def executor_probes(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
             "-i",
             str(pod["name"]),
             "--",
-            "python3",
+            component_python("gpu"),
             "-",
             input_text=script,
             timeout=120,
@@ -359,6 +360,7 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
         settings.spare_node,
         annotation_keys=verdicts.TRACKED_ANNOTATIONS,
         track_unschedulable=True,
+        allow_reclaimed_reservation=True,
     )
     run = _LiveRun(
         settings=settings,
@@ -453,7 +455,7 @@ def _executor_evidence(run: _LiveRun) -> list[str]:
             str(pod["name"]),
             "--since-time",
             run.injected_at.isoformat(),
-            check=False,
+            check=True,
             timeout=120,
         )
         matching = [
@@ -639,6 +641,8 @@ def main() -> int:
             synthetic_incident(arguments.run_dir, arguments.attempt),
         )
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=not preflight["errors"],
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,

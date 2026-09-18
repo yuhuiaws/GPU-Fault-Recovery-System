@@ -27,10 +27,10 @@ from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
     GpuMetricsIngestionResult,
 )
-from gpu_fault.hma import (
+from gpu_fault.nvidia_logs import (
     FabricManagerLogEvent,
-    HmaIngestionResult,
-    HmaNormalizedBatch,
+    FaultIngestionResult,
+    NormalizedFaultBatch,
     NvidiaKernelLogEvent,
 )
 from gpu_fault.host_health import (
@@ -46,10 +46,14 @@ from gpu_fault.models import (
     EfaTrafficAdminRequest,
     RecoveryAction,
     Severity,
+    WorkflowOperation,
     WorkloadState,
 )
 from gpu_fault.processor_diagnostics import (
     report_processor_replay_phase,
+)
+from gpu_fault.regional_compatibility import (
+    ACTIVATION_INHIBITION_VERSION,
 )
 from gpu_fault.store import (
     EfaTrafficAdminConflict,
@@ -62,9 +66,11 @@ from gpu_fault.telemetry import (
     EvidenceKind,
 )
 
+activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
+
 
 def _ignore_unresolved_signals(
-    normalized: HmaNormalizedBatch, *, batch_id: str
+    normalized: NormalizedFaultBatch, *, batch_id: str
 ) -> NodeHealthIngestionResult | None:
     return None
 
@@ -166,19 +172,19 @@ async def ingest_collector_health(
 
 @router.post(
     NVIDIA_KERNEL_PATH,
-    response_model=HmaIngestionResult,
+    response_model=FaultIngestionResult,
 )
 @authorization_bucket("cluster-token")
 async def ingest_nvidia_kernel(
     event: NvidiaKernelLogEvent,
     dependencies: CollectorRouterDependencies = Depends(get_collector_dependencies),
-) -> HmaIngestionResult:
-    def ingest() -> HmaIngestionResult:
+) -> FaultIngestionResult:
+    def ingest() -> FaultIngestionResult:
         ctx = dependencies.context
         report_processor_replay_phase("kernel_workload_context")
         enriched = dependencies.enrich_workload_context(event, event.observed_at)
         report_processor_replay_phase("kernel_normalize")
-        normalized = ctx.hma.normalize_kernel(enriched)
+        normalized = ctx.nvidia_logs.normalize_kernel(enriched)
         normalized = normalized.model_copy(
             update={
                 "sxid_events": [
@@ -213,7 +219,7 @@ async def ingest_nvidia_kernel(
         )
         dependencies.ingest_unresolved_signals(normalized, batch_id=enriched.record_id)
         report_processor_replay_phase("kernel_fault_policy")
-        result = HmaIngestionResult(
+        result = FaultIngestionResult(
             normalized=normalized,
             decisions=[
                 *(dependencies.ingest_xid(item) for item in xids),
@@ -247,14 +253,14 @@ def stale_log_line_age(
 
 @router.post(
     FABRIC_MANAGER_PATH,
-    response_model=HmaIngestionResult,
+    response_model=FaultIngestionResult,
 )
 @authorization_bucket("cluster-token")
 async def ingest_fabric_manager_log(
     event: FabricManagerLogEvent,
     dependencies: CollectorRouterDependencies = Depends(get_collector_dependencies),
-) -> HmaIngestionResult:
-    def ingest() -> HmaIngestionResult:
+) -> FaultIngestionResult:
+    def ingest() -> FaultIngestionResult:
         ctx = dependencies.context
         report_processor_replay_phase("fabric_workload_context")
         enriched = dependencies.enrich_workload_context(event, event.observed_at)
@@ -280,14 +286,14 @@ async def ingest_fabric_manager_log(
                 observed_at=enriched.observed_at,
                 payload=enriched.model_dump(mode="json"),
             )
-            return HmaIngestionResult(
-                normalized=ctx.hma.normalize_fabric_manager(enriched).model_copy(
-                    update={"xid_events": [], "sxid_events": []}
-                ),
+            return FaultIngestionResult(
+                normalized=ctx.nvidia_logs.normalize_fabric_manager(
+                    enriched
+                ).model_copy(update={"xid_events": [], "sxid_events": []}),
                 decisions=[],
             )
         report_processor_replay_phase("fabric_normalize")
-        normalized = ctx.hma.normalize_fabric_manager(enriched)
+        normalized = ctx.nvidia_logs.normalize_fabric_manager(enriched)
         normalized = normalized.model_copy(
             update={
                 "xid_events": [
@@ -317,7 +323,7 @@ async def ingest_fabric_manager_log(
             payload=enriched.model_dump(mode="json"),
         )
         dependencies.ingest_unresolved_signals(normalized, batch_id=enriched.record_id)
-        result = HmaIngestionResult(
+        result = FaultIngestionResult(
             normalized=normalized,
             decisions=[
                 *(dependencies.ingest_xid(item) for item in normalized.xid_events),
@@ -415,17 +421,51 @@ async def inject_test_node_replacement(
         diagnostic_parameters={
             "replacement_strategy": request.replacement_strategy,
             "synthetic": True,
+            **(
+                {"activation_forbidden": request.activation_forbidden}
+                if "activation_forbidden" in request.model_fields_set
+                else {}
+            ),
         },
         policy_source="SITE_SYNTHETIC_REPLACEMENT_TEST",
         policy_reference=("execution-token protected warm-spare E2E test"),
         official_action="REPLACE_NODE",
     )
-    result = await _store_call(
-        dependencies,
-        dependencies.ingest_node_health_findings,
-        request.event_id,
-        [finding],
-    )
+
+    def ingest_bound() -> NodeHealthIngestionResult:
+        requested = "activation_forbidden" in request.model_fields_set
+
+        def check_authority(workflow_id: str) -> None:
+            workflow = ctx.store.get_workflow(workflow_id)
+            replacements = [
+                step
+                for step in workflow.official_steps
+                if step.operation is WorkflowOperation.REPLACE_NODE
+            ]
+            if (requested and not replacements) or any(
+                ("activation_forbidden" in step.parameters) != requested
+                or (requested and step.parameters["activation_forbidden"] is not True)
+                for step in replacements
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="synthetic replacement activation authority is immutable",
+                )
+
+        existing = ctx.store.get_incident_by_event(request.event_id)
+        if existing is not None and existing.workflow_request_id:
+            check_authority(existing.workflow_request_id)
+        result: NodeHealthIngestionResult = dependencies.ingest_node_health_findings(
+            request.event_id,
+            [finding],
+        )
+        # Also check the winner of a concurrent create; do not acknowledge an
+        # inhibited request with another request's unguarded workflow.
+        for workflow_id in result.workflow_request_ids:
+            check_authority(workflow_id)
+        return result
+
+    result = await _store_call(dependencies, ingest_bound)
     ctx.dispatcher.wake()
     return result
 

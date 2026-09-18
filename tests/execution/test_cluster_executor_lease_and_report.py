@@ -24,6 +24,7 @@ The executor itself is always the real one.
 from __future__ import annotations
 
 import socket
+from datetime import datetime, timedelta, timezone
 from threading import Event
 from typing import Any
 
@@ -123,6 +124,7 @@ class FakeExecutorClient:
         self.renewals: list[tuple[str, str, int]] = []
         self.complete_errors = dict(complete_errors or {})
         self.renew_error = renew_error
+        self.renewal_gate: Event | None = None
 
     def claim(
         self,
@@ -142,7 +144,18 @@ class FakeExecutorClient:
                 "wait_seconds": wait_seconds,
             }
         )
-        return self.batches.pop(0) if self.batches else []
+        batch = self.batches.pop(0) if self.batches else []
+        return [
+            command.model_copy(
+                update={
+                    "status": RemoteCommandStatus.LEASED,
+                    "lease_owner": executor_id,
+                    "lease_expires_at": datetime.now(timezone.utc)
+                    + timedelta(seconds=lease_seconds),
+                }
+            )
+            for command in batch
+        ]
 
     def complete(
         self, command: RemoteActionCommand, result: RemoteCommandResult
@@ -157,9 +170,22 @@ class FakeExecutorClient:
         self, command: RemoteActionCommand, executor_id: str, lease_seconds: int
     ) -> RemoteActionCommand:
         self.renewals.append((command.command_id, executor_id, lease_seconds))
-        if self.renew_error is not None:
+        if (
+            self.renew_error is not None
+            and sum(identity == command.command_id for identity, _, _ in self.renewals)
+            > 1
+        ):
+            if self.renewal_gate is not None:
+                assert self.renewal_gate.wait(5), (
+                    "adapter must start before in-flight loss"
+                )
             raise self.renew_error
-        return command
+        return command.model_copy(
+            update={
+                "lease_expires_at": datetime.now(timezone.utc)
+                + timedelta(seconds=lease_seconds)
+            }
+        )
 
     def reported(self, command_id: str) -> RemoteCommandResult:
         return next(
@@ -296,13 +322,15 @@ def test_a_failed_lease_renewal_is_counted_without_abandoning_the_command(
     stop_events(monkeypatch)
     client = FakeExecutorClient(
         [remote_command("command-a")],
-        renew_error=ClusterExecutorError("stale lease token", status_code=409),
+        renew_error=ClusterExecutorError(
+            "temporary store unavailability", status_code=503
+        ),
     )
     executor = build_executor(client, [RecordingAdapter()])
 
     assert executor.run_once() == 1
     assert executor.lease_renewal_failures == 1
-    assert client.renewals == [("command-a", EXECUTOR, 120)]
+    assert client.renewals == [("command-a", EXECUTOR, 120)] * 2
     assert client.reported("command-a").status is RemoteCommandStatus.SUCCEEDED
     assert executor.reported_failures == 0
 

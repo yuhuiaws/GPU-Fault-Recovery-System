@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from gpu_fault_release import regional_release_config as CONFIG
 from scripts.e2e.regional import boot023_verdicts as verdicts
 from scripts.e2e.regional import run_boot023_release_history as boot023
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_ID = "rel-42"
@@ -128,12 +130,8 @@ def test_the_scripts_carry_no_site_topology() -> None:
         ROOT / "scripts/e2e/regional/boot023_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for needle in (
-            "/secure/gpu-fault-bootstrap",
-            "514385905925",
-            "gpu-fault-gpu-1-",
-        ):
-            assert needle not in source, f"{path.name} embeds {needle}"
+        leaks = site_topology_leaks(source)
+        assert not leaks, f"{path.name} embeds {leaks}"
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +344,7 @@ def _probe(**overrides: Any) -> dict[str, Any]:
         "secret_config_sha256": DIGEST,
         "durable_config_sha256": DIGEST,
         "head_generation": 7,
+        "head_content_sha256": DIGEST,
         "healthz": {
             "status": 200,
             "payload": {
@@ -570,6 +569,15 @@ def _preflight_document() -> dict[str, Any]:
 
 def test_plan_identity_pins_release_classification_and_history_shape() -> None:
     identity = boot023.plan_identity(_preflight_document())
+    for key in (
+        "history_sha256",
+        "snapshot_groups_sha256",
+        "registry_identity_sha256",
+        "runtime_identity_sha256",
+    ):
+        assert verdicts.HEX_DIGEST.fullmatch(identity.pop(key)), (
+            f"{key} must bind the actual proof content"
+        )
     assert identity == {
         "release_id": RELEASE_ID,
         "classification": "NOOP",
@@ -603,3 +611,252 @@ def test_plan_details_name_the_noop_hard_stop_and_no_rollout() -> None:
     assert details["rollback"][
         "no_deployment_secret_or_registry_revision_is_written"
     ], details["rollback"]
+
+
+@pytest.mark.parametrize("missing", ["health_digest", "generation", "head_digest"])
+def test_registry_probe_does_not_accept_missing_identity(missing: str) -> None:
+    value = _probe(head_content_sha256=DIGEST)
+    if missing == "health_digest":
+        del value["healthz"]["payload"]["regional_registry"]["secret_config_sha256"]
+    elif missing == "generation":
+        value.pop("head_generation")
+    else:
+        value.pop("head_content_sha256")
+
+    assert verdicts.registry_probe_errors([value]), (
+        "unknown registry identity must fail"
+    )
+
+
+def test_registry_probes_must_agree_on_the_durable_head() -> None:
+    probes = [
+        _probe(head_content_sha256=DIGEST),
+        _probe(pod="worker-a", head_generation=8, head_content_sha256="b" * 64),
+    ]
+
+    assert verdicts.registry_probe_errors(probes), (
+        "different Pod heads are not convergence"
+    )
+
+
+def _release_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, dict[str, Any], Any, list[bool]]:
+    regional = SimpleNamespace(
+        cpu_kubeconfig=Path("/tmp/boot023-cpu"),
+        gpu_kubeconfig=Path("/tmp/boot023-gpu"),
+        namespace="test-namespace",
+        region="us-west-2",
+        cluster_id="cluster-a",
+        gpu_context="test-gpu",
+    )
+    settings = boot023.Settings(
+        regional=regional,  # type: ignore[arg-type]
+        noop_config=Path("/tmp/unused-noop.json"),
+        predecessor_path=Path("/tmp/unused-predecessor.json"),
+    )
+    config = SimpleNamespace(
+        cpu_kubeconfig=str(regional.cpu_kubeconfig),
+        namespace=regional.namespace,
+        aws_region=regional.region,
+        clusters=[SimpleNamespace(cluster_id="cluster-a", context="test-gpu")],
+    )
+    calls: list[bool] = []
+    modules = {
+        "regional_release_config": SimpleNamespace(
+            ReleaseConfig=SimpleNamespace(load=lambda _path: config)
+        ),
+        "rollout_regional_release": SimpleNamespace(
+            Runner=lambda *, dry_run: calls.append(dry_run) or object(),
+            RegionalRelease=lambda supplied, runner: {
+                "config": supplied,
+                "runner": runner,
+            },
+        ),
+    }
+    monkeypatch.setenv("KUBECONFIG", str(regional.gpu_kubeconfig))
+    return settings, modules, config, calls
+
+
+@pytest.mark.parametrize(
+    "field", ["cpu_kubeconfig", "namespace", "aws_region", "cluster", "context", "gpu"]
+)
+def test_release_config_cannot_target_another_site(
+    field: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, modules, config, calls = _release_scope(monkeypatch)
+    if field == "cluster":
+        config.clusters[0].cluster_id = "cluster-b"
+    elif field == "context":
+        config.clusters[0].context = "other-gpu"
+    elif field == "gpu":
+        monkeypatch.setenv("KUBECONFIG", "/tmp/other-gpu")
+    else:
+        setattr(config, field, "other")
+
+    with pytest.raises(Exception, match="target|scope|kubeconfig"):
+        boot023.release_for(settings, modules, dry_run=False)
+
+    assert calls == [], "wrong-scope configuration must fail before Runner construction"
+
+
+def test_release_config_accepts_the_exact_approved_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, modules, config, calls = _release_scope(monkeypatch)
+
+    result = boot023.release_for(settings, modules, dry_run=True)
+
+    assert result["config"] is config, "the validated config must reach the release"
+    assert calls == [True], "planning must keep the release Runner read-only"
+
+
+@pytest.mark.parametrize("field", ["history", "runtime_identity"])
+def test_plan_identity_detects_content_changes_without_count_changes(
+    field: str,
+) -> None:
+    document = _preflight_document()
+    document["runtime_identity"] = {"image": "before"}
+    before = boot023.plan_identity(document)
+    if field == "history":
+        document["history"][0]["state_sha256"] = "b" * 64
+    else:
+        document["runtime_identity"]["image"] = "after"
+
+    assert boot023.plan_identity(document) != before, "shape equality is not identity"
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_execute_case_records_failure_before_reraising_interrupts(
+    interrupted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = {
+        "errors": [],
+        "release_id": RELEASE_ID,
+        "history": _before(),
+        "snapshot_groups": [["a"]],
+        "registry_probes": [_probe(head_content_sha256=DIGEST)],
+        "runtime_identity": {"release_state": {"release_id": RELEASE_ID}},
+    }
+    monkeypatch.setattr(boot023, "read_only_preflight", lambda *_a: preflight)
+    monkeypatch.setattr(boot023, "verify_plan_identity", lambda *_a: None)
+    monkeypatch.setattr(boot023, "deploy_modules", lambda: {})
+    monkeypatch.setattr(boot023, "cpu_runtime_deployments", lambda _m: ("api",))
+    monkeypatch.setattr(boot023, "RegionalLiveFixture", lambda _settings: object())
+    monkeypatch.setattr(
+        boot023,
+        "verify_runtime_identity_allowing",
+        lambda *_a, **_k: {"verified": True},
+    )
+
+    def failed_release(*_args: Any) -> dict[str, Any]:
+        if interrupted:
+            raise KeyboardInterrupt
+        raise OSError("NOOP acknowledgement lost")
+
+    monkeypatch.setattr(boot023, "run_noop_release", failed_release)
+    settings: Any = SimpleNamespace(regional=SimpleNamespace(cluster_id="cluster-a"))
+    from datetime import datetime, timedelta, timezone
+
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            boot023.execute_case(settings, tmp_path, 1, deadline)
+    else:
+        assert boot023.execute_case(settings, tmp_path, 1, deadline) == 1, (
+            "a failed NOOP must return a failing case exit"
+        )
+    path = tmp_path / "cases" / boot023.CASE_ID / f"{boot023.CASE_ID}.json"
+    result = json.loads(path.read_text())
+    assert result["verdict"] == "FAIL", "interrupts cannot leave stale PASS evidence"
+    assert result["cleanup"]["runtime_identity"] == {"verified": True}, (
+        "final identity validation must still be attempted"
+    )
+
+
+@pytest.mark.parametrize("cleanup_drift", [False, True])
+def test_execute_success_requires_final_identity_and_restores_history_environment(
+    cleanup_drift: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    before = _before()
+    after = [*before, _entry()]
+    probes = [_probe(head_content_sha256=DIGEST)]
+    preflight = {
+        "errors": [],
+        "release_id": RELEASE_ID,
+        "history": before,
+        "snapshot_groups": [["a"]],
+        "registry_probes": probes,
+        "runtime_identity": {},
+    }
+    monkeypatch.setattr(boot023, "read_only_preflight", lambda *_a: preflight)
+    monkeypatch.setattr(boot023, "verify_plan_identity", lambda *_a: None)
+    monkeypatch.setattr(
+        boot023, "deploy_modules", lambda: {"regional_release_config": CONFIG}
+    )
+    monkeypatch.setattr(boot023, "cpu_runtime_deployments", lambda _m: ("api",))
+    monkeypatch.setattr(boot023, "RegionalLiveFixture", lambda _s: object())
+    monkeypatch.setattr(boot023, "history_entries", lambda _r: after)
+    monkeypatch.setattr(boot023, "previous_snapshot_groups", lambda _r: [["a"]])
+    monkeypatch.setattr(boot023, "registry_probes", lambda *_a: probes)
+    monkeypatch.setattr(
+        boot023,
+        "manifest_with_rollback_flag",
+        lambda _p: _manifest({"rollback_compatible": True}),
+    )
+    monkeypatch.setenv(boot023.HISTORY_DIR_ENV, "/tmp/synthetic-existing-history")
+
+    def noop(*_args: Any) -> dict[str, Any]:
+        monkeypatch.setenv(boot023.HISTORY_DIR_ENV, "/tmp/synthetic-case-history")
+        return {"mirror_lines": [json.dumps(after[-1])]}
+
+    def verify(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if cleanup_drift:
+            raise RuntimeError("runtime identity drifted")
+        return {"verified": True}
+
+    monkeypatch.setattr(boot023, "run_noop_release", noop)
+    monkeypatch.setattr(boot023, "verify_runtime_identity_allowing", verify)
+    settings: Any = SimpleNamespace(
+        regional=SimpleNamespace(cluster_id="cluster-a"),
+        noop_config=tmp_path / "unused",
+    )
+
+    result = boot023.execute_case(
+        settings, tmp_path, 1, datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
+
+    assert result == int(cleanup_drift), "cleanup drift must overturn a passing body"
+    document = json.loads(
+        (tmp_path / "cases" / boot023.CASE_ID / f"{boot023.CASE_ID}.json").read_text()
+    )
+    assert document["verdict"] == ("FAIL" if cleanup_drift else "PASS"), (
+        "canonical evidence must contain the final verdict"
+    )
+    assert (
+        boot023.os.environ[boot023.HISTORY_DIR_ENV] == "/tmp/synthetic-existing-history"
+    ), "the caller's history destination must survive the case"
+
+
+def test_noop_cannot_fall_back_to_an_engine_that_repairs_gpu_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    release = SimpleNamespace(noop=lambda _diff: calls.append("unsafe-noop"))
+    modules = {
+        "regional_release_diff": SimpleNamespace(
+            ReleaseChangeKind=lambda kind: kind, ReleaseDiff=lambda **kwargs: kwargs
+        )
+    }
+    monkeypatch.setattr(boot023, "release_for", lambda *_a, **_k: release)
+    monkeypatch.setattr(
+        boot023, "classify", lambda *_a: {"kind": "NOOP", "changed": []}
+    )
+    monkeypatch.setenv(boot023.HISTORY_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(TypeError, match="allow_prerequisite_repair"):
+        boot023.run_noop_release(SimpleNamespace(), modules, tmp_path)
+
+    assert calls == [], "the old engine must fail before any watcher apply is possible"

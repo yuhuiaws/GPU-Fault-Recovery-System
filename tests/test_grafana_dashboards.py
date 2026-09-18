@@ -87,6 +87,10 @@ def covering_panels(rule: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     jobs = set(JOB_SELECTOR.findall(expr))
     covering = []
     for uid, panel in all_panels():
+        if "links" in panel and rule["alert"] not in {
+            link["title"] for link in panel["links"]
+        }:
+            continue
         text = " ".join(panel_exprs(panel))
         if families <= set(RULE_METRIC.findall(text)) and all(
             job in text for job in jobs
@@ -107,6 +111,33 @@ def test_checked_in_dashboards_equal_generator_output() -> None:
         assert (DASHBOARDS / name).read_text(encoding="utf-8") == text, (
             f"{name} is stale; run scripts/build-grafana-dashboards.py"
         )
+
+
+def test_explicit_window_alert_bindings_keep_count_and_latency_units_separate() -> None:
+    dashboard = checked_in_dashboards()["gpu-fault-recovery-outcome"]
+    panels = {panel["title"]: panel for panel in panels_of(dashboard)}
+    latency = panels["Containment latency (6h moving mean)"]
+    unavailable = panels["Unavailable containment windows"]
+    assert [link["title"] for link in latency["links"]] == ["GpuFaultClosedLoopSlow"]
+    assert [link["title"] for link in unavailable["links"]] == [
+        "GpuFaultClosedLoopWindowIncomplete"
+    ]
+    assert 900 in {step["value"] for step in threshold_steps(latency)}
+    assert {step["value"] for step in threshold_steps(unavailable)} == {None}
+    assert "delta(" not in " ".join(panel_exprs(latency))
+    assert "gpu_fault_closed_loop_milestone_window_mean_seconds" in " ".join(
+        panel_exprs(latency)
+    )
+
+
+def test_explicit_alert_binding_cannot_hide_a_missing_or_uncovered_rule() -> None:
+    import pytest
+
+    panel = MODULE.Panel(
+        title="invalid binding", targets=(), alert_names=("GpuFaultClosedLoopSlow",)
+    )
+    with pytest.raises(ValueError, match="absent or uncovered"):
+        MODULE.render_panel(panel, MODULE.load_alert_rules(), 1, {})
 
 
 def test_check_mode_reports_a_stale_file(tmp_path: Path, monkeypatch: Any) -> None:

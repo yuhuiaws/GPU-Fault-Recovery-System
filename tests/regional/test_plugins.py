@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from importlib import metadata
+from pathlib import Path
 
 import pytest
 
 from gpu_fault.plugins import PluginGroup, discover_plugins, load_plugin
+from scripts.component_wheels import component_definition
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class _EntryPoints(list):
@@ -129,3 +134,126 @@ def test_allowlisted_plugin_still_loads(monkeypatch) -> None:
         load_plugin(PluginGroup.WORKFLOW_ADAPTERS, "node-action").__name__
         == "HttpEventSink"
     )
+
+
+@pytest.mark.parametrize("source", ["project", "control_plane"])
+def test_shipped_builtin_entry_points_are_discovered_without_importing(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    entries = (
+        tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+            "entry-points"
+        ]
+        if source == "project"
+        else component_definition(source).entry_points
+    )
+    points = metadata.EntryPoints(
+        metadata.EntryPoint(name=name, value=value, group=group)
+        for group, declared in entries.items()
+        for name, value in declared.items()
+    )
+
+    def unexpected_load(_entry: metadata.EntryPoint) -> object:
+        pytest.fail("discovery must not import any plugin")
+
+    monkeypatch.setattr(metadata, "entry_points", lambda: points)
+    monkeypatch.setattr(metadata.EntryPoint, "load", unexpected_load)
+
+    for group, declared in entries.items():
+        actual = discover_plugins(group)
+        assert {name: point.value for name, point in actual.items()} == declared
+
+
+def test_shipped_diagnostic_inconclusive_builder_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault.notifications.diagnostic_inconclusive import (
+        DiagnosticInconclusiveEmailBuilder,
+    )
+
+    points = metadata.EntryPoints(
+        [
+            metadata.EntryPoint(
+                name="diagnostic-inconclusive",
+                value=(
+                    "gpu_fault.notifications.diagnostic_inconclusive:"
+                    "DiagnosticInconclusiveEmailBuilder"
+                ),
+                group=PluginGroup.NOTIFICATION_BUILDERS,
+            )
+        ]
+    )
+    monkeypatch.setattr(metadata, "entry_points", lambda: points)
+
+    assert (
+        load_plugin(PluginGroup.NOTIFICATION_BUILDERS, "diagnostic-inconclusive")
+        is DiagnosticInconclusiveEmailBuilder
+    )
+
+
+def test_duplicate_diagnostic_builder_is_rejected_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    points = metadata.EntryPoints(
+        metadata.EntryPoint(
+            name="diagnostic-inconclusive",
+            value=f"{module}:builder",
+            group=PluginGroup.NOTIFICATION_BUILDERS,
+        )
+        for module in ("first", "second")
+    )
+    monkeypatch.setattr(metadata, "entry_points", lambda: points)
+
+    def unexpected_load(_entry: metadata.EntryPoint) -> object:
+        pytest.fail("duplicate plugins must be refused before import")
+
+    monkeypatch.setattr(metadata.EntryPoint, "load", unexpected_load)
+    with pytest.raises(RuntimeError, match="duplicate plugin"):
+        discover_plugins(PluginGroup.NOTIFICATION_BUILDERS)
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        PluginGroup.COLLECTOR_SINKS,
+        PluginGroup.WORKFLOW_ADAPTERS,
+        PluginGroup.NOTIFICATION_BUILDERS,
+        PluginGroup.METRIC_CONTRIBUTORS,
+    ],
+)
+def test_installed_metadata_cannot_grant_new_plugin_trust(
+    monkeypatch: pytest.MonkeyPatch, group: PluginGroup
+) -> None:
+    points = metadata.EntryPoints(
+        [
+            metadata.EntryPoint(
+                name="unapproved-extension",
+                value="external_package:factory",
+                group=group,
+            )
+        ]
+    )
+    monkeypatch.setattr(metadata, "entry_points", lambda: points)
+
+    assert discover_plugins(group) == {}
+    with pytest.raises(LookupError, match="not on the allowlist"):
+        load_plugin(group, "unapproved-extension")
+
+
+def test_notification_builtin_does_not_widen_the_metrics_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    points = metadata.EntryPoints(
+        [
+            metadata.EntryPoint(
+                name="diagnostic-inconclusive",
+                value="external_package:factory",
+                group=PluginGroup.METRIC_CONTRIBUTORS,
+            )
+        ]
+    )
+    monkeypatch.setattr(metadata, "entry_points", lambda: points)
+
+    assert discover_plugins(PluginGroup.METRIC_CONTRIBUTORS) == {}
+    with pytest.raises(LookupError, match="not on the allowlist"):
+        load_plugin(PluginGroup.METRIC_CONTRIBUTORS, "diagnostic-inconclusive")

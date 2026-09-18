@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import cli as admin_cli
-from gpu_fault.admin import operator_identity
+from gpu_fault.admin import operator_identity, release_state
 from gpu_fault.admin.config import (
     AdminConfigError,
     AuroraCapacityConfig,
@@ -175,7 +175,7 @@ def test_config_dry_run_is_local_and_prints_the_change_plan(
     def forbidden(*arguments, **_kwargs):
         raise AssertionError(f"dry-run ran a subprocess: {arguments[0]}")
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", forbidden)
+    monkeypatch.setattr(admin_cli, "run_driver", forbidden)
     monkeypatch.setattr(admin_cli, "verify_prebuilt_release", forbidden)
     monkeypatch.setattr(admin_cli, "_live_release_state", forbidden)
     config = _yaml(
@@ -254,8 +254,26 @@ def test_config_rolls_back_aurora_and_desired_when_the_release_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     site_file(tmp_path)
-    mock_live_release(monkeypatch)
-    initialize_desired_admin_config(tmp_path)
+    before = initialize_desired_admin_config(tmp_path)
+    monkeypatch.setattr(
+        admin_cli, "verify_prebuilt_release", lambda *_args, **_kwargs: None
+    )
+    live = {
+        "release_id": "release-a",
+        "phase": "complete",
+        "transaction_committed": True,
+        "release_lifecycle": "COMMITTED",
+        "admin_config": before.as_dict(),
+        "admin_config_sha256": before.sha256(),
+        "admin_config_role_sha256": before.role_sha256(),
+    }
+    monkeypatch.setattr(
+        release_state,
+        "run_command",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, json.dumps({"data": {"state.json": json.dumps(live)}}), ""
+        ),
+    )
     config = _yaml(tmp_path / "aurora.yaml", AURORA_16_64)
     stubs = Stubs(monkeypatch, release_returncode=7)
 
@@ -275,6 +293,59 @@ def test_config_rolls_back_aurora_and_desired_when_the_release_fails(
     # A failed apply leaves the administrator's canonical file alone.
     assert (
         load_admin_config_file(admin_config_file_path(tmp_path)).aurora.min_acu == 8.0
+    )
+
+
+@pytest.mark.parametrize("explicit_file", [False, True])
+def test_config_dry_run_missing_input_does_not_create_or_chmod_state(
+    tmp_path: Path, explicit_file: bool
+) -> None:
+    site_file(tmp_path)
+    legacy = replace(
+        preset_admin_config("32-disabled"),
+        aurora=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+    )
+    desired = admin_config_desired_path(tmp_path)
+    desired.parent.mkdir()
+    desired.write_text(json.dumps(legacy_capacity_record(legacy)))
+    tmp_path.chmod(0o750)
+    before = {
+        path.relative_to(tmp_path): (path.read_bytes(), path.stat().st_mode)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    directory_mode = tmp_path.stat().st_mode
+    options = ["--dry-run"]
+    if explicit_file:
+        options.extend(("--file", str(tmp_path / "missing/config.yaml")))
+    with pytest.raises(AdminConfigError, match="missing|does not exist"):
+        admin_cli.run(_arguments(tmp_path, *options))
+    after = {
+        path.relative_to(tmp_path): (path.read_bytes(), path.stat().st_mode)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before, "dry-run created or modified configuration state"
+    assert tmp_path.stat().st_mode == directory_mode, (
+        "dry-run chmodded the state directory"
+    )
+    assert not (tmp_path / "missing").exists(), "dry-run created an input directory"
+
+
+def test_config_dry_run_existing_default_input_preserves_content_and_permissions(
+    tmp_path: Path,
+) -> None:
+    site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    _yaml(tmp_path / "admin-config.yaml", AURORA_16_64)
+    tmp_path.chmod(0o750)
+    paths = (tmp_path / "admin-config.yaml", admin_config_desired_path(tmp_path))
+    before = [(path.read_bytes(), path.stat().st_mode) for path in paths]
+    directory_mode = tmp_path.stat().st_mode
+    assert admin_cli.run(_arguments(tmp_path, "--dry-run")) == 0
+    assert [(path.read_bytes(), path.stat().st_mode) for path in paths] == before
+    assert tmp_path.stat().st_mode == directory_mode, (
+        "dry-run chmodded the state directory"
     )
 
 
@@ -486,7 +557,9 @@ def test_config_reads_live_release_state_from_the_cpu_configmap(
             stderr="",
         )
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", run)
+    from gpu_fault.admin import release_state
+
+    monkeypatch.setattr(release_state, "run_command", run)
     Stubs(monkeypatch)
     config = _yaml(
         tmp_path / "c.yaml",

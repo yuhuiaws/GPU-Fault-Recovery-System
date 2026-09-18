@@ -137,26 +137,42 @@ def webhook_errors(applied: dict[str, Any], *, node: str, username: str) -> list
         return [f"webhook configuration carries {len(hooks)} hooks, expected 1"]
     hook = hooks[0]
     conditions = hook.get("matchConditions") or []
-    expressions = [str(item.get("expression") or "") for item in conditions]
-    if not any(username in expression for expression in expressions):
+    expected_condition = {
+        "name": "executor-only",
+        "expression": f"request.userInfo.username == '{username}'",
+    }
+    if conditions != [expected_condition]:
         errors.append(
-            "the server did not keep the matchConditions naming the executor "
+            "the server did not keep the matchConditions restricted to the executor "
             "ServiceAccount; the outage would hit every client's node updates"
         )
-    labels = (hook.get("objectSelector") or {}).get("matchLabels") or {}
-    if labels.get("kubernetes.io/hostname") != node:
-        errors.append(f"objectSelector does not pin the node: {labels}")
+    selector = hook.get("objectSelector")
+    if selector != {"matchLabels": {"kubernetes.io/hostname": node}}:
+        errors.append(f"objectSelector does not pin the node: {selector}")
     rules = hook.get("rules") or []
-    operations = sorted({op for rule in rules for op in rule.get("operations") or []})
-    resources = sorted({res for rule in rules for res in rule.get("resources") or []})
-    if operations != ["UPDATE"] or resources != ["nodes"]:
-        errors.append(f"rules are not nodes/UPDATE only: {operations} {resources}")
+    if rules != [
+        {
+            "apiGroups": [""],
+            "apiVersions": ["v1"],
+            "operations": ["UPDATE"],
+            "resources": ["nodes"],
+            "scope": "Cluster",
+        }
+    ]:
+        errors.append("rules are not nodes/UPDATE only in the core v1 API")
     if hook.get("failurePolicy") != "Fail":
         errors.append(f"failurePolicy {hook.get('failurePolicy')!r} != Fail")
     if int(hook.get("timeoutSeconds") or 0) != 1:
         errors.append(f"timeoutSeconds {hook.get('timeoutSeconds')!r} != 1")
     service = (hook.get("clientConfig") or {}).get("service") or {}
-    if service.get("name") != ABSENT_SERVICE:
+    identity = username.split(":")
+    namespace = identity[2] if len(identity) == 4 else None
+    if service != {
+        "name": ABSENT_SERVICE,
+        "namespace": namespace,
+        "path": "/validate",
+        "port": 443,
+    } or (hook.get("clientConfig") or {}).get("url"):
         errors.append("clientConfig does not point at the absent Service")
     return errors
 
@@ -178,9 +194,13 @@ def outage_evidence(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     """
 
     for sample in samples:
+        workflow_id = sample.get("workflow_request_id")
+        if not isinstance(workflow_id, str) or not workflow_id:
+            continue
         steps = {
-            str(item.get("operation")): item
+            item.get("step_index"): item
             for item in sample.get("step_executions") or []
+            if type(item.get("step_index")) is int
         }
         for command in sample.get("remote_commands") or []:
             operation = str(command.get("operation"))
@@ -191,13 +211,22 @@ def outage_evidence(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
             marker = retryable_marker(command.get("result_details") or {})
             if marker is None:
                 continue
-            step = steps.get(operation) or {}
-            if step.get("status") == "WAITING":
+            step = steps.get(command.get("step_index")) or {}
+            command_id = command.get("command_id")
+            if (
+                isinstance(command_id, str)
+                and command_id
+                and step.get("operation") == operation
+                and step.get("status") == "WAITING"
+                and (step.get("details") or {}).get("remote_command_id") == command_id
+            ):
                 return {
                     "observed_at": sample.get("observed_at"),
                     "operation": operation,
                     "marker": marker,
-                    "command_id": command.get("command_id"),
+                    "command_id": command_id,
+                    "workflow_request_id": workflow_id,
+                    "step_index": command["step_index"],
                     "status_source": (command.get("result_details") or {}).get(
                         "status_source"
                     ),
@@ -228,7 +257,10 @@ def outage_errors(samples: list[dict[str, Any]]) -> list[str]:
 
 
 def recovery_errors(
-    bundle: dict[str, Any], *, waited_operation: str | None
+    bundle: dict[str, Any],
+    *,
+    waited_operation: str | None,
+    waited_evidence: dict[str, Any] | None = None,
 ) -> list[str]:
     """After the webhook is gone the same step succeeds and the workflow
     closes exactly as COLLECT-017 A does."""
@@ -251,6 +283,33 @@ def recovery_errors(
             errors.append(
                 f"{waited_operation} waited on the 500 but ended "
                 f"{waited.get('status')!r}, not SUCCEEDED"
+            )
+    if waited_evidence is not None:
+        matching = [
+            item
+            for item in bundle.get("remote_commands") or []
+            if item.get("command_id") == waited_evidence.get("command_id")
+        ]
+        matching_steps = [
+            item
+            for item in workflow.get("step_executions") or []
+            if item.get("step_index") == waited_evidence.get("step_index")
+        ]
+        if (
+            not waited_evidence.get("workflow_request_id")
+            or workflow.get("request_id") != waited_evidence["workflow_request_id"]
+            or len(matching) != 1
+            or matching[0].get("status") != "SUCCEEDED"
+            or matching[0].get("operation") != waited_operation
+            or matching[0].get("step_index") != waited_evidence.get("step_index")
+            or len(matching_steps) != 1
+            or matching_steps[0].get("operation") != waited_operation
+            or matching_steps[0].get("status") != "SUCCEEDED"
+            or matching_steps[0].get("operation_id")
+            != f"remote/{waited_evidence.get('command_id')}"
+        ):
+            errors.append(
+                "recovery did not confirm the same waiting workflow, step and command"
             )
     if incident.get("state") != "RECOVERED":
         errors.append(f"incident state {incident.get('state')!r} != RECOVERED")

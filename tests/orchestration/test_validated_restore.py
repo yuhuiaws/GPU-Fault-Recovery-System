@@ -139,3 +139,21 @@ def test_the_fixture_script_uses_the_product_builder() -> None:
     for key in ('"workflow_request_id"', '"incident_id"', '"node_id"'):
         assert key in script, f"the printed contract keeps {key}"
     compile(script, "<create-restore-workflow>", "exec")
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    [{"node-a": ["GPU-1", "GPU-9"]}, {"node-a": ["GPU-9"]}, {"node-a": []}, {}, None],
+    ids=["partially-missing", "all-missing", "empty", "unknown", "omitted"],
+)
+def test_incident_gpus_missing_from_inventory_remain_required(inventory) -> None:
+    incident = _quarantined()
+
+    updated, workflow = module.build_validated_restore_workflow(
+        incident, operator=OPERATOR, reference=None, now=NOW, node_gpu_uuids=inventory
+    )
+
+    assert all(
+        step.gpu_uuids == ["GPU-1", "GPU-2"] for step in workflow.official_steps
+    ), "inventory absence cannot distinguish a failed GPU from an unrelated one"
+    assert updated.gpu_uuids == incident.gpu_uuids

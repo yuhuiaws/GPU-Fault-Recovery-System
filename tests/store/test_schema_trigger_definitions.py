@@ -31,8 +31,8 @@ LEGACY_SYNC = "gpu_fault_processor_queue_count_sync"
 @pytest.fixture(autouse=True)
 def pristine_schema():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 

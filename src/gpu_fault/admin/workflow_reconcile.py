@@ -32,7 +32,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -40,6 +39,8 @@ from gpu_fault import retired_generation
 from gpu_fault.admin import operator_identity
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import run_command
 from gpu_fault.admin.site import RenderedSite
 
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
@@ -165,7 +166,7 @@ def run_control_plane_script(
         "-n",
         str(site.release_config["namespace"]),
     ]
-    pod_result = subprocess.run(
+    pod_result = run_command(
         [
             *kubectl,
             "get",
@@ -176,23 +177,20 @@ def run_control_plane_script(
             "-o",
             "jsonpath={.items[0].metadata.name}",
         ],
-        check=False,
-        capture_output=True,
-        text=True,
+        timeout_seconds=120,
     )
     pod = pod_result.stdout.strip()
     if pod_result.returncode or not pod:
         raise BootstrapError("workflow reconcile found no Running CPU ingress Pod")
-    completed = subprocess.run(
+    completed = run_command(
         [*kubectl, "exec", "-i", pod, "--", "python", "-c", script],
-        input=json.dumps(payload, separators=(",", ":")),
-        check=False,
-        capture_output=True,
-        text=True,
+        input_text=json.dumps(payload, separators=(",", ":")),
+        timeout_seconds=900,
     )
     if completed.returncode:
+        detail = diagnostic_text(completed.stderr, sensitive=True)
         raise BootstrapError(
-            completed.stderr.strip() or "workflow reconcile execution failed"
+            "workflow reconcile execution failed" + (f": {detail}" if detail else "")
         )
     try:
         value = json.loads(completed.stdout)
@@ -269,63 +267,100 @@ def cluster_target(site: RenderedSite, cluster_id: str) -> dict[str, Any]:
     return target
 
 
+def _orphaned_isolation_metadata(
+    node: dict[str, Any], incident_id: str
+) -> dict[str, Any]:
+    metadata = node.get("metadata")
+    spec = node.get("spec")
+    if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise BootstrapError("cannot strip isolation annotations: node is incomplete")
+    if any(
+        not isinstance(metadata.get(key), str) or not metadata[key].strip()
+        for key in ("name", "uid", "resourceVersion")
+    ):
+        raise BootstrapError(
+            "cannot strip isolation annotations: node identity or resourceVersion is missing"
+        )
+    annotations = metadata.get("annotations")
+    if (
+        not incident_id
+        or not isinstance(annotations, dict)
+        or annotations.get(ISOLATION_ANNOTATIONS[0]) != incident_id
+        or not isinstance(annotations.get(ISOLATION_ANNOTATIONS[1]), str)
+        or not annotations[ISOLATION_ANNOTATIONS[1]].strip()
+    ):
+        raise BootstrapError(
+            "cannot strip isolation annotations: ownership is unproven"
+        )
+    taints = spec.get("taints", [])
+    if (
+        metadata.get("deletionTimestamp") is not None
+        or spec.get("unschedulable", False) is not False
+        or not isinstance(taints, list)
+        or any(
+            not isinstance(taint, dict)
+            or not isinstance(taint.get("key"), str)
+            or taint["key"] == QUARANTINE_TAINT
+            for taint in taints
+        )
+    ):
+        raise BootstrapError(
+            "cannot strip isolation annotations: node is still isolated"
+        )
+    return metadata
+
+
 def strip_node_isolation_annotations(
     site: RenderedSite,
     cluster_id: str,
     node: dict[str, Any],
+    *,
+    incident_id: str,
+    expected_node: dict[str, Any],
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Remove the isolation annotations a released quarantine left on ``node``.
+    """Remove proven orphaned annotations, bound to the original node and owner."""
 
-    The quarantine taint is the isolation; ``ISOLATION_ANNOTATIONS`` are the
-    bookkeeping ``RESTORE_SCHEDULING`` removes together with it. A node whose
-    taint an operator released by hand keeps them, and they then orphan the
-    incident between the levers: ``submit-remediation --disposition restore``
-    finds no isolation to restore and ``--close-quarantined`` refuses because
-    the annotations still name the incident (live 2026-09-11). The merge patch
-    carries the node's ``resourceVersion`` so a node the executor touched in
-    the meantime -- a fresh isolation -- makes the patch conflict instead of
-    stripping the new incident's record. ``node`` is the raw
-    ``kubectl get node -o json`` item the caller already holds.
-    """
-
-    metadata = node.get("metadata") if isinstance(node, dict) else None
-    if not isinstance(metadata, dict) or not metadata.get("name"):
-        raise BootstrapError("cannot strip isolation annotations: node has no name")
+    previous = _orphaned_isolation_metadata(expected_node, incident_id)
+    metadata = _orphaned_isolation_metadata(node, incident_id)
     node_id = str(metadata["name"])
-    resource_version = str(metadata.get("resourceVersion") or "")
-    if not resource_version:
+    if any(metadata[key] != previous[key] for key in ("name", "uid")) or any(
+        metadata["annotations"].get(key) != previous["annotations"].get(key)
+        for key in ISOLATION_ANNOTATIONS
+    ):
         raise BootstrapError(
-            f"cannot strip isolation annotations of {node_id}: the node carries "
-            "no resourceVersion to fence the patch on"
+            f"cannot strip isolation annotations of {node_id}: node or ownership changed"
         )
+    resource_version = str(metadata["resourceVersion"])
     patch = {
         "metadata": {
+            "uid": metadata["uid"],
             "resourceVersion": resource_version,
             "annotations": {key: None for key in ISOLATION_ANNOTATIONS},
         }
     }
-    completed = subprocess.run(
-        [
-            *_gpu_kubectl(site, cluster_target(site, cluster_id)),
-            "patch",
-            "node",
-            node_id,
-            "--type",
-            "merge",
-            "-p",
-            json.dumps(patch, sort_keys=True),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode:
-        raise BootstrapError(
-            f"cannot strip the orphaned isolation annotations of {node_id} on "
-            f"{cluster_id}: {completed.stderr.strip()}"
+    if not dry_run:
+        completed = run_command(
+            [
+                *_gpu_kubectl(site, cluster_target(site, cluster_id)),
+                "patch",
+                "node",
+                node_id,
+                "--type",
+                "merge",
+                "-p",
+                json.dumps(patch, sort_keys=True),
+            ],
+            timeout_seconds=120,
         )
+        if completed.returncode:
+            raise BootstrapError(
+                f"cannot strip the orphaned isolation annotations of {node_id} on "
+                f"{cluster_id}: {diagnostic_text(completed.stderr, sensitive=True)}"
+            )
     return {
         "node_id": node_id,
+        "node_uid": metadata["uid"],
         "resource_version": resource_version,
         "annotations": list(ISOLATION_ANNOTATIONS),
     }
@@ -336,16 +371,14 @@ def cluster_nodes(
     cluster_id: str,
 ) -> dict[str, dict[str, Any]]:
     target = cluster_target(site, cluster_id)
-    completed = subprocess.run(
+    completed = run_command(
         [*_gpu_kubectl(site, target), "get", "nodes", "-o", "json"],
-        check=False,
-        capture_output=True,
-        text=True,
+        timeout_seconds=120,
     )
     if completed.returncode:
         raise BootstrapError(
             f"workflow reconcile cannot read GPU nodes for {cluster_id}: "
-            f"{completed.stderr.strip()}"
+            f"{diagnostic_text(completed.stderr, sensitive=True)}"
         )
     try:
         value = json.loads(completed.stdout)
@@ -684,7 +717,9 @@ def run_workflow_reconcile(
     and ``failures`` say which did not land, and the CLI exits 1 on any.
     """
 
-    requested = [str(item).strip() for item in workflow_ids if str(item).strip()]
+    if any(not str(item).strip() for item in (*workflow_ids, *incident_ids)):
+        raise BootstrapError("workflow reconcile selectors must not be blank")
+    requested = [str(item).strip() for item in workflow_ids]
     normalized_reference = _validate_request(
         workflow_ids=requested,
         incident_ids=incident_ids,

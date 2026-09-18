@@ -14,6 +14,7 @@ cluster.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -27,7 +28,14 @@ def audit_errors(report: dict[str, Any]) -> list[str]:
     """The three outcomes the sweep must produce, in order."""
 
     errors: list[str] = []
-    if report.get("unrelated_deleted_after_seconds") is None:
+    if report.get("verdict") != "PASS":
+        errors.append("the retention audit did not report PASS")
+    unrelated_delay = report.get("unrelated_deleted_after_seconds")
+    if (
+        type(unrelated_delay) not in {int, float}
+        or not math.isfinite(unrelated_delay)
+        or not 0 <= unrelated_delay <= 180
+    ):
         errors.append("the unrelated expired row was never deleted")
     if report.get("pinned_present_after_unrelated_deleted") is not True:
         errors.append(
@@ -35,9 +43,14 @@ def audit_errors(report: dict[str, Any]) -> list[str]:
         )
     if report.get("pinned_present_after_extra_wait") is not True:
         errors.append("the pinned row was deleted while its incident was still open")
-    if report.get("pinned_deleted_after_recovered_seconds") is None:
+    pinned_delay = report.get("pinned_deleted_after_recovered_seconds")
+    if (
+        type(pinned_delay) not in {int, float}
+        or not math.isfinite(pinned_delay)
+        or not 0 <= pinned_delay <= 180
+    ):
         errors.append("the pinned row was not deleted after its incident recovered")
-    if report.get("residual_rows") != 0:
+    if type(report.get("residual_rows")) is not int or report["residual_rows"] != 0:
         errors.append(f"{report.get('residual_rows')} audit rows remain in the store")
     return errors
 
@@ -55,15 +68,24 @@ def cleanup_lines(logs: str) -> list[dict[str, Any]]:
 def log_errors(logs: str, *, unrelated_key: str, pinned_key: str) -> list[str]:
     """ARCH-D7: each deletion is one line naming the deleted keys."""
 
+    if not unrelated_key or not pinned_key or unrelated_key == pinned_key:
+        return ["cleanup evidence requires two distinct nonempty keys"]
     lines = cleanup_lines(logs)
     if not lines:
         return ["no 'cleanup raw_evidence deleted' line in the control-plane logs"]
     errors: list[str] = []
-    if not any(unrelated_key in item["keys"] for item in lines):
+    keys = [
+        {
+            part.strip()
+            for part in re.sub(r" \(\+\d+ more\)$", "", item["keys"]).split(",")
+        }
+        for item in lines
+    ]
+    if not any(unrelated_key in listed for listed in keys):
         errors.append(
             f"no cleanup line names the deleted unrelated key {unrelated_key}"
         )
-    if not any(pinned_key in item["keys"] for item in lines):
+    if not any(pinned_key in listed for listed in keys):
         errors.append(
             f"no cleanup line names the pinned key {pinned_key} after recovery"
         )

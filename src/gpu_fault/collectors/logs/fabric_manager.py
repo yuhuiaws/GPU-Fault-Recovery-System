@@ -11,6 +11,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 
 from gpu_fault.channel_registry import (
@@ -18,6 +19,12 @@ from gpu_fault.channel_registry import (
     FABRIC_MANAGER_PATH,
 )
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
+from gpu_fault.collectors.logs.fabric_manager_cursor import FabricManagerCursorState
+from gpu_fault.collectors.logs.fabric_manager_receipts import (
+    FabricManagerReceiptLog,
+    RoundReceipt,
+    identity_sha256,
+)
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.env import env_bool
@@ -48,6 +55,34 @@ SXID_SUMMARY_PATTERN = re.compile(
 )
 
 FABRIC_MANAGER_SXID_PATTERN = SXID_SUMMARY_PATTERN
+
+
+def file_record_id(
+    cluster_id: str,
+    node_id: str,
+    boot_id: str,
+    device: int,
+    inode: int,
+    offset: int,
+    generation: int,
+) -> str:
+    # Generation zero preserves IDs from checkpoints written before this field.
+    parts: list[object] = [cluster_id, node_id, boot_id, device, inode, offset]
+    if generation:
+        parts.extend(("generation", generation))
+    digest = hashlib.sha256(
+        json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "fm-file-" + digest
+
+
+def file_evidence_ref(
+    node_id: str, path: str, device: int, inode: int, offset: int, generation: int
+) -> str:
+    position = f"{device}:{inode}:{offset}"
+    if generation:
+        position += f":generation={generation}"
+    return f"file://{node_id}{path}#{position}"
 
 
 def _read_boot_id() -> str:
@@ -91,6 +126,7 @@ class FabricManagerLogCollector:
         runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
         max_tracked_files: int = DEFAULT_MAX_TRACKED_FILES,
         max_line_age_seconds: float = DEFAULT_MAX_LINE_AGE_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_tracked_files < 1:
             raise ValueError("Fabric Manager tracked file limit must be at least 1")
@@ -105,7 +141,6 @@ class FabricManagerLogCollector:
         self.boot_id = boot_id or _read_boot_id()
         self.interval_seconds = interval_seconds
         self.max_tracked_files = max_tracked_files
-        self._files_bound_warned = False
         self.journal_enabled = journal_enabled
         self.journal_identifiers = tuple(
             item.lower() for item in journal_identifiers if item
@@ -114,9 +149,6 @@ class FabricManagerLogCollector:
         self.state_path = Path(state_path) if state_path else None
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.runner = runner
-        self._journal_cursor: str | None = None
-        self._files: dict[str, dict[str, int]] = {}
-        self._state_dirty = False
         self._resync_warned = False
         # (path, offset, monotonic) of the last "still being written" warning,
         # so a daemon that stalls mid-line says so once instead of every round.
@@ -127,20 +159,59 @@ class FabricManagerLogCollector:
                 "300",
             )
         )
+        if self.health_summary_seconds <= 0:
+            raise ValueError("Fabric Manager health summary interval must be positive")
+        self._collection_lock = RLock()
+        self._receipt_round_failed = False
+        self._receipts = FabricManagerReceiptLog(
+            LOGGER,
+            cluster_id=context.cluster_id,
+            node_id=node_id,
+            boot_id=self.boot_id,
+            source_configuration=json.dumps(
+                {
+                    "journal_enabled": self.journal_enabled,
+                    "journal_identifiers": list(self.journal_identifiers),
+                    "log_paths": self.log_paths,
+                    "state_path": str(self.state_path) if self.state_path else None,
+                    "max_line_age_seconds": self.max_line_age.total_seconds(),
+                    "max_tracked_files": self.max_tracked_files,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            summary_seconds=self.health_summary_seconds,
+            monotonic=monotonic,
+        )
         # First summary on the first collection (see kernel.py); later ones
         # keep their stable phase.
         self._next_health_summary = self.now()
-        self._load_state()
+        self._cursor = FabricManagerCursorState(
+            self.state_path, max_tracked_files=self.max_tracked_files, logger=LOGGER
+        )
 
     def collect_once(self) -> CollectorStats:
+        with self._collection_lock:
+            round_receipt = self._receipts.begin_round()
+            self._receipt_round_failed = False
+            complete = False
+            try:
+                stats = self._collect_round(round_receipt)
+                complete = not self._receipt_round_failed
+                return stats
+            finally:
+                self._receipts.complete_round(round_receipt, complete=complete)
+
+    def _collect_round(self, round_receipt: RoundReceipt) -> CollectorStats:
         collected_at = self.now()
         try:
             records = [
                 *self._journal_records(collected_at),
                 *self._file_records(collected_at),
             ]
-        except Exception:
-            self._flush_state()
+        except BaseException:
+            self._cursor.flush()
             raise
         stats = CollectorStats()
         try:
@@ -153,9 +224,14 @@ class FabricManagerLogCollector:
                 ):
                     if eligible:
                         stats = stats.model_copy(update={"skipped": stats.skipped + 1})
-                    self._commit_record(record)
+                    self._cursor.commit_record(record)
                     continue
                 checkpoint = record.pop("_checkpoint", None)
+                attempt = self._receipts.begin_attempt(
+                    round_receipt,
+                    record_id=str(record.get("record_id") or ""),
+                    source=record.get("source"),
+                )
                 try:
                     result = deliver_event(
                         self.sink,
@@ -170,25 +246,25 @@ class FabricManagerLogCollector:
                     # Only a record that went nowhere pins the checkpoint; one
                     # the outbox took is replayed from there (ARCH-G3).
                     result.raise_for_failure()
-                except Exception:
+                    if not (result.delivered or result.buffered):
+                        raise CollectorError("Fabric Manager sink outcome is unknown")
+                except BaseException:
+                    self._receipts.complete_attempt(attempt, "FAILED")
                     if checkpoint is not None:
                         record["_checkpoint"] = checkpoint
                     raise
+                self._receipts.complete_attempt(
+                    attempt, "BUFFERED" if result.buffered else "DELIVERED"
+                )
                 if result.buffered:
-                    LOGGER.warning(
-                        "Fabric Manager record persisted to the collector "
-                        "outbox; advancing the checkpoint: record=%s error=%s",
-                        record.get("record_id"),
-                        result.error,
-                    )
                     stats = stats.model_copy(update={"buffered": stats.buffered + 1})
                 else:
                     stats = stats.model_copy(update={"delivered": stats.delivered + 1})
                 if checkpoint is not None:
                     record["_checkpoint"] = checkpoint
-                self._commit_record(record)
+                self._cursor.commit_record(record)
         finally:
-            self._flush_state()
+            self._cursor.flush()
         self._deliver_health_summary_without_failing_the_round(collected_at)
         return stats
 
@@ -206,11 +282,10 @@ class FabricManagerLogCollector:
 
         try:
             self._maybe_health_summary(observed_at)
-        except CollectorError as exc:
+        except CollectorError:
             LOGGER.warning(
                 "Fabric Manager health summary delivery failed; "
-                "the collection round is unaffected: %s",
-                exc,
+                "the collection round is unaffected"
             )
 
     def _maybe_health_summary(self, observed_at: datetime) -> None:
@@ -246,26 +321,29 @@ class FabricManagerLogCollector:
             try:
                 self.collect_once()
             except Exception:
-                LOGGER.exception("Fabric Manager log collection failed")
+                LOGGER.error("Fabric Manager log collection failed")
             time.sleep(self.interval_seconds)
 
     def _journal_records(self, collected_at: datetime) -> list[dict[str, Any]]:
-        if not self.journal_enabled or not shutil.which("journalctl"):
+        if not self.journal_enabled:
             return []
-        completed = self._run_journal(collected_at, cursor=self._journal_cursor)
+        if not shutil.which("journalctl"):
+            self._receipt_round_failed = True
+            return []
+        completed = self._run_journal(collected_at, cursor=self._cursor.journal_cursor)
         if (
             completed.returncode != 0
-            and self._journal_cursor
+            and self._cursor.journal_cursor
             and self._is_cursor_rejection(completed.stderr)
         ):
             LOGGER.warning(
                 "Fabric Manager journal cursor is no longer "
                 "available; resuming from the recent window"
             )
-            self._journal_cursor = None
-            self._state_dirty = True
+            self._cursor.clear_journal_cursor()
             completed = self._run_journal(collected_at, cursor=None)
         if completed.returncode != 0:
+            LOGGER.error("Fabric Manager journal query failed")
             raise CollectorError(
                 "Fabric Manager journal query failed: "
                 + (completed.stderr.strip() or "unknown error")
@@ -275,6 +353,10 @@ class FabricManagerLogCollector:
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
+                self._receipt_round_failed = True
+                continue
+            if not isinstance(item, dict):
+                self._receipt_round_failed = True
                 continue
             cursor = str(item.get("__CURSOR") or "")
             unit = str(item.get("_SYSTEMD_UNIT") or "")
@@ -397,21 +479,25 @@ class FabricManagerLogCollector:
 
         live = self._live_files()
         records: list[dict[str, Any]] = []
-        for key, stat, offset in self._resume_offsets(live):
+        plan = self._cursor.resume_offsets(live)
+        # Persist a new file generation before any sink can acknowledge its IDs.
+        # A crash/retry must not mint a second identity for the same new record.
+        self._cursor.flush()
+        for key, stat, offset in plan:
             try:
                 records.extend(self._records_from_file(key, stat, offset, collected_at))
-            except OSError as exc:
+            except OSError:
                 # A 0600 file under ProtectSystem=strict, or one that vanished
                 # between the stat and the open. The read used to raise out of
                 # the round and take the journal SXIDs of that round with it,
                 # every round, permanently (ARCH-G4).
+                self._receipt_round_failed = True
                 LOGGER.warning(
-                    "Fabric Manager log file unreadable this round: %s (%s)",
-                    key,
-                    exc,
+                    "Fabric Manager log file unreadable this round: file_sha256=%s",
+                    identity_sha256(key),
                 )
                 continue
-        self._bound_tracked_files({key for key, _stat in live})
+        self._cursor.bound_files({key for key, _stat in live})
         return records
 
     def _live_files(self) -> list[tuple[str, os.stat_result]]:
@@ -428,107 +514,19 @@ class FabricManagerLogCollector:
                     if not path.is_file():
                         continue
                     stat = path.stat()
-                except OSError as exc:
+                except OSError:
                     # Rotated away between the glob and the stat: the next
                     # round sees the successor. One vanished sibling must
                     # not abort the whole round (ARCH-G9).
+                    self._receipt_round_failed = True
                     LOGGER.warning(
-                        "Fabric Manager log file unreadable this round: %s (%s)",
-                        path,
-                        exc,
+                        "Fabric Manager log file unreadable this round: file_sha256=%s",
+                        identity_sha256(str(path)),
                     )
                     continue
                 seen.add(key)
                 live.append((key, stat))
         return live
-
-    def _resume_offsets(
-        self, live: list[tuple[str, os.stat_result]]
-    ) -> list[tuple[str, os.stat_result, int]]:
-        plan: list[tuple[str, os.stat_result, int]] = []
-        for key, stat in live:
-            previous = self._files.get(key)
-            if previous is None:
-                inherited = self._inherit_rotated_offset(key, stat, live=live)
-                if inherited is None:
-                    # Historical file content has no trustworthy node-generation
-                    # boundary when the durable checkpoint is absent.
-                    self._files[key] = {
-                        "device": stat.st_dev,
-                        "inode": stat.st_ino,
-                        "offset": stat.st_size,
-                    }
-                    self._state_dirty = True
-                    continue
-                plan.append((key, stat, inherited))
-                continue
-            recorded = int(previous.get("offset", 0))
-            if previous.get("inode") != stat.st_ino or stat.st_size < recorded:
-                plan.append((key, stat, 0))
-                continue
-            if previous.get("device") != stat.st_dev:
-                # st_dev is boot-scoped: the NVMe root moved from 66305 to 66306
-                # across one reboot. Same inode, no truncation: the same file,
-                # so the checkpoint stands -- resetting it here replayed every
-                # line the log ever held, including a four-day-old fatal SXID.
-                previous["device"] = stat.st_dev
-                self._state_dirty = True
-            plan.append((key, stat, min(recorded, stat.st_size)))
-        return plan
-
-    def _inherit_rotated_offset(
-        self,
-        key: str,
-        stat: os.stat_result,
-        *,
-        live: list[tuple[str, os.stat_result]],
-    ) -> int | None:
-        """The checkpoint of this inode under the name it had before rotation.
-
-        logrotate renames ``fabricmanager.log`` to ``fabricmanager.1.log``, so
-        the same inode reappears under a name that has no checkpoint. Baselining
-        it at EOF discarded every line written between the last poll and the
-        rename -- including the fatal SXID that made Fabric Manager rotate. The
-        old name keeps a checkpoint at the start of its replacement, or loses it
-        altogether when nothing is there any more.
-        """
-
-        current = {name: (item.st_dev, item.st_ino) for name, item in live}
-        identity = (stat.st_dev, stat.st_ino)
-        for other, record in list(self._files.items()):
-            if other == key:
-                continue
-            if (record.get("device"), record.get("inode")) != identity:
-                continue
-            if current.get(other) == identity:
-                # Two names for one inode (a hard link, or two globs matching
-                # the same file): its checkpoint is not this key's to take.
-                continue
-            offset = min(int(record.get("offset", 0)), stat.st_size)
-            replacement = current.get(other)
-            if replacement is None:
-                del self._files[other]
-            else:
-                self._files[other] = {
-                    "device": replacement[0],
-                    "inode": replacement[1],
-                    "offset": 0,
-                }
-            self._files[key] = {
-                "device": stat.st_dev,
-                "inode": stat.st_ino,
-                "offset": offset,
-            }
-            self._state_dirty = True
-            LOGGER.warning(
-                "Fabric Manager log %s was rotated to %s; resuming its tail "
-                "at byte %d instead of baselining at the end",
-                other,
-                key,
-                offset,
-            )
-            return offset
-        return None
 
     def _records_from_file(
         self,
@@ -545,9 +543,13 @@ class FabricManagerLogCollector:
         """
 
         records: list[dict[str, Any]] = []
+        generation = self._cursor.generation(key)
         stale_in_round = 0
         oldest_stale: datetime | None = None
         with Path(key).open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino):
+                raise OSError("Fabric Manager file identity changed before read")
             if offset > 0:
                 stream.seek(offset - 1)
                 boundary = stream.read(1)
@@ -569,7 +571,7 @@ class FabricManagerLogCollector:
                         {
                             "message": "",
                             "_eligible": False,
-                            "_checkpoint": self._file_checkpoint(
+                            "_checkpoint": self._cursor.file_checkpoint(
                                 key, stat, stream.tell()
                             ),
                         }
@@ -584,7 +586,6 @@ class FabricManagerLogCollector:
                     # ``start`` so the next round reads it whole.
                     break
                 message = raw.decode("utf-8", errors="replace").rstrip("\n")
-                stable = f"{stat.st_dev}:{stat.st_ino}:{start}"
                 observed_at = self._file_timestamp(message, collected_at)
                 stale = collected_at - observed_at > self.max_line_age
                 if stale:
@@ -593,67 +594,49 @@ class FabricManagerLogCollector:
                     oldest_stale = min(oldest_stale or observed_at, observed_at)
                 records.append(
                     {
-                        "record_id": (
-                            "fm-file-"
-                            + self._record_identity(stat.st_dev, stat.st_ino, start)
+                        "record_id": file_record_id(
+                            self.context.cluster_id,
+                            self.node_id,
+                            self.boot_id,
+                            stat.st_dev,
+                            stat.st_ino,
+                            start,
+                            generation,
                         ),
                         "observed_at": observed_at.isoformat(),
                         "message": message,
                         "source": "file",
                         "_eligible": not stale,
-                        "_checkpoint": self._file_checkpoint(key, stat, stream.tell()),
+                        "_checkpoint": self._cursor.file_checkpoint(
+                            key, stat, stream.tell()
+                        ),
                         "fields": {
                             "path": key,
                             "device": str(stat.st_dev),
                             "inode": str(stat.st_ino),
                             "offset": str(start),
+                            "generation": str(generation),
                         },
-                        "evidence_ref": (f"file://{self.node_id}{key}#{stable}"),
+                        "evidence_ref": file_evidence_ref(
+                            self.node_id,
+                            key,
+                            stat.st_dev,
+                            stat.st_ino,
+                            start,
+                            generation,
+                        ),
                     }
                 )
         if stale_in_round:
             LOGGER.warning(
-                "Fabric Manager log %s: %d line(s) older than %ss (oldest %s) "
+                "Fabric Manager log file_sha256=%s: %d line(s) older than %ss (oldest %s) "
                 "advanced the checkpoint without being reported",
-                key,
+                identity_sha256(key),
                 stale_in_round,
                 self.max_line_age.total_seconds(),
                 oldest_stale.isoformat() if oldest_stale else "?",
             )
         return records
-
-    @staticmethod
-    def _file_checkpoint(key: str, stat: os.stat_result, offset: int) -> dict[str, Any]:
-        return {
-            "kind": "file",
-            "path": key,
-            "device": stat.st_dev,
-            "inode": stat.st_ino,
-            "offset": offset,
-        }
-
-    def _record_identity(self, *parts: object) -> str:
-        """A record id that says which cluster, node and boot, and then what.
-
-        The control plane derives ``event_id`` from ``cluster_id`` and the
-        record id alone (``hma.py``), and treats a repeated ``event_id`` as a
-        duplicate. ``dev:ino:offset`` is not node-unique -- identically imaged
-        nodes share the device, and the same inode and offset for
-        ``/var/log/fabricmanager.log`` is plausible on one AMI -- so node B's
-        SXID was folded into node A's event and never recovered. This mirrors
-        ``node.py:_entry_identity``; the parts are JSON-encoded so no two part
-        lists can spell one string. The path is deliberately not a part: a
-        rotation renames the file and the line must keep its id.
-        """
-
-        return hashlib.sha256(
-            json.dumps(
-                [self.context.cluster_id, self.node_id, self.boot_id, *parts],
-                ensure_ascii=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
 
     def _warn_resumed_inside_a_line(self, key: str, offset: int) -> None:
         """Say once that a checkpoint did not land on a line boundary.
@@ -668,10 +651,10 @@ class FabricManagerLogCollector:
             return
         self._resync_warned = True
         LOGGER.warning(
-            "Fabric Manager log %s resumed at byte %d, which is not a line "
+            "Fabric Manager log file_sha256=%s resumed at byte %d, which is not a line "
             "boundary; re-syncing to the next line (an offset from before the "
             "checkpoints were byte counts, or a torn append)",
-            key,
+            identity_sha256(key),
             offset,
         )
 
@@ -697,38 +680,12 @@ class FabricManagerLogCollector:
             return
         self._partial_resume_warned = (key, offset, now)
         LOGGER.warning(
-            "Fabric Manager log %s resumed at byte %d, inside a record the "
+            "Fabric Manager log file_sha256=%s resumed at byte %d, inside a record the "
             "daemon has not finished writing; holding the offset there until "
             "the record is complete (nothing is read from this file meanwhile)",
-            key,
+            identity_sha256(key),
             offset,
         )
-
-    def _bound_tracked_files(self, seen: set[str]) -> None:
-        """Forget the oldest offsets of files the glob no longer finds.
-
-        Files still present are never evicted: dropping a live file's offset
-        would re-baseline it at EOF next round and skip whatever it gained.
-        """
-
-        excess = len(self._files) - self.max_tracked_files
-        if excess <= 0:
-            return
-        stale = [key for key in self._files if key not in seen]
-        evicted = stale[:excess]
-        for key in evicted:
-            del self._files[key]
-        if evicted:
-            self._state_dirty = True
-        if not self._files_bound_warned:
-            self._files_bound_warned = True
-            LOGGER.warning(
-                "Fabric Manager tracked file table exceeded %d entries; "
-                "forgot %d stale offset(s), %d live file(s) kept",
-                self.max_tracked_files,
-                len(evicted),
-                len(self._files),
-            )
 
     def _is_fabric_manager(self, unit: str, identifier: str) -> bool:
         values = {
@@ -775,94 +732,6 @@ class FabricManagerLogCollector:
             )
         except (KeyError, TypeError, ValueError, OSError):
             return fallback
-
-    def _load_state(self) -> None:
-        if self.state_path is None or not self.state_path.exists():
-            return
-        try:
-            value = json.loads(self.state_path.read_text(encoding="utf-8"))
-            self._journal_cursor = value.get("journal_cursor")
-            raw_files = value.get("files") or {}
-            self._files = {
-                str(path): {
-                    "device": int(state["device"]),
-                    "inode": int(state["inode"]),
-                    "offset": int(state["offset"]),
-                }
-                for path, state in raw_files.items()
-                if int(state["offset"]) >= 0
-            }
-        except (
-            KeyError,
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-        ):
-            LOGGER.exception("cannot load Fabric Manager collector state")
-            self._journal_cursor = None
-            self._files = {}
-
-    def _save_state(self) -> None:
-        if self.state_path is None:
-            return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            stream.write(
-                json.dumps(
-                    {
-                        "journal_cursor": self._journal_cursor,
-                        "files": self._files,
-                    },
-                    separators=(",", ":"),
-                )
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.state_path)
-        directory_fd = os.open(
-            self.state_path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-
-    def _commit_record(self, record: dict[str, Any]) -> None:
-        checkpoint = record.pop("_checkpoint", None)
-        if not checkpoint:
-            return
-        if checkpoint["kind"] == "journal":
-            cursor = str(checkpoint.get("cursor") or "")
-            if cursor:
-                self._journal_cursor = cursor
-        elif checkpoint["kind"] == "file":
-            self._files[str(checkpoint["path"])] = {
-                "device": int(checkpoint["device"]),
-                "inode": int(checkpoint["inode"]),
-                "offset": int(checkpoint["offset"]),
-            }
-        else:
-            raise ValueError(
-                "unknown Fabric Manager checkpoint kind: " + str(checkpoint["kind"])
-            )
-        self._state_dirty = True
-
-    def _flush_state(self) -> None:
-        """Persist checkpoints once per batch instead of per record.
-
-        Every ``_save_state`` costs two fsyncs on the shared node
-        volume, so the durability point is moved to the end of the
-        batch. Redelivery after a crash stays bounded by the batch,
-        and the sink is idempotent on ``record_id``.
-        """
-
-        if not self._state_dirty:
-            return
-        self._save_state()
-        self._state_dirty = False
 
 
 def build_from_environment(

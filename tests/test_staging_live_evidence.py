@@ -166,6 +166,110 @@ def test_pending_profile_change_forces_application_release() -> None:
         )
 
 
+@pytest.mark.parametrize("host_changed", [False, True])
+def test_unhealthy_status_reaches_the_deploy_repair_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_changed: bool
+) -> None:
+    (tmp_path / "site.yaml").write_text("kind: RegionalSite\n")
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin/gpu-fault-admin").touch()
+    status = {
+        "mode": "status",
+        "healthy": False,
+        "next_deploy": {
+            "kind": "CONTROL_PLANE_ONLY",
+            "changed": ["observability_drift"],
+        },
+    }
+    monkeypatch.setattr(
+        staging_live_evidence.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _completed(json.dumps(status), returncode=1),
+    )
+    source = staging_deploy.SourceCheckout(
+        repository_root=tmp_path,
+        git_commit="b" * 40,
+        fingerprint="b" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {"identities": _identities(), "source": {"fingerprint": "a" * 64}}
+    current = _identities()
+    if host_changed:
+        current["deploy_host"] = {"sha256": "d" * 64}
+    report, evidence, profile = staging_deploy.pre_deploy_reading(
+        previous=previous, state_dir=tmp_path, source=source, venv=venv, lock_fd=123
+    )
+    assert report == status
+    assert evidence is None, "an unhealthy report became reusable health evidence"
+    assert report is not None
+    mode = staging_deploy.classify_source_deploy(
+        previous,
+        current,
+        source=source,
+        site_exists=True,
+        live_matches=False,
+        profile_change_pending=profile,
+        runtime_repair_pending="observability_drift"
+        in report["next_deploy"]["changed"],
+    )
+    assert mode == "APPLICATION_RELEASE"
+    with pytest.raises(staging_live_evidence.LiveEvidenceError, match="healthy"):
+        staging_live_evidence.collect_live_deploy_evidence(
+            repository_root=tmp_path, state_dir=tmp_path, venv=venv, report=report
+        )
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "payload"),
+    [
+        (0, "not-json"),
+        (0, "[]"),
+        (1, "not-json"),
+        (1, "[]"),
+        (1, "null"),
+        (1, '{"mode":"status"}'),
+        (1, '{"mode":"status","healthy":0}'),
+        (1, '{"mode":"status","healthy":"false"}'),
+        (1, '{"mode":"status","healthy":true}'),
+        (1, '{"mode":"verify","healthy":false}'),
+        (2, '{"mode":"status","healthy":false}'),
+    ],
+)
+def test_failed_status_is_not_accepted_as_arbitrary_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, payload: str
+) -> None:
+    monkeypatch.setattr(
+        staging_live_evidence.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _completed(payload, returncode=exit_code),
+    )
+    with pytest.raises(staging_live_evidence.LiveEvidenceError):
+        staging_live_evidence.read_live_status(
+            repository_root=tmp_path,
+            state_dir=tmp_path,
+            venv=tmp_path,
+            allow_unhealthy=True,
+        )
+
+
+def test_status_remains_strict_outside_deploy_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        staging_live_evidence.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _completed(
+            '{"mode":"status","healthy":false}', returncode=1
+        ),
+    )
+    with pytest.raises(staging_live_evidence.LiveEvidenceError, match="status failed"):
+        staging_live_evidence.read_live_status(
+            repository_root=tmp_path, state_dir=tmp_path, venv=tmp_path
+        )
+
+
 def test_release_deploy_profile_plan_json_is_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -523,8 +627,8 @@ def test_read_live_status_keeps_the_report_of_an_unhealthy_site(
     A deploy over a failed transaction needs exactly that report (live release
     phase and id feed the consent refusals and the classification); live
     2026-09-11 the exit code alone was treated as "no report" and
-    --supersede-failed-transaction could not start. Only an exit code other
-    than 0/1, or an unparsable body, is a failed reading.
+    --supersede-failed-transaction could not start. Deploy planning explicitly
+    accepts a valid unhealthy report; other callers still require exit 0.
     """
 
     state_dir = tmp_path / "state"
@@ -546,7 +650,10 @@ def test_read_live_status_keeps_the_report_of_an_unhealthy_site(
     monkeypatch.setattr(staging_live_evidence.subprocess, "run", run)
 
     report = staging_live_evidence.read_live_status(
-        repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+        repository_root=tmp_path,
+        state_dir=state_dir,
+        venv=tmp_path / "venv",
+        allow_unhealthy=True,
     )
     assert report["healthy"] is False
     assert report["live_release"]["phase"] == "failed"
@@ -556,12 +663,18 @@ def test_read_live_status_keeps_the_report_of_an_unhealthy_site(
         staging_live_evidence.LiveEvidenceError, match="status failed \\(2\\)"
     ):
         staging_live_evidence.read_live_status(
-            repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+            repository_root=tmp_path,
+            state_dir=state_dir,
+            venv=tmp_path / "venv",
+            allow_unhealthy=True,
         )
     answers.update(rc=1, body="not json")
     with pytest.raises(
         staging_live_evidence.LiveEvidenceError, match="status failed \\(1\\)"
     ):
         staging_live_evidence.read_live_status(
-            repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+            repository_root=tmp_path,
+            state_dir=state_dir,
+            venv=tmp_path / "venv",
+            allow_unhealthy=True,
         )

@@ -18,6 +18,8 @@ from gpu_fault.admin.operation_lock import (
     SITE_OPERATION_LOCK_FD_ENV,
     site_operation_lock,
 )
+from gpu_fault.admin.python_environment import python_environment
+from gpu_fault_release import REPOSITORY_ROOT_ENV
 
 if __package__:
     from scripts.setup_deploy_host import prune_venv_versions
@@ -532,13 +534,14 @@ def classify_source_deploy(
     site_exists: bool,
     live_matches: bool = False,
     profile_change_pending: bool = False,
+    runtime_repair_pending: bool = False,
     live_release_pending: bool = False,
 ) -> str:
     # A Runtime Profile template that differs from the live Profile needs the
     # release engine's plan/approve stop, whatever the source identities say:
     # DEPLOY_HOST_ONLY, QUALITY_ONLY and UNCHANGED all apply no release and
     # would record the pending change as a success.
-    if profile_change_pending:
+    if profile_change_pending or runtime_repair_pending:
         return "APPLICATION_RELEASE"
     # The same holds for a live release transaction that is not committed --
     # failed, rolled back, or mid-flight: the site moved since the last
@@ -673,6 +676,17 @@ def run_source_impact_gate(
     return plan
 
 
+def admin_cli_environment(
+    environment: Mapping[str, str], *, repository_root: Path, venv: Path
+) -> dict[str, str]:
+    selected = python_environment(
+        {key: value for key, value in environment.items() if key != "PYTHONPATH"},
+        executable=venv / "bin/python",
+    )
+    selected[REPOSITORY_ROOT_ENV] = str(repository_root.resolve())
+    return selected
+
+
 def run_admin_preflight(
     *,
     repository_root: Path,
@@ -680,11 +694,11 @@ def run_admin_preflight(
     venv: Path,
     lock_fd: int | None = None,
 ) -> None:
-    environment = (
-        {**os.environ, SITE_OPERATION_LOCK_FD_ENV: str(lock_fd)}
-        if lock_fd is not None
-        else None
+    environment = admin_cli_environment(
+        os.environ, repository_root=repository_root, venv=venv
     )
+    if lock_fd is not None:
+        environment[SITE_OPERATION_LOCK_FD_ENV] = str(lock_fd)
     _run(
         [
             str(venv / "bin/gpu-fault-admin"),
@@ -807,10 +821,14 @@ def run_admin_deploy(
     _run(
         command,
         cwd=repository_root,
-        env={
-            **tool_cache_environment(state_dir),
-            SITE_OPERATION_LOCK_FD_ENV: str(lock_fd),
-        },
+        env=admin_cli_environment(
+            {
+                **tool_cache_environment(state_dir),
+                SITE_OPERATION_LOCK_FD_ENV: str(lock_fd),
+            },
+            repository_root=repository_root,
+            venv=venv,
+        ),
         pass_fds=(lock_fd,),
     )
 
@@ -995,6 +1013,7 @@ def pre_deploy_reading(
             state_dir=state_dir,
             venv=venv,
             lock_fd=lock_fd,
+            allow_unhealthy=True,
         )
         evidence = collect_live_deploy_evidence(
             repository_root=source.repository_root,
@@ -1129,8 +1148,23 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             site_exists=not first_deploy,
             live_matches=successful_source_live_matches(previous, live_evidence),
             profile_change_pending=profile_change_pending,
+            runtime_repair_pending=(
+                isinstance(report, dict)
+                and isinstance(report.get("next_deploy"), dict)
+                and bool(
+                    {"observability_drift", "aurora_refresh_drift"}.intersection(
+                        report["next_deploy"].get("changed", [])
+                    )
+                )
+            ),
             live_release_pending=live_release_transaction_pending(report),
         )
+        from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
+
+        if load_admin_custody(state_dir) is not None:
+            # An explicit custody enrollment is an administrator input, not an
+            # application source change; it still must reach bootstrap's gate.
+            mode = "APPLICATION_RELEASE"
         trusted_ci_candidate = (
             restore_trusted_ci_candidate(
                 source.repository_root,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Callable
@@ -28,6 +29,20 @@ class NodePatchConflict(RuntimeError):
     """
 
 
+def node_name(node: object) -> str | None:
+    metadata = (
+        node.get("metadata")
+        if isinstance(node, dict)
+        else getattr(node, "metadata", None)
+    )
+    name = (
+        metadata.get("name")
+        if isinstance(metadata, dict)
+        else getattr(metadata, "name", None)
+    )
+    return name if isinstance(name, str) and name else None
+
+
 def kubernetes_request_timeout_seconds() -> float:
     """Bounded per-request timeout for every Kubernetes API call.
 
@@ -41,9 +56,9 @@ def kubernetes_request_timeout_seconds() -> float:
         raise ValueError(
             "GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS must be a positive number"
         ) from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(
-            "GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS must be a positive number"
+            "GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS must be finite and positive"
         )
     return value
 
@@ -258,6 +273,17 @@ class KubernetesPrimitivesMixin:
                 if getattr(exc, "status", None) != 409 or attempt == 2:
                     raise
                 latest = self._read_workload(namespace, kind, name)
+                if expected_uid := body["metadata"].get("uid"):
+                    metadata = self._metadata(latest)
+                    current_uid = (
+                        metadata.get("uid")
+                        if isinstance(metadata, dict)
+                        else getattr(metadata, "uid", None)
+                    )
+                    if current_uid != expected_uid:
+                        raise ValueError(
+                            "workload identity changed during patch retry"
+                        ) from exc
                 resource_version = self._resource_version(latest)
                 if resource_version is None:
                     body["metadata"].pop("resourceVersion", None)

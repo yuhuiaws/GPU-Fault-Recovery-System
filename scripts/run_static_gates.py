@@ -16,6 +16,29 @@ ROOT = Path(__file__).resolve().parents[1]
 SLOW_COMMAND_SECONDS = 5.0
 
 
+def isolated_gate_environment(parent: Mapping[str, str]) -> dict[str, str]:
+    """Tests have their own clocks/budgets; the build's supervisor still owns them."""
+    values = {
+        name: value
+        for name, value in parent.items()
+        if not name.startswith(
+            (
+                "GPU_FAULT_DEPLOY_DEADLINE_",
+                "GPU_FAULT_DEPLOY_HARD_DEADLINE_",
+                "GPU_FAULT_DEPLOY_API_",
+            )
+        )
+        and name != "GPU_FAULT_DEPLOY_RECOVERY_ACTIVE"
+    }
+    root = parent.get("GPU_FAULT_DEPLOY_API_BUDGET_DIR")
+    if root and "PATH" in values:
+        shim = str(Path(root) / "bin")
+        values["PATH"] = os.pathsep.join(
+            part for part in values["PATH"].split(os.pathsep) if part != shim
+        )
+    return values
+
+
 def _command_label(command: Sequence[str]) -> str:
     """Name a gate's command by the script it runs, not by the interpreter.
 
@@ -136,8 +159,6 @@ def gate_groups(python: str) -> dict[str, GateGroup]:
                     "scripts/e2e",
                     "scripts/perf",
                 ),
-                # Advisory when cfn-lint is absent locally, strict under CI=true.
-                ("make", "cfn-lint-check", f"PYTHON={python}"),
             )
         ),
         "shell": GateGroup(commands=(("make", "shell-check", f"PYTHON={python}"),)),
@@ -152,8 +173,7 @@ def run_gate_group(
     output_lock: threading.Lock,
 ) -> int:
     environment = {
-        **os.environ,
-        **dict(group.environment or {}),
+        **isolated_gate_environment({**os.environ, **dict(group.environment or {})}),
         "PYTHONPYCACHEPREFIX": str(cache_root / name / "pycache"),
         "PYTEST_ADDOPTS": (
             (

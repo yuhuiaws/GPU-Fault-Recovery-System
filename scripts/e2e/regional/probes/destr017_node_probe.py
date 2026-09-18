@@ -35,12 +35,14 @@ stops a service, or touches the Node Agent.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -69,6 +71,7 @@ MAX_HOLD_SECONDS = 3600
 # near enough that it lands inside the pinned quiesce maintenance window.
 MIN_REBOOT_DELAY_SECONDS = 30
 MAX_REBOOT_DELAY_SECONDS = 600
+SAFE_GUARD_SCRIPT = re.compile(r"^/run/gpu-fault-host-probe-[0-9a-f]{6,32}\.py$")
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 # The holder body, kept a host process (Pods cannot start once GPU services are
@@ -410,6 +413,8 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
     if matched is None:
         update_state(path, {"holder_error": "arm ledger row never appeared"})
         return
+    if state.get("reboot_delay_seconds") is not None:
+        require_maintenance_window(str(state.get("maintenance_window_end") or ""))
     unit = holder_unit(run_id)
     _clear_unit(unit + ".service", run_id)
     started_at = datetime.now(timezone.utc).isoformat()
@@ -436,13 +441,8 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             "holder_unit": unit + ".service",
         },
     )
-    # The holder now has VERIFY_NO_GPU_CLIENTS WAITING. quiesce has already
-    # stopped kubelet, so the runner can no longer exec ``arm-reboot`` -- arm the
-    # out-of-band reboot here, on-node, the moment the fence is holding. The
-    # runner pre-validated the delay against the pinned window before injection.
-    reboot_delay = state.get("reboot_delay_seconds")
-    if reboot_delay is not None:
-        place_reboot_timer(run_id, int(reboot_delay), path)
+    # Quiesce alone does not prove the controller's WAITING barrier. The runner
+    # must deliver its exact authorization before any reboot timer is placed.
 
 
 def arm_holder(arguments: argparse.Namespace) -> None:
@@ -462,6 +462,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
     reboot_delay: int | None = None
     if getattr(arguments, "reboot_delay_seconds", None) is not None:
         reboot_delay = checked_reboot_delay(arguments.reboot_delay_seconds)
+        require_maintenance_window(getattr(arguments, "maintenance_window_end", ""))
     path = state_path(run_id)
     armed_at = datetime.now(timezone.utc).isoformat()
     state = update_state(
@@ -475,6 +476,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "baseline_command_ids": baseline_ids,
             "armed_at": armed_at,
             "reboot_delay_seconds": reboot_delay,
+            "maintenance_window_end": getattr(arguments, "maintenance_window_end", ""),
         },
     )
     write_state(path, record_boot_observation(state, boot_id(), observed_at=armed_at))
@@ -539,6 +541,59 @@ def holder_status(arguments: argparse.Namespace) -> None:
     )
 
 
+def require_maintenance_window(value: str) -> datetime:
+    try:
+        deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ProbeError("reboot requires an explicit maintenance deadline") from exc
+    if deadline.tzinfo is None or datetime.now(timezone.utc) >= deadline:
+        raise ProbeError("maintenance window ended before reboot")
+    return deadline
+
+
+def check_barrier(state: dict[str, Any]) -> None:
+    proof = state.get("barrier_authorization")
+    script = str(state.get("barrier_script") or "")
+    if not isinstance(proof, dict) or SAFE_GUARD_SCRIPT.fullmatch(script) is None:
+        raise ProbeError("reboot has no exact WAITING barrier authorization")
+    if hashlib.sha256(Path(script).read_bytes()).hexdigest() != state.get(
+        "barrier_script_sha256"
+    ):
+        raise ProbeError("barrier guard script changed")
+    run(
+        [
+            sys.executable,
+            script,
+            "check-barrier",
+            "--barrier-authorization",
+            json.dumps(proof, sort_keys=True),
+        ]
+    )
+
+
+def fire_reboot(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        require_maintenance_window(str(state.get("maintenance_window_end") or ""))
+        if (
+            state.get("run_id") != run_id
+            or state.get("reboot_cancelled_at")
+            or state.get("fire_requested_at")
+            or state.get("boot_id_before_reboot") != boot_id()
+        ):
+            raise ProbeError(
+                "reboot authorization was consumed, cancelled or changed boot"
+            )
+        check_barrier(state)
+        update_state(
+            path, {"fire_requested_at": datetime.now(timezone.utc).isoformat()}
+        )
+        run(reboot_command())
+
+
 def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
     """Write the durable boot-id marker, then arm the transient reboot timer.
 
@@ -550,6 +605,23 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
 
     delay = checked_reboot_delay(delay)
     armed_at = datetime.now(timezone.utc)
+    recorded = read_state(path)
+    deadline = require_maintenance_window(
+        str(recorded.get("maintenance_window_end") or "")
+    )
+    if armed_at + timedelta(seconds=delay) >= deadline:
+        raise ProbeError("scheduled reboot would outlive the maintenance window")
+    proof = recorded.get("barrier_authorization")
+    if (
+        not isinstance(proof, dict)
+        or proof.get("run_id") != run_id
+        or recorded.get("reboot_armed_at")
+        or recorded.get("reboot_cancelled_at")
+    ):
+        raise ProbeError("reboot requires a new exact barrier authorization")
+    pinned = require_maintenance_window(str(proof.get("window_expires_at") or ""))
+    if armed_at + timedelta(seconds=delay) >= pinned or delay > 60:
+        raise ProbeError("reboot would outlive the barrier authorization")
     current = boot_id()
     unit = reboot_unit(run_id)
     state = update_state(
@@ -578,7 +650,11 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
             f"--on-active={delay}s",
             "--timer-property=AccuracySec=1s",
             "--property=Type=oneshot",
-            *reboot_command(),
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "fire-reboot",
+            "--run-id",
+            run_id,
         ]
     )
     return {
@@ -601,7 +677,34 @@ def arm_reboot(arguments: argparse.Namespace) -> None:
     """
 
     run_id = safe_id(arguments.run_id, "run ID")
-    emit(place_reboot_timer(run_id, arguments.delay_seconds, state_path(run_id)))
+    path = state_path(run_id)
+    proof = json.loads(arguments.authorization)
+    script = arguments.barrier_script
+    if SAFE_GUARD_SCRIPT.fullmatch(script) is None:
+        raise ProbeError("barrier script is not an installed host probe")
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        if (
+            state.get("run_id") != run_id
+            or state.get("disarmed_at")
+            or proof.get("run_id") != run_id
+            or proof.get("device") != state.get("device")
+            or proof.get("drill_id") != state.get("drill_id")
+            or proof.get("boot_id") != boot_id()
+            or state.get("reboot_cancelled_at")
+            or state.get("reboot_armed_at")
+        ):
+            raise ProbeError("reboot authorization does not bind this holder")
+        state["barrier_authorization"] = proof
+        state["barrier_script"] = script
+        state["barrier_script_sha256"] = hashlib.sha256(
+            Path(script).read_bytes()
+        ).hexdigest()
+        check_barrier(state)
+        write_state(path, state)
+        record = place_reboot_timer(run_id, arguments.delay_seconds, path)
+    emit(record)
 
 
 def reboot_status(arguments: argparse.Namespace) -> None:
@@ -625,7 +728,9 @@ def reboot_status(arguments: argparse.Namespace) -> None:
             "reboot_cancelled_at": state.get("reboot_cancelled_at"),
             "boot_id_before_reboot": before or None,
             "boot_id_now": current,
-            "fired": bool(before) and before != current,
+            "fired": bool(state.get("fire_requested_at"))
+            and bool(before)
+            and before != current,
             "observed_boot_ids": state.get("observed_boot_ids") or [],
             "boot_changes": state.get("boot_changes", 0),
             "units": _reboot_unit_state(run_id),
@@ -638,17 +743,19 @@ def cancel_reboot(arguments: argparse.Namespace) -> None:
 
     run_id = safe_id(arguments.run_id, "run ID")
     unit = reboot_unit(run_id)
-    before = _reboot_unit_state(run_id)
-    _clear_unit(unit + ".timer", run_id)
-    _clear_unit(unit + ".service", run_id)
     path = state_path(run_id)
     current = boot_id()
     cancelled_at = datetime.now(timezone.utc).isoformat()
-    state = read_state(path)
-    if state:
-        state = record_boot_observation(state, current, observed_at=cancelled_at)
-        state["reboot_cancelled_at"] = cancelled_at
-        write_state(path, state)
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        if state:
+            state = record_boot_observation(state, current, observed_at=cancelled_at)
+            state["reboot_cancelled_at"] = cancelled_at
+            write_state(path, state)
+    before = _reboot_unit_state(run_id)
+    _clear_unit(unit + ".timer", run_id)
+    _clear_unit(unit + ".service", run_id)
     recorded = str(state.get("boot_id_before_reboot") or "")
     emit(
         {
@@ -659,6 +766,34 @@ def cancel_reboot(arguments: argparse.Namespace) -> None:
             "units_after": _reboot_unit_state(run_id),
         }
     )
+
+
+def clear_state(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    for unit in (
+        arm_unit(run_id) + ".service",
+        holder_unit(run_id) + ".service",
+        reboot_unit(run_id) + ".timer",
+        reboot_unit(run_id) + ".service",
+    ):
+        state = _unit_state(unit, "LoadState", "ActiveState")
+        if state.get("LoadState") != "not-found" and state.get("ActiveState") not in {
+            "inactive",
+            "failed",
+        }:
+            raise ProbeError("cannot clear state while a probe unit may still run")
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = read_state(path)
+        if state and (
+            state.get("run_id") != run_id
+            or not state.get("reboot_cancelled_at")
+            or not state.get("disarmed_at")
+        ):
+            raise ProbeError("probe state has no completed cancellation proof")
+        path.unlink(missing_ok=True)
+    emit({"run_id": run_id, "state_cleared": True})
 
 
 def snapshot(arguments: argparse.Namespace) -> None:
@@ -691,6 +826,7 @@ def parser() -> argparse.ArgumentParser:
     arm.add_argument("--max-hold-seconds", type=int, default=900)
     arm.add_argument("--run-id", required=True)
     arm.add_argument("--probe-script", required=True)
+    arm.add_argument("--maintenance-window-end", default="")
     arm.add_argument(
         "--reboot-delay-seconds",
         type=int,
@@ -718,6 +854,8 @@ def parser() -> argparse.ArgumentParser:
 
     reboot = commands.add_parser("arm-reboot")
     reboot.add_argument("--run-id", required=True)
+    reboot.add_argument("--authorization", required=True)
+    reboot.add_argument("--barrier-script", required=True)
     reboot.add_argument(
         "--delay-seconds",
         type=int,
@@ -728,6 +866,14 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     reboot.set_defaults(handler=arm_reboot)
+
+    fire = commands.add_parser("fire-reboot")
+    fire.add_argument("--run-id", required=True)
+    fire.set_defaults(handler=fire_reboot)
+
+    clear = commands.add_parser("clear-state")
+    clear.add_argument("--run-id", required=True)
+    clear.set_defaults(handler=clear_state)
 
     reboot_state = commands.add_parser("reboot-status")
     reboot_state.add_argument("--run-id", required=True)

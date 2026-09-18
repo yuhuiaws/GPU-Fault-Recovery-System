@@ -38,9 +38,10 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -185,13 +186,15 @@ def _provision(backend: str, workdir: Path) -> Iterator[StoreProvisioner]:
 
     workdir.mkdir(parents=True, exist_ok=True)
     if backend == "sqlite":
-        yield SqliteProvisioner(workdir, "requested with --backend sqlite")
+        with TemporaryDirectory(prefix="p036-", dir=workdir) as directory:
+            yield SqliteProvisioner(Path(directory), "requested with --backend sqlite")
         return
     docker = shutil.which("docker")
     if docker is None:
         if backend == "postgres":
             raise RunnerError("--backend postgres needs docker on PATH")
-        yield SqliteProvisioner(workdir, "docker is not on PATH")
+        with TemporaryDirectory(prefix="p036-", dir=workdir) as directory:
+            yield SqliteProvisioner(Path(directory), "docker is not on PATH")
         return
     container = f"gpu-fault-preempt036-postgres-{os.getpid()}-{uuid4().hex[:8]}"
     started = subprocess.run(
@@ -211,6 +214,7 @@ def _provision(backend: str, workdir: Path) -> Iterator[StoreProvisioner]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=120,
     )
     if started.returncode:
         detail = (started.stderr or started.stdout).strip()
@@ -218,7 +222,8 @@ def _provision(backend: str, workdir: Path) -> Iterator[StoreProvisioner]:
             raise RunnerError(
                 f"--backend postgres could not start a container: {detail}"
             )
-        yield SqliteProvisioner(workdir, f"docker run failed: {detail[:200]}")
+        with TemporaryDirectory(prefix="p036-", dir=workdir) as directory:
+            yield SqliteProvisioner(Path(directory), "docker run failed")
         return
     try:
         for _attempt in range(POSTGRES_READY_ATTEMPTS):
@@ -227,6 +232,7 @@ def _provision(backend: str, workdir: Path) -> Iterator[StoreProvisioner]:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=10,
             )
             if ready.returncode == 0:
                 break
@@ -244,18 +250,22 @@ def _provision(backend: str, workdir: Path) -> Iterator[StoreProvisioner]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
         ).stdout.strip()
         yield PostgresProvisioner(
             f"postgresql://postgres@127.0.0.1:{port}/postgres",
             container,
         )
     finally:
-        subprocess.run(
+        removed = subprocess.run(
             [docker, "rm", "-f", container],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=60,
         )
+        if removed.returncode:
+            raise RunnerError("owned PostgreSQL container removal was not confirmed")
 
 
 def _child_environment(provisioner: StoreProvisioner, url: str) -> dict[str, str]:
@@ -263,6 +273,11 @@ def _child_environment(provisioner: StoreProvisioner, url: str) -> dict[str, str
     return {
         "PATH": os.environ.get("PATH", os.defpath),
         "HOME": os.environ.get("HOME", "/tmp"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "AWS_CONFIG_FILE": "/dev/null",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "KUBECONFIG": "/dev/null",
         "PYTHONPATH": str(ROOT / "src"),
         "GPU_FAULT_STORE_URL": url,
         **CONTEXT_ENVIRONMENT,
@@ -279,6 +294,7 @@ def _run_probe(provisioner: StoreProvisioner, url: str, source: str) -> dict[str
         capture_output=True,
         text=True,
         check=False,
+        timeout=120,
     )
     if completed.returncode:
         raise RunnerError(
@@ -322,7 +338,26 @@ def run_shape(
     """Seed one shape, sweep it, and return its evidence, verdict included."""
 
     url = provisioner.create(shape)
-    store = provisioner.open(url)
+    with closing(provisioner.open(url)) as store:
+        return _run_shape(
+            shape,
+            provisioner,
+            store,
+            url,
+            safety_probe=safety_probe,
+            stats_probe=stats_probe,
+        )
+
+
+def _run_shape(
+    shape: str,
+    provisioner: StoreProvisioner,
+    store: Any,
+    url: str,
+    *,
+    safety_probe: str,
+    stats_probe: str,
+) -> dict[str, Any]:
     seed: ShapeSeed = seed_shape(shape, store)
     stages: dict[str, list[str]] = {}
 
@@ -469,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 document["completed_at"] = utc_now()
                 write_json_atomic(evidence_path, document)
+                if document["shapes"][shape]["verdict"] != "PASS":
+                    break
     except Exception as exc:  # noqa: BLE001 -- a harness failure is a FAIL, recorded
         document["errors"].append(f"{type(exc).__name__}: {exc}")
         document["completed_at"] = utc_now()
@@ -481,6 +518,10 @@ def main(argv: list[str] | None = None) -> int:
         for shape, value in sorted(document["shapes"].items())
         for error in value["errors"]
     ]
+    if set(document["shapes"]) != set(SHAPES) or len(shapes) != len(set(shapes)):
+        document["errors"].append(
+            "all three distinct shapes are required for a case PASS"
+        )
     document["verdict"] = (
         "PASS"
         if not document["errors"]

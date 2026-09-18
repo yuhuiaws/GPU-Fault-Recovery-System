@@ -19,7 +19,6 @@ from typing import Any, Mapping, Sequence
 
 import pytest
 
-from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin.bootstrap import (
     _ensure_internet_gateway,
     _ensure_nlb_network,
@@ -33,7 +32,7 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
 )
-from tests.admin._bootstrap_support import _cluster
+from tests.admin._bootstrap_support import _cluster, patch_bootstrap_commands
 
 SITE_ID = "site-a"
 REGION = "us-east-1"
@@ -276,7 +275,7 @@ def _network(
     *,
     gpu_clusters: Sequence[ClusterIdentity] = (),
 ) -> dict[str, Any]:
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
+    patch_bootstrap_commands(monkeypatch, aws)
     return _ensure_nlb_network(
         CommandRunner(),
         cpu=_cluster(),
@@ -548,7 +547,7 @@ def test_a_control_plane_cluster_in_one_zone_is_refused(
 
     single = [_subnet("subnet-private-a", f"{REGION}a", "10.0.1.0/24")]
     aws = Aws(subnets=single)
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
+    patch_bootstrap_commands(monkeypatch, aws)
 
     with pytest.raises(BootstrapError, match="at least two availability zones"):
         _ensure_public_subnets(CommandRunner(), cluster=_cluster(), site_id=SITE_ID)
@@ -753,7 +752,7 @@ def test_a_gateway_lookup_failure_is_not_read_as_an_absent_gateway(
             )
         ]
     )
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
+    patch_bootstrap_commands(monkeypatch, aws)
 
     with pytest.raises(BootstrapError, match="UnauthorizedOperation"):
         _ensure_internet_gateway(
@@ -773,7 +772,7 @@ def test_nat_addresses_come_only_from_available_gateways(
     """
 
     aws = Aws()
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
+    patch_bootstrap_commands(monkeypatch, aws)
 
     _gpu_nat_eips(CommandRunner(), _gpu("gpu-a", "vpc-gpu-a"))
 
@@ -791,7 +790,7 @@ def test_an_existing_group_is_matched_inside_its_own_vpc(
     """
 
     aws = _prepared()
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
+    patch_bootstrap_commands(monkeypatch, aws)
 
     result = _ensure_security_group(
         CommandRunner(),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -14,7 +15,13 @@ from scripts.e2e.regional import (
 )
 from scripts.e2e.regional import seeded_command_fixture
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
-from scripts.e2e.regional.audit_auth_boundary import validate_matrix
+from scripts.e2e.regional.audit_auth_boundary import (
+    AUTH009_ENTRY_NAMES,
+    AUTH009_PATHS,
+    AUTH009_SCOPE_VARIANTS,
+    EXPECTED_DETAILS,
+    validate_matrix,
+)
 from scripts.e2e.regional.audit_executor_readiness import validate_readiness_matrix
 from scripts.e2e.regional.audit_regional_command_protocol_live import (
     AUDITED_CASE_IDS,
@@ -32,6 +39,7 @@ from scripts.e2e.regional.run_ha007_control_worker_shutdown import (
 from scripts.e2e.regional.run_ha008_processor_exit_acceptance import (
     run_acceptance as run_ha008_acceptance,
 )
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -105,6 +113,93 @@ PLAN_ONLY_SMOKE_CASES = {
 # Plan-only drivers whose ``--plan`` path already gates on the formal
 # predecessor's PASS evidence (exit 1 when it is missing).
 PREDECESSOR_GATED_PLAN_CASES = {"GF-REGIONAL-NET-002", "GF-REGIONAL-NET-003"}
+
+
+def run_isolated_plan(tmp_path, case_id, monkeypatch, *, predecessor_present=True):
+    from dataclasses import replace
+
+    from scripts.e2e.regional import live_driver_guard as guard
+    from scripts.e2e.regional import regional_commands
+    from scripts.e2e.regional.regional_live_fixture import predecessor_evidence
+
+    def refuse_process(*_args, **_kwargs):
+        pytest.fail("plan test attempted an unmocked external process")
+
+    monkeypatch.setattr(subprocess, "run", refuse_process)
+    monkeypatch.setattr(regional_commands, "run_command", refuse_process)
+    monkeypatch.setattr(guard, "source_digest", lambda: "isolated-source")
+    monkeypatch.setattr(guard, "install_abort_signals", lambda: None)
+    monkeypatch.setattr(guard, "install_site_profile", lambda: None)
+    monkeypatch.setattr(guard, "applied_site_profile", lambda: None)
+    for name in ("cpu", "gpu"):
+        (tmp_path / f"{name}.kubeconfig").write_text("apiVersion: v1\n")
+    for key, value in {
+        "GPU_FAULT_CONTROL_KUBECONFIG": str(tmp_path / "cpu.kubeconfig"),
+        "KUBECONFIG": str(tmp_path / "gpu.kubeconfig"),
+        "GPU_FAULT_DATAPLANE_CONTEXT": "test-gpu-context",
+        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
+        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
+        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
+        "GPU_FAULT_CLUSTER_ID": "cluster-test",
+    }.items():
+        monkeypatch.setenv(key, value)
+    previous = formal_predecessor(case_id)
+    if previous and predecessor_present:
+        evidence = tmp_path / "cases" / previous / f"{previous}.json"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_text(
+            json.dumps(
+                {
+                    "case_id": previous,
+                    "verdict": "PASS",
+                    "release_id": "release-test",
+                    "cluster_id": "cluster-test",
+                }
+            )
+        )
+    script = PROMOTED_MANUAL_DRIVERS[case_id]
+    module = importlib.import_module(f"scripts.e2e.regional.{Path(script).stem}")
+    if isinstance(getattr(module, "CASE", None), guard.PlainCaseRunner):
+
+        def plain_preflight(settings, case_dir):
+            identity = {"release_id": "release-test", "cluster_id": settings.cluster_id}
+            proof = predecessor_evidence(
+                tmp_path / "cases" / previous / f"{previous}.json", previous, **identity
+            )
+            return {
+                "identity": identity,
+                "predecessor": proof,
+                "errors": [] if proof["valid"] is True else ["predecessor missing"],
+            }
+
+        monkeypatch.setattr(
+            module, "CASE", replace(module.CASE, read_only_preflight=plain_preflight)
+        )
+    monkeypatch.setattr(module, "install_site_profile", lambda: None, raising=False)
+    argv = [script, "--run-dir", str(tmp_path), "--attempt", "7", "--plan"]
+    if case_id in {"GF-REGIONAL-HA-005", "GF-REGIONAL-HA-006"}:
+        monkeypatch.setattr(
+            module,
+            "chain_preflight",
+            lambda *_args: {
+                "errors": [],
+                "identity": {
+                    "release_id": "release-test",
+                    "cluster_id": "cluster-test",
+                },
+            },
+        )
+        monkeypatch.setattr(module, "residual_preflight", lambda *_args: {"errors": []})
+    if case_id == "GF-REGIONAL-HA-005":
+        argv.append("--all-deployments")
+    monkeypatch.setattr(sys, "argv", argv)
+    previous_umask = os.umask(0o077)
+    try:
+        code = module.main()
+    finally:
+        os.umask(previous_umask)
+    plan = json.loads((tmp_path / "cases" / case_id / "plan.json").read_text())
+    return code, plan, previous
 
 
 def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
@@ -238,7 +333,7 @@ def test_cmd006_fixture_waits_for_the_documented_lease_expiry(
     tokens = iter(("token-1", "token-2", "token-3"))
     completions = iter(
         (
-            (200, {}),
+            (200, {"status": "WAITING"}),
             (409, {}),
             (409, {}),
             (200, {"status": "SUCCEEDED", "last_lease_owner": "cmd006-a3"}),
@@ -251,11 +346,20 @@ def test_cmd006_fixture_waits_for_the_documented_lease_expiry(
 
     def claim(*, executor_id: str, lease_seconds: int):
         leases.append(lease_seconds)
-        return 200, {"commands": [{"executor_id": executor_id, "token": next(tokens)}]}
+        return 200, {
+            "commands": [
+                {
+                    "command_id": "command-1",
+                    "executor_id": executor_id,
+                    "token": next(tokens),
+                }
+            ]
+        }
 
     audit = SimpleNamespace(
         seed=lambda _name: SimpleNamespace(command_id="command-1"),
         claim=claim,
+        claim_records=LiveProtocolAudit.claim_records,
         complete=lambda _command_id, payload: next(completions),
         record=lambda case_id, **fields: recorded.update({case_id: fields}),
         _lease_token=lambda command: command["token"],
@@ -290,7 +394,7 @@ def test_auth_boundary_fixture_validates_precise_results() -> None:
         "AUTH-008-A-fake-executor": 200,
         "AUTH-008-B-header-A-token": 403,
         "AUTH-008-A-header-B-token": 403,
-        "AUTH-009 /v1/gpu-events/xid": 403,
+        **{name: 403 for name in AUTH009_ENTRY_NAMES},
         "AUTH-011-health": 200,
         "AUTH-011-metrics": 403,
         "AUTH-011-clusters-anon": 403,
@@ -299,12 +403,38 @@ def test_auth_boundary_fixture_validates_precise_results() -> None:
     results = {
         name: {"status": status, "body": {}} for name, status in statuses.items()
     }
-    for name in ("AUTH-004-zero", "AUTH-004-near"):
-        results[name]["body"]["detail"] = "regional cluster authentication failed"
+    assert AUTH009_PATHS == (
+        "/v1/collector-events/nvidia-kernel",
+        "/v1/collector-events/fabric-manager",
+        "/v1/collector-events/gpu-metrics",
+        "/v1/collector-events/host-telemetry",
+        "/v1/collector-events/node-logs",
+        "/v1/gpu-events/xid",
+        "/v1/gpu-events/xid/distributed",
+        "/v1/gpu-events/sxid",
+        "/v1/collector-events/gpu-inventory",
+        "/v1/attempts/terminal",
+        "/v1/training-progress",
+        "/v1/collector-events/collector-health",
+    ), "the complete collector/observation binding matrix is required"
+    assert set(AUTH009_SCOPE_VARIANTS) == {
+        "cluster-alias",
+        "camelcase-alias",
+        "nested-alias",
+        "conflicting-nested",
+    }, "all alias and conflicting nested identities need explicit results"
+    for name, detail in EXPECTED_DETAILS.items():
+        results[name]["body"]["detail"] = detail
     for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor"):
         results[name]["body"]["commands"] = [{"cluster_id": "cluster-a"}]
 
     validate_matrix(results, cluster_a="cluster-a")
+    for missing in AUTH009_ENTRY_NAMES:
+        with pytest.raises(AssertionError):
+            validate_matrix(
+                {name: value for name, value in results.items() if name != missing},
+                cluster_a="cluster-a",
+            )
 
     results["AUTH-004-near"]["body"]["detail"] = "token mismatch"
     with pytest.raises(AssertionError):
@@ -334,9 +464,7 @@ def test_net004_dependency_audit_is_environment_driven() -> None:
     path = ROOT / "scripts/e2e/regional/audit_net004_dependency_boundary.py"
     source = path.read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "gpu-fault-gpu-1-" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
 
     help_result = subprocess.run(
         [sys.executable, str(path), "--help"],
@@ -344,8 +472,9 @@ def test_net004_dependency_audit_is_environment_driven() -> None:
         env=_CHECKOUT_ENV,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
     )
+    assert help_result.returncode == 0, help_result.stderr
     assert "--cpu-kubeconfig" in help_result.stdout
     assert "--gpu-kubeconfig" in help_result.stdout
     assert "--gpu-context" in help_result.stdout
@@ -371,9 +500,7 @@ def test_promoted_manual_live_driver_has_safety_entrypoint(
     path = ROOT / "scripts/e2e/regional" / script_name
     source = path.read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "gpu-fault-gpu-1-" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
     assert "2026, 8, 31" not in source
 
     help_result = subprocess.run(
@@ -382,68 +509,30 @@ def test_promoted_manual_live_driver_has_safety_entrypoint(
         env=_CHECKOUT_ENV,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
     )
+    assert help_result.returncode == 0, help_result.stderr
     for option in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
         assert option in help_result.stdout, (case_id, option)
 
 
 @pytest.mark.parametrize(("case_id", "confirmation"), PLAN_ONLY_SMOKE_CASES.items())
 def test_synthetic_registry_live_driver_plan_is_non_mutating(
-    tmp_path: Path, case_id: str, confirmation: str
+    tmp_path: Path, case_id: str, confirmation: str, monkeypatch, capsys
 ) -> None:
-    script_name = PROMOTED_MANUAL_DRIVERS[case_id]
-    env = {
-        **os.environ,
-        "GPU_FAULT_CONTROL_KUBECONFIG": "/tmp/cpu.kubeconfig",
-        "KUBECONFIG": "/tmp/gpu.kubeconfig",
-        "GPU_FAULT_DATAPLANE_CONTEXT": "test-gpu-context",
-        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
-        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
-        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
-    }
-    # The gated drivers' plan path refuses without the formal predecessor's
-    # PASS evidence, so seed it under the run directory; the plan-only gate
-    # binds no release_id/cluster_id, so case_id and verdict are enough.
-    predecessor = None
-    if case_id in PREDECESSOR_GATED_PLAN_CASES:
-        predecessor = formal_predecessor(case_id)
-        assert predecessor is not None, case_id
-        evidence = tmp_path / "cases" / predecessor / f"{predecessor}.json"
-        evidence.parent.mkdir(parents=True)
-        evidence.write_text(
-            json.dumps({"case_id": predecessor, "verdict": "PASS"}), encoding="utf-8"
-        )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/e2e/regional" / script_name),
-            "--run-dir",
-            str(tmp_path),
-            "--attempt",
-            "7",
-        ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    plan = json.loads(
-        (tmp_path / "cases" / case_id / "plan.json").read_text(encoding="utf-8")
-    )
-
-    assert json.loads(completed.stdout)["case_id"] == case_id
+    code, plan, predecessor = run_isolated_plan(tmp_path, case_id, monkeypatch)
+    assert code in (None, 0), plan
+    assert json.loads(capsys.readouterr().out)["case_id"] == case_id
     assert plan["attempt"] == 7
     assert plan["confirmation"] == confirmation
     assert plan["mutation_performed"] is False
-    if predecessor is not None:
+    if case_id in PREDECESSOR_GATED_PLAN_CASES:
         gate = plan["details"]["predecessor"]
         assert gate["case_id"] == predecessor
         assert gate["verdict"] == "PASS"
         assert gate["valid"] is True
         assert gate["execution_allowed"] is True
-        # The seeded evidence is the only file under cases/<predecessor>/.
+        evidence = tmp_path / "cases" / predecessor / f"{predecessor}.json"
         assert sorted(path.name for path in evidence.parent.iterdir()) == [
             evidence.name
         ]
@@ -451,40 +540,15 @@ def test_synthetic_registry_live_driver_plan_is_non_mutating(
 
 @pytest.mark.parametrize("case_id", sorted(PREDECESSOR_GATED_PLAN_CASES))
 def test_predecessor_gated_plan_refuses_without_pass_evidence(
-    tmp_path: Path, case_id: str
+    tmp_path: Path, case_id: str, monkeypatch
 ) -> None:
     """The plan is still written but exits 1 when the predecessor has no PASS."""
 
-    script_name = PROMOTED_MANUAL_DRIVERS[case_id]
-    env = {
-        **os.environ,
-        "GPU_FAULT_CONTROL_KUBECONFIG": "/tmp/cpu.kubeconfig",
-        "KUBECONFIG": "/tmp/gpu.kubeconfig",
-        "GPU_FAULT_DATAPLANE_CONTEXT": "test-gpu-context",
-        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
-        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
-        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
-    }
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/e2e/regional" / script_name),
-            "--run-dir",
-            str(tmp_path),
-            "--attempt",
-            "1",
-        ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    plan = json.loads(
-        (tmp_path / "cases" / case_id / "plan.json").read_text(encoding="utf-8")
+    code, plan, _ = run_isolated_plan(
+        tmp_path, case_id, monkeypatch, predecessor_present=False
     )
 
-    assert completed.returncode == 1, completed.stderr
+    assert code == 1, plan
     assert plan["mutation_performed"] is False
     assert plan["details"]["predecessor"]["verdict"] == "MISSING"
     assert plan["details"]["predecessor"]["valid"] is False
@@ -571,40 +635,59 @@ def test_executor_readiness_fixture_rejects_a_generic_503() -> None:
 class FakeAdminLifecycleBackend:
     def __init__(self) -> None:
         self.cluster_ids = {"cluster-a"}
+        self.worker_generation = 1
         self.calls = []
 
     def snapshot(self) -> dict:
         values = sorted(self.cluster_ids)
         return {
+            "release_id": "release-test",
             "site_cluster_ids": values,
             "registry_secret_cluster_ids": values,
             "release_state_cluster_ids": values,
             "installation_registry_cluster_ids": values,
             "cpu_control_plane_ready": True,
+            "membership_cpu": {
+                "publication": {"map_sha256": ",".join(values)},
+                "deployments": {
+                    name: {
+                        "uid": name,
+                        "generation": self.worker_generation
+                        if name == "gpu-fault-control-worker"
+                        else 1,
+                    }
+                    for name in (
+                        "gpu-fault-api-ha",
+                        "gpu-fault-control-worker",
+                        "gpu-fault-telemetry-spool-worker",
+                    )
+                },
+            },
         }
 
     def join(self, fault=None) -> dict:
         self.calls.append(("join", fault))
-        if fault == "before-site-commit":
+        if fault == "before-activation":
             return {"phase": "ROLLED_BACK", "cluster_id": "cluster-b"}
         self.cluster_ids.add("cluster-b")
-        if fault == "after-site-commit":
-            return {"phase": "FAILED_AFTER_COMMIT", "cluster_id": "cluster-b"}
+        self.worker_generation += 1
+        if fault == "after-activation":
+            return {"phase": "FAILED_AFTER_ACTIVATION", "cluster_id": "cluster-b"}
         return {"phase": "COMPLETED", "cluster_id": "cluster-b"}
 
     def capture_joined_token(self, cluster_id: str) -> dict:
         self.calls.append(("capture", cluster_id))
-        # Like the live backend: the token stays in memory, the record carries
-        # only its digest.
+        # The private credential is separately protected; evidence has digests.
         return {
             "cluster_id": cluster_id,
-            "token_storage": "memory",
+            "token_storage": "private-bound-file",
             "token_sha256": "a" * 64,
         }
 
     def remove(self, cluster_id: str) -> dict:
         self.calls.append(("remove", cluster_id))
         self.cluster_ids.remove(cluster_id)
+        self.worker_generation += 1
         return {
             "phase": "COMPLETED",
             "cluster_id": cluster_id,
@@ -632,8 +715,8 @@ class FakeAdminLifecycleBackend:
             },
         }
 
-    def cleanup_sensitive_files(self) -> None:
-        self.calls.append(("cleanup", None))
+    def cleanup_sensitive_files(self, *, completed: bool = False) -> None:
+        self.calls.append(("discard-credentials" if completed else "cleanup", None))
 
 
 def test_boot019_runner_executes_and_records_the_full_lifecycle(tmp_path: Path) -> None:
@@ -648,8 +731,8 @@ def test_boot019_runner_executes_and_records_the_full_lifecycle(tmp_path: Path) 
     assert result["status"] == "COMPLETED"
     assert set(result["stages"]) == {
         "baseline",
-        "join_failure_before_site_commit",
-        "join_failure_after_site_commit",
+        "join_failure_before_activation",
+        "join_failure_after_activation",
         "join_resumed",
         "joined_snapshot",
         "joined_token_captured",
@@ -661,8 +744,8 @@ def test_boot019_runner_executes_and_records_the_full_lifecycle(tmp_path: Path) 
         "uninstall_keep_cpu",
     }
     assert backend.calls == [
-        ("join", "before-site-commit"),
-        ("join", "after-site-commit"),
+        ("join", "before-activation"),
+        ("join", "after-activation"),
         ("join", None),
         ("capture", "cluster-b"),
         ("remove", "cluster-b"),
@@ -670,8 +753,12 @@ def test_boot019_runner_executes_and_records_the_full_lifecycle(tmp_path: Path) 
         ("remove", "cluster-a"),
         ("uninstall", None),
         ("cleanup", None),
+        ("discard-credentials", None),
     ]
-    assert result["stages"]["joined_token_captured"]["token_storage"] == "memory"
+    assert (
+        result["stages"]["joined_token_captured"]["token_storage"]
+        == "private-bound-file"
+    )
     assert "token_path" not in result["stages"]["joined_token_captured"]
     assert result["stages"]["uninstall_keep_cpu"]["registry_entries_preserved"] == 2
     assert evidence.stat().st_mode & 0o777 == 0o600
@@ -754,13 +841,19 @@ def test_ha007_budgets_come_from_the_generated_control_worker_manifest() -> None
     assert budgets["lifespan_budget_seconds"] + 5 < budgets["kubernetes_grace_seconds"]
 
 
-def test_ha007_child_uses_the_repository_source_tree(monkeypatch) -> None:
-    monkeypatch.setenv("PYTHONPATH", "/existing/path")
+@pytest.mark.parametrize("existing", ["", "/existing/path"])
+def test_ha007_child_uses_the_repository_source_tree(
+    existing: str, monkeypatch
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", existing)
 
     child_path = _child_environment()["PYTHONPATH"].split(os.pathsep)
 
-    assert child_path[0] == str(ROOT / "src")
-    assert child_path[1:] == ["/existing/path"]
+    assert child_path == [
+        str(ROOT / "src"),
+        str(ROOT),
+        *([existing] if existing else []),
+    ]
 
 
 def test_ha008_acceptance_runs_both_fatal_exit_branches(tmp_path: Path) -> None:
@@ -827,24 +920,6 @@ def test_probe_pod_commands_run_the_script_the_configmap_publishes() -> None:
         assert "/scripts/{SCRIPT.name}" in source, (
             f"{module_name} must exec SCRIPT.name"
         )
-
-
-def test_runners_with_their_own_plan_builder_record_the_site_profile() -> None:
-    """HA-001 once built its own plan without ``site_profile``.
-
-    ``authorize_execution`` compares the plan against ``applied_site_profile()``
-    at --execute time, so a runner that writes its own plan.json must record
-    the profile or every --execute under a profile fails with plan drift.
-    """
-    regional = Path(__file__).resolve().parents[2] / "scripts" / "e2e" / "regional"
-    offenders = []
-    for path in sorted(regional.glob("run_*.py")):
-        source = path.read_text(encoding="utf-8")
-        if "def build_plan(" not in source or "authorize_execution(" not in source:
-            continue
-        if '"site_profile": applied_site_profile()' not in source:
-            offenders.append(path.name)
-    assert not offenders, f"plan builders without site_profile: {offenders}"
 
 
 def test_a_completed_recorder_drops_the_error_of_the_attempt_it_resumed(

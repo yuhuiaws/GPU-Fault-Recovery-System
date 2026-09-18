@@ -114,7 +114,7 @@ def test_the_shipped_window_leaves_the_attempt_margin_it_promises() -> None:
         lifetime_seconds=verdicts.LIFETIME_SECONDS,
         cadence_seconds=verdicts.CADENCE_FLOOR_SECONDS,
     )
-    assert attempts == 18
+    assert attempts == 36
     assert attempts + verdicts.ATTEMPT_MARGIN <= verdicts.VERIFY_MAX_ATTEMPTS
     # The window compresses the per-step waiting cap down to the lifetime: the
     # control plane refuses a step cap *above* the lifetime, and a cap *below*
@@ -211,7 +211,7 @@ def test_timing_evidence_records_the_arithmetic_a_reviewer_must_redo() -> None:
     evidence = verdicts.timing_evidence(
         lifetime_seconds=180, execution_timeout_seconds=180, cadence_seconds=6.0
     )
-    assert evidence["worst_case_verify_attempts"] == 15
+    assert evidence["worst_case_verify_attempts"] == 30
     assert evidence["cadence_seconds"] == 6.0
     assert evidence["attempt_margin"] == verdicts.ATTEMPT_MARGIN
     assert (
@@ -1437,3 +1437,27 @@ def test_the_preflight_refuses_a_node_carrying_an_open_lifetime_incident(
     assert not any("open incident" in e for e in _preflight_errors(tmp_path)), (
         "a node without open incidents must not be refused for one"
     )
+
+
+def test_the_waiting_hold_is_found_on_the_compound_agent_command() -> None:
+    commands = happy_commands()
+    commands[1] = _command(
+        "QUIESCE_GPU_SERVICES",
+        status="FAILED",
+        status_source=verdicts.CANCELLED_BY_TIMEOUT,
+        updated_at=T_CANCEL,
+        result_details={
+            "gpu_client_quiesce_attempt": 16,
+            "batched_step_index": 3,
+            "reason": "GPU device clients are still active: GPU-1:1:holder",
+        },
+        command_id=f"{WORKFLOW_ID}/2/QUIESCE_GPU_SERVICES/compound",
+    )
+    commands[1]["step_index"] = 2
+    commands[1]["batched_steps"] = [
+        {"step_index": 3, "step": {"operation": verdicts.WAITING_STEP}}
+    ]
+    assert verdicts.remote_command_errors(commands, t_cancel=T_CANCEL) == []
+    del commands[1]
+    errors = verdicts.remote_command_errors(commands, t_cancel=T_CANCEL)
+    assert f"no remote command was issued for {verdicts.WAITING_STEP}" in _text(errors)

@@ -1,25 +1,31 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
-from functools import lru_cache
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, Mapping
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.policy import load_xid_policy
 
-if __package__:
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.ci_coverage_gate import parse_combined_pytest_receipt
+from tools.regional_native_prerequisites import native_prerequisite_reason
+
+if TYPE_CHECKING or __package__:
     from .case_scheduler import (
         ENVIRONMENT_MODES,
         FAILURE_SCOPES,
@@ -28,7 +34,12 @@ if __package__:
         ResourceLock,
         run_scheduled_cases,
     )
-    from .pytest_result_identity import source_identity
+    from .pytest_result_identity import (
+        PytestReceipt,
+        load_pytest_receipt,
+        normalized_pytest_nodeid,
+        source_identity,
+    )
 else:
     from case_scheduler import (
         ENVIRONMENT_MODES,
@@ -38,7 +49,12 @@ else:
         ResourceLock,
         run_scheduled_cases,
     )
-    from pytest_result_identity import source_identity
+    from pytest_result_identity import (
+        PytestReceipt,
+        load_pytest_receipt,
+        normalized_pytest_nodeid,
+        source_identity,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -192,7 +208,7 @@ ISOLATED_ENVIRONMENT_NAMES = (
 )
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
+class UniqueKeyLoader(yaml.SafeLoader):
     def construct_mapping(self, node, deep=False):
         self.flatten_mapping(node)
         mapping = {}
@@ -501,9 +517,13 @@ def _expand_generated_families(
 def load_catalog(path: Path) -> list[dict[str, Any]]:
     value = yaml.load(
         path.read_text(encoding="utf-8"),
-        Loader=_UniqueKeyLoader,
+        Loader=UniqueKeyLoader,
     )
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+    ):
         raise ValueError("fault scenario catalog schema_version must be 1")
     cases = value.get("test_cases")
     if not isinstance(cases, list) or not cases:
@@ -613,7 +633,85 @@ def build_isolated_environment(
     environment.setdefault("PATH", os.defpath)
     environment["GPU_FAULT_STORE_URL"] = ""
     environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
+    environment["AWS_CONFIG_FILE"] = os.devnull
+    environment["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
+    environment["BOTO_CONFIG"] = os.devnull
+    environment["AWS_EC2_METADATA_DISABLED"] = "true"
+    environment["KUBECONFIG"] = os.devnull
     return environment
+
+
+def _is_pytest_command(command: Sequence[str]) -> bool:
+    return bool(command) and (
+        Path(command[0]).name in {"pytest", "py.test"}
+        or "-mpytest" in command[1:]
+        or any(
+            left == "-m" and right == "pytest"
+            for left, right in zip(command[1:], command[2:])
+        )
+    )
+
+
+def _pytest_record_passed(record: object) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("status") == "PASS"
+        and record.get("phases")
+        == {"setup": "passed", "call": "passed", "teardown": "passed"}
+    )
+
+
+def run_reported_pytest(
+    command: list[str],
+    *,
+    environment: Mapping[str, str],
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[subprocess.CompletedProcess[str], PytestReceipt, str | None]:
+    """Run a fresh source-bound pytest session without inherited selection filters."""
+    identity = source_identity(ROOT)
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-pytest-case-") as directory:
+        report_path = Path(directory) / "report.json"
+        child_environment = dict(environment)
+        child_environment[PYTEST_BATCH_REPORT_ENV] = str(report_path)
+        for name in (
+            "PYTEST_ADDOPTS",
+            "PYTEST_GPU_FAULT_PARTITION_COUNT",
+            "PYTEST_GPU_FAULT_PARTITION_INDEX",
+        ):
+            child_environment.pop(name, None)
+        completed = (subprocess.run if runner is None else runner)(
+            [*command, "-p", "tools.pytest_case_reporter", "-o", "addopts="],
+            cwd=ROOT,
+            env=child_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            **({"timeout": timeout_seconds} if timeout_seconds is not None else {}),
+        )
+        try:
+            if completed.returncode not in {0, 1}:
+                raise ValueError("pytest did not complete normal test execution")
+            if source_identity(ROOT) != identity:
+                raise ValueError("source changed during pytest contract execution")
+            receipt = load_pytest_receipt(
+                report_path,
+                root=ROOT,
+                expected_identity=identity,
+                require_session=True,
+                expected_exitstatus=completed.returncode,
+            )
+            if completed.returncode and all(
+                _pytest_record_passed(record) for record in receipt.records.values()
+            ):
+                raise ValueError("pytest failure has no corresponding test result")
+        except ValueError as exc:
+            return completed, PytestReceipt({}), str(exc)
+        return completed, receipt, None
+
+
+_run_reported_pytest = run_reported_pytest
 
 
 def run_case(
@@ -665,20 +763,65 @@ def run_case(
         command.append(str(case["pytest_nodeid"]))
     else:
         command = [str(item) for item in case["command"]]
+    if reason := native_prerequisite_reason(case):
+        return {
+            **{
+                key: case[key]
+                for key in (
+                    "id",
+                    "title",
+                    "category",
+                    "level",
+                    "risk",
+                    "problem",
+                    "injection",
+                    "expected",
+                )
+            },
+            "status": "BLOCKED",
+            "reason": reason,
+            "executor": command,
+            "started_at": started.isoformat(),
+            "duration_seconds": 0.0,
+            "output": "",
+        }
     child_environment = dict(os.environ if environment is None else environment)
     if environment_overrides:
         child_environment.update(environment_overrides)
     if case.get("capture_processing_trace"):
         child_environment[TRACE_ENV] = "1"
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=child_environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+    pytest_error = None
+    pytest_passed = True
+    if _is_pytest_command(command):
+        completed, receipt, pytest_error = _run_reported_pytest(
+            command, environment=child_environment
+        )
+        records: Sequence[object] = list(receipt.records.values())
+        if case["automation"] == "pytest":
+            records, selection_error = receipt.selection(
+                normalized_pytest_nodeid(str(case["pytest_nodeid"]), root=ROOT)
+            )
+            pytest_error = pytest_error or selection_error
+        elif receipt.collection_skips:
+            pytest_error = pytest_error or (
+                "pytest skipped collector assertions: "
+                + ", ".join(receipt.collection_skips[:20])
+            )
+        pytest_passed = (
+            bool(records)
+            and all(_pytest_record_passed(record) for record in records)
+            and pytest_error is None
+        )
+    else:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=child_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
     trace = None
     output = completed.stdout.strip()
     trace_error = None
@@ -689,6 +832,7 @@ def run_case(
     trace_required = bool(case.get("capture_processing_trace"))
     passed = (
         completed.returncode == 0
+        and pytest_passed
         and trace_error is None
         and (not trace_required or trace is not None)
     )
@@ -715,6 +859,8 @@ def run_case(
         result["trace_error"] = (
             trace_error or "required processing trace was not emitted"
         )
+    if pytest_error is not None:
+        result["pytest_error"] = pytest_error
     return result
 
 
@@ -733,43 +879,29 @@ def pytest_batch_eligible(
     )
 
 
-def _normalized_pytest_nodeid(value: str) -> str:
-    path_text, separator, selector = value.partition("::")
-    path = Path(path_text)
-    resolved = (path if path.is_absolute() else ROOT / path).resolve()
-    return str(resolved) + (f"::{selector}" if separator else "")
-
-
 def _results_from_pytest_records(
     requested: Mapping[str, dict[str, Any]],
     *,
-    normalized_records: Mapping[str, object],
+    receipt: PytestReceipt,
     started: datetime,
     batch_output: str,
 ) -> dict[str, dict[str, Any]]:
     normalized = {
-        _normalized_pytest_nodeid(nodeid): case for nodeid, case in requested.items()
+        normalized_pytest_nodeid(nodeid, root=ROOT): case
+        for nodeid, case in requested.items()
     }
     if len(normalized) != len(requested):
         raise ValueError("pytest cases must use unique nodeids")
     results: dict[str, dict[str, Any]] = {}
     for nodeid, case in requested.items():
-        normalized_nodeid = _normalized_pytest_nodeid(nodeid)
-        exact = normalized_records.get(normalized_nodeid)
-        records_for_case = (
-            [exact]
-            if isinstance(exact, dict)
-            else [
-                record
-                for reported_nodeid, record in normalized_records.items()
-                if reported_nodeid.startswith(normalized_nodeid + "[")
-                and isinstance(record, dict)
-            ]
+        records_for_case, selection_error = receipt.selection(
+            normalized_pytest_nodeid(nodeid, root=ROOT)
         )
         if records_for_case:
             status = (
                 "PASS"
-                if all(record.get("status") == "PASS" for record in records_for_case)
+                if selection_error is None
+                and all(_pytest_record_passed(record) for record in records_for_case)
                 else "FAIL"
             )
             output = "\n".join(
@@ -788,10 +920,12 @@ def _results_from_pytest_records(
             status = "FAIL"
             output = (
                 f"pytest produced no result for {nodeid}; "
-                f"available={sorted(normalized_records)}"
+                f"available={sorted(receipt.records)}"
                 + (f"\n{batch_output}" if batch_output else "")
             )
             duration = 0.0
+        if selection_error is not None:
+            output = f"{output}\n{selection_error}".strip()
         results[str(case["id"])] = {
             "id": case["id"],
             "title": case["title"],
@@ -822,43 +956,16 @@ def run_pytest_batch(
     requested = {str(case["pytest_nodeid"]): case for case in selected}
     if len(requested) != len(selected):
         raise ValueError("batched pytest cases must use unique nodeids")
-    with tempfile.TemporaryDirectory(prefix="gpu-fault-pytest-batch-") as directory:
-        report_path = Path(directory) / "report.json"
-        child_environment = dict(os.environ if environment is None else environment)
-        child_environment[PYTEST_BATCH_REPORT_ENV] = str(report_path)
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "-p",
-                "tools.pytest_case_reporter",
-                *requested,
-            ],
-            cwd=ROOT,
-            env=child_environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-        try:
-            records = _load_pytest_result_records(report_path)
-        except ValueError:
-            records = {}
-    batch_output = (completed.stdout or "").strip()
-    normalized_records = (
-        {
-            _normalized_pytest_nodeid(str(nodeid)): record
-            for nodeid, record in records.items()
-        }
-        if isinstance(records, dict)
-        else {}
+    completed, receipt, proof_error = _run_reported_pytest(
+        [sys.executable, "-m", "pytest", "-q", *requested],
+        environment=os.environ if environment is None else environment,
     )
+    batch_output = (completed.stdout or "").strip()
+    if proof_error is not None:
+        batch_output = f"{batch_output}\n{proof_error}".strip()
     return _results_from_pytest_records(
         requested,
-        normalized_records=normalized_records,
+        receipt=receipt,
         started=started,
         batch_output=batch_output,
     )
@@ -869,35 +976,21 @@ def load_pytest_results(
     *,
     path: Path,
 ) -> dict[str, dict[str, Any]]:
-    records = _load_pytest_result_records(path)
+    receipt = load_pytest_receipt(
+        path,
+        root=ROOT,
+        expected_identity=source_identity(ROOT),
+        aggregate_parser=parse_combined_pytest_receipt,
+    )
     selected = tuple(cases)
     started = datetime.now(timezone.utc)
     requested = {str(case["pytest_nodeid"]): case for case in selected}
-    normalized_records = {
-        _normalized_pytest_nodeid(str(nodeid)): record
-        for nodeid, record in records.items()
-    }
     return _results_from_pytest_records(
         requested,
-        normalized_records=normalized_records,
+        receipt=receipt,
         started=started,
         batch_output="",
     )
-
-
-def _load_pytest_result_records(path: Path) -> dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"pytest case results are invalid: {path}") from exc
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != PYTEST_RESULT_SCHEMA_VERSION
-        or value.get("source_identity") != source_identity(ROOT)
-        or not isinstance(value.get("records"), dict)
-    ):
-        raise ValueError("pytest case result identity does not match current source")
-    return dict(value["records"])
 
 
 def execution_policy(case: dict[str, Any]) -> ExecutionPolicy:

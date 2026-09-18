@@ -8,7 +8,8 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from gpu_fault.app.admission_runtime import NulInRequestBody, declared_body_oversize
+from gpu_fault.app.admission_runtime import NulInRequestBody
+from gpu_fault.app.request_body import read_bounded_request_body
 from gpu_fault.async_store import RequestDeadlineExceeded, StoreIoCapacityExceeded
 from gpu_fault.regional_registry_runtime import regional_cluster_request_allowed
 
@@ -210,17 +211,12 @@ def install_regional_authorization(
                     },
                 )
             if request.method in {"POST", "PUT", "PATCH"}:
-                # This is the first ``await request.body()`` on the regional
-                # path, so the declared-length gate has to sit here: behind
-                # it, dispatch's copy measured a body already resident (A-3).
-                if declared_body_oversize(
-                    request.headers, dependencies.processor_max_request_bytes
-                ):
-                    return oversize_response()
-                body = await request.body()
                 payload = request.scope.get("gpu_fault_json_payload")
                 pool = decode_pool(request.url.path)
                 try:
+                    body = await read_bounded_request_body(
+                        request, dependencies.processor_max_request_bytes
+                    )
                     if payload is None:
                         body, payload, payload_clusters = await pool.run(
                             decode_and_scan,

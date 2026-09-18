@@ -29,7 +29,12 @@ sixth one cannot appear by accident:
 - `store_io_rejection_series.py` takes its parameters as one JSON object in
   `sys.argv[1]`. The `kubectl exec` that runs it has no `-i`, so stdin is not
   attached, and adding `-i` for two scalars would change how that exec handles
-  stdin.
+  stdin. Its complete-zero proof requires non-degraded process coverage and all
+  three reasons in every reported bounded process slot, not merely zero values
+  in whichever series happened to arrive. Legacy merged counters cannot
+  authorize this transient alert-settling path. Executable behavior tests mock
+  urllib transport; the probe stays standard-library-only and bounds/closes its
+  local HTTP response without echoing untrusted metric data.
 - `registry_client.py` takes `method path` in argv, because its stdin is the
   request body being sent to the registry API and the method and path cannot
   travel inside it.

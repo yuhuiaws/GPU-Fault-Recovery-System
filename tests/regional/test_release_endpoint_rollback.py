@@ -325,7 +325,9 @@ class PublishingRelease(Release):
         self.blank_reads = blank_reads
         self.verdicts = list(verdicts)
         self.waits: list[tuple[list[str], float]] = []
-        self.runner = SimpleNamespace(run=self._run, probe=self._probe, dry_run=False)
+        self.runner = SimpleNamespace(
+            run=self._run, condition=self._probe, dry_run=False
+        )
 
     def _run(self, arguments: list[str], **kwargs: Any) -> str:
         if "get" in arguments and "jsonpath" in " ".join(arguments):

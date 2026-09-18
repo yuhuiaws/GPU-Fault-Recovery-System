@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -33,6 +34,39 @@ def test_release_config_requires_unique_clusters(tmp_path) -> None:
 
     with pytest.raises(MODULE.ReleaseError, match="unique"):
         MODULE.ReleaseConfig.load(config_file(tmp_path, clusters=[cluster, cluster]))
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"installation_id": "not-an-incarnation"},
+        {"retained_database_handoff": "/secure/installation-lifecycle.json"},
+        {"installation_id": "a" * 32, "retained_database_handoff": "relative.json"},
+        {"installation_id": 1},
+    ],
+)
+def test_release_config_rejects_unbound_lifecycle_inputs(tmp_path, inputs):
+    path = config_file(tmp_path)
+    value = {**json.loads(path.read_text()), **inputs}
+    path.write_text(json.dumps(value))
+    with pytest.raises(
+        MODULE.ReleaseError, match="installation|retained_database_handoff"
+    ):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_preserves_explicit_retained_handoff_binding(tmp_path):
+    path = config_file(tmp_path)
+    handoff = tmp_path / "installation-lifecycle.json"
+    value = {
+        **json.loads(path.read_text()),
+        "installation_id": "a" * 32,
+        "retained_database_handoff": str(handoff),
+    }
+    path.write_text(json.dumps(value))
+    config = MODULE.ReleaseConfig.load(path)
+    assert config.installation_id == "a" * 32
+    assert config.retained_database_handoff == handoff
 
 
 def test_release_config_requires_runtime_profile_inputs(tmp_path: Path) -> None:
@@ -390,3 +424,46 @@ def test_release_config_loads_health_targets(tmp_path: Path) -> None:
     assert config.health.amp_workspace_id == "ws-test"
     assert config.health.certificate_min_validity_days == 45
     assert config.health.remote_command_max_unclaimed_seconds == 240
+
+
+def test_manifest_artifacts_resolve_against_the_manifests_own_repository_root(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    entrypoint = snapshot / "deploy/control-plane/regional/rollout-regional-release.sh"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (snapshot / "scripts").mkdir()
+    release_dir = snapshot / "dist/abc123def456"
+    release_dir.mkdir(parents=True)
+    wheel = release_dir / "control-plane.whl"
+    bundle = release_dir / "node-installer.tar.gz"
+    wheel.write_bytes(b"wheel")
+    bundle.write_bytes(b"bundle")
+    manifest = snapshot / "dist/current-release.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "release_id": "abc123def456",
+                "wheel": wheel.relative_to(snapshot).as_posix(),
+                "wheel_sha256": hashlib.sha256(b"wheel").hexdigest(),
+                "bundle": bundle.relative_to(snapshot).as_posix(),
+                "bundle_sha256": hashlib.sha256(b"bundle").hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    value = json.loads(config_file(tmp_path).read_text(encoding="utf-8"))
+    value["release"] = {"manifest": str(manifest), "agent_config_digest": "a" * 64}
+    elsewhere = tmp_path / "materialized"
+    elsewhere.mkdir()
+    path = elsewhere / "regional-release.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    config = MODULE.ReleaseConfig.load(path)
+
+    assert config.release_id == "abc123def456", "load the manifest's release identity"
+    assert config.wheel == wheel, "the control-plane wheel belongs to the snapshot"
+    assert config.executor_wheel == wheel, "legacy Executor keeps the shared wheel"
+    assert config.node_wheel == wheel, "legacy Node Runtime keeps the shared wheel"
+    assert config.bundle == bundle, "the node bundle belongs to the same snapshot"

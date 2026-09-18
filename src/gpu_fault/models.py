@@ -16,6 +16,8 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, core_schema
 
+from gpu_fault.restart_containment import RestartContainmentProof
+
 
 def datetime_json_text(value: datetime) -> str:
     """The one JSON text every ``StrictModel`` datetime field serializes to.
@@ -199,6 +201,10 @@ class HealthSignalState(StrictModel):
     # Control-plane time of the last accepted sample (F-M2). Durations and
     # ordering run on it when present; ``observed_at`` is the node's clock.
     clock_at: datetime | None = None
+    semantic_fingerprint: str | None = Field(default=None, min_length=1, max_length=256)
+    # Beginning of the current meaning, independently of the active-duration
+    # window. A -> B -> A creates three distinct receive-clock episodes.
+    semantic_since: datetime | None = None
 
 
 class EfaTrafficSignal(StrEnum):
@@ -973,6 +979,7 @@ class RestartAuthorization(StrictModel):
     restart_budget: int = Field(ge=0)
     restart_count: int = Field(ge=1)
     reservation_id: str
+    containment: RestartContainmentProof | None = None
 
 
 class WorkflowExecutionRequest(StrictModel):
@@ -1038,6 +1045,10 @@ def bounded_reasons(
     and the plain head-plus-tail shape is kept.
     """
 
+    if limit < 0:
+        raise ValueError("reason limit must be nonnegative")
+    if limit == 0:
+        return []
     previously_dropped = 0
     unique: list[str] = []
     for value in dict.fromkeys(values):
@@ -1152,7 +1163,9 @@ def append_workflow_event(
         raw_from = item.details.get("dropped_from")
         if dropped_from is None and isinstance(raw_from, str):
             dropped_from = raw_from
-    dropped_events = remaining[head : len(remaining) - tail]
+    kept_head = remaining[:head]
+    tail_start = max(len(kept_head), len(remaining) - tail)
+    dropped_events = remaining[len(kept_head) : tail_start]
     dropped = previously_dropped + len(dropped_events)
     dropped_to: str | None
     if dropped_events:
@@ -1162,7 +1175,7 @@ def append_workflow_event(
         marker_at = dropped_events[-1].at
     else:
         dropped_to = dropped_from
-        marker_at = remaining[head - 1].at if head else event.at
+        marker_at = kept_head[-1].at if kept_head else event.at
     marker = WorkflowEvent(
         kind=WorkflowEventKind.HISTORY_TRUNCATED,
         at=marker_at,
@@ -1178,7 +1191,7 @@ def append_workflow_event(
             "dropped_to": dropped_to,
         },
     )
-    kept = [*remaining[:head], marker, *remaining[len(remaining) - tail :]]
+    kept = [*kept_head, marker, *remaining[tail_start:]]
     return workflow.model_copy(update={"events": kept})
 
 

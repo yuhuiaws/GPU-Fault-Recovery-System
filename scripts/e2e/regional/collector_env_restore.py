@@ -8,41 +8,54 @@ Pod can become Ready while the node is down.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, cast
 
-from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeMissingResponseError,
+    HostProbeTransportError,
+)
 
 
-def restore_collector_env(collector: Any, run_id: str) -> dict[str, Any]:
-    """Undo the collector env override, through a fresh probe Pod if needed.
+def restore_collector_env(
+    collector: Any,
+    run_id: str,
+    *,
+    owner_nonce: str,
+    reboot_transition: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Attempt restoration once, deferring only an authorized reboot wait.
 
-    The first attempt goes through the Pod the case has been using; after a
-    real RESTART_NODE that Pod is Failed and `kubectl exec` refuses it, which
-    used to leave the override in place until the on-node deadman timer
-    expired. One recreate-and-retry is what the reboot costs. When even the
-    recreate cannot reach the node -- the restore raced the reboot and the node
-    is down (attempts 3 and 4 failed the whole case here) -- the answer is a
-    deferred restore, not an exception: the on-node boot-time oneshot restores
-    the env before the collector starts, the caller retries once the node is
-    back, and the env digest is checked against the baseline either way.
+    The callback must freshly confirm a bounded, identity-bound reboot wait, not
+    node health. The caller waits for the original node's new boot before
+    recreating the probe and restoring with deferral disabled. Explicit host
+    rejection is always a hard failure; deferral never proves cleanup.
     """
 
-    def attempt() -> dict[str, Any]:
+    try:
         return cast(
             dict[str, Any],
-            collector.execute("restore-collector-env", "--run-id", run_id, timeout=300),
+            collector.execute(
+                "restore-collector-env",
+                "--run-id",
+                run_id,
+                "--owner-nonce",
+                owner_nonce,
+                timeout=300,
+            ),
         )
-
-    try:
-        return attempt()
-    except HostProbeError as first:
-        try:
-            collector.recreate()
-            return attempt()
-        except HostProbeError as exc:
-            return {
-                "restored": False,
-                "deferred": True,
-                "reason": f"probe unavailable while the node reboots: {exc}",
-                "first_error": str(first),
-            }
+    except (HostProbeTransportError, HostProbeMissingResponseError) as exc:
+        if reboot_transition is None or reboot_transition() is not True:
+            raise
+        return {
+            "run_id": run_id,
+            "restored": False,
+            "cleanup_verified": False,
+            "deferred": True,
+            "reason": "probe response unavailable during authorized reboot wait",
+            "error_type": (
+                "HostProbeMissingResponseError"
+                if isinstance(exc, HostProbeMissingResponseError)
+                else "HostProbeTransportError"
+            ),
+        }

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from typing import Any
 
+from gpu_fault.admin.execution import run_command
 from gpu_fault.admin.site import RenderedSite, SiteConfigError
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
@@ -18,7 +18,7 @@ def live_release_state(site: RenderedSite) -> dict[str, Any]:
     namespace = str(site.release_config["namespace"])
 
     def read_config_map(name: str) -> dict[str, Any]:
-        completed = subprocess.run(
+        completed = run_command(
             [
                 "kubectl",
                 "--kubeconfig",
@@ -31,10 +31,7 @@ def live_release_state(site: RenderedSite) -> dict[str, Any]:
                 "-o",
                 "json",
             ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
+            timeout_seconds=30,
         )
         if completed.returncode:
             raise SiteConfigError(f"cannot read live ConfigMap {name}")

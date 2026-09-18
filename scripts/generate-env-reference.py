@@ -49,6 +49,8 @@ ENVIRONMENT_RECEIVERS = frozenset({"environ", "values", "environment", "env"})
 GUARD_EXCEPTIONS = frozenset({"ValueError", "TypeError", "Exception"})
 DYNAMIC_PREFIXES = ("GPU_FAULT_NOTIFICATION_TTL_SECONDS_",)
 NON_RUNTIME_PREFIXES = ("GPU_FAULT_TEST_", "GPU_FAULT_PERF_")
+# Wire tags do not authorize environment settings just because the prefix matches.
+NON_CONFIGURATION_NAMES = frozenset({"GPU_FAULT_FM_RECEIPT_V1"})
 DYNAMIC_VARIABLES = tuple(
     f"GPU_FAULT_PROCESSOR_{prefix}ADMISSION_{suffix}"
     for prefix in ("", "FAULT_", "EVIDENCE_")
@@ -66,6 +68,7 @@ def concrete_name(name: str) -> bool:
         bool(NAME_PATTERN.fullmatch(name))
         and not name.endswith("_")
         and not name.startswith(NON_RUNTIME_PREFIXES)
+        and name not in NON_CONFIGURATION_NAMES
     )
 
 

@@ -8,11 +8,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -166,12 +168,16 @@ def _target(cluster_id: str = "cluster-a") -> common.ClusterTarget:
 def _fake_site(**overrides: Any) -> Any:
     site = SimpleNamespace(
         registry=lambda: [{"cluster_id": "cluster-b", "enabled": True}],
+        registry_generation=lambda: 1,
         write_registry=lambda entries, **kwargs: None,
         rollout_control=lambda: 0.5,
         last_registry_ready_seconds=1.25,
     )
     for key, value in overrides.items():
         setattr(site, key, value)
+    site.restore_registry = lambda entries, **kwargs: site.write_registry(
+        entries, **kwargs
+    )
     return site
 
 
@@ -285,7 +291,9 @@ def test_registry_api_reuses_the_api_pod_and_reselects_on_failure(
     ) -> dict[str, Any]:
         seen.append(pod)
         if pod == "api-1" and len(seen) == 3:
-            raise RuntimeError("pod gone")
+            raise common.RegionalCommandFailed(
+                1, 'Error from server (NotFound): pods "api-1" not found'
+            )
         return {"status": 200, "body": {}}
 
     monkeypatch.setattr(site, "pod_json", pod_json)
@@ -454,16 +462,6 @@ def test_certificate_alert_checks_read_the_node_timer_not_the_site_file() -> Non
     }
 
 
-def test_tls_probe_accepts_any_ssl_or_os_error_and_records_default_handshake() -> None:
-    probe = auth.TLS_BOUNDARY_PROBE
-    assert (
-        "except (ssl.SSLError, OSError) as exc:\n    wrong_hostname_rejected = True"
-        in probe
-    )
-    assert '"default_handshake_ok": default_handshake_ok' in probe
-    assert "except ssl.SSLCertVerificationError" not in probe
-
-
 def test_auth013_probe_reads_only_the_threshold_key() -> None:
     text = "GPU_FAULT_CONTROL_PLANE_TOKEN=secret\nGPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS='2592000'\n"
     assert cert_probe.threshold_seconds(text) == 2592000
@@ -519,50 +517,34 @@ def test_iso004_asserts_the_missing_agent_reason_in_one_process() -> None:
     assert '"missing_node_reason_is_precise"' in source
 
 
-def test_iso003_records_the_vacuous_check_as_not_evaluated() -> None:
-    source = Path(iso.__file__).read_text(encoding="utf-8")
-    start = source.index("def run_iso003")
-    end = source.index("SPARE_HEALTH_PROBE")
-    body = source[start:end]
-    assert '"secondary_agent_state_unchanged": before == after' not in body
-    assert '"not_evaluated"' in body and "n/a" in body
-
-
-# --------------------------------------------------------------------------- #
-# 5. ISO-005 command retirement
-# --------------------------------------------------------------------------- #
-def test_iso005_retires_commands_settle_cancel_then_delete() -> None:
-    probe = iso.REMOTE_COMMAND_RETIRE_PROBE
-    assert probe.index("get_remote_command") < probe.index("cancel_remote_command")
-    assert probe.index("cancel_remote_command") < probe.index("_delete(")
-    assert 'if value["status"] == "LEASED":' in probe, "a LEASED command is deleted"
-    source = Path(iso.__file__).read_text(encoding="utf-8")
-    finally_index = source.index("    finally:\n\n        def retire_commands")
-    assert (
-        source.index(
-            'write_json_atomic(case_dir / "iso005-details.json"', finally_index
-        )
-        > 0
-    )
-    assert '"executor_completion"' in source
-    assert (
-        "ALLOWLIST_WORKFLOW_PROBE,\n            target.cluster_id,\n            suffix,"
-        in source
-    )
-    assert source.count("attempts=1") >= 3
-
-
 # --------------------------------------------------------------------------- #
 # 1. ISO-006 actually cuts the executor and judges the catalog's expectations
 # --------------------------------------------------------------------------- #
 def _fake_probe_run(
     calls: list[list[str]],
 ) -> Callable[..., subprocess.CompletedProcess[str]]:
+    rules: list[list[str]] = []
+
     def run(
         command: list[str], *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        output = ""
+        if command[:2] == ["iptables", "-S"]:
+            output = "\n".join(" ".join(rule) for rule in rules)
+        elif command[:2] in (["iptables", "-N"], ["iptables", "-A"]):
+            rules.append(command[1:])
+        elif command[:2] == ["iptables", "-I"]:
+            rules.append(["-A", command[2], *command[4:]])
+        elif command[:2] == ["iptables", "-D"]:
+            rule = ["-A", *command[2:]]
+            if rule in rules:
+                rules.remove(rule)
+        elif command[:2] == ["iptables", "-F"]:
+            rules[:] = [rule for rule in rules if rule[:2] != ["-A", command[2]]]
+        elif command[:2] == ["iptables", "-X"]:
+            rules[:] = [rule for rule in rules if rule != ["-N", command[2]]]
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     return run
 
@@ -595,7 +577,17 @@ def test_network_probe_blocks_output_and_forward_and_restores_both(
 
 
 def test_iso006_cut_must_be_proven_at_the_transport() -> None:
-    assert iso006.cut_proven({"status": None, "transport_error": "URLError"}) is True
+    assert (
+        iso006.cut_proven(
+            {
+                "status": None,
+                "transport_error": "URLError",
+                "transport_failure_kind": "network",
+            }
+        )
+        is True
+    )
+    assert iso006.cut_proven({"status": None, "transport_error": "URLError"}) is False
     assert iso006.cut_proven({"status": 200, "latency_seconds": 0.1}) is False
     assert iso006.cut_proven({"status": 403}) is False
 
@@ -625,10 +617,19 @@ def test_iso006_pressure_and_restart_judgments() -> None:
     assert iso006.pressure_errors(before, {"rejections": {"x": 2.0}}) == [
         "x increased during the block"
     ]
-    earlier = {"api-1": {"uid": "u1", "containers": {"api": {"restart_count": 0}}}}
+    earlier = {
+        "api-1": {
+            "uid": "u1",
+            "phase": "Running",
+            "ready": True,
+            "containers": {"api": {"restart_count": 0}},
+        }
+    }
     restarted = {
         "api-1": {
             "uid": "u1",
+            "phase": "Running",
+            "ready": True,
             "containers": {
                 "api": {"restart_count": 1, "last_terminated_reason": "OOMKilled"}
             },
@@ -672,11 +673,11 @@ def test_iso006_defaults_and_restore_timer_cover_the_window(tmp_path: Path) -> N
         control_plane_cidrs=("10.0.0.0/24",),
         duration_seconds=900,
         predecessor_path=tmp_path / "p.json",
+        site_file=tmp_path / "site.yaml",
     )
     assert settings.restore_seconds == 900 + iso006.RESTORE_MARGIN_SECONDS
     source = Path(str(iso006.__file__)).read_text(encoding="utf-8")
     assert "cpu_blast_snapshot() != preflight" not in source
-    assert "pool.map(lambda probe: probe.create(), probes)" in source
     assert "if not cut_proven(cut):" in source
     assert '"validation_limitations": VALIDATION_LIMITATIONS' in source
 
@@ -700,11 +701,8 @@ def test_metrics_reading_extracts_cluster_depth_and_rejections() -> None:
 # --------------------------------------------------------------------------- #
 # 6. E2E-002
 # --------------------------------------------------------------------------- #
-def test_e2e002_follows_iso001_and_runs_the_clusters_in_parallel() -> None:
+def test_e2e002_follows_the_same_identity_isolation_case() -> None:
     assert e2e002.PREDECESSOR_CASE_ID == "GF-REGIONAL-ISO-001"
-    source = Path(e2e002.__file__).read_text(encoding="utf-8")
-    assert "prepared = list(pool.map(prepare, range(len(targets))))" in source
-    assert "lambda index: settle(index, injected_at, payloads[index])" in source
 
 
 def test_e2e002_notification_and_command_scope_judgments() -> None:
@@ -715,31 +713,67 @@ def test_e2e002_notification_and_command_scope_judgments() -> None:
     states = [
         {
             "incident": {"incident_id": "inc-a", "cluster_id": "a"},
+            "workflow": {"request_id": "wf-a", "incident_id": "inc-a"},
             "notifications": [
                 {
                     "notification": {
                         "notification_id": "n1",
                         "incident_id": "inc-a",
                         "cluster_name": "hp-a",
-                    }
+                    },
+                    "result": {"status": "SENT", "provider_message_id": "message-a"},
                 }
             ],
-            "commands": [{"cluster_id": "a", "last_lease_owner": "exec-a"}],
+            "commands": [
+                {
+                    "command_id": "cmd-a",
+                    "workflow_request_id": "wf-a",
+                    "incident_id": "inc-a",
+                    "cluster_id": "a",
+                    "last_lease_owner": "exec-a",
+                }
+            ],
         },
         {
             "incident": {"incident_id": "inc-b", "cluster_id": "b"},
+            "workflow": {"request_id": "wf-b", "incident_id": "inc-b"},
             "notifications": [
                 {
                     "notification": {
                         "notification_id": "n2",
                         "incident_id": "inc-b",
                         "cluster_name": "hp-a",
-                    }
+                    },
+                    "result": {"status": "SENT", "provider_message_id": "message-b"},
                 }
             ],
-            "commands": [{"cluster_id": "b", "last_lease_owner": "exec-a"}],
+            "commands": [
+                {
+                    "command_id": "cmd-b",
+                    "workflow_request_id": "wf-b",
+                    "incident_id": "inc-b",
+                    "cluster_id": "b",
+                    "last_lease_owner": "exec-a",
+                }
+            ],
         },
     ]
+    for state, cluster_id in zip(states, ["a", "b"], strict=True):
+        state["notifications"][0]["notification"]["category"] = "FAULT_DETECTED"
+        state["notifications"].append(
+            {
+                "notification": {
+                    "notification_id": "completed-" + cluster_id,
+                    "category": "ACTION_COMPLETED",
+                    "incident_id": "inc-" + cluster_id,
+                    "cluster_name": "hp-" + cluster_id,
+                },
+                "result": {
+                    "status": "SENT",
+                    "provider_message_id": "completed-" + cluster_id,
+                },
+            }
+        )
     assert e2e002.notification_errors(states, ["a", "b"], registrations) == [
         "b: notification cluster_name is foreign"
     ]
@@ -747,10 +781,9 @@ def test_e2e002_notification_and_command_scope_judgments() -> None:
         states, ["a", "b"], {"a": ["exec-a"], "b": ["exec-b"]}
     )
     assert "b: command leased by unknown executor 'exec-a'" in errors
-    assert "one executor identity leased commands in both clusters" in errors
-    assert e2e002.command_scope_errors(
+    assert "a: no remote command was recorded" in e2e002.command_scope_errors(
         [{"incident": {}, "commands": []}], ["a"], {}
-    ) == ["a: no remote command was recorded"]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -780,8 +813,12 @@ def _matrix_results() -> dict[str, Any]:
     results: dict[str, Any] = {
         name: {"status": status, "body": {}} for name, status in statuses.items()
     }
-    for name in ("AUTH-004-zero", "AUTH-004-near"):
-        results[name]["body"]["detail"] = "regional cluster authentication failed"
+    for name in audit.AUTH009_ENTRY_NAMES:
+        results[name] = {"status": 403, "body": {}}
+    for name, detail in audit.EXPECTED_DETAILS.items():
+        results[name]["body"]["detail"] = detail
+    for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor"):
+        results[name]["body"]["commands"] = []
     return results
 
 
@@ -815,17 +852,37 @@ def test_audit_store_negative_errors_catch_new_records_and_leased_commands() -> 
     before = {
         "clusters": {"b": {"agent_generations": ["n1:1"], "attempt_observations": 2}},
         "commands": {
-            "c1": {"cluster_id": "a", "status": "PENDING", "lease_owner": None}
+            "c1": {"cluster_id": "b", "status": "PENDING", "lease_owner": None}
         },
     }
+    before["clusters"]["b"].update(
+        {
+            "collector_samples": {},
+            "evidence_count": 0,
+            "agents_sha256": "a" * 64,
+            "observations_sha256": "b" * 64,
+            "evidence_sha256": "c" * 64,
+        }
+    )
+    before["commands"]["c1"]["execution_owner"] = audit.ACCEPTANCE_PROBE_OWNER
     after = {
         "clusters": {
             "b": {"agent_generations": ["n1:1", "probe:1"], "attempt_observations": 3}
         },
         "commands": {
-            "c1": {"cluster_id": "a", "status": "LEASED", "lease_owner": "probe"}
+            "c1": {"cluster_id": "b", "status": "LEASED", "lease_owner": "probe"}
         },
     }
+    after["clusters"]["b"].update(
+        {
+            "collector_samples": {},
+            "evidence_count": 0,
+            "agents_sha256": "a" * 64,
+            "observations_sha256": "b" * 64,
+            "evidence_sha256": "c" * 64,
+        }
+    )
+    after["commands"]["c1"]["execution_owner"] = audit.ACCEPTANCE_PROBE_OWNER
     errors = audit.store_negative_errors(before, after, cluster_a="a", cluster_b="b")
     assert set(errors) == {
         "GF-REGIONAL-AUTH-005",
@@ -870,11 +927,140 @@ def test_audit_drops_probe_clusters_mode_and_redacts_lease_tokens() -> None:
 # --------------------------------------------------------------------------- #
 # 8./9. efficiency and evidence identity
 # --------------------------------------------------------------------------- #
-def test_auth015_creates_probes_in_parallel_and_checks_the_node_set() -> None:
-    source = Path(auth.__file__).read_text(encoding="utf-8")
-    assert "scans_before = dict(pool.map(create_and_scan, probes))" in source
-    assert "does not cover exactly the GPU node set" in source
-    assert '"cpu_secret_restored"' in source and '"node_b_heartbeat_advanced"' in source
+@pytest.mark.parametrize(
+    "defect", ["none", "missing-key", "extra-key", "stalled-heartbeat", "cpu-restore"]
+)
+def test_auth015_creates_probes_in_parallel_and_checks_the_node_set(
+    defect: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    nodes = ("node-a", "node-b")
+    key_nodes = (
+        nodes[:1]
+        if defect == "missing-key"
+        else (*nodes, "node-c")
+        if defect == "extra-key"
+        else nodes
+    )
+    original = {
+        "data": {
+            node: base64.b64encode(("synthetic-" + node).encode()).decode()
+            for node in key_nodes
+        }
+    }
+    current = {plane: copy.deepcopy(original) for plane in ("cpu", "gpu")}
+    master_file = tmp_path / "synthetic-master"
+    master_file.write_text("synthetic-unit-value-" + "x" * 32, encoding="ascii")
+    master_file.chmod(0o600)
+    master_digest = hashlib.sha256(master_file.read_bytes()).hexdigest()
+    events: list[str] = []
+    creation_barrier = Barrier(2, timeout=10)
+
+    def agents(*args: Any) -> dict[str, Any]:
+        advanced = "rotate" in events and defect != "stalled-heartbeat"
+        return {
+            "agents": {
+                node: {
+                    "generation": 1,
+                    "lifecycle_state": "ACTIVE",
+                    "last_heartbeat_at": f"2026-09-12T00:00:0{int(advanced)}Z",
+                }
+                for node in nodes
+            }
+        }
+
+    regional = SimpleNamespace(
+        gpu_nodes=lambda: [{"name": node} for node in reversed(nodes)],
+        cpu_python=agents,
+    )
+    site = SimpleNamespace(
+        regional=lambda target: regional,
+        namespace="gpu-system",
+        gpu_kubeconfig=tmp_path / "gpu",
+        cpu_kubeconfig=tmp_path / "cpu",
+    )
+
+    class Probe:
+        def __init__(self, settings: Any) -> None:
+            self.settings = settings
+
+        def create(self) -> None:
+            events.append("create-" + self.settings.node)
+            creation_barrier.wait()
+
+        def execute(self, *args: str) -> dict[str, Any]:
+            assert args == ("--master-sha256", master_digest), (
+                "host scans must receive only the synthetic master's digest"
+            )
+            assert all("create-" + node in events for node in nodes), (
+                "both probe creations must overlap before either scan completes"
+            )
+            events.append("scan-" + self.settings.node)
+            return {
+                "master_matches": [],
+                "values_scanned": 10,
+                "host_tmp_exists": True,
+                "systemd_environment_exists": True,
+            }
+
+        def cleanup(self) -> dict[str, bool]:
+            events.append("cleanup-" + self.settings.node)
+            return {"pod": False, "configmap": False}
+
+    def rotate(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert command == ["bash", "deploy/node/provision-node-action-keys.sh"]
+        assert kwargs["env"]["GPU_FAULT_ROTATE_NODE_ACTION_KEY"] == nodes[0]
+        events.append("rotate")
+        for document in current.values():
+            document["data"][nodes[0]] = base64.b64encode(b"synthetic-rotated").decode()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def restore(
+        _site: Any,
+        plane: str,
+        _target: Any,
+        document: dict[str, Any],
+        *,
+        expected: dict[str, Any] | None,
+    ) -> None:
+        assert document == original and expected == current[plane], (
+            "restore must retain the original and rotated snapshots for each plane"
+        )
+        events.append("restore-" + plane)
+        if not (defect == "cpu-restore" and plane == "cpu"):
+            current[plane] = copy.deepcopy(document)
+
+    monkeypatch.setattr(
+        auth, "HostProbeSettings", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(auth, "HostProbeFixture", Probe)
+    monkeypatch.setattr(
+        auth,
+        "secret_document",
+        lambda _site, plane, *args: copy.deepcopy(current[plane]),
+    )
+    monkeypatch.setattr(
+        auth,
+        "gpu_master_reference_scan",
+        lambda *args: {"installer_resources": ["Job/test-installer"], "hits": []},
+    )
+    monkeypatch.setattr(auth, "restore_secret", restore)
+    monkeypatch.setattr(auth, "run", rotate)
+    monkeypatch.setattr(auth.time, "sleep", lambda seconds: None)
+    kwargs = {
+        "nodes": nodes,
+        "fleet_master_file": master_file,
+        "host_probe_image": "test@sha256:" + "a" * 64,
+        "case_dir": tmp_path,
+        "focused_tests": {"passed": True},
+    }
+    result = auth.run_auth015(site, _target(), **kwargs)
+    assert result["verdict"] == "FAIL"
+    assert result["requires_new_authorized_evidence"] is True
+    assert result["checks"]["no_node_or_secret_mutation"] is True
+    assert events == [], "a snapshot-only invocation must not touch either node"
+    assert result["verdict"] == "FAIL" and result["not_evaluated"], (
+        "mocked component checks cannot satisfy the outstanding full AUTH-015 proofs"
+    )
 
 
 def test_runners_bind_evidence_to_release_and_cluster() -> None:

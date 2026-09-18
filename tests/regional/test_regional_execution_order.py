@@ -85,7 +85,9 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 190
+    assert len(indexed) == len(document_cases) == 197, (
+        "main lifecycle and distinct WIP cases must all remain indexed"
+    )
 
 
 def test_do_not_run_matches_regional_superseded_cases() -> None:
@@ -114,7 +116,6 @@ def test_do_not_run_matches_regional_superseded_cases() -> None:
         "GF-REGIONAL-AUTH-010": "GF-REGIONAL-AUTH-014",
         "GF-REGIONAL-NOTIFY-002": "GF-REGIONAL-NOTIFY-001",
         "GF-REGIONAL-DESTR-011": "GF-REGIONAL-DESTR-013",
-        "GF-REGIONAL-HA-005": "GF-REGIONAL-HA-009",
         "GF-REGIONAL-PREEMPT-013": "GF-REGIONAL-PREEMPT-014",
         "GF-REGIONAL-PREEMPT-023": "GF-REGIONAL-PREEMPT-024",
         "GF-REGIONAL-PREEMPT-034": "GF-REGIONAL-PREEMPT-035",
@@ -132,6 +133,9 @@ def test_do_not_run_matches_regional_superseded_cases() -> None:
         assert replacement in ordered, replacement
         assert "command" not in case and "pytest_nodeid" not in case, case_id
     assert cases["GF-REGIONAL-DESTR-004"]["risk"] == "destructive"
+    assert {"GF-REGIONAL-HA-005", "GF-REGIONAL-HA-009"} <= ordered, (
+        "rollout continuity and zero-rollout credential rotation are distinct proofs"
+    )
 
 
 def test_folded_cases_left_their_unique_assertions_in_the_replacement() -> None:
@@ -139,9 +143,10 @@ def test_folded_cases_left_their_unique_assertions_in_the_replacement() -> None:
     cases = {case["id"]: case for case in catalog["test_cases"]}
     expected = {
         "GF-REGIONAL-NOTIFY-001": (
-            "四次重复提交",
-            "provider_message_id 不变",
-            "通知条数不变",
+            "首次处理后再重复三次",
+            "provider_message_id与通知条数不变",
+            "发送计数零增量窗口须从首次完成之后开始",
+            "首次合法发送单独计数",
         ),
         "GF-REGIONAL-AUTH-014": ("execution token 未出现在任何数据面 Secret",),
         "GF-REGIONAL-DESTR-013": (
@@ -170,6 +175,9 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-PREEMPT-012"]
     assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-E2E-001"]
     assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-BLAST-001"]
+    assert position["GF-REGIONAL-DESTR-001"] < position["GF-REGIONAL-BLAST-001"], (
+        "blast-radius proof must consume actual containment evidence"
+    )
     assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-NOTIFY-001"]
     # DESTR-011 is folded into DESTR-013; the destructive phase now opens with
     # the isolated warm-spare routing negatives.
@@ -194,7 +202,9 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     assert position["GF-REGIONAL-COLLECT-017"] < position["GF-REGIONAL-COLLECT-018"]
     assert position["GF-REGIONAL-COLLECT-020"] < position["GF-REGIONAL-COLLECT-015"]
     assert position["GF-REGIONAL-HA-003"] < position["GF-REGIONAL-DESTR-013"]
-    assert ordered[-1] == "GF-REGIONAL-COLLECT-015"
+    assert ordered[-2:] == ["GF-REGIONAL-COLLECT-015", "GF-REGIONAL-BOOT-032"], (
+        "full isolated uninstall follows the final collector acceptance"
+    )
 
 
 def test_every_case_is_defined_in_the_chapter_for_its_prefix() -> None:

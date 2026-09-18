@@ -19,6 +19,7 @@ def _text(errors: list[str]) -> str:
 
 def _report(**overrides: Any) -> dict[str, Any]:
     report = {
+        "verdict": "PASS",
         "unrelated_key": "audit-expired-evidence-abc",
         "pinned_key": "audit-pinned-evidence-abc",
         "unrelated_deleted_after_seconds": 42.0,

@@ -2,8 +2,11 @@
 
 \if :{?incident_id}
 \else
-  \echo 'incident_id is required: psql -v incident_id=inc-...'
-  \quit 2
+  DO $audit_incident_argument_guard$
+  BEGIN
+      RAISE EXCEPTION 'incident_id is required: psql -v incident_id=inc-...';
+  END
+  $audit_incident_argument_guard$;
 \endif
 
 \echo 'Incident'
@@ -13,32 +16,36 @@ SELECT
     payload->>'state' AS state,
     payload->>'created_at' AS created_at,
     payload->>'updated_at' AS updated_at
-FROM gpu_fault_objects
+FROM gpu_fault_control_records
 WHERE kind='incident' AND key=:'incident_id';
 
 \echo 'Related object counts'
 WITH
 workflow_ids AS (
     SELECT key
-    FROM gpu_fault_objects
-    WHERE kind='workflow'
-      AND payload->>'incident_id'=:'incident_id'
+    FROM gpu_fault_workflow_records
+    WHERE incident_id=:'incident_id'
+),
+remote_command_ids AS (
+    SELECT key
+    FROM gpu_fault_remote_command_records
+    WHERE incident_id=:'incident_id'
 ),
 notification_ids AS (
     SELECT key
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='notification'
       AND payload->>'incident_id'=:'incident_id'
 ),
 plan_ids AS (
     SELECT key
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='plan'
       AND payload->>'incident_id'=:'incident_id'
 ),
 decision_ids AS (
     SELECT key, payload
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='decision'
       AND payload->>'recovery_plan_id' IN (
           SELECT key FROM plan_ids
@@ -56,10 +63,10 @@ event_ids AS (
 ),
 related_objects AS (
     SELECT kind, key
-    FROM gpu_fault_objects
-    WHERE
+    FROM gpu_fault_control_records
+    WHERE kind NOT IN ('workflow', 'remote_command')
+      AND (
         (kind='incident' AND key=:'incident_id')
-        OR (kind='workflow' AND key IN (SELECT key FROM workflow_ids))
         OR (
             kind IN (
                 'notification',
@@ -82,10 +89,6 @@ related_objects AS (
             AND payload->>'incident_id'=:'incident_id'
         )
         OR (
-            kind='remote_command'
-            AND payload->>'incident_id'=:'incident_id'
-        )
-        OR (
             kind IN (
                 'xid_correlation_event',
                 'xid_policy_decision',
@@ -93,6 +96,11 @@ related_objects AS (
             )
             AND key IN (SELECT key FROM event_ids)
         )
+      )
+    UNION ALL
+    SELECT 'workflow', key FROM workflow_ids
+    UNION ALL
+    SELECT 'remote_command', key FROM remote_command_ids
 ),
 related_links AS (
     SELECT kind, key
@@ -121,38 +129,30 @@ GROUP BY kind
 ORDER BY record_type;
 
 \echo 'Workflow states'
-SELECT key AS workflow_id, payload->>'status' AS status,
-       payload->>'predecessor_workflow_id' AS predecessor_workflow_id,
-       payload->>'updated_at' AS updated_at
-FROM gpu_fault_objects
-WHERE kind='workflow'
-  AND payload->>'incident_id'=:'incident_id'
-ORDER BY payload->>'created_at', key;
+SELECT key AS workflow_id, status, predecessor_workflow_id, updated_at
+FROM gpu_fault_workflow_records
+WHERE incident_id=:'incident_id'
+ORDER BY created_at, key;
 
-\echo 'Open remote commands; this result must be empty before purge'
-SELECT key AS command_id, payload->>'status' AS status,
-       payload->>'workflow_request_id' AS workflow_id
-FROM gpu_fault_objects
-WHERE kind='remote_command'
-  AND payload->>'incident_id'=:'incident_id'
-  AND payload->>'status' IN ('PENDING', 'WAITING', 'LEASED')
+\echo 'Open or unknown remote commands; this result must be empty before purge'
+SELECT key AS command_id, status, workflow_request_id AS workflow_id
+FROM gpu_fault_remote_command_records
+WHERE incident_id=:'incident_id'
+  AND (status IN ('SUCCEEDED', 'FAILED')) IS NOT TRUE
 ORDER BY key;
 
 \echo 'External successor workflows; purge these incidents first'
 WITH workflow_ids AS (
     SELECT key
-    FROM gpu_fault_objects
-    WHERE kind='workflow'
-      AND payload->>'incident_id'=:'incident_id'
+    FROM gpu_fault_workflow_records
+    WHERE incident_id=:'incident_id'
 )
 SELECT key AS workflow_id,
-       payload->>'incident_id' AS dependent_incident_id,
-       payload->>'status' AS status,
-       payload->>'predecessor_workflow_id' AS predecessor_workflow_id
-FROM gpu_fault_objects
-WHERE kind='workflow'
-  AND payload->>'incident_id'<>:'incident_id'
-  AND payload->>'predecessor_workflow_id' IN (
+       incident_id AS dependent_incident_id,
+       status, predecessor_workflow_id
+FROM gpu_fault_workflow_records
+WHERE incident_id IS DISTINCT FROM :'incident_id'
+  AND predecessor_workflow_id IN (
       SELECT key FROM workflow_ids
   )
-ORDER BY payload->>'created_at', key;
+ORDER BY created_at, key;

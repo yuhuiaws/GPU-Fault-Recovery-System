@@ -1,7 +1,8 @@
-"""The rollback verify restores the Aurora refresh CronJob image before judging it."""
+"""Rollback verification is read-only; restore requires a full transaction snapshot."""
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -20,19 +21,29 @@ def _release(cronjob_images: list[str], runs: list[list[str]]) -> SimpleNamespac
         if "deployment" in arguments:
             return {"spec": {"template": {"spec": {"containers": [{"image": OLD}]}}}}
         return {
+            "kind": "CronJob",
+            "metadata": {
+                "name": "gpu-fault-aurora-credential-refresh",
+                "namespace": "gpu-fault-system",
+                "uid": "refresh-uid",
+            },
             "spec": {
                 "jobTemplate": {
                     "spec": {
                         "template": {"spec": {"containers": [{"image": next(images)}]}}
                     }
                 }
-            }
+            },
         }
 
     return SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system"),
         runner=SimpleNamespace(
-            probe=lambda _arguments: True,
+            probe_output=lambda arguments, **_kwargs: (
+                0,
+                json.dumps(get_json(arguments)),
+                "",
+            ),
             run=lambda arguments: runs.append(list(arguments)),
         ),
         _cpu=lambda *arguments: ["kubectl", *arguments],
@@ -41,26 +52,15 @@ def _release(cronjob_images: list[str], runs: list[list[str]]) -> SimpleNamespac
     )
 
 
-def test_verify_restores_a_cronjob_repointed_by_the_bootstrap_task() -> None:
-    """Live 2026-09-08: the deploy re-installed the CronJob with the candidate
-    image before resuming the rollback at verify, whose cpu-restore had
-    already run; the verify must restore, not just complain."""
+def test_verify_does_not_disguise_missing_full_snapshot_with_image_only_restore() -> (
+    None
+):
     runs: list[list[str]] = []
     release = _release([CANDIDATE, OLD], runs)
 
-    VALIDATION.validate_cpu_rollback(release, {"cpu_wheel": "wheel-cm"}, OLD)
-
-    assert runs == [
-        [
-            "kubectl",
-            "-n",
-            "gpu-fault-system",
-            "set",
-            "image",
-            "cronjob/gpu-fault-aurora-credential-refresh",
-            f"refresh={OLD}",
-        ]
-    ], runs
+    with pytest.raises(ReleaseError, match="no full snapshot"):
+        VALIDATION.validate_cpu_rollback(release, {"cpu_wheel": "wheel-cm"}, OLD)
+    assert runs == [], "verification mutated the CronJob"
 
 
 def test_verify_still_fails_when_the_restore_does_not_take() -> None:
@@ -69,7 +69,7 @@ def test_verify_still_fails_when_the_restore_does_not_take() -> None:
 
     with pytest.raises(ReleaseError, match="Aurora refresh image did not converge"):
         VALIDATION.validate_cpu_rollback(release, {"cpu_wheel": "wheel-cm"}, OLD)
-    assert len(runs) == 1, runs
+    assert runs == [], "verification mutated the CronJob"
 
 
 def test_verify_leaves_a_converged_cronjob_alone() -> None:

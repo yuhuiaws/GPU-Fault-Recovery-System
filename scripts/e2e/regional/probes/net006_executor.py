@@ -160,14 +160,20 @@ class RefusingProxy:
     def _relay(client: socket.socket, upstream: socket.socket) -> None:
         sockets = [client, upstream]
         while True:
+            if BLOCK.exists():
+                return
             readable, _, _ = select.select(sockets, [], [], 30)
             if not readable:
                 continue
             for source in readable:
+                if BLOCK.exists():
+                    return
                 data = source.recv(65536)
                 if not data:
                     return
                 target = upstream if source is client else client
+                if BLOCK.exists():
+                    return
                 target.sendall(data)
 
     def _handle(self, client: socket.socket) -> None:

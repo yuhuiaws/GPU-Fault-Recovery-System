@@ -50,14 +50,25 @@ The deploy host therefore needs ``sso:ListInstances``, ``identitystore:GetUserId
 
 from __future__ import annotations
 
+from gpu_fault.admin.deadlines import (
+    Deadline,
+    DeploymentDeadlineExceeded,
+    HttpResponseTooLarge,
+    deadline_scope,
+    recovery_active,
+    remaining_timeout,
+)
+from gpu_fault.admin.native_http import NativeHttpError, http_request
+from gpu_fault.admin.process_supervisor import ensure_supervision_safe
+
+from gpu_fault.admin.diagnostics import diagnostic_text
+
 import argparse
 import hashlib
 import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +82,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapState,
     ClusterIdentity,
     CommandRunner,
+    assert_site_tag,
     safe_name,
     tag_map,
 )
@@ -104,11 +116,29 @@ _OPTION_VARIABLES = (
 )
 HTTP_TIMEOUT_SECONDS = 30
 WORKSPACE_ACTIVE_TIMEOUT_SECONDS = 600
-_WORKSPACE_TASK = "monitoring_install"
+_WORKSPACE_TASK = "grafana_install"
 # Grafana workspace roles, weakest first: a user holding a role at or above the
 # one to grant is not granted again.
 _ROLE_RANK = {"VIEWER": 1, "EDITOR": 2, "ADMIN": 3}
 _ADMIN_GRANTED = frozenset({"granted", "already"})
+_HTTP_DIAGNOSTIC_OPERATIONS = frozenset(
+    {
+        ("GET", "/api/org"),
+        ("GET", f"/api/datasources/uid/{DATASOURCE_UID}"),
+        ("POST", "/api/datasources"),
+        ("PUT", f"/api/datasources/uid/{DATASOURCE_UID}"),
+        ("GET", f"/api/datasources/uid/{DATASOURCE_UID}/health"),
+        ("POST", "/api/ds/query"),
+        ("GET", f"/api/folders/{DASHBOARD_FOLDER_UID}"),
+        ("POST", "/api/folders"),
+        ("POST", "/api/dashboards/db"),
+    }
+)
+_HTTP_DIAGNOSTIC_FAILURES = {
+    "Grafana HTTP request timed out": "HTTP request timed out",
+    "Grafana HTTP request failed": "HTTP request failed",
+    "Grafana HTTP response exceeds its size limit": "HTTP response exceeds its size limit",
+}
 
 
 @dataclass(frozen=True)
@@ -134,7 +164,7 @@ class GrafanaSettings:
     # ``--grafana-viewer``: the IAM Identity Center user granted VIEWER once the
     # dashboards are in. Operator input too; a refused grant fails the deploy.
     viewer_sso_user_id: str | None = None
-    # The previous run's ``monitoring_install.grafana`` record, so the read-only
+    # The previous run's Grafana task record, so the read-only
     # probe can ask for ensure until the dashboards have actually landed.
     previous: Mapping[str, Any] | None = None
     # ``spec.health.identityCenterRegion``: where IAM Identity Center is homed
@@ -263,6 +293,11 @@ def grafana_access_lines(state: BootstrapState) -> list[str]:
 
     result = _state_result(state) or {}
     workspace_id = str(result.get("workspace_id") or "")
+    if result.get("status") in {"FAILED", "DEGRADED"}:
+        return [
+            "Grafana dashboards: DEGRADED; "
+            + diagnostic_text(str(result.get("reason") or "presentation unavailable"))
+        ]
     if str(result.get("status") or "") != "PROVISIONED" or not workspace_id:
         return []
     lines = [f"Grafana dashboards: {result.get('dashboards_url') or ''}"]
@@ -314,7 +349,11 @@ def _role_instructions(role: str, sso_user_id: str) -> list[dict[str, Any]]:
 
 def _state_result(state: BootstrapState) -> Mapping[str, Any] | None:
     resources = state.value.get("resources")
-    task = resources.get(_WORKSPACE_TASK) if isinstance(resources, Mapping) else None
+    task = (
+        resources.get(_WORKSPACE_TASK) or resources.get("monitoring_install")
+        if isinstance(resources, Mapping)
+        else None
+    )
     grafana = task.get("grafana") if isinstance(task, Mapping) else None
     return cast(Mapping[str, Any], grafana) if isinstance(grafana, Mapping) else None
 
@@ -326,6 +365,10 @@ def _site_health(site: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 # --- workspace resolution ----------------------------------------------------------
+
+
+class GrafanaIdentityError(BootstrapError):
+    """Ambiguous or foreign identity is not an optional presentation outage."""
 
 
 def ensure_grafana_workspace(
@@ -355,6 +398,8 @@ def ensure_grafana_workspace(
         item for item in workspaces if tag_map(item.get("tags")).get(SITE_TAG_KEY)
     ]
     ours = [item for item in tagged if _site_of(item) == site_id]
+    if len(ours) > 1:
+        raise GrafanaIdentityError("multiple Grafana workspaces claim this site")
     if ours:
         workspace = _describe_workspace(runner, region, str(ours[0]["id"])) or ours[0]
         _require_active(workspace)
@@ -368,7 +413,7 @@ def ensure_grafana_workspace(
         listed = ", ".join(
             f"{item['id']} ({item.get('name') or 'unnamed'})" for item in candidates
         )
-        raise BootstrapError(
+        raise GrafanaIdentityError(
             f"{len(candidates)} Amazon Managed Grafana workspaces in {region} carry "
             f"no {SITE_TAG_KEY} tag: {listed}; pass --grafana-workspace-id to "
             "choose one"
@@ -427,7 +472,7 @@ def _ownership_of(workspace: Mapping[str, Any], site_id: str) -> str:
     if owner is None:
         return "EXTERNAL"
     if owner != site_id:
-        raise BootstrapError(
+        raise GrafanaIdentityError(
             f"Amazon Managed Grafana workspace {workspace.get('id')} belongs to "
             f"site {owner!r}, not {site_id!r}; refusing to share it"
         )
@@ -556,6 +601,7 @@ def _ensure_workspace_role(
             {"Effect": "Allow", "Action": ["aps:ListWorkspaces"], "Resource": "*"},
         ],
     }
+    existing: dict[str, Any] | None
     try:
         existing = runner.aws_json(
             cpu.region, "iam", "get-role", "--role-name", role_name
@@ -563,10 +609,24 @@ def _ensure_workspace_role(
     except BootstrapError as exc:
         if "NoSuchEntity" not in str(exc):
             raise
-        existing = {}
+        existing = None
     ownership = "REUSED"
-    role_arn = str((existing.get("Role") or {}).get("Arn") or "")
-    if not role_arn:
+    if existing is not None:
+        role = existing.get("Role")
+        if (
+            not isinstance(role, dict)
+            or role.get("Arn") != f"arn:aws:iam::{cpu.account_id}:role/{role_name}"
+        ):
+            raise GrafanaIdentityError(
+                "Grafana workspace IAM role identity differs from the site"
+            )
+        assert_site_tag(
+            role.get("Tags"),
+            site_id=site_id,
+            description=f"Grafana IAM role {role_name}",
+        )
+        role_arn = str(role["Arn"])
+    else:
         ownership = "CREATED"
         created = runner.aws_json(
             cpu.region,
@@ -652,18 +712,35 @@ def dashboard_asset_digests(repository_root: Path) -> dict[str, str]:
 def urllib_transport(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> HttpResponse:
-    request = urllib.request.Request(
-        url, data=body, method=method, headers=dict(headers)
-    )
+    ensure_supervision_safe(allow_interrupted=recovery_active())
+    request_deadline: Deadline | None = None
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            return HttpResponse(
-                int(response.status), response.read().decode("utf-8", "replace")
+        with deadline_scope(
+            "Grafana HTTP request", HTTP_TIMEOUT_SECONDS
+        ) as request_deadline:
+            status, text = http_request(
+                method,
+                url,
+                headers,
+                body,
+                seconds=HTTP_TIMEOUT_SECONDS,
+                label=request_deadline.label,
             )
-    except urllib.error.HTTPError as exc:
-        return HttpResponse(int(exc.code), exc.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, OSError) as exc:
-        raise BootstrapError(f"Grafana {method} {url} failed: {exc}") from None
+        return HttpResponse(status, text)
+    except DeploymentDeadlineExceeded:
+        # The request scope has unwound: enclosing expiry or unsafe cleanup is fatal.
+        ensure_supervision_safe(allow_interrupted=recovery_active())
+        remaining_timeout(HTTP_TIMEOUT_SECONDS)
+        if request_deadline is None or time.monotonic() < request_deadline.expires:
+            raise
+        raise BootstrapError("Grafana HTTP request timed out") from None
+    except TimeoutError:
+        raise
+    except HttpResponseTooLarge:
+        raise BootstrapError("Grafana HTTP response exceeds its size limit") from None
+    except (NativeHttpError, OSError):
+        pass
+    raise BootstrapError("Grafana HTTP request failed") from None
 
 
 class _GrafanaApi:
@@ -689,7 +766,21 @@ class _GrafanaApi:
             if payload is not None
             else None
         )
-        response = self._transport(method, self._base_url + path, self._headers, body)
+        failure: str | None = None
+        try:
+            response = self._transport(
+                method, self._base_url + path, self._headers, body
+            )
+        except BootstrapError as exc:
+            failure = _HTTP_DIAGNOSTIC_FAILURES.get(str(exc), "HTTP request failed")
+        if failure is not None:
+            operation = (
+                f"{method} {path}"
+                if (method, path) in _HTTP_DIAGNOSTIC_OPERATIONS
+                else "unknown API operation"
+            )
+            # Raise after the handler so private transport details leave no chain.
+            raise BootstrapError(f"Grafana {operation}: {failure}") from None
         if response.status not in accept:
             raise BootstrapError(
                 f"Grafana {method} {path} returned {response.status}: "
@@ -980,7 +1071,9 @@ def ensure_grafana_dashboards(
             requested_id=settings.workspace_id,
         )
     except BootstrapError as exc:
-        if settings.workspace_id_is_operator_input:
+        if settings.workspace_id_is_operator_input or isinstance(
+            exc, GrafanaIdentityError
+        ):
             raise
         return _failed(exc, {})
     try:
@@ -1006,13 +1099,18 @@ def ensure_grafana_dashboards(
             sso_user_id=settings.viewer_sso_user_id,
         )
         viewer = {"viewer_sso_user_id": settings.viewer_sso_user_id}
-    admin_grant = grant_admin(
-        runner,
-        region=cpu.region,
-        workspace_id=workspace_id,
-        email=admin_email,
-        identity_center_region=settings.identity_center_region,
-    )
+    try:
+        admin_grant = grant_admin(
+            runner,
+            region=cpu.region,
+            workspace_id=workspace_id,
+            email=admin_email,
+            identity_center_region=settings.identity_center_region,
+        )
+    except GrafanaIdentityError:
+        raise
+    except (BootstrapError, TimeoutError) as exc:
+        return _failed(exc, {**workspace, **summary, **viewer})
     return {
         "status": "PROVISIONED",
         **workspace,
@@ -1251,7 +1349,7 @@ def _grant_role(
 
 
 def _failed(error: Exception, workspace: Mapping[str, Any]) -> dict[str, Any]:
-    reason = str(error)
+    reason = diagnostic_text(str(error))
     print(
         "WARNING: Grafana dashboards were not provisioned; the alerting path is "
         f"unaffected and the deploy continues. Reason: {reason}. Fix the cause "
@@ -1260,7 +1358,12 @@ def _failed(error: Exception, workspace: Mapping[str, Any]) -> dict[str, Any]:
         file=sys.stderr,
         flush=True,
     )
-    return {"status": "FAILED", "reason": reason, **workspace}
+    return {
+        **workspace,
+        "status": "DEGRADED",
+        "reason_code": "PRESENTATION_UNAVAILABLE",
+        "reason": reason,
+    }
 
 
 # --- installation registry -----------------------------------------------------------
@@ -1281,7 +1384,7 @@ def grafana_installation_resources(
     deleted by us. Only a workspace carrying our creation tag is ``CREATED``.
     """
 
-    task = state.get(_WORKSPACE_TASK) or {}
+    task = state.get(_WORKSPACE_TASK) or state.get("monitoring_install") or {}
     grafana = task.get("grafana") if isinstance(task, Mapping) else None
     if not isinstance(grafana, Mapping) or not grafana.get("workspace_id"):
         return []

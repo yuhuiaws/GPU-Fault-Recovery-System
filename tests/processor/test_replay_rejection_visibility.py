@@ -14,7 +14,13 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from gpu_fault.channel_registry import GPU_METRICS_PATH, NVIDIA_KERNEL_PATH
+import pytest
+
+from gpu_fault.channel_registry import (
+    ATTEMPT_COVERAGE_PATH,
+    GPU_METRICS_PATH,
+    NVIDIA_KERNEL_PATH,
+)
 from gpu_fault.processor import ProcessorCoordinator, ProcessorRequestStatus
 from gpu_fault.processor.rejected_events import (
     REJECTED_EVENT_ERROR_PREFIX,
@@ -144,3 +150,68 @@ def test_successful_completions_are_counted_by_status_class() -> None:
     assert store.list_collector_statuses("cluster-a", "node-a") == [], (
         "a successful completion minted a rejected-event status"
     )
+
+
+@pytest.mark.parametrize(
+    ("request_path", "metric_path"),
+    [
+        ("/v1/incidents/incident-{id}/close", "/v1/incidents/{id}"),
+        ("/v1/workflows/workflow-{id}/simulate", "/v1/workflows/{id}"),
+        ("/v1/workflows/workflow-{id}/steps/step-{id}/complete", "/v1/workflows/{id}"),
+        ("/v1/recovery-plans/plan-{id}/simulate", "/v1/recovery-plans/{id}"),
+        ("/v1/attempts/attempt-{id}/hang-check", "/v1/attempts/{id}"),
+        ("/v1/attempts/cluster-{id}/attempt-{id}/decision", "/v1/attempts/{id}"),
+        (
+            "/v1/advisory-notifications/notification-{id}/send",
+            "/v1/advisory-notifications/{id}",
+        ),
+        (
+            "/v1/installation-resources/site-{id}/resource/{id}/nested",
+            "/v1/installation-resources/{id}",
+        ),
+        ("/v1/training-health/cluster-{id}/scan", "/v1/training-health/{id}"),
+        ("/v1/fleet/agents/cluster-{id}/node-{id}/drain", "/v1/fleet/agents/{id}"),
+        ("/v1/fleet/deployments/deployment-{id}/advance", "/v1/fleet/deployments/{id}"),
+    ],
+)
+def test_dynamic_completion_paths_have_bounded_labels_and_keep_request_identity(
+    request_path: str, metric_path: str
+) -> None:
+    store = build_store()
+    processor = _processor(store)
+    for index in range(100):
+        path = request_path.format(id=index)
+        request, claimed = _claimed(store, path, b'{"unchanged":true}')
+        _finalize(processor, claimed, 200 if index % 2 == 0 else 422)
+        current = store.get_processor_request(request.request_id)
+        assert current.path == claimed.path == path
+        assert current.body() == b'{"unchanged":true}'
+        assert current.status is ProcessorRequestStatus.COMPLETED
+    assert processor.metrics_snapshot()["completions_by_path_status"] == {
+        metric_path: {"2xx": 50, "4xx": 50}
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ATTEMPT_COVERAGE_PATH,
+        "/v1/attempts/failure-detected",
+        "/v1/attempts/terminal",
+        "/v1/advisory-notifications/dispatch",
+        "/v1/installation-resources/sync",
+        "/v1/fleet/agents/heartbeat",
+        "/v1/fleet/deployments",
+        "/v1/runtime-profiles",
+        NVIDIA_KERNEL_PATH,
+        GPU_METRICS_PATH,
+    ],
+)
+def test_static_completion_paths_keep_their_labels(path: str) -> None:
+    store = build_store()
+    _, claimed = _claimed(store, path, b"{}")
+    processor = _processor(store)
+    _finalize(processor, claimed, 200)
+    assert processor.metrics_snapshot()["completions_by_path_status"] == {
+        path: {"2xx": 1}
+    }

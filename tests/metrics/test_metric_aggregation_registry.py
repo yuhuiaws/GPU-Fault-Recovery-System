@@ -127,7 +127,7 @@ def test_registry_names_nothing_the_code_no_longer_renders(rendered_families) ->
 def test_alert_rules_agree_with_the_pod_level_strategy() -> None:
     """The rules that read a per-Pod flag with ``min by (pod)`` need the
     Pod's own value to be the minimum over its processes, and the ones that
-    ``sum`` a counter need SUM. A drift here is a silent alert."""
+    take a rate before summing counters need independent process slots."""
 
     assert STRATEGIES["gpu_fault_processor_healthy"] is Strategy.MIN
     assert STRATEGIES["gpu_fault_processor_consumer_running"] is Strategy.MIN
@@ -139,9 +139,28 @@ def test_alert_rules_agree_with_the_pod_level_strategy() -> None:
     assert STRATEGIES["gpu_fault_processor_active_consumer"] is Strategy.SUM
     assert STRATEGIES["gpu_fault_store_io_in_flight"] is Strategy.SUM
     assert STRATEGIES["gpu_fault_store_io_max_in_flight"] is Strategy.SUM
-    assert STRATEGIES["gpu_fault_workflow_lifetime_exceeded_total"] is Strategy.SUM
+    assert (
+        STRATEGIES["gpu_fault_workflow_lifetime_exceeded_total"] is Strategy.PER_PROCESS
+    )
+    for family in (
+        "gpu_fault_processor_admission_rejections_total",
+        "gpu_fault_processor_request_processing_seconds",
+        "gpu_fault_processor_counter_drift_abs",
+        "gpu_fault_processor_counter_drift_scan_timestamp_seconds",
+    ):
+        assert STRATEGIES[family] is Strategy.PER_PROCESS
+    for family in (
+        "gpu_fault_remote_command_total",
+        "gpu_fault_workflow_total",
+        "gpu_fault_notification_total",
+    ):
+        assert STRATEGIES[family] is Strategy.ANY, "retained census is not a counter"
     for family, strategy in STRATEGIES.items():
         if family.endswith("_timestamp_seconds"):
-            assert strategy in (Strategy.MAX, Strategy.ANY), family
-        if family.endswith("_total") and strategy is Strategy.PER_PROCESS:
-            pytest.fail(f"a counter must not be exported per process: {family}")
+            assert strategy in (Strategy.MAX, Strategy.ANY, Strategy.PER_PROCESS), (
+                family
+            )
+        if family.endswith("_total"):
+            assert strategy is not Strategy.SUM, (
+                f"{family} must not collapse independent counter resets"
+            )

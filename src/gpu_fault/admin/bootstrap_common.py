@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.admin.api_budget import api_phase, statistics as api_statistics
+
 import hashlib
 import json
 import os
@@ -7,14 +9,29 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import ContextVar
 from dataclasses import dataclass
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.command_log import child_failure
+from gpu_fault.admin.bootstrap_task_inputs import TaskInputSpec
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
+from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
+from gpu_fault.admin.execution import (
+    current_deadline,
+    deadline_scope,
+    run_command,
+)
+
+_TASK_COMMAND_COUNTS: ContextVar[dict[str, int] | None] = ContextVar(
+    "bootstrap_task_command_counts", default=None
+)
 
 ARN_PATTERN = re.compile(
     r"^arn:(?P<partition>[^:]+):(?P<service>[^:]+):"
@@ -44,6 +61,11 @@ NODE_INSTALLER_CONFIG_DIGEST_ENVIRONMENT_KEYS = frozenset(
 
 class BootstrapError(RuntimeError):
     pass
+
+
+class KubernetesResourceNotFound(BootstrapError):
+    resource_kind: str
+    resource_name: str
 
 
 class BootstrapMutationRequired(RuntimeError):
@@ -130,22 +152,50 @@ class CommandRunner:
         capture: bool = True,
         sensitive: bool = False,
         mutate: bool = False,
+        timeout_seconds: float | None = None,
     ) -> str:
-        shown = "<sensitive command>" if sensitive else " ".join(arguments)
+        counts = _TASK_COMMAND_COUNTS.get()
+        if counts is not None:
+            counts["total"] += 1
+            executable = Path(arguments[0]).name
+            if executable in {"aws", "kubectl"}:
+                counts[executable] += 1
+        shown = "<sensitive command>" if sensitive else diagnostic_command(arguments)
         with self._print_lock:
             print(f"+ {shown}", file=sys.stderr, flush=True)
-        completed = subprocess.run(
-            list(arguments),
-            input=input_text,
-            text=True,
-            capture_output=capture,
-            check=False,
-            env=dict(env) if env is not None else None,
-            cwd=cwd,
-        )
+        try:
+            completed = run_command(
+                arguments,
+                input_text=input_text,
+                capture=capture or sensitive,
+                environment=env,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+            )
+        except (subprocess.TimeoutExpired, TimeoutError):
+            raise BootstrapError(
+                "deployment command exceeded its time budget: "
+                + diagnostic_command(arguments[:3], sensitive=sensitive)
+            ) from None
         if completed.returncode:
-            # The whole captured stderr stays in the message: callers match
-            # ``NoSuchEntity``/``NotFound`` in it to tell "absent" from "broken".
+            missing = re.fullmatch(
+                r'Error from server \(NotFound\): ([a-z][a-z0-9.-]*) "([^"\r\n]+)" not found',
+                (completed.stderr or "").strip(),
+            )
+            if (
+                completed.returncode == 1
+                and Path(arguments[0]).name == "kubectl"
+                and missing is not None
+            ):
+                error = child_failure(
+                    KubernetesResourceNotFound,
+                    arguments,
+                    completed.returncode,
+                    detail=completed.stderr.strip() if capture else "",
+                    sensitive=sensitive,
+                )
+                error.resource_kind, error.resource_name = missing.groups()
+                raise error
             raise child_failure(
                 BootstrapError,
                 arguments,
@@ -212,6 +262,7 @@ class ReadOnlyProbeRunner(CommandRunner):
         capture: bool = True,
         sensitive: bool = False,
         mutate: bool = False,
+        timeout_seconds: float | None = None,
     ) -> str:
         if mutate:
             raise BootstrapMutationRequired(arguments[0])
@@ -222,6 +273,7 @@ class ReadOnlyProbeRunner(CommandRunner):
             cwd=cwd,
             capture=capture,
             sensitive=sensitive,
+            timeout_seconds=timeout_seconds,
         )
 
 
@@ -323,10 +375,49 @@ class BootstrapState:
             self.value["completed_tasks"] = sorted(completed)
             self._write()
 
+    def finish_task(self, name: str, value: Any, report: Mapping[str, Any]) -> None:
+        """Persist a result, completion and timing together, from the scheduler."""
+        with self._lock:
+            completed = set(self.value["completed_tasks"])
+            if report["status"] in {"succeeded", "degraded"}:
+                self.value["resources"][name] = value
+                completed.add(name)
+            else:
+                completed.discard(name)
+            self.value["completed_tasks"] = sorted(completed)
+            self.value.setdefault("task_reports", {})[name] = dict(report)
+            warnings = self.value.setdefault("task_warnings", {})
+            if report["status"] == "degraded":
+                warnings[name] = (
+                    "presentation unavailable; critical deployment gates remain required"
+                )
+            else:
+                warnings.pop(name, None)
+            self._write()
+
+    def record_cache_hits(self, names: Sequence[str]) -> None:
+        if not names:
+            return
+        now = time.time()
+        with self._lock:
+            reports = self.value.setdefault("task_reports", {})
+            for name in names:
+                reports[name] = {
+                    "started_at_epoch": now,
+                    "finished_at_epoch": now,
+                    "mode": "cache",
+                    "status": "succeeded",
+                    "duration_seconds": 0.0,
+                    "runner_commands": {"total": 0, "aws": 0, "kubectl": 0},
+                }
+            self._write()
+
     def bind_inputs(
         self,
         digest: str,
         task_digests: Mapping[str, str] | None = None,
+        *,
+        partial: bool = False,
     ) -> None:
         with self._lock:
             if task_digests is None:
@@ -335,13 +426,16 @@ class BootstrapState:
             else:
                 previous = self.value.get("task_input_sha256")
                 previous = previous if isinstance(previous, dict) else {}
+                effective = (
+                    {**previous, **task_digests} if partial else dict(task_digests)
+                )
                 completed = {
                     task
                     for task in self.value["completed_tasks"]
-                    if previous.get(task) == task_digests.get(task)
+                    if task in effective and previous.get(task) == effective[task]
                 }
                 self.value["completed_tasks"] = sorted(completed)
-                self.value["task_input_sha256"] = dict(sorted(task_digests.items()))
+                self.value["task_input_sha256"] = dict(sorted(effective.items()))
             self.value["input_sha256"] = digest
             self._write()
 
@@ -349,6 +443,13 @@ class BootstrapState:
         with self._lock:
             self.value["phase"] = value
             self._write()
+
+    def is_complete(self, name: str) -> bool:
+        with self._lock:
+            return (
+                name in self.value["completed_tasks"]
+                and name in self.value["resources"]
+            )
 
     def result(self, name: str) -> Any:
         """The recorded result of a task that has already run.
@@ -450,7 +551,49 @@ def _task_dependencies(
                 "neither this run schedules nor an earlier run completed"
             )
         edges[name] = needs - held
+    try:
+        tuple(TopologicalSorter(edges).static_order())
+    except CycleError as exc:
+        raise BootstrapError(
+            "bootstrap task dependency graph contains a cycle"
+        ) from exc
     return edges
+
+
+def _new_task_report(
+    state: BootstrapState, name: str, policy: TaskInputSpec | None
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "started_at_epoch": time.time(),
+        "mode": "ensure",
+        "status": "failed",
+    }
+    if policy is not None:
+        report.update(
+            input_policy=policy.always_revalidate_reason or "content-fingerprint",
+            input_sha256=(state.value.get("task_input_sha256") or {}).get(name),
+            deadline_seconds=policy.deadline_seconds,
+        )
+    return report
+
+
+def _finish_task_report(
+    state: BootstrapState, name: str, value: Any, report: Mapping[str, Any]
+) -> None:
+    state.finish_task(name, value, report)
+    print(
+        f"bootstrap task={name} {report['mode']} "
+        f"status={report['status']} duration={report['duration_seconds']}s "
+        f"runner_commands={report['runner_commands']['total']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if "error" in report:
+        print(
+            f"bootstrap task={name} failure_type={report['error']['type']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def run_parallel(
@@ -460,7 +603,9 @@ def run_parallel(
     revalidate: frozenset[str] = frozenset(),
     probes: Mapping[str, Callable[[], Any]] | None = None,
     dependencies: Mapping[str, Sequence[str]] | None = None,
+    stop_on_failure: frozenset[str] = frozenset(),
     on_complete: Callable[[frozenset[str]], None] | None = None,
+    input_policies: Mapping[str, TaskInputSpec] | None = None,
 ) -> dict[str, Any]:
     """Run the tasks on up to eight threads, each as soon as its dependencies hold.
 
@@ -484,6 +629,10 @@ def run_parallel(
     """
 
     completed = set(state.value["completed_tasks"])
+    cache_allowed = input_policies is None or bool(state.value.get("input_sha256"))
+    if input_policies is not None:
+        if set(input_policies) != set(tasks):
+            raise BootstrapError("bootstrap task input policies do not cover the graph")
     resources = state.value["resources"]
     edges = _task_dependencies(
         tasks, dependencies, completed=completed, resources=resources
@@ -491,30 +640,98 @@ def run_parallel(
     results = {
         name: resources[name]
         for name in tasks
-        if name in completed and name in resources and name not in revalidate
+        if cache_allowed
+        and name in completed
+        and name in resources
+        and name not in revalidate
     }
     probe_tasks = probes or {}
+    reports: dict[str, dict[str, Any]] = {}
+    parent_deadline = current_deadline()
+
+    def reconcile_action(name: str, ensure: Callable[[], Any]) -> Any:
+        probe = probe_tasks.get(name)
+        # A dependency can invalidate this checkpoint (notably the signed
+        # release binding its image inputs). Decide only after it completes.
+        started = time.monotonic()
+        counts = {"total": 0, "aws": 0, "kubectl": 0}
+        token = _TASK_COMMAND_COUNTS.set(counts)
+        report = _new_task_report(
+            state, name, input_policies[name] if input_policies else None
+        )
+        print(f"bootstrap task={name} start", file=sys.stderr, flush=True)
+        try:
+            if (
+                cache_allowed
+                and state.is_complete(name)
+                and name in revalidate
+                and probe is not None
+                and not (
+                    input_policies is not None
+                    and input_policies[name].always_revalidate_reason
+                )
+            ):
+                report["mode"] = "probe"
+                try:
+                    probe()
+                except BootstrapMutationRequired:
+                    report["mode"] = "probe+ensure"
+                else:
+                    report["status"] = "succeeded"
+                    return state.result(name)
+            value = ensure()
+            report["status"] = (
+                input_policies[name].result_status(value)
+                if input_policies is not None
+                else "succeeded"
+            )
+            return value
+        finally:
+            _TASK_COMMAND_COUNTS.reset(token)
+            report.update(
+                duration_seconds=round(time.monotonic() - started, 3),
+                finished_at_epoch=time.time(),
+                runner_commands=counts,
+                subprocess_api=api_statistics(name),
+            )
+            reports[name] = report
 
     def reconcile(name: str, ensure: Callable[[], Any]) -> Any:
-        probe = probe_tasks.get(name)
-        if name in completed and name in revalidate and probe is not None:
-            try:
-                probe()
-                return resources[name]
-            except BootstrapMutationRequired:
-                pass
-        return ensure()
+        budget = input_policies[name].deadline_seconds if input_policies else 7200
+        try:
+            with (
+                api_phase(name),
+                deadline_scope(f"bootstrap/{name}", budget, parent=parent_deadline),
+            ):
+                return reconcile_action(name, ensure)
+        finally:
+            reports.setdefault(
+                name,
+                {
+                    "mode": "deadline",
+                    "status": "failed",
+                    "duration_seconds": 0.0,
+                    "started_at_epoch": time.time(),
+                    "finished_at_epoch": time.time(),
+                    "runner_commands": {"total": 0, "aws": 0, "kubectl": 0},
+                    "deadline_seconds": budget,
+                },
+            )
 
     pending = {
         name: function for name, function in tasks.items() if name not in results
     }
     if on_complete is not None and results:
         on_complete(frozenset(results))
+    for name in results:
+        print(f"bootstrap task={name} cache-hit", file=sys.stderr, flush=True)
+    state.record_cache_hits(tuple(results))
     if not pending:
         return results
     failures: list[tuple[str, Exception]] = []
     skipped: dict[str, str] = {}
     running: dict[Future[Any], str] = {}
+    workers = min(DEPLOY_CONCURRENCY.bootstrap_tasks, len(pending))
 
     def schedule(executor: ThreadPoolExecutor) -> None:
         # To a fixpoint: skipping one task can make its dependents skippable in
@@ -524,18 +741,21 @@ def run_parallel(
         while moved:
             moved = False
             blocked = {name for name, _exc in failures} | set(skipped)
+            abort = sorted({name for name, _exc in failures} & stop_on_failure)
             for name in list(pending):
                 failed_needs = edges[name] & blocked
-                if failed_needs:
+                if abort:
+                    skipped[name] = abort[0]
+                elif failed_needs:
                     skipped[name] = sorted(failed_needs)[0]
-                elif edges[name].issubset(results):
+                elif len(running) < workers and edges[name].issubset(results):
                     running[executor.submit(reconcile, name, pending[name])] = name
                 else:
                     continue
                 del pending[name]
                 moved = True
 
-    with ThreadPoolExecutor(max_workers=min(8, len(pending))) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         while True:
             schedule(executor)
             if not running:
@@ -547,10 +767,12 @@ def run_parallel(
                     results[name] = future.result()
                 except Exception as exc:
                     failures.append((name, exc))
-                    continue
-                state.record(name, results[name])
-                state.complete(name)
-                if on_complete is not None:
+                    reports[name]["error"] = {
+                        "type": type(exc).__name__,
+                        "message": diagnostic_text(str(exc), limit=2048),
+                    }
+                _finish_task_report(state, name, results.get(name), reports[name])
+                if on_complete is not None and name in results:
                     on_complete(frozenset(results))
     if pending:
         raise BootstrapError(
@@ -652,6 +874,10 @@ def kubectl_apply(
         input_text=manifest,
         mutate=True,
         capture=False,
+        sensitive=any(
+            isinstance(document, dict) and document.get("kind") == "Secret"
+            for document in yaml.safe_load_all(manifest)
+        ),
     )
 
 

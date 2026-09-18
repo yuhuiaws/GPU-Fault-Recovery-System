@@ -19,6 +19,7 @@ from gpu_fault.store.shared.health_signals import (
     latched_health_signal_state,
     sample_disposition,
     signal_clock,
+    signal_semantic_fingerprints,
 )
 
 # One NVLink bit's identity: the scope from `_xid74_scope` plus the register
@@ -203,7 +204,9 @@ class MemoryXidMixin:
         items: Sequence[tuple[str, bool, datetime, float]],
         *,
         received_at: datetime | None = None,
+        semantic_fingerprints: Sequence[str | None] | None = None,
     ) -> list[bool]:
+        fingerprints = signal_semantic_fingerprints(len(items), semantic_fingerprints)
         with self._lock:
             results: list[bool] = []
             for (
@@ -211,7 +214,7 @@ class MemoryXidMixin:
                 active,
                 observed_at,
                 minimum_active_seconds,
-            ) in items:
+            ), fingerprint in zip(items, fingerprints, strict=True):
                 previous = self._health_signal_states.get(signal_key)
                 accept, regressed = sample_disposition(
                     previous, observed_at, received_at
@@ -231,6 +234,7 @@ class MemoryXidMixin:
                     previous,
                     minimum_active_seconds,
                     clock=signal_clock(observed_at, received_at),
+                    semantic_fingerprint=fingerprint,
                 )
                 self._health_signal_states[signal_key] = state
                 results.append(emit)
@@ -242,6 +246,9 @@ class MemoryXidMixin:
         active: bool,
         observed_at: datetime,
         minimum_active_seconds: float = 0,
+        *,
+        received_at: datetime | None = None,
+        semantic_fingerprint: str | None = None,
     ) -> bool:
         # The single form is the training-progress path. Like the plural form
         # it only decides to emit; ``TrainingHealthService.mark_notified``
@@ -254,7 +261,9 @@ class MemoryXidMixin:
                     observed_at,
                     minimum_active_seconds,
                 )
-            ]
+            ],
+            received_at=received_at,
+            semantic_fingerprints=[semantic_fingerprint],
         )[0]
 
     def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None:
@@ -262,11 +271,17 @@ class MemoryXidMixin:
             return self._health_signal_states.get(signal_key)
 
     def mark_health_signal_notified(
-        self, signal_key: str, *, notified_at: datetime
+        self,
+        signal_key: str,
+        *,
+        notified_at: datetime,
+        semantic_fingerprint: str | None = None,
     ) -> None:
         with self._lock:
             latched = latched_health_signal_state(
-                self._health_signal_states.get(signal_key), notified_at
+                self._health_signal_states.get(signal_key),
+                notified_at,
+                semantic_fingerprint=semantic_fingerprint,
             )
             if latched is not None:
                 self._health_signal_states[signal_key] = latched

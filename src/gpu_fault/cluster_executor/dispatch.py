@@ -18,6 +18,11 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from gpu_fault.adapters.common import node_action_accepted_nodes
+from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    node_submission_ownership_guard,
+    stop_ownership_scope,
+)
 from gpu_fault.aws_errors import aws_configuration_error
 from gpu_fault.cluster_executor.batching import execute_batched_command
 from gpu_fault.cluster_executor.lease import adapter_facing_details
@@ -34,7 +39,11 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_phase,
 )
-from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
+from gpu_fault.operation_registry import (
+    MULTI_NODE_BARRIER_OPERATIONS,
+    OperationAdapter,
+    operations_for_adapter,
+)
 from gpu_fault.regional import (
     RemoteActionCommand,
     RemoteCommandResult,
@@ -97,9 +106,12 @@ class CommandDispatch:
             if barrier_hold is not None:
                 return barrier_hold
             if command.batched_steps:
-                return execute_batched_command(
-                    self.executor, command, matches[0], lease_token
-                )
+                with stop_ownership_scope(
+                    getattr(self.executor, "stop_ownership_validator", None)
+                ):
+                    return execute_batched_command(
+                        self.executor, command, matches[0], lease_token
+                    )
             workflow = command.workflow
             if command.result_details:
                 previous = WorkflowStepExecution(
@@ -118,7 +130,8 @@ class CommandDispatch:
                         ]
                     }
                 )
-            outcome = matches[0].execute(
+            outcome = self.execute_adapter(
+                matches[0],
                 WorkflowStepContext(
                     workflow=workflow,
                     incident=command.incident,
@@ -126,13 +139,45 @@ class CommandDispatch:
                     step_index=command.step_index,
                     request=self.execution_request(command),
                     idempotency_key=command.idempotency_key,
-                )
+                ),
             )
             return self.outcome_result(
                 outcome, lease_token, operation=command.step.operation
             )
         except Exception as exc:
             return self._classify_failure(exc, command, lease_token)
+
+    def execute_adapter(
+        self, adapter: Any, context: WorkflowStepContext
+    ) -> WorkflowStepOutcome:
+        hold = lease_hold_reason()
+        if hold is not None:
+            return WorkflowStepOutcome.waiting(
+                details={
+                    "lease_guard_blocked": True,
+                    "reason": hold,
+                    "adapter_started": False,
+                }
+            )
+        with stop_ownership_scope(
+            getattr(self.executor, "stop_ownership_validator", None)
+        ):
+            # These registered families check each new mutation internally, preserving
+            # result polls and compensation for already-accepted actions.
+            guarded_at_mutation = (
+                operations_for_adapter(OperationAdapter.NODE_ACTION)
+                | operations_for_adapter(OperationAdapter.HYPERPOD)
+                | {WorkflowOperation.STOP_WORKLOADS}
+            )
+            if context.step.operation not in guarded_at_mutation:
+                denied = node_submission_ownership_guard(context)
+                if denied is not None:
+                    if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
+                        assert denied.details is not None
+                        denied.details["restart_submitted"] = False
+                    return denied
+            outcome: WorkflowStepOutcome = adapter.execute(context)
+            return outcome
 
     @staticmethod
     def outcome_result(

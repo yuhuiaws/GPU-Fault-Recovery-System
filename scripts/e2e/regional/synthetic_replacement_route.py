@@ -43,8 +43,14 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.env import env_bool  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
+)
+from scripts.e2e.regional.deployment_window_guard import (  # noqa: E402
+    complete_population,
+    deployment_snapshot,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -109,15 +115,18 @@ def deployment_env(regional: RegionalLiveFixture) -> dict[str, Any]:
             f"{ROUTE_ENV} is set from a reference, not a literal; "
             "this helper only manages a literal value"
         )
+    snapshot = deployment_snapshot(
+        value,
+        plane="cpu",
+        deployment=DEPLOYMENT,
+        container=CONTAINER,
+        variables=(ROUTE_ENV,),
+    )
     return {
         "observed_at": now(),
-        "deployment": DEPLOYMENT,
-        "container": CONTAINER,
-        "generation": value["metadata"]["generation"],
-        "resource_version": value["metadata"]["resourceVersion"],
-        "replicas": value["spec"].get("replicas"),
-        "route_env_present": bool(present),
-        "route_env_value": present[0].get("value") if present else None,
+        **snapshot,
+        "route_env_present": snapshot["variables"][ROUTE_ENV]["present"],
+        "route_env_value": snapshot["variables"][ROUTE_ENV]["value"],
     }
 
 
@@ -126,23 +135,42 @@ def pod_gates(regional: RegionalLiveFixture) -> list[dict[str, str | None]]:
 
     result: list[dict[str, str | None]] = []
     for pod in regional.ready_pods("cpu", DEPLOYMENT):
-        output = regional.kubectl(
-            "cpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{'enabled':os.getenv({ROUTE_ENV!r})}}))",
-            timeout=60,
-        )
-        enabled = json.loads(output.splitlines()[-1]).get("enabled")
-        result.append(
-            {
-                "pod": str(pod["name"]),
-                "enabled": None if enabled is None else str(enabled),
-            }
-        )
+        try:
+            output = regional.kubectl(
+                "cpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{'enabled':os.getenv({ROUTE_ENV!r})}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as exc:
+            # A removed rollout replica may be omitted from this reading;
+            # convergence still requires the complete declared population.
+            if replica_vanished(exc):
+                continue
+            raise
+        try:
+            payload = json.loads(output.splitlines()[-1])
+        except (ValueError, IndexError):
+            raise RegionalFixtureError("API route gate did not return JSON") from None
+        if not isinstance(payload, dict) or "enabled" not in payload:
+            raise RegionalFixtureError("API route gate omitted its enabled value")
+        enabled = payload["enabled"]
+        if enabled is not None and not isinstance(enabled, str):
+            raise RegionalFixtureError("API route gate value is not a string or null")
+        try:
+            env_bool(
+                ROUTE_ENV,
+                environ={ROUTE_ENV: enabled} if enabled is not None else {},
+            )
+        except ValueError:
+            raise RegionalFixtureError(
+                "API route gate value is not a valid boolean"
+            ) from None
+        result.append({"pod": str(pod["name"]), "enabled": enabled})
     return result
 
 
@@ -179,7 +207,7 @@ def converge_gates(
     enabled: bool,
     sleep: Any = time.sleep,
 ) -> list[dict[str, str | None]]:
-    """Wait until every ready replica agrees the route is on (or off).
+    """Wait for the complete healthy replica set to agree the route is on or off.
 
     `kubectl rollout status` returns as soon as the new ReplicaSet is fully
     available, which is before the old Pods are gone -- and during a rolling
@@ -190,10 +218,32 @@ def converge_gates(
     """
 
     deadline = time.monotonic() + settings.rollout_timeout_seconds
+    identity: tuple[str, int] | None = None
     while True:
+        before = deployment_env(regional)
+        identity = identity or (before["uid"], before["replicas"])
         gates = pod_gates(regional)
-        settled = bool(gates) and all(
-            (item["enabled"] == "true") is enabled for item in gates
+        after = deployment_env(regional)
+        if any(
+            (snapshot["uid"], snapshot["replicas"]) != identity
+            for snapshot in (before, after)
+        ):
+            raise RegionalFixtureError(
+                "API route Deployment identity or replica target changed"
+            )
+        settled = (
+            before["generation"] == after["generation"]
+            and complete_population(after, gates)
+            and all(
+                env_bool(
+                    ROUTE_ENV,
+                    environ={ROUTE_ENV: item["enabled"]}
+                    if item["enabled"] is not None
+                    else {},
+                )
+                is enabled
+                for item in gates
+            )
         )
         if settled:
             return gates
@@ -214,10 +264,16 @@ def open_window(
     sleep: Any = time.sleep,
 ) -> dict[str, Any]:
     live = report["deployment"]
+    live_enabled = env_bool(
+        ROUTE_ENV,
+        environ={ROUTE_ENV: live["route_env_value"]}
+        if live["route_env_value"] is not None
+        else {},
+    )
     record: dict[str, Any] = {}
     if settings.baseline.is_file():
         record = read_baseline(settings.baseline)
-        if not record.get("closed_at") and live["route_env_value"] != "true":
+        if not record.get("closed_at") and not live_enabled:
             raise RegionalFixtureError(
                 f"{settings.baseline} records an open window but {ROUTE_ENV} is "
                 f"{live['route_env_value']!r} on {DEPLOYMENT}; close the record "
@@ -232,7 +288,7 @@ def open_window(
         # here would leave the operator between an open that will not open and a
         # close whose record is already the right one.
         record["resumed_at"] = now()
-    elif live["route_env_value"] == "true":
+    elif live_enabled:
         raise RegionalFixtureError(
             f"{ROUTE_ENV} is already true on {DEPLOYMENT} without a record here; "
             "find out who opened it before adding a second owner"

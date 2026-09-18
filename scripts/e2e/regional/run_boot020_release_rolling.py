@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -20,10 +21,27 @@ from gpu_fault_release import regional_deployment_inventory  # noqa: E402
 from gpu_fault_release import regional_release_config  # noqa: E402
 from gpu_fault_release import regional_release_diff  # noqa: E402
 from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
+from gpu_fault.admin.atomic_json import write_json_atomic  # noqa: E402
+from gpu_fault.admin.config import AdminConfig  # noqa: E402
+from scripts.e2e.regional.boot020_admin_config import (  # noqa: E402
+    public_config_roundtrip,
+    validate_admin_target,
+)
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     EvidenceRecorder,
     utc_now,
 )
+from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
+    add_live_arguments,
+    authorize_execution,
+    build_plan,
+    install_site_profile,
+)
+from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
+    case_evidence_path,
+    predecessor_path,
+)
+from scripts.e2e.regional.regional_live_fixture import predecessor_evidence  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-BOOT-020"
 CONFIRMATION = "RUN_BOOT020_RELEASE_ROLLING"
@@ -131,6 +149,7 @@ def _assert_noop(before: dict[str, Any], after: dict[str, Any]) -> None:
 def _assert_control_plane_only(
     before: dict[str, Any],
     after: dict[str, Any],
+    diff: dict[str, Any] | None = None,
 ) -> None:
     _require(
         before["live"]["clusters"] == after["live"]["clusters"],
@@ -146,6 +165,33 @@ def _assert_control_plane_only(
         before["cpu_generations"] != after["cpu_generations"],
         "CONTROL_PLANE_ONLY rolled no CPU Deployment",
         (before, after),
+    )
+    if diff is not None:
+        roles = regional_release_diff.control_plane_role_targets(_parsed_diff(diff))
+        expected = {
+            {
+                "spool": "gpu-fault-telemetry-spool-worker",
+                "worker": "gpu-fault-control-worker",
+                "ingress": "gpu-fault-api-ha",
+            }[role]
+            for role in roles
+        }
+        moved = {
+            name
+            for name in set(before["cpu_generations"]) | set(after["cpu_generations"])
+            if before["cpu_generations"].get(name) != after["cpu_generations"].get(name)
+        }
+        _require(
+            moved == expected,
+            "CPU role rollout differs from the actual plan",
+            {"moved": sorted(moved), "expected": sorted(expected)},
+        )
+
+
+def _parsed_diff(value: dict[str, Any]) -> regional_release_diff.ReleaseDiff:
+    return regional_release_diff.ReleaseDiff(
+        regional_release_diff.ReleaseChangeKind(value["kind"]),
+        frozenset(value.get("changed") or []),
     )
 
 
@@ -189,20 +235,38 @@ def _assert_data_plane_changed(
         before["gpu_generations"], after["gpu_generations"]
     )
     if scenario == "executor":
-        # An executor-only release rolls the changed data-plane components and
-        # nothing else. The executor Deployment always moves; the watcher and
-        # the collector run the same runtime image, so a candidate whose image
-        # digest changed (``runtime_image`` in the classification -- every
-        # rebuilt candidate) rolls them too, and that is the release engine
-        # rolling by image change, not touching more than it classified. What
-        # must never move here is anything outside the shared-image set: the
-        # Node Runtime, its bundle and the installer reconciler.
-        allowed = {EXECUTOR_DEPLOYMENT}
-        if "runtime_image" in set((diff or {}).get("changed") or []):
-            allowed = set(RUNTIME_IMAGE_DEPLOYMENTS)
+        _require(diff is not None, "executor rollout lacks its input diff")
+        plan = regional_release_diff.build_execution_plan(
+            _parsed_diff(dict(diff or {}))
+        )
+        component = regional_release_diff.ReleaseComponent
         _require(
-            bool(generations),
-            "executor-only release rolled no GPU Deployment",
+            not plan.has(component.AGENT, component.SCHEMA, component.RUNTIME_PROFILE),
+            "executor-only candidate changes node/schema/Profile",
+            plan.as_dict(),
+        )
+        allowed = {
+            deployment
+            for selected, deployment in (
+                (component.EXECUTOR, EXECUTOR_DEPLOYMENT),
+                (
+                    component.WATCHER,
+                    regional_deployment_inventory.GPU_WATCHER_DEPLOYMENT,
+                ),
+                (
+                    component.COLLECTOR,
+                    regional_deployment_inventory.GPU_COLLECTOR_DEPLOYMENT,
+                ),
+                (
+                    component.RECONCILER,
+                    regional_deployment_inventory.GPU_RECONCILER_DEPLOYMENT,
+                ),
+            )
+            if plan.has(selected)
+        }
+        _require(
+            set(generations) == set(before_clusters),
+            "executor-only release did not roll every selected cluster",
             (before, after),
         )
         for cluster_id, moved in generations.items():
@@ -212,8 +276,8 @@ def _assert_data_plane_changed(
                 sorted(moved),
             )
             _require(
-                moved <= allowed,
-                f"executor-only release rolled non-executor Deployments in {cluster_id}",
+                moved == allowed,
+                f"executor-only rollout differs from the component plan in {cluster_id}",
                 {"moved": sorted(moved), "allowed": sorted(allowed)},
             )
 
@@ -506,7 +570,7 @@ def _stage_control_plane(
     )
     _require(control_apply["phase"] == "complete", "CPU apply phase", control_apply)
     control_after = chain.after(backend, recorder, "control_plane")
-    _assert_control_plane_only(control_before, control_after)
+    _assert_control_plane_only(control_before, control_after, control_diff)
     _assert_next_noop(backend, recorder, "control_plane")
 
 
@@ -701,6 +765,30 @@ STAGE_RUNNERS: dict[
 }
 
 
+def complete_evidence(recorder: EvidenceRecorder) -> dict[str, Any]:
+    final = recorder.document["stages"].get("full_after", {})
+    release_id = final.get("release_id")
+    clusters = final.get("live", {}).get("clusters")
+    if (
+        not isinstance(release_id, str)
+        or not release_id
+        or not isinstance(clusters, dict)
+        or not clusters
+    ):
+        raise AcceptanceCheckError("final release/cluster identity is missing")
+    recorder.document.update(
+        {
+            "schema_version": 1,
+            "report_type": "fault-acceptance",
+            "release_id": release_id,
+            "cluster_ids": sorted(clusters),
+            "cluster_id": next(iter(clusters)) if len(clusters) == 1 else None,
+            "verdict": "PASS",
+        }
+    )
+    return recorder.complete()
+
+
 def run_release_rolling(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
@@ -721,6 +809,8 @@ def run_release_rolling(
     here, so whatever stage a run begins at observes its own ``*_before``.
     """
 
+    recorder.document["status"] = "RUNNING"
+    recorder.note("verdict", "FAIL")
     if start_stage not in STAGES:
         raise ValueError(f"unknown BOOT-020 stage: {start_stage}")
     start = STAGES.index(start_stage)
@@ -730,7 +820,7 @@ def run_release_rolling(
             missing = [
                 stage
                 for stage in STAGES[:start]
-                if STAGE_TERMINAL_KEY[stage] not in recorder.document["stages"]
+                if _passed_marker(stage) not in recorder.document["stages"]
             ]
             if missing:
                 raise RuntimeError(
@@ -753,9 +843,9 @@ def run_release_rolling(
             STAGE_RUNNERS[stage](backend, recorder, chain)
             recorder.stage(
                 _passed_marker(stage),
-                lambda stage=stage: {"stage": stage, "passed_at": utc_now()},
+                lambda: {"stage": stage, "passed_at": utc_now()},
             )
-        return recorder.complete()
+        return complete_evidence(recorder)
     except BaseException as exc:
         recorder.fail(exc)
         raise
@@ -834,16 +924,18 @@ def resume_release_rolling(
     would on a first pass.
     """
 
+    recorder.document["status"] = "RUNNING"
+    recorder.note("verdict", "FAIL")
     index, stage = resume_target(recorder.document)
     if stage is None:
-        return recorder.complete()
+        return complete_evidence(recorder)
     _discard_incomplete(recorder, index)
     if index:
         _converge_to_precondition(backend, recorder, index)
     return run_release_rolling(backend, recorder, start_stage=stage)
 
 
-def _read_snapshot(release: Any):
+def _read_snapshot(release: Any) -> AbstractContextManager[Any]:
     """The engine's read snapshot when the release offers one, else a no-op.
 
     Inside it every read-only ``kubectl get`` is served once from one
@@ -852,7 +944,11 @@ def _read_snapshot(release: Any):
     """
 
     factory = getattr(release, "_read_snapshot", None)
-    return factory() if callable(factory) else nullcontext()
+    return (
+        cast(AbstractContextManager[Any], factory())
+        if callable(factory)
+        else nullcontext()
+    )
 
 
 def deployment_generations(
@@ -866,24 +962,30 @@ def deployment_generations(
     ``release._gpu(target)``); the argv is built exactly as the engine's
     ``prime_deployment_snapshot`` builds it, so inside a read snapshot the list
     ``_capture_previous`` already primed answers this without another kubectl
-    call. A Deployment absent from the list reads as generation 0 -- the value
-    the former per-name read fell back to when kubectl returned nothing (a
-    per-name read of a missing object would have raised instead; the compared
-    dicts keep the same key set either way, so no verdict moves).
+    call. Missing, repeated or malformed generations cannot prove stability.
     """
 
     listing = release._get_json(
         args + ["-n", release.config.namespace, "get", "deployment"]
     )
     found: dict[str, int] = {}
-    for item in listing.get("items") or []:
+    if not isinstance(listing, dict) or not isinstance(listing.get("items"), list):
+        raise AcceptanceCheckError("Deployment inventory is missing")
+    for item in listing["items"]:
         if not isinstance(item, dict):
             continue
         metadata = item.get("metadata", {}) or {}
         name = metadata.get("name")
         if name in names:
-            found[str(name)] = int(metadata.get("generation", 0))
-    return {name: found.get(name, 0) for name in names}
+            generation = metadata.get("generation")
+            if name in found or type(generation) is not int or generation < 1:
+                raise AcceptanceCheckError(
+                    "Deployment generation is missing or invalid"
+                )
+            found[str(name)] = generation
+    if set(found) != set(names):
+        raise AcceptanceCheckError("Deployment inventory is incomplete")
+    return {name: found[name] for name in names}
 
 
 class LiveReleaseRollingBackend:
@@ -909,7 +1011,12 @@ class LiveReleaseRollingBackend:
     def classify(self, scenario: str) -> dict[str, Any]:
         release = self._release(scenario)
         state = release._load_state()
-        return dict(self.diff_module.classify_release(release, state).as_dict())
+        diff = self.diff_module.classify_release(release, state)
+        return {
+            **diff.as_dict(),
+            "execution_plan": self.diff_module.build_execution_plan(diff).as_dict(),
+            "cpu_roles": list(self.diff_module.control_plane_role_targets(diff)),
+        }
 
     def _next_deploy(self, release: Any, state: dict[str, Any]) -> Any:
         """What ``build_release_summary(release)["next_deploy"]`` would hold.
@@ -961,7 +1068,10 @@ class LiveReleaseRollingBackend:
                 target.cluster_id: deployment_generations(
                     release,
                     release._gpu(target),
-                    self.inventory.DEPLOYMENTS,
+                    (
+                        *self.inventory.DEPLOYMENTS,
+                        self.inventory.GPU_RECONCILER_DEPLOYMENT,
+                    ),
                 )
                 for target in release.config.clusters
             }
@@ -1062,15 +1172,16 @@ class LiveReleaseRollingBackend:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
+    add_live_arguments(value, confirmation=CONFIRMATION)
     value.add_argument("--noop-config", required=True, type=Path)
     value.add_argument("--control-plane-config", required=True, type=Path)
     value.add_argument("--data-plane-config", required=True, type=Path)
     value.add_argument("--agent-config", required=True, type=Path)
     value.add_argument("--full-config", required=True, type=Path)
-    value.add_argument("--run-dir", required=True, type=Path)
     value.add_argument("--gpu-kubeconfig", type=Path)
-    value.add_argument("--execute", action="store_true")
-    value.add_argument("--confirm")
+    value.add_argument("--predecessor-evidence", default="")
+    value.add_argument("--admin-state-dir", required=True, type=Path)
+    value.add_argument("--admin-reference", required=True)
     value.add_argument(
         "--start-stage",
         choices=STAGES,
@@ -1094,6 +1205,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    install_site_profile()
     arguments = parser().parse_args()
     if arguments.resume and arguments.start_stage != "noop":
         raise SystemExit(
@@ -1114,6 +1226,27 @@ def main() -> int:
     for path in configs.values():
         if not path.is_file():
             raise SystemExit(f"release config does not exist: {path}")
+    validate_admin_target(arguments.admin_state_dir.resolve(), configs["noop"])
+    previous_id, previous_path = predecessor_path(
+        arguments.run_dir, CASE_ID, arguments.predecessor_evidence
+    )
+    predecessor = (
+        predecessor_evidence(previous_path, previous_id)
+        if previous_id is not None and previous_path is not None
+        else {"valid": True, "verdict": "NOT_REQUIRED"}
+    )
+    config_digests = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for name, path in configs.items()
+    }
+    environment = {
+        "GPU_FAULT_BOOT020_CONFIGS": json.dumps(
+            {name: str(path) for name, path in configs.items()}, sort_keys=True
+        ),
+        "KUBECONFIG": str(arguments.gpu_kubeconfig.resolve())
+        if arguments.gpu_kubeconfig is not None
+        else os.getenv("KUBECONFIG", ""),
+    }
     plan = {
         "case_id": CASE_ID,
         "run_dir": str(arguments.run_dir),
@@ -1123,9 +1256,14 @@ def main() -> int:
             else os.getenv("KUBECONFIG")
         ),
         "configs": {name: str(path) for name, path in configs.items()},
+        "config_sha256": config_digests,
+        "predecessor": predecessor,
         "start_stage": "auto (--resume)" if arguments.resume else arguments.start_stage,
         "resume": arguments.resume,
+        "admin_state_dir": str(arguments.admin_state_dir.resolve()),
+        "admin_reference": arguments.admin_reference,
         "stages": [
+            "apply, repeat and restore AdminConfig through the public locked CLI",
             "verify NOOP makes no live artifact change",
             "assert CPU-only rollback T_safe and T_full",
             "assert Executor-only rollback plus interrupted resume RTO",
@@ -1135,22 +1273,67 @@ def main() -> int:
         ],
     }
     if not arguments.execute:
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
-    if arguments.confirm != CONFIRMATION:
-        raise SystemExit(f"--execute requires --confirm {CONFIRMATION}")
+        document = build_plan(
+            arguments=arguments,
+            preflight_passed=predecessor.get("valid") is True,
+            run_dir=arguments.run_dir,
+            case_id=CASE_ID,
+            attempt=arguments.attempt,
+            confirmation=CONFIRMATION,
+            environment=environment,
+            details=plan,
+        )
+        print(json.dumps(document, indent=2, sort_keys=True))
+        return 0 if predecessor.get("valid") is True else 1
+    authorize_execution(
+        arguments,
+        case_id=CASE_ID,
+        confirmation=CONFIRMATION,
+        environment=environment,
+        details=plan,
+    )
+    if predecessor.get("valid") is not True:
+        raise AcceptanceCheckError("formal predecessor evidence is not PASS")
     gpu_kubeconfig = configure_gpu_kubeconfig(arguments.gpu_kubeconfig)
-    arguments.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    case_path = case_evidence_path(arguments.run_dir, CASE_ID)
+    case_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     inputs = {
+        "acceptance_contract": 4,
+        "admin_state_dir": str(arguments.admin_state_dir.resolve()),
+        "admin_reference": arguments.admin_reference,
         "configs": {name: str(path) for name, path in configs.items()},
+        "config_sha256": config_digests,
         "gpu_kubeconfig": str(gpu_kubeconfig),
     }
     recorder = EvidenceRecorder(
-        arguments.run_dir / f"{CASE_ID}.json",
+        case_path,
         case_id=CASE_ID,
         inputs=inputs,
     )
     backend = LiveReleaseRollingBackend(configs)
+    handoff = case_path.parent / "boot023-noop.json"
+    write_json_atomic(handoff, json.loads(configs["full"].read_text(encoding="utf-8")))
+    recorder.note(
+        "final_noop_handoff",
+        {
+            "config": str(handoff),
+            "config_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
+            "usable_only_after_full_pass": True,
+            "classification_stage": "full_next_classification",
+        },
+    )
+    recorder.stage(
+        "public_admin_config_roundtrip",
+        lambda: public_config_roundtrip(
+            arguments.admin_state_dir.resolve(),
+            desired=AdminConfig.from_mapping(
+                json.loads(configs["control_plane"].read_text(encoding="utf-8"))[
+                    "admin_config"
+                ]["config"]
+            ),
+            reference=arguments.admin_reference,
+        ),
+    )
     if arguments.resume:
         result = resume_release_rolling(backend, recorder)
     else:

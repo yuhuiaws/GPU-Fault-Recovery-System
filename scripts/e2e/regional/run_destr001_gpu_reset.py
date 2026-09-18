@@ -26,6 +26,9 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.remote_command_shapes import (  # noqa: E402
     command_operations,
 )
+from scripts.e2e.regional.reset_dependency_chain import (  # noqa: E402
+    reset_chain_errors,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -42,6 +45,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from gpu_fault.orchestration.escalation import unknown_outcome_failure  # noqa: E402
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "destructive_node_probe.py"
 CASE_ID = "GF-REGIONAL-DESTR-001"
@@ -297,14 +301,9 @@ def workflow_errors(
         errors.append("XID evidence is not backed by kmsg://")
     if decision.get("official_action") != official_action:
         errors.append(f"policy did not finalize XID {xid} as {official_action}")
-    steps = [item.get("operation") for item in workflow.get("official_steps", [])]
-    if steps != expected:
-        errors.append("workflow step sequence differs from the reset contract")
+    errors.extend(reset_chain_errors(workflow, expected))
     if workflow.get("status") != "SUCCEEDED":
         errors.append("reset workflow is not SUCCEEDED")
-    completed = workflow.get("completed_operations") or []
-    if completed != expected:
-        errors.append("completed operation sequence differs from the reset contract")
     if not waiting_details_present(state):
         errors.append("remote WAITING evidence lacks control-plane mutation=false")
     commands = state.get("commands") or []
@@ -327,31 +326,156 @@ def workflow_errors(
     return errors
 
 
+def post_restart_client_errors(
+    after: dict[str, Any], contract: dict[str, Any]
+) -> list[str]:
+    """Accept clients only from the observed new attempt's owned Pod allocation."""
+
+    from pydantic import ValidationError
+
+    from gpu_fault.models import Environment
+    from gpu_fault.watcher import AttemptObservation
+
+    # Every Kubernetes-backed environment the watcher can report: a HyperPod EKS
+    # site observes ``hyperpod-eks``, not the bare ``kubernetes`` member.
+    KUBERNETES_ENVIRONMENTS = frozenset(
+        {Environment.KUBERNETES, Environment.EKS, Environment.HYPERPOD_EKS}
+    )
+
+    try:
+        observation = AttemptObservation.model_validate(contract.get("observation"))
+        captured = datetime.fromisoformat(str(after.get("captured_at") or ""))
+    except (ValidationError, TypeError, ValueError):
+        return ["post-restart workload observation or host timestamp is invalid"]
+    if (
+        captured.tzinfo is None
+        or observation.observed_at.tzinfo is None
+        or not 0 <= (captured - observation.observed_at).total_seconds() <= 120
+        or any(
+            not isinstance(contract.get(key), str) or not contract[key]
+            for key in ("cluster_id", "job_id", "node", "source_attempt_id")
+        )
+        or not observation.attempt_id
+        or observation.environment not in KUBERNETES_ENVIRONMENTS
+        or observation.cluster_id != contract.get("cluster_id")
+        or observation.job_id != contract.get("job_id")
+        or observation.workload_phase.value != "RUNNING"
+        or not contract.get("source_attempt_id")
+        or observation.attempt_id == contract["source_attempt_id"]
+    ):
+        return ["post-restart workload identity or freshness is not proven"]
+    source = contract.get("source_pod_uids")
+    pods = contract.get("pods")
+    if (
+        not isinstance(source, list)
+        or not source
+        or any(not isinstance(uid, str) or not uid for uid in source)
+        or len(set(source)) != len(source)
+        or not isinstance(pods, list)
+        or len(pods) != len(source)
+        or any(not isinstance(pod, dict) for pod in pods)
+    ):
+        return ["post-restart Pod lineage is incomplete"]
+    uids = [pod.get("uid") for pod in pods]
+    if (
+        any(not isinstance(uid, str) or not uid for uid in uids)
+        or len(set(uids)) != len(uids)
+        or set(source) & set(uids)
+        or any(
+            pod.get("phase") != "Running"
+            or pod.get("ready") is not True
+            or not pod.get("node")
+            or pod.get("attempt_id") != observation.attempt_id
+            for pod in pods
+        )
+        or {item.pod_uid for item in observation.containers} != set(uids)
+        or any(
+            item.terminated or item.deletion_requested
+            for item in observation.containers
+        )
+    ):
+        return ["post-restart Pods are not the complete Ready replacement attempt"]
+    node = contract.get("node")
+    node_by_uid = {pod["uid"]: pod["node"] for pod in pods}
+    if any(
+        item.node_id != node_by_uid[item.pod_uid] for item in observation.containers
+    ):
+        return ["post-restart Pod placement differs from its observation"]
+    local_uids = {pod["uid"] for pod in pods if pod.get("node") == node}
+    allocations: dict[str, set[str]] = {}
+    for item in observation.containers:
+        if item.node_id == node and item.pod_uid in local_uids:
+            allocations.setdefault(item.pod_uid, set()).update(item.gpu_uuids)
+    clients = after.get("compute_clients")
+    if (
+        not local_uids
+        or set(allocations) != local_uids
+        or any(not values for values in allocations.values())
+        or not isinstance(clients, list)
+        or not clients
+    ):
+        return ["post-restart GPU client ownership is not observed on the target node"]
+    if any(
+        not isinstance(client, dict)
+        or not str(client.get("pid") or "").isdigit()
+        or client.get("pod_uid") not in allocations
+        or client.get("gpu_uuid")
+        not in allocations.get(cast(str, client.get("pod_uid")), set())
+        for client in clients
+    ):
+        return [
+            "post-restart GPU client is foreign, unowned or outside its GPU allocation"
+        ]
+    expected = set().union(*allocations.values())
+    observed = {client["gpu_uuid"] for client in clients}
+    if observed != expected:
+        return [
+            "post-restart GPU clients do not cover the observed workload allocation"
+        ]
+    return []
+
+
 def host_errors(
     baseline: dict[str, Any],
     after: dict[str, Any],
     *,
     expected_gpu_count: int,
     target_bdf: str,
+    incident_id: str = "",
+    workflow_request_id: str = "",
+    post_restart_workload: dict[str, Any] | None = None,
 ) -> list[str]:
     errors = []
     if len(after.get("gpu_inventory") or []) != expected_gpu_count:
         errors.append("GPU inventory count changed after reset")
-    if after.get("compute_clients"):
+    if post_restart_workload is not None:
+        errors.extend(post_restart_client_errors(after, post_restart_workload))
+    elif after.get("compute_clients"):
         errors.append("compute clients remain after reset")
     baseline_rows = {
-        (item["command_id"], item["operation"]) for item in baseline.get("ledger") or []
+        (item["command_id"], item.get("attempt"))
+        for item in baseline.get("ledger") or []
     }
     added = [
         item
         for item in after.get("ledger") or []
-        if (item["command_id"], item["operation"]) not in baseline_rows
+        if (item["command_id"], item.get("attempt")) not in baseline_rows
     ]
     reset_rows = [item for item in added if item["operation"] == "RESET_GPU"]
     if len(reset_rows) != 1:
         errors.append("Node Agent ledger did not add exactly one RESET_GPU result")
     elif reset_rows[0].get("attempt") != 1:
         errors.append("RESET_GPU ledger attempt is not one")
+    elif reset_rows[0].get("state") != "SUCCEEDED":
+        errors.append("RESET_GPU ledger result is not SUCCEEDED")
+    if len(reset_rows) == 1:
+        row = reset_rows[0]
+        for key, expected in (
+            ("incident_id", incident_id),
+            ("workflow_request_id", workflow_request_id),
+        ):
+            if expected and row.get(key) != expected:
+                errors.append(f"RESET_GPU ledger {key} does not match this workflow")
     if len({item["command_id"] for item in added}) != len(added):
         errors.append("Node Agent ledger contains duplicate command IDs")
     if after.get("gpu_fault_timers") != baseline.get("gpu_fault_timers"):
@@ -375,6 +499,39 @@ def host_errors(
     if int(journal.get("target_reset_count") or 0) > 1:
         errors.append(f"kernel journal shows more than one reset for {target_bdf}")
     sampler = after.get("sampler") or {}
+    inventory = baseline.get("gpu_inventory") or []
+    uuids = {item.get("uuid") for item in inventory}
+    target = [
+        item.get("uuid")
+        for item in inventory
+        if str(item.get("pci_bdf") or "").lower().removesuffix(".0")
+        == target_bdf.lower().removesuffix(".0")
+    ]
+    if (
+        len(uuids) != expected_gpu_count
+        or any(not isinstance(value, str) or not value for value in uuids)
+        or len(target) != 1
+    ):
+        errors.append("target GPU UUID/BDF identity is not unique in the baseline")
+    else:
+        observed_sets = sampler.get("observed_gpu_uuid_sets") or []
+        if not any(set(values) == uuids - {target[0]} for values in observed_sets):
+            errors.append(
+                "sampler did not observe only the target GPU leave and return"
+            )
+        if set((sampler.get("last") or {}).get("gpu_uuids") or []) != uuids:
+            errors.append("sampler final GPU UUID set differs from the baseline")
+        if len(reset_rows) == 1 and reset_rows[0].get("gpu_uuids") != target:
+            errors.append("RESET_GPU ledger does not identify only the target GPU")
+        before_identity = {
+            (item.get("uuid"), item.get("pci_bdf")) for item in inventory
+        }
+        after_identity = {
+            (item.get("uuid"), item.get("pci_bdf"))
+            for item in after.get("gpu_inventory") or []
+        }
+        if before_identity != after_identity:
+            errors.append("GPU UUID/BDF inventory changed after reset")
     if int(sampler.get("sample_count") or 0) < 2:
         errors.append("detached host GPU sampler has insufficient samples")
     else:
@@ -422,7 +579,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "probe cleanup leaves a residual",
         ],
         "rollback": {
-            "runner_finally_invokes_quiesce_restore_for_the_case_incident": True,
+            "gpu_service_restoration_is_owned_by_the_product_workflow": True,
+            "runner_never_calls_the_unconditional_host_restore_helper": True,
+            "unknown_physical_outcomes_retain_operator_hold": True,
             "fail_safe_timer_remains_independent_of_the_probe": True,
             "failed_validation_keeps_the_node_quarantined": True,
             "reboot_requires_a_separate_approved_case": True,
@@ -453,6 +612,55 @@ def verify_plan_identity(
         raise RegionalFixtureError(f"DESTR-001 plan drifted: {planned} != {current}")
 
 
+def prepare_host_baseline(
+    host: HostProbeFixture,
+    preflight: dict[str, Any],
+    case_dir: Path,
+) -> tuple[dict[str, Any], int, str]:
+    host.create()
+    baseline_host = host.execute("snapshot")
+    write_json_atomic(case_dir / "host-baseline.json", baseline_host)
+    expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
+    if len(baseline_host["gpu_inventory"]) != expected_gpu_count:
+        raise RegionalFixtureError("host GPU inventory differs from Node allocatable")
+    if baseline_host["compute_clients"]:
+        raise RegionalFixtureError("target node has active NVIDIA compute clients")
+    if baseline_host["quiesce_states"]:
+        raise RegionalFixtureError("target node has a pre-existing quiesce state")
+    if not baseline_host["kmsg_writable"]:
+        raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
+    target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+    return baseline_host, expected_gpu_count, target_bdf
+
+
+def quiesce_recovery_report(
+    state: dict[str, Any], after: dict[str, Any], *, injection_attempted: bool
+) -> dict[str, Any]:
+    workflow = state.get("workflow") or {}
+    unresolved = any(
+        unknown_outcome_failure(item.get("details"))
+        for item in workflow.get("step_executions") or []
+    ) or any(
+        command.get("status") not in {"SUCCEEDED", "FAILED"}
+        or unknown_outcome_failure(command.get("result_details"))
+        for command in state.get("commands") or []
+    )
+    restored = (
+        not unresolved
+        and workflow.get("status") == "SUCCEEDED"
+        and "quiesce_states" in after
+        and not after["quiesce_states"]
+        and "RESTORE_GPU_SERVICES" in (workflow.get("completed_operations") or [])
+    )
+    return {
+        "strategy": "product-workflow",
+        "runner_restore_attempted": False,
+        "product_restoration_observed": restored,
+        "operator_review_required": injection_attempted and not restored,
+        "existing_failsafe_preserved": True,
+    }
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -473,6 +681,7 @@ def execute_case(
     marker = f"destr001-{int(time.time())}-a{attempt}"
     host = HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -494,9 +703,10 @@ def execute_case(
             preflight["focused_tests"].get("focused_tests_reused")
         ),
     }
-    baseline_host: dict[str, Any] | None = None
     incident_id = ""
-    injection_started: datetime | None = None
+    injection_attempted = False
+    state: dict[str, Any] = {}
+    after: dict[str, Any] = {}
     sampler_started = False
     sampler_stopped = False
 
@@ -513,21 +723,11 @@ def execute_case(
         return stopped
 
     try:
-        host.create()
-        baseline_host = host.execute("snapshot")
-        write_json_atomic(case_dir / "host-baseline.json", baseline_host)
-        expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
-        if len(baseline_host["gpu_inventory"]) != expected_gpu_count:
-            raise RegionalFixtureError(
-                "host GPU inventory differs from Node allocatable"
-            )
-        if baseline_host["compute_clients"]:
-            raise RegionalFixtureError("target node has active NVIDIA compute clients")
-        if baseline_host["quiesce_states"]:
-            raise RegionalFixtureError("target node has a pre-existing quiesce state")
-        if not baseline_host["kmsg_writable"]:
-            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
-        target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before probe creation")
+        baseline_host, expected_gpu_count, target_bdf = prepare_host_baseline(
+            host, preflight, case_dir
+        )
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError(
                 "approved maintenance window ended before injection"
@@ -548,7 +748,10 @@ def execute_case(
             timeout=60,
         )
         write_json_atomic(case_dir / "sampler-start.json", sampler)
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before XID injection")
         injection_started = datetime.now(timezone.utc)
+        injection_attempted = True
         injection = host.execute(
             "write-xid46",
             "--marker",
@@ -590,6 +793,10 @@ def execute_case(
                 after,
                 expected_gpu_count=expected_gpu_count,
                 target_bdf=target_bdf,
+                incident_id=incident_id,
+                workflow_request_id=str(
+                    (state.get("workflow") or {}).get("request_id") or ""
+                ),
             )
         )
         node_after = regional.node_snapshot(settings.node)
@@ -632,19 +839,15 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        recovery: dict[str, Any] = {}
-        if incident_id:
-            try:
-                recovery = host.execute(
-                    "restore-quiesce",
-                    "--incident-id",
-                    incident_id,
-                    timeout=300,
-                )
-            except Exception as exc:
-                recovery = {"error": f"{type(exc).__name__}: {exc}"}
-                result["verdict"] = "FAIL"
+        # The product owns normal and confirmed-failure compensation. Calling
+        # restore_state_file here would clear reset_issued even when its
+        # physical outcome is unknown, and cannot be made safe by a stale read.
+        recovery = quiesce_recovery_report(
+            state, after, injection_attempted=injection_attempted
+        )
         result["quiesce_recovery"] = recovery
+        if recovery["operator_review_required"]:
+            result["verdict"] = "FAIL"
         if sampler_started and not sampler_stopped:
             try:
                 stop_sampler()
@@ -663,6 +866,8 @@ def execute_case(
         try:
             final_node = regional.node_snapshot(settings.node)
             result["final_node"] = final_node
+            if final_node.get("uid") != preflight["node"].get("uid"):
+                result.update(verdict="FAIL", node_identity_changed=True)
             if final_node["ready"] != "True":
                 result["verdict"] = "FAIL"
         except Exception as exc:

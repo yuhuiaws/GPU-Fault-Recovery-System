@@ -178,7 +178,14 @@ def configure(arguments: argparse.Namespace) -> Settings:
 # Cluster reads shared with DESTR-024
 # --------------------------------------------------------------------------- #
 def coverage_probe(fixture: RegionalLiveFixture, node: str) -> dict[str, Any]:
-    return fixture.cpu_python(COVERAGE_PROBE, fixture.settings.cluster_id, node)
+    value = fixture.cpu_python(COVERAGE_PROBE, fixture.settings.cluster_id, node)
+    heartbeat = value.get("heartbeat")
+    if (
+        isinstance(heartbeat, dict)
+        and heartbeat.get("cluster_id") != fixture.settings.cluster_id
+    ):
+        raise RegionalFixtureError("coverage heartbeat belongs to another cluster")
+    return value
 
 
 def managed_pods(fixture: RegionalLiveFixture) -> list[dict[str, Any]]:
@@ -207,13 +214,23 @@ def canary_jobs(fixture: RegionalLiveFixture) -> list[str]:
 
 
 def watcher_deployment(fixture: RegionalLiveFixture) -> dict[str, Any]:
-    return deployment_summary(
+    from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
+
+    summary = deployment_summary(
         json.loads(
             fixture.kubectl(
                 "gpu", "get", "deployment", WATCHER_DEPLOYMENT, "-o", "json"
             )
         )
     )
+    pods = json.loads(
+        fixture.kubectl(
+            "gpu", "get", "pods", "-l", f"app={WATCHER_APP_LABEL}", "-o", "json"
+        )
+    )
+    summary["ready_pods"] = ready_pod_records(pods)
+    summary["pod_count"] = len(pods["items"])
+    return summary
 
 
 def watcher_pods(fixture: RegionalLiveFixture) -> list[dict[str, Any]]:
@@ -222,12 +239,14 @@ def watcher_pods(fixture: RegionalLiveFixture) -> list[dict[str, Any]]:
             "gpu", "get", "pods", "-l", f"app={WATCHER_APP_LABEL}", "-o", "json"
         )
     )
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        raise RegionalFixtureError("watcher Pod inventory is incomplete")
     return [
         {
             "name": item["metadata"]["name"],
             "phase": (item.get("status") or {}).get("phase"),
         }
-        for item in value.get("items") or []
+        for item in value["items"]
     ]
 
 
@@ -415,6 +434,27 @@ def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Execute
 # --------------------------------------------------------------------------- #
+def prepare_host_baseline(
+    host: HostProbeFixture,
+    preflight: dict[str, Any],
+    case_dir: Path,
+) -> tuple[dict[str, Any], int, str]:
+    host.create()
+    baseline_host = host.execute("snapshot")
+    write_json_atomic(case_dir / "host-baseline.json", baseline_host)
+    expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
+    if len(baseline_host["gpu_inventory"]) != expected_gpu_count:
+        raise RegionalFixtureError("host GPU inventory differs from Node allocatable")
+    if baseline_host["compute_clients"]:
+        raise RegionalFixtureError("target node has active NVIDIA compute clients")
+    if baseline_host["quiesce_states"]:
+        raise RegionalFixtureError("target node has a pre-existing quiesce state")
+    if not baseline_host["kmsg_writable"]:
+        raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
+    target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+    return baseline_host, expected_gpu_count, target_bdf
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -435,6 +475,7 @@ def execute_case(
     marker = f"destr023-{int(time.time())}-a{attempt}"
     host = HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -456,9 +497,7 @@ def execute_case(
             preflight["focused_tests"].get("focused_tests_reused")
         ),
     }
-    baseline_host: dict[str, Any] | None = None
     incident_id = ""
-    injection_started: datetime | None = None
     sampler_started = False
     sampler_stopped = False
 
@@ -470,21 +509,11 @@ def execute_case(
         return stopped
 
     try:
-        host.create()
-        baseline_host = host.execute("snapshot")
-        write_json_atomic(case_dir / "host-baseline.json", baseline_host)
-        expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
-        if len(baseline_host["gpu_inventory"]) != expected_gpu_count:
-            raise RegionalFixtureError(
-                "host GPU inventory differs from Node allocatable"
-            )
-        if baseline_host["compute_clients"]:
-            raise RegionalFixtureError("target node has active NVIDIA compute clients")
-        if baseline_host["quiesce_states"]:
-            raise RegionalFixtureError("target node has a pre-existing quiesce state")
-        if not baseline_host["kmsg_writable"]:
-            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
-        target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before probe creation")
+        baseline_host, expected_gpu_count, target_bdf = prepare_host_baseline(
+            host, preflight, case_dir
+        )
 
         # The premise. Old observations age out on their own; the heartbeat
         # has to be the only fresh coverage left when the XID lands.
@@ -520,6 +549,8 @@ def execute_case(
             timeout=60,
         )
         write_json_atomic(case_dir / "sampler-start.json", sampler)
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before XID injection")
         injection_started = datetime.now(timezone.utc)
         injection = host.execute(
             "write-xid46",
@@ -559,6 +590,10 @@ def execute_case(
                 after,
                 expected_gpu_count=expected_gpu_count,
                 target_bdf=target_bdf,
+                incident_id=incident_id,
+                workflow_request_id=str(
+                    (state.get("workflow") or {}).get("request_id") or ""
+                ),
             )
         )
         node_after = regional.node_snapshot(settings.node)
@@ -629,6 +664,8 @@ def execute_case(
         try:
             final_node = regional.node_snapshot(settings.node)
             result["final_node"] = final_node
+            if final_node.get("uid") != preflight["node"].get("uid"):
+                result.update(verdict="FAIL", node_identity_changed=True)
             if final_node["ready"] != "True":
                 result["verdict"] = "FAIL"
         except Exception as exc:

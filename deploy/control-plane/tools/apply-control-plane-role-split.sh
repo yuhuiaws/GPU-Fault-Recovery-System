@@ -38,6 +38,8 @@ ALLOW_EMAIL="${GPU_FAULT_ALLOW_EMAIL:-true}"
 ACKNOWLEDGE_NO_ALERT_CHANNEL="$(
     printf '%s' "${GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL:-false}"
 )"
+# Managed callers set an empty value when the site declares no configuration set.
+SES_CONFIGURATION_SET="${GPU_FAULT_SES_CONFIGURATION_SET:-}"
 NOTIFICATION_CONFIG_SHA256="$(
     printf '%s' "${GPU_FAULT_NOTIFICATION_CONFIG_SHA256:-}"
 )"
@@ -89,6 +91,11 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "true" ||
     "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "false" ]] || {
     echo "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL must be true or false" >&2
+    exit 2
+}
+[[ -z "${SES_CONFIGURATION_SET}" ||
+    "${SES_CONFIGURATION_SET}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || {
+    echo "GPU_FAULT_SES_CONFIGURATION_SET must be 1-64 letters, digits, hyphens or underscores" >&2
     exit 2
 }
 [[ "${NOTIFICATION_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -536,7 +543,7 @@ if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
             exit 1
         }
     done
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" create configmap \
+    RELEASE_METADATA_JSON="$(kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" create configmap \
         gpu-fault-release-metadata \
         --from-literal=required-agent-artifact-sha256="${REQUIRED_AGENT_ARTIFACT_SHA256}" \
         --from-literal=compatible-agent-artifact-sha256s="${COMPATIBLE_AGENT_ARTIFACT_SHA256S}" \
@@ -553,13 +560,22 @@ if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
         --from-literal=required-agent-config-digest="${REQUIRED_AGENT_CONFIG_DIGEST}" \
         --from-literal=compatible-agent-config-digests="${COMPATIBLE_AGENT_CONFIG_DIGESTS}" \
         --from-literal=required-node-action-key-version="${REQUIRED_NODE_ACTION_KEY_VERSION}" \
-        --dry-run=client -o yaml |
-        kubectl "${kubectl_args[@]}" apply -f -
-elif ! kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-    gpu-fault-release-metadata >/dev/null 2>&1; then
+        --dry-run=client -o json)"
+    printf '%s\n' "${RELEASE_METADATA_JSON}" | kubectl "${kubectl_args[@]}" apply -f -
+elif [[ -z "${RELEASE_METADATA_JSON:-}" ]]; then
     echo "gpu-fault-release-metadata is missing; set GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST for a greenfield deploy" >&2
     exit 1
 fi
+PIN_METADATA_SHA256="$(jq -cS '.data' <<<"${RELEASE_METADATA_JSON}" | sha256sum | cut -d' ' -f1)"
+ROLE_RESTART_TOKEN=""
+if [[ "${FORCE_ROLE_RESTART}" == "true" ]]; then
+    ROLE_RESTART_TOKEN="$(date -u +%FT%T.%NZ)"
+fi
+printf 'control-plane pin metadata changed=%s force-restart=%s\n' \
+    "${RELOAD_RELEASE_METADATA}" "${FORCE_ROLE_RESTART}" >&2
+LIVE_DEPLOYMENTS="${CONTRACT_DIR}/deployments.json"
+install -m 0600 /dev/null "${LIVE_DEPLOYMENTS}"
+kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployments -o json >"${LIVE_DEPLOYMENTS}"
 
 # A verbatim rollback renders the previous release's container env, which the
 # current release's validators would reject (names it dropped are "unknown" to
@@ -587,19 +603,52 @@ render_manifest_for_apply() {
 
 apply_manifest() {
     local manifest="$1"
-    render_manifest_for_apply "${manifest}" |
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
-}
-
-remove_legacy_notification_env() {
-    local deployment="$1"
-    if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
-        "${deployment}" >/dev/null 2>&1; then
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" set env \
-            "deployment/${deployment}" \
-            GPU_FAULT_ALLOW_EMAIL- \
-            GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL-
-    fi
+    local role_sha=""
+    case "${manifest}" in
+        gpu-fault-api-ha-ingress) role_sha="${ADMIN_CONFIG_INGRESS_SHA256}" ;;
+        gpu-fault-control-worker) role_sha="${ADMIN_CONFIG_WORKER_SHA256}" ;;
+        gpu-fault-telemetry-spool-worker) role_sha="${ADMIN_CONFIG_SPOOL_SHA256}" ;;
+    esac
+    if [[ -z "${role_sha}" ]]; then
+        render_manifest_for_apply "${manifest}"
+    else
+        render_manifest_for_apply "${manifest}" |
+            python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout)' |
+            jq --arg sha "${WHEEL_SHA256}" --arg release "${RELEASE_ID}" \
+                --arg image "${RUNTIME_IMAGE}" --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
+                --arg role_config "${role_sha}" --arg admin_config "${ADMIN_CONFIG_SHA256}" \
+                --arg pin "${PIN_METADATA_SHA256}" --arg domain "${FAILURE_DOMAIN_MAP_SHA256}" \
+                --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
+                .metadata.name as $name |
+                .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
+                .spec.template.metadata.annotations += {
+                    "gpu-fault.io/artifact-sha256": $sha,
+                    "gpu-fault.io/control-plane-wheel-sha256": $sha,
+                    "gpu-fault.io/release-wheel-sha256": $sha,
+                    "gpu-fault.io/release-rollout": $release,
+                    "gpu-fault.io/runtime-image": $image,
+                    "gpu-fault.io/notification-config-sha256": $notification,
+                    "gpu-fault.io/role-config-sha256": $role_config,
+                    "gpu-fault.io/pin-config-sha256": $pin
+                } |
+                if $name == "gpu-fault-control-worker" and $domain != "" then
+                    .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain
+                else . end |
+                (if $restart != "" then $restart else
+                    ([$live[0].items[]? | select(.metadata.name == $name) |
+                      .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]][0] // "")
+                 end) as $restart_at |
+                if $restart_at != "" then
+                    .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] = $restart_at
+                else . end
+            '
+    fi |
+        if [[ -n "${role_sha}" ]]; then
+            python3 "${SCRIPT_DIR}/apply_control_plane_deployment.py" \
+                --live "${LIVE_DEPLOYMENTS}" -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}"
+        else
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
+        fi
 }
 
 render_manifest() {
@@ -616,63 +665,17 @@ render_manifest() {
         "${GENERATED}/${manifest}.yaml"
 }
 
-stamp_release() {
-    local deployment="$1"
-    local admin_config_sha256="$2"
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
-        "${deployment}" --type=merge -p "$(
-            jq -nc \
-                --arg sha "${WHEEL_SHA256}" \
-                --arg release "${RELEASE_ID}" \
-                --arg runtime_image "${RUNTIME_IMAGE}" \
-                --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
-                --arg role_admin_config "${admin_config_sha256}" \
-                '{
-                    spec: {
-                        template: {
-                            metadata: {
-                                annotations: {
-                                    "gpu-fault.io/artifact-sha256": $sha,
-                                    "gpu-fault.io/control-plane-wheel-sha256": $sha,
-                                    "gpu-fault.io/release-wheel-sha256": $sha,
-                                    "gpu-fault.io/release-rollout": $release,
-                                    "gpu-fault.io/runtime-image": $runtime_image,
-                                    "gpu-fault.io/notification-config-sha256": $notification,
-                                    "gpu-fault.io/role-config-sha256": $role_admin_config
-                                }
-                            }
-                        }
-                    }
-                }'
-        )"
-}
-
-stamp_failure_domain_map() {
-    [[ -n "${FAILURE_DOMAIN_MAP_SHA256}" ]] || return 0
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
-        gpu-fault-control-worker --type=merge -p "$(
-            jq -nc --arg sha "${FAILURE_DOMAIN_MAP_SHA256}" '{
-                spec: {
-                    template: {
-                        metadata: {
-                            annotations: {
-                                "gpu-fault.io/failure-domain-map-sha256": $sha
-                            }
-                        }
-                    }
-                }
-            }'
-        )"
-}
-
 stamp_admin_config_metadata() {
-    local deployment
-    for deployment in \
-        gpu-fault-telemetry-spool-worker \
-        gpu-fault-control-worker \
-        gpu-fault-api-ha; do
-        if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
-            "${deployment}" >/dev/null 2>&1; then
+    local deployment role
+    for role in spool worker ingress; do
+        role_selected "${role}" && continue
+        case "${role}" in
+            spool) deployment=gpu-fault-telemetry-spool-worker ;;
+            worker) deployment=gpu-fault-control-worker ;;
+            ingress) deployment=gpu-fault-api-ha ;;
+        esac
+        if jq -e --arg deployment "${deployment}" \
+            'any(.items[]; .metadata.name == $deployment)' "${LIVE_DEPLOYMENTS}" >/dev/null; then
             kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
                 "${deployment}" --type=merge -p "$(
                     jq -nc \
@@ -933,7 +936,8 @@ if [[ "${PRESERVE_ROLE_CONFIG_MAPS}" != "true" ]]; then
     # stream: eighteen separate kubectl processes cost ~15s per run, one prints
     # the same per-object result lines. Rendered into a file first so an empty
     # selection applies nothing instead of failing on an empty stream.
-    ROLE_CONFIG_STREAM="$(mktemp)"
+    ROLE_CONFIG_STREAM="${CONTRACT_DIR}/role-configs.yaml"
+    install -m 0600 /dev/null "${ROLE_CONFIG_STREAM}"
     for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
         name="$(basename "${config}" .yaml)"
         role="$(manifest_role "${name}" || true)"
@@ -943,6 +947,18 @@ if [[ "${PRESERVE_ROLE_CONFIG_MAPS}" != "true" ]]; then
         fi
     done
     if [[ -s "${ROLE_CONFIG_STREAM}" ]]; then
+        PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}" python3 -c '
+from pathlib import Path
+import sys
+from gpu_fault_release.regional_release_rendering import render_notification_config_maps
+path = Path(sys.argv[1])
+path.write_text(
+    render_notification_config_maps(
+        path.read_text(encoding="utf-8"), configuration_set=sys.argv[2] or None
+    ),
+    encoding="utf-8",
+)
+' "${ROLE_CONFIG_STREAM}" "${SES_CONFIGURATION_SET}"
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply \
             -f "${ROLE_CONFIG_STREAM}"
     fi
@@ -952,33 +968,14 @@ fi
 apply_spool_role() {
     role_selected spool || return 0
     apply_manifest gpu-fault-telemetry-spool-worker-pdb
-    remove_legacy_notification_env gpu-fault-telemetry-spool-worker
     apply_manifest gpu-fault-telemetry-spool-worker
-    stamp_release \
-        gpu-fault-telemetry-spool-worker \
-        "${ADMIN_CONFIG_SPOOL_SHA256}"
-    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-        "${FORCE_ROLE_RESTART}" == "true" ]]; then
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-            deployment/gpu-fault-telemetry-spool-worker
-    fi
     wait_for_rollout gpu-fault-telemetry-spool-worker
 }
 
 apply_worker_role() {
     role_selected worker || return 0
     apply_manifest gpu-fault-control-worker-pdb
-    remove_legacy_notification_env gpu-fault-control-worker
     apply_manifest gpu-fault-control-worker
-    stamp_release \
-        gpu-fault-control-worker \
-        "${ADMIN_CONFIG_WORKER_SHA256}"
-    stamp_failure_domain_map
-    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-        "${FORCE_ROLE_RESTART}" == "true" ]]; then
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-            deployment/gpu-fault-control-worker
-    fi
     wait_for_rollout gpu-fault-control-worker
 }
 
@@ -1008,27 +1005,7 @@ apply_consumer_roles() {
 apply_ingress_role() {
     role_selected ingress || return 0
     apply_manifest gpu-fault-api-ha-pdb
-    # Remove inert processor pool values left by historical broad
-    # `kubectl set env` operations before applying the typed role config.
-    if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
-        gpu-fault-api-ha >/dev/null 2>&1; then
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" set env \
-            deployment/gpu-fault-api-ha \
-            GPU_FAULT_PROCESSOR_WORKERS- \
-            GPU_FAULT_PROCESSOR_FAULT_WORKERS- \
-            GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS- \
-            GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS- \
-            GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS- \
-            GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS-
-    fi
-    remove_legacy_notification_env gpu-fault-api-ha
     apply_manifest gpu-fault-api-ha-ingress
-    stamp_release gpu-fault-api-ha "${ADMIN_CONFIG_INGRESS_SHA256}"
-    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-        "${FORCE_ROLE_RESTART}" == "true" ]]; then
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-            deployment/gpu-fault-api-ha
-    fi
     wait_for_rollout gpu-fault-api-ha
 }
 

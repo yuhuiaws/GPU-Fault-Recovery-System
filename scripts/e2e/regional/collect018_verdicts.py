@@ -18,10 +18,14 @@ Every function is judged against documents the runner wrote -- store reads,
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any
 
-from scripts.e2e.regional.collector_window_fixture import metric_max, metric_sum
+from prometheus_client.parser import text_string_to_metric_families
+
+from scripts.e2e.regional.collector_window_fixture import metric_sum
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CASE_ID = "GF-REGIONAL-COLLECT-018"
 CONFIRMATION = "COLLECT018_EXECUTE"
@@ -38,19 +42,7 @@ UNRESOLVED_METRIC = "gpu_fault_ingest_unresolved_fault_signals_total"
 SILENT_METRIC = "gpu_fault_collector_silent_nodes"
 SILENT_TOP_METRIC = "gpu_fault_collector_silent_top_node"
 ERRORING_METRIC = "gpu_fault_collector_erroring_nodes"
-# Operations the code-less line must never compile into: it is format drift,
-# not a fault, and ARCH-G7 chose COLLECT_EVIDENCE over ESCALATE_OPERATOR so one
-# drift cannot cordon a fleet.
-FORBIDDEN_OPERATIONS = frozenset(
-    {
-        "MARK_UNSCHEDULABLE",
-        "QUARANTINE_NODE",
-        "RESTART_NODE",
-        "REPLACE_NODE",
-        "RESET_GPU",
-        "ESCALATE_SUPPORT",
-    }
-)
+EXPECTED_OPERATIONS = ("FREEZE_EVIDENCE",)
 REJECTION_TIMEOUT_SECONDS = 240
 # The kernel collector's all-zero health summary refreshes ``last_success_at``
 # every 300 s (G4), and a success newer than the rejection is exactly what
@@ -88,6 +80,10 @@ def heartbeat_is_imminent(age_seconds: float | None) -> bool:
 
 FINDING_TIMEOUT_SECONDS = 300
 RECOVERY_TIMEOUT_SECONDS = 420
+# The census gauges trail the synchronous rejection counters by a leased,
+# normally 30-second snapshot interval. The runner also caps this wait at the
+# active parent, maintenance and recovery deadlines.
+SILENCE_SNAPSHOT_TIMEOUT_SECONDS = 120
 
 
 def _stamp(value: Any) -> datetime | None:
@@ -138,17 +134,62 @@ def rejected_status_errors(
     return errors
 
 
+def _metric_values(
+    texts: list[str],
+    name: str,
+    *,
+    where: dict[str, str] | None = None,
+    required: bool = True,
+    allow_empty_family: bool = False,
+) -> list[float]:
+    values: list[float] = []
+    family_present = False
+    try:
+        for text in texts:
+            seen: set[tuple[tuple[str, str], ...]] = set()
+            for family in text_string_to_metric_families(text):
+                family_present |= name == (
+                    f"{family.name}_total" if family.type == "counter" else family.name
+                )
+                for sample in family.samples:
+                    if sample.name != name:
+                        continue
+                    labels = tuple(sorted(sample.labels.items()))
+                    value = float(sample.value)
+                    if (
+                        labels in seen
+                        or not math.isfinite(value)
+                        or value < 0
+                        or not value.is_integer()
+                        or any(not sample.labels.get(key) for key in (where or {}))
+                    ):
+                        raise RegionalFixtureError(
+                            f"{name} has invalid or duplicated metric samples"
+                        )
+                    seen.add(labels)
+                    if all(
+                        sample.labels.get(key) == expected
+                        for key, expected in (where or {}).items()
+                    ):
+                        values.append(value)
+    except (TypeError, ValueError):
+        raise RegionalFixtureError("COLLECT-018 metrics are malformed") from None
+    if not values and required and not (allow_empty_family and family_present):
+        raise RegionalFixtureError(f"required COLLECT-018 metric is missing: {name}")
+    return values
+
+
 def rejection_metric_errors(before: list[str], after: list[str]) -> list[str]:
     """Both G1 counters must have moved for the kernel path's 4xx class."""
 
     errors: list[str] = []
-    if metric_sum(after, FAULT_REJECTIONS_METRIC) <= metric_sum(
-        before, FAULT_REJECTIONS_METRIC
+    if sum(_metric_values(after, FAULT_REJECTIONS_METRIC)) <= sum(
+        _metric_values(before, FAULT_REJECTIONS_METRIC)
     ):
         errors.append(f"{FAULT_REJECTIONS_METRIC} did not increase")
     where = {"path": KERNEL_PATH, "status_class": "4xx"}
-    if metric_sum(after, COMPLETIONS_METRIC, where=where) <= metric_sum(
-        before, COMPLETIONS_METRIC, where=where
+    if sum(_metric_values(after, COMPLETIONS_METRIC, where=where)) <= sum(
+        _metric_values(before, COMPLETIONS_METRIC, where=where, allow_empty_family=True)
     ):
         errors.append(
             f"{COMPLETIONS_METRIC}{{path={KERNEL_PATH},status_class=4xx}} did not "
@@ -178,17 +219,23 @@ def silence_errors(
 
     errors: list[str] = []
     where = {"cluster_id": cluster_id, "channel": KERNEL_CHANNEL}
-    silent_before = metric_max(before, SILENT_METRIC, where=where) or 0.0
-    silent_after = metric_max(after, SILENT_METRIC, where=where) or 0.0
+    silent_before = max(_metric_values(before, SILENT_METRIC, where=where))
+    silent_after = max(_metric_values(after, SILENT_METRIC, where=where))
     if silent_after > silent_before:
         errors.append(
             f"{SILENT_METRIC} for the kernel channel rose from {silent_before} to "
             f"{silent_after} after a rejection"
         )
-    top = metric_max(after, SILENT_TOP_METRIC, where={**where, "node_id": node})
+    # The bounded top-N family need not include this node, unlike the census.
+    top = max(
+        _metric_values(
+            after, SILENT_TOP_METRIC, where={**where, "node_id": node}, required=False
+        ),
+        default=0.0,
+    )
     if top:
         errors.append(f"{SILENT_TOP_METRIC} names {node} as silent")
-    if (metric_max(after, ERRORING_METRIC, where=where) or 0.0) < 1:
+    if max(_metric_values(after, ERRORING_METRIC, where=where)) < 1:
         errors.append(f"{ERRORING_METRIC} for the kernel channel is not at least 1")
     return errors
 
@@ -229,14 +276,18 @@ def unparsed_finding_errors(
     if incidents and not workflows:
         errors.append("the unparsed-line incident opened no workflow")
     for workflow in workflows:
-        operations = {
+        operations = [
             str(step.get("operation")) for step in workflow.get("official_steps") or []
-        }
-        forbidden = sorted(operations & FORBIDDEN_OPERATIONS)
+        ]
+        forbidden = sorted(set(operations) - set(EXPECTED_OPERATIONS))
         if forbidden:
             errors.append(f"the unparsed-line workflow compiles {forbidden}")
         if "FREEZE_EVIDENCE" not in operations:
             errors.append("the unparsed-line workflow does not freeze evidence")
+        if operations != list(EXPECTED_OPERATIONS):
+            errors.append("the unparsed-line workflow is not exactly FREEZE_EVIDENCE")
+        if workflow.get("status") != "SUCCEEDED":
+            errors.append("the unparsed-line freeze workflow did not succeed")
     notifications = [
         item
         for item in activity.get("notifications") or []

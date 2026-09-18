@@ -23,15 +23,22 @@ EXPECTED_INDEXES = {
 
 
 def store_dsn() -> str:
+    configured = os.environ.get("GPU_FAULT_STORE_URL_FILE")
     path = (
-        os.environ.get("GPU_FAULT_STORE_URL_FILE")
-        or "/etc/gpu-fault/aurora/postgres-url"
+        configured if configured is not None else "/etc/gpu-fault/aurora/postgres-url"
     )
+    if not path:
+        raise RuntimeError("configured store DSN file path is empty")
     try:
         with open(path, encoding="utf-8") as handle:
-            return handle.read().strip()
-    except OSError:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        if configured is not None:
+            raise
         return os.environ["GPU_FAULT_STORE_URL"]
+    if not value:
+        raise RuntimeError("store DSN file is empty")
+    return value
 
 
 def main() -> None:
@@ -181,8 +188,7 @@ def main() -> None:
             with store._db.transaction(), store._db.cursor() as cursor:
                 cursor.executemany(
                     """
-                    DELETE FROM gpu_fault_objects
-                    WHERE kind=%s AND key=%s
+                    SELECT gpu_fault_delete_control_state(%s,%s)
                     """,
                     object_keys,
                 )

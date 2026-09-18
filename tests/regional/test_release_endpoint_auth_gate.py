@@ -142,7 +142,7 @@ class PhasedRunner(EndpointCheckRunner):
             return "probe log"
         return super().run(arguments, input_text=input_text, capture=capture, **kwargs)
 
-    def probe(self, arguments, *, timeout_seconds=None):
+    def condition(self, arguments, *, timeout_seconds=None):
         self.waits.append((list(arguments), self.clock.now))
         met = self.verdicts.pop(0) if self.verdicts else False
         if not met:

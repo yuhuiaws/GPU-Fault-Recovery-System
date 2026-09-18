@@ -26,15 +26,6 @@ CASE_LITERAL = re.compile(
     r'^(CASE_ID|PREDECESSOR_CASE_ID)\s*=\s*"(GF-REGIONAL-[A-Z0-9-]+)"', re.MULTILINE
 )
 PREDECESSORS_DICT = re.compile(r"^PREDECESSORS\s*=\s*\{", re.MULTILINE)
-# Runner constants that name a pytest wrapper as their predecessor. A pytest
-# wrapper never writes ``cases/<id>/<id>.json``, so in formal scope these
-# constants can never be satisfied; the contract already skips the wrapper.
-# The runners are owned elsewhere -- when one is corrected, delete its row here
-# and this test starts holding it to the contract like every other runner.
-KNOWN_RUNNER_PREDECESSOR_DEFECTS = {
-    "GF-REGIONAL-COLLECT-009": ("GF-REGIONAL-COLLECT-007", "GF-REGIONAL-COLLECT-005"),
-    "GF-REGIONAL-NOTIFY-007": ("GF-REGIONAL-NOTIFY-006", "GF-REGIONAL-NOTIFY-005"),
-}
 
 
 def _catalog() -> dict[str, dict]:
@@ -68,6 +59,8 @@ def _runner_predecessors() -> dict[str, tuple[str, str]]:
                 isinstance(target, ast.Name) and target.id == "PREDECESSORS"
                 for target in node.targets
             ):
+                if isinstance(node.value, ast.DictComp):
+                    continue
                 for case_id, predecessor in ast.literal_eval(node.value).items():
                     found[str(case_id)] = (str(predecessor), path.name)
     return found
@@ -79,8 +72,7 @@ def test_every_runner_predecessor_matches_the_formal_contract() -> None:
     mismatches = {
         case_id: (runner_value, contract.formal_predecessor(case_id), source)
         for case_id, (runner_value, source) in runners.items()
-        if case_id not in KNOWN_RUNNER_PREDECESSOR_DEFECTS
-        and contract.formal_predecessor(case_id) != runner_value
+        if contract.formal_predecessor(case_id) != runner_value
     }
     assert mismatches == {}, (
         "runner predecessor constants disagree with formal_predecessor(); give the "
@@ -88,26 +80,39 @@ def test_every_runner_predecessor_matches_the_formal_contract() -> None:
     )
 
 
-def test_known_runner_predecessor_defects_are_still_present() -> None:
-    runners = _runner_predecessors()
-    for case_id, (stale, formal) in KNOWN_RUNNER_PREDECESSOR_DEFECTS.items():
-        assert runners[case_id][0] == stale, (
-            f"{case_id} runner no longer says {stale}; drop it from "
-            "KNOWN_RUNNER_PREDECESSOR_DEFECTS"
-        )
-        assert contract.formal_predecessor(case_id) == formal
-        assert contract.is_pytest_wrapper(_catalog()[stale]), (
-            f"{stale} is no longer a pytest wrapper; the defect row is stale"
-        )
+def test_computed_collectors_and_fixed_notify_predecessors_skip_local_wrappers() -> (
+    None
+):
+    from scripts.e2e.regional import notify007_verdicts, run_collector_acceptance
+
+    expected = {
+        case_id: predecessor
+        for case_id in run_collector_acceptance.CASE_IDS
+        if (predecessor := contract.formal_predecessor(case_id)) is not None
+    }
+    assert run_collector_acceptance.PREDECESSORS == expected, (
+        "computed Collector predecessors must cover the current declared cases"
+    )
+    assert expected["GF-REGIONAL-COLLECT-009"] == "GF-REGIONAL-COLLECT-005"
+    assert (
+        notify007_verdicts.PREDECESSOR_CASE_ID
+        == (contract.formal_predecessor("GF-REGIONAL-NOTIFY-007"))
+        == "GF-REGIONAL-NOTIFY-005"
+    )
 
 
 def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
     # Each override names the case whose evidence the runner reads; the order
     # notes have said so in prose for every one of them.
     assert contract.explicit_predecessors() == {
+        "GF-REGIONAL-BOOT-017": "GF-REGIONAL-BOOT-016",
+        "GF-REGIONAL-BOOT-020": "GF-REGIONAL-BOOT-018",
         "GF-REGIONAL-BOOT-023": "GF-REGIONAL-BOOT-020",
-        # The admin lifecycle chain: each verb runs on the site the previous
-        # one left behind (BOOT-024's predecessor is positional: BOOT-023).
+        "GF-REGIONAL-BOOT-030": "GF-REGIONAL-BOOT-023",
+        "GF-REGIONAL-BOOT-031": "GF-REGIONAL-BOOT-030",
+        "GF-REGIONAL-BOOT-032": "GF-REGIONAL-COLLECT-015",
+        # The read-only audits do not change the public lifecycle's evidence anchor.
+        "GF-REGIONAL-BOOT-024": "GF-REGIONAL-BOOT-023",
         "GF-REGIONAL-BOOT-025": "GF-REGIONAL-BOOT-024",
         "GF-REGIONAL-BOOT-026": "GF-REGIONAL-BOOT-025",
         "GF-REGIONAL-BOOT-027": "GF-REGIONAL-BOOT-026",
@@ -116,6 +121,10 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         # uninstalled BOOT-028 site leaves behind.
         "GF-REGIONAL-BOOT-029": "GF-REGIONAL-BOOT-028",
         "GF-REGIONAL-HA-010": "GF-REGIONAL-HA-001",
+        "GF-REGIONAL-HA-011": "GF-REGIONAL-HA-010",
+        "GF-REGIONAL-NOTIFY-008": "GF-REGIONAL-NOTIFY-007",
+        "GF-REGIONAL-BLAST-001": "GF-REGIONAL-DESTR-001",
+        "GF-REGIONAL-DESTR-002": "GF-REGIONAL-DESTR-001",
         "GF-REGIONAL-DESTR-016": "GF-REGIONAL-DESTR-002",
         "GF-REGIONAL-DESTR-017": "GF-REGIONAL-DESTR-002",
         "GF-REGIONAL-DESTR-018": "GF-REGIONAL-DESTR-010",
@@ -126,6 +135,9 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         "GF-REGIONAL-DESTR-014": "GF-REGIONAL-DESTR-008",
         "GF-REGIONAL-HA-003": "GF-REGIONAL-DESTR-008",
         "GF-REGIONAL-E2E-002": "GF-REGIONAL-ISO-001",
+        "GF-REGIONAL-ISO-007": "GF-REGIONAL-E2E-002",
+        "GF-REGIONAL-COLLECT-022": "GF-REGIONAL-COLLECT-005",
+        "GF-REGIONAL-COLLECT-009": "GF-REGIONAL-COLLECT-005",
         "GF-REGIONAL-COLLECT-021": "GF-REGIONAL-COLLECT-016",
         # COLLECT-017 reads COLLECT-016's evidence; COLLECT-021 sits between
         # them in the order, so the anchor has to be explicit.
@@ -153,13 +165,16 @@ def test_positional_fallback_skips_pytest_wrappers() -> None:
     assert by_automation <= wrappers
     assert by_command <= wrappers
     assert wrappers == by_automation | by_command
-    # The thirteen command cases that only wrap pytest, by name, so a
+    # Name each command case that only wraps pytest so a
     # reclassification is a visible diff rather than a silent count change.
     assert by_command == {
         "GF-REGIONAL-BOOT-022",
+        "GF-REGIONAL-NOTIFY-006",
+        "GF-REGIONAL-COLLECT-006",
+        "GF-REGIONAL-COLLECT-007",
         *(
             f"GF-REGIONAL-PREEMPT-{number:03d}"
-            for number in (17, 21, 24, 25, 26, 28, 29, 31, 32, 33, 35)
+            for number in (17, 21, 24, 25, 26, 28, 29, 30, 31, 32, 33, 35)
         ),
     }
     # A live case behind a wrapper reads the last real evidence producer.
@@ -173,7 +188,8 @@ def test_positional_fallback_skips_pytest_wrappers() -> None:
         "GF-REGIONAL-PREEMPT-036"
     )
     # Plain positional neighbours are untouched.
-    assert contract.formal_predecessor("GF-REGIONAL-BOOT-011") is None
+    assert contract.formal_predecessor("GF-REGIONAL-BOOT-016") is None
+    assert contract.formal_predecessor("GF-REGIONAL-BOOT-011") == "GF-REGIONAL-BOOT-016"
     assert contract.formal_predecessor("GF-REGIONAL-DESTR-002") == (
         "GF-REGIONAL-DESTR-001"
     )
@@ -205,6 +221,11 @@ def test_do_not_run_cases_are_outside_the_formal_chain() -> None:
 
 def test_order_file_rejects_malformed_predecessors(tmp_path: Path) -> None:
     order = yaml.safe_load(ORDER.read_text(encoding="utf-8"))
+    anchor_index = next(
+        index
+        for index, entry in enumerate(order["phases"][0]["entries"])
+        if entry.get("case") == "GF-REGIONAL-BOOT-023"
+    )
     for mutate, message in (
         (
             lambda phases: phases[0]["entries"].append(
@@ -214,7 +235,7 @@ def test_order_file_rejects_malformed_predecessors(tmp_path: Path) -> None:
         ),
         (
             lambda phases: phases[0]["entries"].__setitem__(
-                1,
+                anchor_index,
                 {
                     "case": "GF-REGIONAL-BOOT-023",
                     "predecessor": "GF-REGIONAL-COLLECT-015",
@@ -224,7 +245,7 @@ def test_order_file_rejects_malformed_predecessors(tmp_path: Path) -> None:
         ),
         (
             lambda phases: phases[0]["entries"].__setitem__(
-                1,
+                anchor_index,
                 {"case": "GF-REGIONAL-BOOT-023", "predecessor": "GF-REGIONAL-NOPE-001"},
             ),
             "not in the formal",

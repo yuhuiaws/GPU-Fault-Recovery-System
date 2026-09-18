@@ -2,10 +2,6 @@ from gpu_fault.lazy_exports import lazy_module
 
 _EXPORTS = {
     "CONNECTION_POOL": ("gpu_fault.transport.http_client", "CONNECTION_POOL"),
-    "CloudWatchHmaCollector": (
-        "gpu_fault.collectors.cloud.cloudwatch",
-        "CloudWatchHmaCollector",
-    ),
     "CollectorContext": ("gpu_fault.collectors.models", "CollectorContext"),
     "CollectorError": ("gpu_fault.collectors.sinks", "CollectorError"),
     "DcgmMetricsCollector": ("gpu_fault.collectors.gpu.dcgm", "DcgmMetricsCollector"),
@@ -20,10 +16,6 @@ _EXPORTS = {
     ),
     "HttpEventSink": ("gpu_fault.collectors.sinks", "HttpEventSink"),
     "KernelLogCollector": ("gpu_fault.collectors.logs.kernel", "KernelLogCollector"),
-    "KubernetesHmaNodeCollector": (
-        "gpu_fault.collectors.cloud.kubernetes",
-        "KubernetesHmaNodeCollector",
-    ),
     "KubernetesNodeResourceCollector": (
         "gpu_fault.collectors.cloud.kubernetes",
         "KubernetesNodeResourceCollector",
@@ -42,16 +34,9 @@ _EXPORTS = {
         "NvidiaSmiMetricsCollector",
     ),
     "SqsEventSink": ("gpu_fault.collectors.sinks", "SqsEventSink"),
-    "SqsHmaConsumer": ("gpu_fault.collectors.cloud.cloudwatch", "SqsHmaConsumer"),
     "TrainingProgressCollector": (
         "gpu_fault.collectors.training_progress",
         "TrainingProgressCollector",
-    ),
-    # deploy/aws/lambda/cloudwatch-hma-template.yaml names this as the Lambda
-    # ``Handler``; scripts/check-lazy-exports.py holds the two in step.
-    "cloudwatch_lambda_handler": (
-        "gpu_fault.collectors.cloud.cloudwatch",
-        "cloudwatch_lambda_handler",
     ),
     "context_from_environment": (
         "gpu_fault.collectors.context",

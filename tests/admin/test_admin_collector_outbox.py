@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -504,8 +505,61 @@ def test_a_workflow_that_does_not_end_in_time_is_reported_not_raised(
     assert result.workflow_status == "RUNNING"
     assert "still RUNNING after 5s" in result.error
     assert "workflow-collector-outbox-1" in result.message
-    assert sum(harness.slept) >= 5
+    assert sum(harness.slept) == 5
     assert [path.name for path in harness.evidence()] == ["stats-20260910T090000Z.json"]
+
+
+@pytest.mark.parametrize("node_results", [{}, {NODE: {"action": "requeue-dead"}}])
+def test_succeeded_workflow_without_the_requested_node_result_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, node_results: dict
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    harness.execution["details"]["node_results"] = node_results
+
+    result = harness.run(_request(tmp_path, site=harness.site))
+
+    assert result.succeeded is False
+    assert result.node_result is None
+    assert result.error, "missing requested node result must report an error"
+    assert json.loads(harness.evidence()[0].read_text())["status"] == "FAILED"
+
+
+def test_late_terminal_result_is_not_accepted_after_the_wait_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    script = module.run_control_plane_script
+
+    def late_script(site, payload, **kwargs):
+        result = script(site, payload, **kwargs)
+        if payload["mode"] == "status":
+            harness.ticks += 6
+        return result
+
+    monkeypatch.setattr(module, "run_control_plane_script", late_script)
+    result = harness.run(_request(tmp_path, site=harness.site, wait_seconds=5))
+
+    assert result.succeeded is False
+    assert result.workflow_status == "PENDING"
+    assert result.error, "late workflow result must report a deadline error"
+    assert json.loads(harness.evidence()[0].read_text())["status"] == "FAILED"
+
+
+def test_status_for_another_workflow_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "read_workflow",
+        lambda *args: {
+            "workflow": {"request_id": "another-workflow", "status": "SUCCEEDED"}
+        },
+    )
+
+    with pytest.raises(BootstrapError, match="invalid workflow identity"):
+        harness.run(_request(tmp_path, site=harness.site))
+    assert harness.evidence() == []
 
 
 def test_a_control_plane_refusal_writes_nothing(
@@ -562,6 +616,7 @@ def test_run_collector_outbox_command_builds_the_request_and_returns_the_verdict
         )
 
     monkeypatch.setattr(module, "run_collector_outbox", fake_run)
+    monkeypatch.setattr(module, "reload_site_for_mutation", lambda site: site)
     arguments = cli.parser().parse_args(
         _argv(
             tmp_path,
@@ -600,6 +655,42 @@ def test_run_collector_outbox_command_builds_the_request_and_returns_the_verdict
         "a FAILED workflow is a non-zero exit"
     )
     assert captured[1].confirm is True
+
+
+def test_outbox_revalidates_cluster_membership_after_taking_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _site(tmp_path)
+    current = _site(tmp_path)
+    current.release_config["clusters"] = []
+    events = []
+
+    @contextmanager
+    def lock(path):
+        assert path == tmp_path
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def reload(site):
+        assert site is original and events == ["lock"]
+        events.append("reload")
+        return current
+
+    monkeypatch.setattr(module, "administrator_operation_lock", lock)
+    monkeypatch.setattr(module, "reload_site_for_mutation", reload)
+    monkeypatch.setattr(
+        module, "run_collector_outbox", lambda *_: pytest.fail("must not submit")
+    )
+    arguments = cli.parser().parse_args(
+        _argv(tmp_path, "--action", "stats", "--reference", "CHG-1")
+    )
+
+    with pytest.raises(BootstrapError, match="not in the managed site"):
+        module.run_collector_outbox_command(arguments, site=original)
+    assert events == ["lock", "reload", "unlock"]
 
 
 def test_cli_rejects_bad_vocabulary_requires_reference_and_dispatches(

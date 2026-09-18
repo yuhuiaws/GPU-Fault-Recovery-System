@@ -9,9 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-if __package__:
+if TYPE_CHECKING or __package__:
     from scripts.component_artifacts import load_component_artifacts
     from scripts.component_wheels import COMPONENTS, build_component
     from scripts.release_identity import build_release_identity
@@ -31,12 +31,14 @@ FROM_PATTERN = re.compile(
 ARG_REFERENCE_PATTERN = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
 )
-MISSING_IMAGE_MARKERS = (
+MISSING_IMAGE_MESSAGES = (
     "manifest unknown",
     "manifest not found",
     "name unknown",
-    "not found",
     "no such manifest",
+    "manifest unknown: manifest unknown",
+    "manifest unknown: requested image not found",
+    "name unknown: repository name not known to registry",
 )
 IMAGE_INPUT_SCHEMA_VERSION = 1
 RUNTIME_COMPONENTS = ("control_plane", "executor")
@@ -44,6 +46,18 @@ RUNTIME_COMPONENTS = ("control_plane", "executor")
 
 class ReleaseImageError(RuntimeError):
     pass
+
+
+def normalize_repository(repository: str) -> str:
+    value = repository.strip().rstrip(":")
+    if (
+        not value
+        or any(character.isspace() for character in value)
+        or "@" in value
+        or ":" in value.rsplit("/", 1)[-1]
+    ):
+        raise ReleaseImageError("runtime image repository is invalid")
+    return value
 
 
 def _sha256(path: Path) -> str:
@@ -131,8 +145,9 @@ def runtime_image_inputs(
     platform: str,
     build_args: Mapping[str, str],
     components: Mapping[str, Mapping[str, str]],
+    dockerfile_name: str = "Dockerfile",
 ) -> dict[str, Any]:
-    dockerfile_path = root / "deploy/image/Dockerfile"
+    dockerfile_path = root / "deploy/image" / dockerfile_name
     dependency_lock_path = root / "requirements/runtime.lock"
     dockerfile = dockerfile_path.read_text(encoding="utf-8")
     effective_args = _effective_build_args(dockerfile, build_args)
@@ -179,9 +194,45 @@ def _image_labels(
     return labels
 
 
-def _missing_registry_image(stderr: str) -> bool:
+def _missing_registry_image(stderr: str, *, tag: str) -> bool:
+    message = stderr.strip().removeprefix("ERROR: ")
+    try:
+        value = json.loads(message)
+    except json.JSONDecodeError:
+        if message in {f"{tag}: not found", f"no such manifest: {tag}"}:
+            return True
+        return message.removeprefix(f"{tag}: ").lower() in MISSING_IMAGE_MESSAGES
+    if not isinstance(value, dict):
+        return False
+    errors = value.get("errors")
+    return (
+        isinstance(errors, list)
+        and bool(errors)
+        and all(
+            isinstance(error, dict)
+            and error.get("code") in ("MANIFEST_UNKNOWN", "NAME_UNKNOWN")
+            for error in errors
+        )
+    )
+
+
+def _registry_failure_hint(stderr: str) -> str:
     lowered = stderr.lower()
-    return any(marker in lowered for marker in MISSING_IMAGE_MARKERS)
+    if "credential" in lowered:
+        return "check Docker credential helper installation and configuration"
+    if any(
+        marker in lowered
+        for marker in ("unauthorized", "denied", "authentication", "insufficient_scope")
+    ):
+        return "check registry login and repository read permissions"
+    if any(marker in lowered for marker in ("x509", "certificate", "tls")):
+        return "check registry TLS trust and certificates"
+    if any(
+        marker in lowered
+        for marker in ("timeout", "timed out", "connection", "no such host")
+    ):
+        return "check registry connectivity and request time limits"
+    return "check Docker Buildx, registry authentication and connectivity"
 
 
 def _platform_image(
@@ -203,8 +254,7 @@ def _platform_image(
         actual.append(str(selected.get("variant") or ""))
     if actual != expected:
         raise ReleaseImageError(
-            f"registry image platform mismatch: expected {platform}, "
-            f"got {'/'.join(actual)}"
+            f"registry image platform mismatch: expected {platform}"
         )
     return selected
 
@@ -226,25 +276,49 @@ def inspect_registry_image(
         "{{json .}}",
         tag,
     ]
-    completed = runner(
-        command,
-        cwd=root,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        completed = runner(
+            command,
+            cwd=root,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except (subprocess.TimeoutExpired, TimeoutError):
+        raise ReleaseImageError(
+            "runtime registry inspection timed out; "
+            "check registry connectivity and request time limits"
+        ) from None
+    except OSError:
+        raise ReleaseImageError(
+            "runtime registry inspection could not execute Docker; "
+            "check Docker Buildx installation and executable permissions"
+        ) from None
+    except UnicodeError:
+        raise ReleaseImageError(
+            "runtime registry inspection returned invalid text; check Docker Buildx"
+        ) from None
     if completed.returncode:
-        if _missing_registry_image(completed.stderr or ""):
+        if completed.returncode == 1 and _missing_registry_image(
+            completed.stderr or "", tag=tag
+        ):
             return None
         raise ReleaseImageError(
-            f"runtime registry inspection failed with status {completed.returncode}"
+            f"runtime registry inspection failed with status {completed.returncode}; "
+            f"{_registry_failure_hint(completed.stderr or '')} "
+            "(registry tool output withheld)"
         )
     try:
         value = json.loads(completed.stdout or "")
-    except json.JSONDecodeError as exc:
+    except json.JSONDecodeError:
         raise ReleaseImageError(
-            "runtime registry inspection returned invalid JSON"
-        ) from exc
+            "runtime registry inspection returned invalid JSON; check Docker Buildx"
+        ) from None
+    if not isinstance(value, dict):
+        raise ReleaseImageError(
+            "runtime registry inspection returned an invalid JSON object; "
+            "check Docker Buildx"
+        )
     manifest = value.get("manifest")
     digest = str(manifest.get("digest") if isinstance(manifest, dict) else "")
     if not DIGEST_PATTERN.fullmatch(digest):
@@ -304,6 +378,103 @@ def _descriptor(
     }
 
 
+def publish_context(
+    root: Path,
+    *,
+    context: Path,
+    repository: str,
+    platform: str,
+    image_inputs: dict[str, Any],
+    push: bool,
+    build_args: Mapping[str, str],
+    cache_from: Sequence[str],
+    cache_to: Sequence[str],
+    reuse_registry_image: bool,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Publish a context and verify the registry, including an immutable-tag race."""
+    repository = normalize_repository(repository)
+    image_input_sha256 = canonical_sha256(image_inputs)
+    tag = f"{repository}:build-{image_input_sha256}"
+    labels = _image_labels(image_inputs, image_input_sha256)
+    if "wheelhouse_sha256" in image_inputs:
+        labels["gpu-fault.node-wheelhouse.sha256"] = image_inputs["wheelhouse_sha256"]
+
+    def inspect() -> str | None:
+        return inspect_registry_image(
+            root, tag=tag, platform=platform, expected_labels=labels, runner=runner
+        )
+
+    digest = inspect() if push and reuse_registry_image else None
+    reused = digest is not None
+    if digest is None:
+        metadata_path = context.parent / "metadata.json"
+        command = [
+            "docker",
+            "buildx",
+            "build",
+            "--file",
+            str(context / "Dockerfile"),
+            "--platform",
+            platform,
+            "--tag",
+            tag,
+            "--metadata-file",
+            str(metadata_path),
+        ]
+        for name, value in sorted(build_args.items()):
+            command.extend(("--build-arg", f"{name}={value}"))
+        for name, value in sorted(labels.items()):
+            command.extend(("--label", f"{name}={value}"))
+        for value in cache_from:
+            command.extend(("--cache-from", value))
+        for value in cache_to:
+            command.extend(("--cache-to", value))
+        command.extend(("--push" if push else "--load", str(context)))
+        completed = runner(command, cwd=root, check=False, text=True)
+        if completed.returncode:
+            digest = inspect() if push else None
+            if digest is None:
+                raise ReleaseImageError(
+                    f"runtime image build failed with status {completed.returncode}"
+                )
+            reused = True
+        else:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                raise ReleaseImageError(
+                    "runtime image build metadata is invalid"
+                ) from exc
+            metadata_digest = str(metadata.get("containerimage.digest") or "")
+            if push:
+                if not DIGEST_PATTERN.fullmatch(metadata_digest):
+                    raise ReleaseImageError(
+                        "pushed runtime image has no OCI manifest digest"
+                    )
+                digest = inspect()
+                if digest is None or digest != metadata_digest:
+                    raise ReleaseImageError(
+                        "runtime image metadata and registry digest do not match"
+                    )
+            elif DIGEST_PATTERN.fullmatch(metadata_digest):
+                digest = metadata_digest
+    return _descriptor(
+        source_sha=str(build_release_identity(root)["sha256"]),
+        repository=repository,
+        tag=tag,
+        digest=digest,
+        platform=platform,
+        image_inputs=image_inputs,
+        image_input_sha256=image_input_sha256,
+        components=image_inputs["components"],
+        deployable=push,
+        registry_reused=reused,
+        cache_from=cache_from,
+        cache_to=cache_to,
+    )
+
+
 def build_runtime_image(
     root: Path,
     *,
@@ -316,20 +487,24 @@ def build_runtime_image(
     component_artifacts: Path | None = None,
     reuse_registry_image: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    component: str | None = None,
 ) -> dict[str, Any]:
-    repository = repository.strip().rstrip(":")
-    leaf = repository.rsplit("/", 1)[-1]
-    if (
-        not repository
-        or any(character.isspace() for character in repository)
-        or "@" in repository
-        or ":" in leaf
-    ):
-        raise ReleaseImageError("runtime image repository is invalid")
+    repository = normalize_repository(repository)
     platform = _normalize_platform(platform)
     build_args = dict(sorted((build_args or {}).items()))
-    identity = build_release_identity(root)
-    source_sha = str(identity["sha256"])
+    selected: tuple[str, ...] = RUNTIME_COMPONENTS
+    dockerfile_name = "Dockerfile"
+    if component is not None:
+        if component not in RUNTIME_COMPONENTS:
+            raise ReleaseImageError("unknown runtime image component")
+        if {"COMPONENT", "DISTRIBUTION"} & build_args.keys():
+            raise ReleaseImageError("component build arguments cannot be overridden")
+        selected = (component,)
+        dockerfile_name = "Dockerfile.component"
+        build_args.update(
+            COMPONENT=component.replace("_", "-"),
+            DISTRIBUTION=COMPONENTS[component].distribution,
+        )
     with tempfile.TemporaryDirectory(prefix="gpu-fault-image-") as directory:
         temporary = Path(directory)
         context = temporary / "context"
@@ -337,7 +512,7 @@ def build_runtime_image(
         requirements = context / "requirements"
         wheels.mkdir(parents=True)
         requirements.mkdir()
-        shutil.copy2(root / "deploy/image/Dockerfile", context / "Dockerfile")
+        shutil.copy2(root / "deploy/image" / dockerfile_name, context / "Dockerfile")
         shutil.copy2(
             root / "requirements/runtime.lock",
             requirements / "runtime.lock",
@@ -348,7 +523,7 @@ def build_runtime_image(
             if component_artifacts is not None
             else None
         )
-        for name in RUNTIME_COMPONENTS:
+        for name in selected:
             if cached is None:
                 wheel, module_digest, _modules = build_component(
                     python=sys.executable,
@@ -370,130 +545,18 @@ def build_runtime_image(
             platform=platform,
             build_args=build_args,
             components=components,
+            dockerfile_name=dockerfile_name,
         )
-        image_input_sha256 = canonical_sha256(image_inputs)
-        tag = f"{repository}:build-{image_input_sha256}"
-        labels = _image_labels(image_inputs, image_input_sha256)
-        if push and reuse_registry_image:
-            existing_digest = inspect_registry_image(
-                root,
-                tag=tag,
-                platform=platform,
-                expected_labels=labels,
-                runner=runner,
-            )
-            if existing_digest is not None:
-                return _descriptor(
-                    source_sha=source_sha,
-                    repository=repository,
-                    tag=tag,
-                    digest=existing_digest,
-                    platform=platform,
-                    image_inputs=image_inputs,
-                    image_input_sha256=image_input_sha256,
-                    components=components,
-                    deployable=True,
-                    registry_reused=True,
-                    cache_from=cache_from,
-                    cache_to=cache_to,
-                )
-        metadata_path = temporary / "metadata.json"
-        command = [
-            "docker",
-            "buildx",
-            "build",
-            "--file",
-            str(context / "Dockerfile"),
-            "--platform",
-            platform,
-            "--tag",
-            tag,
-            "--metadata-file",
-            str(metadata_path),
-        ]
-        for name, value in build_args.items():
-            command.extend(("--build-arg", f"{name}={value}"))
-        for name, value in sorted(labels.items()):
-            command.extend(("--label", f"{name}={value}"))
-        for value in cache_from:
-            command.extend(("--cache-from", value))
-        for value in cache_to:
-            command.extend(("--cache-to", value))
-        command.extend(("--push" if push else "--load", str(context)))
-        completed = runner(
-            command,
-            cwd=root,
-            check=False,
-            text=True,
+        return publish_context(
+            root,
+            context=context,
+            repository=repository,
+            platform=platform,
+            image_inputs=image_inputs,
+            push=push,
+            build_args=build_args,
+            cache_from=cache_from,
+            cache_to=cache_to,
+            reuse_registry_image=reuse_registry_image,
+            runner=runner,
         )
-        if completed.returncode:
-            if push:
-                raced_digest = inspect_registry_image(
-                    root,
-                    tag=tag,
-                    platform=platform,
-                    expected_labels=labels,
-                    runner=runner,
-                )
-                if raced_digest is not None:
-                    return _descriptor(
-                        source_sha=source_sha,
-                        repository=repository,
-                        tag=tag,
-                        digest=raced_digest,
-                        platform=platform,
-                        image_inputs=image_inputs,
-                        image_input_sha256=image_input_sha256,
-                        components=components,
-                        deployable=True,
-                        registry_reused=True,
-                        cache_from=cache_from,
-                        cache_to=cache_to,
-                    )
-            raise ReleaseImageError(
-                f"runtime image build failed with status {completed.returncode}"
-            )
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
-            raise ReleaseImageError("runtime image build metadata is invalid") from exc
-        metadata_digest = str(metadata.get("containerimage.digest") or "")
-        if push:
-            if not DIGEST_PATTERN.fullmatch(metadata_digest):
-                raise ReleaseImageError(
-                    "pushed runtime image has no OCI manifest digest"
-                )
-            registry_digest = inspect_registry_image(
-                root,
-                tag=tag,
-                platform=platform,
-                expected_labels=labels,
-                runner=runner,
-            )
-            if registry_digest is None:
-                raise ReleaseImageError(
-                    "pushed runtime image is missing from the registry"
-                )
-            if registry_digest != metadata_digest:
-                raise ReleaseImageError(
-                    "runtime image metadata and registry digest do not match"
-                )
-            digest = registry_digest
-        else:
-            digest = (
-                metadata_digest if DIGEST_PATTERN.fullmatch(metadata_digest) else None
-            )
-    return _descriptor(
-        source_sha=source_sha,
-        repository=repository,
-        tag=tag,
-        digest=digest,
-        platform=platform,
-        image_inputs=image_inputs,
-        image_input_sha256=image_input_sha256,
-        components=components,
-        deployable=push,
-        registry_reused=False,
-        cache_from=cache_from,
-        cache_to=cache_to,
-    )

@@ -605,6 +605,25 @@ CONTAINMENT_ONLY_OPERATIONS = frozenset(
     if semantics.destructive and not _node_mutating(semantics)
 )
 NODE_MUTATING_OPERATIONS = DESTRUCTIVE_OPERATIONS - CONTAINMENT_ONLY_OPERATIONS
+# Device-plugin restarts delete the plugin Pod so kubelet re-registers the
+# node's devices; the containers already holding devices keep them. They stay
+# node-mutating for merge, budget and busy-node rules, but the STOP-ownership
+# guard has no device holder to protect from them: COLLECT-017 C restarts the
+# EFA plugin under a live 24-GPU training on purpose and forbids STOP_WORKLOADS
+# in that workflow (2026-09-18: demanding a receipt quarantined a healthy node).
+_DEVICE_PLUGIN_CLAIMS = frozenset(
+    {
+        OperationResourceClaim.EFA_DEVICE_PLUGIN_MUTATION,
+        OperationResourceClaim.GPU_DEVICE_PLUGIN_MUTATION,
+    }
+)
+DEVICE_PLUGIN_RESTART_OPERATIONS = frozenset(
+    operation
+    for operation, semantics in OPERATION_REGISTRY.items()
+    if semantics.resource_claims
+    and semantics.resource_claims <= _DEVICE_PLUGIN_CLAIMS
+    and operation in NODE_MUTATING_OPERATIONS
+)
 RECOVERY_OPERATION_RANK = {
     operation: semantics.recovery_rank
     for operation, semantics in OPERATION_REGISTRY.items()

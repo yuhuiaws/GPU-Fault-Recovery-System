@@ -1,27 +1,40 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
-import os
-import re
-import secrets
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
-from scripts.e2e.regional.auth016_command_baseline import SeededBaseline
+from gpu_fault.regional_compatibility import (
+    CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+)
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
-from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeSettings
+from scripts.e2e.regional.auth015_context import (
+    Auth015Context as Auth015Context,
+)
+from scripts.e2e.regional.auth015_context import (
+    cleanup_auth015 as cleanup_auth015,
+)
+from scripts.e2e.regional.auth015_context import (
+    scan_auth015_hosts as scan_auth015_hosts,
+)
+from scripts.e2e.regional.auth015_custody import run_custody_acceptance
+from scripts.e2e.regional.auth015_custody_inputs import Auth015CustodyInputs
+from scripts.e2e.regional.auth015_deployed import (
+    prove_deployed_protocol as prove_deployed_protocol,
+)
+from scripts.e2e.regional.auth015_release import Auth015ReleaseInputs
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeFixture,
+    HostProbeSettings,
+)
 from scripts.e2e.regional.identity_acceptance_common import (
     ACCEPTANCE_PROBE_OWNER,
     EXECUTOR_APP,
-    ROOT,
     WRITE_METHODS,
     ClusterTarget,
     IdentityAcceptanceError,
@@ -33,14 +46,103 @@ from scripts.e2e.regional.identity_acceptance_common import (
     run,
     run_cleanup_steps,
     secret_digest,
-    utc_now,
     write_cluster_token,
 )
+from scripts.e2e.regional.identity_acceptance_common import (
+    secret_document as secret_document,
+)
+from scripts.e2e.regional.identity_auth_backlog import (
+    auth008_claim as auth008_claim,
+)
+from scripts.e2e.regional.identity_auth_backlog import (
+    run_auth008 as run_auth008,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    AUTH015_PROOF_GAPS,
+    auth015_scan_checks as auth015_scan_checks,
+    valid_master_scan as valid_master_scan,
+    validated_node_key_rotation as validated_node_key_rotation,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    HIGH_RISK_ROUTE_BUCKETS as HIGH_RISK_ROUTE_BUCKETS,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    INSTALLER_SECRET as INSTALLER_SECRET,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    certificate_alert_checks as certificate_alert_checks,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    commands_not_misterminated as commands_not_misterminated,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    execution_token_hits as execution_token_hits,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    failure_details as failure_details,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    heartbeat_advanced as heartbeat_advanced,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    high_risk_route_errors as high_risk_route_errors,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    master_reference_scan as master_reference_scan,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    node_key_digests as node_key_digests,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    registry_token_digests as registry_token_digests,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    update_registry_token as update_registry_token,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    verdict as verdict,
+)
+from scripts.e2e.regional.identity_auth_checks import (
+    world_open_rules as world_open_rules,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    AGENT_SNAPSHOT_PROBE as AGENT_SNAPSHOT_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    ANONYMOUS_ROUTE_PROBE as ANONYMOUS_ROUTE_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    AUTH008_BACKLOG_PROBE as AUTH008_BACKLOG_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    AUTH008_CLAIM_PROBE as AUTH008_CLAIM_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    AUTH008_EXECUTOR_IDENTITY_PROBE as AUTH008_EXECUTOR_IDENTITY_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    DIRECT_CLAIM_PROBE_TEMPLATE as DIRECT_CLAIM_PROBE_TEMPLATE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    EXECUTION_TOKEN_DIGEST_PROBE as EXECUTION_TOKEN_DIGEST_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    REMOTE_STATUS_PROBE as REMOTE_STATUS_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    ROUTE_INVENTORY_PROBE as ROUTE_INVENTORY_PROBE,
+)
+from scripts.e2e.regional.identity_auth_probes import (
+    TLS_BOUNDARY_PROBE as TLS_BOUNDARY_PROBE,
+)
+from scripts.e2e.regional.identity_auth_sampling import (
+    TokenRotationSampler as TokenRotationSampler,
+)
+from scripts.e2e.regional.identity_fleet_scope import authenticated_fleet_isolation
 
 AUTH015_PROBE = Path(__file__).with_name("probes") / "auth015_node_probe.py"
 AUTH013_PROBE = Path(__file__).with_name("probes") / "auth013_certificate_probe.py"
 NODE_ACTION_KEYS_SECRET = "gpu-fault-node-action-keys"
-INSTALLER_SECRET = "gpu-fault-control-plane-active"
 # How long AUTH-016 waits for its sampler thread after asking it to stop. A
 # sample is one ``direct_claim``: the executor Pod lookup (``kubectl get``,
 # default 300 s bound) plus one exec bounded at 60 s. The old 15 s join let a
@@ -50,24 +152,8 @@ DIRECT_CLAIM_EXEC_TIMEOUT_SECONDS = 60
 DIRECT_CLAIM_JOIN_SECONDS = 300 + DIRECT_CLAIM_EXEC_TIMEOUT_SECONDS + 15
 
 
-def verdict(checks: dict[str, Any]) -> str:
-    """PASS only when every check is literally ``True``.
-
-    ``all(checks.values())`` accepted any truthy value, so a check recorded as
-    the string ``"NOT_EVALUATED"`` passed. Checks that could not be evaluated
-    belong in a separate ``not_evaluated`` mapping, not here.
-    """
-
-    return "PASS" if all(value is True for value in checks.values()) else "FAIL"
-
-
-def failure_details(
-    *,
-    checks: dict[str, Any],
-    cleanup_errors: list[str],
-    **extra: Any,
-) -> dict[str, Any]:
-    return {"checks": checks, "cleanup_errors": cleanup_errors, **extra}
+# A saved, leased NO_ACTION workflow prevents the dispatcher from owning the
+# candidate. No node/workload targets, adapters, registry writes or SQL deletion.
 
 
 def run_auth007(
@@ -78,10 +164,18 @@ def run_auth007(
     case_dir: Path,
 ) -> dict[str, Any]:
     original = site.registry()
+    if primary.cluster_id == secondary.cluster_id:
+        raise IdentityAcceptanceError("isolation requires distinct cluster identities")
+    if site.registry_generation() is None:
+        raise IdentityAcceptanceError(
+            "registration isolation requires a durable registry"
+        )
     updated = [dict(item) for item in original]
     found = False
     for item in updated:
         if item.get("cluster_id") == secondary.cluster_id:
+            if item.get("enabled") is not True:
+                raise IdentityAcceptanceError("secondary registration is not enabled")
             item["enabled"] = False
             found = True
     if not found:
@@ -94,7 +188,7 @@ def run_auth007(
     cleanup_errors: list[str] = []
     checks: dict[str, Any] = {}
     try:
-        site.write_registry(updated)
+        site.write_registry(updated, expected_entries=original)
         # The revision is applied once every member acked it; that wait is the
         # isolation delay, and write_registry measured it from the POST.
         disabled_latency = site.last_registry_ready_seconds or site.rollout_control()
@@ -117,7 +211,7 @@ def run_auth007(
         # ones.
         step_outcomes, step_errors = run_cleanup_steps(
             [
-                ("restore_registry", lambda: site.write_registry(original)),
+                ("restore_registry", lambda: site.restore_registry(original)),
                 ("rollout_control", site.rollout_control),
                 ("secondary_claim", lambda: claim(site, secondary)),
             ]
@@ -137,10 +231,23 @@ def run_auth007(
             },
         )
     secondary_recovered = cleanup.get("secondary_claim") or {}
+    try:
+        disabled_detail = json.loads(secondary_disabled.get("detail") or "{}")
+    except (TypeError, ValueError):
+        disabled_detail = None
     checks = {
-        "secondary_disabled_403": secondary_disabled.get("status") == 403,
-        "primary_remains_200": primary_healthy.get("status") == 200,
-        "secondary_recovers_200": secondary_recovered.get("status") == 200,
+        "secondary_disabled_403": (
+            secondary_disabled.get("status") == 403
+            and disabled_detail == {"detail": "regional cluster authentication failed"}
+        ),
+        "primary_remains_200": (
+            primary_healthy.get("status") == 200
+            and primary_healthy.get("command_count") == 0
+        ),
+        "secondary_recovers_200": (
+            secondary_recovered.get("status") == 200
+            and secondary_recovered.get("command_count") == 0
+        ),
         "registry_restored": site.registry() == original,
         "cleanup_completed": not cleanup_errors,
     }
@@ -157,95 +264,6 @@ def run_auth007(
             "ack, not from a control-plane rollout."
         ],
     }
-
-
-ROUTE_INVENTORY_PROBE = r"""
-import json
-from gpu_fault.app import create_app
-from gpu_fault.app.authorization import (
-    UNDOCUMENTED_PUBLIC_PATHS,
-    ExplicitAuthorizationRegistry,
-    iter_api_routes,
-)
-
-app = create_app()
-registry = ExplicitAuthorizationRegistry()
-registry.load(app.routes)
-routes = []
-for route in iter_api_routes(app.routes):
-    if not (
-        route.path.startswith("/v1/")
-        or route.path in {"/healthz", "/metrics"}
-    ):
-        continue
-    routes.append({
-        "path": route.path,
-        "methods": sorted(route.methods or []),
-        "bucket": registry.inventory[route.path],
-    })
-# The OpenAPI surface has no bucket: it is public read-only information that
-# AUTH-014 records (anonymous status) rather than judges against a bucket.
-for path in sorted(UNDOCUMENTED_PUBLIC_PATHS):
-    routes.append({"path": path, "methods": ["GET"], "bucket": "public-undocumented"})
-print(json.dumps({"routes": routes}, sort_keys=True))
-"""
-
-EXECUTION_TOKEN_DIGEST_PROBE = r"""
-import hashlib
-import json
-import os
-token = os.environ["GPU_FAULT_EXECUTION_TOKEN"]
-print(json.dumps({
-    "sha256": hashlib.sha256(token.encode()).hexdigest(),
-    "stripped_sha256": hashlib.sha256(token.strip().encode()).hexdigest(),
-}))
-"""
-
-ANONYMOUS_ROUTE_PROBE = r"""
-import json
-import os
-import re
-import ssl
-import sys
-import urllib.error
-import urllib.request
-
-routes = json.loads(sys.argv[1])
-base = os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
-context = ssl.create_default_context(
-    cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
-)
-results = []
-for item in routes:
-    path = re.sub(r"\{[^}]+\}", "probe", item["path"])
-    method = item["method"]
-    request = urllib.request.Request(
-        base + path,
-        data=(b"{}" if method in {"POST", "PUT", "PATCH", "DELETE"} else None),
-        headers={"Content-Type": "application/json"},
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(request, context=context, timeout=15) as response:
-            status = response.status
-    except urllib.error.HTTPError as exc:
-        status = exc.code
-    except Exception as exc:
-        results.append({
-            "path": item["path"],
-            "method": method,
-            "bucket": item["bucket"],
-            "error": type(exc).__name__,
-        })
-        continue
-    results.append({
-        "path": item["path"],
-        "method": method,
-        "bucket": item["bucket"],
-        "status": status,
-    })
-print(json.dumps({"results": results}, sort_keys=True))
-"""
 
 
 def route_inventory(site: IdentitySite, target: ClusterTarget) -> list[dict[str, Any]]:
@@ -288,70 +306,6 @@ def anonymous_routes(
     return cast(list[dict[str, Any]], value["results"])
 
 
-def execution_token_hits(
-    secrets_document: dict[str, Any],
-    pods_document: dict[str, Any],
-    *,
-    digests: set[str],
-) -> list[dict[str, str]]:
-    """Where the data plane holds the execution token, by name or by value.
-
-    ``digests`` are the SHA-256 of the token as the API Pod holds it (raw and
-    stripped); every Secret value and every literal Pod env value is digested
-    and compared, so a token stored under an innocent key is found too. Only
-    names and keys are returned, never values.
-    """
-
-    matches = []
-    pattern = re.compile(r"execution[_.-]?token", re.IGNORECASE)
-
-    def value_digests(raw: bytes) -> set[str]:
-        return {
-            hashlib.sha256(raw).hexdigest(),
-            hashlib.sha256(raw.strip()).hexdigest(),
-        }
-
-    for item in secrets_document.get("items", []):
-        name = str(item.get("metadata", {}).get("name", ""))
-        for key, encoded in (item.get("data") or {}).items():
-            try:
-                raw = base64.b64decode(str(encoded))
-            except (ValueError, TypeError):
-                raw = b""
-            by_value = bool(value_digests(raw) & digests) if raw else False
-            by_name = pattern.search(str(key)) is not None
-            if by_value or by_name:
-                matches.append(
-                    {
-                        "kind": "Secret",
-                        "name": name,
-                        "key": str(key),
-                        "match": "value" if by_value else "name",
-                    }
-                )
-    for item in pods_document.get("items", []):
-        name = str(item.get("metadata", {}).get("name", ""))
-        spec = item.get("spec", {})
-        containers = [*spec.get("initContainers", []), *spec.get("containers", [])]
-        for container in containers:
-            for entry in container.get("env", []):
-                literal = entry.get("value")
-                by_value = isinstance(literal, str) and bool(
-                    value_digests(literal.encode()) & digests
-                )
-                by_name = pattern.search(str(entry.get("name", ""))) is not None
-                if by_value or by_name:
-                    matches.append(
-                        {
-                            "kind": "Pod",
-                            "name": name,
-                            "key": str(entry.get("name")),
-                            "match": "value" if by_value else "name",
-                        }
-                    )
-    return matches
-
-
 def data_plane_execution_token_hits(
     site: IdentitySite,
     target: ClusterTarget,
@@ -364,8 +318,12 @@ def data_plane_execution_token_hits(
 
     reference = site.api_pod_json(EXECUTION_TOKEN_DIGEST_PROBE)
     digests = {str(reference["sha256"]), str(reference["stripped_sha256"])}
-    secrets_document = json.loads(site.gpu(target, "get", "secret", "-o", "json"))
-    pods_document = json.loads(site.gpu(target, "get", "pod", "-o", "json"))
+    secrets_document = json.loads(
+        site.gpu(target, "get", "secret", "-o", "json", all_namespaces=True)
+    )
+    pods_document = json.loads(
+        site.gpu(target, "get", "pod", "-o", "json", all_namespaces=True)
+    )
     return execution_token_hits(secrets_document, pods_document, digests=digests)
 
 
@@ -422,29 +380,6 @@ def run_auth010(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
     }
 
 
-REMOTE_STATUS_PROBE = r"""
-import json
-import sys
-from gpu_fault.app import ApplicationContext
-# argv: command IDs whose status must be reported even once terminal, so the
-# "after" reading can tell SUCCEEDED (not interrupted) from a vanished row.
-tracked = set(sys.argv[1:])
-commands = ApplicationContext.from_environment().store.list_remote_commands()
-print(json.dumps({
-    "commands": [
-        {
-            "command_id": item.command_id,
-            "status": item.status.value,
-            "lease_owner_present": item.lease_owner is not None,
-        }
-        for item in commands
-        if item.status.value in {"PENDING", "WAITING", "LEASED"}
-        or item.command_id in tracked
-    ]
-}, sort_keys=True))
-"""
-
-
 def executor_claim_identity(
     site: IdentitySite,
     target: ClusterTarget,
@@ -481,34 +416,6 @@ def executor_claim_identity(
         "compatibility": environment["GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST"],
         "owners": owners,
     }
-
-
-DIRECT_CLAIM_PROBE_TEMPLATE = r"""
-import json
-import os
-import ssl
-import urllib.error
-import urllib.request
-payload = __PAYLOAD__
-request = urllib.request.Request(
-    os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/") + "/v1/regional/executors/claim",
-    data=json.dumps(payload, separators=(",", ":")).encode(),
-    headers={
-        "Authorization": "Bearer " + __TOKEN__,
-        "Content-Type": "application/json",
-        "X-GPU-Fault-Cluster-ID": __CLUSTER_ID__,
-    },
-    method="POST",
-)
-context = ssl.create_default_context(cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"])
-try:
-    with urllib.request.urlopen(request, context=context, timeout=10) as response:
-        print(json.dumps({"status": int(response.status)}))
-except urllib.error.HTTPError as exc:
-    print(json.dumps({"status": exc.code}))
-except Exception as exc:
-    print(json.dumps({"status": type(exc).__name__}))
-"""
 
 
 def direct_claim(
@@ -561,85 +468,6 @@ def direct_claim(
     return int(status) if isinstance(status, int) else str(status)
 
 
-def registry_token_digests(
-    entries: list[dict[str, Any]],
-    cluster_id: str,
-) -> tuple[str | None, str | None, str | None]:
-    """(token digest, retiring digest, deadline) for one cluster.
-
-    The bootstrap Secret carries plaintext tokens and a durable revision carries
-    digests; comparing digests lets a restore be checked on either kind of site
-    without handling the plaintext again.
-    """
-
-    for item in entries:
-        if item.get("cluster_id") != cluster_id:
-            continue
-        token = item.get("token")
-        retiring = item.get("retiring_token")
-        return (
-            secret_digest(str(token)) if token else item.get("token_sha256"),
-            (
-                secret_digest(str(retiring))
-                if retiring
-                else item.get("retiring_token_sha256")
-            ),
-            item.get("token_rotation_expires_at"),
-        )
-    raise IdentityAcceptanceError("target cluster is absent from registry")
-
-
-def update_registry_token(
-    entries: list[dict[str, Any]],
-    cluster_id: str,
-    token: str,
-    *,
-    retiring_token: str | None = None,
-    rotation_expires_at: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return the registry with one cluster's token, and rotation slot, replaced.
-
-    Both plaintext fields are handed to the control plane, which stores only the
-    digests; the driver never writes a token into evidence.
-    """
-
-    result = [dict(item) for item in entries]
-    for item in result:
-        if item.get("cluster_id") != cluster_id:
-            continue
-        item["token"] = token
-        item.pop("token_sha256", None)
-        item.pop("retiring_token", None)
-        item.pop("retiring_token_sha256", None)
-        item.pop("token_rotation_expires_at", None)
-        if retiring_token is not None:
-            item["retiring_token"] = retiring_token
-            item["token_rotation_expires_at"] = rotation_expires_at
-        return result
-    raise IdentityAcceptanceError("target cluster is absent from registry")
-
-
-def commands_not_misterminated(
-    before_status: dict[str, str],
-    after_status: dict[str, str | None],
-) -> bool:
-    """Whether every command open before the rotation survived it.
-
-    An empty baseline used to pass vacuously (``all`` over nothing), so the
-    check said "no command was misterminated" on a site that had no command to
-    misterminate. It now needs at least one open command before the rotation.
-    A command that ran to SUCCEEDED during the window was not interrupted; one
-    that vanished (the status probe lists open commands only) or FAILED was.
-    """
-
-    if not before_status:
-        return False
-    return all(
-        after_status.get(command_id) in {"PENDING", "WAITING", "LEASED", "SUCCEEDED"}
-        for command_id in before_status
-    )
-
-
 def auth016_result(
     site: IdentitySite,
     primary: Any,
@@ -660,17 +488,13 @@ def auth016_result(
     by_phase: dict[str, list[int | str]] = {}
     for item in samples:
         by_phase.setdefault(str(item["phase"]), []).append(item["status"])
-    # Only HTTP answers speak to authentication; a sample the probe could not
-    # take (no Ready executor while the data plane rolls) is recorded but does
-    # not decide a phase. A phase still needs at least one real answer.
-    http_by_phase = {
-        phase: [value for value in values if isinstance(value, int)]
-        for phase, values in by_phase.items()
-    }
+    # Missing observations cannot prove continuous availability. A transport
+    # failure or unavailable probe is a failed sample, not an omitted sample.
     uninterrupted = [
         phase
-        for phase in ("baseline", "overlap", "cutover")
-        if http_by_phase.get(phase) and set(http_by_phase[phase]) == {200}
+        for phase in ("baseline", "overlap", "cutover", "completed")
+        if by_phase.get(phase)
+        and all(type(value) is int and value == 200 for value in by_phase[phase])
     ]
     before_ids = [str(item["command_id"]) for item in before_commands["commands"]]
     after_commands = primary.cpu_python(REMOTE_STATUS_PROBE, *before_ids)
@@ -684,6 +508,15 @@ def auth016_result(
         "baseline_only_200": "baseline" in uninterrupted,
         "overlap_only_200": "overlap" in uninterrupted,
         "cutover_only_200": "cutover" in uninterrupted,
+        "completed_only_200": "completed" in uninterrupted,
+        "both_credentials_sampled_during_overlap": (
+            {
+                item.get("credential_slot")
+                for item in samples
+                if item.get("phase") == "overlap"
+            }
+            == {"old", "new"}
+        ),
         "new_token_accepted_during_overlap": new_token_during_overlap == 200,
         "old_token_rejected_after_completion": old_token_after_completion == 403,
         "remote_commands_not_misterminated": commands_not_misterminated(
@@ -717,6 +550,7 @@ def auth016_result(
                 "observed_at": item["observed_at"],
                 "phase": item["phase"],
                 "status": item["status"],
+                "credential_slot": item.get("credential_slot"),
             }
             for item in samples
         ],
@@ -726,11 +560,86 @@ def auth016_result(
             "The retiring token stays valid for the whole overlap window, so this "
             "case proves there is no interruption, not that the old credential is "
             "revoked instantly; both original Secrets are restored.",
-            "remote_commands_not_misterminated is proven on one seeded command for "
-            "the synthetic cluster perf-cap-000 (never executed, purged after the "
-            "verdict) plus whatever real commands were open before the rotation.",
+            "remote_commands_not_misterminated requires a nonempty command baseline "
+            "in the target cluster; an unrelated synthetic cluster is not proof "
+            "that the rotating cluster's commands survived.",
         ],
     }
+
+
+def restore_auth016(
+    site: IdentitySite,
+    target: ClusterTarget,
+    *,
+    thread: threading.Thread,
+    original_registry: list[dict[str, Any]],
+    old_token: str,
+    new_token: str,
+    connection_uid: str,
+    registry_started: bool,
+    token_started: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    def verify_restored() -> bool:
+        return registry_token_digests(
+            site.registry(), target.cluster_id
+        ) == registry_token_digests(
+            original_registry, target.cluster_id
+        ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
+            old_token
+        )
+
+    # In place: the IdentityCaseFailure raised above holds these containers.
+    def restore_token() -> None:
+        if registry_token_digests(
+            site.registry(), target.cluster_id
+        ) != registry_token_digests(original_registry, target.cluster_id):
+            raise IdentityAcceptanceError(
+                "registry restoration is unproven; token restore deferred"
+            )
+        current = read_cluster_token(site, target)
+        if current == old_token:
+            return
+        write_cluster_token(
+            site,
+            target,
+            old_token,
+            expected_token=new_token,
+            expected_uid=connection_uid,
+        )
+
+    def restore_executor() -> float:
+        if read_cluster_token(site, target) != old_token:
+            raise IdentityAcceptanceError(
+                "token restoration is unproven; executor rollout deferred"
+            )
+        return rollout_executor(site, target)
+
+    steps: list[tuple[str, Any]] = []
+    if not thread.is_alive() and registry_started:
+        steps.extend(
+            [
+                (
+                    "restore_registry",
+                    lambda: site.restore_registry(
+                        original_registry,
+                        reason=(
+                            "GF-REGIONAL-AUTH-016 restore: original token republished"
+                        ),
+                    ),
+                ),
+                ("rollout_control", site.rollout_control),
+            ]
+        )
+    if not thread.is_alive() and token_started:
+        steps.extend(
+            [
+                ("restore_cluster_token", restore_token),
+                ("rollout_executor", restore_executor),
+            ]
+        )
+    if not thread.is_alive():
+        steps.append(("verify_restored", verify_restored))
+    return run_cleanup_steps(steps)
 
 
 def run_auth016(
@@ -739,304 +648,41 @@ def run_auth016(
     *,
     case_dir: Path,
 ) -> dict[str, Any]:
-    """Prove the overlap window rotates a cluster token without any 403.
+    """Run the full production rotation and independently observe its consumers."""
+    from scripts.e2e.regional.auth016_lifecycle import run_rotation_acceptance
 
-    The old token stays valid until an explicit deadline, so the control plane
-    can accept the new credential before the data plane presents it. What has to
-    be proven is both halves of that: no rejection while both slots are live,
-    and an immediate rejection once the retiring slot is dropped.
-    """
-
-    original_registry = site.registry()
-    old_token = read_cluster_token(site, target)
-    new_token = secrets.token_urlsafe(48)
     identity = executor_claim_identity(site, target)
     primary = site.regional(target)
-    # One command stays open through the whole rotation and the restore, so
-    # the misterminated-command check has something real to prove; the seed is
-    # purged when this block exits, after the verdict below has read it.
-    with SeededBaseline.open(primary.cpu_python, case_dir):
-        before_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
-        deadline = datetime.now(timezone.utc) + timedelta(minutes=30)
-        token_lock = threading.Lock()
-        token_box = [old_token]
-        phase_box = ["baseline"]
-        stop = threading.Event()
-        samples: list[dict[str, Any]] = []
+    return run_rotation_acceptance(
+        site,
+        target,
+        case_dir=case_dir,
+        retired_probe=lambda token: direct_claim(
+            primary, target, token=token, identity=identity
+        ),
+    )
 
-        def sampler() -> None:
-            while not stop.is_set():
-                with token_lock:
-                    token = token_box[0]
-                    phase = phase_box[0]
-                # Re-check after the wait: a stop that arrived during the pause
-                # must not be answered with one more claim, which would run while
-                # the restore is republishing the original token.
-                if stop.is_set():
-                    return
-                samples.append(
-                    {
-                        "observed_at": utc_now(),
-                        "phase": phase,
-                        "status": direct_claim(
-                            primary, target, token=token, identity=identity
-                        ),
-                    }
-                )
-                stop.wait(2)
-
-        def enter(phase: str, *, token: str | None = None) -> None:
-            with token_lock:
-                phase_box[0] = phase
-                if token is not None:
-                    token_box[0] = token
-
-        thread = threading.Thread(target=sampler, daemon=True)
-        restored = False
-        control_rollout: float | None = None
-        executor_rollout = None
-        new_token_during_overlap: int | str | None = None
-        old_token_after_completion: int | str | None = None
-        registry_generation = site.registry_generation()
-        cleanup_errors: list[str] = []
-        cleanup: dict[str, Any] = {}
-
-        def partial() -> dict[str, Any]:
-            return {
-                "samples": samples,
-                "new_token_during_overlap": new_token_during_overlap,
-                "old_token_after_completion": old_token_after_completion,
-                "cleanup": cleanup,
-                "cleanup_errors": cleanup_errors,
-                "restored": restored,
-            }
-
-        try:
-            thread.start()
-            time.sleep(60)
-            # Control plane first: both slots live, data plane untouched.
-            site.write_registry(
-                update_registry_token(
-                    original_registry,
-                    target.cluster_id,
-                    new_token,
-                    retiring_token=old_token,
-                    rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
-                ),
-                reason="GF-REGIONAL-AUTH-016 overlap: new token live, old token retiring",
-            )
-            # POST-to-last-ack propagation time; rollout_control is a no-op on a
-            # durable-revision site and would have measured ~1 s.
-            control_rollout = site.last_registry_ready_seconds or site.rollout_control()
-            enter("overlap")
-            time.sleep(30)
-            new_token_during_overlap = direct_claim(
-                primary, target, token=new_token, identity=identity
-            )
-            write_cluster_token(site, target, new_token)
-            executor_rollout = rollout_executor(site, target)
-            enter("cutover", token=new_token)
-            time.sleep(30)
-            # Finishing the rotation must withdraw the old credential at once
-            # instead of leaving it live until the deadline lapses.
-            site.write_registry(
-                update_registry_token(original_registry, target.cluster_id, new_token),
-                reason="GF-REGIONAL-AUTH-016 completed: retiring slot withdrawn",
-            )
-            site.rollout_control()
-            enter("completed")
-            old_token_after_completion = direct_claim(
-                primary, target, token=old_token, identity=identity
-            )
-            time.sleep(10)
-        except Exception as exc:
-            raise IdentityCaseFailure(str(exc), details=partial()) from exc
-        finally:
-            stop.set()
-            # The sampler's worst case is one whole direct_claim; a shorter join
-            # let a claim in flight land after the restore below.
-            thread.join(timeout=DIRECT_CLAIM_JOIN_SECONDS)
-            if thread.is_alive():
-                cleanup_errors.append("sampler thread did not stop before restore")
-
-            def verify_restored() -> bool:
-                return registry_token_digests(
-                    site.registry(), target.cluster_id
-                ) == registry_token_digests(
-                    original_registry, target.cluster_id
-                ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
-                    old_token
-                )
-
-            # In place: the IdentityCaseFailure raised above holds these containers.
-            step_outcomes, step_errors = run_cleanup_steps(
-                [
-                    (
-                        "restore_registry",
-                        lambda: site.write_registry(
-                            original_registry,
-                            reason=(
-                                "GF-REGIONAL-AUTH-016 restore: original token republished"
-                            ),
-                        ),
-                    ),
-                    ("rollout_control", site.rollout_control),
-                    (
-                        "restore_cluster_token",
-                        lambda: write_cluster_token(site, target, old_token),
-                    ),
-                    ("rollout_executor", lambda: rollout_executor(site, target)),
-                    ("verify_restored", verify_restored),
-                ]
-            )
-            cleanup.update(step_outcomes)
-            cleanup_errors.extend(step_errors)
-            restored = cleanup.get("verify_restored") is True and not cleanup_errors
-            write_json_atomic(case_dir / "auth016-details.json", partial())
-        if thread.is_alive():
-            raise IdentityCaseFailure(
-                "sampler thread outlived the restore; samples cannot be attributed",
-                details=partial(),
-            )
-        return auth016_result(
-            site,
-            primary,
-            samples=samples,
-            before_commands=before_commands,
-            new_token_during_overlap=new_token_during_overlap,
-            old_token_after_completion=old_token_after_completion,
-            restored=restored,
-            registry_generation=registry_generation,
-            control_rollout=control_rollout,
-            executor_rollout=executor_rollout,
-            old_token=old_token,
-            new_token=new_token,
-        )
-
-
-TLS_BOUNDARY_PROBE = r"""
-import json
-import os
-import socket
-import ssl
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlsplit
-
-url = urlsplit(os.environ["GPU_FAULT_CONTROL_PLANE_URL"])
-host = url.hostname
-ca_file = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
-context = ssl.create_default_context(cafile=ca_file)
-certificate = {}
-default_handshake_ok = False
-default_handshake_error = None
-try:
-    with socket.create_connection((host, url.port or 443), timeout=15) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as tls:
-            certificate = tls.getpeercert() or {}
-            default_handshake_ok = True
-except (ssl.SSLError, OSError) as exc:
-    default_handshake_error = type(exc).__name__
-
-empty_ca_rejected = False
-Path("/tmp/auth013-empty-ca.pem").write_text("", encoding="ascii")
-try:
-    ssl.create_default_context(cafile="/tmp/auth013-empty-ca.pem")
-except ssl.SSLError:
-    empty_ca_rejected = True
-
-# Any TLS or socket failure is a rejection of the wrong name; the server may
-# close the connection (OSError) instead of completing a handshake that then
-# fails hostname verification (SSLCertVerificationError). What must not
-# happen is a completed handshake.
-wrong_hostname_rejected = False
-wrong_hostname_error = None
-try:
-    with socket.create_connection((host, url.port or 443), timeout=15) as raw:
-        with context.wrap_socket(raw, server_hostname="wrong.invalid"):
-            pass
-except (ssl.SSLError, OSError) as exc:
-    wrong_hostname_rejected = True
-    wrong_hostname_error = type(exc).__name__
-
-not_after = certificate.get("notAfter")
-expires = (
-    datetime.fromtimestamp(ssl.cert_time_to_seconds(not_after), tz=timezone.utc)
-    if not_after else None
-)
-sans = [
-    value
-    for kind, value in certificate.get("subjectAltName", [])
-    if kind == "DNS"
-]
-print(json.dumps({
-    "host": host,
-    "ca_file": ca_file,
-    "ca_exists": Path(ca_file).is_file(),
-    "ssl_cert_file_set": bool(os.getenv("SSL_CERT_FILE")),
-    "requests_ca_bundle_set": bool(os.getenv("REQUESTS_CA_BUNDLE")),
-    "sans": sans,
-    "hostname_in_san": host in sans,
-    "default_handshake_ok": default_handshake_ok,
-    "default_handshake_error": default_handshake_error,
-    "empty_ca_rejected": empty_ca_rejected,
-    "wrong_hostname_rejected": wrong_hostname_rejected,
-    "wrong_hostname_error": wrong_hostname_error,
-    "not_after": expires.isoformat() if expires else None,
-    "remaining_days": (
-        (expires - datetime.now(timezone.utc)).total_seconds() / 86400
-        if expires else None
-    ),
-}, sort_keys=True))
-"""
 
 CERTIFICATE_CHECK_TIMER = "gpu-fault-certificate-check.timer"
-
-
-def certificate_alert_checks(
-    alert: dict[str, Any] | None,
-    *,
-    threshold_days: int,
-) -> dict[str, Any]:
-    """Whether the expiry alert the deploy ships is armed on a GPU node.
-
-    The only certificate-expiry alerting in ``deploy/`` is the per-node
-    ``gpu-fault-certificate-check.timer`` running
-    ``check-control-plane-certificate`` with
-    ``GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS`` from ``collector.env``; there
-    is no PrometheusRule for it. ``threshold >= 30`` read the site file, not the
-    node, so it passed with the timer disabled. ``alert`` is the host probe's
-    reading; ``None`` means no node was given and the check is not evaluated.
-    """
-
-    if alert is None:
-        return {"expiry_threshold_configured": "NOT_EVALUATED"}
-    seconds = alert.get("min_validity_seconds")
-    configured = (
-        isinstance(seconds, int)
-        and seconds >= threshold_days * 86400
-        and alert.get("timer_enabled") is True
-        and alert.get("timer_active") is True
-    )
-    return {"expiry_threshold_configured": configured}
 
 
 def run_auth013(
     site: IdentitySite,
     target: ClusterTarget,
     *,
+    case_dir: Path,
     node: str = "",
     host_probe_image: str = "",
-    case_dir: Path | None = None,
 ) -> dict[str, Any]:
     pod = site.any_executor_pod(target)
     result = site.pod_json("gpu", target, pod, TLS_BOUNDARY_PROBE)
-    threshold = int(site.config["health"]["certificate_min_validity_days"])
+    threshold = max(30, int(site.config["health"]["certificate_min_validity_days"]))
     alert: dict[str, Any] | None = None
     alert_residuals: dict[str, Any] = {}
     if node and host_probe_image:
         probe = HostProbeFixture(
             HostProbeSettings(
+                state_directory=case_dir / "host-probes",
                 kubeconfig=site.gpu_kubeconfig,
                 context=target.context,
                 namespace=site.namespace,
@@ -1082,10 +728,10 @@ def run_auth013(
             checks[name] = False
         else:
             checks[name] = value
-    if alert_residuals and any(
-        value for key, value in alert_residuals.items() if key != "cleanup_error"
-    ):
-        checks["alert_probe_removed"] = False
+    if node and host_probe_image:
+        checks["alert_probe_removed"] = bool(alert_residuals) and not any(
+            alert_residuals.values()
+        )
     outcome = {
         "verdict": verdict(checks),
         "checks": checks,
@@ -1152,33 +798,6 @@ def select_load_balancer(
         f"no ELBv2 load balancer has DNS name {hostname!r} "
         f"({len(load_balancers)} load balancers listed)"
     )
-
-
-def world_open_rules(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ingress permissions open to every IPv4 or IPv6 source."""
-
-    broad = []
-    for group in groups:
-        for permission in group.get("IpPermissions") or []:
-            sources = [
-                item.get("CidrIp")
-                for item in permission.get("IpRanges") or []
-                if item.get("CidrIp") == "0.0.0.0/0"
-            ] + [
-                item.get("CidrIpv6")
-                for item in permission.get("Ipv6Ranges") or []
-                if item.get("CidrIpv6") == "::/0"
-            ]
-            if sources:
-                broad.append(
-                    {
-                        "group_id": group["GroupId"],
-                        "from_port": permission.get("FromPort"),
-                        "to_port": permission.get("ToPort"),
-                        "sources": sources,
-                    }
-                )
-    return broad
 
 
 def nlb_security_groups(site: IdentitySite) -> dict[str, Any]:
@@ -1296,27 +915,6 @@ def outside_probe(
     }
 
 
-HIGH_RISK_ROUTE_BUCKETS = {
-    "/v1/runtime-profiles": "execution-token",
-    "/v1/advisory-notifications/{notification_id}/send": "execution-token",
-    "/v1/fleet/agents": "dual-credential",
-}
-
-
-def high_risk_route_errors(routes: list[dict[str, Any]]) -> list[str]:
-    """The three routes whose bucket the catalog names, checked, not counted."""
-
-    buckets = {str(item["path"]): item.get("bucket") for item in routes}
-    errors = []
-    for path, expected in HIGH_RISK_ROUTE_BUCKETS.items():
-        actual = buckets.get(path)
-        if actual is None:
-            errors.append(f"{path} is not in the route inventory")
-        elif actual != expected:
-            errors.append(f"{path} is {actual}, expected {expected}")
-    return errors
-
-
 def run_auth014(
     site: IdentitySite,
     target: ClusterTarget,
@@ -1328,6 +926,7 @@ def run_auth014(
     nlb = nlb_security_groups(site)
     external = outside_probe(outside_probe_path, nlb_hostname=str(nlb["hostname"]))
     token_hits = data_plane_execution_token_hits(site, target)
+    authenticated_fleet = authenticated_fleet_isolation(site, target)
     expected = {
         "cluster-token": {401},
         "dual-credential": {403},
@@ -1364,13 +963,28 @@ def run_auth014(
     bucket_errors = high_risk_route_errors(routes)
     checks = {
         "route_matrix_matches_buckets": not mismatches,
+        "route_matrix_complete": {
+            (item["path"], method, item["bucket"])
+            for item in routes
+            for method in item["methods"]
+            if method not in {"HEAD", "OPTIONS"}
+        }
+        == {(item["path"], item["method"], item["bucket"]) for item in results},
+        "write_routes_explicitly_protected": all(
+            item.get("bucket")
+            in {"cluster-token", "dual-credential", "execution-token"}
+            for item in routes
+            if set(item.get("methods") or []) & WRITE_METHODS
+        ),
         "anonymous_write_routes_never_succeed": not anonymous_write_success,
+        "nlb_has_security_groups": nlb["security_group_count"] > 0,
         "nlb_has_no_world_open_ipv4_rule": not nlb["broad_ipv4_rules"],
         "nlb_has_no_world_open_ipv6_rule": not nlb["broad_ipv6_rules"],
         "outside_vpc_connection_blocked": external["valid"],
         "high_risk_routes_in_declared_buckets": not bucket_errors,
         "openapi_surface_recorded": len(openapi_surface) >= 3,
         "execution_token_absent_from_data_plane": not token_hits,
+        "authenticated_fleet_isolation": authenticated_fleet["passed"] is True,
     }
     return {
         "verdict": verdict(checks),
@@ -1384,6 +998,7 @@ def run_auth014(
         "high_risk_bucket_errors": bucket_errors,
         "openapi_surface": openapi_surface,
         "execution_token_hits": token_hits,
+        "authenticated_fleet": authenticated_fleet,
         "limitations": [
             "The network denial is supplied by a separately executed probe "
             "outside the NLB allowlist; this runner validates its structured "
@@ -1395,130 +1010,51 @@ def run_auth014(
     }
 
 
-AGENT_SNAPSHOT_PROBE = r"""
-import json
-import sys
-from gpu_fault.app import ApplicationContext
-cluster_id, *nodes = sys.argv[1:]
-store = ApplicationContext.from_environment().store
-result = {}
-for node in nodes:
-    agent = store.get_agent(cluster_id, node)
-    result[node] = {
-        "generation": agent.generation,
-        "lifecycle_state": agent.lifecycle_state.value,
-        # AgentRecord renamed the heartbeat field to last_seen_at; the evidence
-        # key stays for readers of earlier reports.
-        "last_heartbeat_at": agent.last_seen_at.isoformat(),
-        "node_action_key_version": agent.node_action_key_version,
-    }
-print(json.dumps({"agents": result}, sort_keys=True))
-"""
-
-
-def secret_document(
-    site: IdentitySite,
-    plane: str,
-    target: ClusterTarget,
-    name: str,
-) -> dict[str, Any]:
-    value = json.loads(
-        site.regional(target).kubectl(
-            plane,
-            "get",
-            "secret",
-            name,
-            "-o",
-            "json",
-        )
-    )
-    return cast(dict[str, Any], value)
-
-
 def restore_secret(
     site: IdentitySite,
     plane: str,
     target: ClusterTarget,
     value: dict[str, Any],
+    *,
+    expected: dict[str, Any] | None = None,
 ) -> None:
-    manifest = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": value["metadata"]["name"],
-            "namespace": value["metadata"]["namespace"],
-        },
-        "type": value.get("type", "Opaque"),
-        "data": value.get("data") or {},
-    }
+    current = secret_document(site, plane, target, value["metadata"]["name"])
+    metadata = current.get("metadata") or {}
+    if (
+        not value["metadata"].get("uid")
+        or metadata.get("uid") != value["metadata"]["uid"]
+        or metadata.get("namespace") != value["metadata"].get("namespace")
+        or not metadata.get("resourceVersion")
+    ):
+        raise IdentityAcceptanceError(
+            "node-key Secret identity changed; restore refused"
+        )
+    if current.get("data") == value.get("data"):
+        return
+    if expected is None or current.get("data") != expected.get("data"):
+        raise IdentityAcceptanceError(
+            "node-key rotation ownership is unproven; restore deferred"
+        )
     site.regional(target).kubectl(
         plane,
-        "apply",
-        "-f",
-        "-",
-        input_text=json.dumps(manifest),
+        "patch",
+        "secret",
+        metadata["name"],
+        "--type=json",
+        "--patch-file=/dev/stdin",
+        input_text=json.dumps(
+            [
+                {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": metadata["resourceVersion"],
+                },
+                {"op": "test", "path": "/data", "value": current["data"]},
+                {"op": "replace", "path": "/data", "value": value["data"]},
+            ]
+        ),
     )
-
-
-def node_key_digests(secret: dict[str, Any]) -> dict[str, str]:
-    return {
-        key: hashlib.sha256(base64.b64decode(value)).hexdigest()
-        for key, value in (secret.get("data") or {}).items()
-    }
-
-
-def master_reference_scan(resources: dict[str, Any]) -> dict[str, Any]:
-    """Which GPU-plane resources reference the fleet-master Secret.
-
-    The check is only meaningful if an installer resource was in the scan:
-    the installer Job is transient, and a scan of an idle namespace finds no
-    reference because it finds no installer. ``installer_resources`` names the
-    Jobs/Pods that looked like an installer so the caller can tell "clean" from
-    "nothing to look at".
-    """
-
-    hits: list[dict[str, str]] = []
-    installer_resources: list[str] = []
-    for item in resources.get("items", []):
-        metadata = item.get("metadata") or {}
-        name = str(metadata.get("name") or "")
-        kind = str(item.get("kind") or "")
-        labels = metadata.get("labels") or {}
-        if "installer" in name or any("installer" in str(v) for v in labels.values()):
-            installer_resources.append(f"{kind}/{name}")
-
-    def visit(value: Any, path: str) -> None:
-        if isinstance(value, dict):
-            reference = value.get("secretKeyRef")
-            if isinstance(reference, dict) and (
-                reference.get("name") == INSTALLER_SECRET
-            ):
-                hits.append(
-                    {
-                        "path": path,
-                        "secret": str(reference.get("name") or ""),
-                        "key": str(reference.get("key") or ""),
-                    }
-                )
-            secret_volume = value.get("secret")
-            if isinstance(secret_volume, dict) and (
-                secret_volume.get("secretName") == INSTALLER_SECRET
-            ):
-                hits.append(
-                    {
-                        "path": path,
-                        "secret": str(secret_volume.get("secretName") or ""),
-                        "key": "",
-                    }
-                )
-            for key, child in value.items():
-                visit(child, f"{path}/{key}")
-        elif isinstance(value, list):
-            for index, child in enumerate(value):
-                visit(child, f"{path}/{index}")
-
-    visit(resources, "")
-    return {"hits": hits, "installer_resources": sorted(installer_resources)}
 
 
 def gpu_master_reference_scan(
@@ -1546,6 +1082,12 @@ def auth015_focused_tests() -> dict[str, Any]:
         "tests/fleet/test_fleet.py::test_derived_node_key_cannot_sign_for_another_node",
         "tests/fleet/test_fleet.py::"
         "test_node_specific_key_can_rotate_without_changing_peer",
+        "tests/admin/test_node_key_custody_openssl.py::"
+        "test_real_openssl_verifies_an_independently_signed_receipt_and_rejects_forgery",
+        "tests/deploy/test_node_key_custody_provisioning.py::"
+        "test_real_provisioning_captures_signed_prospective_custody_and_rotation",
+        "tests/regional/test_auth015_custody_activation.py::"
+        "test_prospective_install_rotate_and_independent_runtime_witness_chain",
     ]
     completed = run(command, check=False, timeout=600)
     return {
@@ -1555,18 +1097,7 @@ def auth015_focused_tests() -> dict[str, Any]:
     }
 
 
-def heartbeat_advanced(before: dict[str, Any], after: dict[str, Any]) -> bool:
-    """Node B kept heartbeating: its last_heartbeat_at moved forward."""
-
-    try:
-        earlier = datetime.fromisoformat(str(before["last_heartbeat_at"]))
-        later = datetime.fromisoformat(str(after["last_heartbeat_at"]))
-    except (KeyError, ValueError, TypeError):
-        return False
-    return later > earlier
-
-
-def run_auth015(
+def prepare_auth015(
     site: IdentitySite,
     target: ClusterTarget,
     *,
@@ -1574,8 +1105,9 @@ def run_auth015(
     fleet_master_file: Path,
     host_probe_image: str,
     case_dir: Path,
-    focused_tests: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> Auth015Context:
+    if len(set(nodes)) != 2 or not all(nodes):
+        raise IdentityAcceptanceError("AUTH-015 requires two distinct nodes")
     if fleet_master_file.stat().st_mode & 0o077:
         raise IdentityAcceptanceError("fleet master file must be mode 0600")
     master = fleet_master_file.read_text(encoding="utf-8").strip()
@@ -1587,6 +1119,13 @@ def run_auth015(
     original_cpu = secret_document(site, "cpu", target, NODE_ACTION_KEYS_SECRET)
     before_keys = node_key_digests(original_gpu)
     before_cpu_keys = node_key_digests(original_cpu)
+    if any(before_cpu_keys.get(node) != digest for node, digest in before_keys.items()):
+        raise IdentityAcceptanceError("CPU/GPU node-action keys do not agree")
+    reference_before = gpu_master_reference_scan(site, target)
+    if not reference_before["installer_resources"] or reference_before["hits"]:
+        raise IdentityAcceptanceError(
+            "installer master-reference proof is missing or unsafe"
+        )
     # provision-node-action-keys.sh derives a key for every GPU node missing
     # from the Secret. If the Secret does not already cover the node set, the
     # run adds keys for nodes the case never named and the "only node A
@@ -1603,6 +1142,7 @@ def run_auth015(
     probes = [
         HostProbeFixture(
             HostProbeSettings(
+                state_directory=case_dir / "host-probes",
                 kubeconfig=site.gpu_kubeconfig,
                 context=target.context,
                 namespace=site.namespace,
@@ -1616,171 +1156,49 @@ def run_auth015(
         )
         for index, node in enumerate(nodes)
     ]
-    scans_before: dict[str, Any] = {}
-    scans_after: dict[str, Any] = {}
-    rotation = None
-    residuals: dict[str, Any] = {}
-    cleanup_errors: list[str] = []
-    checks: dict[str, Any] = {}
-    not_evaluated: dict[str, str] = {}
-    tests = focused_tests if focused_tests is not None else auth015_focused_tests()
+    return Auth015Context(
+        master_sha256=master_sha256,
+        regional=regional,
+        original_gpu=original_gpu,
+        original_cpu=original_cpu,
+        before_keys=before_keys,
+        before_cpu_keys=before_cpu_keys,
+        gpu_node_names=gpu_node_names,
+        before_agents=before_agents,
+        probes=probes,
+    )
 
-    def create_and_scan(probe: HostProbeFixture) -> tuple[str, dict[str, Any]]:
-        probe.create()
-        return probe.settings.node, probe.execute("--master-sha256", master_sha256)
 
-    try:
-        # Two privileged Pods on two nodes: creating them one after the other
-        # doubled the slowest step for nothing they share.
-        with ThreadPoolExecutor(max_workers=len(probes)) as pool:
-            scans_before = dict(pool.map(create_and_scan, probes))
-        environment = {
-            **os.environ,
-            "PYTHONPATH": str(ROOT / "src"),
-            "KUBECONFIG": str(site.gpu_kubeconfig),
-            "GPU_FAULT_KUBECTL_CONTEXT": target.context,
-            "GPU_FAULT_NAMESPACE": site.namespace,
-            "GPU_FAULT_CLUSTER_ID": target.cluster_id,
-            "GPU_FAULT_HYPERPOD_CLUSTER": target.hyperpod_cluster_name,
-            "GPU_FAULT_FLEET_MASTER_FILE": str(fleet_master_file.resolve()),
-            "GPU_FAULT_ROTATE_NODE_ACTION_KEY": nodes[0],
-            "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": str(site.cpu_kubeconfig),
-            "GPU_FAULT_CONTROL_PLANE_NAMESPACE": site.namespace,
+def run_auth015(
+    site: IdentitySite,
+    target: ClusterTarget,
+    *,
+    nodes: tuple[str, str],
+    fleet_master_file: Path | None = None,
+    host_probe_image: str = "",
+    case_dir: Path,
+    focused_tests: dict[str, Any] | None = None,
+    release_inputs: Auth015ReleaseInputs | None = None,
+    custody_inputs: Auth015CustodyInputs | None = None,
+) -> dict[str, Any]:
+    # Compatibility arguments are never opened. A current master/Secret snapshot
+    # cannot authorize a historical claim or a new test-only key mutation.
+    del fleet_master_file, host_probe_image
+    if custody_inputs is None or release_inputs is None:
+        return {
+            "verdict": "FAIL",
+            "checks": {"no_node_or_secret_mutation": True},
+            "not_evaluated": dict(AUTH015_PROOF_GAPS),
+            "requires_new_authorized_evidence": True,
+            "cleanup_errors": [],
         }
-        rotation = run(
-            ["bash", "deploy/node/provision-node-action-keys.sh"],
-            check=False,
-            timeout=600,
-            env=environment,
-        )
-        # Scan while the rotation's resources are freshest; the installer Job
-        # is transient, and the scan says so when it saw none.
-        reference_scan = gpu_master_reference_scan(site, target)
-        after_gpu = secret_document(site, "gpu", target, NODE_ACTION_KEYS_SECRET)
-        after_keys = node_key_digests(after_gpu)
-        time.sleep(30)
-        after_agents = regional.cpu_python(
-            AGENT_SNAPSHOT_PROBE,
-            target.cluster_id,
-            *nodes,
-        )
-        with ThreadPoolExecutor(max_workers=len(probes)) as pool:
-            scans_after = dict(
-                pool.map(
-                    lambda probe: (
-                        probe.settings.node,
-                        probe.execute("--master-sha256", master_sha256),
-                    ),
-                    probes,
-                )
-            )
-        checks = {
-            "host_scan_before_zero_matches": all(
-                not item["master_matches"] for item in scans_before.values()
-            ),
-            "host_scan_after_zero_matches": all(
-                not item["master_matches"] for item in scans_after.values()
-            ),
-            "cross_node_signature_tests": tests.get("passed") is True,
-            "rotation_command_succeeded": rotation.returncode == 0,
-            "node_a_key_changed": before_keys.get(nodes[0]) != after_keys.get(nodes[0]),
-            "node_b_key_unchanged": before_keys.get(nodes[1])
-            == after_keys.get(nodes[1]),
-            "no_other_node_key_changed": all(
-                before_keys.get(node) == after_keys.get(node)
-                for node in before_keys
-                if node != nodes[0]
-            ),
-            "node_b_agent_continues": (
-                before_agents["agents"][nodes[1]]["generation"]
-                == after_agents["agents"][nodes[1]]["generation"]
-                and after_agents["agents"][nodes[1]]["lifecycle_state"] == "ACTIVE"
-            ),
-            "node_b_heartbeat_advanced": heartbeat_advanced(
-                before_agents["agents"][nodes[1]], after_agents["agents"][nodes[1]]
-            ),
-        }
-        if reference_scan["installer_resources"]:
-            checks["installer_references_no_fleet_master"] = not reference_scan["hits"]
-        else:
-            not_evaluated["installer_references_no_fleet_master"] = (
-                "no installer Job/Pod was present during the scan; the "
-                "reference check had nothing to inspect"
-            )
-    except Exception as exc:
-        raise IdentityCaseFailure(
-            str(exc),
-            details=failure_details(
-                checks=checks,
-                cleanup_errors=cleanup_errors,
-                scan_before=scans_before,
-                scan_after=scans_after,
-                rotation_returncode=(
-                    rotation.returncode if rotation is not None else None
-                ),
-            ),
-        ) from exc
-    finally:
-        steps: list[tuple[str, Any]] = [
-            (
-                "restore_gpu_secret",
-                lambda: restore_secret(site, "gpu", target, original_gpu),
-            ),
-            (
-                "restore_cpu_secret",
-                lambda: restore_secret(site, "cpu", target, original_cpu),
-            ),
-        ]
-        for probe in probes:
-            steps.append((f"cleanup_probe:{probe.settings.node}", probe.cleanup))
-        # In place: the IdentityCaseFailure raised above holds cleanup_errors.
-        cleanup, step_errors = run_cleanup_steps(steps)
-        cleanup_errors.extend(step_errors)
-        for probe in probes:
-            key = f"cleanup_probe:{probe.settings.node}"
-            residuals[probe.settings.node] = cleanup.get(key) or {"cleanup_error": True}
-        write_json_atomic(
-            case_dir / "auth015-details.json",
-            {
-                "checks": checks,
-                "cleanup_errors": cleanup_errors,
-                "scan_before": scans_before,
-                "scan_after": scans_after,
-                "probe_residuals": residuals,
-            },
-        )
-    checks["gpu_secret_restored"] = (
-        node_key_digests(secret_document(site, "gpu", target, NODE_ACTION_KEYS_SECRET))
-        == before_keys
+    if focused_tests is not None and focused_tests.get("passed") is not True:
+        raise IdentityAcceptanceError("AUTH-015 focused signature tests failed")
+    return run_custody_acceptance(
+        site,
+        target,
+        nodes=nodes,
+        release_inputs=release_inputs,
+        custody_inputs=custody_inputs,
+        case_dir=case_dir,
     )
-    checks["cpu_secret_restored"] = (
-        node_key_digests(secret_document(site, "cpu", target, NODE_ACTION_KEYS_SECRET))
-        == before_cpu_keys
-    )
-    checks["probe_resources_removed"] = all(
-        not any(value.values()) for value in residuals.values()
-    )
-    checks["cleanup_completed"] = not cleanup_errors
-    return {
-        "verdict": verdict(checks),
-        "checks": checks,
-        "not_evaluated": not_evaluated,
-        "master_sha256": master_sha256,
-        "gpu_node_set": gpu_node_names,
-        "installer_scan": {
-            "installer_resources": reference_scan["installer_resources"],
-            "hits": reference_scan["hits"],
-        },
-        "focused_tests": tests,
-        "scan_before": scans_before,
-        "scan_after": scans_after,
-        "probe_residuals": residuals,
-        "cleanup_errors": cleanup_errors,
-        "limitations": [
-            "The master is supplied from a trusted-host mode-0600 file. Only "
-            "its SHA-256 enters evidence; the runner restores both key Secrets.",
-            "The installer-reference scan is only evaluated when an installer "
-            "Job or Pod exists during the case; otherwise it is recorded under "
-            "not_evaluated.",
-        ],
-    }

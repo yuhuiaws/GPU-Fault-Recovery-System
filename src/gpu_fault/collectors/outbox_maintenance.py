@@ -23,9 +23,8 @@ from typing import Any
 
 #: The node collector units that write an outbox: every ``gpu-fault-collector
 #: <command>`` the node installer runs (``deploy/systemd/*.service``; the
-#: metrics unit runs ``dcgm`` or ``nvidia-smi``). The CPU-side collectors
-#: (SQS/Kubernetes HMA, node resources) post from inside the cluster and have
-#: no node-local outbox an operator would ever requeue.
+#: metrics unit runs ``dcgm`` or ``nvidia-smi``). The node-resource collector
+#: posts from inside the cluster and has no node-local outbox.
 OUTBOX_COLLECTORS: tuple[str, ...] = (
     "kernel",
     "dcgm",

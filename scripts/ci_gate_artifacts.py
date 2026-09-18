@@ -98,6 +98,15 @@ def repository_files(root: Path) -> tuple[Path, ...]:
     )
     if completed.returncode:
         raise GateArtifactError("cannot enumerate gate inputs")
+    deleted = subprocess.run(
+        ["git", "ls-files", "--deleted", "-z"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if deleted.returncode:
+        raise GateArtifactError("cannot enumerate deleted gate inputs")
+    deleted_paths = set(deleted.stdout.split(b"\0"))
     result = []
     for raw in completed.stdout.split(b"\0"):
         if not raw:
@@ -106,7 +115,13 @@ def repository_files(root: Path) -> tuple[Path, ...]:
         if relative.is_absolute() or ".." in relative.parts:
             raise GateArtifactError(f"gate input leaves repository: {relative}")
         path = root / relative
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink():
+            raise GateArtifactError(f"unsupported gate input: {relative}")
+        if not path.is_file():
+            # The dirty working tree is the candidate. An indexed deletion is
+            # absent from its digest, but a vanished untracked input still fails.
+            if raw in deleted_paths and not path.exists():
+                continue
             raise GateArtifactError(f"unsupported gate input: {relative}")
         result.append(path)
     return tuple(sorted(result))

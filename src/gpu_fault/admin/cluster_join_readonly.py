@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from typing import Callable, TypeVar, cast
 
@@ -18,8 +20,8 @@ def parallel_verify_and_discover(
     discover: Callable[[], T],
 ) -> T:
     with ThreadPoolExecutor(max_workers=2) as executor:
-        verify_future = executor.submit(verify)
-        discovery_future = executor.submit(discover)
+        verify_future = executor.submit(copy_context().run, verify)
+        discovery_future = executor.submit(copy_context().run, discover)
         verify_future.result()
         return discovery_future.result()
 
@@ -36,10 +38,12 @@ def load_network_baseline_cache(
         networks = value["networks"]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
+    age = time.time() - observed
     if (
         value.get("schema_version") != 1
         or value.get("site_sha256") != site.source_sha256
-        or time.time() - observed > NETWORK_BASELINE_CACHE_MAX_AGE_SECONDS
+        or not math.isfinite(age)
+        or not 0 <= age <= NETWORK_BASELINE_CACHE_MAX_AGE_SECONDS
         or not isinstance(networks, list)
         or any(not isinstance(item, dict) for item in networks)
     ):

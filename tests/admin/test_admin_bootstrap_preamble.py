@@ -19,6 +19,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -99,19 +100,18 @@ def test_cluster_access_runs_its_three_chains_concurrently_and_in_order(
         return {"addon": "eks-pod-identity-agent", "ownership": "CREATED"}
 
     started = time.monotonic()
-    cpu_kubeconfig, gpu_kubeconfig, master_file = (
-        admin_bootstrap.prepare_cluster_access(
-            runner,
-            state=state,
-            cpu=_cluster(),
-            gpu_clusters=[_gpu("gpu-a"), _gpu("gpu-b")],
-            state_dir=tmp_path,
-            namespace="gpu-fault-system",
-            secure_dir=tmp_path / "secure",
-            site_id="site-a",
-            ensure_pod_identity_agent=ensure_pod_identity_agent,
-        )
+    access = admin_bootstrap.plan_cluster_access(
+        runner,
+        state=state,
+        cpu=_cluster(),
+        gpu_clusters=[_gpu("gpu-a"), _gpu("gpu-b")],
+        state_dir=tmp_path,
+        namespace="gpu-fault-system",
+        secure_dir=tmp_path / "secure",
+        site_id="site-a",
+        ensure_pod_identity_agent=ensure_pod_identity_agent,
     )
+    access.graph.run(state=state)
     elapsed = time.monotonic() - started
 
     # Ten commands at 50 ms each would be 0.5 s in series; three chains overlap.
@@ -136,9 +136,9 @@ def test_cluster_access_runs_its_three_chains_concurrently_and_in_order(
     assert gpu_writes.count(True) == 2 and gpu_writes == sorted(
         gpu_writes, reverse=True
     ), "GPU namespaces were created before every GPU context was written"
-    assert cpu_kubeconfig == tmp_path / "cpu.kubeconfig"
-    assert gpu_kubeconfig == tmp_path / "gpu.kubeconfig"
-    assert master_file.read_text(encoding="utf-8") == "master"
+    assert access.cpu_kubeconfig == tmp_path / "cpu.kubeconfig"
+    assert access.gpu_kubeconfig == tmp_path / "gpu.kubeconfig"
+    assert access.fleet_master_file.read_text(encoding="utf-8") == "master"
     assert ensured == ["site-a"]
     assert "pod_identity_agent" in state.value["completed_tasks"], (
         "the add-on checkpoint semantics changed"
@@ -156,7 +156,7 @@ def test_a_failing_chain_stops_cluster_access_with_its_own_error(
         raise BootstrapError("eks describe-addon: AccessDenied")
 
     with pytest.raises(BootstrapError, match="AccessDenied"):
-        admin_bootstrap.prepare_cluster_access(
+        admin_bootstrap.plan_cluster_access(
             runner,
             state=state,
             cpu=_cluster(),
@@ -166,7 +166,7 @@ def test_a_failing_chain_stops_cluster_access_with_its_own_error(
             secure_dir=tmp_path / "secure",
             site_id="site-a",
             ensure_pod_identity_agent=refuse,
-        )
+        ).graph.run(state=state)
 
     assert "pod_identity_agent" not in state.value["completed_tasks"]
 
@@ -460,7 +460,23 @@ class _AuroraAccount:
             "describe-db-clusters": {
                 "DBClusters": [
                     {
+                        "DBClusterIdentifier": "gpu-fault-site-a-aurora",
                         "DBClusterArn": "arn:aws:rds:us-east-1:123456789012:cluster:c",
+                        "Status": "available",
+                        "DBClusterMembers": [
+                            {
+                                "DBInstanceIdentifier": (
+                                    "gpu-fault-site-a-aurora-writer"
+                                ),
+                                "IsClusterWriter": True,
+                            },
+                            {
+                                "DBInstanceIdentifier": (
+                                    "gpu-fault-site-a-aurora-reader"
+                                ),
+                                "IsClusterWriter": False,
+                            },
+                        ],
                         "EngineVersion": "16.8",
                         "Endpoint": "c.cluster.example",
                         "MasterUserSecret": {
@@ -471,6 +487,17 @@ class _AuroraAccount:
                 ]
             },
         }
+        if operation == "describe-db-instances":
+            identifier = arguments[arguments.index("--db-instance-identifier") + 1]
+            return {
+                "DBInstances": [
+                    {
+                        "DBInstanceIdentifier": identifier,
+                        "DBClusterIdentifier": "gpu-fault-site-a-aurora",
+                        "DBInstanceStatus": "available",
+                    }
+                ]
+            }
         return answers.get(operation, {})
 
 
@@ -489,9 +516,14 @@ def _aurora(
         admin_bootstrap, "ensure_cluster_parameter_group", lambda *_a, **_k: "pg"
     )
     if stub_instances:
-        monkeypatch.setattr(
-            admin_bootstrap, "ensure_serverless_writer", lambda *_a, **_k: ["w", "r"]
-        )
+
+        def instances(_runner, *, wait, **_kwargs):
+            assert wait is False, (
+                "foundation must defer final readiness to aurora_ready"
+            )
+            return ["w", "r"]
+
+        monkeypatch.setattr(admin_bootstrap, "ensure_serverless_instances", instances)
     return _ensure_aurora(
         account,
         cpu=_cluster(),
@@ -535,13 +567,14 @@ def test_the_subnet_group_is_modified_when_its_subnets_drifted(
     assert "modify-db-subnet-group" in drifted.mutations
 
 
-def test_the_foundation_aurora_task_neither_waits_for_instances_nor_reads_the_secret(
+def test_foundation_reuses_settled_instances_without_waiting_or_reading_credentials(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """The instance wait and the credential read moved to ``aurora_ready`` so the
-    monitoring and node-key installs no longer sit behind them. What RDS already
-    exposes -- the master secret ARN of an existing cluster -- still rides along,
-    so a checkpoint reader that knew the old shape keeps working."""
+    """Existing available instances need no wait or credential read.
+
+    Creating a replica still requires the primary and cluster readiness barrier.
+    The foundation retains the master Secret reference for older checkpoints.
+    """
 
     settled = _AuroraAccount(
         subnet_group_subnets=["subnet-private-a", "subnet-private-b"]
@@ -603,10 +636,14 @@ def _ready(account: _ReadyAccount, tmp_path: Path, *, probe_only: bool) -> dict:
     )
 
 
+@pytest.mark.parametrize("inherited_ca", [None, "", "/etc/rds/ca.pem"])
 def test_aurora_ready_hands_the_control_plane_its_secret_once_both_instances_are_up(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, inherited_ca: str | None
 ) -> None:
-    monkeypatch.setenv(RDS_CA_BUNDLE_ENVIRONMENT, "/etc/rds/ca.pem")
+    if inherited_ca is None:
+        monkeypatch.delenv(RDS_CA_BUNDLE_ENVIRONMENT, raising=False)
+    else:
+        monkeypatch.setenv(RDS_CA_BUNDLE_ENVIRONMENT, inherited_ca)
     account = _ReadyAccount()
 
     result = _ready(account, tmp_path, probe_only=False)
@@ -623,7 +660,10 @@ def test_aurora_ready_hands_the_control_plane_its_secret_once_both_instances_are
     assert manifest["stringData"]["master-secret-arn"] == "arn:aws:secretsmanager:x"
     url = manifest["stringData"]["postgres-url"]
     assert url.startswith("postgresql://u:p@c.cluster.example:5432/"), url
-    assert "sslmode=verify-full" in url
+    assert parse_qs(urlsplit(url).query) == {
+        "sslmode": ["verify-full"],
+        "sslrootcert": ["/etc/gpu-fault/rds/ca-bundle.pem"],
+    }, "managed bootstrap must use the CA path mounted by its consumers"
 
 
 def test_the_aurora_ready_probe_reads_two_facts_and_mutates_nothing(

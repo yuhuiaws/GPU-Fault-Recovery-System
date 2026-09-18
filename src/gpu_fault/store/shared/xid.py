@@ -63,6 +63,7 @@ class SharedXidSignalMixin:
         minimum_active_seconds: float,
         *,
         clock: datetime | None = None,
+        semantic_fingerprint: str | None = None,
     ) -> tuple[HealthSignalState, bool]:
         """Advance one signal. ``clock`` is the time durations are measured on
         (the control plane's receive time when the caller has it); it defaults
@@ -75,6 +76,13 @@ class SharedXidSignalMixin:
 
         minimum_active_seconds = max(0.0, minimum_active_seconds)
         now_on_clock = clock if clock is not None else observed_at
+        fingerprint = (
+            semantic_fingerprint
+            if semantic_fingerprint is not None
+            else previous.semantic_fingerprint
+            if previous is not None
+            else None
+        )
         if not active:
             return (
                 HealthSignalState(
@@ -84,6 +92,7 @@ class SharedXidSignalMixin:
                     active_since=None,
                     notified=False,
                     clock_at=now_on_clock,
+                    semantic_fingerprint=fingerprint,
                 ),
                 False,
             )
@@ -92,10 +101,25 @@ class SharedXidSignalMixin:
             if previous is not None and previous.active
             else now_on_clock
         )
-        previously_notified = (
-            (previous.notified if previous.notified is not None else previous.active)
-            if previous is not None
-            else False
+        same_semantics = (
+            previous is not None
+            and previous.active
+            and previous.semantic_fingerprint == fingerprint
+            and (fingerprint is None or previous.semantic_since is not None)
+        )
+        previously_notified = bool(
+            same_semantics
+            and previous is not None
+            and (
+                previous.notified if previous.notified is not None else previous.active
+            )
+        )
+        semantic_since = (
+            previous.semantic_since
+            if same_semantics and previous is not None
+            else now_on_clock
+            if fingerprint is not None
+            else None
         )
         duration = (now_on_clock - active_since).total_seconds()
         emit = not previously_notified and duration >= minimum_active_seconds
@@ -107,6 +131,8 @@ class SharedXidSignalMixin:
                 active_since=active_since,
                 notified=previously_notified,
                 clock_at=now_on_clock,
+                semantic_fingerprint=fingerprint,
+                semantic_since=semantic_since,
             ),
             emit,
         )

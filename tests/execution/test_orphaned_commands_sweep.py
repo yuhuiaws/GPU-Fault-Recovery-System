@@ -6,9 +6,9 @@ orphaned-commands``, used live once: a ``CHECK_MECHANICALS`` command still
 release upgrade that refuses to start while any command is open. The predicate
 -- an open command whose workflow is terminal -- is a pure Store read, so the
 dispatcher now runs it on ``sweep_stuck_records`` with the proofs the manual
-path had: the Store's own ``cancel_remote_commands_for_workflow``, the workflow
+path had: the Store's own ``cancel_orphaned_remote_commands``, the workflow
 row left as it was, an ``OPERATOR_RECONCILED`` event with actor ``dispatcher``
-written in the same transaction as the amend, nothing deleted, and never by age.
+written in the same transaction as cancellation, nothing deleted, and never by age.
 """
 
 from __future__ import annotations
@@ -249,14 +249,14 @@ def test_a_failing_cancel_on_one_workflow_does_not_stop_the_others() -> None:
         incident_id="inc-second",
         command_id="remote-second",
     )
-    genuine_cancel = store.cancel_remote_commands_for_workflow
+    genuine_cancel = store.cancel_orphaned_remote_commands
 
-    def failing_cancel(workflow_request_id, *, reason):
-        if workflow_request_id == WORKFLOW:
+    def failing_cancel(workflow, *, now, actor):
+        if workflow.request_id == WORKFLOW:
             raise RuntimeError("store hiccup")
-        return genuine_cancel(workflow_request_id, reason=reason)
+        return genuine_cancel(workflow, now=now, actor=actor)
 
-    store.cancel_remote_commands_for_workflow = failing_cancel  # type: ignore[method-assign]
+    store.cancel_orphaned_remote_commands = failing_cancel  # type: ignore[method-assign]
 
     cancelled = cancel_orphaned_commands(store, now=datetime.now(timezone.utc))
 

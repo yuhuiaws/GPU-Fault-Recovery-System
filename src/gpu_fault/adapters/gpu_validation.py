@@ -591,10 +591,16 @@ class GpuValidationAdapter:
             "row_remap_correctable_total",
             "composite:CORRECTABLE_MEMORY_DEGRADATION",
         }
+        power_names = {
+            "power_violation_total_us",
+            "composite:POWER_LIMIT_THROTTLING",
+        }
         warning_grace = None
         if _warning_only(findings, thermal_names):
             warning_grace = self.temperature_warning_grace
-        elif _warning_only(findings, memory_names):
+        elif _warning_only(findings, memory_names) or _warning_only(
+            findings, power_names
+        ):
             warning_grace = self.transient_warning_grace
         if (
             operation is WorkflowOperation.VALIDATE_GPU

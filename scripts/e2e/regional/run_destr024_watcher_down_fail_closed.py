@@ -174,7 +174,12 @@ def stop_process_group(process: subprocess.Popen[str] | None) -> dict[str, Any]:
     if process is None:
         return {"armed": False}
     if process.poll() is not None:
-        return {"armed": True, "fired": True, "returncode": process.returncode}
+        return {
+            "armed": True,
+            "fired": True,
+            "returncode": process.returncode,
+            "stop_error": "watchdog exited before an explicit disarm; descendants are unproved",
+        }
     try:
         os.killpg(process.pid, signal.SIGTERM)
         try:
@@ -237,6 +242,8 @@ class WatcherScaleFixture:
             raise RegionalFixtureError(
                 "watcher scale-down requested before the watchdog was armed"
             )
+        if self.watchdog.poll() is not None:
+            raise RegionalFixtureError("watcher watchdog exited before scale-down")
         self.scaled_down = True
         self.regional.kubectl(
             "gpu", "scale", f"deployment/{WATCHER_DEPLOYMENT}", "--replicas=0"
@@ -258,6 +265,7 @@ class WatcherScaleFixture:
             time.sleep(5)
 
     def restore(self) -> dict[str, Any]:
+        restore_started_at = _now()
         self.regional.kubectl(
             "gpu",
             "scale",
@@ -278,11 +286,18 @@ class WatcherScaleFixture:
             raise RegionalFixtureError(
                 "watcher restore incomplete: " + "; ".join(errors)
             )
-        self.restored = True
         # Disarmed last and only once the live restore ran; if the restore
         # raised above, the watchdog is the remaining rollback and stays.
         watchdog = stop_process_group(self.watchdog)
-        record = {"deployment": summary, "watchdog": watchdog, "restored_at": _now()}
+        if watchdog.get("stop_error"):
+            raise RegionalFixtureError("watcher watchdog could not be disarmed")
+        self.restored = True
+        record = {
+            "deployment": summary,
+            "watchdog": watchdog,
+            "restore_started_at": restore_started_at,
+            "restored_at": _now(),
+        }
         write_json_atomic(self.case_dir / "watcher-restored.json", record)
         return record
 
@@ -463,6 +478,26 @@ def validated_restore(
     }
 
 
+def prepare_host_baseline(
+    host: HostProbeFixture,
+    preflight: dict[str, Any],
+    case_dir: Path,
+) -> tuple[dict[str, Any], str]:
+    host.create()
+    baseline_host = host.execute("snapshot")
+    write_json_atomic(case_dir / "host-baseline.json", baseline_host)
+    if len(baseline_host["gpu_inventory"]) != int(preflight["node"]["gpu_allocatable"]):
+        raise RegionalFixtureError("host GPU inventory differs from Node allocatable")
+    if baseline_host["compute_clients"]:
+        raise RegionalFixtureError("target node has active NVIDIA compute clients")
+    if baseline_host["quiesce_states"]:
+        raise RegionalFixtureError("target node has a pre-existing quiesce state")
+    if not baseline_host["kmsg_writable"]:
+        raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
+    target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+    return baseline_host, target_bdf
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -484,6 +519,7 @@ def execute_case(
     marker = f"destr024-{int(time.time())}-a{attempt}"
     host = HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -516,30 +552,20 @@ def execute_case(
     incident_id = ""
     injection_started: datetime | None = None
     after_host: dict[str, Any] | None = None
-    restore_done = False
 
     try:
-        host.create()
-        baseline_host = host.execute("snapshot")
-        write_json_atomic(case_dir / "host-baseline.json", baseline_host)
-        if len(baseline_host["gpu_inventory"]) != int(
-            preflight["node"]["gpu_allocatable"]
-        ):
-            raise RegionalFixtureError(
-                "host GPU inventory differs from Node allocatable"
-            )
-        if baseline_host["compute_clients"]:
-            raise RegionalFixtureError("target node has active NVIDIA compute clients")
-        if baseline_host["quiesce_states"]:
-            raise RegionalFixtureError("target node has a pre-existing quiesce state")
-        if not baseline_host["kmsg_writable"]:
-            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
-        target_bdf = str(baseline_host["gpu_inventory"][0]["pci_bdf"])
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before probe creation")
+        baseline_host, target_bdf = prepare_host_baseline(host, preflight, case_dir)
 
         coverage_alive = idle_case.coverage_probe(regional, settings.node)
         write_json_atomic(case_dir / "coverage-alive.json", coverage_alive)
         settle_wait = expiry_wait_seconds(coverage_alive, include_heartbeat=True)
         result["coverage_expiry_wait_seconds"] = settle_wait
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before watcher scale-down"
+            )
         result["watchdog"] = watcher.arm(
             watchdog_delay_seconds(expiry_wait_seconds=settle_wait)
         )
@@ -608,7 +634,13 @@ def execute_case(
             regional,
             settings.node,
             case_dir=case_dir,
-            judge=lambda sample: heartbeat_recovered_errors(coverage_stale, sample),
+            judge=lambda sample: heartbeat_recovered_errors(
+                coverage_stale,
+                sample,
+                not_before=datetime.fromisoformat(
+                    result["watcher_restored"]["restore_started_at"]
+                ),
+            ),
             budget_seconds=HEARTBEAT_RETURN_BUDGET_SECONDS,
             label="recovered",
         )
@@ -623,7 +655,6 @@ def execute_case(
                 incident_id=incident_id,
                 profile_version=profile_version,
             )
-            restore_done = True
             write_json_atomic(case_dir / "validated-restore.json", restore)
             errors.extend(restore_errors(restore["workflow"], restore["node"]))
             result["restore_workflow_request_id"] = restore["created"].get(
@@ -696,9 +727,12 @@ def execute_case(
         try:
             final_node = regional.node_snapshot(settings.node)
             result["final_node"] = final_node
+            if final_node.get("uid") != preflight["node"].get("uid"):
+                result["verdict"] = "FAIL"
+                result["node_identity_changed"] = True
             if final_node["ready"] != "True":
                 result["verdict"] = "FAIL"
-            if is_isolated(final_node) and not restore_done:
+            if is_isolated(final_node):
                 # Left for the operator: only the validated restore may lift it.
                 result["node_left_isolated"] = True
                 result["verdict"] = "FAIL"

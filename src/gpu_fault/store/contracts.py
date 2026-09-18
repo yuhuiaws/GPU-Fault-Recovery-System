@@ -18,6 +18,7 @@ from typing import (
 )
 
 from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.store.shared.orphaned_commands import OrphanedCommandCancellation
 
 if TYPE_CHECKING:
     from gpu_fault.fleet import (
@@ -491,7 +492,16 @@ class WorkflowStore(Protocol):
         attempt_id: str,
         *,
         limit: int = 100,
-    ) -> list[tuple[FaultIncident, WorkflowRequest]]: ...
+        include_terminal: bool = False,
+    ) -> list[tuple[FaultIncident, WorkflowRequest]]:
+        """Read one job/attempt's recovery history, newest first.
+
+        By default, source-attempt matches must be executable; completed restart
+        evidence may match regardless of status. ``include_terminal`` also
+        includes terminal/blocked source-attempt workflows, without widening
+        cluster, job or attempt scope. Filtering precedes ``limit``.
+        """
+        ...
 
     def list_unhandled_failed_workflows(
         self, *, limit: int = 1000
@@ -736,6 +746,24 @@ class WorkflowStore(Protocol):
         reason: str,
     ) -> dict[str, int]: ...
 
+    def cancel_orphaned_remote_commands(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        now: datetime,
+        actor: str,
+    ) -> OrphanedCommandCancellation:
+        """Atomically cancel a terminal workflow's commands and append its audit.
+
+        Recheck the complete workflow snapshot under its write lock, including
+        status and versions. A missing, live or changed workflow is a no-op.
+        Only freshly changed command IDs appear in the result and event.
+        Already requested cancellations are not audited again. Failures commit
+        neither cancellation nor audit; an in-flight executor is asked to
+        cancel, never reported as physically stopped.
+        """
+        ...
+
     def cancel_remote_command(
         self,
         command_id: str,
@@ -823,8 +851,15 @@ class CompletionStore(Protocol):
         fabric_partitions: set[str],
         observed_from: datetime,
         observed_to: datetime,
+        cluster_id: str | None = None,
         limit: int = 1000,
-    ) -> list[NodeMarker]: ...
+    ) -> list[NodeMarker]:
+        """Match allocation evidence, filtering tenant scope before the limit.
+
+        An explicit cluster excludes foreign and unbound legacy markers.
+        None preserves unscoped inventory reads for existing callers.
+        """
+        ...
 
     def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
         """Serialize and (where the backend can) atomize one attempt's decision.
@@ -927,8 +962,38 @@ class TelemetryStore(Protocol):
 
     def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None: ...
 
+    def claim_health_signal_transitions(
+        self,
+        items: Sequence[tuple[str, bool, datetime, float]],
+        *,
+        received_at: datetime | None = None,
+        semantic_fingerprints: Sequence[str | None] | None = None,
+    ) -> list[bool]:
+        """Claim emissions in input order, without latching notification delivery.
+
+        Fingerprints align with items, not keys. An accepted change rearms the
+        stable signal key without resetting its continuous-active duration.
+        Missing fingerprints preserve legacy behavior.
+        """
+        ...
+
+    def claim_health_signal_transition(
+        self,
+        signal_key: str,
+        active: bool,
+        observed_at: datetime,
+        minimum_active_seconds: float = 0,
+        *,
+        received_at: datetime | None = None,
+        semantic_fingerprint: str | None = None,
+    ) -> bool: ...
+
     def mark_health_signal_notified(
-        self, signal_key: str, *, notified_at: datetime
+        self,
+        signal_key: str,
+        *,
+        notified_at: datetime,
+        semantic_fingerprint: str | None = None,
     ) -> None:
         """Set a signal's ``notified`` latch once its notification was delivered.
 
@@ -936,6 +1001,10 @@ class TelemetryStore(Protocol):
         (P0-38B); the deliverer calls this after the commit that carried the
         incident. A missing or inactive signal, or one whose activation began
         after ``notified_at``, is left alone.
+        For semantic claims, pass their fingerprint and original claim clock
+        as ``notified_at`` (received_at when supplied, else observed_at), not
+        the later delivery time. A different or newer semantic episode is
+        never latched by that acknowledgement.
         """
         ...
 

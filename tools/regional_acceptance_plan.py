@@ -1118,6 +1118,16 @@ def _codex_default_policy() -> ExecutionPolicy:
     )
 
 
+def _formal_base_policy(case: _CatalogCase, executor: ExecutorKind) -> ExecutionPolicy:
+    if (
+        case.risk == "non-destructive"
+        and executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
+        and not case.execution.configured_in_catalog
+    ):
+        return _local_default_policy()
+    return case.execution
+
+
 def _formal_executor(
     catalog_case: _CatalogCase,
     override: _CaseOverride,
@@ -1316,7 +1326,7 @@ def compile_regional_acceptance_plan(
             executor, pytest_nodeids, command, local_proxy, blocked_reason = (
                 _formal_executor(catalog_case, override)
             )
-            base_policy = catalog_case.execution
+            base_policy = _formal_base_policy(catalog_case, executor)
             effective_parallel_safe = False
         elif selected_mode is PlanMode.LOCAL_PREACCEPTANCE:
             executor, pytest_nodeids, command, local_proxy, blocked_reason = (

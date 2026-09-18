@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 import pytest
 
+from gpu_fault.channel_registry import CHANNEL_REGISTRY
 from gpu_fault.regional import (
     RegionalClusterLifecycle,
     RegionalClusterRegistration,
     RegionalRegistryHead,
+    RegionalRegistryMember,
     RegionalRegistryRevision,
 )
 from gpu_fault.regional_registry_runtime import (
@@ -238,6 +243,40 @@ def test_cluster_lifecycle_route_policy(
     assert regional_cluster_request_allowed(item, path=path, method=method) is allowed
 
 
+@pytest.mark.parametrize("path", sorted(CHANNEL_REGISTRY))
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_pending_ingestion_is_limited_to_registered_post_channels(
+    path: str, method: str
+):
+    item = registration("cluster-a").model_copy(
+        update={"lifecycle_state": RegionalClusterLifecycle.PENDING}
+    )
+
+    assert regional_cluster_request_allowed(item, path=path, method=method) is (
+        method == "POST"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/collector-events/unregistered",
+        "/v1/collector-events/nvidia-kernel/claim",
+        "/v1/regional/executors/claim",
+        "/v1/regional/executors/hyperpod-submissions",
+        "/v1/attempts/terminal",
+    ],
+)
+def test_pending_readiness_does_not_authorize_unregistered_or_action_posts(path: str):
+    item = registration("cluster-a").model_copy(
+        update={"lifecycle_state": RegionalClusterLifecycle.PENDING}
+    )
+
+    assert not regional_cluster_request_allowed(item, path=path, method="POST"), (
+        "PENDING ingestion must not authorize unregistered channels or action posts"
+    )
+
+
 # --- A-7: one transient refresh error must not fail readiness -----------------
 
 
@@ -313,3 +352,196 @@ def test_a_head_digest_mismatch_still_fails_readiness_at_once() -> None:
 
     assert not loaded.refresh_once(), loaded.status()
     assert not loaded.is_ready(), loaded.status()
+
+
+def test_refresh_success_cannot_extend_readiness_past_a_persisted_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryStore()
+    clock = [NOW]
+    loaded = runtime(store, clock)
+    save_member = store.save_regional_registry_member
+
+    def unavailable(_member: RegionalRegistryMember) -> None:
+        raise ConnectionError("synthetic heartbeat write outage")
+
+    monkeypatch.setattr(store, "save_regional_registry_member", unavailable)
+    clock[0] += timedelta(seconds=5)
+    assert not loaded.refresh_once(), "the heartbeat write must fail"
+    assert loaded.is_ready(), "the last durable heartbeat is valid at its boundary"
+    clock[0] += timedelta(microseconds=1)
+    assert not loaded.refresh_once(), "successful reads do not repair a failed write"
+    assert loaded.status()["last_successful_refresh"] == clock[0]
+    assert (
+        active_registry_member_ids(
+            store.list_regional_registry_members(),
+            observed_at=clock[0],
+            stale_seconds=5,
+        )
+        == []
+    ), "the persisted row is now outside the fleet's liveness window"
+    assert not loaded.is_ready(), (
+        "a process removed from the convergence barrier must stop serving traffic"
+    )
+
+    monkeypatch.setattr(store, "save_regional_registry_member", save_member)
+    assert loaded.refresh_once(), "a successful durable heartbeat repairs readiness"
+    assert loaded.is_ready(), "validated read and persisted heartbeat are both fresh"
+
+
+def test_throttled_heartbeat_and_later_refresh_share_a_safe_readiness_deadline() -> (
+    None
+):
+    store = InMemoryStore()
+    clock = [NOW]
+    loaded = runtime(store, clock)
+    clock[0] += timedelta(seconds=1)
+
+    assert loaded.refresh_once(), "the unchanged snapshot is still refreshed"
+    (persisted,) = store.list_regional_registry_members()
+    assert persisted.last_seen_at == NOW, "the unchanged heartbeat is throttled"
+    assert loaded.status()["last_successful_refresh"] == clock[0]
+
+    clock[0] = NOW + timedelta(seconds=5, microseconds=1)
+    assert not loaded.is_ready(), (
+        "a newer local refresh cannot outlive the published heartbeat lease"
+    )
+
+
+def test_registry_readiness_fails_closed_if_its_clock_moves_before_the_heartbeat() -> (
+    None
+):
+    store = InMemoryStore()
+    clock = [NOW]
+    loaded = runtime(store, clock)
+    clock[0] -= timedelta(microseconds=1)
+
+    assert not loaded.is_ready(), "future refresh and heartbeat times are not fresh"
+
+
+def test_a_loaded_snapshot_without_a_persisted_member_never_authorizes_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryStore()
+    clock = [NOW]
+    runtime(store, clock)
+    loaded = RegionalRegistryRuntime(
+        store,
+        member_id="unpublished/process",
+        service_role="ingress",
+        release_id="release-a",
+        now=lambda: clock[0],
+    )
+
+    def unavailable(_member: RegionalRegistryMember) -> None:
+        raise ConnectionError("synthetic initial heartbeat write outage")
+
+    monkeypatch.setattr(store, "save_regional_registry_member", unavailable)
+
+    assert not loaded.refresh_once(), "the first heartbeat never persisted"
+    assert loaded.snapshot().generation == 1, "the validated head is still cached"
+    assert not loaded.is_ready(), "a cached head is not a published membership lease"
+
+
+def test_a_delayed_refresh_failure_cannot_backdate_a_newer_durable_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryStore()
+    loaded = runtime(store, [NOW])
+    clock = ContextVar("registry-clock", default=NOW)
+    loaded.now = clock.get
+    read_head = store.get_regional_registry_head
+    earlier = NOW + timedelta(seconds=1)
+    later = NOW + timedelta(seconds=2)
+    reading = Event()
+    release_read = Event()
+
+    def delayed_head() -> RegionalRegistryHead:
+        if clock.get() == earlier:
+            reading.set()
+            assert release_read.wait(5), "the test must release its delayed read"
+            raise ConnectionError("synthetic delayed head read failure")
+        return read_head()
+
+    monkeypatch.setattr(store, "get_regional_registry_head", delayed_head)
+
+    def refresh() -> bool:
+        clock.set(earlier)
+        return loaded.refresh_once()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delayed = pool.submit(refresh)
+        try:
+            assert reading.wait(5), "the earlier refresh must reach its read"
+            clock.set(later)
+            assert loaded.refresh_once(), "the newer refresh persists its heartbeat"
+        finally:
+            release_read.set()
+        assert delayed.result(timeout=5) is False, (
+            "the old read failure remains visible"
+        )
+
+    (member,) = store.list_regional_registry_members()
+    assert member.last_seen_at == later, "a delayed failure cannot backdate the row"
+    assert member.ready is True, "the newer successful ACK remains authoritative"
+    assert loaded.is_ready(), "the newer validated refresh and heartbeat stay usable"
+
+
+def test_concurrent_refreshes_serialize_durable_heartbeat_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryStore()
+    loaded = runtime(store, [NOW])
+    clock = ContextVar("registry-clock", default=NOW)
+    loaded.now = clock.get
+    read_head = store.get_regional_registry_head
+    save_member = store.save_regional_registry_member
+    earlier = NOW + timedelta(seconds=2)
+    later = NOW + timedelta(seconds=4)
+    first_writing = Event()
+    second_reading = Event()
+    second_writing = Event()
+    release_write = Event()
+
+    def head() -> RegionalRegistryHead:
+        if clock.get() == later:
+            second_reading.set()
+        return read_head()
+
+    def delayed_write(member: RegionalRegistryMember) -> RegionalRegistryMember:
+        if member.last_seen_at == earlier:
+            first_writing.set()
+            assert release_write.wait(5), "the test must release its heartbeat write"
+        if member.last_seen_at == later:
+            second_writing.set()
+        return save_member(member)
+
+    monkeypatch.setattr(store, "get_regional_registry_head", head)
+    monkeypatch.setattr(store, "save_regional_registry_member", delayed_write)
+
+    def refresh(observed_at: datetime) -> bool:
+        clock.set(observed_at)
+        return loaded.refresh_once()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(refresh, earlier)
+        try:
+            assert first_writing.wait(5), "the first heartbeat must enter the store"
+            second = pool.submit(refresh, later)
+            assert second_reading.wait(5), "the second refresh must run concurrently"
+            overlapped = second_writing.wait(0.1)
+        finally:
+            release_write.set()
+        assert first.result(timeout=5), "the first owned refresh must finish"
+        assert second.result(timeout=5), "the second owned refresh must finish"
+
+    assert not overlapped, "writes and their acknowledgements must remain serialized"
+    (member,) = store.list_regional_registry_members()
+    assert member.last_seen_at == later, "the latest durable heartbeat must win"
+    observed_at = later + timedelta(seconds=5)
+    assert loaded.is_ready(observed_at), (
+        "traffic and the durable lease share a deadline"
+    )
+    assert not loaded.is_ready(observed_at + timedelta(microseconds=1)), (
+        "the process must stop serving when its durable heartbeat expires"
+    )

@@ -15,6 +15,7 @@ from gpu_fault.policy import SxidEvent, XidEvent
 from gpu_fault.training_models import TrainingProgressHeartbeat
 from gpu_fault.watcher import AttemptObservation
 from scripts.perf import benchmark_correlated_action_scenario as benchmark
+from scripts.perf import regional_capacity_suite as capacity_suite
 from scripts.perf import regional_correlated_action_suite as suite
 from tests._builders import build_context, copy_model, workflow_step_execution
 
@@ -88,21 +89,37 @@ def test_correlated_action_seed_uses_release_bound_agent_identity(monkeypatch) -
     assert b"release_bound_synthetic_agent" in captured["stdin"]
 
 
-def test_correlated_action_purge_removes_policy_decisions(monkeypatch) -> None:
+def test_correlated_action_purge_uses_registered_scope(tmp_path, monkeypatch) -> None:
     captured = {}
+    (tmp_path / "registry-registration-intent.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "cluster_ids": ["perf-cap-007"],
+                "data_empty_before_registration": True,
+            }
+        )
+    )
 
     def fake_control(*args, **kwargs):
         if args[0] == "get":
             return "api-a"
-        captured["stdin"] = kwargs["stdin"].decode()
-        return ""
+        captured["request"] = json.loads(args[-1])
+        captured["checked"] = kwargs.get("check", True)
+        return '{"total": 0}'
 
-    monkeypatch.setattr(suite, "control", fake_control)
+    monkeypatch.setattr(capacity_suite, "control", fake_control)
 
-    suite.purge_scenario_rows("run-a")
+    suite.purge_scenario_rows("run-a", artifacts=tmp_path)
 
-    assert "kind='xid_policy_decision'" in captured["stdin"]
-    assert "corr-live-run-a-%" in captured["stdin"]
+    assert captured == {
+        "request": {
+            "run_id": "run-a",
+            "cluster_ids": ["perf-cap-007"],
+            "cleanup": True,
+        },
+        "checked": True,
+    }
 
 
 def test_correlated_action_database_audit_script_compiles(monkeypatch) -> None:

@@ -28,6 +28,7 @@ dev = [
   # they were invoked without ever being declared, so a fresh checkout
   # got "No module named ruff" from a target the README tells you to run.
   "build>=1.2,<2",
+  "cryptography>=50.0.1,<51",
   "httpx>=0.28,<1",
   "openpyxl>=3.1,<4",
   "pathspec>=0.12,<1",

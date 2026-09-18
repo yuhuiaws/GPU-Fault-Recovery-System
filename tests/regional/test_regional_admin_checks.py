@@ -215,28 +215,6 @@ def test_check_aggregates_exceptions_without_stopping() -> None:
     assert result["summary"] == "boom"
 
 
-def test_empty_node_action_keys_are_valid_for_an_empty_gpu_registry(
-    monkeypatch,
-) -> None:
-    values = {
-        "gpu-fault-aurora": {"data": {"postgres-url": "x", "master-secret-arn": "y"}},
-        "gpu-fault-control-plane-active": {
-            "data": {
-                "execution-token": base64.b64encode(b"a" * 32).decode(),
-                "processor-replay-secret": base64.b64encode(b"b" * 32).decode(),
-                "node-action-secret": base64.b64encode(b"c" * 32).decode(),
-            }
-        },
-        "gpu-fault-node-action-keys": {"data": None},
-    }
-    monkeypatch.setattr(CHECKS, "_secret", lambda _release, name: values[name])
-    release = SimpleNamespace(config=SimpleNamespace(clusters=[]))
-
-    result = CHECKS.check_cpu_secrets(release)
-
-    assert result.details["node_action_key_count"] == 0
-
-
 def test_email_check_validates_declared_routing_and_site_context(monkeypatch) -> None:
     module = _checks_module()
     values = {

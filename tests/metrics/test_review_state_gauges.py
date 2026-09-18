@@ -15,6 +15,7 @@ import asyncio
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.models import CompletionDecision, DecisionStatus, IncidentState
 from tests._builders import asgi_client, fault_incident
+from tests.metrics._assertions import assert_sample, assert_samples
 
 
 def _scrape(app) -> str:
@@ -43,15 +44,17 @@ def test_dispatcher_pending_state_reaches_the_metrics_endpoint(monkeypatch) -> N
 
     text = _scrape(app)
 
-    for line in (
-        "gpu_fault_workflow_dispatch_preemption_pending_seen_total 31",
-        "gpu_fault_workflow_pending_age_seconds_max 12.5",
-        "gpu_fault_workflow_pending_age_warnings_total 32",
-        "gpu_fault_workflow_retired_generation_awaiting_operator 33",
-        'gpu_fault_workflow_dispatch_filtered_total{reason="batch_limit"} 4',
-        'gpu_fault_workflow_dispatch_filtered_total{reason="preemption_pending"} 5',
-    ):
-        assert line in text, line
+    assert_samples(
+        text,
+        (
+            'gpu_fault_workflow_dispatch_preemption_pending_seen_total{process="0"} 31',
+            "gpu_fault_workflow_pending_age_seconds_max 12.5",
+            'gpu_fault_workflow_pending_age_warnings_total{process="0"} 32',
+            "gpu_fault_workflow_retired_generation_awaiting_operator 33",
+            'gpu_fault_workflow_dispatch_filtered_total{reason="batch_limit",process="0"} 4',
+            'gpu_fault_workflow_dispatch_filtered_total{reason="preemption_pending",process="0"} 5',
+        ),
+    )
 
 
 def test_dispatch_filter_reasons_are_zero_filled_before_the_first_cycle(
@@ -62,11 +65,14 @@ def test_dispatch_filter_reasons_are_zero_filled_before_the_first_cycle(
 
     text = _scrape(app)
 
-    for line in (
-        'gpu_fault_workflow_dispatch_filtered_total{reason="batch_limit"} 0',
-        'gpu_fault_workflow_dispatch_filtered_total{reason="preemption_pending"} 0',
-    ):
-        assert line in text, line
+    for reason in ("batch_limit", "preemption_pending"):
+        assert_sample(
+            text,
+            "gpu_fault_workflow_dispatch_filtered_total",
+            0,
+            reason=reason,
+            process="0",
+        )
 
 
 def test_a_filter_reason_outside_the_known_set_is_still_exported(monkeypatch) -> None:
@@ -79,7 +85,13 @@ def test_a_filter_reason_outside_the_known_set_is_still_exported(monkeypatch) ->
 
     text = _scrape(app)
 
-    assert 'gpu_fault_workflow_dispatch_filtered_total{reason="predecessor"} 2' in text
+    assert_sample(
+        text,
+        "gpu_fault_workflow_dispatch_filtered_total",
+        2,
+        reason="predecessor",
+        process="0",
+    )
 
 
 def test_completion_decision_and_incident_state_gauges_are_zero_filled(
@@ -141,7 +153,11 @@ def test_gpu_findings_closed_without_an_incident_reach_the_metrics_endpoint(
     context.gpu_metrics.findings_without_incident["suppressed_by_composite"] += 7
     after = _scrape(app)
 
-    zero = 'gpu_fault_gpu_findings_without_incident_total{reason="suppressed_by_composite"} 0'
-    seven = 'gpu_fault_gpu_findings_without_incident_total{reason="suppressed_by_composite"} 7'
-    assert zero in before, "the known reason must be present at zero"
-    assert seven in after, after
+    for text, value in ((before, 0), (after, 7)):
+        assert_sample(
+            text,
+            "gpu_fault_gpu_findings_without_incident_total",
+            value,
+            reason="suppressed_by_composite",
+            process="0",
+        )

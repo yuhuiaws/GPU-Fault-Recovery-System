@@ -40,6 +40,8 @@ NODE_ACTION_KEYS_SECRET="$(
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
 DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
+NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
+NODE_WHEELHOUSE_SHA256="${GPU_FAULT_NODE_WHEELHOUSE_SHA256:-}"
 INSTALLER_ACTIVE_DEADLINE_SECONDS="$(
     printf '%s' "${GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS:-840}"
 )"
@@ -47,6 +49,7 @@ INSTALLER_LOCK_TIMEOUT_SECONDS="$(
     printf '%s' "${GPU_FAULT_INSTALLER_LOCK_TIMEOUT_SECONDS:-30}"
 )"
 NODE_NAME=""
+NODE_INPUTS_FILE=""
 RENDER_ONLY="false"
 PREFLIGHT_ONLY="false"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
@@ -105,6 +108,13 @@ ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="$(
     printf 'ERROR: invalid GPU_FAULT_NODE_INSTALLER_IMAGE\n' >&2
     exit 2
 }
+if [[ -n "${NODE_DEPENDENCY_IMAGE}${NODE_WHEELHOUSE_SHA256}" ]]; then
+    [[ "${NODE_DEPENDENCY_IMAGE}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ &&
+        "${NODE_WHEELHOUSE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+        printf 'ERROR: offline node dependency identity is incomplete\n' >&2
+        exit 2
+    }
+fi
 [[ "${INSTALLER_BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_BUNDLE_SHA256\n' >&2
     exit 2
@@ -174,6 +184,14 @@ while [[ $# -gt 0 ]]; do
             RENDER_ONLY="true"
             shift
             ;;
+        --node-inputs)
+            [[ $# -ge 2 && -n "$2" ]] || {
+                printf 'ERROR: --node-inputs requires a file\n' >&2
+                exit 2
+            }
+            NODE_INPUTS_FILE="$2"
+            shift 2
+            ;;
         --preflight-only)
             PREFLIGHT_ONLY="true"
             shift
@@ -225,6 +243,10 @@ done
     printf 'ERROR: GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR must be true or false\n' >&2
     exit 2
 }
+[[ "${ENABLE_EFA_DRIVER_REMEDIATION}" =~ ^(true|false)$ ]] || {
+    printf 'ERROR: GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION must be true or false\n' >&2
+    exit 2
+}
 [[ "${REQUIRE_ROLLBACK_SLOT}" =~ ^(true|false)$ ]] || {
     printf 'ERROR: GPU_FAULT_REQUIRE_ROLLBACK_SLOT must be true or false\n' >&2
     exit 2
@@ -265,17 +287,33 @@ if [[ "${DCGM_EXPORTER_MODE}" == "disabled" &&
     exit 2
 fi
 
-NODE_IP="$(
-    kubectl get node "${NODE_NAME}" \
-        -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
-)"
-NODE_UID="$(
-    kubectl get node "${NODE_NAME}" -o jsonpath='{.metadata.uid}'
-)"
-NODE_INSTANCE_TYPE="$(
-    kubectl get node "${NODE_NAME}" \
-        -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}'
-)"
+if [[ -n "${NODE_INPUTS_FILE}" ]]; then
+    [[ "${RENDER_ONLY}" == "true" || "${PREFLIGHT_ONLY}" == "true" ]] || {
+        printf 'ERROR: node input snapshots cannot authorize an installation\n' >&2
+        exit 2
+    }
+    [[ "${CONNECTION_MODE}" == "regional" && -f "${NODE_INPUTS_FILE}" &&
+        ! -L "${NODE_INPUTS_FILE}" &&
+        "$(stat -c %u "${NODE_INPUTS_FILE}")" == "${EUID}" &&
+        "$(stat -c %a "${NODE_INPUTS_FILE}")" =~ ^(400|600)$ ]] || {
+        printf 'ERROR: node input snapshot must be a private, owned regional file\n' >&2
+        exit 2
+    }
+    NODE_DOCUMENT="$(jq -ce --arg node "${NODE_NAME}" --arg cluster "${CLUSTER_ID}" \
+        --arg context "${KUBECTL_CONTEXT}" --arg namespace "${NAMESPACE}" \
+        --arg keys "${NODE_ACTION_KEYS_SECRET}" --arg connection "${REGIONAL_CONNECTION_SECRET}" '
+        select(.schema_version == 1 and .cluster_id == $cluster and
+            .context == $context and .namespace == $namespace and
+            .node_action_keys_secret == $keys and .connection_secret == $connection and
+            .references_validated == true) | .nodes[$node] | select(type == "object")
+    ' "${NODE_INPUTS_FILE}")"
+else
+    NODE_DOCUMENT="$(kubectl get node "${NODE_NAME}" -o json)"
+fi
+NODE_IP="$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address] |
+    join(" ") | select(length > 0)' <<<"${NODE_DOCUMENT}")"
+NODE_UID="$(jq -er '.metadata.uid | select(type == "string" and length > 0)' <<<"${NODE_DOCUMENT}")"
+NODE_INSTANCE_TYPE="$(jq -er '.metadata.labels["node.kubernetes.io/instance-type"]' <<<"${NODE_DOCUMENT}")"
 # AWS EC2 DescribeInstanceTypes GPU count and MaximumEfaInterfaces,
 # verified 2026-07-27. HyperPod labels may include the "ml." prefix.
 case "${NODE_INSTANCE_TYPE}" in
@@ -330,13 +368,14 @@ fi
     exit 1
 }
 if [[ "${CONNECTION_MODE}" == "regional" ]]; then
-    kubectl -n "${NAMESPACE}" get secret \
-        "${REGIONAL_CONNECTION_SECRET}" >/dev/null
     CONNECTION_SECRET="${REGIONAL_CONNECTION_SECRET}"
     NODE_ACTION_SECRET_NAME="${NODE_ACTION_KEYS_SECRET}"
     NODE_ACTION_SECRET_KEY="${NODE_NAME}"
     DERIVE_NODE_ACTION_SECRET="false"
-    kubectl -n "${NAMESPACE}" get secret \
+    if [[ -z "${NODE_INPUTS_FILE}" ]]; then
+        kubectl -n "${NAMESPACE}" get secret \
+            "${REGIONAL_CONNECTION_SECRET}" >/dev/null
+        kubectl -n "${NAMESPACE}" get secret \
         "${NODE_ACTION_SECRET_NAME}" -o json |
         python3 -c '
 import json, sys
@@ -347,6 +386,7 @@ if node not in data:
         f"node action key Secret has no key for {node}"
     )
 ' "${NODE_NAME}"
+    fi
     CONTROL_PLANE_ENV="$(cat <<EOF
             - name: CONTROL_PLANE_URL
               valueFrom:
@@ -481,6 +521,8 @@ spec:
               value: "${INSTALLER_LOCK_TIMEOUT_SECONDS}"
             - name: PREFLIGHT_ONLY
               value: "${PREFLIGHT_ONLY}"
+            - name: NODE_WHEELHOUSE_SHA256
+              value: "${NODE_WHEELHOUSE_SHA256}"
             - name: REQUIRE_ROLLBACK_SLOT
               value: "${REQUIRE_ROLLBACK_SLOT}"
             - name: NODE_COMPATIBILITY_DIGEST
@@ -581,6 +623,7 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE=/run/gpu-fault-preflight-artifact/gpu-fault-node-installer-${VERSION}.tar.gz \
                 GPU_FAULT_PREFLIGHT_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
                 GPU_FAULT_PREFLIGHT_ARTIFACT_SHA256="${INSTALLER_ARTIFACT_SHA256}" \
+                GPU_FAULT_NODE_WHEELHOUSE_SHA256="\${NODE_WHEELHOUSE_SHA256}" \
                 GPU_FAULT_REQUIRE_ROLLBACK_SLOT="\${REQUIRE_ROLLBACK_SLOT}" \
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
@@ -623,6 +666,7 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_INSTALLER_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
                 GPU_FAULT_INSTALLER_TEMPLATE_SHA256="${INSTALLER_TEMPLATE_SHA256}" \
                 GPU_FAULT_NODE_COMPATIBILITY_DIGEST="\${NODE_COMPATIBILITY_DIGEST}" \
+                GPU_FAULT_NODE_WHEELHOUSE_SHA256="\${NODE_WHEELHOUSE_SHA256}" \
                 DERIVE_NODE_ACTION_SECRET="\${DERIVE_NODE_ACTION_SECRET}" \
                 CONTROL_PLANE_URL="\${CONTROL_PLANE_URL}" \
                 ${CA_CHROOT_ENV}
@@ -694,6 +738,14 @@ ${CONTROL_PLANE_ENV}
                   rm -rf /tmp/gpu-fault-node-installer-${VERSION}
                   tar -xzf "\${bundle}" -C /tmp
                   cd /tmp/gpu-fault-node-installer-${VERSION}
+                  dependency_args=()
+                  if [[ -n "\${GPU_FAULT_NODE_WHEELHOUSE_SHA256}" ]]; then
+                    /usr/bin/python3.12 -I -S -B deploy/node/runtime_integrity.py \
+                      wheelhouse --wheelhouse /run/gpu-fault-node-wheelhouse \
+                      --expected-inventory "\${GPU_FAULT_NODE_WHEELHOUSE_SHA256}" \
+                      --bundle "\${bundle}"
+                    dependency_args=(--wheelhouse /run/gpu-fault-node-wheelhouse)
+                  fi
                   required_interfaces=""
                   for interface_path in \
                       /sys/class/infiniband/*/device/net/*; do
@@ -780,6 +832,10 @@ ${CONTROL_PLANE_ENV}
                     remediation_args+=(
                       --allow-efa-driver-remediation
                     )
+                  else
+                    remediation_args+=(
+                      --disable-efa-driver-remediation
+                    )
                   fi
                   if [[ "\${ENABLE_FIRMWARE_UPDATE}" == "true" ]]; then
                     remediation_args+=(
@@ -840,6 +896,7 @@ ${CONTROL_PLANE_ENV}
                     --training-log-paths \
                       "/var/log/pods/*/*/*.log,/opt/ml/output/**/*.log" \
                     --python-command /usr/bin/python3.12 \
+                    "\${dependency_args[@]}" \
                     --enable-node-agent \
                     "\${node_action_args[@]}" \
                     --allow-gpu-reset \
@@ -882,6 +939,20 @@ ${CONNECTION_SECRET_MOUNT}
                 path: node-action-secret
 ${CONNECTION_SECRET_VOLUME}
 EOF
+
+if [[ -n "${NODE_DEPENDENCY_IMAGE}" ]]; then
+    python3 - "${MANIFEST}" "${NODE_DEPENDENCY_IMAGE}" "${NODE_WHEELHOUSE_SHA256}" <<'PY'
+import pathlib
+import sys
+import yaml
+from gpu_fault.node_installer_rendering import configure_node_dependencies, manifest_object
+
+path = pathlib.Path(sys.argv[1])
+job = manifest_object(yaml.safe_load(path.read_text()), "installer Job")
+configure_node_dependencies(job, sys.argv[2], sys.argv[3])
+path.write_text(yaml.safe_dump(job, sort_keys=False))
+PY
+fi
 
 if [[ "${RENDER_ONLY}" == "true" ]]; then
     cat "${MANIFEST}"

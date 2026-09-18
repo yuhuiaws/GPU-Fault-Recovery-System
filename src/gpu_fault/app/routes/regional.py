@@ -49,11 +49,13 @@ from gpu_fault.regional import (
     RemoteSpareHealthRequest,
 )
 from gpu_fault.regional_compatibility import (
+    ACTIVATION_INHIBITION_VERSION,
     REMOTE_STEP_BATCHING_PROTOCOL_VERSION,
     RegionalExecutorCompatibilityPolicy,
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import RawEvidenceRecord
+from gpu_fault.workflow_quarantine import has_terminal_quarantine_hold
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ def get_regional_dependencies() -> RegionalRouterDependencies:
 
 
 router = APIRouter(prefix="/v1/regional", tags=["regional"])
+activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
 
 
 async def _store_call(
@@ -310,6 +313,7 @@ async def claim_remote_commands(
             lease_seconds=claim.lease_seconds,
             execution_owners=owners,
             accept_batched_steps=accept_batched_steps,
+            executor_protocol_version=claim.executor_protocol_version,
         )
         return commands
 
@@ -550,11 +554,7 @@ async def get_remote_incident_ownership(
         }
         quarantine_hold = (
             incident.state is IncidentState.QUARANTINED
-            or (
-                WorkflowOperation.QUARANTINE in workflow.completed_operations
-                and WorkflowOperation.RESTORE_SCHEDULING
-                not in workflow.completed_operations
-            )
+            or has_terminal_quarantine_hold(workflow)
             or any(
                 execution.operation is WorkflowOperation.REPLACE_NODE
                 and execution.details.get("action") == "SPARE_FAILOVER"

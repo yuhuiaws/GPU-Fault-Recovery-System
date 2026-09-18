@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -27,6 +28,7 @@ from scripts.e2e.regional.boot_acceptance_common import (
     run,
     utc_now,
 )
+from scripts.e2e.regional.regional_live_fixture import component_python
 
 EXECUTOR_MANIFEST = ROOT / "deploy/dataplane/cluster-action-executor.yaml"
 OPERATIONS_MANUAL = ROOT / "docs/部署和运维手册.md"
@@ -200,7 +202,7 @@ def ready_within(
         "ready_seconds": durations,
         "passed": replicas >= 1
         and len(ready) == replicas
-        and all(value <= limit_seconds for value in ready.values()),
+        and all(0 <= value <= limit_seconds for value in ready.values()),
     }
 
 
@@ -305,7 +307,6 @@ def run_boot011(
             "logs",
             pod,
             "--since=10m",
-            check=False,
         )
         for pod in pods
     )
@@ -360,7 +361,8 @@ def run_boot011(
             ].get("optional")
         ),
         "no_database_credentials": all(
-            name != "GPU_FAULT_STORE_URL" and not name.startswith("POSTGRES_POOL_")
+            name not in {"GPU_FAULT_STORE_URL", "GPU_FAULT_STORE_URL_FILE"}
+            and not name.startswith(("POSTGRES_POOL_", "GPU_FAULT_POSTGRES_POOL_"))
             for name in environment
         ),
         "executor_ready_within_180s": readiness["passed"],
@@ -437,12 +439,7 @@ MATRIX_STATUS = {
 
 
 def readiness_matrix_verdict(replicas: list[dict[str, Any]]) -> dict[str, Any]:
-    """The BOOT-021 conclusion from the per-Pod readiness matrices BOOT-012 ran.
-
-    BOOT-012 already executes ``audit_executor_readiness.py`` in every executor
-    Pod, which is the whole BOOT-021 case; recording it once here spares a
-    second live run whose only difference would be the case id on the file.
-    """
+    """Judge matrices from this invocation without authorizing a future case."""
 
     matrices: list[dict[str, Any]] = []
     complete = bool(replicas)
@@ -469,9 +466,6 @@ def readiness_matrix_verdict(replicas: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-# The markers with which the executor client refuses an empty CA file: the TLS
-# handshake failing verification (OpenSSL < 3.5) or the trust store refusing to
-# load an empty PEM at all (OpenSSL 3.5, live 2026-09-13 after a cold image build).
 EMPTY_CA_REJECTION_MARKERS = (
     "CERTIFICATE_VERIFY_FAILED",
     "NO_CERTIFICATE_OR_CRL_FOUND",
@@ -482,12 +476,30 @@ def empty_ca_rejection(output: str) -> bool:
     return any(marker in output for marker in EMPTY_CA_REJECTION_MARKERS)
 
 
-def run_boot012(
-    fixture: SiteFixture,
-    *,
-    boot021_evidence_path: Path | None = None,
-) -> dict[str, Any]:
-    started_at = utc_now()
+def run_boot021(fixture: SiteFixture) -> dict[str, Any]:
+    results = []
+    for pod in fixture.pods("gpu", EXECUTOR_DEPLOYMENT):
+        completed = fixture.exec(
+            "gpu",
+            pod,
+            component_python("gpu"),
+            "-",
+            input_text=READINESS_PROBE,
+            check=False,
+        )
+        matrix = (
+            parse_probe_json(completed.stdout)
+            if completed.returncode == 0 and completed.stdout.strip()
+            else None
+        )
+        results.append({"pod": pod, "readiness_matrix": matrix})
+    return {
+        **readiness_matrix_verdict(results),
+        **fixture.regional.evidence_identity(),
+    }
+
+
+def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
     contract = secret_key_contract()
     live_deployment = json.loads(
         fixture.regional.kubectl(
@@ -516,8 +528,9 @@ def run_boot012(
             "sh",
             "-c",
             (
-                ": > /tmp/boot012-empty-ca.pem; "
-                f"{CA_FILE_ENV}=/tmp/boot012-empty-ca.pem "
+                "umask 077; ca_file=$(mktemp /tmp/boot012-ca.XXXXXX) || exit 1; "
+                "trap 'rm -f -- \"$ca_file\"' EXIT; "
+                f'{CA_FILE_ENV}="$ca_file" '
                 "gpu-fault-cluster-executor-readiness"
             ),
             check=False,
@@ -526,7 +539,7 @@ def run_boot012(
         stale = fixture.exec(
             "gpu",
             pod,
-            "python3",
+            component_python("gpu"),
             "-",
             input_text=READINESS_PROBE,
             check=False,
@@ -543,7 +556,6 @@ def run_boot012(
             "logs",
             pod,
             "--since=5m",
-            check=False,
         )
         error_count = sum(
             logs.lower().count(marker.lower())
@@ -555,6 +567,9 @@ def run_boot012(
             )
         )
         empty_ca_output = empty_ca.stdout + empty_ca.stderr
+        empty_ca_rejected = empty_ca.returncode != 0 and empty_ca_rejection(
+            empty_ca_output
+        )
         results.append(
             {
                 "pod": pod,
@@ -568,13 +583,7 @@ def run_boot012(
                 "authenticated_readiness": readiness.returncode == 0,
                 # A non-zero exit alone could be any failure; the negative probe
                 # has to fail *because* the empty CA cannot verify the server.
-                # OpenSSL < 3.5 loaded an empty PEM silently and the handshake
-                # then failed CERTIFICATE_VERIFY_FAILED; OpenSSL 3.5 refuses the
-                # empty file when the client builds its context
-                # (X509: NO_CERTIFICATE_OR_CRL_FOUND). Both are the rejection
-                # the case wants; what must not happen is a completed request.
-                "empty_ca_rejected": empty_ca.returncode != 0
-                and empty_ca_rejection(empty_ca_output),
+                "empty_ca_rejected": empty_ca_rejected,
                 "sts_public_trust": sts["caller_identity_available"],
                 "stale_claim_503": (
                     (stale_payload.get("stale_claim") or {}).get("status") == 503
@@ -587,7 +596,7 @@ def run_boot012(
                     _tail(readiness) if readiness.returncode != 0 else None
                 ),
                 "empty_ca_stderr_tail": (
-                    _tail(empty_ca) if not empty_ca_rejection(empty_ca_output) else None
+                    _tail(empty_ca) if not empty_ca_rejected else None
                 ),
                 "stale_probe_stderr_tail": (
                     _tail(stale) if stale.returncode != 0 else None
@@ -607,6 +616,7 @@ def run_boot012(
         and all(item["sts_public_trust"] for item in results),
         "stale_claim_503": bool(results)
         and all(item["stale_claim_503"] for item in results),
+        "readiness_matrix": readiness_matrix_verdict(results)["verdict"] == "PASS",
         "no_recent_tls_errors": all(
             item["recent_error_count"] == 0 for item in results
         ),
@@ -623,28 +633,6 @@ def run_boot012(
             "the running executor process environment."
         ],
     }
-    if boot021_evidence_path is not None:
-        boot021 = readiness_matrix_verdict(results)
-        write_json_atomic(
-            boot021_evidence_path,
-            {
-                "schema_version": 2,
-                "report_type": "fault-acceptance",
-                "case_id": "GF-REGIONAL-BOOT-021",
-                "verdict": boot021["verdict"],
-                "started_at": started_at,
-                "executed_at": utc_now(),
-                "recorded_by": "GF-REGIONAL-BOOT-012",
-                "checks": boot021["checks"],
-                "replicas": boot021["replicas"],
-                **identity,
-                "limitations": [
-                    "Recorded from the readiness matrix BOOT-012 ran in every "
-                    "executor Pod; the matrix is the BOOT-021 procedure."
-                ],
-            },
-        )
-        result["boot021_evidence"] = str(boot021_evidence_path)
     return result
 
 
@@ -656,12 +644,13 @@ import sys
 
 from botocore.exceptions import ParamValidationError
 from gpu_fault.env import env_bool
+from gpu_fault.notifications.channel import notification_channel_from_environment
 
 # The live channel decides which client the case inspects. Both clients take
 # their region from the environment, never from the Pod's SDK defaults; the SNS
 # client additionally pins it to the topic ARN's region when the variables are
 # absent, so its negative branch proves that pin instead of NoRegionError.
-channel = (os.getenv("GPU_FAULT_NOTIFICATION_CHANNEL") or "ses").strip().lower()
+channel = notification_channel_from_environment()
 if channel == "sns":
     from gpu_fault.notifications.sns import SnsNotificationConfig, SnsNotifier
 
@@ -677,7 +666,7 @@ if channel == "sns":
         "c=SnsNotificationConfig.from_environment();"
         "print('REGION=' + str(SnsNotifier._create_client(c).meta.region_name))"
     )
-else:
+elif channel == "ses":
     from gpu_fault.notifications import SesEmailNotifier, SesNotificationConfig
 
     config = SesNotificationConfig.from_environment()
@@ -700,6 +689,8 @@ else:
         "SesEmailNotifier._create_client("
         "SesNotificationConfig.from_environment())"
     )
+else:
+    raise ValueError("BOOT-013 requires an enabled SNS or SES notification channel")
 
 local_validation = False
 try:
@@ -776,6 +767,7 @@ import os
 from collections import Counter
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.env import env_bool
 
 context = ApplicationContext.from_environment()
 service = context.advisory_notifications
@@ -793,6 +785,12 @@ print(json.dumps({
     "dispatcher_enabled": service.dispatcher_enabled,
     "deliver_backlog": service.deliver_backlog,
     "backlog_grace_seconds": service.backlog_grace_seconds,
+    "environment": {
+        "async_delivery": env_bool("GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY", False),
+        "dispatcher_enabled": env_bool("GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED", False),
+        "deliver_backlog": env_bool("GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG", False),
+        "backlog_grace_seconds": int(os.getenv("GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS", "300")),
+    },
     "notification_count": len(notifications),
     "result_count": sum(item is not None for item in results),
     "status_counts": dict(statuses),
@@ -816,9 +814,6 @@ def run_boot014(fixture: SiteFixture) -> dict[str, Any]:
         }
         for item in values
     ]
-    backlog = sum(
-        item["notification_count"] - item["result_count"] for item in values[:1]
-    )
     checks = {
         "api_replicas_present": bool(values),
         "replica_env_consistent": len(
@@ -836,7 +831,21 @@ def run_boot014(fixture: SiteFixture) -> dict[str, Any]:
             )
             for item in values
         ),
-        "backlog_without_result_zero": backlog == 0,
+        "service_matches_environment": all(
+            item.get("environment")
+            == {
+                key: item[key]
+                for key in (
+                    "async_delivery",
+                    "dispatcher_enabled",
+                    "deliver_backlog",
+                    "backlog_grace_seconds",
+                )
+            }
+            for item in values
+        ),
+        "backlog_without_result_zero": bool(values)
+        and all(item["notification_count"] == item["result_count"] for item in values),
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
@@ -856,7 +865,7 @@ import sys
 
 from gpu_fault.app import ApplicationContext
 
-cluster_id, owners_csv = sys.argv[1:]
+profile_version, owners_csv = sys.argv[1:]
 executor_owners = {item for item in owners_csv.split(",") if item}
 remote_owners = {
     item.strip()
@@ -868,9 +877,7 @@ remote_owners = {
     if item.strip()
 }
 profiles = []
-for profile in ApplicationContext.from_environment().store._list("profile"):
-    if profile.cluster_id != cluster_id:
-        continue
+for profile in (ApplicationContext.from_environment().store.get_profile(profile_version),):
     owners = {
         item.owner
         for item in profile.capabilities
@@ -1179,8 +1186,14 @@ def boot015_cleanup(
         "final_baseline",
         lambda: fixture.regional.cpu_python(REMOTE_BASELINE_PROBE),
     )
-    final_ids = set((final or {}).get("ids") or [])
-    cleanup["synthetic_command_removed"] = final is not None and (
+    try:
+        final_ids = command_inventory_ids(final)
+        inventory_valid = True
+    except BootAcceptanceError:
+        final_ids = set()
+        inventory_valid = False
+    cleanup["inventory_verified"] = inventory_valid
+    cleanup["synthetic_command_removed"] = inventory_valid and (
         command_id not in final_ids
     )
     # The retention sweep deletes old terminal commands on its own schedule,
@@ -1189,9 +1202,6 @@ def boot015_cleanup(
     cleanup["commands_introduced"] = sorted(final_ids - baseline_ids)
     cleanup["remote_count_after"] = (final or {}).get("count")
     if cleanup["synthetic_command_removed"]:
-        # Staleness of the AMP series is not a cleanup defect: the gauge may
-        # keep its last value for a scrape interval after the command is gone.
-        # The wait is recorded, never a verdict.
         _cleanup_step(
             cleanup,
             "resolve_observed",
@@ -1215,14 +1225,33 @@ def boot015_cleanup(
         return recovered
 
     recovered = _cleanup_step(cleanup, "readiness_recovered", readiness)
+    resolved = cleanup.get("resolve_observed")
     cleanup["passed"] = bool(
         cleanup["synthetic_command_removed"]
         and not cleanup["commands_introduced"]
+        and isinstance(resolved, dict)
+        and resolved.get("matched") is True
         and isinstance(recovered, dict)
         and recovered
         and all(recovered.values())
     )
     return cleanup
+
+
+def command_inventory_ids(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        raise BootAcceptanceError("remote command inventory is missing")
+    count, ids = value.get("count"), value.get("ids")
+    if (
+        type(count) is not int
+        or count < 0
+        or not isinstance(ids, list)
+        or len(ids) != count
+        or any(not isinstance(item, str) or not item for item in ids)
+        or len(set(ids)) != count
+    ):
+        raise BootAcceptanceError("remote command inventory is incomplete")
+    return set(ids)
 
 
 def run_boot015(
@@ -1231,7 +1260,7 @@ def run_boot015(
     case_dir: Path,
     attempt: int,
 ) -> dict[str, Any]:
-    command_id = f"remote-boot015-{attempt}-{int(time.time())}"
+    command_id = f"remote-boot015-{attempt}-{uuid4().hex}"
     pods = fixture.pods("gpu", "gpu-fault-cluster-executor")
     owner_sets = []
     for pod in pods:
@@ -1248,30 +1277,47 @@ def run_boot015(
         owner_sets.append(value["owners"])
     if not owner_sets:
         raise BootAcceptanceError("no Ready executor Pods")
+    profile_version = fixture.config.get("runtime_profile", {}).get("version")
+    if not isinstance(profile_version, str) or not profile_version:
+        raise BootAcceptanceError(
+            "the site must name the exact Runtime Profile version"
+        )
     profile = fixture.regional.cpu_python(
         PROFILE_OWNER_PROBE,
-        fixture.cluster_id,
+        profile_version,
         ",".join(owner_sets[0]),
     )
+    profiles = profile.get("profiles")
+    if (
+        not isinstance(profiles, list)
+        or len(profiles) != 1
+        or profiles[0].get("profile_version") != profile_version
+        or profiles[0].get("orphan_owners") != []
+    ):
+        raise BootAcceptanceError("Runtime Profile remote owner coverage is incomplete")
+    if any(item != owner_sets[0] for item in owner_sets):
+        raise BootAcceptanceError("Executor owner sets differ between replicas")
     static_alert = run(
         [sys.executable, "scripts/verify-regional-alerting.py"],
         check=False,
     )
+    if static_alert.returncode:
+        raise BootAcceptanceError("alert reachability gate failed before injection")
     baseline = fixture.regional.cpu_python(REMOTE_BASELINE_PROBE)
-    baseline_ids = set(baseline.get("ids") or [])
+    baseline_ids = command_inventory_ids(baseline)
     result: dict[str, Any] = {
         "verdict": "FAIL",
         "remote_count_before": baseline["count"],
     }
     injected = False
     try:
+        injected = True
         fixture.regional.cpu_python(
             REMOTE_INJECT_PROBE,
             fixture.cluster_id,
             command_id,
             REMOTE_OWNER,
         )
-        injected = True
         # The alert window starts at injection; the reads below happen inside it.
         alert_deadline = time.monotonic() + AMP_FIRING_WINDOW_SECONDS
         readiness = []
@@ -1312,7 +1358,6 @@ def run_boot015(
                 "logs",
                 pod,
                 "--since=5m",
-                check=False,
             )
             for pod in pods
         ]
@@ -1385,8 +1430,8 @@ def run_boot015(
         result["limitations"] = [
             "The current implementation validates owner compatibility at runtime "
             "readiness; registration-time owner validation remains a known gap.",
-            "AMP alert resolution after cleanup is observed, not required: the "
-            "gauge may hold its last value for one scrape interval.",
+            "Cleanup requires bounded AMP alert resolution and restored executor "
+            "readiness before the case may pass.",
         ]
         write_json_atomic(case_dir / "boot015-details.json", result)
     return result

@@ -17,13 +17,13 @@ from typing import Any, Sequence
 
 import pytest
 
-from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin.bootstrap import (
     DEFAULT_ADOT_IMAGE_AMD64,
     _discover_adot_image,
     _ensure_base_secrets,
 )
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
+from tests.admin._bootstrap_support import patch_bootstrap_commands
 
 NAMESPACE = "gpu-fault-system"
 SECRET = "gpu-fault-control-plane-active"
@@ -116,7 +116,7 @@ class Kubectl:
 
 
 def _secrets(kubectl: Kubectl, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", kubectl)
+    patch_bootstrap_commands(monkeypatch, kubectl)
     return _ensure_base_secrets(
         CommandRunner(),
         cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
@@ -297,7 +297,7 @@ def _adot(
         monkeypatch.delenv("GPU_FAULT_ADOT_IMAGE", raising=False)
     else:
         monkeypatch.setenv("GPU_FAULT_ADOT_IMAGE", configured)
-    monkeypatch.setattr(admin_bootstrap.subprocess, "run", kubectl)
+    patch_bootstrap_commands(monkeypatch, kubectl)
     return _discover_adot_image(
         CommandRunner(), cpu_kubeconfig=tmp_path / "cpu.kubeconfig"
     )

@@ -5,11 +5,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,16 +42,24 @@ AWS_REGION = os.getenv("GPU_FAULT_PERF_AWS_REGION", "us-west-2")
 # moment HA-009 rotates the password (attempt 4, every post-rotation read
 # failed with "password authentication failed"). Prepend this to such a script
 # and call ``store_dsn()``; it has no braces, so it also fits an f-string, and
-# it falls back to the env var where no file is mounted (a deploy host).
+# Only an absent default mount permits the legacy environment fallback.
 STORE_DSN_SNIPPET = """\
 def store_dsn():
     import os
-    path = os.environ.get("GPU_FAULT_STORE_URL_FILE") or "/etc/gpu-fault/aurora/postgres-url"
+    configured = os.environ.get("GPU_FAULT_STORE_URL_FILE")
+    path = configured if configured is not None else "/etc/gpu-fault/aurora/postgres-url"
+    if not path:
+        raise RuntimeError("configured store DSN file path is empty")
     try:
         with open(path, encoding="utf-8") as handle:
-            return handle.read().strip()
-    except OSError:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        if configured is not None:
+            raise
         return os.environ["GPU_FAULT_STORE_URL"]
+    if not value:
+        raise RuntimeError("store DSN file is empty")
+    return value
 """
 REGISTRY_SECRET = os.getenv(
     "GPU_FAULT_PERF_REGISTRY_SECRET",
@@ -62,6 +72,7 @@ CONNECTION_SECRET = os.getenv(
 TOKEN_SECRET = "gpu-fault-perf-clusters"
 PERF_CLUSTER_PREFIX = "perf-cap-"
 LIVE_REGISTRY_CONFIRMATION = "ALLOW_PERF_CAPACITY_LIVE_REGISTRY"
+RUN_LABEL = "gpu-fault.io/acceptance-run"
 REGISTRY_API_CLIENT = r"""
 import json
 import os
@@ -81,6 +92,19 @@ request = urllib.request.Request(
 )
 with urllib.request.urlopen(request, timeout=30) as response:
     print(json.dumps(json.load(response), separators=(",", ":")))
+"""
+REGISTRY_SNAPSHOT = """
+import json
+from gpu_fault.app import ApplicationContext
+store = ApplicationContext.from_environment().store
+try:
+    head = store.get_regional_registry_head()
+    revision = store.get_regional_registry_revision(head.generation)
+    if head.content_sha256 != revision.content_sha256:
+        raise RuntimeError("registry head changed during snapshot")
+    print(revision.model_dump_json())
+finally:
+    store.close()
 """
 
 
@@ -266,11 +290,227 @@ def validate_registry(entries: list[dict]) -> None:
         RegionalClusterRegistration(**item)
 
 
-def write_registry(entries: list[dict]) -> None:
-    validate_registry(entries)
-    payload = base64.b64encode(json.dumps(entries, indent=1).encode()).decode()
-    patch = json.dumps({"data": {"clusters.json": payload}})
-    control("patch", "secret", REGISTRY_SECRET, "-p", patch)
+def _registry_entry_index(
+    values: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for entry in values:
+        key = entry.get("cluster_id")
+        if not isinstance(key, str) or not key or key in result:
+            raise RuntimeError("registry cluster identities are unknown or duplicated")
+        result[key] = entry
+    return result
+
+
+def _read_registry_secret() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        value = json.loads(control("get", "secret", REGISTRY_SECRET, "-o", "json"))
+        metadata = value["metadata"]
+        values = json.loads(
+            base64.b64decode(value["data"]["clusters.json"], validate=True)
+        )
+    except Exception:
+        raise RuntimeError("registry Secret could not be read safely") from None
+    if (
+        not isinstance(metadata, dict)
+        or not metadata.get("uid")
+        or not metadata.get("resourceVersion")
+        or not isinstance(values, list)
+    ):
+        raise RuntimeError("registry Secret identity or contents are unknown")
+    return metadata, values
+
+
+def write_registry(
+    entries: list[dict],
+    *,
+    run_id: str,
+    expected_entries: list[dict],
+    reason: str,
+) -> dict:
+    from gpu_fault.regional import (
+        RegionalClusterRegistration,
+        regional_registry_content_sha256,
+    )
+    from gpu_fault.regional_registry import (
+        configured_regional_registrations,
+        regional_registry_config_sha256,
+    )
+    from scripts.e2e.regional.regional_live_fixture import component_python
+
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("registry write requires an explicit run identity")
+
+    def owned(value: dict) -> bool:
+        return (
+            value.get("synthetic") is True and value.get("synthetic_run_id") == run_id
+        )
+
+    before = _registry_entry_index(expected_entries)
+    desired = _registry_entry_index(entries)
+    for key in before.keys() | desired.keys():
+        if before.get(key) != desired.get(key):
+            if any(
+                not owned(value)
+                for value in (before.get(key), desired.get(key))
+                if value is not None
+            ):
+                raise RuntimeError(
+                    "registry write would change another run or a production registration"
+                )
+    registrations = configured_regional_registrations(entries)
+
+    metadata, observed = _read_registry_secret()
+    if observed != expected_entries:
+        raise RuntimeError("registry Secret changed since the run inspected it")
+    pod = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    if not pod:
+        raise RuntimeError("no CPU API Pod for the registry snapshot")
+    raw = control(
+        "exec",
+        "-i",
+        pod,
+        "--",
+        component_python("cpu"),
+        "-",
+        "registry-snapshot",
+        stdin=REGISTRY_SNAPSHOT.encode(),
+        timeout=120,
+    )
+    revision = json.loads(raw.splitlines()[-1])
+    generation = revision.get("generation")
+    if type(generation) is not int or generation < 1:
+        raise RuntimeError("durable registry generation is unknown")
+    current = [
+        RegionalClusterRegistration.model_validate(item)
+        for item in revision["registrations"]
+    ]
+    if regional_registry_content_sha256(current) != revision.get("content_sha256"):
+        raise RuntimeError("durable registry snapshot digest is inconsistent")
+    current_by_id = {item.cluster_id: item for item in current}
+    if len(current_by_id) != len(current):
+        raise RuntimeError("durable registry cluster identities are duplicated")
+    targets = {item.cluster_id: item for item in registrations}
+    for key, original in current_by_id.items():
+        target = targets.get(key)
+        original_owned = owned(original.model_dump(mode="json"))
+        if target is None:
+            if not original_owned:
+                raise RuntimeError(
+                    "registry cleanup would drop an unrelated durable registration"
+                )
+            continue
+        same_config = regional_registry_config_sha256(
+            [original]
+        ) == regional_registry_config_sha256([target])
+        same_scope = (
+            original.synthetic == target.synthetic
+            and original.synthetic_run_id == target.synthetic_run_id
+            and original.synthetic_expires_at == target.synthetic_expires_at
+        )
+        if same_config and same_scope:
+            targets[key] = original
+        elif not original_owned or not owned(target.model_dump(mode="json")):
+            raise RuntimeError("durable registry identity changed outside this run")
+    for key, target in targets.items():
+        if key not in current_by_id and not owned(target.model_dump(mode="json")):
+            raise RuntimeError(
+                "registry write would recreate an unrelated durable registration"
+            )
+    payload = base64.b64encode(
+        json.dumps(entries, separators=(",", ":")).encode()
+    ).decode()
+    if observed != entries:
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": metadata["resourceVersion"],
+            },
+            {"op": "replace", "path": "/data/clusters.json", "value": payload},
+        ]
+        try:
+            control(
+                "patch",
+                "secret",
+                REGISTRY_SECRET,
+                "--type=json",
+                "--patch-file=/dev/stdin",
+                stdin=json.dumps(patch).encode(),
+            )
+        except Exception:
+            after_metadata, after = _read_registry_secret()
+            if after_metadata["uid"] != metadata["uid"] or after != entries:
+                raise RuntimeError(
+                    "registry Secret write acknowledgement is unresolved"
+                ) from None
+    after_metadata, after = _read_registry_secret()
+    if after_metadata["uid"] != metadata["uid"] or after != entries:
+        raise RuntimeError("registry Secret changed while confirming the write")
+    target_values = [targets[key] for key in sorted(targets)]
+    digest = regional_registry_content_sha256(target_values)
+    publication_required = digest != revision["content_sha256"]
+    target_generation = generation + int(publication_required)
+    if publication_required:
+        try:
+            registry_api(
+                "POST",
+                "/v1/regional/registry/revisions",
+                {
+                    "expected_generation": generation,
+                    "registrations": [
+                        item.model_dump(mode="json") for item in target_values
+                    ],
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            # Reconcile the expected head after a lost ACK, without another POST.
+            status = registry_api("GET", "/v1/regional/registry/status")
+            if (
+                status.get("generation") != target_generation
+                or status.get("content_sha256") != digest
+            ):
+                raise RuntimeError(
+                    "registry publication acknowledgement is unresolved"
+                ) from None
+    deadline = time.monotonic() + 300
+    while True:
+        status = registry_api("GET", "/v1/regional/registry/status")
+        if (
+            type(status.get("generation")) is not int
+            or status["generation"] != target_generation
+            or status.get("content_sha256") != digest
+        ):
+            raise RuntimeError("registry head changed while confirming this run")
+        if status.get("converged") is True:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("run-owned registry revision did not converge")
+        time.sleep(1)
+    final_metadata, final_entries = _read_registry_secret()
+    if final_metadata["uid"] != metadata["uid"] or final_entries != entries:
+        raise RuntimeError("registry Secret changed during publication")
+    return {
+        "expected_generation": generation,
+        "expected_content_sha256": digest,
+        "generation": target_generation,
+        "publication_required": publication_required,
+        "registrations": [item.model_dump(mode="json") for item in target_values],
+        "secret_uid": metadata["uid"],
+    }
 
 
 def control_pods() -> list[str]:
@@ -628,31 +868,14 @@ def cleanup_registry_residuals(
     attempts: int = 3,
     now: datetime | None = None,
 ) -> int:
-    observed = now or datetime.now(timezone.utc)
+    del attempts, now
     initial = load_registry()
-    synthetic = [
-        entry
-        for entry in initial
-        if _synthetic_entry(entry)
-        and (run_id is None or str(entry.get("synthetic_run_id") or "") == run_id)
-    ]
-    active = [
-        entry
-        for entry in synthetic
-        if (expires := _synthetic_expiration(entry)) is not None and expires > observed
-    ]
-    if active and not force:
-        run_ids = sorted(
-            {str(entry.get("synthetic_run_id") or "<unknown>") for entry in active}
-        )
-        raise RuntimeError(
-            "active synthetic registry entries already exist for run(s): "
-            + ", ".join(run_ids)
-        )
-    if not synthetic:
-        foreign = [entry for entry in initial if _synthetic_entry(entry)]
-        if run_id is not None and foreign:
-            raise RuntimeError("registry contains synthetic entries from another run")
+    synthetic = [entry for entry in initial if _synthetic_entry(entry)]
+    if not force:
+        if synthetic:
+            raise RuntimeError(
+                "synthetic registry entries already exist; preflight cannot purge any run"
+            )
         _write_registry_audit(
             artifacts,
             phase=phase,
@@ -661,48 +884,55 @@ def cleanup_registry_residuals(
             removed=0,
         )
         return 0
-    baseline = [entry for entry in initial if entry not in synthetic]
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            write_registry(baseline)
-            publish_registry_revision(
-                baseline,
-                reason=f"capacity cleanup {run_id or 'all-synthetic'}",
-            )
-            persisted = load_registry()
-            remaining = [
-                entry
-                for entry in persisted
-                if _synthetic_entry(entry)
-                and (
-                    run_id is None or str(entry.get("synthetic_run_id") or "") == run_id
-                )
-            ]
-            if remaining:
-                raise RuntimeError(
-                    f"registry still contains {len(remaining)} synthetic entries"
-                )
-            foreign = [entry for entry in persisted if _synthetic_entry(entry)]
-            if run_id is not None and foreign:
-                raise RuntimeError(
-                    "registry contains synthetic entries from another run"
-                )
-            _write_registry_audit(
-                artifacts,
-                phase=phase,
-                scope=scope,
-                entries=initial,
-                removed=len(synthetic),
-            )
-            return len(synthetic)
-        except Exception as exc:
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(attempt)
-    raise RuntimeError(
-        f"synthetic registry cleanup failed after {attempts} attempts: {last_error}"
-    ) from last_error
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("registry cleanup requires an explicit run identity")
+    owned = [
+        entry
+        for entry in synthetic
+        if entry.get("synthetic") is True and entry.get("synthetic_run_id") == run_id
+    ]
+    baseline = [entry for entry in initial if entry not in owned]
+    write_registry(
+        baseline,
+        run_id=run_id,
+        expected_entries=initial,
+        reason=f"capacity cleanup {run_id}",
+    )
+    if load_registry() != baseline:
+        raise RuntimeError("registry changed while verifying scoped cleanup")
+    _write_registry_audit(
+        artifacts,
+        phase=phase,
+        scope=scope,
+        entries=initial,
+        removed=len(owned),
+    )
+    return len(owned)
+
+
+def registered_cluster_ids(artifacts: Path, run_id: str) -> list[str]:
+    if __package__:
+        from .regional_capacity_data import validate_scope
+    else:
+        from regional_capacity_data import validate_scope
+
+    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
+    if not isinstance(intent, dict) or intent.get("run_id") != run_id:
+        raise RuntimeError("capacity registration intent belongs to another run")
+    if intent.get("data_empty_before_registration") is not True:
+        raise RuntimeError("capacity registration intent lacks its empty-data proof")
+    cluster_ids = intent.get("cluster_ids")
+    if not isinstance(cluster_ids, list) or any(
+        not isinstance(item, str) for item in cluster_ids
+    ):
+        raise RuntimeError(
+            "capacity registration intent has no exact cluster inventory"
+        )
+    validate_scope(run_id, cluster_ids)
+    return cluster_ids
 
 
 def validate_registered_synthetic_run(
@@ -741,21 +971,87 @@ def validate_registered_synthetic_run(
     )
 
 
-def upsert_secret(name: str, files: dict[str, bytes]) -> None:
+def upsert_secret(name: str, files: dict[str, bytes], *, run_id: str) -> dict:
+    if (
+        name != TOKEN_SECRET
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("synthetic token Secret requires an explicit run identity")
     data = {key: base64.b64encode(value).decode() for key, value in files.items()}
     manifest = {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": name, "namespace": NAMESPACE},
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {RUN_LABEL: run_id},
+        },
         "type": "Opaque",
         "data": data,
     }
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(manifest).encode(),
-    )
+
+    def read() -> dict | None:
+        try:
+            raw = dataplane("get", "secret", name, "--ignore-not-found", "-o", "json")
+            value = json.loads(raw) if raw.strip() else None
+        except Exception:
+            raise RuntimeError(
+                "synthetic token Secret read was not confirmed"
+            ) from None
+        if value is not None and not isinstance(value, dict):
+            raise RuntimeError("synthetic token Secret response is invalid")
+        return value
+
+    def verify(value: dict | None, *, expected_uid: str | None = None) -> dict:
+        metadata = (value or {}).get("metadata") or {}
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(metadata.get("uid"), str)
+            or not metadata["uid"]
+            or not isinstance(metadata.get("resourceVersion"), str)
+            or not metadata["resourceVersion"]
+            or not isinstance(metadata.get("labels"), dict)
+            or (metadata.get("labels") or {}).get(RUN_LABEL) != run_id
+            or (value or {}).get("data") != data
+            or (expected_uid is not None and metadata["uid"] != expected_uid)
+        ):
+            raise RuntimeError("synthetic token Secret ownership or contents differ")
+        return {
+            "uid": metadata["uid"],
+            "resource_version": metadata["resourceVersion"],
+            "run_id": run_id,
+        }
+
+    existing = read()
+    if existing is not None:
+        return verify(existing)
+    try:
+        raw = dataplane(
+            "create",
+            "-f",
+            "-",
+            "-o",
+            "jsonpath={.metadata}",
+            stdin=json.dumps(manifest).encode(),
+        )
+    except Exception:
+        # A lost create ACK is resolved by the run label, contents and fresh UID.
+        # Never replay the create or overwrite a same-name foreign Secret.
+        return verify(read())
+    try:
+        created = json.loads(raw)
+        uid = created["uid"]
+        if (
+            not isinstance(uid, str)
+            or not uid
+            or created["labels"][RUN_LABEL] != run_id
+        ):
+            raise ValueError("invalid create identity")
+    except Exception:
+        raise RuntimeError(
+            "synthetic token Secret create identity is unknown"
+        ) from None
+    return verify(read(), expected_uid=uid)
 
 
 def register(
@@ -771,6 +1067,12 @@ def register(
         allow_live_registry=allow_live_registry,
         confirmation=live_registry_confirmation,
     )
+    if type(count) is not int or count <= 0:
+        raise RuntimeError("synthetic cluster count must be a positive integer")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None:
+        raise RuntimeError(
+            "synthetic registry mutation requires an explicit run identity"
+        )
     validate_notification_safety()
     validate_alertmanager_drill_route()
     cleanup_registry_residuals(
@@ -778,6 +1080,7 @@ def register(
         artifacts=artifacts,
         phase="preflight",
         force=False,
+        run_id=run_id,
     )
     existing = load_registry()
     baseline = [entry for entry in existing if not _synthetic_entry(entry)]
@@ -793,11 +1096,6 @@ def register(
         f"registering {len(perf)} audit clusters "
         f"(keeping {len(baseline)} production entries)"
     )
-    write_registry(baseline + perf)
-    publish_registry_revision(
-        baseline + perf,
-        reason=f"capacity register {run_id}",
-    )
     tokens = [
         {
             "cluster_id": entry["cluster_id"],
@@ -805,9 +1103,51 @@ def register(
         }
         for entry in perf
     ]
-    upsert_secret(
+    if __package__:
+        from .regional_capacity_data import invoke
+    else:
+        from regional_capacity_data import invoke
+    cluster_ids = [item["cluster_id"] for item in perf]
+    data_preflight = invoke(
+        control, run_id=run_id, cluster_ids=cluster_ids, cleanup=False
+    )
+    if data_preflight["total"] != 0:
+        raise RuntimeError(
+            "synthetic cluster data already exists; registration cannot adopt it"
+        )
+    (artifacts / "registry-data-preflight.json").write_text(
+        json.dumps(data_preflight, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    intent_path = artifacts / "registry-registration-intent.json"
+    intent_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "cluster_ids": cluster_ids,
+                "synthetic_expires_at": expires_at.isoformat(),
+                "data_empty_before_registration": True,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    intent_path.chmod(0o600)
+    token_proof = upsert_secret(
         TOKEN_SECRET,
         {"clusters.json": json.dumps(tokens, indent=1).encode()},
+        run_id=run_id,
+    )
+    token_path = artifacts / "registry-token-proof.json"
+    token_path.write_text(
+        json.dumps(token_proof, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    token_path.chmod(0o600)
+    write_registry(
+        baseline + perf,
+        run_id=run_id,
+        expected_entries=existing,
+        reason=f"capacity register {run_id}",
     )
     return tokens
 

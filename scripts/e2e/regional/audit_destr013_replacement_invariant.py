@@ -11,29 +11,45 @@ this case.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
-from pathlib import Path
-import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterator, cast
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.admin.diagnostics import diagnostic_text  # noqa: E402
+from gpu_fault.admin.process_supervisor import ProcessSupervisionLost  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # noqa: E402
+from scripts.e2e.regional.acceptance_supervision import (  # noqa: E402
+    bind_command_supervision,
+)
+from scripts.e2e.regional.destr013_audit_evidence import (  # noqa: E402
+    SYNTHETIC_ROUTE_ENV,
+    AuditError,
+    arn_parts,
+    json_object,
+    run,
+    target_evidence,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     PROVIDER_EVENT_VISIBILITY_SECONDS,
+    RegionalFixtureAbort,
+    RegionalFixtureError,
+    install_abort_signals,
     predecessor_evidence,
-    required,
 )
-
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    required as require_text,
+)
 
 CASE_ID = "GF-REGIONAL-DESTR-013"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-HA-004"
@@ -50,8 +66,6 @@ FORBIDDEN_EVENT_NAMES = (
 )
 POSITIVE_CONTROL_EVENT = "BatchRebootClusterNodes"
 EVENT_NAMES = (*FORBIDDEN_EVENT_NAMES, POSITIVE_CONTROL_EVENT)
-SYNTHETIC_ROUTE_ENV = "GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS"
-API_APP = "gpu-fault-api-ha"
 # Top-level keys of a case's evidence documents that carry a run timestamp,
 # and the two timeline shapes the runners write.
 RUN_TIMESTAMP_KEYS = (
@@ -65,11 +79,16 @@ RUN_TIMESTAMP_KEYS = (
 )
 
 
-class AuditError(RuntimeError):
-    pass
+def required(value: str, label: str) -> str:
+    try:
+        return require_text(value, label)
+    except RegionalFixtureError:
+        raise AuditError(f"{label} is required") from None
 
 
-def parse_time(value: str, label: str) -> datetime:
+def parse_time(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise AuditError(f"{label} must be a nonempty ISO-8601 timestamp")
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError as exc:
@@ -77,50 +96,6 @@ def parse_time(value: str, label: str) -> datetime:
     if parsed.tzinfo is None:
         raise AuditError(f"{label} must include a timezone")
     return parsed.astimezone(timezone.utc)
-
-
-def run(
-    command: list[str],
-    *,
-    timeout: int = 180,
-) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
-    if completed.returncode:
-        raise AuditError(
-            f"command failed ({completed.returncode}): {' '.join(command)}; "
-            f"stderr={completed.stderr.strip()}"
-        )
-    return completed
-
-
-def kubectl(
-    kubeconfig: Path,
-    context: str,
-    namespace: str,
-    *arguments: str,
-) -> str:
-    # The control plane kubeconfig names its own current context, so an empty
-    # ``context`` means "the kubeconfig's" rather than a literal empty name.
-    selector = ["--context", context] if context else []
-    return run(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(kubeconfig),
-            *selector,
-            "-n",
-            namespace,
-            *arguments,
-        ]
-    ).stdout
 
 
 def cluster_recovery(region: str, cluster_name: str) -> dict[str, Any]:
@@ -180,112 +155,6 @@ def node_inventory(region: str, cluster_name: str) -> dict[str, Any]:
         ),
     )
     return {"count": len(rows), "nodes": rows}
-
-
-def executor_environment(
-    kubeconfig: Path,
-    context: str,
-    namespace: str,
-) -> list[dict[str, str | None]]:
-    value = json.loads(
-        kubectl(
-            kubeconfig,
-            context,
-            namespace,
-            "get",
-            "pod",
-            "-l",
-            "app=gpu-fault-cluster-executor",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "json",
-        )
-    )
-    result = []
-    for item in value.get("items", []):
-        pod = str(item["metadata"]["name"])
-        output = kubectl(
-            kubeconfig,
-            context,
-            namespace,
-            "exec",
-            pod,
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os; print(json.dumps({"
-                "'allow_replace':os.getenv("
-                "'GPU_FAULT_ALLOW_HYPERPOD_REPLACE'),"
-                "'allow_reboot':os.getenv("
-                "'GPU_FAULT_ALLOW_HYPERPOD_REBOOT'),"
-                "'allow_automatic':os.getenv("
-                "'GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY'),"
-                "'legacy_mutation':os.getenv("
-                "'GPU_FAULT_ALLOW_HYPERPOD_MUTATION')}))"
-            ),
-        )
-        environment = json.loads(output.splitlines()[-1])
-        result.append(
-            {
-                "pod": pod,
-                "allow_replace": environment.get("allow_replace"),
-                "allow_reboot": environment.get("allow_reboot"),
-                "allow_automatic": environment.get("allow_automatic"),
-                "legacy_mutation": environment.get("legacy_mutation"),
-            }
-        )
-    return sorted(result, key=lambda item: str(item["pod"]))
-
-
-def api_environment(
-    kubeconfig: Path,
-    context: str,
-    namespace: str,
-) -> list[dict[str, str | None]]:
-    """Whether each running API replica still carries the synthetic route switch.
-
-    DESTR-003/008 open the route for their window; this final invariant is
-    where a window nobody closed is caught, because a route that fabricates a
-    REPLACE_NODE finding for any node must not outlive the cases that needed it.
-    """
-
-    value = json.loads(
-        kubectl(
-            kubeconfig,
-            context,
-            namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={API_APP}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "json",
-        )
-    )
-    result = []
-    for item in value.get("items", []):
-        pod = str(item["metadata"]["name"])
-        output = kubectl(
-            kubeconfig,
-            context,
-            namespace,
-            "exec",
-            pod,
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os; print(json.dumps({"
-                f"'synthetic_route':os.getenv({SYNTHETIC_ROUTE_ENV!r})}}))"
-            ),
-        )
-        environment = json.loads(output.splitlines()[-1])
-        result.append(
-            {"pod": pod, "synthetic_route": environment.get("synthetic_route")}
-        )
-    return sorted(result, key=lambda item: str(item["pod"]))
 
 
 def environment_errors(environments: list[dict[str, str | None]]) -> list[str]:
@@ -370,6 +239,12 @@ def window_errors(
 
     errors = []
     provisional = False
+    if ended_at <= started_at:
+        errors.append("window end must be after window start")
+    if ended_at > now or started_at > now:
+        errors.append("window must not extend into the future")
+    if errors:
+        return errors, provisional
     lag = timedelta(seconds=PROVIDER_EVENT_VISIBILITY_SECONDS)
     if now - ended_at < lag:
         if accept_recent_window:
@@ -393,18 +268,6 @@ def window_errors(
     return errors, provisional
 
 
-def _parse_timestamp(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
 def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
     """Every run timestamp recorded under the destructive cases' evidence.
 
@@ -413,34 +276,69 @@ def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
     records (agents, profiles) whose own timestamps predate the run.
     """
 
+    def unreadable(_error: OSError) -> None:
+        raise AuditError("destructive evidence directory cannot be read")
+
     found: list[dict[str, Any]] = []
-    for case_dir in sorted((run_dir / "cases").glob("GF-REGIONAL-DESTR-*")):
-        for path in sorted(case_dir.rglob("*.json")):
+    try:
+        cases = sorted((run_dir / "cases").iterdir())
+    except OSError:
+        raise AuditError(
+            "--run-dir destructive evidence inventory cannot be read"
+        ) from None
+    for case_dir in cases:
+        if (
+            not case_dir.name.startswith("GF-REGIONAL-DESTR-")
+            or case_dir.name == CASE_ID
+        ):
+            continue
+        if not case_dir.is_dir() or case_dir.is_symlink():
+            raise AuditError("destructive evidence case directory is invalid")
+        case_count = len(found)
+        paths: list[Path] = []
+        for parent, directories, files in os.walk(case_dir, onerror=unreadable):
+            if any((Path(parent) / name).is_symlink() for name in directories):
+                raise AuditError("destructive evidence directory must not be a symlink")
+            paths.extend(
+                Path(parent) / name for name in files if name.endswith(".json")
+            )
+        for path in sorted(paths):
+            label = str(path.relative_to(run_dir))
+            if path.is_symlink():
+                raise AuditError(f"destructive evidence must not be a symlink: {label}")
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
+            except (OSError, ValueError):
+                raise AuditError(
+                    f"destructive evidence cannot be read as JSON: {label}"
+                ) from None
             if not isinstance(document, dict):
                 continue
             candidates: list[tuple[str, Any]] = [
-                (key, document.get(key)) for key in RUN_TIMESTAMP_KEYS
+                (key, document[key]) for key in RUN_TIMESTAMP_KEYS if key in document
             ]
             for entries_key in ("entries", "transitions"):
-                for entry in document.get(entries_key) or []:
-                    if isinstance(entry, dict):
-                        candidates.append(
-                            (f"{entries_key}[].observed_at", entry.get("observed_at"))
-                        )
-            for key, raw in candidates:
-                parsed = _parse_timestamp(raw)
-                if parsed is not None:
-                    found.append(
-                        {
-                            "path": str(path.relative_to(run_dir)),
-                            "key": key,
-                            "at": parsed.isoformat(),
-                        }
+                if entries_key not in document:
+                    continue
+                entries = document[entries_key]
+                if not isinstance(entries, list) or any(
+                    not isinstance(entry, dict) or "observed_at" not in entry
+                    for entry in entries
+                ):
+                    raise AuditError(
+                        f"destructive evidence timeline is malformed: {label} {entries_key}"
                     )
+                candidates.extend(
+                    (f"{entries_key}[].observed_at", entry["observed_at"])
+                    for entry in entries
+                )
+            for key, raw in candidates:
+                parsed = parse_time(raw, f"destructive evidence {label} {key}")
+                found.append({"path": label, "key": key, "at": parsed.isoformat()})
+        if len(found) == case_count:
+            raise AuditError(
+                f"destructive case has no run timestamp evidence: {case_dir.name}"
+            )
     return found
 
 
@@ -457,7 +355,9 @@ def coverage_errors(
     outside = [
         item
         for item in timestamps
-        if not (started_at <= datetime.fromisoformat(item["at"]) <= ended_at)
+        if not (
+            started_at <= parse_time(item["at"], "run evidence timestamp") <= ended_at
+        )
     ]
     if not outside:
         return []
@@ -507,36 +407,111 @@ def cloudtrail_events(
     region: str,
     started_at: datetime,
     ended_at: datetime,
+    *,
+    cluster_arn: str,
+    cluster_name: str,
+    role_arn: str,
 ) -> dict[str, list[dict[str, str]]]:
-    result = {}
+    result: dict[str, list[dict[str, str]]] = {}
+    account = arn_parts(cluster_arn, "sagemaker")[4]
     for event_name in EVENT_NAMES:
-        value = json.loads(
-            run(
-                [
-                    "aws",
-                    "cloudtrail",
-                    "lookup-events",
-                    "--region",
-                    region,
-                    "--start-time",
-                    started_at.isoformat(),
-                    "--end-time",
-                    ended_at.isoformat(),
-                    "--lookup-attributes",
-                    f"AttributeKey=EventName,AttributeValue={event_name}",
-                    "--output",
-                    "json",
-                ]
-            ).stdout
-        )
-        result[event_name] = [
-            {
-                "event_time": str(item.get("EventTime") or ""),
-                "event_name": str(item.get("EventName") or ""),
-                "username": str(item.get("Username") or ""),
-            }
-            for item in value.get("Events", [])
-        ]
+        result[event_name] = []
+        token = ""
+        seen: set[str] = set()
+        for _page in range(1000):
+            value = json_object(
+                run(
+                    [
+                        "aws",
+                        "cloudtrail",
+                        "lookup-events",
+                        "--region",
+                        region,
+                        "--start-time",
+                        started_at.isoformat(),
+                        "--end-time",
+                        ended_at.isoformat(),
+                        "--lookup-attributes",
+                        f"AttributeKey=EventName,AttributeValue={event_name}",
+                        "--output",
+                        "json",
+                        "--no-paginate",
+                        *(["--next-token", token] if token else []),
+                    ]
+                ).stdout,
+                "CloudTrail page",
+            )
+            if not isinstance(value.get("Events"), list):
+                raise AuditError("CloudTrail page has no complete Events inventory")
+            for item in value["Events"]:
+                if not isinstance(item, dict):
+                    raise AuditError("CloudTrail event is malformed")
+                detail = json_object(
+                    item.get("CloudTrailEvent"), "CloudTrail event detail"
+                )
+                if detail.get("eventSource") != "sagemaker.amazonaws.com":
+                    if not detail.get("eventSource"):
+                        raise AuditError("CloudTrail event source is missing")
+                    continue
+                at = parse_time(detail.get("eventTime"), "CloudTrail event time")
+                if (
+                    detail.get("eventName") != event_name
+                    or item.get("EventName") != event_name
+                    or detail.get("awsRegion") != region
+                    or detail.get("recipientAccountId") != account
+                    or not started_at <= at <= ended_at
+                    or parse_time(item.get("EventTime"), "CloudTrail lookup time") != at
+                ):
+                    raise AuditError(
+                        "CloudTrail event identity/time differs from the target window"
+                    )
+                if event_name == POSITIVE_CONTROL_EVENT:
+                    parameters = detail.get("requestParameters")
+                    if not isinstance(parameters, dict):
+                        raise AuditError(
+                            "CloudTrail reboot control has no cluster binding"
+                        )
+                    targets = [
+                        parameters[key]
+                        for key in ("clusterName", "clusterArn")
+                        if key in parameters
+                    ]
+                    if not targets or any(
+                        not isinstance(target, str) or not target for target in targets
+                    ):
+                        raise AuditError(
+                            "CloudTrail reboot control has no cluster binding"
+                        )
+                    matches = [
+                        target in {cluster_name, cluster_arn} for target in targets
+                    ]
+                    if any(matches) and not all(matches):
+                        raise AuditError(
+                            "CloudTrail reboot control has conflicting cluster identities"
+                        )
+                    if not any(matches):
+                        continue
+                    identity = detail.get("userIdentity") or {}
+                    issuer = (identity.get("sessionContext") or {}).get(
+                        "sessionIssuer"
+                    ) or {}
+                    if detail.get("errorCode") or issuer.get("arn") != role_arn:
+                        raise AuditError(
+                            "CloudTrail reboot control is not a successful call by the bound executor role"
+                        )
+                # Forbidden verbs remain region-wide and actor-independent.
+                result[event_name].append(
+                    {"event_time": at.isoformat(), "event_name": event_name}
+                )
+            next_token = value.get("NextToken")
+            if next_token is None:
+                break
+            if not isinstance(next_token, str) or not next_token or next_token in seen:
+                raise AuditError("CloudTrail pagination is malformed or repeated")
+            seen.add(next_token)
+            token = next_token
+        else:
+            raise AuditError("CloudTrail pagination exceeds the audit bound")
     return result
 
 
@@ -565,8 +540,8 @@ def manifest_invariants() -> dict[str, Any]:
             continue
         try:
             documents = list(yaml.safe_load_all(text))
-        except (OSError, yaml.YAMLError) as exc:
-            violations.append(f"{path.relative_to(ROOT)} cannot be parsed: {exc}")
+        except (OSError, yaml.YAMLError):
+            violations.append(f"{path.relative_to(ROOT)} cannot be parsed")
             continue
         for document in documents:
             for item in _walk(document):
@@ -576,7 +551,11 @@ def manifest_invariants() -> dict[str, Any]:
                     observed.append(
                         {
                             "path": str(path.relative_to(ROOT)),
-                            "value": value,
+                            "value": (
+                                str(value).lower()
+                                if str(value).lower() in {"true", "false"}
+                                else "invalid"
+                            ),
                         }
                     )
                     if str(value).lower() != "false":
@@ -610,19 +589,29 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
         "tests/regional/test_regional_release_commands.py::"
         "test_executor_iam_boundary_rejects_excess_privilege",
     ]
-    # Not ``run()``: a failing test must become ``passed: False`` in the
-    # verdict, not an exception that leaves the case with no verdict at all.
-    completed = subprocess.run(
+    # Test failure is evidence; transport/supervision failure still aborts.
+    completed = run(
         command,
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         timeout=300,
         check=False,
+        env={
+            "HOME": "/tmp",
+            "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
+            "PYTHONPATH": f"{ROOT / 'src'}:{ROOT}",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "AWS_CONFIG_FILE": "/dev/null",
+            "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+            "AWS_EC2_METADATA_DISABLED": "true",
+            "KUBECONFIG": "/dev/null",
+        },
     )
     path = case_dir / "focused-tests.log"
-    path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    path.write_text(
+        f"returncode={completed.returncode}\n"
+        + diagnostic_text(completed.stdout + completed.stderr, sensitive=True)
+        + "\n",
+        encoding="utf-8",
+    )
     path.chmod(0o600)
     return {
         "passed": completed.returncode == 0,
@@ -652,7 +641,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "allow a --window-end inside CloudTrail's 15-minute delivery lag; "
-            "the CloudTrail conclusion is then recorded as provisional"
+            "record a provisional INCOMPLETE result, never formal PASS"
         ),
     )
     value.add_argument(
@@ -667,9 +656,9 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def main() -> int:
-    arguments = parser().parse_args()
-    os.umask(0o077)
+def audit(
+    arguments: argparse.Namespace, case_dir: Path, result: dict[str, Any]
+) -> None:
     kubeconfig = (
         Path(
             required(
@@ -723,6 +712,15 @@ def main() -> int:
     ended_at = parse_time(arguments.window_end, "window end")
     if ended_at <= started_at:
         raise AuditError("window end must be after window start")
+    if ended_at > datetime.now(timezone.utc):
+        raise AuditError("window must not extend into the future")
+    result.update(window_start=started_at.isoformat(), window_end=ended_at.isoformat())
+    timestamps = run_timestamps(arguments.run_dir)
+    problems = coverage_errors(
+        started_at=started_at, ended_at=ended_at, timestamps=timestamps
+    )
+    if problems:
+        raise AuditError("; ".join(problems))
     predecessor_path = (
         Path(arguments.predecessor_evidence).expanduser().resolve()
         if arguments.predecessor_evidence
@@ -733,107 +731,185 @@ def main() -> int:
             / f"{PREDECESSOR_CASE_ID}.json"
         ).resolve()
     )
+    recovery = cluster_recovery(region, cluster)
+    target_arguments: dict[str, Any] = {
+        "gpu_kubeconfig": kubeconfig,
+        "gpu_context": context,
+        "cpu_kubeconfig": cpu_kubeconfig,
+        "cpu_context": cpu_context,
+        "namespace": required(arguments.namespace, "namespace"),
+        "region": region,
+        "cluster": cluster,
+        "role_arn": role_arn,
+    }
+    target = target_evidence(**target_arguments, recovery=recovery)
+    result.update(
+        release_id=target["release_id"],
+        cluster_id=target["cluster_id"],
+        target_binding=target,
+    )
+    predecessor = predecessor_evidence(
+        predecessor_path,
+        PREDECESSOR_CASE_ID,
+        release_id=target["release_id"],
+        cluster_id=target["cluster_id"],
+    )
+    result["predecessor"] = predecessor
+    if predecessor["valid"] is not True:
+        raise AuditError(
+            "HA-004 predecessor is not formal PASS for this release/cluster"
+        )
+    inventory_before = node_inventory(region, cluster)
+    environments = target["executor_environment"]
+    api_env = target["api_environment"]
+    cluster_arn = recovery["cluster_arn"]
+    decisions = iam_decisions(region, role_arn, cluster_arn)
+    events = cloudtrail_events(
+        region,
+        started_at,
+        ended_at,
+        cluster_arn=cluster_arn,
+        cluster_name=cluster,
+        role_arn=role_arn,
+    )
+    manifests = manifest_invariants()
+    tests = focused_tests(case_dir)
+    inventory_after = node_inventory(region, cluster)
+    recovery_after = cluster_recovery(region, cluster)
+    target_after = target_evidence(**target_arguments, recovery=recovery_after)
+    errors = []
+    if recovery.get("cluster_status") != "InService":
+        errors.append("HyperPod cluster is not InService")
+    if recovery.get("node_recovery") != "None":
+        errors.append("HyperPod NodeRecovery is not None")
+    if recovery_after != recovery or target_after != target:
+        errors.append(
+            "release/registration/EKS/IRSA or replica identity drifted during audit"
+        )
+    errors.extend(environment_errors(environments))
+    errors.extend(synthetic_route_errors(api_env))
+    if decisions.get("sagemaker:BatchReplaceClusterNodes") not in {
+        "implicitDeny",
+        "explicitDeny",
+    }:
+        errors.append("executor IAM permits BatchReplaceClusterNodes")
+    if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
+        errors.append("executor IAM does not allow BatchRebootClusterNodes")
+    errors.extend(cloudtrail_invariant_errors(events))
+    window_problems, provisional = window_errors(
+        started_at=started_at,
+        ended_at=ended_at,
+        now=datetime.now(timezone.utc),
+        accept_recent_window=bool(arguments.accept_recent_window),
+        reboot_events=len(events.get(POSITIVE_CONTROL_EVENT, [])),
+        expect_no_reboots=bool(arguments.expect_no_reboots),
+    )
+    errors.extend(window_problems)
+    timestamps_after = run_timestamps(arguments.run_dir)
+    if timestamps_after != timestamps:
+        errors.append("destructive run timestamp evidence changed during audit")
+    errors.extend(
+        coverage_errors(
+            started_at=started_at, ended_at=ended_at, timestamps=timestamps_after
+        )
+    )
+    if manifests["violations"]:
+        errors.extend(cast(list[str], manifests["violations"]))
+    if inventory_before != inventory_after:
+        errors.append("HyperPod node inventory changed during the read-only audit")
+    if not inventory_before["count"]:
+        errors.append("HyperPod node inventory is empty")
+    if not tests["passed"]:
+        errors.append("focused regression tests failed")
+    incomplete = provisional and not errors
+    if provisional:
+        errors.append(
+            "CloudTrail conclusion is provisional; formal PASS requires a settled window"
+        )
+    result.update(
+        {
+            "verdict": "PASS" if not errors else "FAIL",
+            "status": "INCOMPLETE"
+            if incomplete
+            else "FAILED"
+            if errors
+            else "COMPLETED",
+            "formal_sequence_satisfied": not errors
+            and not current_acceptance_scope().selective,
+            "errors": errors,
+            "cluster": recovery,
+            "executor_environment": environments,
+            "executor_replica_count": len(environments),
+            "api_environment": api_env,
+            "api_replica_count": len(api_env),
+            "iam_decisions": decisions,
+            "cloudtrail_events": events,
+            "cloudtrail_provisional": provisional,
+            "run_evidence_timestamps": timestamps,
+            "manifest_invariants": manifests,
+            "inventory_before": inventory_before,
+            "inventory_after": inventory_after,
+            "focused_tests": tests,
+            "window_limitation": (
+                "CloudTrail absence only applies to the explicit query window; "
+                "configuration and IAM evidence support the forward invariant."
+            ),
+        }
+    )
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    os.umask(0o077)
+    arguments.run_dir = arguments.run_dir.expanduser().resolve()
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": arguments.attempt,
         "verdict": "FAIL",
+        "status": "RUNNING",
+        "formal_sequence_satisfied": False,
         "supersedes": list(SUPERSEDED_CASE_IDS),
-        "window_start": started_at.isoformat(),
-        "window_end": ended_at.isoformat(),
     }
+    write_json_atomic(case_dir / f"{CASE_ID}.json", result)
+    code = 1
     try:
-        predecessor = predecessor_evidence(
-            predecessor_path,
-            PREDECESSOR_CASE_ID,
-        )
-        inventory_before = node_inventory(region, cluster)
-        recovery = cluster_recovery(region, cluster)
-        environments = executor_environment(
-            kubeconfig,
-            context,
-            arguments.namespace,
-        )
-        api_env = api_environment(cpu_kubeconfig, cpu_context, arguments.namespace)
-        cluster_arn = str(recovery.get("cluster_arn") or "")
-        if not cluster_arn:
-            raise AuditError("describe-cluster did not return a cluster ARN")
-        decisions = iam_decisions(region, role_arn, cluster_arn)
-        events = cloudtrail_events(region, started_at, ended_at)
-        manifests = manifest_invariants()
-        tests = focused_tests(case_dir)
-        inventory_after = node_inventory(region, cluster)
-        timestamps = run_timestamps(arguments.run_dir)
-        errors = []
-        if not predecessor["valid"]:
-            errors.append("HA-004 predecessor evidence is not PASS")
-        if recovery.get("cluster_status") != "InService":
-            errors.append("HyperPod cluster is not InService")
-        if recovery.get("node_recovery") != "None":
-            errors.append("HyperPod NodeRecovery is not None")
-        errors.extend(environment_errors(environments))
-        errors.extend(synthetic_route_errors(api_env))
-        if decisions.get("sagemaker:BatchReplaceClusterNodes") not in {
-            "implicitDeny",
-            "explicitDeny",
-        }:
-            errors.append("executor IAM permits BatchReplaceClusterNodes")
-        # Prove the deny above is specific to replace. A policy that denied every
-        # SageMaker verb on this cluster would satisfy the assertion while making
-        # the reboot path DESTR-002 depends on impossible, so the scoped
-        # simulation has to show reboot is still allowed.
-        if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
-            errors.append("executor IAM does not allow BatchRebootClusterNodes")
-        errors.extend(cloudtrail_invariant_errors(events))
-        window_problems, provisional = window_errors(
-            started_at=started_at,
-            ended_at=ended_at,
-            now=datetime.now(timezone.utc),
-            accept_recent_window=bool(arguments.accept_recent_window),
-            reboot_events=len(events.get(POSITIVE_CONTROL_EVENT, [])),
-            expect_no_reboots=bool(arguments.expect_no_reboots),
-        )
-        errors.extend(window_problems)
-        errors.extend(
-            coverage_errors(
-                started_at=started_at, ended_at=ended_at, timestamps=timestamps
-            )
-        )
-        if manifests["violations"]:
-            errors.extend(cast(list[str], manifests["violations"]))
-        if inventory_before != inventory_after:
-            errors.append("read-only audit changed HyperPod node inventory")
-        if not tests["passed"]:
-            errors.append("focused regression tests failed")
+        install_abort_signals()
+        try:
+            bind_command_supervision(arguments.run_dir)
+        except RuntimeError:
+            raise AuditError(
+                "acceptance run lost command supervision; independent recovery is required"
+            ) from None
+        result.update(current_acceptance_scope().plan_fields())
+        audit(arguments, case_dir, result)
+        code = 0 if result["verdict"] == "PASS" else 1
+    except (
+        Exception,
+        ProcessSupervisionLost,
+        RegionalFixtureAbort,
+        KeyboardInterrupt,
+    ) as exc:
         result.update(
-            {
-                "verdict": "PASS" if not errors else "FAIL",
-                "errors": errors,
-                "predecessor": predecessor,
-                "cluster": recovery,
-                "executor_environment": environments,
-                "executor_replica_count": len(environments),
-                "api_environment": api_env,
-                "iam_decisions": decisions,
-                "cloudtrail_events": events,
-                "cloudtrail_provisional": provisional,
-                "run_evidence_timestamps": timestamps,
-                "manifest_invariants": manifests,
-                "inventory_before": inventory_before,
-                "inventory_after": inventory_after,
-                "focused_tests": tests,
-                "window_limitation": (
-                    "CloudTrail absence only applies to the explicit query window; "
-                    "configuration and IAM evidence support the forward invariant."
-                ),
-            }
+            verdict="FAIL",
+            status="FAILED",
+            formal_sequence_satisfied=False,
+            error=(
+                str(exc)
+                if isinstance(exc, AuditError)
+                else f"{type(exc).__name__}: {diagnostic_text(str(exc), sensitive=True)}"
+            ),
         )
-    except Exception as exc:
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, ProcessSupervisionLost):
+            result["status"] = "RECOVERY_REQUIRED"
+        if isinstance(exc, RegionalFixtureAbort):
+            code = 128 + exc.signum
+        elif isinstance(exc, KeyboardInterrupt):
+            code = 130
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
-    return 0 if result["verdict"] == "PASS" else 1
+    return code
 
 
 if __name__ == "__main__":

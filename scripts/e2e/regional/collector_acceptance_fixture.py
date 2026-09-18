@@ -15,13 +15,21 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    finite_seconds,
+    require_action_time,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
 )
 from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
+from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
+from scripts.e2e.regional.collector_recovery_safety import (  # noqa: E402
+    require_bound_refresh,
+    require_settled_recovery,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
 )
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
@@ -30,7 +38,8 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
 
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "collector_node_probe.py"
-TERMINAL_WORKFLOW_STATUSES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED"})
+# A superseded predecessor is settled even when the marker also names its successor.
+TERMINAL_WORKFLOW_STATUSES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"})
 # The control plane's own isolation taint. A node the validated restore left
 # with it is still quarantined whatever the annotations say.
 QUARANTINE_TAINT_PREFIX = "gpu-fault.io/"
@@ -54,7 +63,12 @@ def collector_setting(env: dict[str, str], key: str) -> int:
         raise RegionalFixtureError(
             f"{key} is absent from the node's collector.env; it holds {sorted(env)}"
         )
-    return int(env[key])
+    try:
+        value = int(env[key])
+    except (TypeError, ValueError):
+        raise RegionalFixtureError(f"{key} is not a positive integer") from None
+    finite_seconds(value, label=key)
+    return value
 
 
 def select_workflow(
@@ -89,124 +103,126 @@ def select_workflow(
 
 STORE_PROBE = r"""
 import json
+import re
 import sys
 from datetime import datetime
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.nvidia_logs import FabricManagerLogEvent
+from gpu_fault.store import NotFoundError
+from gpu_fault.telemetry import EvidenceKind
 
 cluster_id, node_id, marker, observed_after_text = (sys.argv[1:] + [""])[:4]
-# A fifth argument turns the raw-evidence scan on. Every poll used to page
-# 2000 evidence rows through the API Pod and json-dump each one to grep the
-# marker; the wait loop needs that only once its workflow is terminal.
+# FM inputs are needed even by light polls to resolve deterministic SXID IDs.
+# The fifth argument controls returning the full raw evidence to the caller.
 scan_evidence = bool((sys.argv[1:] + [""] * 5)[4])
 observed_after = (
     datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
     if observed_after_text
     else None
 )
-store = ApplicationContext.from_environment().store
+context = ApplicationContext.from_environment()
+store = context.store
+def marked(text):
+    return re.search(r"(?:^|\s)marker=" + re.escape(marker) + r"(?=$|[\s,;])", text) is not None
+
+records = store.list_raw_evidence(cluster_id, node_id=node_id, limit=2000)
+matching = [
+    item for item in records
+    if item.cluster_id == cluster_id and item.node_id == node_id
+    and (
+        item.payload.get("record_id") == marker
+        or marked(str(item.payload.get("message") or ""))
+        or marked(str(item.payload.get("raw_message") or ""))
+    )
+]
 evidence = (
-    [
-        item.model_dump(mode="json")
-        for item in store.list_raw_evidence(cluster_id, node_id=node_id, limit=2000)
-        if marker in json.dumps(item.payload, sort_keys=True, default=str)
-    ]
+    [item.model_dump(mode="json") for item in matching]
     if scan_evidence
     else []
 )
 events = [
     item.model_dump(mode="json")
     for item in store.list_xid_events(cluster_id, node_id)
-    if marker in str(item.raw_message or "")
+    if item.cluster_id == cluster_id and item.node_id == node_id
+    and marked(str(item.raw_message or ""))
 ]
+# SXIDs have no event table. Reuse the deployed normalizer only for deterministic
+# event IDs from stored input, then follow persisted decisions and event links.
+# Do not re-enrich against today's topology and call that historical evidence.
+fabric_events = []
+for item in matching:
+    if item.kind != EvidenceKind.FABRIC_MANAGER_LOG:
+        continue
+    source = FabricManagerLogEvent.model_validate(item.payload)
+    if source.cluster_id != cluster_id or source.node_id != node_id:
+        raise RuntimeError("fabric evidence payload identity mismatch")
+    fabric_events.extend(
+        event.model_dump(mode="json")
+        for event in context.nvidia_logs.normalize_fabric_manager(source).sxid_events
+    )
 decisions = []
-for item in events:
+for item in [*events, *fabric_events]:
     try:
         decision = store.get_xid_policy_decision(item["event_id"])
-    except Exception:
+    except NotFoundError:
         continue
-    decisions.append(decision.model_dump(mode="json"))
-# A kmsg-injected XID carries the marker only in the raw kernel line. The
-# incident and workflow it produces never quote that line, so matching them by
-# marker text alone finds nothing (COLLECT-009 watched a workflow sit in WAITING
-# for ten minutes while its own snapshot reported "workflows: []"). The event
-# and decision records are already selected by marker above; a workflow belongs
-# to this injection when its incident points at one of those events, or when a
-# marked decision names it.
-marked_event_ids = {item["event_id"] for item in events}
-marked_workflow_ids = {
-    item.get("workflow_request_id")
-    for item in decisions
-    if item.get("workflow_request_id")
-}
+    if decision is not None:
+        decisions.append(decision.model_dump(mode="json"))
+marked_event_ids = {item["event_id"] for item in [*events, *fabric_events]}
 incidents = []
 workflows = []
-for workflow in store.list_workflows(limit=500, newest_first=True):
-    # With an injection time the caller wants nothing older than it, so the
-    # incident read (one store round trip per workflow) is skipped for the
-    # hundreds of rows that predate the case.
-    if observed_after is not None and workflow.created_at < observed_after:
-        continue
-    try:
-        incident = store.get_incident(workflow.incident_id)
-    except Exception:
-        continue
-    if incident.cluster_id != cluster_id or node_id not in incident.node_ids:
-        continue
-    encoded = json.dumps({
-        "incident": incident.model_dump(mode="json"),
-        "workflow": workflow.model_dump(mode="json"),
-    }, sort_keys=True, default=str)
-    # A Fabric Manager SXID is not an XID event: nothing the marker can reach
-    # (raw evidence aside) names its workflow, so the caller passes the moment
-    # it injected and every workflow this node grew since then is its own.
-    injected_since = (
-        observed_after is not None and workflow.created_at >= observed_after
-    )
-    if (
-        marker not in encoded
-        and incident.event_id not in marked_event_ids
-        and workflow.request_id not in marked_workflow_ids
-        and not injected_since
-    ):
-        continue
-    incidents.append(incident.model_dump(mode="json"))
-    workflows.append(workflow.model_dump(mode="json"))
-# A MONITOR_ONLY / NO_ACTION decision (RESTART_APP on an IDLE node) opens no
-# workflow at all, so the workflow walk above never surfaces its incident. The
-# marked decision still names it, so its incident is read directly here -- the
-# only way a case can assert the RECOVERED incident that closed without a
-# workflow. Deduped against the workflow-discovered incidents and filtered by
-# cluster/node exactly as they are.
-seen_incident_ids = {item["incident_id"] for item in incidents}
+seen_incident_ids = set()
+linked_incidents = []
+for event_id in marked_event_ids:
+    incident = store.get_incident_by_event(event_id)
+    if incident is not None:
+        linked_incidents.append(incident)
 for item in decisions:
     incident_id = item.get("incident_id")
-    if not incident_id or incident_id in seen_incident_ids:
+    if not incident_id:
         continue
-    try:
-        incident = store.get_incident(incident_id)
-    except Exception:
+    linked_incidents.append(store.get_incident(incident_id))
+for incident in linked_incidents:
+    if incident.incident_id in seen_incident_ids:
         continue
     if incident.cluster_id != cluster_id or node_id not in incident.node_ids:
-        continue
-    seen_incident_ids.add(incident_id)
+        raise RuntimeError("marked event incident identity mismatch")
+    seen_incident_ids.add(incident.incident_id)
     incidents.append(incident.model_dump(mode="json"))
+for workflow in store.list_workflows(limit=500, newest_first=True):
+    if workflow.incident_id in seen_incident_ids:
+        workflows.append(workflow.model_dump(mode="json"))
+seen_workflow_ids = {item["request_id"] for item in workflows}
+for item in [*incidents, *decisions]:
+    request_id = item.get("workflow_request_id")
+    if not request_id or request_id in seen_workflow_ids:
+        continue
+    workflow = store.get_workflow(request_id)
+    if workflow.incident_id not in seen_incident_ids:
+        raise RuntimeError("marked decision workflow identity mismatch")
+    workflows.append(workflow.model_dump(mode="json"))
+    seen_workflow_ids.add(request_id)
 # Every backend filters remote commands by workflow in the store; paging the
 # whole table through the API Pod to filter it here was the slowest read of
 # the poll.
 request_ids = [item["request_id"] for item in workflows]
 commands = (
     [
-        item.model_dump(mode="json")
+        item.model_dump(mode="json", exclude={"lease_token"})
         for item in store.list_remote_commands(workflow_request_ids=request_ids)
     ]
     if request_ids
     else []
 )
 print(json.dumps({
+    "seed_marker": marker,
     "evidence": evidence,
     "evidence_scanned": scan_evidence,
+    "evidence_scan_complete": len(records) < 2000,
     "events": events,
+    "fabric_events": fabric_events,
+    "fabric_events_reconstructed": True,
     "decisions": decisions,
     "incidents": incidents,
     "workflows": workflows,
@@ -224,6 +240,7 @@ class CollectorAcceptanceFixture:
         image: str,
         case_id: str,
         run_id: str,
+        case_dir: Path,
     ) -> None:
         self.regional = regional
         self.node = node
@@ -237,11 +254,13 @@ class CollectorAcceptanceFixture:
                 case_id=case_id,
                 run_id=run_id,
                 probe_script=PROBE_SCRIPT,
+                state_directory=case_dir / "host-probes",
                 active_deadline_seconds=3600,
             )
         )
 
     def create(self) -> None:
+        require_action_time(180)
         self.host.create()
 
     def recreate(self) -> None:
@@ -268,6 +287,18 @@ class CollectorAcceptanceFixture:
         return inventory
 
     def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        finite_seconds(timeout)
+        if arguments[0] in {
+            "throttle-gpu",
+            "write-xid",
+            "append-sxid",
+            "restart-service",
+            "set-persistence-mode",
+            "override-expected-gpu-count",
+            "unbind-efa",
+            "kill-workload",
+        }:
+            require_action_time(timeout)
         return self.host.execute(*arguments, timeout=timeout)
 
     def store_snapshot(
@@ -305,7 +336,7 @@ class CollectorAcceptanceFixture:
         evidence rows every few seconds while it does.
         """
 
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + finite_seconds(timeout_seconds)
         timeline = []
         last: dict[str, Any] = {}
         while time.monotonic() < deadline:
@@ -326,6 +357,10 @@ class CollectorAcceptanceFixture:
                     scan_evidence=True,
                 )
                 statuses = [item.get("status") for item in last.get("workflows") or []]
+                terminal = not terminal_workflow or (
+                    bool(statuses)
+                    and all(item in TERMINAL_WORKFLOW_STATUSES for item in statuses)
+                )
             timeline.append(
                 {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -374,17 +409,28 @@ class CollectorAcceptanceFixture:
         did not SUCCEED -- is a failure, not the silent ``[]`` it used to be.
         """
 
+        marker = state.get("seed_marker")
+        if isinstance(marker, str) and marker:
+            current = self.store_snapshot(marker)
+            require_bound_refresh(state, current, marker)
+            state = current
+        require_settled_recovery(state)
         restore = WarmSpareLiveFixture(self.regional, "")
         results = []
         seen = set()
         for incident in reversed(list(state.get("incidents") or [])):
             incident_id = str(incident.get("incident_id") or "")
-            if not incident_id or incident_id in seen:
+            if not incident_id:
+                raise RegionalFixtureError(
+                    "validated recovery has no exact incident identity"
+                )
+            if incident_id in seen:
                 continue
             seen.add(incident_id)
             node = self.regional.node_snapshot(self.node)
             if not node["ownership_annotations"]:
                 continue
+            restore.wait_incident_idle(incident_id)
             created = restore.create_restore_workflow(
                 incident_id=incident_id,
                 node=self.node,
@@ -392,9 +438,17 @@ class CollectorAcceptanceFixture:
                 reason=reason,
             )
             result = restore.wait_workflow_id(str(created["workflow_request_id"]))
+            if result.get("status") != "SUCCEEDED":
+                raise RegionalFixtureError(
+                    "product validated restoration did not succeed"
+                )
             results.append(result)
         residual = self.residual_isolation()
-        if residual["ownership_annotations"] or residual["taints"]:
+        if (
+            residual["ownership_annotations"]
+            or residual["taints"]
+            or residual["unschedulable"]
+        ):
             raise RegionalFixtureError(
                 f"node {self.node} is still isolated after the validated restore "
                 f"({reason}): {residual}; restore workflows: {results}"

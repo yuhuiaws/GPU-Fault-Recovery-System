@@ -2,22 +2,31 @@
 
 \if :{?incident_id}
 \else
-  \echo 'incident_id is required'
-  \quit 2
+  DO $audit_incident_argument_guard$
+  BEGIN
+      RAISE EXCEPTION 'incident_id is required';
+  END
+  $audit_incident_argument_guard$;
 \endif
 
 \if :{?confirm_incident_id}
 \else
-  \echo 'confirm_incident_id is required'
-  \quit 2
+  DO $audit_confirmation_argument_guard$
+  BEGIN
+      RAISE EXCEPTION 'confirm_incident_id is required';
+  END
+  $audit_confirmation_argument_guard$;
 \endif
 
 SELECT :'incident_id' = :'confirm_incident_id' AS confirmed
 \gset
 \if :confirmed
 \else
-  \echo 'confirmation does not match incident_id'
-  \quit 2
+  DO $audit_confirmation_guard$
+  BEGIN
+      RAISE EXCEPTION 'confirmation does not match incident_id';
+  END
+  $audit_confirmation_guard$;
 \endif
 
 BEGIN ISOLATION LEVEL SERIALIZABLE;
@@ -30,38 +39,45 @@ SELECT pg_advisory_xact_lock(
 
 SELECT EXISTS (
     SELECT 1
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='incident' AND key=:'incident_id'
 ) AS incident_exists
 \gset
 \if :incident_exists
 \else
-  \echo 'incident does not exist'
   ROLLBACK;
-  \quit 3
+  DO $audit_missing_incident_guard$
+  BEGIN
+      RAISE EXCEPTION 'incident does not exist';
+  END
+  $audit_missing_incident_guard$;
 \endif
 
 CREATE TEMP TABLE purge_workflow_ids ON COMMIT DROP AS
-SELECT key
-FROM gpu_fault_objects
-WHERE kind='workflow'
-  AND payload->>'incident_id'=:'incident_id';
+SELECT key, payload
+FROM gpu_fault_workflow_records
+WHERE incident_id=:'incident_id';
+
+CREATE TEMP TABLE purge_remote_command_ids ON COMMIT DROP AS
+SELECT key, payload
+FROM gpu_fault_remote_command_records
+WHERE incident_id=:'incident_id';
 
 CREATE TEMP TABLE purge_notification_ids ON COMMIT DROP AS
 SELECT key
-FROM gpu_fault_objects
+FROM gpu_fault_control_records
 WHERE kind='notification'
   AND payload->>'incident_id'=:'incident_id';
 
 CREATE TEMP TABLE purge_plan_ids ON COMMIT DROP AS
 SELECT key
-FROM gpu_fault_objects
+FROM gpu_fault_control_records
 WHERE kind='plan'
   AND payload->>'incident_id'=:'incident_id';
 
 CREATE TEMP TABLE purge_decision_ids ON COMMIT DROP AS
 SELECT key, payload
-FROM gpu_fault_objects
+FROM gpu_fault_control_records
 WHERE kind='decision'
   AND payload->>'recovery_plan_id' IN (
       SELECT key FROM purge_plan_ids
@@ -77,52 +93,62 @@ SELECT key
 FROM gpu_fault_links
 WHERE kind='incident_by_event' AND value=:'incident_id';
 
-SELECT EXISTS (
-    SELECT 1
-    FROM gpu_fault_objects
-    WHERE kind='workflow'
-      AND key IN (SELECT key FROM purge_workflow_ids)
-      AND payload->>'status' IN (
-          'PENDING', 'RUNNING', 'SAFETY_PENDING'
-      )
-) AS has_active_workflow
-\gset
-\if :has_active_workflow
-  \echo 'refusing purge: incident has an active workflow'
-  ROLLBACK;
-  \quit 4
-\endif
+DO $purge_terminal_guard$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM purge_workflow_ids
+        WHERE (
+            payload->>'status' IN ('SUCCEEDED', 'SUPERSEDED')
+            OR (
+                payload->>'status'='FAILED'
+                AND NULLIF(payload->>'failure_handled_at', '') IS NOT NULL
+            )
+        ) IS NOT TRUE
+    ) THEN
+        RAISE EXCEPTION 'refusing purge: incident has a non-terminal or unhandled workflow';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM purge_remote_command_ids
+        WHERE (payload->>'status' IN ('SUCCEEDED', 'FAILED')) IS NOT TRUE
+    ) THEN
+        RAISE EXCEPTION 'refusing purge: incident has an open or unknown remote command';
+    END IF;
+END
+$purge_terminal_guard$;
 
 SELECT EXISTS (
     SELECT 1
-    FROM gpu_fault_objects
-    WHERE kind='remote_command'
-      AND payload->>'incident_id'=:'incident_id'
-      AND payload->>'status' IN ('PENDING', 'WAITING', 'LEASED')
-) AS has_open_command
-\gset
-\if :has_open_command
-  \echo 'refusing purge: incident has an open remote command'
-  ROLLBACK;
-  \quit 4
-\endif
-
-SELECT EXISTS (
-    SELECT 1
-    FROM gpu_fault_objects
-    WHERE kind='workflow'
-      AND payload->>'incident_id'<>:'incident_id'
-      AND payload->>'predecessor_workflow_id' IN (
+    FROM gpu_fault_workflow_records
+    WHERE incident_id IS DISTINCT FROM :'incident_id'
+      AND predecessor_workflow_id IN (
           SELECT key FROM purge_workflow_ids
       )
 ) AS has_external_successor
 \gset
 \if :has_external_successor
-  \echo 'refusing purge: another incident references this workflow'
-  \echo 'purge dependent incidents first'
   ROLLBACK;
-  \quit 4
+  DO $audit_successor_guard$
+  BEGIN
+      RAISE EXCEPTION 'refusing purge: another incident references this workflow; purge dependent incidents first';
+  END
+  $audit_successor_guard$;
 \endif
+
+DO $purge_control_state$
+DECLARE victim RECORD;
+BEGIN
+    FOR victim IN
+        SELECT 'remote_command' AS kind, key, payload FROM purge_remote_command_ids
+        UNION ALL
+        SELECT 'workflow', key, payload FROM purge_workflow_ids
+        ORDER BY kind, key
+    LOOP
+        IF NOT gpu_fault_delete_control_state(victim.kind, victim.key, victim.payload) THEN
+            RAISE EXCEPTION 'refusing purge: control-state record changed or could not be deleted';
+        END IF;
+    END LOOP;
+END
+$purge_control_state$;
 
 DELETE FROM gpu_fault_links
 WHERE kind='notification_dedup'
@@ -135,10 +161,6 @@ WHERE kind IN ('notification_delivery', 'notification_result')
 DELETE FROM gpu_fault_objects
 WHERE kind='notification'
   AND key IN (SELECT key FROM purge_notification_ids);
-
-DELETE FROM gpu_fault_objects
-WHERE kind='remote_command'
-  AND payload->>'incident_id'=:'incident_id';
 
 DELETE FROM gpu_fault_objects
 WHERE kind IN ('diagnostic', 'triage')
@@ -174,10 +196,6 @@ WHERE
         )
         AND value=:'incident_id'
     );
-
-DELETE FROM gpu_fault_objects
-WHERE kind='workflow'
-  AND key IN (SELECT key FROM purge_workflow_ids);
 
 DELETE FROM gpu_fault_objects
 WHERE kind='incident' AND key=:'incident_id';

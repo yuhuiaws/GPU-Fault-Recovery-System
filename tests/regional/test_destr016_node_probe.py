@@ -575,6 +575,8 @@ def test_arm_holder_schedules_the_absorb_and_escalation_writes_after_the_holder(
             f"{RUN_ID}-e",
             "--escalate-after-seconds",
             "240",
+            "--maintenance-window-end",
+            "2099-01-01T00:00:00+00:00",
         ]
     )
 
@@ -586,18 +588,17 @@ def test_arm_holder_schedules_the_absorb_and_escalation_writes_after_the_holder(
     command = probe.injection_command(RUN_ID, plan[1])
     assert command[:2] == ["systemd-run", "--unit"], command
     assert command[2] == probe.injection_unit(RUN_ID, "escalate"), command
-    assert "--on-active=240" in command, command
-    assert command[-8:] == [
-        "/run/gpu-fault-host-probe-ab894dd753.py",
-        "write-xid79",
-        "--marker",
-        "m-escalate",
-        "--drill-id",
-        f"{RUN_ID}-e",
-        "--pci-bdf",
-        "0000:59:00",
+    assert "--on-active=1s" in command, command
+    assert command[-5:] == [
+        "fire-injection",
+        "--run-id",
+        RUN_ID,
+        "--phase",
+        "escalate",
     ], command
-    assert command[-9] == "/opt/gpu-fault/current/venv/bin/python", command
+    assert "write-xid79" not in command, (
+        "the timer must recheck authorization before writing"
+    )
     # The scheduled units are the probe's own: the allow-listed systemctl verbs
     # may stop them, so disarm-holder can clear a timer that never fired.
     timer = probe.injection_unit(RUN_ID, "absorb") + ".timer"

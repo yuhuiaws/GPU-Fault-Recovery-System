@@ -27,6 +27,7 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
+    component_python,
 )
 
 
@@ -126,7 +127,9 @@ print(json.dumps({
     "workflow": (
         workflow.model_dump(mode="json") if workflow is not None else None
     ),
-    "commands": [item.model_dump(mode="json") for item in commands],
+    "commands": [
+        item.model_dump(mode="json", exclude={"lease_token"}) for item in commands
+    ],
     "notifications": notifications,
     "notification_results": notification_results,
     "markers": markers,
@@ -270,7 +273,11 @@ import sys
 from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowStatus
+from gpu_fault.models import WorkflowStatus, WorkflowOperation, workflow_is_open
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action, refresh_remote_action_state, quiesce_needs_restoration,
+)
+from gpu_fault.recovery_safety import recovery_safety_errors
 from gpu_fault.orchestration.validated_restore import (
     build_validated_restore_workflow,
 )
@@ -279,14 +286,30 @@ incident_id, node_id, profile_version, reason = sys.argv[1:]
 context = ApplicationContext.from_environment()
 store = context.store
 incident = store.get_incident(incident_id)
+if store.list_active_workflow_incidents(
+    incident.cluster_id, node_ids=set(incident.node_ids) | {node_id}
+):
+    raise RuntimeError("node still has an active or operator-held workflow")
 if incident.workflow_request_id:
     current = store.get_workflow(incident.workflow_request_id)
-    if current.status in {
-        WorkflowStatus.PENDING,
-        WorkflowStatus.RUNNING,
-        WorkflowStatus.SAFETY_PENDING,
-    }:
-        raise RuntimeError("incident still has an active workflow")
+    if workflow_is_open(current.status, current.blocked_kind) or (
+        current.status is WorkflowStatus.BLOCKED and current.blocked_kind is None
+    ):
+        raise RuntimeError("incident still has an active or unclassified blocked workflow")
+    commands = store.list_remote_commands(workflow_request_ids=[current.request_id])
+    current = refresh_remote_action_state(store, current)
+    errors = recovery_safety_errors(
+        [current.model_dump(mode="json")],
+        [command.model_dump(mode="json", exclude={"lease_token"}) for command in commands],
+    )
+    if errors or has_unresolved_node_action(current):
+        raise RuntimeError("physical action outcome requires operator reconciliation")
+    if quiesce_needs_restoration(
+        current,
+        None,
+        settling_operations={WorkflowOperation.RESTART_NODE, WorkflowOperation.REPLACE_NODE},
+    ):
+        raise RuntimeError("product quiesce restoration is not complete")
 now = datetime.now(timezone.utc)
 incident, workflow = build_validated_restore_workflow(
     incident,
@@ -326,6 +349,41 @@ from gpu_fault.app import ApplicationContext
 
 incident = ApplicationContext.from_environment().store.get_incident(sys.argv[1])
 print(json.dumps(incident.model_dump(mode="json"), sort_keys=True, default=str))
+"""
+
+
+INCIDENT_CLEANUP_STATE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, incident_id = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+incident = store.get_incident(incident_id)
+if incident.cluster_id != cluster_id:
+    raise RuntimeError("cleanup incident belongs to another cluster")
+workflow = (
+    store.get_workflow(incident.workflow_request_id)
+    if incident.workflow_request_id else None
+)
+active = [
+    {"request_id": item.request_id, "status": item.status.value}
+    for _, item in store.list_active_workflow_incidents(
+        cluster_id, node_ids=set(incident.node_ids)
+    )
+]
+commands = [
+    {"command_id": item.command_id, "status": item.status.value}
+    for item in store.list_remote_commands()
+    if item.cluster_id == cluster_id and item.status.value not in {"SUCCEEDED", "FAILED"}
+]
+print(json.dumps({
+    "incident": incident.model_dump(mode="json"),
+    "workflow_status": workflow.status.value if workflow else None,
+    "active_workflows": active,
+    "open_commands": commands,
+}, sort_keys=True, default=str))
 """
 
 
@@ -438,7 +496,13 @@ class WarmSpareLiveFixture:
         self.regional = regional
         self.hyperpod_cluster = hyperpod_cluster
 
-    def node_snapshot(self, node: str) -> dict[str, Any]:
+    def node_snapshot(
+        self,
+        node: str,
+        *,
+        extra_label_keys: tuple[str, ...] = (),
+        extra_annotation_keys: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
         value = json.loads(
             self.regional.kubectl("gpu", "get", "node", node, "-o", "json")
         )
@@ -470,9 +534,13 @@ class WarmSpareLiveFixture:
                     HYPERPOD_HEALTH_LABEL,
                     INSTANCE_GROUP_LABEL,
                     *INSTANCE_TYPE_LABELS,
+                    *extra_label_keys,
                 )
             },
-            "annotations": {key: annotations.get(key) for key in SNAPSHOT_ANNOTATIONS},
+            "annotations": {
+                key: annotations.get(key)
+                for key in (*SNAPSHOT_ANNOTATIONS, *extra_annotation_keys)
+            },
         }
 
     def spare_nodes(self) -> list[str]:
@@ -560,7 +628,7 @@ class WarmSpareLiveFixture:
                 "exec",
                 str(pod["name"]),
                 "--",
-                "python3",
+                component_python("gpu"),
                 "-c",
                 (
                     "import json,os; print(json.dumps({"
@@ -597,7 +665,7 @@ class WarmSpareLiveFixture:
                 "exec",
                 str(pod["name"]),
                 "--",
-                "python3",
+                component_python("cpu"),
                 "-c",
                 (
                     "import json,os; print(json.dumps({"
@@ -626,15 +694,12 @@ class WarmSpareLiveFixture:
         job_id: str = "",
         attempt_id: str = "",
     ) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(
-                STORE_PROBE,
-                self.regional.settings.cluster_id,
-                event_id,
-                job_id,
-                attempt_id,
-            ),
+        return self.regional.cpu_python(
+            STORE_PROBE,
+            self.regional.settings.cluster_id,
+            event_id,
+            job_id,
+            attempt_id,
         )
 
     def post_synthetic_replacement(
@@ -645,15 +710,12 @@ class WarmSpareLiveFixture:
             raise RegionalFixtureError(
                 "replacement payload cluster ID does not match settings"
             )
-        return cast(
-            dict[str, Any],
-            # One attempt: the route persists a finding and opens a workflow, so
-            # a kubectl retry after a lost receipt would inject the fault twice.
-            self.regional.cpu_python(
-                SYNTHETIC_REPLACEMENT_POST,
-                json.dumps(payload, sort_keys=True),
-                attempts=1,
-            ),
+        # One attempt: the route persists a finding and opens a workflow, so
+        # a kubectl retry after a lost receipt would inject the fault twice.
+        return self.regional.cpu_python(
+            SYNTHETIC_REPLACEMENT_POST,
+            json.dumps(payload, sort_keys=True),
+            attempts=1,
         )
 
     def wait_for_workflow(
@@ -694,38 +756,30 @@ class WarmSpareLiveFixture:
         )
 
     def release_spares(self, nodes: list[str], incident_id: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.executor_python(
-                RELEASE_SPARES,
-                json.dumps(nodes),
-                incident_id,
-                attempts=1,
-            ),
+        return self.regional.executor_python(
+            RELEASE_SPARES,
+            json.dumps(nodes),
+            incident_id,
+            attempts=1,
         )
 
     def reactivate_agent(self, node: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(
-                REACTIVATE_AGENT,
-                self.regional.settings.cluster_id,
-                node,
-                attempts=1,
-            ),
+        return self.regional.cpu_python(
+            REACTIVATE_AGENT,
+            self.regional.settings.cluster_id,
+            node,
+            attempts=1,
         )
 
     def incident_by_id(self, incident_id: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(INCIDENT_BY_ID, incident_id),
-        )
+        return self.regional.cpu_python(INCIDENT_BY_ID, incident_id)
 
     def wait_incident_idle(
         self,
         incident_id: str,
         *,
         timeout_seconds: int = 900,
+        quiet_seconds: int = 15,
     ) -> dict[str, Any]:
         """Wait until the incident has no workflow a restore would race.
 
@@ -737,17 +791,38 @@ class WarmSpareLiveFixture:
 
         deadline = time.monotonic() + timeout_seconds
         last: dict[str, Any] = {}
+        quiet_since: float | None = None
         while time.monotonic() < deadline:
-            last = self.incident_by_id(incident_id)
-            workflow_id = str(last.get("workflow_request_id") or "")
-            if not workflow_id:
-                return last
-            workflow = self.regional.cpu_python(WORKFLOW_BY_ID, workflow_id)
-            if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED"}:
-                return last
+            last = self.regional.cpu_python(
+                INCIDENT_CLEANUP_STATE, self.regional.settings.cluster_id, incident_id
+            )
+            incident = last.get("incident")
+            active = last.get("active_workflows")
+            commands = last.get("open_commands")
+            if (
+                not isinstance(incident, dict)
+                or incident.get("incident_id") != incident_id
+                or incident.get("cluster_id") != self.regional.settings.cluster_id
+                or not isinstance(active, list)
+                or not isinstance(commands, list)
+                or "workflow_status" not in last
+            ):
+                raise RegionalFixtureError("incident cleanup state is incomplete")
+            idle = (
+                not active
+                and not commands
+                and last["workflow_status"]
+                in {None, "SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
+            )
+            now = time.monotonic()
+            quiet_since = (
+                (quiet_since if quiet_since is not None else now) if idle else None
+            )
+            if quiet_since is not None and now - quiet_since >= quiet_seconds:
+                return incident
             time.sleep(5)
         raise RegionalFixtureError(
-            f"incident workflow did not reach a terminal state: {last}"
+            f"incident workflows and commands did not become quiescent: {last}"
         )
 
     def create_restore_workflow(
@@ -758,16 +833,13 @@ class WarmSpareLiveFixture:
         profile_version: str,
         reason: str,
     ) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(
-                CREATE_RESTORE_WORKFLOW,
-                incident_id,
-                node,
-                profile_version,
-                reason,
-                attempts=1,
-            ),
+        return self.regional.cpu_python(
+            CREATE_RESTORE_WORKFLOW,
+            incident_id,
+            node,
+            profile_version,
+            reason,
+            attempts=1,
         )
 
     def close_incident(
@@ -782,11 +854,8 @@ class WarmSpareLiveFixture:
         Not retried: a close that landed must not be repeated blindly.
         """
 
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(
-                CLOSE_INCIDENT_POST, incident_id, reason, operator, attempts=1
-            ),
+        return self.regional.cpu_python(
+            CLOSE_INCIDENT_POST, incident_id, reason, operator, attempts=1
         )
 
     def wait_workflow_id(
@@ -821,20 +890,17 @@ class WarmSpareLiveFixture:
                 for item in state.get("agents") or []
                 if item.get("node_id") == node
             ]
-            last = matches[0] if matches else {}
+            last = matches[0] if len(matches) == 1 else {}
             if last.get("lifecycle_state") == "ACTIVE":
                 return last
             time.sleep(5)
         raise RegionalFixtureError(f"agent did not return ACTIVE: {last}")
 
     def fleet_readiness(self, node: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.regional.cpu_python(
-                FLEET_READINESS,
-                self.regional.settings.cluster_id,
-                node,
-            ),
+        return self.regional.cpu_python(
+            FLEET_READINESS,
+            self.regional.settings.cluster_id,
+            node,
         )
 
     def open_workflows(
@@ -878,7 +944,7 @@ class WarmSpareLiveFixture:
         last: dict[str, Any] = {}
         while time.monotonic() < deadline:
             last = self.fleet_readiness(node)
-            if bool(last.get("ready")) is ready:
+            if last.get("ready") is ready:
                 return last
             time.sleep(5)
         raise RegionalFixtureError(f"fleet readiness did not become {ready}: {last}")
@@ -909,11 +975,12 @@ class WarmSpareLiveFixture:
             try:
                 last = self.node_snapshot(node)
             except Exception:
-                if not ready:
-                    return {"name": node, "ready": "Unknown"}
                 time.sleep(5)
                 continue
-            if (last.get("ready") == "True") is ready:
+            observed_ready = last.get("ready")
+            if observed_ready in ("True", "False", "Unknown") and (
+                (observed_ready == "True") is ready
+            ):
                 return last
             time.sleep(5)
         expected = "True" if ready else "not True"
@@ -929,16 +996,87 @@ class NodeMutationFixture:
         label_keys: tuple[str, ...] = (),
         annotation_keys: tuple[str, ...] = (),
         track_unschedulable: bool = False,
+        allow_reclaimed_reservation: bool = False,
     ) -> None:
         self.warm = warm
         self.node = node
         self.label_keys = label_keys
         self.annotation_keys = annotation_keys
         self.track_unschedulable = track_unschedulable
-        self.baseline = warm.node_snapshot(node)
+        self.allow_reclaimed_reservation = allow_reclaimed_reservation
+        self.baseline = self._snapshot()
+        self._written_labels: dict[str, str | None] = {}
+        self._written_annotations: dict[str, str | None] = {}
+        self._written_unschedulable: bool | None = None
+
+    def _snapshot(self) -> dict[str, Any]:
+        value = self.warm.node_snapshot(
+            self.node,
+            extra_label_keys=self.label_keys,
+            extra_annotation_keys=self.annotation_keys,
+        )
+        if not value.get("uid") or not value.get("resource_version"):
+            raise RegionalFixtureError("node UID or resourceVersion is unknown")
+        if value.get("name") != self.node:
+            raise RegionalFixtureError("node snapshot names another target")
+        if hasattr(self, "baseline") and value["uid"] != self.baseline["uid"]:
+            raise RegionalFixtureError("node UID changed; mutation and restore refused")
+        return value
 
     def apply(self, patch: NodePatch) -> None:
-        metadata: dict[str, Any] = {}
+        if (
+            set(patch.labels) - set(self.label_keys)
+            or set(patch.annotations) - set(self.annotation_keys)
+            or (patch.unschedulable is not None and not self.track_unschedulable)
+        ):
+            raise RegionalFixtureError("node patch contains untracked fields")
+        current = self._snapshot()
+        for section, desired, written in (
+            ("labels", patch.labels, self._written_labels),
+            ("annotations", patch.annotations, self._written_annotations),
+        ):
+            for key in desired:
+                expected = written.get(key, self.baseline[section].get(key))
+                if current[section].get(key) != expected:
+                    raise RegionalFixtureError(f"tracked node field changed: {key}")
+        if patch.unschedulable is not None:
+            expected_cordon = (
+                self._written_unschedulable
+                if self._written_unschedulable is not None
+                else self.baseline["unschedulable"]
+            )
+            if current["unschedulable"] != expected_cordon:
+                raise RegionalFixtureError("tracked node cordon state changed")
+        # Record intent before transport: an exception can mean the ACK was lost.
+        self._written_labels.update(patch.labels)
+        self._written_annotations.update(patch.annotations)
+        if patch.unschedulable is not None:
+            self._written_unschedulable = patch.unschedulable
+        self._patch(current, patch)
+
+    def _patch(self, current: dict[str, Any], patch: NodePatch) -> None:
+        for key in (
+            *OWNERSHIP_ANNOTATIONS,
+            SPARE_RESERVATION_ANNOTATION,
+            SPARE_RESERVED_AT_ANNOTATION,
+            SPARE_POOL_STATE_ANNOTATION,
+        ):
+            if key not in self.annotation_keys and (
+                current["annotations"].get(key) != self.baseline["annotations"].get(key)
+            ):
+                raise RegionalFixtureError("node ownership or reservation changed")
+        if current["taints"] != self.baseline["taints"]:
+            raise RegionalFixtureError("node taints changed before tracked mutation")
+        if not self.track_unschedulable and (
+            current["unschedulable"] != self.baseline["unschedulable"]
+        ):
+            raise RegionalFixtureError(
+                "node scheduling changed before tracked mutation"
+            )
+        metadata: dict[str, Any] = {
+            "uid": self.baseline["uid"],
+            "resourceVersion": current["resource_version"],
+        }
         if patch.labels:
             metadata["labels"] = patch.labels
         if patch.annotations:
@@ -955,24 +1093,64 @@ class NodeMutationFixture:
             "-p",
             json.dumps(body, sort_keys=True),
         )
+        after = self._snapshot()
+        for section, desired in (
+            ("labels", patch.labels),
+            ("annotations", patch.annotations),
+        ):
+            if any(after[section].get(key) != value for key, value in desired.items()):
+                raise RegionalFixtureError(f"node {section} patch was not observed")
+        if patch.unschedulable is not None and (
+            after["unschedulable"] != patch.unschedulable
+        ):
+            raise RegionalFixtureError("node cordon patch was not observed")
 
     def restore(self) -> dict[str, Any]:
-        labels = {key: self.baseline["labels"].get(key) for key in self.label_keys}
-        annotations = {
-            key: self.baseline["annotations"].get(key) for key in self.annotation_keys
-        }
-        self.apply(
-            NodePatch(
-                labels=labels,
-                annotations=annotations,
-                unschedulable=(
-                    bool(self.baseline["unschedulable"])
-                    if self.track_unschedulable
-                    else None
+        current = self._snapshot()
+        annotations = current["annotations"]
+        reclaimed = (
+            self.allow_reclaimed_reservation
+            and bool(self._written_annotations.get(SPARE_RESERVATION_ANNOTATION))
+            and self._written_annotations.get(SPARE_POOL_STATE_ANNOTATION)
+            == "ALLOCATED"
+            and annotations.get(SPARE_RESERVATION_ANNOTATION) is None
+            and annotations.get(SPARE_RESERVED_AT_ANNOTATION) is None
+            and annotations.get(SPARE_POOL_STATE_ANNOTATION) == "AVAILABLE"
+            and current["unschedulable"] is True
+            and current["labels"].get(SPARE_LABEL) == "true"
+        )
+        desired: dict[str, dict[str, str | None]] = {"labels": {}, "annotations": {}}
+        for section, written in (
+            ("labels", self._written_labels),
+            ("annotations", self._written_annotations),
+        ):
+            for key, value in written.items():
+                baseline = self.baseline[section].get(key)
+                observed = current[section].get(key)
+                if observed == baseline:
+                    continue
+                if observed != value and not (
+                    reclaimed and key == SPARE_POOL_STATE_ANNOTATION
+                ):
+                    raise RegionalFixtureError(f"tracked node field changed: {key}")
+                desired[section][key] = baseline
+        cordon = None
+        if self._written_unschedulable is not None:
+            baseline_cordon = self.baseline["unschedulable"]
+            if current["unschedulable"] != baseline_cordon:
+                if current["unschedulable"] != self._written_unschedulable:
+                    raise RegionalFixtureError("tracked node cordon state changed")
+                cordon = bool(baseline_cordon)
+        if desired["labels"] or desired["annotations"] or cordon is not None:
+            self._patch(
+                current,
+                NodePatch(
+                    labels=desired["labels"],
+                    annotations=desired["annotations"],
+                    unschedulable=cordon,
                 ),
             )
-        )
-        return self.warm.node_snapshot(self.node)
+        return self._snapshot()
 
 
 class GpuHolderFixture:
@@ -1084,7 +1262,7 @@ class GpuHolderFixture:
             self.name,
             "--ignore-not-found",
             "--wait=true",
-            check=False,
+            check=True,
             timeout=180,
         )
         return bool(
@@ -1096,7 +1274,7 @@ class GpuHolderFixture:
                 "--ignore-not-found",
                 "-o",
                 "name",
-                check=False,
+                check=True,
             ).strip()
         )
 
@@ -1110,9 +1288,19 @@ class WarmSpareServiceFixture:
         image: str,
         case_id: str,
         run_id: str,
+        state_directory: Path,
+        node_uid: str,
+        plan_sha256: str,
+        release_id: str,
+        maintenance_expires_at: datetime,
     ) -> None:
+        from scripts.e2e.regional.destr008_service_window import (
+            ServiceWindowController,
+        )
+
         self.host = HostProbeFixture(
             HostProbeSettings(
+                state_directory=state_directory,
                 kubeconfig=warm.regional.settings.gpu_kubeconfig,
                 context=warm.regional.settings.gpu_context,
                 namespace=warm.regional.settings.namespace,
@@ -1125,11 +1313,31 @@ class WarmSpareServiceFixture:
             )
         )
         self.run_id = run_id
-        self.service = ""
-        self.failsafe_at: datetime | None = None
+        self.window = ServiceWindowController(
+            self.host,
+            cluster_id=warm.regional.settings.cluster_id,
+            node_uid=node_uid,
+            plan_sha256=plan_sha256,
+            release_id=release_id,
+            maintenance_expires_at=maintenance_expires_at,
+            read_node_uid=lambda: str(warm.node_snapshot(node)["uid"]),
+        )
+
+    @property
+    def service(self) -> str:
+        return self.window.service
+
+    @property
+    def failsafe_at(self) -> datetime | None:
+        """The fixed restoration start, not a guarantee of restored health."""
+        return self.window.failsafe_at
+
+    @property
+    def journal_path(self) -> Path:
+        return self.window.path
 
     def create(self) -> None:
-        self.host.create()
+        self.window.create()
 
     def stop(
         self,
@@ -1138,51 +1346,21 @@ class WarmSpareServiceFixture:
         restore_seconds: int = 180,
         delay_seconds: int = 0,
     ) -> dict[str, Any]:
-        """Stop one allowlisted unit, with a systemd failsafe that restores it.
-
-        ``delay_seconds`` hands the stop to a systemd timer instead of running
-        it inline. That is required for ``kubelet.service``: the probe answers
-        over ``kubectl exec``, which kubelet itself serves, so an inline stop
-        cannot reply until the failsafe brings kubelet back -- long after the
-        NotReady window the caller wanted to watch.
-        """
-
-        self.service = service
-        # The unit is back no later than this, whatever the caller does next;
-        # a shortage that must still hold at REPLACE_NODE has to conclude first.
-        self.failsafe_at = datetime.now(timezone.utc) + timedelta(
-            seconds=delay_seconds + restore_seconds
-        )
-        return cast(
-            dict[str, Any],
-            self.host.execute(
-                "stop-with-failsafe",
-                "--service",
-                service,
-                "--run-id",
-                self.run_id,
-                "--restore-seconds",
-                str(restore_seconds),
-                "--stop-delay-seconds",
-                str(delay_seconds),
-                timeout=180,
-            ),
+        """Arm/ACK independent recovery, then schedule exactly one owned stop."""
+        return self.window.stop(
+            service, restore_seconds=restore_seconds, delay_seconds=delay_seconds
         )
 
     def restore(self) -> dict[str, Any]:
-        if not self.service:
-            return {"restored": False, "reason": "service was not stopped"}
-        return cast(
-            dict[str, Any],
-            self.host.execute(
-                "restore-service",
-                "--service",
-                self.service,
-                "--run-id",
-                self.run_id,
-                timeout=180,
-            ),
-        )
+        return self.window.restore()
 
     def cleanup(self) -> dict[str, bool]:
-        return cast(dict[str, bool], self.host.cleanup())
+        return self.window.cleanup()
+
+    def resume_cleanup(self) -> dict[str, Any]:
+        """Use the original journals; never create or schedule a new window."""
+        return self.window.resume_cleanup()
+
+    def close(self) -> None:
+        """Release only the local controller lock; this is not cleanup."""
+        self.window.close()

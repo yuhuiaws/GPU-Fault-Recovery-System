@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from gpu_fault.admin.bootstrap_task_inputs import (
+    TaskInputContext,
+    task_input_fingerprints,
+)
+
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -13,9 +18,9 @@ from gpu_fault.admin.bootstrap_common import (
     safe_name,
 )
 from gpu_fault.admin.grafana import dashboard_asset_digests
+from gpu_fault.admin.rds_ca_bundle import RDS_CA_BUNDLE_PATH
 
-# The one module still bound into a task digest, for the two tasks below that no
-# read-only probe re-proves.
+# Orchestration identity remains an input for tasks without read-only revalidation.
 _ORCHESTRATION_SOURCE = "src/gpu_fault/admin/bootstrap.py"
 BOOTSTRAP_RECONCILE_SOURCES = (
     _ORCHESTRATION_SOURCE,
@@ -25,13 +30,16 @@ BOOTSTRAP_RECONCILE_SOURCES = (
     "src/gpu_fault/admin/bootstrap_platform_probes.py",
     "src/gpu_fault/admin/bootstrap_site.py",
     "src/gpu_fault/admin/bootstrap_services.py",
+    "src/gpu_fault/admin/monitoring_policy.py",
     "src/gpu_fault/admin/monitoring_subscriptions.py",
+    "src/gpu_fault/admin/node_key_proof.py",
     "src/gpu_fault/admin/notification_bootstrap.py",
     "src/gpu_fault/admin/notifications.py",
     "src/gpu_fault/admin/release_artifacts.py",
     "src/gpu_fault/admin/release_repositories.py",
+    "src/gpu_fault/admin/resource_registry_dns.py",
 )
-# Assets the second-phase tasks execute or render. They belong to the per-task
+# Assets bootstrap tasks execute or render. They belong to the per-task
 # inputs, not to the shared reconcile sources: a task must re-run when the asset
 # it applies changes, and must not re-run because an unrelated asset changed.
 # The Grafana dashboards (``deploy/observability/dashboards/*.json``) are a
@@ -39,10 +47,12 @@ BOOTSTRAP_RECONCILE_SOURCES = (
 # per file through ``dashboard_asset_digests`` instead of an entry here.
 BOOTSTRAP_TASK_ASSETS = (
     "deploy/node/provision-node-action-keys.sh",
+    "deploy/node/provision_node_action_keys.py",
     "deploy/observability/install-amp-monitoring.sh",
     "deploy/observability/adot-control-plane.yaml",
     "deploy/observability/amp-rules.yaml",
     "deploy/observability/amp-alertmanager.yaml",
+    "deploy/observability/amp-sns-publish-policy.json",
     "deploy/control-plane/regional/aurora-credential-refresh.yaml",
 )
 # ``resources`` key holding the EKS ARN -> HyperPod ARN map the first discovery
@@ -53,6 +63,16 @@ BOOTSTRAP_TASK_ASSETS = (
 # orchestrator no longer matches, and ``bind_initial_deploy_target`` still
 # validates the resolved identity against the site.
 HYPERPOD_HINTS = "hyperpod_by_eks"
+
+
+def remember_hyperpod_hints(
+    state: BootstrapState,
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+) -> None:
+    hints = {cluster.eks_arn: cluster.hyperpod_arn for cluster in (cpu, *gpu_clusters)}
+    if state.value["resources"].get(HYPERPOD_HINTS) != hints:
+        state.record(HYPERPOD_HINTS, hints)
 
 
 def load_hyperpod_hints(state_dir: Path) -> dict[str, str]:
@@ -105,87 +125,47 @@ def _manifest_wheel_sha256(root: Path, manifest: Path) -> str | None:
     return _file_sha256(wheel)
 
 
-def _platform_task_digests(
-    task_digest: Callable[[str, object], str],
-    *,
-    assets: Mapping[str, str | None],
-    images: Mapping[str, Any],
-    alert_email: str | None,
-    control_plane_wheel_sha256: str | None,
-    gpu_identity: Sequence[Mapping[str, Any]],
-    dashboards: Mapping[str, str],
-    grafana: Mapping[str, Any],
-) -> dict[str, str]:
-    """Digest the probe-before-ensure tasks against their real inputs.
-
-    These tasks install live resources whose desired state is decided by the
-    assets they apply and by the images and wheel bytes they reference, not by
-    the release identity. Binding `release_identity` made every release ID bump
-    re-run them even when nothing they touch changed; drift that no static input
-    can describe (node membership, out-of-band edits) is caught by the read-only
-    probes instead.
-    """
-
-    digests = {
-        "monitoring_install": task_digest(
-            "monitoring_install",
-            {
-                "assets": {
-                    "installer": assets[
-                        "deploy/observability/install-amp-monitoring.sh"
-                    ],
-                    "collector": assets["deploy/observability/adot-control-plane.yaml"],
-                    "rules": assets["deploy/observability/amp-rules.yaml"],
-                    "alertmanager": assets[
-                        "deploy/observability/amp-alertmanager.yaml"
-                    ],
-                },
-                "adot_image": images.get("adot"),
-                "alert_email": alert_email,
-                # The Grafana step rides on this task: a changed dashboard or a
-                # changed --grafana option must re-run the import.
-                "dashboards": dict(dashboards),
-                "grafana": dict(grafana),
-            },
-        ),
-        "aurora_refresh": task_digest(
-            "aurora_refresh",
-            {
-                "asset": assets[
-                    "deploy/control-plane/regional/aurora-credential-refresh.yaml"
-                ],
-                "control_plane_wheel_sha256": control_plane_wheel_sha256,
-                "runtime_image": images.get("runtime"),
-            },
-        ),
-    }
-    for cluster_identity in gpu_identity:
-        cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        name = f"node_keys:{cluster_id}"
-        digests[name] = task_digest(
-            name,
-            {
-                "asset": assets["deploy/node/provision-node-action-keys.sh"],
-                "cluster": cluster_identity,
-            },
-        )
-    return digests
-
-
 def bind_bootstrap_inputs(
     state: BootstrapState,
     *,
     request: BootstrapRequest,
     cpu: ClusterIdentity,
     gpu_clusters: tuple[ClusterIdentity, ...],
-    release: Mapping[str, Any],
+    release: Mapping[str, Any] | None = None,
 ) -> str:
+    """Bind before scheduling, then rebind against the actual signed candidate.
+
+    Ordinary infrastructure fingerprints are identical across both binds.
+    Custody key fingerprints include the candidate and remain provisional until
+    the release dependency completes; current-process completion is no exemption.
+    """
+
     root = request.repository_root.resolve()
-    manifest = Path(str(release["manifest"])).expanduser().resolve()
+    manifest = (
+        Path(str(release["manifest"])).expanduser().resolve()
+        if release is not None
+        else None
+    )
+    release_value = release or {}
+    from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
+
+    custody_registration = load_admin_custody(request.state_dir)
     sources = {
         relative: _file_sha256(root / relative)
         for relative in BOOTSTRAP_RECONCILE_SOURCES
     }
+    if custody_registration is not None:
+        custody_paths = [
+            *sorted((root / "src/gpu_fault/admin").glob("node_key_custody*.py")),
+            root / "src/gpu_fault/admin/bootstrap_tasks.py",
+            root / "src/gpu_fault/admin/bootstrap_task_inputs.py",
+        ]
+        sources.update(
+            {
+                path.relative_to(root).as_posix(): _file_sha256(path)
+                for path in custody_paths
+            }
+        )
     assets = {
         relative: _file_sha256(root / relative) for relative in BOOTSTRAP_TASK_ASSETS
     }
@@ -208,14 +188,16 @@ def bind_bootstrap_inputs(
         for item in gpu_clusters
     ]
     release_identity = {
-        "release_id": release.get("release_id"),
-        "manifest_sha256": _file_sha256(manifest),
-        "agent_config_digest": release.get("agent_config_digest"),
-        "images": release.get("images"),
+        "release_id": release_value.get("release_id"),
+        "manifest_sha256": _file_sha256(manifest) if manifest is not None else None,
+        "agent_config_digest": release_value.get("agent_config_digest"),
+        "images": release_value.get("images"),
     }
-    images = release.get("images")
+    images = release_value.get("images")
     images = images if isinstance(images, Mapping) else {}
-    control_plane_wheel_sha256 = _manifest_wheel_sha256(root, manifest)
+    control_plane_wheel_sha256 = (
+        _manifest_wheel_sha256(root, manifest) if manifest is not None else None
+    )
     # Sender and recipient are the administrator address (see
     # ``resolve_notification_routing``), so the address is the whole identity.
     notification_identity = {"admin_email": request.alert_email}
@@ -238,110 +220,36 @@ def bind_bootstrap_inputs(
         "site_id": state.value["site_id"],
     }
 
-    def task_digest(name: str, value: object) -> str:
-        """Digest one task's desired state.
-
-        The task name is part of the digest because two tasks can legitimately
-        describe the same inputs -- `nlb_network` and `pki` both describe the same
-        clusters -- and a shared digest would let one task's checkpoint answer for
-        the other.
-
-        What is deliberately *not* here is the bytes of the modules that do the
-        work. Embedding them meant any refactor of `bootstrap.py` and its siblings
-        re-ran every ensure path on the next deploy, including the unconditional
-        `rds modify-db-subnet-group` and its `rds wait`, for a site where no
-        desired resource had changed.
-
-        That is only safe for a task whose completion is re-proved on every
-        deploy. `bootstrap_tasks.py` revalidates `pod_identity_agent`,
-        `monitoring_install`, `aurora_ready`, `aurora_refresh`, `node_keys:*`,
-        `load_balancer_controller`, `control_plane_role`, `email_notifications`,
-        `monitoring_resources` and `executor_role:*` through a read-only probe
-        that enters ensure on detected drift, so for those the probe is the
-        re-convergence trigger and the module bytes are noise.
-
-        `nlb_network` and `pki` have no probe, so the digest is their only
-        trigger: `_ORCHESTRATION_SOURCE` (the `bootstrap.py` bytes) stays in
-        those two, and a change to how they converge still re-runs them.
-        `aurora` has no probe either but is deliberately left source-free: its
-        reconcilable inputs are covered by `admin_config_sha256` and the CPU
-        subnet ids, and its ensure path writes to RDS unconditionally, which is
-        exactly what a refactor must not re-trigger.
-        """
-
-        return hashlib.sha256(
-            json.dumps(
-                {"common": common, "name": name, "task": value},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-
-    task_digests = {
-        "release_repositories": task_digest(
-            "release_repositories",
-            {"region": cpu.region, "account_id": cpu.account_id},
-        ),
-        "release": task_digest("release", {"release": release_identity}),
-        "pod_identity_agent": task_digest(
-            "pod_identity_agent", {"eks_arn": cpu.eks_arn}
-        ),
-        # These two are the tasks no read-only probe re-proves; see `task_digest`.
-        "nlb_network": task_digest(
-            "nlb_network",
-            {
-                "cpu": cpu_identity,
-                "gpu_clusters": gpu_identity,
-                "source": sources[_ORCHESTRATION_SOURCE],
+    task_digests = task_input_fingerprints(
+        TaskInputContext(
+            common=common,
+            region=cpu.region,
+            account_id=cpu.account_id,
+            cpu=cpu_identity,
+            gpu_clusters=gpu_identity,
+            cluster_inputs={
+                safe_name(str(item["hyperpod_name"])): item for item in gpu_identity
             },
-        ),
-        "pki": task_digest(
-            "pki",
-            {
-                "cpu": cpu_identity,
-                "gpu_clusters": gpu_identity,
-                "source": sources[_ORCHESTRATION_SOURCE],
-            },
-        ),
-        "aurora": task_digest(
-            "aurora",
-            {"admin_config_sha256": payload["admin_config_sha256"]},
-        ),
-        # Instances available and the control-plane Secret present: nothing
-        # static decides it, so the probe is its only trigger (like the add-on).
-        "aurora_ready": task_digest("aurora_ready", {"eks_arn": cpu.eks_arn}),
-        "load_balancer_controller": task_digest(
-            "load_balancer_controller", {"eks_arn": cpu.eks_arn}
-        ),
-        "control_plane_role": task_digest(
-            "control_plane_role", {"notifications": notification_identity}
-        ),
-        "email_notifications": task_digest(
-            "email_notifications", {"notifications": notification_identity}
-        ),
-        "monitoring_resources": task_digest(
-            "monitoring_resources", {"admin_email": request.alert_email}
-        ),
-        **_platform_task_digests(
-            task_digest,
-            assets=assets,
+            release=release_identity,
             images=images,
-            alert_email=request.alert_email,
+            assets=assets,
+            sources=sources,
+            notifications=notification_identity,
+            admin_config_sha256=payload["admin_config_sha256"],
             control_plane_wheel_sha256=control_plane_wheel_sha256,
-            gpu_identity=gpu_identity,
             dashboards=dashboard_asset_digests(root),
             grafana={
                 "workspace_id": request.grafana_workspace_id,
                 "viewer": request.grafana_viewer,
             },
-        ),
-    }
-    for cluster_identity in gpu_identity:
-        cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        # Both per-cluster roles are re-proved by a read-only probe; the digest
-        # only has to change when the cluster itself does.
-        for prefix in ("executor_role:", "adot_writer_role:"):
-            name = f"{prefix}{cluster_id}"
-            task_digests[name] = task_digest(name, {"cluster": cluster_identity})
-    state.bind_inputs(digest, task_digests)
+            release_ready=release is not None,
+            rds_ca_bundle_path=RDS_CA_BUNDLE_PATH,
+            custody=(
+                custody_registration.model_dump(mode="json")
+                if custody_registration is not None
+                else {}
+            ),
+        )
+    )
+    state.bind_inputs(digest, task_digests, partial=release is None)
     return digest

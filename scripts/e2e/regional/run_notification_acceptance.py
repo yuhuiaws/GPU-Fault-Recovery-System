@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import copy
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -33,16 +33,36 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     install_site_profile,
     record_focused_tests,
     reusable_focused_tests,
+    source_digest,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
 )
+from scripts.e2e.regional.notification_evidence import (  # noqa: E402
+    NOTIFICATION_KINDS,
+    NotificationAcceptanceError,
+    action_completed_records_from_evidence,
+    completion_checks,
+    notification_kind as notification_kind,
+    parse_time,
+    requeue_route_errors as requeue_route_errors,
+    select_live_record as select_live_record,
+    validate_duplicate_evidence,
+    validate_external_evidence,
+)
+from scripts.e2e.regional.notify005_checks import (  # noqa: E402
+    low_utilization_manifest,
+    node_errors,
+    phase_checks,
+)
+from scripts.e2e.regional.notification_probe_cache import cached_drill  # noqa: E402
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
     predecessor_path,
 )
+from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     install_abort_signals,
@@ -54,18 +74,9 @@ CASE_IDS = tuple(f"GF-REGIONAL-NOTIFY-{number:03d}" for number in range(1, 6))
 DRILL_PROBE = (Path(__file__).with_name("probes") / "notification_drill.py").read_text(
     encoding="utf-8"
 )
-# NOTIFY-002's duplicate-result proof is carried by NOTIFY-001 (the drill sends
-# the same notification four times and requires one provider message ID), so
-# the catalog marks NOTIFY-002 superseded. The runner stays callable so an old
-# evidence chain can still be reproduced, but says so in its result.
+# NOTIFY-001 replays the result handler four times in an isolated Store.
+# The legacy helper remains importable; the NOTIFY-002 CLI is retired.
 NOTIFY002_SUPERSEDED_BY = "GF-REGIONAL-NOTIFY-001"
-# The two completion kinds NOTIFY-001 judges, keyed by the drill's `--kind` and
-# mapped to the substring the builders put in `deduplication_key`
-# (`.../gpu-reset/<operation>` and `.../workload-restarted/<operation>`).
-NOTIFICATION_KINDS: dict[str, str] = {
-    "gpu-reset": "/gpu-reset/",
-    "workload-restart": "/workload-restarted/",
-}
 YAML_ALIAS_PATTERN = re.compile(r"(?:^|\s)[&*]id\d+\b")
 NOTIFY003_FOCUSED_TESTS = (
     "tests/notifications/test_notifications.py::"
@@ -74,27 +85,13 @@ NOTIFY003_FOCUSED_TESTS = (
     "test_suppressed_backlog_can_be_requeued_on_demand",
     "tests/notifications/test_notifications.py::"
     "test_notification_worker_reclaims_expired_lease_and_stops",
+    "tests/notifications/test_acceptance_alignment_requeue.py",
 )
-
-
-class NotificationAcceptanceError(RuntimeError):
-    pass
+REQUEUE_PROBE = Path(__file__).with_name("probes") / "notify003_requeue_drill.py"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def parse_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
 
 
 def run(
@@ -105,22 +102,7 @@ def run(
     cwd: Path = ROOT,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-        cwd=cwd,
-        env=env,
-    )
-    if check and completed.returncode:
-        raise NotificationAcceptanceError(
-            f"command failed ({completed.returncode}): {' '.join(command[:6])}; "
-            f"stderr={completed.stderr[-1000:]}"
-        )
-    return completed
+    return run_fixture_command(command, check=check, timeout=timeout, cwd=cwd, env=env)
 
 
 def control_worker_pod(site: IdentitySite, target: ClusterTarget) -> str:
@@ -143,7 +125,19 @@ def drill(
     kind: str,
     drill_id: str,
     pod: str | None = None,
+    maintenance_window_end: datetime | None = None,
+    duplicate_delay_seconds: int = 0,
 ) -> dict[str, Any]:
+    if (
+        maintenance_window_end is not None
+        and datetime.now(timezone.utc) >= maintenance_window_end
+    ):
+        raise NotificationAcceptanceError("maintenance window ended before drill")
+    deadline_args = (
+        ["--maintenance-window-end", maintenance_window_end.isoformat()]
+        if maintenance_window_end is not None
+        else []
+    )
     result = site.pod_json(
         "cpu",
         target,
@@ -155,148 +149,20 @@ def drill(
         drill_id,
         "--cluster-id",
         target.cluster_id,
+        "--duplicate-delay-seconds",
+        str(duplicate_delay_seconds),
+        *deadline_args,
         timeout=180,
     )
-    # `executed_at` is written by the probe; a probe from before it existed
-    # gets the runner's clock so the operator's SES window can still be
-    # cross-checked against something.
-    result.setdefault("executed_at", utc_now())
-    result.setdefault("drill_id", drill_id)
+    if (
+        result.get("drill_id") != drill_id
+        or parse_time(result.get("executed_at")) is None
+        or parse_time(result.get("completed_at")) is None
+    ):
+        raise NotificationAcceptanceError(
+            "drill identity or observation interval is missing"
+        )
     return result
-
-
-def validate_external_evidence(
-    path: Path | None,
-    kind: str,
-    *,
-    record_times: Sequence[datetime] = (),
-) -> dict[str, Any]:
-    """Judge the operator's out-of-solution evidence for ``kind``.
-
-    Both kinds must say how the fact was established (``method``), what to look
-    at to re-establish it (``reference``) and the SES-side window it was read
-    over (``window_start``/``window_end``); the window must cover every drill or
-    record time the runner is claiming for. Without the window a `received:
-    true` or a `send_count_delta: 0` cannot be tied to *this* run's messages,
-    and the account has no SES configuration set, so the SES-side answer is
-    necessarily a windowed CloudWatch count that only means something with its
-    window attached. ``receipt`` additionally needs ``received``; ``dedup``
-    needs both counters at zero.
-    """
-
-    if path is None:
-        return {"valid": False, "errors": [f"{kind} evidence is required"]}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"valid": False, "errors": [f"cannot read {kind} evidence: {exc}"]}
-    if not isinstance(value, dict):
-        return {"valid": False, "errors": ["external evidence is not an object"]}
-    errors = []
-    for field in ("method", "reference"):
-        if not str(value.get(field) or "").strip():
-            errors.append(f"{field} is required")
-    window_start = parse_time(value.get("window_start"))
-    window_end = parse_time(value.get("window_end"))
-    if window_start is None or window_end is None:
-        errors.append("window_start and window_end must be ISO-8601 timestamps")
-    elif window_start > window_end:
-        errors.append("window_start is after window_end")
-    else:
-        uncovered = [
-            item.isoformat()
-            for item in record_times
-            if not (window_start <= item <= window_end)
-        ]
-        if uncovered:
-            errors.append(f"window does not cover record times: {uncovered}")
-    if kind == "receipt":
-        if not bool(value.get("received")):
-            errors.append("received is not true")
-    elif kind == "dedup":
-        try:
-            if int(value.get("send_count_delta", -1)) != 0:
-                errors.append("send_count_delta is not 0")
-            if int(value.get("duplicate_inbox_count", -1)) != 0:
-                errors.append("duplicate_inbox_count is not 0")
-        except (TypeError, ValueError):
-            errors.append("send_count_delta/duplicate_inbox_count are not integers")
-    else:
-        errors.append(f"unknown evidence kind {kind}")
-    return {"valid": not errors, "errors": errors, **value}
-
-
-def notification_kind(deduplication_key: str) -> str | None:
-    for kind, marker in NOTIFICATION_KINDS.items():
-        if marker in deduplication_key:
-            return kind
-    return None
-
-
-def _notification_entries(value: Any) -> Iterator[dict[str, Any]]:
-    """Every ``{"notification": {...}, "result": ...}`` pair inside ``value``.
-
-    That is the shape the store probe writes into a case result
-    (``state.notifications[]``), wherever the runner nested the state.
-    """
-
-    if isinstance(value, dict):
-        notification = value.get("notification")
-        if isinstance(notification, dict) and "result" in value:
-            yield value
-            return
-        for item in value.values():
-            yield from _notification_entries(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _notification_entries(item)
-
-
-def action_completed_records_from_evidence(
-    run_dir: Path,
-    *,
-    cluster_id: str,
-) -> dict[str, list[dict[str, Any]]]:
-    """This run's real ACTION_COMPLETED notifications, from the case evidence.
-
-    DESTR-001, DESTR-009 and E2E-001 record the notifications their workflows
-    produced; the catalog says NOTIFY-001 reuses those and drills only when the
-    run has none. Only records for ``cluster_id`` count -- a notification for
-    another cluster proves nothing about this target's mail path.
-    """
-
-    records: dict[str, list[dict[str, Any]]] = {kind: [] for kind in NOTIFICATION_KINDS}
-    cases_dir = run_dir / "cases"
-    if not cases_dir.is_dir():
-        return records
-    for path in sorted(cases_dir.glob("GF-REGIONAL-*/GF-REGIONAL-*.json")):
-        if path.stem != path.parent.name or path.stem in CASE_IDS:
-            continue
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        for entry in _notification_entries(document):
-            notification = entry["notification"]
-            if notification.get("category") != "ACTION_COMPLETED":
-                continue
-            if str(notification.get("cluster_name") or "") != cluster_id:
-                continue
-            kind = notification_kind(str(notification.get("deduplication_key") or ""))
-            if kind is None or not notification.get("notification_id"):
-                continue
-            records[kind].append(
-                {
-                    "case_id": document.get("case_id"),
-                    "evidence_path": str(path),
-                    "notification_id": str(notification["notification_id"]),
-                    "incident_id": notification.get("incident_id"),
-                    "deduplication_key": notification.get("deduplication_key"),
-                    "created_at": notification.get("created_at"),
-                    "recorded_result": entry.get("result"),
-                }
-            )
-    return records
 
 
 LIVE_NOTIFICATION_PROBE = r"""
@@ -361,11 +227,14 @@ def live_action_completed_records(
     *,
     run_dir: Path,
     pod: str,
+    release_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve the run's recorded ACTION_COMPLETED notifications against the store."""
 
     candidates = action_completed_records_from_evidence(
-        run_dir, cluster_id=target.cluster_id
+        run_dir,
+        cluster_id=target.cluster_id,
+        release_id=release_id,
     )
     notification_ids = sorted(
         {item["notification_id"] for items in candidates.values() for item in items}
@@ -381,30 +250,14 @@ def live_action_completed_records(
         *notification_ids,
         timeout=180,
     )
-    return {"candidates": candidates, "records": live.get("records") or []}
-
-
-def select_live_record(
-    records: Sequence[dict[str, Any]],
-    *,
-    kind: str,
-    cluster_id: str,
-) -> dict[str, Any] | None:
-    """The newest real ``kind`` record for ``cluster_id`` that is SENT with an ID."""
-
-    matching = [
-        item
-        for item in records
-        if not item.get("missing")
-        and item.get("kind") == kind
-        and item.get("cluster_name") == cluster_id
-        and not item.get("drill_id")
-        and item.get("status") == "SENT"
-        and item.get("provider_message_id_present")
-    ]
-    if not matching:
-        return None
-    return max(matching, key=lambda item: str(item.get("created_at") or ""))
+    records = live.get("records")
+    if (
+        not isinstance(records, list)
+        or sorted(str(item.get("notification_id") or "") for item in records)
+        != notification_ids
+    ):
+        raise NotificationAcceptanceError("live notification reads are incomplete")
+    return {"candidates": candidates, "records": records}
 
 
 def run_notify001(
@@ -415,13 +268,83 @@ def run_notify001(
     run_dir: Path,
     receipt_evidence: Path | None,
     ses_window_evidence: Path | None,
+    maintenance_window_end: datetime | None = None,
+    release_id: str | None = None,
 ) -> dict[str, Any]:
     pod = control_worker_pod(site, target)
-    live = live_action_completed_records(site, target, run_dir=run_dir, pod=pod)
+    digest = source_digest() if release_id is not None else None
+    plan_path = run_dir / "cases" / "GF-REGIONAL-NOTIFY-001" / "plan.json"
+    plan_digest = (
+        hashlib.sha256(plan_path.read_bytes()).hexdigest()
+        if plan_path.is_file()
+        else None
+    )
+
+    def observed_drill(kind: str, stage: str, *, delay: int = 0) -> dict[str, Any]:
+        def capture() -> dict[str, Any]:
+            return drill(
+                site,
+                target,
+                kind=kind,
+                drill_id=f"notify001-{stage}-{attempt}-{int(time.time())}",
+                pod=pod,
+                maintenance_window_end=maintenance_window_end,
+                duplicate_delay_seconds=delay,
+            )
+
+        if release_id is None:
+            return capture()
+        result = cached_drill(
+            run_dir
+            / "cases"
+            / "GF-REGIONAL-NOTIFY-001"
+            / f"drill-{attempt}-{stage}.json",
+            {
+                "source_digest": digest,
+                "release_id": release_id,
+                "plan_sha256": plan_digest,
+                "cluster_id": target.cluster_id,
+                "attempt": attempt,
+                "stage": stage,
+                "kind": kind,
+                "duplicate_delay_seconds": delay,
+            },
+            capture,
+        )
+        if result.get("kind") != kind or not str(result.get("drill_id", "")).startswith(
+            f"notify001-{stage}-{attempt}-"
+        ):
+            raise NotificationAcceptanceError(
+                "cached notification drill identity changed"
+            )
+        return result
+
+    live = live_action_completed_records(
+        site, target, run_dir=run_dir, pod=pod, release_id=release_id
+    )
     evidence: dict[str, dict[str, Any]] = {}
     drills: list[dict[str, Any]] = []
     record_times: list[datetime] = []
     for kind in NOTIFICATION_KINDS:
+        candidate_ids = {
+            item["notification_id"] for item in live["candidates"].get(kind, [])
+        }
+        unusable = [
+            item
+            for item in live["records"]
+            if (
+                item.get("kind") == kind or item.get("notification_id") in candidate_ids
+            )
+            and (
+                item.get("missing")
+                or item.get("status") != "SENT"
+                or not item.get("provider_message_id_present")
+            )
+        ]
+        if unusable:
+            raise NotificationAcceptanceError(
+                f"{kind} has unverified live delivery; a drill cannot replace it"
+            )
         record = select_live_record(
             live["records"], kind=kind, cluster_id=target.cluster_id
         )
@@ -433,83 +356,60 @@ def run_notify001(
                 "record": record,
             }
             created_at = parse_time(record.get("created_at"))
-            if created_at is not None:
-                record_times.append(created_at)
+            if created_at is None:
+                raise NotificationAcceptanceError(
+                    "live notification has no creation time"
+                )
+            record_times.append(created_at)
             continue
         # Drill fallback, as the catalog allows: the run produced no real
         # completion of this kind, so the mail path is proven with a labeled
         # drill rather than by re-executing the action.
-        result = drill(
-            site,
-            target,
-            kind=kind,
-            drill_id=f"notify001-{kind}-{attempt}-{int(time.time())}",
-            pod=pod,
-        )
+        result = observed_drill(kind, kind)
         drills.append(result)
         executed_at = parse_time(result.get("executed_at"))
-        if executed_at is not None:
-            record_times.append(executed_at)
+        completed_at = parse_time(result.get("completed_at"))
+        if executed_at is None or completed_at is None or completed_at < executed_at:
+            raise NotificationAcceptanceError("drill has no valid observation interval")
+        record_times.extend((executed_at, completed_at))
         evidence[kind] = {
             "source": "drill",
             "sent": result["statuses"][0] == "SENT"
             and result["provider_message_id_present"],
-            "deduplicated": bool(result["provider_message_id_stable"]),
+            "deduplicated": (
+                result["provider_message_id_stable"] is True
+                and result.get("notification_count") == 1
+                and result.get("notifier_calls") == 1
+                and result.get("completion_calls") == 4
+            ),
             "drill": result,
         }
-    # NOTIFY-002's proof lives here now: four submissions of one notification
-    # must return one provider message ID. A gpu-reset drill that already ran
-    # as fallback is that proof; when both kinds came from live records, one
-    # dedicated drill supplies it so the check is never inferred.
-    dedup_drill = next(
-        (item for item in drills if item.get("kind") == "gpu-reset"),
-        None,
-    )
-    if dedup_drill is None:
-        dedup_drill = drill(
-            site,
-            target,
-            kind="gpu-reset",
-            drill_id=f"notify001-dedup-{attempt}-{int(time.time())}",
-            pod=pod,
-        )
-        drills.append(dedup_drill)
-        executed_at = parse_time(dedup_drill.get("executed_at"))
-        if executed_at is not None:
-            record_times.append(executed_at)
+    # Last email in this attempt. Leave a whole metric period between its
+    # initial send and duplicates so a minute bucket can exclude all sends.
+    dedup_drill = observed_drill("gpu-reset", "dedup", delay=65)
+    drills.append(dedup_drill)
+    executed_at = parse_time(dedup_drill.get("executed_at"))
+    completed_at = parse_time(dedup_drill.get("completed_at"))
+    if executed_at is None or completed_at is None or completed_at < executed_at:
+        raise NotificationAcceptanceError("drill has no valid observation interval")
+    record_times.extend((executed_at, completed_at))
     receipt = validate_external_evidence(
         receipt_evidence, "receipt", record_times=record_times
     )
-    dedup_executed_at = parse_time(dedup_drill.get("executed_at"))
-    ses_window = validate_external_evidence(
-        ses_window_evidence,
-        "dedup",
-        record_times=[dedup_executed_at] if dedup_executed_at else [],
-    )
-    checks = {
-        "gpu_reset_sent": evidence["gpu-reset"]["sent"],
-        "workload_restart_sent": evidence["workload-restart"]["sent"],
-        "gpu_reset_deduplicated": evidence["gpu-reset"]["deduplicated"],
-        "workload_restart_deduplicated": evidence["workload-restart"]["deduplicated"],
-        "four_submissions_return_one_provider_id": (
-            len(dedup_drill["statuses"]) == 4
-            and bool(dedup_drill["provider_message_id_present"])
-            and bool(dedup_drill["provider_message_id_stable"])
-        ),
-        # The gate is "delivery was confirmed by something outside this
-        # solution", and an SES-side delivery record satisfies that as well as
-        # a human inbox check does -- provided its window covers the records.
-        "receipt_confirmed_outside_the_solution": receipt["valid"],
-        "ses_send_count_did_not_increase_for_duplicates": ses_window["valid"],
-    }
+    ses_window = validate_duplicate_evidence(ses_window_evidence, dedup_drill)
+    checks = completion_checks(evidence, dedup_drill, receipt, ses_window)
     sources = {kind: value["source"] for kind, value in evidence.items()}
     limitations = [
         "Drill emails are explicitly labeled and are built without executing "
         "RESET_GPU or RESTART_WORKLOAD; the deduplication drill always sends "
-        "one labeled mail and repeats the same notification three more times.",
+        "one final labeled mail, waits 65 seconds and replays the same remote result "
+        "three more times. Fallback delivery drills may send two earlier emails.",
+        "Completed drill observations are reused within the same source/release/attempt "
+        "when external receipts arrive later; an unconfirmed drill is never resent.",
         "GF-REGIONAL-NOTIFY-002 is superseded by this case: "
         "four_submissions_return_one_provider_id and the SES window evidence "
-        "carry its duplicate-result proof.",
+        "cover the actual result handler using an isolated Store. HTTP authorization "
+        "and provider-acceptance crash ambiguity are separate boundaries.",
     ]
     if any(source == "live" for source in sources.values()):
         limitations.append(
@@ -559,12 +459,7 @@ def run_notify002(
         kind="gpu-reset",
         drill_id=f"notify002-{attempt}-{int(time.time())}",
     )
-    executed_at = parse_time(result.get("executed_at"))
-    external = validate_external_evidence(
-        ses_window_evidence,
-        "dedup",
-        record_times=[executed_at] if executed_at else [],
-    )
+    external = validate_duplicate_evidence(ses_window_evidence, result)
     checks = {
         "four_submissions_return_one_provider_id": (
             len(result["statuses"]) == 4
@@ -730,6 +625,19 @@ def run_notify003(
     roles = {name: value["service_role"] for name, value in config.items()}
     checks = {
         "backlog_and_requeue_contract_tests": bool(tests["passed"]),
+        "enabled_worker_and_complete_replicas": all(
+            value["ready_replicas"] == value["desired_replicas"]
+            and (
+                value["desired_replicas"] > 0
+                or name == "gpu-fault-telemetry-spool-worker"
+            )
+            for name, value in config.items()
+        ),
+        "delivery_enabled": all(
+            str(value[key]).strip().lower() in {"1", "true", "yes", "on"}
+            for value in config.values()
+            for key in ("dispatcher_enabled", "async_delivery")
+        ),
         "only_worker_has_worker_role": (
             roles["gpu-fault-control-worker"] == "worker"
             and roles["gpu-fault-api-ha"] == "ingress"
@@ -753,15 +661,31 @@ def run_notify003(
             value["replicas_agree"] for value in config.values()
         ),
     }
+    route_drill = (
+        site.pod_json(
+            "cpu",
+            target,
+            control_worker_pod(site, target),
+            REQUEUE_PROBE.read_text(encoding="utf-8"),
+            timeout=180,
+        )
+        if all(checks.values())
+        else {}
+    )
+    checks["public_requeue_route_flow"] = requeue_route_errors(route_drill) == []
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "deployment_config": config,
         "focused_tests": tests,
         "focused_test_returncode": tests["returncode"],
+        "public_route_drill": route_drill,
+        "public_route_errors": requeue_route_errors(route_drill),
         "limitations": [
-            "The backlog is exercised in an isolated in-process store while live "
-            "Deployments prove the production service-role assembly."
+            "The installed incident router and authorization middleware exercise "
+            "send/requeue/dispatch over ASGI HTTP in an isolated in-memory Store. "
+            "The notifier is local; no production backlog or SES is mutated.",
+            "Live Deployments separately prove the production service-role assembly.",
         ],
     }
 
@@ -769,10 +693,13 @@ def run_notify003(
 SES_DENIAL_PROBE = r"""
 import json
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 try:
-    boto3.client("sesv2").send_email(
+    boto3.client("sesv2", config=Config(
+        connect_timeout=5, read_timeout=10, retries={"total_max_attempts": 1}
+    )).send_email(
         FromEmailAddress="gpu-fault-probe@example.invalid",
         Destination={"ToAddresses": ["gpu-fault-probe@example.invalid"]},
         Content={"Simple": {
@@ -792,18 +719,36 @@ except ClientError as exc:
 def run_notify004(
     site: IdentitySite,
     target: ClusterTarget,
+    *,
+    maintenance_window_end: datetime | None = None,
 ) -> dict[str, Any]:
-    pod = site.any_executor_pod(target)
-    result = site.pod_json("gpu", target, pod, SES_DENIAL_PROBE)
+    pods = site.ready_pods("gpu", "gpu-fault-cluster-executor", target)
+    if not pods:
+        raise NotificationAcceptanceError("no Ready Executor Pod")
+    results = {}
+    for pod in pods:
+        if (
+            maintenance_window_end is not None
+            and datetime.now(timezone.utc) >= maintenance_window_end
+        ):
+            raise NotificationAcceptanceError(
+                "maintenance window ended before SES denial probe"
+            )
+        results[pod] = site.pod_json("gpu", target, pod, SES_DENIAL_PROBE, timeout=30)
     checks = {
-        "executor_ses_denied": result.get("result") == "DENIED",
-        "denial_is_access_control": str(result.get("code") or "").lower()
-        in {"accessdenied", "accessdeniedexception", "unauthorizedoperation"},
+        "executor_ses_denied": all(
+            result.get("result") == "DENIED" for result in results.values()
+        ),
+        "denial_is_access_control": all(
+            str(result.get("code") or "").lower()
+            in {"accessdenied", "accessdeniedexception", "unauthorizedoperation"}
+            for result in results.values()
+        ),
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
-        "provider_result": result,
+        "provider_results": results,
         "limitations": [
             "The request uses invalid recipient identities and must be rejected "
             "by IAM before SES message validation."
@@ -826,12 +771,12 @@ GPU_UUID = re.compile(
 # host-resource scoped ("<cluster> <node> host_gpu_utilization_percent"), so
 # filtering on the fixture's job name only finds the ones whose body happens to
 # list the workload -- and it hides the notifications this case has to count.
-needle, observed_after_text, *nodes = sys.argv[1:]
+cluster_id, needle, observed_after_text, *nodes = sys.argv[1:]
 observed_after = datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
 store = ApplicationContext.from_environment().store
 records = []
 for notification in store.list_notifications():
-    if notification.created_at < observed_after:
+    if notification.created_at < observed_after or notification.cluster_name != cluster_id:
         continue
     searchable = "\n".join(
         (
@@ -840,7 +785,12 @@ for notification in store.list_notifications():
             notification.body_text,
         )
     )
-    matched = sorted(node for node in nodes if node in searchable)
+    if "LOW_GPU_UTILIZATION" not in searchable or not any(node in searchable for node in nodes):
+        continue
+    incident = store.get_incident(notification.incident_id)
+    if incident.cluster_id != cluster_id:
+        raise RuntimeError("notification incident cluster identity differs")
+    matched = sorted(set(nodes).intersection(incident.node_ids))
     if not matched:
         continue
     result = store.get_notification_result(notification.notification_id)
@@ -955,123 +905,6 @@ print(json.dumps({
 """
 
 
-def low_utilization_manifest(
-    *,
-    name: str,
-    nodes: tuple[str, ...],
-    image: str,
-) -> dict[str, Any]:
-    command = [
-        "/bin/bash",
-        "-ceu",
-        (
-            "python - <<'PY'\n"
-            "import multiprocessing\n"
-            "import time\n"
-            "def burn():\n"
-            "    value = 1\n"
-            "    while True:\n"
-            "        value = (value * 1103515245 + 12345) & 0x7fffffff\n"
-            "workers = [multiprocessing.Process(target=burn, daemon=True) "
-            "for _ in range(8)]\n"
-            "for worker in workers: worker.start()\n"
-            "time.sleep(1800)\n"
-            "PY"
-        ),
-    ]
-    container = {
-        "name": "pytorch",
-        "image": image,
-        "imagePullPolicy": "IfNotPresent",
-        "command": command,
-        "resources": {
-            "requests": {
-                "cpu": "8",
-                "memory": "2Gi",
-                "nvidia.com/gpu": "1",
-            },
-            "limits": {
-                "cpu": "16",
-                "memory": "4Gi",
-                "nvidia.com/gpu": "1",
-            },
-        },
-    }
-    if len(nodes) == 1:
-        return {
-            "apiVersion": "batch/v1",
-            "kind": "Job",
-            "metadata": {"name": name},
-            "spec": {
-                "template": {
-                    "metadata": {"labels": {"app": name}},
-                    "spec": {
-                        "restartPolicy": "Never",
-                        "nodeName": nodes[0],
-                        "containers": [container],
-                    },
-                }
-            },
-        }
-    affinity = {
-        "nodeAffinity": {
-            "requiredDuringSchedulingIgnoredDuringExecution": {
-                "nodeSelectorTerms": [
-                    {
-                        "matchExpressions": [
-                            {
-                                "key": "kubernetes.io/hostname",
-                                "operator": "In",
-                                "values": list(nodes),
-                            }
-                        ]
-                    }
-                ]
-            }
-        },
-        "podAntiAffinity": {
-            "requiredDuringSchedulingIgnoredDuringExecution": [
-                {
-                    "labelSelector": {"matchLabels": {"app": name}},
-                    "topologyKey": "kubernetes.io/hostname",
-                }
-            ]
-        },
-    }
-    template = {
-        "metadata": {"labels": {"app": name}},
-        "spec": {
-            "restartPolicy": "Never",
-            "affinity": affinity,
-            "containers": [container],
-        },
-    }
-    # One template object per role. Sharing the dict made yaml.safe_dump emit
-    # an alias, and gpu-training-submit then injected role/rank-offset into the
-    # same object twice: Master ended up `role=worker, rank-offset=1` and the
-    # Completion Watcher counted ranks that did not exist.
-    return {
-        "apiVersion": "kubeflow.org/v1",
-        "kind": "PyTorchJob",
-        "metadata": {"name": name},
-        "spec": {
-            "runPolicy": {"cleanPodPolicy": "All"},
-            "pytorchReplicaSpecs": {
-                "Master": {
-                    "replicas": 1,
-                    "restartPolicy": "Never",
-                    "template": copy.deepcopy(template),
-                },
-                "Worker": {
-                    "replicas": 2,
-                    "restartPolicy": "Never",
-                    "template": copy.deepcopy(template),
-                },
-            },
-        },
-    }
-
-
 def manifest_alias_errors(document: dict[str, Any]) -> list[str]:
     """Why ``document`` would not survive a per-role metadata injection.
 
@@ -1174,23 +1007,29 @@ def foreign_gpu_reservations(
     holders = []
     for item in value.get("items", []):
         spec = item.get("spec", {})
-        if item.get("status", {}).get("phase") != "Running":
-            continue
-        # A Pod already being deleted still reports phase Running while its
-        # containers stop; it is releasing the GPU, not holding it (live
-        # 2026-09-07: phase one's own Pod tripped this check for phase two).
-        if item.get("metadata", {}).get("deletionTimestamp"):
+        if item.get("status", {}).get("phase") in {"Succeeded", "Failed"}:
             continue
         if spec.get("nodeName") not in nodes:
             continue
-        reserved = sum(
-            int(
-                container.get("resources", {})
-                .get("requests", {})
-                .get("nvidia.com/gpu", 0)
-                or 0
+
+        def gpu_request(container: dict[str, Any]) -> int:
+            resources = container.get("resources") or {}
+            return int(
+                (resources.get("requests") or {}).get(
+                    "nvidia.com/gpu",
+                    (resources.get("limits") or {}).get("nvidia.com/gpu", 0),
+                )
             )
-            for container in spec.get("containers", [])
+
+        reserved = max(
+            sum(gpu_request(container) for container in spec.get("containers", [])),
+            max(
+                (
+                    gpu_request(container)
+                    for container in spec.get("initContainers", [])
+                ),
+                default=0,
+            ),
         )
         if not reserved:
             continue
@@ -1245,11 +1084,13 @@ def wait_low_utilization_latch_disarmed(
 def wait_low_utilization_notifications(
     regional: Any,
     *,
+    cluster_id: str,
     needle: str,
     nodes: tuple[str, ...],
     observed_after: datetime,
     deadline_seconds: int,
     poll_seconds: int = 30,
+    settle_seconds: int = 60,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Poll until every selected node has reported, or the deadline passes.
 
@@ -1265,9 +1106,11 @@ def wait_low_utilization_notifications(
 
     deadline = time.monotonic() + deadline_seconds
     polls: list[dict[str, Any]] = []
+    covered_since: float | None = None
     while True:
         query = regional.cpu_python(
             NOTIFICATION_QUERY_PROBE,
+            cluster_id,
             needle,
             observed_after.isoformat(),
             *nodes,
@@ -1281,9 +1124,59 @@ def wait_low_utilization_notifications(
                 "reported_nodes": sorted(reported),
             }
         )
-        if set(nodes) <= reported or time.monotonic() >= deadline:
+        complete = set(nodes) == reported and all(
+            item.get("status") == "SENT"
+            and item.get("provider_message_id_present") is True
+            for item in records
+        )
+        if complete:
+            covered_since = time.monotonic() if covered_since is None else covered_since
+        else:
+            covered_since = None
+        if (
+            len(records) > len(nodes)
+            or time.monotonic() >= deadline
+            or (
+                covered_since is not None
+                and time.monotonic() - covered_since >= settle_seconds
+            )
+        ):
             return records, polls
         time.sleep(poll_seconds)
+
+
+def delete_notification_workload(
+    regional: Any, fixture: ManagedWorkloadFixture
+) -> None:
+    fixture.delete()
+    deadline = time.monotonic() + 300
+    while fixture.pods() and time.monotonic() < deadline:
+        time.sleep(5)
+    if (
+        fixture.pods()
+        or regional.kubectl(
+            "gpu",
+            "get",
+            fixture.resource,
+            fixture.name,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ).strip()
+    ):
+        raise NotificationAcceptanceError("test workload resources remain")
+
+
+def cleanup_notification_workloads(
+    regional: Any, fixtures: Sequence[ManagedWorkloadFixture]
+) -> list[str]:
+    errors = []
+    for fixture in fixtures:
+        try:
+            delete_notification_workload(regional, fixture)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return errors
 
 
 def run_notify005(
@@ -1294,8 +1187,19 @@ def run_notify005(
     case_dir: Path,
     attempt: int,
     training_image: str,
+    maintenance_window_end: datetime | None = None,
+    planned_nodes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     regional = site.regional(target)
+    baseline_nodes = {node: regional.node_snapshot(node) for node in nodes}
+    for node, value in baseline_nodes.items():
+        errors = node_errors(value)
+        if planned_nodes is not None and value.get("uid") != (
+            planned_nodes.get(node) or {}
+        ).get("uid"):
+            errors.append("node UID differs from the approved plan")
+        if errors:
+            raise NotificationAcceptanceError(f"{node}: " + "; ".join(errors))
     worker_pods = site.ready_pods("cpu", "gpu-fault-control-worker", target)
     if not worker_pods:
         raise NotificationAcceptanceError("no Ready control-worker Pod")
@@ -1332,6 +1236,7 @@ def run_notify005(
     # hours earlier is exactly the one that would suppress this run.
     baseline = regional.cpu_python(
         NOTIFICATION_QUERY_PROBE,
+        target.cluster_id,
         "",
         datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
         *nodes,
@@ -1342,6 +1247,22 @@ def run_notify005(
     result: dict[str, Any] = {"verdict": "FAIL"}
     try:
         for count, selected in ((1, nodes[:1]), (3, nodes)):
+            if (
+                maintenance_window_end is not None
+                and datetime.now(timezone.utc) >= maintenance_window_end
+            ):
+                raise NotificationAcceptanceError(
+                    "maintenance window ended before workload creation"
+                )
+            for node in selected:
+                current = regional.node_snapshot(node)
+                if (
+                    node_errors(current)
+                    or current["uid"] != baseline_nodes[node]["uid"]
+                ):
+                    raise NotificationAcceptanceError(
+                        "selected node identity or readiness changed"
+                    )
             # Foreign GPU holders first, because that latch never clears and
             # waiting on it would spend the whole gap to report the wrong cause.
             holders = foreign_gpu_reservations(regional, selected)
@@ -1387,15 +1308,19 @@ def run_notify005(
                     expected_pods=count,
                     expected_gpu_count=count,
                 ),
+                state_path=case_dir / f"{name}.ownership.json",
             )
             fixtures.append(fixture)
             fixture.submit()
             metadata_errors = low_utilization_metadata_errors(
                 fixture.workload(), expected_pods=count
             )
+            if metadata_errors:
+                raise NotificationAcceptanceError("; ".join(metadata_errors))
             running = wait_running_pods(fixture, count)
             records, polls = wait_low_utilization_notifications(
                 regional,
+                cluster_id=target.cluster_id,
                 needle=name,
                 nodes=selected,
                 observed_after=phase_started_at,
@@ -1419,52 +1344,16 @@ def run_notify005(
                     *selected,
                 )["records"]
             observations.append(observation)
-            fixture.delete()
-            # The PyTorchJob is gone once delete returns; its Pods may still be
-            # terminating on the node, and the next phase must not see them.
-            deadline = time.monotonic() + 300
-            while fixture.pods() and time.monotonic() < deadline:
-                time.sleep(5)
-        single_count = len(observations[0]["notifications"])
-        three_count = len(observations[1]["notifications"])
-        observed = [item for value in observations for item in value["notifications"]]
+            observation["checks"] = phase_checks(observation)
+            if not all(observation["checks"].values()):
+                raise NotificationAcceptanceError(
+                    f"{count}-node aggregation phase failed"
+                )
+            delete_notification_workload(regional, fixture)
         checks = {
-            # Master and Worker must each carry their own role and rank offset;
-            # a shared template object once gave Master `role=worker,
-            # rank-offset=1`, and the three-node phase then counted wrong.
-            "replica_metadata_injected_per_role": all(
-                not value["metadata_errors"] for value in observations
-            ),
-            # The 判定 is an upper bound -- "通知条数按节点数或任务数增长（≤3 条），
-            # 不是按 GPU 数（不应是 24 条）" -- so these three are stated as bounds
-            # rather than as an exact count.
-            "single_node_count_at_most_one": single_count <= 1,
-            "three_node_count_at_most_node_count": three_count <= len(nodes),
-            "three_node_count_not_twenty_four": three_count != 24,
-            # An upper bound on its own is satisfied by a detector that never
-            # fires, so every node the fixture occupied has to have reported
-            # within its own phase.
-            "every_selected_node_reported_in_its_phase": all(
-                {
-                    node
-                    for item in value["notifications"]
-                    for node in item["matched_nodes"]
-                }
-                >= set(value["nodes"])
-                for value in observations
-            ),
-            # Each message speaks for exactly one node, which is why the count
-            # tracks nodes rather than GPUs.
-            "every_notification_is_node_scoped": all(
-                len(item["matched_nodes"]) == 1 for item in observed
-            ),
-            # And the aggregation itself: the sustained signal is tracked per
-            # GPU, so an 8-GPU node raises 8 findings. One message naming
-            # several of them is the direct evidence that they were folded
-            # together instead of mailed one by one -- that is where the 24 in
-            # the 判定 would have come from.
-            "notifications_aggregate_multiple_gpu_devices": bool(observed)
-            and all(len(item["gpu_devices"]) > 1 for item in observed),
+            f"{value['node_count']}n/{key}": passed
+            for value in observations
+            for key, passed in value["checks"].items()
         }
         result = {
             "verdict": "PASS" if all(checks.values()) else "FAIL",
@@ -1475,13 +1364,12 @@ def run_notify005(
             "pre_existing_notifications": pre_existing,
             "observations": observations,
         }
+    except Exception as exc:
+        result.update(
+            {"error": f"{type(exc).__name__}: {exc}", "observations": observations}
+        )
     finally:
-        cleanup_errors = []
-        for fixture in fixtures:
-            try:
-                fixture.delete()
-            except Exception as exc:
-                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        cleanup_errors = cleanup_notification_workloads(regional, fixtures)
         result["cleanup_errors"] = cleanup_errors
         if cleanup_errors:
             result["verdict"] = "FAIL"
@@ -1568,6 +1456,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     install_site_profile()
     arguments = parser().parse_args()
+    if arguments.case == "GF-REGIONAL-NOTIFY-002":
+        raise NotificationAcceptanceError(
+            "NOTIFY-002 is superseded by NOTIFY-001 and cannot execute"
+        )
     os.umask(0o077)
     install_abort_signals()
     site = IdentitySite(arguments.site)
@@ -1586,6 +1478,8 @@ def main() -> int:
     # have earned its PASS against the same pair, and the result carries it so
     # the next case can demand the same.
     identity = site.regional(target).evidence_identity()
+    if not identity["release_id"].strip():
+        raise NotificationAcceptanceError("the deployed release identity is missing")
     predecessor_id, path = predecessor_path(
         arguments.run_dir,
         arguments.case,
@@ -1602,6 +1496,10 @@ def main() -> int:
     environment = {
         "GPU_FAULT_NOTIFICATION_CASE": arguments.case,
         "GPU_FAULT_SITE_FILE": str(arguments.site.resolve()),
+        "GPU_FAULT_CONTROL_KUBECONFIG": str(site.cpu_kubeconfig),
+        "KUBECONFIG": str(site.gpu_kubeconfig),
+        "SITE_INPUTS_SHA256": hashlib.sha256(arguments.site.read_bytes()).hexdigest(),
+        "DEPLOYED_RELEASE_ID": identity["release_id"],
         "GPU_FAULT_CLUSTER_ID": target.cluster_id,
         "GPU_FAULT_TARGET_NODES": ",".join(nodes),
     }
@@ -1618,21 +1516,46 @@ def main() -> int:
             # while the source digest still matches.
             case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             record_focused_tests(details, notify003_focused_tests(case_dir))
+        preflight_errors = []
+        if predecessor.get("valid") is not True:
+            preflight_errors.append("predecessor evidence is not valid")
+        if not site.ready_pods("cpu", "gpu-fault-control-worker", target):
+            preflight_errors.append("no Ready control-worker Pod")
+        if arguments.case == "GF-REGIONAL-NOTIFY-004" and not site.ready_pods(
+            "gpu", "gpu-fault-cluster-executor", target
+        ):
+            preflight_errors.append("no Ready Executor Pod")
+        if arguments.case == "GF-REGIONAL-NOTIFY-003" and (
+            details["focused_tests"].get("passed") is not True
+        ):
+            preflight_errors.append("focused tests failed")
+        if arguments.case == "GF-REGIONAL-NOTIFY-005":
+            details["node_baseline"] = {
+                node: site.regional(target).node_snapshot(node) for node in nodes
+            }
+            preflight_errors.extend(
+                f"{node}: {error}"
+                for node, snapshot in details["node_baseline"].items()
+                for error in node_errors(snapshot)
+            )
+        details["preflight_errors"] = preflight_errors
         plan = build_plan(
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
             confirmation=confirmation,
+            arguments=arguments,
+            preflight_passed=not preflight_errors,
             environment=environment,
             details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if not preflight_errors else 1
     if arguments.confirm != confirmation:
         raise NotificationAcceptanceError(
             f"confirmation must be exactly {confirmation}"
         )
-    authorize_execution(
+    deadline = authorize_execution(
         arguments,
         case_id=arguments.case,
         confirmation=confirmation,
@@ -1651,6 +1574,8 @@ def main() -> int:
                 run_dir=arguments.run_dir,
                 receipt_evidence=arguments.receipt_evidence,
                 ses_window_evidence=arguments.ses_window_evidence,
+                maintenance_window_end=deadline,
+                release_id=identity["release_id"],
             ),
             "GF-REGIONAL-NOTIFY-002": lambda: run_notify002(
                 site,
@@ -1661,7 +1586,9 @@ def main() -> int:
             "GF-REGIONAL-NOTIFY-003": lambda: run_notify003(
                 site, target, case_dir=case_dir
             ),
-            "GF-REGIONAL-NOTIFY-004": lambda: run_notify004(site, target),
+            "GF-REGIONAL-NOTIFY-004": lambda: run_notify004(
+                site, target, maintenance_window_end=deadline
+            ),
             "GF-REGIONAL-NOTIFY-005": lambda: run_notify005(
                 site,
                 target,
@@ -1669,6 +1596,10 @@ def main() -> int:
                 case_dir=case_dir,
                 attempt=arguments.attempt,
                 training_image=arguments.training_image,
+                maintenance_window_end=deadline,
+                planned_nodes=json.loads((case_dir / "plan.json").read_text())[
+                    "details"
+                ].get("node_baseline", {}),
             ),
         }
         outcome = handlers[arguments.case]()

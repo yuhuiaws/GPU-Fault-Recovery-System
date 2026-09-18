@@ -58,6 +58,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     predecessor_evidence,
     required,
     run_case_main,
@@ -447,7 +448,7 @@ def worker_metrics(regional: RegionalLiveFixture) -> list[str]:
             "-i",
             str(pod["name"]),
             "--",
-            "python3",
+            component_python("cpu"),
             "-",
             str(WORKER_METRICS_PORT),
             input_text=METRICS_PROBE,
@@ -669,6 +670,7 @@ class _LiveRun:
     holder: HostProbeFixture
     injector: HostProbeFixture
     window: env_window.Settings
+    maintenance_window_end: datetime | None = None
     incident_id: str = ""
     support_incident_id: str = ""
     workflow_request_id: str = ""
@@ -688,9 +690,12 @@ class _LiveRun:
     cadence_sample: dict[str, Any] = field(default_factory=dict)
 
 
-def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
+def _probe(
+    settings: Settings, run_id: str, script: Path, case_dir: Path
+) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -705,13 +710,13 @@ def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
 
 def _open_window(run: _LiveRun) -> dict[str, Any]:
     report = env_window.survey(run.regional)
+    run.window_opened = True
     record = env_window.open_window(
         run.window,
         run.regional,
         report,
         run.settings.assignments(),
     )
-    run.window_opened = True
     write_json_atomic(
         run.case_dir / "env-window-open.json",
         env_window.without_survey(record),
@@ -720,6 +725,7 @@ def _open_window(run: _LiveRun) -> dict[str, Any]:
 
 
 def arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
+    run.holder_armed = True
     armed = run.holder.execute(
         "arm-holder",
         "--device",
@@ -734,7 +740,6 @@ def arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
         run.holder.host_script,
         timeout=120,
     )
-    run.holder_armed = True
     write_json_atomic(run.case_dir / "holder-armed.json", armed)
     status = run.holder.execute(
         "holder-status",
@@ -755,6 +760,10 @@ def arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
 def _absorb(run: _LiveRun, target_bdf: str) -> dict[str, Any]:
     """XID 79 on the same node, after the lifetime failure."""
 
+    if run.maintenance_window_end is None or (
+        datetime.now(timezone.utc) >= run.maintenance_window_end
+    ):
+        raise RegionalFixtureError("maintenance window ended before absorb injection")
     marker = f"{run.marker}-absorb"
     started = datetime.now(timezone.utc)
     injection = run.injector.execute(
@@ -805,8 +814,8 @@ def _prepare_live_run(
         run_id=run_id,
         # One script per fixture, and the fixture identity is a digest of
         # (case, run, node): two fixtures on one node need two run ids.
-        holder=_probe(settings, f"{run_id}-hold", HOLDER_PROBE_SCRIPT),
-        injector=_probe(settings, f"{run_id}-inject", INJECT_PROBE_SCRIPT),
+        holder=_probe(settings, f"{run_id}-hold", HOLDER_PROBE_SCRIPT, case_dir),
+        injector=_probe(settings, f"{run_id}-inject", INJECT_PROBE_SCRIPT, case_dir),
         window=env_window.Settings(
             baseline=case_dir / "env-window-baseline.json",
             rollout_timeout_seconds=600,
@@ -872,6 +881,10 @@ def _open_and_arm(run: _LiveRun) -> None:
 
 
 def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
+    if run.maintenance_window_end is None or (
+        datetime.now(timezone.utc) >= run.maintenance_window_end
+    ):
+        raise RegionalFixtureError("maintenance window ended before injection")
     run.injected_at = datetime.now(timezone.utc)
     injection = run.injector.execute(
         "write-xid46",
@@ -985,6 +998,8 @@ def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
     node_after = regional.node_snapshot(settings.node)
     write_json_atomic(case_dir / "node-after.json", node_after)
     errors.extend(verdicts.quarantine_errors(node_after))
+    if errors:
+        return errors
 
     absorb = _absorb(run, run.target_bdf)
     errors.extend(
@@ -1041,6 +1056,7 @@ def execute_case(
     calls are. Every cleanup failure downgrades the verdict to FAIL."""
 
     run = _prepare_live_run(settings, run_dir, attempt)
+    run.maintenance_window_end = maintenance_window_end
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -1049,12 +1065,15 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
         _baseline_host(run, maintenance_window_end)
         _open_and_arm(run)
         state = _inject_and_observe(run)
         errors = _control_plane_errors(run, state)
         errors.extend(_data_plane_errors(run, state))
-        errors.extend(_escalation_and_absorb_errors(run))
+        if not errors:
+            errors.extend(_escalation_and_absorb_errors(run))
         provider_errors, metrics = _provider_and_metric_errors(run)
         errors.extend(provider_errors)
         result.update(

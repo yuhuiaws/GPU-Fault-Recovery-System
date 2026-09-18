@@ -35,7 +35,10 @@ from gpu_fault.models import (
     WorkflowEventKind,
     WorkflowOperation,
     WorkflowStatus,
+    WorkflowStepStatus,
 )
+from gpu_fault.orchestration.arbitration import RecoveryArbiter
+from gpu_fault.orchestration.families.conflicts import NodeConflictService
 from gpu_fault.regional import RemoteActionCommand
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store.shared.errors import StaleWriteError
@@ -405,3 +408,94 @@ def test_an_escalated_incidents_blocked_record_waits_for_the_operator() -> None:
     dispatcher(store).run_once()
 
     assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED
+
+
+@pytest.mark.parametrize("blocked_kind", [None, *BlockedKind])
+@pytest.mark.parametrize(
+    "status", [WorkflowStepStatus.WAITING, WorkflowStepStatus.FAILED]
+)
+def test_recovered_incident_does_not_resolve_unknown_physical_work(
+    blocked_kind: BlockedKind | None, status: WorkflowStepStatus
+) -> None:
+    store = build_store()
+    incident, workflow = settled_incident_pair(
+        store,
+        blocked_kind=blocked_kind,
+        step_executions=[
+            workflow_step_execution(
+                1,
+                WorkflowOperation.RESTART_NODE,
+                status,
+                details={"outcome_unknown": True, "manual_confirmation_required": True},
+            )
+        ],
+        remediation_budget_claims=["region"],
+    )
+    command = store.ensure_remote_command(
+        RemoteActionCommand(
+            command_id="remote-terminal-unknown",
+            cluster_id=incident.cluster_id,
+            workflow_request_id=WORKFLOW,
+            incident_id=INCIDENT,
+            step_index=1,
+            fencing_token=workflow.fencing_token,
+            idempotency_key=f"{WORKFLOW}/1/RESTART_NODE",
+            step=workflow.official_steps[1],
+            workflow=workflow,
+            incident=incident,
+            status=RemoteCommandStatus.FAILED,
+        )
+    )
+
+    for _ in range(2):
+        assert (
+            close_compile_blocked_workflows(store, now=datetime.now(timezone.utc)) == []
+        )
+
+    assert store.get_workflow(WORKFLOW) == workflow, (
+        "closed incident and terminal command bookkeeping cannot release physical occupancy"
+    )
+    assert store.get_remote_command(command.command_id) == command
+    assert store.get_incident(INCIDENT) == incident
+    assert reconcile_events(store) == []
+    if blocked_kind in {BlockedKind.NEEDS_OPERATOR, BlockedKind.INTERNAL_ERROR}:
+        occupying = NodeConflictService(
+            store, RecoveryArbiter()
+        ).active_node_exclusive_workflow(incident.cluster_id, set(incident.node_ids))
+        assert occupying is not None and occupying.request_id == WORKFLOW
+
+
+@pytest.mark.parametrize("guard", ["lease", "waiting", "occupying", "source-plan"])
+def test_settled_sweep_keeps_unproven_work_and_source_plan_reconciliation(guard: str):
+    now = datetime.now(timezone.utc)
+    overrides = {
+        "lease": {"execution_lease_expires_at": now + timedelta(minutes=1)},
+        "waiting": {
+            "step_executions": [
+                workflow_step_execution(
+                    1, WorkflowOperation.RESTART_NODE, WorkflowStepStatus.WAITING
+                )
+            ]
+        },
+        "occupying": {"blocked_kind": BlockedKind.INTERNAL_ERROR, "execution_epoch": 1},
+        "source-plan": {"source_plan_id": "plan-requires-reconcile"},
+    }
+    store = build_store()
+    _, workflow = settled_incident_pair(store, **overrides[guard])
+
+    assert close_compile_blocked_workflows(store, now=now) == []
+    assert store.get_workflow(WORKFLOW) == workflow, guard
+
+
+@pytest.mark.parametrize("state", [IncidentState.RECOVERED, IncidentState.ESCALATED])
+def test_compile_time_shape_cannot_hide_a_live_execution_lease(state: IncidentState):
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    _, workflow = compile_blocked_pair(
+        store,
+        incident_state=state,
+        execution_lease_expires_at=now + timedelta(minutes=1),
+    )
+
+    assert close_compile_blocked_workflows(store, now=now) == []
+    assert store.get_workflow(WORKFLOW) == workflow

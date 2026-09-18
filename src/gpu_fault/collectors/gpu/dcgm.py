@@ -32,6 +32,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSource,
     GpuMetricsThresholds,
 )
+from gpu_fault.gpu_temperature_policy import temperature_decision
 from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
@@ -437,6 +438,8 @@ class DcgmMetricsCollector:
         # duty cycle (F2).
         self._previous_values: OrderedDict[str, tuple[float, datetime]] = OrderedDict()
         self._candidate_streaks: dict[str, int] = {}
+        self._candidate_semantics: dict[str, str] = {}
+        self._delivered_candidate_semantics: dict[str, str] = {}
         self._implausible_duty_cycle_keys: OrderedDict[str, datetime] = OrderedDict()
         self._last_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
@@ -548,6 +551,16 @@ class DcgmMetricsCollector:
             # BUFFERED exactly as for DELIVERED; only a batch that went nowhere
             # keeps the edge open (ARCH-G3).
             self._last_delivered_at = timestamp
+            self._delivered_candidate_semantics = {
+                key: (
+                    self._candidate_semantics[key]
+                    if streak >= self.edge_confirmation_samples
+                    else self._delivered_candidate_semantics[key]
+                )
+                for key, streak in self._candidate_streaks.items()
+                if streak >= self.edge_confirmation_samples
+                or key in self._delivered_candidate_semantics
+            }
             if (
                 self._next_health_summary_at is None
                 or timestamp >= self._next_health_summary_at
@@ -704,15 +717,15 @@ class DcgmMetricsCollector:
             )
         return False
 
-    def _candidate_keys(self, batch: GpuMetricBatch) -> tuple[set[str], set[str]]:
-        """The batch's candidate keys, and the keys it carries no news about.
+    def _candidate_keys(self, batch: GpuMetricBatch) -> tuple[dict[str, str], set[str]]:
+        """Candidate semantics, and the keys this batch carries no news about.
 
         The second set holds duty-cycle counters the exporter has not refreshed
         since the previous scrape. They are neither candidates nor recoveries:
         their streak is carried over untouched.
         """
 
-        candidates: set[str] = set()
+        candidates: dict[str, str] = {}
         carried_over: set[str] = set()
         values_by_device: dict[str, dict[str, float]] = {}
         for sample in batch.samples:
@@ -720,27 +733,21 @@ class DcgmMetricsCollector:
             values_by_device.setdefault(device, {})[sample.canonical_name] = (
                 sample.value
             )
+        for sample in batch.samples:
+            device = sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
             name = sample.canonical_name
-            breached = (
-                (
-                    name == "gpu_temperature_c"
-                    and sample.value >= self.thresholds.gpu_temperature_warning_c
-                )
-                or (
-                    name == "memory_temperature_c"
-                    and sample.value >= self.thresholds.memory_temperature_warning_c
-                )
-                or (
-                    name
-                    in {
-                        "retired_pages_pending",
-                        "row_remap_failure",
-                        "row_remap_pending",
-                    }
-                    and sample.value > 0
-                )
-                or (name == "xid_last_error" and sample.value > 0)
+            temperature = temperature_decision(
+                self.thresholds, sample, values_by_device[device]
             )
+            breached = (
+                name
+                in {
+                    "retired_pages_pending",
+                    "row_remap_failure",
+                    "row_remap_pending",
+                }
+                and sample.value > 0
+            ) or (name == "xid_last_error" and sample.value > 0)
             duty_cycle, no_new_value = self._grade_duty_cycle(sample, batch.observed_at)
             if no_new_value:
                 carried_over.add(self._sample_key(sample))
@@ -748,8 +755,12 @@ class DcgmMetricsCollector:
                 sample, duty_cycle, batch.observed_at
             ):
                 breached = True
-            if breached:
-                candidates.add(self._sample_key(sample))
+            if temperature is not None:
+                candidates[self._sample_key(sample)] = (
+                    f"{temperature['severity']}:{temperature['automatic_action']}"
+                )
+            elif breached:
+                candidates[self._sample_key(sample)] = "breached"
         for device, values in values_by_device.items():
             power = values.get("power_usage_w")
             limit = values.get("power_limit_w")
@@ -763,8 +774,8 @@ class DcgmMetricsCollector:
                 and utilization
                 >= self.thresholds.power_correlation_min_utilization_percent
             ):
-                candidates.add(f"{device}/power_limit_correlation")
-        return candidates, carried_over - candidates
+                candidates[f"{device}/power_limit_correlation"] = "breached"
+        return candidates, carried_over - candidates.keys()
 
     @staticmethod
     def _device_keys(batch: GpuMetricBatch) -> set[str]:
@@ -817,27 +828,44 @@ class DcgmMetricsCollector:
             reasons.append("health-summary")
 
         candidates, carried_over = self._candidate_keys(batch)
-        confirmed_candidates = {
-            key
-            for key, streak in self._candidate_streaks.items()
-            if streak >= self.edge_confirmation_samples
-        }
         recovered = {
             key
-            for key in confirmed_candidates - candidates - carried_over
+            for key in self._delivered_candidate_semantics.keys()
+            - candidates.keys()
+            - carried_over
             # A candidate whose device vanished has not recovered.
             if key.rsplit("/", 1)[0] not in lost_devices
         }
         if recovered:
             reasons.append("candidate-recovered")
-        self._candidate_streaks, confirmed = _merged_candidate_streaks(
-            self._candidate_streaks,
-            candidates,
+        # A warning streak cannot confirm a different action. Keep the last
+        # delivered semantics until a new state is confirmed or really clears.
+        previous_streaks = {
+            key: streak
+            for key, streak in self._candidate_streaks.items()
+            if key in carried_over
+            or candidates.get(key) == self._candidate_semantics.get(key)
+        }
+        self._candidate_streaks, _ = _merged_candidate_streaks(
+            previous_streaks,
+            set(candidates),
             carried_over,
             self.edge_confirmation_samples,
             self.state_max_keys,
         )
-        reasons.extend("candidate-confirmed" for _ in range(confirmed))
+        self._candidate_semantics = {
+            key: candidates[key]
+            if key in candidates
+            else self._candidate_semantics[key]
+            for key in self._candidate_streaks
+        }
+        if any(
+            streak >= self.edge_confirmation_samples
+            and self._delivered_candidate_semantics.get(key)
+            != self._candidate_semantics[key]
+            for key, streak in self._candidate_streaks.items()
+        ):
+            reasons.append("candidate-confirmed")
 
         for sample in batch.samples:
             key = self._sample_key(sample)

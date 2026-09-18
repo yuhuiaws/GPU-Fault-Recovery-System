@@ -130,6 +130,13 @@ def _validated_result(
             TypeError("executor result must be a mapping"),
         )
     result = dict(value)
+    if result.get("id") != case["id"]:
+        return _failure_result(
+            case,
+            ValueError(
+                "executor result case identity does not match the scheduled case"
+            ),
+        )
     status = result.get("status")
     if status not in RESULT_STATUSES:
         return _failure_result(

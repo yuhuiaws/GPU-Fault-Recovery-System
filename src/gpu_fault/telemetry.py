@@ -38,7 +38,7 @@ class EvidenceKind(StrEnum):
     NODE_LOGS = "NODE_LOGS"
     NVIDIA_KERNEL = "NVIDIA_KERNEL"
     FABRIC_MANAGER_LOG = "FABRIC_MANAGER_LOG"
-    HMA = "HMA"
+    HMA = "HMA"  # Historical raw evidence, no active HMA collector.
     TRAINING_PROGRESS = "TRAINING_PROGRESS"
     WORKLOAD_LOG = "WORKLOAD_LOG"
     ADMIN_ACTION = "ADMIN_ACTION"

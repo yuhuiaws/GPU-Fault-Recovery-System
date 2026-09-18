@@ -318,8 +318,10 @@ def test_declaration_is_refused_on_a_topology_mismatch() -> None:
 def _record(**overrides: Any) -> dict[str, Any]:
     record = {
         "node": NODE,
+        "cluster_id": "cluster-a",
         "declared_at": "2026-09-08T00:00:00Z",
         "baseline": {"labels": {SPARE_LABEL: None}, "unschedulable": False},
+        "pre_declaration_survey": {"node": _snapshot()},
     }
     record.update(overrides)
     return record
@@ -406,7 +408,11 @@ def test_declare_writes_the_baseline_before_patching_and_verifies_after(
         (
             NODE,
             {
-                "metadata": {"labels": {SPARE_LABEL: "true"}},
+                "metadata": {
+                    "uid": f"uid-{NODE}",
+                    "resourceVersion": "1",
+                    "labels": {SPARE_LABEL: "true"},
+                },
                 "spec": {"unschedulable": True},
             },
         )
@@ -483,7 +489,11 @@ def test_release_restores_the_recorded_baseline_not_the_current_state(
         (
             NODE,
             {
-                "metadata": {"labels": {SPARE_LABEL: None}},
+                "metadata": {
+                    "uid": f"uid-{NODE}",
+                    "resourceVersion": "1",
+                    "labels": {SPARE_LABEL: None},
+                },
                 "spec": {"unschedulable": True},
             },
         )
@@ -514,6 +524,105 @@ def test_release_uncordons_a_node_that_was_schedulable_before(tmp_path: Path) ->
     )
 
     assert record["restored_state"]["unschedulable"] is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"cluster_id": "cluster-b"}, "cluster"),
+        ({"cluster_id": None}, "cluster"),
+        ({"pre_declaration_survey": {"node": {"uid": "replaced-node"}}}, "UID"),
+        ({"pre_declaration_survey": {}}, "UID"),
+        ({"baseline": {}}, "baseline"),
+        ({"baseline": {"labels": {}, "unschedulable": False}}, "baseline"),
+    ],
+)
+def test_release_refuses_unbound_or_incomplete_baselines_before_patching(
+    tmp_path: Path, overrides: dict, message: str
+) -> None:
+    api = FakeCoreApi(_raw_node(NODE, labels={SPARE_LABEL: "true"}, unschedulable=True))
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    record_file.write_text(json.dumps(_record(**overrides)), encoding="utf-8")
+
+    with pytest.raises(WarmSpareError, match=message):
+        release(
+            api,
+            node=NODE,
+            record=record_file,
+            reference="CHG-2",
+            actor="bob",
+            survey=_survey(api),
+        )
+    assert api.patches == []
+    assert not json.loads(record_file.read_text()).get("released_at"), (
+        "rejected release must not record a release timestamp"
+    )
+
+
+def test_release_does_not_record_success_when_the_patch_did_not_restore_the_node(
+    tmp_path: Path,
+) -> None:
+    api = FakeCoreApi(_raw_node(NODE, labels={SPARE_LABEL: "true"}, unschedulable=True))
+    api.apply_patches = False
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    record_file.write_text(json.dumps(_record()), encoding="utf-8")
+
+    with pytest.raises(WarmSpareError, match="did not restore"):
+        release(
+            api,
+            node=NODE,
+            record=record_file,
+            reference="CHG-2",
+            actor="bob",
+            survey=_survey(api),
+        )
+    assert not json.loads(record_file.read_text()).get("released_at"), (
+        "unrestored node must not be recorded as released"
+    )
+
+
+def test_release_patch_is_bound_to_the_surveyed_resource_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeCoreApi(_raw_node(NODE, labels={SPARE_LABEL: "true"}, unschedulable=True))
+    before = _survey(api)
+    api.nodes[NODE]["metadata"]["resourceVersion"] = "2"
+    api.nodes[NODE]["metadata"]["annotations"][SPARE_RESERVATION_ANNOTATION] = "inc-new"
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    record_file.write_text(json.dumps(_record()), encoding="utf-8")
+    original = api.patch_node
+
+    def checked_patch(node, body):
+        assert body["metadata"]["uid"] == f"uid-{NODE}"
+        if (
+            body["metadata"].get("resourceVersion")
+            != api.nodes[node]["metadata"]["resourceVersion"]
+        ):
+            raise WarmSpareError("resource version conflict")
+        return original(node, body)
+
+    monkeypatch.setattr(api, "patch_node", checked_patch)
+    with pytest.raises(WarmSpareError, match="resource version conflict"):
+        release(
+            api,
+            node=NODE,
+            record=record_file,
+            reference="CHG-2",
+            actor="bob",
+            survey=before,
+        )
+    assert api.patches == []
+    assert api.nodes[NODE]["spec"]["unschedulable"] is True
+
+
+def test_unknown_spare_pool_state_refuses_release() -> None:
+    refusals = release_refusals(
+        _snapshot(annotations={SPARE_POOL_STATE_ANNOTATION: "UNKNOWN"}), _record()
+    )
+    assert "spare pool state is unknown or unavailable" in refusals
 
 
 def test_release_refuses_an_already_released_or_mismatched_record(
@@ -829,6 +938,28 @@ def test_a_failing_kubectl_is_a_named_error() -> None:
 
     with pytest.raises(WarmSpareError, match="Unable to connect"):
         api.read_node(NODE)
+
+
+def test_kubectl_failure_does_not_expose_credential_helper_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "synthetic-unstructured-auth-value-13579"
+
+    class Completed:
+        stdout = ""
+        stderr = f"Forbidden: exec helper failed\n{marker}"
+        returncode = 1
+
+    monkeypatch.setattr(
+        warm_spare, "run_command", lambda *_args, **_kwargs: Completed()
+    )
+    api = warm_spare.KubectlNodeApi(["kubectl"])
+    with pytest.raises(WarmSpareError) as failure:
+        api.read_node(NODE)
+    message = str(failure.value)
+    assert marker not in message
+    assert "Forbidden" in message
+    assert "redacted" in message
 
 
 def test_the_control_plane_agent_lookup_never_passes_silently(

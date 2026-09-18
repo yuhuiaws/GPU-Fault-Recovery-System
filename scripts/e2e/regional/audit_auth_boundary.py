@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
+import secrets
 import ssl
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -21,6 +23,8 @@ from gpu_fault.regional_compatibility import (  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
 
 # Same value as identity_acceptance_common.ACCEPTANCE_PROBE_OWNER (asserted by
 # a unit test). The store filters claim candidates by step.execution_owner, so
@@ -29,6 +33,62 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 # adapter owner and every 200 in the matrix took a 60 s lease on production
 # work.
 ACCEPTANCE_PROBE_OWNER = "gpu-fault-acceptance-probe"
+GUARDED_AUTH008_CASE = "GF-REGIONAL-AUTH-008"
+AUTH009_PATHS = (
+    "/v1/collector-events/nvidia-kernel",
+    "/v1/collector-events/fabric-manager",
+    "/v1/collector-events/gpu-metrics",
+    "/v1/collector-events/host-telemetry",
+    "/v1/collector-events/node-logs",
+    "/v1/gpu-events/xid",
+    "/v1/gpu-events/xid/distributed",
+    "/v1/gpu-events/sxid",
+    "/v1/collector-events/gpu-inventory",
+    "/v1/attempts/terminal",
+    "/v1/training-progress",
+    "/v1/collector-events/collector-health",
+)
+AUTH009_SCOPE_VARIANTS = {
+    "cluster-alias": {"cluster": "__FOREIGN__"},
+    "camelcase-alias": {"clusterId": "__FOREIGN__"},
+    "nested-alias": {"events": [{"context": {"clusterId": "__FOREIGN__"}}]},
+    "conflicting-nested": {
+        "cluster_id": "__LOCAL__",
+        "events": [{"cluster": "__FOREIGN__"}],
+    },
+}
+AUTH009_VARIANT_PATH = "/v1/gpu-events/xid/distributed"
+AUTH009_ENTRY_NAMES = (
+    *(f"AUTH-009 {path}" for path in AUTH009_PATHS),
+    *(f"AUTH-009 {name}" for name in AUTH009_SCOPE_VARIANTS),
+)
+AUTHENTICATION_DENIAL = "regional cluster authentication failed"
+PAYLOAD_BINDING_DENIAL = (
+    "authenticated cluster does not match all payload cluster_id values"
+)
+EXPECTED_DETAILS = {
+    "AUTH-001": "X-GPU-Fault-Cluster-ID is required",
+    "AUTH-002-no-auth": "regional cluster bearer token is required",
+    "AUTH-002-basic": "regional cluster bearer token is required",
+    "AUTH-002-empty-bearer": AUTHENTICATION_DENIAL,
+    "AUTH-003": "regional cluster is not registered",
+    "AUTH-004-zero": AUTHENTICATION_DENIAL,
+    "AUTH-004-near": AUTHENTICATION_DENIAL,
+    "AUTH-005": PAYLOAD_BINDING_DENIAL,
+    "AUTH-006": PAYLOAD_BINDING_DENIAL,
+    "AUTH-008-B-header-A-token": AUTHENTICATION_DENIAL,
+    "AUTH-008-A-header-B-token": AUTHENTICATION_DENIAL,
+    **{f"AUTH-009 {path}": PAYLOAD_BINDING_DENIAL for path in AUTH009_PATHS},
+    **{f"AUTH-009 {name}": PAYLOAD_BINDING_DENIAL for name in AUTH009_SCOPE_VARIANTS},
+    **{
+        name: "regional mode requires a valid X-GPU-Fault-Execution-Token for this endpoint"
+        for name in (
+            "AUTH-011-metrics",
+            "AUTH-011-clusters-anon",
+            "AUTH-011-clusters-cluster-token",
+        )
+    },
+}
 
 # Which matrix entries make up which catalogued case. AUTH-001..006/008/009/011
 # had no live evidence path: the matrix printed to stdout and nothing landed
@@ -51,7 +111,7 @@ CASE_ENTRIES: dict[str, tuple[str, ...]] = {
         "AUTH-008-B-header-A-token",
         "AUTH-008-A-header-B-token",
     ),
-    "GF-REGIONAL-AUTH-009": ("AUTH-009 ",),
+    "GF-REGIONAL-AUTH-009": AUTH009_ENTRY_NAMES,
     "GF-REGIONAL-AUTH-011": (
         "AUTH-011-health",
         "AUTH-011-metrics",
@@ -67,22 +127,51 @@ STORE_NEGATIVE_CASES = (
     "GF-REGIONAL-AUTH-009",
 )
 
-# Runs inside a control-plane API Pod. Counts only; no record content, no
-# lease tokens.
+# Runs inside a control-plane API Pod. The main entry supplies a fresh probe ID;
+# only records carrying that ID belong to this denial experiment. Routine
+# heartbeats, evidence and collector health can keep changing concurrently.
 STORE_NEGATIVE_PROBE = r"""
+import hashlib
 import json
 import sys
 from gpu_fault.app import ApplicationContext
-cluster_ids = sys.argv[1:]
+cluster_ids = sys.argv[1:3]
+probe_id = sys.argv[3] if len(sys.argv) > 3 else "auth-probe-node"
 store = ApplicationContext.from_environment().store
-result = {"clusters": {}, "commands": {}}
+result = {"clusters": {}, "commands": {}, "probe_id": probe_id}
+def scoped(items):
+    def matches(value):
+        if isinstance(value, dict):
+            return any(matches(item) for item in value.values())
+        if isinstance(value, list):
+            return any(matches(item) for item in value)
+        return isinstance(value, str) and probe_id in value
+    return [
+        item for item in items if matches(item.model_dump(mode="json"))
+    ]
+def fingerprint(items):
+    values = sorted(
+        json.dumps(item.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        for item in items
+    )
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 for cluster_id in cluster_ids:
-    agents = store.list_agents(cluster_id)
+    agents = scoped(store.list_agents(cluster_id))
+    observations = scoped(store.list_attempt_observations(cluster_id))
+    evidence = scoped(store.list_raw_evidence(cluster_id))
     result["clusters"][cluster_id] = {
         "agent_generations": sorted(
             f"{item.node_id}:{item.generation}" for item in agents
         ),
-        "attempt_observations": len(store.list_attempt_observations(cluster_id)),
+        "agents_sha256": fingerprint(agents),
+        "attempt_observations": len(observations),
+        "observations_sha256": fingerprint(observations),
+        "collector_samples": {
+            f"{item.collector.value}/{item.node_id}": item.sample_count
+            for item in scoped(store.list_collector_statuses(cluster_id))
+        },
+        "evidence_count": len(evidence),
+        "evidence_sha256": fingerprint(evidence),
     }
 for item in store.list_remote_commands():
     if item.status.value in {"PENDING", "WAITING", "LEASED"}:
@@ -90,6 +179,7 @@ for item in store.list_remote_commands():
             "cluster_id": item.cluster_id,
             "status": item.status.value,
             "lease_owner": item.lease_owner,
+            "execution_owner": item.step.execution_owner,
         }
 print(json.dumps(result, sort_keys=True))
 """
@@ -107,6 +197,16 @@ def redact_body(body: Any) -> Any:
     if isinstance(body, list):
         return [redact_body(item) for item in body]
     return body
+
+
+def response_body(raw: bytes) -> Any:
+    try:
+        return redact_body(json.loads(raw or b"{}"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "non_json_body_sha256": hashlib.sha256(raw).hexdigest(),
+            "non_json_body_bytes": len(raw),
+        }
 
 
 def post(
@@ -138,12 +238,12 @@ def post(
             raw = response.read()
             return {
                 "status": response.status,
-                "body": redact_body(json.loads(raw or b"{}")),
+                "body": response_body(raw),
             }
     except urllib.error.HTTPError as exc:
         return {
             "status": exc.code,
-            "body": redact_body(json.loads(exc.read() or b"{}")),
+            "body": response_body(exc.read()),
         }
 
 
@@ -171,12 +271,12 @@ def get(
             raw = response.read()
             return {
                 "status": response.status,
-                "body": redact_body(json.loads(raw or b"{}")),
+                "body": response_body(raw),
             }
     except urllib.error.HTTPError as exc:
         return {
             "status": exc.code,
-            "body": redact_body(json.loads(exc.read() or b"{}")),
+            "body": response_body(exc.read()),
         }
 
 
@@ -217,7 +317,7 @@ def expected_statuses(results: dict[str, Any]) -> dict[str, int]:
         "AUTH-011-clusters-anon": 403,
         "AUTH-011-clusters-cluster-token": 403,
     }
-    expected.update({name: 403 for name in results if name.startswith("AUTH-009 ")})
+    expected.update({name: 403 for name in AUTH009_ENTRY_NAMES})
     return expected
 
 
@@ -226,16 +326,30 @@ def matrix_errors(results: dict[str, Any], *, cluster_a: str) -> dict[str, list[
 
     errors: dict[str, list[str]] = {}
     for name, status in expected_statuses(results).items():
-        actual = results.get(name, {}).get("status")
-        if actual != status:
+        entry = results.get(name)
+        if not isinstance(entry, dict):
+            errors.setdefault(name, []).append("missing or invalid matrix entry")
+            continue
+        actual = entry.get("status")
+        if type(actual) is not int or actual != status:
             errors.setdefault(name, []).append(f"status {actual}, expected {status}")
-    expected_detail = "regional cluster authentication failed"
-    for name in ("AUTH-004-zero", "AUTH-004-near"):
-        if results.get(name, {}).get("body", {}).get("detail") != expected_detail:
-            errors.setdefault(name, []).append("detail is not the generic denial")
+        body = entry.get("body")
+        if not isinstance(body, dict):
+            errors.setdefault(name, []).append("response body is not an object")
+            continue
+        expected_detail = EXPECTED_DETAILS.get(name)
+        if expected_detail is not None and body != {"detail": expected_detail}:
+            errors.setdefault(name, []).append("body is not the precise denial")
     for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor"):
-        commands = results.get(name, {}).get("body", {}).get("commands") or []
-        if any(command.get("cluster_id") != cluster_a for command in commands):
+        entry = results.get(name)
+        body = entry.get("body") if isinstance(entry, dict) else None
+        commands = body.get("commands") if isinstance(body, dict) else None
+        if not isinstance(commands, list):
+            errors.setdefault(name, []).append("claim has no commands list")
+        elif any(
+            not isinstance(command, dict) or command.get("cluster_id") != cluster_a
+            for command in commands
+        ):
             errors.setdefault(name, []).append("a claimed command is foreign")
     return errors
 
@@ -243,10 +357,12 @@ def matrix_errors(results: dict[str, Any], *, cluster_a: str) -> dict[str, list[
 def probe_claims_leased_nothing(results: dict[str, Any]) -> bool:
     """The probe owner has no commands; a non-empty claim body leased real work."""
 
-    return not any(
-        results.get(name, {}).get("body", {}).get("commands")
-        for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor")
-    )
+    for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor"):
+        entry = results.get(name)
+        body = entry.get("body") if isinstance(entry, dict) else None
+        if not isinstance(body, dict) or body.get("commands") != []:
+            return False
+    return True
 
 
 def validate_matrix(results: dict[str, Any], *, cluster_a: str) -> None:
@@ -261,18 +377,55 @@ def store_negative_errors(
     cluster_a: str,
     cluster_b: str,
 ) -> dict[str, list[str]]:
-    """What the denied requests must not have done to the store.
-
-    AUTH-005 posts a workload observation for B with A's token; AUTH-006 a
-    heartbeat for B; AUTH-009 every collector/event route for B; AUTH-008
-    claims with a fake executor id and with crossed token/header pairs. None
-    may add a record for B, and no command open before the matrix may have
-    changed status or lease owner.
-    """
+    """Compare only the unique probe identities, not cluster-wide activity."""
 
     errors: dict[str, list[str]] = {}
+    if "probe_id" in before or "probe_id" in after:
+        if (
+            not isinstance(before.get("probe_id"), str)
+            or not before["probe_id"]
+            or before["probe_id"] != after.get("probe_id")
+        ):
+            for case_id in STORE_NEGATIVE_CASES:
+                errors.setdefault(case_id, []).append(
+                    "probe identity is missing or changed"
+                )
     b_before = before.get("clusters", {}).get(cluster_b, {})
     b_after = after.get("clusters", {}).get(cluster_b, {})
+    if "probe_id" in before and any(
+        b_before.get(field)
+        for field in (
+            "agent_generations",
+            "attempt_observations",
+            "collector_samples",
+            "evidence_count",
+        )
+    ):
+        for case_id in (
+            "GF-REGIONAL-AUTH-005",
+            "GF-REGIONAL-AUTH-006",
+            "GF-REGIONAL-AUTH-009",
+        ):
+            errors.setdefault(case_id, []).append("probe identity already exists")
+    for case_id, field, kind in (
+        ("GF-REGIONAL-AUTH-005", "attempt_observations", int),
+        ("GF-REGIONAL-AUTH-005", "observations_sha256", str),
+        ("GF-REGIONAL-AUTH-006", "agent_generations", list),
+        ("GF-REGIONAL-AUTH-006", "agents_sha256", str),
+        ("GF-REGIONAL-AUTH-009", "collector_samples", dict),
+        ("GF-REGIONAL-AUTH-009", "evidence_count", int),
+        ("GF-REGIONAL-AUTH-009", "evidence_sha256", str),
+    ):
+        if any(type(value.get(field)) is not kind for value in (b_before, b_after)):
+            errors.setdefault(case_id, []).append(f"cluster B {field} not measured")
+        elif kind is str and any(
+            len(value[field]) != 64
+            or any(char not in "0123456789abcdef" for char in value[field])
+            for value in (b_before, b_after)
+        ):
+            errors.setdefault(case_id, []).append(f"cluster B {field} is invalid")
+        elif b_after[field] != b_before[field]:
+            errors.setdefault(case_id, []).append(f"cluster B {field} changed")
     if b_after.get("attempt_observations") != b_before.get("attempt_observations"):
         errors.setdefault("GF-REGIONAL-AUTH-005", []).append(
             "cluster B attempt observations changed"
@@ -283,7 +436,21 @@ def store_negative_errors(
     if b_after.get("agent_generations") != b_before.get("agent_generations"):
         errors.setdefault("GF-REGIONAL-AUTH-006", []).append("cluster B agents changed")
         errors.setdefault("GF-REGIONAL-AUTH-009", []).append("cluster B agents changed")
+    if not any(
+        state.get("cluster_id") == cluster_b
+        and state.get("status") == "PENDING"
+        and state.get("execution_owner") == ACCEPTANCE_PROBE_OWNER
+        for state in before.get("commands", {}).values()
+    ):
+        errors.setdefault("GF-REGIONAL-AUTH-008", []).append(
+            "no cluster B PENDING probe-owner command was measured before the matrix"
+        )
     for command_id, state in before.get("commands", {}).items():
+        if (
+            state.get("cluster_id") != cluster_b
+            or state.get("execution_owner") != ACCEPTANCE_PROBE_OWNER
+        ):
+            continue
         current = after.get("commands", {}).get(command_id)
         if current is None:
             if state.get("status") == "PENDING":
@@ -313,16 +480,11 @@ def case_documents(
     entry_errors = matrix_errors(results, cluster_a=cluster_a)
     executed_at = datetime.now(timezone.utc).isoformat()
     documents = {}
-    for case_id, prefixes in CASE_ENTRIES.items():
-        names = sorted(
-            name
-            for name in results
-            if any(
-                name == prefix or (prefix.endswith(" ") and name.startswith(prefix))
-                for prefix in prefixes
-            )
-        )
-        errors = {name: entry_errors[name] for name in names if name in entry_errors}
+    for case_id, required_names in CASE_ENTRIES.items():
+        names = sorted(name for name in required_names if name in results)
+        errors = {
+            name: entry_errors[name] for name in required_names if name in entry_errors
+        }
         store_checked = case_id in STORE_NEGATIVE_CASES
         store_case_errors = (
             (store_errors or {}).get(case_id, []) if store_errors is not None else []
@@ -333,7 +495,9 @@ def case_documents(
                 "no --cpu-kubeconfig: the store was not read before and after"
             )
         checks: dict[str, bool] = {
-            "matrix_entries_match_contract": bool(names) and not errors,
+            "matrix_entries_match_contract": (
+                len(names) == len(required_names) and not errors
+            ),
         }
         if store_checked and store_errors is not None:
             checks["store_unchanged"] = not store_case_errors
@@ -357,7 +521,7 @@ def case_documents(
 
 
 def kubectl_api_pod(kubeconfig: Path, namespace: str) -> str:
-    completed = subprocess.run(
+    completed = run_fixture_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -371,25 +535,47 @@ def kubectl_api_pod(kubeconfig: Path, namespace: str) -> str:
             "-o",
             "json",
         ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=True,
         timeout=120,
     )
-    for item in json.loads(completed.stdout).get("items", []):
+    document = json.loads(completed.stdout)
+    if not isinstance(document.get("items"), list):
+        raise RuntimeError("control-plane Pod list is incomplete")
+    for item in sorted(
+        document["items"],
+        key=lambda item: (item.get("metadata") or {}).get("creationTimestamp", ""),
+        reverse=True,
+    ):
         status = item.get("status") or {}
-        if status.get("phase") == "Running" and all(
-            bool(entry.get("ready")) for entry in status.get("containerStatuses") or []
+        containers = (item.get("spec") or {}).get("containers") or []
+        container_statuses = status.get("containerStatuses") or []
+        if (
+            not (item.get("metadata") or {}).get("deletionTimestamp")
+            and status.get("phase") == "Running"
+            and any(
+                entry.get("type") == "Ready" and entry.get("status") == "True"
+                for entry in status.get("conditions") or []
+            )
+            and containers
+            and {entry["name"] for entry in containers}
+            == {entry.get("name") for entry in container_statuses}
+            and all(entry.get("ready") is True for entry in container_statuses)
         ):
             return str(item["metadata"]["name"])
     raise RuntimeError("no Ready control-plane API Pod")
 
 
 def store_snapshot(
-    kubeconfig: Path, namespace: str, pod: str, cluster_ids: list[str]
+    kubeconfig: Path,
+    namespace: str,
+    pod: str,
+    cluster_ids: list[str],
+    *,
+    probe_id: str = "auth-probe-node",
 ) -> dict[str, Any]:
-    completed = subprocess.run(
+    if not re.fullmatch(r"auth-probe-(?:[0-9a-f]{32}|node)", probe_id):
+        raise ValueError("invalid authentication probe identity")
+    completed = run_fixture_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -400,25 +586,38 @@ def store_snapshot(
             "-i",
             pod,
             "--",
-            "python3",
+            component_python("cpu"),
             "-",
             *cluster_ids,
+            probe_id,
         ],
-        input=STORE_NEGATIVE_PROBE,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        input_text=STORE_NEGATIVE_PROBE,
         check=True,
         timeout=180,
     )
     value = json.loads(completed.stdout.splitlines()[-1])
     if not isinstance(value, dict):
         raise RuntimeError("store probe did not return an object")
+    if value.get("probe_id") != probe_id:
+        raise RuntimeError("store probe returned a different probe identity")
     return value
 
 
+def scoped_variant(value: Any, *, local: str, foreign: str) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: scoped_variant(item, local=local, foreign=foreign)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [scoped_variant(item, local=local, foreign=foreign) for item in value]
+    return (
+        foreign if value == "__FOREIGN__" else local if value == "__LOCAL__" else value
+    )
+
+
 def release_id(kubeconfig: Path, namespace: str) -> str:
-    completed = subprocess.run(
+    completed = run_fixture_command(
         [
             "kubectl",
             "--kubeconfig",
@@ -431,9 +630,6 @@ def release_id(kubeconfig: Path, namespace: str) -> str:
             "-o",
             "json",
         ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=True,
         timeout=120,
     )
@@ -444,6 +640,18 @@ def release_id(kubeconfig: Path, namespace: str) -> str:
 def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
     token_a = arguments.token_a_file.read_text(encoding="utf-8").strip()
     token_b = arguments.token_b_file.read_text(encoding="utf-8").strip()
+    probe_id = getattr(
+        arguments, "probe_id", None
+    ) or "auth-probe-" + secrets.token_hex(16)
+    if not re.fullmatch(r"auth-probe-[0-9a-f]{32}", probe_id):
+        raise ValueError("authentication matrix requires a fresh probe identity")
+    scope = {
+        "node_id": probe_id,
+        "event_id": probe_id,
+        "batch_id": probe_id,
+        "job_id": probe_id,
+        "attempt_id": probe_id,
+    }
     claim = claim_payload(
         executor_id="auth-probe",
         artifact_sha256=arguments.executor_artifact_sha256,
@@ -515,7 +723,7 @@ def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
             "/v1/workload-observations",
             cluster_id=arguments.cluster_a,
             token=token_a,
-            payload={"cluster_id": arguments.cluster_b},
+            payload={"cluster_id": arguments.cluster_b, **scope},
         ),
         "AUTH-006": post(
             arguments.url,
@@ -526,7 +734,7 @@ def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
             payload={
                 "heartbeat": {
                     "cluster_id": arguments.cluster_b,
-                    "node_id": "auth-probe-node",
+                    "node_id": probe_id,
                     "agent_version": "0.10.0",
                 },
                 "signature": "invalid",
@@ -565,25 +773,26 @@ def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
             payload=claim,
         ),
     }
-    for path in (
-        "/v1/collector-events/nvidia-kernel",
-        "/v1/collector-events/fabric-manager",
-        "/v1/collector-events/gpu-metrics",
-        "/v1/collector-events/host-telemetry",
-        "/v1/collector-events/node-logs",
-        "/v1/gpu-events/xid",
-        "/v1/gpu-events/sxid",
-        "/v1/provider-events/hyperpod-hma/node",
-        "/v1/attempts/terminal",
-        "/v1/training-progress",
-    ):
+    for path in AUTH009_PATHS:
         results[f"AUTH-009 {path}"] = post(
             arguments.url,
             arguments.ca_file,
             path,
             cluster_id=arguments.cluster_a,
             token=token_a,
-            payload={"cluster_id": arguments.cluster_b},
+            payload={"cluster_id": arguments.cluster_b, **scope},
+        )
+    for name, template in AUTH009_SCOPE_VARIANTS.items():
+        payload = scoped_variant(
+            template, foreign=arguments.cluster_b, local=arguments.cluster_a
+        )
+        results[f"AUTH-009 {name}"] = post(
+            arguments.url,
+            arguments.ca_file,
+            AUTH009_VARIANT_PATH,
+            cluster_id=arguments.cluster_a,
+            token=token_a,
+            payload={**payload, **scope},
         )
     results.update(
         {
@@ -617,10 +826,11 @@ def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
-            "Live AUTH-001..006/008/009/011 boundary matrix. Tokens are read "
+            "Live AUTH-001..006/009/011 boundary matrix. Tokens are read "
             "from files and stay in memory; with --run-dir each case gets its "
             "own evidence document, with --cpu-kubeconfig the store is read "
-            "before and after so the denials are proven to have written nothing."
+            "before and after so the denials are proven to have written nothing. "
+            "AUTH-008 request diagnostics do not replace its guarded acceptance."
         )
     )
     # The former "probe-clusters" mode (one enabled-claim per cluster) is what
@@ -643,6 +853,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     arguments = parser().parse_args()
+    arguments.probe_id = "auth-probe-" + secrets.token_hex(16)
     identity: dict[str, str] = {"cluster_id": arguments.cluster_a}
     store_before: dict[str, Any] | None = None
     api_pod = ""
@@ -656,6 +867,7 @@ def main() -> int:
             arguments.namespace,
             api_pod,
             [arguments.cluster_a, arguments.cluster_b],
+            probe_id=arguments.probe_id,
         )
     results = run_matrix(arguments)
     store_errors: dict[str, list[str]] | None = None
@@ -665,6 +877,7 @@ def main() -> int:
             arguments.namespace,
             api_pod,
             [arguments.cluster_a, arguments.cluster_b],
+            probe_id=arguments.probe_id,
         )
         store_errors = store_negative_errors(
             store_before,
@@ -678,6 +891,9 @@ def main() -> int:
         store_errors=store_errors,
         identity=identity,
     )
+    # Only the guarded handler owns AUTH-008's candidate lifecycle and verdict.
+    # Exclude it even when no guarded evidence exists yet.
+    documents.pop(GUARDED_AUTH008_CASE, None)
     if arguments.run_dir is not None:
         for case_id, document in documents.items():
             path = arguments.run_dir / "cases" / case_id / f"{case_id}.json"
@@ -692,6 +908,12 @@ def main() -> int:
                     for case_id, document in documents.items()
                 },
                 "store_errors": store_errors,
+                "not_evaluated": {
+                    GUARDED_AUTH008_CASE: (
+                        "requires run_identity_acceptance.py with the guarded "
+                        "AUTH-008 owned-backlog handler"
+                    )
+                },
             },
             indent=2,
             sort_keys=True,

@@ -76,13 +76,15 @@ def test_replica_counts_come_from_spec_replicas() -> None:
         ha001.declared_replicas({"deployments": {ha001.INGRESS_APP: {"replicas": 3}}})
 
 
-def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() -> None:
+def test_validate_roles_uses_declared_replicas_and_requires_leaderless_epoch() -> None:
     replicas = {ha001.INGRESS_APP: 1, ha001.WORKER_APP: 2, ha001.SPOOL_APP: 0}
     ingress = {
         "name": "api-a",
         "health": {
             "service_role": "ingress",
             "processor_role": "inactive",
+            "processor_mode": "active-active",
+            "processor_epoch": "",
             "leadership": None,
         },
         "processor_active_consumer": 0.0,
@@ -92,15 +94,56 @@ def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() ->
         "health": {
             "service_role": "worker",
             "processor_role": "active-consumer",
+            "processor_mode": "active-active",
+            "processor_epoch": "",
             "leadership": None,
         },
-        "processor_active_consumer": 1.0,
+        "processor_active_consumer": 4.0,
     }
     clean = {
         ha001.INGRESS_APP: [ingress],
         ha001.WORKER_APP: [worker, {**worker, "name": "worker-b"}],
     }
     assert ha001.validate_roles(clean, replicas) == []
+
+    one_process = {**worker, "name": "worker-one", "processor_active_consumer": 1.0}
+    assert (
+        ha001.validate_roles(
+            {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, one_process]},
+            replicas,
+        )
+        == []
+    )
+    idle = {**worker, "name": "worker-idle", "processor_active_consumer": 0.0}
+    assert ha001.validate_roles(
+        {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, idle]}, replicas
+    ) == [
+        "worker-idle active-consumer metric is 0.0, "
+        "expected >= 1 (one per uvicorn worker process)"
+    ]
+    held_epoch = {
+        **worker,
+        "name": "worker-epoch",
+        "health": {**worker["health"], "processor_epoch": "7"},
+    }
+    assert ha001.validate_roles(
+        {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, held_epoch]}, replicas
+    ) == [
+        "worker-epoch holds processor leadership epoch '7'; "
+        "expected none (leaderless active-active)"
+    ]
+    missing_epoch = {
+        **worker,
+        "name": "worker-missing",
+        "health": {k: v for k, v in worker["health"].items() if k != "processor_epoch"},
+    }
+    assert any(
+        "processor_epoch" in error
+        for error in ha001.validate_roles(
+            {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, missing_epoch]},
+            replicas,
+        )
+    ), "omitting processor_epoch cannot prove leaderless active-active"
 
     leader = {
         **worker,
@@ -112,20 +155,38 @@ def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() ->
     )
     assert errors == ["worker-c reports leadership; expected null"], errors
 
-    missing_leadership_key = {
+    wrong_processor_mode = {
         **worker,
-        "health": {k: v for k, v in worker["health"].items() if k != "leadership"},
+        "name": "worker-wrong-mode",
+        "health": {**worker["health"], "processor_mode": "active-standby"},
     }
     assert any(
-        "leadership" in item
+        "processor mode" in item
         for item in ha001.validate_roles(
             {
                 ha001.INGRESS_APP: [ingress],
-                ha001.WORKER_APP: [worker, missing_leadership_key],
+                ha001.WORKER_APP: [worker, wrong_processor_mode],
             },
             replicas,
         )
-    ), "a healthz without the leadership field is not proof of null leadership"
+    ), "the active-active mode is required on the current health endpoint"
+    without_legacy_field = {
+        **worker,
+        "name": "worker-current-contract",
+        "health": {
+            key: value for key, value in worker["health"].items() if key != "leadership"
+        },
+    }
+    assert (
+        ha001.validate_roles(
+            {
+                ha001.INGRESS_APP: [ingress],
+                ha001.WORKER_APP: [worker, without_legacy_field],
+            },
+            replicas,
+        )
+        == []
+    )
 
     short = ha001.validate_roles(
         {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker]}, replicas
@@ -244,7 +305,7 @@ def test_observe_phase_reports_cap_reached_when_never_settled(monkeypatch) -> No
 def _closure(statuses: list[str], owners: list[str | None], cached: list[bool]) -> dict:
     return {
         "workflow_id": "workflow-x",
-        "workflow_status_observed": "BLOCKED",
+        "workflow_status_observed": "PENDING",
         "commands": [
             {
                 "command_id": f"remote-x-{index}",
@@ -286,8 +347,10 @@ def test_closure_is_judged_from_control_plane_records_not_a_runner_write() -> No
 
     assert summary["succeeded_by_step_index"] == {"0": 1, "1": 1, "2": 1}
     assert summary["physical_executions"] == 3
-    assert summary["workflow_status_observed"] == "BLOCKED", (
-        "the runner records the workflow as the control plane left it"
+    assert summary["workflow_status_observed"] == "PENDING", (
+        "the runner records the workflow as the control plane left it; the seed "
+        "is PENDING under its own lease, never BLOCKED, so the orphan sweep "
+        "cannot cancel its open commands"
     )
     assert ha001.closure_errors(SEED, summary, executor_id=executor) == []
     assert not hasattr(ha001, "finalize_closure"), (
@@ -370,6 +433,11 @@ def test_cleanup_steps_run_every_step_and_collect_errors(
         case_dir=tmp_path,
         result=result,
         expected_replicas={ha001.INGRESS_APP: 3, ha001.WORKER_APP: 6},
+        owned_resources=type(
+            "Owned",
+            (),
+            {"delete": lambda self, kind, name: calls.append(f"delete {kind}")},
+        )(),
     )
 
     assert errors == ["stop probe: CaseError: kubectl exec timed out"], errors
@@ -388,3 +456,30 @@ def test_execute_case_refuses_a_plan_without_derived_fields(tmp_path: Path) -> N
     (case_dir / "plan.json").write_text('{"attempt": 1, "targets": []}')
     with pytest.raises(ha001.CaseError, match="re-plan"):
         ha001.execute_case(tmp_path, 1, ha001.CONFIRMATION)
+
+
+def test_probe_uses_the_executor_component_interpreter() -> None:
+    deployment = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "image": "unit-image",
+                            "env": [
+                                {"name": name, "value": "unit-identity"}
+                                for name in (
+                                    "GPU_FAULT_EXECUTOR_ARTIFACT_SHA256",
+                                    "GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST",
+                                )
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    manifest = ha001.probe_manifest(deployment)
+    assert manifest["spec"]["containers"][0]["command"][0] == ha001.component_python(
+        "gpu"
+    )

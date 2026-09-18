@@ -364,3 +364,18 @@ def test_max_hold_bounds_are_enforced() -> None:
     for value in (0, 59, 3601):
         with pytest.raises(probe.ProbeError):
             probe.checked_max_hold(value)
+
+
+def test_unbound_legacy_agent_commands_cannot_change_any_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import argparse
+
+    calls: list[object] = []
+    monkeypatch.setattr(probe, "run", lambda *args, **kwargs: calls.append(args))
+    args = argparse.Namespace(run_id="legacy-test")
+    with pytest.raises(probe.ProbeError, match="recovery safeguard"):
+        probe.disable_agent_restart(args)
+    with pytest.raises(probe.ProbeError, match="unbound legacy"):
+        probe.restore_agent(args)
+    assert calls == []

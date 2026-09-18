@@ -27,8 +27,13 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
 )
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalFixtureError,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     business_workload_items,
+    component_python,
     predecessor_evidence,
 )
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
@@ -139,24 +144,14 @@ def command(
     if timeout is None:
         timeout = kubectl_timeout(argv)
     try:
-        completed = subprocess.run(
+        return run_fixture_command(
             argv,
-            input=input_text,
-            text=True,
-            capture_output=True,
-            check=False,
+            input_text=input_text,
+            check=check,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise CaseError(
-            f"command timed out after {timeout:.0f}s: {' '.join(argv)}"
-        ) from exc
-    if check and completed.returncode:
-        raise CaseError(
-            f"command failed ({completed.returncode}): {' '.join(argv)}: "
-            f"{completed.stderr.strip()}"
-        )
-    return completed
+    except RegionalFixtureError as exc:
+        raise CaseError(str(exc)) from None
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -196,10 +191,8 @@ class Runner:
         self.wake_drill_id = f"net001-wake-{self.suffix}"
         self.ips: list[str] = []
         self.baseline: dict[str, Any] | None = None
-        # Tags whose host rollback timer has been armed. A tag is added the
-        # moment `arm` returns -- before the block, before any connectivity
-        # assertion -- so a failure anywhere after arming still reaches
-        # `cleanup_tag` in `finally` instead of leaving the rules to the timer.
+        # Record arm intent before the remote call so a lost acknowledgement
+        # still reaches cleanup_tag instead of leaving recovery to the timer.
         self.active_tags: list[str] = []
         self.created = False
         self.worker_pod = ""
@@ -349,10 +342,6 @@ class Runner:
                 "json",
             ).stdout
         )
-        # One definition for the whole runner family: infrastructure
-        # namespaces never count, the solution's namespace counts only for
-        # GPU-holding Pods (live 2026-09-14: a private allowlist refused the
-        # target node for hosting cert-manager and the inference router).
         return business_workload_items(
             payload.get("items", []), namespace=self.settings.namespace
         )
@@ -495,7 +484,7 @@ finally:
             "-i",
             self.select_worker(),
             "--",
-            "python",
+            component_python("cpu"),
             "-",
             self.settings.cluster_id,
             self.settings.target_node,
@@ -594,9 +583,9 @@ finally:
         ]
         for ip in self.ips:
             args.extend(["--ip", ip])
-        armed = self.host_tool(*args)
         if tag not in self.active_tags:
             self.active_tags.append(tag)
+        armed = self.host_tool(*args)
         write_json(self.case_dir / f"{tag}-armed.json", armed)
         args = ["block", "--tag", tag]
         for ip in self.ips:
@@ -861,7 +850,6 @@ finally:
                     "--ignore-not-found",
                     "-o",
                     "name",
-                    check=False,
                 ).stdout.strip()
             ),
             "configmap": bool(
@@ -874,7 +862,6 @@ finally:
                     "--ignore-not-found",
                     "-o",
                     "name",
-                    check=False,
                 ).stdout.strip()
             ),
         }
@@ -936,7 +923,7 @@ finally:
         final_store: dict[str, Any] = {}
         residuals: dict[str, bool] = {}
         try:
-            if not self.settings.predecessor.get("valid", False):
+            if self.settings.predecessor.get("valid") is not True:
                 raise CaseError("formal predecessor evidence is not PASS")
             if (
                 datetime.now(timezone.utc).timestamp()
@@ -1096,6 +1083,8 @@ def main() -> int:
     )
     if not args.execute:
         plan = build_plan(
+            arguments=args,
+            preflight_passed=predecessor.get("valid") is True,
             run_dir=args.run_dir,
             case_id=CASE_ID,
             attempt=args.attempt,
@@ -1131,7 +1120,7 @@ def main() -> int:
             },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if predecessor.get("valid") is True else 1
     deadline = authorize_execution(
         args,
         case_id=CASE_ID,

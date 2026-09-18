@@ -129,6 +129,10 @@ class KubernetesWorkloadStopper:
                     else {"suspend": True}
                 ),
             }
+            if incident_id is not None:
+                body["metadata"]["annotations"][TERMINATION_INCIDENT_ANNOTATION] = (
+                    incident_id
+                )
             if kind == "job":
                 self.batch.patch_namespaced_job(name, namespace, body)
                 continue
@@ -356,7 +360,7 @@ class KubernetesWorkloadStopper:
         ).hexdigest()[:24]
         snapshot = {
             "record_id": f"workload-log/{record_hash}",
-            "node_id": str(spec.get("nodeName") or "UNKNOWN"),
+            "node_id": str(spec.get("nodeName") or spec.get("node_name") or "UNKNOWN"),
             "attempt_id": attempt_id,
             "namespace": namespace,
             "pod_name": pod_name,

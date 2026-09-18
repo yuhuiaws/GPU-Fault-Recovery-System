@@ -186,13 +186,16 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
     }
 
 
-def _collector(settings: Settings, run_id: str) -> CollectorAcceptanceFixture:
+def _collector(
+    settings: Settings, run_id: str, case_dir: Path
+) -> CollectorAcceptanceFixture:
     return CollectorAcceptanceFixture(
         RegionalLiveFixture(settings.regional),
         node=settings.node,
         image=settings.host_probe_image,
         case_id=CASE_ID,
         run_id=run_id,
+        case_dir=case_dir,
     )
 
 
@@ -205,7 +208,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     tests = focused_tests(case_dir)
     runtime_identity = regional.runtime_identity()
-    collector = _collector(settings, "destr021-preflight")
+    collector = _collector(settings, "destr021-preflight", case_dir)
     try:
         collector.create()
         inventory = collector.snapshot().get("efa_inventory") or {}
@@ -327,6 +330,7 @@ class _LiveRun:
     run_id: str
     collector: CollectorAcceptanceFixture
     writer: AnnotationWriter
+    maintenance_window_end: datetime | None = None
     mutation: NodeMutationFixture | None = None
     foreign_incident: str = ""
     foreign_operation: str = ""
@@ -366,10 +370,11 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
         case_dir=case_dir,
         preflight=preflight,
         run_id=run_id,
-        collector=_collector(settings, run_id),
+        collector=_collector(settings, run_id, case_dir),
         writer=AnnotationWriter(
             _kubectl_prefix(settings.regional),
             settings.node,
+            node_uid=str(preflight["node"]["uid"]),
             interval_seconds=settings.writer_interval_seconds,
             max_seconds=settings.writer_max_seconds,
         ),
@@ -406,7 +411,12 @@ def _preseed(run: _LiveRun) -> None:
 def _quiet_control_plane(run: _LiveRun) -> None:
     state = run.regional.store_snapshot(node=run.settings.node, queue_attempts=1)
     write_json_atomic(run.case_dir / "store-before-injection.json", state)
-    if (state.get("remote_commands") or {}).get("open_by_cluster"):
+    commands = state.get("remote_commands")
+    if (
+        not isinstance(commands, dict)
+        or "open_by_cluster" not in commands
+        or commands["open_by_cluster"]
+    ):
         raise RegionalFixtureError("remote commands are open; refusing to inject")
     if processor_queue_backlog(state.get("queue") or {}):
         raise RegionalFixtureError("the processor queue is not empty before injection")
@@ -494,6 +504,11 @@ def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
         raise RegionalFixtureError("no bound EFA BDF was discovered")
     run.efa_bdf = bound[0]
     _quiet_control_plane(run)
+    if (
+        run.maintenance_window_end is None
+        or datetime.now(timezone.utc) >= run.maintenance_window_end
+    ):
+        raise RegionalFixtureError("maintenance window ended before EFA injection")
     run.writer.start()
     run.started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
     run.efa_restore_owed = True
@@ -571,6 +586,7 @@ def execute_case(
     calls are. Every cleanup failure downgrades the verdict to FAIL."""
 
     run = _prepare_live_run(settings, run_dir, attempt)
+    run.maintenance_window_end = maintenance_window_end
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -619,7 +635,6 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
-    guard("writer", lambda: _stop_writer(run))
     if run.efa_restore_owed:
         guard(
             "restore_efa",
@@ -627,8 +642,11 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
                 "restore-efa", "--run-id", run.run_id, "--pci-bdf", run.efa_bdf
             ),
         )
-    if run.mutation is not None:
+    guard("writer", lambda: _stop_writer(run))
+    if run.mutation is not None and not run.writer.running:
         guard("annotations_restored", lambda: _restore_annotations(run))
+    elif run.mutation is not None:
+        result["annotations_restore_deferred"] = True
     guard("final_node", lambda: _final_node(run))
     guard("probe_cleanup", lambda: _refuse_residual_map(run.collector.cleanup()))
     guard(
@@ -644,6 +662,8 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
 
 def _stop_writer(run: _LiveRun) -> dict[str, Any]:
     run.writer.stop()
+    if run.writer.started_at is None:
+        return {"not_started": True}
     run.writer.clear()
     report = run.writer.report()
     report["achieved_interval_seconds"] = verdicts.writer_achieved_interval(report)

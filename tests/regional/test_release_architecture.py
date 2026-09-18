@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
 import time
 from dataclasses import replace
@@ -9,16 +8,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_MODULE
 from gpu_fault_release import regional_release_node_preflight as NODE_PREFLIGHT_MODULE
 from gpu_fault_release import regional_release_node_runtime_rollout as RUNTIME_MODULE
 from gpu_fault_release import regional_release_validation as VALIDATION_MODULE
 from gpu_fault_release import rollout as MODULE
+from tests.deploy.test_installer_template_identity import pinned_identity, template_job
 from tests.regional._release_orchestrator_support import (
     config_file,
     ingress_pod_list_json,
 )
+from tests.regional.test_store_io_zero_view_probe import zero_view_report
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -567,16 +569,15 @@ def test_secret_backup_returns_only_reference(tmp_path: Path, monkeypatch) -> No
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     calls = []
-    monkeypatch.setattr(
-        MODULE.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
-    )
-    monkeypatch.setattr(
-        release,
-        "_get_json",
-        lambda _args: {"type": "Opaque", "data": {"sensitive-key": "encoded-value"}},
-    )
+    from tests.regional._resource_probe_fakes import resource_probe_result
+
+    def read_secret(args, **_kwargs):
+        code, raw, error = resource_probe_result(args)
+        document = json.loads(raw)
+        document.update(type="Opaque", data={"sensitive-key": "encoded-value"})
+        return code, json.dumps(document), error
+
+    monkeypatch.setattr(release.runner, "probe_output", read_secret)
     monkeypatch.setattr(
         release.runner, "run", lambda args, **kwargs: calls.append((args, kwargs)) or ""
     )
@@ -621,11 +622,13 @@ def test_rollback_rejects_non_transactional_cluster_change(tmp_path: Path) -> No
     release.state = {"release_diff": {"kind": "FULL", "changed": ["clusters"]}}
 
     with pytest.raises(MODULE.ReleaseError, match="not transactional"):
-        release.rollback(state={"metadata": {}, "cpu_wheel": "old-wheel"})
+        release.rollback(
+            state={"metadata": {}, "cpu_wheel": "old-wheel", "aurora_refresh": None}
+        )
 
 
 def test_rollback_accepts_endpoint_change_once_compensated(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The endpoint left ``NON_TRANSACTIONAL_CHANGES`` when it gained a snapshot.
 
@@ -635,10 +638,22 @@ def test_rollback_accepts_endpoint_change_once_compensated(
     non-transactional refusal is what proves the guard let it through.
     """
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     release.state = {
         "release_diff": {"kind": "DATA_PLANE_COMPATIBLE", "changed": ["endpoint"]}
     }
+    target = config.clusters[0]
+    text = yaml.safe_dump(template_job(offline=False))
+    identity = pinned_identity(text, offline=False)
+    template_reads: list[list[str]] = []
+
+    def read_template(arguments: list[str]) -> dict[str, dict[str, str]]:
+        assert arguments[-3:] == ["get", "configmap", "old-template"]
+        assert target.context in arguments
+        template_reads.append(arguments)
+        return {"data": {"job.yaml": text}}
+
+    monkeypatch.setattr(release, "_get_json", read_template)
     # The credential refresh preflight probes the live CronJob; this test is
     # about the transactional guard, not the site.
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
@@ -647,7 +662,24 @@ def test_rollback_accepts_endpoint_change_once_compensated(
     )
 
     with pytest.raises(MODULE.ReleaseError, match="previous Agent identities"):
-        release.rollback(state={"metadata": {}, "cpu_wheel": "old-wheel"})
+        release.rollback(
+            state={
+                "release_manifest_schema_version": 3,
+                "metadata": {},
+                "cpu_wheel": "old-wheel",
+                "aurora_refresh": None,
+                "clusters": {
+                    target.cluster_id: {
+                        "bundle": "old-bundle",
+                        "bundle_sha256": identity.bundle_sha256,
+                        "template": "old-template",
+                        "template_sha256": identity.template_sha256,
+                        "template_content_sha256": identity.template_content_sha256,
+                    }
+                },
+            }
+        )
+    assert len(template_reads) == 1, "the trusted Job must pass the earlier node gate"
 
 
 def test_profile_finalize_allows_drained_old_profile(
@@ -817,11 +849,7 @@ def test_store_io_rejection_series_gate_reads_each_running_cpu_role(
 
     monkeypatch.setattr(release, "_get_json", get_json)
     monkeypatch.setattr(
-        release.runner,
-        "run",
-        lambda *_args, **_kwargs: json.dumps(
-            {"series_count": 1, "all_labeled": True, "all_zero": True}
-        ),
+        release.runner, "run", lambda *_args, **_kwargs: json.dumps(zero_view_report())
     )
 
     report = VALIDATION_MODULE.store_io_rejection_series_ready(release)
@@ -850,7 +878,7 @@ def test_store_io_rejection_series_gate_probes_pods_in_parallel(
     def run(args, **_kwargs):
         # Every probe waits for the others, so a serial gate would time out here.
         barrier.wait()
-        return json.dumps({"series_count": 1, "all_labeled": True, "all_zero": True})
+        return json.dumps(zero_view_report())
 
     monkeypatch.setattr(release, "_get_json", get_json)
     monkeypatch.setattr(release.runner, "run", run)
@@ -880,7 +908,7 @@ def test_store_io_rejection_series_gate_reports_probes_in_stable_order(
         # if the fan-out consumes results in input order.
         if not pod.startswith("gpu-fault-telemetry-spool-worker"):
             time.sleep(0.05)
-        return json.dumps({"series_count": 1, "all_labeled": False, "all_zero": True})
+        return json.dumps(zero_view_report(all_labeled=False))
 
     monkeypatch.setattr(release, "_get_json", get_json)
     monkeypatch.setattr(release.runner, "run", run)

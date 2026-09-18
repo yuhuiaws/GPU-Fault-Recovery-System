@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from gpu_fault_release import regional_admin_commands as ADMIN
 from gpu_fault_release import regional_release_gpu_rollout as ROLLOUT
 from gpu_fault_release.regional_release_diff import ReleaseChangeKind, ReleaseDiff
 from tests.regional._release_orchestrator_support import RELEASE_MODULE, config_file
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -41,7 +43,8 @@ def _manifest() -> str:
 def test_existing_watcher_state_configmap_is_not_reapplied() -> None:
     release = SimpleNamespace(
         runner=SimpleNamespace(
-            dry_run=False, probe_output=lambda *_args, **_kwargs: (0, "", "")
+            dry_run=False,
+            probe_output=lambda arguments, **_kwargs: resource_probe_result(arguments),
         ),
         config=SimpleNamespace(namespace="gpu-fault-system"),
         _gpu=lambda _target, *args: list(args),
@@ -58,10 +61,8 @@ def test_missing_watcher_state_configmap_is_created() -> None:
     release = SimpleNamespace(
         runner=SimpleNamespace(
             dry_run=False,
-            probe_output=lambda *_args, **_kwargs: (
-                1,
-                "",
-                'Error from server (NotFound): configmaps "x" not found',
+            probe_output=lambda arguments, **_kwargs: resource_probe_result(
+                arguments, present=False
             ),
         ),
         config=SimpleNamespace(namespace="gpu-fault-system"),
@@ -86,11 +87,9 @@ def test_the_new_active_state_object_is_applied_while_the_outbox_is_preserved() 
     probes: list[str] = []
 
     def probe_output(command, *_args, **_kwargs):
-        name = command[-1]
+        name = command[command.index("get") + 2]
         probes.append(name)
-        if name.endswith("-active"):
-            return (1, "", 'Error from server (NotFound): configmaps "x" not found')
-        return (0, "", "")
+        return resource_probe_result(command, present=not name.endswith("-active"))
 
     release = SimpleNamespace(
         runner=SimpleNamespace(dry_run=False, probe_output=probe_output),
@@ -128,9 +127,8 @@ class _RecordingRunner:
         return ""
 
     def probe_output(self, arguments, **_kwargs):
-        if arguments[-1] in self.existing:
-            return (0, "", "")
-        return (1, "", 'Error from server (NotFound): configmaps "x" not found')
+        name = arguments[arguments.index("get") + 2]
+        return resource_probe_result(arguments, present=name in self.existing)
 
 
 def _applied_objects(runner: _RecordingRunner) -> list[tuple[str, str]]:
@@ -221,7 +219,10 @@ def test_stage_noop_reasserts_watcher_state_on_every_cluster_before_saving(
     ], f"a NOOP release must re-assert the watcher state on each GPU cluster: {events}"
 
 
-def test_orchestrator_noop_reasserts_watcher_state(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("allow_repair", [True, False])
+def test_orchestrator_noop_reasserts_watcher_state(
+    tmp_path: Path, monkeypatch, allow_repair: bool
+) -> None:
     config = RELEASE_MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = RELEASE_MODULE.RegionalRelease(
         config, RELEASE_MODULE.Runner(dry_run=True)
@@ -238,7 +239,40 @@ def test_orchestrator_noop_reasserts_watcher_state(tmp_path: Path, monkeypatch) 
         lambda target: events.append(f"reassert:{target.cluster_id}"),
     )
 
-    release.noop(ReleaseDiff(ReleaseChangeKind.NOOP, frozenset()))
+    release.noop(
+        ReleaseDiff(ReleaseChangeKind.NOOP, frozenset()),
+        allow_prerequisite_repair=allow_repair,
+    )
 
-    assert "reassert:gpu-a" in events, events
-    assert events.index("reassert:gpu-a") < events.index("save"), events
+    assert ("reassert:gpu-a" in events) is allow_repair, events
+    assert "_validate_release" in events, events
+    assert events[-1] == "save", events
+    if allow_repair:
+        assert events.index("reassert:gpu-a") < events.index("save"), events
+
+
+@pytest.mark.parametrize("repair_value", [None, "false", 0])
+def test_noop_rejects_ambiguous_repair_policy(tmp_path: Path, repair_value) -> None:
+    release = RELEASE_MODULE.RegionalRelease(
+        RELEASE_MODULE.ReleaseConfig.load(config_file(tmp_path)),
+        RELEASE_MODULE.Runner(dry_run=True),
+    )
+    with pytest.raises(RELEASE_MODULE.ReleaseError, match="boolean"):
+        release.noop(
+            ReleaseDiff(ReleaseChangeKind.NOOP, frozenset()),
+            allow_prerequisite_repair=repair_value,
+        )
+
+
+def test_noop_rejects_changed_release_before_any_resource_access(
+    tmp_path: Path,
+) -> None:
+    release = RELEASE_MODULE.RegionalRelease(
+        RELEASE_MODULE.ReleaseConfig.load(config_file(tmp_path)),
+        RELEASE_MODULE.Runner(dry_run=True),
+    )
+    with pytest.raises(RELEASE_MODULE.ReleaseError, match="unchanged release"):
+        release.noop(
+            ReleaseDiff(ReleaseChangeKind.FULL, frozenset({"schema"})),
+            allow_prerequisite_repair=False,
+        )

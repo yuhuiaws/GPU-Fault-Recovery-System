@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,6 +55,12 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import run_command
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+)
 from gpu_fault.admin.operator_identity import resolve_operator_identity
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import (
@@ -201,12 +207,18 @@ elif payload["mode"] == "restore":
             + ", ".join(f"{item.request_id} ({item.status.value})" for item in still_open)
         )
     else:
+        from gpu_fault.execution.node_rebinding import inventory_gpu_uuids
+
         updated, created = build_validated_restore_workflow(
             incident,
             operator=payload["operator"],
             reference=payload.get("reference"),
             now=datetime.now(timezone.utc),
             runtime_profile_version=payload.get("runtime_profile_version"),
+            node_gpu_uuids={
+                node_id: inventory_gpu_uuids(store, incident.cluster_id, node_id)
+                for node_id in incident.node_ids
+            },
         )
         store.save_incident_and_workflow(updated, created)
         context.dispatcher.wake()
@@ -1059,13 +1071,23 @@ def acknowledge_inspection(
     written = []
     for node_id in plan.node_ids:
         metadata = cast(dict[str, Any], live_nodes[node_id].get("metadata") or {})
+        version = metadata.get("resourceVersion")
+        if (
+            metadata.get("name") != node_id
+            or not metadata.get("uid")
+            or not isinstance(version, str)
+            or not version
+        ):
+            raise BootstrapError(
+                f"cannot annotate node {node_id}: node identity is incomplete"
+            )
         current = (metadata.get("annotations") or {}).get(
             ANNOTATION_MECHANICAL_INSPECTION_COMPLETE
         )
         if current == plan.acknowledgement_value:
             already.append(node_id)
             continue
-        completed = subprocess.run(
+        completed = run_command(
             [
                 *gpu_kubectl_command(site, target),
                 "annotate",
@@ -1074,15 +1096,17 @@ def acknowledge_inspection(
                 f"{ANNOTATION_MECHANICAL_INSPECTION_COMPLETE}="
                 f"{plan.acknowledgement_value}",
                 "--overwrite",
+                f"--resource-version={version}",
             ],
-            check=False,
-            capture_output=True,
-            text=True,
+            timeout_seconds=120,
         )
         if completed.returncode:
             raise BootstrapError(
                 f"cannot annotate node {node_id}: "
-                + (completed.stderr.strip() or "kubectl annotate failed")
+                + (
+                    diagnostic_text(completed.stderr, sensitive=True)
+                    or "kubectl annotate failed"
+                )
             )
         written.append(node_id)
     return {
@@ -1297,13 +1321,19 @@ def run_submit_remediation_command(
 ) -> int:
     """Submit the disposition named on the command line."""
 
-    request = SubmitRemediationRequest(
-        site=site,
-        incident_id=str(arguments.incident_id),
-        disposition=str(arguments.disposition),
-        reference=cast(str | None, arguments.reference),
-        plan_only=bool(arguments.plan),
-    )
-    result = submit_remediation(request)
+    plan_only = bool(arguments.plan)
+    with (
+        nullcontext() if plan_only else administrator_operation_lock(site.source.parent)
+    ):
+        if not plan_only:
+            site = reload_site_for_mutation(site)
+        request = SubmitRemediationRequest(
+            site=site,
+            incident_id=str(arguments.incident_id),
+            disposition=str(arguments.disposition),
+            reference=cast(str | None, arguments.reference),
+            plan_only=plan_only,
+        )
+        result = submit_remediation(request)
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
     return 0

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import pytest
 
@@ -32,18 +33,26 @@ def restore_root() -> Iterator[logging.Logger]:
 
 
 @pytest.fixture
-def configure_fresh(restore_root: logging.Logger) -> Callable[[], None]:
-    """Configures logging as a service process would, from an empty root.
+def configure_fresh() -> Callable[[], AbstractContextManager[logging.Logger]]:
+    """Use a fresh process hierarchy only while the test emits its records."""
 
-    The clearing happens when the test calls this rather than during setup:
-    pytest installs its own capture handler around the call phase, and
-    `configure_logging` deliberately keeps its hands off a root that already has
-    handlers, so clearing in setup would test the embedder path instead.
-    """
-
-    def configure() -> None:
-        restore_root.handlers = []
-        logging_setup.configure_logging()
+    @contextmanager
+    def configure() -> Iterator[logging.Logger]:
+        root = logging.RootLogger(logging.WARNING)
+        manager = logging.Manager(root)
+        # Enter during the call, after pytest has installed its capture handlers;
+        # restore before leaving the call so pytest keeps its own logging state.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(logging, "root", root)
+            patch.setattr(logging.Logger, "root", root)
+            patch.setattr(logging.Logger, "manager", manager)
+            try:
+                logging_setup.configure_logging()
+                yield root
+            finally:
+                for handler in root.handlers[:]:
+                    root.removeHandler(handler)
+                    handler.close()
 
     return configure
 
@@ -52,8 +61,112 @@ def _emitted(capsys: pytest.CaptureFixture[str]) -> str:
     return capsys.readouterr().err
 
 
+def _logger_state(logger: logging.Logger) -> tuple[object, ...]:
+    return (
+        logger.level,
+        logger.disabled,
+        logger.propagate,
+        tuple(logger.handlers),
+        tuple(logger.filters),
+        logger.parent,
+        logger.manager,
+    )
+
+
+@pytest.mark.parametrize(
+    "suppression",
+    [
+        "global-disable",
+        "child-disable",
+        "child-level",
+        "child-filter",
+        "parent-level",
+        "parent-handler",
+    ],
+)
+@pytest.mark.parametrize("exceptional_exit", [False, True])
+def test_fresh_logging_isolates_and_restores_inherited_state(
+    configure_fresh: Callable[[], AbstractContextManager[logging.Logger]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    suppression: str,
+    exceptional_exit: bool,
+) -> None:
+    original_root = logging.getLogger()
+    original_manager = logging.Logger.manager
+    original_state = _logger_state(original_root), original_manager.disable
+    literal = "logging-fixture-public-test-value"
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_TOKEN", literal)
+    parent_handler = logging.NullHandler()
+    try:
+        with configure_fresh() as inherited_root:
+            inherited_manager = logging.Logger.manager
+            parent = logging.getLogger("gpu_fault")
+            child = logging.getLogger("gpu_fault.test")
+            if suppression == "global-disable":
+                logging.disable(logging.CRITICAL)
+            elif suppression == "child-disable":
+                child.disabled = True
+            elif suppression == "child-level":
+                child.setLevel(logging.CRITICAL + 1)
+            elif suppression == "child-filter":
+                child.addFilter(logging.Filter("unrelated.logger"))
+            elif suppression == "parent-level":
+                parent.setLevel(logging.CRITICAL + 1)
+            else:
+                parent.propagate = False
+                parent.addHandler(parent_handler)
+            # Prime the enabled-level cache that logging.disable must invalidate.
+            enabled = child.isEnabledFor(logging.WARNING)
+            inherited_states = [
+                _logger_state(logger) for logger in (inherited_root, parent, child)
+            ]
+            inherited_disable = inherited_manager.disable
+            registry = inherited_manager.loggerDict.copy()
+
+            exit_check = (
+                pytest.raises(RuntimeError, match="synthetic fixture exit")
+                if exceptional_exit
+                else nullcontext()
+            )
+            with exit_check, configure_fresh() as fresh_root:
+                fresh_child = logging.getLogger("gpu_fault.test")
+                assert fresh_root is not inherited_root
+                assert logging.Logger.root is fresh_root
+                assert logging.Logger.manager is fresh_root.manager
+                assert fresh_root.manager.disable == logging.NOTSET
+                assert fresh_child is not child
+                assert fresh_child.level == logging.NOTSET
+                assert not fresh_child.disabled and fresh_child.propagate
+                assert not fresh_child.handlers and not fresh_child.filters
+                fresh_child.warning("fixture diagnostic %s", literal)
+                if exceptional_exit:
+                    raise RuntimeError("synthetic fixture exit")
+
+            emitted = _emitted(capsys)
+            assert "fixture diagnostic" in emitted
+            assert logging_setup.PLACEHOLDER in emitted
+            assert literal not in emitted
+            assert not fresh_root.handlers, "the temporary handlers must be detached"
+            assert logging.getLogger() is logging.Logger.root is inherited_root
+            assert logging.Logger.manager is inherited_manager
+            assert inherited_manager.disable == inherited_disable
+            assert inherited_manager.loggerDict == registry
+            assert [
+                _logger_state(logger) for logger in (inherited_root, parent, child)
+            ] == inherited_states, "fresh logging must not rewrite caller preferences"
+            assert child.isEnabledFor(logging.WARNING) is enabled
+    finally:
+        parent_handler.close()
+    assert logging.getLogger() is logging.Logger.root is original_root
+    assert logging.Logger.manager is original_manager
+    assert (_logger_state(original_root), original_manager.disable) == original_state, (
+        "nested fixture scopes must restore the pytest process"
+    )
+
+
 def test_a_live_environment_secret_is_replaced_by_its_literal_value(
-    configure_fresh: Callable[[], None],
+    configure_fresh: Callable[[], AbstractContextManager[logging.Logger]],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -66,11 +179,10 @@ def test_a_live_environment_secret_is_replaced_by_its_literal_value(
     """
 
     monkeypatch.setenv("GPU_FAULT_CLUSTER_TOKEN", "sk-live-9d41f0c2ab7e")
-    configure_fresh()
-
-    logging.getLogger("gpu_fault.test").warning(
-        "data plane rejected the call using %s", "sk-live-9d41f0c2ab7e"
-    )
+    with configure_fresh():
+        logging.getLogger("gpu_fault.test").warning(
+            "data plane rejected the call using %s", "sk-live-9d41f0c2ab7e"
+        )
 
     emitted = _emitted(capsys)
     assert "sk-live-9d41f0c2ab7e" not in emitted, "the live token must not be printed"
@@ -160,7 +272,7 @@ def test_a_path_valued_key_is_not_treated_as_a_secret() -> None:
 
 
 def test_a_traceback_carrying_a_secret_is_redacted_too(
-    configure_fresh: Callable[[], None],
+    configure_fresh: Callable[[], AbstractContextManager[logging.Logger]],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -172,22 +284,23 @@ def test_a_traceback_carrying_a_secret_is_redacted_too(
     """
 
     monkeypatch.setenv("GPU_FAULT_CLUSTER_TOKEN", "sk-live-9d41f0c2ab7e")
-    configure_fresh()
-
-    try:
-        raise RuntimeError("401 for token sk-live-9d41f0c2ab7e")
-    except RuntimeError:
-        logging.getLogger("gpu_fault.test").exception("cluster call failed")
+    with configure_fresh():
+        try:
+            raise RuntimeError("401 for token sk-live-9d41f0c2ab7e")
+        except RuntimeError:
+            logging.getLogger("gpu_fault.test").exception("cluster call failed")
 
     emitted = _emitted(capsys)
     assert "Traceback" in emitted, "the traceback is still reported"
+    assert logging_setup.PLACEHOLDER in emitted, "the exception value was redacted"
+    assert "cluster call failed" in emitted, "the exception remains diagnosable"
     assert "sk-live-9d41f0c2ab7e" not in emitted, (
         "an exception message is not exempt from redaction"
     )
 
 
 def test_a_child_logger_is_redacted_by_the_root_handler(
-    configure_fresh: Callable[[], None],
+    configure_fresh: Callable[[], AbstractContextManager[logging.Logger]],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -200,14 +313,18 @@ def test_a_child_logger_is_redacted_by_the_root_handler(
     """
 
     monkeypatch.setenv("GPU_FAULT_CLUSTER_TOKEN", "sk-live-9d41f0c2ab7e")
-    configure_fresh()
+    with configure_fresh():
+        logging.getLogger("gpu_fault.deep.child.module").error(
+            "token sk-live-9d41f0c2ab7e was refused"
+        )
 
-    logging.getLogger("gpu_fault.deep.child.module").error(
-        "token sk-live-9d41f0c2ab7e was refused"
-    )
-
-    assert "sk-live-9d41f0c2ab7e" not in _emitted(capsys), (
+    emitted = _emitted(capsys)
+    assert "sk-live-9d41f0c2ab7e" not in emitted, (
         "a record from a child logger reaches the root handler and must be redacted"
+    )
+    assert logging_setup.PLACEHOLDER in emitted, "the child record must be emitted"
+    assert "gpu_fault.deep.child.module" in emitted and "was refused" in emitted, (
+        "child redaction must preserve the logger identity and readable message"
     )
 
 
@@ -245,7 +362,11 @@ def test_a_misspelled_level_falls_back_instead_of_killing_the_process(
     not start reports nothing at all.
     """
 
-    monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", "VERBOSE")
+    unknown = "GPU_FAULT_UNKNOWN_LOG_LEVEL"
+    assert unknown not in logging.getLevelNamesMapping(), (
+        "the typo fixture must remain unknown even when dependencies add log levels"
+    )
+    monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", unknown)
     assert logging_setup.resolve_level() == logging.INFO, (
         "an unknown level name falls back to INFO"
     )
@@ -264,4 +385,15 @@ def test_a_misspelled_level_falls_back_instead_of_killing_the_process(
     monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", "ERROR")
     assert logging_setup.resolve_level() == logging.ERROR, (
         "the namespaced variable wins over the bare one"
+    )
+
+
+def test_registered_dependency_levels_are_valid_not_typos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    levels = {**logging.getLevelNamesMapping(), "VERBOSE": 15}
+    monkeypatch.setattr(logging, "getLevelNamesMapping", lambda: levels)
+    monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", "VERBOSE")
+    assert logging_setup.resolve_level() == 15, (
+        "a registered dependency log level should retain its configured verbosity"
     )

@@ -114,11 +114,15 @@ class BranchEscalator:
         node_id = step.node_ids[0]
         branch_id = step.branch_id
         assert branch_id is not None
-        branch_indexes = set(self.brancher.node_branch_step_indexes(workflow, node_id))
+        branch_indexes = set(self.brancher.branch_step_indexes(workflow, branch_id))
+        lineage_nodes = (
+            tuple(step.branch_node_ids) or branch_node_ids(branch_id) or (node_id,)
+        )
+        lineage_node = lineage_nodes[0] if len(lineage_nodes) == 1 else node_id
         recovery_context = self._recovery_context(workflow, branch_indexes)
         unknown = unknown_outcome_failure(details)
         rung = None if unknown else next_rung(step.operation, recovery_context)
-        taken = workflow.branch_escalation_counts.get(node_id, 0)
+        taken = workflow.branch_escalation_counts.get(lineage_node, 0)
         if rung is None or taken >= self.max_rungs:
             return self._exhaust(
                 workflow,
@@ -146,6 +150,10 @@ class BranchEscalator:
             # Nothing compiled (profile gone, unsupported operation): the
             # whole-workflow failure path keeps the record honest.
             return None
+        candidate_steps = [
+            item.model_copy(update={"branch_node_ids": list(lineage_nodes)})
+            for item in candidate_steps
+        ]
         if rung is WorkflowOperation.REPLACE_NODE:
             candidate_steps = [
                 (
@@ -172,13 +180,13 @@ class BranchEscalator:
             official_steps=candidate_steps,
         )
         replaced = self.brancher.replace_parallel_job_branch(
-            workflow, candidate, node_id
+            workflow, candidate, node_id, branch_id=branch_id
         )
         replaced = replaced.model_copy(
             update={
                 "branch_escalation_counts": {
                     **workflow.branch_escalation_counts,
-                    node_id: taken + 1,
+                    lineage_node: taken + 1,
                 },
                 "updated_at": datetime.now(timezone.utc),
             }
@@ -200,6 +208,7 @@ class BranchEscalator:
             reason=reason,
             details={
                 "node_id": node_id,
+                "lineage_node_id": lineage_node,
                 "branch_id": branch_id,
                 "to_branch_id": next(
                     (
@@ -236,7 +245,7 @@ class BranchEscalator:
     ) -> BranchEscalation:
         """Retire ``node_id``'s branch without a further rung (caller's reason)."""
 
-        branch_indexes = set(self.brancher.node_branch_step_indexes(workflow, node_id))
+        branch_indexes = set(self.brancher.branch_step_indexes(workflow, branch_id))
         return self._exhaust(
             workflow, node_id, branch_id, branch_indexes, reason=reason
         )
@@ -267,12 +276,23 @@ class BranchEscalator:
         operation: WorkflowOperation | None = None,
     ) -> BranchEscalation:
         pending = branch_indexes - set(resolved_step_indexes(workflow))
+        exhausted_ids = list(dict.fromkeys([*workflow.exhausted_branch_ids, branch_id]))
+        if not pending and exhausted_ids == workflow.exhausted_branch_ids:
+            return BranchEscalation(
+                workflow, "exhausted", node_id, branch_id, None, reason
+            )
+        lineage_nodes = {
+            node
+            for index in branch_indexes
+            for node in workflow.official_steps[index].branch_node_ids
+        } or set(branch_node_ids(branch_id))
+        lineage_node = next(iter(lineage_nodes)) if len(lineage_nodes) == 1 else node_id
         exhausted = workflow.model_copy(
             update={
                 "superseded_step_indexes": sorted(
                     set(workflow.superseded_step_indexes) | pending
                 ),
-                "exhausted_branch_ids": [*workflow.exhausted_branch_ids, branch_id],
+                "exhausted_branch_ids": exhausted_ids,
                 "updated_at": datetime.now(timezone.utc),
             }
         )
@@ -286,9 +306,10 @@ class BranchEscalator:
             reason=reason,
             details={
                 "node_id": node_id,
+                "lineage_node_id": lineage_node,
                 "branch_id": branch_id,
                 "exhausted": True,
-                "rung_count": workflow.branch_escalation_counts.get(node_id, 0),
+                "rung_count": workflow.branch_escalation_counts.get(lineage_node, 0),
                 "superseded_indexes": sorted(pending),
             },
         )

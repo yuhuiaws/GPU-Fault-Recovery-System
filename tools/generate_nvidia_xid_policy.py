@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ def text(value: Any) -> str | None:
 
 
 def integer(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("catalog integer cell must not be a boolean")
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -46,8 +49,13 @@ def integer(value: Any) -> int:
 
 def generate(source: Path, catalog_version: str) -> dict[str, Any]:
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    workbook = load_workbook(source, read_only=True, data_only=True)
+    with closing(load_workbook(source, read_only=True, data_only=True)) as workbook:
+        return _catalog_from_workbook(workbook, catalog_version, digest)
 
+
+def _catalog_from_workbook(
+    workbook: Any, catalog_version: str, digest: str
+) -> dict[str, Any]:
     xid_sheet = workbook["Xids"]
     catalog_rules = []
     for row in xid_sheet.iter_rows(min_row=2, values_only=True):

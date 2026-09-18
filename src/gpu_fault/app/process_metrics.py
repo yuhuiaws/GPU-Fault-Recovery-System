@@ -17,19 +17,19 @@ that counted does not have to be the one that answers the scrape. The
 answering process merges its own fresh render with every other live process's
 file and aggregates each family by the strategy registered for it in
 :mod:`gpu_fault.app.metric_aggregation` (SUM, MAX, MIN, ANY or PER_PROCESS).
-A file whose PID is gone is removed on sight, so a restarted process's old
-counts leave the sum with it (Prometheus reads that as a counter reset, which
-it is). The directory defaults to a per-Pod path under ``/dev/shm`` when
+Counters retain a bounded process-slot label: their reset domains must survive
+until Prometheus applies rate/increase. Dead PID files are removed; stale,
+malformed or missing live publications mark coverage degraded. The directory
+defaults to a per-Pod path under ``/dev/shm`` when
 ``POD_UID`` is set (the Deployment injects it) and is otherwise off, so a
-single-process run and the unit tests aggregate a single source -- byte for
-byte the plain render, plus the two merger gauges below.
+single-process run uses slot zero and the two merger gauges below.
 ``GPU_FAULT_PROCESS_METRICS_DIR`` overrides the path or disables the
 mechanism with ``off``.
 
 Two gauges belong to the merger itself and are never aggregated:
 ``gpu_fault_metrics_aggregation_processes`` (live processes merged, this one
-included) and ``gpu_fault_metrics_aggregation_degraded`` (1 when the shared
-directory was configured but unusable, so the sample is one process's view).
+included) and ``gpu_fault_metrics_aggregation_degraded`` (1 when any live
+publication is unknown or the shared directory is unusable).
 
 PER_PROCESS families carry a ``process="<slot>"`` label. The slot is a stable
 0..N-1 number claimed with an ``flock`` on ``<dir>/slot-<n>.lock`` for the
@@ -66,6 +66,7 @@ ENVIRONMENT = "GPU_FAULT_PROCESS_METRICS_DIR"
 DISABLED_TOKENS = frozenset({"off", "0", "false", "none", "disabled"})
 DEFAULT_ROOT = Path("/dev/shm/gpu-fault-process-metrics")
 PUBLISH_INTERVAL_SECONDS = 5.0
+MAX_PUBLISH_AGE_SECONDS = 60.0
 MAX_SLOTS = 16
 FILE_FORMAT = 1
 
@@ -100,6 +101,8 @@ class Rendered:
     samples: dict[str, list[Sample]] = field(default_factory=dict)
     slot: int | None = None
     pid: int | None = None
+    published_at: float | None = None
+    degraded: bool = False
 
     def family_type(self, family: str) -> str | None:
         type_line = self.families.get(family, (None, None))[1]
@@ -272,13 +275,13 @@ def _combine(values: Sequence[str], how: str) -> str:
 
 def _fallback_strategy(family: str, family_type: str | None) -> Strategy:
     """For a family nobody registered (a plugin contributor, or drift the
-    registry test did not run against): counters and additive families add
-    up, timestamps and everything else take the maximum."""
+    registry test did not run against): counters preserve reset domains and
+    gauges take the maximum."""
 
     if family_type in ("counter", "summary", "histogram"):
-        return Strategy.SUM
-    if family.endswith(("_total", "_bucket", "_count", "_sum")):
-        return Strategy.SUM
+        return Strategy.PER_PROCESS
+    if family_type is None and family.endswith(("_total", "_bucket", "_count", "_sum")):
+        return Strategy.PER_PROCESS
     return Strategy.MAX
 
 
@@ -397,10 +400,10 @@ def aggregate(local: Rendered, others: Sequence[Rendered]) -> list[str]:
 
 def merger_lines(processes: int, degraded: bool) -> list[str]:
     return [
-        f"# HELP {PROCESSES_METRIC} Live processes of this Pod whose samples were merged into this scrape, the answering process included.",
+        f"# HELP {PROCESSES_METRIC} Live processes with fresh complete metric publications merged into this scrape, the answering process included.",
         f"# TYPE {PROCESSES_METRIC} gauge",
         f"{PROCESSES_METRIC} {processes}",
-        f"# HELP {DEGRADED_METRIC} 1 when the Pod's processes could not share their samples (shared directory unusable), so this scrape is one process's view rather than the Pod's.",
+        f"# HELP {DEGRADED_METRIC} 1 when process metric coverage is incomplete: a live publication is stale, malformed or missing, or the shared directory is unusable.",
         f"# TYPE {DEGRADED_METRIC} gauge",
         f"{DEGRADED_METRIC} {int(degraded)}",
     ]
@@ -528,40 +531,96 @@ def _load(path: Path) -> Rendered | None:
     except (OSError, ValueError):
         # Being rewritten, or never completed: the next scrape sees it.
         return None
-    if not isinstance(payload, dict) or payload.get("format") != FILE_FORMAT:
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("format")) is not int
+        or payload["format"] != FILE_FORMAT
+    ):
         return None
-    rendered = Rendered(pid=payload.get("pid"), slot=payload.get("slot"))
+    rendered = Rendered(
+        pid=payload.get("pid"),
+        slot=payload.get("slot"),
+        published_at=payload.get("published_at"),
+    )
     families = payload.get("families")
     if isinstance(families, dict):
         for name, declared in families.items():
-            if isinstance(declared, list) and len(declared) == 2:
+            if (
+                isinstance(name, str)
+                and isinstance(declared, list)
+                and len(declared) == 2
+                and all(value is None or isinstance(value, str) for value in declared)
+            ):
                 rendered.families[name] = (declared[0], declared[1])
                 rendered.samples.setdefault(name, [])
+            else:
+                rendered.degraded = True
+    else:
+        rendered.degraded = True
     samples = payload.get("samples")
     if isinstance(samples, list):
         for item in samples:
             if not (isinstance(item, list) and len(item) == 3):
+                rendered.degraded = True
                 continue
             name, labels, value = item
-            pairs = tuple(
-                (str(k), str(v)) for k, v in labels if isinstance(labels, list)
-            )
+            if not isinstance(labels, list) or any(
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or not all(isinstance(part, str) for part in pair)
+                for pair in labels
+            ):
+                rendered.degraded = True
+                continue
+            try:
+                _number(str(value))
+            except ValueError:
+                rendered.degraded = True
+                continue
+            pairs = tuple((str(k), str(v)) for k, v in labels)
+            if not isinstance(name, str) or len({key for key, _ in pairs}) != len(
+                pairs
+            ):
+                rendered.degraded = True
+                continue
             family = _family_of(str(name), rendered.families)
             rendered.families.setdefault(family, (None, None))
             rendered.samples.setdefault(family, []).append(
                 Sample(str(name), pairs, str(value))
             )
+    else:
+        rendered.degraded = True
     return rendered
 
 
-def live_siblings(directory: Path, *, pid: int | None = None) -> list[Rendered]:
-    """Every other live process's published render; a dead PID's file is
-    removed rather than counted again after a worker restart."""
+def active_slots(directory: Path) -> set[int]:
+    """Observe held slot locks, including a publisher that has not rendered yet."""
+
+    active: set[int] = set()
+    for slot in range(MAX_SLOTS):
+        try:
+            with (directory / f"slot-{slot}.lock").open("r+") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    active.add(slot)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except FileNotFoundError:
+            continue
+    return active
+
+
+def live_siblings(
+    directory: Path, *, pid: int | None = None, local_slot: int | None = None
+) -> list[Rendered]:
+    """Fresh live publications, plus explicit unknown-coverage sentinels."""
 
     own = os.getpid() if pid is None else pid
     others: list[Rendered] = []
     if not directory.is_dir():
         return others
+    slots = set() if local_slot is None else {local_slot}
     for path in sorted(directory.glob("*.json")):
         try:
             other = int(path.stem)
@@ -573,8 +632,28 @@ def live_siblings(directory: Path, *, pid: int | None = None) -> list[Rendered]:
             path.unlink(missing_ok=True)
             continue
         loaded = _load(path)
-        if loaded is not None:
-            others.append(loaded)
+        if loaded is None:
+            others.append(Rendered(pid=other, degraded=True))
+            continue
+        observed_at = time.time()
+        stamp, slot = loaded.published_at, loaded.slot
+        if (
+            type(loaded.pid) is not int
+            or loaded.pid != other
+            or type(slot) is not int
+            or not 0 <= slot < MAX_SLOTS
+            or slot in slots
+            or not isinstance(stamp, (int, float))
+            or isinstance(stamp, bool)
+            or not math.isfinite(stamp)
+            or not 0 <= observed_at - stamp <= MAX_PUBLISH_AGE_SECONDS
+        ):
+            others.append(Rendered(pid=other, degraded=True))
+            continue
+        slots.add(slot)
+        others.append(loaded)
+    if active_slots(directory) - slots:
+        others.append(Rendered(degraded=True))
     return others
 
 
@@ -603,16 +682,21 @@ def pod_coherent_lines(
         return aggregate(local, []) + merger_lines(1, False)
     try:
         local.slot = SLOTS.slot(target)
+        if local.slot is None:
+            raise OSError("no free process metric slot")
         local.pid = os.getpid()
         publish(target, local, slot=local.slot)
-        others = live_siblings(target)
+        others = live_siblings(target, local_slot=local.slot)
     except OSError as error:
         LOGGER.warning(
             "process metrics could not be shared through %s: %s", target, error
         )
         local.slot = 0
         return aggregate(local, []) + merger_lines(1, True)
-    return aggregate(local, others) + merger_lines(1 + len(others), False)
+    complete = sum(not peer.degraded for peer in others)
+    return aggregate(local, others) + merger_lines(
+        1 + complete, any(peer.degraded for peer in others)
+    )
 
 
 def publish_forever(
@@ -634,8 +718,11 @@ def publish_forever(
         return
     while True:
         try:
+            slot = SLOTS.slot(target)
+            if slot is None:
+                raise OSError("no free process metric slot")
             rendered = parse_lines(render())
-            rendered.slot = SLOTS.slot(target)
+            rendered.slot = slot
             rendered.pid = os.getpid()
             publish(target, rendered, slot=rendered.slot)
         except Exception:  # noqa: BLE001 - a publisher must not die on one write

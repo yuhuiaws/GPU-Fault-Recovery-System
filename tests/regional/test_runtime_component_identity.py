@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault_release import regional_release_runtime_identity as MODULE
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 
 class Runner:
@@ -46,6 +47,7 @@ class Release:
     ) -> None:
         self.config = SimpleNamespace(
             namespace="gpu-fault-system",
+            release_manifest_schema_version=3,
             component_digests={"control_plane": "c" * 64, "executor": "e" * 64},
             clusters=(SimpleNamespace(cluster_id="gpu-a", context="gpu-a-context"),),
         )
@@ -99,6 +101,25 @@ def test_runtime_component_identity_checks_pods_concurrently_with_stable_output(
     assert list(cpu_pods) == sorted(cpu_pods)
 
 
+def test_single_replica_deployments_are_checked_in_parallel_across_clusters() -> None:
+    runner = ConcurrentRunner()
+    release = Release(replicas=1, runner=runner)
+    release.config.clusters = tuple(
+        SimpleNamespace(cluster_id=f"gpu-{index}", context=f"context-{index}")
+        for index in range(3)
+    )
+
+    result = MODULE.validate_runtime_component_identity(release)
+
+    assert 1 < runner.max_active <= MODULE.MAX_RUNTIME_IDENTITY_WORKERS
+    assert set(result["executor"]["clusters"]) == {"gpu-0", "gpu-1", "gpu-2"}
+    for deployments in result["executor"]["clusters"].values():
+        assert len(deployments) == 4
+        assert all(len(pods) == 1 for pods in deployments.values()), (
+            "identity validation omitted a single-replica deployment"
+        )
+
+
 class ProbeRelease:
     """A release whose ingress Pod can be replaced between two exec attempts.
 
@@ -121,7 +142,9 @@ class ProbeRelease:
         self.failures = failures
         self.failure_exit_code = failure_exit_code
         self.execs: list[str] = []
-        self.runner = SimpleNamespace(run=self._run, probe=self._probe, dry_run=False)
+        self.runner = SimpleNamespace(
+            run=self._run, probe_output=self._probe, dry_run=False
+        )
 
     @staticmethod
     def _cpu(*arguments):
@@ -129,6 +152,8 @@ class ProbeRelease:
 
     def _run(self, arguments, **_kwargs):
         if "get" in arguments and "pod" in arguments and "-l" in arguments:
+            if "json" not in arguments:
+                return self.pod
             # The resolver now reads the Pod list as JSON and prefers a Ready,
             # non-terminating Pod; a single Ready Pod answers as the resolution.
             import json as _json
@@ -163,7 +188,8 @@ class ProbeRelease:
         raise AssertionError(f"unexpected command: {arguments}")
 
     def _probe(self, arguments, **_kwargs):
-        return arguments[-1] in self.live_pods
+        name = arguments[arguments.index("get") + 2]
+        return resource_probe_result(arguments, present=name in self.live_pods)
 
     def prime(self) -> None:
         """Memoise the current Pod the way the run's first probe would.

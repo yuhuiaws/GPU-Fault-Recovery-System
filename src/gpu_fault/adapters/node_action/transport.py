@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import ssl
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -12,6 +13,14 @@ from urllib import request as urllib_request
 from gpu_fault.adapters.common import (
     NODE_ACTION_ACCEPTED_NODES_KEY,
     NodeActionPending,
+    node_action_accepted_nodes,
+)
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    guard_new_node_submission,
+    regional_ownership_enforced,
+)
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    refusal as ownership_refusal,
 )
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
 from gpu_fault.execution import (
@@ -23,11 +32,12 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.models import (
     WorkflowOperation,
+    WorkflowStepStatus,
+    execution_phase,
 )
 from gpu_fault.node_action_keys import (
     resolve_node_action_secret,
 )
-from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
 from gpu_fault.node_agent import (
     NodeActionCommand,
     NodeActionExecutionState,
@@ -38,6 +48,15 @@ from gpu_fault.node_agent import (
     sign_node_action,
     sign_result_query,
 )
+from gpu_fault.node_agent.late_ownership import (
+    OWNERSHIP_PROTOCOL,
+    command_identity,
+    ownership_recheck_scope,
+    ownership_required,
+    sign_permit,
+)
+from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
+from gpu_fault.orchestration.escalation import unknown_outcome_failure
 from gpu_fault.transport.http_client import urlopen
 
 # Agent answers that mean "ask again later with the same command": the agent
@@ -45,6 +64,21 @@ from gpu_fault.transport.http_client import urlopen
 # successful operation -- the ledger write failing behind a finished reset --
 # is the case that must not become a FAILED step.
 TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
+
+# These native validation errors precede dispatch of an initial submission.
+# They do not prove closure after a permit or an acknowledged command.
+_PRE_DISPATCH_HTTP_REJECTIONS = {
+    "INVALID_SIGNATURE": 401,
+    "TARGET_NODE_MISMATCH": 422,
+    "AGENT_GENERATION_UNKNOWN": 409,
+    "STALE_AGENT_GENERATION": 409,
+    "OPERATION_NOT_ALLOWED": 403,
+    "INVALID_ISSUED_AT": 422,
+    "COMMAND_EXPIRED": 410,
+    "INVALID_TTL": 422,
+    "STALE_FENCING_TOKEN": 409,
+    "OWNERSHIP_REFUSED": 409,
+}
 
 # COMPATIBILITY SHIM -- REMOVE ONE RELEASE AFTER R4 SHIPS (added 2026-09-09).
 #
@@ -72,6 +106,12 @@ LEGACY_COMMAND_ID_SUFFIX = "/agent-"
 LEGACY_COMMAND_IDS_KEY = "node_action_legacy_command_ids"
 
 
+class _UnconfirmedSubmissionHTTPError(RuntimeError):
+    def __init__(self, error: urllib_error.HTTPError) -> None:
+        super().__init__("protected node submission returned an HTTP error")
+        self.error = error
+
+
 def _control_plane_did_not_answer(exc: BaseException) -> bool:
     """Whether a registry read failed without saying anything about the record.
 
@@ -87,6 +127,441 @@ def _control_plane_did_not_answer(exc: BaseException) -> bool:
         return False
     status = exc.status_code
     return status is None or int(status) >= 500
+
+
+def _unknown_response(
+    command_id: str,
+    node_id: str,
+    reason: str,
+    *,
+    accepted: bool = False,
+    permit: bool = False,
+    http_status: int | None = None,
+) -> NodeActionPending:
+    details: dict[str, Any] = {
+        "reason": reason,
+        "waiting_node": node_id,
+        "node_action_response_unknown": True,
+        "outcome_unknown": True,
+        "manual_confirmation_required": True,
+        NODE_ACTION_ACCEPTED_NODES_KEY: [node_id] if accepted else [],
+    }
+    if permit:
+        details["ownership_permit_delivery_unknown"] = True
+    if http_status is not None:
+        details["http_status"] = http_status
+    return NodeActionPending(command_id, details)
+
+
+def _pending_outcome(
+    context: WorkflowStepContext,
+    node_id: str,
+    pending: NodeActionPending,
+    *,
+    intent_sha256: str | None = None,
+) -> WorkflowStepOutcome:
+    return WorkflowStepOutcome.waiting(
+        operation_id=context.idempotency_key,
+        details={
+            "node_action_command_id": pending.command_id,
+            "node_action_state": "PENDING",
+            NODE_ACTION_ACCEPTED_NODES_KEY: [node_id],
+            **pending.details,
+            **(
+                {"node_action_intent_sha256": intent_sha256}
+                if intent_sha256 is not None
+                else {}
+            ),
+        },
+    )
+
+
+def _action_intent(
+    context: WorkflowStepContext,
+    node_id: str,
+    operation: WorkflowOperation,
+    gpu_uuids: list[str],
+    command_suffix: str,
+    agent_generation: int | None,
+) -> str:
+    payload = {
+        "workflow_request_id": context.workflow.request_id,
+        "incident_id": context.incident.incident_id,
+        "cluster_id": context.incident.cluster_id,
+        "fencing_token": context.workflow.fencing_token,
+        "step_index": context.step_index,
+        "phase": execution_phase(context.workflow),
+        "idempotency_key": context.idempotency_key,
+        "command_suffix": command_suffix,
+        "operation": operation.value,
+        "node_id": node_id,
+        "agent_generation": agent_generation,
+        "gpu_uuids": gpu_uuids,
+        "parameters": context.step.model_dump(mode="json")["parameters"],
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _resume_ownership_action(
+    adapter: NodeActionTransportMixin,
+    context: WorkflowStepContext,
+    node_id: str,
+    operation: WorkflowOperation,
+    recorded: dict[str, Any],
+    intent_sha256: str,
+) -> NodeActionResult | WorkflowStepOutcome | None:
+    previous = recorded.get("node_action_intent_sha256")
+    unknown = (
+        recorded.get("node_action_response_unknown") is True
+        or recorded.get("ownership_permit_delivery_unknown") is True
+    )
+    mismatch = recorded.get("node_action_intent_mismatch") is True or (
+        (unknown or previous is not None) and previous != intent_sha256
+    )
+    if mismatch:
+        pending = _unknown_response(
+            str(recorded["node_action_command_id"]),
+            node_id,
+            "OWNERSHIP_INTENT_MISMATCH",
+            accepted=node_id in node_action_accepted_nodes(recorded),
+            permit=recorded.get("ownership_permit_delivery_unknown") is True,
+        )
+        pending.details["node_action_intent_mismatch"] = True
+        return _pending_outcome(
+            context,
+            node_id,
+            pending,
+            intent_sha256=previous if isinstance(previous, str) else None,
+        )
+    if unknown:
+        return _poll_unknown_action(adapter, context, node_id, operation, recorded)
+    return None
+
+
+def _recorded_ownership_action(
+    context: WorkflowStepContext, node_id: str, command_suffix: str
+) -> dict[str, Any]:
+    prefix = f"{context.idempotency_key}/{command_suffix}"
+    settled_phases: set[str | None] = set()
+    for execution in reversed(context.workflow.step_executions):
+        if (
+            execution.step_index != context.step_index
+            or execution.operation is not context.step.operation
+            or execution.phase in settled_phases
+        ):
+            continue
+        details: dict[str, Any] = execution.details
+        unknown = (
+            details.get("node_action_response_unknown") is True
+            or details.get("ownership_permit_delivery_unknown") is True
+        )
+        if execution.status is WorkflowStepStatus.SUCCEEDED and not unknown:
+            settled_phases.add(execution.phase)
+            continue
+        command_id = details.get("node_action_command_id")
+        if not isinstance(command_id, str) or not command_id:
+            continue
+        accepted = node_id in node_action_accepted_nodes(details)
+        same_id = (
+            re.fullmatch(re.escape(prefix) + r"(?:/agent-[1-9][0-9]*)?", command_id)
+            is not None
+        )
+        if unknown and (accepted or details.get("waiting_node") == node_id or same_id):
+            if not same_id or execution.phase != execution_phase(context.workflow):
+                return {**details, "node_action_intent_mismatch": True}
+            return details
+        if execution.status is WorkflowStepStatus.WAITING and accepted and same_id:
+            if execution.phase != execution_phase(context.workflow):
+                return {**details, "node_action_intent_mismatch": True}
+            return details
+    return {}
+
+
+def _validate_ownership_response(
+    state: NodeActionSubmission,
+    command_id: str,
+    node_id: str,
+    operation: WorkflowOperation,
+    *,
+    accepted: bool,
+    permit: bool = False,
+) -> NodeActionSubmission:
+    result = state.result
+    if (
+        state.command_id != command_id
+        or (
+            result is not None
+            and (
+                result.command_id != command_id
+                or result.operation is not operation
+                or state.state.value != result.status.value
+                or (
+                    result.status is NodeActionStatus.SUCCEEDED
+                    and unknown_outcome_failure(result.details)
+                )
+            )
+        )
+        or (state.state is not NodeActionExecutionState.PENDING and result is None)
+    ):
+        raise _unknown_response(
+            command_id,
+            node_id,
+            "OWNERSHIP_RESPONSE_MISMATCH",
+            accepted=accepted,
+            permit=permit,
+        )
+    if result is not None and result.details.get("node_action_not_started") is True:
+        details = result.details
+        confirmed = (
+            result.status is NodeActionStatus.FAILED
+            and not result.retryable
+            and details.get("safety_rejection") is True
+            and details.get("manual_confirmation_required") is True
+            and details.get("agent_queue_ownership_checked") is True
+            and details.get("ownership_check_boundary") == "AGENT_PRE_SPAWN"
+            and details.get("node_action_command_id") == command_id
+            and details.get("physical_ownership_checks") == []
+            and (
+                details.get("outcome_unknown") is None
+                or details.get("outcome_unknown") is False
+            )
+        )
+        if not confirmed:
+            if result.status is NodeActionStatus.SUCCEEDED:
+                raise _unknown_response(
+                    command_id,
+                    node_id,
+                    "OWNERSHIP_RESPONSE_MISMATCH",
+                    accepted=accepted,
+                    permit=permit,
+                )
+            details = {
+                **details,
+                "outcome_unknown": True,
+                "manual_confirmation_required": True,
+            }
+            details.pop("node_action_not_started")
+            state = state.model_copy(
+                update={
+                    "result": result.model_copy(
+                        update={"details": details, "retryable": False}
+                    )
+                }
+            )
+    result = state.result
+    if (
+        result is not None
+        and result.retryable
+        and unknown_outcome_failure(result.details)
+    ):
+        state = state.model_copy(
+            update={"result": result.model_copy(update={"retryable": False})}
+        )
+    return state
+
+
+def _submission_response(
+    request: urllib_request.Request,
+    command: NodeActionCommand,
+    *,
+    timeout_seconds: float,
+    ssl_context: ssl.SSLContext | None,
+    accepted: bool = False,
+    permit: bool = False,
+) -> NodeActionSubmission:
+    try:
+        with urlopen(
+            request, timeout=timeout_seconds, ssl_context=ssl_context
+        ) as response:
+            state = NodeActionSubmission.model_validate_json(response.read())
+    except urllib_error.HTTPError as exc:
+        if command.ownership_guard is None:
+            raise
+        if not permit and not accepted:
+            raise _UnconfirmedSubmissionHTTPError(exc) from None
+        raise _unknown_response(
+            command.command_id,
+            command.node_id,
+            "OWNERSHIP_RESPONSE_UNAVAILABLE",
+            accepted=accepted,
+            permit=permit,
+            http_status=exc.code,
+        ) from None
+    except Exception:
+        if command.ownership_guard is None:
+            raise
+        raise _unknown_response(
+            command.command_id,
+            command.node_id,
+            "OWNERSHIP_PROTOCOL_UNVERIFIABLE",
+            accepted=accepted,
+            permit=permit,
+        ) from None
+    if command.ownership_guard is not None:
+        state = _validate_ownership_response(
+            state,
+            command.command_id,
+            command.node_id,
+            command.operation,
+            accepted=accepted,
+            permit=permit,
+        )
+    return state
+
+
+def _poll_unknown_action(
+    adapter: NodeActionTransportMixin,
+    context: WorkflowStepContext,
+    node_id: str,
+    operation: WorkflowOperation,
+    recorded: dict[str, Any],
+) -> NodeActionResult | WorkflowStepOutcome:
+    """An uncertain delivery permits reads, never a replacement submission."""
+
+    command_id = str(recorded["node_action_command_id"])
+    accepted = node_id in node_action_accepted_nodes(recorded)
+    reason = "OWNERSHIP_RESULT_UNAVAILABLE"
+    http_status = None
+    try:
+        endpoint = adapter._endpoint(context.incident.cluster_id, node_id, None)
+        if not endpoint:
+            raise ValueError("node action endpoint is unavailable")
+        record = (
+            adapter._agent_record(context.incident.cluster_id, node_id)
+            if adapter.registry is not None
+            else None
+        )
+        secret = adapter._secret_for_node(
+            context.incident.cluster_id, node_id, record=record
+        )
+        ssl_context = adapter._ssl_context(
+            context.incident.cluster_id, node_id, endpoint, record=record
+        )
+        state = adapter._poll_result(
+            endpoint, command_id, secret=secret, ssl_context=ssl_context
+        )
+        if state is not None:
+            state = _validate_ownership_response(
+                state, command_id, node_id, operation, accepted=accepted
+            )
+            if state.result is not None:
+                return adapter._retry_exhausted(state.result) or state.result
+            accepted = True
+    except NodeActionPending as exc:
+        reason = str(exc.details["reason"])
+    except urllib_error.HTTPError as exc:
+        http_status = exc.code
+    except Exception:
+        pass
+    return _pending_outcome(
+        context,
+        node_id,
+        _unknown_response(
+            command_id,
+            node_id,
+            reason,
+            accepted=accepted,
+            permit=recorded.get("ownership_permit_delivery_unknown") is True,
+            http_status=http_status,
+        ),
+        intent_sha256=recorded.get("node_action_intent_sha256"),
+    )
+
+
+def _classify_http_error(
+    context: WorkflowStepContext,
+    node_id: str,
+    command: NodeActionCommand,
+    exc: urllib_error.HTTPError,
+    *,
+    legacy_command_ids: tuple[str, ...] = (),
+    submission_unconfirmed: bool = False,
+) -> WorkflowStepOutcome:
+    try:
+        raw_detail = exc.read().decode(errors="replace")
+    except Exception:
+        if not submission_unconfirmed:
+            raise
+        raw_detail = ""
+    structured: dict[str, Any] = {}
+    try:
+        parsed = json.loads(raw_detail)
+        if isinstance(parsed, dict):
+            detail = parsed.get("detail", parsed)
+            if isinstance(detail, dict):
+                structured = detail
+    except json.JSONDecodeError:
+        pass
+    message = str(structured.get("message") or raw_detail or exc.reason)
+    code = str(structured.get("code", "HTTP_REJECTION"))
+    retryable = bool(structured.get("retryable", False))
+    requires_new_command = bool(structured.get("requires_new_command", False))
+    if submission_unconfirmed and not (
+        _PRE_DISPATCH_HTTP_REJECTIONS.get(code) == exc.code
+        and type(structured.get("retryable")) is bool
+        and type(structured.get("requires_new_command")) is bool
+    ):
+        return _pending_outcome(
+            context,
+            node_id,
+            _unknown_response(
+                command.command_id,
+                node_id,
+                "OWNERSHIP_RESPONSE_UNAVAILABLE",
+                http_status=exc.code,
+            ),
+        )
+    common = {
+        "node_action_command_id": command.command_id,
+        "node_action_error_code": code,
+        "node_action_retryable": retryable,
+        "node_action_requires_new_command": requires_new_command,
+        "http_status": exc.code,
+        # No ledger row was reached, so keep the exact legacy pointer (shim).
+        **NodeActionTransportMixin._carried_legacy_ids(legacy_command_ids),
+    }
+    if requires_new_command:
+        # A rejected envelope can be refreshed only while the workflow owns
+        # its fence; it is not evidence of a failed GPU.
+        return WorkflowStepOutcome.waiting(
+            operation_id=context.idempotency_key,
+            details={
+                **common,
+                "node_action_state": "NEW_COMMAND_REQUIRED",
+                "waiting_node": node_id,
+                "reason": f"node agent {node_id} requires a new command: "
+                f"HTTP {exc.code} {code}: {message}",
+            },
+        )
+    if exc.code >= 500 or exc.code in TRANSIENT_HTTP_STATUSES or retryable:
+        return WorkflowStepOutcome.waiting(
+            operation_id=context.idempotency_key,
+            details={
+                **common,
+                "node_action_state": "TRANSPORT_RETRY",
+                "node_action_transport_retry": True,
+                "waiting_node": node_id,
+                "reason": f"node agent {node_id} answered HTTP {exc.code} "
+                f"{code}: {message}",
+            },
+        )
+    if code == "COMMAND_ID_REUSED":
+        # A prior body may already have run under this ID. Neither hardware
+        # ladder may escalate a command-identity conflict.
+        common["manual_confirmation_required"] = True
+        common["failed_nodes"] = [node_id]
+        common["node_failures"] = {
+            node_id: [f"command_id reused with a different body (HTTP {exc.code})"]
+        }
+    if code == "OWNERSHIP_REFUSED" or command.ownership_guard is not None:
+        common["manual_confirmation_required"] = True
+        common["safety_rejection"] = True
+    return WorkflowStepOutcome.failed(
+        f"node agent {node_id} rejected request: HTTP {exc.code}: {message}",
+        details=common,
+    )
 
 
 class NodeActionTransportMixin:
@@ -150,8 +625,11 @@ class NodeActionTransportMixin:
     ) -> str | None:
         if self.registry is not None:
             if maintenance and expected_generation is not None:
-                return self.registry.maintenance_endpoint(
-                    cluster_id, node_id, expected_generation
+                return cast(
+                    str,
+                    self.registry.maintenance_endpoint(
+                        cluster_id, node_id, expected_generation
+                    ),
                 )
             endpoint, generation = self.registry.endpoint(cluster_id, node_id)
             if expected_generation is not None and generation != expected_generation:
@@ -159,8 +637,8 @@ class NodeActionTransportMixin:
                     f"agent generation changed from "
                     f"{expected_generation} to {generation}"
                 )
-            return endpoint
-        return self.endpoints.get(node_id)
+            return cast(str, endpoint)
+        return cast(str | None, self.endpoints.get(node_id))
 
     def _send_action(
         self,
@@ -172,6 +650,25 @@ class NodeActionTransportMixin:
         command_suffix: str,
         agent_generation: int | None = None,
     ) -> NodeActionResult | WorkflowStepOutcome:
+        guarded = regional_ownership_enforced() and ownership_required(operation)
+        recorded = (
+            _recorded_ownership_action(context, node_id, command_suffix)
+            if guarded
+            else {}
+        )
+        intent_sha256 = (
+            _action_intent(
+                context, node_id, operation, gpu_uuids, command_suffix, agent_generation
+            )
+            if guarded
+            else None
+        )
+        if recorded and intent_sha256 is not None:
+            resumed = _resume_ownership_action(
+                self, context, node_id, operation, recorded, intent_sha256
+            )
+            if resumed is not None:
+                return resumed
         hold_reason = lease_hold_reason()
         if hold_reason is not None:
             # The executor no longer holds (or was told to give up) its lease
@@ -220,6 +717,14 @@ class NodeActionTransportMixin:
         except ValueError as exc:
             return WorkflowStepOutcome.failed(str(exc))
         now = datetime.now(timezone.utc)
+        expires_at = now + self.command_ttl
+        lifetime = context.workflow.lifetime_deadline_at
+        if guarded and lifetime is not None:
+            if lifetime.tzinfo is None:
+                return ownership_refusal("OWNERSHIP_LIFETIME_UNKNOWN")
+            expires_at = min(expires_at, lifetime)
+            if expires_at <= now:
+                return ownership_refusal("OWNERSHIP_WORKFLOW_EXPIRED")
         command_id = f"{context.idempotency_key}/{command_suffix}"
         recorded_legacy_ids: tuple[str, ...] = ()
         legacy_command_ids: tuple[str, ...] = ()
@@ -250,7 +755,8 @@ class NodeActionTransportMixin:
             gpu_uuids=gpu_uuids,
             parameters=context.step.parameters,
             issued_at=now,
-            expires_at=now + self.command_ttl,
+            expires_at=expires_at,
+            ownership_guard=OWNERSHIP_PROTOCOL if guarded else None,
         )
         envelope = SignedNodeAction(
             command=command,
@@ -258,6 +764,9 @@ class NodeActionTransportMixin:
         )
         try:
             if self.sender is not None:
+                denied = guard_new_node_submission(context, node_id)
+                if denied is not None:
+                    return denied
                 return self.sender(endpoint, envelope)
             return self._send(
                 endpoint,
@@ -265,30 +774,21 @@ class NodeActionTransportMixin:
                 secret=action_secret,
                 ssl_context=ssl_context,
                 legacy_command_ids=legacy_command_ids,
+                before_submit=lambda: guard_new_node_submission(context, node_id),
+                accepted=node_id in node_action_accepted_nodes(recorded),
             )
         except NodeActionPending as exc:
-            # The only path that parsed an acceptance out of the agent: the
-            # ledger row exists and the agent owns the work. Every other branch
-            # below also carries ``node_action_command_id`` -- a refused
-            # connection, a 503, an expired envelope -- so the pointer alone
-            # cannot tell a caller that anything started. Callers that must know
-            # (the executor's destructive fleet preflight) read these keys.
-            #
-            # Acceptance is per node, not per step: a multi-node step is folded
-            # one node at a time, so naming the node is the only way a reader
-            # can tell "this step began" from "this step began on this node and
-            # has not reached the others". The list is the only marker; the
-            # step-level ``node_action_accepted`` bool it replaced had no reader
-            # left and let a never-contacted node past the fleet fence.
-            return WorkflowStepOutcome.waiting(
-                operation_id=context.idempotency_key,
-                details={
-                    "node_action_command_id": exc.command_id,
-                    "node_action_state": "PENDING",
-                    NODE_ACTION_ACCEPTED_NODES_KEY: [node_id],
-                    **exc.details,
-                },
+            # A parsed PENDING proves acceptance. An unreadable initial reply
+            # does not: _unknown_response overrides the accepted-node list,
+            # while keeping the command pending until its ledger can answer.
+            return _pending_outcome(context, node_id, exc, intent_sha256=intent_sha256)
+        except _UnconfirmedSubmissionHTTPError as exc:
+            outcome = self._classify_http_error(
+                context, node_id, command, exc.error, submission_unconfirmed=True
             )
+            if outcome.details and outcome.details.get("node_action_response_unknown"):
+                outcome.details["node_action_intent_sha256"] = intent_sha256
+            return outcome
         except urllib_error.HTTPError as exc:
             return self._classify_http_error(
                 context,
@@ -312,6 +812,18 @@ class NodeActionTransportMixin:
                 },
             )
         except Exception as exc:
+            if command.ownership_guard is not None:
+                return _pending_outcome(
+                    context,
+                    node_id,
+                    _unknown_response(
+                        command.command_id,
+                        node_id,
+                        "OWNERSHIP_PROTOCOL_UNVERIFIABLE",
+                        accepted=node_id in node_action_accepted_nodes(recorded),
+                    ),
+                    intent_sha256=intent_sha256,
+                )
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id} request failed: {type(exc).__name__}: {exc}"
             )
@@ -403,74 +915,15 @@ class NodeActionTransportMixin:
         exc: urllib_error.HTTPError,
         *,
         legacy_command_ids: tuple[str, ...] = (),
+        submission_unconfirmed: bool = False,
     ) -> WorkflowStepOutcome:
-        raw_detail = exc.read().decode(errors="replace")
-        structured: dict[str, Any] = {}
-        try:
-            parsed = json.loads(raw_detail)
-            detail = parsed.get("detail", parsed)
-            if isinstance(detail, dict):
-                structured = detail
-        except json.JSONDecodeError:
-            pass
-        message = str(structured.get("message") or raw_detail or exc.reason)
-        code = str(structured.get("code", "HTTP_REJECTION"))
-        retryable = bool(structured.get("retryable", False))
-        requires_new_command = bool(structured.get("requires_new_command", False))
-        common = {
-            "node_action_command_id": command.command_id,
-            "node_action_error_code": code,
-            "node_action_retryable": retryable,
-            "node_action_requires_new_command": requires_new_command,
-            "http_status": exc.code,
-            # None of the branches below reached a ledger row, so the exact
-            # legacy pointer must outlive this record (shim).
-            **NodeActionTransportMixin._carried_legacy_ids(legacy_command_ids),
-        }
-        if requires_new_command:
-            # STALE_AGENT_GENERATION, COMMAND_EXPIRED, STALE_FENCING_TOKEN: the
-            # agent will never accept this envelope again, but the step is not
-            # lost -- the next dispatch builds a fresh envelope (new issued_at
-            # and signature), and the control plane decides whether the
-            # workflow still holds the fence. Failing here turned a superseded
-            # command into a FAILED GPU.
-            return WorkflowStepOutcome.waiting(
-                operation_id=context.idempotency_key,
-                details={
-                    **common,
-                    "node_action_state": "NEW_COMMAND_REQUIRED",
-                    "waiting_node": node_id,
-                    "reason": f"node agent {node_id} requires a new command: "
-                    f"HTTP {exc.code} {code}: {message}",
-                },
-            )
-        if exc.code >= 500 or exc.code in TRANSIENT_HTTP_STATUSES or retryable:
-            return WorkflowStepOutcome.waiting(
-                operation_id=context.idempotency_key,
-                details={
-                    **common,
-                    "node_action_state": "TRANSPORT_RETRY",
-                    "node_action_transport_retry": True,
-                    "waiting_node": node_id,
-                    "reason": f"node agent {node_id} answered HTTP {exc.code} "
-                    f"{code}: {message}",
-                },
-            )
-        if code == "COMMAND_ID_REUSED":
-            # A workflow defect, not a failed GPU: the idempotency key excludes
-            # the body, so a rebind that changed this step's GPU set collides
-            # with an attempt 1 that may already have reset the old set. Both
-            # ladders read this flag and hand the step to an operator instead
-            # of rebooting on top of it; ``node_failures`` is the per-node
-            # cause the escalation's reason text and support email quote.
-            common["manual_confirmation_required"] = True
-            common["failed_nodes"] = [node_id]
-            common["node_failures"] = {
-                node_id: [f"command_id reused with a different body (HTTP {exc.code})"]
-            }
-        return WorkflowStepOutcome.failed(
-            f"node agent {node_id} rejected request: HTTP {exc.code}: {message}",
-            details=common,
+        return _classify_http_error(
+            context,
+            node_id,
+            command,
+            exc,
+            legacy_command_ids=legacy_command_ids,
+            submission_unconfirmed=submission_unconfirmed,
         )
 
     def _agent_record(self, cluster_id: str, node_id: str) -> Any:
@@ -583,11 +1036,41 @@ class NodeActionTransportMixin:
         secret: str,
         ssl_context: ssl.SSLContext | None = None,
         legacy_command_ids: tuple[str, ...] = (),
-    ) -> NodeActionResult:
+        before_submit: Callable[[], WorkflowStepOutcome | None] | None = None,
+        accepted: bool = False,
+    ) -> NodeActionResult | WorkflowStepOutcome:
         command_id = envelope.command.command_id
-        state = self._poll_result(
-            endpoint, command_id, secret=secret, ssl_context=ssl_context
-        )
+
+        def poll(expected_id: str) -> NodeActionSubmission | None:
+            try:
+                current = self._poll_result(
+                    endpoint, expected_id, secret=secret, ssl_context=ssl_context
+                )
+            except Exception as exc:
+                if envelope.command.ownership_guard is None or (
+                    not accepted and isinstance(exc, (urllib_error.HTTPError, OSError))
+                ):
+                    raise
+                raise _unknown_response(
+                    expected_id,
+                    envelope.command.node_id,
+                    "OWNERSHIP_PROTOCOL_UNVERIFIABLE",
+                    accepted=accepted,
+                    http_status=(
+                        exc.code if isinstance(exc, urllib_error.HTTPError) else None
+                    ),
+                ) from None
+            if current is not None and envelope.command.ownership_guard is not None:
+                current = _validate_ownership_response(
+                    current,
+                    expected_id,
+                    envelope.command.node_id,
+                    envelope.command.operation,
+                    accepted=accepted,
+                )
+            return current
+
+        state = poll(command_id)
         pending_details: dict[str, Any] = {"node_action_endpoint": endpoint}
         for legacy_command_id in legacy_command_ids:
             # COMPATIBILITY SHIM (see LEGACY_COMMAND_ID_SUFFIX): the agent may
@@ -598,11 +1081,16 @@ class NodeActionTransportMixin:
             # the next poll's read-back is exact.
             if state is not None:
                 break
-            state = self._poll_result(
-                endpoint, legacy_command_id, secret=secret, ssl_context=ssl_context
-            )
+            state = poll(legacy_command_id)
             if state is not None:
                 pending_details["node_action_legacy_command_id"] = legacy_command_id
+        if state is None and accepted:
+            raise _unknown_response(
+                command_id,
+                envelope.command.node_id,
+                "OWNERSHIP_RESULT_UNAVAILABLE",
+                accepted=True,
+            )
         if state is not None and self._should_resubmit(state):
             # The agent's ledger holds a retryable failure and will run the
             # command again as attempt + 1 when the same envelope is
@@ -624,6 +1112,10 @@ class NodeActionTransportMixin:
                 )
             state = None
         if state is None:
+            if before_submit is not None:
+                denied = before_submit()
+                if denied is not None:
+                    return denied
             request = urllib_request.Request(
                 endpoint.rstrip("/") + "/v1/node-actions/submit",
                 data=envelope.model_dump_json().encode(),
@@ -633,12 +1125,27 @@ class NodeActionTransportMixin:
                 },
                 method="POST",
             )
-            with urlopen(
+            state = _submission_response(
                 request,
-                timeout=self.submit_timeout_seconds,
+                envelope.command,
+                timeout_seconds=self.submit_timeout_seconds,
                 ssl_context=ssl_context,
-            ) as response:
-                state = NodeActionSubmission.model_validate_json(response.read())
+                accepted=accepted,
+            )
+        if (
+            state.state is NodeActionExecutionState.PENDING
+            and state.ownership_challenge is not None
+        ):
+            state, refused = self._final_ownership_permit(
+                endpoint,
+                envelope,
+                state,
+                secret=secret,
+                ssl_context=ssl_context,
+                before_submit=before_submit,
+            )
+            if refused is not None:
+                return refused
         if state.state is NodeActionExecutionState.PENDING:
             # ``state.command_id`` rather than the envelope's: under the shim
             # they differ, and the pointer must name the row that is running.
@@ -646,6 +1153,115 @@ class NodeActionTransportMixin:
         if state.result is None:
             raise RuntimeError("node action completed without a result")
         return self._retry_exhausted(state.result) or state.result
+
+    def _final_ownership_permit(
+        self,
+        endpoint: str,
+        envelope: SignedNodeAction,
+        state: NodeActionSubmission,
+        *,
+        secret: str,
+        ssl_context: ssl.SSLContext | None,
+        before_submit: Callable[[], WorkflowStepOutcome | None] | None,
+    ) -> tuple[NodeActionSubmission, WorkflowStepOutcome | None]:
+        challenge = state.ownership_challenge
+        if (
+            challenge is None
+            or envelope.command.ownership_guard != OWNERSHIP_PROTOCOL
+            or challenge.boundary != "AGENT_PRE_SPAWN"
+            or challenge.command_sha256 != command_identity(envelope.command)
+            or challenge.command_id != envelope.command.command_id
+            or challenge.workflow_id != envelope.command.workflow_request_id
+            or challenge.incident_id != envelope.command.incident_id
+            or challenge.node_id != envelope.command.node_id
+            or challenge.agent_generation != envelope.command.agent_generation
+            or challenge.fencing_token != envelope.command.fencing_token
+        ):
+            raise _unknown_response(
+                envelope.command.command_id,
+                envelope.command.node_id,
+                "OWNERSHIP_CHALLENGE_MISMATCH",
+                accepted=True,
+            )
+        try:
+            with ownership_recheck_scope(challenge):
+                refused = (
+                    before_submit()
+                    if before_submit is not None
+                    else ownership_refusal("STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE")
+                )
+        except Exception:
+            raise _unknown_response(
+                envelope.command.command_id,
+                envelope.command.node_id,
+                "OWNERSHIP_RECHECK_UNVERIFIABLE",
+                accepted=True,
+            ) from None
+        reason = "OK"
+        if refused is not None:
+            details = refused.details or {}
+            reason = str(details.get("reason") or "STOP_OWNERSHIP_UNVERIFIABLE")
+            if details.get("node_action_state") == "LEASE_LOST":
+                reason = "OWNERSHIP_LEASE_LOST"
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None:
+                reason = "STOP_OWNERSHIP_UNVERIFIABLE"
+        permit = sign_permit(
+            challenge,
+            secret,
+            allowed=refused is None,
+            reason=reason,
+            now=datetime.now(timezone.utc),
+        )
+        authorized = envelope.model_copy(update={"ownership_permit": permit})
+        request = urllib_request.Request(
+            endpoint.rstrip("/") + "/v1/node-actions/submit",
+            data=authorized.model_dump_json().encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": envelope.command.command_id,
+            },
+            method="POST",
+        )
+        current = _submission_response(
+            request,
+            envelope.command,
+            timeout_seconds=self.submit_timeout_seconds,
+            ssl_context=ssl_context,
+            accepted=True,
+            permit=True,
+        )
+        if refused is None:
+            return current, None
+        if current.result is None:
+            pending = _unknown_response(
+                envelope.command.command_id,
+                envelope.command.node_id,
+                "OWNERSHIP_DENIAL_UNCONFIRMED",
+                accepted=True,
+            )
+            pending.details.update(
+                {
+                    "ownership_check_boundary": challenge.boundary,
+                    "agent_queue_ownership_checked": True,
+                }
+            )
+            raise pending
+        # A denial request is not a terminal result. Preserve the Agent's
+        # actual outcome, including evidence of an earlier granted checkpoint.
+        current = current.model_copy(
+            update={
+                "result": current.result.model_copy(
+                    update={
+                        "details": {
+                            **current.result.details,
+                            "node_action_command_id": envelope.command.command_id,
+                            NODE_ACTION_ACCEPTED_NODES_KEY: [envelope.command.node_id],
+                        }
+                    }
+                )
+            }
+        )
+        return current, None
 
     def _should_resubmit(self, state: NodeActionSubmission) -> bool:
         result = state.result

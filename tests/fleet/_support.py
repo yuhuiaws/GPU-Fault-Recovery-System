@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     AgentHeartbeat,
     FleetCompatibilityPolicy,
     FleetRegistry,
@@ -50,7 +51,7 @@ def heartbeat(
         cluster_id="cluster-a",
         node_id=node_id,
         endpoint=f"http://{node_id}:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version=version,
         artifact_sha256=ARTIFACT,
         policy_version="catalog-a",

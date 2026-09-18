@@ -43,6 +43,7 @@ RUNBOOK_HEADING = re.compile(r"^### (Gpu[A-Za-z0-9]+)\s*$", re.MULTILINE)
 # Pod is affected is the point.
 STORE_DERIVED_CONTRIBUTORS = (
     "src/gpu_fault/app/builtin_metric_contributors.py",
+    "src/gpu_fault/app/closed_loop_metrics.py",
     "src/gpu_fault/app/collector_metrics.py",
 )
 # Adjacent string literals are how the long HELP lines are written, and some

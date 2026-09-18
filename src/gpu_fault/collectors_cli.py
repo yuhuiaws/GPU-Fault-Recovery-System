@@ -3,18 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from gpu_fault.collector_registry import (
     COLLECTOR_REGISTRY,
-    CollectorDescriptor,
+    OUTBOX_COMMAND,
+    VALIDATE_PLUGINS_COMMAND,
     collector_registry_with_plugins,
+    discover_collector_plugins,
+    validate_collector_plugins,
 )
 from gpu_fault.collectors import (
-    KubernetesHmaNodeCollector,
     KubernetesNodeResourceCollector,
-    SqsHmaConsumer,
     context_from_environment,
     sink_from_environment,
 )
@@ -60,7 +61,7 @@ def _add_outbox_parser(
     """
 
     outbox = subcommands.add_parser(
-        "outbox", help="inspect or requeue a collector's durable outbox"
+        OUTBOX_COMMAND, help="inspect or requeue a collector's durable outbox"
     )
     outbox.add_argument(
         "--outbox-path",
@@ -265,7 +266,7 @@ CLI_ARGUMENTS: dict[str, Callable[[argparse.ArgumentParser], None]] = {
 
 
 def parser(
-    registry: Mapping[str, CollectorDescriptor] | None = None,
+    registry: Iterable[str] | None = None,
 ) -> argparse.ArgumentParser:
     registry = COLLECTOR_REGISTRY if registry is None else registry
     result = argparse.ArgumentParser(
@@ -278,23 +279,14 @@ def parser(
         if add_arguments is not None:
             add_arguments(subparser)
     _add_outbox_parser(subcommands)
+    subcommands.add_parser(
+        VALIDATE_PLUGINS_COMMAND,
+        help="validate all installed collector descriptors and factory imports",
+    )
     return result
 
 
-# Factories for the cluster-side commands whose collector modules are shared
-# with the Lambda and control-plane surfaces; the node collectors carry their
-# own ``build_from_environment``.
-def build_sqs_hma(sink: EventSink, arguments: argparse.Namespace) -> SqsHmaConsumer:
-    queue_url = os.getenv("GPU_FAULT_HMA_QUEUE_URL")
-    if not queue_url:
-        raise SystemExit("GPU_FAULT_HMA_QUEUE_URL is required")
-    return SqsHmaConsumer(sink, queue_url)
-
-
-def build_kubernetes_hma(
-    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
-) -> KubernetesHmaNodeCollector:
-    return KubernetesHmaNodeCollector(sink, context)
+# The node collectors carry their own ``build_from_environment``.
 
 
 def build_kubernetes_node_resources(
@@ -324,12 +316,18 @@ def build_kubernetes_node_resources(
 
 def main() -> None:
     configure_logging()
-    registry = collector_registry_with_plugins()
-    args = parser(registry).parse_args()
-    if args.command == "outbox":
+    plugins = discover_collector_plugins()
+    args = parser((*COLLECTOR_REGISTRY, *plugins)).parse_args()
+    if args.command == OUTBOX_COMMAND:
         # An operator command on a file: no control-plane URL, no collector.
         run_outbox_command(args)
         return
+    if args.command == VALIDATE_PLUGINS_COMMAND:
+        validate_collector_plugins(discovered=plugins)
+        return
+    registry = collector_registry_with_plugins(
+        selected_command=args.command, discovered=plugins
+    )
     validate_gpu_fault_environment(process_name="gpu-fault-collector")
     descriptor = registry[args.command]
     os.environ.setdefault(

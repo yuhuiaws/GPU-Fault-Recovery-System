@@ -6,10 +6,9 @@ every live process's render before answering. Merging needs a rule per
 family, and the rule is a fact about the family's meaning, not its type:
 
 ``SUM``
-    Counters, and gauges that add up across processes: queue depth held by
+    Gauges that add up across processes: queue depth held by
     this process, in-flight calls, pool connections, worker threads,
-    rejections. Summary/histogram families are SUM as a whole; their
-    ``_max`` sample takes the maximum (a high-water mark does not add).
+    and capacity. Counters must retain their individual reset domains.
 ``MAX``
     ``*_timestamp_seconds`` (the newest event anywhere in the Pod), ages and
     durations read as "worst process", high-water marks, and "any process
@@ -24,8 +23,9 @@ family, and the rule is a fact about the family's meaning, not its type:
     and every store-derived, fleet-level family (the same table read on
     every process; the local render wins, then the lowest slot).
 ``PER_PROCESS``
-    Facts that cannot be combined at all, exported once per process with a
-    ``process="<slot>"`` label (the notification shard a process owns).
+    Counters, cumulative summaries/histograms and paired observations, exported
+    with a bounded ``process="<slot>"`` label. Apply rate/increase before summing
+    counters so one child restart cannot reset its surviving siblings' history.
 
 Every family the built-in contributors can render must be listed here;
 ``tests/metrics/test_metric_aggregation_registry.py`` renders each role and
@@ -145,6 +145,10 @@ _ANY = (
     "gpu_fault_notification_outbox_depth",
     "gpu_fault_notification_oldest_pending_age_seconds",
     "gpu_fault_closed_loop_milestone_seconds",
+    "gpu_fault_closed_loop_milestone_window_mean_seconds",
+    "gpu_fault_closed_loop_milestone_window_count",
+    "gpu_fault_closed_loop_milestone_window_complete",
+    "gpu_fault_closed_loop_window_end_timestamp_seconds",
     "gpu_fault_completion_decisions",
     "gpu_fault_completion_events_without_decision",
     "gpu_fault_incidents_by_state",
@@ -154,6 +158,7 @@ _ANY = (
 # the worst process, high-water marks, and "any process is in this state".
 _MAX = (
     "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds",
+    "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds",
     "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds",
     "gpu_fault_notification_expired_last_seen_timestamp_seconds",
     "gpu_fault_periodic_job_error_last_seen_timestamp_seconds",
@@ -181,8 +186,6 @@ _MAX = (
     "gpu_fault_processor_consumer_last_cycle_age_seconds",
     "gpu_fault_processor_fault_pressure_active",
     "gpu_fault_processor_fault_rows_blocked_by_observation",
-    "gpu_fault_processor_counter_drift_abs",
-    "gpu_fault_processor_counter_mismatched_clusters",
     "gpu_fault_telemetry_spool_in_flight_bytes_max",
     "gpu_fault_telemetry_spool_fault_pressure_active",
     "gpu_fault_telemetry_spool_fault_backlog_depth",
@@ -211,11 +214,13 @@ _MIN = (
     "gpu_fault_telemetry_spool_fault_pressure_workers",
 )
 
-# A fact about one process that no arithmetic combines.
-_PER_PROCESS = ("gpu_fault_processor_notification_shard",)
-
-# Counters, summaries/histograms, and gauges that add up across processes.
-_SUM = (
+# Reset domains and scan observations must survive aggregation as paired series.
+_PER_PROCESS = (
+    "gpu_fault_processor_notification_shard",
+    "gpu_fault_processor_counter_drift_abs",
+    "gpu_fault_processor_counter_mismatched_clusters",
+    "gpu_fault_processor_counter_drift_scan_timestamp_seconds",
+    "gpu_fault_processor_counter_drift_scan_max_age_seconds",
     "gpu_fault_ambiguous_attempt_ownership_total",
     "gpu_fault_control_record_archive_archived_total",
     "gpu_fault_control_record_archive_errors_total",
@@ -231,10 +236,8 @@ _SUM = (
     "gpu_fault_ingest_unresolved_fault_signals_total",
     "gpu_fault_ingress_backpressure_rejections_total",
     "gpu_fault_ingress_decode_rejections_total",
-    "gpu_fault_ingress_lane_in_flight",
     "gpu_fault_ingress_lane_rejections_total",
     "gpu_fault_ingress_lane_wait_seconds",
-    "gpu_fault_ingress_lane_workers",
     "gpu_fault_metrics_contributor_errors_total",
     "gpu_fault_notification_dead_lettered_total",
     "gpu_fault_notification_delivery_errors_total",
@@ -247,9 +250,6 @@ _SUM = (
     "gpu_fault_periodic_lease_errors_total",
     "gpu_fault_policy_unknown_product_total",
     "gpu_fault_postgres_pool_checkout_wait_seconds",
-    "gpu_fault_postgres_pool_size",
-    "gpu_fault_postgres_pool_available",
-    "gpu_fault_postgres_pool_requests_waiting",
     "gpu_fault_postgres_pool_requests_errors_total",
     "gpu_fault_postgres_pool_connections_errors_total",
     "gpu_fault_postgres_pool_connections_lost_total",
@@ -257,19 +257,14 @@ _SUM = (
     "gpu_fault_postgres_credential_read_failures_total",
     "gpu_fault_postgres_credential_authentication_failures_total",
     "gpu_fault_postgres_credential_reconnect_failures_total",
-    "gpu_fault_processor_active_consumer",
     "gpu_fault_processor_admission_batch_cap_waits_total",
     "gpu_fault_processor_admission_batch_deferred_total",
     "gpu_fault_processor_admission_batch_expired_total",
     "gpu_fault_processor_admission_batch_flush_seconds",
     "gpu_fault_processor_admission_batch_groups_total",
-    "gpu_fault_processor_admission_batch_in_flight",
     "gpu_fault_processor_admission_batch_items_total",
-    "gpu_fault_processor_admission_batch_pending",
     "gpu_fault_processor_admission_batch_rounds_total",
     "gpu_fault_processor_admission_batch_scope_busy_defers_total",
-    "gpu_fault_processor_admission_batch_scope_pending",
-    "gpu_fault_processor_admission_batch_scopes_pending",
     "gpu_fault_processor_admission_batch_shed_total",
     "gpu_fault_processor_admission_batch_submitted_total",
     "gpu_fault_processor_admission_batch_wait_seconds",
@@ -286,7 +281,6 @@ _SUM = (
     "gpu_fault_processor_claim_rows_by_stream_total",
     "gpu_fault_processor_claim_rows_total",
     "gpu_fault_processor_claim_seconds_sum",
-    "gpu_fault_processor_claimed_not_started",
     "gpu_fault_processor_claimed_not_started_released_total",
     "gpu_fault_processor_completion_failure_releases_total",
     "gpu_fault_processor_completion_failures_total",
@@ -297,26 +291,20 @@ _SUM = (
     "gpu_fault_processor_deadline_exceeded_total",
     "gpu_fault_processor_evidence_admission_batch_expired_total",
     "gpu_fault_processor_evidence_admission_batch_flush_seconds",
-    "gpu_fault_processor_evidence_admission_batch_in_flight",
     "gpu_fault_processor_evidence_admission_batch_items_total",
-    "gpu_fault_processor_evidence_admission_batch_pending",
     "gpu_fault_processor_evidence_admission_batch_shed_total",
     "gpu_fault_processor_evidence_admission_batch_submitted_total",
     "gpu_fault_processor_evidence_admission_batch_wait_seconds",
     "gpu_fault_processor_expired_leases_reclaimed_total",
     "gpu_fault_processor_fault_admission_batch_expired_total",
     "gpu_fault_processor_fault_admission_batch_flush_seconds",
-    "gpu_fault_processor_fault_admission_batch_in_flight",
     "gpu_fault_processor_fault_admission_batch_items_total",
-    "gpu_fault_processor_fault_admission_batch_pending",
     "gpu_fault_processor_fault_admission_batch_shed_total",
     "gpu_fault_processor_fault_admission_batch_submitted_total",
     "gpu_fault_processor_fault_admission_batch_wait_seconds",
     "gpu_fault_processor_fault_pressure_activations_total",
     "gpu_fault_processor_fault_rejections_total",
     "gpu_fault_processor_fault_rows_skipped_by_observation_total",
-    "gpu_fault_processor_in_flight",
-    "gpu_fault_processor_in_flight_by_phase",
     "gpu_fault_processor_interlock_probes_total",
     "gpu_fault_processor_lane_holder_seconds",
     "gpu_fault_processor_lane_wait_seconds",
@@ -328,7 +316,6 @@ _SUM = (
     "gpu_fault_processor_queue_bypass_total",
     "gpu_fault_processor_renewal_errors_total",
     "gpu_fault_processor_renewal_fenced_total",
-    "gpu_fault_processor_replay_inbound_by_phase",
     "gpu_fault_processor_request_processing_seconds",
     "gpu_fault_processor_requests_processed_total",
     "gpu_fault_processor_retry_horizon_failures_total",
@@ -337,23 +324,17 @@ _SUM = (
     "gpu_fault_processor_stale_superseded_by_path_total",
     "gpu_fault_processor_stale_superseded_total",
     "gpu_fault_processor_telemetry_coalesced_total",
-    "gpu_fault_processor_workers",
     "gpu_fault_remote_command_batched_commands_total",
     "gpu_fault_remote_command_batched_steps_total",
     "gpu_fault_remote_command_open_sibling_holds_total",
     "gpu_fault_request_decode_admission_wait_seconds",
-    "gpu_fault_request_decode_in_flight",
-    "gpu_fault_request_decode_max_in_flight",
     "gpu_fault_request_decode_rejections_total",
     "gpu_fault_spare_reservations_reclaimed_total",
     "gpu_fault_store_io_admission_wait_seconds",
-    "gpu_fault_store_io_in_flight",
-    "gpu_fault_store_io_max_in_flight",
     "gpu_fault_store_io_rejections_total",
     "gpu_fault_telemetry_spool_abandoned_total",
     "gpu_fault_telemetry_spool_admission_batch_seconds",
     "gpu_fault_telemetry_spool_admission_items_total",
-    "gpu_fault_telemetry_spool_admission_pending",
     "gpu_fault_telemetry_spool_admission_shed_total",
     "gpu_fault_telemetry_spool_admitted_by_path_total",
     "gpu_fault_telemetry_spool_admitted_total",
@@ -364,8 +345,6 @@ _SUM = (
     "gpu_fault_telemetry_spool_dropped_total",
     "gpu_fault_telemetry_spool_errors_total",
     "gpu_fault_telemetry_spool_fallback_polls_total",
-    "gpu_fault_telemetry_spool_in_flight_bytes",
-    "gpu_fault_telemetry_spool_in_flight_bytes_limit",
     "gpu_fault_telemetry_spool_notification_reconnects_total",
     "gpu_fault_telemetry_spool_notifications_received_total",
     "gpu_fault_telemetry_spool_rejected_total",
@@ -391,6 +370,35 @@ _SUM = (
     "gpu_fault_workflow_placement_holds_dissolved_total",
     "gpu_fault_workflow_placement_holds_failed_total",
     "gpu_fault_workflow_placement_holds_opened_total",
+)
+
+_SUM = (
+    "gpu_fault_ingress_lane_in_flight",
+    "gpu_fault_ingress_lane_workers",
+    "gpu_fault_postgres_pool_size",
+    "gpu_fault_postgres_pool_available",
+    "gpu_fault_postgres_pool_requests_waiting",
+    "gpu_fault_processor_active_consumer",
+    "gpu_fault_processor_admission_batch_in_flight",
+    "gpu_fault_processor_admission_batch_pending",
+    "gpu_fault_processor_admission_batch_scope_pending",
+    "gpu_fault_processor_admission_batch_scopes_pending",
+    "gpu_fault_processor_claimed_not_started",
+    "gpu_fault_processor_evidence_admission_batch_in_flight",
+    "gpu_fault_processor_evidence_admission_batch_pending",
+    "gpu_fault_processor_fault_admission_batch_in_flight",
+    "gpu_fault_processor_fault_admission_batch_pending",
+    "gpu_fault_processor_in_flight",
+    "gpu_fault_processor_in_flight_by_phase",
+    "gpu_fault_processor_replay_inbound_by_phase",
+    "gpu_fault_processor_workers",
+    "gpu_fault_request_decode_in_flight",
+    "gpu_fault_request_decode_max_in_flight",
+    "gpu_fault_store_io_in_flight",
+    "gpu_fault_store_io_max_in_flight",
+    "gpu_fault_telemetry_spool_admission_pending",
+    "gpu_fault_telemetry_spool_in_flight_bytes",
+    "gpu_fault_telemetry_spool_in_flight_bytes_limit",
 )
 
 

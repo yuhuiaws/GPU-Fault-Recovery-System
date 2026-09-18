@@ -7,9 +7,8 @@ from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     AgentHeartbeat,
-    BarrierCoordinator,
-    BarrierState,
     FleetCompatibilityPolicy,
     FleetRegistry,
     SignedAgentHeartbeat,
@@ -77,7 +76,7 @@ def register_agents(store: InMemoryStore) -> FleetRegistry:
             cluster_id=CLUSTER,
             node_id=node_id,
             endpoint=f"http://{node_id}:9099",
-            agent_protocol_version=3,
+            agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
             agent_version="0.9.0",
             artifact_sha256=ARTIFACT,
             policy_version="catalog-a",
@@ -119,10 +118,7 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
     )
     store.save_profile(profile)
     registry = register_agents(store)
-    barriers = BarrierCoordinator(store, now=lambda: NOW)
-    context = ApplicationContext(
-        store=store, fleet_registry=registry, barrier_coordinator=barriers
-    )
+    context = ApplicationContext(store=store, fleet_registry=registry)
 
     async def detect_faults() -> str:
         async with asgi_client(context) as client:
@@ -169,6 +165,7 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
 
     workflow_id = asyncio.run(detect_faults())
     workflow = store.get_workflow(workflow_id)
+    assert workflow.dag_enabled
     by_operation = {step.operation: step for step in workflow.official_steps}
     assert by_operation[WorkflowOperation.STOP_WORKLOADS].node_ids == NODES
     assert by_operation[WorkflowOperation.STOP_WORKLOADS].workload_ids == [
@@ -182,13 +179,17 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
         "source_gpu_count": 3,
         "restart_budget": 2,
     }
-    assert by_operation[WorkflowOperation.RESET_GPU].node_ids == FAULT_NODES
-    assert by_operation[WorkflowOperation.RESET_GPU].parameters[
-        "gpu_uuids_by_node"
-    ] == {"worker-0": ["GPU-0"], "worker-1": ["GPU-1"]}
-    assert by_operation[WorkflowOperation.VERIFY_NO_GPU_CLIENTS].parameters[
-        "gpu_uuids_by_node"
-    ] == {"worker-0": ["GPU-0"], "worker-1": ["GPU-1"]}
+    for operation in (
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+    ):
+        scoped = [
+            step for step in workflow.official_steps if step.operation is operation
+        ]
+        assert [step.node_ids for step in scoped] == [[node] for node in FAULT_NODES]
+        assert [step.parameters["gpu_uuids_by_node"] for step in scoped] == [
+            {node: [f"GPU-{index}"]} for index, node in enumerate(FAULT_NODES)
+        ]
 
     sent = []
 
@@ -202,7 +203,7 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
 
     workload = WorkloadAdapter()
     node_actions = NodeActionWorkflowAdapter(
-        {}, SECRET, registry=registry, barriers=barriers, sender=sender
+        {}, SECRET, registry=registry, sender=sender
     )
     executor = active_workflow_executor(
         store,
@@ -215,30 +216,18 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
     assert sent == []
     assert (WorkflowOperation.STOP_WORKLOADS, NODES) in workload.calls
 
-    prepared = execute_workflow(
+    completed = execute_workflow(
         executor,
         workflow_id,
         expected_fencing_token=1,
         confirmed_adapter_operation_ids=[workload.stop_operation_id],
     )
-    assert prepared.status is WorkflowStatus.RUNNING
-    assert not any(
-        command.operation is WorkflowOperation.RESET_GPU for _, command in sent
-    )
+    assert completed.status is WorkflowStatus.SUCCEEDED
     assert [
         (command.node_id, command.gpu_uuids)
         for _, command in sent
         if command.operation is WorkflowOperation.VERIFY_NO_GPU_CLIENTS
-    ] == [
-        ("worker-0", ["GPU-0"]),
-        ("worker-1", ["GPU-1"]),
-        ("worker-0", ["GPU-0"]),
-        ("worker-1", ["GPU-1"]),
-    ]
-    assert next(iter(store.list_barriers())).state is (BarrierState.PREPARED)
-
-    completed = execute_workflow(executor, workflow_id, expected_fencing_token=1)
-    assert completed.status is WorkflowStatus.SUCCEEDED
+    ] == [("worker-0", ["GPU-0"]), ("worker-1", ["GPU-1"])]
     reset_commands = [
         command
         for _, command in sent
@@ -250,5 +239,5 @@ def test_three_node_job_stops_before_two_fault_gpu_resets() -> None:
     ]
     assert not any(command.node_id == "worker-2" for _, command in sent)
     assert (WorkflowOperation.RESTART_WORKLOAD, NODES) in workload.calls
-    barrier = next(iter(store.list_barriers()))
-    assert barrier.state is BarrierState.COMMITTED
+    assert node_actions.barriers is None
+    assert store.list_barriers() == []

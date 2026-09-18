@@ -241,7 +241,9 @@ def _judge_step(
             idempotency_key=idempotency_key,
         )
         result = dispatch.outcome_result(
-            adapter.execute(context), lease_token, operation=step.operation
+            dispatch.execute_adapter(adapter, context),
+            lease_token,
+            operation=step.operation,
         )
     except Exception as exc:  # noqa: BLE001 - the dispatch taxonomy classifies it
         if view is None:

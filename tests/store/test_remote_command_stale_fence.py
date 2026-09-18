@@ -21,6 +21,7 @@ fails a LEASED command whose lease lapsed under a stale fence.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -41,12 +42,15 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 CLUSTER = "cluster-a"
 EXECUTOR = "regional-executor-a"
 
 
-@pytest.fixture(params=["memory", "sqlite", "postgres"])
+@pytest.fixture(
+    params=["memory", "sqlite", "postgres", "postgres-dual", "postgres-dedicated"]
+)
 def store(request, tmp_path):
     if request.param == "memory":
         yield build_store()
@@ -60,9 +64,20 @@ def store(request, tmp_path):
         return
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
-    for postgres in postgres_store_instance():
-        yield postgres
-    _truncate()
+    import psycopg
+
+    mode = request.param.removeprefix("postgres-")
+    with contextmanager(postgres_store_instance)() as postgres:
+        try:
+            if mode != "postgres":
+                with psycopg.connect(
+                    os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+                ) as connection:
+                    for kind in ("remote_command", "workflow"):
+                        select_mode(connection, kind, mode)
+            yield postgres
+        finally:
+            _truncate()
 
 
 def _leased_command(
@@ -71,6 +86,7 @@ def _leased_command(
     command_id: str = "remote-old",
     request_id: str = "workflow-a",
     token: int = 3,
+    lease_seconds: int = 600,
 ):
     incident = fault_incident(
         f"incident-{request_id}",
@@ -105,7 +121,7 @@ def _leased_command(
         )
     )
     (leased,) = store.claim_remote_commands(
-        CLUSTER, EXECUTOR, limit=1, lease_seconds=600
+        CLUSTER, EXECUTOR, limit=1, lease_seconds=lease_seconds
     )
     return workflow, leased
 
@@ -164,6 +180,85 @@ def test_a_matching_fence_still_rejects_a_stale_lease_token(store):
                 lease_token="not-the-lease", status=RemoteCommandStatus.SUCCEEDED
             ),
         )
+
+
+def test_a_stale_fence_rejects_results_from_a_replaced_lease(store):
+    workflow, first = _leased_command(store, lease_seconds=-1)
+    (second,) = store.claim_remote_commands(
+        CLUSTER, "executor-b", limit=1, lease_seconds=600
+    )
+    _replace_in_place(store, workflow)
+
+    with pytest.raises(WorkflowLeaseError):
+        store.complete_remote_command(
+            CLUSTER,
+            first.command_id,
+            RemoteCommandResult(
+                lease_token=first.lease_token,
+                status=RemoteCommandStatus.SUCCEEDED,
+                details={"executor": EXECUTOR},
+            ),
+        )
+    assert store.get_remote_command(first.command_id) == second, (
+        "a former executor replaced the current lease's evidence"
+    )
+    settled = store.complete_remote_command(
+        CLUSTER,
+        second.command_id,
+        RemoteCommandResult(
+            lease_token=second.lease_token,
+            status=RemoteCommandStatus.SUCCEEDED,
+            details={"executor": "executor-b"},
+        ),
+    )
+    assert settled.status is RemoteCommandStatus.FAILED
+    assert settled.status_source == STALE_FENCE_STATUS_SOURCE
+    assert settled.last_lease_owner == "executor-b"
+    assert settled.result_details["executor"] == "executor-b"
+
+
+def test_a_stale_fence_accepts_late_evidence_from_its_unreplaced_lease(store):
+    workflow, leased = _leased_command(store, lease_seconds=-1)
+    _replace_in_place(store, workflow)
+
+    settled = store.complete_remote_command(
+        CLUSTER,
+        leased.command_id,
+        RemoteCommandResult(
+            lease_token=leased.lease_token,
+            status=RemoteCommandStatus.SUCCEEDED,
+            details={"late": "executor evidence"},
+        ),
+    )
+    assert settled.status is RemoteCommandStatus.FAILED
+    assert settled.status_source == STALE_FENCE_STATUS_SOURCE
+    assert settled.result_details["late"] == "executor evidence"
+    assert settled.last_lease_owner == EXECUTOR
+
+
+def test_a_stale_fence_does_not_accept_evidence_for_an_unleased_command(store):
+    workflow, leased = _leased_command(store)
+    pending = leased.model_copy(
+        update={
+            "command_id": "remote-never-leased",
+            "status": RemoteCommandStatus.PENDING,
+            "lease_owner": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+        }
+    )
+    store.ensure_remote_command(pending)
+    _replace_in_place(store, workflow)
+
+    with pytest.raises(WorkflowLeaseError):
+        store.complete_remote_command(
+            CLUSTER,
+            pending.command_id,
+            RemoteCommandResult(
+                lease_token=leased.lease_token, status=RemoteCommandStatus.SUCCEEDED
+            ),
+        )
+    assert store.get_remote_command(pending.command_id) == pending
 
 
 def test_a_renewal_under_a_stale_fence_asks_the_executor_to_stop(store):

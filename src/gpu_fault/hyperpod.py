@@ -615,7 +615,7 @@ class HyperPodLifecycleAdapter:
     ) -> list[HyperPodNode]:
         if not identifiers:
             raise HyperPodAdapterError("at least one target node is required")
-        candidates = nodes or self.list_nodes(enrich=True)
+        candidates = self.list_nodes(enrich=True) if nodes is None else nodes
         index: dict[str, list[HyperPodNode]] = {}
         for node in candidates:
             for alias in node.aliases:
@@ -656,6 +656,10 @@ class HyperPodLifecycleAdapter:
                 "cluster must be InService, got " + cluster["ClusterStatus"]
             )
         node_recovery = cluster.get("NodeRecovery")
+        if node_recovery not in {"None", "Automatic"}:
+            failures.append(
+                "HyperPod NodeRecovery must be explicitly None before mutation"
+            )
         if (
             node_recovery == "Automatic"
             and not self.config.allow_when_node_recovery_automatic
@@ -1049,12 +1053,11 @@ class HyperPodWorkflowDispatcher:
             raise HyperPodAdapterError(
                 "workflow must be PENDING or RUNNING for HyperPod dispatch"
             )
-        try:
-            step = workflow.official_steps[step_index]
-        except IndexError as exc:
+        if not 0 <= step_index < len(workflow.official_steps):
             raise HyperPodAdapterError(
                 f"workflow step index out of range: {step_index}"
-            ) from exc
+            )
+        step = workflow.official_steps[step_index]
         if step.execution_owner != self.execution_owner:
             raise HyperPodAdapterError(
                 f"workflow step owner {step.execution_owner} does not "

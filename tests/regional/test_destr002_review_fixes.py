@@ -80,22 +80,23 @@ def _submitted_state() -> dict[str, Any]:
 
 
 def _final_state() -> dict[str, Any]:
+    operations = (
+        "MARK_UNSCHEDULABLE",
+        "RESTART_NODE",
+        "VALIDATE_GPU",
+        "VALIDATE_HOST",
+        "VALIDATE_FABRIC",
+        "RESTORE_SCHEDULING",
+    )
     return {
         "event": {"xid": 79},
         "decision": {"action": destr002.EXPECTED_ACTION},
         "workflow": {
             "request_id": WORKFLOW_ID,
             "status": "SUCCEEDED",
-            "official_steps": [
-                {"operation": name}
-                for name in (
-                    "MARK_UNSCHEDULABLE",
-                    "RESTART_NODE",
-                    "VALIDATE_GPU",
-                    "VALIDATE_HOST",
-                    "VALIDATE_FABRIC",
-                    "RESTORE_SCHEDULING",
-                )
+            "official_steps": [{"operation": name} for name in operations],
+            "step_executions": [
+                {"operation": name, "status": "SUCCEEDED"} for name in operations
             ],
         },
         "submission": {
@@ -145,6 +146,12 @@ class SpyRegional:
         self._record("kubectl", plane=plane, arguments=arguments, **kwargs)
         if arguments[:2] == ("delete", "pod"):
             self.deleted_pod = arguments[2]
+        if arguments[:2] == ("get", "pod"):
+            return json.dumps({"metadata": {"uid": "uid-c"}})
+        if arguments[:2] == ("exec", "-i"):
+            return json.dumps(
+                {"replay_mode": "store-level", "duplicate": True, "checks": {}}
+            )
         return ""
 
     def executor_python(self, script: str, *arguments: str, **kwargs: Any) -> Any:
@@ -329,13 +336,19 @@ def test_destr002_replays_the_durable_record_from_the_replacement_executor(
 ) -> None:
     _, evidence, regional, _ = _drive_execute_case(tmp_path, monkeypatch)
 
-    replays = regional.kwargs_of("executor_python")
+    replays = [
+        item
+        for item in regional.kwargs_of("kubectl")
+        if item["arguments"][:2] == ("exec", "-i")
+    ]
     assert len(replays) == 1, regional.calls
-    assert replays[0]["script"] == destr002.STORE_REPLAY_PROBE
+    assert replays[0]["input_text"] == destr002.STORE_REPLAY_PROBE
+    assert replays[0]["arguments"][2] == "executor-c"
     # The probe receives the command as the executor recorded it, key included,
     # and never a recomputed one.
-    assert json.loads(replays[0]["arguments"][0]) == _reboot_command()
+    assert json.loads(replays[0]["arguments"][-1]) == _reboot_command()
     assert evidence["duplicate_replay"]["duplicate"] is True
+    assert evidence["duplicate_replay"]["executor_pod_uid"] == "uid-c"
     # The replay runs after the submitting Pod was deleted.
     deletes = [
         item["arguments"]
@@ -343,8 +356,12 @@ def test_destr002_replays_the_durable_record_from_the_replacement_executor(
         if item["arguments"][:2] == ("delete", "pod")
     ]
     assert deletes == [("delete", "pod", "executor-a", "--wait=false")]
-    order = [name for name, _ in regional.calls]
-    assert order.index("kubectl") < order.index("executor_python")
+    commands = regional.kwargs_of("kubectl")
+    assert commands.index(replays[0]) > next(
+        index
+        for index, item in enumerate(commands)
+        if item["arguments"][:2] == ("delete", "pod")
+    )
 
 
 def test_destr002_workflow_wait_is_scoped_to_the_submitted_workflow(

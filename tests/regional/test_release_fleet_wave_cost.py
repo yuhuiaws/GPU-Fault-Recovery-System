@@ -364,6 +364,30 @@ def test_first_wave_stays_a_single_node_canary() -> None:
     assert policy.first_wave_max_unavailable == 1
 
 
+def test_parallel_clusters_share_the_site_installer_budget() -> None:
+    for parallel in (1, 2, 3, 4, 8):
+        release = _policy_release(0)
+        release.config.upgrade_max_parallel_clusters = parallel
+        policy = FLEET.node_rollout_policy(release, 1024, phase="upgrade")
+        assert policy.max_unavailable * parallel <= FLEET.MAX_SITE_INSTALLER_UNAVAILABLE
+        assert policy.max_unavailable == min(32, 64 // parallel)
+        assert policy.first_wave_max_unavailable == 1
+
+
+@pytest.mark.parametrize("clusters", [1, 2, 3, 4, 8])
+def test_bootstrap_cluster_pool_shares_the_site_installer_budget(clusters: int) -> None:
+    release = _policy_release(0)
+    release.config.upgrade_max_parallel_clusters = 1
+    release.config.clusters = [object() for _ in range(clusters)]
+
+    policy = FLEET.node_rollout_policy(release, 1024, phase="bootstrap")
+
+    parallel = min(4, clusters)
+    assert policy.max_unavailable == min(32, 64 // parallel)
+    assert policy.max_unavailable * parallel <= FLEET.MAX_SITE_INSTALLER_UNAVAILABLE
+    assert policy.first_wave_max_unavailable == 1
+
+
 def test_release_config_accepts_auto_upgrade_max_unavailable(tmp_path: Path) -> None:
     """The rendered site value has to survive release-config validation."""
 

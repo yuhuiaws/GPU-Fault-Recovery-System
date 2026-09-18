@@ -45,7 +45,7 @@ recomputed when GPU clusters join or leave. To change capability content, use
 a new profile version instead of overwriting a live version.
 
 The regional release orchestrator treats `runtime_profile.version` as the
-single source for the CPU fleet pin, data-plane Resource/HMA collectors, and
+single source for the CPU fleet pin, data-plane Resource Collector, and
 the Node Installer template. Training submission must use the same version in
 its managed Pod annotations; Completion Watcher reads that annotation rather
 than a static environment default.

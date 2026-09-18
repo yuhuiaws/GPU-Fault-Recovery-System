@@ -233,7 +233,7 @@ def _run_xid_kmsg_catalog_replay(
                 },
                 {
                     "order": 4,
-                    "component": "HyperPodHmaNormalizer",
+                    "component": "NvidiaLogNormalizer",
                     "operation": "extract and normalize XID evidence",
                     "provider_signals": normalized["provider_signals"],
                     "xid_event": event,

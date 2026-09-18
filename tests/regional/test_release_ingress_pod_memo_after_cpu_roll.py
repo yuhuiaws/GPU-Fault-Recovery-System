@@ -37,7 +37,7 @@ class ScriptRunner:
 
 
 def release_with_memo() -> SimpleNamespace:
-    release = SimpleNamespace(runner=ScriptRunner(), state={})
+    release = SimpleNamespace(runner=ScriptRunner(), state={}, _load_state=lambda: {})
     setattr(release, CPU_INGRESS_POD_ATTRIBUTE, STALE_POD)
     return release
 

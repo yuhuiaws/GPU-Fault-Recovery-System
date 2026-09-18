@@ -7,11 +7,14 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.lifecycle import ShutdownCoordinator
 from scripts.e2e.regional import run_ha007_control_worker_shutdown as ha007
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -175,3 +178,154 @@ def test_child_leaves_no_thread_waiting_past_grace(tmp_path: Path) -> None:
     assert time.monotonic() - started < 3, (
         "the over-budget child must exit at the budget, not at the request end"
     )
+
+
+def test_event_wait_can_return_false_after_the_signal_flag_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeliveredAtTimeout(threading.Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            # Model handler dispatch after a timed C wait, before lock reacquisition.
+            self.release()
+            try:
+                event.set()
+            finally:
+                self.acquire()
+            return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Condition", DeliveredAtTimeout)
+        event = threading.Event()
+    assert event.wait(0.01) is False, (
+        "Event.wait returns the Condition timeout result without rereading the flag"
+    )
+    assert event.is_set() is True, (
+        "a false timed-wait result does not prove that the handler never ran"
+    )
+
+
+@pytest.mark.parametrize("delivery", ["wait-boundary", "dispatch-point", "absent"])
+def test_child_signal_dispatch_preserves_the_deadline_without_condition_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delivery: str
+) -> None:
+    now = 0.0
+    signal_timeout = 0.055
+    handlers = []
+    sleeps: list[float] = []
+    waits: list[float | None] = []
+    joins: list[float] = []
+    budgets: list[float] = []
+
+    class DeliveredAtTimeout(threading.Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            nonlocal now
+            waits.append(timeout)
+            now += float(timeout or 0)
+            if delivery != "absent":
+                self.release()
+                try:
+                    handlers[0](signal.SIGTERM, None)
+                finally:
+                    self.acquire()
+            return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Condition", DeliveredAtTimeout)
+        event = threading.Event()
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+        if delivery == "dispatch-point" or (
+            delivery == "wait-boundary" and now >= signal_timeout
+        ):
+            handlers[0](signal.SIGTERM, None)
+
+    class OverBudgetThread:
+        def __init__(self, *, target, name: str, daemon: bool) -> None:
+            assert callable(target) and daemon is True, (
+                "the child must retain a real request target and daemon semantics"
+            )
+            self.name = name
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def join(self, *, timeout: float) -> None:
+            nonlocal now
+            assert self.started, "shutdown must join the already started request"
+            joins.append(timeout)
+            now += timeout
+
+        def is_alive(self) -> bool:
+            return self.started
+
+    def coordinator(budget: float) -> ShutdownCoordinator:
+        budgets.append(budget)
+        return ShutdownCoordinator(budget, now=lambda: now)
+
+    monkeypatch.setattr(ha007, "Event", lambda: event)
+    monkeypatch.setattr(ha007, "Thread", OverBudgetThread)
+    monkeypatch.setattr(
+        ha007,
+        "signal",
+        SimpleNamespace(
+            SIGTERM=signal.SIGTERM, signal=lambda _sig, fn: handlers.append(fn)
+        ),
+    )
+    monkeypatch.setattr(
+        ha007, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+    )
+    monkeypatch.setattr(ha007, "ShutdownCoordinator", coordinator)
+    result_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ha007-signal-boundary",
+            "--child",
+            "--duration",
+            "2",
+            "--started-file",
+            str(tmp_path / "started"),
+            "--result-file",
+            str(result_path),
+            "--lifespan-budget-seconds",
+            "1",
+            "--signal-timeout-seconds",
+            str(signal_timeout),
+        ],
+    )
+    assert ha007.main() == (3 if delivery == "absent" else 1), (
+        "an observed signal must reach the coordinator, not the orphan timeout exit"
+    )
+    result = json.loads(result_path.read_text())
+    assert result["signal_timed_out"] is (delivery == "absent"), (
+        "only absence of the signal flag may claim a signal timeout"
+    )
+    assert waits == [], (
+        "the signal handler must not reenter an Event condition held by the main thread"
+    )
+    assert sleeps and all(0 < seconds <= 0.02 for seconds in sleeps), (
+        "short sleeps must provide bounded Python signal dispatch points"
+    )
+    assert sum(sleeps) <= signal_timeout, "polling must not extend the signal deadline"
+    if delivery == "absent":
+        assert now == signal_timeout and not joins and not budgets, (
+            "an orphan must exit at its original deadline without starting shutdown"
+        )
+    else:
+        assert budgets == [1.0], (
+            "the coordinator must retain the original one-second budget"
+        )
+        assert joins == pytest.approx([1.0], rel=0, abs=1e-15), (
+            "the remaining join time may differ only by floating-point subtraction roundoff"
+        )
+        assert result["shutdown_failures"] == [ha007.WORKER_THREAD_NAME], (
+            "an over-budget request must remain the coordinator's explicit failure"
+        )
+        assert result["completed"] == 0, (
+            "the pending request must not be marked complete"
+        )

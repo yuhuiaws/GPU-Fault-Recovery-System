@@ -364,3 +364,31 @@ def test_read_back_failure_falls_back_to_waiting_instead_of_failing() -> None:
 
     assert waiting.status is WorkflowStepStatus.WAITING
     assert waiting.details["unknown_stop_state"] == [JOB_ID]
+
+
+def test_pytorch_stop_of_an_already_failed_job_succeeds_despite_frozen_counts() -> None:
+    # training-operator stops reconciling a Failed PyTorchJob: replicaStatuses
+    # keeps the counts of the moment it failed however many Pods are deleted
+    # and whatever ``suspend`` says (live, v1-855e096). The terminal condition
+    # wins over the frozen counts; Pod absence stays authoritative.
+    frozen = {
+        "conditions": [{"type": "Failed", "status": "True"}],
+        "replicaStatuses": {"Master": {"failed": 1}, "Worker": {"active": 2}},
+    }
+    custom = ReconcilingCustom(status_after_patch=frozen)
+    custom.status = dict(frozen)
+    core = AttemptPodCore()
+    adapter, context = _pytorch_adapter(custom, core)
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, (
+        f"a Failed PyTorchJob is not active however stale its counts: {outcome}"
+    )
+    assert custom.patches[0]["spec"]["runPolicy"]["suspend"] is True, (
+        "the suspend patch still goes out so a resume cannot revive the attempt"
+    )
+    assert len(core.deleted) == 2, "the attempt Pods are still deleted"
+    assert "waiting_for_active_workloads" not in outcome.details, (
+        "frozen counts must not be reported as active workloads"
+    )

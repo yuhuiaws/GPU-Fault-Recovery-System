@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -243,3 +244,69 @@ def test_convergence_has_no_per_cluster_scope_and_an_empty_set_is_immediate() ->
         revision, [], observed_at=now, stale_seconds=90
     ), "a revision no member has to ack converges at once"
     assert active_registry_member_ids([], observed_at=now, stale_seconds=90) == []
+
+
+def test_batch_drain_validates_every_target_once_before_one_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    targeted: list[str] = []
+    published: list[dict[str, Any]] = []
+    idle = True
+    monkeypatch.setattr(
+        REGISTRY,
+        "publish_current_registry",
+        lambda _release, **kwargs: published.append(kwargs) or {},
+    )
+    release = SimpleNamespace(
+        _target=targeted.append, _remote_commands_are_idle=lambda: idle
+    )
+
+    REGISTRY.drain_registry_clusters(release, ["gpu-b", "gpu-a", "gpu-b"])
+
+    assert targeted == ["gpu-b", "gpu-a"]
+    assert published == [
+        {
+            "reason": "remove gpu-b, gpu-a draining",
+            "lifecycle_overrides": {"gpu-b": "DRAINING", "gpu-a": "DRAINING"},
+        }
+    ], "the batch minted more than one revision"
+    idle = False
+    with pytest.raises(ReleaseError, match="PENDING/LEASED/WAITING"):
+        REGISTRY.drain_registry_clusters(release, ["gpu-a"])
+    with pytest.raises(ReleaseError, match="--cluster-id is required"):
+        REGISTRY.drain_registry_clusters(release, [])
+    assert len(published) == 1, "a refused drain reached the publisher"
+
+
+@pytest.mark.parametrize("cluster_ids", ["gpu-a", ["", "gpu-a"], ["   "], [None]])
+def test_batch_drain_rejects_malformed_ids_before_any_target_or_publish(
+    cluster_ids: Any,
+) -> None:
+    release = SimpleNamespace(
+        _target=lambda _cluster: pytest.fail("malformed IDs reached target validation"),
+        _remote_commands_are_idle=lambda: pytest.fail(
+            "malformed IDs queried the fleet"
+        ),
+    )
+    with pytest.raises(ReleaseError, match="non-empty strings"):
+        REGISTRY.drain_registry_clusters(release, cluster_ids)
+
+
+def test_batch_drain_refuses_an_unknown_target_before_publishing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def target(cluster_id: str) -> None:
+        if cluster_id != "gpu-a":
+            raise ReleaseError("unknown cluster")
+
+    monkeypatch.setattr(
+        REGISTRY,
+        "publish_current_registry",
+        lambda *_args, **_kwargs: pytest.fail("an invalid batch published"),
+    )
+    release = SimpleNamespace(
+        _target=target,
+        _remote_commands_are_idle=lambda: pytest.fail("invalid batch queried commands"),
+    )
+    with pytest.raises(ReleaseError, match="unknown cluster"):
+        REGISTRY.drain_registry_clusters(release, ["gpu-a", "gpu-unknown"])

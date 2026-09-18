@@ -64,7 +64,10 @@ class XidCorrelationCoordinator:
             event, retain_from=self._retain_from(event)
         )
         existing = self.store.get_xid_policy_decision(event.event_id)
-        if not inserted and existing is not None:
+        if existing is not None and (
+            not inserted
+            or existing.disposition is not ActionDisposition.PENDING_CORRELATION
+        ):
             return existing.model_copy(update={"duplicate": True})
 
         candidates = self._candidates(event)

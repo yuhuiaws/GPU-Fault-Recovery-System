@@ -1,8 +1,8 @@
 """Declarative table of the GPU fault Grafana dashboards.
 
 One dashboard per ``amp-rules.yaml`` group plus an overview. Each panel names
-its PromQL and legend; the alert thresholds, the alert names in the panel
-description and the runbook anchors are NOT written here -- the generator in
+its PromQL and legend; the alert thresholds, descriptions and runbook anchors
+are not copied here -- the generator in
 ``build-grafana-dashboards.py`` reads them out of the rule file and attaches
 them to whichever panel plots the alert's metric families, so a threshold that
 moves in the rule moves on the panel in the same commit.
@@ -25,8 +25,14 @@ from dataclasses import dataclass
 
 from grafana_dashboard_review_panels import (
     COLLECTOR_MEMORY_PANEL,
+    CONTAINMENT_LATENCY_PANEL,
+    CONTAINMENT_WINDOW_PANEL,
     CONSUMER_LIVENESS_PANEL,
     CONTRIBUTOR_FAILURES_PANEL,
+    COUNTER_DRIFT_PANEL,
+    COUNTER_SCAN_PANEL,
+    METRIC_COVERAGE_PANEL,
+    NOTIFICATION_FAILURE_PANEL,
     POOL_AND_CREDENTIAL_PANELS,
     REVIEW_COUNTER_PANELS,
 )
@@ -54,6 +60,8 @@ class Panel:
     unit: str = "short"
     kind: str = "timeseries"
     description: str = ""
+    # Guard metrics can match another rule without sharing its output unit.
+    alert_names: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,9 +95,8 @@ def increase_by_control_plane(metric: str, window: str) -> str:
 def _seconds_since(metric: str) -> str:
     """Age of a ``*_timestamp_seconds`` gauge, read the way the alerts read it.
 
-    Process-level counters on the four-worker Pods are sampled one process per
-    scrape, so the liveness and last-seen alerts compare ``time()`` against the
-    newest stamp any process published instead of taking ``increase()``.
+    Event recency is a timestamp, not a counter delta. The newest stamp across
+    processes remains meaningful when individual counter reset domains restart.
     """
     return f"time() - max {BY_CONTROL_PLANE} ({series(metric)})"
 
@@ -619,27 +626,8 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                         ),
                     ),
                 ),
-                Panel(
-                    "Processor counter drift",
-                    (
-                        Target(
-                            f"max {BY_CONTROL_PLANE} (min_over_time("
-                            + series("gpu_fault_processor_counter_drift_abs")
-                            + "[5m]))",
-                            "drift",
-                        ),
-                        Target(
-                            f"max {BY_CONTROL_PLANE} (min_over_time("
-                            + series("gpu_fault_processor_counter_mismatched_clusters")
-                            + "[5m]))",
-                            "mismatched clusters",
-                        ),
-                    ),
-                    description=(
-                        "Sustained for a full 5m window; a transient mismatch "
-                        "during a reconcile is not drift."
-                    ),
-                ),
+                COUNTER_DRIFT_PANEL,
+                COUNTER_SCAN_PANEL,
             ),
         ),
         Row(
@@ -823,8 +811,8 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                         ),
                     ),
                     description=(
-                        "Fault events the processor refused, per worker Pod "
-                        "(summed over the Pod's four processes by /metrics)."
+                        "Fault events refused by worker processes. Increase is "
+                        "computed per reset domain before regional aggregation."
                     ),
                 ),
                 Panel(
@@ -837,12 +825,12 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                             "lease",
                         ),
                         Target(
-                            "time() - max by (control_plane_cluster, region, job) ("
+                            "time() - max by (control_plane_cluster, region, periodic_job) ("
                             + series(
                                 "gpu_fault_periodic_job_error_last_seen_timestamp_seconds"
                             )
                             + ")",
-                            "{{job}}",
+                            "{{periodic_job}}",
                         ),
                     ),
                     unit="s",
@@ -851,6 +839,7 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                         "job error; small is bad."
                     ),
                 ),
+                METRIC_COVERAGE_PANEL,
             ),
         ),
     ),
@@ -1235,40 +1224,9 @@ RECOVERY_OUTCOME = Dashboard(
         Row(
             "Closed loop and notifications",
             (
-                Panel(
-                    "Containment latency (6h moving mean)",
-                    (
-                        Target(
-                            f"delta((max {BY_CONTROL_PLANE} ("
-                            + series(
-                                "gpu_fault_closed_loop_milestone_seconds_sum",
-                                'milestone="containment"',
-                            )
-                            + "))[6h:5m]) / clamp_min(delta((max "
-                            + BY_CONTROL_PLANE
-                            + " ("
-                            + series(
-                                "gpu_fault_closed_loop_milestone_seconds_count",
-                                'milestone="containment"',
-                            )
-                            + "))[6h:5m]), 1)",
-                            "{{control_plane_cluster}} {{region}}",
-                        ),
-                    ),
-                    unit="s",
-                    description="Workflow creation to successful containment.",
-                ),
-                Panel(
-                    "Notification deliveries FAILED (15m)",
-                    (
-                        Target(
-                            f"delta((max {BY_CONTROL_PLANE} ("
-                            + series("gpu_fault_notification_total", 'status="FAILED"')
-                            + "))[15m:1m])",
-                            "{{control_plane_cluster}} {{region}}",
-                        ),
-                    ),
-                ),
+                CONTAINMENT_LATENCY_PANEL,
+                CONTAINMENT_WINDOW_PANEL,
+                NOTIFICATION_FAILURE_PANEL,
                 Panel(
                     "Notifications by status",
                     (

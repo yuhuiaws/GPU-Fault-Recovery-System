@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from gpu_fault.admin.config_patch import preset_admin_config
 from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import rollout as MODULE
+from tests.deploy.test_installer_template_identity import template_job
 
 ROOT = Path(__file__).resolve().parents[2]
 REGION = "us-east-1"
@@ -67,6 +70,10 @@ class RecordingRunner:
     probe that ran and found nothing in flight), and ``""`` to everything else.
     Answering ``""`` to the gate too would mean "no Running Pod", which a manual
     rollback correctly refuses -- and the pins are what these tests are about."""
+
+    def probe_output(self, args, **_kwargs):
+        assert "get" in args and "cronjob" in args and "--ignore-not-found" in args
+        return 0, "", ""
 
     dry_run = True
 
@@ -162,6 +169,31 @@ def test_gpu_rollouts_use_five_minute_timeout(tmp_path: Path) -> None:
     )
 
 
+def _rollback_started_state(cluster_id: str) -> dict[str, Any]:
+    cluster_components = ["executor", "watcher", "collector", "reconciler", "agent"]
+    return {
+        "execution_plan": {
+            "nodes": [
+                "registry",
+                "cpu-stage",
+                *cluster_components,
+                "cpu-finalize",
+                "verify",
+            ]
+        },
+        "component_progress": {
+            "schema_version": 1,
+            "global": {
+                name: {"status": "STARTED"}
+                for name in ("registry", "cpu-stage", "cpu-finalize")
+            },
+            "clusters": {
+                cluster_id: {name: {"status": "STARTED"} for name in cluster_components}
+            },
+        },
+    }
+
+
 def test_rollback_uses_previous_executor_and_node_pins(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -215,41 +247,17 @@ def test_rollback_uses_previous_executor_and_node_pins(
     )
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)
     target = config.clusters[0]
-    release.state = {
-        "execution_plan": {
-            "nodes": [
-                "registry",
-                "cpu-stage",
-                "executor",
-                "watcher",
-                "collector",
-                "reconciler",
-                "agent",
-                "cpu-finalize",
-                "verify",
-            ]
-        },
-        "component_progress": {
-            "schema_version": 1,
-            "global": {
-                "registry": {"status": "STARTED"},
-                "cpu-stage": {"status": "STARTED"},
-                "cpu-finalize": {"status": "STARTED"},
-            },
-            "clusters": {
-                target.cluster_id: {
-                    "executor": {"status": "STARTED"},
-                    "watcher": {"status": "STARTED"},
-                    "collector": {"status": "STARTED"},
-                    "reconciler": {"status": "STARTED"},
-                    "agent": {"status": "STARTED"},
-                }
-            },
-        },
-    }
+    release.state = _rollback_started_state(target.cluster_id)
+    job = template_job(offline=False)
+    pod = job["spec"]["template"]["spec"]
+    pod["containers"][0]["image"] = previous_installer_image
+    pod["volumes"][-1]["configMap"]["name"] = "old-node-bundle"
+    template_text = yaml.safe_dump(job)
     previous_admin_config = preset_admin_config("32-enabled")
     previous = {
+        "release_manifest_schema_version": 3,
         "cpu_wheel": "old-control-wheel",
+        "aurora_refresh": None,
         "runtime_image": previous_runtime_image,
         "node_installer_image": previous_installer_image,
         "runtime_profile_version": "hyperpod-v1",
@@ -290,6 +298,12 @@ def test_rollback_uses_previous_executor_and_node_pins(
                 "reconciler_wheel": "old-executor-wheel",
                 "reconciler_wheel_key": "old-executor.whl",
                 "bundle": "old-node-bundle",
+                "bundle_sha256": "e" * 64,
+                "template": "old-node-template",
+                "template_sha256": "3" * 64,
+                "template_content_sha256": hashlib.sha256(
+                    template_text.encode()
+                ).hexdigest(),
             }
         },
     }
@@ -360,3 +374,6 @@ def test_rollback_uses_previous_executor_and_node_pins(
     assert reconciler_calls[0][1]["runtime_image"] == release.runtime_image
     assert reconciler_calls[0][1]["steady_runtime_image"] == previous_runtime_image
     assert reconciler_calls[0][1]["node_installer_image"] == previous_installer_image
+    assert reconciler_calls[0][1]["bundle_sha256"] == "e" * 64
+    assert reconciler_calls[0][1]["template_sha256"] == "3" * 64
+    assert reconciler_calls[0][1]["steady_template_config_map"] == "old-node-template"

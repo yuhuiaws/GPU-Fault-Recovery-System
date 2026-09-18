@@ -9,9 +9,11 @@ itself is checked to be plan-only by default. Nothing here touches a cluster.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -122,6 +124,85 @@ def test_the_rejection_is_posted_after_a_heartbeat_not_before_one() -> None:
         "a row last written by an event says nothing about the heartbeat phase"
     )
     assert not verdicts.heartbeat_is_imminent(None), "unknown phase does not wait"
+
+
+def test_alignment_phase_waits_for_a_changed_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(timezone.utc)
+    previous = [
+        _status(
+            batch_id="kernel-health-node-1",
+            observed_at=(now - timedelta(seconds=270)).isoformat(),
+        )
+    ]
+    current = [_status(batch_id="kernel-health-node-2", observed_at=now.isoformat())]
+    monkeypatch.setattr(collect018, "utc_now", lambda: now)
+
+    def wait_until(predicate: Any, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {
+            "timeout_seconds": verdicts.KERNEL_HEARTBEAT_GUARD_SECONDS + 60,
+            "poll_seconds": 5,
+            "case_dir": tmp_path,
+            "name": "heartbeat-align",
+        }
+        assert predicate() is None
+        value = predicate()
+        assert value == {"records": current}
+        return value
+
+    fixture = SimpleNamespace(
+        wait_until=wait_until, collector_statuses=Mock(side_effect=[previous, current])
+    )
+    assert collect018.align_kernel_heartbeat(fixture, previous, case_dir=tmp_path) == {
+        "heartbeat_age_before_seconds": 270.0,
+        "heartbeat_aligned": True,
+    }
+
+
+def test_alignment_phase_leaves_a_fresh_heartbeat_undisturbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(collect018, "utc_now", lambda: now)
+    fixture = SimpleNamespace(wait_until=Mock())
+    statuses = [
+        _status(
+            batch_id="kernel-health-node-1",
+            observed_at=(now - timedelta(seconds=30)).isoformat(),
+        )
+    ]
+    assert collect018.align_kernel_heartbeat(fixture, statuses, case_dir=tmp_path) == {
+        "heartbeat_age_before_seconds": 30.0
+    }
+    fixture.wait_until.assert_not_called()
+
+
+def test_alignment_timeout_refuses_before_any_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(collect018, "utc_now", lambda: now)
+    fixture = SimpleNamespace(
+        snapshot=lambda: {},
+        control_plane_metrics=lambda: [],
+        collector_statuses=lambda: [
+            _status(
+                batch_id="kernel-health-node-1",
+                observed_at=(now - timedelta(seconds=270)).isoformat(),
+            )
+        ],
+        wait_until=Mock(return_value=None),
+        execute=Mock(),
+    )
+    with pytest.raises(collect018.RegionalFixtureError, match="refusing post"):
+        collect018.execute(
+            SimpleNamespace(), fixture, tmp_path, 1, now + timedelta(minutes=10)
+        )
+    fixture.execute.assert_not_called()
+    assert not (tmp_path / "seed-intent.json").exists(), (
+        "heartbeat alignment failed but the rejected-event injection was still registered"
+    )
 
 
 def test_the_metric_contract_needs_both_g1_counters_to_move() -> None:

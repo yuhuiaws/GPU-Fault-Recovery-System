@@ -24,6 +24,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.execution import run_driver
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+)
+from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
 from gpu_fault.admin.release_consent import ALLOW_INFLIGHT_INSTALLS_ENV
 from gpu_fault.admin.release_state import live_release_state
 from gpu_fault.admin.rollback_alignment import reconcile_rollback_management
@@ -79,8 +85,12 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _release_id(value: Mapping[str, Any]) -> str:
-    return str(value.get("release_id") or "unknown")
+def _release_id(value: object) -> str:
+    return (
+        str(value.get("release_id") or "unknown")
+        if isinstance(value, Mapping)
+        else "unknown"
+    )
 
 
 def _mid_transaction(state: Mapping[str, Any], phase: str) -> bool:
@@ -187,11 +197,12 @@ def run_release_mode(
         "GPU_FAULT_REPO_ROOT": str(root),
     }
     with materialized_release_config(site) as config:
-        completed = subprocess.run(
+        completed = run_driver(
             [str(root / ROLLOUT_SCRIPT), mode, "--config", str(config)],
             cwd=root,
             env=rollout_environment,
             check=False,
+            pass_fds=inherited_lock_pass_fds(),
         )
     if completed.returncode:
         raise RollbackCommandError(
@@ -304,6 +315,21 @@ def run_rollback(
     consents = dict(environment or {})
     refuse_foreign_consents(consents)
     state_dir = state_dir.expanduser().resolve()
+    if site.source.parent.resolve() != state_dir:
+        raise SiteConfigError(
+            "rollback state directory does not match the managed site"
+        )
+    with administrator_operation_lock(state_dir):
+        site = reload_site_for_mutation(site)
+        return _run_rollback_locked(site, state_dir=state_dir, consents=consents)
+
+
+def _run_rollback_locked(
+    site: RenderedSite,
+    *,
+    state_dir: Path,
+    consents: Mapping[str, str],
+) -> int:
     state = live_release_state(site)
     refusal = rollback_refusal(state)
     release_id = _release_id(state)
@@ -319,7 +345,7 @@ def run_rollback(
         return 2
     environment = {**effective_environment(site), **consents}
     with materialized_release_config(site) as config:
-        completed = subprocess.run(
+        completed = run_driver(
             [
                 str(site.repository_root / ROLLOUT_SCRIPT),
                 "rollback",
@@ -329,6 +355,7 @@ def run_rollback(
             cwd=site.repository_root,
             env=environment,
             check=False,
+            pass_fds=inherited_lock_pass_fds(),
         )
     if completed.returncode:
         _emit(

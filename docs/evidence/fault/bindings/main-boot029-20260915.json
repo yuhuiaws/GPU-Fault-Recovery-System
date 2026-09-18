@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "purpose": "Preserve main's historical catalog binding without asserting execution of the current, stronger lifecycle case.",
+  "source_commit": "7e9ab13ba066d996a74d3c25735ce8f94d07885a",
+  "bindings": [
+    {
+      "case_id": "GF-REGIONAL-BOOT-029",
+      "reason": "The current case binds all three component-image cold builds, immutable lifecycle inputs and complete command-exit receipts. The historical binding does not describe these current obligations and must not be rebound or promoted to current PASS.",
+      "previous_evidence": {
+        "verdict": "PASS",
+        "verified": {
+          "case_digest": "7a58ca8121467c92d674fd1ef764b40156d42c8425e6960b9b78a4f1e16fee98",
+          "components": {
+            "control_plane": "872969248a18f66a648d0e01da19eeb31b3a85a0724933792a653384fd6f64eb",
+            "executor": "3875b952e91c68439ed894f2d88f78ca6e824de960b133900f5f08b96808e50b",
+            "node_runtime": "f2eff541a397849fa062f6d3bce5ec3ec27e8b58e6226963d67d71588aaf76db"
+          }
+        }
+      }
+    }
+  ]
+}

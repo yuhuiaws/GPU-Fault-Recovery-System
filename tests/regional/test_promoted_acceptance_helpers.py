@@ -129,41 +129,160 @@ def test_promoted_helpers_contain_no_site_specific_topology() -> None:
         assert all(value not in source for value in forbidden), path
 
 
-def test_ha009_default_invocation_is_plan_only(tmp_path: Path) -> None:
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(ROOT / "src"),
-        "GPU_FAULT_CONTROL_KUBECONFIG": "/secure/cpu.kubeconfig",
-        "KUBECONFIG": "/secure/gpu.kubeconfig",
-        "GPU_FAULT_DATAPLANE_CONTEXT": "gpu-context",
-        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
-        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
-        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
-    }
-    completed = subprocess.run(
+def test_ha009_default_invocation_is_plan_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from argparse import Namespace
+
+    from scripts.e2e.regional import live_driver_guard as guard
+    from scripts.e2e.regional import regional_commands
+    from scripts.e2e.regional.regional_case_contract import (
+        case_evidence_path,
+        formal_predecessor,
+    )
+
+    for key in guard.COMMON_ENVIRONMENT_KEYS:
+        monkeypatch.setenv(key, f"unit-{key.lower()}")
+    for plane, keys in (
+        ("cpu", ("CPU_KUBECONFIG", "GPU_FAULT_CONTROL_KUBECONFIG")),
+        ("gpu", ("GPU_KUBECONFIG", "KUBECONFIG")),
+    ):
+        path = tmp_path / f"{plane}.kubeconfig"
+        path.write_text("unit fixture; transport is mocked\n")
+        for key in keys:
+            monkeypatch.setitem(os.environ, key, str(path))
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_ID", "unit-cluster")
+    monkeypatch.setenv("AWS_REGION", "unit-region")
+    monkeypatch.delenv(guard.SITE_PROFILE_ENV, raising=False)
+    monkeypatch.setattr(guard, "applied_site_profile", lambda: None)
+    monkeypatch.setattr(guard, "source_digest", lambda: "unit-source")
+    monkeypatch.setattr(ha009, "install_site_profile", lambda: None)
+    for name in ("RDS_CLUSTER_ID", "AWS_REGION", "CRONJOB", "SECRET_NAME"):
+        monkeypatch.setattr(ha009, name, getattr(ha009, name))
+    previous = formal_predecessor(ha009.CASE_ID)
+    assert previous is not None
+    predecessor = case_evidence_path(tmp_path, previous)
+    predecessor.parent.mkdir(parents=True)
+    predecessor.write_text(
+        json.dumps(
+            {
+                "case_id": previous,
+                "verdict": "PASS",
+                "release_id": "unit-release",
+                "cluster_id": "unit-cluster",
+            }
+        )
+    )
+    calls = []
+
+    def read_command(command, **kwargs):
+        assert command[0] == "kubectl" and "get" in command
+        assert "gpu-fault-regional-release-state" in command
+        calls.append("release-state")
+        return SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=json.dumps(
+                {"data": {"state.json": json.dumps({"release_id": "unit-release"})}}
+            ),
+        )
+
+    def control(*args, **kwargs):
+        calls.append(args[0])
+        if args[0] == "get":
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "ingress", "uid": "pod-uid"},
+                            "spec": {"containers": [{"name": "api"}]},
+                            "status": {
+                                "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
+                                "containerStatuses": [{"name": "api", "ready": True}],
+                            },
+                        }
+                    ]
+                }
+            )
+        assert args[0] == "exec"
+        assert kwargs["stdin"]
+        return json.dumps({"total": 0})
+
+    def dataplane(*args, **kwargs):
+        assert args[0] == "get" and "--ignore-not-found" in args
+        calls.append("dataplane-read")
+        return ""
+
+    arguments = {}
+
+    def build_plan(**kwargs):
+        arguments["value"] = kwargs["arguments"]
+        return guard.build_plan(**kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("plan must not execute a rotation or mutation")
+
+    monkeypatch.setattr(regional_commands, "run_command", read_command)
+    monkeypatch.setattr(ha009.BASE, "control", control)
+    monkeypatch.setattr(ha009.BASE, "dataplane", dataplane)
+    monkeypatch.setattr(ha009.BASE, "load_registry", lambda: [])
+    monkeypatch.setattr(ha009, "build_plan", build_plan)
+    monkeypatch.setattr(ha009, "run_case", forbidden)
+    monkeypatch.setattr(ha009, "aws", forbidden)
+    monkeypatch.setattr(
+        ha009, "aurora_guard", lambda: SimpleNamespace(read=lambda: {"unit": "proof"})
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
         [
-            sys.executable,
             str(REGIONAL / "run_ha009_aurora_credential_rotation.py"),
             "--run-dir",
             str(tmp_path),
             "--rds-cluster-id",
             "aurora-test",
         ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
     )
-
+    assert ha009.main() == 0
     plan_path = tmp_path / "cases/GF-REGIONAL-HA-009/plan.json"
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["schema_version"] == 3
+    assert plan["preflight_passed"] is True
+    assert plan["source_digest"] == "unit-source"
+    assert plan["arguments_sha256"]
     assert plan["mutation_performed"] is False
     assert plan["confirmation"] == "HA009_ROTATE_AURORA_CREDENTIALS"
     assert plan["details"]["rds_cluster_id"] == "aurora-test"
+    assert plan["details"]["chain"]["identity"]["release_id"] == "unit-release"
     assert plan_path.stat().st_mode & 0o777 == 0o600
-    assert '"mutation_performed": false' in completed.stdout
+    assert calls.count("release-state") == 1
+    execute = Namespace(
+        **{
+            **vars(arguments["value"]),
+            "execute": True,
+            "plan": False,
+            "confirm": ha009.CONFIRMATION,
+            "maintenance_window_end": "2099-01-01T00:00:00Z",
+        }
+    )
+    assert (
+        guard.authorize_execution(
+            execute,
+            case_id=ha009.CASE_ID,
+            confirmation=ha009.CONFIRMATION,
+            environment=ha009.environment_values(),
+        ).year
+        == 2099
+    )
+    execute.rds_cluster_id = "different-target"
+    with pytest.raises(RuntimeError, match="arguments_sha256"):
+        guard.authorize_execution(
+            execute,
+            case_id=ha009.CASE_ID,
+            confirmation=ha009.CONFIRMATION,
+            environment=ha009.environment_values(),
+        )
 
 
 def test_ha009_accepts_rds_current_pending_alias() -> None:
@@ -240,6 +359,7 @@ def test_host_probe_fixture_is_node_pinned_and_time_bounded(tmp_path: Path) -> N
             case_id="GF-REGIONAL-DESTR-010",
             run_id="run-a",
             probe_script=probe,
+            state_directory=tmp_path / "host-probes",
         )
     )
 
@@ -508,10 +628,14 @@ def test_warm_spare_audit_allows_unchanged_preexisting_business_taint() -> None:
 def test_warm_spare_audit_records_postflight_after_probe_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from tests.regional.test_warm_spare_guardrails import pytest_receipt
+
     baseline = [_gpu_node("node-a")]
     snapshots = iter([baseline, baseline])
     monkeypatch.setattr(warm_spare, "node_snapshot", lambda: next(snapshots))
-    monkeypatch.setattr(warm_spare, "run_pytest", lambda _dir, _nodeids: True)
+    monkeypatch.setattr(
+        warm_spare, "run_pytest", lambda _dir, nodeids: pytest_receipt(nodeids)
+    )
     monkeypatch.setattr(
         warm_spare,
         "cluster_recovery",
@@ -584,6 +708,7 @@ def _host_probe(
             case_id=case_id,
             run_id="run-a",
             probe_script=probe,
+            state_directory=tmp_path / "host-probes",
         )
     )
 
@@ -601,7 +726,7 @@ _KUBECTL_PREFIX_LENGTH = 7
 def _fake_kubectl(
     monkeypatch: pytest.MonkeyPatch, handler: Any
 ) -> list[tuple[str, ...]]:
-    """Stand in for the ``subprocess.run`` the fixture shells out through.
+    """Stand in for the supervised command transport.
 
     ``handler`` receives the kubectl arguments after the connection prefix
     and returns a ``CompletedProcess``; every call is recorded so the tests
@@ -612,33 +737,37 @@ def _fake_kubectl(
 
     calls: list[tuple[str, ...]] = []
 
-    def run(command: list[str], **_kwargs: Any) -> Any:
+    def run(command: list[str], **kwargs: Any) -> Any:
+        from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
         assert command[0] == "kubectl", command
         arguments = tuple(command[_KUBECTL_PREFIX_LENGTH:])
         calls.append(arguments)
-        return handler(arguments)
+        result = handler(arguments)
+        if kwargs.get("check", True) and result.returncode:
+            raise RegionalCommandFailed(result.returncode, result.stderr)
+        return result
 
-    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "run_fixture_command", run)
     return calls
 
 
-def test_host_probe_create_deletes_a_leftover_pod_before_applying(
+def test_host_probe_create_does_not_delete_an_unowned_leftover_pod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The pod name is a digest of (case, run, node), so a rerun after an
-    operator abort meets the previous pod, by then Failed on its
-    activeDeadlineSeconds; `apply` onto it is a no-op and the Ready wait can
-    only time out. create() has to delete whatever carries the name first."""
+    from scripts.e2e.regional import host_probe_fixture as module
+    from tests.regional._host_probe_support import ProbeApi
 
     fixture = _host_probe(tmp_path, case_id="GF-REGIONAL-COLLECT-014")
-    calls = _fake_kubectl(monkeypatch, lambda _arguments: _completed())
-
-    fixture.create()
-
-    verbs = [call[0] for call in calls]
-    assert verbs == ["delete", "apply", "apply", "wait"], verbs
-    assert calls[0][1:3] == ("pod", fixture.pod), calls[0]
-    assert "--ignore-not-found" in calls[0], calls[0]
+    api = ProbeApi()
+    api.objects["pod"] = {
+        "metadata": {"name": fixture.pod, "uid": "foreign"},
+        "status": {"phase": "Failed"},
+    }
+    monkeypatch.setattr(module, "run_fixture_command", api.run)
+    with pytest.raises(HostProbeError, match="ownership"):
+        fixture.create()
+    assert all(args[0] == "get" for args, _ in api.calls), api.calls
 
 
 def _ha009_snapshot(generation: int, pods: list[tuple[str, str]]) -> dict:
@@ -660,29 +789,29 @@ def _ha009_snapshot(generation: int, pods: list[tuple[str, str]]) -> dict:
 
 
 def test_ha009_rollout_wait_outlives_draining_old_pods(monkeypatch) -> None:
-    """A Terminating control-worker Pod stays Ready for up to its 240 s grace.
+    """HA009 rejects both a draining rollout and a fully completed rollout."""
+    import copy
 
-    The wait must not return while any pre-rotation Pod uid is still listed,
-    or _rotation_result reports "did not replace every old Pod" for a
-    rollout that merely had not finished draining.
-    """
     before = _ha009_snapshot(1, [("old-a", "uid-a"), ("old-b", "uid-b")])
-    snapshots = iter(
-        [
-            _ha009_snapshot(2, [("old-a", "uid-a"), ("new-b", "uid-nb")]),
-            _ha009_snapshot(2, [("new-a", "uid-na"), ("new-b", "uid-nb")]),
-        ]
-    )
-    seen = []
-    monkeypatch.setattr(ha009, "deployment_snapshot", lambda: next(snapshots))
-    monkeypatch.setattr(ha009.time, "sleep", lambda _seconds: seen.append("slept"))
-
-    after = ha009.wait_deployments(before, timeout_seconds=30)
-
-    assert seen == ["slept"], "wait must poll past the still-draining old Pod"
     for name in ha009.DEPLOYMENTS:
-        uids = {value["uid"] for _pod, value in after[name]["pods"]}
-        assert uids == {"uid-na", "uid-nb"}, name
+        before[name]["uid"] = f"deployment-{name}"
+    assert ha009.deployments_steady(before, copy.deepcopy(before)) == []
+    for pods in (
+        [("old-a", "uid-a"), ("new-b", "uid-nb")],
+        [("new-a", "uid-na"), ("new-b", "uid-nb")],
+    ):
+        after = _ha009_snapshot(2, pods)
+        for name in ha009.DEPLOYMENTS:
+            after[name]["uid"] = before[name]["uid"]
+        errors = ha009.deployments_steady(before, after)
+        assert any("generation changed" in error for error in errors), errors
+        assert any("Pod set changed" in error for error in errors), errors
+    replaced = copy.deepcopy(before)
+    replaced[ha009.DEPLOYMENTS[0]]["uid"] = "replacement-deployment"
+    assert any(
+        "Deployment UID" in error
+        for error in ha009.deployments_steady(before, replaced)
+    ), {"before": before, "after": replaced}
 
 
 def test_host_probe_residual_check_fails_closed_on_a_kubectl_error(
@@ -700,7 +829,7 @@ def test_host_probe_residual_check_fails_closed_on_a_kubectl_error(
 
     _fake_kubectl(monkeypatch, failing_get)
 
-    with pytest.raises(HostProbeError, match="Unable to connect"):
+    with pytest.raises(HostProbeError, match="command failed"):
         fixture.residuals()
 
 
@@ -708,13 +837,14 @@ def test_host_probe_kubectl_timeout_is_a_probe_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts.e2e.regional import host_probe_fixture as module
+    from scripts.e2e.regional.regional_commands import RegionalCommandTimeout
 
     fixture = _host_probe(tmp_path)
 
     def hang(command: list[str], **_kwargs: Any) -> None:
-        raise subprocess.TimeoutExpired(command, 30)
+        raise RegionalCommandTimeout(command, 30)
 
-    monkeypatch.setattr(module.subprocess, "run", hang)
+    monkeypatch.setattr(module, "run_fixture_command", hang)
 
     with pytest.raises(HostProbeError, match="timed out after 30s"):
         fixture._kubectl("get", "pod", fixture.pod, timeout=30)
@@ -728,17 +858,13 @@ def test_host_probe_cleanup_reaches_the_configmap_and_audit_past_a_stuck_pod(
     the ConfigMap and run the residual check."""
 
     from scripts.e2e.regional import host_probe_fixture as module
+    from tests.regional._host_probe_support import ProbeApi
 
     fixture = _host_probe(tmp_path)
-    state = {"forced": False}
-
-    def stuck_pod(arguments: tuple[str, ...]) -> Any:
-        if arguments[0] == "delete" and "--force" in arguments:
-            state["forced"] = True
-        if arguments[0] == "get" and arguments[1] == "pod":
-            # Present until forced; the graceful delete never takes effect.
-            return _completed(stdout="" if state["forced"] else f"pod/{fixture.pod}\n")
-        return _completed()
+    api = ProbeApi()
+    monkeypatch.setattr(module, "run_fixture_command", api.run)
+    fixture.create()
+    api.stuck_pod = True
 
     clock = {"now": 0.0}
 
@@ -748,47 +874,42 @@ def test_host_probe_cleanup_reaches_the_configmap_and_audit_past_a_stuck_pod(
 
     monkeypatch.setattr(module.time, "monotonic", monotonic)
     monkeypatch.setattr(module.time, "sleep", lambda _s: None)
-    calls = _fake_kubectl(monkeypatch, stuck_pod)
-
     residuals = fixture.cleanup()
 
-    deletes = [call for call in calls if call[0] == "delete"]
-    assert deletes[0][1:3] == ("pod", fixture.pod) and "--wait=false" in deletes[0]
-    assert "--wait=true" not in deletes[0], deletes[0]
-    assert any("--force" in call and "--grace-period=0" in call for call in deletes), (
-        f"a pod that never leaves must be force-deleted; deletes issued: {deletes}"
-    )
-    assert deletes[-1][1:3] == ("configmap", fixture.configmap), deletes
-    assert residuals == {
-        f"pod/{fixture.pod}": False,
-        f"configmap/{fixture.configmap}": False,
-    }, residuals
-    # The residual check ran after the ConfigMap delete, not before it.
-    configmap_delete = calls.index(deletes[-1])
+    deletes = [(args, kwargs) for args, kwargs in api.calls if args[0] == "delete"]
+    assert "/pods/" in deletes[0][0][2]
+    assert all("--raw" in args for args, _ in deletes), deletes
     assert any(
-        call[0] == "get" and call[1] == "configmap"
-        for call in calls[configmap_delete + 1 :]
-    ), calls[configmap_delete:]
+        json.loads(kwargs["input_text"]).get("gracePeriodSeconds") == 0
+        for _, kwargs in deletes
+    ), deletes
+    assert "/configmaps/" in deletes[-1][0][2], deletes
+    assert not any(residuals.values()), residuals
+    configmap_delete = api.calls.index(deletes[-1])
+    assert any(
+        args[:2] == ["get", "configmap"]
+        for args, _ in api.calls[configmap_delete + 1 :]
+    ), api.calls[configmap_delete:]
 
 
-def test_host_probe_execute_reports_a_non_json_last_line_with_stderr(
+def test_host_probe_execute_rejects_non_json_without_leaking_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from scripts.e2e.regional import host_probe_fixture as module
+    from tests.regional._host_probe_support import ProbeApi
+
     fixture = _host_probe(tmp_path)
-    _fake_kubectl(
-        monkeypatch,
-        lambda _arguments: _completed(
-            stdout="Traceback (most recent call last):\n  File ...\nOSError: boom\n",
-            stderr="chroot: failed to run command\n",
-            returncode=1,
-        ),
-    )
-
-    with pytest.raises(HostProbeError, match="chroot: failed") as raised:
+    api = ProbeApi()
+    monkeypatch.setattr(module, "run_fixture_command", api.run)
+    fixture.create()
+    api.probe_stdout = "Traceback (most recent call last):\nOSError: private-data\n"
+    api.probe_stderr = "chroot: failed to run private-command\n"
+    api.probe_returncode = 1
+    with pytest.raises(HostProbeError, match="invalid JSON") as raised:
         fixture.execute("snapshot")
-
-    assert "returned no JSON" in str(raised.value), raised.value
-    assert isinstance(raised.value.__cause__, json.JSONDecodeError), (
-        "the probe error must chain the JSON parse failure, "
-        f"got {raised.value.__cause__!r}"
-    )
+    assert "private-data" not in str(raised.value)
+    assert "private-command" not in str(raised.value)
+    assert not any(fixture.cleanup().values()), {
+        "remaining_objects": api.objects,
+        "calls": api.calls,
+    }

@@ -28,9 +28,6 @@ proves nothing looks exactly like a fixed manifest:
 * The reconciler tolerated every taint with no ``tolerationSeconds``
   (``§F7``), so taint-based eviction never moved the singleton off a dead
   node.
-* The optional HMA manifests still posted to ``gpu-fault-api-canary`` with no
-  token, which the regional API answers with 401 -- a non-retryable error on
-  the very first post (``§F11``).
 """
 
 from __future__ import annotations
@@ -76,11 +73,11 @@ class _RecordingRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    def probe(self, arguments: Any, **_kwargs: Any) -> bool:
+    def probe_output(self, arguments: Any, **_kwargs: Any) -> tuple[int, str, str]:
         # The collector's skip branch probes for a leftover Deployment to scale
         # down (F10 fix 1, F4); a cluster that never had one answers "absent",
         # so the skip still mutates nothing.
-        return False
+        return 0, "", ""
 
     def run(self, arguments: Any, **kwargs: Any) -> str:
         self.calls.append((list(arguments), dict(kwargs)))
@@ -721,63 +718,6 @@ def test_executor_finishes_its_command_before_the_kubelet_kills_it() -> None:
     assert _pod_spec(deployment).get("terminationGracePeriodSeconds") == 60, (
         "the executor needs longer than the 30 s default to finish the batch "
         "it already claimed"
-    )
-
-
-def _optional_containers() -> list[tuple[Path, dict[str, Any], dict[str, Any]]]:
-    found = []
-    for path, deployment in _workloads(
-        iter(sorted((DATAPLANE / "optional").glob("*.yaml"))), "Deployment"
-    ):
-        spec = _pod_spec(deployment)
-        for container in spec.get("containers") or []:
-            found.append((path, spec, container))
-    return found
-
-
-def test_optional_hma_manifests_use_the_regional_connection_secret() -> None:
-    containers = _optional_containers()
-
-    assert len(containers) == 2, f"expected two optional collectors, got {containers}"
-    for path, spec, container in containers:
-        where = f"{path.name}:{container.get('name')}"
-        env = {item["name"]: item for item in container.get("env") or []}
-        for name in (
-            "GPU_FAULT_CONTROL_PLANE_URL",
-            "GPU_FAULT_CONTROL_PLANE_TOKEN",
-            "GPU_FAULT_CLUSTER_ID",
-        ):
-            source = (env.get(name) or {}).get("valueFrom") or {}
-            secret = source.get("secretKeyRef") or {}
-            assert secret.get("name") == "gpu-fault-regional-connection", (
-                f"{where}: {name} must come from the regional connection "
-                f"Secret, got {env.get(name)!r} -- the canary URL answers 401 "
-                "and a 401 is not retried"
-            )
-        assert (env.get("SSL_CERT_FILE") or {}).get("value") == (
-            "/etc/gpu-fault/tls/ca.crt"
-        ), f"{where}: the control-plane CA is not trusted"
-        outbox = (env.get("GPU_FAULT_COLLECTOR_OUTBOX_PATH") or {}).get("value")
-        assert outbox and outbox.startswith("/var/lib/gpu-fault/"), (
-            f"{where}: without an outbox path every buffered event is dropped, "
-            f"got {outbox!r}"
-        )
-        mounts = {
-            str(mount["mountPath"]) for mount in container.get("volumeMounts") or []
-        }
-        assert any(outbox.startswith(f"{mount}/") for mount in mounts), (
-            f"{where}: the outbox path {outbox} is not under a mounted volume"
-        )
-        assert "/etc/gpu-fault/tls" in mounts, f"{where}: the CA volume is not mounted"
-        declared = {volume["name"] for volume in spec.get("volumes") or []}
-        mounted = {str(mount["name"]) for mount in container.get("volumeMounts") or []}
-        assert declared == mounted, (
-            f"{where}: declared volumes {sorted(declared)} do not match the "
-            f"mounted ones {sorted(mounted)}"
-        )
-    texts = [path.read_text(encoding="utf-8") for path, _spec, _c in containers]
-    assert not any("gpu-fault-api-canary" in text for text in texts), (
-        "the canary Service does not exist in the regional architecture"
     )
 
 

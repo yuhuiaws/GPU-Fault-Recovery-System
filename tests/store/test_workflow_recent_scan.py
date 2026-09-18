@@ -25,6 +25,7 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
 OPEN = {
@@ -36,7 +37,15 @@ OPEN = {
 WINDOW_EDGE = NOW - timedelta(days=7)
 
 
-@pytest.fixture(params=["memory", "sqlite", "postgres"])
+@pytest.fixture(
+    params=[
+        "memory",
+        "sqlite",
+        "postgres-legacy",
+        "postgres-dual",
+        "postgres-dedicated",
+    ]
+)
 def store(request, tmp_path):
     if request.param == "memory":
         yield build_store()
@@ -50,9 +59,19 @@ def store(request, tmp_path):
         return
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
     for postgres in postgres_store_instance():
-        yield postgres
-    _truncate()
+        try:
+            with psycopg.connect(
+                os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+            ) as connection:
+                select_mode(
+                    connection, "workflow", request.param.removeprefix("postgres-")
+                )
+            yield postgres
+        finally:
+            _truncate()
 
 
 def _workflow(store, request_id: str, status: WorkflowStatus, updated_at: datetime):
@@ -137,10 +156,37 @@ def test_an_empty_open_set_is_purely_the_window(store) -> None:
     assert _ids(rows) == ["fresh-b", "fresh-a", "edge"]
 
 
+def test_a_naive_window_edge_is_inclusive(store) -> None:
+    edge = WINDOW_EDGE.replace(tzinfo=None)
+    for request_id, updated_at in (
+        ("edge", edge),
+        ("before", edge - timedelta(microseconds=1)),
+        ("after", edge + timedelta(microseconds=1)),
+    ):
+        _workflow(store, request_id, WorkflowStatus.SUCCEEDED, updated_at)
+
+    rows = store.list_recent_workflows(set(), updated_since=edge, limit=10)
+
+    assert _ids(rows) == ["after", "edge"], (
+        "the inclusive recent-history bound must preserve naive timestamp text"
+    )
+
+
+def test_recent_order_preserves_serialized_timestamp_style(store) -> None:
+    _workflow(store, "z-naive", WorkflowStatus.SUCCEEDED, NOW.replace(tzinfo=None))
+    _workflow(store, "a-aware", WorkflowStatus.SUCCEEDED, NOW)
+
+    rows = store.list_recent_workflows(set(), updated_since=None, limit=10)
+
+    assert _ids(rows) == ["a-aware", "z-naive"], (
+        "all backends must order by the stored timestamp text before request ID"
+    )
+
+
 def test_postgres_scan_is_two_status_bounded_range_scans() -> None:
     """G-2: never ``statuses=None``; the recent half carries the window edge as
-    a text bound on ``payload->>'updated_at'`` so ``gpu_fault_workflow_updated_all``
-    can serve it as a range scan that stops at the edge."""
+    a text bound on the projected updated_at column so the legacy or dedicated
+    updated index can serve a range scan that stops at the edge."""
 
     sql, parameters = PostgresWorkflowMixin.workflow_scan_query(
         {WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED},
@@ -149,13 +195,13 @@ def test_postgres_scan_is_two_status_bounded_range_scans() -> None:
         updated_since=WINDOW_EDGE,
     )
 
-    assert "w.payload->>'status' IN ('FAILED', 'SUCCEEDED')" in sql
-    assert "w.payload->>'updated_at' >= %s" in sql
-    assert "ORDER BY w.payload->>'updated_at' DESC, w.key DESC LIMIT %s" in sql
+    assert "w.status IN ('FAILED', 'SUCCEEDED')" in sql
+    assert "w.updated_at >= %s" in sql
+    assert "ORDER BY w.updated_at DESC, w.key DESC LIMIT %s" in sql
     assert parameters == ("2026-09-03T12:00:00.000000Z", 7)
 
     without_window, parameters = PostgresWorkflowMixin.workflow_scan_query(
         {WorkflowStatus.SUCCEEDED}, limit=7, newest_first=True
     )
-    assert "updated_at' >=" not in without_window
+    assert "updated_at >=" not in without_window
     assert parameters == (7,)

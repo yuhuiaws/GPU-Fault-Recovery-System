@@ -117,7 +117,7 @@ def delivered_errors(
             )
     if any(item.get("marker_present") for item in records):
         errors.append("delivered records are still in the outbox")
-    if int(stats.get("replayable") or 0):
+    if type(stats.get("replayable")) is not int or stats["replayable"] != 0:
         errors.append(f"{stats.get('replayable')} replayable record(s) remain")
     return errors
 
@@ -178,7 +178,9 @@ def stream_identity_errors(before: dict[str, Any], after: dict[str, Any]) -> lis
         errors.append(
             f"kernel collector PID changed: {before.get('pid')} -> {after.get('pid')}"
         )
-    if before.get("invocation_id") != after.get("invocation_id"):
+    if not before.get("invocation_id") or before.get("invocation_id") != after.get(
+        "invocation_id"
+    ):
         errors.append("kernel collector InvocationID changed during the blackout")
     fds_before = {
         int(item["fd"]): item.get("pos") for item in before.get("kmsg_streams") or []
@@ -195,21 +197,47 @@ def stream_identity_errors(before: dict[str, Any], after: dict[str, Any]) -> lis
         )
     for fd, position in fds_before.items():
         later = fds_after.get(fd)
-        if position is not None and later is not None and later < position:
+        if type(position) is not int or type(later) is not int:
+            errors.append(f"fd {fd} position is missing or invalid")
+        elif position < 0 or later < position:
             errors.append(f"fd {fd} position went backwards: {position} -> {later}")
     return errors
 
 
-def blackout_errors(blocked: dict[str, Any], unblocked: dict[str, Any]) -> list[str]:
+def block_errors(blocked: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if any((blocked.get("connectivity") or {}).values()):
+    connectivity = blocked.get("connectivity")
+    if not isinstance(connectivity, dict) or not connectivity:
+        errors.append("blocked destinations were not observed")
+    elif any(value is not False for value in connectivity.values()):
         errors.append("the control plane stayed reachable while blocked")
     if (blocked.get("timer") or {}).get("ActiveState") != "active":
         errors.append("the rollback timer was not active while blocked")
-    if unblocked.get("rules"):
+    return errors
+
+
+def unblock_errors(unblocked: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if unblocked.get("rules") != []:
         errors.append(f"firewall rules remain after unblock: {unblocked.get('rules')}")
-    if not all((unblocked.get("connectivity") or {}).values()):
+    connectivity = unblocked.get("connectivity")
+    if (
+        not isinstance(connectivity, dict)
+        or not connectivity
+        or not all(value is True for value in connectivity.values())
+    ):
         errors.append("the control plane is not reachable after unblock")
+    if (unblocked.get("timer") or {}).get("ActiveState") != "inactive":
+        errors.append("rollback timer removal is unproven after unblock")
+    return errors
+
+
+def blackout_errors(blocked: dict[str, Any], unblocked: dict[str, Any]) -> list[str]:
+    errors = [*block_errors(blocked), *unblock_errors(unblocked)]
+    if set(blocked.get("connectivity") or {}) != set(
+        unblocked.get("connectivity") or {}
+    ):
+        errors.append("firewall destination identity changed during the window")
     return errors
 
 

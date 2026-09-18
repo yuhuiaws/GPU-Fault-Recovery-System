@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any, Callable
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+from gpu_fault.node_agent.late_ownership import (
+    final_ownership_boundary,
+    require_physical_ownership,
+)
 
 if TYPE_CHECKING:
     from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
@@ -107,6 +111,7 @@ class RemediationOperationsMixin:
             "manual_confirmation_required": True,
             "install": name,
         }
+        require_physical_ownership()
         try:
             self._run_checked(rendered, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -137,6 +142,7 @@ class RemediationOperationsMixin:
             for_reset=False,
         )
 
+    @final_ownership_boundary
     def _remediate_driver(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.driver_remediation_enabled:
             raise RuntimeError("driver remediation is disabled")
@@ -194,6 +200,7 @@ class RemediationOperationsMixin:
         except OSError:
             return None
 
+    @final_ownership_boundary
     def _remediate_efa_driver(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.efa_driver_remediation_enabled:
             raise RuntimeError("EFA driver remediation is disabled")
@@ -239,6 +246,7 @@ class RemediationOperationsMixin:
             for device in devices:
                 if self._bound_driver(device) == self.efa_driver_module:
                     continue
+                require_physical_ownership()
                 try:
                     self.efa_driver_bind_path.write_text(
                         device.name + "\n", encoding="ascii"
@@ -279,6 +287,7 @@ class RemediationOperationsMixin:
             verify=bind_and_verify,
         )
 
+    @final_ownership_boundary
     def _update_firmware(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.firmware_update_enabled:
             raise RuntimeError("firmware update is disabled")

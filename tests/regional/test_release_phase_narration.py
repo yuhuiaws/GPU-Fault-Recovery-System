@@ -179,8 +179,8 @@ def test_an_invocation_is_bounded_even_when_it_fails(
 
 def _succeeding_subprocess(monkeypatch: pytest.MonkeyPatch, **fields: object) -> None:
     monkeypatch.setattr(
-        ROLLOUT.subprocess,
-        "run",
+        ROLLOUT,
+        "run_command",
         lambda *_args, **_keywords: SimpleNamespace(
             returncode=0, stdout="", stderr="", **fields
         ),
@@ -233,8 +233,8 @@ def test_a_slow_command_that_failed_still_reports_its_duration(
     runner = ROLLOUT.Runner()
     monkeypatch.setattr(ROLLOUT, "SLOW_COMMAND_SECONDS", 0.0)
     monkeypatch.setattr(
-        ROLLOUT.subprocess,
-        "run",
+        ROLLOUT,
+        "run_command",
         lambda *_args, **_keywords: SimpleNamespace(
             returncode=1, stdout="", stderr="denied"
         ),
@@ -284,12 +284,18 @@ def test_a_silent_probe_is_annotated_when_it_stalls(
     runner = ROLLOUT.Runner()
     monkeypatch.setattr(ROLLOUT, "SLOW_COMMAND_SECONDS", 0.0)
     monkeypatch.setattr(
-        ROLLOUT.subprocess,
-        "run",
-        lambda *_args, **_keywords: SimpleNamespace(returncode=1),
+        ROLLOUT,
+        "run_command",
+        lambda *_args, **_keywords: SimpleNamespace(
+            returncode=1, stdout="", stderr="not found"
+        ),
     )
 
-    assert runner.probe(["/usr/bin/kubectl", "get", "configmap", "absent"]) is False
+    assert runner.probe_output(["/usr/bin/kubectl", "get", "configmap", "absent"]) == (
+        1,
+        "",
+        "not found",
+    )
 
     assert "s kubectl get configmap absent" in capsys.readouterr().err
 

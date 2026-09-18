@@ -9,6 +9,7 @@ TARGET_NODE_NAME="${TARGET_NODE_NAME:-}"
 TARGET_NODE_UID="${TARGET_NODE_UID:-}"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
 MIN_FREE_BYTES="${GPU_FAULT_INSTALLER_MIN_FREE_BYTES:-2147483648}"
+NODE_WHEELHOUSE_SHA256="${GPU_FAULT_NODE_WHEELHOUSE_SHA256:-}"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -55,6 +56,8 @@ observed_artifact_sha256="$(
 
 for required_member in \
     /deploy/node/install-gpu-fault-collector.sh \
+    /deploy/node/runtime-slot.sh \
+    /deploy/node/runtime_integrity.py \
     /deploy/node/preflight-gpu-fault-node.sh \
     /deploy/systemd/gpu-fault-node-agent.service \
     /deploy/systemd/gpu-fault-host-collector.service \
@@ -91,6 +94,19 @@ done
 host_shell \
     "/usr/bin/python3.12 -c 'import sys, venv; raise SystemExit(sys.version_info < (3, 12))'" ||
     die "host Python 3.12 venv support is unavailable"
+if [[ -n "${NODE_WHEELHOUSE_SHA256}" ]]; then
+    [[ "${NODE_WHEELHOUSE_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+        die "node wheelhouse inventory SHA-256 is invalid"
+    integrity_member="${wheel_members[0]%/dist/*}/deploy/node/runtime_integrity.py"
+    # The bundle has already been hash-verified; stream its validator without
+    # extracting files onto the read-only host filesystem.
+    tar -xOzf "${CANDIDATE_BUNDLE}" "${integrity_member}" |
+        host_shell "/usr/bin/python3.12 -I -S -B - wheelhouse \
+          --wheelhouse /run/gpu-fault-node-wheelhouse \
+          --expected-inventory '${NODE_WHEELHOUSE_SHA256}' \
+          --bundle /run/gpu-fault-preflight-artifact/$(basename "${CANDIDATE_BUNDLE}")" ||
+        die "offline node wheelhouse integrity validation failed"
+fi
 systemd_state="$(host_shell "systemctl is-system-running 2>/dev/null || true")"
 [[ "${systemd_state}" == "running" || "${systemd_state}" == "degraded" ]] ||
     die "host systemd is not operational: ${systemd_state:-unknown}"
@@ -147,6 +163,10 @@ if [[ "${REQUIRE_ROLLBACK_SLOT}" == "true" ]]; then
         die "rollback runtime slot has no GPU service restore command"
     [[ -s "${HOST_ROOT}/opt/gpu-fault/installed-units.txt" ]] ||
         die "rollback runtime unit inventory is unavailable"
+    integrity_member="${wheel_members[0]%/dist/*}/deploy/node/runtime_integrity.py"
+    tar -xOzf "${CANDIDATE_BUNDLE}" "${integrity_member}" |
+        host_shell "/usr/bin/python3.12 -I -S -B - previous --root /opt/gpu-fault" ||
+        die "rollback runtime integrity validation failed"
 fi
 
 printf '{"artifact_sha256":"%s","bundle_sha256":"%s","node_id":"%s","node_uid":"%s","status":"PASSED"}\n' \

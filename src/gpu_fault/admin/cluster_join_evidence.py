@@ -3,29 +3,39 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
+from pydantic import ValidationError
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
-from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import run_command
+from gpu_fault.admin.site import (
+    IDENTIFIER_PATTERN,
+    RenderedSite,
+    effective_environment,
+)
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
     hydrate_previous_snapshot,
 )
+from gpu_fault.regional import RegionalRegistryStatus
 from gpu_fault_release.regional_deployment_inventory import CPU_INGRESS_DEPLOYMENT
+from gpu_fault_release.regional_release_state import _live_truth_state
 
 REGIONAL_RELEASE_STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
-# The Pod the registry status is read through: the same Deployment the release
-# engine execs into. A private literal here named a Deployment that never
-# existed, and every live join failed at verification with "no Running CPU
-# ingress Pod" (2026-09-12).
 CPU_INGRESS_APP = CPU_INGRESS_DEPLOYMENT
 VERIFICATION_MAX_AGE_SECONDS = 900
+RUNTIME_MEMBERSHIP_FIELDS = (
+    "live_release_identity_sha256",
+    "registry_generation",
+    "registry_content_sha256",
+    "registry_cluster_states",
+)
 
 
 class JoinVerificationExpired(BootstrapError):
@@ -92,10 +102,16 @@ RELEASE_IDENTITY_FIELDS = (
     "agent_config_digest",
     "release_delivery_sha256",
     "runtime_image",
+    "executor_image",
     "node_installer_image",
+    "node_dependencies",
+    "release_manifest_schema_version",
+    "node_template_sha256",
     "dcgm_image",
     "adot_image",
 )
+# The rendered-manifest digest also covers membership, so sync-state legitimately
+# changes it. Its complete state bytes are still checked across candidate verify.
 
 
 def _require_cluster_id(value: str) -> str:
@@ -161,7 +177,7 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
         str(site.release_config["cpu_kubeconfig"]),
     ]
     namespace = str(site.release_config["namespace"])
-    state_result = subprocess.run(
+    state_result = run_command(
         [
             *cpu,
             "-n",
@@ -172,12 +188,13 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
             "-o",
             "json",
         ],
-        text=True,
-        capture_output=True,
+        environment=effective_environment(site),
+        timeout_seconds=60,
     )
     if state_result.returncode:
         raise BootstrapError(
-            "cannot read live regional release state: " + state_result.stderr.strip()
+            "cannot read live regional release state: "
+            + diagnostic_text(state_result.stderr.strip())
         )
     state_document = _mapping(
         json.loads(state_result.stdout or "{}"),
@@ -190,7 +207,7 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
     parsed_state = _mapping(json.loads(raw_state), "live regional release state")
 
     def read_snapshot_config_map(name: str) -> dict[str, Any]:
-        result = subprocess.run(
+        result = run_command(
             [
                 *cpu,
                 "-n",
@@ -201,13 +218,13 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
                 "-o",
                 "json",
             ],
-            text=True,
-            capture_output=True,
+            environment=effective_environment(site),
+            timeout_seconds=60,
         )
         if result.returncode:
             raise BootstrapError(
                 f"cannot read live release previous snapshot {name}: "
-                + result.stderr.strip()
+                + diagnostic_text(result.stderr.strip())
             )
         return _mapping(
             json.loads(result.stdout or "{}"),
@@ -224,7 +241,7 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
             "live regional release previous snapshot is invalid"
         ) from exc
 
-    pod_result = subprocess.run(
+    pod_result = run_command(
         [
             *cpu,
             "-n",
@@ -237,13 +254,13 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
             "-o",
             "jsonpath={.items[0].metadata.name}",
         ],
-        text=True,
-        capture_output=True,
+        environment=effective_environment(site),
+        timeout_seconds=30,
     )
     pod = (pod_result.stdout or "").strip()
     if pod_result.returncode or not pod:
         raise BootstrapError("no Running CPU ingress Pod for membership evidence")
-    registry_result = subprocess.run(
+    registry_result = run_command(
         [
             *cpu,
             "-n",
@@ -255,33 +272,35 @@ def membership_runtime_snapshot(site: RenderedSite) -> dict[str, Any]:
             "-c",
             REGISTRY_STATUS_CLIENT,
         ],
-        text=True,
-        capture_output=True,
+        environment=effective_environment(site),
+        timeout_seconds=60,
     )
     if registry_result.returncode:
         raise BootstrapError(
             "cannot read regional registry generation: "
-            + registry_result.stderr.strip()
+            + diagnostic_text(registry_result.stderr.strip())
         )
-    registry = _mapping(
-        json.loads(registry_result.stdout or "{}"),
-        "regional registry status",
-    )
+    try:
+        registry = RegionalRegistryStatus.model_validate_json(
+            registry_result.stdout or "{}"
+        )
+    except ValidationError:
+        raise BootstrapError("regional registry status is malformed") from None
+    if not registry.converged or registry.missing_member_ids:
+        raise BootstrapError("regional registry has not converged")
     cluster_states = {
-        str(cluster_id): str(lifecycle)
-        for cluster_id, lifecycle in _mapping(
-            registry.get("cluster_states") or {},
-            "regional registry cluster states",
-        ).items()
+        cluster_id: lifecycle.value
+        for cluster_id, lifecycle in registry.cluster_states.items()
     }
+    live_identity = _live_truth_state(live_state)
     release_identity = {
-        field: live_state.get(field) for field in RELEASE_IDENTITY_FIELDS
+        field: live_identity.get(field) for field in RELEASE_IDENTITY_FIELDS
     }
     return {
         "live_release_state_sha256": hashlib.sha256(raw_state.encode()).hexdigest(),
         "live_release_identity_sha256": _canonical_sha256(release_identity),
-        "registry_generation": int(registry["generation"]),
-        "registry_content_sha256": str(registry["content_sha256"]),
+        "registry_generation": registry.generation,
+        "registry_content_sha256": registry.content_sha256,
         "registry_cluster_states": cluster_states,
         "observed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -342,14 +361,10 @@ def validate_verified_membership(
     candidate_site: RenderedSite,
     cluster_id: str,
     now: datetime | None = None,
+    check_runtime: bool = True,
+    allow_expired: bool = False,
 ) -> None:
-    """Check the recorded evidence against the transaction, without a live read.
-
-    The verify itself brackets the rollout with two runtime snapshots and the
-    final step records a third after activation; between them the site lock keeps
-    every other mutation out, so this gate only has to prove that the files and
-    identities the evidence was built from are still the ones being committed.
-    """
+    """Bind verification to its files and the live registry before activation."""
 
     cluster_id = _require_cluster_id(cluster_id)
     if evidence.get("cluster_id") != cluster_id:
@@ -377,8 +392,66 @@ def validate_verified_membership(
     }
     if candidate_ids != actual_candidate_ids or cluster_id not in candidate_ids:
         raise BootstrapError("join candidate cluster set drifted after verification")
-    if verification_is_stale(evidence, now):
+    if not allow_expired and verification_is_stale(evidence, now):
         raise JoinVerificationExpired("join verification evidence expired")
+    if check_runtime:
+        observed = membership_runtime_snapshot(current_site)
+        expected = evidence.get("post_verification_runtime") or evidence
+        drifted = [
+            field
+            for field in RUNTIME_MEMBERSHIP_FIELDS
+            if observed.get(field) != expected.get(field)
+        ]
+        if drifted:
+            raise BootstrapError(
+                "membership identity drifted before activation: " + ", ".join(drifted)
+            )
+        if not allow_expired and verification_is_stale(evidence, now):
+            raise JoinVerificationExpired("join verification evidence expired")
+
+
+def advance_batch_verification(
+    evidence: dict[str, Any],
+    *,
+    committed_evidence: dict[str, Any],
+    final_identity: dict[str, Any],
+    cluster_id: str,
+) -> dict[str, Any]:
+    """Account only for a completed sibling's activation, without renewing age."""
+    expected = evidence.get("post_verification_runtime") or evidence
+    committed = (
+        committed_evidence.get("post_verification_runtime") or committed_evidence
+    )
+    if any(
+        expected.get(field) != committed.get(field)
+        for field in RUNTIME_MEMBERSHIP_FIELDS
+    ):
+        raise BootstrapError("batch join verification baselines diverged")
+    expected_states = _mapping(
+        expected.get("registry_cluster_states"), "verified batch cluster states"
+    )
+    if expected_states.get(cluster_id) != "PENDING":
+        raise BootstrapError("batch activation did not start from PENDING")
+    expected_states[cluster_id] = "ACTIVE"
+    if (
+        final_identity.get("registry_cluster_states") != expected_states
+        or final_identity.get("live_release_identity_sha256")
+        != expected.get("live_release_identity_sha256")
+        or int(final_identity.get("registry_generation") or 0)
+        <= int(expected.get("registry_generation") or 0)
+        or not final_identity.get("registry_content_sha256")
+    ):
+        raise BootstrapError("batch membership drifted during sibling activation")
+    return {
+        **evidence,
+        "post_verification_runtime": {
+            field: final_identity[field] for field in RUNTIME_MEMBERSHIP_FIELDS
+        },
+        "verified_batch_activations": [
+            *(evidence.get("verified_batch_activations") or []),
+            cluster_id,
+        ],
+    }
 
 
 def final_membership_identity(
@@ -387,6 +460,7 @@ def final_membership_identity(
     candidate_site_sha256: str,
     cluster_id: str,
     verified_at: str,
+    verification_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cluster_id = _require_cluster_id(cluster_id)
     snapshot = membership_runtime_snapshot(site)
@@ -399,12 +473,16 @@ def final_membership_identity(
         raise BootstrapError(
             f"joined cluster {cluster_id} is not ACTIVE in the runtime registry"
         )
+    if verification_evidence is not None and snapshot[
+        "live_release_identity_sha256"
+    ] != verification_evidence.get("live_release_identity_sha256"):
+        raise BootstrapError("live release identity drifted after join verification")
     return {
+        **snapshot,
         "candidate_site_sha256": candidate_site_sha256,
         "live_release_state_sha256": snapshot["live_release_state_sha256"],
         "live_release_identity_sha256": snapshot["live_release_identity_sha256"],
         "registry_generation": snapshot["registry_generation"],
-        "registry_content_sha256": snapshot["registry_content_sha256"],
         "cluster_id": cluster_id,
         "registry_lifecycle": lifecycle,
         "verified_at": verified_at,

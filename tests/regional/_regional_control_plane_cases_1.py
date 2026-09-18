@@ -13,6 +13,7 @@ from gpu_fault.execution.restart_budget_preflight import (
     reservation_id,
 )
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     AgentHeartbeat,
     FleetRegistry,
     SignedAgentHeartbeat,
@@ -151,7 +152,7 @@ def test_regional_spare_health_uses_fleet_registry() -> None:
         cluster_id="cluster-a",
         node_id="node-a",
         endpoint="http://node-a:9099",
-        agent_protocol_version=3,
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version="0.10.0",
         artifact_sha256="a" * 64,
         policy_version="policy-v1",

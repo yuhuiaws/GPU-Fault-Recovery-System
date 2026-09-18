@@ -21,13 +21,11 @@ The shape: every open command whose workflow is terminal (``FAILED``,
 ``SUCCEEDED``, ``BLOCKED``, ``SUPERSEDED``). A command whose workflow is still
 ``PENDING``/``RUNNING``/``SAFETY_PENDING`` is never touched, however old -- an
 open command there is live work, and an executor holding its lease is the only
-party allowed to settle it. Cancelling goes through the Store's own
-``cancel_remote_commands_for_workflow`` (what the workflow-timeout and
-retired-generation paths use): ``PENDING``/``WAITING`` go ``FAILED`` at once, a
-``LEASED`` one gets a cancellation request the agent side honours. The
-workflow row is not moved; the cancel is recorded on it as an
-``OPERATOR_RECONCILED`` event with actor ``dispatcher`` through
-``amend_workflow``, in the same transaction as the amend. Nothing is deleted.
+party allowed to settle it. The Store's ``cancel_orphaned_remote_commands``
+rechecks the workflow under its write lock and commits cancellation and its
+``OPERATOR_RECONCILED`` audit together: ``PENDING``/``WAITING`` go ``FAILED``,
+while ``LEASED`` gets a cancellation request the agent side honours. The
+workflow status is unchanged and nothing is deleted.
 """
 
 from __future__ import annotations
@@ -35,28 +33,29 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
-from gpu_fault.models import (
-    WorkflowEventKind,
-    WorkflowRequest,
-    WorkflowStatus,
-    build_operator_event,
-)
+from gpu_fault.models import WorkflowRequest
 from gpu_fault.remote_command_models import RemoteCommandStatus
+from gpu_fault.store.shared.orphaned_commands import (
+    AUDIT_ACTION as AUDIT_ACTION,
+)
+from gpu_fault.store.shared.orphaned_commands import (
+    TERMINAL_WORKFLOW_STATUSES as TERMINAL_WORKFLOW_STATUSES,
+)
+from gpu_fault.store.shared.orphaned_commands import (
+    cancellation_event,
+)
+from gpu_fault.store.shared.orphaned_commands import (
+    cancellation_reason as cancellation_reason,
+)
+
+if TYPE_CHECKING:
+    from gpu_fault.store.contracts import WorkflowStore
 
 LOGGER = logging.getLogger(__name__)
 
 DISPATCHER_ACTOR = "dispatcher"
-AUDIT_ACTION = "cancelled orphaned remote commands"
-TERMINAL_WORKFLOW_STATUSES = frozenset(
-    {
-        WorkflowStatus.FAILED,
-        WorkflowStatus.SUCCEEDED,
-        WorkflowStatus.BLOCKED,
-        WorkflowStatus.SUPERSEDED,
-    }
-)
 OPEN_REMOTE_STATUSES = frozenset(
     {
         RemoteCommandStatus.PENDING,
@@ -89,13 +88,6 @@ def orphaned_commands(
     )
 
 
-def cancellation_reason(workflow: WorkflowRequest, actor: str) -> str:
-    return (
-        f"{actor} reconciliation: cancelled remote commands orphaned by "
-        f"{workflow.status.value} workflow {workflow.request_id}"
-    )
-
-
 def record_cancellation(
     store: Any,
     workflow: WorkflowRequest,
@@ -115,24 +107,14 @@ def record_cancellation(
     store.amend_workflow(
         workflow.request_id,
         {},
-        event=build_operator_event(
-            workflow,
-            WorkflowEventKind.OPERATOR_RECONCILED,
-            actor=actor,
-            reference=None,
-            previous_status=workflow.status,
-            at=now,
-            details={
-                "action": AUDIT_ACTION,
-                "cancelled_remote_commands": dict(cancelled),
-                "command_ids": list(command_ids),
-            },
+        event=cancellation_event(
+            workflow, cancelled, command_ids, now=now, actor=actor
         ),
     )
 
 
 def cancel_orphaned_commands(
-    store: Any,
+    store: WorkflowStore,
     *,
     now: datetime,
     limit: int = SWEEP_LIMIT,
@@ -164,38 +146,26 @@ def cancel_orphaned_commands(
         )
         if not orphans:
             continue
-        command_ids = [str(command.command_id) for command in orphans]
         try:
-            result = dict(
-                store.cancel_remote_commands_for_workflow(
-                    workflow.request_id,
-                    reason=cancellation_reason(workflow, DISPATCHER_ACTOR),
-                )
+            result = store.cancel_orphaned_remote_commands(
+                workflow, now=now, actor=DISPATCHER_ACTOR
             )
-            if sum(int(value) for value in result.values()) == 0:
+            if not result.command_ids:
                 continue
-            record_cancellation(
-                store,
-                workflow,
-                result,
-                command_ids,
-                now=now,
-                actor=DISPATCHER_ACTOR,
-            )
         except Exception:  # noqa: BLE001 - keep sweeping, retry next tick
             LOGGER.exception(
                 "orphaned remote command cancel failed, left for the next tick: %s",
                 workflow.request_id,
             )
             continue
-        cancelled[workflow.request_id] = result
+        cancelled[workflow.request_id] = result.counters
         LOGGER.warning(
             "orphaned remote commands cancelled by the dispatcher: workflow=%s "
             "workflow_status=%s commands=%s cancelled=%s cancellation_requested=%s",
             workflow.request_id,
             workflow.status.value,
-            ",".join(command_ids),
-            result.get("cancelled", 0),
-            result.get("cancellation_requested", 0),
+            ",".join(result.command_ids),
+            result.cancelled,
+            result.cancellation_requested,
         )
     return cancelled

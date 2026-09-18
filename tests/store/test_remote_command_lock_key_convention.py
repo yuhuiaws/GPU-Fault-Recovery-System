@@ -60,8 +60,10 @@ WRITE_MARKERS = (
     '_put(\n                "remote_command"',
     '_put(\n                    "remote_command"',
     '_put("remote_command"',
+    '_put_fields("remote_command"',
     '_delete("remote_command"',
     "DELETE FROM gpu_fault_objects",
+    "gpu_fault_delete_control_state(",
 )
 
 
@@ -141,7 +143,14 @@ def _serialisation(body: str) -> str:
         and "ORDER BY command_id" in body
     ):
         return "bulk-ordered"
-    if '"remote_command/cleanup"' in body and "FOR UPDATE SKIP LOCKED" in body:
+    routed_skip_locked = (
+        "WITH victims AS MATERIALIZED" in body
+        and "gpu_fault_delete_control_state(" in body
+        and "'remote_command', key, payload, true" in " ".join(body.split())
+    )
+    if '"remote_command/cleanup"' in body and (
+        "FOR UPDATE SKIP LOCKED" in body or routed_skip_locked
+    ):
         if "'SUCCEEDED', 'FAILED'" in body:
             return "terminal-cleanup"
     if '"remote_command/cleanup"' in body and "RemoteCommandStatus.SUCCEEDED" in body:

@@ -7,21 +7,20 @@
 | Collector | 数据源 | 控制面入口 | 幂等 ID |
 |---|---|---|---|
 | `kernel` | 节点 `/dev/kmsg` | `/v1/collector-events/nvidia-kernel` | boot ID + kmsg sequence |
-| `kubernetes-hma` | Kubernetes Node list/watch | `/v1/provider-events/hyperpod-hma/kubernetes-node` | Node resourceVersion + fault content |
-| CloudWatch Lambda | HMA Logs subscription | `/v1/provider-events/hyperpod-hma/cloudwatch` | CloudWatch log event ID |
+| `fabric-manager` | Fabric Manager journal/file | `/v1/collector-events/fabric-manager` | journal cursor 或 file record ID |
+| `kubernetes-node-resources` | Node GPU/EFA allocatable | `/v1/collector-events/host-telemetry` | node + sample timestamp |
 | `dcgm` | DCGM Exporter Prometheus endpoint | `/v1/collector-events/gpu-metrics` | node + scrape timestamp |
 | `nvidia-smi` | 本机 NVIDIA CLI | `/v1/collector-events/gpu-metrics` | node + sample timestamp |
 
 kernel collector 只发送包含 `NVRM ... Xid` 或 `SXid` 的行，不发送完整内核日志。
-HMA watcher 只发送包含 `sagemaker.amazonaws.com/node-health-status`、
-`fault-types`、`fault-reasons` 或 `fault-details` 的 Node。
+Kernel/FM 共用 `gpu_fault.nvidia_logs.NvidiaLogNormalizer`，不依赖 HMA Node 或
+CloudWatch 转发。AWS HMA 自身不属于本方案 collector。
 
 上表的幂等 ID 会作为 HTTP `Idempotency-Key` 头随请求发出，控制面按它去重。sink 只对
 **带**这个头的请求重试：默认 4 次尝试并退避，尊重 `Retry-After` 但最多等 30 秒；
 一个拿不出幂等 ID 的 payload 只发一次，失败即写 outbox。`snapshot_id`（gpu-inventory
-快照）、`log_event_id`（CloudWatch HMA）和 HMA Node 事件（用
-`node/<name>/<resourceVersion>`）此前都落在单次发送的分支上，一次 idle-closed 的
-keep-alive 连接就把它们推进 outbox；现在三者都有幂等 ID。代价是控制面不可达时
+快照）也有幂等 ID；历史 outbox 的 `log_event_id` 和 `node/<name>/<resourceVersion>`
+身份规则保留，不因采集入口退役而改变记录身份。代价是控制面不可达时
 `post()` 阻塞更久（4 次尝试加退避），调用方不能假设它很快返回。
 
 HTTP 2xx 但 body 不是 JSON object 的响应按**结果未知**处理，走与网络失败相同的重试
@@ -39,8 +38,22 @@ HTTP 2xx 但 body 不是 JSON object 的响应按**结果未知**处理，走与
 
 `nvidia-smi`保留为DCGM Exporter不可用时的fallback；两种模式共用同一套 inventory 节拍：inventory
 校验失败（如 `GPU_FAULT_EXPECTED_GPU_COUNT` 配错）连续 3 次后按 inventory 间隔退避，不再让整轮
-失败，节点照常发出带样本的 GPU_METRICS 批次；vGPU/MIG 上查不到温度阈值也同样退避而不是每轮重跑。Kubernetes HMA和
-CloudWatch HMA属于optional验证链路，不在默认拓扑中。
+失败，节点照常发出带样本的 GPU_METRICS 批次；vGPU/MIG 上查不到温度阈值也同样退避而不是每轮重跑。
+Kubernetes HMA 和 CloudWatch HMA 两条可选链路已退役，相关命令、API 与部署资产已删除。
+
+FM文件游标还保存已观察的截断generation。rename沿用同一文件身份；copytruncate
+使已发送offset被复用时，先持久化新generation，再生成不同record_id和evidence_ref。
+同boot的普通进程重启保留重试身份；游标缺失或损坏仍以EOF建立新基线，不重放旧日志。
+轮询无法恢复在两次观察之间完成且不留下尺寸/身份变化的截断历史，不能宣称原子日志协议。
+
+FM通过`fabric_manager_receipts.py`输出有界`GPU_FAULT_FM_RECEIPT_V1`收据：
+绑定producer/systemd invocation、PID、顺序与累计计数，record和scope仅输出摘要，
+不记录原始身份、payload、URL或自由错误文本。首次两个round、实际投递和失败可观测，
+健康空轮询按现有summary间隔汇总，不逐poll输出INFO。每分钟投递pair预算为256，
+每条消息最多2048字节；省略量和饱和显式记录，不阻塞故障采集。
+验收必须核对完整journal窗口、attempt/completion和round进度；缺口不能证明零重放。
+DELIVERED只代表sink确认，BUFFERED只代表outbox保管，不代表下游或物理恢复恰好一次。
+`GPU_FAULT_FM_RECEIPT_V1`是日志协议标签，不是环境变量，也不进入生产配置白名单。
 
 ### 新增 Collector
 
@@ -72,13 +85,14 @@ Collector 与 operation、channel、node-action 一样是表驱动的：
 5. **部署**：`deploy/systemd/` 的 unit 名必须等于 `COLLECTOR_KINDS` 里的
    `systemd_unit`；数据面清单在 `deploy/dataplane/`。
 
-校验器会拒绝：`CollectorKind` 没有描述符产出（或反之）、`channel_paths` 不在
+校验器会拒绝：非 retired 的 `CollectorKind` 没有描述符产出（或反之）、`channel_paths` 不在
 `CHANNEL_REGISTRY`/provider-events 前缀内、`export_name` 未被 `gpu_fault.collectors`
 导出、字典键与 `cli_command` 不一致、一个节点子命令跨两个 systemd unit、共享 unit
 的 kind 声明不同 producer。第三方 collector 通过 `gpu_fault.collectors` entry-point
 组（`PluginGroup.COLLECTORS`）提供一个与 entry point 同名的 `CollectorDescriptor`，
 CLI 启动时经 `collector_registry_with_plugins()` 合并并走同一校验；与内建子命令
-同名即拒绝。`tests/test_collector_registry.py` 覆盖以上每条规则。
+同名即拒绝。旧 HMA kind 只为持久化数据解码保留，不能由新描述符或插件注册为 producer。
+`tests/test_collector_registry.py` 覆盖以上每条规则。
 
 ## 公共配置
 
@@ -112,15 +126,9 @@ python3 -m pip install '.[collectors]'
 历史通用 Kubernetes 模板位于
 `examples/legacy/kubernetes/collectors.yaml`，只用于协议和迁移参考，不是受支持的
 生产部署入口。区域 HyperPod 数据面使用 `deploy/dataplane/` 清单以及节点
-Installer/Reconciler。HMA watcher 只有 Node `get/list/watch` 权限，不具备 patch、
-cordon、drain 或 Pod 权限。
-
-当前 HyperPod 方案默认
-`GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR=false`，不部署
-`gpu-fault-hma-watcher`。现阶段控制面只消费 HMA Node 数据中的 XID/SXID，而节点
-Kernel Collector 和 Fabric Manager Collector 已分别覆盖这两类信号。禁用 watcher
-不会关闭 SageMaker HMA，也不会删除 Node 上的 HMA labels/annotations。仅在单独验证
-该转发链路时显式设置为 `true`。
+Installer/Reconciler。集群级资源采集由 `KubernetesNodeResourceCollector` 保留，
+不会因删除 HMA watcher 而失去 GPU/EFA allocatable 检查。退役自建转发链路不会关闭
+AWS HMA，也不会删除 Node 上的 provider 健康标签。
 
 `deploy/image/Dockerfile` 可用于构建 collector 镜像：
 
@@ -137,7 +145,7 @@ nodeSelector 限制到 GPU 节点，并通过准入策略只允许固定镜像 d
 
 ```bash
 gpu-fault-collector kernel --node-id worker-1
-gpu-fault-collector kubernetes-hma
+gpu-fault-collector kubernetes-node-resources
 gpu-fault-collector dcgm --node-id worker-1 \
   --metrics-url http://127.0.0.1:9400/metrics
 gpu-fault-collector nvidia-smi --node-id worker-1
@@ -386,11 +394,16 @@ GET /v1/evidence/{cluster_id}?node_id={node_id}&attempt_id={attempt_id}
 ```
 
 温度、ECC DBE、row-remap、PCIe/NVLink 增量和 power/thermal violation 生成结构化
-finding，默认 `automatic_action=null`。这类指标不能冒充 NVIDIA XID Immediate Action。
+finding，其处置来自站点指标策略，不能冒充NVIDIA XID Immediate Action。
 新的非零 `DCGM_FI_DEV_XID_ERRORS` 状态会转换为 `XidEvent` 并进入官方策略；相同 GPU
 上的相同 XID gauge 值不会在每次 scrape 时重复触发。由于该字段表示持久化的“最后一次
 XID”，collector 启动后的首个值仅建立 baseline；之后从 0 或其他 XID 发生变化时才
 生成事件。原始 `/dev/kmsg` 仍是捕获新事件及识别同一 XID 重复发生的主要事件源。
+
+温度采集边沿与控制面共用`gpu_temperature_policy.temperature_decision`，包括设备推导
+限制与站点fallback。确认按severity/action语义分别累计，已确认warning不能吞掉
+critical升级或替代其确认样本；尚未确认的变化不伪报旧异常恢复。投递被拒时保留待发送
+边沿，后续相同样本仍重试。计数器变化、正常稳定抑制、设备缺失和定期摘要规则不变。
 
 ## 时间语义与跨源关联
 
@@ -398,14 +411,14 @@ XID”，collector 启动后的首个值仅建立 baseline；之后从 0 或其�
 
 | 字段 | 含义 |
 |---|---|
-| `source_event_time` | HMA/CloudWatch 原始 RFC3339 时间，保留时区偏移 |
+| `source_event_time` | Fabric Manager 日志中的 RFC3339 wall clock；原始文本保留时区偏移 |
 | `source_monotonic_us` | `/dev/kmsg` 启动后单调微秒数 |
 | `source_boot_id` | 单调时间所属 Linux boot ID |
 | `collected_at` | collector 读取到事件的 UTC 时间 |
 | `ingested_at` | 控制面收到事件的 UTC 时间 |
 
-原始 dmesg/kmsg 单调时间没有时区，不能直接与 CloudWatch UTC 时间比较。同一 kernel
-源且 boot ID 相同时优先使用单调时间并保持 30 秒窗口；HMA Node、CloudWatch、kernel
+原始 dmesg/kmsg 单调时间没有时区，不能直接与 wall clock 比较。同一 kernel
+源且 boot ID 相同时优先使用单调时间并保持 30 秒窗口；Fabric Manager、kernel
 和 DCGM 之间使用 5 分钟窗口，以容忍日志投递和 collector 启动延迟。扩大窗口不会放宽
 身份条件：XID/SXID、节点必须一致；两侧都有 GPU UUID 或 PCI BDF 时也必须相交。
 
@@ -548,31 +561,16 @@ GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US=1
 GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES=2
 ```
 
-## CloudWatch Logs Lambda
+## HMA 转发退役
 
-当前方案暂不建议部署 `CloudWatchHmaCollector`，专用部署脚本默认
-`GPU_FAULT_ENABLE_CLOUDWATCH_HMA_COLLECTOR=false` 并直接跳过。控制面目前只处理
-CloudWatch HMA 消息中的 XID/SXID，而节点 Kernel Collector 和 Fabric Manager
-Collector 已覆盖这两类信号。现有 Lambda、SQS、Subscription 和 consumer 不会被默认
-脚本自动删除；仅在隔离环境验证该链路时显式设置为 `true`。
+`kubernetes-hma`、`sqs-hma`、Lambda handler 和四条 HMA provider API 已删除，旧地址返回
+404。升级前必须在旧 release 下停流并排空或归档 SQS/DLQ、collector outbox 与 processor
+请求，再退役两项 solution-owned Deployment。预检发现历史 Deployment 或状态不明时
+拒绝继续，不能用新 API 排空已退役入口的旧请求。
 
-`deploy/aws/lambda/cloudwatch-hma-template.yaml` 创建 HMA log group subscription 和 Lambda。
-部署包必须包含本项目及其运行依赖。handler 为：
+历史资源发现与卸载记录保留；AWS 栈、队列、日志和历史数据不会被本次源码删除自动清理。
+操作顺序见[部署和运维手册](docs/部署和运维手册.md) §7.4。通用 `SqsEventSink` 仍保留，
+不再交付 HMA 专用 consumer。
 
-```text
-gpu_fault.collectors.cloudwatch_lambda_handler
-```
-
-默认从 `<node>/SagemakerHealthMonitoringAgent` 格式的 log stream 提取节点。格式不同时
-设置 `GPU_FAULT_HMA_NODE_REGEX`，并提供命名捕获组 `(?P<node_id>...)`。无法准确解析节点
-时函数失败并让 Lambda 重试，禁止把事件随意关联到集群中的某个节点。
-
-CloudWatch subscription 至少一次投递；控制面通过 `logEvent.id` 保持幂等。HTTP 429、
-5xx 和网络错误在函数内有限重试，最终失败继续交给 Lambda 重试和告警。
-
-## HMA Metrics
-
-只有 HMA DaemonSet 声明 metrics 端口且存在匹配 Service 时，discovery 才会报告
-`metrics_available=true`。缺少端口、Service 或必需字段时，不能从 HMA Pod Ready
-推断 DCGM Prometheus 路径可用。当前默认禁用 HMA Node watcher 和 CloudWatch HMA
-collector，由 kernel collector 采集 XID，并由 Fabric Manager collector 采集 SXID。
+AWS 自带 HMA、Node Agent quiesce 容器协调与热备健康标签检查保持不变；不能从 HMA Pod
+Ready 推断 DCGM Prometheus 路径可用。连续 GPU 指标仍由独立 DCGM collector 提供。

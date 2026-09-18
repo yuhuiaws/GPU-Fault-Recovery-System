@@ -4,10 +4,49 @@ import re
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts import run_release_gates, run_static_gates
+
+
+@pytest.fixture(autouse=True)
+def runner_subprocess_namespaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Process doubles must not replace subprocess for the rest of the test worker."""
+
+    for module in (run_release_gates, run_static_gates):
+        monkeypatch.setattr(module, "subprocess", SimpleNamespace(**vars(subprocess)))
+
+
+def _preflight_only(command, **_kwargs):
+    assert command == ["make", "promtool-preflight", "PYTHON=python3"], (
+        "only the dependency preflight may run before a failing gate"
+    )
+    return subprocess.CompletedProcess(command, 0)
+
+
+def test_quality_gates_do_not_inherit_the_deploy_execution_scope():
+    parent = {
+        "GPU_FAULT_DEPLOY_DEADLINE_MONOTONIC": "123",
+        "GPU_FAULT_DEPLOY_DEADLINE_LABEL": "deployment",
+        "GPU_FAULT_DEPLOY_HARD_DEADLINE_MONOTONIC": "456",
+        "GPU_FAULT_DEPLOY_RECOVERY_ACTIVE": "true",
+        "GPU_FAULT_DEPLOY_API_BUDGET_DIR": "/private/deploy-budget",
+        "GPU_FAULT_DEPLOY_API_PHASE": "release",
+        "GPU_FAULT_DEPLOY_API_PARENT_LEASE": "test-parent",
+        "PATH": "/private/deploy-budget/bin:/test/tools:/usr/bin",
+        "GPU_FAULT_TEST_POSTGRES_URL": "test-database-reference",
+        "GPU_FAULT_RELEASE_GATE_PARALLELISM": "3",
+    }
+    assert run_static_gates.isolated_gate_environment(parent) == {
+        "PATH": "/test/tools:/usr/bin",
+        "GPU_FAULT_TEST_POSTGRES_URL": "test-database-reference",
+        "GPU_FAULT_RELEASE_GATE_PARALLELISM": "3",
+    }
+    assert parent["GPU_FAULT_DEPLOY_RECOVERY_ACTIVE"] == "true", (
+        "isolating test children changed the real deployment environment"
+    )
 
 
 def test_release_gate_parallelism_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,7 +89,7 @@ def test_static_gate_failure_is_aggregated(monkeypatch: pytest.MonkeyPatch) -> N
         run_static_gates.run_static_gates("python3")
 
 
-def test_release_gates_build_artifacts_only_after_parallel_success(
+def test_release_gates_build_source_artifacts_alongside_tests_after_static(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gates: list[str] = []
@@ -77,14 +116,14 @@ def test_release_gates_build_artifacts_only_after_parallel_success(
     run_release_gates.run_release_gates("python3")
 
     assert gates[0] == "static", "the one-minute gate runs alone, before the others"
-    assert set(gates[1:]) == {"postgres", "pytest"}
+    assert set(gates[1:]) == {"postgres", "pytest", "artifact"}
     assert commands == [
-        ["make", "artifact-check", "PYTHON=python3"],
+        ["make", "promtool-preflight", "PYTHON=python3"],
         ["make", "python-cache-clean", "PYTHON=python3"],
     ]
 
 
-def test_release_gate_failure_blocks_artifact_build(
+def test_release_gate_failure_prevents_success_after_source_artifact_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(
@@ -98,13 +137,7 @@ def test_release_gate_failure_blocks_artifact_build(
             name, 1 if name == "postgres" else 0, ()
         ),
     )
-    monkeypatch.setattr(
-        run_release_gates.subprocess,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail(
-            "artifact build ran after a parallel gate failure"
-        ),
-    )
+    monkeypatch.setattr(run_release_gates.subprocess, "run", _preflight_only)
 
     with pytest.raises(run_release_gates.ReleaseGateError, match="postgres=1"):
         run_release_gates.run_release_gates("python3")
@@ -189,11 +222,7 @@ def test_a_static_failure_stops_before_the_slow_gates_start(
             launched,
         ),
     )
-    monkeypatch.setattr(
-        run_release_gates.subprocess,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("artifact build ran after a failure"),
-    )
+    monkeypatch.setattr(run_release_gates.subprocess, "run", _preflight_only)
 
     with pytest.raises(run_release_gates.ReleaseGateError, match="static=2"):
         run_release_gates.run_release_gates("python3")
@@ -223,27 +252,27 @@ def test_a_parallel_gate_failure_stops_the_others_and_names_the_first(
     monkeypatch.setenv("GPU_FAULT_RELEASE_GATE_PARALLELISM", "3")
     launched: list[str] = []
     pytest_gate = _FakeGateProcess(["...........", ""], None)
-    monkeypatch.setattr(
-        run_release_gates.subprocess,
-        "Popen",
-        _fake_popen(
-            {
-                "check-static": _FakeGateProcess(["static ok"], 0),
-                "test-postgres-stress": _FakeGateProcess(
-                    ["FAILED tests/store/test_x.py::test_y", "1 failed in 3.0s"],
-                    1,
-                    after=pytest_gate.started,
-                ),
-                "test-parallel-release": pytest_gate,
-            },
-            launched,
+    artifact_gate = _FakeGateProcess(["source-only artifact"], None)
+    both_started = threading.Event()
+    processes = {
+        "check-static": _FakeGateProcess(["static ok"], 0),
+        "test-postgres-stress": _FakeGateProcess(
+            ["FAILED tests/store/test_x.py::test_y", "1 failed in 3.0s"],
+            1,
+            after=both_started,
         ),
-    )
-    monkeypatch.setattr(
-        run_release_gates.subprocess,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("artifact build ran after a failure"),
-    )
+        "test-parallel-release": pytest_gate,
+        "artifact-check": artifact_gate,
+    }
+
+    def popen(command, **_kwargs):
+        launched.append(command[1])
+        if {"test-parallel-release", "artifact-check"}.issubset(launched):
+            both_started.set()
+        return processes[command[1]]
+
+    monkeypatch.setattr(run_release_gates.subprocess, "Popen", popen)
+    monkeypatch.setattr(run_release_gates.subprocess, "run", _preflight_only)
 
     with pytest.raises(
         run_release_gates.ReleaseGateError, match=r"gate failed: postgres=1$"
@@ -254,11 +283,12 @@ def test_a_parallel_gate_failure_stops_the_others_and_names_the_first(
         "check-static",
         "test-postgres-stress",
         "test-parallel-release",
+        "artifact-check",
     }
     err = capsys.readouterr().err
     assert "release-gates: pytest cancelled after postgres failed" in err
     block = err[err.index("release-gates: first failing gate: postgres (status 1)") :]
-    assert "stopped: pytest" in block.splitlines()[0]
+    assert "stopped: artifact, pytest" in block.splitlines()[0]
     assert "[postgres] 1 failed in 3.0s" in block
 
 
@@ -285,6 +315,7 @@ def test_default_check_runs_static_then_parallel_artifact_and_pytest(
     run_release_gates.run_check_gates("python3")
 
     assert commands == [
+        ["make", "promtool-preflight", "PYTHON=python3"],
         ["make", "check-static", "PYTHON=python3"],
         ["make", "python-cache-clean", "PYTHON=python3"],
     ]

@@ -11,6 +11,7 @@ if __package__:
         executor_identity,
         release_agent_identity,
     )
+    from .regional_capacity_resources import RunResources, run_manifest
     from .regional_capacity_results import (
         artifact_dir,
         move_to_aborted,
@@ -28,6 +29,7 @@ if __package__:
     )
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        purge_audit_rows,
         release_identity,
         teardown,
         upsert_configmap,
@@ -37,6 +39,7 @@ else:
         executor_identity,
         release_agent_identity,
     )
+    from regional_capacity_resources import RunResources, run_manifest
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
@@ -50,6 +53,7 @@ else:
     )
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        purge_audit_rows,
         release_identity,
         teardown,
         upsert_configmap,
@@ -307,7 +311,7 @@ prefix='corr-live-{run_id}-%'
 with psycopg.connect(store_dsn()) as conn:
     cur=conn.cursor()
     cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_control_records "
         "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
         (prefix,),
     )
@@ -315,7 +319,7 @@ with psycopg.connect(store_dsn()) as conn:
     incidents=[row[1] for row in incident_rows]
     incident_ids=[row[0] for row in incident_rows]
     cur.execute(
-        "SELECT payload FROM gpu_fault_objects WHERE kind='workflow'"
+        "SELECT payload FROM gpu_fault_control_records WHERE kind='workflow'"
     )
     all_workflows=[row[0] for row in cur.fetchall()]
     selected={{
@@ -342,7 +346,7 @@ with psycopg.connect(store_dsn()) as conn:
     workflows=list(selected.values())
     workflow_ids=[item['request_id'] for item in workflows]
     cur.execute(
-        "SELECT payload FROM gpu_fault_objects "
+        "SELECT payload FROM gpu_fault_control_records "
         "WHERE kind='remote_command' "
         "AND payload->>'workflow_request_id'=ANY(%s)",
         (workflow_ids,),
@@ -354,7 +358,7 @@ with psycopg.connect(store_dsn()) as conn:
         if item.get('incident_id')
     }})
     cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_control_records "
         "WHERE kind='incident' AND key=ANY(%s)",
         (related_incident_ids,),
     )
@@ -751,95 +755,14 @@ def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
     return ("PASS" if not errors else "FAIL", errors)
 
 
-def purge_scenario_rows(run_id: str) -> None:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    script = f"""
-import os, psycopg
-{STORE_DSN_SNIPPET}
-prefix='corr-live-{run_id}-%'
-with psycopg.connect(store_dsn(), autocommit=True) as conn:
-    cur=conn.cursor()
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='xid_policy_decision' "
-        "AND payload->>'event_id' LIKE %s",
-        (prefix,),
-    )
-    cur.execute(
-        "SELECT key FROM gpu_fault_objects "
-        "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
-        (prefix,),
-    )
-    incidents=[row[0] for row in cur.fetchall()]
-    cur.execute(
-        "SELECT key,payload FROM gpu_fault_objects WHERE kind='workflow'"
-    )
-    all_workflows=cur.fetchall()
-    selected={{
-        key:payload
-        for key,payload in all_workflows
-        if payload.get('incident_id') in incidents
-    }}
-    changed=True
-    while changed:
-        changed=False
-        expected_reboots={{
-            f"workflow-reboot-after-{{request_id}}"
-            for request_id in selected
-        }}
-        for key,payload in all_workflows:
-            if key in selected:
-                continue
-            if (
-                payload.get('predecessor_workflow_id') in selected
-                or key in expected_reboots
-            ):
-                selected[key]=payload
-                changed=True
-    workflows=list(selected)
-    incidents=sorted({{
-        *incidents,
-        *(
-            payload.get('incident_id')
-            for payload in selected.values()
-            if payload.get('incident_id')
-        ),
-    }})
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='remote_command' "
-        "AND payload->>'workflow_request_id'=ANY(%s)",
-        (workflows,),
-    )
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='workflow' AND key=ANY(%s)",
-        (workflows,),
-    )
-    cur.execute(
-        "DELETE FROM gpu_fault_objects "
-        "WHERE kind='incident' AND key=ANY(%s)",
-        (incidents,),
-    )
-"""
-    control(
-        "exec",
-        "-i",
-        pod,
-        "--",
-        "python3",
-        "-",
-        stdin=script.encode(),
-        timeout=120,
-        check=False,
-    )
+def purge_scenario_rows(run_id: str, *, artifacts: Path) -> None:
+    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
+    if intent.get("run_id") != run_id:
+        raise RuntimeError(
+            "scenario cleanup registration intent belongs to another run"
+        )
+    RunResources(artifacts, run_id, NAMESPACE, dataplane).delete_all()
+    purge_audit_rows(run_id=run_id, artifacts=artifacts)
 
 
 def main() -> int:
@@ -888,6 +811,7 @@ def main() -> int:
     failure: BaseException | None = None
     result = 1
     try:
+        resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
         validate_preemption_enabled()
         register(
             args.clusters,
@@ -912,6 +836,7 @@ def main() -> int:
                     PERF_DIR / "benchmark_correlated_action_scenario.py"
                 ).read_text()
             },
+            resources=resources,
         )
         identity = executor_identity(
             require_dataplane_deployment=registry_scope == "live",
@@ -924,10 +849,11 @@ def main() -> int:
             runtime_profile_version=str(seeded["runtime_profile_version"]),
             **identity,
         )
+        manifest = run_manifest(manifest, run_id)
         (artifacts / "job.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
-        dataplane("apply", "-f", "-", stdin=json.dumps(manifest).encode())
+        resources.create(manifest)
         wait = dataplane(
             "wait",
             "--for=condition=complete",
@@ -984,24 +910,16 @@ def main() -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        dataplane("delete", "job", JOB_NAME, "--ignore-not-found", check=False)
-        dataplane(
-            "delete",
-            "configmap",
-            SCRIPT_CONFIGMAP,
-            "--ignore-not-found",
-            check=False,
-        )
-        purge_scenario_rows(run_id)
         try:
-            teardown(
-                purge=True,
-                deregister_clusters=True,
-                allow_live_registry=args.allow_live_registry,
-                live_registry_confirmation=args.confirm_live_registry,
-                artifacts=artifacts,
-                run_id=run_id,
-            )
+            if (artifacts / "registry-registration-intent.json").exists():
+                teardown(
+                    purge=True,
+                    deregister_clusters=True,
+                    allow_live_registry=args.allow_live_registry,
+                    live_registry_confirmation=args.confirm_live_registry,
+                    artifacts=artifacts,
+                    run_id=run_id,
+                )
         except Exception as cleanup_error:
             if failure is None:
                 failure = cleanup_error

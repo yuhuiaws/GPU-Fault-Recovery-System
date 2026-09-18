@@ -8,8 +8,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import psycopg
-
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -26,6 +24,8 @@ WORK = Path("/work")
 
 
 def main() -> int:
+    import psycopg
+
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 4
     tag = sys.argv[2] if len(sys.argv) > 2 else "default"
     if not 1 <= count <= 4:

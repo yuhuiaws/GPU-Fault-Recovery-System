@@ -16,6 +16,7 @@ from gpu_fault.store.postgres.index_builder import (
     index_definition_defects,
     index_health,
 )
+from gpu_fault.store.postgres.state_table_schema import validate_state_table_schema
 
 POSTGRES_SCHEMA_VERSION = LATEST_POSTGRES_SCHEMA_VERSION
 
@@ -114,6 +115,7 @@ class PostgresSchemaMixin:
             self._bootstrap_schema()
         else:
             self._validate_existing_schema()
+        validate_state_table_schema(self._db)
         if self.hot_state_mode == "dedicated":
             self._validate_dedicated_hot_state()
 

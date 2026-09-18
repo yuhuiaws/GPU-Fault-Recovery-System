@@ -20,6 +20,9 @@ from gpu_fault.adapters import (
     KubernetesWorkflowAdapter,
     NodeActionWorkflowAdapter,
 )
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    KubernetesStopOwnershipValidator,
+)
 from gpu_fault.aws_errors import missing_aws_credentials
 from gpu_fault.dataplane_metrics import (
     HealthPredicate,
@@ -250,7 +253,7 @@ def executor_from_environment() -> ClusterActionExecutor:
         if value.strip()
     }
     sweep = SpareReservationSweep(spare_coordinator) if spare_coordinator else None
-    return ClusterActionExecutor(
+    executor = ClusterActionExecutor(
         regional_client,
         adapters,
         executor_id=executor_id,
@@ -263,6 +266,13 @@ def executor_from_environment() -> ClusterActionExecutor:
         confirm_cluster_name=(hyperpod_confirm_cluster),
         **_claim_loop_settings_from_environment(),
     )
+    validator = KubernetesStopOwnershipValidator.from_adapter(
+        kubernetes_adapter,
+        cluster_id=cluster_id,
+        allowed_namespaces=frozenset(namespaces),
+    )
+    setattr(executor, "stop_ownership_validator", validator)
+    return executor
 
 
 def _claim_loop_settings_from_environment() -> dict[str, float | int]:
@@ -358,7 +368,7 @@ def readiness_probe() -> int:
                         datetime.now(timezone.utc) - datetime.fromisoformat(claimed_at)
                     ).total_seconds(),
                 )
-            except ValueError:
+            except (TypeError, ValueError):
                 claim_age = None
     try:
         report = client.readiness(

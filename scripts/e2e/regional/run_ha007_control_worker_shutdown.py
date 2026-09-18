@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -10,18 +11,27 @@ import time
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
+from uuid import uuid4
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault.lifecycle import ShutdownCoordinator
+ROOT = Path(__file__).resolve().parents[3]
+for source_path in (ROOT, ROOT / "src"):
+    if str(source_path) not in sys.path:
+        sys.path.insert(0, str(source_path))
+
+from gpu_fault.lifecycle import ShutdownCoordinator  # noqa: E402
 
 if __package__:
     from .acceptance_runner_common import write_json_atomic
+    from .ha_evidence import isolated_chain
+    from .regional_case_contract import case_evidence_path
 else:
     from acceptance_runner_common import write_json_atomic
+    from ha_evidence import isolated_chain
+    from regional_case_contract import case_evidence_path
 
 
-ROOT = Path(__file__).resolve().parents[3]
 CASE_ID = "GF-REGIONAL-HA-007"
 WORKER_THREAD_NAME = "ha007-processor-request"
 GENERATED = ROOT / "deploy/control-plane/regional/generated"
@@ -117,7 +127,15 @@ def _child(
     started_file.chmod(0o600)
     # A bounded wait: if the parent died before sending SIGTERM this process
     # must not stay behind as an orphan holding the request.
-    if not shutdown_requested.wait(timeout=signal_timeout_seconds):
+    # Event.wait can return False after signal dispatch sets the flag; its
+    # condition lock is also unsafe to reenter from the signal handler.
+    signal_deadline = time.monotonic() + signal_timeout_seconds
+    while not shutdown_requested.is_set():
+        remaining = signal_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.02, remaining))
+    if not shutdown_requested.is_set():
         write_json_atomic(
             result_file,
             {
@@ -172,7 +190,9 @@ def _child_environment() -> dict[str, str]:
     env = dict(os.environ)
     source = str(ROOT / "src")
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = source if not existing else source + os.pathsep + existing
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (source, str(ROOT), existing) if path
+    )
     return env
 
 
@@ -193,6 +213,8 @@ def evaluate_run(
         return errors
     if float(result["elapsed_seconds"]) > kubernetes_grace_seconds:
         errors.append("Pod exit exceeded terminationGracePeriodSeconds")
+    if result["returncode"] < 0:
+        errors.append("child was killed by a signal rather than exiting")
     if outcome == "completed":
         if result["returncode"] != 0:
             errors.append("in-budget request exited non-zero")
@@ -224,12 +246,19 @@ def run_probe(
     budgets = budgets or control_worker_budgets()
     lifespan_budget = float(budgets["lifespan_budget_seconds"])
     grace = float(budgets["kubernetes_grace_seconds"])
+    if not durations or any(
+        not math.isfinite(value) or value <= 0
+        for value in [lifespan_budget, grace, *durations]
+    ):
+        raise ValueError("durations and shutdown budgets must be finite and positive")
     results = []
     errors: list[str] = []
     for index, duration in enumerate(durations):
-        started_file = run_dir / f"started-{index}.txt"
-        result_file = run_dir / f"result-{index}.json"
-        log_file = run_dir / f"process-{index}.log"
+        probe_dir = run_dir / f"probe-{index}-{uuid4().hex}"
+        probe_dir.mkdir(mode=0o700)
+        started_file = probe_dir / "started.txt"
+        result_file = probe_dir / "result.json"
+        log_file = probe_dir / "process.log"
         with log_file.open("w") as output:
             process = subprocess.Popen(
                 [
@@ -251,14 +280,19 @@ def run_probe(
                 stderr=subprocess.STDOUT,
                 env=_child_environment(),
             )
-            _wait_for_file(started_file, process)
-            signal_started = time.monotonic()
-            process.send_signal(signal.SIGTERM)
             try:
-                returncode = process.wait(timeout=grace + 5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                returncode = process.wait(timeout=10)
+                _wait_for_file(started_file, process)
+                signal_started = time.monotonic()
+                process.send_signal(signal.SIGTERM)
+                try:
+                    returncode = process.wait(timeout=grace + 5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    returncode = process.wait(timeout=10)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=10)
         elapsed = time.monotonic() - signal_started
         if not result_file.is_file():
             errors.append(
@@ -298,6 +332,8 @@ def run_probe(
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     value.add_argument("--run-dir", type=Path)
+    value.add_argument("--release-id", default="")
+    value.add_argument("--cluster-id", default="")
     value.add_argument(
         "--durations",
         type=float,
@@ -332,7 +368,17 @@ def main() -> int:
         )
     if arguments.run_dir is None:
         raise SystemExit("--run-dir is required")
-    report = run_probe(arguments.run_dir, arguments.durations)
+    path = case_evidence_path(arguments.run_dir, CASE_ID)
+    try:
+        binding = isolated_chain(arguments, CASE_ID)
+        report = {**run_probe(path.parent, arguments.durations), **binding}
+    except Exception as exc:
+        report = {
+            "case_id": CASE_ID,
+            "verdict": "FAIL",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    write_json_atomic(path, report)
     print(json.dumps(report, indent=2))
     return 0 if report["verdict"] == "PASS" else 1
 

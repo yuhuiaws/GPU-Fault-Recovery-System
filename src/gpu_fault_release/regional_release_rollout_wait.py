@@ -57,7 +57,7 @@ def bounded_kubectl_wait(release: Any, wait_args: list[str], *, seconds: float) 
     started = time.monotonic()
     try:
         met = bool(
-            release.runner.probe(
+            release.runner.condition(
                 [*wait_args, f"--timeout={whole}s"],
                 timeout_seconds=whole + 30,
             )

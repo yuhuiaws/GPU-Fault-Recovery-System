@@ -2,20 +2,65 @@
 
 from __future__ import annotations
 
+import sys
+from datetime import datetime, timezone
+
 import pytest
 
 from scripts.e2e.regional import run_ha005_rollout_continuity as ha005
+from tests.regional.test_acceptance_alignment_ha_telemetry import telemetry_proof
 
 
 def _probe(
     attempts: int, accepted: int, failures: int, buffered: int | None = None, **extra
 ) -> dict:
+    base, _ = telemetry_proof(spooled=False)
+    final = base["attempted_events"][0]
+    events = [
+        {**final, "batch_id": f"earlier-{index}"} for index in range(attempts - 1)
+    ] + [final]
+    admissions = [
+        {
+            **base["admissions"][0],
+            "batch_id": event["batch_id"],
+            "request_id": f"r{index + 1}",
+        }
+        for index, event in enumerate(events[:accepted])
+    ]
+    if accepted < attempts:
+        admissions.append(
+            {
+                **base["admissions"][0],
+                "batch_id": final["batch_id"],
+                "request_id": None,
+                "replay": True,
+                "spooled": True,
+                "coalesced": True,
+            }
+        )
     return {
+        **base,
+        "attempted_events": events,
+        "attempted_batch_ids": [event["batch_id"] for event in events],
+        "admissions": admissions,
+        "wire_responses": [
+            {"path": "/v1/collector-events/host-telemetry", "status": 202}
+            for _ in admissions
+        ]
+        + [
+            {
+                "path": "/v1/collector-events/host-telemetry",
+                "status": 503,
+                "retry_after": "2",
+            }
+            for _ in range(failures)
+        ],
         "counters": {
             "event_attempts": attempts,
             "event_accepted": accepted,
             "event_failures": failures,
             "event_buffered": failures if buffered is None else buffered,
+            "claim_success": 1,
         },
         "outbox": {"records": 0, "replayable": 0},
         "error_types": {},
@@ -24,7 +69,9 @@ def _probe(
 
 
 def _receipts(ids: list[str]) -> dict:
+    _, base = telemetry_proof()
     return {
+        "telemetry": base["telemetry"],
         "requests": [
             {"request_id": value, "status": "COMPLETED", "response_status": 200}
             for value in ids
@@ -35,9 +82,20 @@ def _receipts(ids: list[str]) -> dict:
 
 def test_continuity_errors_pass_a_clean_probe_and_catch_each_defect() -> None:
     clean = ha005.continuity_errors(
-        _probe(10, 8, 2), _receipts(["r1"]), accepted_ids=["r1"]
+        _probe(3, 1, 2), _receipts(["r1"]), accepted_ids=["r1"]
     )
     assert clean == []
+    assert ha005.continuity_errors(
+        _probe(3, 1, 2), {"requests": [], "missing": []}, accepted_ids=["r1"]
+    ), "an accepted request without a persisted receipt must invalidate continuity"
+    assert ha005.continuity_errors(
+        _probe(10, 8, 2), _receipts(["r1"]), accepted_ids=["r1"]
+    ), "eight accepted events cannot be proved by one accepted request ID"
+    no_claim = _probe(3, 1, 2)
+    no_claim["counters"]["claim_success"] = 0
+    assert "probe observed no successful claim" in ha005.continuity_errors(
+        no_claim, _receipts(["r1"]), accepted_ids=["r1"]
+    )
 
     assert (
         "event attempts minus accepted does not equal failures"
@@ -53,13 +111,14 @@ def test_continuity_errors_pass_a_clean_probe_and_catch_each_defect() -> None:
         _receipts(["r1"]),
         accepted_ids=["r1"],
     )
-    assert "probe observed 401, 403 or 500" in ha005.continuity_errors(
+    assert "probe observed a nonretryable HTTP error" in ha005.continuity_errors(
         {**_probe(10, 8, 2), "error_types": {"http-500": 1}},
         _receipts(["r1"]),
         accepted_ids=["r1"],
     )
-    assert "probe captured no processor request IDs" in ha005.continuity_errors(
-        _probe(10, 8, 2), _receipts([]), accepted_ids=[]
+    assert (
+        "queue receipt IDs do not cover every observed queue admission"
+        in ha005.continuity_errors(_probe(10, 8, 2), _receipts([]), accepted_ids=[])
     )
     incomplete = _receipts(["r1"])
     incomplete["requests"][0]["status"] = "LEASED"
@@ -85,7 +144,7 @@ def test_rollout_complete_requires_updated_available_and_old_uids_gone() -> None
             "available": available,
             "generation": 5,
             "observed_generation": observed,
-            "pods": [(f"p-{uid}", {"uid": uid}) for uid in uids],
+            "pods": [(f"p-{uid}", {"uid": uid, "ready": True}) for uid in uids],
         }
 
     old = {"old-1", "old-2", "old-3"}
@@ -175,4 +234,31 @@ def test_parser_accepts_all_deployments_flag() -> None:
     assert (
         parser.parse_args(["--run-dir", "/tmp/x", "--all-deployments"]).all_deployments
         is True
+    )
+
+
+def test_formal_case_refuses_an_ingress_subset_before_any_read(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("GPU_FAULT_ACCEPTANCE_EXECUTION_SCOPE", "formal")
+    monkeypatch.delenv("GPU_FAULT_ACCEPTANCE_SELECTION_REFERENCE", raising=False)
+    monkeypatch.setattr(ha005, "install_site_profile", lambda: None)
+    calls = []
+    monkeypatch.setattr(ha005, "database_residuals", lambda: calls.append("read"))
+    monkeypatch.setattr(sys, "argv", [ha005.__file__, "--run-dir", str(tmp_path)])
+    with pytest.raises(ha005.CaseError, match="requires --all-deployments"):
+        ha005.main()
+    with pytest.raises(ha005.CaseError, match="requires --all-deployments"):
+        ha005.run_case(tmp_path, 1, datetime(2099, 1, 1, tzinfo=timezone.utc))
+    assert calls == []
+
+
+def test_probe_manifest_uses_the_executor_component_python() -> None:
+    manifest = ha005.pod_manifest(
+        "unit-image",
+        {"executor_artifact_sha256": "unit", "executor_compatibility_digest": "unit"},
+        "unit-run",
+    )
+    assert manifest["spec"]["containers"][0]["command"][0] == ha005.component_python(
+        "gpu"
     )

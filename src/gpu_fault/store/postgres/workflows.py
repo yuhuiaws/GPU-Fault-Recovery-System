@@ -9,15 +9,20 @@ from gpu_fault.models import (
     IncidentState,
     WorkflowRequest,
     WorkflowStatus,
+    datetime_json_text,
 )
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
+from gpu_fault.store.postgres.state_table_storage import (
+    get_state_payload,
+    put_state_fields,
+    put_state_record,
+)
 from gpu_fault.store.shared.errors import (
     NotFoundError,
     RemediationBudgetError,
     StaleFencingTokenError,
     StaleWriteError,
     WorkflowLeaseError,
-    WorkflowMergedError,
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
@@ -29,6 +34,7 @@ from gpu_fault.store.shared.transactional_workflows import (
     incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
+    validate_leased_workflow_save,
 )
 from gpu_fault.store.shared.workflow_scan import dispatch_order_key
 
@@ -123,9 +129,9 @@ class PostgresWorkflowMixin:
     # parked by an internal error (F-A4). A settled safety plan and a legacy
     # BLOCKED row without a kind release it. Mirrors ``workflow_is_open``.
     _OPEN_PREDECESSOR_SQL = (
-        "(predecessor.payload->>'status' IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
-        " OR (predecessor.payload->>'status' = 'BLOCKED'"
-        " AND predecessor.payload->>'blocked_kind'"
+        "(predecessor.status IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
+        " OR (predecessor.status = 'BLOCKED'"
+        " AND predecessor.blocked_kind"
         " IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')))"
     )
 
@@ -142,14 +148,12 @@ class PostgresWorkflowMixin:
             # one UTC form ``utc_text`` renders, and a ``::timestamptz`` cast
             # would defeat any expression index (see the review's note on
             # payload timestamp comparisons).
-            clauses.append(
-                "(w.payload->>'not_before' IS NULL OR w.payload->>'not_before' <= %s)"
-            )
+            clauses.append("(w.not_before IS NULL OR w.not_before <= %s)")
             parameters.append(_utc_text(dispatchable_at))
             clauses.append(
-                "NOT EXISTS (SELECT 1 FROM gpu_fault_objects AS predecessor"
+                "NOT EXISTS (SELECT 1 FROM gpu_fault_workflow_records AS predecessor"
                 " WHERE predecessor.kind='workflow'"
-                " AND predecessor.key=w.payload->>'predecessor_workflow_id'"
+                " AND predecessor.key=w.predecessor_workflow_id"
                 f" AND {cls._OPEN_PREDECESSOR_SQL})"
             )
         if exclude_request_ids:
@@ -162,7 +166,7 @@ class PostgresWorkflowMixin:
     # value is ``isoformat()`` and a ``::timestamptz`` cast would defeat the
     # expression index ``gpu_fault_executable_workflow_dispatch_order`` that
     # carries exactly this expression. GREATEST skips a NULL ``not_before``.
-    _DISPATCH_ORDER_SQL = "GREATEST(w.payload->>'created_at', w.payload->>'not_before')"
+    _DISPATCH_ORDER_SQL = "w.dispatch_eligible_at"
 
     @classmethod
     def workflow_scan_query(
@@ -204,14 +208,14 @@ class PostgresWorkflowMixin:
                 f"'{status.value}'"
                 for status in sorted(statuses, key=lambda item: item.value)
             )
-            clauses.append(f"w.payload->>'status' IN ({literals})")
+            clauses.append(f"w.status IN ({literals})")
         pushdown, parameters = cls._pushdown_clauses(
             dispatchable_at, exclude_request_ids
         )
         clauses.extend(pushdown)
         if updated_since is not None:
-            clauses.append("w.payload->>'updated_at' >= %s")
-            parameters.append(_utc_text(updated_since))
+            clauses.append("w.updated_at >= %s")
+            parameters.append(datetime_json_text(updated_since))
         direction = "DESC" if newest_first else "ASC"
         if dispatchable_at is not None:
             order_key = cls._DISPATCH_ORDER_SQL
@@ -221,9 +225,9 @@ class PostgresWorkflowMixin:
                 clauses.append(f"({order_key}, w.key) {comparison} (%s, %s)")
                 parameters.extend((eligible_at, request_id))
         else:
-            order_key = "w.payload->>'updated_at'"
+            order_key = "w.updated_at"
         sql = (
-            "SELECT w.payload FROM gpu_fault_objects AS w WHERE "
+            "SELECT w.payload FROM gpu_fault_workflow_records AS w WHERE "
             + " AND ".join(clauses)
             + f" ORDER BY {order_key} {direction}, "
             + f"w.key {direction} LIMIT %s"
@@ -245,19 +249,19 @@ class PostgresWorkflowMixin:
                 f"'{status.value}'"
                 for status in sorted(statuses, key=lambda item: item.value)
             )
-            clauses.append(f"w.payload->>'status' IN ({literals})")
+            clauses.append(f"w.status IN ({literals})")
         excluded = sorted(set(exclude_request_ids))
         with self._db.cursor() as cursor:
             cursor.execute(
                 "SELECT"
-                " count(*) FILTER (WHERE w.payload->>'not_before' > %s),"
+                " count(*) FILTER (WHERE w.not_before > %s),"
                 " count(*) FILTER (WHERE EXISTS ("
-                "SELECT 1 FROM gpu_fault_objects AS predecessor"
+                "SELECT 1 FROM gpu_fault_workflow_records AS predecessor"
                 " WHERE predecessor.kind='workflow'"
-                " AND predecessor.key=w.payload->>'predecessor_workflow_id'"
+                " AND predecessor.key=w.predecessor_workflow_id"
                 f" AND {self._OPEN_PREDECESSOR_SQL})),"
                 " count(*) FILTER (WHERE w.key = ANY(%s))"
-                " FROM gpu_fault_objects AS w WHERE " + " AND ".join(clauses),
+                " FROM gpu_fault_workflow_records AS w WHERE " + " AND ".join(clauses),
                 (_utc_text(dispatchable_at), excluded),
             )
             not_before, predecessor, retired = cursor.fetchone()
@@ -309,12 +313,16 @@ class PostgresWorkflowMixin:
         value outside the enum is not counted (the gauge is per enum member).
         """
 
+        table = (
+            "gpu_fault_workflow_records" if kind == "workflow" else "gpu_fault_objects"
+        )
+        expression = "status" if kind == "workflow" else f"payload->>'{field}'"
         with self._db.cursor() as cursor:
             cursor.execute(
                 f"""
                 SELECT s.value, (
-                    SELECT count(*) FROM gpu_fault_objects
-                    WHERE kind='{kind}' AND payload->>'{field}' = s.value
+                    SELECT count(*) FROM {table}
+                    WHERE kind='{kind}' AND {expression} = s.value
                 )
                 FROM unnest(%s::text[]) AS s(value)
                 """,
@@ -335,26 +343,24 @@ class PostgresWorkflowMixin:
             cursor.execute(
                 """
                 SELECT COUNT(*)
-                FROM gpu_fault_objects w
+                FROM gpu_fault_workflow_records w
                 WHERE w.kind='workflow'
-                  AND w.payload->>'status'='BLOCKED'
+                  AND w.status='BLOCKED'
                   AND NOT EXISTS (
                       SELECT 1
                       FROM gpu_fault_objects i
-                      JOIN gpu_fault_objects s
+                      JOIN gpu_fault_workflow_records s
                         ON s.kind='workflow'
                        AND s.key=i.payload->>'workflow_request_id'
                       WHERE i.kind='incident'
-                        AND i.key=w.payload->>'incident_id'
+                        AND i.key=w.incident_id
                         AND i.payload->>'state'='RECOVERED'
                         AND s.key<>w.key
-                        AND s.payload->>'incident_id'
-                            =w.payload->>'incident_id'
-                        AND s.payload->>'status'='SUCCEEDED'
-                        AND s.payload->>'fencing_token'
-                            =w.payload->>'fencing_token'
+                        AND s.incident_id=w.incident_id
+                        AND s.status='SUCCEEDED'
+                        AND s.fencing_token=w.fencing_token
                         AND i.payload->>'fencing_token'
-                            =w.payload->>'fencing_token'
+                            =w.fencing_token::text
                         AND jsonb_exists(
                             s.payload->'completed_operations',
                             'RESTORE_SCHEDULING'
@@ -382,23 +388,23 @@ class PostgresWorkflowMixin:
             cursor.execute(
                 """
                 SELECT w.payload
-                FROM gpu_fault_objects w
+                FROM gpu_fault_workflow_records w
                 LEFT JOIN gpu_fault_objects i
                   ON i.kind='incident'
-                 AND i.key=w.payload->>'incident_id'
+                 AND i.key=w.incident_id
                 WHERE w.kind='workflow'
-                  AND w.payload->>'status' IN ('PENDING', 'SAFETY_PENDING')
-                  AND w.payload->>'created_at' < %s
+                  AND w.status IN ('PENDING', 'SAFETY_PENDING')
+                  AND w.created_at < %s
                   AND (
                       i.key IS NULL
                       OR COALESCE(i.payload->>'workflow_request_id', '') <> w.key
                   )
                   AND NOT EXISTS (
-                      SELECT 1 FROM gpu_fault_objects s
+                      SELECT 1 FROM gpu_fault_workflow_records s
                       WHERE s.kind='workflow'
-                        AND s.payload->>'predecessor_workflow_id'=w.key
+                        AND s.predecessor_workflow_id=w.key
                   )
-                ORDER BY w.payload->>'created_at', w.key
+                ORDER BY w.created_at, w.key
                 LIMIT %s
                 """,
                 (_utc_text(created_before), limit),
@@ -417,7 +423,7 @@ class PostgresWorkflowMixin:
                 WHERE i.kind='incident'
                   AND i.payload->>'workflow_request_id' > ''
                   AND NOT EXISTS (
-                      SELECT 1 FROM gpu_fault_objects w
+                      SELECT 1 FROM gpu_fault_workflow_records w
                       WHERE w.kind='workflow'
                         AND w.key=i.payload->>'workflow_request_id'
                   )
@@ -477,14 +483,10 @@ class PostgresWorkflowMixin:
 
         sql = """
                 SELECT payload
-                FROM gpu_fault_objects
+                FROM gpu_fault_workflow_records
                 WHERE kind='workflow'
-                  AND payload->>'status'='FAILED'
-                  AND (
-                      payload->>'failure_handled_at' IS NULL
-                      OR payload->>'failure_handled_at'=''
-                  )
-                ORDER BY payload->>'updated_at', key
+                  AND status='FAILED' AND failure_unhandled
+                ORDER BY updated_at, key
                 LIMIT %s
                 """
         return sql, (limit,)
@@ -502,9 +504,9 @@ class PostgresWorkflowMixin:
             "i.kind='incident'",
             # Executable rows plus BLOCKED rows that still occupy their node
             # (waiting for an operator / parked by an internal error, F-A4).
-            "(w.payload->>'status' IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
-            " OR (w.payload->>'status' = 'BLOCKED'"
-            " AND w.payload->>'blocked_kind' IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')))",
+            "(w.status IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
+            " OR (w.status = 'BLOCKED'"
+            " AND w.blocked_kind IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')))",
             "i.payload->>'cluster_id'=%s",
         ]
         parameters: list[object] = [cluster_id]
@@ -520,13 +522,13 @@ class PostgresWorkflowMixin:
             cursor.execute(
                 """
                 SELECT i.payload, w.payload
-                FROM gpu_fault_objects w
+                FROM gpu_fault_workflow_records w
                 JOIN gpu_fault_objects i
-                  ON i.key=w.payload->>'incident_id'
+                  ON i.key=w.incident_id
                 WHERE
                 """
                 + " AND ".join(clauses)
-                + " ORDER BY w.payload->>'updated_at' DESC, w.key DESC"
+                + " ORDER BY w.updated_at DESC, w.key DESC"
                 + " LIMIT %s",
                 [*parameters, limit],
             )
@@ -546,29 +548,29 @@ class PostgresWorkflowMixin:
         attempt_id: str,
         *,
         limit: int = 100,
+        include_terminal: bool = False,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
-        # Text order on ``updated_at`` (store review 2026-09-07, item H2): the
-        # ``::timestamptz`` cast forced a per-row detoast and sort. Text order
-        # is time order for rows written after item E (fixed-width
-        # ``YYYY-MM-DDTHH:MM:SS.ffffffZ``); legacy rows with a shorter
-        # fraction may misorder within one second, which this reader
-        # tolerates because it filters by rank afterwards.
+        # Fixed-width UTC text avoids per-row detoasting and preserves time order.
+        # Legacy fractions may differ within one second; callers filter by rank.
+        status_predicate = (
+            "TRUE"
+            if include_terminal
+            else "w.status IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
+        )
         with self._db.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT i.payload, w.payload
-                FROM gpu_fault_objects w
+                FROM gpu_fault_workflow_records w
                 JOIN gpu_fault_objects i
                   ON i.kind='incident'
-                 AND i.key=w.payload->>'incident_id'
+                 AND i.key=w.incident_id
                 WHERE w.kind='workflow'
                   AND i.payload->>'cluster_id'=%s
                   AND i.payload->>'job_id'=%s
                   AND (
                         (
-                            w.payload->>'status' IN (
-                                'PENDING', 'RUNNING', 'SAFETY_PENDING'
-                            )
+                            {status_predicate}
                             AND i.payload->>'attempt_id'=%s
                         )
                         OR EXISTS (
@@ -585,7 +587,7 @@ class PostgresWorkflowMixin:
                                   ->>'restart_attempt_id'=%s
                         )
                   )
-                ORDER BY w.payload->>'updated_at' DESC,
+                ORDER BY w.updated_at DESC,
                          w.key DESC
                 LIMIT %s
                 """,
@@ -654,11 +656,11 @@ class PostgresWorkflowMixin:
                         cursor.execute(
                             """
                             SELECT payload
-                            FROM gpu_fault_objects
+                            FROM gpu_fault_workflow_records
                             WHERE kind='workflow'
                               AND key<>%s
-                              AND payload->>'status'='RUNNING'
-                              AND (payload->>'execution_lease_expires_at')
+                              AND status='RUNNING'
+                              AND execution_lease_expires_at
                                   ::timestamptz > %s
                               AND coalesce(
                                   payload->'remediation_budget_claims',
@@ -745,11 +747,11 @@ class PostgresWorkflowMixin:
                     cursor.execute(
                         """
                         SELECT payload
-                        FROM gpu_fault_objects
+                        FROM gpu_fault_workflow_records
                         WHERE kind='workflow'
                           AND key<>%s
-                          AND payload->>'status'='RUNNING'
-                          AND (payload->>'execution_lease_expires_at')
+                          AND status='RUNNING'
+                          AND execution_lease_expires_at
                               ::timestamptz > %s
                           AND coalesce(
                               payload->'remediation_budget_claims',
@@ -794,7 +796,13 @@ class PostgresWorkflowMixin:
             workflow = workflow.model_copy(
                 update={"execution_lease_expires_at": (renewed_at + lease_duration)}
             )
-            self._put("workflow", request_id, workflow)
+            put_state_fields(
+                self._db,
+                "workflow",
+                request_id,
+                workflow,
+                frozenset({"execution_lease_expires_at"}),
+            )
             return workflow
 
     def save_workflow(
@@ -803,83 +811,30 @@ class PostgresWorkflowMixin:
         *,
         expected: WorkflowRequest | None = None,
     ) -> None:
-        """See ``WorkflowStore.save_workflow`` (store review 2026-09-07, item B).
+        """Keep full CAS or the merge/epoch/fence guard on the authoritative row.
 
-        The inherited SQLite version was a blind whole-row upsert under the
-        process lock that ``PostgresStore`` neutralizes, so a copy read before
-        a merge, a re-lease or a generation change overwrote it. With
-        ``expected`` this is the full-payload compare-and-set of ``_put``.
-        Without it, two statements and no transaction:
-
-        1. a guarded UPDATE that matches only while the three version fields
-           still equal the caller's copy;
-        2. if that touched nothing, ``INSERT ... ON CONFLICT DO NOTHING``.
-
-        Race analysis: the UPDATE is atomic on its own; a concurrent writer
-        either commits first and moves a version (we match nothing) or waits
-        behind our row lock and then sees our row. If it matched nothing the
-        row was absent or moved. The INSERT then creates it only if it is still
-        absent -- two creators race on the unique key and exactly one wins, the
-        other gets no row back and is told the row moved, which is true. A row
-        that was present with other versions at step 1 stays untouched and
-        step 2 finds it, so nothing is ever overwritten. The one interleaving
-        that lands is "present at step 1, deleted before step 2", which
-        recreates a row the archive just removed; workflow rows are only
-        deleted by control-record retention, which is off, so that is accepted
-        rather than paid for with a transaction on every save.
+        The routed upsert applies the same version guard in legacy and dedicated
+        modes. A failed guard cannot fall through to an unconditional overwrite.
         """
 
         if expected is not None:
             self._put("workflow", workflow.request_id, workflow, expected=expected)
             return
-        payload = workflow.model_dump_json()
-        with self._db.cursor() as cursor:
-            # COALESCE to the model defaults: rows written before a field
-            # existed decode with the default, and must compare as such.
-            cursor.execute(
-                """
-                UPDATE gpu_fault_objects
-                SET payload=%s::jsonb
-                WHERE kind='workflow' AND key=%s
-                  AND coalesce(payload->>'merge_revision', '0')=%s
-                  AND coalesce(payload->>'execution_epoch', '0')=%s
-                  AND payload->>'fencing_token'=%s
-                """,
-                (
-                    payload,
-                    workflow.request_id,
-                    str(workflow.merge_revision),
-                    str(workflow.execution_epoch),
-                    str(workflow.fencing_token),
-                ),
-            )
-            if cursor.rowcount == 1:
-                return
-            cursor.execute(
-                """
-                INSERT INTO gpu_fault_objects(kind, key, payload)
-                VALUES ('workflow', %s, %s::jsonb)
-                ON CONFLICT(kind, key) DO NOTHING
-                RETURNING key
-                """,
-                (workflow.request_id, payload),
-            )
-            if cursor.fetchone() is not None:
-                return
-            # Neither statement landed: re-read only to name what moved.
-            cursor.execute(
-                """
-                SELECT payload FROM gpu_fault_objects
-                WHERE kind='workflow' AND key=%s
-                """,
-                (workflow.request_id,),
-            )
-            row = cursor.fetchone()
-        if row is None:
+        if put_state_record(
+            self._db,
+            "workflow",
+            workflow.request_id,
+            workflow,
+            guard_versions=True,
+        ):
+            return
+        try:
+            payload = get_state_payload(self._db, "workflow", workflow.request_id)
+        except NotFoundError:
             raise StaleWriteError(
                 f"workflow/{workflow.request_id} changed since it was read"
-            )
-        stored: WorkflowRequest = self._decode("workflow", row[0])
+            ) from None
+        stored: WorkflowRequest = self._decode("workflow", payload)
         stale = stale_workflow_versions(stored, workflow)
         if stale is None:
             # The guard missed but the versions match now: the row moved and
@@ -901,15 +856,9 @@ class PostgresWorkflowMixin:
         with self._db.transaction():
             current = self._get_for_update("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._put("workflow", workflow.request_id, workflow)
 
     def save_workflow_and_incident_if_leased(
@@ -935,15 +884,9 @@ class PostgresWorkflowMixin:
                 current_incident = None
             current = self._get_for_update("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
-            if (
-                current.execution_owner_id != executor_id
-                or current.execution_epoch != execution_epoch
-                or current.execution_lease_expires_at is None
-                or current.execution_lease_expires_at <= checked_at
-            ):
-                raise WorkflowLeaseError("workflow execution lease is stale")
-            if current.merge_revision != workflow.merge_revision:
-                raise WorkflowMergedError("workflow was merged since it was read")
+            validate_leased_workflow_save(
+                current, workflow, executor_id, execution_epoch, checked_at
+            )
             self._put("workflow", workflow.request_id, workflow)
             if incident_pointer_moved(current_incident, incident):
                 # Inside the row lock (C-02): the caller's incident snapshot

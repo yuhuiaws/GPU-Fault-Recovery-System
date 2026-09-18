@@ -24,11 +24,12 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_HOST_ORCHESTRATION_INPUTS = (
+    "src/gpu_fault/admin/node_key_custody*.py",
+    "src/gpu_fault/admin/node_key_proof.py",
+    "deploy/node/provision-node-action-keys.sh",
+    "deploy/node/provision_node_action_keys.py",
     "src/gpu_fault_release/*.py",
-    # The engine runs from the site's source snapshot: its shell entry points,
-    # the in-Pod probe programs it ships and the control-plane tools it calls
-    # are deploy-host orchestration too. Live 2026-09-13: a probe-only fix was
-    # classified QUALITY_ONLY and the site kept running the old probe.
+    # Probes and tools execute from the site snapshot and must advance its identity.
     "deploy/control-plane/regional/*.sh",
     "deploy/control-plane/regional/probes/*.py",
     "deploy/control-plane/tools/*.py",

@@ -179,11 +179,11 @@ def test_cleanup_counters_reach_metrics():
 
     rows = runner.metrics_snapshot()["cleanup_rows_total"]["completed_requests"]
     assert (
-        f'gpu_fault_periodic_cleanup_rows_total{{job="completed_requests"}} {rows}'
+        f'gpu_fault_periodic_cleanup_rows_total{{periodic_job="completed_requests"}} {rows}'
         in lines
     )
     assert (
-        'gpu_fault_periodic_cleanup_budget_exhausted_total{job="processor_lanes"} 1'
+        'gpu_fault_periodic_cleanup_budget_exhausted_total{periodic_job="processor_lanes"} 1'
         in lines
     )
 

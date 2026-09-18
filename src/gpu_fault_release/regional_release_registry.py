@@ -6,9 +6,13 @@ import ipaddress
 import json
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
 REGISTRY_CURRENT_KEY = "clusters.json"
@@ -38,28 +42,15 @@ def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
 
 
 def registry_payloads(
-    release: Any,
+    release: RegionalRelease,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-    exists = release.runner.probe(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "secret",
-            REGISTRY_SECRET,
-        ),
-    )
-    if not exists:
+    value = probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef("secret", "Secret", REGISTRY_SECRET, release.config.namespace),
+    ).require_readable()
+    if value is None:
         return [], None
-    value = release._get_json(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "secret",
-            REGISTRY_SECRET,
-        )
-    )
     return _registry_payloads_from_secret(value)
 
 
@@ -82,7 +73,7 @@ def _registry_payloads_from_secret(
     return decode(REGISTRY_CURRENT_KEY) or [], decode(REGISTRY_BACKUP_KEY)
 
 
-def registry(release: Any) -> list[dict[str, Any]]:
+def registry(release: RegionalRelease) -> list[dict[str, Any]]:
     current, _backup = registry_payloads(release)
     return current
 
@@ -112,6 +103,8 @@ def registry_entry(target: ClusterTarget) -> dict[str, Any]:
         ) from exc
     if not endpoint_cidrs:
         raise ReleaseError(f"{target.cluster_id} requires Agent endpoint CIDRs")
+    if not target.token_file:
+        raise ReleaseError(f"{target.cluster_id} requires a cluster token file")
     token = Path(target.token_file).read_text().strip()
     if len(token) < 32:
         raise ReleaseError("cluster token is too short")
@@ -126,7 +119,7 @@ def registry_entry(target: ClusterTarget) -> dict[str, Any]:
     }
 
 
-def desired_registry(release: Any) -> list[dict[str, Any]]:
+def desired_registry(release: RegionalRelease) -> list[dict[str, Any]]:
     return sorted(
         (registry_entry(target) for target in release.config.clusters),
         key=lambda item: str(item["cluster_id"]),
@@ -134,7 +127,7 @@ def desired_registry(release: Any) -> list[dict[str, Any]]:
 
 
 def write_registry(
-    release: Any,
+    release: RegionalRelease,
     registrations: list[dict[str, Any]],
     *,
     backup: list[dict[str, Any]] | None = None,
@@ -182,7 +175,7 @@ def write_registry(
 
 
 def initialize_registry(
-    release: Any,
+    release: RegionalRelease,
     *,
     load: Callable[
         [Any],
@@ -199,7 +192,7 @@ def initialize_registry(
         write(release, target)
 
 
-def stage_registry(release: Any) -> bool:
+def stage_registry(release: RegionalRelease) -> bool:
     current, backup = registry_payloads(release)
     desired = desired_registry(release)
     if current == desired and backup is None:
@@ -212,13 +205,13 @@ def stage_registry(release: Any) -> bool:
     return True
 
 
-def commit_registry_update(release: Any) -> None:
+def commit_registry_update(release: RegionalRelease) -> None:
     current, backup = registry_payloads(release)
     if backup is not None:
         write_registry(release, current)
 
 
-def restore_registry_backup(release: Any) -> bool:
+def restore_registry_backup(release: RegionalRelease) -> bool:
     _current, backup = registry_payloads(release)
     if backup is None:
         return False
@@ -227,7 +220,7 @@ def restore_registry_backup(release: Any) -> bool:
 
 
 def update_registry(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     *,
     remove: bool,

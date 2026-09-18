@@ -96,15 +96,14 @@ data:
                 # label so a query can tell an ingress sample from a
                 # worker sample. gpu-fault-api-ha AND
                 # gpu-fault-control-worker run uvicorn --workers 4
-                # behind one port; the application aggregates /metrics
-                # over the Pod's live processes (sum for counters and
-                # additive gauges, max for timestamps, min for health
-                # flags -- gpu_fault.app.metric_aggregation), so a
-                # scrape of a Pod is the whole Pod and the families may
-                # be summed or rate()d per pod like any other counter.
+                # behind one port; /metrics covers the Pod's live processes.
+                # Counters and cumulative summaries keep process="<slot>"
+                # (bounded 0..15); rate/increase MUST precede aggregation.
+                # Additive gauges sum, timestamps take max, and health flags
+                # take min -- gpu_fault.app.metric_aggregation.
                 # gpu_fault_metrics_aggregation_degraded 1 marks a Pod
-                # whose processes could not share, i.e. a sample of one
-                # process.
+                # with stale, missing or malformed process publications, or
+                # unusable shared storage. Publications expire after 60s.
                 - action: replace
                   source_labels:
                     - __meta_kubernetes_pod_label_app
@@ -162,6 +161,13 @@ data:
                 # gpu_fault_aurora_.+ is the credential refresher's last
                 # verdict read from the mounted Secret (control-plane review
                 # 2026-09-08, G-8 / H1-2).
+                # gpu_fault_closed_loop_.+ keeps the legacy summary AND the
+                # event-time window mean/count/completeness/scan timestamp.
+                # Dropping coverage or freshness would hide an unknown window.
+                # gpu_fault_processor_.+ also keeps drift values and their
+                # actual scan timestamp/age limit; notification_.+ keeps the
+                # terminal failure event stamp. metrics_.+ and aurora_.+ keep
+                # incomplete process coverage and unknown refresh evidence.
                 - action: keep
                   source_labels: [__name__]
                   regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+

@@ -349,6 +349,16 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     monkeypatch.setattr(probe, "boot_id", lambda: BOOT_A)
     monkeypatch.setattr(probe, "_reboot_unit_state", lambda run_id: {})
     path = tmp_path / "state.json"
+    probe.write_state(
+        path,
+        {
+            "maintenance_window_end": "2099-01-01T00:00:00+00:00",
+            "barrier_authorization": {
+                "run_id": RUN_ID,
+                "window_expires_at": "2099-01-01T00:00:00+00:00",
+            },
+        },
+    )
 
     record = probe.place_reboot_timer(RUN_ID, 45, path)
 
@@ -361,7 +371,7 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     armed = [c for c in calls if "systemd-run" in c and "--on-active=45s" in c]
     assert len(armed) == 1, calls
     assert f"--unit={timer}" in armed[0]
-    assert armed[0][-2:] == ["/bin/systemctl", "reboot"], "only an ordinary reboot"
+    assert armed[0][-3:] == ["fire-reboot", "--run-id", RUN_ID]
 
 
 # --------------------------------------------------------------------------- #
@@ -469,10 +479,30 @@ def test_parser_accepts_every_documented_subcommand() -> None:
     )
     assert armed_reboot.reboot_delay_seconds == 30
     reboot = parser.parse_args(
-        ["arm-reboot", "--run-id", RUN_ID, "--delay-seconds", "45"]
+        [
+            "arm-reboot",
+            "--run-id",
+            RUN_ID,
+            "--delay-seconds",
+            "45",
+            "--authorization",
+            "{}",
+            "--barrier-script",
+            "/run/gpu-fault-host-probe-ab894dd753.py",
+        ]
     )
     assert reboot.delay_seconds == 45
-    default_reboot = parser.parse_args(["arm-reboot", "--run-id", RUN_ID])
+    default_reboot = parser.parse_args(
+        [
+            "arm-reboot",
+            "--run-id",
+            RUN_ID,
+            "--authorization",
+            "{}",
+            "--barrier-script",
+            "/run/gpu-fault-host-probe-ab894dd753.py",
+        ]
+    )
     assert default_reboot.delay_seconds == probe.MIN_REBOOT_DELAY_SECONDS
     for command in (
         ["disarm-holder", "--run-id", RUN_ID],

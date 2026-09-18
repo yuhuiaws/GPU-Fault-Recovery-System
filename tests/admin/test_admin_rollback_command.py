@@ -10,12 +10,21 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gpu_fault.admin import release_consent as CONSENT
 from gpu_fault.admin import rollback_command as COMMAND
+from gpu_fault.admin.execution import (
+    DeploymentDeadlineExceeded,
+    deployment_deadline,
+    run_driver,
+)
+from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.site import SiteConfigError, load_site
 from gpu_fault_release import regional_admin_commands as ADMIN
 from gpu_fault_release import regional_release_store_preflight as PREFLIGHT
@@ -176,8 +185,9 @@ class FakeRuns:
         self.calls: list[tuple[list[str], Path, dict[str, str]]] = []
         self.rollback_returncode = rollback_returncode
 
-    def __call__(self, arguments, *, cwd, env, check):
+    def __call__(self, arguments, *, cwd, env, check, pass_fds):
         assert check is False, "the caller reads the exit code itself"
+        assert isinstance(pass_fds, tuple), "rollback driver pass_fds must be a tuple"
         self.calls.append((list(arguments), Path(cwd), dict(env)))
         mode = arguments[1]
         code = self.rollback_returncode if mode == "rollback" else 0
@@ -201,7 +211,7 @@ def _prepare(
     runs = FakeRuns(rollback_returncode=rollback_returncode)
     reads = iter(states)
     monkeypatch.setattr(COMMAND, "live_release_state", lambda _site: next(reads))
-    monkeypatch.setattr(COMMAND.subprocess, "run", runs)
+    monkeypatch.setattr(COMMAND, "run_driver", runs)
     reconciled: list[dict] = []
 
     def reconcile(path, live_state, *, site_before, source):
@@ -332,6 +342,95 @@ def test_an_engine_failure_returns_its_exit_code_and_skips_alignment(
     )
 
 
+def test_rollback_reloads_the_site_under_the_mutation_lock_before_reading_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _site_path, site, _runs, reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_rolled_back_state()]
+    )
+    current = SimpleNamespace(source=site.source)
+    events = []
+
+    @contextmanager
+    def lock(path):
+        assert path == tmp_path
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def reload(original):
+        assert original is site and events == ["lock"]
+        events.append("reload")
+        return current
+
+    def state(observed):
+        assert observed is current and events == ["lock", "reload"]
+        events.append("state")
+        return _rolled_back_state()
+
+    monkeypatch.setattr(COMMAND, "administrator_operation_lock", lock)
+    monkeypatch.setattr(COMMAND, "reload_site_for_mutation", reload)
+    monkeypatch.setattr(COMMAND, "live_release_state", state)
+    assert COMMAND.run_rollback(site, state_dir=tmp_path) == 2
+    assert events == ["lock", "reload", "state", "unlock"]
+    assert reconciled == []
+
+
+def test_rollback_driver_deadline_stops_the_child_before_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _site_path, site, _runs, reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state()]
+    )
+    modes = []
+
+    def driver(arguments, **kwargs):
+        modes.append(arguments[1])
+        return run_driver(
+            [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs
+        )
+
+    monkeypatch.setattr(COMMAND, "run_driver", driver)
+    with deployment_deadline("rollback regression", 0.2, recovery_seconds=0):
+        with pytest.raises(DeploymentDeadlineExceeded):
+            COMMAND.run_rollback(site, state_dir=tmp_path)
+    assert modes == ["rollback"]
+    assert reconciled == []
+
+
+@pytest.mark.parametrize("failed_mode", ["rollback", "sync-state"])
+def test_supervision_loss_is_not_converted_to_an_ordinary_rollback_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_mode: str
+) -> None:
+    _site_path, site, runs, reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state(), _rolled_back_state()]
+    )
+
+    def driver(arguments, **kwargs):
+        if arguments[1] == failed_mode:
+            raise ProcessSupervisionLost("no completion proof")
+        return runs(arguments, **kwargs)
+
+    monkeypatch.setattr(COMMAND, "run_driver", driver)
+    with pytest.raises(ProcessSupervisionLost):
+        COMMAND.run_rollback(site, state_dir=tmp_path)
+    assert runs.modes == ([] if failed_mode == "rollback" else ["rollback"])
+    assert len(reconciled) == (0 if failed_mode == "rollback" else 1)
+
+
+def test_malformed_previous_snapshot_is_a_refusal_not_an_attribute_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _site_path, site, runs, reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state(previous="invalid")]
+    )
+    assert COMMAND.run_rollback(site, state_dir=tmp_path) == 2
+    assert runs.calls == []
+    assert reconciled == []
+
+
 def test_an_alignment_failure_after_a_good_rollback_is_reported_not_hidden(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -370,13 +469,13 @@ def test_a_failed_sync_state_is_an_alignment_failure(
         tmp_path, monkeypatch, states=[_committed_state(), _rolled_back_state()]
     )
 
-    def failing_sync(arguments, *, cwd, env, check):
+    def failing_sync(arguments, *, cwd, env, check, pass_fds):
         runs.calls.append((list(arguments), Path(cwd), dict(env)))
         return subprocess.CompletedProcess(
             arguments, 0 if arguments[1] == "rollback" else 4
         )
 
-    monkeypatch.setattr(COMMAND.subprocess, "run", failing_sync)
+    monkeypatch.setattr(COMMAND, "run_driver", failing_sync)
 
     status = COMMAND.run_rollback(site, state_dir=tmp_path)
 

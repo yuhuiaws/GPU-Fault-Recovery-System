@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from gpu_fault.collectors.sinks import HttpEventSink
@@ -539,9 +540,7 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "GPU_FAULT_LEGACY_COMPONENT_PINS" in script
     assert "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS" in script
     assert "GPU_FAULT_FORCE_ROLE_RESTART" in script
-    assert "remove_legacy_notification_env" in script
-    assert "GPU_FAULT_ALLOW_EMAIL-" in script
-    assert "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL-" in script
+    assert "apply_control_plane_deployment.py" in script
     assert "filter_legacy_release_env.py" in script
     assert (
         'CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST="'
@@ -551,7 +550,8 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'PIN_METADATA_CHANGED="true"' in script
     assert 'RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"' in script
     assert "PIN_FINALIZATION" not in script
-    assert "rollout restart" in script
+    assert "gpu-fault.io/pin-config-sha256" in script
+    assert "kubectl.kubernetes.io/restartedAt" in script
     assert 'PRESERVE_ROLE_CONFIG_MAPS}" != "true"' in script
     assert 'name="$(basename "${config}" .yaml)"' in script
     # The selected role ConfigMaps travel as one multi-document apply; the
@@ -559,13 +559,16 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'render_manifest_for_apply "${name}" >>"${ROLE_CONFIG_STREAM}"' in script
     assert 'apply \\\n            -f "${ROLE_CONFIG_STREAM}"' in script
     assert 'if [[ -s "${ROLE_CONFIG_STREAM}" ]]' in script
-    ingress_role = script.index("apply_ingress_role()")
-    ingress_exists = script.index(
-        "get deployment \\\n        gpu-fault-api-ha >/dev/null 2>&1", ingress_role
+    final_apply = script[
+        script.index("apply_manifest() {") : script.index("render_manifest() {")
+    ]
+    assert (
+        '--live "${LIVE_DEPLOYMENTS}" -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}"'
+        in final_apply
     )
-    stale_env_cleanup = script.index("GPU_FAULT_PROCESSOR_WORKERS-")
-    ingress_apply = script.index("apply_manifest gpu-fault-api-ha-ingress")
-    assert ingress_exists < stale_env_cleanup < ingress_apply
+    assert " set env " not in script, (
+        "legacy cleanup must not create another Pod template"
+    )
 
 
 def test_hyperpod_deploy_uses_two_phase_agent_pin_migration() -> None:
@@ -962,25 +965,36 @@ def test_regional_executor_uses_independent_hyperpod_switches() -> None:
     assert env["GPU_FAULT_ALLOW_HYPERPOD_REPLACE"] == "false"
 
 
-def test_ambiguous_attempt_ownership_has_a_prometheus_alert() -> None:
-    document = yaml.safe_load(
-        (ROOT / "deploy/control-plane/regional/processor-alerts.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+@pytest.mark.parametrize(
+    "rules_path",
+    [
+        "deploy/control-plane/regional/processor-alerts.yaml",
+        "deploy/observability/amp-rules.yaml",
+    ],
+)
+def test_ambiguous_attempt_ownership_has_a_prometheus_alert(rules_path: str) -> None:
+    document = yaml.safe_load((ROOT / rules_path).read_text(encoding="utf-8"))
+    groups = document["spec"]["groups"] if "spec" in document else document["groups"]
     rules = {
         rule["alert"]: rule
-        for group in document["spec"]["groups"]
+        for group in groups
         for rule in group["rules"]
         if "alert" in rule
     }
     alert = rules["GpuFaultExclusiveNodeOwnershipInvariantViolation"]
     stale = rules["GpuFaultStaleAttemptObservation"]
 
-    assert alert["expr"] == "gpu_fault_ambiguous_attempt_ownership_current > 1"
+    amp = rules_path == "deploy/observability/amp-rules.yaml"
+    aggregation = "max by (control_plane_cluster, region, cluster_id, gpu_node) "
+    assert alert["expr"] == (
+        aggregation + "(gpu_fault_ambiguous_attempt_ownership_current) > 1"
+        if amp
+        else "gpu_fault_ambiguous_attempt_ownership_current > 1"
+    )
     assert alert["labels"]["severity"] == "critical"
     assert stale["expr"] == (
-        "max by (cluster_id, gpu_node) (gpu_fault_stale_attempt_observations) > 0"
+        (aggregation if amp else "max by (cluster_id, gpu_node) ")
+        + "(gpu_fault_stale_attempt_observations) > 0"
     )
     assert stale["for"] == "2m"
     assert stale["labels"]["severity"] == "warning"
@@ -1239,8 +1253,16 @@ def test_boot_guard_probe_is_small_and_uses_isolated_schema() -> None:
     assert '"GPU_FAULT_ALLOW_EMAIL": "false"' in derive
     assert '"GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": "true"' in derive
     assert "gpu-fault-aurora-guardprobe" in derive
-    assert "PostgresStore(" in section
-    assert 'path="/gpu_fault_guardprobe"' in section
+    assert (
+        'BOOT_DB_HELPER="${REPO:?}/scripts/e2e/regional/boot_guard_isolation.py"'
+        in section
+    )
+    assert "/opt/gpu-fault/control-plane/bin/python - initialize" in section
+    assert "/opt/gpu-fault/control-plane/bin/python - secret" in section
+    assert '< "${BOOT_DB_HELPER}"' in section
+    assert "PostgresStore(" not in section, (
+        "the procedure must use the checked helper, not a renamed production DSN"
+    )
 
 
 def test_boot_guard_registry_matches_current_regional_schema() -> None:

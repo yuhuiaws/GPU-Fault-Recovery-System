@@ -88,7 +88,7 @@ def test_status_prints_a_header_on_stderr_and_the_json_unchanged_on_stdout(
         assert kwargs.get("stdout") is subprocess.PIPE, "status output is captured"
         return subprocess.CompletedProcess(arguments, 0, stdout=document)
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_cli, "run_driver", fake_run)
     monkeypatch.setattr(admin_cli, "_live_release_state", lambda _site: {})
     monkeypatch.setenv(admin_cli.ADMIN_LOG_ENVIRONMENT, "/var/log/status.log")
     arguments = argparse.Namespace(
@@ -126,7 +126,7 @@ def test_status_full_reaches_the_engine(tmp_path: Path, monkeypatch) -> None:
         calls.append([str(item) for item in arguments])
         return subprocess.CompletedProcess(arguments, 1, stdout="not json\n")
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_cli, "run_driver", fake_run)
     monkeypatch.setattr(admin_cli, "_live_release_state", lambda _site: {})
     arguments = argparse.Namespace(
         command="status",

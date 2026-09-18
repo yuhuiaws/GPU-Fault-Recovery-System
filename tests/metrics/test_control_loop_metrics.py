@@ -13,6 +13,7 @@ import asyncio
 
 from gpu_fault.app import ApplicationContext, create_app
 from tests._builders import asgi_client
+from tests.metrics._assertions import assert_samples
 
 
 def _scrape(app) -> str:
@@ -49,23 +50,25 @@ def test_review_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
 
     text = _scrape(app)
 
-    for line in (
-        "gpu_fault_workflow_dispatch_node_busy_timeouts_total 2",
-        "gpu_fault_workflow_dispatch_failure_handling_abandoned_total 1",
-        "gpu_fault_workflow_dispatch_plan_sync_misses_total 3",
-        "gpu_fault_workflow_dispatch_internal_errors_total 4",
-        "gpu_fault_workflow_lifetime_exceeded_total 5",
-        'gpu_fault_workflow_merge_record_only_total{reason="covered_read_only"} 6',
-        'gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded"} 7',
-        'gpu_fault_workflow_merge_record_only_total{reason="workload_withdrawn"} 8',
-        'gpu_fault_workflow_merge_record_only_total{reason="unsettled_host_resource_incident"} 14',
-        "gpu_fault_processor_completion_failure_releases_total 9",
-        "gpu_fault_processor_retry_horizon_failures_total 10",
-        "gpu_fault_processor_renewal_errors_total 11",
-        "gpu_fault_processor_renewal_fenced_total 12",
-        'gpu_fault_store_io_rejections_total{reason="deadline"} 13',
-    ):
-        assert line in text, line
+    assert_samples(
+        text,
+        (
+            'gpu_fault_workflow_dispatch_node_busy_timeouts_total{process="0"} 2',
+            'gpu_fault_workflow_dispatch_failure_handling_abandoned_total{process="0"} 1',
+            'gpu_fault_workflow_dispatch_plan_sync_misses_total{process="0"} 3',
+            'gpu_fault_workflow_dispatch_internal_errors_total{process="0"} 4',
+            'gpu_fault_workflow_lifetime_exceeded_total{process="0"} 5',
+            'gpu_fault_workflow_merge_record_only_total{reason="covered_read_only",process="0"} 6',
+            'gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded",process="0"} 7',
+            'gpu_fault_workflow_merge_record_only_total{reason="workload_withdrawn",process="0"} 8',
+            'gpu_fault_workflow_merge_record_only_total{reason="unsettled_host_resource_incident",process="0"} 14',
+            'gpu_fault_processor_completion_failure_releases_total{process="0"} 9',
+            'gpu_fault_processor_retry_horizon_failures_total{process="0"} 10',
+            'gpu_fault_processor_renewal_errors_total{process="0"} 11',
+            'gpu_fault_processor_renewal_fenced_total{process="0"} 12',
+            'gpu_fault_store_io_rejections_total{reason="deadline",process="0"} 13',
+        ),
+    )
 
 
 def test_the_second_batch_of_review_counters_reaches_the_metrics_endpoint(
@@ -94,19 +97,21 @@ def test_the_second_batch_of_review_counters_reaches_the_metrics_endpoint(
 
     text = _scrape(app)
 
-    for line in (
-        "gpu_fault_workflow_dispatch_deferred_total 21",
-        "gpu_fault_workflow_branch_escalation_budget_refusals_total 22",
-        "gpu_fault_health_signal_clock_regressions_total 23",
-        "gpu_fault_ingest_stale_event_link_repairs_total 24",
-        'gpu_fault_control_record_archive_withheld_total{reason="incident has external successor"} 25',
-        "gpu_fault_processor_fault_rows_skipped_by_observation_total 26",
-        "gpu_fault_processor_fault_rows_blocked_by_observation 27",
-        "gpu_fault_processor_interlock_probes_total 28",
-        "gpu_fault_processor_notification_shardless_episodes_total 29",
-        "gpu_fault_processor_notification_listener_connected 0",
-    ):
-        assert line in text, line
+    assert_samples(
+        text,
+        (
+            'gpu_fault_workflow_dispatch_deferred_total{process="0"} 21',
+            'gpu_fault_workflow_branch_escalation_budget_refusals_total{process="0"} 22',
+            'gpu_fault_health_signal_clock_regressions_total{process="0"} 23',
+            'gpu_fault_ingest_stale_event_link_repairs_total{process="0"} 24',
+            'gpu_fault_control_record_archive_withheld_total{reason="incident has external successor",process="0"} 25',
+            'gpu_fault_processor_fault_rows_skipped_by_observation_total{process="0"} 26',
+            "gpu_fault_processor_fault_rows_blocked_by_observation 27",
+            'gpu_fault_processor_interlock_probes_total{process="0"} 28',
+            'gpu_fault_processor_notification_shardless_episodes_total{process="0"} 29',
+            "gpu_fault_processor_notification_listener_connected 0",
+        ),
+    )
 
 
 def test_escalation_chain_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
@@ -122,11 +127,13 @@ def test_escalation_chain_counters_reach_the_metrics_endpoint(monkeypatch) -> No
 
     text = _scrape(app)
 
-    for line in (
-        "gpu_fault_hardware_escalation_chain_terminated_total 3",
-        "gpu_fault_hardware_escalation_containment_refused_total 4",
-    ):
-        assert line in text, line
+    assert_samples(
+        text,
+        (
+            'gpu_fault_hardware_escalation_chain_terminated_total{process="0"} 3',
+            'gpu_fault_hardware_escalation_containment_refused_total{process="0"} 4',
+        ),
+    )
 
 
 def test_incident_closure_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
@@ -145,10 +152,12 @@ def test_incident_closure_counters_reach_the_metrics_endpoint(monkeypatch) -> No
 
     text = _scrape(app)
 
-    for line in (
-        "# TYPE gpu_fault_incident_operator_closed_total counter",
-        "gpu_fault_incident_operator_closed_total 31",
-        "# TYPE gpu_fault_incident_auto_closed_by_restore_total counter",
-        "gpu_fault_incident_auto_closed_by_restore_total 32",
-    ):
-        assert line in text, line
+    assert_samples(
+        text,
+        (
+            "# TYPE gpu_fault_incident_operator_closed_total counter",
+            'gpu_fault_incident_operator_closed_total{process="0"} 31',
+            "# TYPE gpu_fault_incident_auto_closed_by_restore_total counter",
+            'gpu_fault_incident_auto_closed_by_restore_total{process="0"} 32',
+        ),
+    )

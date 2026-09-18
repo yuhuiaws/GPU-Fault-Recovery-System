@@ -28,7 +28,7 @@ from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
     SELECTION_REFERENCE_ENV,
 )
-from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.host_probe_fixture import HostProbeTransportError
 from scripts.e2e.regional.managed_workload_fixture import (
     TRAINING_IMAGE,
     ImagePrewarmFixture,
@@ -47,6 +47,15 @@ from scripts.e2e.regional.warm_spare_fixture import (
     GpuHolderFixture,
     WarmSpareLiveFixture,
 )
+from tests.regional._destructive_acceptance_builders import (
+    _reset_state,
+    _runtime_identity,
+)
+from tests.regional._destructive_acceptance_support import (
+    reset_host_pair,
+    restart_state,
+)
+from tests.regional._site_topology import site_topology_leaks
 
 yaml = importlib.import_module("yaml")
 
@@ -91,8 +100,7 @@ def test_destructive_live_drivers_are_promoted_and_plan_only() -> None:
         path = REGIONAL / name
         assert path.is_file(), f"missing destructive live driver: {name}"
         source = path.read_text(encoding="utf-8")
-        assert "/secure/gpu-fault-bootstrap" not in source, name
-        assert "514385905925" not in source, name
+        assert not site_topology_leaks(source), name
         module = {
             "run_destr001_gpu_reset.py": destr001,
             "run_destr002_hyperpod_reboot.py": destr002,
@@ -142,6 +150,7 @@ def test_selective_predecessor_is_explicitly_skipped(
     assert result["valid"] is True, result
     assert result["execution_allowed"] is True, result
     assert result["evidence_valid"] is False, result
+    assert result["evidence_error"] == "predecessor evidence does not exist", result
     assert result["verdict"] == "SKIPPED_BY_OPERATOR", result
     assert result["execution_scope"] == "selective", result
     assert result["formal_sequence_satisfied"] is False, result
@@ -447,59 +456,6 @@ def test_warm_spare_gpu_holder_is_node_pinned_and_bounded(tmp_path: Path) -> Non
     assert manifest["spec"]["tolerations"] == [{"operator": "Exists"}], manifest
 
 
-def _reset_state() -> dict[str, Any]:
-    waiting = []
-    for operation in (
-        "QUIESCE_GPU_SERVICES",
-        "VERIFY_NO_GPU_CLIENTS",
-        "RESET_GPU",
-        "RESTORE_GPU_SERVICES",
-    ):
-        waiting.append(
-            {
-                "operation": operation,
-                "status": "WAITING",
-                "details": {"mutation_submitted_by_control_plane": False},
-            }
-        )
-    return {
-        "event": {"xid": 46, "evidence_ref": "kmsg://node/boot/1"},
-        "decision": {"official_action": "RESET_GPU"},
-        "workflow": {
-            "status": "SUCCEEDED",
-            "official_steps": [
-                {"operation": operation} for operation in destr001.EXPECTED_STEPS
-            ],
-            "completed_operations": list(destr001.EXPECTED_STEPS),
-            "step_executions": [
-                {
-                    "operation": operation,
-                    "status": "SUCCEEDED",
-                    "adapter_operation_id": f"remote/{operation.lower()}",
-                }
-                for operation in (
-                    "QUIESCE_GPU_SERVICES",
-                    "VERIFY_NO_GPU_CLIENTS",
-                    "RESET_GPU",
-                    "RESTORE_GPU_SERVICES",
-                )
-            ],
-        },
-        "observed_waiting_step_executions": waiting,
-        "commands": [
-            {"status": "SUCCEEDED", "step": {"operation": operation}}
-            for operation in (
-                "MARK_UNSCHEDULABLE",
-                "QUIESCE_GPU_SERVICES",
-                "VERIFY_NO_GPU_CLIENTS",
-                "RESET_GPU",
-                "RESTORE_GPU_SERVICES",
-                "RESTORE_SCHEDULING",
-            )
-        ],
-    }
-
-
 def test_destr001_requires_the_exact_reset_contract() -> None:
     state = _reset_state()
 
@@ -588,12 +544,20 @@ def test_destr002_preflight_and_reboot_contract() -> None:
     }
 
     assert destr002.preflight_probe_errors(probe, "hp-a") == [], probe
+    state["workflow"]["step_executions"] = [
+        {"operation": step["operation"], "status": "SUCCEEDED"}
+        for step in state["workflow"]["official_steps"]
+    ]
     assert (
         destr002.workflow_errors(
             state, expected_artifact="a" * 64, expected_boot_id="boot-old"
         )
         == []
     ), state
+    state["workflow"]["step_executions"].pop()
+    assert destr002.workflow_errors(
+        state, expected_artifact="a" * 64, expected_boot_id="boot-old"
+    ), "a succeeded workflow without the scheduling execution is not a reboot proof"
 
 
 def test_destr002_allows_transient_zero_gpu_capacity_before_validation() -> None:
@@ -661,24 +625,77 @@ def test_destr002_wait_stops_on_terminal_workflow_without_submission(
     assert observed is state
 
 
-def test_destr002_duplicate_replay_requires_exact_submitted_record() -> None:
-    """The replay is a store read from the replacement executor: the record
-    under the command's recorded key must be SUBMITTED with a result and the
-    same request identity. It never submits and never recomputes the key."""
+@pytest.mark.parametrize("record_state", ["SUBMITTED", "INTENDED", "UNKNOWN"])
+def test_destr002_duplicate_replay_requires_exact_submitted_record(
+    record_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sys
+    from types import SimpleNamespace
+    from typing import cast
 
-    source = destr002.STORE_REPLAY_PROBE
-
-    assert "get_hyperpod_submission" in source
-    assert 'record.state == "SUBMITTED"' in source
-    assert "record.result is not None" in source
-    assert "record.request_identity == expected_identity" in source
-    assert 'command["result_details"]["submission_idempotency_key"]' in source
-    assert ".submit(" not in source
-    assert "hyperpod_submission_idempotency_key" not in source
-    assert not hasattr(destr002, "DIRECT_DUPLICATE_REPLAY"), (
-        "DESTR-002 no longer ships the direct duplicate-replay probe"
+    import gpu_fault.cluster_executor as executor_module
+    from gpu_fault.hyperpod import (
+        HyperPodAction,
+        HyperPodAdapterConfig,
+        HyperPodLifecycleAdapter,
+        HyperPodSubmissionRecord,
+        HyperPodSubmissionResult,
     )
-    assert "hyperpod_submission_idempotency_key" in live_fixture_module.STORE_PROBE
+
+    outcome = HyperPodSubmissionResult(
+        idempotency_key="key-a",
+        action=HyperPodAction.REBOOT,
+        cluster_name="cluster-a",
+        requested_node_logical_ids=["node-a"],
+        successful_node_logical_ids=["node-a"],
+    )
+    record = HyperPodSubmissionRecord(
+        cluster_name="cluster-a",
+        idempotency_key="key-a",
+        action=HyperPodAction.REBOOT,
+        requested_node_identifiers=["node-a"],
+        state=record_state,
+        result=outcome,
+    )
+    reads: list[tuple[str, str]] = []
+
+    def get(cluster: str, key: str) -> HyperPodSubmissionRecord:
+        reads.append((cluster, key))
+        return record
+
+    class Provider:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"replay attempted provider access: {name}")
+
+    lifecycle = HyperPodLifecycleAdapter(
+        HyperPodAdapterConfig(cluster_name="cluster-a"),
+        client=cast(Any, Provider()),
+        store=SimpleNamespace(get_hyperpod_submission=get),
+    )
+    executor = SimpleNamespace(
+        adapters=[
+            SimpleNamespace(
+                owner="gpu-fault-hyperpod-adapter",
+                dispatcher=SimpleNamespace(adapter=lifecycle),
+            )
+        ]
+    )
+    monkeypatch.setattr(executor_module, "executor_from_environment", lambda: executor)
+    command = {
+        "step": {"node_ids": ["node-a"]},
+        "result_details": {"submission_idempotency_key": "key-a"},
+    }
+    monkeypatch.setattr(sys, "argv", ["probe", json.dumps(command)])
+
+    exec(destr002.STORE_REPLAY_PROBE, {"__name__": "isolated_test_probe"})
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["duplicate"] is (record_state == "SUBMITTED"), result
+    assert reads == [("cluster-a", "key-a")] * (
+        2 if record_state == "SUBMITTED" else 1
+    ), reads
 
 
 def test_destr002_redacts_lease_tokens_from_evidence() -> None:
@@ -843,66 +860,8 @@ def test_destr003_rejects_a_restart_that_reported_no_gpu_counts(tmp_path: Path) 
     assert not [item for item in errors if "count is not" in item], errors
 
 
-def _restart_state(gpu_count: int) -> dict[str, Any]:
-    waiting: list[dict[str, Any]] = []
-    executions: list[dict[str, Any]] = []
-    for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD"):
-        waiting.append(
-            {
-                "operation": operation,
-                "status": "WAITING",
-                "details": {"mutation_submitted_by_control_plane": False},
-            }
-        )
-        details: dict[str, Any] = {}
-        if operation == "RESTART_WORKLOAD":
-            details = {
-                "notification_context": {
-                    "source_gpu_count": gpu_count,
-                    "target_gpu_count": gpu_count,
-                    "restart_count": 1,
-                }
-            }
-        executions.append(
-            {
-                "operation": operation,
-                "status": "SUCCEEDED",
-                "adapter_operation_id": f"remote/{operation.lower()}",
-                "details": details,
-            }
-        )
-    return {
-        "event": {"xid": 11},
-        "decision": {"official_action": "RESTART_APP"},
-        "workflow": {
-            "status": "SUCCEEDED",
-            "official_steps": [
-                {
-                    "operation": "FREEZE_EVIDENCE",
-                    "execution_owner": "gpu-fault-control-plane",
-                },
-                {
-                    "operation": "STOP_WORKLOADS",
-                    "execution_owner": "gpu-fault-kubernetes-adapter",
-                },
-                {
-                    "operation": "RESTART_WORKLOAD",
-                    "execution_owner": "gpu-fault-kubernetes-adapter",
-                },
-            ],
-            "step_executions": executions,
-        },
-        "observed_waiting_step_executions": waiting,
-        "commands": [
-            {"status": "SUCCEEDED", "step": {"operation": operation}}
-            for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD")
-        ],
-        "restart_budget": {"budget": 1, "restart_count": 1},
-    }
-
-
 def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
-    state = _restart_state(24)
+    state = restart_state(24)
 
     assert destr009.workflow_errors(state, expected_gpu_count=24) == [], state
     # COLLECT-016 A reaches the same RESTART_APP contract from a real kmsg
@@ -919,7 +878,7 @@ def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
 
 
 def test_destr009_accepts_fast_remote_step_terminal_evidence() -> None:
-    state = _restart_state(24)
+    state = restart_state(24)
     state["observed_waiting_step_executions"] = [
         item
         for item in state["observed_waiting_step_executions"]
@@ -930,7 +889,7 @@ def test_destr009_accepts_fast_remote_step_terminal_evidence() -> None:
 
 
 def test_destr009_rejects_fast_step_without_remote_command_evidence() -> None:
-    state = _restart_state(24)
+    state = restart_state(24)
     state["observed_waiting_step_executions"] = []
     state["commands"] = [
         item
@@ -1225,28 +1184,6 @@ def test_destr012_keeps_group_c_optional_and_isolated(
     )
 
 
-def _runtime_identity(*, phase: str = "complete") -> dict[str, Any]:
-    deployments = {}
-    for plane, names in live_fixture_module.RUNTIME_IDENTITY_DEPLOYMENTS.items():
-        deployments[plane] = {
-            name: {
-                "generation": 1,
-                "desired_replicas": 2,
-                "observed_generation": 1,
-                "updated_replicas": 2,
-                "ready_replicas": 2,
-                "available_replicas": 2,
-                "template_sha256": "a" * 64,
-                "images": ["registry.example/runtime@sha256:" + "b" * 64],
-            }
-            for name in names
-        }
-    return {
-        "release_state": {"release_id": "release-a", "phase": phase},
-        "deployments": deployments,
-    }
-
-
 def test_runtime_identity_rejects_active_release_rollback() -> None:
     errors = runtime_identity_errors(
         _runtime_identity(phase="rollback-controller-staged")
@@ -1265,6 +1202,45 @@ def test_runtime_identity_rejects_incomplete_runtime_rollout() -> None:
         "gpu/gpu-fault-cluster-executor is not fully rolled out" in error
         for error in errors
     ), errors
+
+
+def test_selective_predecessor_still_reports_the_evidence_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(EXECUTION_SCOPE_ENV, "selective")
+    monkeypatch.setenv(SELECTION_REFERENCE_ENV, "CHG-DESTR012-SELECTIVE")
+    path = tmp_path / "predecessor.json"
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": "GF-REGIONAL-DESTR-009",
+                "verdict": "PASS",
+                "execution_scope": "selective",
+                "release_id": "release-a",
+                "cluster_id": "cluster-a",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bound = predecessor_evidence(
+        path, "GF-REGIONAL-DESTR-009", release_id="release-a", cluster_id="cluster-a"
+    )
+    assert bound["verdict"] == "SKIPPED_BY_OPERATOR", bound
+    assert bound["valid"] is True and bound["execution_allowed"] is True, bound
+    assert bound["evidence_valid"] is True, bound
+    assert bound["evidence_verdict"] == "PASS", bound
+    assert bound["evidence_error"] is None, bound
+    assert bound["formal_sequence_satisfied"] is False, bound
+    assert len(bound["evidence_sha256"]) == 64, bound
+
+    foreign = predecessor_evidence(
+        path, "GF-REGIONAL-DESTR-009", release_id="release-b", cluster_id="cluster-a"
+    )
+    assert foreign["verdict"] == "SKIPPED_BY_OPERATOR", foreign
+    assert foreign["valid"] is True, foreign
+    assert foreign["evidence_valid"] is False, foreign
+    assert foreign["evidence_error"] == "release_id mismatch", foreign
 
 
 def test_runtime_identity_verification_records_and_rejects_drift(
@@ -1405,26 +1381,54 @@ def test_collect004_restores_the_collector_env_through_a_fresh_probe_after_a_reb
     None
 ):
     calls: list[str] = []
+    owner_nonce = "a" * 32
+    arguments = (
+        "restore-collector-env",
+        "--run-id",
+        "collect004-fixture-a1",
+        "--owner-nonce",
+        owner_nonce,
+    )
 
     class Collector:
         def __init__(self) -> None:
             self.alive = False
 
-        def execute(self, *arguments: str, timeout: int = 180) -> dict:
+        def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+            assert timeout == 300
             calls.append("execute" if self.alive else "execute-dead")
             if not self.alive:
-                raise HostProbeError("cannot exec into a container in a completed pod")
+                raise HostProbeTransportError(
+                    "cannot exec into a container in a completed pod"
+                )
             return {"restored": True, "arguments": arguments}
 
         def recreate(self) -> None:
             calls.append("recreate")
             self.alive = True
 
-    result = collector_destructive.restore_collector_env(Collector(), "c004-1")
+    def reboot_transition() -> bool:
+        calls.append("reboot-binding")
+        return True
 
+    collector = Collector()
+    result = collector_destructive.restore_collector_env(
+        collector,
+        "collect004-fixture-a1",
+        owner_nonce=owner_nonce,
+        reboot_transition=reboot_transition,
+    )
+
+    assert result["deferred"] is True and result["restored"] is False
+    assert calls == ["execute-dead", "reboot-binding"]
+    collector.recreate()
+    result = collector_destructive.restore_collector_env(
+        collector, "collect004-fixture-a1", owner_nonce=owner_nonce
+    )
     assert result["restored"] is True, result
-    assert calls == ["execute-dead", "recreate", "execute"], (
-        "the dead Pod is replaced exactly once and the restore then goes through it"
+    assert result["arguments"] == arguments
+    assert calls == ["execute-dead", "reboot-binding", "recreate", "execute"], (
+        "only the post-reboot caller replaces the probe and retries restoration"
     )
 
 
@@ -1441,36 +1445,8 @@ def test_reset_contract_is_parametrised_for_the_xid48_companion_drill() -> None:
     assert "policy did not finalize XID 46 as RESET_GPU" in errors, errors
 
 
-def _reset_host_pair(
-    *, minimum: int, last: int, journal_resets: int = 0
-) -> tuple[dict, dict]:
-    ledger_before = [
-        {"command_id": "cmd-old", "operation": "QUIESCE_GPU_SERVICES", "attempt": 1}
-    ]
-    baseline = {
-        "gpu_inventory": [{"pci_bdf": f"0000:{index:02x}:00.0"} for index in range(8)],
-        "ledger": list(ledger_before),
-        "services": {"kubelet.service": {"ActiveState": "active"}},
-        "gpu_fault_timers": ["gpu-fault-certificate-check.timer"],
-    }
-    after = {
-        **baseline,
-        "compute_clients": [],
-        "quiesce_states": [],
-        "ledger": ledger_before
-        + [{"command_id": "cmd-reset", "operation": "RESET_GPU", "attempt": 1}],
-        "kernel_reset_journal": {"target_reset_count": journal_resets},
-        "sampler": {
-            "sample_count": 40,
-            "min_gpu_count": minimum,
-            "last": {"gpu_count": last},
-        },
-    }
-    return baseline, after
-
-
 def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> None:
-    baseline, after = _reset_host_pair(minimum=7, last=8)
+    baseline, after = reset_host_pair(minimum=7, last=8)
     assert (
         destr001.host_errors(
             baseline, after, expected_gpu_count=8, target_bdf="0000:59:00"
@@ -1478,13 +1454,13 @@ def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> No
         == []
     )
 
-    baseline, flat = _reset_host_pair(minimum=8, last=8)
+    baseline, flat = reset_host_pair(minimum=8, last=8)
     errors = destr001.host_errors(
         baseline, flat, expected_gpu_count=8, target_bdf="0000:59:00"
     )
     assert any("leave and return" in error for error in errors), errors
 
-    baseline, twice = _reset_host_pair(minimum=7, last=8, journal_resets=2)
+    baseline, twice = reset_host_pair(minimum=7, last=8, journal_resets=2)
     errors = destr001.host_errors(
         baseline, twice, expected_gpu_count=8, target_bdf="0000:59:00"
     )

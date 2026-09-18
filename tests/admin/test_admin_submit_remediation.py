@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,7 +89,12 @@ def _inspection(**overrides) -> dict:
 def _nodes(annotations: dict | None = None) -> dict:
     return {
         "node-a": {
-            "metadata": {"name": "node-a", "annotations": dict(annotations or {})},
+            "metadata": {
+                "name": "node-a",
+                "uid": "uid-node-a",
+                "resourceVersion": "17",
+                "annotations": dict(annotations or {}),
+            },
             "spec": {},
         }
     }
@@ -299,7 +305,7 @@ class Harness:
         monkeypatch.setattr(
             module, "gpu_kubectl_command", lambda site, target: ["kubectl"]
         )
-        monkeypatch.setattr(module.subprocess, "run", run)
+        monkeypatch.setattr(module, "run_command", run)
         monkeypatch.setattr(module, "submit_operator_action", submit)
 
     def decision(
@@ -363,6 +369,7 @@ def test_inspected_annotates_the_node_and_is_a_no_op_the_second_time(
             "node-a",
             f"{ANNOTATION_MECHANICAL_INSPECTION_COMPLETE}={INCIDENT}:7",
             "--overwrite",
+            "--resource-version=17",
         ]
     ]
     assert first.no_op is False
@@ -375,6 +382,59 @@ def test_inspected_annotates_the_node_and_is_a_no_op_the_second_time(
     assert second.no_op is True
     assert "already acknowledged" in second.message
     assert len(harness.evidence()) == 2
+
+
+def test_annotation_conflict_stops_the_operator_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+
+    def conflict(arguments, **kwargs):
+        assert "--resource-version=17" in arguments
+        assert kwargs["timeout_seconds"] == 120
+        return SimpleNamespace(returncode=1, stderr="resource version conflict")
+
+    monkeypatch.setattr(module, "run_command", conflict)
+    with pytest.raises(BootstrapError, match="cannot annotate node node-a") as failure:
+        harness.submit("reboot-node", reference="CHG-1")
+    assert "resource version conflict" not in str(failure.value)
+    assert "redacted" in str(failure.value)
+    assert harness.submissions == []
+    assert harness.evidence() == []
+
+
+def test_annotation_failure_does_not_expose_credential_helper_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    marker = "synthetic-unstructured-auth-value-13579"
+    monkeypatch.setattr(
+        module,
+        "run_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stderr=f"Forbidden: exec helper failed\n{marker}"
+        ),
+    )
+    with pytest.raises(BootstrapError) as failure:
+        harness.submit("inspected")
+    message = str(failure.value)
+    assert marker not in message
+    assert "Forbidden" in message
+    assert "redacted" in message
+    assert harness.annotations == []
+    assert harness.submissions == []
+    assert harness.evidence() == []
+
+
+@pytest.mark.parametrize("missing", ["uid", "resourceVersion"])
+def test_acknowledgement_refuses_incomplete_node_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    del harness.nodes["node-a"]["metadata"][missing]
+    with pytest.raises(BootstrapError, match="node identity is incomplete"):
+        harness.submit("inspected")
+    assert harness.annotations == []
 
 
 def test_hardware_disposition_acknowledges_then_submits_marker_and_terminal(
@@ -616,6 +676,46 @@ def _restore_plan(inspection: dict | None = None, nodes: dict | None = None):
         reference="CHG-R1",
         live_nodes=_quarantined_nodes() if nodes is None else nodes,
         now=NOW,
+    )
+
+
+@pytest.mark.parametrize("plan_only", [False, True])
+def test_remediation_reads_the_locked_site_only_for_mutating_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan_only: bool
+) -> None:
+    original = _site(tmp_path)
+    current = _site(tmp_path)
+    events = []
+
+    @contextmanager
+    def lock(path):
+        assert path == tmp_path
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def reload(site):
+        assert site is original and events == ["lock"]
+        events.append("reload")
+        return current
+
+    def submit(request):
+        assert request.site is (original if plan_only else current)
+        assert events == ([] if plan_only else ["lock", "reload"])
+        events.append("submit")
+        return module.SubmissionResult(plan=_build("inspected"))
+
+    monkeypatch.setattr(module, "administrator_operation_lock", lock)
+    monkeypatch.setattr(module, "reload_site_for_mutation", reload)
+    monkeypatch.setattr(module, "submit_remediation", submit)
+    arguments = SimpleNamespace(
+        incident_id=INCIDENT, disposition="inspected", reference="CHG-1", plan=plan_only
+    )
+    assert module.run_submit_remediation_command(arguments, site=original) == 0
+    assert events == (
+        ["submit"] if plan_only else ["lock", "reload", "submit", "unlock"]
     )
 
 

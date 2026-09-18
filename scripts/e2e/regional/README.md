@@ -94,6 +94,7 @@ them would turn every `--plan` into an execute against a real node.
 - `run_destr009_workload_restart.py`
 - `run_destr010_fabric_manager_restart.py`
 - `run_destr012_managed_recovery_guard.py`
+- `run_destr014_branch_exhaustion.py`
 - `run_destr015_parallel_branch_join.py`
 - `run_destr016_preempting_reboot.py`
 - `run_destr017_out_of_band_reboot_fence.py`
@@ -154,6 +155,34 @@ PREEMPT-001..009; with `--run-dir` (and `--release-id`) it writes
 `GPU_FAULT_E2E001_EVIDENCE_DIR`) and `--trusted-cpu-baseline` to that
 directory's `cpu-nodes-before.json` (or `GPU_FAULT_TRUSTED_CPU_BASELINE`).
 
+### Collector development layers
+
+Run the non-live layers before a COLLECT-004 live attempt:
+
+```bash
+make collect004-check
+make collector-recovery-check
+make collector-platform-check
+```
+
+The first uses the real inventory Collector with a private sink and tests the
+finite publisher and product-workflow evidence separately. The second exercises
+legacy env-recovery, transport loss and ownership contracts without host actions.
+The explicit platform target uses only a uniquely owned temporary user-systemd
+service and a read-only, network-disabled Docker container. It requires an active
+user systemd manager, Docker and a local `python:3.12.14-slim` image; it fails if
+they are absent and never downloads tools or changes production services.
+These checks do not prove a physical reboot or mark any live case PASS.
+
+The COLLECT-004 live path no longer edits production `collector.env` or restarts
+the production Host Collector. A separate Collector instance captures two
+inventory batches into a non-forwarding sink. After sampling returns, the runner
+saves their identities and explicitly publishes the unchanged batches through
+the real collector endpoint. Unknown publication responses are resolved through
+durable evidence without republishing. The full scoped reboot, single-workflow,
+unchanged-config, provider and cleanup assertions remain mandatory. Old override
+journals retain their original guarded recovery path.
+
 ### Flags and defaults that changed with the 2026-09 runner review
 
 - `run_workload_acceptance.py --skip-admin-status`: `gpu-fault-admin status`
@@ -163,7 +192,7 @@ directory's `cpu-nodes-before.json` (or `GPU_FAULT_TRUSTED_CPU_BASELINE`).
 - `run_collector_destructive.py --xid {109,62}` (COLLECT-013, default `109`):
   one kmsg injection, one real single-GPU reset per run. `--debounce-tolerance`
   (COLLECT-004, default `0.5`) is the allowed fraction above
-  `samples x interval` for the debounced finding.
+  `(required_samples - 1) x interval` from the first sample to the threshold.
 - `audit_destr013_replacement_invariant.py` now needs a CPU kubeconfig
   (`--cpu-kubeconfig/--cpu-context`, or `GPU_FAULT_CONTROL_KUBECONFIG` /
   `CPU_KUBECONFIG`): it reads every running API replica and fails if any still
@@ -175,9 +204,9 @@ directory's `cpu-nodes-before.json` (or `GPU_FAULT_TRUSTED_CPU_BASELINE`).
   `cloudtrail_provisional: true`; `--expect-no-reboots` declares that the run
   drove no reboot case, otherwise zero `BatchRebootClusterNodes` events are
   read as a wrong region or wrong hours, not as a clean cluster.
-- `run_boot_acceptance.py --also-record-boot021` (BOOT-012 only): the executor
-  readiness matrix BOOT-012 ran is also written as `GF-REGIONAL-BOOT-021`
-  evidence under `--run-dir`.
+- BOOT-021 runs at its own formal position with fresh bound readiness evidence.
+  BOOT-012 does not write a future BOOT-021 PASS; the former
+  `--also-record-boot021` option is no longer accepted.
 - `run_capacity_acceptance.py --b-latency-factor` (CAP-001, default `2.0`):
   the storm-phase cluster B p95 may be at most this multiple of the B-only
   baseline p95.
@@ -306,11 +335,24 @@ Current classification:
   site after live identity verification unless explicitly retained.
 - AUTH-007/010/012..015 and ISO-003..005 share
   `run_identity_acceptance.py`. Registry, token and key documents remain only
-  in memory and are restored in `finally`; Secret values never enter evidence.
+  in controlled memory/files; Secret values never enter evidence.
+  AUTH-015 consumes prospective independently signed custody and the actual
+  rotated-key activation chain. It does not rotate or restore Secrets, create
+  host probes, or use a snapshot as historical custody. Initial activation is
+  only a prerequisite; complete PASS requires a later authorized/deployed
+  rotation and exact new/old/sibling-key command/result-query controls.
+  See [Node Key Custody Evidence](../../../docs/components/node-key-custody-evidence.md)
+  for explicit administrator enrollment and descriptor formats.
   AUTH-013's per-node certificate-timer reading is
   `probes/auth013_certificate_probe.py`, a node-pinned host probe run through
   `host_probe_fixture.py`. AUTH-001..006/008/009/011 are the live matrix of
   `audit_auth_boundary.py`.
+- DESTR-014 uses a persistent, independently acknowledged systemd recovery
+  service/timer rather than an ordinary transient timer. The original
+  Node/boot/runtime binding, enable-link inode and fixed restore/expiry times
+  govern disable and restoration. Existing attempts only resume cleanup;
+  unbound legacy Agent disable/restore commands refuse. Local process/reboot
+  simulations are not LIVE acceptance.
 - WORKLOAD-001/002, ISO-001 and E2E-001 share
   `run_workload_acceptance.py`. It owns prewarm, managed submission,
   observation checks and workload cleanup. E2E-001 emits the execution card
@@ -388,6 +430,15 @@ Current classification:
   join that restarts the job once, and both nodes schedulable afterwards.
   Its verdicts live in `destr015_verdicts.py`; a node a failed branch left
   isolated is restored only through the validation-first workflow.
+- The physical late-ownership companion in `run_late_ownership_acceptance.py`
+  is a separately approved manual session after ordinary DESTR-015 PASS and
+  cleanup. It requires explicit `--ordinary-destr015-evidence` and retains the
+  DESTR-012 `--predecessor-evidence` check. Run the three variants once under
+  canonical DESTR-015 with separate non-nested directories; PREEMPT-033 references
+  the same mechanism evidence. Native post-queue checks and independent exec
+  traces establish the controlled pre-permit boundary, not atomic Kubernetes
+  read-to-syscall fencing. See
+  [the companion contract](../../../docs/components/late-ownership-acceptance.md).
 - DESTR-016 has a reusable manual live driver for the second fault that arrives
   while a physical step is already in progress. It requires DESTR-002 PASS,
   pins one idle GPU node, and writes one XID 46 through the shared host probe
@@ -570,6 +621,13 @@ Current classification:
   produce a PASS verdict. Both use the execution-token protected synthetic
   replacement signal to drive the real workflow and real Kubernetes
   mutations, and explicitly do not claim a real hardware fault.
+  All DESTR-008 requests carry solely inhibiting `activation_forbidden=true`;
+  protocol-3 or older Executors cannot claim them. Expiring fixtures require
+  the independent CPU cancellation Job and Node-bound GPU fence before setup.
+  Real source completion and command/workflow quiescence precede fence/observer
+  retirement and fixture restoration. Unknown POST/create ACKs never authorize
+  a retry or metadata adoption. Existing runs enter cleanup only and cannot
+  reissue PASS. See [Cancellation And Inhibition](../../../docs/components/destr008-cancellation.md).
 - HA-003/004 have reusable destructive live drivers. HA-003 triggers Aurora
   failover only after the real RESET_GPU command is observed in flight (LEASED,
   or WAITING while the Node Agent executes) and is `INCONCLUSIVE` rather than

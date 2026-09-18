@@ -765,11 +765,14 @@ def test_the_counter_drift_alert_reads_both_drift_gauges_over_a_window() -> None
     """A single scrape can straddle a batch commit; five minutes of drift cannot."""
     expression = _expression("GpuFaultProcessorCounterDrift")
 
-    assert "min_over_time(gpu_fault_processor_counter_drift_abs[5m])" in expression
-    assert (
-        "min_over_time(gpu_fault_processor_counter_mismatched_clusters[5m])"
-        in expression
+    assert expression.startswith("min_over_time(("), (
+        "the drift stability window must wrap the coherent current-scan view"
     )
+    assert "gpu_fault_processor_counter_drift_abs" in expression
+    assert "gpu_fault_processor_counter_mismatched_clusters" in expression
+    assert "gpu_fault_processor_counter_drift_scan_timestamp_seconds" in expression
+    assert "gpu_fault_processor_counter_drift_scan_max_age_seconds" in expression
+    assert "[5m:1m]" in expression, "stability is measured after latest-scan selection"
 
 
 def test_the_batch3_alerts_are_not_a_severity_of_their_own() -> None:
@@ -1012,7 +1015,7 @@ def test_the_consumer_loop_has_a_per_pod_stall_alert() -> None:
 def test_the_review_counters_each_have_an_alert() -> None:
     expectations = {
         "GpuFaultRemoteCommandStaleFenceSwept": (
-            'gpu_fault_periodic_cleanup_rows_total{job="stale_fence_remote_commands"}'
+            'gpu_fault_periodic_cleanup_rows_total{periodic_job="stale_fence_remote_commands"}'
         ),
         "GpuFaultNotificationDeliveryErrors": "gpu_fault_notification_delivery_errors_total",
         "GpuFaultControlRecordArchiveErrors": "gpu_fault_control_record_archive_errors_total",

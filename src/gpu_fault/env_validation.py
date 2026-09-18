@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from functools import cache
 from importlib.resources import files
@@ -151,6 +152,9 @@ def invalid_gpu_fault_environment_values(
                 )
             else:
                 # A parsable value can still be one the reading code refuses.
+                if kind == "number" and not math.isfinite(number):
+                    problems.append(f"{name} must be finite")
+                    continue
                 out_of_range = _out_of_range(name, number)
                 if out_of_range is not None:
                     problems.append(out_of_range)

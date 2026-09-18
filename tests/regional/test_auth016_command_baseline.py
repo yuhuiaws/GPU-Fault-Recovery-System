@@ -107,19 +107,17 @@ def test_a_purge_failure_does_not_hide_the_case_failure(tmp_path: Path) -> None:
             pass
 
 
-def test_run_auth016_opens_the_seed_before_the_baseline_probe_and_verdict() -> None:
-    """The seed must exist when REMOTE_STATUS_PROBE takes the baseline and still
-    when the verdict re-reads it, so both sit inside the ``with``."""
+def test_run_auth016_does_not_seed_an_unrelated_synthetic_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.regional._security_token_rotation_support import RotationWorld
 
-    source = Path(auth.__file__).read_text(encoding="utf-8")
-    body = source[source.index("def run_auth016(") : source.index("TLS_BOUNDARY_PROBE")]
-    opened = body.index("with SeededBaseline.open(primary.cpu_python, case_dir):")
-    assert opened < body.index(
-        "before_commands = primary.cpu_python(REMOTE_STATUS_PROBE)"
+    world = RotationWorld(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        baseline.SeededBaseline,
+        "open",
+        lambda *_a: pytest.fail("rotation must not write an unrelated synthetic seed"),
     )
-    verdict_line = next(
-        line for line in body.splitlines() if "return auth016_result(" in line
-    )
-    assert verdict_line.startswith("        return"), (
-        "the verdict is computed outside the with, after the seed was purged"
-    )
+    result = auth.run_auth016(world.site, world.target, case_dir=tmp_path)
+    assert result["verdict"] == "PASS"
+    assert result["checks"]["full_production_lifecycle"] is True

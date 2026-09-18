@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
 )
+from gpu_fault_release.regional_release_preflight import preflight_retired_collectors
 
 
 def preflight_upgrade_mutations(
@@ -22,7 +25,9 @@ def preflight_upgrade_mutations(
         )
         if plan.has(component)
     )
-    for target in release.config.clusters:
+
+    def preflight(target: Any) -> None:
+        preflight_retired_collectors(release, target)
         if plan.has(ReleaseComponent.DCGM):
             release._preflight_gpu_dcgm_exporter(target)
         if plan.has(ReleaseComponent.OBSERVABILITY):
@@ -42,3 +47,13 @@ def preflight_upgrade_mutations(
                 artifact_sha=release.node_wheel_sha,
                 config_digest=release.config.agent_config_digest,
             )
+
+    targets = release.config.clusters
+    if not targets:
+        return
+    with ThreadPoolExecutor(
+        max_workers=min(DEPLOY_CONCURRENCY.candidate_clusters, len(targets))
+    ) as executor:
+        futures = [executor.submit(preflight, target) for target in targets]
+        for future in futures:
+            future.result()

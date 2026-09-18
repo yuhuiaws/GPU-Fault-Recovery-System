@@ -32,6 +32,7 @@ from gpu_fault.admin.bootstrap_common import (
     ReadOnlyProbeRunner,
     run_parallel,
 )
+from gpu_fault.admin.bootstrap_task_inputs import task_input_spec
 from gpu_fault.admin.notifications import NotificationRouting
 from tests.admin._bootstrap_support import _cluster
 
@@ -61,6 +62,12 @@ def _state(
     tmp_path: Path, *, completed: dict[str, Any] | None = None
 ) -> BootstrapState:
     state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
+    state.bind_inputs(
+        "test-inputs",
+        dict.fromkeys(
+            FOUNDATION_TASKS | PLATFORM_TASKS | {"pod_identity_agent"}, "fixture"
+        ),
+    )
     for name, value in (completed or {}).items():
         state.record(name, value)
         state.complete(name)
@@ -149,6 +156,7 @@ def _platform_graph(
     log: list[tuple[str, bool, bool]],
     *,
     ensure_aurora_ready: Callable[..., Any] | None = None,
+    release: Callable[[], dict[str, Any]] | None = None,
 ) -> bootstrap_tasks.TaskGraph:
     return bootstrap_tasks.platform_task_graph(
         runner=CommandRunner(),
@@ -161,10 +169,13 @@ def _platform_graph(
         namespace="gpu-fault-system",
         site_id="site-a",
         alert_email=None,
-        release=lambda: {
-            "manifest": str(tmp_path / "manifest.json"),
-            "images": {"adot": "adot:1", "runtime": "runtime:1"},
-        },
+        release=release
+        or (
+            lambda: {
+                "manifest": str(tmp_path / "manifest.json"),
+                "images": {"adot": "adot:1", "runtime": "runtime:1"},
+            }
+        ),
         fleet_master_file=tmp_path / "master",
         ensure_aurora_ready=ensure_aurora_ready or Recorder("aurora_ready", log),
     )
@@ -402,6 +413,8 @@ FOUNDATION_REPROVED = {
 }
 # ``_platform_graph`` provisions node keys for two GPU clusters.
 PLATFORM_TASKS = {
+    "release",
+    "grafana_install",
     "monitoring_install",
     "aurora_ready",
     "aurora_refresh",
@@ -753,15 +766,13 @@ def test_a_completed_graph_reruns_only_what_a_probe_re_proves(
     assert results["aurora"] == {"task": "aurora"}, "a one-time task was re-entered"
 
 
-def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
+def test_runtime_iam_preparation_does_not_wait_for_the_release_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The signed release is built beside the graph, not before it.
 
-    ``monitoring_install`` and ``aurora_refresh`` ship an image, so they read
-    the release and block until it is built; ``node_keys:*`` and
-    ``aurora_ready`` need nothing from it and must not wait. Here the release
-    "build" refuses to finish until both node-key tasks have started.
+    The platform graph prepares identities only. The release cannot finish
+    until node keys and both runtime IAM tasks have started.
     """
 
     log: list[tuple[str, bool, bool]] = []
@@ -769,6 +780,7 @@ def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
     _stub_platform_services(monkeypatch, log)
     node_keys_started = {"gpu-a": threading.Event(), "gpu-b": threading.Event()}
     release_read_from: list[str] = []
+    iam_started = {"monitoring": threading.Event(), "refresh": threading.Event()}
 
     def node_keys(_runner: CommandRunner, **keywords: Any) -> dict:
         node_keys_started[keywords["cluster_id"]].set()
@@ -780,6 +792,9 @@ def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
         assert all(event.wait(timeout=5) for event in node_keys_started.values()), (
             "node keys waited for the release build"
         )
+        assert all(event.wait(timeout=5) for event in iam_started.values()), (
+            "runtime IAM preparation waited for the release build"
+        )
         return {
             "manifest": str(tmp_path / "manifest.json"),
             "images": {"adot": "adot:lazy", "runtime": "runtime:lazy"},
@@ -787,9 +802,18 @@ def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
 
     monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
     monitoring = Recorder("install_monitoring", log)
-    monkeypatch.setattr(bootstrap_services, "install_monitoring", monitoring)
     refresh = Recorder("install_aurora_refresh", log)
-    monkeypatch.setattr(bootstrap_services, "install_aurora_refresh", refresh)
+
+    def prepare_monitoring(*args: Any, **kwargs: Any) -> dict:
+        iam_started["monitoring"].set()
+        return monitoring(*args, **kwargs)
+
+    def prepare_refresh(*args: Any, **kwargs: Any) -> dict:
+        iam_started["refresh"].set()
+        return refresh(*args, **kwargs)
+
+    monkeypatch.setattr(bootstrap_services, "install_monitoring", prepare_monitoring)
+    monkeypatch.setattr(bootstrap_services, "install_aurora_refresh", prepare_refresh)
     state = _state(tmp_path)
 
     bootstrap_tasks.run_bootstrap_tasks(
@@ -812,16 +836,207 @@ def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
         ),
     )
 
-    assert monitoring.keywords[0]["adot_image"] == "adot:lazy", (
-        "monitoring ships the image the lazily built release names"
+    assert monitoring.keywords[0]["runtime_managed_by_release"] is True, (
+        "bootstrap must not install versioned monitoring"
     )
-    assert refresh.keywords[0]["runtime_image"] == "runtime:lazy", (
-        "the credential refresh renders the lazily built runtime image"
+    assert refresh.keywords[0]["runtime_managed_by_release"] is True, (
+        "bootstrap must not install the versioned refresher"
     )
-    assert str(refresh.keywords[0]["release_manifest"]).endswith("manifest.json"), (
-        "the manifest path comes from the built release"
+    assert monitoring.keywords[0]["adot_image"] == "", (
+        "IAM preparation must not consume the candidate image"
     )
-    assert release_read_from, "the image-shipping tasks read the release"
+    assert refresh.keywords[0]["runtime_image"] == "", (
+        "refresher IAM preparation must not consume the candidate image"
+    )
+    assert len(release_read_from) == 1, "only the build join reads the release"
     assert all("MainThread" != name for name in release_read_from), (
         "the release is read on the task's own worker thread, not the caller's"
     )
+
+
+def test_release_binding_does_not_invalidate_prepared_runtime_iam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log: list[tuple[str, bool, bool]] = []
+    _stub_platform_services(monkeypatch, log)
+    state = _state(tmp_path, completed=FOUNDATION_RESULTS)
+    previous = {"monitoring_install": "iam", "aurora_refresh": "iam"}
+    state.bind_inputs("old", {**state.value["task_input_sha256"], **previous})
+    for name, value in FOUNDATION_RESULTS.items():
+        state.record(name, value)
+        state.complete(name)
+    for name in previous:
+        state.record(name, {"previous": True})
+        state.complete(name)
+    node_key_started = threading.Event()
+    bound = threading.Event()
+
+    def node_keys(_runner: CommandRunner, **_keywords: Any) -> dict:
+        node_key_started.set()
+        return {}
+
+    def release() -> dict[str, Any]:
+        assert node_key_started.wait(timeout=5), (
+            "node-key provisioning was serialized behind the release build"
+        )
+        if not bound.is_set():
+            state.bind_inputs(
+                "new",
+                {**state.value["task_input_sha256"], "release": "new"},
+                partial=True,
+            )
+            bound.set()
+        return {
+            "manifest": str(tmp_path / "release.json"),
+            "images": {"adot": "adot:new", "runtime": "runtime:new"},
+        }
+
+    monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
+    _platform_graph(tmp_path, state, log, release=release).run(state=state)
+
+    assert bound.is_set(), "the candidate inputs were not bound"
+    assert ("install_monitoring", True, True) in log, (
+        "a release change must only re-prove unchanged monitoring IAM"
+    )
+    assert ("install_aurora_refresh", True, True) in log, (
+        "a release change must only re-prove unchanged refresher IAM"
+    )
+    assert not any(
+        name in {"install_monitoring", "install_aurora_refresh"} and not read_only
+        for name, read_only, _ in log
+    ), "the release build caused duplicate runtime IAM preparation"
+
+
+def test_prebuild_input_binding_preserves_only_unbound_release_tasks(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path)
+    previous = {"pki": "old", "aurora": "same", "monitoring_install": "old-image"}
+    state.bind_inputs("old", previous)
+    for name in previous:
+        state.record(name, {})
+        state.complete(name)
+
+    state.bind_inputs("prebuild", {"pki": "new", "aurora": "same"}, partial=True)
+
+    assert not state.is_complete("pki"), "changed foundation inputs remained reusable"
+    assert state.is_complete("aurora"), "unchanged foundation work was invalidated"
+    assert state.is_complete("monitoring_install"), (
+        "unresolved release inputs were invalidated before the build"
+    )
+    state.bind_inputs("built", {**previous, "pki": "new", "monitoring_install": "new"})
+    assert not state.is_complete("monitoring_install"), "new image kept old checkpoint"
+    assert state.is_complete("aurora"), "image binding invalidated unchanged Aurora"
+
+
+def test_aurora_starts_after_cpu_access_without_waiting_for_gpu_or_pod_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log: list[tuple[str, bool, bool]] = []
+    _stub_foundation_services(monkeypatch, log)
+    _stub_platform_services(monkeypatch, log)
+    cpu_ready = threading.Event()
+    aurora_started = threading.Event()
+
+    def cpu_access() -> dict:
+        cpu_ready.set()
+        return {}
+
+    def slow_access() -> dict:
+        assert aurora_started.wait(5), "Aurora still waits for unrelated access chains"
+        return {}
+
+    def aurora(*_args: Any, **_kwargs: Any) -> dict:
+        assert cpu_ready.is_set(), "Aurora started without CPU access"
+        aurora_started.set()
+        return {}
+
+    state = _state(tmp_path)
+    access = bootstrap_tasks.TaskGraph(
+        {
+            "cpu_access": bootstrap_tasks.TaskSpec(
+                cpu_access, input_policy=task_input_spec("cpu_access"), revalidate=True
+            ),
+            "gpu_access": bootstrap_tasks.TaskSpec(
+                slow_access, input_policy=task_input_spec("gpu_access"), revalidate=True
+            ),
+            "pod_identity_agent": bootstrap_tasks.TaskSpec(
+                slow_access,
+                input_policy=task_input_spec("pod_identity_agent"),
+                revalidate=True,
+            ),
+        }
+    )
+    bootstrap_tasks.run_bootstrap_tasks(
+        state=state,
+        access=access,
+        foundation=_foundation_graph(tmp_path, state, log, ensure_aurora=aurora),
+        platform=_platform_graph(tmp_path, state, log),
+    )
+    assert aurora_started.is_set(), "CPU-ready Aurora task was never started"
+    assert state.value["phase"] == "platform-prerequisites-ready"
+
+
+def test_graph_composition_rejects_duplicate_and_orphan_definitions() -> None:
+    graph = bootstrap_tasks.TaskGraph(
+        {
+            "aurora": bootstrap_tasks.TaskSpec(
+                lambda: {}, input_policy=task_input_spec("aurora")
+            )
+        }
+    )
+    with pytest.raises(BootstrapError, match="duplicate bootstrap tasks: aurora"):
+        graph.merged(graph)
+    with pytest.raises(BootstrapError, match="unknown bootstrap dependency owners"):
+        graph.after({"unknown": ("aurora",)})
+    with pytest.raises(BootstrapError, match="unknown bootstrap task definitions"):
+        bootstrap_tasks.TaskGraph.from_parts(
+            tasks=graph.tasks,
+            probes={"typo": lambda: {}},
+            revalidate=frozenset(),
+            dependencies={},
+        )
+
+
+def test_cycles_are_rejected_before_independent_tasks_mutate(tmp_path: Path) -> None:
+    calls: list[str] = []
+    with pytest.raises(BootstrapError, match="cycle"):
+        run_parallel(
+            {
+                "a": lambda: {},
+                "b": lambda: {},
+                "resource": lambda: calls.append("mutated"),
+            },
+            state=_state(tmp_path),
+            dependencies={"a": ("b",), "b": ("a",)},
+        )
+    assert calls == []
+
+
+def test_access_failure_stops_not_yet_started_resource_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_fault.admin import bootstrap_common
+
+    monkeypatch.setattr(
+        bootstrap_common,
+        "DEPLOY_CONCURRENCY",
+        replace(bootstrap_common.DEPLOY_CONCURRENCY, bootstrap_tasks=1),
+    )
+    calls: list[str] = []
+
+    def denied() -> dict:
+        raise BootstrapError("access denied")
+
+    state = _state(tmp_path)
+    with pytest.raises(BootstrapError, match="access denied"):
+        run_parallel(
+            {"access": denied, "resource": lambda: calls.append("mutated")},
+            state=state,
+            stop_on_failure=frozenset({"access"}),
+        )
+    assert calls == []
+    report = state.value["task_reports"]["access"]
+    assert report["status"] == "failed"
+    assert report["duration_seconds"] >= 0
+    assert report["runner_commands"] == {"total": 0, "aws": 0, "kubectl": 0}

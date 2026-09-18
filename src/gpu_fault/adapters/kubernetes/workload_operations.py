@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -28,6 +29,10 @@ from gpu_fault.adapters.kubernetes.restart_source_guard import (
     workload_lifecycle_identity,
 )
 from gpu_fault.adapters.kubernetes.stop_state import stop_state_after_mutation
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    prepare_stop_ownership,
+    finish_stop_ownership,
+)
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -90,8 +95,8 @@ class KubernetesWorkloadOperationsMixin:
         keeps the bound explicit on the one call that streams a Pod log,
         including when a caller injects its own core API.
         """
-        if seconds <= 0:
-            raise ValueError("kubernetes request timeout must be positive")
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("kubernetes request timeout must be finite and positive")
         self.request_timeout_seconds = seconds
 
     def _managed_job_recovery_conflict(
@@ -157,6 +162,13 @@ class KubernetesWorkloadOperationsMixin:
         prepared = self._prepare_workload_mutation(context, suspend)
         if isinstance(prepared, WorkflowStepOutcome):
             return prepared
+        stop_receipt = (
+            prepare_stop_ownership(context, prepared, self._mark_terminating_pods)
+            if suspend
+            else None
+        )
+        if isinstance(stop_receipt, WorkflowStepOutcome):
+            return stop_receipt
         if suspend and not prepared.workloads:
             return WorkflowStepOutcome.succeeded(
                 operation_id=context.idempotency_key,
@@ -181,7 +193,7 @@ class KubernetesWorkloadOperationsMixin:
             self._delete_terminating_pods(prepared.terminating_pods)
             outcome = self._suspend_outcome(context, prepared)
             if outcome is not None:
-                return outcome
+                return finish_stop_ownership(context, stop_receipt, outcome)
         notification_id, notification_context = self._restart_notification(
             context, prepared, suspend
         )
@@ -193,7 +205,7 @@ class KubernetesWorkloadOperationsMixin:
                 ]
             )
         )
-        return WorkflowStepOutcome.succeeded(
+        outcome = WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
             details={
                 "workloads": context.step.workload_ids,
@@ -220,6 +232,7 @@ class KubernetesWorkloadOperationsMixin:
                 ),
             },
         )
+        return finish_stop_ownership(context, stop_receipt, outcome)
 
     def _prepare_workload_mutation(
         self,
@@ -293,14 +306,6 @@ class KubernetesWorkloadOperationsMixin:
             source_workload_uids=source_workload_uids,
             source_resource_versions=source_resource_versions,
         )
-        if suspend:
-            initiator = context.step.parameters.get("termination_initiator_incident_id")
-            if initiator:
-                (
-                    state.terminating_pods,
-                    state.log_evidence,
-                    state.log_errors,
-                ) = self._mark_terminating_pods(workloads, context)
         if not suspend:
             refresh_failure = refresh_restart_workloads(
                 state,
@@ -343,7 +348,7 @@ class KubernetesWorkloadOperationsMixin:
             namespace,
             kind,
             name,
-            _,
+            workload_id,
             workload,
         ) in state.workloads:
             annotations = self._annotations(workload)
@@ -366,12 +371,14 @@ class KubernetesWorkloadOperationsMixin:
                     context.step.parameters["restart_budget"]
                 )
                 annotations[ANNOTATION_RESTART_COUNT] = str(state.restart_count)
-            metadata = {"annotations": annotations}
+            metadata: dict[str, Any] = {"annotations": annotations}
             if state.restart_attempt_id is not None:
                 metadata["labels"] = {LABEL_ATTEMPT_ID: state.restart_attempt_id}
             resource_version = self._resource_version(workload)
             if resource_version is not None:
                 metadata["resourceVersion"] = resource_version
+            if uid := state.source_workload_uids.get(workload_id):
+                metadata["uid"] = uid
             body = {
                 "metadata": metadata,
                 "spec": self._suspend_spec(kind, suspend),

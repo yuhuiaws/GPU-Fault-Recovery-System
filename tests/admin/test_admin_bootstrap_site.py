@@ -269,10 +269,17 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     )
     scopes: dict[str, tuple[str, ...]] = {}
     namespaced: list[str | None] = []
+    order: list[str] = []
+    resolved_capacity = object()
 
     def record(name: str, result=None):
         def step(*_arguments, gpu_clusters=(), **_kwargs):
             scopes[name] = tuple(cluster.hyperpod_name for cluster in gpu_clusters)
+            order.append(name)
+            if name == "foundation":
+                assert _kwargs["aurora_capacity"] is resolved_capacity, (
+                    "foundation did not receive the capacity resolved before binding"
+                )
             return result
 
         return step
@@ -289,6 +296,13 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_gpu_scope", lambda *_arguments: [gpu_a]
     )
+    original_bind = admin_bootstrap.bind_bootstrap_inputs
+
+    def bind_inputs(state, **kwargs):
+        record("foundation_bind")(**kwargs)
+        return original_bind(state, **kwargs)
+
+    monkeypatch.setattr(admin_bootstrap, "bind_bootstrap_inputs", bind_inputs)
     monkeypatch.setattr(
         admin_bootstrap,
         "prepare_signed_release",
@@ -326,33 +340,37 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
         record("secure_files", ({}, tmp_path / "secure")),
     )
     monkeypatch.setattr(
-        admin_bootstrap, "_ensure_base_secrets", lambda *_a, **_k: tmp_path / "master"
+        admin_bootstrap,
+        "_ensure_base_secrets",
+        lambda *_a, **_k: tmp_path / "secure/fleet-master",
     )
     monkeypatch.setattr(
         admin_bootstrap_services, "_ensure_pod_identity_agent", lambda *_a: {}
     )
-    monkeypatch.setattr(
-        admin_bootstrap, "revalidate_pod_identity_agent", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
-    )
+
+    def capacity(_state_dir):
+        order.append("capacity")
+        return resolved_capacity
+
+    monkeypatch.setattr(admin_bootstrap, "bootstrap_aurora_capacity", capacity)
     # Both graph builders receive the baseline scope; the one run that follows
     # answers for both former phases.
     monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", record("foundation"))
     monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record("platform"))
-    monkeypatch.setattr(
-        admin_bootstrap,
-        "run_bootstrap_tasks",
-        lambda **_keywords: {
+
+    def run_tasks(**keywords):
+        order.append("graph")
+        keywords["access"].run(state=keywords["state"])
+        return {
             "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
             "aurora": {"cluster_id": "c"},
             "aurora_ready": {"master_secret_arn": "arn:new"},
             "monitoring_resources": {},
             "nlb_network": {},
             "pki": {},
-        },
-    )
+        }
+
+    monkeypatch.setattr(admin_bootstrap, "run_bootstrap_tasks", run_tasks)
     documents: dict[str, object] = {}
 
     def site_document(*_arguments, gpu_clusters=(), aurora=None, **_kwargs):
@@ -387,6 +405,7 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     assert documents["aurora"] == {"cluster_id": "c", "master_secret_arn": "arn:new"}
     baseline = (gpu_a.hyperpod_name,)
     assert scopes == {
+        "foundation_bind": baseline,
         "release": baseline,
         "kubeconfigs": baseline,
         "secure_files": baseline,
@@ -395,6 +414,16 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
         "site_document": baseline,
         "finalize": (gpu_a.hyperpod_name, gpu_b.hyperpod_name),
     }
+    assert order.index("capacity") < order.index("foundation_bind"), (
+        "legacy config migration happened after the early digest bind"
+    )
+    assert order.index("foundation_bind") < order.index("release"), (
+        "the release build started before the foundation inputs were bound"
+    )
+    assert order.index("foundation_bind") < order.index("graph"), (
+        "the graph consumed checkpoints before the foundation inputs were bound"
+    )
+    assert order.count("capacity") == 1, "capacity was reread after binding"
     # The CPU and GPU namespace chains run on their own threads, so only the
     # set is deterministic.
     assert sorted(namespaced, key=str) == sorted([None, gpu_a.context], key=str), (
@@ -588,18 +617,33 @@ def test_existing_site_keeps_the_declared_rollback_policy() -> None:
     declared_off = preserve_existing_site_contract(
         deepcopy(generated), {"spec": {"autoRollback": False, "clusters": []}}
     )
-    assert declared_off["spec"]["autoRollback"] is False
+    assert declared_off["spec"]["autoRollback"] is False, (
+        "an explicit fail-forward policy must survive site regeneration"
+    )
 
     declared_on = preserve_existing_site_contract(
         deepcopy(generated), {"spec": {"autoRollback": True, "clusters": []}}
     )
-    assert declared_on["spec"]["autoRollback"] is True
+    assert declared_on["spec"]["autoRollback"] is True, (
+        "an explicit automatic rollback policy must survive site regeneration"
+    )
 
-    # Neither a missing nor a malformed declaration may turn into "false":
-    # losing automatic rollback has to be something an operator wrote down.
-    for existing in ({"spec": {"clusters": []}}, {"spec": {"autoRollback": "false"}}):
+    # The shared YAML boolean reader defines missing/null as the generated default.
+    for existing in ({"spec": {"clusters": []}}, {"spec": {"autoRollback": None}}):
         fell_back = preserve_existing_site_contract(deepcopy(generated), existing)
-        assert fell_back["spec"]["autoRollback"] is True, existing
+        assert fell_back["spec"]["autoRollback"] is True, (
+            "an absent policy must not silently disable the generated rollback default"
+        )
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, [], {}])
+def test_existing_site_refuses_malformed_rollback_policy(value: object) -> None:
+    generated = {"spec": {"autoRollback": True, "clusters": []}}
+    existing = {"spec": {"autoRollback": value, "clusters": []}}
+    before = deepcopy(existing)
+    with pytest.raises(BootstrapError, match=r"spec\.autoRollback must be a boolean"):
+        preserve_existing_site_contract(deepcopy(generated), existing)
+    assert existing == before, "malformed operator policy must not be rewritten"
 
 
 def test_existing_site_recovers_latest_verified_release_contract(

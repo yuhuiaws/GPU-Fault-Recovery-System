@@ -35,15 +35,18 @@ from grafana_dashboard_catalog import DASHBOARDS, Dashboard, Panel
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "deploy" / "observability" / "dashboards"
 AMP_RULES = ROOT / "deploy" / "observability" / "amp-rules.yaml"
-# Every module that renders a ``/metrics`` family the control-plane scrape job
-# can see. ``collector_metrics.py`` is the one an earlier inventory forgot.
+# Sources supplying metric names rendered by the control-plane scrape job.
+# The aggregation registry defines the merger's own two gauge constants.
 EXPORTER_SOURCES = (
     "src/gpu_fault/app/metrics.py",
     "src/gpu_fault/app/metric_contributors.py",
     "src/gpu_fault/app/metrics_sections.py",
     "src/gpu_fault/app/builtin_metric_contributors.py",
+    "src/gpu_fault/app/closed_loop_metrics.py",
     "src/gpu_fault/app/aurora_refresh_metrics.py",
     "src/gpu_fault/app/collector_metrics.py",
+    "src/gpu_fault/app/metric_aggregation.py",
+    "src/gpu_fault/app/process_metrics.py",
     "src/gpu_fault/completion_metrics_server.py",
 )
 DATASOURCE = {"type": "prometheus", "uid": "gpu-fault-amp"}
@@ -102,6 +105,9 @@ class AlertRule:
 
     def covers(self, panel: Panel) -> bool:
         """Whether ``panel`` plots every family and job selector this rule reads."""
+        alert_names = getattr(panel, "alert_names", None)
+        if alert_names is not None and self.name not in alert_names:
+            return False
         text = " ".join(target.expr for target in panel.targets)
         return self.families <= frozenset(RULE_METRIC.findall(text)) and all(
             job in text for job in self.jobs
@@ -244,6 +250,11 @@ def render_panel(
     grid: dict[str, int],
 ) -> dict[str, Any]:
     attached = [rule for rule in rules if rule.covers(panel)]
+    alert_names = getattr(panel, "alert_names", None)
+    if alert_names is not None:
+        if set(alert_names) - {rule.name for rule in attached}:
+            raise ValueError(f"{panel.title} names an absent or uncovered alert")
+        attached = [rule for rule in attached if rule.name in alert_names]
     steps = threshold_steps(attached)
     has_threshold = len(steps) > 1
     rendered: dict[str, Any] = {
@@ -262,6 +273,11 @@ def render_panel(
         "title": panel.title,
         "type": panel.kind,
     }
+    if alert_names is not None:
+        rendered["links"] = [
+            {"title": rule.name, "url": rule.runbook, "targetBlank": True}
+            for rule in attached
+        ]
     if panel.kind == "stat":
         rendered["targets"] = _targets(panel, instant=True)
         rendered["options"] = {

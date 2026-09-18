@@ -7,7 +7,13 @@
 
 - `manifest.yaml`：公开报告清单，默认 `reports: []`；
 - `index.json`：由 `scripts/build-fault-evidence-index.py` 生成；
+- `bindings/superseded-acceptance-bindings-20260915.json`：仅保全已变更用例的旧摘要绑定，
+  不含现场报告或身份，不是当前PASS。对应catalog已回到NOT_RUN，不能重算旧摘要冒充复验；
+- `bindings/main-boot029-20260915.json`：保全main中BOOT-029的历史PASS摘要；
+  当前用例要求三个组件镜像的冷构建及完整退出回执，仍为NOT_RUN，不沿用旧判定；
 - 本 README。
+
+`bindings/`是历史catalog元数据，不是执行报告目录，不计入`manifest.yaml`的报告清单。
 
 标准 verdict 只有：
 

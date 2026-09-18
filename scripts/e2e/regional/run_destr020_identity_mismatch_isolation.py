@@ -221,7 +221,7 @@ def kubernetes_node_present(fixture: RegionalLiveFixture, name: str) -> bool:
         "--ignore-not-found",
         "-o",
         "name",
-        check=False,
+        check=True,
         timeout=60,
     )
     return bool(output.strip())
@@ -679,6 +679,8 @@ def main() -> int:
         )
         preflight = read_only_preflight(settings, case_dir, alias=alias)
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=not preflight["errors"],
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,

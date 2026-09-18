@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
+
+from gpu_fault.adapters.kubernetes.stop_ownership import (
+    OwnershipMutationRefused,
+    ownership_outcome,
+    refusal as ownership_refusal,
+    require_mutation_ownership,
+)
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,13 +40,18 @@ from gpu_fault.hyperpod import (
     HyperPodWorkflowDispatcher,
 )
 from gpu_fault.hyperpod_spares import (
+    ACTIVATION_NOT_SPECIFIED,
+    ACTIVATION_FORBIDDEN_REASON,
     HyperPodSpareCoordinator,
+    SpareActivationForbidden,
     SpareAllocation,
     SpareHealthPending,
+    require_spare_activation_permitted,
 )
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
+    WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
@@ -63,6 +77,8 @@ class HyperPodLifecycleStepAdapter(
     HyperPodConfirmationMixin,
     HyperPodNotificationMixin,
 ):
+    activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
+
     OPERATIONS = operations_for_adapter(OperationAdapter.HYPERPOD)
 
     def __init__(
@@ -162,6 +178,8 @@ class HyperPodLifecycleStepAdapter(
                 "incident annotation is "
                 f"{annotations.get(ANNOTATION_INCIDENT)!r}, not this incident"
             )
+        if annotations.get(ANNOTATION_FENCING) != str(context.workflow.fencing_token):
+            problems.append("fencing token annotation does not match this workflow")
         return problems
 
     def _reassert_isolation(
@@ -198,7 +216,11 @@ class HyperPodLifecycleStepAdapter(
 
             def body(node: Any) -> dict[str, Any] | None:
                 annotations = KubernetesWorkflowAdapter._annotations(node)
-                if annotations.get(ANNOTATION_INCIDENT) != incident_id:
+                if annotations.get(
+                    ANNOTATION_INCIDENT
+                ) != incident_id or annotations.get(ANNOTATION_FENCING) != str(
+                    context.workflow.fencing_token
+                ):
                     return None
                 if KubernetesWorkflowAdapter._unschedulable(node):
                     return None
@@ -286,6 +308,33 @@ class HyperPodLifecycleStepAdapter(
             verified.update({node_id, kubernetes_node})
         return ObservedIsolation(sorted(verified), nodes)
 
+    @staticmethod
+    def _spare_activation_kwargs(context: WorkflowStepContext) -> dict[str, object]:
+        parameters = context.step.parameters
+        return (
+            {"activation_forbidden": parameters["activation_forbidden"]}
+            if "activation_forbidden" in parameters
+            else {}
+        )
+
+    @staticmethod
+    def _spare_inhibition_failure(
+        context: WorkflowStepContext,
+    ) -> WorkflowStepOutcome | None:
+        if context.step.operation is not WorkflowOperation.REPLACE_NODE:
+            return None
+        try:
+            require_spare_activation_permitted(
+                context.step.parameters.get(
+                    "activation_forbidden", ACTIVATION_NOT_SPECIFIED
+                )
+            )
+        except SpareActivationForbidden as exc:
+            return WorkflowStepOutcome.failed(
+                str(exc), details={"activation_inhibited": True}
+            )
+        return None
+
     def _allocate_spare_or_wait(
         self,
         context: WorkflowStepContext,
@@ -294,6 +343,7 @@ class HyperPodLifecycleStepAdapter(
     ) -> SpareAllocation | WorkflowStepOutcome:
         if self.spare_coordinator is None:
             raise RuntimeError("spare coordinator is unavailable")
+        require_mutation_ownership(context)
         try:
             return self.spare_coordinator.allocate(
                 cluster_id=context.incident.cluster_id,
@@ -305,6 +355,7 @@ class HyperPodLifecycleStepAdapter(
                     if self.node_action_adapter is not None
                     else None
                 ),
+                **self._spare_activation_kwargs(context),
             )
         except SpareHealthPending as exc:
             return WorkflowStepOutcome.waiting(
@@ -326,7 +377,9 @@ class HyperPodLifecycleStepAdapter(
             raise RuntimeError("spare coordinator is unavailable")
         pending = dict(state or {})
         activated = list(pending.get("activated_spare_nodes") or [])
-        if not activated:
+        inhibited = "activation_forbidden" in context.step.parameters
+        cached_inhibited = inhibited and bool(activated)
+        if not activated or inhibited:
             allocation = self._allocate_spare_or_wait(context, local_only=local_only)
             if isinstance(allocation, WorkflowStepOutcome):
                 return WorkflowStepOutcome.waiting(
@@ -338,18 +391,39 @@ class HyperPodLifecycleStepAdapter(
                 )
             if not allocation.sufficient:
                 return WorkflowStepOutcome.failed(
-                    allocation.reason or "insufficient healthy HyperPod spares"
+                    allocation.reason or "insufficient healthy HyperPod spares",
+                    details=(
+                        {
+                            "activation_inhibited": True,
+                            **(
+                                {"cached_activation_rejected": True}
+                                if cached_inhibited
+                                else {}
+                            ),
+                        }
+                        if inhibited
+                        and (allocation.activation_inhibited or cached_inhibited)
+                        else None
+                    ),
                 )
             if not allocation.applicable or not allocation.selected_node_ids:
+                if activated and inhibited:
+                    failure = self._spare_inhibition_failure(context)
+                    if failure is not None:
+                        return failure
                 return WorkflowStepOutcome.failed(
                     "warm-spare replacement is required; provider node "
                     "replacement API fallback is disabled"
                 )
             activated = list(allocation.selected_node_ids)
+        inhibition = self._spare_inhibition_failure(context)
+        if inhibition is not None:
+            return inhibition
         provider_baselines = dict(pending.get("provider_baselines") or {})
         if not provider_baselines and not local_only:
             provider_baselines = self._provider_baselines(context)
         try:
+            require_mutation_ownership(context)
             revoked_agents = (
                 list(pending.get("revoked_agents") or [])
                 if "revoked_agents" in pending
@@ -387,21 +461,96 @@ class HyperPodLifecycleStepAdapter(
                     "reason": str(exc),
                 },
             )
+        except OwnershipMutationRefused:
+            try:
+                coordinator.release(activated, context.incident.incident_id)
+            except Exception:
+                raise OwnershipMutationRefused(
+                    ownership_refusal("OWNERSHIP_CLEANUP_UNVERIFIABLE")
+                ) from None
+            raise
         except Exception:
             coordinator.release(activated, context.incident.incident_id)
             raise
 
-    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
-        previous = next(
-            (
-                item
-                for item in context.workflow.step_executions
-                if item.step_index == context.step_index
-                and item.operation is context.step.operation
-                and item.status is WorkflowStepStatus.WAITING
+    def _guard_inhibited_confirmation(
+        self, context: WorkflowStepContext, details: dict[str, Any]
+    ) -> None:
+        if "activation_forbidden" not in context.step.parameters:
+            return
+        if self.spare_coordinator is None:
+            require_spare_activation_permitted(
+                context.step.parameters["activation_forbidden"]
+            )
+        outcome = self._run_spare_failover(
+            context,
+            local_only=(
+                context.step.parameters.get("replacement_strategy")
+                == "HEALTHY_WARM_SPARE_ONLY"
             ),
-            None,
+            state=details,
         )
+        if outcome.status is WorkflowStepStatus.WAITING:
+            raise SpareHealthPending(
+                str((outcome.details or {}).get("reason") or "spare health is pending")
+            )
+        if outcome.status is WorkflowStepStatus.FAILED and not (
+            outcome.details or {}
+        ).get("activation_inhibited"):
+            raise ValueError(outcome.error)
+        raise SpareActivationForbidden(outcome.error or ACTIVATION_FORBIDDEN_REASON)
+
+    def _waiting_spare_failover(
+        self, context: WorkflowStepContext, details: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        self._guard_inhibited_confirmation(context, details)
+        return super()._waiting_spare_failover(context, details)
+
+    def _spare_failover_details(
+        self,
+        context: WorkflowStepContext,
+        spare_nodes: list[str],
+        *,
+        revoked_agents: list[str],
+        provider_baselines: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._guard_inhibited_confirmation(
+            context, {"activated_spare_nodes": spare_nodes}
+        )
+        return super()._spare_failover_details(
+            context,
+            spare_nodes,
+            revoked_agents=revoked_agents,
+            provider_baselines=provider_baselines,
+        )
+
+    def _replacement_confirmation(
+        self, context: WorkflowStepContext, details: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        self._guard_inhibited_confirmation(context, details)
+        return super()._replacement_confirmation(context, details)
+
+    def _resume_previous(
+        self, context: WorkflowStepContext, previous: WorkflowStepExecution | None
+    ) -> WorkflowStepOutcome | None:
+        if (
+            previous is not None
+            and context.step.operation is WorkflowOperation.REPLACE_NODE
+            and "activation_forbidden" in context.step.parameters
+        ):
+            # Cached or externally confirmed success is not activation authority.
+            if self.spare_coordinator is None:
+                failure = self._spare_inhibition_failure(context)
+                if failure is not None:
+                    return failure
+            return self._run_spare_failover(
+                context,
+                local_only=(
+                    context.step.parameters.get("replacement_strategy")
+                    == "HEALTHY_WARM_SPARE_ONLY"
+                ),
+                state=previous.details,
+            )
         if previous and (
             previous.details.get("spare_failover_pending")
             or previous.details.get("spare_health_pending")
@@ -460,10 +609,28 @@ class HyperPodLifecycleStepAdapter(
                 operation_id=previous.adapter_operation_id,
                 details=base_details,
             )
+        return None
+
+    @ownership_outcome
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        previous = next(
+            (
+                item
+                for item in context.workflow.step_executions
+                if item.step_index == context.step_index
+                and item.operation is context.step.operation
+                and item.status is WorkflowStepStatus.WAITING
+            ),
+            None,
+        )
+        resumed = self._resume_previous(context, previous)
+        if resumed is not None:
+            return resumed
         if not context.request.confirm_cluster_name:
             return WorkflowStepOutcome.failed(
                 "confirm_cluster_name is required for HyperPod mutation"
             )
+        require_mutation_ownership(context)
         # What the scheduler shows now, not what the workflow remembers: an
         # unschedulable node carrying this incident's quarantine taint and
         # annotation. Anything less refuses the provider mutation.
@@ -506,6 +673,25 @@ class HyperPodLifecycleStepAdapter(
                 raise
             preflight_configuration_error = reason
             preflight_error = exc
+        if preflight_configuration_error is not None:
+            return WorkflowStepOutcome.failed(
+                "HyperPod preflight cannot run: " + preflight_configuration_error,
+                details={
+                    "configuration_error": True,
+                    "exception_type": type(preflight_error).__name__,
+                    "remediation": (
+                        "kubectl -n gpu-fault-system annotate sa "
+                        "gpu-fault-cluster-executor --overwrite "
+                        "eks.amazonaws.com/role-arn=<role>, then "
+                        "rollout restart the executor: the projected "
+                        "token volume is only injected at pod creation"
+                    ),
+                },
+            )
+        if preflight_error is not None:
+            return WorkflowStepOutcome.failed(
+                "HyperPod preflight failed: " + str(preflight_error)
+            )
         if (
             warm_spare_only
             and preflight is not None
@@ -533,6 +719,9 @@ class HyperPodLifecycleStepAdapter(
             )
         ):
             return self._run_spare_failover(context, local_only=warm_spare_only)
+        inhibition = self._spare_inhibition_failure(context)
+        if inhibition is not None:
+            return inhibition
         agent_baselines = self._agent_baselines(context)
         provider_baselines = (
             self._provider_baselines(context)
@@ -550,26 +739,8 @@ class HyperPodLifecycleStepAdapter(
                 "warm-spare replacement is required; provider node "
                 "replacement API fallback is disabled"
             )
-        if preflight_configuration_error is not None:
-            return WorkflowStepOutcome.failed(
-                "HyperPod preflight cannot run: " + preflight_configuration_error,
-                details={
-                    "configuration_error": True,
-                    "exception_type": type(preflight_error).__name__,
-                    "remediation": (
-                        "kubectl -n gpu-fault-system annotate sa "
-                        "gpu-fault-cluster-executor --overwrite "
-                        "eks.amazonaws.com/role-arn=<role>, then "
-                        "rollout restart the executor: the projected "
-                        "token volume is only injected at pod creation"
-                    ),
-                },
-            )
-        if preflight_error is not None:
-            return WorkflowStepOutcome.failed(
-                "HyperPod preflight failed: " + str(preflight_error)
-            )
         try:
+            require_mutation_ownership(context)
             revoked_agents = self._revoke_agents(context)
         except (KeyError, ValueError) as exc:
             return WorkflowStepOutcome.failed(
@@ -577,6 +748,7 @@ class HyperPodLifecycleStepAdapter(
             )
         # The dispatcher owns the provider submission key; it is distinct
         # from the remote command idempotency key carried by this context.
+        require_mutation_ownership(context)
         result = self.dispatcher.submit(
             context.workflow,
             context.step_index,
@@ -597,6 +769,7 @@ class HyperPodLifecycleStepAdapter(
             details={
                 "action": result.action.value,
                 "submission_idempotency_key": result.idempotency_key,
+                **({"provider_submission_duplicate": True} if result.duplicate else {}),
                 "submitted_nodes": (result.successful_node_logical_ids),
                 "revoked_agents": revoked_agents,
                 "agent_baselines": agent_baselines,

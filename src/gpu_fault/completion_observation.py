@@ -268,16 +268,18 @@ def workload_objects_verdict(
 
     verdicts = [
         _status_verdict(status, expected_critical_ranks)
-        for status in (data.get("status") for data in objects)
         if isinstance(status, dict)
+        else WorkloadVerdict.UNKNOWN
+        for status in (data.get("status") for data in objects)
     ]
     for candidate in (
         WorkloadVerdict.ACTIVE,
         WorkloadVerdict.FAILED,
-        WorkloadVerdict.SUCCEEDED,
     ):
         if candidate in verdicts:
             return candidate
+    if verdicts and all(verdict is WorkloadVerdict.SUCCEEDED for verdict in verdicts):
+        return WorkloadVerdict.SUCCEEDED
     return WorkloadVerdict.UNKNOWN
 
 
@@ -525,6 +527,10 @@ def resolve_missing_attempt_tombstone(
     if attempt_id not in controller._restored_attempts:
         return tombstone
     verdict = workload_objects_verdict(objects, previous.expected_critical_ranks)
+    if verdict is WorkloadVerdict.SUCCEEDED and len(objects) != len(
+        previous.workload_ids
+    ):
+        return tombstone
     if verdict is WorkloadVerdict.ACTIVE:
         controller._missing_attempts.defer_tombstone(attempt_id)
         LOGGER.info(

@@ -5,21 +5,39 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 ROOT = Path(__file__).resolve().parents[3]
 # The trees whose content decides whether a recorded focused-test result still
 # speaks for the code about to run: the drivers, their unit tests, the package.
-SOURCE_DIGEST_PATHS = ("scripts/e2e/regional", "tests/regional", "src")
+SOURCE_DIGEST_PATHS = (
+    "scripts/e2e/regional",
+    "tests",
+    "src",
+    "tools",
+    "testcases",
+    "deploy",
+    "config",
+    "requirements",
+    "pyproject.toml",
+    "uv.lock",
+    "Makefile",
+)
+PLAN_SCHEMA_VERSION = 3
+_APPROVAL_ARGUMENTS = frozenset(
+    {"plan", "execute", "confirm", "maintenance_window_end"}
+)
 
-if __package__:
+if TYPE_CHECKING or __package__:
     from .acceptance_runner_common import write_json_atomic
     from .acceptance_scope import current_acceptance_scope
     from .regional_live_fixture import RegionalFixtureError, install_abort_signals
+    from .regional_case_contract import do_not_run_case_ids
     from .site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
@@ -30,6 +48,7 @@ else:
     from acceptance_runner_common import write_json_atomic
     from acceptance_scope import current_acceptance_scope
     from regional_live_fixture import RegionalFixtureError, install_abort_signals
+    from regional_case_contract import do_not_run_case_ids
     from site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
@@ -49,8 +68,10 @@ __all__ = [
     "environment_snapshot",
     "install_site_profile",
     "PlainCaseRunner",
+    "argument_identity",
     "details_sha256",
     "record_focused_tests",
+    "preflight_succeeded",
     "reusable_focused_tests",
     "run_plain_case",
     "run_selected_case",
@@ -139,8 +160,64 @@ def details_sha256(details: dict[str, Any]) -> str:
         separators=(",", ":"),
         default=str,
         ensure_ascii=False,
+        allow_nan=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def argument_identity(arguments: argparse.Namespace) -> str:
+    return details_sha256(
+        {
+            "entrypoint": str(Path(sys.argv[0]).resolve()),
+            "arguments": {
+                key: value
+                for key, value in vars(arguments).items()
+                if key not in _APPROVAL_ARGUMENTS
+            },
+        }
+    )
+
+
+def preflight_succeeded(preflight: dict[str, Any]) -> bool:
+    errors = preflight.get("errors")
+    if not isinstance(errors, list) or any(
+        not isinstance(item, str) for item in errors
+    ):
+        raise RuntimeError("live-driver preflight errors are missing or malformed")
+    return not errors
+
+
+def connection_identity(
+    arguments: argparse.Namespace, environment: dict[str, str]
+) -> dict[str, Any]:
+    identities: dict[str, Any] = {}
+    for origin, values in (
+        ("arguments", vars(arguments)),
+        ("environment", environment),
+    ):
+        for name, value in sorted(values.items()):
+            if (
+                "kubeconfig" not in name.lower()
+                or not isinstance(value, (str, Path))
+                or not value
+            ):
+                continue
+            path = Path(value).expanduser().resolve()
+            if not path.is_file():
+                identities[f"{origin}:{name}"] = {
+                    "path": str(path),
+                    "readable_file": False,
+                }
+                continue
+            try:
+                with path.open("rb") as handle:
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            except OSError:
+                raise RuntimeError(
+                    f"cannot bind kubeconfig identity for {name}"
+                ) from None
+            identities[f"{origin}:{name}"] = {"path": str(path), "sha256": digest}
+    return identities
 
 
 def build_plan(
@@ -150,19 +227,35 @@ def build_plan(
     attempt: int,
     confirmation: str,
     details: dict[str, Any],
+    arguments: argparse.Namespace,
+    preflight_passed: bool,
     environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    from scripts.e2e.regional.acceptance_supervision import require_supervision_clear
+
+    require_supervision_clear(run_dir)
+    if case_id in do_not_run_case_ids():
+        raise RuntimeError(f"{case_id} is DO_NOT_RUN")
+    if type(preflight_passed) is not bool:
+        raise RuntimeError("live-driver preflight result must be a boolean")
     scope = current_acceptance_scope()
+    selected_environment = (
+        environment if environment is not None else environment_snapshot()
+    )
     plan = {
-        "schema_version": 2,
+        "schema_version": PLAN_SCHEMA_VERSION,
         "case_id": case_id,
         "attempt": attempt,
         "confirmation": confirmation,
-        "environment": environment or environment_snapshot(),
+        "environment": selected_environment,
         "site_profile": applied_site_profile(),
         **scope.plan_fields(),
         "details": details,
         "details_sha256": details_sha256(details),
+        "arguments_sha256": argument_identity(arguments),
+        "connections": connection_identity(arguments, selected_environment),
+        "source_digest": source_digest(),
+        "preflight_passed": preflight_passed,
         "mutation_performed": False,
     }
     write_json_atomic(run_dir / "cases" / case_id / "plan.json", plan)
@@ -192,6 +285,8 @@ def authorize_execution(
         raise RuntimeError("execute authorization requested outside --execute mode")
     if arguments.confirm != confirmation:
         raise RuntimeError(f"confirmation must be exactly {confirmation}")
+    if case_id in do_not_run_case_ids():
+        raise RuntimeError(f"{case_id} is DO_NOT_RUN")
     deadline = _deadline(arguments.maintenance_window_end)
     if datetime.now(timezone.utc) >= deadline:
         raise RuntimeError("approved maintenance window has ended")
@@ -199,22 +294,32 @@ def authorize_execution(
     if not path.is_file():
         raise RuntimeError("run --plan before --execute")
     plan = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(plan, dict):
+        raise RuntimeError("live-driver plan is not an object")
     scope = current_acceptance_scope()
+    selected_environment = (
+        environment if environment is not None else environment_snapshot()
+    )
     expected = {
-        "schema_version": 2,
+        "schema_version": PLAN_SCHEMA_VERSION,
         "case_id": case_id,
         "attempt": arguments.attempt,
         "confirmation": confirmation,
-        "environment": environment or environment_snapshot(),
+        "environment": selected_environment,
         # A plan built against one site profile must not be executed under
         # another. Absent on both sides when no profile is in use, so plans
         # written before profiles existed still compare equal.
         "site_profile": applied_site_profile(),
         **scope.plan_fields(),
+        "arguments_sha256": argument_identity(arguments),
+        "connections": connection_identity(arguments, selected_environment),
+        "source_digest": source_digest(),
     }
     for key, value in expected.items():
         if plan.get(key) != value:
             raise RuntimeError(f"live-driver plan drifted at {key}")
+    if plan.get("preflight_passed") is not True:
+        raise RuntimeError("live-driver plan did not pass its preflight")
     recorded_details = plan.get("details")
     if not isinstance(recorded_details, dict):
         raise RuntimeError("live-driver plan drifted at details")
@@ -223,6 +328,9 @@ def authorize_execution(
         raise RuntimeError("live-driver plan drifted at details_sha256")
     if details is not None and details_sha256(details) != recorded_digest:
         raise RuntimeError("live-driver plan drifted at details")
+    from scripts.e2e.regional.acceptance_supervision import bind_command_supervision
+
+    bind_command_supervision(arguments.run_dir)
     return deadline
 
 
@@ -247,14 +355,44 @@ def _git_output(*arguments: str) -> str:
 def source_digest() -> str:
     """A digest of the source a focused-test result was computed against.
 
-    ``git rev-parse HEAD`` plus the working-tree diff of the driver, test and
-    package trees, so an uncommitted edit to any of them changes the digest
-    while an unrelated edit (docs, deploy manifests) does not. Read-only.
+    Bind tracked and untracked execution inputs, including helper source,
+    deployment inputs, case ordering and dependencies. No cached result may
+    survive a new or changed file simply because it has not been staged.
     """
 
     head = _git_output("rev-parse", "HEAD").strip()
-    diff = _git_output("diff", "HEAD", "--", *SOURCE_DIGEST_PATHS)
-    return hashlib.sha256(f"{head}\n{diff}".encode()).hexdigest()
+    files = _git_output(
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        *SOURCE_DIGEST_PATHS,
+    )
+    deleted = set(
+        _git_output("ls-files", "--deleted", "-z", "--", *SOURCE_DIGEST_PATHS).split(
+            "\0"
+        )
+    )
+    digest = hashlib.sha256(head.encode())
+    for name in sorted(set(files.split("\0")) - {""}):
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("focused-test input leaves the repository")
+        path = ROOT / relative
+        if path.is_symlink():
+            raise RuntimeError("focused-test inputs cannot be symbolic links")
+        if not path.is_file():
+            if name in deleted and not path.exists():
+                continue
+            raise RuntimeError("focused-test input is unavailable")
+        digest.update(b"\0" + name.encode() + b"\0")
+        digest.update(f"{path.stat().st_mode & 0o777:04o}".encode())
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def record_focused_tests(details: dict[str, Any], result: dict[str, Any]) -> None:
@@ -361,6 +499,7 @@ def _plan_case(
     confirmation: str,
 ) -> int:
     preflight = case.read_only_preflight(settings, case_dir)
+    passed = preflight_succeeded(preflight)
     plan = build_plan(
         run_dir=arguments.run_dir,
         case_id=case_id,
@@ -368,9 +507,11 @@ def _plan_case(
         confirmation=confirmation,
         environment=settings.environment(),
         details=case.plan_details(settings, preflight),
+        arguments=arguments,
+        preflight_passed=passed,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
-    return 0 if not preflight["errors"] else 1
+    return 0 if passed else 1
 
 
 def _execute_case(
@@ -427,47 +568,74 @@ def run_standard_case(case: CaseRunner[S]) -> int:
 
 
 @dataclass(frozen=True)
-class PlainCaseRunner:
-    """A runner with no configured settings.
-
-    The plan is static (no read-only preflight, no environment snapshot) and
-    the case reads the site from the environment only when it executes; the
-    CMD/NET hold cases are this shape.
-    """
+class PlainCaseRunner(Generic[S]):
+    """An environment-driven case with an explicit read-only identity gate."""
 
     case_id: str
     confirmation: str
     parser: Callable[[], argparse.ArgumentParser]
     plan_details: Callable[[], dict[str, Any]]
     run_case: Callable[[Path, int, datetime], int]
+    configure: Callable[[argparse.Namespace], S]
+    read_only_preflight: Callable[[S, Path], dict[str, Any]]
 
 
-def run_plain_case(case: PlainCaseRunner) -> int:
-    """``run_standard_case`` for a ``PlainCaseRunner``.
+def run_plain_case(case: PlainCaseRunner[S]) -> int:
+    """Gate the legacy execution signature with current, approved identity."""
 
-    Site profile first, then parse, then the ``0o077`` umask before anything
-    under ``--run-dir`` exists. Without ``--execute`` the static plan is
-    printed and the exit code is 0; with it, ``authorize_execution`` must pass
-    before ``run_case`` runs, and its verdict is the exit code.
-    """
+    from scripts.e2e.regional.acceptance_supervision import require_supervision_clear
+    from scripts.e2e.regional.plain_case_identity import PlainCaseEvidence
 
     install_site_profile()
     arguments = case.parser().parse_args()
     os.umask(0o077)
-    if not arguments.execute:
-        plan = build_plan(
-            run_dir=arguments.run_dir,
+    install_abort_signals()
+    case_dir = _case_dir(arguments, case.case_id)
+    evidence = PlainCaseEvidence(case_dir, case.case_id, arguments.attempt)
+    try:
+        require_supervision_clear(arguments.run_dir)
+        settings = case.configure(arguments)
+        environment = settings.environment()
+        if arguments.execute:
+            authorize_execution(
+                arguments,
+                case_id=case.case_id,
+                confirmation=case.confirmation,
+                environment=environment,
+            )
+        preflight = case.read_only_preflight(settings, case_dir)
+        passed = preflight_succeeded(preflight)
+        details = {**case.plan_details(), "preflight": preflight}
+        evidence.bind(preflight, details, passed=passed)
+        if not arguments.execute:
+            plan = build_plan(
+                run_dir=arguments.run_dir,
+                case_id=case.case_id,
+                attempt=arguments.attempt,
+                confirmation=case.confirmation,
+                details=details,
+                arguments=arguments,
+                environment=environment,
+                preflight_passed=passed,
+            )
+            evidence.planned(passed)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return 0 if passed else 1
+        if not passed:
+            raise RegionalFixtureError("plain case read-only preflight failed")
+        deadline = authorize_execution(
+            arguments,
             case_id=case.case_id,
-            attempt=arguments.attempt,
             confirmation=case.confirmation,
-            details=case.plan_details(),
+            environment=environment,
+            details=details,
         )
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
-    deadline = authorize_execution(
-        arguments, case_id=case.case_id, confirmation=case.confirmation
-    )
-    return case.run_case(arguments.run_dir, arguments.attempt, deadline)
+        return evidence.finish(
+            case.run_case(arguments.run_dir, arguments.attempt, deadline)
+        )
+    except BaseException as exc:
+        evidence.fail(exc)
+        raise
 
 
 def run_selected_case(case: CaseSurface[T]) -> int:

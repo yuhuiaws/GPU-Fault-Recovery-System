@@ -5,11 +5,12 @@ import hmac
 import json
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer
 
 from gpu_fault.models import StrictModel, WorkflowOperation
+from gpu_fault.node_agent.late_ownership import OwnershipChallenge, OwnershipPermit
 
 RESULT_QUERY_MAX_SKEW_SECONDS = 300
 
@@ -99,7 +100,19 @@ class UnsupportedOperationError(RuntimeError):
     """Raised when an allow-listed action has no executor branch."""
 
 
-class NodeActionCommand(StrictModel):
+class OwnershipWireModel(StrictModel):
+    @model_serializer(mode="wrap")
+    def serialize_ownership(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = handler(self)
+        for name in ("ownership_guard", "ownership_permit", "ownership_challenge"):
+            if value.get(name) is None:
+                value.pop(name, None)
+        return value
+
+
+class NodeActionCommand(OwnershipWireModel):
     command_id: str
     workflow_request_id: str
     incident_id: str
@@ -111,11 +124,13 @@ class NodeActionCommand(StrictModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     issued_at: datetime
     expires_at: datetime
+    ownership_guard: Literal["node-final-ownership/v1"] | None = None
 
 
-class SignedNodeAction(StrictModel):
+class SignedNodeAction(OwnershipWireModel):
     command: NodeActionCommand
     signature: str
+    ownership_permit: OwnershipPermit | None = None
 
 
 class NodeActionResult(StrictModel):
@@ -129,7 +144,8 @@ class NodeActionResult(StrictModel):
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class NodeActionSubmission(StrictModel):
+class NodeActionSubmission(OwnershipWireModel):
     command_id: str
     state: NodeActionExecutionState
     result: NodeActionResult | None = None
+    ownership_challenge: OwnershipChallenge | None = None

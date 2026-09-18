@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
-import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from scripts.e2e.regional import live_driver_guard
+from scripts.e2e.regional import run_collect022_fm_cursor_recovery as collect022
+from scripts.e2e.regional import run_collector_acceptance as collector
 from scripts.e2e.regional.site_profile import (
     SITE_PROFILE_ENV,
     SiteProfileError,
@@ -211,7 +215,16 @@ def test_a_plan_cannot_be_executed_under_a_different_profile(
     monkeypatch.delenv("GPU_FAULT_ACCEPTANCE_EXECUTION_SCOPE", raising=False)
     monkeypatch.delenv("GPU_FAULT_ACCEPTANCE_SELECTION_REFERENCE", raising=False)
     run_dir = tmp_path / "run"
+    arguments = argparse.Namespace(
+        execute=True,
+        confirm="COLLECT002_EXECUTE",
+        maintenance_window_end="2099-01-01T00:00:00Z",
+        run_dir=run_dir,
+        attempt=1,
+    )
     live_driver_guard.build_plan(
+        arguments=arguments,
+        preflight_passed=True,
         run_dir=run_dir,
         case_id="GF-REGIONAL-COLLECT-002",
         attempt=1,
@@ -221,13 +234,6 @@ def test_a_plan_cannot_be_executed_under_a_different_profile(
     )
 
     monkeypatch.setenv(SITE_PROFILE_ENV, str(second))
-    arguments = argparse.Namespace(
-        execute=True,
-        confirm="COLLECT002_EXECUTE",
-        maintenance_window_end="2099-01-01T00:00:00Z",
-        run_dir=run_dir,
-        attempt=1,
-    )
 
     with pytest.raises(RuntimeError, match="drifted at site_profile"):
         live_driver_guard.authorize_execution(
@@ -249,12 +255,19 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
             continue
         if "install_site_profile()" in source:
             continue
-        # A runner that hands its ``main`` to the shared spine inherits the
-        # call; tests/test_acceptance_runner_main.py pins that the spine makes
-        # it before the parser exists.
+        # Both named CASEs and inline CaseRunner instances inherit the shared
+        # spine's profile-before-parser contract.
+        tree = ast.parse(source, filename=str(path))
         if any(
-            f"{spine}(CASE)" in source
-            for spine in ("run_standard_case", "run_selected_case", "run_plain_case")
+            isinstance(node, ast.FunctionDef)
+            and node.name == "main"
+            and len(node.body) == 1
+            and isinstance(statement := node.body[0], ast.Return)
+            and isinstance(call := statement.value, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id
+            in {"run_standard_case", "run_selected_case", "run_plain_case"}
+            for node in tree.body
         ):
             continue
         # NET-002/003 delegate to net_command_fixture.run_main, which installs
@@ -266,19 +279,100 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
     assert not missing, missing
 
 
-def test_runner_help_still_works_without_a_profile() -> None:
-    # The profile hooks both the environment and `parse_args`, so the cheapest
-    # regression it could cause is breaking every runner's --help.
-    completed = subprocess.run(
-        [sys.executable, "scripts/e2e/regional/run_collector_acceptance.py", "--help"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+def test_collect022_delegates_its_complete_case_to_the_standard_spine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delegate = Mock(return_value=7)
+    monkeypatch.setattr(collect022, "run_standard_case", delegate)
+
+    assert collect022.main() == 7
+
+    delegate.assert_called_once()
+    case = delegate.call_args.args[0]
+    assert isinstance(case, live_driver_guard.CaseRunner), (
+        "COLLECT022 must delegate a complete fixed-identity case"
+    )
+    assert case.case_id == collect022.CASE_ID
+    assert case.confirmation == collect022.CONFIRMATION
+    for name in (
+        "parser",
+        "configure",
+        "read_only_preflight",
+        "plan_details",
+        "execute_case",
+    ):
+        assert getattr(case, name) is getattr(collect022, name), name
+
+
+def test_collect022_installs_profile_before_constructing_its_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _profile(
+        tmp_path,
+        {
+            "arguments": {"node": "profile-node", "region": "us-west-2"},
+            "environment": {"AWS_REGION": "us-west-2"},
+        },
+    )
+    monkeypatch.setenv(SITE_PROFILE_ENV, str(path))
+    monkeypatch.setenv("AWS_REGION", "")
+    monkeypatch.setattr(
+        sys, "argv", ["collect022", "--run-dir", str(tmp_path / "unused")]
+    )
+    original_parser = collect022.parser
+    blocked = Mock(
+        side_effect=AssertionError("parsing must not enter the case lifecycle")
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "--site-profile" in completed.stdout, completed.stdout
+    class Parsed(Exception):
+        pass
+
+    def parser() -> argparse.ArgumentParser:
+        assert os.environ["AWS_REGION"] == "us-west-2", (
+            "profile environment must exist before parser defaults are constructed"
+        )
+        record = applied_site_profile()
+        assert record is not None and record["path"] == str(path)
+        arguments = original_parser().parse_args()
+        assert arguments.node == "profile-node"
+        assert arguments.region == "us-west-2"
+        raise Parsed
+
+    monkeypatch.setattr(collect022, "parser", parser)
+    for name in ("configure", "read_only_preflight", "plan_details", "execute_case"):
+        monkeypatch.setattr(collect022, name, blocked)
+
+    with pytest.raises(Parsed):
+        collect022.main()
+
+    blocked.assert_not_called()
+    assert not (tmp_path / "unused").exists(), "profile tests must not create a run"
+
+
+def test_runner_help_still_works_without_a_profile(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(SITE_PROFILE_ENV, "")
+    monkeypatch.setattr(sys, "argv", ["run_collector_acceptance.py", "--help"])
+    blocked = Mock(side_effect=AssertionError("help must not enter the case lifecycle"))
+    monkeypatch.setattr(
+        collector,
+        "CASE",
+        replace(
+            collector.CASE,
+            configure=blocked,
+            read_only_preflight=blocked,
+            plan_details=blocked,
+            execute_case=blocked,
+        ),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        collector.main()
+
+    assert caught.value.code == 0
+    assert "--site-profile" in capsys.readouterr().out
+    blocked.assert_not_called()
 
 
 def test_a_profile_may_not_carry_the_per_case_approval_flags(tmp_path: Path) -> None:

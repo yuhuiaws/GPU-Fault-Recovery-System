@@ -9,16 +9,32 @@ from pathlib import Path
 import pytest
 
 from scripts.e2e.regional import run_preemption_contracts as contracts
+from tests.test_acceptance_receipt_alignment import IDENTITY, complete_report
+from tools import run_fault_test_cases as fault_runner
 
 
 def fake_runner(returncode: int):
-    def run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    def run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
         assert command[1:4] == ["-m", "pytest", "-q"]
+        selectors = [item for item in command if item.startswith("tests/")]
+        report = complete_report(selectors)
+        report["session"]["exitstatus"] = returncode
+        if returncode:
+            report["records"][selectors[0]]["status"] = "FAIL"
+            report["records"][selectors[0]]["phases"]["call"] = "failed"
+        Path(kwargs["env"]["PYTEST_GPU_FAULT_CASE_REPORT"]).write_text(
+            json.dumps(report)
+        )
         return subprocess.CompletedProcess(
             command, returncode, stdout="1 passed\n", stderr=""
         )
 
     return run
+
+
+@pytest.fixture(autouse=True)
+def source_binding(monkeypatch):
+    monkeypatch.setattr(fault_runner, "source_identity", lambda root: IDENTITY)
 
 
 @pytest.mark.parametrize(("returncode", "verdict"), [(0, "PASS"), (1, "FAIL")])
@@ -45,6 +61,15 @@ def test_run_case_writes_case_evidence_under_run_dir(
         "case_id": case_id,
         "verdict": verdict,
         "pytest_nodeids": list(contracts.CASE_NODEIDS[case_id]),
+        "source_identity": IDENTITY,
+        "receipt_errors": []
+        if returncode == 0
+        else [
+            f"pytest contract lacks successful setup/call/teardown: "
+            f"{contracts.ROOT / contracts.CASE_NODEIDS[case_id][0]}",
+            "pytest did not finish successfully",
+        ],
+        "proof_scope": "local-contract",
     }
 
 

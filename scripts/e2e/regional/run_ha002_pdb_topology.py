@@ -6,22 +6,31 @@ import functools
 import json
 import os
 import signal
+import shlex
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 if __package__:
     from . import run_ha001_control_plane_failover as COMMON
+    from .ha_evidence import chain_preflight, require_chain, result_identity
+    from .ha_kubernetes import (
+        NODE_OWNER,
+        node_cordon_patch,
+        node_restore_patch,
+        require_uid,
+    )
     from .acceptance_runner_common import write_json_atomic
-    from .acceptance_scope import current_acceptance_scope
     from .live_driver_guard import (
         add_live_arguments,
-        applied_site_profile,
         install_site_profile,
     )
     from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
+        build_plan as guard_build_plan,
     )
     from .regional_live_fixture import (
         install_abort_signals,
@@ -29,15 +38,21 @@ if __package__:
     )
 else:
     import run_ha001_control_plane_failover as COMMON
+    from ha_evidence import chain_preflight, require_chain, result_identity
+    from ha_kubernetes import (
+        NODE_OWNER,
+        node_cordon_patch,
+        node_restore_patch,
+        require_uid,
+    )
     from acceptance_runner_common import write_json_atomic
-    from acceptance_scope import current_acceptance_scope
     from live_driver_guard import (
         add_live_arguments,
-        applied_site_profile,
         install_site_profile,
     )
     from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
+        build_plan as guard_build_plan,
     )
     from regional_live_fixture import (
         install_abort_signals,
@@ -82,8 +97,12 @@ def current_node(name: str) -> dict[str, Any]:
     return {
         "name": value["metadata"]["name"],
         "uid": value["metadata"]["uid"],
+        "resource_version": value["metadata"].get("resourceVersion"),
+        "annotations_present": "annotations" in value["metadata"],
+        "ha_owner": value["metadata"].get("annotations", {}).get(NODE_OWNER),
         "unschedulable": value["spec"].get("unschedulable", False),
         "taints": value["spec"].get("taints", []),
+        "taints_present": "taints" in value["spec"],
         "ready": next(
             (
                 item["status"]
@@ -96,27 +115,32 @@ def current_node(name: str) -> dict[str, Any]:
 
 
 def pod_by_name(name: str) -> dict[str, Any] | None:
-    result = COMMON.cpu("get", "pod", name, "-o", "json", check=False)
+    result = COMMON.cpu("get", "pod", name, "--ignore-not-found", "-o", "json")
     if not result.strip():
         return None
     value = json.loads(result)
-    statuses = value.get("status", {}).get("containerStatuses", [])
+    ready = COMMON.ready_pod_records({"items": [value]})
     return {
         "name": value["metadata"]["name"],
         "uid": value["metadata"]["uid"],
         "node": value["spec"].get("nodeName"),
         "app": value["metadata"].get("labels", {}).get("app"),
-        "ready": bool(statuses) and all(bool(item.get("ready")) for item in statuses),
+        "ready": bool(ready),
         "phase": value.get("status", {}).get("phase"),
     }
 
 
-def eviction(pod_name: str) -> subprocess.CompletedProcess[str]:
+def eviction(
+    pod_name: str, *, uid: str, dry_run: bool = False
+) -> subprocess.CompletedProcess[str]:
     manifest = {
         "apiVersion": "policy/v1",
         "kind": "Eviction",
         "metadata": {"name": pod_name, "namespace": COMMON.NAMESPACE},
+        "deleteOptions": {"preconditions": {"uid": require_uid(uid)}},
     }
+    if dry_run:
+        manifest["deleteOptions"]["dryRun"] = ["All"]
     return COMMON.run(
         [
             "kubectl",
@@ -210,14 +234,32 @@ def require_pdb_rejection(
 
 
 def start_uncordon_watchdog(
-    case_dir: Path, node: str
+    case_dir: Path, node: str, *, baseline: dict[str, Any], owner: str
 ) -> tuple[subprocess.Popen[str], Any]:
     log_path = case_dir / "uncordon-watchdog.log"
     handle = log_path.open("w")
     os.chmod(log_path, 0o600)
+    patch_path = case_dir / "uncordon-patch.json"
+    patch_path.write_text(json.dumps(node_restore_patch(baseline, owner=owner)))
+    patch_path.chmod(0o600)
     command = (
-        f"sleep {WATCHDOG_SECONDS}; exec kubectl "
-        f"--kubeconfig {COMMON.CPU_KUBECONFIG} uncordon {node}"
+        f"sleep {WATCHDOG_SECONDS}; exec "
+        + shlex.join(
+            [
+                "kubectl",
+                "--kubeconfig",
+                str(COMMON.CPU_KUBECONFIG),
+                "patch",
+                "node",
+                node,
+                "--type=json",
+                "--patch-file=/dev/stdin",
+                "-o",
+                "name",
+            ]
+        )
+        + " < "
+        + shlex.quote(str(patch_path))
     )
     process = subprocess.Popen(
         ["/bin/bash", "-c", command],
@@ -231,10 +273,30 @@ def start_uncordon_watchdog(
         {
             "pid": process.pid,
             "node": node,
+            "uid": baseline["uid"],
+            "owner": owner,
             "delay_seconds": WATCHDOG_SECONDS,
         },
     )
     return process, handle
+
+
+def patch_node(name: str, patch: list[dict[str, Any]]) -> None:
+    COMMON.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(COMMON.CPU_KUBECONFIG),
+            "patch",
+            "node",
+            name,
+            "--type=json",
+            "--patch-file=/dev/stdin",
+            "-o",
+            "name",
+        ],
+        stdin=json.dumps(patch),
+    )
 
 
 def stop_watchdog(process: subprocess.Popen[str] | None, handle: Any) -> None:
@@ -301,7 +363,10 @@ def schedulable_cpu_nodes(nodes: dict[str, Any]) -> list[str]:
     return sorted(result)
 
 
-def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
+def build_plan(
+    run_dir: Path, attempt: int, *, arguments: argparse.Namespace
+) -> dict[str, Any]:
+    chain = chain_preflight(arguments, CASE_ID)
     nodes = json.loads(
         COMMON.run(
             [
@@ -316,6 +381,7 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
         ).stdout
     )
     pods = json.loads(COMMON.cpu("get", "pods", "-o", "json"))
+    ready_names = {item["name"] for item in COMMON.ready_pod_records(pods)}
     active_by_node: dict[str, list[dict[str, Any]]] = {}
     for item in pods.get("items", []):
         if item.get("status", {}).get("phase") not in {"Pending", "Running"}:
@@ -323,14 +389,12 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
         node = item.get("spec", {}).get("nodeName")
         if not node:
             continue
-        statuses = item.get("status", {}).get("containerStatuses", [])
         active_by_node.setdefault(node, []).append(
             {
                 "name": item["metadata"]["name"],
                 "uid": item["metadata"]["uid"],
                 "app": item["metadata"].get("labels", {}).get("app"),
-                "ready": bool(statuses)
-                and all(bool(status.get("ready")) for status in statuses),
+                "ready": item["metadata"]["name"] in ready_names,
             }
         )
     topology = COMMON.deployment_and_pdb_snapshot()
@@ -397,16 +461,20 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
         app: COMMON.failure_window_limit(topology["deployments"][app])
         for app in (COMMON.INGRESS_APP, COMMON.WORKER_APP)
     }
-    scope = current_acceptance_scope()
+    errors = [
+        *chain["errors"],
+        *COMMON.validate_roles(COMMON.role_snapshot(), replicas),
+    ]
     plan = {
-        "schema_version": 3,
-        "case_id": CASE_ID,
-        "attempt": attempt,
-        "confirmation": CONFIRMATION,
-        "environment": COMMON.environment_values(),
-        "site_profile": applied_site_profile(),
-        **scope.plan_fields(),
-        "mutation_performed": False,
+        "risk": "live-control-plane-pdb-eviction",
+        "mutation": (
+            "cordon one CPU node and issue Eviction API calls against same-role "
+            "Pods to prove the PodDisruptionBudget rejects the second same-role "
+            "disruption; no Deployment spec change; restore the owned node "
+            "cordon in finally with an independent uncordon watchdog"
+        ),
+        "errors": errors,
+        "chain": chain,
         "region": COMMON.AWS_REGION,
         "maintenance_window_required_at_execute": True,
         "target_node": selected["node"],
@@ -414,6 +482,9 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
             "ingress": [selected["ingress"][0]["name"]],
             "workers": [item["name"] for item in selected["workers"][:2]],
             "spool_worker": [item["name"] for item in selected["spool_workers"][:1]],
+        },
+        "pod_uids": {
+            item["metadata"]["name"]: item["metadata"]["uid"] for item in pods["items"]
         },
         "replicas": replicas,
         "cpu_nodes": cpu_nodes,
@@ -440,10 +511,16 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
             "wait_for_declared_replicas": True,
         },
     }
-    path = run_dir / "cases" / CASE_ID / "plan.json"
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_json_atomic(path, plan)
-    return plan
+    return guard_build_plan(
+        run_dir=run_dir,
+        case_id=CASE_ID,
+        attempt=attempt,
+        confirmation=CONFIRMATION,
+        arguments=arguments,
+        preflight_passed=not errors,
+        environment=COMMON.environment_values(),
+        details=plan,
+    )
 
 
 def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
@@ -452,8 +529,9 @@ def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
     node_name = str(plan["target_node"]["name"])
     baseline_node = current_node(node_name)
     if (
-        baseline_node["uid"] != plan["target_node"].get("uid", baseline_node["uid"])
+        baseline_node["uid"] != plan["target_node"].get("uid")
         or baseline_node["unschedulable"]
+        or baseline_node["ha_owner"] is not None
         or baseline_node["taints"] != plan["target_node"]["taints"]
         or baseline_node["ready"] != "True"
     ):
@@ -480,6 +558,7 @@ def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
         pod = pod_by_name(name)
         if (
             pod is None
+            or pod["uid"] != plan.get("pod_uids", {}).get(name)
             or pod["app"] != app
             or pod["node"] != node_name
             or not pod["ready"]
@@ -487,9 +566,7 @@ def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
             raise CaseError(f"planned Pod drifted: {name}: {pod}")
     queue_baseline = plan["baseline"].get("queue")
     if not isinstance(queue_baseline, dict):
-        queue_baseline = COMMON.queue_stats()
-        plan["baseline"]["queue"] = queue_baseline
-        write_json_atomic(plan_path, plan)
+        raise CaseError("plan has no observed queue baseline; re-plan")
     return {
         "plan": plan,
         "node_name": node_name,
@@ -507,6 +584,7 @@ def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
         "spool_replicas": replicas[COMMON.SPOOL_APP],
         "cpu_nodes": [str(value) for value in plan.get("cpu_nodes", [])],
         "baseline_depth": int(queue_baseline["depth"]),
+        "pod_uids": plan["pod_uids"],
     }
 
 
@@ -534,10 +612,17 @@ def _evict_role(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Evict ``first``, wait for the PDB to close, re-check it, then try ``second``."""
 
-    first_result = require_eviction_success(eviction(first), first)
+    if datetime.now(timezone.utc) >= context["maintenance_window_end"]:
+        raise CaseError("maintenance window ended before Eviction")
+    first_result = require_eviction_success(
+        eviction(first, uid=context["pod_uids"][first]), first
+    )
     blocked = wait_pdb_block(PDB_NAMES[role])
     recheck = require_pdb_still_blocked(PDB_NAMES[role])
-    second_result = require_pdb_rejection(eviction(second), second)
+    second_result = require_pdb_rejection(
+        eviction(second, uid=context["pod_uids"][second], dry_run=True), second
+    )
+    second_result["dry_run"] = True
     phase = _observe(
         context,
         f"ha002-{role}",
@@ -556,8 +641,14 @@ def _evict_role(
 def _run_disruptions(
     case_dir: Path, context: dict[str, Any], state: dict[str, Any]
 ) -> dict[str, Any]:
-    COMMON.create_probe()
+    if COMMON.probe_resources()["count"] != 0:
+        raise CaseError("HA probe resources already exist")
+    state["resources"] = COMMON.OwnedProbeResources(
+        case_dir / f"probe-resources-a{context['attempt']}.json",
+        lambda args, body: COMMON.gpu(*args, stdin=body),
+    )
     state["probe_created"] = True
+    COMMON.create_probe(state["resources"])
     COMMON.wait_probe_file("/state/stats.json", 60)
     baseline_phase = _observe(context, "ha002-baseline", 10)
     write_json_atomic(case_dir / "baseline-timeline.json", baseline_phase)
@@ -567,21 +658,31 @@ def _run_disruptions(
     if role_errors:
         raise CaseError(f"role baseline failed: {role_errors}")
 
-    watchdog, handle = start_uncordon_watchdog(case_dir, context["node_name"])
+    if datetime.now(timezone.utc) >= context["maintenance_window_end"]:
+        raise CaseError("maintenance window ended before cordon")
+    watchdog, handle = start_uncordon_watchdog(
+        case_dir,
+        context["node_name"],
+        baseline=context["baseline_node"],
+        owner=context["node_owner"],
+    )
     state.update({"watchdog": watchdog, "watchdog_handle": handle})
     COMMON.log(f"cordoning CPU node {context['node_name']}")
-    COMMON.run(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(COMMON.CPU_KUBECONFIG),
-            "cordon",
-            context["node_name"],
-        ]
-    )
     state["cordoned"] = True
+    patch_node(
+        context["node_name"],
+        node_cordon_patch(
+            current_node(context["node_name"]),
+            uid=context["baseline_node"]["uid"],
+            owner=context["node_owner"],
+        ),
+    )
     cordoned_state = current_node(context["node_name"])
-    if not cordoned_state["unschedulable"]:
+    if (
+        not cordoned_state["unschedulable"]
+        or cordoned_state["uid"] != context["baseline_node"]["uid"]
+        or cordoned_state["ha_owner"] != context["node_owner"]
+    ):
         raise CaseError("node did not become unschedulable")
     write_json_atomic(case_dir / "cordoned-node.json", cordoned_state)
 
@@ -608,14 +709,9 @@ def _run_disruptions(
     spool_result, spool_phase = _run_spool_disruption(case_dir, context)
 
     COMMON.log(f"uncordoning CPU node {context['node_name']}")
-    COMMON.run(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(COMMON.CPU_KUBECONFIG),
-            "uncordon",
-            context["node_name"],
-        ]
+    patch_node(
+        context["node_name"],
+        node_restore_patch(context["baseline_node"], owner=context["node_owner"]),
     )
     state["cordoned"] = False
     recovery = wait_recovery(replicas=context["replicas"])
@@ -682,7 +778,12 @@ def _distribution(items: list[dict[str, Any]]) -> dict[str, int]:
     return result
 
 
-def balanced_distribution(distribution: dict[str, int], replicas: int) -> bool:
+def balanced_distribution(
+    distribution: dict[str, int],
+    replicas: int,
+    *,
+    eligible_nodes: list[str] | None = None,
+) -> bool:
     """Whether ``replicas`` Pods sit across nodes with maxSkew 1, as the spread demands.
 
     The old check compared against ``[1, 1, 1]``/``[2, 2, 2]`` -- three nodes
@@ -691,7 +792,13 @@ def balanced_distribution(distribution: dict[str, int], replicas: int) -> bool:
     the declared replicas, whatever both numbers are.
     """
 
-    counts = list(distribution.values())
+    if eligible_nodes is not None and set(distribution) - set(eligible_nodes):
+        return False
+    counts = (
+        [distribution.get(node, 0) for node in eligible_nodes]
+        if eligible_nodes is not None
+        else list(distribution.values())
+    )
     if sum(counts) != replicas:
         return False
     if not counts:
@@ -797,10 +904,24 @@ def _ha002_result(
     ingress_distribution = _distribution(topology["ingress"])
     worker_distribution = _distribution(topology["workers"])
     spool_distribution = _distribution(topology["spool_workers"])
-    if not balanced_distribution(ingress_distribution, replicas[COMMON.INGRESS_APP]):
+    if not balanced_distribution(
+        ingress_distribution,
+        replicas[COMMON.INGRESS_APP],
+        eligible_nodes=context["cpu_nodes"],
+    ):
         errors.append("ingress topology did not return to a balanced spread")
-    if not balanced_distribution(worker_distribution, replicas[COMMON.WORKER_APP]):
+    if not balanced_distribution(
+        worker_distribution,
+        replicas[COMMON.WORKER_APP],
+        eligible_nodes=context["cpu_nodes"],
+    ):
         errors.append("worker topology did not return to a balanced spread")
+    if not balanced_distribution(
+        spool_distribution,
+        replicas[COMMON.SPOOL_APP],
+        eligible_nodes=context["cpu_nodes"],
+    ):
+        errors.append("spool-worker topology did not return to a balanced spread")
     last_cordoned_sample = (
         ingress_phase["samples"][-1] if ingress_phase["samples"] else {}
     )
@@ -867,24 +988,37 @@ def cleanup_case(
             errors.append(f"{label}: {type(exc).__name__}: {exc}")
 
     if state["cordoned"]:
+
+        def restore_node() -> None:
+            current = current_node(context["node_name"])
+            if current.get("uid") != require_uid(context["baseline_node"].get("uid")):
+                result["node_identity_changed"] = True
+                raise CaseError("refusing to uncordon a replacement Node")
+            if current["unschedulable"] is False and current.get("ha_owner") is None:
+                return
+            patch_node(
+                context["node_name"],
+                node_restore_patch(
+                    context["baseline_node"], owner=context["node_owner"]
+                ),
+            )
+            if current_node(context["node_name"])["unschedulable"]:
+                raise CaseError("uncordon did not restore scheduling")
+
+        attempt("uncordon", restore_node)
+    if not errors or result.get("node_identity_changed"):
         attempt(
-            "uncordon",
-            lambda: COMMON.run(
-                [
-                    "kubectl",
-                    "--kubeconfig",
-                    str(COMMON.CPU_KUBECONFIG),
-                    "uncordon",
-                    context["node_name"],
-                ],
-                check=False,
-            ),
+            "stop watchdog",
+            lambda: stop_watchdog(state["watchdog"], state["watchdog_handle"]),
         )
-    attempt(
-        "stop watchdog",
-        lambda: stop_watchdog(state["watchdog"], state["watchdog_handle"]),
-    )
-    if state["probe_created"]:
+    else:
+        result["watchdog_left_armed"] = state["watchdog"] is not None
+        if state["watchdog_handle"] is not None:
+            state["watchdog_handle"].close()
+    resources = state.get("resources")
+    if state["probe_created"] and resources is None:
+        errors.append("probe resources have no ownership receipt; preserving them")
+    if state["probe_created"] and resources is not None:
         attempt(
             "stop probe",
             lambda: COMMON.gpu(
@@ -896,22 +1030,14 @@ def cleanup_case(
                 check=False,
             ),
         )
-    attempt(
-        "delete probe pod",
-        lambda: COMMON.gpu(
-            "delete", "pod", COMMON.PROBE_POD, "--ignore-not-found", check=False
-        ),
-    )
-    attempt(
-        "delete probe configmap",
-        lambda: COMMON.gpu(
-            "delete",
-            "configmap",
-            COMMON.CONFIGMAP,
-            "--ignore-not-found",
-            check=False,
-        ),
-    )
+        attempt(
+            "delete probe pod",
+            lambda: resources.delete("Pod", COMMON.PROBE_POD),
+        )
+        attempt(
+            "delete probe configmap",
+            lambda: resources.delete("ConfigMap", COMMON.CONFIGMAP),
+        )
     deployments = [COMMON.INGRESS_APP, COMMON.WORKER_APP]
     if context["spool_replicas"]:
         deployments.append(COMMON.SPOOL_APP)
@@ -951,15 +1077,30 @@ def cleanup_case(
     return errors
 
 
-def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
+def execute(
+    run_dir: Path,
+    attempt: int,
+    confirmation: str,
+    *,
+    maintenance_window_end: datetime | None = None,
+    chain: dict[str, Any] | None = None,
+) -> int:
     if confirmation != CONFIRMATION:
         raise CaseError(f"confirmation must be exactly {CONFIRMATION}")
     case_dir = run_dir / "cases" / CASE_ID
     plan_path = case_dir / "plan.json"
     if not plan_path.is_file():
         raise CaseError("HA-002 plan is missing")
-    context = execute_context(json.loads(plan_path.read_text()), plan_path)
+    envelope = json.loads(plan_path.read_text())
+    context = execute_context(envelope.get("details") or {}, plan_path)
+    if (
+        maintenance_window_end is None
+        or datetime.now(timezone.utc) >= maintenance_window_end
+    ):
+        raise CaseError("approved maintenance window is missing or has ended")
     context["attempt"] = attempt
+    context["maintenance_window_end"] = maintenance_window_end
+    context["node_owner"] = f"ha002-{attempt}-{uuid4().hex}"
     result: dict[str, Any] = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
     state: dict[str, Any] = {
         "probe_created": False,
@@ -969,13 +1110,18 @@ def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
     }
     try:
         result = _run_disruptions(case_dir, context, state)
+    except COMMON.ProcessSupervisionLost:
+        COMMON.record_supervision_loss(result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup_errors = cleanup_case(case_dir, context, state, result)
+        cleanup_errors = COMMON.run_cleanup(
+            result, lambda: cleanup_case(case_dir, context, state, result)
+        )
         result["cleanup_errors"] = cleanup_errors
         if cleanup_errors:
             result["verdict"] = "FAIL"
+    result.update(result_identity(chain))
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -988,6 +1134,7 @@ def main() -> int:
     parser.add_argument("--cpu-kubeconfig", default="")
     parser.add_argument("--gpu-kubeconfig", default="")
     parser.add_argument("--gpu-context", default="")
+    parser.add_argument("--cluster-id", default="")
     parser.add_argument("--namespace", default="gpu-fault-system")
     parser.add_argument("--region", default="")
     args = parser.parse_args()
@@ -995,20 +1142,25 @@ def main() -> int:
     COMMON.configure(args)
     install_abort_signals()
     if not args.execute:
-        plan = build_plan(args.run_dir, args.attempt)
+        plan = build_plan(args.run_dir, args.attempt, arguments=args)
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
+        return 0 if plan["preflight_passed"] is True else 1
     deadline = guard_authorize_execution(
         args,
         case_id=CASE_ID,
         confirmation=CONFIRMATION,
         environment=COMMON.environment_values(),
     )
-    plan_path = args.run_dir / "cases" / CASE_ID / "plan.json"
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    plan["maintenance_window_end"] = deadline.isoformat()
-    write_json_atomic(plan_path, plan)
-    return execute(args.run_dir, args.attempt, args.confirm)
+    chain = chain_preflight(args, CASE_ID)
+    plan = json.loads((args.run_dir / "cases" / CASE_ID / "plan.json").read_text())
+    require_chain(plan["details"].get("chain", {}), chain)
+    return execute(
+        args.run_dir,
+        args.attempt,
+        args.confirm,
+        maintenance_window_end=deadline,
+        chain=chain,
+    )
 
 
 if __name__ == "__main__":

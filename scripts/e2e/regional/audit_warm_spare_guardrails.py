@@ -5,22 +5,45 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from gpu_fault.admin.atomic_json import write_json_atomic as _write_document
-
-if __package__:
-    from .acceptance_runner_common import write_json_atomic
-else:
-    from acceptance_runner_common import write_json_atomic
-
-
 ROOT = Path(__file__).resolve().parents[3]
+for _path in (ROOT, ROOT / "src"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from gpu_fault.admin.atomic_json import (  # noqa: E402
+    write_json_atomic as _write_document,
+)
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    write_json_atomic,
+)
+from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # noqa: E402
+from scripts.e2e.regional.acceptance_supervision import (  # noqa: E402
+    bind_command_supervision,
+)
+from scripts.e2e.regional.destr_net_isolation_probe import (  # noqa: E402
+    ISOLATED_NODE_READER,
+)
+from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
+    REGISTRY_PROBE,
+    complete_pod_population,
+    registration_identity,
+    validate_provider_record,
+)
+from scripts.e2e.regional.regional_case_contract import predecessor_path  # noqa: E402
+from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    PROVIDER_MUTATIONS,
+    component_python,
+    predecessor_evidence,
+)
+from scripts.e2e.regional.warm_node_evidence import project_gpu_nodes  # noqa: E402
+from tools.pytest_result_identity import PytestReceipt  # noqa: E402
+
 # CloudTrail's delivery guarantee: a negative read whose window ended inside
 # this is provisional, not proof.
 PROVIDER_EVENT_VISIBILITY_SECONDS = 900
@@ -110,11 +133,10 @@ def configure(arguments: argparse.Namespace, selected_cases: set[str]) -> None:
         or os.getenv("GPU_FAULT_CONTROL_CONTEXT")
         or os.getenv("CPU_EKS_CONTEXT", "")
     )
-    if "GF-REGIONAL-DESTR-005" in selected_cases:
-        if not cpu_kubeconfig:
-            missing.append("CPU kubeconfig")
-        if not CPU_CONTEXT:
-            missing.append("CPU context")
+    if not cpu_kubeconfig:
+        missing.append("CPU kubeconfig")
+    if not CPU_CONTEXT:
+        missing.append("CPU context")
     if missing:
         raise RuntimeError(
             "required audit configuration is missing: " + ", ".join(missing)
@@ -135,21 +157,7 @@ def command(
     timeout: int = 180,
     stdin: str | None = None,
 ) -> str:
-    result = subprocess.run(
-        argv,
-        cwd=ROOT,
-        text=True,
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"command failed ({result.returncode}): {' '.join(argv)}; "
-            f"stderr={result.stderr.strip()}"
-        )
-    return result.stdout
+    return run_fixture_command(argv, cwd=ROOT, input_text=stdin, timeout=timeout).stdout
 
 
 def kubectl(
@@ -211,19 +219,36 @@ def _running_pods(
     context: str,
     selector: str,
 ) -> list[str]:
-    return kubectl(
-        kubeconfig,
-        context,
-        "-n",
-        NAMESPACE,
-        "get",
-        "pod",
-        "-l",
-        selector,
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[*].metadata.name}",
-    ).split()
+    inventory = json.loads(
+        kubectl(
+            kubeconfig,
+            context,
+            "-n",
+            NAMESPACE,
+            "get",
+            "pod",
+            "-l",
+            selector,
+            "-o",
+            "json",
+        )
+    )
+    if not selector.startswith("app=") or selector.count("=") != 1:
+        raise RuntimeError("guard audit Pod selector is unsupported")
+    deployment = json.loads(
+        kubectl(
+            kubeconfig,
+            context,
+            "-n",
+            NAMESPACE,
+            "get",
+            "deployment",
+            selector.removeprefix("app="),
+            "-o",
+            "json",
+        )
+    )
+    return [pod["name"] for pod in complete_pod_population(deployment, inventory)]
 
 
 def executor_env() -> list[dict[str, Any]]:
@@ -233,40 +258,100 @@ def executor_env() -> list[dict[str, Any]]:
         GPU_CONTEXT,
         "app=gpu-fault-cluster-executor",
     ):
-        result.append(
-            json.loads(
-                kubectl(
-                    GPU_KUBECONFIG,
-                    GPU_CONTEXT,
-                    "-n",
-                    NAMESPACE,
-                    "exec",
-                    pod,
-                    "--",
-                    "python",
-                    "-c",
-                    (
-                        "import json,os; print(json.dumps({"
-                        "'pod':os.environ.get('HOSTNAME'),"
-                        "'spare_failover':os.environ.get("
-                        "'GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER'),"
-                        "'remote_state':os.environ.get("
-                        "'GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE'),"
-                        "'allow_replace':os.environ.get("
-                        "'GPU_FAULT_ALLOW_HYPERPOD_REPLACE')}))"
-                    ),
-                ).splitlines()[-1]
+        metadata = json.loads(
+            kubectl(
+                GPU_KUBECONFIG,
+                GPU_CONTEXT,
+                "-n",
+                NAMESPACE,
+                "get",
+                "pod",
+                pod,
+                "-o",
+                "json",
             )
+        )["metadata"]
+        uid = metadata.get("uid")
+        if not isinstance(uid, str) or not uid:
+            raise RuntimeError("executor Pod UID is missing")
+        observation = json.loads(
+            kubectl(
+                GPU_KUBECONFIG,
+                GPU_CONTEXT,
+                "-n",
+                NAMESPACE,
+                "exec",
+                pod,
+                "--",
+                component_python("gpu"),
+                "-c",
+                (
+                    "import json,os; print(json.dumps({"
+                    "'pod':os.environ.get('HOSTNAME'),"
+                    "'cluster_id':os.environ.get('GPU_FAULT_CLUSTER_ID'),"
+                    "'spare_failover':os.environ.get("
+                    "'GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER'),"
+                    "'remote_state':os.environ.get("
+                    "'GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE'),"
+                    "'allow_replace':os.environ.get("
+                    "'GPU_FAULT_ALLOW_HYPERPOD_REPLACE')}))"
+                ),
+            ).splitlines()[-1]
         )
+        after = json.loads(
+            kubectl(
+                GPU_KUBECONFIG,
+                GPU_CONTEXT,
+                "-n",
+                NAMESPACE,
+                "get",
+                "pod",
+                pod,
+                "-o",
+                "json",
+            )
+        )["metadata"]
+        if after.get("uid") != uid or observation.get("pod") != pod:
+            raise RuntimeError("executor Pod changed during its environment probe")
+        result.append({**observation, "pod_uid": uid})
     return result
 
 
-def _gpu_capacity(node: dict[str, Any]) -> int:
-    raw = node.get("status", {}).get("allocatable", {}).get("nvidia.com/gpu", "0")
-    try:
-        return int(str(raw))
-    except ValueError:
-        return 0
+def audit_identity() -> dict[str, str]:
+    pods = _running_pods(CPU_KUBECONFIG, CPU_CONTEXT, "app=gpu-fault-api-ha")
+    if not pods:
+        raise RuntimeError("no Ready API Pod for registry identity")
+    registry = _pod_python(CPU_KUBECONFIG, CPU_CONTEXT, pods[0], REGISTRY_PROBE)
+    registration = registration_identity(
+        registry, MANAGED_GPU_CLUSTER, AUTOMATIC_NEGATIVE_CLUSTER, AWS_REGION
+    )
+    document = json.loads(
+        kubectl(
+            CPU_KUBECONFIG,
+            CPU_CONTEXT,
+            "-n",
+            NAMESPACE,
+            "get",
+            "configmap",
+            "gpu-fault-regional-release-state",
+            "-o",
+            "json",
+        )
+    )
+    state = json.loads(document["data"]["state.json"])
+    release_id = state.get("release_id")
+    if (
+        not isinstance(release_id, str)
+        or not release_id.strip()
+        or state.get("phase") != "complete"
+    ):
+        raise RuntimeError("guard audit requires a complete bound release")
+    return {
+        "release_id": release_id,
+        "cluster_id": registration["cluster_id"],
+        "eks_cluster_arn": registration["eks_cluster_arn"],
+        "registry_generation": str(registry["generation"]),
+    }
 
 
 def node_snapshot() -> list[dict[str, Any]]:
@@ -280,55 +365,35 @@ def node_snapshot() -> list[dict[str, Any]]:
             "json",
         )
     )
-    nodes = []
-    for item in value.get("items", []):
-        if _gpu_capacity(item) <= 0:
+    return project_gpu_nodes(value, ownership_annotations=OWNERSHIP_ANNOTATIONS)
+
+
+def node_identity_errors(nodes: list[dict[str, Any]]) -> list[str]:
+    errors = []
+    names: set[str] = set()
+    uids: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            errors.append("GPU node snapshot contains a non-object identity")
             continue
-        metadata = item.get("metadata", {})
-        annotations = metadata.get("annotations", {})
-        taints = sorted(
-            (
-                {
-                    key: taint[key]
-                    for key in ("key", "value", "effect", "timeAdded")
-                    if key in taint
-                }
-                for taint in item.get("spec", {}).get("taints", [])
-            ),
-            key=lambda taint: (
-                str(taint.get("key", "")),
-                str(taint.get("value", "")),
-                str(taint.get("effect", "")),
-            ),
-        )
-        ready = next(
-            (
-                condition.get("status")
-                for condition in item.get("status", {}).get("conditions", [])
-                if condition.get("type") == "Ready"
-            ),
-            None,
-        )
-        nodes.append(
-            {
-                "name": metadata.get("name"),
-                "uid": metadata.get("uid"),
-                "ready": ready,
-                "gpu_allocatable": _gpu_capacity(item),
-                "unschedulable": bool(item.get("spec", {}).get("unschedulable", False)),
-                "taints": taints,
-                "ownership_annotations": {
-                    key: annotations.get(key) for key in OWNERSHIP_ANNOTATIONS
-                },
-            }
-        )
-    return sorted(nodes, key=lambda node: str(node["name"]))
+        for field, seen in (("name", names), ("uid", uids)):
+            value = node.get(field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"GPU node snapshot has an invalid {field}")
+            elif value in seen:
+                errors.append(f"GPU node snapshot has a duplicate {field}")
+            else:
+                seen.add(value)
+    return errors
 
 
 def node_preflight_errors(nodes: list[dict[str, Any]]) -> list[str]:
     errors = []
     if not nodes:
         return ["GPU node snapshot is empty"]
+    errors = node_identity_errors(nodes)
+    if errors:
+        return errors
     for node in nodes:
         quarantine = [
             taint for taint in node["taints"] if taint.get("key") == QUARANTINE_TAINT
@@ -349,7 +414,10 @@ def node_state_drift(
     before: list[dict[str, Any]],
     after: list[dict[str, Any]],
 ) -> list[str]:
-    errors = []
+    errors = [f"baseline: {error}" for error in node_identity_errors(before)]
+    errors.extend(f"postflight: {error}" for error in node_identity_errors(after))
+    if errors:
+        return errors
     before_by_name = {str(node["name"]): node for node in before}
     after_by_name = {str(node["name"]): node for node in after}
     if set(before_by_name) != set(after_by_name):
@@ -396,13 +464,15 @@ def replace_events(started_at: datetime, ended_at: datetime) -> list[dict[str, A
             ]
         )
     )
+    if not isinstance(value, dict) or not isinstance(value.get("Events"), list):
+        raise RuntimeError("CloudTrail event inventory is unreadable")
     return [
         {
             "event_name": item.get("EventName"),
             "event_time": str(item.get("EventTime")),
         }
         for item in value.get("Events", [])
-        if item.get("EventName") in {"BatchReplaceClusterNodes", "ReplaceClusterNodes"}
+        if item.get("EventName") in PROVIDER_MUTATIONS
     ]
 
 
@@ -421,11 +491,16 @@ def _pod_python(
         "-i",
         pod,
         "--",
-        "python",
+        component_python(
+            "cpu" if (kubeconfig, context) == (CPU_KUBECONFIG, CPU_CONTEXT) else "gpu"
+        ),
         "-",
         stdin=script,
     )
-    return cast(dict[str, Any], json.loads(output.splitlines()[-1]))
+    value = json.loads(output.splitlines()[-1])
+    if not isinstance(value, dict) or not value:
+        raise RuntimeError("guard probe did not return a nonempty object")
+    return value
 
 
 def deployed_managed_owner_probe() -> dict[str, Any]:
@@ -500,6 +575,7 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
     real provider data, not a copy of the cluster's network and IAM identity.
     """
 
+    recorded_at = datetime.now(timezone.utc)
     described = json.loads(
         command(
             [
@@ -517,6 +593,7 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
     )
     pages: list[dict[str, Any]] = []
     next_token: str | None = None
+    seen_tokens: set[str] = set()
     while True:
         argv = [
             "aws",
@@ -529,12 +606,17 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
             "--include-node-logical-ids",
             "--max-results",
             "100",
+            "--no-paginate",
             "--output",
             "json",
         ]
         if next_token:
             argv += ["--next-token", next_token]
         listed = json.loads(command(argv))
+        if not isinstance(listed, dict) or not isinstance(
+            listed.get("ClusterNodeSummaries"), list
+        ):
+            raise RuntimeError("provider node page is unreadable")
         pages.append(
             {
                 "ClusterNodeSummaries": [
@@ -547,6 +629,9 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
         next_token = listed.get("NextToken")
         if not next_token:
             break
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise RuntimeError("provider node pagination repeated a token")
+        seen_tokens.add(next_token)
     details: dict[str, Any] = {}
     for page in pages:
         for item in page["ClusterNodeSummaries"]:
@@ -576,12 +661,14 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
         "describe_cluster_node": details,
     }
     serialized = json.dumps(payloads, sort_keys=True, separators=(",", ":"))
-    return {
+    result = {
         "payloads": payloads,
-        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "recorded_at": recorded_at.isoformat().replace("+00:00", "Z"),
         "payload_digest": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         "recorded_by": "acceptance auditor host (SageMaker read-only)",
     }
+    validate_provider_record(result, cluster_name)
+    return result
 
 
 def deployed_automatic_recovery_probe(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -603,9 +690,12 @@ def deployed_automatic_recovery_probe(snapshot: dict[str, Any]) -> dict[str, Any
 
     Nothing here can mutate: the replayed client implements the three read
     calls and nothing else, no spare coordinator is attached, and the negative
-    cluster's `NodeRecovery` is never touched.
+    cluster's `NodeRecovery` is never touched. A target-bound, read-only
+    synthetic Kubernetes reader satisfies the earlier isolation fence; this
+    proves the recovery guard, not the live negative cluster's isolation.
     """
 
+    validate_provider_record(snapshot, AUTOMATIC_NEGATIVE_CLUSTER)
     pods = _running_pods(
         GPU_KUBECONFIG,
         GPU_CONTEXT,
@@ -694,9 +784,10 @@ if target is None:
     raise SystemExit("the Automatic negative cluster has no Running node to preflight")
 
 now = datetime.now(timezone.utc)
+ISOLATION_READS = {}
 
 
-def guard_outcome(parameters):
+def guard_outcome(arm, parameters):
     step = WorkflowStepSpec(
         operation=WorkflowOperation.REPLACE_NODE,
         execution_owner="gpu-fault-hyperpod-adapter",
@@ -728,7 +819,12 @@ def guard_outcome(parameters):
         created_at=now,
         updated_at=now,
     )
-    outcome = HyperPodLifecycleStepAdapter(adapter).execute(
+    kubernetes, reader = isolated_kubernetes_adapter(
+        incident.incident_id, incident.fencing_token, target.aliases
+    )
+    outcome = HyperPodLifecycleStepAdapter(
+        adapter, kubernetes_adapter=kubernetes
+    ).execute(
         WorkflowStepContext(
             workflow=workflow,
             incident=incident,
@@ -742,6 +838,7 @@ def guard_outcome(parameters):
             idempotency_key="workflow-destr006-deployed-probe/0/REPLACE_NODE",
         )
     )
+    ISOLATION_READS[arm] = reader.reads
     return {"status": outcome.status.value, "error": outcome.error}
 
 
@@ -751,15 +848,21 @@ print(json.dumps({
     "probed_node_status": target.status,
     "probed_node_count": len(nodes),
     "warm_spare_guard": guard_outcome(
-        {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
+        "warm_spare_guard", {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
     ),
-    "control_without_warm_spare_strategy": guard_outcome({}),
+    "control_without_warm_spare_strategy": guard_outcome(
+        "control_without_warm_spare_strategy", {}
+    ),
+    "isolation_reads": ISOLATION_READS,
+    "isolation_source": "synthetic-read-only",
 }, sort_keys=True))
 """
     header = (
         f"import json\nRECORDED = json.loads({json.dumps(snapshot['payloads'])!r})\n"
     )
-    probe = _pod_python(GPU_KUBECONFIG, GPU_CONTEXT, pods[0], header + script)
+    probe = _pod_python(
+        GPU_KUBECONFIG, GPU_CONTEXT, pods[0], header + ISOLATED_NODE_READER + script
+    )
     probe["payload_provenance"] = {
         key: snapshot[key] for key in ("recorded_at", "payload_digest", "recorded_by")
     }
@@ -825,7 +928,10 @@ workflow = WorkflowRequest(
     created_at=now,
     updated_at=now,
 )
-adapter = HyperPodLifecycleStepAdapter(object())
+kubernetes, reader = isolated_kubernetes_adapter(
+    incident.incident_id, incident.fencing_token, step.node_ids
+)
+adapter = HyperPodLifecycleStepAdapter(object(), kubernetes_adapter=kubernetes)
 adapter.dispatcher.preflight = lambda *_args, **_kwargs: SimpleNamespace(
     safe_to_submit=True,
     gate_failures=[],
@@ -870,65 +976,65 @@ print(json.dumps({
         "error": outcome.error,
     },
     "startup_guard_error": startup_error,
+    "isolation_reads": reader.reads,
+    "isolation_source": "synthetic-read-only",
 }, sort_keys=True))
 """
-    return _pod_python(GPU_KUBECONFIG, GPU_CONTEXT, pods[0], script)
-
-
-def run_pytest(case_dir: Path, nodeids: list[str]) -> bool:
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", *nodeids],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=300,
+    return _pod_python(
+        GPU_KUBECONFIG, GPU_CONTEXT, pods[0], ISOLATED_NODE_READER + script
     )
-    path = case_dir / "pytest.log"
-    path.write_text(result.stdout)
-    path.chmod(0o600)
-    return result.returncode == 0
 
 
-def failed_nodeids(log_text: str) -> set[str]:
-    """The nodeids pytest's short summary reports as FAILED or ERROR."""
+def run_pytest(case_dir: Path, nodeids: list[str]) -> PytestReceipt | None:
+    from scripts.e2e.regional.warm_pytest import run_pytest as execute_pytest
 
-    failed = set()
-    for line in log_text.splitlines():
-        status, _, rest = line.partition(" ")
-        if status in {"FAILED", "ERROR"} and rest:
-            failed.add(rest.split(" - ", 1)[0].strip())
-    return failed
+    return execute_pytest(case_dir, nodeids, root=ROOT)
 
 
 def run_focused_pytest(
     run_dir: Path,
     definitions: dict[str, list[str]],
 ) -> dict[str, bool]:
-    """One pytest process for every selected case's nodeids, attributed per case.
+    """Attribute complete discovered variants and passing phases to each case."""
 
-    Three interpreter start-ups for five tests was the slowest part of the
-    audit. One run, then the log's FAILED lines say which case a failure
-    belongs to; a failed run whose log attributes nothing fails every case
-    rather than passing any.
-    """
+    from scripts.e2e.regional.focused_pytest import PASSED_PHASES
+    from tools.pytest_result_identity import normalized_pytest_nodeid
 
     if not definitions:
         return {}
     log_dir = run_dir / "cases"
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    nodeids = [nodeid for items in definitions.values() for nodeid in items]
-    passed = run_pytest(log_dir, nodeids)
-    if passed:
-        return {case_id: True for case_id in definitions}
-    log = log_dir / "pytest.log"
-    failed = failed_nodeids(log.read_text()) if log.is_file() else set()
-    if not failed:
+    nodeids = list(
+        dict.fromkeys(nodeid for items in definitions.values() for nodeid in items)
+    )
+    if not nodeids:
         return {case_id: False for case_id in definitions}
-    return {
-        case_id: not any(nodeid in failed for nodeid in items)
-        for case_id, items in definitions.items()
-    }
+    receipt = run_pytest(log_dir, nodeids)
+    if (
+        receipt is None
+        or receipt.discovered_nodeids is None
+        or receipt.collection_skips
+    ):
+        return {case_id: False for case_id in definitions}
+    results = {}
+    for case_id, items in definitions.items():
+        passed = bool(items)
+        for nodeid in items:
+            records, error = receipt.selection(
+                normalized_pytest_nodeid(nodeid, root=ROOT)
+            )
+            if (
+                error
+                or not records
+                or any(
+                    record.get("status") != "PASS"
+                    or record.get("phases") != PASSED_PHASES
+                    for record in records
+                )
+            ):
+                passed = False
+        results[case_id] = passed
+    return results
 
 
 def cloudtrail_provisional(ended_at: datetime, *, now: datetime | None = None) -> bool:
@@ -1078,9 +1184,21 @@ class _Probes:
             return None
 
 
-def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
+def run_audit(
+    run_dir: Path, selected_cases: list[str], *, identity: dict[str, str] | None = None
+) -> int:
     definitions = case_definitions()
     started_at = datetime.now(timezone.utc)
+    for case_id in selected_cases:
+        write_json(
+            run_dir / "cases" / case_id / f"{case_id}.json",
+            {
+                "case_id": case_id,
+                "verdict": "FAIL",
+                "status": "RUNNING",
+                "formal_sequence_satisfied": False,
+            },
+        )
     baseline = node_snapshot()
     preflight_errors = node_preflight_errors(baseline)
     write_json(run_dir / "gpu-node-baseline.json", baseline)
@@ -1088,6 +1206,19 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
         (run_dir / "cases" / case_id).mkdir(parents=True, exist_ok=True, mode=0o700)
 
     probes = _Probes(selected_cases)
+    if identity is not None and preflight_errors:
+        for case_id in selected_cases:
+            write_json(
+                run_dir / "cases" / case_id / f"{case_id}.json",
+                {
+                    "case_id": case_id,
+                    "verdict": "FAIL",
+                    **identity,
+                    "errors": preflight_errors,
+                    "formal_sequence_satisfied": False,
+                },
+            )
+        return 1
     # The focused pytest first and once: it is independent of every live probe,
     # and running it afterwards meant one probe exception left it unrun and
     # reported as "focused pytest failed" -- a deployment problem disguised as
@@ -1105,6 +1236,11 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
         probes.guarded(lambda: cluster_recovery(MANAGED_GPU_CLUSTER)) or {}
     )
     env: list[dict[str, Any]] = probes.guarded(executor_env) or []
+    if identity is not None and any(
+        item.get("cluster_id") != identity["cluster_id"] for item in env
+    ):
+        for errors in probes.errors.values():
+            errors.append("executor cluster identity differs from the durable registry")
     automatic: dict[str, Any] | None = None
     automatic_probe: dict[str, Any] | None = None
     managed_probe: dict[str, Any] | None = None
@@ -1144,6 +1280,15 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
         write_json(run_dir / "gpu-node-postflight.json", postflight)
 
     probes.guarded(postflight_read)
+    post_env = probes.guarded(executor_env)
+    if post_env != env:
+        for errors in probes.errors.values():
+            errors.append(
+                "executor population or safety environment changed during audit"
+            )
+    if identity is not None and probes.guarded(audit_identity) != identity:
+        for errors in probes.errors.values():
+            errors.append("release or durable registry identity changed during audit")
 
     failed = False
     for case_id in selected_cases:
@@ -1154,7 +1299,7 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
             errors.append("focused pytest failed")
         errors.extend(probes.errors[case_id])
         if events:
-            errors.append("CloudTrail contains provider replace")
+            errors.append("CloudTrail contains an unexpected provider mutation")
         errors.extend(drift_errors)
         errors.extend(
             probe_errors(
@@ -1170,8 +1315,8 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
             if automatic is None or automatic["node_recovery"] != "Automatic":
                 errors.append("negative cluster is not Automatic")
         if case_id == "GF-REGIONAL-DESTR-007":
-            if len(env) != 2:
-                errors.append("expected two executor replicas")
+            if not env:
+                errors.append("complete Ready executor population is missing")
             if any(
                 item.get("spare_failover") != "true"
                 or item.get("remote_state") != "true"
@@ -1181,6 +1326,13 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
                 errors.append("production executor safety environment is inconsistent")
         result: dict[str, Any] = {
             "case_id": case_id,
+            "status": "COMPLETED" if not errors else "FAILED",
+            "started_at": started_at.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            **(identity or {}),
+            **current_acceptance_scope().result_fields(),
+            "formal_sequence_satisfied": identity is not None
+            and not current_acceptance_scope().selective,
             "verdict": "PASS" if not errors else "FAIL",
             "acceptance_incomplete": bool(preflight_errors or drift_errors),
             "errors": errors,
@@ -1194,7 +1346,7 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
             "replace_events_provisional": provisional,
             "node_baseline": baseline,
             "node_postflight": postflight,
-            "node_state_identical": not drift_errors,
+            "node_state_identical": bool(baseline and postflight) and not drift_errors,
         }
         # Each case carries only its own probe; the shared baseline/postflight
         # and cluster reads are the same for all three and are kept.
@@ -1229,21 +1381,66 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--region")
     result.add_argument("--managed-gpu-cluster-name")
     result.add_argument("--automatic-negative-cluster-name")
+    result.add_argument("--predecessor-evidence", default="")
     return result
 
 
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    selected_cases = arguments.case or list(CASE_IDS)
-    configure(arguments, set(selected_cases))
-    if arguments.run_dir is not None:
-        return run_audit(arguments.run_dir, selected_cases)
+    if len(arguments.case) != 1:
+        raise RuntimeError(
+            "select exactly one explicit --case for this read-only live audit"
+        )
+    selected_cases = arguments.case
     configured = os.getenv("GPU_FAULT_ACCEPTANCE_RUN_DIR", "").strip()
-    if configured:
-        return run_audit(Path(configured), selected_cases)
-    with tempfile.TemporaryDirectory(prefix="gpu-fault-warm-spare-guards-") as value:
-        return run_audit(Path(value), selected_cases)
+    run_dir = arguments.run_dir or (Path(configured) if configured else None)
+    if run_dir is None:
+        raise RuntimeError(
+            "an explicit audit --run-dir or GPU_FAULT_ACCEPTANCE_RUN_DIR is required"
+        )
+    case_id = selected_cases[0]
+    result_path = run_dir / "cases" / case_id / f"{case_id}.json"
+    write_json(
+        result_path,
+        {
+            "case_id": case_id,
+            "verdict": "FAIL",
+            "status": "RUNNING",
+            "formal_sequence_satisfied": False,
+        },
+    )
+    try:
+        bind_command_supervision(run_dir)
+        configure(arguments, set(selected_cases))
+        identity = audit_identity()
+        previous_id, path = predecessor_path(
+            run_dir, case_id, arguments.predecessor_evidence
+        )
+        if previous_id is not None and path is not None:
+            previous = predecessor_evidence(
+                path,
+                previous_id,
+                release_id=identity["release_id"],
+                cluster_id=identity["cluster_id"],
+            )
+            if previous.get("valid") is not True:
+                raise RuntimeError(
+                    "formal predecessor did not pass for this release and cluster"
+                )
+        return run_audit(run_dir, selected_cases, identity=identity)
+    except BaseException as exc:
+        write_json(
+            result_path,
+            {
+                "case_id": case_id,
+                "verdict": "FAIL",
+                "status": "FAILED",
+                "error_type": type(exc).__name__,
+                "formal_sequence_satisfied": False,
+            },
+        )
+        raise
 
 
 if __name__ == "__main__":

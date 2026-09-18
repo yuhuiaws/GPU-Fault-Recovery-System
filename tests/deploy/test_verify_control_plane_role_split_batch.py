@@ -161,14 +161,16 @@ def test_a_missing_role_deployment_is_reported_from_the_batched_answer(
     )
 
 
-def test_an_unreadable_api_server_reports_every_role_missing_as_before(
+def test_an_unreadable_api_server_is_not_reported_as_missing(
     monkeypatch, verifier, capsys
 ):
     _install(monkeypatch, verifier, _Kubectl({}, {}, unreachable=True))
 
     assert verifier.main() == 1, "an unreadable control plane fails the check"
     out = capsys.readouterr().out
-    assert all(f"{name} is missing" in out for name in ROLE_DEPLOYMENTS), out
+    assert "role Deployments could not be read" in out, out
+    assert "connection to the server" in out, out
+    assert "is missing" not in out, "a failed read did not establish absence"
 
 
 def test_batched_config_map_read_keeps_kubelet_optional_semantics(
@@ -249,3 +251,81 @@ def test_kubectl_get_indexes_single_object_and_empty_answers(monkeypatch, verifi
 
 def _pod(container: dict[str, Any]) -> dict[str, Any]:
     return {"spec": {"template": {"spec": {"containers": [container]}}}}
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "not-json",
+        "[]",
+        "{}",
+        '{"kind":"List","items":null}',
+        '{"kind":"List","items":[null]}',
+        '{"kind":"List","items":[{"metadata":{}}]}',
+        '{"kind":"List","items":[{"metadata":{"name":"foreign"}}]}',
+        '{"kind":"List","items":[{"metadata":{"name":"only"}},'
+        '{"metadata":{"name":"only"}}]}',
+        '{"kind":"Secret","metadata":{"name":"only"}}',
+        '{"kind":"ConfigMap","metadata":{"name":"only","namespace":"foreign"}}',
+    ],
+)
+def test_invalid_batch_cannot_prove_optional_absence(monkeypatch, verifier, document):
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            [], 0, stdout=document, stderr=""
+        ),
+    )
+    with pytest.raises(SystemExit, match="could not be read"):
+        verifier.config_map_data("only", optional=True)
+
+    calls = _Kubectl({}, {"only": {"value": "fresh"}})
+    _install(monkeypatch, verifier, calls)
+    assert verifier.config_map_data("only") == {"value": "fresh"}, (
+        "a malformed read was cached as absence or accepted data"
+    )
+    assert len(calls.calls) == 1, "failed reads must not populate the cache"
+
+
+@pytest.mark.parametrize("data", [[], "", 0, False, {"key": 1}])
+def test_invalid_config_map_data_is_not_cached(monkeypatch, verifier, data):
+    document = {
+        "kind": "List",
+        "items": [
+            {"metadata": {"name": "first"}, "data": {"value": "old"}},
+            {"metadata": {"name": "bad"}, "data": data},
+        ],
+    }
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(document), stderr=""
+        ),
+    )
+    with pytest.raises(SystemExit, match="invalid string data"):
+        verifier.load_config_maps(["first", "bad"])
+
+    calls = _Kubectl({}, {"first": {"value": "new"}})
+    _install(monkeypatch, verifier, calls)
+    assert verifier.config_map_data("first") == {"value": "new"}, (
+        "part of a failed batch was cached"
+    )
+    assert len(calls.calls) == 1, "failed batch members require a fresh read"
+
+
+def test_batch_error_retains_reason_without_credentials(monkeypatch, verifier):
+    token = "unit-test-role-query-token"
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_TOKEN", token)
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            [], 1, stdout="", stderr=f"Forbidden: Bearer {token}"
+        ),
+    )
+    found, error = verifier.kubectl_get("deployment", ROLE_DEPLOYMENTS)
+    assert found is None, "a forbidden read was accepted"
+    assert "Forbidden" in error, "the useful failure category was lost"
+    assert token not in error, "the diagnostic exposed a credential"

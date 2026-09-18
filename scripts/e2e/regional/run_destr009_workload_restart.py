@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -44,6 +44,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     runtime_identity_errors,
     settings_from_arguments,
 )
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 DEFAULT_MANIFEST = (
     Path(__file__).with_name("manifests")
@@ -75,8 +76,11 @@ FORBIDDEN_OPERATIONS = {
 CLEANUP_TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED"}
 CLEANUP_TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED"}
 CLEANUP_QUIET_SECONDS = 15
-CLEANUP_TIMEOUT_SECONDS = 300
 CLEANUP_POLL_SECONDS = 5
+# Cleanup must outlive the watcher's missing-attempt grace and quiet window.
+ATTEMPT_MISSING_GRACE_SECONDS = 300
+CLEANUP_TIMEOUT_SECONDS = ATTEMPT_MISSING_GRACE_SECONDS + 300
+SILENCE_HISTORY_BYTES = 4096
 CONTROL_PLANE_LOG_APPS = (
     "gpu-fault-api-ha",
     "gpu-fault-control-worker",
@@ -310,9 +314,17 @@ def observation_gpu_count(observation: dict[str, Any]) -> int:
     return declared or len(observation_gpu_uuids(observation))
 
 
+class AttemptIdentity(Protocol):
+    @property
+    def job_id(self) -> str: ...
+
+    @property
+    def attempt_id(self) -> str: ...
+
+
 def wait_observation(
     regional: RegionalLiveFixture,
-    settings: Settings,
+    settings: AttemptIdentity,
     *,
     node: str,
     expected_gpu_count: int = 24,
@@ -393,6 +405,120 @@ def workload_write_lines(output: str, workload_name: str) -> list[str]:
     ]
 
 
+def _silence_source(
+    regional: RegionalLiveFixture, *, plane: str, pod: str, since: datetime
+) -> dict[str, Any]:
+    described = json.loads(
+        regional.kubectl(plane, "get", "pod", pod, "-o", "json", timeout=60)
+    )
+    ready = ready_pod_records({"items": [described]})
+    if len(ready) != 1 or ready[0]["name"] != pod:
+        raise ValueError("log source is not the named Ready Pod")
+    statuses = described["status"]["containerStatuses"]
+    if len(statuses) != 1:
+        raise ValueError("default log container is not uniquely identified")
+    status = statuses[0]
+    running = (status.get("state") or {}).get("running") or {}
+    try:
+        started_at = datetime.fromisoformat(
+            str(running.get("startedAt")).replace("Z", "+00:00")
+        )
+    except ValueError:
+        raise ValueError("container start timestamp is invalid") from None
+    if started_at.tzinfo is None or since.tzinfo is None:
+        raise ValueError("log window or container start has no timezone")
+    if started_at > since:
+        raise ValueError("container started inside the window; earlier lines are gone")
+    if (
+        not isinstance(status.get("containerID"), str)
+        or not status["containerID"]
+        or type(status.get("restartCount")) is not int
+        or status["restartCount"] < 0
+    ):
+        raise ValueError("log container identity or restart count is missing")
+    return {
+        "pod_uid": ready[0]["uid"],
+        "container_name": status["name"],
+        "container_id": status["containerID"],
+        "container_started_at": started_at.isoformat(),
+        "restart_count": status["restartCount"],
+    }
+
+
+def silence_evidence(
+    regional: RegionalLiveFixture,
+    *,
+    plane: str,
+    pod: str,
+    since: datetime,
+    expected_uid: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Trust silence only for a stable container with retained pre-window logs."""
+
+    try:
+        source = _silence_source(regional, plane=plane, pod=pod, since=since)
+        if expected_uid is not None and source["pod_uid"] != expected_uid:
+            raise ValueError("Pod UID changed before the silence proof")
+        options = (f"--container={source['container_name']}", "--timestamps")
+        history = regional.kubectl(
+            plane,
+            "logs",
+            pod,
+            *options,
+            "--tail=-1",
+            f"--limit-bytes={SILENCE_HISTORY_BYTES}",
+            timeout=60,
+        )
+        payload = history.encode("utf-8")
+        if (
+            not payload
+            or len(payload) > SILENCE_HISTORY_BYTES
+            or (len(payload) < SILENCE_HISTORY_BYTES and not payload.endswith(b"\n"))
+        ):
+            raise ValueError("log history is missing, incomplete or exceeds its bound")
+        prefix = payload[: payload.rfind(b"\n") + 1]
+        lines = prefix.decode("utf-8").splitlines()
+        if not lines or any(" " not in line for line in lines):
+            raise ValueError("log history has no complete timestamped record")
+        try:
+            times = [
+                datetime.fromisoformat(line.split(" ", 1)[0].replace("Z", "+00:00"))
+                for line in lines
+            ]
+        except ValueError:
+            raise ValueError("log history timestamp is invalid") from None
+        started = datetime.fromisoformat(source["container_started_at"])
+        if any(
+            stamp.tzinfo is None or not started <= stamp < since for stamp in times
+        ) or times != sorted(times):
+            raise ValueError("log history cannot prove retention before the window")
+        # Re-read the exact prefix and source, so rotation/restart is not silence.
+        verified = regional.kubectl(
+            plane,
+            "logs",
+            pod,
+            *options,
+            "--tail=-1",
+            f"--limit-bytes={len(prefix)}",
+            timeout=60,
+        )
+        if verified.encode("utf-8") != prefix:
+            raise ValueError("log history changed during the silence proof")
+        if _silence_source(regional, plane=plane, pod=pod, since=since) != source:
+            raise ValueError("log source changed during the silence proof")
+    except RegionalFixtureError:
+        return None, "silence proof unavailable: Kubernetes read failed"
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, f"silence proof unavailable: {type(exc).__name__}: {exc}"[:300]
+    return {
+        **source,
+        "history_tail_lines": len(lines),
+        "history_prefix_bytes": len(prefix),
+        "history_sha256": hashlib.sha256(prefix).hexdigest(),
+        "history_first_at": times[0].isoformat(),
+    }, None
+
+
 def log_write_snapshot(
     regional: RegionalLiveFixture,
     *,
@@ -403,37 +529,59 @@ def log_write_snapshot(
 ) -> dict[str, Any]:
     """Grep the Pods of ``apps`` for a write against the workload.
 
-    A Pod that returned no log lines for the window has not been checked --
-    the window may predate its log retention, or the read may have failed --
-    so it is listed under ``inconclusive`` and the verdict is INCONCLUSIVE,
-    not CLEAN. The old shape counted an empty read as "no suspicious lines".
+    An empty read needs stable container identity and retained pre-window
+    history. Failed reads and missing proof remain INCONCLUSIVE.
     """
 
     entries: list[dict[str, Any]] = []
     suspicious: list[dict[str, Any]] = []
     inconclusive: list[str] = []
+    silent: list[str] = []
     for app in apps:
-        for pod in regional.ready_pods(plane, app):
-            output = regional.kubectl(
-                plane,
-                "logs",
-                str(pod["name"]),
-                "--since-time",
-                since.isoformat(),
-                check=False,
-                timeout=120,
-            )
+        pods = regional.ready_pods(plane, app)
+        if not pods:
+            inconclusive.append(f"{app}/*")
+        for pod in pods:
+            name = str(pod["name"])
             path_key = f"{app}/{pod['name']}"
-            line_count = len(output.splitlines())
-            entries.append(
-                {
-                    "pod": path_key,
-                    "line_count": line_count,
-                    "sha256": hashlib.sha256(output.encode()).hexdigest(),
-                }
-            )
-            if line_count == 0:
+            try:
+                output = regional.kubectl(
+                    plane, "logs", name, "--since-time", since.isoformat(), timeout=120
+                )
+            except RegionalFixtureError:
+                entries.append(
+                    {
+                        "pod": path_key,
+                        "line_count": 0,
+                        "sha256": None,
+                        "classification": "inconclusive",
+                        "reason": "window read failed",
+                    }
+                )
                 inconclusive.append(path_key)
+                continue
+            line_count = len(output.splitlines())
+            entry: dict[str, Any] = {
+                "pod": path_key,
+                "line_count": line_count,
+                "sha256": hashlib.sha256(output.encode()).hexdigest(),
+                "classification": "checked",
+            }
+            if not output.strip():
+                proof, reason = silence_evidence(
+                    regional,
+                    plane=plane,
+                    pod=name,
+                    since=since,
+                    expected_uid=str(pod.get("uid") or ""),
+                )
+                if proof is None:
+                    entry.update(classification="inconclusive", reason=reason)
+                    inconclusive.append(path_key)
+                else:
+                    entry.update(classification="silent", silence_evidence=proof)
+                    silent.append(path_key)
+            entries.append(entry)
             suspicious.extend(
                 {"pod": path_key, "line": line}
                 for line in workload_write_lines(output, workload_name)
@@ -448,6 +596,7 @@ def log_write_snapshot(
         "entries": entries,
         "suspicious": suspicious,
         "inconclusive": inconclusive,
+        "silent": silent,
         "verdict": verdict,
     }
 
@@ -461,6 +610,10 @@ def log_write_errors(logs: dict[str, Any], label: str) -> list[str]:
             f"{label} logs are INCONCLUSIVE: no lines from "
             + (", ".join(logs.get("inconclusive") or []) or "any Pod")
         )
+    if logs.get("verdict") not in {"CLEAN", "SUSPICIOUS", "INCONCLUSIVE"}:
+        errors.append(f"{label} logs have no conclusive verdict")
+    if logs.get("verdict") == "SUSPICIOUS" and not logs.get("suspicious"):
+        errors.append(f"{label} logs report unexplained suspicious activity")
     return errors
 
 
@@ -818,7 +971,7 @@ def cleanup_case(
                     "--ignore-not-found",
                     "-o",
                     "name",
-                    check=False,
+                    check=True,
                 ).strip()
             )
     except Exception as exc:
@@ -850,6 +1003,24 @@ def cleanup_case(
         result["verdict"] = "FAIL"
 
 
+def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> dict[str, Any]:
+    plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
+    planned: dict[str, Any] = plan["details"]["preflight_identity"]
+    current = {
+        "release_id": preflight["release_id"],
+        "runtime_profile_version": (preflight["store"].get("profile") or {}).get(
+            "profile_version"
+        ),
+        "candidate_node_uids": sorted(
+            str(item["uid"]) for item in preflight["candidate_nodes"]
+        ),
+        "runtime_identity": preflight["runtime_identity"],
+    }
+    if current != planned:
+        raise RegionalFixtureError(f"DESTR-009 plan drifted: {planned} != {current}")
+    return planned
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -863,20 +1034,7 @@ def execute_case(
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
         )
-    plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
-    planned = plan["details"]["preflight_identity"]
-    current = {
-        "release_id": preflight["release_id"],
-        "runtime_profile_version": (preflight["store"].get("profile") or {}).get(
-            "profile_version"
-        ),
-        "candidate_node_uids": sorted(
-            str(item["uid"]) for item in preflight["candidate_nodes"]
-        ),
-        "runtime_identity": preflight["runtime_identity"],
-    }
-    if current != planned:
-        raise RegionalFixtureError(f"DESTR-009 plan drifted: {planned} != {current}")
+    planned = verify_plan_identity(case_dir, preflight)
 
     regional = RegionalLiveFixture(settings.regional)
     workload = ManagedWorkloadFixture(
@@ -914,6 +1072,8 @@ def execute_case(
     target_node: str | None = None
     workflow_request_ids: list[str] = []
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before image prewarm")
         candidate_names = [str(item["name"]) for item in preflight["candidate_nodes"]]
         prewarmed = prewarm.create(candidate_names)
         cached = prewarm.cached_nodes()
@@ -924,6 +1084,10 @@ def execute_case(
         if not set(candidate_names) <= set(cached):
             raise RegionalFixtureError(
                 "training image is not cached on every candidate"
+            )
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before workload submission"
             )
         submission = workload.submit()
         write_json_atomic(case_dir / "submission.json", submission)
@@ -973,6 +1137,7 @@ def execute_case(
         if workflow_request_id:
             workflow_request_ids.append(str(workflow_request_id))
         errors = workflow_errors(state)
+        workload.authorize_restart(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "workload-target.json", target)
         regional.verify_runtime_identity(

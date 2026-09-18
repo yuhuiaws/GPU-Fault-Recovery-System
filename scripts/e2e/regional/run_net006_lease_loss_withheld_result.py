@@ -140,11 +140,14 @@ def _run_net006_case(
     preflight = preflight_metadata(attempt, maintenance_window_end)
     seeded.write_json(case_dir / "preflight.json", preflight)
     seeded.preflight_residuals(probe, case_dir)
+    state["registry_started"] = True
     seeded.register_synthetic_cluster(case_dir, run_id)
-    ready = seeded.create_probe_pod(probe, case_dir)
+    state["probe_started"] = True
+    ready = seeded.create_probe_pod(probe, case_dir, run_id=run_id)
     errors = verdicts.ready_errors(ready)
     if errors:
         raise seeded.SeededCommandError("probe ready contract: " + "; ".join(errors))
+    state["seed"] = seeded.seed_identity(run_id)
     seed = seeded.seed_command(
         run_id,
         owner=probe.owner,
@@ -279,7 +282,7 @@ def run_case(run_dir: Path, attempt: int, maintenance_window_end: datetime) -> i
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        seeded.cleanup(probe, case_dir, run_id, result, state["seed"])
+        seeded.cleanup(probe, case_dir, run_id, result, state["seed"], state=state)
     seeded.write_json(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -302,7 +305,7 @@ def plan_details() -> dict[str, Any]:
         "pod_active_deadline_seconds": verdicts.POD_DEADLINE_SECONDS,
         "mutations": [
             "temporary synthetic registry entry",
-            "controlled CPU registry rollouts",
+            "converged CPU registry revision publication without Deployment rollout",
             "temporary GPU probe Pod and ConfigMap",
         ],
         "hard_stop": (
@@ -314,6 +317,14 @@ def plan_details() -> dict[str, Any]:
     }
 
 
+from scripts.e2e.regional.live_driver_guard import environment_snapshot  # noqa: E402
+from scripts.e2e.regional.plain_case_identity import (  # noqa: E402
+    add_plain_identity_arguments,
+    configure_plain_case,
+    plain_case_preflight,
+)
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
@@ -322,6 +333,7 @@ def parser() -> argparse.ArgumentParser:
         )
     )
     add_live_arguments(value, confirmation=CONFIRMATION)
+    add_plain_identity_arguments(value)
     return value
 
 
@@ -331,6 +343,12 @@ CASE = PlainCaseRunner(
     parser=parser,
     plan_details=plan_details,
     run_case=run_case,
+    configure=configure_plain_case,
+    read_only_preflight=lambda settings, case_dir: plain_case_preflight(
+        settings,
+        case_dir,
+        read_environment=environment_snapshot,
+    ),
 )
 
 

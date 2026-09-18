@@ -210,7 +210,7 @@ def _details(
     messages: list[str] = []
     severities: list[str] = []
 
-    def visit(item: Any) -> None:
+    def visit(item: Any, *, message_value: bool = False) -> None:
         if isinstance(item, dict):
             for key, child in item.items():
                 normalized = _normalized_key(key)
@@ -231,12 +231,16 @@ def _details(
                     if text is not None:
                         messages.append(text)
                     else:
-                        visit(child)
+                        visit(child, message_value=True)
                 elif isinstance(child, (dict, list)):
                     visit(child)
         elif isinstance(item, list):
             for child in item:
-                visit(child)
+                visit(child, message_value=message_value)
+        elif message_value:
+            text = _bounded_text(item)
+            if text is not None:
+                messages.append(text)
 
     visit(value)
     return (

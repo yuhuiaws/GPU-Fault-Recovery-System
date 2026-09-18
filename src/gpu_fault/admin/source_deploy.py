@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from gpu_fault.admin.execution import run_driver
+
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -126,7 +127,7 @@ def run_source_deploy(
         command.extend(
             ("--wait-for-email-confirmation", str(wait_for_email_confirmation))
         )
-    completed = subprocess.run(
+    completed = run_driver(
         command,
         cwd=repository_root,
         env={

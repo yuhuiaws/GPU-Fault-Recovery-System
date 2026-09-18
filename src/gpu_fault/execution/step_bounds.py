@@ -25,6 +25,10 @@ from typing import Any
 
 from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.node_action_uncertainty import (
+    refresh_remote_action_state,
+    unresolved_node_action,
+)
 from gpu_fault.models import (
     EXECUTABLE_WORKFLOW_STATUSES,
     StepPhase,
@@ -39,6 +43,7 @@ from gpu_fault.models import (
     execution_matches_step,
     execution_phase,
     record_workflow_event,
+    resolved_step_indexes,
 )
 from gpu_fault.store.shared.errors import NotFoundError
 
@@ -129,11 +134,22 @@ def workflow_deadline_failure(
             workflow.request_id,
         )
         cancellation = f"{type(exc).__name__}: {exc}"
+    refreshed = refresh_remote_action_state(executor.store, workflow)
+    previous = previous_execution(refreshed, step, index)
+    unresolved: dict[str, Any] = {}
+    if previous is not None and unresolved_node_action(previous):
+        unresolved = {
+            **previous.details,
+            "outcome_unknown": True,
+            "manual_confirmation_required": True,
+        }
+        unresolved.pop("node_action_not_started", None)
     return WorkflowStepOutcome.failed(
         f"{what} exceeded at "
         f"{deadline.isoformat()} ({overdue}s overdue) before step "
         f"{index}/{step.operation.value}",
         details={
+            **unresolved,
             "workflow_execution_deadline": deadline.isoformat(),
             "workflow_deadline_overdue_seconds": overdue,
             "workflow_deadline_remote_command_cancellation": cancellation,
@@ -302,6 +318,35 @@ def _open_remediation(executor: Any, request_id: Any) -> WorkflowRequest | None:
     if remediation.status not in EXECUTABLE_WORKFLOW_STATUSES:
         return None
     return remediation
+
+
+def record_completion(
+    workflow: WorkflowRequest, index: int, operation: WorkflowOperation
+) -> WorkflowRequest:
+    return workflow.model_copy(
+        update={
+            "completed_step_indexes": [*workflow.completed_step_indexes, index],
+            "completed_operations": [*workflow.completed_operations, operation],
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+
+
+def dag_step_is_current(
+    workflow: WorkflowRequest,
+    steps: list[WorkflowStepSpec],
+    index: int,
+    revision: int | None,
+    is_safety: bool,
+) -> bool:
+    current_steps = workflow.safety_steps if is_safety else workflow.official_steps
+    resolved = resolved_step_indexes(workflow)
+    return (
+        workflow.dag_revision == revision
+        and current_steps == steps
+        and index not in resolved
+        and set(current_steps[index].depends_on_step_indexes) <= resolved
+    )
 
 
 def record_attempt(

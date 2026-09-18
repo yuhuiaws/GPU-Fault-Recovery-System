@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from gpu_fault.regional_compatibility import (
+    LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+    command_protocol_eligible,
+)
+
 import secrets
-import sqlite3
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -27,6 +31,7 @@ from gpu_fault.store.shared.remote_helpers import (
 from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
+from gpu_fault.store.sqlite.core import QueryRows
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
@@ -47,13 +52,13 @@ class SqliteRemoteCommandMixin:
     """
 
     # Attributes supplied by the composed concrete implementation.
-    _db: sqlite3.Connection
     _models: dict[str, Any]
     _delete: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _list: Callable[..., Any]
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
+    _query_rows: QueryRows
 
     def get_remote_command(self, command_id: str) -> RemoteActionCommand:
         command = self._get_optional("remote_command", command_id)
@@ -81,7 +86,7 @@ class SqliteRemoteCommandMixin:
                 f" IN ({placeholders})"
             )
             parameters.extend(wanted)
-        rows = self._db.execute(query, parameters).fetchall()
+        rows = self._query_rows(query, parameters)
         model = self._models["remote_command"]
         return sorted(
             (model.model_validate_json(row[0]) for row in rows),
@@ -99,8 +104,7 @@ class SqliteRemoteCommandMixin:
         # The step space lives on the embedded workflow (``safety_only`` or a
         # SAFETY_PENDING status), so it is decided in Python on the few rows one
         # workflow's step has; the SQL narrows to those rows first.
-        rows = self._db.execute(
-            """
+        query = """
             SELECT payload FROM objects
             WHERE kind='remote_command'
               AND json_extract(payload, '$.workflow_request_id')=?
@@ -108,9 +112,10 @@ class SqliteRemoteCommandMixin:
               AND json_extract(payload, '$.status') IN ('PENDING', 'LEASED', 'WAITING')
               AND key IS NOT ?
             ORDER BY json_extract(payload, '$.created_at'), key
-            """,
-            (workflow_request_id, step_index, exclude_command_id),
-        ).fetchall()
+            """
+        rows = self._query_rows(
+            query, (workflow_request_id, step_index, exclude_command_id)
+        )
         model = self._models["remote_command"]
         for row in rows:
             command = model.model_validate_json(row[0])
@@ -128,16 +133,14 @@ class SqliteRemoteCommandMixin:
     ) -> RemoteActionCommand | None:
         # Only compound rows carry the key at all (the serializer omits an
         # empty list), so ``json_type`` narrows to them before any decode.
-        rows = self._db.execute(
-            """
+        query = """
             SELECT payload FROM objects
             WHERE kind='remote_command'
               AND json_extract(payload, '$.workflow_request_id')=?
               AND json_extract(payload, '$.fencing_token')=?
               AND json_type(payload, '$.batched_steps')='array'
-            """,
-            (workflow_request_id, fencing_token),
-        ).fetchall()
+            """
+        rows = self._query_rows(query, (workflow_request_id, fencing_token))
         model = self._models["remote_command"]
         return covering_compound_command(
             [model.model_validate_json(row[0]) for row in rows],
@@ -183,6 +186,7 @@ class SqliteRemoteCommandMixin:
         lease_seconds: int,
         execution_owners: set[str] | None = None,
         accept_batched_steps: bool = True,
+        executor_protocol_version: int = LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
     ):
         now = datetime.now(timezone.utc)
         claimed = []
@@ -213,12 +217,14 @@ class SqliteRemoteCommandMixin:
                 )
                 if (
                     command.cluster_id != cluster_id
+                    or command.cancellation_requested_at is not None
                     or (
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
                     )
                     # See ``MemoryRemoteCommandMixin.claim_remote_commands``.
                     or (not accept_batched_steps and command.batched_steps)
+                    or not command_protocol_eligible(command, executor_protocol_version)
                     or (
                         command.status
                         not in {

@@ -14,9 +14,21 @@ to end: self-scrape, keep list and remote_write.
 
 from __future__ import annotations
 
+from gpu_fault.admin.deadlines import (
+    deadline_scope,
+    remaining_timeout,
+    recovery_active,
+)
+from gpu_fault.admin.native_http import (
+    NativeHttpError,
+    export_aws_credentials,
+    http_request,
+)
+from gpu_fault.admin.process_supervisor import ensure_supervision_safe
+
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -58,12 +70,14 @@ def amp_instant_query(release: Any, expression: str) -> list[dict[str, Any]]:
     the deploy host's own credentials (the same chain every ``aws`` call in
     this process uses). Returns the ``data.result`` vector.
     """
-    import urllib.request
+    ensure_supervision_safe(allow_interrupted=recovery_active())
+    remaining_timeout(AMP_QUERY_TIMEOUT_SECONDS)
+
     from urllib.parse import urlencode
 
-    import boto3
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
+    from botocore.credentials import ReadOnlyCredentials
 
     region = str(release.config.aws_region)
     workspace_id = str(release.config.health.amp_workspace_id)
@@ -71,25 +85,52 @@ def amp_instant_query(release: Any, expression: str) -> list[dict[str, Any]]:
         f"https://aps-workspaces.{region}.amazonaws.com/workspaces/"
         f"{workspace_id}/api/v1/query"
     )
-    body = urlencode({"query": expression}).encode()
-    signed = AWSRequest(
-        method="POST",
-        url=url,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    credentials = boto3.Session().get_credentials()
-    if credentials is None:
-        raise ReleaseError("AWS credentials are unavailable for the AMP query")
-    SigV4Auth(credentials, "aps", region).add_auth(signed)
-    request = urllib.request.Request(
-        url, data=body, headers=dict(signed.headers), method="POST"
-    )
-    with urllib.request.urlopen(request, timeout=AMP_QUERY_TIMEOUT_SECONDS) as handle:
-        document = json.load(handle)
-    if document.get("status") != "success":
-        raise ReleaseError(f"AMP query {expression!r} failed: {document}")
-    return list((document.get("data") or {}).get("result") or [])
+    response: tuple[int, str] | None = None
+    try:
+        with deadline_scope("AMP query", AMP_QUERY_TIMEOUT_SECONDS):
+            exported = export_aws_credentials(seconds=AMP_QUERY_TIMEOUT_SECONDS)
+            credentials = ReadOnlyCredentials(
+                exported["AccessKeyId"],
+                exported["SecretAccessKey"],
+                exported["SessionToken"] or None,
+            )
+            body = urlencode({"query": expression}).encode()
+            signed = AWSRequest(
+                method="POST",
+                url=url,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            SigV4Auth(credentials, "aps", region).add_auth(signed)
+            response = http_request(
+                "POST",
+                url,
+                dict(signed.headers),
+                body,
+                backend="aws",
+                seconds=AMP_QUERY_TIMEOUT_SECONDS,
+                label="AMP query",
+            )
+            remaining_timeout(AMP_QUERY_TIMEOUT_SECONDS)
+    except NativeHttpError:
+        pass
+    if response is None:
+        raise ReleaseError("AMP query transport or credential resolution failed")
+    if response[0] != 200:
+        raise ReleaseError(f"AMP query returned HTTP {response[0]}")
+    try:
+        document = json.loads(response[1])
+    except (ValueError, UnicodeError):
+        document = None
+    if not isinstance(document, dict) or document.get("status") != "success":
+        raise ReleaseError("AMP query returned an invalid response")
+    data = document.get("data")
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, list) or not all(
+        isinstance(item, dict) for item in result
+    ):
+        raise ReleaseError("AMP query returned an invalid result vector")
+    return cast(list[dict[str, Any]], result)
 
 
 def adot_self_metrics_report(release: Any) -> tuple[str, dict[str, Any]]:

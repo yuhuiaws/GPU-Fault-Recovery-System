@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_workload_acceptance as workload
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+from tests.regional.test_identity_causal_review import lifecycle_harness
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,6 +51,7 @@ def test_identity_baseline_must_be_empty_or_the_operator_changes_the_identity() 
         "observations": [],
         "incidents": [],
         "workflows": [],
+        "commands": [],
     }
     assert workload.identity_baseline_errors(clean) == []
     workload.assert_clean_identity_baseline([clean], job_id="j", attempt_id="j-a001")
@@ -245,6 +248,12 @@ def test_cleanup_workload_deletes_after_quiescence_or_without_an_injection(
         return {"safe_to_delete": True}
 
     monkeypatch.setattr(destr009, "wait_for_cleanup_quiescence", quiescent)
+    monkeypatch.setattr(workload, "workload_residuals", lambda *args: [])
+    monkeypatch.setattr(
+        workload,
+        "workload_store",
+        lambda *args, **kwargs: {"commands": [], "workflows": []},
+    )
     fake = FakeWorkload()
     result: dict[str, Any] = {}
 
@@ -328,30 +337,14 @@ def test_raise_with_outcome_wraps_once_and_merges_the_result() -> None:
 # --- 4f/4g: WORKLOAD-002 pre-apply delete, real checks ----------------------
 
 
-def test_workload002_deletes_the_same_named_job_before_apply() -> None:
-    source = Path(workload.__file__).read_text(encoding="utf-8")
-    body = source[source.index("def run_workload_baseline") :]
-    body = body[
-        : body.index("def OBSERVATION_POST_PROBE")
-        if "def OBSERVATION_POST_PROBE" in body
-        else len(body)
-    ]
-
-    delete_index = body.index("fixture.delete()")
-    apply_index = body.index('"apply",\n                    "-f",')
-    assert delete_index < apply_index, "spec step 1: delete before kubectl apply"
-    assert '"pre_apply_delete": True' in body
-    # The two tautologies are gone.
-    assert "render_equivalence = True" not in body
-    assert '"submission_succeeded": bool(submission)' not in body
-    assert 'int(submission["returncode"]) == 0' in body
-
-
 def test_loss_errors_require_non_increasing_loss_per_rank() -> None:
     good = {
-        "pod-0": "rank=0 step=0 loss=0.250000\nrank=0 step=1 loss=0.240000\n"
-        "rank=1 step=0 loss=0.300000\nrank=1 step=1 loss=0.300000\nSUCCESS rank=0/2",
-        "pod-1": "HEARTBEAT x\nrank=8 step=1 loss=0.10\nrank=8 step=0 loss=0.20",
+        f"pod-{pod}": "\n".join(
+            f"rank={rank} step={step} loss={0.3 - step * 0.05:.6f}"
+            for rank in range(pod * 8, (pod + 1) * 8)
+            for step in range(3)
+        )
+        for pod in range(3)
     }
     assert workload.loss_errors(good) == []
 
@@ -359,7 +352,7 @@ def test_loss_errors_require_non_increasing_loss_per_rank() -> None:
         "pod-0": "rank=0 step=0 loss=0.25\nrank=0 step=1 loss=0.26",
         "pod-1": "SUCCESS rank=8/16 all_reduce=136.0",
     }
-    errors = workload.loss_errors(bad)
+    errors = workload.loss_errors(bad, world_size=1, steps=2)
     assert errors == [
         "pod-0: rank 0 loss increased: [0.25, 0.26]",
         "pod-1: no loss lines",
@@ -441,15 +434,113 @@ def test_gpu_nodes_clean_tolerates_only_the_cordoned_spare() -> None:
     )
 
 
-def test_e2e001_source_checks_attempt_id_scope_and_nodes_after_cleanup() -> None:
-    source = Path(workload.__file__).read_text(encoding="utf-8")
-    body = source[source.index("def run_e2e001") : source.index("def gpu_nodes_clean")]
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "none",
+        "same-attempt",
+        "empty-attempt",
+        "mixed-attempt",
+        "incident-cluster",
+        "workflow-incident",
+        "cleanup-taint",
+        "cleanup-node-uid",
+        "cleanup-empty",
+        "cpu-eviction",
+    ],
+)
+def test_e2e001_checks_attempt_id_scope_and_nodes_after_cleanup(
+    defect: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site, targets, events = lifecycle_harness(monkeypatch, tmp_path)
+    regional = site.regional(targets[0])
+    managed = workload.managed_fixture
+    wait_restarted = managed.wait_restarted
+    wait_for_workflow = regional.wait_for_workflow
+    gpu_nodes = regional.gpu_nodes
+    blast_snapshot = regional.cpu_blast_snapshot
+    invalid_attempts = {
+        "same-attempt": ["attempt-test"] * 3,
+        "empty-attempt": [""] * 3,
+        "mixed-attempt": ["attempt-new", "attempt-other", "attempt-new"],
+    }
 
-    assert '"workload_attempt_id_changed"' in body
-    assert '"incident_and_plan_cluster_scoped"' in body
-    assert '"gpu_nodes_restored_after_cleanup"' in body
-    assert "control_plane_blast_errors(blast_before, blast_after)" in body
-    assert "blast_before == blast_after" not in body
+    def restarted(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        snapshot = wait_restarted(self, *args, **kwargs)
+        if defect in invalid_attempts:
+            for pod, attempt_id in zip(
+                snapshot["pods"], invalid_attempts[defect], strict=True
+            ):
+                pod["attempt_id"] = attempt_id
+        return snapshot
+
+    def settled(**kwargs: Any) -> dict[str, Any]:
+        state = wait_for_workflow(**kwargs)
+        if defect == "incident-cluster":
+            state["incident"]["cluster_id"] = "b"
+        elif defect == "workflow-incident":
+            state["workflow"]["incident_id"] = "foreign-incident"
+        return state
+
+    def nodes() -> list[dict[str, Any]]:
+        snapshot = gpu_nodes()
+        if "prewarm-cleanup-a" in events:
+            events.append("nodes-after-cleanup")
+            if defect == "cleanup-taint":
+                snapshot[0]["taints"] = [{"key": "gpu-fault.io/quarantined"}]
+            elif defect == "cleanup-node-uid":
+                snapshot[0]["uid"] = "replacement-node-uid"
+            elif defect == "cleanup-empty":
+                return []
+        return snapshot
+
+    def blast() -> dict[str, Any]:
+        snapshot = blast_snapshot()
+        # Aging out an old event must not look like a new CPU eviction.
+        snapshot["eviction_events"] = (
+            [["uid-old", "Evicted", "pod-old"]] if "kmsg-inject" not in events else []
+        )
+        if defect == "cpu-eviction" and "kmsg-inject" in events:
+            snapshot["eviction_events"] = [["uid-new", "Evicted", "pod-new"]]
+        return snapshot
+
+    monkeypatch.setattr(managed, "wait_restarted", restarted)
+    monkeypatch.setattr(regional, "wait_for_workflow", settled)
+    monkeypatch.setattr(regional, "gpu_nodes", nodes)
+    monkeypatch.setattr(regional, "cpu_blast_snapshot", blast)
+
+    result = workload.run_e2e001(
+        site=site,
+        target=targets[0],
+        case_dir=tmp_path,
+        job_id="job-test",
+        attempt_id="attempt-test",
+        host_probe_image="image@sha256:" + "a" * 64,
+        attempt=1,
+        maintenance_window_end=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    checks = result["checks"]
+    assert checks["workload_pod_uids_changed"] is True, (
+        "different Pod UIDs alone must not prove an attempt transition"
+    )
+    assert checks["workload_attempt_id_changed"] is (defect not in invalid_attempts)
+    assert checks["incident_and_plan_cluster_scoped"] is (
+        defect not in {"incident-cluster", "workflow-incident"}
+    )
+    assert checks["gpu_nodes_restored"] is True, (
+        "the pre-cleanup snapshot is clean even when cleanup later changes a node"
+    )
+    assert checks["gpu_nodes_restored_after_cleanup"] is (
+        not defect.startswith("cleanup-")
+    )
+    assert checks["control_plane_eks_identical"] is (defect != "cpu-eviction")
+    assert result["verdict"] == ("PASS" if defect == "none" else "FAIL")
+    assert events.count("nodes-after-cleanup") == 1
+    assert all(
+        events.index(step) < events.index("nodes-after-cleanup")
+        for step in ("host-cleanup", "delete-a", "prewarm-cleanup-a")
+    ), "node restoration must be checked after every resource cleanup"
 
 
 # --- 4i: admin status once per group ----------------------------------------
@@ -485,15 +576,88 @@ def test_admin_status_runs_only_on_the_group_closing_case_unless_skipped() -> No
 # --- 4j: the two ISO-001 clusters are prepared concurrently ----------------
 
 
-def test_iso001_prepares_both_clusters_in_a_thread_pool() -> None:
-    source = Path(workload.__file__).read_text(encoding="utf-8")
-    body = source[source.index("def run_iso001") : source.index("E2E_PREFLIGHT_PROBE")]
+@pytest.mark.parametrize("defect", ["none", "dirty-a", "dirty-b", "leaked-command"])
+def test_iso001_prepares_both_clusters_in_a_thread_pool(
+    defect: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site, targets, events = lifecycle_harness(monkeypatch, tmp_path)
+    baseline_reads: list[str] = []
+    log_reads: list[tuple[str, ...]] = []
+    store = workload.workload_store
+    prewarm = workload.ImagePrewarmFixture
+    create = prewarm.create
+    preparation_barrier = Barrier(2, timeout=10)
 
-    assert "ThreadPoolExecutor(max_workers=2)" in body
-    assert "pool.map(prepare" in body
-    assert "assert_clean_identity_baseline(" in body
-    assert "executor_logs_since(regional_b" in body
-    assert '"secondary_executor_logs_free_of_primary_command_ids"' in body
+    def read_store(regional: Any, **kwargs: Any) -> dict[str, Any]:
+        state = store(regional, **kwargs)
+        if not regional.submitted:
+            baseline_reads.append(regional.cluster)
+            if defect == "dirty-" + regional.cluster:
+                state["workflows"] = [{"request_id": "previous-run"}]
+        return state
+
+    def prepare(self: Any, nodes: list[str]) -> None:
+        assert baseline_reads == ["a", "b"], (
+            "both identity baselines must be checked before either preparation"
+        )
+        create(self, nodes)
+        preparation_barrier.wait()
+
+    def secondary_logs(*args: str, **kwargs: Any) -> str:
+        assert args[:3] == ("gpu", "logs", "executor-b")
+        assert len(args) == 4 and args[3].startswith("--since=")
+        assert kwargs == {"timeout": 120}
+        assert "inject-a" in events, "the log window must follow primary injection"
+        log_reads.append(args)
+        return (
+            "claimed command-a-1\n"
+            if defect == "leaked-command"
+            else "completed command-b-1\n"
+        )
+
+    monkeypatch.setattr(workload, "workload_store", read_store)
+    monkeypatch.setattr(prewarm, "create", prepare)
+    monkeypatch.setattr(site.regional(targets[1]), "kubectl", secondary_logs)
+    kwargs = {
+        "site": site,
+        "primary": targets[0],
+        "secondary": targets[1],
+        "case_dir": tmp_path,
+        "job_id": "job-test",
+        "attempt_id": "attempt-test",
+        "attempt": 1,
+        "maintenance_window_end": datetime.now(timezone.utc) + timedelta(hours=1),
+    }
+    if defect.startswith("dirty-"):
+        with pytest.raises(
+            workload.WorkloadCaseError, match="already has control-plane state"
+        ):
+            workload.run_iso001(**kwargs)
+        assert baseline_reads == ["a", "b"]
+        assert not log_reads, "dirty baselines must stop before the executor log window"
+        assert not any(
+            event.startswith(("prewarm-a", "prewarm-b", "submit-", "inject-"))
+            for event in events
+        ), "a dirty baseline on either cluster must stop both preparations"
+        return
+
+    result = workload.run_iso001(**kwargs)
+
+    assert len(log_reads) == 1, "the secondary executor log window must be inspected"
+    assert result["primary_command_ids"] == ["command-a-1", "command-a-2"]
+    assert result["secondary_leaked_command_ids"] == (
+        ["command-a-1"] if defect == "leaked-command" else []
+    )
+    assert result["checks"]["secondary_executor_logs_free_of_primary_command_ids"] is (
+        defect != "leaked-command"
+    )
+    assert result["verdict"] == ("PASS" if defect == "none" else "FAIL")
+    assert all(
+        events.index(prepared) < events.index(submitted)
+        for prepared in ("prewarm-a", "prewarm-b")
+        for submitted in ("submit-a", "submit-b")
+    ), "both prewarm operations must start before either submission"
+    assert "delete-a" in events and "delete-b" in events
 
 
 # --- 4k: UID polling without log pulls --------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from threading import Event
 from typing import Any, Awaitable, Callable
 
@@ -11,19 +12,57 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from gpu_fault.app import create_app as create_base_app
+from gpu_fault.app.factory import _request_budgets as runtime_request_budgets
+from gpu_fault.app.routes.regional import (
+    CLAIM_WAIT_RESERVE_SECONDS,
+    bounded_claim_wait_seconds,
+)
+
+
+def claim_wait_configuration(
+    requested: Any, *, request_budget: float, maximum: Any
+) -> dict[str, float]:
+    if (
+        type(requested) not in {int, float}
+        or not math.isfinite(requested)
+        or requested <= 0
+        or not math.isfinite(request_budget)
+        or request_budget < 0
+        or type(maximum) not in {int, float}
+        or not math.isfinite(maximum)
+        or maximum <= 0
+    ):
+        raise ValueError("claim wait configuration is invalid")
+    effective = min(
+        float(maximum),
+        bounded_claim_wait_seconds(
+            float(requested),
+            deadline=request_budget if request_budget > 0 else None,
+            now=0,
+        ),
+    )
+    return {
+        "requested_wait_seconds": float(requested),
+        "request_budget_seconds": request_budget,
+        "claim_wait_reserve_seconds": CLAIM_WAIT_RESERVE_SECONDS,
+        "server_max_wait_seconds": float(maximum),
+        "effective_wait_seconds": effective,
+    }
 
 
 def create_app() -> FastAPI:
     app = create_base_app()
+    # Read the deployed factory's defaults, not another copy in the runner.
+    request_budget, _, _ = runtime_request_budgets()
     holds: dict[str, tuple[list[Event], list[asyncio.Task[Any]]]] = {}
 
-    @app.middleware("http")  # type: ignore[untyped-decorator]
+    @app.middleware("http")
     async def capacity_controls(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         path = request.url.path
-        if path not in {"/__cap__/hold", "/__cap__/release"}:
+        if path not in {"/__cap__/hold", "/__cap__/release", "/__cap__/claim-wakeups"}:
             return await call_next(request)
         client_host = request.client.host if request.client else None
         if client_host not in {"127.0.0.1", "::1", "localhost"}:
@@ -32,6 +71,30 @@ def create_app() -> FastAPI:
         tag = str(payload.get("tag", "")).strip()
         if not tag:
             return JSONResponse(status_code=422, content={"detail": "tag required"})
+        if path == "/__cap__/claim-wakeups":
+            hub = app.state.remote_command_wakeups
+            configuration = {}
+            if "wait_seconds" in payload:
+                try:
+                    configuration = claim_wait_configuration(
+                        payload["wait_seconds"],
+                        request_budget=request_budget,
+                        maximum=hub.max_wait_seconds,
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"detail": "claim wait configuration is invalid"},
+                    )
+            return JSONResponse(
+                content={
+                    "listener_alive": hub.listener_alive,
+                    "listener_connected": hub.connected,
+                    "disconnects_total": hub.disconnects_total,
+                    "wakeups_total": hub.wakeups_total,
+                    **configuration,
+                }
+            )
         if path.endswith("/hold"):
             durations = [float(item) for item in payload.get("durations", [])]
             if not durations or len(durations) > 4:

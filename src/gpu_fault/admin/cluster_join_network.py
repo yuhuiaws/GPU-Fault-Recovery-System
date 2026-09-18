@@ -1,31 +1,23 @@
-"""Network prerequisites of a join and their undo, moved out of ``cluster_join``.
-
-The NLB security-group ingress for the joined cluster's NAT EIPs and the private
-hosted zone's VPC association: created by ``_ensure_network``, undone by
-``_rollback`` through :func:`rollback_network`.
-"""
+"""Supervised network preparation and journal-aware compensation for joins."""
 
 from __future__ import annotations
 
-import subprocess
-import time
 from typing import Any
 
+from gpu_fault.admin.aws_commands import CommandResult, matches_not_found, wait_until
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
-from gpu_fault.admin.cluster_join_rollback import rollback_command
-from gpu_fault.admin.cluster_removal import _wait_vpc_association_absent
+from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.site import RenderedSite
 
 
 def ensure_nlb_ingress(
-    *,
-    region: str,
-    security_group: str,
-    eips: list[str],
+    *, region: str, security_group: str, eips: list[str]
 ) -> list[str]:
+    from gpu_fault.admin import cluster_join as join
+
     created = []
     for eip in eips:
-        result = subprocess.run(
+        result = join.run_command(
             [
                 "aws",
                 "ec2",
@@ -41,78 +33,41 @@ def ensure_nlb_ingress(
                 "--cidr",
                 f"{eip}/32",
             ],
-            text=True,
-            capture_output=True,
         )
         if result.returncode == 0:
             created.append(eip)
-        elif "InvalidPermission.Duplicate" not in result.stderr:
+        elif not matches_not_found(
+            CommandResult(result.stdout or "", result.stderr or "", result.returncode),
+            ("InvalidPermission.Duplicate",),
+        ):
             raise BootstrapError(
-                f"cannot authorize NLB ingress for {eip}: {result.stderr.strip()}"
+                f"cannot authorize NLB ingress for {eip}: "
+                + diagnostic_text(result.stderr.strip())
             )
     return created
 
 
 def wait_zone_association(
-    runner: CommandRunner,
-    *,
-    region: str,
-    hosted_zone_id: str,
-    vpc_id: str,
+    runner: CommandRunner, *, region: str, hosted_zone_id: str, vpc_id: str
 ) -> None:
-    for _ in range(60):
+    def associated() -> bool:
         document = runner.aws_json(
-            region,
-            "route53",
-            "get-hosted-zone",
-            "--id",
-            hosted_zone_id,
+            region, "route53", "get-hosted-zone", "--id", hosted_zone_id
         )
-        if any(
+        return any(
             item.get("VPCRegion") == region and item.get("VPCId") == vpc_id
             for item in document.get("VPCs", [])
-        ):
-            return
-        time.sleep(5)
-    raise BootstrapError("Route53 VPC association did not become visible")
+        )
+
+    wait_until(
+        associated,
+        description="Route53 VPC association",
+        timeout_seconds=300,
+        interval_seconds=5,
+    )
 
 
 def rollback_network(network: dict[str, Any], site: RenderedSite) -> None:
-    region = str(site.release_config["aws_region"])
-    for eip in network.get("created_ingress_eips", []):
-        rollback_command(
-            [
-                "aws",
-                "ec2",
-                "revoke-security-group-ingress",
-                "--region",
-                region,
-                "--group-id",
-                str(site.release_config["nlb"]["security_group"]),
-                "--protocol",
-                "tcp",
-                "--port",
-                "443",
-                "--cidr",
-                f"{eip}/32",
-            ],
-            not_found=("InvalidPermission.NotFound",),
-        )
-    if network.get("association_created"):
-        rollback_command(
-            [
-                "aws",
-                "route53",
-                "disassociate-vpc-from-hosted-zone",
-                "--hosted-zone-id",
-                str(network["hosted_zone_id"]),
-                "--vpc",
-                f"VPCRegion={region},VPCId={network['vpc_id']}",
-            ],
-            not_found=("VPCAssociationNotFound",),
-        )
-        _wait_vpc_association_absent(
-            hosted_zone_id=str(network["hosted_zone_id"]),
-            region=region,
-            vpc_id=str(network["vpc_id"]),
-        )
+    from gpu_fault.admin.cluster_join_rollback import _network
+
+    _network(network, site)

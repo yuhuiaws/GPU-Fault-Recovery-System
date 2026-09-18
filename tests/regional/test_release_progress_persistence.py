@@ -116,10 +116,8 @@ def test_completed_component_progress_is_flushed_by_phase_checkpoint() -> None:
         .get("status")
         == "COMPLETED"
     )
-    # The schema no longer waits behind the candidate node preflight, so the
-    # write that carries its STARTED marker is stamped with the last phase that
-    # really completed before it.
-    assert schema_started["phase"] == "uploaded"
+    # Candidate proof is durable before the first schema mutation.
+    assert schema_started["phase"] == "candidate-preflight-ready"
     assert schema_completed["phase"] == "schema-ready"
 
 
@@ -270,11 +268,8 @@ def test_agent_progress_starts_only_after_node_barrier() -> None:
 def test_candidate_host_preflight_covers_every_mutation_it_gates() -> None:
     """Each cluster is preflighted in dependency order before it is mutated.
 
-    The preflight now runs beside the control-plane phases instead of in front of
-    them (see `test_release_orchestration_concurrency.py` for the overlap and the
-    join), so the schema here waits for the preflight to finish before it fails:
-    the ordering under test is the one *inside* the preflight, and a race would
-    otherwise decide it.
+    The schema waits for candidate preflight, including retired producer
+    discovery; the ordering inside each cluster must also remain explicit.
     """
 
     target = SimpleNamespace(cluster_id="gpu-a")
@@ -290,9 +285,19 @@ def test_candidate_host_preflight_covers_every_mutation_it_gates() -> None:
         calls.append("host-preflight")
         preflighted.set()
 
+    def get_json(_arguments):
+        calls.append("retired-preflight")
+        return {"items": []}
+
     release = SimpleNamespace(
         state={"phase": "preflight"},
-        config=SimpleNamespace(clusters=(target,), agent_config_digest="config-a"),
+        config=SimpleNamespace(
+            clusters=(target,),
+            agent_config_digest="config-a",
+            namespace="gpu-fault-system",
+        ),
+        _gpu=lambda _target, *arguments: list(arguments),
+        _get_json=get_json,
         executor_wheel_cm="wheel",
         bundle_cm="bundle",
         node_wheel_sha="a" * 64,
@@ -334,6 +339,7 @@ def test_candidate_host_preflight_covers_every_mutation_it_gates() -> None:
 
     assert calls == [
         "upload",
+        "retired-preflight",
         "dcgm-preflight",
         "gpu-preflight",
         "host-preflight",
@@ -347,7 +353,7 @@ def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> No
     `candidate-preflight-ready` being recorded does not make it true any more:
     the fleet may have changed between the two attempts, and the data plane is
     told it was already preflighted. The schema waits for the preflight here for
-    the same reason as in the test above -- the two now run concurrently.
+    the same reason as in the test above.
     """
 
     target = SimpleNamespace(cluster_id="gpu-a")
@@ -363,9 +369,19 @@ def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> No
         calls.append("host-preflight")
         preflighted.set()
 
+    def get_json(_arguments):
+        calls.append("retired-preflight")
+        return {"items": []}
+
     release = SimpleNamespace(
         state={"phase": "candidate-preflight-ready"},
-        config=SimpleNamespace(clusters=(target,), agent_config_digest="config-a"),
+        config=SimpleNamespace(
+            clusters=(target,),
+            agent_config_digest="config-a",
+            namespace="gpu-fault-system",
+        ),
+        _gpu=lambda _target, *arguments: list(arguments),
+        _get_json=get_json,
         executor_wheel_cm="wheel",
         bundle_cm="bundle",
         node_wheel_sha="a" * 64,
@@ -400,7 +416,7 @@ def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> No
             registry_staged=False,
         )
 
-    assert calls == ["host-preflight", "schema"]
+    assert calls == ["retired-preflight", "host-preflight", "schema"]
 
 
 CPU_SIDE_PLAN = ("SCHEMA", "REGISTRY", "CPU_STAGE", "VERIFY")

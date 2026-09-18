@@ -382,6 +382,16 @@ class CompletionService:
                 )
             except NotFoundError:
                 explicit_initiator = None
+        for incident in (explicit_initiator, passive):
+            if (
+                incident is not None
+                and incident.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
+                and (incident.cluster_id, incident.job_id, incident.attempt_id)
+                != (event.cluster_id, event.job_id, event.attempt_id)
+            ):
+                raise ValueError(
+                    "passive containment incident identity does not match terminal"
+                )
         passive_containment = (
             explicit_initiator
             if (
@@ -461,6 +471,8 @@ class CompletionService:
                 incident = self.store.get_incident(selected.incident_id)
             except NotFoundError:
                 incident = None
+            if incident is not None and incident.cluster_id != event.cluster_id:
+                raise ValueError("matched marker incident belongs to another cluster")
             if (
                 incident is not None
                 and incident.workflow_request_id
@@ -594,12 +606,13 @@ class CompletionService:
             pairs = self.store.list_active_workflow_incidents(
                 event.cluster_id, job_id=event.job_id
             )
-        except Exception:  # noqa: BLE001 - the decision must still be recorded
+        except Exception:
             LOGGER.exception(
                 "could not look up job workflows to withdraw: job=%s", event.job_id
             )
-            return
+            raise
         now = datetime.now(timezone.utc)
+        first_error: Exception | None = None
         for incident, workflow in pairs:
             if (
                 incident.attempt_id not in (None, event.attempt_id)
@@ -625,12 +638,14 @@ class CompletionService:
                         "workload_withdrawn_reason": reason,
                     },
                 )
-            except Exception:  # noqa: BLE001 - one workflow must not block the rest
+            except Exception as exc:  # noqa: BLE001 - attempt each independent workflow
                 LOGGER.exception(
                     "could not withdraw workflow %s after job %s stopped",
                     workflow.request_id,
                     event.job_id,
                 )
+                if first_error is None:
+                    first_error = exc
                 continue
             LOGGER.warning(
                 "workflow %s withdrawn: job %s attempt %s ended (%s)",
@@ -639,6 +654,9 @@ class CompletionService:
                 event.attempt_id,
                 reason,
             )
+        if first_error is not None:
+            # Do not cache a terminal decision while withdrawal still needs retry.
+            raise first_error
 
     def _workflow_owns_workload_restart(self, workflow_request_id: str) -> bool:
         workflow = self.store.get_workflow(workflow_request_id)
@@ -671,6 +689,8 @@ class CompletionService:
             except NotFoundError:
                 live.append(marker)
                 continue
+            if incident.cluster_id != event.cluster_id:
+                raise ValueError("matched marker incident belongs to another cluster")
             if marker_is_diagnostic(marker):
                 LOGGER.info(
                     "diagnostic marker %s of incident %s does not own attempt %s",
@@ -721,10 +741,16 @@ class CompletionService:
             item.fabric_partition for item in event.allocation if item.fabric_partition
         }
         candidates = self.store.list_markers_in_scope_window(
+            cluster_id=event.cluster_id,
             node_ids=nodes,
             gpu_uuids=gpus,
             fabric_partitions=fabrics,
             observed_from=event.ended_at - self.marker_window,
             observed_to=event.ended_at + self.marker_window,
         )
-        return [marker for marker in candidates if marker.expires_at >= event.ended_at]
+        return [
+            marker
+            for marker in candidates
+            if marker.cluster_id == event.cluster_id
+            and marker.expires_at >= event.ended_at
+        ]

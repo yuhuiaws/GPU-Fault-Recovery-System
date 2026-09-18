@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ import boto3
 import httpx
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+from prometheus_client.parser import text_string_to_metric_families
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -28,19 +30,22 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from gpu_fault.admin.site import load_site  # noqa: E402
+from gpu_fault.admin.site import RenderedSite, load_site  # noqa: E402
+from gpu_fault.postgres_capacity import PostgresPoolCapacity  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
-from scripts.perf.regional_capacity_registry import (  # noqa: E402
-    STORE_DSN_SNIPPET,
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandTimeout,
+    RegionalFixtureError,
+    run_fixture_command,
 )
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
 
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
 PROBE_DIR = Path(__file__).with_name("probes")
-# Live worker volumes a probe Pod must inherit to reach Aurora at all.
-PROBE_CARRIED_VOLUMES = frozenset({"rds-ca-bundle"})
 CASE_LIMITATIONS = [
     "The load is generated against disposable control-plane "
     "Deployments and isolated databases in the selected CPU EKS; "
@@ -49,10 +54,36 @@ CASE_LIMITATIONS = [
 # CAP-001: storm-phase B latency may degrade to at most this multiple of the
 # B-only baseline measured before the storm. Overridable per run.
 DEFAULT_B_LATENCY_FACTOR = 2.0
+PRODUCTION_APPS = frozenset(
+    {
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+        "gpu-fault-adot",
+    }
+)
 
 
 class CapError(RuntimeError):
     pass
+
+
+def unpooled_connection_budget(deployment: str) -> dict[str, int]:
+    """Upper bound for installed listeners, including lazy claim wakeups."""
+    roles = {
+        "gpu-fault-api-ha": "ingress",
+        "gpu-fault-control-worker": "worker",
+        "gpu-fault-telemetry-spool-worker": "spool-worker",
+    }
+    if deployment not in roles:
+        raise CapError("unrecognized CPU role in connection budget")
+    return PostgresPoolCapacity.listener_connections(
+        roles[deployment],
+        queued_processor=True,
+        spool_enabled=True,
+        workflow_dispatcher_enabled=True,
+        regional=True,
+    )
 
 
 @dataclass
@@ -64,7 +95,7 @@ class Probe:
     pod: str
     local_port: int
     url: str
-    port_forward: subprocess.Popen[str]
+    port_forward: subprocess.Popen[str] | None
 
 
 def utc_now() -> str:
@@ -94,25 +125,21 @@ def command(
     *,
     input_text: str | None = None,
     check: bool = True,
-    timeout: float | None = 300,
+    timeout: float = 300,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        list(args),
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-        env=dict(env) if env is not None else None,
-    )
-    if check and result.returncode != 0:
-        raise CapError(
-            f"command failed ({result.returncode}): {' '.join(args[:5])}; "
-            f"stderr={result.stderr[-800:]!r}"
+    try:
+        return run_fixture_command(
+            args,
+            input_text=input_text,
+            check=check,
+            timeout=timeout,
+            env=env,
         )
-    return result
+    except RegionalCommandTimeout:
+        raise
+    except RegionalFixtureError as exc:
+        raise CapError(str(exc)) from exc
 
 
 class CapCoreHarness:
@@ -124,12 +151,24 @@ class CapCoreHarness:
         case_id: str,
         predecessor: dict[str, Any],
         b_latency_factor: float = DEFAULT_B_LATENCY_FACTOR,
+        rendered_site: RenderedSite | None = None,
+        evidence_identity: Mapping[str, str] | None = None,
+        scrape_source_binding: Mapping[str, Any] | None = None,
+        maintenance_deadline: datetime | None = None,
     ) -> None:
-        if not b_latency_factor >= 1.0:
-            raise CapError("b_latency_factor must be at least 1.0")
+        if not math.isfinite(b_latency_factor) or b_latency_factor < 1.0:
+            raise CapError("b_latency_factor must be finite and at least 1.0")
         self.site_path = site_path.resolve()
-        self.site = load_site(self.site_path)
+        self.site = (
+            rendered_site if rendered_site is not None else load_site(self.site_path)
+        )
         self.config = self.site.release_config
+        self.evidence_identity = dict(evidence_identity or {})
+        self.scrape_source_binding = (
+            dict(scrape_source_binding) if scrape_source_binding is not None else None
+        )
+        self.maintenance_deadline = maintenance_deadline
+        self.cap002_scrape_stopped = True
         self.root_run_dir = run_dir.resolve()
         self.case_id = case_id
         self.run_dir = self.root_run_dir / "cases" / case_id
@@ -157,12 +196,15 @@ class CapCoreHarness:
                 "live processor mode is not a supported probe mode: "
                 f"{self.processor_mode!r}"
             )
-        self.run_id = datetime.now(timezone.utc).strftime("cap%H%M%S")
+        self.run_id = datetime.now(timezone.utc).strftime(
+            "cap%H%M%S"
+        ) + secrets.token_hex(4)
         self.resource_prefix = f"gpu-fault-{self.run_id}"
         self.secret_name = f"{self.resource_prefix}-registry"
         self.configmap_name = f"{self.resource_prefix}-scripts"
         self.tokens = [secrets.token_urlsafe(48) for _ in range(20)]
         self.execution_replay_secret = secrets.token_urlsafe(48)
+        self.execution_token = secrets.token_urlsafe(48)
         self.registrations: list[dict[str, Any]] = [
             {
                 "cluster_id": f"cap-cluster-{index:03d}",
@@ -190,7 +232,7 @@ class CapCoreHarness:
         *args: str,
         input_text: str | None = None,
         check: bool = True,
-        timeout: float | None = 300,
+        timeout: float = 300,
     ) -> subprocess.CompletedProcess[str]:
         return command(
             (
@@ -244,6 +286,7 @@ class CapCoreHarness:
                 "stringData": {
                     "clusters.json": json.dumps(self.registrations),
                     "processor-replay-secret": self.execution_replay_secret,
+                    "execution-token": self.execution_token,
                 },
             }
         )
@@ -327,7 +370,7 @@ class CapCoreHarness:
                     "name": "GPU_FAULT_EXECUTION_TOKEN",
                     "valueFrom": {
                         "secretKeyRef": {
-                            "name": "gpu-fault-control-plane-active",
+                            "name": self.secret_name,
                             "key": "execution-token",
                         }
                     },
@@ -376,27 +419,39 @@ class CapProbeHarness(CapCoreHarness):
         environment: list[dict[str, Any]],
     ) -> None:
         labels = {
-            "app": "gpu-fault-control-worker",
+            "app": "gpu-fault-capacity-probe",
             "gpu-fault.io/capacity-probe": f"{self.run_id}-{suffix}",
         }
         live_pod_spec = self.live_worker["spec"]["template"]["spec"]
         live_container = live_pod_spec["containers"][0]
-        # The Aurora DSN pins sslmode=verify-full to a CA bundle the release
-        # projects into every control-plane Pod (live 2026-09-14: the probe
-        # crash-looped on "root certificate file /etc/gpu-fault/rds/ca-bundle.pem
-        # does not exist"). Carry the worker's TLS material verbatim instead
-        # of naming the ConfigMap here, so the probe follows whatever the
-        # release mounts; a release that stops mounting it carries nothing.
-        carried_volumes = [
-            dict(volume)
-            for volume in live_pod_spec.get("volumes", [])
-            if volume.get("name") in PROBE_CARRIED_VOLUMES
-        ]
-        carried_mounts = [
-            dict(mount)
+        services = self.kubectl_json("get", "services", "-o", "json")
+        if not isinstance(services, dict) or not isinstance(
+            services.get("items"), list
+        ):
+            raise CapError("production Service selectors are unknown")
+        for item in services["items"]:
+            selector = item.get("spec", {}).get("selector", {})
+            if selector and all(
+                labels.get(key) == value for key, value in selector.items()
+            ):
+                raise CapError("capacity probe would enter an existing Service")
+        ca_mounts = [
+            mount
             for mount in live_container.get("volumeMounts", [])
-            if mount.get("name") in PROBE_CARRIED_VOLUMES
+            if mount.get("name") == "rds-ca-bundle"
         ]
+        ca_volumes = [
+            volume
+            for volume in live_pod_spec.get("volumes", [])
+            if volume.get("name") == "rds-ca-bundle"
+        ]
+        if (
+            len(ca_mounts) != 1
+            or ca_mounts[0].get("readOnly") is not True
+            or len(ca_volumes) != 1
+            or not ca_volumes[0].get("configMap", {}).get("name")
+        ):
+            raise CapError("capacity probe requires the production public RDS CA mount")
         self.apply(
             {
                 "apiVersion": "v1",
@@ -485,17 +540,18 @@ class CapProbeHarness(CapCoreHarness):
                                         "securityContext", {}
                                     ),
                                     "volumeMounts": [
+                                        *ca_mounts,
                                         {
                                             "name": "scripts",
                                             "mountPath": "/opt/cap",
                                             "readOnly": True,
                                         },
                                         {"name": "work", "mountPath": "/work"},
-                                        *carried_mounts,
                                     ],
                                 }
                             ],
                             "volumes": [
+                                *ca_volumes,
                                 {
                                     "name": "scripts",
                                     "configMap": {
@@ -504,7 +560,6 @@ class CapProbeHarness(CapCoreHarness):
                                     },
                                 },
                                 {"name": "work", "emptyDir": {}},
-                                *carried_volumes,
                             ],
                         },
                     },
@@ -530,14 +585,18 @@ class CapProbeHarness(CapCoreHarness):
                 "--timeout=240s",
                 timeout=260,
             )
-            pod = self.kubectl(
+            inventory = self.kubectl_json(
                 "get",
                 "pods",
                 "-l",
                 f"gpu-fault.io/capacity-probe={self.run_id}-{suffix}",
                 "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ).stdout.strip()
+                "json",
+            )
+            ready = ready_pod_records(inventory)
+            if len(inventory["items"]) != 1 or len(ready) != 1:
+                raise CapError("capacity probe replica is not completely Ready")
+            pod = str(ready[0]["name"])
             local_port = self.reserve_port()
             port_forward = subprocess.Popen(
                 [
@@ -590,46 +649,55 @@ class CapProbeHarness(CapCoreHarness):
                 except subprocess.TimeoutExpired:
                     port_forward.kill()
                     port_forward.wait(timeout=3)
-            self.kubectl(
-                "delete",
-                "deployment",
-                deployment,
-                "--ignore-not-found",
-                "--wait=true",
-                "--timeout=180s",
-                check=False,
-                timeout=200,
-            )
-            self.kubectl(
-                "delete",
-                "service",
-                service,
-                "--ignore-not-found",
-                check=False,
-            )
-            self.drop_database_fallback(database)
             raise
 
     def deploy_probe(self, case: str, overrides: Mapping[str, str]) -> Probe:
+        if self.active_probe is not None:
+            raise CapError("the previous capacity probe still requires cleanup")
         suffix = case.lower().replace("-", "")
         deployment = f"{self.resource_prefix}-{suffix}"
         service = deployment
-        database = f"gpu_fault_{self.run_id}_{suffix}".lower()
         environment = self.base_environment(case)
         self.set_env(environment, overrides)
-        self._apply_probe_resources(
-            suffix=suffix,
-            deployment=deployment,
-            service=service,
-            environment=environment,
+        database = next(
+            item["value"] for item in environment if item["name"] == "CAP_DATABASE_NAME"
         )
-        return self._wait_for_probe(
+        expected_database = (
+            f"gpu_fault_{self.run_id.replace('-', '_')}_{suffix}".lower()
+        )
+        if database != expected_database:
+            raise CapError("capacity database target differs from this run")
+        planned = Probe(
             case=case,
-            suffix=suffix,
             deployment=deployment,
             service=service,
             database=database,
+            pod="",
+            local_port=0,
+            url="",
+            port_forward=None,
         )
+        self.active_probe = planned
+        try:
+            self._apply_probe_resources(
+                suffix=suffix,
+                deployment=deployment,
+                service=service,
+                environment=environment,
+            )
+            return self._wait_for_probe(
+                case=case,
+                suffix=suffix,
+                deployment=deployment,
+                service=service,
+                database=database,
+            )
+        except BaseException as exc:
+            try:
+                self.cleanup_probe(self.active_probe or planned)
+            except Exception as cleanup_error:
+                exc.add_note(f"probe cleanup failed: {type(cleanup_error).__name__}")
+            raise
 
     @staticmethod
     def reserve_port() -> int:
@@ -638,44 +706,69 @@ class CapProbeHarness(CapCoreHarness):
             return int(listener.getsockname()[1])
 
     def cleanup_probe(self, probe: Probe) -> dict[str, Any]:
-        if probe.port_forward.poll() is None:
+        if getattr(self, "cap002_scrape_stopped", True) is not True:
+            raise CapError("CAP002 scrape shutdown is unverified; probe retained")
+        if getattr(self, "cap004_executor_stopped", True) is not True:
+            raise CapError("CAP004 Executor shutdown is unverified; probe retained")
+        if probe.port_forward is not None and probe.port_forward.poll() is None:
             probe.port_forward.terminate()
             try:
                 probe.port_forward.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 probe.port_forward.kill()
                 probe.port_forward.wait(timeout=3)
-        self.kubectl(
-            "delete",
-            "deployment",
-            probe.deployment,
-            "--ignore-not-found",
-            "--wait=true",
-            "--timeout=180s",
-            check=False,
-            timeout=200,
-        )
-        self.kubectl(
-            "delete",
-            "service",
-            probe.service,
-            "--ignore-not-found",
-            check=False,
-        )
-        self.drop_database_fallback(probe.database)
-        residual = self.kubectl(
+        errors = []
+        for kind, name in (
+            ("deployment", probe.deployment),
+            ("service", probe.service),
+        ):
+            try:
+                self.kubectl(
+                    "delete",
+                    kind,
+                    name,
+                    "--ignore-not-found",
+                    "--cascade=foreground",
+                    "--wait=true",
+                    "--timeout=180s",
+                    timeout=200,
+                )
+                self._require_resource_absent(kind, name)
+            except Exception as exc:
+                errors.append(f"{kind} delete: {type(exc).__name__}")
+        suffix = probe.case.lower().replace("-", "")
+        residual = self.kubectl_json(
             "get",
             "pods",
             "-l",
-            f"gpu-fault.io/capacity-probe={self.run_id}",
+            f"gpu-fault.io/capacity-probe={self.run_id}-{suffix}",
             "-o",
-            "name",
-            check=False,
-        ).stdout.splitlines()
+            "json",
+        )
+        if not isinstance(residual, dict) or not isinstance(
+            residual.get("items"), list
+        ):
+            errors.append("probe Pod absence is unknown")
+        elif residual["items"]:
+            errors.append("residual probe Pods remain")
+        if errors:
+            raise CapError("; ".join(errors))
+        self.drop_database_fallback(probe.database)
         self.active_probe = None
-        return {"database_dropped": True, "residual_probe_pods": residual}
+        return {"database_dropped": True, "residual_probe_pods": []}
+
+    def _require_resource_absent(self, kind: str, name: str) -> None:
+        result = self.kubectl("get", kind, name, "--ignore-not-found", "-o", "json")
+        if result.stdout.strip():
+            raise CapError(f"{kind} still exists after cleanup")
 
     def drop_database_fallback(self, database: str) -> None:
+        prefix = f"gpu_fault_{self.run_id.replace('-', '_')}_"
+        if (
+            not database.startswith(prefix)
+            or re.fullmatch("[a-z0-9_]+", database) is None
+        ):
+            raise CapError("refusing to drop a database outside this capacity run")
         worker = self.kubectl_json(
             "get", "pods", "-l", "app=gpu-fault-control-worker", "-o", "json"
         )
@@ -693,25 +786,33 @@ class CapProbeHarness(CapCoreHarness):
         pod = sorted(
             pods, key=lambda item: item["metadata"].get("creationTimestamp", "")
         )[-1]["metadata"]["name"]
-        cleanup = (
-            STORE_DSN_SNIPPET
-            + r"""
-import sys
+        cleanup = r"""
+import os,sys
+from pathlib import Path
 import psycopg
 from psycopg import sql
 database=sys.argv[1]
-with psycopg.connect(store_dsn(),autocommit=True) as c:
+credential_file=os.environ.get("GPU_FAULT_STORE_URL_FILE", "")
+url=Path(credential_file).read_text().strip() if credential_file else os.environ["GPU_FAULT_STORE_URL"]
+if not url:
+    raise RuntimeError("database credential reference is empty")
+with psycopg.connect(url,autocommit=True,connect_timeout=10) as c:
   with c.cursor() as cur:
+    cur.execute("select current_database()")
+    if cur.fetchone()[0] == database:
+        raise RuntimeError("cleanup target is the production database")
     cur.execute("select pg_terminate_backend(pid) from pg_stat_activity where datname=%s and pid<>pg_backend_pid()",(database,))
     cur.execute(sql.SQL("drop database if exists {} with (force)").format(sql.Identifier(database)))
+    cur.execute("select 1 from pg_database where datname=%s",(database,))
+    if cur.fetchone() is not None:
+        raise RuntimeError("capacity database still exists after cleanup")
 """
-        )
         self.kubectl(
             "exec",
             "-i",
             pod,
             "--",
-            "python",
+            component_python("cpu"),
             "-",
             database,
             input_text=cleanup,
@@ -719,20 +820,22 @@ with psycopg.connect(store_dsn(),autocommit=True) as c:
         )
 
     def cleanup_common(self) -> None:
-        self.kubectl(
-            "delete",
-            "secret",
-            self.secret_name,
-            "--ignore-not-found",
-            check=False,
-        )
-        self.kubectl(
-            "delete",
-            "configmap",
-            self.configmap_name,
-            "--ignore-not-found",
-            check=False,
-        )
+        if getattr(self, "cap002_scrape_stopped", True) is not True:
+            raise CapError("CAP002 scrape shutdown is unverified; resources retained")
+        if self.active_probe is not None and self.active_probe.case == "CAP002":
+            raise CapError("CAP002 probe cleanup is unverified; resources retained")
+        errors = []
+        for kind, name in (
+            ("secret", self.secret_name),
+            ("configmap", self.configmap_name),
+        ):
+            try:
+                self.kubectl("delete", kind, name, "--ignore-not-found")
+                self._require_resource_absent(kind, name)
+            except Exception as exc:
+                errors.append(f"{kind} cleanup: {type(exc).__name__}")
+        if errors:
+            raise CapError("; ".join(errors))
 
 
 class CapHarnessBase(CapProbeHarness):
@@ -746,24 +849,14 @@ class CapHarnessBase(CapProbeHarness):
 
     @staticmethod
     def parse_metrics(text: str) -> list[tuple[str, dict[str, str], float]]:
-        values = []
-        pattern = re.compile(
-            r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+"
-            r"([-+]?[0-9.eE]+)$"
-        )
-        for line in text.splitlines():
-            if not line or line.startswith("#"):
-                continue
-            match = pattern.match(line)
-            if not match:
-                continue
-            labels = {}
-            raw_labels = match.group(2)
-            if raw_labels:
-                for item in re.findall(r'(\w+)="((?:\\.|[^"])*)"', raw_labels):
-                    labels[item[0]] = item[1].replace('\\"', '"').replace("\\\\", "\\")
-            values.append((match.group(1), labels, float(match.group(3))))
-        return values
+        try:
+            return [
+                (sample.name, dict(sample.labels), float(sample.value))
+                for family in text_string_to_metric_families(text)
+                for sample in family.samples
+            ]
+        except ValueError as exc:
+            raise CapError("capacity metrics are malformed") from exc
 
     def metrics(self, url: str) -> list[tuple[str, dict[str, str], float]]:
         response = httpx.get(f"{url}/metrics", timeout=10)
@@ -784,7 +877,11 @@ class CapHarnessBase(CapProbeHarness):
                 metric_labels.get(key) == expected for key, expected in labels.items()
             )
         ]
-        return max(candidates, default=0.0)
+        if not candidates or any(
+            not math.isfinite(value) or value < 0 for value in candidates
+        ):
+            raise CapError(f"required capacity metric is missing or invalid: {name}")
+        return max(candidates)
 
     def amp_request(
         self, method: str, path: str, params: Mapping[str, str] | None = None
@@ -816,11 +913,28 @@ class CapHarnessBase(CapProbeHarness):
             headers=dict(signed.headers),
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        timeout = 30.0
+        if getattr(self, "case_id", None) == "GF-REGIONAL-CAP-002":
+            deadline = self.maintenance_deadline
+            if not isinstance(deadline, datetime) or deadline.utcoffset() is None:
+                raise CapError("CAP-002 requires an aware maintenance deadline")
+            remaining = deadline.timestamp() - time.time()
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise CapError("CAP-002 maintenance deadline has expired")
+            timeout = min(timeout, remaining)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
     def alert_states(self, alert_name: str) -> list[str]:
-        alerts = self.amp_request("GET", "/api/v1/alerts")["data"]["alerts"]
+        response = self.amp_request("GET", "/api/v1/alerts")
+        if response.get("status") != "success":
+            raise CapError("AMP alert response is not successful")
+        alerts = response.get("data", {}).get("alerts")
+        if not isinstance(alerts, list) or any(
+            not isinstance(item, dict) or item.get("state") not in {"pending", "firing"}
+            for item in alerts
+        ):
+            raise CapError("AMP alert inventory is missing or invalid")
         return sorted(
             {
                 str(item.get("state"))
@@ -920,33 +1034,62 @@ with psycopg.connect(url) as c:
                 "gpu-fault-telemetry-spool-worker-config-postgres"
             ),
         }
+        if set(pools) != set(config_by_deployment.values()) or any(
+            pool < 1 for pool in pools.values()
+        ):
+            raise CapError("PostgreSQL pool configuration is incomplete")
         for item in deployments["items"]:
             name = item["metadata"]["name"]
             if name not in config_by_deployment:
                 continue
-            replicas = int(item["spec"].get("replicas", 0))
-            args = " ".join(item["spec"]["template"]["spec"]["containers"][0]["args"])
+            replicas = item["spec"].get("replicas")
+            if type(replicas) is not int or replicas < 0:
+                raise CapError("capacity role replica count is missing or invalid")
+            container = item["spec"]["template"]["spec"]["containers"][0]
+            args = " ".join(container["args"])
             match = re.search(r"--workers\s+(\d+)", args)
             processes = int(match.group(1)) if match else 1
             pool = pools[config_by_deployment[name]]
-            maximum = replicas * processes * pool
+            overrides = [
+                entry
+                for entry in container.get("env", [])
+                if entry.get("name") == "GPU_FAULT_POSTGRES_POOL_MAX_SIZE"
+            ]
+            if overrides:
+                if (
+                    len(overrides) != 1
+                    or not str(overrides[0].get("value", "")).isdigit()
+                ):
+                    raise CapError("effective PostgreSQL pool size is unknown")
+                pool = int(overrides[0]["value"])
+            if pool < 1 or processes < 1:
+                raise CapError("capacity process or pool size is invalid")
+            listeners = unpooled_connection_budget(name)
+            unpooled = sum(listeners.values())
+            maximum = replicas * processes * (pool + unpooled)
             rows.append(
                 {
                     "deployment": name,
                     "replicas": replicas,
                     "processes_per_pod": processes,
                     "pool_max_size": pool,
+                    "unpooled_per_process": unpooled,
+                    "unpooled_by_consumer": listeners,
+                    "pooled_connections": replicas * processes * pool,
+                    "unpooled_connections": replicas * processes * unpooled,
                     "theoretical_connections": maximum,
                 }
             )
             total += maximum
+        if len(rows) != len(config_by_deployment) or {
+            row["deployment"] for row in rows
+        } != set(config_by_deployment):
+            raise CapError("capacity connection budget is missing a CPU role")
         worker = self.kubectl_json(
             "get", "pods", "-l", "app=gpu-fault-control-worker", "-o", "json"
         )
-        # The capacity probes carry the same app label but talk to their own
-        # isolated database through their own environment; only a production
-        # worker knows GPU_FAULT_STORE_URL (live 2026-09-07: KeyError inside a
-        # probe Pod ended CAP-003 after all four scale points had run).
+        # Exclude legacy capacity probes that used the production app label;
+        # only a production worker has the production database credential.
         pod = next(
             item["metadata"]["name"]
             for item in worker["items"]
@@ -956,32 +1099,45 @@ with psycopg.connect(url) as c:
             .get("labels", {})
             .get("gpu-fault.io/capacity-probe")
         )
-        script = (
-            STORE_DSN_SNIPPET
-            + r"""
-import json,psycopg
-with psycopg.connect(store_dsn()) as c:
+        script = r"""
+import os,psycopg
+from pathlib import Path
+path = os.environ.get("GPU_FAULT_STORE_URL_FILE", "").strip()
+url = Path(path).read_text().strip() if path else os.environ["GPU_FAULT_STORE_URL"]
+if not url:
+    raise RuntimeError("database credential reference is empty")
+with psycopg.connect(url, connect_timeout=10) as c:
   with c.cursor() as cur:
     cur.execute("select current_setting('max_connections')::int")
     print(cur.fetchone()[0])
 """
-        )
         max_connections = int(
             self.kubectl(
                 "exec",
                 "-i",
                 pod,
                 "--",
-                "python",
+                component_python("cpu"),
                 "-",
                 input_text=script,
             ).stdout.strip()
         )
+        if max_connections <= 0:
+            raise CapError("PostgreSQL max_connections is invalid")
         return {
             "roles": rows,
             "theoretical_total": total,
             "max_connections": max_connections,
             "budget_ratio": total / max_connections,
+            "budget_scope": (
+                "all installed role listeners, including lazy claim listeners; "
+                "disabled features may use fewer connections"
+            ),
+            "excluded_consumers": [
+                "transient schema/administrator/probe connections",
+                "other applications on the same Aurora server",
+                "temporary surge Pods during a rollout",
+            ],
         }
 
     def cloudwatch_window(self, start: datetime, end: datetime) -> dict[str, Any]:
@@ -1013,60 +1169,118 @@ with psycopg.connect(store_dsn()) as c:
                 ],
                 key=lambda item: item["timestamp"],
             )
+            if not result[metric] or any(
+                type(item[key]) not in {int, float}
+                or not math.isfinite(item[key])
+                or item[key] < 0
+                for item in result[metric]
+                for key in ("average", "maximum")
+            ):
+                raise CapError(
+                    f"CloudWatch {metric} measurements are missing or invalid"
+                )
         return result
 
     def production_baseline(self) -> dict[str, Any]:
         deployments = self.kubectl_json("get", "deployments", "-o", "json")
         pods = self.kubectl_json("get", "pods", "-o", "json")
+        for label, inventory in (("Deployment", deployments), ("Pod", pods)):
+            if (
+                not isinstance(inventory, dict)
+                or not isinstance(inventory.get("items"), list)
+                or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("metadata"), dict)
+                    for item in inventory["items"]
+                )
+            ):
+                raise CapError(f"production {label} inventory is incomplete")
+        rows = []
+        desired = {}
+        for item in deployments["items"]:
+            name = item["metadata"].get("name")
+            if name not in PRODUCTION_APPS:
+                continue
+            generation = item["metadata"].get("generation")
+            replicas = (item.get("spec") or {}).get("replicas")
+            ready = (item.get("status") or {}).get("readyReplicas", 0)
+            if (
+                name in desired
+                or type(generation) is not int
+                or generation < 1
+                or type(replicas) is not int
+                or replicas < 0
+                or type(ready) is not int
+                or ready != replicas
+            ):
+                raise CapError("production Deployment identity or readiness is unknown")
+            desired[name] = replicas
+            rows.append(
+                {
+                    "name": name,
+                    "generation": generation,
+                    "replicas": replicas,
+                    "ready": ready,
+                }
+            )
+        if set(desired) != PRODUCTION_APPS:
+            raise CapError("production baseline is missing a CPU or observability role")
+        selected = [
+            item
+            for item in pods["items"]
+            if "gpu-fault.io/capacity-probe"
+            not in (item["metadata"].get("labels") or {})
+            and (item["metadata"].get("labels") or {}).get("app") in PRODUCTION_APPS
+        ]
+        try:
+            ready_pods = ready_pod_records({"items": selected})
+        except RegionalFixtureError as exc:
+            raise CapError("production Pod identity is incomplete") from exc
+        if len(ready_pods) != len(selected) or Counter(
+            item["metadata"]["labels"]["app"] for item in selected
+        ) != Counter(desired):
+            raise CapError(
+                "production Pod readiness or replica inventory is incomplete"
+            )
+        snapshots = []
+        for item in selected:
+            restarts = 0
+            for spec_key, status_key in (
+                ("containers", "containerStatuses"),
+                ("initContainers", "initContainerStatuses"),
+            ):
+                containers = item["spec"].get(spec_key, [])
+                statuses = item["status"].get(status_key, [])
+                if (
+                    not isinstance(containers, list)
+                    or not isinstance(statuses, list)
+                    or len(containers) != len(statuses)
+                    or any(
+                        not isinstance(entry, dict) for entry in containers + statuses
+                    )
+                    or {entry.get("name") for entry in containers}
+                    != {entry.get("name") for entry in statuses}
+                    or any(
+                        type(entry.get("restartCount")) is not int
+                        or entry["restartCount"] < 0
+                        for entry in statuses
+                    )
+                ):
+                    raise CapError(
+                        "production container restart counters are incomplete"
+                    )
+                restarts += sum(entry["restartCount"] for entry in statuses)
+            snapshots.append(
+                {
+                    "name": item["metadata"]["name"],
+                    "uid": item["metadata"]["uid"],
+                    "phase": item["status"]["phase"],
+                    "restarts": restarts,
+                }
+            )
         return {
-            "deployments": sorted(
-                [
-                    {
-                        "name": item["metadata"]["name"],
-                        "generation": item["metadata"].get("generation"),
-                        "replicas": item["spec"].get("replicas", 0),
-                        "ready": item.get("status", {}).get("readyReplicas", 0),
-                    }
-                    for item in deployments.get("items", [])
-                    if item["metadata"]["name"]
-                    in {
-                        "gpu-fault-api-ha",
-                        "gpu-fault-control-worker",
-                        "gpu-fault-telemetry-spool-worker",
-                        "gpu-fault-adot",
-                    }
-                ],
-                key=lambda item: item["name"],
-            ),
-            "pods": sorted(
-                [
-                    {
-                        "name": item["metadata"]["name"],
-                        "uid": item["metadata"]["uid"],
-                        "phase": item.get("status", {}).get("phase"),
-                        "restarts": sum(
-                            status.get("restartCount", 0)
-                            for status in item.get("status", {}).get(
-                                "containerStatuses", []
-                            )
-                        ),
-                    }
-                    for item in pods.get("items", [])
-                    # Probe Pods wear the worker's `app` label too; one left
-                    # behind by another run must not count as production, or
-                    # its removal mid-case reads as a baseline change.
-                    if "gpu-fault.io/capacity-probe"
-                    not in item.get("metadata", {}).get("labels", {})
-                    and item.get("metadata", {}).get("labels", {}).get("app")
-                    in {
-                        "gpu-fault-api-ha",
-                        "gpu-fault-control-worker",
-                        "gpu-fault-telemetry-spool-worker",
-                        "gpu-fault-adot",
-                    }
-                ],
-                key=lambda item: item["name"],
-            ),
+            "deployments": sorted(rows, key=lambda item: item["name"]),
+            "pods": sorted(snapshots, key=lambda item: item["name"]),
         }
 
     def run(self) -> int:
@@ -1089,7 +1303,7 @@ with psycopg.connect(store_dsn()) as c:
                 "predecessor": self.predecessor,
             },
         )
-        if not self.predecessor.get("valid", True):
+        if self.predecessor.get("valid") is not True:
             raise CapError("formal predecessor evidence is not PASS")
         case_path = self.run_dir / f"{self.case_id}.json"
         # The verdict file exists from the start but says PENDING: the next
@@ -1157,6 +1371,8 @@ with psycopg.connect(store_dsn()) as c:
             raise CapError(
                 "production control-plane baseline changed during capacity run"
             )
+        if verdict != "PASS":
+            raise CapError("capacity case did not return a passing result")
         return 0
 
     @staticmethod
@@ -1169,7 +1385,7 @@ with psycopg.connect(store_dsn()) as c:
     ) -> str:
         """PASS only when the case passed *and* it left nothing behind."""
 
-        if result is None or error is not None:
+        if result is None or result.get("status") != "PASS" or error is not None:
             return "FAIL"
         if cleanup_errors or not production_unchanged:
             return "FAIL"
@@ -1185,6 +1401,7 @@ with psycopg.connect(store_dsn()) as c:
         production_unchanged: bool | None = None,
     ) -> dict[str, Any]:
         return {
+            **self.evidence_identity,
             "schema_version": 2,
             "report_type": "fault-acceptance",
             "case_id": self.case_id,
@@ -1205,7 +1422,12 @@ with psycopg.connect(store_dsn()) as c:
         the run, so each failure is recorded and the verdict becomes FAIL.
         """
 
+        if getattr(self, "cap002_scrape_stopped", True) is not True:
+            return ["CAP002 scrape shutdown is unverified; resources retained"]
+        if getattr(self, "cap004_executor_stopped", True) is not True:
+            return ["CAP004 Executor shutdown is unverified; resources retained"]
         errors: list[str] = []
+        cap002 = getattr(self, "case_id", None) == "GF-REGIONAL-CAP-002"
         if self.active_probe is not None:
             probe = self.active_probe
             try:
@@ -1221,12 +1443,18 @@ with psycopg.connect(store_dsn()) as c:
                     )
             except Exception as exc:  # noqa: BLE001 - recorded, verdict FAIL
                 errors.append(
-                    f"probe cleanup {probe.deployment}: {type(exc).__name__}: {exc}"
+                    f"probe cleanup: {type(exc).__name__}"
+                    if cap002
+                    else f"probe cleanup {probe.deployment}: {type(exc).__name__}: {exc}"
                 )
         try:
             self.cleanup_common()
         except Exception as exc:  # noqa: BLE001 - recorded, verdict FAIL
-            errors.append(f"common resource cleanup: {type(exc).__name__}: {exc}")
+            errors.append(
+                f"common resource cleanup: {type(exc).__name__}"
+                if cap002
+                else f"common resource cleanup: {type(exc).__name__}: {exc}"
+            )
         return errors
 
     def case_001(self) -> dict[str, Any]:

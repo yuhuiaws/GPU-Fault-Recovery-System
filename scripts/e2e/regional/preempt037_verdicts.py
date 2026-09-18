@@ -19,11 +19,15 @@ runner wrote and touches no cluster.
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from scripts.e2e.regional.collector_window_fixture import metric_max
+from gpu_fault.models import WorkflowStatus
+from scripts.e2e.regional.collector_window_fixture import parse_metric_samples
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CASE_ID = "GF-REGIONAL-PREEMPT-037"
 CONFIRMATION = "PREEMPT037_EXECUTE"
@@ -48,9 +52,10 @@ QUIESCENT_WORKFLOW_STATUSES = frozenset(
 def _duration_seconds(value: str) -> int:
     text = str(value).strip()
     units = {"s": 1, "m": 60, "h": 3600}
-    if text and text[-1] in units:
-        return int(float(text[:-1]) * units[text[-1]])
-    return int(float(text))
+    match = re.fullmatch(r"([1-9][0-9]*)([smh]?)", text)
+    if match is None:
+        raise ValueError("alert duration must be a positive supported duration")
+    return int(match[1]) * units.get(match[2], 1)
 
 
 def alert_rule(rules_text: str, name: str) -> dict[str, Any] | None:
@@ -69,17 +74,19 @@ def stall_rule_parameters(rules_text: str) -> dict[str, Any]:
     if rule is None:
         raise ValueError(f"{STALLED_ALERT} is not defined in the rule file")
     expr = str(rule.get("expr") or "")
-    threshold = DEFAULT_THRESHOLD_SECONDS
-    tail = expr.rsplit(">", 1)
-    if len(tail) == 2 and tail[1].strip().isdigit():
-        threshold = int(tail[1].strip())
+    match = re.fullmatch(
+        r"\s*time\(\)\s*-\s*max\s+by\s*\(\s*control_plane_cluster\s*,\s*region\s*\)"
+        r"\s*\(\s*" + re.escape(DISPATCH_METRIC) + r"\s*\)\s*>\s*([1-9][0-9]*)\s*",
+        expr,
+    )
+    if match is None:
+        raise ValueError("unsupported dispatcher stall alert expression")
+    threshold = int(match[1])
     return {
         "expr": expr,
         "metric": DISPATCH_METRIC,
         "threshold_seconds": threshold,
-        "for_seconds": _duration_seconds(
-            str(rule.get("for") or f"{DEFAULT_FOR_SECONDS}s")
-        ),
+        "for_seconds": _duration_seconds(str(rule.get("for") or "")),
         "runbook_url": str((rule.get("annotations") or {}).get("runbook_url") or ""),
         "severity": str((rule.get("labels") or {}).get("severity") or ""),
     }
@@ -100,15 +107,35 @@ def rule_errors(parameters: dict[str, Any], runbook_text: str) -> list[str]:
 def stalled(texts: list[str], *, now: float, threshold_seconds: int) -> bool:
     """The alert expression: ``time() - max(stamp) > threshold``."""
 
-    latest = metric_max(texts, DISPATCH_METRIC)
-    if latest is None:
-        return True
+    latest = _latest_stamp(texts, DISPATCH_METRIC, now=now)
     return now - latest > threshold_seconds
 
 
+def _latest_stamp(texts: list[str], metric: str, *, now: float) -> float:
+    if not texts:
+        raise ValueError(f"no replica metric series for {metric}")
+    values: list[float] = []
+    for text in texts:
+        try:
+            samples = parse_metric_samples(text, metric)
+        except RegionalFixtureError:
+            raise ValueError(f"invalid metric timestamp for {metric}") from None
+        if not samples:
+            raise ValueError(f"missing replica metric series for {metric}")
+        for sample in samples:
+            value = float(sample["value"])
+            if not math.isfinite(value) or value < 0 or value > now:
+                raise ValueError(f"invalid metric timestamp for {metric}")
+            values.append(value)
+    return max(values)
+
+
 def periodic_alive(texts: list[str], *, now: float, threshold_seconds: int) -> bool:
-    latest = metric_max(texts, PERIODIC_METRIC)
-    return latest is not None and now - latest <= threshold_seconds
+    _latest_stamp(texts, PERIODIC_METRIC, now=now)
+    return all(
+        now - _latest_stamp([text], PERIODIC_METRIC, now=now) <= threshold_seconds
+        for text in texts
+    )
 
 
 def quiescence_errors(workflows: list[dict[str, Any]]) -> list[str]:
@@ -122,6 +149,24 @@ def quiescence_errors(workflows: list[dict[str, Any]]) -> list[str]:
     if active:
         return [f"workflows are still in flight: {active}"]
     return []
+
+
+def workflow_census_errors(report: dict[str, Any]) -> list[str]:
+    counts = report.get("status_counts")
+    if not isinstance(counts, dict):
+        return ["workflow status census is missing"]
+    known = {status.value for status in WorkflowStatus}
+    if any(
+        status not in known or type(count) is not int or count < 0
+        for status, count in counts.items()
+    ):
+        return ["workflow status census contains unknown states or counts"]
+    active = {
+        status: count
+        for status, count in counts.items()
+        if count and status not in QUIESCENT_WORKFLOW_STATUSES
+    }
+    return [f"workflows are still in flight: {active}"] if active else []
 
 
 def effective_variable_value(replicas: list[dict[str, Any]]) -> str | None:
@@ -162,6 +207,19 @@ def stall_timeline_errors(
 
     if not timeline:
         return ["no stall samples were recorded"]
+    previous: float | None = None
+    for sample in timeline:
+        stamp = sample.get("observed_epoch")
+        if type(stamp) not in {int, float} or not math.isfinite(stamp):
+            return ["stall observation timestamp is missing or invalid"]
+        if (
+            type(sample.get("stalled")) is not bool
+            or type(sample.get("periodic_alive")) is not bool
+        ):
+            return ["stall observation is unknown"]
+        if previous is not None and not 0 <= stamp - previous <= 2 * POLL_SECONDS:
+            return ["stall observation gap cannot prove a continuous alert"]
+        previous = stamp
     true_samples = [item for item in timeline if item.get("stalled")]
     if not true_samples:
         return ["the stall expression never became true while the dispatcher was off"]
@@ -184,7 +242,7 @@ def stall_timeline_errors(
 def recovery_errors(
     samples: list[dict[str, Any]], *, threshold_seconds: int
 ) -> list[str]:
-    fresh = [item for item in samples if not item.get("stalled")]
+    fresh = [item for item in samples if item.get("stalled") is False]
     if not fresh:
         return [
             "the dispatch stamp did not become fresh within "
@@ -195,7 +253,9 @@ def recovery_errors(
 
 def restore_errors(record: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if record.get("restored_state") != record.get("baseline"):
+    if not isinstance(record.get("baseline"), dict) or record.get(
+        "restored_state"
+    ) != record.get("baseline"):
         errors.append(
             "the control-worker env was not restored to the recorded baseline"
         )
@@ -207,6 +267,8 @@ def restore_errors(record: dict[str, Any]) -> list[str]:
     expected = record.get(
         "effective_before", (record.get("baseline") or {}).get("value")
     )
+    if not record.get("replicas_after_close"):
+        errors.append("no ready replicas proved restoration")
     for replica in record.get("replicas_after_close") or []:
         if (replica.get("values") or {}).get(VARIABLE) != expected:
             errors.append(

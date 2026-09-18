@@ -32,7 +32,7 @@ def fetch(url: str) -> dict[str, Any]:
         body = exc.read()
         try:
             payload = json.loads(body) if body else {}
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
             payload = {"raw": body.decode("utf-8", "replace")[:500]}
         return {"status": exc.code, "payload": payload}
     except (URLError, OSError, ValueError) as exc:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
 import socket
@@ -12,8 +14,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault.hma import FabricManagerLogEvent
-from gpu_fault.regional import RegionalClusterRegistration
+from gpu_fault.nvidia_logs import FabricManagerLogEvent
+from gpu_fault.regional import (
+    RegionalClusterLifecycle,
+    RegionalClusterRegistration,
+    regional_registry_content_sha256,
+)
 from gpu_fault.training_models import TrainingProgressHeartbeat
 from gpu_fault.watcher import AttemptObservation
 from scripts.perf import benchmark_synchronized_burst as burst
@@ -52,7 +58,9 @@ def test_artifact_directory_uses_case_release_and_utc(tmp_path: Path) -> None:
 
     assert path.parent.parent.name == "burst-32c"
     assert path.parent.name == "release-abc123"
-    assert path.name.endswith("Z")
+    assert path.name.endswith("Z"), (
+        f"capacity artifact timestamp must be UTC: {path.name}"
+    )
 
 
 def test_status_and_aborted_directory_are_explicit(tmp_path: Path) -> None:
@@ -64,7 +72,9 @@ def test_status_and_aborted_directory_are_explicit(tmp_path: Path) -> None:
     assert status["reason"] == "probe failed"
 
     moved = suite.move_to_aborted(tmp_path, path)
-    assert moved.is_dir()
+    assert moved.is_dir(), (
+        f"aborted capacity artifact directory was not preserved: {moved}"
+    )
     assert moved.relative_to(tmp_path).parts[0] == "_aborted"
 
 
@@ -180,7 +190,7 @@ def test_live_registry_requires_double_confirmation(monkeypatch) -> None:
     )
 
 
-def test_preflight_cleanup_removes_legacy_synthetic_entries(
+def test_preflight_cleanup_refuses_legacy_synthetic_entries(
     tmp_path: Path, monkeypatch
 ) -> None:
     entries = [{"cluster_id": "production"}, {"cluster_id": "perf-cap-000"}]
@@ -197,21 +207,21 @@ def test_preflight_cleanup_removes_legacy_synthetic_entries(
         lambda values, **kwargs: published.append((list(values), kwargs)),
     )
 
-    removed = registry_module.cleanup_registry_residuals(
-        scope="isolated", artifacts=tmp_path, phase="preflight", force=False
-    )
+    with pytest.raises(RuntimeError, match="preflight cannot purge"):
+        registry_module.cleanup_registry_residuals(
+            scope="isolated", artifacts=tmp_path, phase="preflight", force=False
+        )
 
-    assert removed == 1
-    assert entries == [{"cluster_id": "production"}]
-    assert published == [
-        ([{"cluster_id": "production"}], {"reason": "capacity cleanup all-synthetic"})
-    ]
-    audit = json.loads((tmp_path / "registry-preflight.json").read_text())
-    assert audit["removed"] == 1
-    assert audit["synthetic_entries"][0]["legacy_prefix_only"] is True
+    assert entries == [{"cluster_id": "production"}, {"cluster_id": "perf-cap-000"}]
+    assert published == []
+    assert not (tmp_path / "registry-preflight.json").exists(), (
+        "refused legacy cleanup must not write a successful preflight receipt"
+    )
 
 
 def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> None:
+    from scripts.perf import regional_capacity_data
+
     baseline = [{"cluster_id": "production", "token": "p" * 32}]
     written = []
     published = []
@@ -227,19 +237,32 @@ def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> 
         registry_module, "cleanup_registry_residuals", lambda **_kwargs: 0
     )
     monkeypatch.setattr(registry_module, "load_registry", lambda: list(baseline))
-    monkeypatch.setattr(
-        registry_module, "write_registry", lambda values: written.append(list(values))
-    )
+    monkeypatch.setattr(regional_capacity_data, "invoke", lambda *a, **k: {"total": 0})
+
+    def write_registry(values, **kwargs):
+        assert token_secrets, "token creation must precede registry publication"
+        assert kwargs["expected_entries"] == baseline
+        assert kwargs["run_id"] == "run-a"
+        written.append(list(values))
+        published.append((list(values), kwargs["reason"]))
+
+    monkeypatch.setattr(registry_module, "write_registry", write_registry)
     monkeypatch.setattr(
         registry_module,
         "publish_registry_revision",
-        lambda values, **kwargs: published.append((list(values), kwargs)),
+        lambda *a, **k: pytest.fail("write_registry already owns the CAS publication"),
     )
-    monkeypatch.setattr(
-        registry_module,
-        "upsert_secret",
-        lambda name, files: token_secrets.append((name, files)),
-    )
+
+    def upsert_secret(name, files, *, run_id):
+        intent = json.loads(
+            (tmp_path / "registry-registration-intent.json").read_text()
+        )
+        assert intent["run_id"] == run_id
+        assert intent["data_empty_before_registration"] is True
+        token_secrets.append((name, files))
+        return {"run_id": run_id, "uid": "token-uid", "resource_version": "1"}
+
+    monkeypatch.setattr(registry_module, "upsert_secret", upsert_secret)
 
     tokens = registry_module.register(
         2,
@@ -253,12 +276,479 @@ def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> 
     assert len(tokens) == 2
     assert len(written) == 1
     assert len(published) == 1
-    assert published[0][1] == {"reason": "capacity register run-a"}
+    assert published[0][1] == "capacity register run-a"
     assert [item["cluster_id"] for item in published[0][0][-2:]] == [
         "perf-cap-000",
         "perf-cap-001",
     ]
     assert token_secrets[0][0] == registry_module.TOKEN_SECRET
+    proof = json.loads((tmp_path / "registry-token-proof.json").read_text())
+    assert proof == {"run_id": "run-a", "uid": "token-uid", "resource_version": "1"}
+
+
+@pytest.mark.parametrize("failure", [None, "create-ack", "replaced"])
+def test_token_secret_is_created_labelled_and_never_adopts_a_replacement(
+    monkeypatch, failure: str | None
+) -> None:
+    resources = []
+    creates = []
+
+    def dataplane(*args, **kwargs):
+        if args[0] == "get":
+            return json.dumps(resources[0]) if resources else ""
+        assert args[:3] == ("create", "-f", "-")
+        item = json.loads(kwargs["stdin"])
+        assert item["metadata"]["labels"] == {registry_module.RUN_LABEL: "run-a"}
+        item["metadata"].update(uid="token-uid", resourceVersion="1")
+        resources.append(item)
+        creates.append(item)
+        if failure == "create-ack":
+            raise TimeoutError("create acknowledgement lost")
+        acknowledgement = json.dumps(item["metadata"])
+        if failure == "replaced":
+            item["metadata"]["uid"] = "replacement"
+        return acknowledgement
+
+    monkeypatch.setattr(registry_module, "dataplane", dataplane)
+    if failure == "replaced":
+        with pytest.raises(RuntimeError, match="ownership"):
+            registry_module.upsert_secret(
+                registry_module.TOKEN_SECRET, {"clusters.json": b"[]"}, run_id="run-a"
+            )
+    else:
+        assert registry_module.upsert_secret(
+            registry_module.TOKEN_SECRET, {"clusters.json": b"[]"}, run_id="run-a"
+        ) == {"uid": "token-uid", "resource_version": "1", "run_id": "run-a"}
+    assert len(creates) == 1
+
+
+def test_token_secret_from_another_run_is_not_overwritten(monkeypatch) -> None:
+    calls = []
+
+    def dataplane(*args, **kwargs):
+        calls.append(args)
+        return json.dumps(
+            {
+                "metadata": {
+                    "uid": "foreign",
+                    "resourceVersion": "1",
+                    "labels": {registry_module.RUN_LABEL: "other-run"},
+                },
+                "data": {"clusters.json": base64.b64encode(b"[]").decode()},
+            }
+        )
+
+    monkeypatch.setattr(registry_module, "dataplane", dataplane)
+    with pytest.raises(RuntimeError, match="ownership"):
+        registry_module.upsert_secret(
+            registry_module.TOKEN_SECRET, {"clusters.json": b"[]"}, run_id="run-a"
+        )
+    assert [args[0] for args in calls] == ["get"]
+
+
+def registry_wire(monkeypatch, *, failure=None) -> SimpleNamespace:
+    registration = RegionalClusterRegistration(
+        cluster_id="production",
+        region="us-west-2",
+        hyperpod_cluster_name="production",
+        eks_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/production",
+        token_sha256="a" * 64,
+        agent_endpoint_allowed_cidrs=["127.0.0.1/32"],
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    durable = registration.model_copy(
+        update={"lifecycle_state": RegionalClusterLifecycle.DRAINING}
+    )
+    wire = SimpleNamespace(
+        baseline=[registration.model_dump(mode="json")],
+        entries=[registration.model_dump(mode="json")],
+        uid="registry-uid",
+        version="1",
+        patches=[],
+        publications=[],
+        revision={
+            "generation": 1,
+            "registrations": [durable.model_dump(mode="json")],
+            "content_sha256": regional_registry_content_sha256([durable]),
+        },
+    )
+
+    def control(*args, **kwargs):
+        if args[:2] == ("get", "secret"):
+            data = base64.b64encode(json.dumps(wire.entries).encode()).decode()
+            if args[-1] != "json":
+                return data
+            return json.dumps(
+                {
+                    "metadata": {"uid": wire.uid, "resourceVersion": wire.version},
+                    "data": {"clusters.json": data},
+                }
+            )
+        if args[:2] == ("get", "pod"):
+            return "cpu-api"
+        if args[0] == "exec":
+            assert "/opt/gpu-fault/control-plane/bin/python" in args
+            return json.dumps(wire.revision)
+        assert args[:2] == ("patch", "secret")
+        assert "--patch-file=/dev/stdin" in args and "-p" not in args
+        patch = json.loads(kwargs["stdin"])
+        assert patch[:2] == [
+            {"op": "test", "path": "/metadata/uid", "value": wire.uid},
+            {"op": "test", "path": "/metadata/resourceVersion", "value": wire.version},
+        ]
+        wire.patches.append(patch)
+        wire.entries = json.loads(base64.b64decode(patch[2]["value"]))
+        wire.version = str(int(wire.version) + 1)
+        if failure == "secret-replaced":
+            wire.uid = "replacement"
+        if failure == "secret-ack":
+            raise TimeoutError("Secret acknowledgement lost")
+        return "patched"
+
+    def registry_api(method, path, payload=None):
+        if method == "POST":
+            assert payload["expected_generation"] == wire.revision["generation"]
+            wire.publications.append(payload)
+            if failure == "publication-rejected":
+                raise RuntimeError("publication rejected")
+            values = [
+                RegionalClusterRegistration.model_validate(item)
+                for item in payload["registrations"]
+            ]
+            wire.revision = {
+                "generation": wire.revision["generation"] + 1,
+                "registrations": payload["registrations"],
+                "content_sha256": regional_registry_content_sha256(values),
+            }
+            if failure == "publication-ack":
+                raise TimeoutError("publication acknowledgement lost")
+        status = {
+            "generation": wire.revision["generation"],
+            "content_sha256": wire.revision["content_sha256"],
+            "converged": True,
+        }
+        if failure == "head-drift" and wire.publications:
+            status["generation"] += 1
+        return status
+
+    monkeypatch.setattr(registry_module, "control", control)
+    monkeypatch.setattr(registry_module, "registry_api", registry_api)
+    return wire
+
+
+def synthetic_registration() -> dict:
+    return RegionalClusterRegistration(
+        cluster_id="perf-cap-000",
+        region="us-west-2",
+        hyperpod_cluster_name="perf-cap-000",
+        eks_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/perf-cap-000",
+        token_sha256="b" * 64,
+        agent_endpoint_allowed_cidrs=["127.0.0.1/32"],
+        synthetic=True,
+        synthetic_run_id="run-a",
+        synthetic_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    ).model_dump(mode="json")
+
+
+@pytest.mark.parametrize("failure", [None, "secret-ack", "publication-ack"])
+def test_registry_write_reconciles_ack_without_replaying_or_resetting_lifecycle(
+    monkeypatch, failure: str | None
+) -> None:
+    wire = registry_wire(monkeypatch, failure=failure)
+    original = copy.deepcopy(wire.revision["registrations"][0])
+    result = registry_module.write_registry(
+        wire.baseline + [synthetic_registration()],
+        run_id="run-a",
+        expected_entries=wire.baseline,
+        reason="test registration",
+    )
+    assert result["generation"] == 2
+    assert result["secret_uid"] == "registry-uid"
+    assert len(wire.patches) == len(wire.publications) == 1
+    preserved = next(
+        item for item in result["registrations"] if item["cluster_id"] == "production"
+    )
+    assert preserved == original
+
+
+@pytest.mark.parametrize(
+    "failure", ["secret-replaced", "head-drift", "publication-rejected"]
+)
+def test_registry_ack_reconciliation_refuses_identity_or_generation_drift(
+    monkeypatch, failure: str
+) -> None:
+    wire = registry_wire(monkeypatch, failure=failure)
+    with pytest.raises(RuntimeError, match="changed|unresolved"):
+        registry_module.write_registry(
+            wire.baseline + [synthetic_registration()],
+            run_id="run-a",
+            expected_entries=wire.baseline,
+            reason="test registration",
+        )
+    assert len(wire.patches) == 1
+    assert len(wire.publications) == (0 if failure == "secret-replaced" else 1)
+
+
+def test_cleanup_recovers_a_durable_only_registration_after_partial_ack(
+    monkeypatch,
+) -> None:
+    wire = registry_wire(monkeypatch)
+    wire.revision["registrations"].append(synthetic_registration())
+    wire.revision["content_sha256"] = regional_registry_content_sha256(
+        [
+            RegionalClusterRegistration.model_validate(item)
+            for item in wire.revision["registrations"]
+        ]
+    )
+    removed = registry_module.cleanup_registry_residuals(
+        scope="isolated", artifacts=None, phase="postflight", force=True, run_id="run-a"
+    )
+    assert removed == 0, (
+        "Secret already removed the row; durable cleanup must still run"
+    )
+    assert len(wire.publications) == 1
+    assert [item["cluster_id"] for item in wire.revision["registrations"]] == [
+        "production"
+    ]
+    assert wire.patches == []
+
+
+def test_registry_cleanup_preserves_other_runs(monkeypatch) -> None:
+    owned = synthetic_registration()
+    foreign = {**owned, "cluster_id": "perf-cap-001", "synthetic_run_id": "other-run"}
+    entries = [owned, foreign, {"cluster_id": "production"}]
+    writes = []
+    monkeypatch.setattr(registry_module, "load_registry", lambda: list(entries))
+
+    def write(values, **kwargs):
+        writes.append(kwargs)
+        entries[:] = values
+
+    monkeypatch.setattr(registry_module, "write_registry", write)
+    assert (
+        registry_module.cleanup_registry_residuals(
+            scope="isolated",
+            artifacts=None,
+            phase="postflight",
+            force=True,
+            run_id="run-a",
+        )
+        == 1
+    )
+    assert entries == [foreign, {"cluster_id": "production"}]
+    assert writes[0]["expected_entries"][0] == owned
+
+
+@pytest.mark.parametrize("run_id", [None, "", "run/other"])
+def test_unscoped_capacity_cleanup_never_contacts_a_cluster(
+    monkeypatch, run_id
+) -> None:
+    from scripts.e2e.regional import net_command_fixture
+
+    monkeypatch.setattr(
+        net_command_fixture,
+        "database_residuals",
+        lambda *a: pytest.fail("unscoped cleanup must not contact the database"),
+    )
+    monkeypatch.setattr(
+        suite, "dataplane", lambda *a, **k: pytest.fail("unscoped teardown")
+    )
+    with pytest.raises(RuntimeError, match="explicit run identity"):
+        suite.purge_audit_rows(run_id=run_id)
+    with pytest.raises(RuntimeError, match="explicit run identity"):
+        suite.teardown(purge=True, deregister_clusters=True, run_id=run_id, attempts=1)
+
+
+@pytest.mark.parametrize("remaining", [0, 1, False, None])
+@pytest.mark.parametrize("lost_ack", [False, True])
+def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_revocation(
+    tmp_path: Path, monkeypatch, remaining, lost_ack: bool
+) -> None:
+    from scripts.perf import regional_capacity_data
+
+    job = str(suite.CASES["burst"]["job"])
+    resources = {
+        f"{kind}/{name}": {
+            "uid": f"uid-{kind}",
+            "resourceVersion": "1",
+            "name": name,
+            "namespace": suite.NAMESPACE,
+            "labels": {registry_module.RUN_LABEL: "run-a"},
+        }
+        for kind, name in (("job", job), ("secret", suite.TOKEN_SECRET))
+    }
+    events = []
+    (tmp_path / "registry-registration-intent.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "cluster_ids": ["perf-cap-000"],
+                "data_empty_before_registration": True,
+            }
+        )
+    )
+    (tmp_path / "capacity-resources.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "namespace": suite.NAMESPACE,
+                "resources": {f"job/{job}": {"uid": "uid-job", "data_sha256": ""}},
+            }
+        )
+    )
+    (tmp_path / "registry-token-proof.json").write_text(
+        '{"run_id":"run-a","uid":"uid-secret"}'
+    )
+
+    def dataplane(*args, **kwargs):
+        if args[0] == "get":
+            value = resources.get(f"{args[1]}/{args[2]}")
+            if not value:
+                return ""
+            return json.dumps(
+                value if args[-1] == "jsonpath={.metadata}" else {"metadata": value}
+            )
+        assert args[:2] == ("delete", "--raw")
+        options = json.loads(kwargs["stdin"])
+        uid = options["preconditions"]["uid"]
+        key = next(key for key, item in resources.items() if item["uid"] == uid)
+        assert options["preconditions"]["resourceVersion"] == "1"
+        events.append(key)
+        del resources[key]
+        if lost_ack and key.startswith("job/"):
+            raise TimeoutError("Job delete acknowledgement lost")
+        return "deleted"
+
+    def residuals(control, *, run_id, cluster_ids, cleanup):
+        assert run_id == "run-a"
+        assert cluster_ids == ["perf-cap-000"] and cleanup is True
+        assert f"job/{job}" not in resources
+        events.append("residuals")
+        return {"total": remaining}
+
+    monkeypatch.setattr(suite, "dataplane", dataplane)
+    monkeypatch.setattr(regional_capacity_data, "invoke", residuals)
+    monkeypatch.setattr(suite, "deregister", lambda **k: events.append("deregister"))
+    kwargs = {
+        "purge": True,
+        "deregister_clusters": True,
+        "run_id": "run-a",
+        "artifacts": tmp_path,
+        "attempts": 1,
+    }
+    if type(remaining) is int and remaining == 0:
+        suite.teardown(**kwargs)
+        assert events == [
+            f"job/{job}",
+            "residuals",
+            "deregister",
+            f"secret/{suite.TOKEN_SECRET}",
+        ]
+        assert resources == {}
+    else:
+        with pytest.raises(RuntimeError, match="exact run-owned cleanup"):
+            suite.teardown(**kwargs)
+        assert events == [f"job/{job}", "residuals"]
+        assert f"secret/{suite.TOKEN_SECRET}" in resources
+
+
+def test_capacity_teardown_never_deletes_a_foreign_or_replaced_job(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "registry-registration-intent.json").write_text('{"run_id":"run-a"}')
+    job = str(suite.CASES["burst"]["job"])
+    metadata = {
+        "uid": "replacement",
+        "resourceVersion": "2",
+        "name": job,
+        "namespace": suite.NAMESPACE,
+        "labels": {registry_module.RUN_LABEL: "other-run"},
+    }
+
+    def dataplane(*args, **kwargs):
+        assert args[0] == "get", "an unowned Job must never be deleted"
+        return json.dumps({"metadata": metadata}) if args[1:3] == ("job", job) else ""
+
+    monkeypatch.setattr(suite, "dataplane", dataplane)
+    (tmp_path / "capacity-resources.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "namespace": suite.NAMESPACE,
+                "resources": {f"job/{job}": {"uid": "original", "data_sha256": ""}},
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="ownership or UID changed"):
+        suite.teardown(
+            purge=False,
+            deregister_clusters=False,
+            artifacts=tmp_path,
+            run_id="run-a",
+            attempts=1,
+        )
+    metadata["labels"][registry_module.RUN_LABEL] = "run-a"
+    with pytest.raises(RuntimeError, match="ownership or UID changed"):
+        suite.teardown(
+            purge=False,
+            deregister_clusters=False,
+            artifacts=tmp_path,
+            run_id="run-a",
+            attempts=1,
+        )
+
+
+def test_registration_rejects_old_cluster_data_before_any_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts.perf import regional_capacity_data
+    from tests.regional._perf_caller_support import AmpWire
+
+    amp = AmpWire(monkeypatch)
+    monkeypatch.setattr(registry_module, "validate_notification_safety", lambda: None)
+    monkeypatch.setattr(
+        registry_module, "validate_registry_target", lambda **k: "isolated"
+    )
+    monkeypatch.setattr(registry_module, "cleanup_registry_residuals", lambda **k: 0)
+    monkeypatch.setattr(registry_module, "load_registry", lambda: [])
+    monkeypatch.setattr(regional_capacity_data, "invoke", lambda *a, **k: {"total": 1})
+    monkeypatch.setattr(
+        registry_module,
+        "upsert_secret",
+        lambda *a, **k: pytest.fail("old data must prevent creating a new token"),
+    )
+    with pytest.raises(RuntimeError, match="data already exists"):
+        registry_module.register(
+            1,
+            tmp_path,
+            run_id="run-a",
+            expires_at=NOW + timedelta(hours=1),
+            allow_live_registry=False,
+            live_registry_confirmation=None,
+        )
+    assert amp.calls == ["list-workspaces", "describe-alert-manager-definition"], (
+        "old-data rejection must be reached only after AMP notification preflight"
+    )
+    assert not (tmp_path / "registry-registration-intent.json").exists(), (
+        "rejected preflight must not grant cleanup ownership of old data"
+    )
+
+
+def test_teardown_without_registration_receipt_is_refused_before_commands(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        suite, "dataplane", lambda *a, **k: pytest.fail("unowned cleanup")
+    )
+    with pytest.raises(RuntimeError, match="no registration ownership receipt"):
+        suite.teardown(
+            purge=True,
+            deregister_clusters=True,
+            run_id="run-a",
+            artifacts=tmp_path,
+            attempts=1,
+        )
 
 
 def test_preflight_refuses_another_active_synthetic_run(monkeypatch) -> None:
@@ -274,7 +764,7 @@ def test_preflight_refuses_another_active_synthetic_run(monkeypatch) -> None:
             }
         ],
     )
-    with pytest.raises(RuntimeError, match="other-run"):
+    with pytest.raises(RuntimeError, match="preflight cannot purge"):
         registry_module.cleanup_registry_residuals(
             scope="isolated", artifacts=None, phase="preflight", force=False, now=NOW
         )
@@ -298,7 +788,9 @@ def test_teardown_retries_idempotently(monkeypatch) -> None:
 
 
 def test_capacity_exception_still_runs_teardown(tmp_path: Path, monkeypatch) -> None:
-    calls = []
+    from tests.regional._perf_caller_support import CapacityWire
+
+    wire = CapacityWire(tmp_path, monkeypatch)
     args = SimpleNamespace(
         command="all",
         clusters=1,
@@ -323,14 +815,11 @@ def test_capacity_exception_still_runs_teardown(tmp_path: Path, monkeypatch) -> 
         prewarm_connections=False,
         artifact_root=tmp_path,
     )
-    monkeypatch.setattr(suite, "register", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         suite,
         "execute_case",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
     )
-    monkeypatch.setattr(suite, "teardown", lambda **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(suite, "move_to_aborted", lambda _root, path: path)
 
     with pytest.raises(RuntimeError, match="failed"):
         suite.execute_capacity_command(
@@ -343,8 +832,8 @@ def test_capacity_exception_still_runs_teardown(tmp_path: Path, monkeypatch) -> 
             sxid_total=1,
         )
 
-    assert calls[0]["run_id"] == "run-a"
-    assert calls[0]["deregister_clusters"] is True
+    assert wire.teardowns[0]["run_id"] == "run-a"
+    assert wire.teardowns[0]["deregister_clusters"] is True
 
 
 def test_registry_baseline_artifact_carries_digests_not_tokens() -> None:

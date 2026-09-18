@@ -11,6 +11,7 @@ from gpu_fault.adapters.common import (
     dcgm_result_is_configuration_only,
     node_action_accepted_nodes,
 )
+from gpu_fault.adapters.node_action.reset_outcome import normalize_legacy_reset_failure
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
@@ -216,6 +217,7 @@ class NodeActionExecutionService:
                 node_id,
                 result,
             )
+        result = normalize_legacy_reset_failure(result)
         if result.status is NodeActionStatus.INTERRUPTED:
             # ``node_failures`` is what the escalation's reason text and the
             # support email quote per node; without it every unknown outcome
@@ -223,6 +225,7 @@ class NodeActionExecutionService:
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id}: {result.error}",
                 details={
+                    **result.details,
                     **self._partial_progress(state),
                     "node_action_interrupted": True,
                     "manual_confirmation_required": True,
@@ -275,7 +278,17 @@ class NodeActionExecutionService:
                 },
             )
         failure_details: dict[str, Any] = {
-            "gpu_client_quiesce_attempt": state.verify_attempt
+            **{
+                key: result.details[key]
+                for key in (
+                    "reset_completed",
+                    "reset_outcome_unknown",
+                    "reset_failed",
+                    "reset_not_attempted",
+                )
+                if key in result.details
+            },
+            "gpu_client_quiesce_attempt": state.verify_attempt,
         }
         if result.details.get("node_action_retry_exhausted"):
             # The transport turned a retryable failure terminal after the

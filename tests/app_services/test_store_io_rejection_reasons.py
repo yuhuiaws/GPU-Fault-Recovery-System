@@ -29,6 +29,7 @@ from gpu_fault.async_store import (
     StoreIoCapacityExceeded,
 )
 from tests._builders import asgi_client, build_store
+from tests.metrics._assertions import assert_sample
 from tests.store.test_async_store import _admission_batcher
 
 FAMILY = "gpu_fault_store_io_rejections_total"
@@ -173,7 +174,7 @@ def test_a_retryable_error_wrapped_by_the_admission_batch_is_backend_unavailable
         executor.close()
 
 
-def test_the_scrape_exports_one_series_per_reason_and_no_process_label() -> None:
+def test_the_scrape_exports_one_series_per_reason_and_bounded_process_slot() -> None:
     app = create_app(ApplicationContext(store=build_store()))
     app.state.store_io.record_rejection("capacity")
     app.state.store_io.record_rejection("backend_unavailable")
@@ -186,20 +187,17 @@ def test_the_scrape_exports_one_series_per_reason_and_no_process_label() -> None
             return response.text
 
     metrics = asyncio.run(fetch())
-    series = [line for line in metrics.splitlines() if line.startswith(FAMILY)]
-
-    assert series == [
-        f'{FAMILY}{{reason="backend_unavailable"}} 2',
-        f'{FAMILY}{{reason="capacity"}} 1',
-        f'{FAMILY}{{reason="deadline"}} 0',
-    ], series
+    samples = process_metrics.parse_lines(metrics.splitlines()).samples[FAMILY]
+    assert len(samples) == 3
+    for reason, count in (("backend_unavailable", 2), ("capacity", 1), ("deadline", 0)):
+        assert_sample(metrics, FAMILY, count, reason=reason, process="0")
     assert "process_id=" not in metrics
     assert metrics.count(f"# TYPE {FAMILY} counter") == 1
 
 
-def test_the_pod_merge_adds_each_reason_across_processes_separately() -> None:
+def test_the_pod_merge_keeps_each_rejection_reason_and_reset_domain() -> None:
     """Four uvicorn processes each keep their own counts; the answering process
-    sums them per reason, so the alert sees one Pod-wide series per reason and
+    keeps each reset domain per reason, so rate runs before aggregation and
     a reason only one process ever hit still shows up."""
     header = [
         f"# HELP {FAMILY} Store calls rejected, by reason.",
@@ -225,11 +223,14 @@ def test_the_pod_merge_adds_each_reason_across_processes_separately() -> None:
     sibling.pid = 4243
 
     lines = process_metrics.aggregate(local, [sibling])
-    series = [line for line in lines if line.startswith(FAMILY)]
-
-    assert series == [
-        f'{FAMILY}{{reason="backend_unavailable"}} 3',
-        f'{FAMILY}{{reason="capacity"}} 4',
-        f'{FAMILY}{{reason="deadline"}} 0',
-    ], series
+    samples = process_metrics.parse_lines(lines).samples[FAMILY]
+    assert len(samples) == 6
+    for process, counts in (
+        ("0", {"backend_unavailable": 2, "capacity": 0, "deadline": 0}),
+        ("1", {"backend_unavailable": 1, "capacity": 4, "deadline": 0}),
+    ):
+        for reason, count in counts.items():
+            assert_sample(
+                "\n".join(lines), FAMILY, count, reason=reason, process=process
+            )
     assert lines.count(f"# TYPE {FAMILY} counter") == 1

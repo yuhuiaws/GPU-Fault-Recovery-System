@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from gpu_fault.store.shared.telemetry_models import (
     TELEMETRY_SPOOL_MAX_ATTEMPTS,
@@ -65,6 +66,7 @@ class MemoryTelemetrySpoolMixin:
                     existing["cluster_id"] = request.cluster_id
                     existing["path"] = request.path
                     existing["revision"] += 1
+                    existing["lease_owner"] = None
                     # A row whose lease has not expired still becomes
                     # claimable now: the consumer holding it is carrying a
                     # payload this sample just superseded, and its
@@ -120,6 +122,7 @@ class MemoryTelemetrySpoolMixin:
             created_at=row["created_at"],
             payload=row["payload"],
             payload_bytes=payload_bytes,
+            lease_token=row["lease_owner"],
         )
 
     def claim_telemetry_spool(
@@ -163,7 +166,8 @@ class MemoryTelemetrySpoolMixin:
                 item = self._spooled_telemetry(row)
                 if claimed and claimed_bytes + item.payload_bytes > byte_limit:
                     break
-                row["lease_owner"] = owner_id
+                # The existing owner slot also carries a fresh claim generation.
+                row["lease_owner"] = f"{owner_id}:{uuid4().hex}"
                 row["available_at"] = now + lease_duration
                 row["attempts"] += 1
                 row["updated_at"] = now
@@ -177,7 +181,12 @@ class MemoryTelemetrySpoolMixin:
             removed = 0
             for item in items:
                 row = self._telemetry_spool.get(item.spool_key)
-                if row is None or row["revision"] != item.revision:
+                if (
+                    row is None
+                    or row["revision"] != item.revision
+                    or not item.lease_token
+                    or row["lease_owner"] != item.lease_token
+                ):
                     continue
                 del self._telemetry_spool[item.spool_key]
                 removed += 1
@@ -195,7 +204,12 @@ class MemoryTelemetrySpoolMixin:
         with self._lock:
             for item in items:
                 row = self._telemetry_spool.get(item.spool_key)
-                if row is None or row["revision"] != item.revision:
+                if (
+                    row is None
+                    or row["revision"] != item.revision
+                    or not item.lease_token
+                    or row["lease_owner"] != item.lease_token
+                ):
                     continue
                 row["lease_owner"] = None
                 row["available_at"] = now
@@ -215,9 +229,8 @@ class MemoryTelemetrySpoolMixin:
         """Return failed rows to the queue, or drop the hopeless ones.
 
         Returns ``(released, dropped)``. A row is only touched if its
-        revision still matches: a sample that arrived while the replay was
-        failing has already reset the row's availability, and pushing the
-        backoff onto it would delay the newer payload.
+        payload revision and claim token still match: neither a newer sample
+        nor a replacement owner may inherit a stale replay's backoff or drop.
         """
 
         limit = (
@@ -228,7 +241,12 @@ class MemoryTelemetrySpoolMixin:
         with self._lock:
             for item in items:
                 row = self._telemetry_spool.get(item.spool_key)
-                if row is None or row["revision"] != item.revision:
+                if (
+                    row is None
+                    or row["revision"] != item.revision
+                    or not item.lease_token
+                    or row["lease_owner"] != item.lease_token
+                ):
                     continue
                 if row["attempts"] >= limit:
                     del self._telemetry_spool[item.spool_key]

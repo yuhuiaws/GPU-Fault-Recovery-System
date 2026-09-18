@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 import secrets
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from functools import lru_cache
-from typing import Any, Callable
+from threading import Lock
+from typing import Any, Callable, cast
 
 from gpu_fault.channel_registry import (
     CHANNEL_REGISTRY,
@@ -31,15 +33,29 @@ _FAULT_CLAIM_PATHS = (
     *(path for path in CHANNEL_REGISTRY if path in FAULT_CHANNEL_PATHS),
 )
 
+_ClaimAfter = tuple[int, datetime, str]
+_ClaimScope = tuple[tuple[str, ...], tuple[str, ...]]
+_CLAIM_PROGRESS_SCOPES = 64
+_CLAIM_PROGRESS_LOCK = Lock()
+
 
 def _fault_path_list_sql(indent: int) -> str:
     pad = " " * indent
     return ",\n".join(f"{pad}'{path}'" for path in _FAULT_CLAIM_PATHS)
 
 
+def _scope_array_sql(alias: str) -> str:
+    return f"""ARRAY(
+        SELECT jsonb_array_elements_text(
+            coalesce({alias}.payload->'correlation_scope_keys', '[]'::jsonb)
+        )
+    )"""
+
+
 _CLAIM_WINDOW_COLUMNS_SQL = f"""\
         candidate.request_id,
         candidate.ordering_key,
+        candidate.priority AS raw_priority,
         CASE
             WHEN candidate.priority={ROUTINE_PRIORITY}
               AND candidate.created_at
@@ -49,11 +65,8 @@ _CLAIM_WINDOW_COLUMNS_SQL = f"""\
         END AS priority,
         candidate.created_at,
         candidate.payload->>'path' AS path,
-        coalesce(
-            candidate.payload
-                ->'correlation_scope_keys',
-            '[]'::jsonb
-        ) AS scope_keys
+        {_scope_array_sql("candidate")} AS scope_keys,
+        {{window_id}} AS window_id
 """
 
 # Shared by both sub-windows. Every predicate here is either implied by the
@@ -108,6 +121,23 @@ _PATH_EXCLUDES_SQL = """\
       )
 """
 
+_STRICT_PREDECESSOR_SQL = """\
+    AND NOT EXISTS (
+        SELECT 1 FROM gpu_fault_processor_queue AS earlier
+        WHERE earlier.ordering_key=claim_window.ordering_key
+          AND earlier.lane_policy='STRICT'
+          AND (
+              earlier.status='PENDING'
+              OR (earlier.status='LEASED' AND earlier.lease_expires_at <= %(now)s)
+          )
+          AND (earlier.not_before IS NULL OR earlier.not_before <= %(now)s)
+          AND (earlier.priority, earlier.created_at, earlier.request_id)
+              < (claim_window.raw_priority, claim_window.created_at,
+                 claim_window.request_id)
+{path_filter}
+    )
+"""
+
 # Every path the claim can be asked for is a registered route; anything else
 # is rejected before it reaches the statement text.
 _PATH_LITERAL_PATTERN = re.compile(r"^/[A-Za-z0-9/_.-]*$")
@@ -119,59 +149,71 @@ def _path_literal(path: str) -> str:
     return "'" + path + "'"
 
 
-def _claim_sub_windows(path_filter: str) -> str:
-    """The two index walks of F-D2 for one path filter: the best rows by raw
-    priority, plus the oldest routine rows past the starvation threshold."""
-
+def _claim_sub_window(
+    path_filter: str,
+    window_id: int,
+    *,
+    seeking: bool = False,
+    routine: bool = False,
+) -> str:
     eligible = _CLAIM_ELIGIBLE_SQL.format(path_filter=path_filter)
+    extra = ""
+    ordering = "candidate.priority, candidate.created_at, candidate.request_id"
+    if seeking:
+        extra = """
+          AND (candidate.priority, candidate.created_at, candidate.request_id)
+              > (%(after_priority)s, %(after_created_at)s, %(after_request_id)s)
+        """
+    if routine:
+        extra = f"""
+          AND candidate.priority={ROUTINE_PRIORITY}
+          AND candidate.created_at <= %(routine_starvation_before)s
+        """
+        ordering = "candidate.created_at, candidate.request_id"
     return f"""\
     (
         SELECT
-{_CLAIM_WINDOW_COLUMNS_SQL}
+{_CLAIM_WINDOW_COLUMNS_SQL.format(window_id=window_id)}
 {eligible}
-        ORDER BY
-            candidate.priority,
-            candidate.created_at,
-            candidate.request_id
-        LIMIT %(window_limit)s
-    )
-    UNION ALL
-    (
-        SELECT
-{_CLAIM_WINDOW_COLUMNS_SQL}
-{eligible}
-          AND candidate.priority={ROUTINE_PRIORITY}
-          AND candidate.created_at <= %(routine_starvation_before)s
-        ORDER BY
-            candidate.created_at,
-            candidate.request_id
+{extra}
+        ORDER BY {ordering}
         LIMIT %(window_limit)s
     )"""
 
 
 @lru_cache(maxsize=64)
-def _claim_window_sql(included: tuple[str, ...], excluded: bool) -> str:
-    if included:
-        return "\n    UNION ALL\n".join(
-            _claim_sub_windows(
-                _PATH_EQUALS_SQL.format(path_literal=_path_literal(path))
-            )
+def _claim_window_sql(
+    included: tuple[str, ...], excluded: bool, seeking: bool
+) -> tuple[str, str]:
+    filters = (
+        tuple(
+            _PATH_EQUALS_SQL.format(path_literal=_path_literal(path))
             for path in included
         )
-    return _claim_sub_windows(_PATH_EXCLUDES_SQL if excluded else "")
+        if included
+        else (_PATH_EXCLUDES_SQL if excluded else "",)
+    )
+    raw = []
+    windows = ["SELECT * FROM raw_window"]
+    for window_id, path_filter in enumerate(filters):
+        raw.append(_claim_sub_window(path_filter, window_id, seeking=seeking))
+        if seeking:
+            windows.append(_claim_sub_window(path_filter, window_id))
+        windows.append(_claim_sub_window(path_filter, window_id, routine=True))
+    separator = "\n    UNION ALL\n"
+    return separator.join(raw), separator.join(windows)
 
 
-# The window is the union of two index walks per path filter (F-D2): the
-# best rows by raw priority, plus the oldest routine rows past the starvation
-# threshold. The second walk is what lets a starved routine row enter a
-# window that fresher evidence rows would otherwise fill on every claim;
-# before it, the 49 promotion ran only over rows the first walk had already
-# admitted. Every walk stops at the window limit, so the claim's cost stays
-# bounded by the window (times the number of included paths) rather than by
-# queue depth. Duplicates collapse in candidate_ids. The window text is
-# rendered per (include_paths, exclude_paths) by ``_claim_window_sql``.
+# A full window that cannot fill a claim advances a bounded seek on the next
+# call. The original head and aging windows remain, so new high-priority work
+# and newly unblocked head rows are not hidden by the continuation. At most
+# three windows per path feed the interlock and lane dedup; no backlog-sized
+# retry loop or OFFSET scan is needed. Continuations are hints, never fences.
 _CLAIM_ACTIVE_PROCESSOR_SQL = f"""\
-WITH claim_window AS MATERIALIZED (
+WITH raw_window AS MATERIALIZED (
+{{raw_window}}
+),
+claim_window AS MATERIALIZED (
 {{claim_window}}
 ),
 candidate_ids AS MATERIALIZED (
@@ -183,24 +225,13 @@ candidate_ids AS MATERIALIZED (
                  = '/v1/workload-observations'
               AND EXISTS (
                   SELECT 1
-                  FROM
-                      jsonb_array_elements_text(
-                          claim_window.scope_keys
-                      ) AS candidate_scope(value)
-                  WHERE EXISTS (
-                      SELECT 1
-                      FROM gpu_fault_processor_queue
-                           AS fault
-                      WHERE fault.status='PENDING'
-                        AND fault.payload->>'path' IN (
-{_fault_path_list_sql(28)}
-                        )
-                        AND coalesce(
-                            fault.payload
-                                ->'correlation_scope_keys',
-                            '[]'::jsonb
-                        ) ? candidate_scope.value
+                  FROM gpu_fault_processor_queue AS fault
+                  WHERE fault.status='PENDING'
+                    AND fault.payload->>'path' IN (
+{_fault_path_list_sql(24)}
                   )
+                    AND fault.payload->'correlation_scope_keys'
+                        ?| claim_window.scope_keys
               )
             THEN -1
             ELSE claim_window.priority
@@ -213,31 +244,21 @@ candidate_ids AS MATERIALIZED (
         )
         AND EXISTS (
             SELECT 1
-            FROM
-                jsonb_array_elements_text(
-                    claim_window.scope_keys
-                ) AS fault_scope(value)
-            WHERE EXISTS (
-                SELECT 1
-                FROM gpu_fault_processor_queue
-                     AS observation
-                WHERE (
-                          observation.status='PENDING'
-                          OR (
-                              observation.status='LEASED'
-                              AND observation.lease_expires_at > %(now)s
-                          )
+            FROM gpu_fault_processor_queue AS observation
+            WHERE (
+                      observation.status='PENDING'
+                      OR (
+                          observation.status='LEASED'
+                          AND observation.lease_expires_at > %(now)s
                       )
-                  AND observation.payload->>'path'
-                      = '/v1/workload-observations'
-                  AND coalesce(
-                      observation.payload
-                          ->'correlation_scope_keys',
-                      '[]'::jsonb
-                  ) ? fault_scope.value
-            )
+                  )
+              AND observation.payload->>'path'
+                  = '/v1/workload-observations'
+              AND observation.payload->'correlation_scope_keys'
+                  ?| claim_window.scope_keys
         )
     )
+{{strict_predecessor}}
     ORDER BY
         claim_window.ordering_key,
         effective_priority,
@@ -343,10 +364,36 @@ updated AS (
         queue.retry_count,
         queue.lane_policy,
         queue.updated_at
+),
+scan_after AS MATERIALIZED (
+    SELECT raw_priority, created_at, request_id
+    FROM (
+        SELECT DISTINCT ON (window_id)
+            raw_priority, created_at, request_id,
+            count(*) OVER (PARTITION BY window_id) AS window_size
+        FROM raw_window
+        ORDER BY window_id, raw_priority DESC, created_at DESC, request_id DESC
+    ) AS boundaries
+    WHERE window_size=%(window_limit)s
+    -- Advance only past rows every non-exhausted path has examined.
+    ORDER BY raw_priority, created_at, request_id
+    LIMIT 1
+),
+scan_progress AS MATERIALIZED (
+    SELECT scan_after.*,
+        (
+            SELECT count(*) FROM candidate_ids
+            WHERE request_id IN (SELECT request_id FROM raw_window)
+        ) AS eligible_count
+    FROM (SELECT 1) AS singleton
+    LEFT JOIN scan_after ON TRUE
 )
-SELECT {{effective_payload}}
-FROM updated
-JOIN selected
+SELECT {{effective_payload}},
+       scan_progress.raw_priority, scan_progress.created_at,
+       scan_progress.request_id, scan_progress.eligible_count
+FROM scan_progress
+LEFT JOIN updated ON TRUE
+LEFT JOIN selected
   ON selected.request_id=updated.request_id
 ORDER BY
     selected.effective_priority,
@@ -361,9 +408,38 @@ class PostgresProcessorClaimsMixin:
     _decode: Callable[..., Any]
     _persist_processor_state: Callable[..., Any]
     _processor_queue_effective_payload: Callable[..., Any]
-    claim_window_multiplier: Any
+    claim_window_multiplier: int
     get_processor_leadership: Callable[..., Any]
     processor_queue_state_mode: Any
+    _processor_claim_progress: OrderedDict[_ClaimScope, _ClaimAfter] | None = None
+
+    def _claim_after(self, scope: _ClaimScope) -> _ClaimAfter | None:
+        with _CLAIM_PROGRESS_LOCK:
+            progress = self._processor_claim_progress
+            return progress.get(scope) if progress is not None else None
+
+    def _remember_claim_progress(
+        self,
+        scope: _ClaimScope,
+        previous: _ClaimAfter | None,
+        after: _ClaimAfter | None,
+    ) -> None:
+        with _CLAIM_PROGRESS_LOCK:
+            progress = self._processor_claim_progress
+            current = progress.get(scope) if progress is not None else None
+            if current != previous:
+                return
+            if after is None:
+                if progress is not None:
+                    progress.pop(scope, None)
+                return
+            if progress is None:
+                progress = OrderedDict()
+                self._processor_claim_progress = progress
+            progress[scope] = after
+            progress.move_to_end(scope)
+            while len(progress) > _CLAIM_PROGRESS_SCOPES:
+                progress.popitem(last=False)
 
     def count_fault_rows_blocked_by_observation(self, *, now: datetime) -> int:
         """Claimable fault rows an incomplete observation holds back (F-D3)."""
@@ -380,29 +456,18 @@ class PostgresProcessorClaimsMixin:
                   )
                   AND EXISTS (
                       SELECT 1
-                      FROM jsonb_array_elements_text(
-                          coalesce(
-                              fault.payload->'correlation_scope_keys',
-                              '[]'::jsonb
-                          )
-                      ) AS fault_scope(value)
-                      WHERE EXISTS (
-                          SELECT 1
-                          FROM gpu_fault_processor_queue AS observation
-                          WHERE observation.payload->>'path'
-                                = '/v1/workload-observations'
-                            AND (
-                                observation.status='PENDING'
-                                OR (
-                                    observation.status='LEASED'
-                                    AND observation.lease_expires_at > %s
-                                )
+                      FROM gpu_fault_processor_queue AS observation
+                      WHERE observation.payload->>'path'
+                            = '/v1/workload-observations'
+                        AND (
+                            observation.status='PENDING'
+                            OR (
+                                observation.status='LEASED'
+                                AND observation.lease_expires_at > %s
                             )
-                            AND coalesce(
-                                observation.payload->'correlation_scope_keys',
-                                '[]'::jsonb
-                            ) ? fault_scope.value
-                      )
+                        )
+                        AND observation.payload->'correlation_scope_keys'
+                            ?| {_scope_array_sql("fault")}
                   )
                 """,
                 (now, now),
@@ -445,28 +510,13 @@ class PostgresProcessorClaimsMixin:
                                      = '/v1/workload-observations'
                                   AND EXISTS (
                                       SELECT 1
-                                      FROM
-                                          jsonb_array_elements_text(
-                                              coalesce(
-                                                  candidate.payload
-                                                      ->'correlation_scope_keys',
-                                                  '[]'::jsonb
-                                              )
-                                          ) AS candidate_scope(value)
-                                      WHERE EXISTS (
-                                          SELECT 1
-                                          FROM gpu_fault_processor_queue
-                                               AS fault
-                                          WHERE fault.status='PENDING'
-                                            AND fault.payload->>'path' IN (
-{_fault_path_list_sql(48)}
-                                            )
-                                            AND coalesce(
-                                                fault.payload
-                                                    ->'correlation_scope_keys',
-                                                '[]'::jsonb
-                                            ) ? candidate_scope.value
+                                      FROM gpu_fault_processor_queue AS fault
+                                      WHERE fault.status='PENDING'
+                                        AND fault.payload->>'path' IN (
+{_fault_path_list_sql(44)}
                                       )
+                                        AND fault.payload->'correlation_scope_keys'
+                                            ?| {_scope_array_sql("candidate")}
                                   )
                                 THEN -1
                                 ELSE candidate.priority
@@ -500,34 +550,18 @@ class PostgresProcessorClaimsMixin:
                               )
                               AND EXISTS (
                                   SELECT 1
-                                  FROM
-                                      jsonb_array_elements_text(
-                                          coalesce(
-                                              candidate.payload
-                                                  ->'correlation_scope_keys',
-                                              '[]'::jsonb
-                                          )
-                                      ) AS fault_scope(value)
-                                  WHERE EXISTS (
-                                      SELECT 1
-                                      FROM gpu_fault_processor_queue
-                                           AS observation
-                                      WHERE (
-                                                observation.status='PENDING'
-                                                OR (
-                                                    observation.status='LEASED'
-                                                    AND observation.lease_expires_at
-                                                        > %s
-                                                )
+                                  FROM gpu_fault_processor_queue AS observation
+                                  WHERE (
+                                            observation.status='PENDING'
+                                            OR (
+                                                observation.status='LEASED'
+                                                AND observation.lease_expires_at > %s
                                             )
-                                        AND observation.payload->>'path'
-                                            = '/v1/workload-observations'
-                                        AND coalesce(
-                                            observation.payload
-                                                ->'correlation_scope_keys',
-                                            '[]'::jsonb
-                                        ) ? fault_scope.value
-                                  )
+                                        )
+                                    AND observation.payload->>'path'
+                                        = '/v1/workload-observations'
+                                    AND observation.payload->'correlation_scope_keys'
+                                        ?| {_scope_array_sql("candidate")}
                               )
                           )
                           AND NOT EXISTS (
@@ -591,19 +625,16 @@ class PostgresProcessorClaimsMixin:
 
         Exposed so a test can EXPLAIN it against the real schema (F-J3):
         the window must walk ``gpu_fault_processor_queue_priority_claim``
-        rather than sort the eligible backlog.
+        rather than sort the eligible backlog. The internal result also carries
+        a continuation boundary; an empty claim has one NULL-payload metadata row.
         """
 
         included = sorted(include_paths or ())
         excluded = sorted(exclude_paths or ())
+        after = self._claim_after((tuple(included), tuple(excluded)))
         expires_at = now + lease_duration
-        # Bound the claim's cost. Lane dedup and the two
-        # correlation-scope interlocks are the expensive parts, and they
-        # run over this window instead of the whole eligible backlog,
-        # so claim latency stops scaling with queue depth - that scaling
-        # is what let depth feed back into itself at a 65536 cap. A
-        # window short on claimable rows just returns fewer than
-        # ``limit``; the caller claims again.
+        # Keep each ordered probe bounded. A held prefix advances a seek on the
+        # next call; it does not enlarge this budget or loop through the backlog.
         window_limit = max(limit * self.claim_window_multiplier, limit + 64)
         payload_update = ""
         if self.processor_queue_state_mode != "dedicated":
@@ -620,8 +651,25 @@ class PostgresProcessorClaimsMixin:
                                     'updated_at', %(now_text)s::text
                                 )
             """
+        raw_window, claim_window = _claim_window_sql(
+            tuple(included), bool(excluded), after is not None
+        )
+        strict_predecessor = ""
+        if after is not None:
+            # A STRICT retry can become ready behind the cursor. It must still
+            # precede a later same-lane request found by the advancing window.
+            path_filter = (
+                "          AND earlier.payload->>'path'=ANY(%(included)s)"
+                if included
+                else "          AND NOT (earlier.payload->>'path'=ANY(%(excluded)s))"
+                if excluded
+                else ""
+            )
+            strict_predecessor = _STRICT_PREDECESSOR_SQL.format(path_filter=path_filter)
         sql = _CLAIM_ACTIVE_PROCESSOR_SQL.format(
-            claim_window=_claim_window_sql(tuple(included), bool(excluded)),
+            raw_window=raw_window,
+            claim_window=claim_window,
+            strict_predecessor=strict_predecessor,
             payload_update=payload_update,
             effective_payload=self._processor_queue_effective_payload("updated"),
         )
@@ -630,6 +678,7 @@ class PostgresProcessorClaimsMixin:
             "routine_starvation_before": (
                 now - timedelta(seconds=routine_starvation_seconds)
             ),
+            "included": included,
             "excluded": excluded,
             "window_limit": window_limit,
             "limit": limit,
@@ -637,6 +686,9 @@ class PostgresProcessorClaimsMixin:
             "expires_at": expires_at,
             "expires_text": _utc_text(expires_at),
             "now_text": _utc_text(now),
+            "after_priority": after[0] if after is not None else None,
+            "after_created_at": after[1] if after is not None else None,
+            "after_request_id": after[2] if after is not None else None,
         }
         return sql, parameters
 
@@ -664,7 +716,33 @@ class PostgresProcessorClaimsMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(sql, parameters)
                 rows = cursor.fetchall()
-            return [self._decode("processor_request", row[0]) for row in rows]
+            claimed = [
+                self._decode("processor_request", row[0])
+                for row in rows
+                if row[0] is not None
+            ]
+        previous = (
+            (
+                cast(int, parameters["after_priority"]),
+                cast(datetime, parameters["after_created_at"]),
+                cast(str, parameters["after_request_id"]),
+            )
+            if parameters["after_priority"] is not None
+            else None
+        )
+        after = (
+            (int(rows[0][1]), cast(datetime, rows[0][2]), str(rows[0][3]))
+            if rows
+            and rows[0][1] is not None
+            and (len(claimed) < limit or int(rows[0][4]) < limit)
+            else None
+        )
+        self._remember_claim_progress(
+            (tuple(sorted(include_paths or ())), tuple(sorted(exclude_paths or ()))),
+            previous,
+            after,
+        )
+        return claimed
 
     def active_backlog_is_lane_blocked(
         self,

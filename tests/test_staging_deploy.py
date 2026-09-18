@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from gpu_fault.admin.notification_precheck import EmailConfirmation
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
 from scripts import (
     staging_deploy,
@@ -17,81 +16,23 @@ from scripts import (
     staging_live_evidence,
     staging_state_hygiene,
 )
-
-
-def _signing_material(root: Path) -> staging_deploy.SigningMaterial:
-    signing = root / "release-signing"
-    signing.mkdir(parents=True)
-    private_key = signing / "cosign.key"
-    public_key = signing / "cosign.pub"
-    password_file = signing / "cosign.password"
-    private_key.write_text("private", encoding="utf-8")
-    public_key.write_text("public", encoding="utf-8")
-    password_file.write_text("password", encoding="utf-8")
-    private_key.chmod(0o600)
-    password_file.chmod(0o600)
-    public_key.chmod(0o644)
-    return staging_deploy.SigningMaterial(
-        private_key=private_key,
-        public_key=public_key,
-        password_file=password_file,
-        password="password",
-    )
-
-
-def _source_identities() -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "sha256": "f" * 64,
-        "application": {"sha256": "a" * 64},
-        "deploy_host": {"sha256": "b" * 64, "bundle": {"sha256": "c" * 64}},
-    }
-
-
-def _live_evidence() -> dict[str, object]:
-    return {
-        "site_sha256": "d" * 64,
-        "runtime_profile_sha256": "f" * 64,
-        "runtime_profile_policy_digest": "c" * 64,
-        "release_id": "release-a",
-        "state_sha256": "e" * 64,
-        "phase": "complete",
-        "transaction_committed": True,
-        "next_deploy_kind": "NOOP",
-    }
-
-
-def _status_report() -> dict[str, object]:
-    """The quick ``status`` report the pre-deploy reading returns."""
-
-    return {
-        "mode": "status",
-        "healthy": True,
-        "health_scope": "quick",
-        "live_release": {
-            "release_id": "release-a",
-            "phase": "complete",
-            "transaction_committed": True,
-            "state_sha256": "e" * 64,
-        },
-        "configured_release": {
-            "release_id": "release-a",
-            "database_schema_version": 12,
-        },
-        "next_deploy": {"kind": "NOOP", "changed": []},
-    }
-
-
-def _confirmed_email() -> EmailConfirmation:
-    return EmailConfirmation(
-        sender="operations@example.com",
-        admin_email="operations@example.com",
-        ses_verified=True,
-        ses_identity_created=False,
-        sns_topic_arn="arn:aws:sns:us-east-1:123456789012:gpu-fault-alerts",
-        sns_status="CONFIRMED",
-        sns_subscription_arn="arn:aws:sns:us-east-1:123456789012:gpu-fault-alerts:1",
-    )
+from tests._staging_deploy_support import (
+    DEPLOY_EVENT,
+    EVIDENCE_EVENT,
+    RECORD_EVIDENCE_EVENT,
+    STUB_LOCK_FD,
+)
+from tests._staging_deploy_support import confirmed_email as _confirmed_email
+from tests._staging_deploy_support import deploy_arguments as _deploy_arguments
+from tests._staging_deploy_support import install_admin_stub as _install_admin_stub
+from tests._staging_deploy_support import live_evidence as _live_evidence
+from tests._staging_deploy_support import managed_state as _managed_state
+from tests._staging_deploy_support import signing_material as _signing_material
+from tests._staging_deploy_support import source_identities as _source_identities
+from tests._staging_deploy_support import status_report as _status_report
+from tests._staging_deploy_support import (
+    stub_deploy_orchestration as _stub_deploy_orchestration,
+)
 
 
 def test_pending_profile_change_runs_the_release_on_unchanged_source(
@@ -345,6 +286,18 @@ def test_source_deploy_classification_separates_application_and_host_changes() -
         )
         == "UNCHANGED"
     )
+    for identities in (current, host_changed):
+        assert (
+            staging_deploy.classify_source_deploy(
+                previous,
+                identities,
+                source=source,
+                site_exists=True,
+                live_matches=True,
+                runtime_repair_pending=True,
+            )
+            == "APPLICATION_RELEASE"
+        ), "source/deploy-host reuse must not swallow a runtime repair"
     # A live transaction that is not committed (failed, rolled back, mid-flight)
     # needs the release engine whatever the source identities say (live
     # 2026-09-11: a foreign candidate FAILED at cpu-staged was classified
@@ -364,11 +317,15 @@ def test_source_deploy_classification_separates_application_and_host_changes() -
 
 def test_live_release_transaction_pending_reads_the_status_report() -> None:
     committed = {"live_release": {"phase": "complete", "transaction_committed": True}}
+    uncommitted = {
+        "live_release": {"phase": "complete", "transaction_committed": False}
+    }
     failed = {"live_release": {"phase": "failed", "transaction_committed": False}}
     rolled_back = {
         "live_release": {"phase": "rolled-back", "transaction_committed": False}
     }
     assert staging_deploy.live_release_transaction_pending(committed) is False
+    assert staging_deploy.live_release_transaction_pending(uncommitted) is True
     assert staging_deploy.live_release_transaction_pending(failed) is True
     assert staging_deploy.live_release_transaction_pending(rolled_back) is True
     assert staging_deploy.live_release_transaction_pending(None) is False
@@ -967,141 +924,6 @@ def test_makefile_keeps_staging_release_build_internal() -> None:
     assert '--impact-base "$(BASE)"' in staging_build
 
 
-def _deploy_arguments(repository: Path, state: Path) -> argparse.Namespace:
-    return argparse.Namespace(
-        repo_root=repository,
-        state_dir=state,
-        cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/cpu",
-        gpu_cluster_arn=["arn:aws:eks:us-east-1:123456789012:cluster/gpu"],
-        admin_email="operations@example.com",
-        base="origin/main",
-    )
-
-
-def _managed_state(tmp_path: Path) -> tuple[Path, Path]:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
-    return repository, state
-
-
-def _install_admin_stub(state: Path) -> None:
-    admin = state / "deployer-venv/bin"
-    admin.mkdir(parents=True)
-    (admin / "gpu-fault-admin").write_text("", encoding="utf-8")
-
-
-# The descriptor the stubbed lock hands out. It is carried into the recorded
-# event names because a child that collects live evidence without it opens the
-# lock file a second time and blocks on the lock this process already holds.
-STUB_LOCK_FD = 17
-EVIDENCE_EVENT = f"evidence(lock_fd={STUB_LOCK_FD})"
-DEPLOY_EVENT = f"deploy(lock_fd={STUB_LOCK_FD})"
-RECORD_EVIDENCE_EVENT = "evidence(release-record)"
-
-
-def _stub_deploy_orchestration(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    state: Path,
-    source: staging_deploy.SourceCheckout,
-    signing: staging_deploy.SigningMaterial,
-    previous: dict[str, object] | None,
-    events: list[str],
-) -> None:
-    """Everything ``deploy`` shells out to, recorded as an ordered event log.
-
-    The log is what the ordering assertions read: the point of collecting live
-    evidence once is *when* each call happens, not what it returns.
-    """
-
-    artifacts = staging_deploy.DeployHostArtifacts(
-        archive=state / "bundle.tar.gz",
-        checksum=state / "bundle.tar.gz.sha256",
-        signature_bundle=state / "bundle.sigstore.json",
-    )
-
-    class Lock:
-        def __enter__(self) -> int:
-            events.append("lock-enter")
-            return STUB_LOCK_FD
-
-        def __exit__(self, *_arguments: object) -> None:
-            events.append("lock-exit")
-
-    def evidence(**kwargs: object) -> dict[str, object]:
-        events.append(f"evidence(lock_fd={kwargs.get('lock_fd')})")
-        return _live_evidence()
-
-    def record_evidence(**_kwargs: object) -> dict[str, object]:
-        events.append(RECORD_EVIDENCE_EVENT)
-        return _live_evidence()
-
-    def admin_deploy(**kwargs: object) -> None:
-        events.append(f"deploy(lock_fd={kwargs.get('lock_fd')})")
-
-    monkeypatch.setattr(
-        staging_deploy, "prepare_source_checkout", lambda *_a, **_k: source
-    )
-    monkeypatch.setattr(
-        staging_deploy, "validate_source_checkout", lambda _root, **_k: None
-    )
-    monkeypatch.setattr(
-        staging_deploy, "ensure_signing_material", lambda *_a, **_k: signing
-    )
-    monkeypatch.setattr(
-        staging_deploy, "source_deploy_identity", lambda *_a, **_k: _source_identities()
-    )
-    monkeypatch.setattr(
-        staging_deploy, "load_successful_source_deploy", lambda *_a, **_k: previous
-    )
-    monkeypatch.setattr(
-        staging_deploy, "restore_trusted_ci_candidate", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(staging_deploy, "site_operation_lock", lambda *_a, **_k: Lock())
-    monkeypatch.setattr(
-        staging_deploy, "deploy_host_artifacts", lambda *_a, **_k: artifacts
-    )
-    monkeypatch.setattr(
-        staging_deploy,
-        "deploy_host_wheelhouse_cache",
-        lambda *_a, **_k: state / "wheelhouse",
-    )
-    monkeypatch.setattr(
-        staging_deploy, "ensure_deploy_host_bundle", lambda *_a, **_k: True
-    )
-    monkeypatch.setattr(
-        staging_deploy,
-        "ensure_deploy_host_venv",
-        lambda *_a, **_k: state / "deployer-venv",
-    )
-    monkeypatch.setattr(staging_deploy, "run_admin_deploy", admin_deploy)
-    monkeypatch.setattr(staging_deploy, "collect_live_deploy_evidence", evidence)
-    monkeypatch.setattr(
-        staging_deploy, "read_live_status", lambda **_k: _status_report()
-    )
-    monkeypatch.setattr(
-        staging_deploy, "precheck_email_confirmations", lambda **_k: _confirmed_email()
-    )
-    monkeypatch.setattr(
-        staging_deploy, "live_evidence_from_release_record", record_evidence
-    )
-    monkeypatch.setattr(
-        staging_deploy,
-        "prune_source_snapshots",
-        lambda *_a, **_k: events.append("prune") or (),
-    )
-    monkeypatch.setattr(
-        staging_deploy,
-        "record_successful_source_deploy",
-        lambda *_a, **_k: (
-            events.append("success") or state / "source-deploy-success.json"
-        ),
-    )
-
-
 def test_apply_source_deploy_has_no_lockless_path() -> None:
     """One classification per deploy, and it is made under the lock.
 
@@ -1347,3 +1169,81 @@ def test_missing_venv_promotes_prepared_mode_and_deploys(
     )
     assert "gate" not in events
     assert events.index(DEPLOY_EVENT) < events.index("success")
+
+
+@pytest.mark.parametrize("old_mode", ["UNCHANGED", "DEPLOY_HOST_ONLY", "QUALITY_ONLY"])
+def test_configured_custody_cannot_be_skipped_by_source_only_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_mode: str
+) -> None:
+    import socket
+    import subprocess
+
+    from gpu_fault.admin.node_key_custody_admin_config import configure_admin_custody
+    from tests.deploy._node_key_custody_support import Authorities
+
+    def refused(*args, **kwargs):
+        raise AssertionError("custody source-deploy integration must use fake I/O")
+
+    monkeypatch.setattr(subprocess, "Popen", refused)
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket, "create_connection", refused)
+    repository, state = _managed_state(tmp_path)
+    _install_admin_stub(state)
+    signing = _signing_material(state)
+    security = tmp_path / "custody-security"
+    security.mkdir(mode=0o700)
+    authorities = Authorities(security)
+    selection = tmp_path / "custody-selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trust": str(authorities.trust_path),
+                "clusters": {"arn:aws:eks:us-east-1:123456789012:cluster/gpu": None},
+            }
+        )
+    )
+    selection.chmod(0o600)
+    configure_admin_custody(
+        state, selection, authorities.trust_pin, crypto=authorities.crypto()
+    )
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": _source_identities(),
+        "source": {"fingerprint": source.fingerprint, "git_commit": source.git_commit},
+        "live": _live_evidence(),
+    }
+    if old_mode == "DEPLOY_HOST_ONLY":
+        previous["identities"]["deploy_host"]["sha256"] = "different"
+    elif old_mode == "QUALITY_ONLY":
+        previous["source"]["fingerprint"] = "different"
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous,
+            _source_identities(),
+            source=source,
+            site_exists=True,
+            live_matches=True,
+        )
+        == old_mode
+    )
+    events: list[str] = []
+    _stub_deploy_orchestration(
+        monkeypatch,
+        state=state,
+        source=source,
+        signing=signing,
+        previous=previous,
+        events=events,
+    )
+    result = staging_deploy.deploy(_deploy_arguments(repository, state))
+    assert result["deploy_mode"] == "APPLICATION_RELEASE"
+    assert DEPLOY_EVENT in events, "configured custody never reached admin bootstrap"

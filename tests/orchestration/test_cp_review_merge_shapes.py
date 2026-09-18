@@ -37,6 +37,7 @@ from gpu_fault.orchestration.families.node_lifecycle import (
     NodeLifecycleOperationService,
     ReplacementContext,
 )
+from gpu_fault.orchestration.workflow_merge import WorkflowMergeService
 from tests._builders import (
     attempt_observation,
     build_store,
@@ -54,11 +55,19 @@ from ._support import NOW, WorkloadState, event
 
 def _lifecycle_service() -> NodeLifecycleOperationService:
     unused = lambda *args, **kwargs: None  # noqa: E731
+    arbiter = RecoveryArbiter()
+    merger = WorkflowMergeService(
+        arbiter,
+        DagBrancher(arbiter),
+        preemption_enabled=True,
+        workload_scoped_operations=set(),
+        node_exclusive_operations=set(),
+        workflow_resource_claims_by_node=lambda *_: {},
+    )
     return NodeLifecycleOperationService(
         build_store(),
         None,
-        RecoveryArbiter(),
-        None,
+        merger,
         NodeLifecycleCallbacks(
             active_job_recovery_workflow=unused,
             active_node_exclusive_workflow=unused,

@@ -388,8 +388,16 @@ def test_ha004_reads_a_second_lease_from_the_owner_change_when_tokens_are_hidden
         "lease_owner": None,
         "last_lease_owner": "cluster/pod-a",
         "lease_token": None,
+        "killed_owner": "cluster/pod-a",
+        "kill_completed_at": "2026-09-12T00:00:00+00:00",
     }
-    reclaimed = {**waiting, "status": "SUCCEEDED", "last_lease_owner": "cluster/pod-b"}
+    reclaimed = {
+        **waiting,
+        "status": "SUCCEEDED",
+        "last_lease_owner": "cluster/pod-b",
+        "killed_owner": None,
+        "kill_completed_at": None,
+    }
 
     assert ha004.lease_reissue_observed(
         [waiting, reclaimed], first_owner="cluster/pod-a"
@@ -400,13 +408,13 @@ def test_ha004_reads_a_second_lease_from_the_owner_change_when_tokens_are_hidden
     assert not ha004.lease_reissue_observed([waiting, reclaimed], first_owner=""), (
         "without a recorded first owner the owner side cannot stand in for tokens"
     )
-    assert ha004.lease_reissue_observed(
+    assert not ha004.lease_reissue_observed(
         [
             {**waiting, "status": "LEASED", "lease_token_sha256": "digest-a"},
             {**waiting, "status": "LEASED", "lease_token_sha256": "digest-b"},
         ],
         first_owner="cluster/pod-a",
-    ), "two distinct token digests remain the direct proof"
+    ), "same-owner token renewal cannot prove a post-kill takeover"
 
 
 def test_ha004_timeline_reads_the_probe_digest_and_never_the_raw_token() -> None:
@@ -566,7 +574,9 @@ def test_ha003_executor_result_submission_codes_come_from_rejected_reports() -> 
     )
     assert ha003.result_submission_codes(logs) == [409, 500]
     assert ha003.result_submission_codes("") == []
-    assert ha003.ALLOWED_RESULT_SUBMISSION_CODES == {200, 409}
+    assert ha003.ALLOWED_RESULT_SUBMISSION_CODES == {200, 409, 503}, (
+        "Aurora failover permits retryable 503 but must still reject internal 500"
+    )
 
 
 def test_store_snapshot_drains_the_queue_for_gates_but_samples_once_in_wait_loops(

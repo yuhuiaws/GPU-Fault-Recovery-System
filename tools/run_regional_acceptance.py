@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
-from pathlib import Path
 import platform
 import re
 import sys
 import tempfile
 import time
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,16 +88,32 @@ _SAFE_ENVIRONMENT_NAMES = (
 _INHERITED_ENVIRONMENT_REQUIREMENTS = {
     "GF-REGIONAL-CAP-005": ("GPU_FAULT_STORE_URL",),
 }
+# Match each identifier once; overlapping prefixes made long public output quadratic.
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)(?P<prefix>"
-    r"(?:authorization\s*:\s*bearer|"
-    r"[A-Z0-9_.-]*(?:TOKEN|PASSWORD|PASSWD|SECRET|PRIVATE_KEY|"
-    r"API_KEY|ACCESS_KEY|CREDENTIAL|DSN|DATABASE_URL|STORE_URL)"
-    r"[A-Z0-9_.-]*[\"']?\s*[=:]\s*[\"']?)"
+    r"(?i)(?<![A-Z0-9_.-])(?P<prefix>"
+    r"(?:authorization\s*:\s*bearer\s*|"
+    r"(?=[A-Z0-9_.-]*(?:TOKEN|PASSWORD|PASSWD|SECRET|PRIVATE_KEY|"
+    r"API_KEY|ACCESS_KEY|CREDENTIAL|DSN|DATABASE_URL|STORE_URL))"
+    r"[A-Z0-9_.-]+[\"']?\s*[=:]\s*[\"']?)"
     r")(?P<value>[^\s,;\"']+)"
 )
-_URL_CREDENTIAL = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_URL_CREDENTIAL = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_SENSITIVE_FIELD = re.compile(
+    r"token|password|passwd|secret|authorization|private[_-]?key|api[_-]?key|"
+    r"access[_-]?key|credential|dsn|database[_-]?url|store[_-]?url",
+    re.I,
+)
+_SAFE_CREDENTIAL_METADATA = (
+    "_sha256",
+    "_length",
+    "_version",
+    "_ref",
+    "_path",
+    "_file",
+    "_name",
+    "_arn",
+)
 
 
 def _positive_integer(value: str) -> int:
@@ -108,7 +125,7 @@ def _positive_integer(value: str) -> int:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
     return parsed
 
@@ -129,6 +146,11 @@ def build_local_environment(
     environment.setdefault("PATH", os.defpath)
     environment["GPU_FAULT_STORE_URL"] = ""
     environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
+    environment["AWS_CONFIG_FILE"] = os.devnull
+    environment["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
+    environment["BOTO_CONFIG"] = os.devnull
+    environment["AWS_EC2_METADATA_DISABLED"] = "true"
+    environment["KUBECONFIG"] = os.devnull
     for name in extra_names:
         value = source_environment.get(name)
         if value is None or not value:
@@ -164,7 +186,21 @@ def sanitize_value(value: object) -> object:
     if isinstance(value, tuple):
         return [sanitize_value(item) for item in value]
     if isinstance(value, Mapping):
-        return {str(key): sanitize_value(item) for key, item in value.items()}
+        secret_value = bool(_SENSITIVE_FIELD.search(str(value.get("name", ""))))
+        kubernetes_secret = value.get("kind") == "Secret"
+        return {
+            str(key): (
+                "<redacted>"
+                if (
+                    _SENSITIVE_FIELD.search(str(key))
+                    and not str(key).lower().endswith(_SAFE_CREDENTIAL_METADATA)
+                )
+                or (secret_value and key == "value")
+                or (kubernetes_secret and key in {"data", "stringData", "binaryData"})
+                else sanitize_value(item)
+            )
+            for key, item in value.items()
+        }
     return value
 
 
@@ -179,8 +215,8 @@ def secure_write_json(path: Path, value: Mapping[str, object]) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             json.dump(
                 sanitize_value(value),
                 handle,
@@ -307,6 +343,12 @@ def _run_automated_case(
     *,
     approved_inherited_cases: set[str],
 ) -> dict[str, Any]:
+    if case.risk != "non-destructive" and not case.local_proxy:
+        return _base_result(
+            case,
+            status="BLOCKED",
+            reason="live execution requires its separately approved guarded case runner",
+        )
     environment, blocked_reason = _command_environment(
         case,
         approved_inherited_cases=approved_inherited_cases,
@@ -353,6 +395,17 @@ def _run_automated_case(
             reason="automated executor returned a non-mapping result",
         )
     raw = dict(raw_value)
+    if raw.get("id") != case.id or raw.get("status") not in {
+        "PASS",
+        "FAIL",
+        "BLOCKED",
+        "NOT_RUN",
+    }:
+        return _base_result(
+            case,
+            status="FAIL",
+            reason="automated executor returned an invalid case identity or status",
+        )
     raw["execution_status"] = raw["status"]
     raw["regional"] = _base_result(
         case,
@@ -365,10 +418,20 @@ def _run_automated_case(
     proxy_status = str(raw["status"])
     result = _base_result(
         case,
-        status="NOT_RUN" if proxy_status == "PASS" else "FAIL",
+        status=(
+            "NOT_RUN"
+            if proxy_status == "PASS"
+            else "BLOCKED"
+            if proxy_status == "BLOCKED"
+            else "FAIL"
+        ),
         reason=(
             "manual procedure was not executed; associated local check passed"
             if proxy_status == "PASS"
+            else str(
+                raw.get("reason") or "associated local prerequisite is unavailable"
+            )
+            if proxy_status == "BLOCKED"
             else "manual procedure was not executed; associated local check failed"
         ),
     )
@@ -432,6 +495,11 @@ def _agent_blocked_result(
 
 
 def _analysis_succeeded(result: Mapping[str, Any]) -> bool:
+    if result.get("status") in {"FAIL", "BLOCKED"}:
+        return False
+    review = result.get("independent_review")
+    if isinstance(review, Mapping) and review.get("status") != "PASS":
+        return False
     if result.get("status") == "PASS":
         return True
     if result.get("analysis_status") == "PASS":
@@ -503,6 +571,11 @@ def _review_agent_results(
         for future in as_completed(futures):
             case_id, review_result = future.result()
             by_id[case_id]["independent_review"] = sanitize_value(review_result)
+            if review_result.get("status") != "PASS":
+                by_id[case_id]["status"] = (
+                    "FAIL" if review_result.get("status") == "FAIL" else "BLOCKED"
+                )
+                by_id[case_id]["reason"] = "independent evidence review did not pass"
 
 
 def execute_plan(
@@ -516,7 +589,11 @@ def execute_plan(
     approved_inherited_cases: set[str],
 ) -> list[dict[str, Any]]:
     plan_by_id = {case.id: case for case in plan.cases}
-    scheduler_cases = [_case_payload(case) for case in plan.cases]
+    scheduler_cases = [
+        _case_payload(case)
+        for case in plan.cases
+        if case.executor is not ExecutorKind.DO_NOT_RUN
+    ]
 
     def policy_for(payload: dict[str, Any]) -> ExecutionPolicy:
         return _scheduler_policy(plan_by_id[str(payload["id"])], plan.mode)
@@ -592,7 +669,14 @@ def execute_plan(
         max_batch_size=codex_batch_size,
         max_workers=workers,
         collect_all=plan.collect_all,
-        is_successful=_analysis_succeeded,
+        is_successful=(
+            (
+                lambda result: result.get("status") == "PASS"
+                and result.get("execution_status") == "PASS"
+            )
+            if plan.mode is PlanMode.FORMAL
+            else _analysis_succeeded
+        ),
     )
     if review_with_codex:
         if backend is None:
@@ -603,12 +687,26 @@ def execute_plan(
             results=results,
             max_workers=review_workers,
         )
+    results.extend(
+        _base_result(
+            case, status="NOT_RUN", reason=case.do_not_run_reason or "DO_NOT_RUN"
+        )
+        for case in plan.cases
+        if case.executor is ExecutorKind.DO_NOT_RUN
+    )
     return results
 
 
 def _report_verdict(results: Sequence[Mapping[str, Any]]) -> str:
+    if not results:
+        return "PARTIAL"
     statuses = {str(result.get("status")) for result in results}
-    if "FAIL" in statuses:
+    if "FAIL" in statuses or statuses.difference({"PASS", "NOT_RUN", "BLOCKED"}):
+        return "FAIL"
+    if any(
+        result.get("status") == "PASS" and result.get("execution_status") != "PASS"
+        for result in results
+    ):
         return "FAIL"
     if statuses.intersection({"BLOCKED", "NOT_RUN"}):
         return "PARTIAL"
@@ -626,7 +724,28 @@ def build_report(
     order_path: Path,
     catalog_path: Path,
 ) -> dict[str, object]:
-    status_counts = Counter(str(result["status"]) for result in results)
+    result_ids = [result.get("id") for result in results]
+    integrity_errors = []
+    if len(results) != len(plan.case_ids) or set(
+        str(case_id) for case_id in result_ids
+    ) != set(plan.case_ids):
+        integrity_errors.append("result inventory differs from the compiled plan")
+    if len(set(str(case_id) for case_id in result_ids)) != len(result_ids):
+        integrity_errors.append("result inventory contains duplicate case IDs")
+    if any(
+        result.get("status") not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}
+        for result in results
+    ):
+        integrity_errors.append("result inventory contains an invalid status")
+    retired = set(plan.do_not_run_case_ids)
+    if any(
+        result.get("status") != "NOT_RUN"
+        for result in results
+        if result.get("id") in retired
+    ):
+        integrity_errors.append("a DO_NOT_RUN case claims execution")
+    active_results = [result for result in results if result.get("id") not in retired]
+    status_counts = Counter(str(result.get("status")) for result in results)
     executor_counts = Counter(
         str(result["regional"]["executor"])
         for result in results
@@ -667,7 +786,8 @@ def build_report(
         "schema_version": 2,
         "report_type": "regional-acceptance-run",
         "executed_at": datetime.now(timezone.utc).isoformat(),
-        "verdict": _report_verdict(results),
+        "verdict": "FAIL" if integrity_errors else _report_verdict(active_results),
+        "integrity_errors": integrity_errors,
         "mode": plan.mode.value,
         "limitations": limitations,
         "sources": {
@@ -900,7 +1020,13 @@ def main(argv: list[str] | None = None) -> int:
     case_status = summary["case_status"]
     if not isinstance(case_status, Mapping):
         raise RuntimeError("regional report case_status is not a mapping")
-    return 1 if case_status.get("FAIL", 0) or case_status.get("BLOCKED", 0) else 0
+    if (
+        report["verdict"] == "FAIL"
+        or case_status.get("FAIL", 0)
+        or case_status.get("BLOCKED", 0)
+    ):
+        return 1
+    return 1 if plan.mode is PlanMode.FORMAL and report["verdict"] != "PASS" else 0
 
 
 if __name__ == "__main__":

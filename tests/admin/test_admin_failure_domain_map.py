@@ -65,13 +65,24 @@ def _inventory(cluster_id: str) -> dict[str, dict]:
     group = f"{cluster_id}-group"
     return {
         f"{cluster_id}-node-1": {
+            "kind": "Node",
             "metadata": {
                 "name": f"{cluster_id}-node-1",
-                "labels": {GROUP: group, RACK: f"{cluster_id}-rack"},
-            }
+                "uid": f"{cluster_id}-uid-1",
+                "labels": {
+                    GROUP: group,
+                    RACK: f"{cluster_id}-rack",
+                    module.HYPERPOD_CLUSTER_LABEL: f"hp-{cluster_id}",
+                },
+            },
         },
         f"{cluster_id}-node-2": {
-            "metadata": {"name": f"{cluster_id}-node-2", "labels": {}}
+            "kind": "Node",
+            "metadata": {
+                "name": f"{cluster_id}-node-2",
+                "uid": f"{cluster_id}-uid-2",
+                "labels": {module.HYPERPOD_CLUSTER_LABEL: f"hp-{cluster_id}"},
+            },
         },
     }
 
@@ -81,25 +92,76 @@ class FakeKubectl:
 
     def __init__(self, *, worker_exists: bool = True) -> None:
         self.worker_exists = worker_exists
+        self.worker_annotations: dict[str, str] = {}
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.worker_uid = "worker-uid"
+        self.configmap_uid = "map-uid"
+        self.manifest: dict[str, Any] | None = None
+        self.worker_ready = True
 
     def __call__(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         self.calls.append((list(args), kwargs))
         if "get" in args and "deployment" in args:
-            code = 0 if self.worker_exists else 1
-            return subprocess.CompletedProcess(args, code, "", "not found")
+            worker = {
+                "kind": "Deployment",
+                "metadata": {
+                    "name": module.CONTROL_WORKER_DEPLOYMENT,
+                    "namespace": "gpu-fault-system",
+                    "uid": self.worker_uid,
+                    "resourceVersion": "worker-version",
+                    "generation": 2,
+                },
+                "spec": {
+                    "replicas": 2,
+                    "template": {"metadata": {"annotations": self.worker_annotations}},
+                },
+                "status": {
+                    "observedGeneration": 2,
+                    "replicas": 2,
+                    "updatedReplicas": 2,
+                    "readyReplicas": 2 if self.worker_ready else 1,
+                    "availableReplicas": 2 if self.worker_ready else 1,
+                },
+            }
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps(worker) if self.worker_exists else "", ""
+            )
         if "get" in args and "nodes" in args:
             context = args[args.index("--context") + 1]
             items = list(_inventory(context.removesuffix("-context")).values())
             return subprocess.CompletedProcess(
                 args, 0, json.dumps({"items": items}), ""
             )
+        if "patch" in args:
+            self.worker_annotations.update(
+                json.loads(args[-1])["spec"]["template"]["metadata"]["annotations"]
+            )
+        if "apply" in args:
+            self.manifest = json.loads(kwargs["input_text"])
+        if "get" in args and "configmap" in args:
+            manifest = (
+                {
+                    **self.manifest,
+                    "metadata": {
+                        **self.manifest["metadata"],
+                        "uid": self.configmap_uid,
+                        "resourceVersion": "1",
+                    },
+                }
+                if self.manifest is not None
+                else None
+            )
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps(manifest) if manifest is not None else "", ""
+            )
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def verbs(self) -> list[str]:
         verbs = []
         for args, _ in self.calls:
-            if "apply" in args:
+            if "rollout" in args:
+                verbs.append("rollout status")
+            elif "apply" in args:
                 verbs.append("apply")
             elif "patch" in args:
                 verbs.append("patch")
@@ -190,11 +252,12 @@ def test_apply_ships_the_map_and_stamps_the_worker_pod_template() -> None:
     assert kubectl.verbs() == [
         "get nodes",
         "get nodes",
-        "apply",
         "get deployment",
+        "apply",
         "patch",
         "rollout status",
-    ], "the stamp starts a worker roll; the apply must wait for it to settle"
+        "get deployment",
+    ], "the worker roll must settle and retain the original identity"
     rollout_args, _ = next(c for c in kubectl.calls if "rollout" in c[0])
     assert rollout_args[-2:] == [
         f"deployment/{module.CONTROL_WORKER_DEPLOYMENT}",
@@ -208,11 +271,15 @@ def test_apply_ships_the_map_and_stamps_the_worker_pod_template() -> None:
         "-n",
         "gpu-fault-system",
     ]
-    manifest = json.loads(apply_kwargs["input"])
+    manifest = json.loads(apply_kwargs["input_text"])
     assert json.loads(manifest["data"][module.FAILURE_DOMAIN_FILE]) == result.mapping
     patch_args, _ = next(c for c in kubectl.calls if "patch" in c[0])
     assert patch_args[-4:-2] == [module.CONTROL_WORKER_DEPLOYMENT, "--type=merge"]
     patch = json.loads(patch_args[-1])
+    assert patch["metadata"] == {
+        "uid": "worker-uid",
+        "resourceVersion": "worker-version",
+    }
     assert patch["spec"]["template"]["metadata"]["annotations"] == {
         FAILURE_DOMAIN_MAP_ANNOTATION: failure_domain_map_sha256(manifest)
     }
@@ -221,9 +288,9 @@ def test_apply_ships_the_map_and_stamps_the_worker_pod_template() -> None:
 def test_apply_leaves_the_stamp_to_deploy_when_the_worker_does_not_exist_yet() -> None:
     kubectl = FakeKubectl(worker_exists=False)
 
-    module.apply_failure_domain_map(_site(), run=kubectl)
+    module.apply_failure_domain_map(_site(), run=kubectl, allow_absent_worker=True)
 
-    assert kubectl.verbs() == ["get nodes", "get nodes", "apply", "get deployment"]
+    assert kubectl.verbs() == ["get nodes", "get nodes", "get deployment", "apply"]
 
 
 def test_apply_refuses_a_malformed_map_before_touching_the_cluster(
@@ -244,12 +311,126 @@ def test_apply_refuses_a_malformed_map_before_touching_the_cluster(
 
 def test_apply_surfaces_a_failed_kubectl_apply() -> None:
     def failing(args, **_kwargs):
-        if "nodes" in args:
+        if "get" in args:
             return FakeKubectl()(args)
         return subprocess.CompletedProcess(args, 1, "", "forbidden")
 
-    with pytest.raises(BootstrapError, match="forbidden"):
+    with pytest.raises(BootstrapError, match="apply failed"):
         module.apply_failure_domain_map(_site(), run=failing)
+
+
+def test_missing_worker_blocks_managed_membership_refresh() -> None:
+    kubectl = FakeKubectl(worker_exists=False)
+    with pytest.raises(BootstrapError, match="worker is missing"):
+        module.apply_failure_domain_map(_site(), run=kubectl)
+    assert "apply" not in kubectl.verbs(), "missing worker must not mutate the map"
+
+
+def test_worker_permission_error_is_not_bootstrap_absence() -> None:
+    kubectl = FakeKubectl()
+
+    def denied(arguments, **kwargs):
+        if "get" in arguments and "deployment" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "Forbidden")
+        return kubectl(arguments, **kwargs)
+
+    with pytest.raises(BootstrapError, match="cannot verify"):
+        module.apply_failure_domain_map(_site(), run=denied, allow_absent_worker=True)
+    assert "apply" not in kubectl.verbs(), "read failure must precede map mutation"
+
+
+def test_unchanged_worker_template_is_not_patched_again() -> None:
+    kubectl = FakeKubectl()
+    site = _site()
+    mapping = module.build_failure_domain_map(
+        site, list_nodes=lambda _site, cluster_id: _inventory(cluster_id)
+    )
+    manifest = module.failure_domain_configmap(mapping.mapping)
+    kubectl.worker_annotations[FAILURE_DOMAIN_MAP_ANNOTATION] = (
+        failure_domain_map_sha256(manifest)
+    )
+    module.apply_failure_domain_map(site, run=kubectl)
+    assert "patch" not in kubectl.verbs(), (
+        "matching map digest must not trigger a patch"
+    )
+    assert kubectl.verbs()[-2:] == ["rollout status", "get deployment"]
+
+
+@pytest.mark.parametrize("invalid", ["missing", "duplicate", "foreign"])
+def test_node_inventory_cannot_silently_drop_invalid_rows(invalid: str) -> None:
+    items = list(_inventory("gpu-a").values())
+    if invalid == "missing":
+        items.append({})
+    elif invalid == "duplicate":
+        items.append(items[0])
+    else:
+        items[0]["metadata"]["labels"][module.HYPERPOD_CLUSTER_LABEL] = "other"
+
+    def read(arguments, **_kwargs):
+        return subprocess.CompletedProcess(
+            arguments, 0, json.dumps({"items": items}), ""
+        )
+
+    with pytest.raises(BootstrapError, match="node identity"):
+        module.cluster_nodes(_site(), "gpu-a", run=read)
+
+
+def test_default_calls_use_the_supervised_command_boundary(monkeypatch) -> None:
+    kubectl = FakeKubectl()
+    monkeypatch.setattr(module, "run_command", kubectl)
+    module.apply_failure_domain_map(_site())
+    assert all(
+        kwargs.get("timeout_seconds", 0) > 0 for _args, kwargs in kubectl.calls
+    ), "every node/map/worker command must carry a finite budget"
+
+
+def test_map_refresh_does_not_succeed_before_worker_rollout() -> None:
+    kubectl = FakeKubectl()
+
+    def timeout(arguments, **kwargs):
+        if "rollout" in arguments:
+            raise subprocess.TimeoutExpired(arguments, kwargs["timeout_seconds"])
+        return kubectl(arguments, **kwargs)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        module.apply_failure_domain_map(_site(), run=timeout)
+    assert "patch" in kubectl.verbs(), "this case must reach the rollout wait"
+
+
+def test_map_refresh_rejects_a_recreated_worker_after_rollout() -> None:
+    kubectl = FakeKubectl()
+    rolled = False
+
+    def recreated(arguments, **kwargs):
+        nonlocal rolled
+        result = kubectl(arguments, **kwargs)
+        if "rollout" in arguments:
+            rolled = True
+        if rolled and "get" in arguments and "deployment" in arguments:
+            body = json.loads(result.stdout)
+            body["metadata"]["uid"] = "replacement-worker"
+            result.stdout = json.dumps(body)
+        return result
+
+    with pytest.raises(BootstrapError, match="changed during rollout"):
+        module.apply_failure_domain_map(_site(), run=recreated)
+
+
+@pytest.mark.parametrize("invalid", [[], "invalid", {"template": []}])
+def test_invalid_worker_shape_is_refused_before_configmap_mutation(invalid) -> None:
+    kubectl = FakeKubectl()
+
+    def malformed(arguments, **kwargs):
+        result = kubectl(arguments, **kwargs)
+        if "get" in arguments and "deployment" in arguments:
+            body = json.loads(result.stdout)
+            body["spec"] = invalid
+            result.stdout = json.dumps(body)
+        return result
+
+    with pytest.raises(BootstrapError, match="worker template"):
+        module.apply_failure_domain_map(_site(), run=malformed)
+    assert "apply" not in kubectl.verbs(), "malformed worker must not alter the map"
 
 
 def test_join_renders_the_map_from_the_committed_site_after_activation(

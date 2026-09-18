@@ -172,6 +172,11 @@ class HyperPodManagedRecoveryObserver:
         )
 
     def observe(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        requested = context.step.node_ids
+        if not requested or len(set(requested)) != len(requested):
+            return WorkflowStepOutcome.failed(
+                "managed recovery requires non-empty unique node_ids"
+            )
         identities = self.identities.refresh()
         by_logical = {item.node_logical_id: item for item in identities}
         previous = next(
@@ -247,6 +252,20 @@ class HyperPodManagedRecoveryObserver:
                 },
             )
 
+        targets = previous.details.get("managed_targets")
+        if (
+            not isinstance(targets, list)
+            or len(targets) != len(requested)
+            or any(
+                not isinstance(target, dict)
+                or not isinstance(target.get("old_node_id"), str)
+                for target in targets
+            )
+            or {target["old_node_id"] for target in targets} != set(requested)
+        ):
+            return WorkflowStepOutcome.failed(
+                "managed recovery target evidence does not match node_ids"
+            )
         started_at = datetime.fromisoformat(
             previous.details["managed_recovery_started_at"]
         )
@@ -260,7 +279,7 @@ class HyperPodManagedRecoveryObserver:
 
         rebindings = {}
         observations = []
-        for target in previous.details.get("managed_targets", []):
+        for target in targets:
             identity = by_logical.get(target["node_logical_id"])
             if identity is None or identity.status != "Running":
                 return self._waiting(previous, "AWS_REPLACING")

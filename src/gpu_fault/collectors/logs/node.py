@@ -111,6 +111,8 @@ def _decode_files(stored: dict[str, Any]) -> dict[str, dict[str, int]]:
     training log rotated.
     """
 
+    if not isinstance(stored, dict):
+        raise ValueError("node log file checkpoints must be an object")
     files: dict[str, dict[str, int]] = {}
     for key, item in stored.items():
         record = (
@@ -1011,6 +1013,8 @@ class NodeLogCollector:
             return
         try:
             value = json.loads(self.state_path.read_text())
+            if not isinstance(value, dict):
+                raise ValueError("node log collector state must be an object")
             since = value.get("journal_since")
             self._journal_since = datetime.fromisoformat(since) if since else None
             self._cold_start_reason = (

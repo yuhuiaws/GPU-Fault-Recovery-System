@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import datetime, timezone
+from typing import NoReturn
 
 import pytest
 
@@ -142,12 +143,76 @@ def test_the_registry_runtime_wins_over_the_start_up_copy() -> None:
     )
 
 
-def test_the_start_up_copy_still_answers_when_the_runtime_cannot() -> None:
+def test_unresolved_runtime_never_reuses_the_start_up_allow_list() -> None:
     networks = ClusterEndpointNetworks(
         {"cluster-a": (ipaddress.ip_network("10.1.0.0/16"),)},
         resolver=lambda _cluster_id: None,
     )
 
-    assert networks["cluster-a"] == (ipaddress.ip_network("10.1.0.0/16"),), (
-        "a cluster the runtime cannot resolve keeps its start-up allow-list"
+    with pytest.raises(ValueError, match="unavailable for cluster cluster-a"):
+        endpoint_networks_for_cluster(
+            "cluster-a", networks, (ipaddress.ip_network("10.0.0.0/8"),)
+        )
+
+
+@pytest.mark.parametrize("initially_configured", [False, True])
+def test_removal_revokes_a_previously_resolved_cluster(
+    initially_configured: bool,
+) -> None:
+    current = {"cluster-a": (ipaddress.ip_network("10.1.0.0/16"),)}
+    networks = ClusterEndpointNetworks(
+        current if initially_configured else {}, resolver=current.get
     )
+    fallback = (ipaddress.ip_network("10.0.0.0/8"),)
+    assert (
+        endpoint_networks_for_cluster("cluster-a", networks, fallback)
+        == current["cluster-a"]
+    ), "current membership must resolve before its removal"
+
+    current.pop("cluster-a")
+
+    with pytest.raises(ValueError, match="unavailable for cluster cluster-a"):
+        endpoint_networks_for_cluster("cluster-a", networks, fallback)
+
+
+@pytest.mark.parametrize("loaded_once", [False, True])
+def test_unavailable_registry_runtime_cannot_reauthorize_start_up_membership(
+    monkeypatch: pytest.MonkeyPatch, loaded_once: bool
+) -> None:
+    context = build_context()
+    context.regional_mode = True
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+    context.fleet_registry = FleetRegistry(
+        context.store,
+        SECRET,
+        endpoint_allowed_networks_by_cluster={
+            "cluster-a": (ipaddress.ip_network("10.0.0.0/16"),)
+        },
+    )
+    runtime = (
+        _runtime(context.store)
+        if loaded_once
+        else RegionalRegistryRuntime(
+            context.store,
+            member_id="pod-a",
+            service_role="ingress",
+            release_id="release-a",
+            now=lambda: NOW,
+        )
+    )
+    context.bind_regional_registry_runtime(runtime)
+    networks = context.fleet_registry.endpoint_allowed_networks_by_cluster
+    fallback = (ipaddress.ip_network("10.0.0.0/8"),)
+    if loaded_once:
+        assert endpoint_networks_for_cluster("cluster-a", networks, fallback) == (
+            ipaddress.ip_network("10.0.0.0/16"),
+        ), "a loaded runtime must resolve its current cluster"
+
+        def unavailable_snapshot() -> NoReturn:
+            raise RuntimeError("regional registry snapshot is unavailable")
+
+        monkeypatch.setattr(runtime, "snapshot", unavailable_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot is unavailable"):
+        runtime.snapshot()
+    with pytest.raises(ValueError, match="unavailable for cluster cluster-a"):
+        endpoint_networks_for_cluster("cluster-a", networks, fallback)

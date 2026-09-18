@@ -43,7 +43,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricsService,
     GpuMetricsThresholds,
 )
-from gpu_fault.hma import HyperPodHmaNormalizer
+from gpu_fault.nvidia_logs import NvidiaLogNormalizer
 from gpu_fault.host_health import NodeHealthPolicy
 from gpu_fault.hyperpod import (
     HyperPodAdapterConfig,
@@ -181,7 +181,7 @@ class ApplicationContext:
                 os.getenv("GPU_FAULT_XID_CORRELATION_LEASE_SECONDS", "30")
             ),
         )
-        self.hma = HyperPodHmaNormalizer()
+        self.nvidia_logs = NvidiaLogNormalizer()
         self.gpu_metrics = GpuMetricsService(
             GpuMetricsThresholds.from_environment(),
             store=self.store,

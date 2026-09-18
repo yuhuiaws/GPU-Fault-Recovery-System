@@ -11,17 +11,20 @@ import yaml
 
 from gpu_fault import node_installer_reconciler
 from gpu_fault.admin import cluster_removal as admin_cluster_removal
+from gpu_fault.admin import cluster_removal_network as removal_network
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
     _detach_network,
     _parallel_cluster_networks,
     _remove_target_aws_resources,
+    _update_bootstrap_state,
     _verify_removal_parallel,
     _write_site_without_cluster,
     remove_cluster,
 )
 from gpu_fault.admin.resource_registry import write_installation_resource_snapshot
+from gpu_fault.admin.resource_registry_dns import vpc_association_resource
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -30,79 +33,105 @@ from gpu_fault.installation_resources import (
     InstallationResourceSnapshot,
     InstallationResourceStatus,
 )
+from tests.admin._cluster_removal_support import RemovalScenario
+from tests.admin._cluster_removal_support import resource as _resource
+from tests.admin._cluster_removal_support import snapshot as _base_snapshot
 from tests.admin.test_admin_site import site_file
 
 
-def _resource(
-    key: str,
-    resource_type: str,
-    resource_id: str,
-    *,
-    policy: InstallationResourceDeletePolicy,
-) -> InstallationResource:
-    now = datetime.now(timezone.utc)
-    ownership = (
-        InstallationResourceOwnership.CREATED
-        if policy is InstallationResourceDeletePolicy.DELETE
-        else InstallationResourceOwnership.EXTERNAL
-    )
-    return InstallationResource(
+def _snapshot() -> InstallationResourceSnapshot:
+    original = _base_snapshot()
+    association = vpc_association_resource(
         site_id="test-site",
-        resource_key=key,
-        resource_type=resource_type,
-        resource_id=resource_id,
+        hosted_zone_id="Z123",
+        vpc_id="vpc-gpu-a",
+        vpc_region="us-east-1",
         region="us-east-1",
         account_id="123456789012",
-        ownership=ownership,
-        delete_policy=policy,
-        created_at=now,
-        updated_at=now,
+        ownership=InstallationResourceOwnership.CREATED,
+        resource_key="aws/route53/vpc-association/gpu-a",
     )
-
-
-def _snapshot() -> InstallationResourceSnapshot:
     value = InstallationResourceSnapshot(
-        site_id="test-site",
+        site_id=original.site_id,
         resources=[
+            association if item.resource_key == association.resource_key else item
+            for item in original.resources
+        ]
+        + [
             _resource(
-                "aws/iam/executor/gpu-a/role",
-                "iam_role",
-                "executor-role",
+                "aws/route53/zone",
+                "route53_zone",
+                "Z123",
                 policy=InstallationResourceDeletePolicy.DELETE,
-            ),
-            _resource(
-                "aws/iam/executor/gpu-a/oidc-provider",
-                "iam_oidc_provider",
-                "arn:aws:iam::123456789012:oidc-provider/test",
-                policy=InstallationResourceDeletePolicy.PRESERVE,
-            ),
-            _resource(
-                "aws/iam/adot-writer/gpu-a/role",
-                "iam_role",
-                "adot-writer-role",
-                policy=InstallationResourceDeletePolicy.DELETE,
-            ),
-            _resource(
-                "cluster/gpu-a/eks",
-                "gpu_eks",
-                "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
-                policy=InstallationResourceDeletePolicy.PRESERVE,
-            ),
-            _resource(
-                "aws/route53/vpc-association/gpu-a",
-                "route53_vpc_association",
-                "Z123:us-east-1:vpc-gpu-a",
-                policy=InstallationResourceDeletePolicy.DETACH,
-            ),
-            _resource(
-                "aws/nlb",
-                "nlb",
-                "gpu-fault-nlb",
-                policy=InstallationResourceDeletePolicy.DELETE,
-            ),
+            )
         ],
     )
     return value.model_copy(update={"source_sha256": value.digest()})
+
+
+@pytest.mark.parametrize("mode", ["created", "external", "shared", "cpu"])
+def test_bootstrap_dns_inventory_only_drops_the_verified_exclusive_association(
+    tmp_path, mode
+) -> None:
+    site = load_site(site_file(tmp_path))
+    target_vpc = "vpc-cpu" if mode == "cpu" else "vpc-gpu-a"
+    native = {
+        "vpc_region": "us-east-1",
+        "vpc_id": "vpc-cpu",
+        "ownership": "CREATED",
+        "native": True,
+    }
+    target = {
+        "vpc_region": "us-east-1",
+        "vpc_id": target_vpc,
+        "ownership": "EXTERNAL" if mode == "external" else "CREATED",
+        "resource_key": "aws/route53/vpc-association/former-member",
+        "cluster_ids": ["former-member"],
+    }
+    remote = {"vpc_region": "us-west-2", "vpc_id": target_vpc, "ownership": "EXTERNAL"}
+    associations = [native, remote] if mode == "cpu" else [native, target, remote]
+    path = site.source.parent / "bootstrap-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "site_id": "test-site",
+                "resources": {
+                    "pki": {"hosted_zone_id": "Z123", "vpc_associations": associations}
+                },
+            }
+        )
+    )
+    _update_bootstrap_state(
+        RemoveClusterRequest(site, "gpu-a", "REMOVE_GPU_CLUSTER"),
+        target_network={"vpc_id": target_vpc, "nat_eips": []},
+        remaining_networks=(
+            [{"vpc_id": target_vpc, "nat_eips": []}] if mode == "shared" else []
+        ),
+        cpu_vpc_id="vpc-cpu",
+        detached_vpc_id=target_vpc if mode == "created" else None,
+    )
+    updated = json.loads(path.read_text())
+    assert updated["resources"]["pki"]["vpc_associations"] == (
+        [native, remote] if mode == "created" else associations
+    )
+
+
+def test_bootstrap_dns_update_refuses_a_detached_shared_vpc_without_writing(
+    tmp_path,
+) -> None:
+    site = load_site(site_file(tmp_path))
+    path = site.source.parent / "bootstrap-state.json"
+    original = json.dumps({"site_id": "test-site", "resources": {}})
+    path.write_text(original)
+    with pytest.raises(BootstrapError, match="shared VPC"):
+        _update_bootstrap_state(
+            RemoveClusterRequest(site, "gpu-a", "REMOVE_GPU_CLUSTER"),
+            target_network={"vpc_id": "vpc-cpu", "nat_eips": []},
+            remaining_networks=[],
+            cpu_vpc_id="vpc-cpu",
+            detached_vpc_id="vpc-cpu",
+        )
+    assert path.read_text() == original
 
 
 def test_site_update_allows_the_last_gpu_cluster_to_be_removed(tmp_path) -> None:
@@ -163,7 +192,7 @@ def test_target_aws_resources_are_deleted_or_detached_without_touching_cpu(
     assert statuses["cluster/gpu-a/eks"] is InstallationResourceStatus.DETACHED
     assert (
         statuses["aws/route53/vpc-association/gpu-a"]
-        is InstallationResourceStatus.DETACHED
+        is InstallationResourceStatus.ACTIVE
     )
     assert statuses["aws/nlb"] is InstallationResourceStatus.ACTIVE
     assert sorted(evidence["deleted"]) == [
@@ -239,16 +268,17 @@ def test_cluster_network_detach_removes_only_exclusive_sources(
         commands.append(arguments)
         return True
 
-    monkeypatch.setattr(admin_cluster_removal, "_idempotent_aws", run)
+    monkeypatch.setattr(removal_network, "idempotent_aws", run)
+    monkeypatch.setattr(removal_network, "verify_revoked_nat_eips", lambda *_args: None)
     monkeypatch.setattr(
-        admin_cluster_removal,
+        removal_network,
         "disassociate_vpc_from_hosted_zone",
         lambda **kwargs: route53_changes.append(kwargs)
         or {"changed": True, "change_id": "/change/C123", "change_status": "INSYNC"},
     )
     monkeypatch.setattr(
-        admin_cluster_removal,
-        "_wait_vpc_association_absent",
+        removal_network,
+        "wait_vpc_association_absent",
         lambda **kwargs: waits.append(kwargs),
     )
 
@@ -262,6 +292,7 @@ def test_cluster_network_detach_removes_only_exclusive_sources(
         },
         remaining_networks=[{"vpc_id": "vpc-gpu-b", "nat_eips": ["192.0.2.11"]}],
         cpu_vpc_id="vpc-cpu",
+        detach_dns=True,
     )
 
     assert result == {
@@ -283,8 +314,8 @@ def test_cluster_network_detach_removes_only_exclusive_sources(
 def test_route53_disassociation_waits_for_change_insync(monkeypatch) -> None:
     waits = []
     monkeypatch.setattr(
-        admin_cluster_removal.subprocess,
-        "run",
+        removal_network,
+        "run_command",
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -295,7 +326,7 @@ def test_route53_disassociation_waits_for_change_insync(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        admin_cluster_removal,
+        removal_network,
         "wait_route53_change_insync",
         lambda change_id: waits.append(change_id),
     )
@@ -333,14 +364,48 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
         }
 
     monkeypatch.setattr(admin_cluster_removal, "_export_registry", export_registry)
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "fetch_installation_resource_registry",
+        lambda _site: _snapshot(),
+    )
     monkeypatch.setattr(admin_cluster_removal, "_cluster_network", network)
     monkeypatch.setattr(
-        admin_cluster_removal, "_target_nodes", lambda _site, _target: ["node-a"]
+        admin_cluster_removal,
+        "_removal_identity",
+        lambda *_args: (
+            {
+                "eks_arn": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+                "eks_created_at": "2026-01-01T00:00:00Z",
+                "hyperpod_arn": "arn:aws:sagemaker:us-east-1:123456789012:cluster/hp-a-id",
+            },
+            None if "namespace-request" in calls else "namespace-a",
+        ),
     )
     monkeypatch.setattr(
         admin_cluster_removal,
-        "prune_workload_namespace_rbac",
-        lambda *_args: (calls.append("workload-rbac"), ["role/gpu-fault-x"])[1],
+        "membership_runtime_snapshot",
+        lambda _site: {
+            "registry_generation": 1,
+            "registry_content_sha256": "a" * 64,
+            "live_release_identity_sha256": "b" * 64,
+            "registry_cluster_states": (
+                {}
+                if "registry-secret" in calls
+                else {"gpu-a": "DRAINING" if "registry-drain" in calls else "ACTIVE"}
+            ),
+        },
+    )
+
+    def nodes(_site, _target, **kwargs):
+        kwargs.get("identities", {}).update({"node-a": "uid-node-a"})
+        return ["node-a"]
+
+    monkeypatch.setattr(admin_cluster_removal, "_target_nodes", nodes)
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "_run_control_plane_drain",
+        lambda *_args: calls.append("registry-drain"),
     )
 
     def kubernetes_cleanup(_request, _target, state_dir):
@@ -366,7 +431,17 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
         lambda *_args: calls.append("namespace-wait"),
     )
     monkeypatch.setattr(
-        admin_cluster_removal, "_remove_node_action_keys", lambda *_args: 1
+        admin_cluster_removal, "_remove_node_action_keys", lambda *_args, **_kwargs: 1
+    )
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "verify_node_key_ownership",
+        lambda _site, _cluster_id, nodes, **kwargs: kwargs.get("saved")
+        or {
+            "cpu_secret_uid": "cpu-keys",
+            "gpu_secret_uid": "gpu-keys",
+            "expected_key_sha256": dict.fromkeys(nodes, "a" * 64),
+        },
     )
     monkeypatch.setattr(
         admin_cluster_removal,
@@ -378,13 +453,16 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
         "_detach_network",
         lambda *_args, **_kwargs: {
             "revoked_nat_eips": ["192.0.2.10"],
-            "detached_vpc_id": "vpc-gpu",
+            "detached_vpc_id": None,
         },
     )
     monkeypatch.setattr(
         admin_cluster_removal,
         "_remove_target_aws_resources",
-        lambda _request, snapshot: (snapshot, {"deleted": [], "detached": []}),
+        lambda _request, snapshot, **_kwargs: (
+            snapshot,
+            {"deleted": [], "detached": []},
+        ),
     )
     monkeypatch.setattr(
         admin_cluster_removal,
@@ -448,17 +526,13 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     assert calls.index("namespace-wait") < len(calls) - 1 - calls[::-1].index(
         "annotations"
     )
-    # The engine's label-owned workload RBAC goes before the fail-closed
-    # cleanup, which would otherwise meet it as unregistered and refuse
-    # (live 2026-09-12); the evidence records what was deleted.
-    assert calls.count("workload-rbac") == 1
-    assert calls.index("workload-rbac") < calls.index("kubernetes-cleanup")
+    assert calls.index("registry-drain") < calls.index("kubernetes-cleanup")
     state = json.loads(
         (tmp_path / "remove-cluster" / "gpu-a" / "state.json").read_text("utf-8")
     )
-    assert state["evidence"]["KUBERNETES_QUIESCED"][
-        "workload_namespace_rbac_deleted"
-    ] == ["role/gpu-fault-x"]
+    assert state["evidence"]["KUBERNETES_QUIESCED"]["cleanup_state"].endswith(
+        "cleanup.json"
+    ), "quiescence evidence must retain the bound cleanup journal path"
     assert calls.count("site-verified") == 1
     # The failure-domain map is re-rendered once, for the remaining (empty)
     # cluster set, before the release state moves on.
@@ -680,7 +754,7 @@ def test_resolve_cluster_id_resolves_a_hyperpod_arn_through_discovery(tmp_path) 
 
     def discover(arn: str) -> tuple[str, str]:
         asked.append(arn)
-        return "arn:aws:eks:us-east-1:123456789012:cluster/other", "hp-gpu-a"
+        return "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a", "hp-gpu-a"
 
     resolved = admin_cluster_removal.resolve_cluster_id(
         site,
@@ -709,87 +783,49 @@ def test_resolve_cluster_id_refuses_unknown_and_non_cluster_arns(tmp_path) -> No
         )
 
 
-def test_workload_namespace_rbac_prune_selects_by_the_engine_label_only(
+def test_workload_namespace_rbac_prune_proves_ownership_before_cleanup(
     tmp_path, monkeypatch
 ) -> None:
-    site = load_site(site_file(tmp_path))
-    site.release_config["gpu_kubeconfig"] = str(tmp_path / "gpu.kubeconfig")
-    seen: list[list[str]] = []
-
-    def run(arguments, **_kwargs):
-        seen.append(list(arguments))
-        return subprocess.CompletedProcess(
-            arguments,
-            0,
-            'role.rbac.authorization.k8s.io "gpu-fault-cluster-executor" deleted\n'
-            'rolebinding.rbac.authorization.k8s.io "gpu-fault-cluster-executor" deleted\n',
-            "",
-        )
-
-    monkeypatch.setattr(admin_cluster_removal.subprocess, "run", run)
-    target = next(
-        item
-        for item in site.release_config["clusters"]
-        if item["cluster_id"] == "gpu-a"
+    from tests.admin.test_admin_cluster_removal_rbac import (
+        exercise_real_pruner_in_removal,
     )
 
-    deleted = admin_cluster_removal.prune_workload_namespace_rbac(site, target)
+    exercise_real_pruner_in_removal(tmp_path, monkeypatch)
 
-    [command] = seen
-    assert command[:3] == ["kubectl", "--kubeconfig", str(tmp_path / "gpu.kubeconfig")]
-    assert command[3:5] == ["--context", target["context"]]
-    assert command[5:] == [
-        "delete",
-        "roles,rolebindings",
-        "--all-namespaces",
-        "-l",
-        "gpu-fault.io/workload-namespace-rbac=true",
-        "--ignore-not-found",
-        "--wait=true",
-    ], "selection is by the engine's label across every namespace, nothing else"
-    assert len(deleted) == 2
+
+def test_removal_preserves_bound_cleanup_after_rbac_proof(
+    tmp_path, monkeypatch
+) -> None:
+    scenario = RemovalScenario(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "run_command",
+        lambda *_args, **_kwargs: pytest.fail("unregistered cleanup bypass"),
+    )
+    remove_cluster(scenario.request())
+    assert scenario.calls.count("cleanup") == 1
+    assert scenario.calls.index("drain") < scenario.calls.index("cleanup")
 
 
 def test_resolve_cluster_id_reaches_an_unfinished_removal_the_site_already_dropped(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     """SITE_UPDATED removes the cluster from site.yaml; a rerun after a later
     step failed (live 2026-09-12: sync-state) must still resolve the ARN
     through the removal's DISCOVERED evidence, or "rerun with the same
     arguments" is a promise the last steps cannot keep."""
 
-    site = _site_with_clusters(tmp_path)
+    scenario = RemovalScenario(tmp_path, monkeypatch)
     arn = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
-    site.release_config["clusters"] = []
-    state_dir = site.source.parent / "remove-cluster" / "gpu-a"
-    state_dir.mkdir(parents=True)
-    (state_dir / "state.json").write_text(
-        json.dumps(
-            {
-                "cluster_id": "gpu-a",
-                "phase": "SITE_UPDATED",
-                "evidence": {
-                    "DISCOVERED": {
-                        "target": {
-                            "cluster_id": "gpu-a",
-                            "eks_cluster_arn": arn,
-                            "hyperpod_cluster_name": "hp-gpu-a",
-                        }
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert admin_cluster_removal.resolve_cluster_id(site, arn) == "gpu-a"
-
-    (state_dir / "state.json").write_text(
-        json.dumps({"cluster_id": "gpu-a", "phase": "COMPLETED", "evidence": {}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(BootstrapError, match="managed clusters: none"):
-        admin_cluster_removal.resolve_cluster_id(site, arn)
+    scenario.failure = "release-state"
+    with pytest.raises(BootstrapError, match="release-state"):
+        remove_cluster(scenario.request())
+    site = load_site(scenario.path)
+    assert not site.release_config["clusters"]
+    assert admin_cluster_removal.resolve_removal_cluster_id(site, arn) == "gpu-a"
+    scenario.failure = None
+    assert remove_cluster(scenario.request())["phase"] == "COMPLETED"
+    assert scenario.calls.count("cleanup") == 1
 
 
 def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
@@ -811,6 +847,7 @@ def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
         )
     )
     assert first["phase"] == "COMPLETED"
+    calls.clear()
     path.write_bytes(original)  # the cluster joined again
 
     second = remove_cluster(
@@ -820,11 +857,9 @@ def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
     )
 
     assert second["phase"] == "COMPLETED"
-    assert calls.count("registry") == 2, "the second removal must run, not resume"
+    assert calls.count("registry") == 1, "the second removal must run, not resume"
     assert load_site(path).release_config["clusters"] == [], (
         "the second removal must drop the cluster from the site again"
     )
-    archived = list(
-        (tmp_path / "remove-cluster" / "gpu-a").glob("state.completed-*.json")
-    )
+    archived = list((tmp_path / "remove-cluster" / "gpu-a" / "history").glob("*.json"))
     assert len(archived) == 1, "the morning's record must be kept as history"

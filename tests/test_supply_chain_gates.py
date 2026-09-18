@@ -3,11 +3,11 @@
 ``make ci-tooling-check`` already proves that ruff, yamllint and shellcheck
 walk the same roots in the Makefile and in ``ci.yml``. These tests extend that
 parity to the gates added for review items S8 and S10: the lazy-export table
-check, CloudFormation linting, the documentation-facts check, ``pip-audit``
+check, the documentation-facts check, ``pip-audit``
 over every shipped lock, and the CycloneDX SBOM bound into the release
 attestation. Tool versions live in one place (the Makefile) so the workflow
-cannot drift from it; strictness is decided by ``CI`` so the same targets are
-advisory on a developer machine and load-bearing on the runner.
+cannot drift from it. Audit/SBOM tools remain advisory outside CI; native PromQL
+behavior is mandatory whenever its test gate is invoked.
 """
 
 from __future__ import annotations
@@ -30,10 +30,10 @@ SHIPPED_LOCKS = (
     "requirements/runtime.lock",
     "requirements/deploy-host.lock",
     "requirements/node-runtime.lock",
+    "requirements/node-tools.lock",
 )
 NEW_TARGETS = (
     "lazy-export-check",
-    "cfn-lint-check",
     "doc-facts-check",
     "pip-audit-check",
     "sbom",
@@ -78,13 +78,13 @@ def test_doc_facts_gate_is_part_of_docs_check() -> None:
 
 
 def test_tool_versions_are_pinned_once_in_the_makefile() -> None:
-    for variable in ("PIP_AUDIT_VERSION", "CFN_LINT_VERSION", "CYCLONEDX_BOM_VERSION"):
+    for variable in ("PIP_AUDIT_VERSION", "CYCLONEDX_BOM_VERSION"):
         match = re.search(rf"^{variable} \?= (\d+\.\d+\.\d+)$", MAKEFILE, re.MULTILINE)
         assert match is not None, f"{variable} is not pinned in the Makefile"
     install = _target("ci-supply-chain-tools")
-    assert "pip-audit==$(PIP_AUDIT_VERSION)" in install
-    assert "cfn-lint==$(CFN_LINT_VERSION)" in install
-    assert "cyclonedx-bom==$(CYCLONEDX_BOM_VERSION)" in install
+    assert "scripts/setup_supply_chain_tools.py" in install
+    assert '--pip-audit-version "$(PIP_AUDIT_VERSION)"' in install
+    assert '--cyclonedx-bom-version "$(CYCLONEDX_BOM_VERSION)"' in install
     assert "$(SUPPLY_CHAIN_TOOLS_VENV)" in install, (
         "tools must install into their own venv, not the hash-locked one"
     )
@@ -93,28 +93,16 @@ def test_tool_versions_are_pinned_once_in_the_makefile() -> None:
         (ROOT / path).read_text(encoding="utf-8")
         for path in (".github/workflows/ci.yml", ".github/workflows/release.yml")
     )
-    for tool in ("pip-audit==", "cfn-lint==", "cyclonedx-bom=="):
+    for tool in ("pip-audit==", "cyclonedx-bom=="):
         assert tool not in workflows, f"{tool} version must come from the Makefile"
 
 
-def test_ci_installs_tools_then_lints_templates_and_audits_locks() -> None:
+def test_ci_installs_tools_then_audits_locks() -> None:
     runs = _static_runs()
     tools = runs.index("make ci-supply-chain-tools PYTHON=python")
-    cfn = runs.index("make cfn-lint-check PYTHON=python")
     audit = runs.index("make pip-audit-check PYTHON=python")
 
-    assert tools < cfn
     assert tools < audit
-
-
-def test_cfn_lint_covers_the_lambda_templates() -> None:
-    target = _target("cfn-lint-check")
-
-    assert "cfn-lint" in target
-    assert "deploy/aws/lambda/*.yaml" in MAKEFILE
-    assert list((ROOT / "deploy/aws/lambda").glob("*.yaml")), (
-        "the template set the gate covers is empty"
-    )
 
 
 def test_pip_audit_covers_every_shipped_lock_with_hashes() -> None:
@@ -196,8 +184,9 @@ def _make(target: str, *assignments: str) -> subprocess.CompletedProcess[str]:
         [
             "make",
             target,
-            "PYTHON=/nonexistent/bin/python",
+            f"PYTHON={sys.executable}",
             "SUPPLY_CHAIN_PYTHON=/nonexistent/bin/python",
+            "PROMTOOL=/nonexistent/bin/promtool",
             "DEPLOY_HOST_PLATFORM=test",
             *assignments,
         ],
@@ -209,7 +198,7 @@ def _make(target: str, *assignments: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_missing_tools_are_advisory_locally_and_fatal_in_ci() -> None:
-    for target in ("cfn-lint-check", "promtool-check", "pip-audit-check", "sbom"):
+    for target in ("pip-audit-check", "sbom"):
         local = _make(target, "CI=")
         assert local.returncode == 0, (target, local.stdout, local.stderr)
         assert "not installed" in local.stdout + local.stderr, target
@@ -217,3 +206,14 @@ def test_missing_tools_are_advisory_locally_and_fatal_in_ci() -> None:
         strict = _make(target, "CI=true")
         assert strict.returncode == 2, (target, strict.stdout, strict.stderr)
         assert "ci-supply-chain-tools" in strict.stderr, target
+
+
+def test_missing_promtool_cannot_skip_mandatory_behavior_tests() -> None:
+    for ci in ("CI=", "CI=true"):
+        completed = _make("promtool-check", ci)
+        assert completed.returncode == 2, (
+            "missing native behavior tests are a hard failure"
+        )
+        assert "ci-supply-chain-tools" in completed.stderr, (
+            "the failure identifies the pinned installer instead of accepting a skip"
+        )

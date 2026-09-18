@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
@@ -14,7 +15,19 @@ from gpu_fault.models import (
     record_operator_event,
 )
 from gpu_fault.retired_generation import retired_generation_records
-from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
+from gpu_fault.store.shared.errors import (
+    NotFoundError,
+    StaleFencingTokenError,
+    StaleWriteError,
+    WorkflowLeaseError,
+    WorkflowMergedError,
+)
+from gpu_fault.store.shared.orphaned_commands import (
+    TERMINAL_WORKFLOW_STATUSES,
+    OrphanedCommandCancellation,
+    cancellation_event,
+    orphaned_cancellation_records,
+)
 from gpu_fault.store.shared.preemption import preemption_pending_update
 from gpu_fault.store.shared.primitives import (
     GetLink,
@@ -91,6 +104,29 @@ def lease_extension_due(
     expires_at = workflow.execution_lease_expires_at
     assert expires_at is not None  # validated by the caller
     return expires_at - renewed_at <= lease_duration / 2
+
+
+def validate_leased_workflow_save(
+    current: WorkflowRequest,
+    workflow: WorkflowRequest,
+    executor_id: str,
+    execution_epoch: int,
+    checked_at: datetime,
+) -> None:
+    """Validate a leased replacement while the caller holds its backend lock."""
+
+    if (
+        current.execution_owner_id != executor_id
+        or current.execution_epoch != execution_epoch
+        or workflow.execution_epoch != execution_epoch
+        or current.execution_lease_expires_at is None
+        or current.execution_lease_expires_at <= checked_at
+    ):
+        raise WorkflowLeaseError("workflow execution lease is stale")
+    if current.fencing_token != workflow.fencing_token:
+        raise StaleFencingTokenError("stale workflow fencing token")
+    if current.merge_revision != workflow.merge_revision:
+        raise WorkflowMergedError("workflow was merged since it was read")
 
 
 def incident_pointer_moved(
@@ -367,6 +403,59 @@ class TransactionalWorkflowMixin:
                 amended = append_workflow_event(amended, event)
             self._put("workflow", request_id, amended)
             return amended
+
+    def cancel_orphaned_remote_commands(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        now: datetime,
+        actor: str,
+    ) -> OrphanedCommandCancellation:
+        candidates = self.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+        command_ids = sorted({command.command_id for command in candidates})
+        with ExitStack() as transaction:
+            # All advisory locks precede row locks, in key order. The workflow
+            # key is already held when amend_workflow re-enters it for the audit.
+            for command_id in command_ids:
+                transaction.enter_context(
+                    self._state_transaction(f"remote_command/{command_id}")
+                )
+            transaction.enter_context(
+                self._state_transaction(f"workflow/{workflow.request_id}")
+            )
+            current = self._locked_optional("workflow", workflow.request_id)
+            if (
+                current is None
+                or current.status not in TERMINAL_WORKFLOW_STATUSES
+                or not workflow_matches_expected(current, workflow)
+            ):
+                return OrphanedCommandCancellation()
+            records, result = orphaned_cancellation_records(
+                current,
+                (
+                    self._locked_optional("remote_command", command_id)
+                    for command_id in command_ids
+                ),
+                now=now,
+                actor=actor,
+            )
+            for command in records:
+                self._put("remote_command", command.command_id, command)
+            if result.command_ids:
+                self.amend_workflow(
+                    current.request_id,
+                    {},
+                    event=cancellation_event(
+                        current,
+                        result.counters,
+                        result.command_ids,
+                        now=now,
+                        actor=actor,
+                    ),
+                )
+            return result
 
     def save_incident_and_workflow(
         self,

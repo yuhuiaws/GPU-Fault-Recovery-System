@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from threading import Event
+from threading import Event, Lock
 from typing import Any, Callable
 
 from gpu_fault.collector_requirements import (
@@ -244,6 +244,8 @@ class PeriodicServiceRunner:
         # refreshed by the drift job; a scrape only reads them.
         self.processor_counter_drift_abs: int = 0
         self.processor_counter_mismatched_clusters: int = 0
+        self.processor_counter_drift_scan_timestamp_seconds = 0.0
+        self._counter_drift_lock = Lock()
         # ARCH-E E3: the runner's own heartbeat, and each job's last run. The
         # counters above are written by the loop, so a dead thread leaves
         # every one of them at a healthy-looking value.
@@ -276,13 +278,13 @@ class PeriodicServiceRunner:
     def run_all_due(self, now: float) -> None:
         """One tick: every job gets its turn even if another one raised.
 
-        The loop body used to call the six jobs bare; the one statement they
-        all share without a guard -- the task-lease write in ``_due`` -- ended
-        the thread on its first store error, and with it all six services for
-        the life of the process (F-F1).
+        The loop body used to call every job in ``_JOBS`` bare; the one
+        statement they all share without a guard -- the task-lease write in
+        ``_due`` -- ended the thread on its first store error, and with it
+        every periodic service for the life of the process (F-F1).
 
         ``now`` is refreshed after a job actually ran: a 20 s cleanup used to
-        leave the five jobs behind it judging their schedule by a clock taken
+        leave the jobs behind it judging their schedule by a clock taken
         before it started (F-F2).
         """
 
@@ -309,6 +311,10 @@ class PeriodicServiceRunner:
                 self.job_last_run_timestamp_seconds[name] = time.time()
 
     def metrics_snapshot(self) -> dict[str, Any]:
+        with self._counter_drift_lock:
+            drift = self.processor_counter_drift_abs
+            mismatched = self.processor_counter_mismatched_clusters
+            scanned_at = self.processor_counter_drift_scan_timestamp_seconds
         return {
             "periodic_lease_errors_total": self.periodic_lease_errors_total,
             "periodic_job_errors_total": dict(self.periodic_job_errors_total),
@@ -318,9 +324,11 @@ class PeriodicServiceRunner:
             "processor_expired_leases_reclaimed_total": (
                 self.processor_expired_leases_reclaimed_total
             ),
-            "processor_counter_drift_abs": self.processor_counter_drift_abs,
-            "processor_counter_mismatched_clusters": (
-                self.processor_counter_mismatched_clusters
+            "processor_counter_drift_abs": drift,
+            "processor_counter_mismatched_clusters": mismatched,
+            "processor_counter_drift_scan_timestamp_seconds": scanned_at,
+            "processor_counter_drift_scan_max_age_seconds": max(
+                120.0, 3 * self.config.counter_drift_interval
             ),
             "last_cycle_timestamp_seconds": self.last_cycle_timestamp_seconds,
             "job_last_run_timestamp_seconds": dict(self.job_last_run_timestamp_seconds),
@@ -454,8 +462,15 @@ class PeriodicServiceRunner:
             return False
 
         def refresh() -> None:
+            failure: Exception | None = None
             for registry in self.identity_registries:
-                registry.refresh()
+                try:
+                    registry.refresh()
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+            if failure is not None:
+                raise failure
 
         return self._run_scheduled(
             "identity-refresh",
@@ -793,8 +808,10 @@ class PeriodicServiceRunner:
             status = self.context.store.processor_queue_count_status()
             drift = abs(int(status["expected_total"]) - int(status["counter_total"]))
             mismatched = int(status["mismatched_clusters"])
-            self.processor_counter_drift_abs = drift
-            self.processor_counter_mismatched_clusters = mismatched
+            with self._counter_drift_lock:
+                self.processor_counter_drift_abs = drift
+                self.processor_counter_mismatched_clusters = mismatched
+                self.processor_counter_drift_scan_timestamp_seconds = time.time()
             if drift or mismatched:
                 LOGGER.warning(
                     "processor counter drift: rows=%s counters=%s "

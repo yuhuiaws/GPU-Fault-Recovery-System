@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -331,3 +332,61 @@ async def asgi_client(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         yield client
+
+
+def contained_stop_receipt(**overrides: Any) -> dict[str, Any]:
+    """The JSON form of a contained ``StopOwnershipReceipt`` for one workload.
+
+    The receipt a passive restart's authorization carries is exactly this
+    dictionary, so the builder speaks JSON rather than the guard's model.
+    """
+
+    receipt: dict[str, Any] = {
+        "version": 1,
+        "cluster_id": "cluster-a",
+        "workflow_id": "containment-workflow",
+        "incident_id": "containment-a",
+        "fencing_token": 1,
+        "execution_epoch": 1,
+        "stop_step_index": 1,
+        "stop_idempotency_key": "containment-workflow/1/STOP_WORKLOADS",
+        "phase": "official",
+        "workloads": [
+            {
+                "workload_id": "training/job/training-a",
+                "namespace": "training",
+                "kind": "job",
+                "name": "training-a",
+                "uid": "training-a-uid",
+                "attempt_id": "attempt-a",
+                "owners": [],
+            }
+        ],
+        "pods": [],
+        "nodes": [{"name": "node-a", "uid": "node-a-uid", "boot_id": "boot-a"}],
+        "contained": True,
+        "completed_at": "2026-09-18T00:00:00+00:00",
+    }
+    workload = dict(receipt["workloads"][0])
+    for key in ("workload_id", "attempt_id"):
+        if key in overrides:
+            workload[key] = overrides.pop(key)
+    receipt["workloads"] = [workload]
+    receipt.update(overrides)
+    return receipt
+
+
+def supply_chain_tools_venv(root: Path) -> Path:
+    """A supply-chain tools venv with the two executables the release gates bind.
+
+    Tests that drive ``build_signed_release`` create one under their state dir
+    so the gates resolve the site's own toolchain, not the developer host's
+    ``/tmp`` venv or whatever ``SUPPLY_CHAIN_PYTHON`` the shell exported.
+    """
+
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    for name in ("python", "promtool"):
+        path = root / "bin" / name
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+    return root

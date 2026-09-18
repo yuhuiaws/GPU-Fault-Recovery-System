@@ -34,16 +34,20 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
 from gpu_fault.models import (
     IncidentState,
     WorkflowEventKind,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepStatus,
     record_operator_event,
+    workflow_is_open,
 )
+from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
 
@@ -114,8 +118,10 @@ def never_dispatched_reasons(workflow: WorkflowRequest) -> list[str]:
         reasons.append("workflow has step executions, so it was dispatched")
     if workflow.completed_operations or workflow.completed_step_indexes:
         reasons.append("workflow completed operations, so it changed state")
-    if workflow.execution_owner_id:
+    if workflow.execution_owner_id is not None:
         reasons.append("workflow still has an execution owner")
+    if workflow.execution_lease_expires_at is not None:
+        reasons.append("workflow carries an execution lease, so it was claimed")
     if workflow.source_plan_id:
         reasons.append(
             "workflow has a source recovery plan; the restore reconcile owns it"
@@ -244,21 +250,39 @@ def settled_incident_blocked_reasons(
     workflow: WorkflowRequest,
     incident: Any | None,
     open_commands: Iterable[str],
+    *,
+    evaluated_at: datetime | None = None,
 ) -> list[str]:
     """Why ``workflow`` is not a BLOCKED record of a RECOVERED incident.
 
     Fewer guards than the compile-time shape on purpose: this record may have
     run steps. What makes it safe to end is that its incident is closed --
     RECOVERED, not ESCALATED, which still awaits an operator who may act on the
-    record -- and that nothing on it is live: no execution owner, no budget
-    claim, no open remote command.
+    record -- and that no owner, lease, command or physical action remains live.
     """
 
     reasons: list[str] = []
     if workflow.status is not WorkflowStatus.BLOCKED:
         reasons.append(f"workflow is {workflow.status.value}, not BLOCKED")
-    if workflow.execution_owner_id:
+    if workflow.execution_owner_id is not None:
         reasons.append("workflow still has an execution owner")
+    if (
+        workflow.execution_lease_expires_at is not None
+        and workflow.execution_lease_expires_at
+        > (evaluated_at or datetime.now(timezone.utc))
+    ):
+        reasons.append("workflow execution lease has not expired")
+    if workflow_is_open(
+        workflow.status, workflow.blocked_kind
+    ) and not never_executed_operator_block(workflow):
+        reasons.append("workflow still occupies its nodes")
+    if has_unresolved_node_action(workflow):
+        reasons.append("workflow has an unresolved physical action")
+    if any(
+        execution.status is WorkflowStepStatus.WAITING
+        for execution in workflow.step_executions
+    ):
+        reasons.append("workflow has an unknown provider action")
     # ``remediation_budget_claims`` left on a BLOCKED record are not live:
     # budget occupancy counts RUNNING rows with a live lease only, so they hold
     # nothing and are released with the close (3 SAFETY_SETTLED records of
@@ -347,7 +371,9 @@ def close_settled_incident_blocked_workflow(
         )
         if command.status in OPEN_REMOTE_STATUSES
     ]
-    if settled_incident_blocked_reasons(workflow, incident, open_commands):
+    if settled_incident_blocked_reasons(
+        workflow, incident, open_commands, evaluated_at=now
+    ):
         return False
     closed = closed_settled_incident_record(
         workflow, reconciled_at=now, actor=actor, reference=reference

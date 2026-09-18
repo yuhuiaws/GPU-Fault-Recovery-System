@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.app.process_metrics import parse_lines
 from tests._builders import asgi_client, build_store
 
 TOKEN = "processor-snapshot-bypass-token-" + "x" * 32
@@ -188,10 +189,16 @@ def test_snapshot_bypass_is_counted_per_path_in_metrics(monkeypatch) -> None:
     )
     metrics = get(app, "/metrics").text
 
-    assert (
-        "gpu_fault_processor_queue_bypass_total"
-        f'{{path="{INVENTORY_PATH}"}} 2' in metrics
-    )
+    samples = [
+        sample
+        for sample in parse_lines(metrics.splitlines()).samples[
+            "gpu_fault_processor_queue_bypass_total"
+        ]
+        if dict(sample.labels).get("path") == INVENTORY_PATH
+    ]
+    assert len(samples) == 1
+    assert dict(samples[0].labels) == {"path": INVENTORY_PATH, "process": "0"}
+    assert float(samples[0].value) == 2
     assert "gpu_fault_processor_queue_bypass_enabled 1" in metrics
 
 
@@ -204,8 +211,14 @@ def test_bypass_metrics_report_zero_in_the_control_arm(monkeypatch) -> None:
     post(app, INVENTORY_PATH, inventory_payload())
     metrics = get(app, "/metrics").text
 
-    assert (
-        "gpu_fault_processor_queue_bypass_total"
-        f'{{path="{INVENTORY_PATH}"}} 0' in metrics
-    )
+    samples = [
+        sample
+        for sample in parse_lines(metrics.splitlines()).samples[
+            "gpu_fault_processor_queue_bypass_total"
+        ]
+        if dict(sample.labels).get("path") == INVENTORY_PATH
+    ]
+    assert len(samples) == 1
+    assert dict(samples[0].labels) == {"path": INVENTORY_PATH, "process": "0"}
+    assert float(samples[0].value) == 0
     assert "gpu_fault_processor_queue_bypass_enabled 0" in metrics

@@ -18,7 +18,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from gpu_fault.models import FaultIncident, WorkflowRequest
+from gpu_fault.models import FaultIncident, WorkflowRequest, resolved_step_indexes
+from gpu_fault.workflow_quarantine import (
+    dependency_ancestors,
+    fixed_quarantine_nodes,
+    terminal_quarantine_nodes,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -60,9 +65,24 @@ def rebind_nodes(
 
     field = "safety_steps" if is_safety else "official_steps"
     steps = list(getattr(workflow, field))
-    for index in range(after_index + 1, len(steps)):
-        step = steps[index]
-        node_ids = replace(step.node_ids)
+    immutable = resolved_step_indexes(workflow) | {
+        execution.step_index for execution in workflow.step_executions
+    }
+    for index, step in enumerate(steps):
+        if index in immutable:
+            continue
+        if not is_safety and workflow.dag_enabled:
+            if after_index not in dependency_ancestors(workflow, index):
+                continue
+        elif index <= after_index:
+            continue
+        fixed = fixed_quarantine_nodes(step)
+        node_ids = list(
+            dict.fromkeys(
+                node_id if node_id in fixed else rebindings.get(node_id, node_id)
+                for node_id in step.node_ids
+            )
+        )
         update: dict[str, Any] = {"node_ids": node_ids}
         if set(node_ids) != set(step.node_ids):
             if step.gpu_uuids:
@@ -72,9 +92,13 @@ def rebind_nodes(
                 update["parameters"] = {
                     **step.parameters,
                     "gpu_uuids_by_node": {
-                        rebindings.get(node_id, node_id): (
+                        (
+                            node_id
+                            if node_id in fixed
+                            else rebindings.get(node_id, node_id)
+                        ): (
                             list(values)
-                            if node_id not in rebindings
+                            if node_id not in rebindings or node_id in fixed
                             else rebound_gpu_uuids([rebindings[node_id]])
                         )
                         for node_id, values in by_node.items()
@@ -82,10 +106,16 @@ def rebind_nodes(
                 }
         steps[index] = step.model_copy(update=update)
     now = datetime.now(timezone.utc)
-    incident_nodes = replace(incident.node_ids)
+    replacement_nodes = replace(incident.node_ids)
+    held = terminal_quarantine_nodes(workflow)
+    incident_nodes = list(
+        dict.fromkeys(
+            [*replacement_nodes, *sorted(held.intersection(incident.node_ids))]
+        )
+    )
     incident_update: dict[str, Any] = {"node_ids": incident_nodes, "updated_at": now}
-    if set(incident_nodes) != set(incident.node_ids) and incident.gpu_uuids:
-        incident_update["gpu_uuids"] = rebound_gpu_uuids(incident_nodes)
+    if set(replacement_nodes) != set(incident.node_ids) and incident.gpu_uuids:
+        incident_update["gpu_uuids"] = rebound_gpu_uuids(replacement_nodes)
     return (
         workflow.model_copy(update={field: steps, "updated_at": now}),
         incident.model_copy(update=incident_update),

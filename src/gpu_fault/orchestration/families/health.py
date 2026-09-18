@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Callable
 
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -19,6 +20,10 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.workflow_quarantine import (
+    TERMINAL_QUARANTINE_NODES,
+    inherit_terminal_quarantine,
+)
 from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
@@ -100,6 +105,8 @@ class HealthBuildContext:
 
 
 class NodeHealthPlanBuilder:
+    activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
+
     def __init__(
         self,
         store,
@@ -549,6 +556,15 @@ class NodeHealthPlanBuilder:
         parameters = step.parameters
         if step.operation is WorkflowOperation.RESTART_WORKLOAD:
             parameters = restart
+        elif (
+            step.operation is WorkflowOperation.QUARANTINE
+            and finding.recommended_action
+            in {RecoveryAction.QUARANTINE, RecoveryAction.DRAIN}
+        ):
+            parameters = {
+                **parameters,
+                TERMINAL_QUARANTINE_NODES: list(step.node_ids),
+            }
         elif step.operation is WorkflowOperation.STOP_WORKLOADS:
             # The completion watcher tells a controller-initiated stop from a
             # user stop by this marker; without it the job the system stopped
@@ -580,11 +596,16 @@ class NodeHealthPlanBuilder:
             and inventory
         ):
             parameters = {**parameters, **inventory}
-        elif (
-            step.operation is WorkflowOperation.REPLACE_NODE
-            and diagnostic.get("replacement_strategy") == "HEALTHY_WARM_SPARE_ONLY"
-        ):
-            parameters = {"replacement_strategy": diagnostic["replacement_strategy"]}
+        elif step.operation is WorkflowOperation.REPLACE_NODE:
+            if diagnostic.get("replacement_strategy") == "HEALTHY_WARM_SPARE_ONLY":
+                parameters = {
+                    "replacement_strategy": diagnostic["replacement_strategy"]
+                }
+            if "activation_forbidden" in diagnostic:
+                parameters = {
+                    **parameters,
+                    "activation_forbidden": diagnostic["activation_forbidden"],
+                }
         return step.model_copy(update={"parameters": parameters})
 
     def _hung_triage_dag(
@@ -988,7 +1009,7 @@ class NodeHealthIngestionService:
                 ]
             }
         )
-        workflow = workflow.model_copy(
+        workflow = inherit_terminal_quarantine(incumbent, workflow).model_copy(
             update={"predecessor_workflow_id": incumbent.request_id}
         )
         if self.callbacks.preemption_scope_matches(

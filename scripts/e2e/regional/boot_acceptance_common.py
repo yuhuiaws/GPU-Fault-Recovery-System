@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -15,10 +14,17 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import load_site  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandTimeout,
+    RegionalFixtureError,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
 )
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 
 class BootAcceptanceError(RuntimeError):
@@ -39,24 +45,28 @@ def run(
     env: dict[str, str] | None = None,
     umask: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-        cwd=cwd,
-        env=env,
-        preexec_fn=(lambda: os.umask(umask)) if umask is not None else None,
-    )
-    if check and completed.returncode:
-        raise BootAcceptanceError(
-            f"command failed ({completed.returncode}): {' '.join(command[:5])}; "
-            f"stderr={completed.stderr[-1000:]}"
+    if umask is not None:
+        command = [
+            "sh",
+            "-c",
+            'umask "$1"; shift; exec "$@"',
+            "gpu-fault-umask",
+            f"{umask:03o}",
+            *command,
+        ]
+    try:
+        return run_fixture_command(
+            command,
+            input_text=input_text,
+            check=check,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
         )
-    return completed
+    except RegionalCommandTimeout:
+        raise
+    except RegionalFixtureError as exc:
+        raise BootAcceptanceError(str(exc)) from exc
 
 
 def write_log(path: Path, completed: subprocess.CompletedProcess[str]) -> None:
@@ -131,6 +141,12 @@ class SiteFixture:
         )
 
     def pods(self, plane: str, app: str) -> list[str]:
+        deployment = json.loads(
+            self.regional.kubectl(plane, "get", "deployment", app, "-o", "json")
+        )
+        replicas = deployment.get("spec", {}).get("replicas")
+        if type(replicas) is not int or replicas < 1:
+            raise BootAcceptanceError(f"{app} has no positive replica target")
         value = json.loads(
             self.regional.kubectl(
                 plane,
@@ -142,18 +158,22 @@ class SiteFixture:
                 "json",
             )
         )
-        result = []
-        for item in value.get("items", []):
-            conditions = item.get("status", {}).get("conditions", [])
-            if item.get("status", {}).get("phase") != "Running":
-                continue
-            if not any(
-                condition.get("type") == "Ready" and condition.get("status") == "True"
-                for condition in conditions
-            ):
-                continue
-            result.append(str(item["metadata"]["name"]))
-        return sorted(result)
+        items = value.get("items")
+        if not isinstance(items, list) or len(items) != replicas:
+            raise BootAcceptanceError(f"{app} replica set is incomplete")
+        try:
+            records = ready_pod_records(value)
+        except RegionalFixtureError as exc:
+            raise BootAcceptanceError(f"{app} replica inventory is invalid") from exc
+        names = [str(item["name"]) for item in records]
+        uids = {item["uid"] for item in records}
+        if (
+            len(records) != replicas
+            or len(set(names)) != replicas
+            or len(uids) != replicas
+        ):
+            raise BootAcceptanceError(f"{app} replica identity/readiness is invalid")
+        return sorted(names)
 
     def pod_json(
         self,
@@ -169,7 +189,7 @@ class SiteFixture:
             "-i",
             pod,
             "--",
-            "python3",
+            component_python(plane),
             "-",
             *arguments,
             input_text=script,

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_images import node_dependency_pin
+
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 
 
 class ReleaseChangeKind(StrEnum):
@@ -13,6 +18,7 @@ class ReleaseChangeKind(StrEnum):
 
 
 class ReleaseComponent(StrEnum):
+    AURORA_REFRESH = "aurora-refresh"
     SCHEMA = "schema"
     REGISTRY = "registry"
     CPU_STAGE = "cpu-stage"
@@ -56,6 +62,7 @@ class ReleaseExecutionPlan:
 
 
 PLAN_ORDER = tuple(ReleaseComponent)
+AURORA_PREREQUISITE_REPAIR_KEY = "aurora_prerequisite_repair"
 ADMIN_CONFIG_CHANGE_FIELDS = frozenset(
     {
         "admin_config_ingress",
@@ -112,6 +119,15 @@ GPU_CLUSTER_COMPONENTS = (
 def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     changed = diff.changed
     selected = {ReleaseComponent.VERIFY}
+    aurora_refresh = bool(
+        changed
+        & {
+            "aurora_refresh_manifests",
+            "aurora_refresh_drift",
+            "control_plane_wheel",
+            "runtime_image",
+        }
+    )
     schema = bool(changed & {"database_schema", "schema_manifests"})
     profile = bool(changed & {"runtime_profile", "runtime_profile_version"})
     endpoint = bool(
@@ -128,6 +144,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "observability_manifests",
             "observability_rules",
             "observability_adot",
+            "observability_drift",
             "adot_image",
         }
     )
@@ -138,7 +155,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "executor_wheel",
             "executor_protocol",
             "executor_manifests",
-            "runtime_image",
+            "executor_image",
             "clusters",
         }
     )
@@ -147,7 +164,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         & {
             "executor_wheel",
             "watcher_manifests",
-            "runtime_image",
+            "executor_image",
             "clusters",
         }
     )
@@ -156,7 +173,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         & {
             "executor_wheel",
             "collector_manifests",
-            "runtime_image",
+            "executor_image",
             "runtime_profile_version",
             "clusters",
         }
@@ -169,6 +186,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "node_template",
             "node_manifests",
             "node_installer_image",
+            "node_dependencies",
             "agent_config",
             "agent_protocol",
             "runtime_profile",
@@ -181,7 +199,8 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "executor_wheel",
             "node_manifests",
             "node_installer_image",
-            "runtime_image",
+            "node_dependencies",
+            "executor_image",
             "runtime_profile",
             "runtime_profile_version",
             "agent_config",
@@ -226,6 +245,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     )
 
     for enabled, component in (
+        (aurora_refresh, ReleaseComponent.AURORA_REFRESH),
         (schema, ReleaseComponent.SCHEMA),
         (registry, ReleaseComponent.REGISTRY),
         (cpu_stage, ReleaseComponent.CPU_STAGE),
@@ -255,7 +275,7 @@ def _legacy_value(state: dict[str, Any], name: str) -> Any:
     return state.get(name)
 
 
-def _current_profile_digest(release: Any, state: dict[str, Any]) -> Any:
+def _current_profile_digest(release: RegionalRelease, state: dict[str, Any]) -> Any:
     current = state.get("runtime_profile_policy_sha256")
     if current:
         return current
@@ -279,12 +299,16 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
     elif scoped.issubset(
         {
             "control_plane_wheel",
+            "aurora_refresh_manifests",
+            "runtime_image",
+            "aurora_refresh_drift",
             "notifications",
             "cpu_manifests",
             *CPU_ROLE_MANIFEST_FIELDS,
             "observability_manifests",
             "observability_rules",
             "observability_adot",
+            "observability_drift",
             "adot_image",
             *ADMIN_CONFIG_CHANGE_FIELDS,
         }
@@ -308,7 +332,7 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
     return ReleaseDiff(kind=kind, changed=normalized)
 
 
-def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
+def classify_release(release: RegionalRelease, state: dict[str, Any]) -> ReleaseDiff:
     desired = {
         "control_plane_wheel": release.wheel_sha,
         "executor_wheel": release.executor_wheel_sha,
@@ -328,6 +352,9 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "admin_config_worker": release.admin_config_role_digests["worker"],
         "admin_config_spool": release.admin_config_role_digests["spool"],
         "release_delivery": release.config.release_delivery_sha256,
+        "aurora_refresh_manifests": release.config.delivery_component_digests.get(
+            "aurora_refresh"
+        ),
         "cpu_manifests": release.config.delivery_component_digests.get("cpu"),
         "cpu_ingress_manifests": release.config.delivery_component_digests.get(
             "cpu_ingress"
@@ -355,6 +382,12 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "rendered_manifests": release.rendered_manifest_digest,
         "node_template": release.node_template_sha,
         "runtime_image": release.runtime_image,
+        "executor_image": release.executor_image,
+        "node_dependencies": node_dependency_pin(
+            release.config.release_delivery_identity.get("images", {}).get(
+                "node_dependencies"
+            )
+        ),
         "node_installer_image": release.node_installer_image,
         "dcgm_image": release.dcgm_exporter_image,
         "adot_image": release.adot_image,
@@ -384,6 +417,7 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
             (state.get("admin_config_role_sha256") or {}).get("spool")
         ),
         "release_delivery": state.get("release_delivery_sha256"),
+        "aurora_refresh_manifests": state.get("aurora_refresh_manifest_sha256"),
         "cpu_manifests": state.get("cpu_manifest_sha256"),
         "cpu_ingress_manifests": state.get("cpu_ingress_manifest_sha256"),
         "cpu_worker_manifests": state.get("cpu_worker_manifest_sha256"),
@@ -408,11 +442,25 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "rendered_manifests": state.get("rendered_manifest_sha256"),
         "node_template": state.get("node_template_sha256"),
         "runtime_image": state.get("runtime_image"),
+        "executor_image": state.get("executor_image")
+        or (
+            state.get("runtime_image")
+            if int(state.get("release_manifest_schema_version") or 3) < 4
+            else None
+        ),
+        "node_dependencies": node_dependency_pin(state.get("node_dependencies")),
         "node_installer_image": state.get("node_installer_image"),
         "dcgm_image": state.get("dcgm_image"),
         "adot_image": state.get("adot_image"),
     }
-    changed = frozenset(
-        name for name, value in desired.items() if current.get(name) != value
-    )
+    changed = set(name for name, value in desired.items() if current.get(name) != value)
+    if state and release._observability_drift():
+        changed.add("observability_drift")
+    if state and release._aurora_refresh_drift():
+        changed.add("aurora_refresh_drift")
+    if AURORA_PREREQUISITE_REPAIR_KEY in state and not (
+        state.get("transaction_committed") is False
+        and isinstance(state.get("previous"), dict)
+    ):
+        changed.add("aurora_refresh_drift")
     return diff_from_changed(changed)

@@ -15,6 +15,7 @@ is false before and after: the Secret and the durable head agree.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
@@ -71,8 +72,8 @@ def positive_seconds(value: Any, *, default: float, label: str) -> float:
         parsed = float(str(value).strip())
     except ValueError as exc:
         raise ValueError(f"{label} is not a number: {value!r}") from exc
-    if parsed <= 0:
-        raise ValueError(f"{label} must be positive: {value!r}")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{label} must be finite and positive: {value!r}")
     return parsed
 
 
@@ -197,6 +198,12 @@ def sampler_errors(
         stale_seconds + READINESS_RECOVERY_MARGIN_SECONDS
     )
     times = [float(item.get("t") or 0) for item in samples]
+    if any(not math.isfinite(moment) or moment <= 0 for moment in times):
+        return [f"{pod}: the probe has invalid sample timestamps"]
+    gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+    # Two 3s HTTP request budgets plus two sampling intervals for scheduling.
+    if any(gap <= 0 or gap > 6 + 2 * SAMPLE_INTERVAL_SECONDS for gap in gaps):
+        errors.append(f"{pod}: the probe timeline has reordered or missing samples")
     if min(times) > failover_requested_at.timestamp():
         errors.append(f"{pod}: the probe started after the failover was requested")
     if max(times) < recovery_deadline:
@@ -212,10 +219,17 @@ def sampler_errors(
                 "never fail during an Aurora outage"
             )
         healthz = item.get("healthz")
-        if isinstance(healthz, int) and healthz >= 500 and healthz != 503:
+        if healthz is not None and healthz not in {200, 503}:
             errors.append(
                 f"{pod}: /healthz answered {healthz} at {moment:.0f}; only 503 "
                 "is a readiness answer"
+            )
+        if healthz == 200 and (
+            item.get("registry_ready") is not True
+            or item.get("secret_drift") is not False
+        ):
+            errors.append(
+                f"{pod}: a 200 readiness response has no healthy registry proof"
             )
         if healthz is None and livez == 200:
             errors.append(
@@ -241,11 +255,13 @@ def readiness_outage_seconds(samples: list[dict[str, Any]]) -> float:
 
     total = 0.0
     previous: float | None = None
+    previous_unhealthy = False
     for item in sorted(samples, key=lambda entry: float(entry.get("t") or 0)):
         moment = float(item.get("t") or 0)
-        if previous is not None and item.get("healthz") != 200:
+        if previous is not None and previous_unhealthy:
             total += moment - previous
         previous = moment
+        previous_unhealthy = item.get("healthz") != 200
     return round(total, 3)
 
 
@@ -313,6 +329,8 @@ def replacement_errors(
     name = str(replacement.get("name") or "")
     if not name or name == deleted_pod:
         errors.append("no replacement Pod distinct from the deleted one was found")
+    if not replacement.get("uid"):
+        errors.append("replacement Pod has no UID")
     if replacement.get("ready") is not True:
         errors.append(f"replacement Pod {name} never became Ready")
     if int(replacement.get("restarts") or 0):
@@ -326,6 +344,8 @@ def replacement_errors(
     ready_at = parse_time(replacement.get("ready_at"))
     if ready_at is None:
         errors.append(f"replacement Pod {name} has no ready_at")
+    elif ready_at < deleted_at:
+        errors.append(f"replacement Pod {name} was Ready before the deletion")
     elif (ready_at - deleted_at).total_seconds() > budget_seconds:
         errors.append(
             f"replacement Pod {name} took "

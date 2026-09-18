@@ -30,6 +30,7 @@ class FakeBackend:
         self, *, revoked_status: int = 403, uninstall: dict[str, Any] | None = None
     ):
         self.cluster_ids = {"cluster-a"}
+        self.worker_generation = 1
         self.calls: list[str] = []
         self.revoked_status = revoked_status
         self.uninstall_result = uninstall or {
@@ -44,20 +45,38 @@ class FakeBackend:
     def snapshot(self) -> dict[str, Any]:
         values = sorted(self.cluster_ids)
         return {
+            "release_id": "release-a",
             "site_cluster_ids": values,
             "registry_secret_cluster_ids": values,
             "release_state_cluster_ids": values,
             "installation_registry_cluster_ids": values,
             "cpu_control_plane_ready": True,
+            "membership_cpu": {
+                "publication": {"map_sha256": ",".join(values)},
+                "deployments": {
+                    name: {
+                        "uid": name,
+                        "generation": self.worker_generation
+                        if name == "gpu-fault-control-worker"
+                        else 1,
+                    }
+                    for name in (
+                        "gpu-fault-api-ha",
+                        "gpu-fault-control-worker",
+                        "gpu-fault-telemetry-spool-worker",
+                    )
+                },
+            },
         }
 
     def join(self, fault: str | None = None) -> dict[str, Any]:
         self.calls.append(f"join:{fault}")
-        if fault == "before-site-commit":
+        if fault == "before-activation":
             return {"phase": "ROLLED_BACK", "cluster_id": "cluster-b"}
         self.cluster_ids.add("cluster-b")
-        if fault == "after-site-commit":
-            return {"phase": "FAILED_AFTER_COMMIT", "cluster_id": "cluster-b"}
+        self.worker_generation += 1
+        if fault == "after-activation":
+            return {"phase": "FAILED_AFTER_ACTIVATION", "cluster_id": "cluster-b"}
         return {"phase": "COMPLETED", "cluster_id": "cluster-b"}
 
     def capture_joined_token(self, cluster_id: str) -> dict[str, Any]:
@@ -67,6 +86,7 @@ class FakeBackend:
     def remove(self, cluster_id: str) -> dict[str, Any]:
         self.calls.append(f"remove:{cluster_id}")
         self.cluster_ids.remove(cluster_id)
+        self.worker_generation += 1
         return {
             "phase": "COMPLETED",
             "cluster_id": cluster_id,
@@ -84,8 +104,8 @@ class FakeBackend:
         self.calls.append("uninstall")
         return dict(self.uninstall_result)
 
-    def cleanup_sensitive_files(self) -> None:
-        self.calls.append("cleanup")
+    def cleanup_sensitive_files(self, *, completed: bool = False) -> None:
+        self.calls.append("discard-credentials" if completed else "cleanup")
 
 
 def _recorder(tmp_path: Path) -> EvidenceRecorder:
@@ -102,7 +122,7 @@ def test_lifecycle_completes_and_cleans_up_last(tmp_path: Path) -> None:
     result = boot019.run_admin_lifecycle(backend, _recorder(tmp_path))
 
     assert result["status"] == "COMPLETED"
-    assert backend.calls[-2:] == ["uninstall", "cleanup"]
+    assert backend.calls[-3:] == ["uninstall", "cleanup", "discard-credentials"]
     assert backend.calls.count("cleanup") == 1
 
 
@@ -192,6 +212,7 @@ def test_final_registry_statuses_come_from_the_snapshot_file(tmp_path: Path) -> 
 def _live_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     token_file = tmp_path / "cluster-b.token"
     token_file.write_bytes(b"t" * 40 + b"\n")
+    (tmp_path / "ca.pem").write_bytes(b"fixture-trust-root")
     backend = boot019.LiveAdminLifecycleBackend(
         site_path=tmp_path / "site.yaml",
         gpu_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/gpu",
@@ -216,18 +237,17 @@ def _live_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     return backend
 
 
-def test_live_backend_keeps_the_captured_token_in_memory_only(
+def test_live_backend_protects_revocation_credentials_until_the_case_completes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = _live_backend(tmp_path, monkeypatch)
 
     capture = backend.capture_joined_token("cluster-b")
 
-    assert capture["token_storage"] == "memory"
+    assert capture["token_storage"] == "private-bound-file"
     assert "token_path" not in capture
-    assert not list((tmp_path / "run").rglob("*revoked-token*")), (
-        "the revoked token never reaches the run directory on disk"
-    )
+    files = list((tmp_path / "run").rglob("*revoked-token*"))
+    assert len(files) == 1 and files[0].stat().st_mode & 0o777 == 0o600
 
     seen: dict[str, str] = {}
 
@@ -253,7 +273,9 @@ def test_live_backend_keeps_the_captured_token_in_memory_only(
     assert seen["authorization"] == "Bearer " + "t" * 40
 
     backend.cleanup_sensitive_files()
-    with pytest.raises(boot019.AcceptanceCheckError, match="no captured token"):
+    assert backend.probe_revoked_token(capture)["status"] == 403
+    backend.cleanup_sensitive_files(completed=True)
+    with pytest.raises(ValueError, match="unavailable"):
         backend.probe_revoked_token(capture)
 
 
@@ -271,3 +293,118 @@ def test_runner_checks_survive_python_optimisation(name: str) -> None:
     tree = ast.parse((REGIONAL / name).read_text(encoding="utf-8"))
     asserts = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     assert asserts == [], f"{name} still uses bare assert at lines {asserts}"
+
+
+@pytest.mark.parametrize(
+    ("fault", "phase", "last_step"),
+    [
+        ("before-activation", "ROLLED_BACK", "REGISTRY_UPDATED"),
+        ("after-activation", "FAILED_AFTER_ACTIVATION", "ACTIVATION_STARTED"),
+    ],
+)
+def test_live_backend_injects_at_the_current_irreversible_boundary(
+    fault: str,
+    phase: str,
+    last_step: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault.admin import cluster_join_commit
+
+    backend = _live_backend(tmp_path, monkeypatch)
+    backend.join_state_dir.mkdir()
+    original = cluster_join_commit.complete_step
+    steps: list[str] = []
+
+    def join(_request: Any) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "evidence": {"DISCOVERED": {"cluster_id": "cluster-b"}}
+        }
+        path = backend.join_state_dir / "state.json"
+        try:
+            for step in ("SITE_UPDATED", "REGISTRY_UPDATED", "ACTIVATION_STARTED"):
+                steps.append(step)
+                cluster_join_commit.complete_step(path, state, step)
+        except boot019.InjectedAcceptanceFailure:
+            state["phase"] = (
+                "FAILED_AFTER_ACTIVATION"
+                if "ACTIVATION_STARTED" in state["completed_steps"]
+                else "ROLLED_BACK"
+            )
+            path.write_text(json.dumps(state), encoding="utf-8")
+            raise
+        pytest.fail("the intended fault must interrupt the local state machine")
+
+    monkeypatch.setattr(boot019, "join_cluster", join)
+
+    result = backend.join(fault)
+
+    assert result["phase"] == phase, "rollback direction must follow activation intent"
+    assert result["cluster_id"] == "cluster-b", (
+        "failure evidence must retain the target"
+    )
+    assert steps[-1] == last_step, "the fault must be injected at the named boundary"
+    assert cluster_join_commit.complete_step is original, (
+        "the hook must always be restored"
+    )
+
+
+@pytest.mark.parametrize(
+    "overlap", ["none", "cpu", "baseline", "join", "self-join", "unknown"]
+)
+def test_lifecycle_epoch_cannot_touch_the_protected_clusters(
+    overlap: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def arn(name: str) -> str:
+        return f"arn:aws:eks:us-west-2:000000000000:cluster/{name}"
+
+    disposable = {
+        "cpu_eks_arn": arn("disposable-cpu"),
+        "clusters": [{"eks_cluster_arn": arn("disposable-gpu")}],
+    }
+    protected = {
+        "cpu_eks_arn": arn("persistent-cpu"),
+        "clusters": [{"eks_cluster_arn": arn("persistent-gpu")}],
+    }
+    join = arn("new-disposable-gpu")
+    if overlap == "cpu":
+        disposable["cpu_eks_arn"] = protected["cpu_eks_arn"]
+    elif overlap == "baseline":
+        disposable["clusters"] = protected["clusters"]
+    elif overlap == "join":
+        join = arn("persistent-gpu")
+    elif overlap == "self-join":
+        join = arn("disposable-gpu")
+    elif overlap == "unknown":
+        join = "arn:aws:sagemaker:us-west-2:000000000000:cluster/unknown"
+    left, right = tmp_path / "disposable", tmp_path / "protected"
+    monkeypatch.setattr(
+        boot019,
+        "load_site",
+        lambda path, **_kw: SimpleNamespace(
+            release_config=disposable if path == left else protected
+        ),
+    )
+
+    if overlap == "none":
+        result = boot019.epoch_targets(left, right, join)
+        assert result["protected_cpu_eks_arn"] == arn("persistent-cpu"), (
+            "the plan must preserve the protected physical target"
+        )
+    else:
+        with pytest.raises(boot019.AcceptanceCheckError, match="overlap|physical"):
+            boot019.epoch_targets(left, right, join)
+
+
+def test_lifecycle_entrypoint_requires_a_protected_site() -> None:
+    with pytest.raises(SystemExit):
+        boot019.parser().parse_args(
+            [
+                "--run-dir",
+                "/tmp/run",
+                "--site",
+                "/tmp/disposable",
+                "--gpu-cluster-arn",
+                "arn:aws:eks:us-west-2:000000000000:cluster/new",
+            ]
+        )

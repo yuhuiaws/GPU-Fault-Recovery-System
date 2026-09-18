@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from tests._script_loader import lazy_script_module
 
@@ -261,4 +266,215 @@ def test_existing_test_module_still_avoids_full_escalation() -> None:
     assert "tests/notifications/test_notifications.py" in plan.pytest_targets
     assert not any("no guard tests mapped" in reason for reason in plan.reasons), (
         plan.reasons
+    )
+
+
+def execution_plan(
+    targets: tuple[str, ...], *, full: bool = False, postgres: bool = False
+):
+    return MODULE.Plan(
+        changed_files=("inputs/changed.txt",),
+        domains=("metrics",),
+        pytest_targets=targets,
+        checks=("config-check",),
+        safe_cases=(),
+        approval_cases=("GF-REGIONAL-DESTR-001",),
+        not_selected_families=("BOOT",),
+        full=full,
+        postgres=postgres,
+        reasons=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tests/native/test_future_rules.py",
+        "tests/native/test_future_rules.py::test_query[one]",
+        "tests/native",
+        "./tests/native",
+        "tests",
+    ],
+)
+def test_selected_promql_uses_make_metadata_and_binds_only_the_pytest_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    plan = execution_plan((target,), postgres=True)
+    original_plan = plan.as_dict()
+    monkeypatch.delenv("PROMTOOL", raising=False)
+    monkeypatch.setenv("GPU_FAULT_TEST_POSTGRES_URL", "explicit-test-reference")
+    monkeypatch.delenv("PYTEST_GPU_FAULT_POSTGRES_ALLOCATION_DIR", raising=False)
+    monkeypatch.setenv("HOME", "/original/build-home")
+    monkeypatch.setenv("PGPASSFILE", "/original/pgpass")
+    monkeypatch.setenv("COSIGN_PASSWORD", "example-test-only-signing-password")
+    parent = dict(os.environ)
+    calls: list[tuple[list[str], dict]] = []
+
+    def run(command, **options):
+        calls.append((list(command), options))
+        if "promql-test-files" in command:
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(["tests/native/test_future_rules.py"])
+            )
+        if "promtool-preflight" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {"status": "ready", "promtool": sys.executable, "version": "3.14.0"}
+                ),
+            )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(
+        MODULE, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    MODULE.execute_plan(plan, settings(), root=tmp_path)
+    assert [command[3] for command, _ in calls[:2]] == [
+        "promql-test-files",
+        "promtool-preflight",
+    ], "Make metadata and the tool-only probe must precede every selected gate"
+    assert calls[2][0] == ["make", "config-check", f"PYTHON={sys.executable}"], (
+        "the original static selection must remain intact"
+    )
+    assert "env" not in calls[2][1], (
+        "static gates must retain their existing environment"
+    )
+    command, options = calls[3]
+    assert command == [sys.executable, "-m", "pytest", "-q", target], (
+        "the guard must preserve the exact pytest node/directory selection"
+    )
+    child = options["env"]
+    assert child["PROMTOOL"] == sys.executable, (
+        "pytest must receive the absolute path returned by the tool-only probe"
+    )
+    assert (
+        child["HOME"] == parent["HOME"] and child["PGPASSFILE"] == parent["PGPASSFILE"]
+    ), "binding promtool must not load the native PostgreSQL allocation"
+    assert "COSIGN_PASSWORD" not in child, "selected tests cannot consume signing data"
+    native, native_options = calls[4]
+    assert native == ["make", "test-postgres-stress", f"PYTHON={sys.executable}"], (
+        "PromQL binding cannot alter native test permissions or selection"
+    )
+    assert native_options["env"] == parent, (
+        "only the original native environment applies"
+    )
+    assert dict(os.environ) == parent, (
+        "a Make child's tool binding cannot mutate the parent"
+    )
+    assert plan.as_dict() == original_plan, (
+        "the dependency guard changed acceptance risks"
+    )
+
+
+@pytest.mark.parametrize(
+    "targets,full",
+    [
+        ((), False),
+        (("tests/plain.py",), False),
+        (("tests/native-other",), False),
+        ((), True),
+    ],
+)
+def test_unrelated_or_full_selections_do_not_gain_a_selective_tool_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    targets: tuple[str, ...],
+    full: bool,
+) -> None:
+    monkeypatch.setenv("PROMTOOL", str(tmp_path / "unavailable"))
+    calls: list[tuple[list[str], dict]] = []
+
+    def run(command, **options):
+        calls.append((list(command), options))
+        assert "promtool-preflight" not in command, (
+            "unrelated selections must not depend on promtool; full Make owns its preflight"
+        )
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps(["tests/native/test_future_rules.py"])
+        )
+
+    monkeypatch.setattr(
+        MODULE, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    MODULE.execute_plan(execution_plan(targets, full=full), settings(), root=tmp_path)
+    execution = [
+        (command, options)
+        for command, options in calls
+        if "promql-test-files" not in command
+    ]
+    expected = [
+        ["make", "check" if full else "config-check", f"PYTHON={sys.executable}"]
+    ]
+    if targets and not full:
+        expected.append([sys.executable, "-m", "pytest", "-q", *targets])
+    assert [command for command, _ in execution] == expected, (
+        "dependency protection must not expand test or regional execution"
+    )
+    assert all("env" not in options for _, options in execution), (
+        "non-PromQL execution must keep its original environment contract"
+    )
+    assert len(calls) == len(expected) + bool(targets and not full), (
+        "only nonempty selective test plans need read-only Make metadata"
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["not-json", "null", "[]", '[""]', '{"files": ["tests/native/test_rules.py"]}'],
+)
+def test_invalid_make_metadata_refuses_before_selective_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(command, **_options):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, metadata)
+
+    monkeypatch.setattr(
+        MODULE, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    with pytest.raises(MODULE.ImpactError):
+        MODULE.execute_plan(
+            execution_plan(("tests/native",)), settings(), root=tmp_path
+        )
+    assert len(calls) == 1 and "promql-test-files" in calls[0], (
+        "unknown dependency metadata cannot authorize static, pytest or native work"
+    )
+
+
+@pytest.mark.parametrize("defect", ["json", "status", "path", "version", "extra"])
+def test_invalid_tool_binding_refuses_before_selective_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    binding = {"status": "ready", "promtool": sys.executable, "version": "3.14.0"}
+    if defect == "status":
+        binding["status"] = "checked"
+    elif defect == "path":
+        binding["promtool"] = "relative/promtool"
+    elif defect == "version":
+        binding["version"] = ""
+    elif defect == "extra":
+        binding["unexpected"] = "value"
+    calls: list[list[str]] = []
+
+    def run(command, **_options):
+        calls.append(command)
+        output = (
+            json.dumps(["tests/native/test_rules.py"])
+            if "promql-test-files" in command
+            else ("not-json" if defect == "json" else json.dumps(binding))
+        )
+        return subprocess.CompletedProcess(command, 0, output)
+
+    monkeypatch.setattr(
+        MODULE, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    with pytest.raises(MODULE.ImpactError):
+        MODULE.execute_plan(
+            execution_plan(("tests/native",)), settings(), root=tmp_path
+        )
+    assert len(calls) == 2 and "promtool-preflight" in calls[1], (
+        "a zero-exit preflight without a validated binding must not launch any tests"
     )

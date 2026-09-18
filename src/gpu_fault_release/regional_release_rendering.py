@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -12,10 +12,18 @@ from gpu_fault.admin.config import AdminConfig
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
+from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refresh
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
     render_nlb_manifest,
+    ses_configuration_set,
+)
+from gpu_fault_release.regional_release_images import (
+    NodeDependencyTarget,
+    node_dependency_environment,
+    previous_node_dependency_environment,
+    previous_node_template_environment,
 )
 
 from gpu_fault.dcgm_exporter_cadence import (
@@ -25,6 +33,8 @@ from gpu_fault.dcgm_exporter_cadence import (
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY as INSTANCE_TYPES
 
 ROOT = repository_root()
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
 #: What the checked-in DaemonSet carries in place of the instance-type list.
@@ -160,7 +170,9 @@ def render_dataplane_adot_manifest(
     return text
 
 
-def dataplane_adot_skip_reason(release: Any, target: ClusterTarget) -> str | None:
+def dataplane_adot_skip_reason(
+    release: RegionalRelease, target: ClusterTarget
+) -> str | None:
     """Why the collector cannot be applied to ``target``, or ``None``.
 
     The two prerequisites live outside the repository: the site's AMP
@@ -185,7 +197,7 @@ def dataplane_adot_skip_reason(release: Any, target: ClusterTarget) -> str | Non
 
 
 def render_dataplane_adot_for_target(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     *,
     image: str | None = None,
@@ -301,7 +313,7 @@ def _payload_digest(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def render_release_payload(release: Any) -> dict[str, Any]:
+def render_release_payload(release: RegionalRelease) -> dict[str, Any]:
     """The manifests and digests a release delivers, as one JSON-able payload.
 
     When the release carries an ``approved_manifest_digest`` -- the digest the
@@ -324,11 +336,36 @@ def render_release_payload(release: Any) -> dict[str, Any]:
     return payload
 
 
-def rendered_release_manifest_sha256(release: Any) -> str:
+def rendered_release_manifest_sha256(release: RegionalRelease) -> str:
     return _payload_digest(render_release_payload(release))
 
 
-def render_cpu_manifest_text(release: Any, filename: str, text: str) -> str:
+def render_notification_config_maps(text: str, *, configuration_set: str | None) -> str:
+    """Set the SES value structurally, preserving manifests without this key."""
+
+    value = (
+        ses_configuration_set(configuration_set, "notifications.ses_configuration_set")
+        or ""
+    )
+    documents = list(yaml.safe_load_all(text))
+    changed = False
+    for document in documents:
+        if not isinstance(document, dict) or document.get("kind") != "ConfigMap":
+            continue
+        data = document.get("data")
+        if isinstance(data, dict) and "GPU_FAULT_SES_CONFIGURATION_SET" in data:
+            if data["GPU_FAULT_SES_CONFIGURATION_SET"] != value:
+                data["GPU_FAULT_SES_CONFIGURATION_SET"] = value
+                changed = True
+    if not changed:
+        return text
+    rendered = yaml.safe_dump_all(documents, sort_keys=False, width=72)
+    if not isinstance(rendered, str):
+        raise ReleaseError("notification ConfigMap renderer did not produce YAML text")
+    return rendered
+
+
+def render_cpu_manifest_text(release: RegionalRelease, filename: str, text: str) -> str:
     """One generated CPU manifest with every release-time placeholder filled.
 
     Mirrors the ``sed`` in ``apply-control-plane-role-split.sh``; the two must
@@ -361,10 +398,12 @@ def render_cpu_manifest_text(release: Any, filename: str, text: str) -> str:
     )
     if "REPLACE_WITH" in text:
         raise ReleaseError(f"{filename} still contains a placeholder")
-    return text
+    return render_notification_config_maps(
+        text, configuration_set=config.notifications.ses_configuration_set
+    )
 
 
-def _render_release_payload(release: Any) -> dict[str, Any]:
+def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
     config = release.config
     generated = ROOT / "deploy/control-plane/regional/generated"
     manifest_names = [
@@ -407,15 +446,10 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
         }.items():
             schema_text = schema_text.replace(source, destination)
         schema_documents.extend(_documents(schema_text))
-    refresh_text = (
-        ROOT / "deploy/control-plane/regional/aurora-credential-refresh.yaml"
-    ).read_text(encoding="utf-8")
-    refresh_text = refresh_text.replace(
-        "namespace: gpu-fault-system",
-        f"namespace: {config.namespace}",
-    ).replace(
-        DEFAULT_RUNTIME_IMAGE,
-        release.runtime_image,
+    refresh_text = render_aurora_refresh(
+        namespace=config.namespace,
+        runtime_image=release.runtime_image,
+        wheel_config_map=release.wheel_cm,
     )
 
     nlb_documents = (
@@ -474,8 +508,11 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
                 "template_source_sha256": release.node_template_sha,
                 "config_digest": config.agent_config_digest,
                 "runtime_profile_version": config.runtime_profile_version,
-                "runtime_image": release.runtime_image,
+                "runtime_image": release.executor_image,
                 "node_installer_image": release.node_installer_image,
+                "node_dependencies": config.release_delivery_identity.get(
+                    "images", {}
+                ).get("node_dependencies"),
             }
             for target in config.clusters
         },
@@ -484,7 +521,7 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
 
 
 def stamp_gpu_deployments(
-    release: Any,
+    release: RegionalRelease,
     text: str,
     *,
     executor_artifact_sha: str | None = None,
@@ -515,25 +552,37 @@ def stamp_gpu_deployments(
                 "gpu-fault.io/release-wheel-sha256": artifact_sha,
                 "gpu-fault.io/executor-wheel-sha256": artifact_sha,
                 "gpu-fault.io/executor-compatibility-digest": compatibility_digest,
-                "gpu-fault.io/runtime-image": (runtime_image or release.runtime_image),
+                "gpu-fault.io/runtime-image": (runtime_image or release.executor_image),
             }
         )
-    return yaml.safe_dump_all(
+    result = yaml.safe_dump_all(
         documents,
         sort_keys=False,
         width=72,
     )
+    if not isinstance(result, str):
+        raise ReleaseError("GPU deployment renderer did not produce YAML text")
+    return result
 
 
 def build_cpu_apply_environment(
-    release: Any,
+    release: RegionalRelease,
     *,
     finalize: bool,
     runtime_profile_version: str | None = None,
 ) -> dict[str, str]:
     config = release.config
     return {
-        **os.environ,
+        **{
+            name: value
+            for name, value in os.environ.items()
+            if name
+            not in {
+                "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE",
+                "GPU_FAULT_NOTIFICATION_CHANNEL",
+                "GPU_FAULT_SNS_TOPIC_ARN",
+            }
+        },
         **admin_config_renderer_environment(config.admin_config),
         # Present only when site.yaml spec.retention turns archive-first
         # deletion on; the renderer forwards these to the control-worker.
@@ -565,6 +614,9 @@ def build_cpu_apply_environment(
         "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": str(
             config.notifications.acknowledge_external_alert_channel
         ).lower(),
+        "GPU_FAULT_SES_CONFIGURATION_SET": (
+            config.notifications.ses_configuration_set or ""
+        ),
         "GPU_FAULT_NOTIFICATION_CONFIG_SHA256": notification_digest(
             config.notifications
         ),
@@ -584,11 +636,14 @@ def build_cpu_apply_environment(
         ),
         "GPU_FAULT_FINALIZE_AGENT_PIN": str(finalize).lower(),
         "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": str(finalize).lower(),
+        "GPU_FAULT_LEGACY_COMPONENT_PINS": "false",
+        "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS": "false",
+        "GPU_FAULT_FORCE_ROLE_RESTART": "false",
     }
 
 
 def render_gpu_rollout_manifests(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     wheel_cm: str,
     *,
@@ -618,7 +673,7 @@ def render_gpu_rollout_manifests(
             ).removesuffix(".xz")
         ),
         "namespace: gpu-fault-system": f"namespace: {config.namespace}",
-        DEFAULT_RUNTIME_IMAGE: runtime_image or release.runtime_image,
+        DEFAULT_RUNTIME_IMAGE: runtime_image or release.executor_image,
         "REPLACE_WITH_AWS_REGION": target.region,
         "REPLACE_WITH_RUNTIME_PROFILE_VERSION": profile_version,
         "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": target.executor_irsa_role_arn,
@@ -650,7 +705,7 @@ def render_gpu_rollout_manifests(
 
 
 def build_reconciler_environment(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     *,
     wheel_cm: str,
@@ -663,15 +718,23 @@ def build_reconciler_environment(
     bundle_sha256: str | None = None,
     template_sha256: str | None = None,
     template_config_map: str | None = None,
+    template_content_sha256: str | None = None,
     allowed_node_names: tuple[str, ...] | None = None,
     max_unavailable: int | None = None,
     sync_registry: bool = True,
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
+    node_dependency_target: NodeDependencyTarget = NodeDependencyTarget.CANDIDATE,
 ) -> dict[str, str]:
     config = release.config
     environment = {
         **os.environ,
+        "GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256": "",
+        "GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP": "",
+        "GPU_FAULT_RECONCILER_PRODUCTS_FILE": "",
+        "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP": "",
+        "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256": "",
+        "GPU_FAULT_INSTALLER_TEMPLATE_PATH": "",
         "GPU_FAULT_KUBECTL_CONTEXT": target.context,
         "GPU_FAULT_NAMESPACE": config.namespace,
         "GPU_FAULT_CLUSTER_ID": target.cluster_id,
@@ -695,7 +758,7 @@ def build_reconciler_environment(
             # the wheel filename and re-derives the `.xz` key itself.
             (executor_wheel_filename or config.executor_wheel.name).removesuffix(".xz")
         ),
-        "GPU_FAULT_RUNTIME_IMAGE": runtime_image or release.runtime_image,
+        "GPU_FAULT_RUNTIME_IMAGE": runtime_image or release.executor_image,
         "GPU_FAULT_NODE_INSTALLER_IMAGE": (
             node_installer_image or release.node_installer_image
         ),
@@ -710,20 +773,78 @@ def build_reconciler_environment(
             runtime_profile_version or config.runtime_profile_version
         ),
     }
+    previous_template_identity: dict[str, str] = {}
+    if node_dependency_target is NodeDependencyTarget.PREVIOUS:
+        environment.update(
+            previous_node_dependency_environment(
+                release.state.get("previous"),
+                cluster_id=target.cluster_id,
+                bundle_cm=bundle_cm,
+                bundle_sha256=bundle_sha256,
+            )
+        )
+        previous_template_identity = previous_node_template_environment(
+            release.state.get("previous"),
+            cluster_id=target.cluster_id,
+            template_config_map=template_config_map,
+            template_sha256=template_sha256,
+        )
+        for name in (
+            "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
+            "GPU_FAULT_INSTALLER_BUNDLE_SHA256",
+        ):
+            environment[name] = previous_template_identity[name]
+    elif node_dependency_target is NodeDependencyTarget.CANDIDATE:
+        if config.release_manifest_schema_version >= 4 and (
+            bundle_cm != release.bundle_cm
+            or bundle_sha256 is not None
+            and bundle_sha256 != release.bundle_sha
+        ):
+            raise ReleaseError(
+                "candidate bundle disagrees with node dependency image target"
+            )
+        environment.update(
+            node_dependency_environment(
+                identity=config.release_delivery_identity.get("images", {}).get(
+                    "node_dependencies"
+                ),
+                required=config.release_manifest_schema_version >= 4,
+            )
+        )
+    else:
+        raise ReleaseError("node dependency image target is invalid")
     if target.fleet_master_file:
         environment["GPU_FAULT_FLEET_MASTER_FILE"] = target.fleet_master_file
         environment["GPU_FAULT_CONTROL_PLANE_KUBECONFIG"] = config.cpu_kubeconfig
     if template_config_map:
-        environment["GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP"] = template_config_map
+        if node_dependency_target is NodeDependencyTarget.PREVIOUS:
+            environment.update(previous_template_identity)
+            if (
+                template_content_sha256 is not None
+                and template_content_sha256
+                != (environment["GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"])
+            ):
+                raise ReleaseError(
+                    "rollback template disagrees with captured content pin"
+                )
+        else:
+            if not re.fullmatch(r"[0-9a-f]{64}", template_content_sha256 or ""):
+                raise ReleaseError(
+                    "explicit installer template requires a trusted content pin"
+                )
+            environment["GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP"] = template_config_map
+            environment["GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"] = str(
+                template_content_sha256
+            )
+    elif template_content_sha256 is not None:
+        raise ReleaseError(
+            "installer template content pin requires an explicit template"
+        )
     return environment
 
 
-# The reconciler deploy script's expensive, idempotent products -- the node
-# action key Secret (derived from the fleet master and mirrored to the control
-# plane) and the rendered template ConfigMap -- are made once per release and
-# handed to its later runs as hints through these variables. The script owns
-# the check that the hints are still true (live node set, live ConfigMap
-# content); this side owns the scope: same release, same render inputs.
+# Product reports describe work done for a release. They do not authorize
+# bypassing live key proof or the full trusted template content pin.
 INSTALLER_PRODUCTS_STATE_KEY = "node_installer_products"
 INSTALLER_REUSE_NODE_SET_ENV = "GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256"
 INSTALLER_REUSE_TEMPLATE_ENV = "GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP"
@@ -747,9 +868,15 @@ INSTALLER_PRODUCT_INPUT_ENV = (
     # one (a rollback's steady template) shares no products with a run that
     # renders; the rollback pays the full path, the join and upgrade do not.
     "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP",
+    "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256",
     "GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS",
     "GPU_FAULT_NODE_COMPATIBILITY_DIGEST",
     "GPU_FAULT_NODE_INSTALLER_IMAGE",
+    "GPU_FAULT_NODE_DEPENDENCY_IMAGE",
+    "GPU_FAULT_NODE_WHEELHOUSE_SHA256",
+    "GPU_FAULT_RUNTIME_IMAGE",
+    "GPU_FAULT_WHEEL_CONFIG_MAP",
+    "GPU_FAULT_EXECUTOR_WHEEL_FILENAME",
     "GPU_FAULT_NODE_ACTION_KEYS_SECRET",
     "GPU_FAULT_DCGM_METRICS_URL",
     "GPU_FAULT_REQUIRE_ROLLBACK_SLOT",
@@ -774,11 +901,7 @@ def recorded_installer_products(
     *,
     inputs_digest: str,
 ) -> dict[str, Any] | None:
-    """What an earlier run of *this* release produced for *these* inputs.
-
-    A record from another release, or from the same release with different
-    inputs (a rollback's steady template, a changed image), is not a hint.
-    """
+    """Return a scoped diagnostic record, never permission to bypass proof."""
 
     state = getattr(release, "state", None)
     if not isinstance(state, dict):

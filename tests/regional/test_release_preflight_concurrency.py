@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault_release import regional_release_aurora_refresh as REFRESH
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_preflight_concurrency as PREFLIGHT
@@ -39,7 +40,7 @@ class _Stop(RuntimeError):
 def _control_plane_diff() -> DIFF.ReleaseDiff:
     return DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
 
@@ -73,8 +74,8 @@ def _await(event: threading.Event, what: str) -> None:
 # --- the upgrade ---------------------------------------------------------------
 
 
-def test_upgrade_refresh_probes_and_capture_overlap() -> None:
-    """Each lane can only finish once the other two have started."""
+def test_upgrade_probes_and_capture_overlap_after_refresh() -> None:
+    """Read-only lanes overlap only after credentials have been prepared."""
 
     refresh_started = threading.Event()
     probe_started = threading.Event()
@@ -87,9 +88,13 @@ def test_upgrade_refresh_probes_and_capture_overlap() -> None:
             order.append(name)
 
     def refresh() -> dict:
+        assert not probe_started.is_set(), (
+            "store probes must wait until the credential refresh has completed"
+        )
+        assert not capture_started.is_set(), (
+            "the previous snapshot must wait until credentials are refreshed"
+        )
         refresh_started.set()
-        _await(probe_started, "the refresh")
-        _await(capture_started, "the refresh")
         note("refresh")
         return {"status": "refreshed"}
 
@@ -121,9 +126,8 @@ def test_upgrade_refresh_probes_and_capture_overlap() -> None:
     with pytest.raises(_Stop):
         ORCHESTRATION.upgrade_release(release, diff=_control_plane_diff())
 
-    assert sorted(order[:3]) == ["capture", "idle", "refresh"], (
-        "all three lanes must complete before the first mutation"
-    )
+    assert order[0] == "refresh"
+    assert sorted(order[1:3]) == ["capture", "idle"]
     assert order[3] == "backup", "the Secret backup is the first step after the lanes"
 
 
@@ -141,8 +145,21 @@ def test_upgrade_capture_from_the_lane_is_the_previous_state(monkeypatch) -> Non
     def recover(_release, *, error, **_kwargs) -> None:
         raise error
 
+    previous = {
+        "metadata": {"release_id": "old"},
+        "aurora_refresh": {
+            "schema_version": 1,
+            "namespace": "gpu-fault-system",
+            "objects": [],
+            "absent": [
+                {"resource": resource, "name": REFRESH.CRONJOB_NAME}
+                for resource in sorted(REFRESH.OBJECT_RESOURCES)
+            ],
+            "absence_verified": True,
+        },
+    }
     release = _upgrade_double(
-        _capture_previous=lambda **_kwargs: {"metadata": {"release_id": "old"}},
+        _capture_previous=lambda **_kwargs: previous,
         _backup_release_secrets=lambda: {"cpu": None, "clusters": {}},
         _save_state=save_state,
     )
@@ -190,25 +207,47 @@ def test_a_busy_store_still_refuses_the_upgrade_with_the_same_error() -> None:
 
 
 def test_the_first_failure_in_declared_order_wins(capsys) -> None:
-    """Two failing lanes: the refresh's error is raised, the probe's is printed."""
+    """Independent read failures retain their order after all workers finish."""
 
-    release = _upgrade_double(
-        _refresh_aurora_credentials=lambda: (_ for _ in ()).throw(
-            ReleaseError("Aurora credential refresh Job x did not complete")
-        ),
-        _remote_commands_are_idle=lambda: False,
-    )
-
-    with pytest.raises(ReleaseError, match="credential refresh"):
-        ORCHESTRATION.upgrade_release(release, diff=_control_plane_diff())
+    with pytest.raises(ReleaseError, match="store failed"):
+        PREFLIGHT.run_preflight_lanes(
+            SimpleNamespace(),
+            (
+                PREFLIGHT.PreflightLane(
+                    "store-probes",
+                    lambda: (_ for _ in ()).throw(ReleaseError("store failed")),
+                ),
+                PREFLIGHT.PreflightLane(
+                    "previous-capture",
+                    lambda: (_ for _ in ()).throw(ReleaseError("capture failed")),
+                ),
+            ),
+            phase="upgrade-preflight",
+        )
 
     captured = capsys.readouterr()
-    assert "store-probes also failed" in captured.err, (
+    assert "previous-capture also failed" in captured.err, (
         "the second failure is reported beside the first"
     )
     assert "preflight-concurrent" in captured.err, (
         "the lane timing line is narrated even when a lane fails"
     )
+
+
+def test_failed_refresh_prevents_store_reads_and_previous_capture() -> None:
+    def refused_read(*_args, **_kwargs):
+        pytest.fail("a dependent read started before credentials were prepared")
+
+    release = _upgrade_double(
+        _refresh_aurora_credentials=lambda: (_ for _ in ()).throw(
+            ReleaseError("credential refresh failed")
+        ),
+        _remote_commands_are_idle=refused_read,
+        _capture_previous=refused_read,
+    )
+    with pytest.raises(ReleaseError, match="credential refresh failed"):
+        ORCHESTRATION.upgrade_release(release, diff=_control_plane_diff())
+    assert release.state == {}
 
 
 def test_a_refused_validation_never_pays_for_the_capture() -> None:
@@ -338,55 +377,32 @@ def _rollback_double(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def test_rollback_refresh_and_install_gate_overlap(monkeypatch) -> None:
-    refresh_started = threading.Event()
-    gate_started = threading.Event()
+def test_rollback_refresh_finishes_before_install_gate() -> None:
     order: list[str] = []
 
     def refresh() -> None:
-        refresh_started.set()
-        _await(gate_started, "the rollback refresh")
+        assert order == []
         order.append("refresh")
 
     def gate(**kwargs) -> dict:
-        gate_started.set()
-        _await(refresh_started, "the rollback install gate")
+        assert order == ["refresh"]
         order.append(f"gate:{kwargs['action']}:{kwargs['unreadable']}")
         return {"verdict": "clear"}
 
-    def plan(*_args, **_kwargs):
-        order.append("compensation-plan")
-        raise _Stop()
-
-    monkeypatch.setattr(ORCHESTRATION, "build_rollback_compensation_plan", plan)
     release = _rollback_double(
         _refresh_aurora_credentials=refresh, _require_no_inflight_installs=gate
     )
 
-    with pytest.raises(_Stop):
-        ORCHESTRATION.rollback_release(
-            release, state={"metadata": {}, "cpu_wheel": "w"}, automatic=True
-        )
-
-    assert sorted(order[:2]) == ["gate:rollback:proceed", "refresh"], (
-        "both rollback preflight lanes finished before the restore was planned"
+    verdict = PREFLIGHT.run_rollback_preflight(
+        release, check_installs=True, automatic=True
     )
-    assert order[2] == "compensation-plan", "planning follows the lanes"
-    assert release.state["inflight_installs"] == {"verdict": "clear"}, (
-        "the gate's verdict rides in the rollback state"
-    )
+    assert order == ["refresh", "gate:rollback:proceed"]
+    assert verdict == {"verdict": "clear"}
 
 
-def test_rollback_skips_the_install_gate_once_the_control_plane_is_restored(
-    monkeypatch,
-) -> None:
+def test_rollback_skips_the_install_gate_once_the_control_plane_is_restored() -> None:
     """A cleanup re-entry runs the refresh alone, on the calling thread."""
 
-    monkeypatch.setattr(
-        ORCHESTRATION,
-        "build_rollback_compensation_plan",
-        lambda *_a, **_k: (_ for _ in ()).throw(_Stop()),
-    )
     calls: list[str] = []
     release = _rollback_double(
         # The rollback reads its own completed phases from the live state.
@@ -399,8 +415,10 @@ def test_rollback_skips_the_install_gate_once_the_control_plane_is_restored(
         ),
     )
 
-    with pytest.raises(_Stop):
-        ORCHESTRATION.rollback_release(release, state={"metadata": {}})
+    assert (
+        PREFLIGHT.run_rollback_preflight(release, check_installs=False, automatic=False)
+        is None
+    )
 
     assert calls == [f"refresh:{threading.current_thread().name}"], (
         "a single lane runs inline, without a thread pool"

@@ -634,7 +634,13 @@ class HostTelemetryCollector(
         for sample in batch.samples:
             immediate = NodeHealthPolicy.METRIC_RULES.get(sample.name)
             if immediate is not None and sample.value >= immediate[0]:
-                reasons.add(f"threshold:{sample.name}")
+                reason = f"threshold:{sample.name}"
+                if sample.name == "efa_inventory_mismatch":
+                    # A different recovery path can be required while the gauge stays 1.
+                    reason += ":" + sample.labels.get(
+                        "failure_mode", "PCI_DEVICE_MISSING"
+                    )
+                reasons.add(reason)
             candidate = sustained.get(sample.name)
             if candidate is not None:
                 comparison, threshold = candidate

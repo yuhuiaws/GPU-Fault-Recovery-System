@@ -415,7 +415,7 @@ outcome = adapter.execute(
         incident=command.incident,
         step=command.step,
         step_index=command.step_index,
-        request=executor._execution_request(command),
+        request=executor.dispatch.execution_request(command),
         idempotency_key=command.idempotency_key,
     )
 )
@@ -484,8 +484,16 @@ def host_errors(
         errors.append("Node Agent ledger did not add exactly the expected command")
     if replay_service.get("MainPID") != first_service.get("MainPID"):
         errors.append("Fabric Manager MainPID changed during replay")
-    if {item["command_id"] for item in after_replay["ledger"]} != first_ids:
-        errors.append("Node Agent ledger grew during replay")
+    if replay_service.get("InvocationID") != first_service.get("InvocationID"):
+        errors.append("Fabric Manager InvocationID changed during replay")
+    if replay_service.get("ActiveState") != "active":
+        errors.append("Fabric Manager is not active after replay")
+    if after_replay["journal"].get("started_count") != 1:
+        errors.append(
+            "journal does not show exactly one Fabric Manager start after replay"
+        )
+    if after_replay["ledger"] != after_first["ledger"]:
+        errors.append("Node Agent ledger changed during replay")
     if baseline["gpu_fault_timers"] != after_replay["gpu_fault_timers"]:
         errors.append("gpu-fault timer inventory changed")
     return errors
@@ -499,6 +507,19 @@ def preflight_identity(preflight: dict[str, Any]) -> dict[str, Any]:
         "agent_generation": (store.get("agent") or {}).get("generation"),
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
     }
+
+
+def prepare_host_baseline(fixture: HostProbeFixture, case_dir: Path) -> dict[str, Any]:
+    fixture.create()
+    baseline_host = fixture.execute("snapshot")
+    write_json_atomic(case_dir / "host-baseline.json", baseline_host)
+    if not baseline_host["kmsg_writable"]:
+        raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
+    if baseline_host["compute_clients"]:
+        raise RegionalFixtureError("target node has active NVIDIA compute clients")
+    if baseline_host["fabric_manager"].get("ActiveState") != "active":
+        raise RegionalFixtureError("Fabric Manager is not active at baseline")
+    return baseline_host
 
 
 def execute_case(
@@ -525,6 +546,7 @@ def execute_case(
     marker = f"destr010-{int(time.time())}-a{attempt}"
     fixture = HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -550,15 +572,9 @@ def execute_case(
     baseline_host: dict[str, Any] | None = None
     injected_at: datetime | None = None
     try:
-        fixture.create()
-        baseline_host = fixture.execute("snapshot")
-        write_json_atomic(case_dir / "host-baseline.json", baseline_host)
-        if not baseline_host["kmsg_writable"]:
-            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
-        if baseline_host["compute_clients"]:
-            raise RegionalFixtureError("target node has active NVIDIA compute clients")
-        if baseline_host["fabric_manager"].get("ActiveState") != "active":
-            raise RegionalFixtureError("Fabric Manager is not active at baseline")
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before probe creation")
+        baseline_host = prepare_host_baseline(fixture, case_dir)
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError(
                 "approved maintenance window ended before injection"
@@ -617,6 +633,10 @@ def execute_case(
 
         replay: dict[str, Any] = {}
         if not errors:
+            if datetime.now(timezone.utc) >= maintenance_window_end:
+                raise RegionalFixtureError(
+                    "maintenance window ended before Node Agent replay"
+                )
             replay = replay_command(regional, command)
             write_json_atomic(case_dir / "replay.json", replay)
             if replay.get("status") != "SUCCEEDED":

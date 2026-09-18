@@ -25,7 +25,12 @@ import pytest
 from gpu_fault.models import IncidentState
 from gpu_fault.store import SqliteStore
 from gpu_fault.store.shared.evidence_pins import EVIDENCE_PIN_WINDOW
-from gpu_fault.telemetry import EvidenceKind, EvidenceService
+from gpu_fault.telemetry import (
+    CollectorKind,
+    CollectorStatus,
+    EvidenceKind,
+    EvidenceService,
+)
 from tests._builders import build_store, copy_model, fault_incident
 from tests.store._postgres_processor_claim_support import (
     _truncate,
@@ -176,3 +181,36 @@ def test_unexpired_and_pinned_rows_do_not_starve_the_limit(store) -> None:
     assert store.cleanup_expired_raw_evidence(now=SWEEP_AT, limit=2) == 2
     assert store.cleanup_expired_raw_evidence(now=SWEEP_AT, limit=2) == 1
     assert _remaining(store) == ["ev-pinned"]
+
+
+@pytest.mark.parametrize("collector", ["HMA_NODE", "HMA_CLOUDWATCH"])
+def test_retired_collector_status_and_evidence_survive_round_trip(
+    store, collector
+) -> None:
+    status = CollectorStatus.model_validate(
+        {
+            "cluster_id": "cluster-a",
+            "node_id": "node-a",
+            "collector": collector,
+            "observed_at": NOW.isoformat(),
+            "ingested_at": NOW.isoformat(),
+        }
+    )
+    assert store.save_collector_status(status)
+    restored = store.list_collector_statuses("cluster-a", "node-a")
+    assert len(restored) == 1
+    assert restored[0].collector is CollectorKind(collector)
+    payload = {"source": collector, "fault_details": ["historical observation"]}
+    evidence = EvidenceService(store).capture(
+        record_id="legacy-hma",
+        cluster_id="cluster-a",
+        node_id="node-a",
+        kind=EvidenceKind("HMA"),
+        observed_at=NOW,
+        attempt_ids=["attempt-a"],
+        payload=payload,
+    )
+    records = store.list_raw_evidence("cluster-a", limit=100)
+    assert len(records) == 1
+    assert records[0].model_dump(mode="json") == evidence.model_dump(mode="json")
+    assert records[0].payload == payload

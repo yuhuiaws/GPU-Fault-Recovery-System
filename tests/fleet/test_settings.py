@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from gpu_fault.fleet_compatibility import CURRENT_AGENT_PROTOCOL_VERSION
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.settings import ControlPlaneSettings
 
@@ -208,7 +209,10 @@ def test_agent_registry_protocol_defaults_to_current_version() -> None:
 
     settings = ControlPlaneSettings.from_mapping(values)
 
-    assert settings.agent_registry.required_agent_protocol_version == 3
+    assert (
+        settings.agent_registry.required_agent_protocol_version
+        == CURRENT_AGENT_PROTOCOL_VERSION
+    )
     assert settings.agent_registry.endpoint_require_tls is True
 
 

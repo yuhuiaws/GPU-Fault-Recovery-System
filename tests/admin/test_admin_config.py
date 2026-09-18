@@ -528,12 +528,15 @@ def test_admin_config_file_merges_omitted_fields_with_current_state(
     tmp_path: Path,
 ) -> None:
     current = preset_admin_config("32-disabled")
+    current = replace(
+        current, capacity=replace(current.capacity, control_worker_replicas=5)
+    )
     path = _config_file(tmp_path, {"telemetrySpool": {"enabled": True, "replicas": 3}})
 
     desired = load_admin_config_file(path, base=current)
 
     assert desired.capacity.remediation == current.capacity.remediation
-    assert desired.capacity.control_worker_replicas == 6
+    assert desired.capacity.control_worker_replicas == 5
     assert desired.capacity.telemetry_spool.enabled is True
     assert desired.capacity.telemetry_spool.replicas == 3
     assert desired.aurora == current.aurora

@@ -41,6 +41,7 @@ import shlex
 import sqlite3
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -610,8 +611,8 @@ def build_legacy_ledger(path: Path, *, now: datetime) -> list[str]:
     from gpu_fault.models import WorkflowOperation
     from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 
-    if path.exists():
-        path.unlink()
+    if path.exists() or path.is_symlink():
+        raise ProbeError("refusing to overwrite an existing scratch ledger")
     connection = sqlite3.connect(str(path), isolation_level=None)
     try:
         for statement in LEGACY_STATEMENTS:
@@ -649,6 +650,18 @@ def build_legacy_ledger(path: Path, *, now: datetime) -> list[str]:
 
 
 def migration_drill_report(
+    scratch: Path, *, now: datetime | None = None
+) -> dict[str, Any]:
+    if scratch.exists() or scratch.is_symlink():
+        raise ProbeError("refusing to overwrite an existing scratch ledger")
+    scratch.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="destr019-ledger-", dir=scratch.parent
+    ) as root:
+        return _migration_drill_report(Path(root) / scratch.name, now=now)
+
+
+def _migration_drill_report(
     scratch: Path, *, now: datetime | None = None
 ) -> dict[str, Any]:
     """Build, migrate and re-read one scratch ledger; return the evidence.

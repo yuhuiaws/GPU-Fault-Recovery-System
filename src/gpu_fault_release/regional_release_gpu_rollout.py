@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
@@ -24,9 +25,11 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseExecutionPlan,
     build_execution_plan,
 )
+from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_gpu_stage import GpuStageStep, run_gpu_stage
 from gpu_fault_release.regional_release_rendering import render_gpu_rollout_manifests
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 ProgressSelection = ReleaseComponent | tuple[ReleaseComponent, ...]
 ProgressCallback = Callable[[ProgressSelection, str, dict[str, Any] | None], None]
@@ -41,7 +44,9 @@ COMPLETION_WATCHER_STATE_CONFIG_MAPS = (
     "gpu-fault-completion-watcher-outbox-active",
 )
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
-NODE_INVENTORY_ATTRIBUTE = "_gpu_node_inventory"
+NODE_INVENTORY: ContextVar[tuple[object, dict[str, list[dict[str, Any]]]] | None] = (
+    ContextVar("gpu_fault_release_node_inventory", default=None)
+)
 #: Label on every Role/RoleBinding this module renders into a workload
 #: namespace. Pruning selects by it, so nothing an operator created by hand in
 #: the same namespace is ever touched.
@@ -424,12 +429,11 @@ def node_inventory_scope(release: Any):
     gates stay outside this scope and read with ``fresh=True``.
     """
 
-    previous = getattr(release, NODE_INVENTORY_ATTRIBUTE, None)
-    setattr(release, NODE_INVENTORY_ATTRIBUTE, {})
+    token = NODE_INVENTORY.set((release, {}))
     try:
         yield
     finally:
-        setattr(release, NODE_INVENTORY_ATTRIBUTE, previous)
+        NODE_INVENTORY.reset(token)
 
 
 def gpu_node_items(
@@ -442,7 +446,12 @@ def gpu_node_items(
     # gates must observe live node state, never a value another step captured
     # seconds earlier. They also must not run inside `read_snapshot`, whose
     # cache would otherwise re-serve the first read until the deadline expires.
-    cache = None if fresh else getattr(release, NODE_INVENTORY_ATTRIBUTE, None)
+    if fresh and getattr(release, "_json_read_cache", None) is not None:
+        raise ReleaseError("fresh node safety reads cannot use a report snapshot")
+    scope = NODE_INVENTORY.get()
+    cache = (
+        scope[1] if not fresh and scope is not None and scope[0] is release else None
+    )
     if cache is not None and target.cluster_id in cache:
         return cache[target.cluster_id]
     value = release._get_json(gpu_node_command(release, target))
@@ -462,27 +471,15 @@ def preserve_completion_watcher_state(
     # Probed one object at a time so that the upgrade which introduces the
     # second one still preserves the first: the new object does not exist yet
     # and has to be applied, the outbox exists and must not be.
+    # A failed read must never authorize reapplying the empty state defaults.
     existing = set()
     for name in COMPLETION_WATCHER_STATE_CONFIG_MAPS:
-        returncode, _stdout, stderr = release.runner.probe_output(
-            release._gpu(
-                target,
-                "-n",
-                release.config.namespace,
-                "get",
-                "configmap",
-                name,
-            )
-        )
-        if not returncode:
+        if probe_resource(
+            release.runner,
+            release._gpu(target),
+            ResourceRef("configmap", "ConfigMap", name, release.config.namespace),
+        ).exists():
             existing.add(name)
-            continue
-        if "NotFound" in stderr or "not found" in stderr:
-            continue
-        raise ReleaseError(
-            f"{target.cluster_id} cannot inspect Completion Watcher state: "
-            + stderr.strip()
-        )
     if not existing:
         return text
     documents = [
@@ -975,6 +972,7 @@ def upgrade_gpu_target(
                 bundle_cm=release.bundle_cm,
                 artifact_sha=release.node_wheel_sha,
                 config_digest=release.config.agent_config_digest,
+                node_dependency_target=NodeDependencyTarget.CANDIDATE,
             ),
         )
 

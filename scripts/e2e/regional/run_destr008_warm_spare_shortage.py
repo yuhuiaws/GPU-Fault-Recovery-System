@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -13,11 +14,56 @@ from pathlib import Path
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for import_root in (ROOT, ROOT / "src"):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
+from gpu_fault.admin.operation_lock import site_operation_lock  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
+)
+from scripts.e2e.regional.destr008_admission import require_admission_api  # noqa: E402
+from scripts.e2e.regional.destr008_capabilities import read_capabilities  # noqa: E402
+from scripts.e2e.regional.destr008_cleanup_identity import (  # noqa: E402
+    require_cleanup_family,
+    require_cleanup_node,
+)
+from scripts.e2e.regional.destr008_contract import (  # noqa: E402
+    ALERT_SCENARIOS as ALERT_SCENARIOS,
+    BOUND_MARGIN_SECONDS as BOUND_MARGIN_SECONDS,
+    EXPECTED_REASON as EXPECTED_REASON,
+    SERVICE_UNIT as SERVICE_UNIT,
+    WORKFLOW_WAIT_SECONDS as WORKFLOW_WAIT_SECONDS,
+    agent_by_node as agent_by_node,
+    bound_errors as bound_errors,
+    capability as capability,
+    instance_type as instance_type,
+    observation_gpu_uuids as observation_gpu_uuids,
+    profile_errors as profile_errors,
+    scenario_admission_errors as scenario_admission_errors,
+    scenario_errors as scenario_errors,
+    terminal_execution as terminal_execution,
+    wait_timeout_seconds as wait_timeout_seconds,
+)
+from scripts.e2e.regional.destr008_gpu_holder import (  # noqa: E402
+    BoundedGpuHolderFixture as GpuHolderFixture,
+)
+from scripts.e2e.regional.destr008_controller_lock import controller_ownership  # noqa: E402
+from scripts.e2e.regional.destr008_journal import (  # noqa: E402
+    SCENARIOS as SCENARIOS,
+    ExecutionJournal,
+    ExecutionRecord,
+    ScenarioState,
+)
+from scripts.e2e.regional.destr008_safety import ShortageSafety  # noqa: E402
+from scripts.e2e.regional.fixture_ownership import (  # noqa: E402
+    file_digest,
+    fixture_binding,
+)
+from scripts.e2e.regional.probes.destr008_cancellation_protocol import (  # noqa: E402
+    Plan,
+    digest as plan_digest,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
@@ -44,13 +90,11 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     HYPERPOD_HEALTH_LABEL,
     INSTANCE_GROUP_LABEL,
-    INSTANCE_TYPE_LABELS,
     PROVIDER_REPLACE_EVENTS,
     QUARANTINE_TAINT,
     SPARE_LABEL,
     SPARE_POOL_STATE_ANNOTATION,
     SPARE_RESERVATION_ANNOTATION,
-    GpuHolderFixture,
     NodeMutationFixture,
     NodePatch,
     WarmSpareLiveFixture,
@@ -65,30 +109,6 @@ DEFAULT_MANIFEST = (
 CASE_ID = "GF-REGIONAL-DESTR-008"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-003"
 CONFIRMATION = "DESTR008_RUN_WARM_SPARE_SHORTAGE_MATRIX"
-SCENARIOS = (
-    "no-spare",
-    "topology-mismatch",
-    "kubernetes-not-ready",
-    "reserved-by-other",
-    "active-gpu-pod",
-    "agent-unavailable",
-)
-EXPECTED_REASON = {
-    "no-spare": (
-        "warm-spare replacement is required; "
-        "provider node replacement API fallback is disabled"
-    ),
-    "topology-mismatch": "insufficient healthy HyperPod spares",
-    "kubernetes-not-ready": "Kubernetes node is not Ready",
-    "reserved-by-other": "reserved by incident",
-    "active-gpu-pod": "active GPU resource pods exist",
-    "agent-unavailable": "node agent is not fleet-ready",
-}
-ALERT_SCENARIOS = set(SCENARIOS) - {"no-spare"}
-SERVICE_UNIT = {
-    "kubernetes-not-ready": "kubelet.service",
-    "agent-unavailable": "gpu-fault-node-agent.service",
-}
 # kubelet serves the probe's own `kubectl exec` channel, so its stop is handed
 # to a systemd timer that fires after the probe has already answered.
 SERVICE_STOP_DELAY_SECONDS = {
@@ -96,12 +116,6 @@ SERVICE_STOP_DELAY_SECONDS = {
     "agent-unavailable": 0,
 }
 SERVICE_RESTORE_SECONDS = 420
-# How long a scenario may wait for its workflow when nothing bounds the
-# mutation, and how far short of a bounded mutation's expiry the wait stops.
-# A wait that outlives the failsafe (kubelet back, holder exited) is a wait for
-# REPLACE_NODE to *succeed* -- a real failover nobody authorised.
-WORKFLOW_WAIT_SECONDS = 900
-BOUND_MARGIN_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -212,57 +226,6 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
     }
 
 
-def instance_type(snapshot: dict[str, Any]) -> str | None:
-    return next(
-        (
-            snapshot["labels"].get(key)
-            for key in INSTANCE_TYPE_LABELS
-            if snapshot["labels"].get(key)
-        ),
-        None,
-    )
-
-
-def agent_by_node(state: dict[str, Any], node: str) -> dict[str, Any] | None:
-    matches = [
-        item for item in state.get("agents") or [] if item.get("node_id") == node
-    ]
-    return cast(dict[str, Any], matches[0]) if len(matches) == 1 else None
-
-
-def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
-    for item in (profile or {}).get("capabilities", []):
-        if isinstance(item, dict) and item.get("capability") == name:
-            return cast(dict[str, Any], item)
-    return None
-
-
-def profile_errors(profile: dict[str, Any] | None) -> list[str]:
-    expected = {
-        "nodeReplace": ("gpu-fault-hyperpod-adapter", "regional-cluster-executor"),
-        "workloadStop": (
-            "gpu-fault-kubernetes-adapter",
-            "regional-cluster-executor",
-        ),
-        "workloadRestart": (
-            "gpu-fault-kubernetes-adapter",
-            "regional-cluster-executor",
-        ),
-    }
-    errors = []
-    for name, (owner, adapter) in expected.items():
-        item = capability(profile, name)
-        if item is None:
-            errors.append(f"runtime profile has no {name} capability")
-        elif (
-            item.get("mode") != "OWN"
-            or item.get("owner") != owner
-            or item.get("adapter") != adapter
-        ):
-            errors.append(f"{name} has the wrong owner or adapter")
-    return errors
-
-
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
@@ -279,6 +242,8 @@ def read_only_preflight(
     fault_state = regional.store_snapshot(node=settings.fault_node)
     state["profile"] = fault_state.get("profile")
     state["release_id"] = fault_state.get("release_id")
+    state["queue"] = fault_state.get("queue")
+    state["remote_commands"] = fault_state.get("remote_commands")
     cluster = warm.cluster_recovery()
     executor_env = warm.executor_environment()
     synthetic_gates = warm.synthetic_replacement_gates()
@@ -343,8 +308,27 @@ def read_only_preflight(
         if agent is None or agent.get("lifecycle_state") != "ACTIVE":
             errors.append(f"{node} does not have exactly one ACTIVE Agent")
     errors.extend(profile_errors(state.get("profile")))
+    capabilities: dict[str, Any] = {}
+    try:
+        capabilities = read_capabilities(regional)
+        if set(settings.scenarios) & {*SERVICE_UNIT, "active-gpu-pod"}:
+            require_admission_api(regional)
+    except Exception as exc:
+        errors.append(
+            f"independent shortage safeguards unavailable: {type(exc).__name__}"
+        )
+    errors.extend(
+        scenario_admission_errors(settings.scenarios, capabilities=capabilities)
+    )
     if (state.get("profile") or {}).get("warnings"):
         errors.append("runtime profile has warnings")
+    if processor_queue_backlog(state.get("queue")):
+        errors.append("processor queue is not empty")
+    commands = state.get("remote_commands")
+    if not isinstance(commands, dict) or "open_by_cluster" not in commands:
+        errors.append("remote command queue state is unknown")
+    elif commands["open_by_cluster"]:
+        errors.append("remote command queue is not empty")
     if cluster.get("status") != "InService" or cluster.get("node_recovery") != "None":
         errors.append("HyperPod cluster is not InService with NodeRecovery=None")
     if len(executor_env) < 1 or any(
@@ -373,6 +357,7 @@ def read_only_preflight(
         "synthetic_replacement_gates": synthetic_gates,
         "predecessor": predecessor,
         "focused_tests": tests,
+        "activation_inhibition": capabilities,
         "cpu_blast": regional.cpu_blast_snapshot(),
         "selected_scenarios": list(settings.scenarios),
         "errors": errors,
@@ -387,16 +372,6 @@ def scenario_identity(run_dir: Path, attempt: int, scenario: str) -> tuple[str, 
     ).hexdigest()[:10]
     job_id = f"destr008-{suffix}"
     return job_id, f"{job_id}-a001"
-
-
-def observation_gpu_uuids(observation: dict[str, Any]) -> list[str]:
-    return sorted(
-        {
-            str(gpu_uuid)
-            for container in observation.get("containers", [])
-            for gpu_uuid in container.get("gpu_uuids", [])
-        }
-    )
 
 
 def wait_observation(
@@ -422,19 +397,6 @@ def wait_observation(
     raise RegionalFixtureError(f"8-GPU attempt observation did not appear: {last}")
 
 
-def terminal_execution(
-    workflow: dict[str, Any],
-    operation: str,
-) -> dict[str, Any] | None:
-    matches = [
-        item
-        for item in workflow.get("step_executions", [])
-        if item.get("operation") == operation
-        and item.get("status") in {"SUCCEEDED", "FAILED"}
-    ]
-    return cast(dict[str, Any], matches[-1]) if matches else None
-
-
 class ScenarioFixture:
     def __init__(
         self,
@@ -443,19 +405,58 @@ class ScenarioFixture:
         *,
         scenario: str,
         run_id: str,
+        state_directory: Path,
     ) -> None:
         self.settings = settings
         self.warm = warm
         self.scenario = scenario
         self.run_id = run_id
+        self.state_directory = state_directory
         self.node_mutation: NodeMutationFixture | None = None
         self.service: WarmSpareServiceFixture | None = None
         self.holder: GpuHolderFixture | None = None
+        self.plan: Plan | None = None
+        self.maintenance_expires_at: datetime | None = None
         # When the scenario's shortage stops holding on its own: the service
         # failsafe timer, or the GPU holder's sleep. None for the label and
         # annotation scenarios, which hold until restored.
         self.bound_at: datetime | None = None
         self.bound_label = ""
+
+    def bind_safety(self, plan: Plan, maintenance_expires_at: datetime) -> None:
+        if (
+            self.plan is not None
+            or plan.run_id != self.run_id
+            or plan.fault_node != self.settings.fault_node
+            or plan.spare_node != self.settings.spare_node
+            or plan.cluster_id != self.settings.regional.cluster_id
+        ):
+            raise RegionalFixtureError("scenario fixture safety binding differs")
+        self.plan = plan
+        self.maintenance_expires_at = maintenance_expires_at
+
+    def bound_inputs(self) -> dict[str, Any]:
+        if self.plan is None or self.maintenance_expires_at is None:
+            raise RegionalFixtureError("bounded fixture has no independent safety plan")
+        return {
+            "state_directory": self.state_directory,
+            "node_uid": self.plan.fence.node_uid,
+            "plan_sha256": plan_digest(self.plan),
+            "release_id": self.plan.release_id,
+        }
+
+    def service_fixture(self) -> WarmSpareServiceFixture:
+        if self.maintenance_expires_at is None:
+            raise RegionalFixtureError("service fixture maintenance expiry is missing")
+        return WarmSpareServiceFixture(
+            self.warm,
+            node=self.settings.spare_node,
+            image=self.settings.host_probe_image,
+            case_id=CASE_ID,
+            run_id=self.run_id,
+            maintenance_expires_at=self.maintenance_expires_at,
+            **self.bound_inputs(),
+        )
 
     def apply(self) -> dict[str, Any]:
         if self.scenario == "no-spare":
@@ -504,16 +505,11 @@ class ScenarioFixture:
                 self.warm,
                 node=self.settings.spare_node,
                 run_id=self.run_id,
+                **self.bound_inputs(),
             )
             return {"holder_pod": self.holder.name, "armed": "late"}
         if self.scenario in SERVICE_UNIT:
-            self.service = WarmSpareServiceFixture(
-                self.warm,
-                node=self.settings.spare_node,
-                image=self.settings.host_probe_image,
-                case_id=CASE_ID,
-                run_id=self.run_id,
-            )
+            self.service = self.service_fixture()
             self.service.create()
             return {"service": SERVICE_UNIT[self.scenario], "host_probe": "created"}
         raise ValueError(f"unknown scenario: {self.scenario}")
@@ -616,56 +612,36 @@ class ScenarioFixture:
         result["errors"] = errors
         return result
 
+    def resume_cleanup(self) -> dict[str, Any]:
+        if self.scenario == "active-gpu-pod":
+            self.holder = GpuHolderFixture(
+                self.warm,
+                node=self.settings.spare_node,
+                run_id=self.run_id,
+                **self.bound_inputs(),
+            )
+            residual = self.holder.cleanup()
+            return {"errors": ["GPU holder remains"] if residual else []}
+        if self.scenario in SERVICE_UNIT:
+            self.service = self.service_fixture()
+            if self.scenario == "kubernetes-not-ready":
+                self.warm.wait_node_ready(
+                    self.settings.spare_node,
+                    ready=True,
+                    timeout_seconds=SERVICE_RESTORE_SECONDS + 180,
+                )
+            report = self.service.resume_cleanup()
+            self.warm.wait_fleet_readiness(
+                self.settings.spare_node, ready=True, timeout_seconds=180
+            )
+            return {"errors": [], "service": report}
+        raise RegionalFixtureError(
+            "interrupted metadata shortage requires its original mutation owner"
+        )
 
-def wait_timeout_seconds(
-    bound_at: datetime | None,
-    now: datetime,
-    *,
-    default: int = WORKFLOW_WAIT_SECONDS,
-    margin: int = BOUND_MARGIN_SECONDS,
-) -> int:
-    """How long to wait for the shortage workflow without outliving its bound.
-
-    Unbounded scenarios get ``default``. A bounded one gets whatever is left
-    before ``bound_at`` less ``margin``; once that is nothing, the wait is one
-    second, so the caller fails on the timeout rather than on a REPLACE_NODE
-    that had every chance to succeed.
-    """
-
-    if bound_at is None:
-        return default
-    remaining = int((bound_at - now).total_seconds()) - margin
-    return max(1, min(default, remaining))
-
-
-def bound_errors(
-    replace: dict[str, Any] | None,
-    *,
-    bound_at: datetime | None,
-    label: str,
-) -> list[str]:
-    """Refuse a REPLACE_NODE verdict reached after the shortage stopped holding.
-
-    A REPLACE_NODE that concluded after the kubelet failsafe fired or the GPU
-    holder exited was judged against a spare that had already come back; a
-    FAILED there says nothing about the gate, and a SUCCEEDED is the failover
-    this case exists never to perform.
-    """
-
-    if bound_at is None or replace is None:
-        return []
-    concluded_text = str(replace.get("updated_at") or replace.get("started_at") or "")
-    if not concluded_text:
-        return [f"REPLACE_NODE has no timestamp to compare with the {label}"]
-    concluded = datetime.fromisoformat(concluded_text.replace("Z", "+00:00"))
-    if concluded.tzinfo is None:
-        concluded = concluded.replace(tzinfo=timezone.utc)
-    if concluded >= bound_at:
-        return [
-            f"the {label} fired at {bound_at.isoformat()} before REPLACE_NODE "
-            f"concluded at {concluded.isoformat()}; the shortage was not holding"
-        ]
-    return []
+    def close(self) -> None:
+        if self.service is not None:
+            self.service.close()
 
 
 def recover_incident_id(warm: WarmSpareLiveFixture, event_id: str) -> str:
@@ -703,78 +679,9 @@ def replacement_payload(
         "gpu_uuids": observation_gpu_uuids(observation),
         "reason": "synthetic warm-spare shortage acceptance trigger",
         "replacement_strategy": "HEALTHY_WARM_SPARE_ONLY",
+        "activation_forbidden": True,
         "synthetic": True,
     }
-
-
-def scenario_errors(
-    state: dict[str, Any],
-    settings: Settings,
-    scenario: str,
-    *,
-    event_id: str,
-) -> list[str]:
-    workflow = state.get("workflow") or {}
-    incident = state.get("incident") or {}
-    errors = []
-    if workflow.get("status") != "FAILED":
-        errors.append("shortage workflow is not FAILED")
-    stop = terminal_execution(workflow, "STOP_WORKLOADS")
-    if stop is None or stop.get("status") != "SUCCEEDED":
-        errors.append("STOP_WORKLOADS did not execute successfully")
-    replace = terminal_execution(workflow, "REPLACE_NODE")
-    if replace is None or replace.get("status") != "FAILED":
-        errors.append("REPLACE_NODE did not execute and fail")
-    elif EXPECTED_REASON[scenario] not in str(replace.get("error") or ""):
-        errors.append("REPLACE_NODE failure reason does not match the scenario")
-    replace_step = next(
-        (
-            item
-            for item in workflow.get("official_steps", [])
-            if item.get("operation") == "REPLACE_NODE"
-        ),
-        None,
-    )
-    if (replace_step or {}).get("parameters") != {
-        "replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"
-    }:
-        errors.append("REPLACE_NODE lacks HEALTHY_WARM_SPARE_ONLY")
-    alerts = [
-        item
-        for item in state.get("notifications") or []
-        if "hyperpod-spare-insufficient" in str(item.get("deduplication_key") or "")
-    ]
-    expected_alerts = 1 if scenario in ALERT_SCENARIOS else 0
-    if len(alerts) != expected_alerts:
-        errors.append(
-            f"expected {expected_alerts} spare-insufficient alerts, got {len(alerts)}"
-        )
-    # The injected finding's own marker belongs to this incident, and has to:
-    # a marker pointing at an incident nobody persisted lets a terminal attempt
-    # inside the marker window open a second recovery for the same fault, which
-    # is what re-quarantined the fault node minutes into the next scenario. What
-    # the shortage path must not do is add any *other* marker -- handing the node
-    # to a different replacement mechanism once warm-spare replacement failed.
-    marker_ids = sorted(
-        str(item.get("marker_id") or "") for item in state.get("markers") or []
-    )
-    if marker_ids != [f"marker-{event_id}"]:
-        errors.append(
-            "incident markers are not exactly the injected finding's own marker: "
-            f"{marker_ids}"
-        )
-    fault = state.get("fault_node") or {}
-    if not fault.get("unschedulable") or not any(
-        item.get("key") == QUARANTINE_TAINT for item in fault.get("taints") or []
-    ):
-        errors.append("fault node is not kept quarantined")
-    incident_id = str(incident.get("incident_id") or "")
-    spare = state.get("spare_node") or {}
-    if spare.get("annotations", {}).get(SPARE_RESERVATION_ANNOTATION) == incident_id:
-        errors.append("failed scenario left an incident spare reservation")
-    if spare.get("annotations", {}).get(SPARE_POOL_STATE_ANNOTATION) == "ALLOCATED":
-        errors.append("failed scenario left the spare ALLOCATED")
-    return errors
 
 
 def restore_fault_node(
@@ -788,17 +695,43 @@ def restore_fault_node(
     if not incident_id:
         return result
     try:
+        original = warm.node_snapshot(settings.fault_node)
+        owner = str(original["annotations"].get("gpu-fault.io/incident-id") or "")
+        if not isinstance(original.get("uid"), str) or not original["uid"]:
+            raise RegionalFixtureError("cleanup fault Node UID is missing")
+        require_cleanup_family(
+            warm,
+            incident_id=incident_id,
+            owner=owner,
+            cluster_id=settings.regional.cluster_id,
+            node=settings.fault_node,
+            profile_version=profile_version,
+        )
+        require_cleanup_node(
+            warm, node=settings.fault_node, uid=original["uid"], owner=owner
+        )
+    except Exception as exc:
+        result["errors"].append(f"cleanup ownership: {type(exc).__name__}: {exc}")
+        return result
+    try:
         warm.release_spares([settings.spare_node], incident_id)
     except Exception as exc:
         result["errors"].append(f"spare rollback: {type(exc).__name__}: {exc}")
     try:
+        require_cleanup_node(
+            warm, node=settings.fault_node, uid=original["uid"], owner=owner
+        )
         warm.reactivate_agent(settings.fault_node)
         warm.wait_agent_active(settings.fault_node)
     except Exception as exc:
         result["errors"].append(f"agent cleanup: {type(exc).__name__}: {exc}")
     try:
         fault = warm.node_snapshot(settings.fault_node)
-        owner = str(fault["annotations"].get("gpu-fault.io/incident-id") or "")
+        if (
+            fault["uid"] != original["uid"]
+            or str(fault["annotations"].get("gpu-fault.io/incident-id") or "") != owner
+        ):
+            raise RegionalFixtureError("cleanup quarantine owner or Node UID changed")
         result["quarantine_owner"] = owner or None
         if owner and owner != incident_id:
             # A shortage that blocks recovery is escalated by the product
@@ -811,6 +744,9 @@ def restore_fault_node(
             result["successor_incident"] = owner
         if owner:
             warm.wait_incident_idle(owner)
+            require_cleanup_node(
+                warm, node=settings.fault_node, uid=original["uid"], owner=owner
+            )
             created = warm.create_restore_workflow(
                 incident_id=owner,
                 node=settings.fault_node,
@@ -826,26 +762,72 @@ def restore_fault_node(
     return result
 
 
-def run_scenario(
+def audit_scenario_nodes(
+    warm: WarmSpareLiveFixture,
     settings: Settings,
-    *,
+    result: dict[str, Any],
+) -> None:
+    try:
+        result["final_fault_node"] = warm.node_snapshot(settings.fault_node)
+        result["final_spare_node"] = warm.node_snapshot(settings.spare_node)
+        fault = result["final_fault_node"]
+        spare = result["final_spare_node"]
+        if (
+            fault["ready"] != "True"
+            or fault["unschedulable"]
+            or any(item.get("key") == QUARANTINE_TAINT for item in fault["taints"])
+            or any(
+                fault["annotations"].get(key)
+                for key in (
+                    "gpu-fault.io/incident-id",
+                    "gpu-fault.io/fencing-token",
+                    "gpu-fault.io/previous-unschedulable",
+                )
+            )
+        ):
+            result["verdict"] = "FAIL"
+            result.setdefault("postflight_errors", []).append(
+                "fault node did not return to Ready/schedulable/unowned"
+            )
+        if (
+            spare["ready"] != "True"
+            or not spare["unschedulable"]
+            or spare["labels"].get(SPARE_LABEL) != "true"
+            or spare["annotations"].get(SPARE_RESERVATION_ANNOTATION)
+            or spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION)
+            not in {None, "AVAILABLE"}
+        ):
+            result["verdict"] = "FAIL"
+            result.setdefault("postflight_errors", []).append(
+                "spare node did not return to the available cordoned pool"
+            )
+    except Exception as exc:
+        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+
+
+@dataclass(frozen=True)
+class ScenarioResources:
+    directory: Path
+    job_id: str
+    attempt_id: str
+    workload: ManagedWorkloadFixture
+    fixture: ScenarioFixture
+
+
+def prepare_scenario_resources(
+    settings: Settings,
     warm: WarmSpareLiveFixture,
     regional: RegionalLiveFixture,
-    case_dir: Path,
+    directory: Path,
     run_dir: Path,
     attempt: int,
     scenario: str,
-    maintenance_window_end: datetime,
-    provider_baseline: dict[str, Any],
-    profile_version: str,
-) -> dict[str, Any]:
-    scenario_dir = case_dir / "scenarios" / scenario
-    scenario_dir.mkdir(parents=True, exist_ok=True)
+) -> ScenarioResources:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     job_id, attempt_id = scenario_identity(run_dir, attempt, scenario)
     pinned = render_node_pinned_manifest(
-        settings.manifest,
-        scenario_dir / "pinned-workload.yaml",
-        node=settings.fault_node,
+        settings.manifest, directory / "pinned-workload.yaml", node=settings.fault_node
     )
     workload = ManagedWorkloadFixture(
         regional,
@@ -858,13 +840,168 @@ def run_scenario(
             expected_pods=1,
             expected_gpu_count=8,
         ),
+        state_path=directory / "workload-owner.json",
     )
     fixture = ScenarioFixture(
         settings,
         warm,
         scenario=scenario,
-        run_id=f"destr008-{scenario}-{attempt}",
+        run_id=job_id,
+        state_directory=directory / "host-probes",
     )
+    return ScenarioResources(directory, job_id, attempt_id, workload, fixture)
+
+
+def cleanup_scenario(
+    settings: Settings,
+    warm: WarmSpareLiveFixture,
+    resources: ScenarioResources,
+    safety: ShortageSafety | None,
+    result: dict[str, Any],
+    *,
+    incident_id: str,
+    event_id: str,
+    profile_version: str,
+) -> None:
+    cleanup_safe = True
+    if safety is not None:
+        proof = safety.finish()
+        result["independent_safety_cleanup"] = proof
+        if proof["errors"]:
+            result["verdict"] = "FAIL"
+        if proof["quiescent"] is not True:
+            cleanup_safe = False
+            result["cleanup_deferred"] = True
+    if not incident_id:
+        try:
+            incident_id = recover_incident_id(warm, event_id)
+            result["incident_id_recovered_from_event"] = bool(incident_id)
+        except Exception as exc:
+            result["incident_lookup_error"] = f"{type(exc).__name__}: {exc}"
+    if event_id:
+        try:
+            if not incident_id:
+                raise RegionalFixtureError(
+                    "replacement outcome has no incident identity"
+                )
+            warm.wait_incident_idle(incident_id)
+        except Exception as exc:
+            cleanup_safe = False
+            result["cleanup_quiescence_error"] = f"{type(exc).__name__}: {exc}"
+            result["cleanup_deferred"] = True
+            result["verdict"] = "FAIL"
+    if cleanup_safe:
+        try:
+            resources.workload.delete()
+        except Exception as exc:
+            result["workload_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+            result["verdict"] = "FAIL"
+    scenario_cleanup = (
+        resources.fixture.restore()
+        if cleanup_safe
+        else {"errors": ["shortage restore deferred while commands may still act"]}
+    )
+    result["scenario_cleanup"] = scenario_cleanup
+    if scenario_cleanup["errors"]:
+        result["verdict"] = "FAIL"
+    fault_cleanup = (
+        restore_fault_node(
+            warm,
+            settings=settings,
+            incident_id=incident_id,
+            profile_version=profile_version,
+        )
+        if cleanup_safe
+        else {"errors": ["fault restore deferred while commands may still act"]}
+    )
+    result["fault_cleanup"] = fault_cleanup
+    if fault_cleanup["errors"]:
+        result["verdict"] = "FAIL"
+    audit_scenario_nodes(warm, settings, result)
+    result["cleanup_complete"] = bool(
+        cleanup_safe
+        and not scenario_cleanup["errors"]
+        and not fault_cleanup["errors"]
+        and "workload_cleanup_error" not in result
+        and not result.get("postflight_errors")
+        and "postflight_error" not in result
+        and (
+            safety is None
+            or result["independent_safety_cleanup"].get("retired") is True
+        )
+    )
+    try:
+        resources.fixture.close()
+    except Exception as exc:
+        result["fixture_close_error"] = type(exc).__name__
+        result["cleanup_complete"] = False
+        result["verdict"] = "FAIL"
+
+
+def run_scenario(
+    settings: Settings,
+    *,
+    warm: WarmSpareLiveFixture,
+    regional: RegionalLiveFixture,
+    case_dir: Path,
+    run_dir: Path,
+    attempt: int,
+    scenario: str,
+    maintenance_window_end: datetime,
+    provider_baseline: dict[str, Any],
+    profile_version: str,
+    capabilities: dict[str, Any] | None = None,
+    release_id: str = "",
+    spare_uid: str = "",
+    journal: ExecutionJournal | None = None,
+) -> dict[str, Any]:
+    directory = case_dir / "scenarios" / scenario
+    with controller_ownership(directory / "scenario-owner.json"):
+        resources = prepare_scenario_resources(
+            settings, warm, regional, directory, run_dir, attempt, scenario
+        )
+        return _run_scenario(
+            settings,
+            warm=warm,
+            regional=regional,
+            resources=resources,
+            scenario=scenario,
+            maintenance_window_end=maintenance_window_end,
+            provider_baseline=provider_baseline,
+            profile_version=profile_version,
+            capabilities=capabilities,
+            release_id=release_id,
+            spare_uid=spare_uid,
+            journal=journal,
+        )
+
+
+def require_maintenance_window(expires_at: datetime, *, before: str) -> None:
+    if datetime.now(timezone.utc) >= expires_at:
+        raise RegionalFixtureError(f"maintenance window ended before {before}")
+
+
+def _run_scenario(
+    settings: Settings,
+    *,
+    warm: WarmSpareLiveFixture,
+    regional: RegionalLiveFixture,
+    resources: ScenarioResources,
+    scenario: str,
+    maintenance_window_end: datetime,
+    provider_baseline: dict[str, Any],
+    profile_version: str,
+    capabilities: dict[str, Any] | None,
+    release_id: str,
+    spare_uid: str,
+    journal: ExecutionJournal | None,
+) -> dict[str, Any]:
+    scenario_dir, job_id, attempt_id = (
+        resources.directory,
+        resources.job_id,
+        resources.attempt_id,
+    )
+    workload, fixture = resources.workload, resources.fixture
     result: dict[str, Any] = {
         "scenario": scenario,
         "verdict": "FAIL",
@@ -872,9 +1009,22 @@ def run_scenario(
     }
     incident_id = ""
     event_id = ""
+    planned_event_id = f"destr008-{scenario}-{job_id}-event"
+    bounded = scenario in {*SERVICE_UNIT, "active-gpu-pod"}
+    safety: ShortageSafety | None = None
     try:
-        mutation = fixture.apply()
-        write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
+        admission = scenario_admission_errors([scenario], capabilities=capabilities)
+        if admission:
+            raise RegionalFixtureError("; ".join(admission))
+        require_maintenance_window(maintenance_window_end, before="shortage setup")
+        if not bounded and journal is not None:
+            journal.stage(scenario, "fixture_started")
+        mutation = {} if bounded else fixture.apply()
+        if mutation:
+            write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
+        require_maintenance_window(maintenance_window_end, before="workload submission")
+        if journal is not None:
+            journal.stage(scenario, "workload_started")
         submission = workload.submit()
         write_json_atomic(scenario_dir / "submission.json", submission)
         workload.wait_running(timeout_seconds=900)
@@ -883,15 +1033,60 @@ def run_scenario(
             job_id=job_id,
             attempt_id=attempt_id,
         )
-        if datetime.now(timezone.utc) >= maintenance_window_end:
+        if observation.get("runtime_profile_version") != profile_version:
             raise RegionalFixtureError(
-                f"maintenance window ended before scenario {scenario}"
+                "workload observation profile differs from the approved preflight"
             )
+        if bounded:
+            if not release_id or not spare_uid:
+                raise RegionalFixtureError(
+                    "bounded shortage has no release or Node UID binding"
+                )
+            if journal is not None:
+                journal.stage(scenario, "safety_started")
+            safety = ShortageSafety(
+                regional,
+                run_id=job_id,
+                attempt_id=attempt_id,
+                event_id=planned_event_id,
+                fault_node=settings.fault_node,
+                spare_node=settings.spare_node,
+                spare_uid=spare_uid,
+                release_id=release_id,
+                directory=scenario_dir / "safety",
+            )
+            window = (
+                GpuHolderFixture.HOLD_SECONDS
+                if scenario == "active-gpu-pod"
+                else SERVICE_RESTORE_SECONDS
+            ) - BOUND_MARGIN_SECONDS
+            safety.arm(
+                observation,
+                window_seconds=window,
+                maintenance_window_end=maintenance_window_end,
+            )
+            safety.admit_fixture()
+            if safety.plan is None:
+                raise RegionalFixtureError("independent cancellation plan is missing")
+            fixture.bind_safety(safety.plan, maintenance_window_end)
+            if journal is not None:
+                journal.stage(scenario, "fixture_started")
+            mutation = fixture.apply()
+            write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
+        require_maintenance_window(
+            maintenance_window_end, before=f"scenario {scenario}"
+        )
         late = fixture.apply_late()
         if late:
             mutation = {**mutation, "late": late}
             write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
-        event_id = f"destr008-{scenario}-{int(time.time())}"
+        if safety is not None:
+            safety.require_bound(fixture.bound_at, margin=BOUND_MARGIN_SECONDS)
+        require_maintenance_window(maintenance_window_end, before="replacement trigger")
+        if journal is not None:
+            journal.stage(scenario, "post_started")
+        claim_id = safety.before_post() if safety is not None else ""
+        event_id = planned_event_id
         started_at = datetime.now(timezone.utc)
         injection = warm.post_synthetic_replacement(
             replacement_payload(
@@ -908,14 +1103,20 @@ def run_scenario(
             raise RegionalFixtureError(
                 f"synthetic replacement endpoint failed: {injection}"
             )
+        if safety is not None:
+            safety.acknowledge(claim_id, injection)
+            incident_id = str(injection["body"]["incident_ids"][0])
+        wait_seconds = wait_timeout_seconds(
+            fixture.bound_at, datetime.now(timezone.utc)
+        )
+        if safety is not None:
+            wait_seconds = min(wait_seconds, safety.remaining_seconds())
         state = warm.wait_for_workflow(
             event_id=event_id,
             job_id=job_id,
             attempt_id=attempt_id,
             case_dir=scenario_dir,
-            timeout_seconds=wait_timeout_seconds(
-                fixture.bound_at, datetime.now(timezone.utc)
-            ),
+            timeout_seconds=wait_seconds,
         )
         incident_id = str((state.get("incident") or {}).get("incident_id") or "")
         state["fault_node"] = warm.node_snapshot(settings.fault_node)
@@ -962,67 +1163,16 @@ def run_scenario(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        if not incident_id:
-            try:
-                incident_id = recover_incident_id(warm, event_id)
-                result["incident_id_recovered_from_event"] = bool(incident_id)
-            except Exception as exc:
-                result["incident_lookup_error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            workload.delete()
-        except Exception as exc:
-            result["workload_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        scenario_cleanup = fixture.restore()
-        result["scenario_cleanup"] = scenario_cleanup
-        if scenario_cleanup["errors"]:
-            result["verdict"] = "FAIL"
-        fault_cleanup = restore_fault_node(
+        cleanup_scenario(
+            settings,
             warm,
-            settings=settings,
+            resources,
+            safety,
+            result,
             incident_id=incident_id,
+            event_id=event_id,
             profile_version=profile_version,
         )
-        result["fault_cleanup"] = fault_cleanup
-        if fault_cleanup["errors"]:
-            result["verdict"] = "FAIL"
-        try:
-            result["final_fault_node"] = warm.node_snapshot(settings.fault_node)
-            result["final_spare_node"] = warm.node_snapshot(settings.spare_node)
-            fault = result["final_fault_node"]
-            spare = result["final_spare_node"]
-            if (
-                fault["ready"] != "True"
-                or fault["unschedulable"]
-                or any(item.get("key") == QUARANTINE_TAINT for item in fault["taints"])
-                or any(
-                    fault["annotations"].get(key)
-                    for key in (
-                        "gpu-fault.io/incident-id",
-                        "gpu-fault.io/fencing-token",
-                        "gpu-fault.io/previous-unschedulable",
-                    )
-                )
-            ):
-                result["verdict"] = "FAIL"
-                result.setdefault("postflight_errors", []).append(
-                    "fault node did not return to Ready/schedulable/unowned"
-                )
-            if (
-                spare["ready"] != "True"
-                or not spare["unschedulable"]
-                or spare["labels"].get(SPARE_LABEL) != "true"
-                or spare["annotations"].get(SPARE_RESERVATION_ANNOTATION)
-                or spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION)
-                not in {None, "AVAILABLE"}
-            ):
-                result["verdict"] = "FAIL"
-                result.setdefault("postflight_errors", []).append(
-                    "spare node did not return to the available cordoned pool"
-                )
-        except Exception as exc:
-            result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
     write_json_atomic(scenario_dir / f"{scenario}.json", result)
     return result
 
@@ -1070,6 +1220,14 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "delete_each_unique_test_workload": True,
             "release_only_incident_owned_spare_state": True,
             "restore_fault_node_via_validation_first_workflow": True,
+            "revoke_producer_and_wait_for_complete_command_quiescence": True,
+            "keep_independent_inhibition_when_cleanup_is_unproven": True,
+        },
+        "independent_safety": {
+            "activation_forbidden_on_every_replacement": True,
+            "old_executor_claims_are_refused": True,
+            "bounded_scenarios_require_cpu_watchdog_and_admission_fence": True,
+            "guard_refusal_is_not_a_shortage_pass": True,
         },
         "preflight": preflight,
     }
@@ -1102,8 +1260,78 @@ def execute_case(
     attempt: int,
     maintenance_window_end: datetime,
 ) -> int:
+    directory = settings.site_file.parent.resolve()
+    information = directory.stat()
+    if (
+        directory == Path("/")
+        or not stat.S_ISDIR(information.st_mode)
+        or information.st_uid != os.getuid()
+        or information.st_mode & 0o077
+    ):
+        raise RegionalFixtureError(
+            "DESTR-008 requires the canonical private administrator site directory"
+        )
+    with site_operation_lock(directory, wait=False):
+        return _execute_case(settings, run_dir, attempt, maintenance_window_end)
+
+
+def execution_binding(
+    settings: Settings, regional: RegionalLiveFixture, run_dir: Path
+) -> dict[str, Any]:
+    return fixture_binding(
+        regional,
+        purpose=CASE_ID,
+        inputs={
+            "run_dir": str(run_dir.resolve()),
+            "site_sha256": file_digest(settings.site_file),
+            "manifest_sha256": file_digest(settings.manifest),
+            "runner_sha256": file_digest(Path(__file__)),
+            "contract_sha256": file_digest(
+                Path(__file__).with_name("destr008_contract.py")
+            ),
+            "hyperpod_cluster": settings.hyperpod_cluster,
+            "fault_node": settings.fault_node,
+            "spare_node": settings.spare_node,
+            "host_probe_image": settings.host_probe_image,
+            "scenarios": list(settings.scenarios),
+        },
+    )
+
+
+def _execute_case(
+    settings: Settings,
+    run_dir: Path,
+    attempt: int,
+    maintenance_window_end: datetime,
+) -> int:
     case_dir = run_dir / "cases" / CASE_ID
-    case_dir.mkdir(parents=True, exist_ok=True)
+    case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    regional = RegionalLiveFixture(settings.regional)
+    warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
+    journal_path = case_dir / "execution-owner.json"
+
+    def binding() -> dict[str, Any]:
+        return execution_binding(settings, regional, run_dir)
+
+    if journal_path.exists() or journal_path.is_symlink():
+        from scripts.e2e.regional.destr008_resume import resume_execution
+
+        journal = ExecutionJournal(journal_path, binding)
+        cleanup_report = resume_execution(
+            settings,
+            regional=regional,
+            warm=warm,
+            journal=journal,
+            case_dir=case_dir,
+            run_dir=run_dir,
+        )
+        write_json_atomic(case_dir / f"cleanup-attempt-{attempt}.json", cleanup_report)
+        print(json.dumps(cleanup_report, sort_keys=True))
+        return 1
+    if (case_dir / "scenarios").exists() or (case_dir / "prewarm-owner.json").exists():
+        raise RegionalFixtureError(
+            "prior DESTR-008 artifacts have no execution owner; reconciliation required"
+        )
     preflight = read_only_preflight(
         settings,
         case_dir,
@@ -1114,12 +1342,29 @@ def execute_case(
             "preflight failed: " + "; ".join(preflight["errors"])
         )
     verify_plan_identity(case_dir, preflight)
-    regional = RegionalLiveFixture(settings.regional)
-    warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
+    profile_version = str(
+        (preflight["store"].get("profile") or {}).get("profile_version") or ""
+    )
+    journal = ExecutionJournal(
+        journal_path,
+        binding,
+        initial=ExecutionRecord(
+            schema_version=1,
+            binding=binding(),
+            attempt=attempt,
+            maintenance_expires_at=int(maintenance_window_end.timestamp()),
+            release_id=preflight["release_id"],
+            profile_version=profile_version,
+            fault_uid=preflight["fault_node"]["uid"],
+            spare_uid=preflight["spare_node"]["uid"],
+            scenarios={scenario: ScenarioState() for scenario in settings.scenarios},
+        ),
+    )
     prewarm = ImagePrewarmFixture(
         regional,
         case_id=CASE_ID,
-        run_id=f"destr008-{attempt}",
+        run_id=scenario_identity(run_dir, attempt, "prewarm")[0],
+        state_path=case_dir / "prewarm-owner.json",
     )
     result: dict[str, Any] = {
         "case_id": CASE_ID,
@@ -1135,11 +1380,11 @@ def execute_case(
     }
     scenario_results = []
     try:
+        require_maintenance_window(maintenance_window_end, before="image prewarm")
+        journal.start_prewarm()
         prewarm.create([settings.fault_node, settings.spare_node])
-        profile_version = str(
-            (preflight["store"].get("profile") or {}).get("profile_version") or ""
-        )
         for scenario in settings.scenarios:
+            journal.start_scenario(scenario)
             current = run_scenario(
                 settings,
                 warm=warm,
@@ -1151,7 +1396,19 @@ def execute_case(
                 maintenance_window_end=maintenance_window_end,
                 provider_baseline=preflight["provider_inventory"],
                 profile_version=profile_version,
+                capabilities=preflight["activation_inhibition"],
+                release_id=preflight["release_id"],
+                spare_uid=preflight["spare_node"]["uid"],
+                journal=journal,
             )
+            if current.get("cleanup_complete") is True:
+                journal.cleaned_scenario(scenario)
+            else:
+                current = {
+                    **current,
+                    "verdict": "FAIL",
+                    "cleanup_contract_error": "scenario resource closure is unproven",
+                }
             scenario_results.append(current)
             if current["verdict"] != "PASS":
                 break
@@ -1186,6 +1443,12 @@ def execute_case(
         result["prewarm_residuals"] = residuals
         if any(residuals.values()):
             result["verdict"] = "FAIL"
+        else:
+            journal.cleaned_prewarm()
+            if not any(
+                item.state == "STARTED" for item in journal.record.scenarios.values()
+            ):
+                journal.complete()
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

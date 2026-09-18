@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.channel_registry import WORKLOAD_OBSERVATIONS_PATH
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
+from gpu_fault.orchestration.placement_hold import hold_incident_id
 from tests._builders import (
     asgi_client,
     attempt_observation,
@@ -83,7 +84,12 @@ def test_observing_an_attempt_on_a_repairing_node_opens_a_hold_and_wakes():
     status = _post(context)
 
     assert status == 200
-    hold = context.store.get_incident("hold-cluster-a-train-1-a1")
+    hold = context.store.get_incident(hold_incident_id("cluster-a", "train-1-a1"))
+    assert (hold.cluster_id, hold.job_id, hold.attempt_id) == (
+        "cluster-a",
+        "train-1",
+        "train-1-a1",
+    ), "the canonical hold must still bind the observed cluster, job and attempt"
     assert hold.state is IncidentState.ACTION_PENDING
     workflow = context.store.get_workflow(hold.workflow_request_id)
     assert workflow.placement_hold is True

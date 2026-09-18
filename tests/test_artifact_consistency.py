@@ -228,7 +228,7 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
         == manifest
     )
     assert manifest["module_digest"] == component_source_digest("control_plane")
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] in {3, 4}
     delivery = dict(manifest["delivery"])
     delivery_sha256 = delivery.pop("sha256")
     assert canonical_sha256(delivery) == delivery_sha256
@@ -257,8 +257,15 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
         for item in manifest["delivery"]["images"].values()
     ), "release delivery contains a mutable image reference"
     if manifest["deployable"]:
-        runtime_components = manifest["delivery"]["images"]["runtime"]["components"]
         for name in ("control_plane", "executor"):
+            image_name = (
+                "executor"
+                if manifest["schema_version"] == 4 and name == "executor"
+                else "runtime"
+            )
+            runtime_components = manifest["delivery"]["images"][image_name][
+                "components"
+            ]
             assert (
                 runtime_components[name]["wheel_sha256"]
                 == (manifest["components"][name]["wheel_sha256"])
@@ -266,6 +273,22 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
             assert (
                 runtime_components[name]["module_digest"]
                 == (manifest["components"][name]["module_digest"])
+            )
+        if manifest["schema_version"] == 4:
+            assert manifest["delivery"]["image_layout"] == "split-v1"
+            assert set(manifest["delivery"]["images"]["runtime"]["components"]) == {
+                "control_plane"
+            }
+            assert set(manifest["delivery"]["images"]["executor"]["components"]) == {
+                "executor"
+            }
+            assert (
+                len(
+                    manifest["delivery"]["images"]["node_dependencies"][
+                        "wheelhouse_sha256"
+                    ]
+                )
+                == 64
             )
     assert list((ROOT / "dist").glob("*.whl")) == []
     assert list((ROOT / "dist").glob("*.tar.gz")) == []

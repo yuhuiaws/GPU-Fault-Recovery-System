@@ -27,6 +27,7 @@ from gpu_fault.cluster_executor.dispatch import CommandDispatch
 from gpu_fault.cluster_executor.lease import (
     DEFAULT_MAX_EXECUTION_SECONDS,
     CommandLifecycle,
+    CommandLeaseWatch,
     CommandOutcome,
 )
 from gpu_fault.cluster_executor.metrics import ClusterExecutorMetrics
@@ -536,6 +537,9 @@ class ClusterActionExecutor:
                 f"{type(exc).__name__}: {exc}",
                 status_code=getattr(exc, "status_code", None),
             ) from exc
+        claimed = [
+            (command, self.lifecycle.watch_claim(command)) for command in commands
+        ]
         # A successful claim round-trip proves the token, the TLS trust
         # chain and the control-plane route all work, even when the
         # queue is empty. That is the only useful executor liveness
@@ -555,8 +559,8 @@ class ClusterActionExecutor:
             )
             try:
                 futures = [
-                    pool.submit(self._execute_and_report, command)
-                    for command in commands
+                    pool.submit(self._execute_and_report, command, watch)
+                    for command, watch in claimed
                 ]
                 pending = set(futures)
                 self.metrics.in_flight(len(pending))
@@ -609,7 +613,9 @@ class ClusterActionExecutor:
         )
         return len(commands)
 
-    def _execute_and_report(self, command: RemoteActionCommand) -> CommandOutcome:
+    def _execute_and_report(
+        self, command: RemoteActionCommand, watch: CommandLeaseWatch | None = None
+    ) -> CommandOutcome:
         """One command, start to reported: never raises into ``run_once``.
 
         Anything that leaves this method comes back out of ``future.result()``
@@ -623,7 +629,7 @@ class ClusterActionExecutor:
         """
 
         try:
-            return self.lifecycle.run(command)
+            return self.lifecycle.run(command, watch)
         except Exception:
             self.increment("unexpected_failures")
             LOGGER.exception(

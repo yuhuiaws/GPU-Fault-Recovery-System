@@ -24,6 +24,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from tools.run_fault_test_cases import load_catalog  # noqa: E402
+from gpu_fault.admin.postgres_grant import (  # noqa: E402
+    ALLOCATION_ENV,
+    postgres_test_environment,
+)
+from scripts.run_static_gates import isolated_gate_environment  # noqa: E402
 
 
 DEFAULT_MATRIX = ROOT / "testcases" / "change-impact.yaml"
@@ -678,7 +683,85 @@ def render_text(plan: Plan, *, regional_only: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+def promql_pytest_environment(
+    targets: Sequence[str], *, root: Path = ROOT
+) -> dict[str, str] | None:
+    """Bind Make's validated native tool only when the selection includes PromQL."""
+
+    if not targets:
+        return None
+    environment = isolated_gate_environment(os.environ)
+    environment.pop("COSIGN_PASSWORD", None)
+
+    def make_json(target: str) -> Any:
+        completed = subprocess.run(
+            [
+                "make",
+                "--silent",
+                "--no-print-directory",
+                target,
+                f"PYTHON={sys.executable}",
+            ],
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        try:
+            return json.loads(completed.stdout)
+        except (TypeError, ValueError) as exc:
+            raise ImpactError(f"{target} returned invalid JSON") from exc
+
+    files = _strings(
+        make_json("promql-test-files"), "Make PROMQL_TESTS", allow_empty=False
+    )
+    selected = tuple((root / target.split("::", 1)[0]).resolve() for target in targets)
+    if not any(
+        (root / name).resolve().is_relative_to(path)
+        for name in files
+        for path in selected
+    ):
+        return None
+    binding = _mapping(make_json("promtool-preflight"), "promtool preflight")
+    tool = binding.get("promtool")
+    version = binding.get("version")
+    if (
+        set(binding) != {"status", "promtool", "version"}
+        or binding.get("status") != "ready"
+        or not isinstance(tool, str)
+        or not Path(tool).is_absolute()
+        or not Path(tool).is_file()
+        or not os.access(tool, os.X_OK)
+        or not isinstance(version, str)
+        or not version.strip()
+    ):
+        raise ImpactError("promtool preflight returned an invalid tool binding")
+    return {**environment, "PROMTOOL": tool}
+
+
 def execute_plan(plan: Plan, settings: Settings, *, root: Path = ROOT) -> None:
+    if (
+        plan.full
+        and plan.postgres
+        and ALLOCATION_ENV in os.environ
+        and settings.postgres_command == ("make", "test-postgres-stress")
+    ):
+        postgres_test_environment(os.environ)
+        subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "run_release_gates.py"),
+                "--mode",
+                "release",
+                "--python",
+                sys.executable,
+            ],
+            cwd=root,
+            check=True,
+        )
+        return
     if plan.full:
         subprocess.run(
             ["make", "check", f"PYTHON={sys.executable}"],
@@ -686,6 +769,7 @@ def execute_plan(plan: Plan, settings: Settings, *, root: Path = ROOT) -> None:
             check=True,
         )
     else:
+        environment = promql_pytest_environment(plan.pytest_targets, root=root)
         for check in plan.checks:
             subprocess.run(
                 ["make", check, f"PYTHON={sys.executable}"],
@@ -694,15 +778,26 @@ def execute_plan(plan: Plan, settings: Settings, *, root: Path = ROOT) -> None:
             )
         command = pytest_command(plan)
         if command:
-            subprocess.run(command, cwd=root, check=True)
+            if environment is None:
+                subprocess.run(command, cwd=root, check=True)
+            else:
+                subprocess.run(command, cwd=root, env=environment, check=True)
     if plan.postgres:
         if not os.environ.get("GPU_FAULT_TEST_POSTGRES_URL"):
             raise ImpactError(
                 "PostgreSQL stress is required; set GPU_FAULT_TEST_POSTGRES_URL"
             )
+        environment = postgres_test_environment(os.environ)
+        postgres_command = settings.postgres_command
+        if ALLOCATION_ENV in environment and postgres_command == (
+            "make",
+            "test-postgres-stress",
+        ):
+            postgres_command = (*postgres_command, "POSTGRES_TEST_PARALLEL=1")
         subprocess.run(
-            [*settings.postgres_command, f"PYTHON={sys.executable}"],
+            [*postgres_command, f"PYTHON={sys.executable}"],
             cwd=root,
+            env=environment,
             check=True,
         )
 

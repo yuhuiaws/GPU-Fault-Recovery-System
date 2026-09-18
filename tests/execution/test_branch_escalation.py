@@ -12,7 +12,7 @@ restarting the job.
 
 from __future__ import annotations
 
-from gpu_fault.models import WorkflowOperation
+from gpu_fault.models import BlockedKind, WorkflowOperation, workflow_is_open
 from gpu_fault.orchestration.escalation import next_rung
 from tests._builders import build_store
 from tests.execution._support import workflow_state
@@ -262,7 +262,11 @@ def test_an_unknown_outcome_branch_failure_goes_to_an_operator_not_up_the_ladder
         "a reboot rung was appended for a step whose outcome nobody knows: "
         f"{adapter.calls}"
     )
-    assert result.status is WorkflowStatus.FAILED, result.status
+    assert result.status is WorkflowStatus.BLOCKED, result.status
+    assert saved.blocked_kind is BlockedKind.NEEDS_OPERATOR
+    assert workflow_is_open(saved.status, saved.blocked_kind), (
+        "an unknown physical outcome must not release node ownership"
+    )
     assert saved.branch_escalation_counts == {}, saved.branch_escalation_counts
     classification = HardwareEscalationService.classify(saved)
     assert classification is not None, "the whole-workflow classifier must take it"
@@ -393,7 +397,11 @@ def test_an_unknown_outcome_branch_is_exhausted_and_its_siblings_finish_first():
     assert "workflow-active/3/RESTORE_SCHEDULING" in adapter.calls, (
         f"node-c was never released: {adapter.calls}"
     )
-    assert second.status is WorkflowStatus.FAILED, second.status
+    assert second.status is WorkflowStatus.BLOCKED, second.status
+    assert saved.blocked_kind is BlockedKind.NEEDS_OPERATOR
+    assert workflow_is_open(saved.status, saved.blocked_kind), (
+        "finished siblings do not settle the unknown node's physical outcome"
+    )
     assert all(
         call == "workflow-active/2/RESTART_NODE" or not call.endswith("/RESTART_NODE")
         for call in adapter.calls

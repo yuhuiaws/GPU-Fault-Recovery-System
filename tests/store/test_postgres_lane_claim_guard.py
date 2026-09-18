@@ -31,8 +31,8 @@ LEASE = timedelta(seconds=120)
 @pytest.fixture(autouse=True)
 def clean_tables():
     assert POSTGRES_URL is not None
-    PostgresStore(POSTGRES_URL).close()
     _truncate()
+    PostgresStore(POSTGRES_URL).close()
     yield
     _truncate()
 

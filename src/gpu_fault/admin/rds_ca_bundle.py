@@ -7,6 +7,8 @@ from pathlib import Path
 
 from gpu_fault.admin.bootstrap_common import CommandRunner
 
+RDS_CA_BUNDLE_PATH = "/etc/gpu-fault/rds/ca-bundle.pem"
+
 
 def ensure_rds_ca_bundle(
     runner: CommandRunner,

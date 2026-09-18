@@ -97,7 +97,7 @@ def test_rollback_target_arguments_rejects_tag_runtime_image() -> None:
 def test_rollback_target_arguments_accepts_digest_targets() -> None:
     arguments = rollback_target_arguments(
         _rollback_release(),
-        previous={"node_installer_image": OTHER_DIGEST},
+        previous={"runtime_image": DIGEST, "node_installer_image": OTHER_DIGEST},
         metadata={},
         artifact="art",
         config_digest="cfg",

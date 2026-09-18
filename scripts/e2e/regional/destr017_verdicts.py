@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+from scripts.e2e.regional.remote_command_shapes import command_operations
 
 # The official steps a single idle node's RESET_GPU workflow compiles to.
 OFFICIAL_OPERATIONS = (
@@ -347,7 +348,7 @@ def command_errors(
     errors: list[str] = []
     for command in commands:
         operation = str((command.get("step") or {}).get("operation") or "")
-        if operation in RESET_OPERATIONS:
+        if RESET_OPERATIONS.intersection(command_operations(command)):
             errors.append(
                 f"a GPU reset command was dispatched to {node}: "
                 f"{command.get('command_id')}"

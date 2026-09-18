@@ -140,6 +140,31 @@ def observe_attempt(observed_at: datetime) -> None:
     )
 
 
+def validate_hung_workflow(workflow: dict[str, Any]) -> None:
+    steps = workflow["official_steps"]
+    assert [step["operation"] for step in steps] == [
+        "FREEZE_EVIDENCE",
+        "COLLECT_HUNG_TRIAGE",
+        "COLLECT_DIAGNOSTIC_BUNDLE",
+        "VALIDATE_FABRIC",
+    ], "active hung-traffic recovery requires the current read-only triage DAG"
+    assert workflow["dag_enabled"] is True
+    assert workflow["blocked_reasons"] == [], "fixture allowlist must admit the plan"
+    assert [step["depends_on_step_indexes"] for step in steps] == [
+        [],
+        [0],
+        [1],
+        [1],
+    ], "bundle and validation must wait for the triage result"
+    for step in steps[1:3]:
+        assert step["parameters"]["diagnostic_reason"] == "EFA_TRAFFIC_HUNG_SUSPECTED"
+        assert step["node_ids"] == [NODE_ID]
+    assert steps[1]["parameters"]["capture_process_state"] is True
+    assert steps[2]["parameters"]["capture_process_state"] is False
+    assert steps[2]["parameters"]["hung_triage_target_pending"] is True
+    assert workflow["step_executions"] == [], "this fixture does not execute actions"
+
+
 def main() -> int:
     global API_URL
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +176,8 @@ def main() -> int:
             "GPU_FAULT_STORE_URL": f"sqlite:///{DB_PATH}",
             "GPU_FAULT_EXECUTION_TOKEN": random_execution_token(),
             "GPU_FAULT_ALLOWED_OPERATIONS": (
-                "FREEZE_EVIDENCE,COLLECT_DIAGNOSTIC_BUNDLE,VALIDATE_FABRIC"
+                "FREEZE_EVIDENCE,COLLECT_HUNG_TRIAGE,"
+                "COLLECT_DIAGNOSTIC_BUNDLE,VALIDATE_FABRIC"
             ),
             "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER": "false",
             "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER": "false",
@@ -175,11 +201,13 @@ def main() -> int:
         "test_case_id": "HYPERPOD-EFA-TRAFFIC-HUNG-E2E",
         "cluster_id": CLUSTER_ID,
         "dispatcher_enabled": False,
+        "evidence_scope": "synthetic RDMA counters and an unexecuted active-workload triage DAG",
         "verdict": "FAIL",
         "status": "FAILED",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "samples": [],
     }
+    store: SqliteStore | None = None
     try:
         require_assertions_enabled()
         wait_for_isolated_api(api, expected_executor="active")
@@ -267,16 +295,7 @@ def main() -> int:
             for item in workflows
             if item["incident_id"] == f"inc-{hung['event_id']}"
         )
-        operations = [step["operation"] for step in hung_workflow["official_steps"]]
-        assert operations == [
-            "FREEZE_EVIDENCE",
-            "COLLECT_DIAGNOSTIC_BUNDLE",
-            "VALIDATE_FABRIC",
-        ]
-        assert (
-            hung_workflow["official_steps"][1]["parameters"]["diagnostic_reason"]
-            == "EFA_TRAFFIC_HUNG_SUSPECTED"
-        )
+        validate_hung_workflow(hung_workflow)
         report["hung_workflow"] = hung_workflow
         state_key = store.efa_traffic_state_key(
             CLUSTER_ID,
@@ -294,10 +313,14 @@ def main() -> int:
         report["error"] = f"{type(exc).__name__}: {exc}"
         return 1
     finally:
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            stop_isolated_api(api)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         rendered_report = json.dumps(report, indent=2, sort_keys=True)
         REPORT_PATH.write_text(rendered_report)
-        stop_isolated_api(api)
         print("EFA_E2E_REPORT_BEGIN")
         print(rendered_report)
         print("EFA_E2E_REPORT_END")

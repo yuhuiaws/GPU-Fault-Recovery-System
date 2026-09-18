@@ -59,6 +59,8 @@ def test_live_driver_defaults_to_non_execute_mode(tmp_path: Path) -> None:
 
 def test_live_driver_authorizes_matching_plan(tmp_path: Path) -> None:
     plan = build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -67,7 +69,7 @@ def test_live_driver_authorizes_matching_plan(tmp_path: Path) -> None:
         details={"mutation": "test-only"},
     )
 
-    assert plan["schema_version"] == 2, plan
+    assert plan["schema_version"] == 3, plan
     assert plan["execution_scope"] == "formal", plan
     assert plan["selection_reference"] is None, plan
     deadline = authorize_execution(
@@ -82,6 +84,8 @@ def test_live_driver_authorizes_matching_plan(tmp_path: Path) -> None:
 
 def test_live_driver_rejects_confirmation_and_environment_drift(tmp_path: Path) -> None:
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -114,6 +118,8 @@ def test_selective_scope_requires_an_audit_reference(
 
     with pytest.raises(RuntimeError, match=SELECTION_REFERENCE_ENV):
         build_plan(
+            arguments=_arguments(tmp_path),
+            preflight_passed=True,
             run_dir=tmp_path,
             case_id=CASE_ID,
             attempt=1,
@@ -129,6 +135,8 @@ def test_selective_scope_is_bound_to_plan_and_case_result(
     monkeypatch.setenv(EXECUTION_SCOPE_ENV, "selective")
     monkeypatch.setenv(SELECTION_REFERENCE_ENV, "CHG-SELECTIVE-001")
     plan = build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -157,6 +165,8 @@ def test_execute_rejects_execution_scope_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -178,6 +188,8 @@ def test_execute_rejects_execution_scope_drift(
 
 def test_live_driver_rejects_expired_window(tmp_path: Path) -> None:
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -204,6 +216,8 @@ def test_plan_records_a_details_digest_and_refuses_edited_details(
     details were edited after approval is not the approved plan."""
 
     plan = build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -231,6 +245,8 @@ def test_authorize_compares_the_callers_current_details_when_given(
     tmp_path: Path,
 ) -> None:
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -259,6 +275,8 @@ def test_authorize_compares_the_callers_current_details_when_given(
 
 def test_a_plan_without_a_details_digest_is_refused(tmp_path: Path) -> None:
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -295,6 +313,8 @@ def test_focused_tests_are_reused_only_for_the_same_source(
     record_focused_tests(details, {"passed": True, "returncode": 0})
     assert details["focused_tests_source_digest"] == "digest-a", details
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,
@@ -319,6 +339,8 @@ def test_a_failed_or_absent_focused_result_is_never_reused(
     details: dict[str, Any] = {}
     record_focused_tests(details, {"passed": False, "returncode": 1})
     build_plan(
+        arguments=_arguments(tmp_path),
+        preflight_passed=True,
         run_dir=tmp_path,
         case_id=CASE_ID,
         attempt=1,

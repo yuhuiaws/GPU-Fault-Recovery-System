@@ -1,9 +1,9 @@
 """M-6: the RDS CA bundle is shipped, mounted and pointed at everywhere the
 control-plane Postgres DSN is opened.
 
-``gpu_fault.admin.bootstrap._aurora_dsn`` refuses to build the Aurora DSN
-unless ``GPU_FAULT_RDS_CA_BUNDLE`` names the in-Pod path of an RDS CA bundle;
-it then bakes ``sslmode=verify-full&sslrootcert=<that path>`` into the
+Managed bootstrap explicitly supplies the canonical CA path; the legacy DSN
+helper refuses absent CA input. Both bake
+``sslmode=verify-full&sslrootcert=<that path>`` into the
 ``gpu-fault-aurora`` Secret. These tests pin the deploy-side wiring that makes
 that path real:
 
@@ -11,8 +11,8 @@ that path real:
   control-plane Deployment, the Aurora migration Job and the credential
   refresh CronJob -- mounts the bundle read-only at the one canonical path and
   sets ``GPU_FAULT_RDS_CA_BUNDLE`` to it;
-* the admin-CLI deploy environment exports the same path, so bootstrap bakes a
-  path the Pods actually serve;
+* the legacy regional environment exports the same path; the managed bootstrap
+  behavior without that export is covered by the bootstrap preamble tests;
 * the bundle is fetched from the official AWS truststore and admitted only if
   its SHA-256 matches the pinned value (fail closed), the same digest-gate
   convention the wheel and node-bundle ship with.
@@ -30,13 +30,15 @@ from typing import Any
 
 import yaml
 
+from gpu_fault.admin.rds_ca_bundle import RDS_CA_BUNDLE_PATH
+
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
 
 # One canonical in-Pod path, shared by every consumer and by the DSN bootstrap
 # bakes. The bundle ConfigMap is mounted at the parent directory so the file
 # lands here without a subPath.
-CANONICAL_PATH = "/etc/gpu-fault/rds/ca-bundle.pem"
+CANONICAL_PATH = RDS_CA_BUNDLE_PATH
 MOUNT_DIR = "/etc/gpu-fault/rds"
 CONFIGMAP_NAME = "gpu-fault-rds-ca-bundle"
 VOLUME_NAME = "rds-ca-bundle"

@@ -4,35 +4,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy" / "hyperpod" / "deploy.sh"
-CLOUDWATCH_HMA_SCRIPT = ROOT / "deploy" / "hyperpod" / "deploy-cloudwatch-hma.sh"
 MANIFEST = ROOT / "deploy" / "control-plane" / "base" / "control-plane-deployment.yaml"
 COMPLETION_MANIFEST = ROOT / "deploy" / "dataplane" / "completion-watcher.yaml"
-HMA_MANIFEST = ROOT / "deploy" / "dataplane" / "optional" / "hma-watcher.yaml"
 NODE_INSTALLER = ROOT / "deploy" / "node" / "run-hyperpod-installer-job.sh"
 
 
 def test_hyperpod_deploy_script_has_valid_shell_syntax() -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
-    subprocess.run(["bash", "-n", str(CLOUDWATCH_HMA_SCRIPT)], check=True)
-
-
-def test_cloudwatch_hma_deployment_is_disabled_by_default() -> None:
-    result = subprocess.run(
-        [str(CLOUDWATCH_HMA_SCRIPT)],
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key != "GPU_FAULT_ENABLE_CLOUDWATCH_HMA_COLLECTOR"
-        },
-        text=True,
-        capture_output=True,
-    )
-
-    assert result.returncode == 0
-    assert "SKIP CloudWatch HMA collector" in result.stdout
-    script = CLOUDWATCH_HMA_SCRIPT.read_text()
-    assert "GPU_FAULT_ENABLE_CLOUDWATCH_HMA_COLLECTOR:-false" in script
-    assert "GPU_FAULT_ENABLE_CLOUDWATCH_HMA_COLLECTOR must be true or false" in script
 
 
 def test_hyperpod_deploy_script_expands_passive_fallback() -> None:
@@ -137,10 +115,9 @@ def test_control_plane_reads_addresses_from_optional_secret() -> None:
 
 
 def test_control_watchers_tolerate_solution_quarantine_taint() -> None:
-    for path in (COMPLETION_MANIFEST, HMA_MANIFEST):
-        manifest = path.read_text()
-        assert "key: gpu-fault.io/quarantined" in manifest
-        assert "effect: NoSchedule" in manifest
+    manifest = COMPLETION_MANIFEST.read_text()
+    assert "key: gpu-fault.io/quarantined" in manifest
+    assert "effect: NoSchedule" in manifest
 
 
 def test_hyperpod_deploy_wires_pinned_field_diagnostic() -> None:

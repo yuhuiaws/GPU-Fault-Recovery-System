@@ -10,7 +10,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -25,9 +25,12 @@ from gpu_fault.admin.site import load_site  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.live_driver_guard import source_digest  # noqa: E402
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
 )
+from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 EXECUTION_TOKEN_NAME = re.compile(r"execution[_.-]?token", re.IGNORECASE)
 GPU_FAULT_PREFIX = "gpu-fault.io/"
@@ -37,6 +40,7 @@ E2E001_CASE_ID = "GF-REGIONAL-E2E-001"
 E2E001_EXECUTION_CARD = "execution-card.json"
 E2E001_CONTROL_PLANE_STATE = "control-plane-current.json"
 E2E001_CPU_NODES_BEFORE = "cpu-nodes-before.json"
+CONTAINMENT_CASE_ID = "GF-REGIONAL-DESTR-001"
 # The four BLAST cases share one preflight (site/account/EKS/HyperPod
 # bindings); a result this young is reused rather than paid for four times.
 PREFLIGHT_REUSE_SECONDS = 30 * 60
@@ -100,27 +104,27 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def observed_in_windows(
+    timestamp: str, windows: Sequence[tuple[datetime, datetime]]
+) -> bool:
+    observed = parse_time(timestamp)
+    if observed.tzinfo is None:
+        raise CheckError("CPU audit timestamp has no timezone")
+    return any(start <= observed <= end for start, end in windows)
+
+
 def command(
     args: Sequence[str],
     *,
     check: bool = True,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        list(args),
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    return run_fixture_command(
+        args,
+        input_text=input_text,
+        check=check,
+        timeout=180,
     )
-    if check and result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise CheckError(
-            f"command failed with exit {result.returncode}: {args[0]} "
-            f"{' '.join(args[1:4])}; stderr={stderr[:600]!r}"
-        )
-    return result
 
 
 def json_command(args: Sequence[str]) -> Any:
@@ -167,6 +171,214 @@ def sha256_text(value: str) -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def successful_containment_command(
+    state: dict[str, Any], source: dict[str, Any]
+) -> str:
+    """Bind the successful MARK step to the producer's exact remote command."""
+
+    workflow, incident, event = (
+        state.get("workflow") or {},
+        state.get("incident") or {},
+        state.get("event") or {},
+    )
+    if (
+        not source.get("workflow_request_id")
+        or not source.get("incident_id")
+        or workflow.get("request_id") != source["workflow_request_id"]
+        or workflow.get("incident_id") != source["incident_id"]
+        or workflow.get("status") != "SUCCEEDED"
+        or type(workflow.get("fencing_token")) is not int
+        or workflow["fencing_token"] < 1
+        or incident.get("incident_id") != source["incident_id"]
+        or incident.get("workflow_request_id") != source["workflow_request_id"]
+        or incident.get("cluster_id") != source["cluster_id"]
+        or not event.get("event_id")
+        or incident.get("event_id") != event["event_id"]
+        or event.get("cluster_id") != source["cluster_id"]
+        or event.get("node_id") != source["node"]
+        or source["node"] not in (incident.get("node_ids") or [])
+    ):
+        raise CheckError("DESTR-001 containment workflow identity is inconsistent")
+    executions = [
+        step
+        for step in workflow.get("step_executions") or []
+        if step.get("operation") == "MARK_UNSCHEDULABLE"
+        and step.get("status") == "SUCCEEDED"
+    ]
+    if len(executions) != 1:
+        raise CheckError(
+            "DESTR-001 has no unique successful MARK_UNSCHEDULABLE execution"
+        )
+    execution = executions[0]
+    if type(execution.get("step_index")) is not int or execution["step_index"] < 0:
+        raise CheckError("DESTR-001 containment step index is missing")
+    matches = []
+    for command in state.get("commands") or []:
+        if (
+            command.get("status") != "SUCCEEDED"
+            or command.get("cluster_id") != source["cluster_id"]
+            or command.get("workflow_request_id") != source["workflow_request_id"]
+            or command.get("incident_id") != source["incident_id"]
+            or command.get("fencing_token") != workflow.get("fencing_token")
+            or not command.get("last_lease_owner")
+            or execution.get("adapter_operation_id")
+            != "remote/" + str(command.get("command_id"))
+        ):
+            continue
+        covered = [
+            {"step_index": command.get("step_index"), "step": command.get("step")},
+            *(command.get("batched_steps") or []),
+        ]
+        if any(
+            item.get("step_index") == execution.get("step_index")
+            and (item.get("step") or {}).get("operation") == "MARK_UNSCHEDULABLE"
+            and (item.get("step") or {}).get("node_ids") == [source["node"]]
+            for item in covered
+        ):
+            matches.append(str(command["command_id"]))
+    if len(matches) != 1:
+        raise CheckError(
+            "DESTR-001 successful containment command is missing or ambiguous"
+        )
+    return matches[0]
+
+
+def containment_source(
+    root_run_dir: Path,
+    *,
+    predecessor: dict[str, Any],
+    release_id: str,
+    cluster_id: str,
+    cpu_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    source_dir = root_run_dir / "cases" / CONTAINMENT_CASE_ID
+    verdict_path = source_dir / f"{CONTAINMENT_CASE_ID}.json"
+    if (
+        predecessor.get("valid") is not True
+        or predecessor.get("case_id") != CONTAINMENT_CASE_ID
+        or predecessor.get("verdict") != "PASS"
+        or Path(str(predecessor.get("path") or "")).resolve() != verdict_path.resolve()
+    ):
+        raise CheckError("BLAST-001 requires this run's DESTR-001 PASS predecessor")
+    documents = {}
+    digests = {}
+    for name in (
+        verdict_path.name,
+        "preflight.json",
+        "workflow-state.json",
+        "host-baseline.json",
+        "host-after.json",
+        "cpu-blast-after.json",
+    ):
+        path = source_dir / name
+        if path.resolve().parent != source_dir.resolve():
+            raise CheckError("DESTR-001 source file escaped its case directory")
+        raw = path.read_bytes()
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise CheckError("DESTR-001 source file is not an object")
+        documents[name] = document
+        digests[name] = sha256_bytes(raw)
+    source = documents[verdict_path.name]
+    preflight = documents["preflight.json"]
+    state = documents["workflow-state.json"]
+    residuals = source.get("probe_residuals")
+    if (
+        source.get("case_id") != CONTAINMENT_CASE_ID
+        or source.get("verdict") != "PASS"
+        or source.get("release_id") != release_id
+        or source.get("cluster_id") != cluster_id
+        or source.get("errors") != []
+        or source.get("error")
+        or any(
+            source.get(key)
+            for key in (
+                "sampler_cleanup_error",
+                "probe_cleanup_error",
+                "postflight_error",
+            )
+        )
+        or not isinstance(residuals, dict)
+        or not residuals
+        or any(value is not False for value in residuals.values())
+        or not isinstance(source.get("quiesce_recovery"), dict)
+        or source["quiesce_recovery"].get("error")
+        or preflight.get("errors") != []
+        or (preflight.get("evidence_identity") or {}).get("release_id") != release_id
+        or (preflight.get("evidence_identity") or {}).get("cluster_id") != cluster_id
+        or state.get("release_id") != release_id
+    ):
+        raise CheckError(
+            "DESTR-001 source is not successful, cleaned and deployment-bound"
+        )
+    before_node, after_node = (
+        preflight.get("node") or {},
+        source.get("final_node") or {},
+    )
+    if (
+        not source.get("node")
+        or not before_node.get("uid")
+        or before_node.get("name") != source["node"]
+        or after_node.get("name") != source["node"]
+        or after_node.get("uid") != before_node["uid"]
+        or after_node.get("ready") != "True"
+        or after_node.get("unschedulable") is not False
+        or after_node.get("ownership_annotations")
+        != before_node.get("ownership_annotations")
+        or after_node.get("taints") != before_node.get("taints")
+    ):
+        raise CheckError("DESTR-001 node identity or cleanup is unproven")
+    start_text = str(documents["host-baseline.json"].get("captured_at") or "")
+    end_text = str(documents["host-after.json"].get("captured_at") or "")
+    start, end = parse_time(start_text), parse_time(end_text)
+    approved_end = parse_time(str(source.get("maintenance_window_end") or ""))
+    event_time = parse_time(str((state.get("event") or {}).get("observed_at") or ""))
+    if (
+        any(item.tzinfo is None for item in (start, end, approved_end, event_time))
+        or not start <= event_time <= end <= datetime.now(timezone.utc)
+        or start == end
+        or end > approved_end
+    ):
+        raise CheckError("DESTR-001 containment observation window is invalid")
+    expected_nodes = {
+        name: {
+            "taints": [
+                [item["key"], item["value"], item["effect"]] for item in node["taints"]
+            ],
+            "unschedulable": node["unschedulable"],
+            "labels": node["gpu_fault_labels"],
+            "annotations": node["gpu_fault_annotations"],
+        }
+        for name, node in cpu_snapshot.items()
+    }
+    before_cpu, after_cpu = (
+        preflight.get("cpu_blast") or {},
+        documents["cpu-blast-after.json"],
+    )
+    if (
+        before_cpu.get("nodes") != expected_nodes
+        or before_cpu != after_cpu
+        or not isinstance(before_cpu.get("gpu_fault_jobs"), list)
+        or not isinstance(before_cpu.get("eviction_events"), list)
+    ):
+        raise CheckError("DESTR-001 CPU snapshots do not match the trusted baseline")
+    command_id = successful_containment_command(state, source)
+    return {
+        "case_id": CONTAINMENT_CASE_ID,
+        "evidence_dir": str(source_dir),
+        "release_id": release_id,
+        "cluster_id": cluster_id,
+        "workflow_request_id": source["workflow_request_id"],
+        "command_id": command_id,
+        "node": source["node"],
+        "node_uid": before_node["uid"],
+        "window_start": start_text,
+        "window_end": end_text,
+        "operations": ["MARK_UNSCHEDULABLE"],
+        "source_sha256": digests,
+    }
 
 
 def as_list(value: Any) -> list[Any]:
@@ -218,11 +430,13 @@ def notification_channel(config: Mapping[str, Any]) -> str:
     """
 
     declared = str(config.get("GPU_FAULT_NOTIFICATION_CHANNEL") or "").strip().lower()
-    if declared in ("sns", "ses", "disabled"):
+    if declared:
+        if declared not in ("sns", "ses", "disabled"):
+            raise CheckError("deployed notification channel is unknown")
         return declared
     if str(config.get("GPU_FAULT_SNS_TOPIC_ARN") or "").strip():
         return "sns"
-    if str(config.get("GPU_FAULT_EMAIL_SENDER") or "").strip():
+    if config.get("GPU_FAULT_EMAIL_SENDER") or config.get("GPU_FAULT_EMAIL_RECIPIENTS"):
         return "ses"
     return "disabled"
 
@@ -287,9 +501,34 @@ class BlastRunnerBase:
         ]
         if not self.targets:
             raise CheckError("site contains no GPU clusters")
+        self._input_binding = self.input_binding()
+        if self._input_binding["site_sha256"] != self.site.source_sha256:
+            raise CheckError("site changed while loading BLAST inputs")
         self.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.run_dir.chmod(0o700)
         self.case_statuses: list[dict[str, Any]] = []
+
+    def input_binding(self) -> dict[str, str]:
+        binding = {}
+        for key, path in (
+            ("site_sha256", self.site_path),
+            ("cpu_kubeconfig_sha256", Path(self.cpu_kubeconfig)),
+            ("gpu_kubeconfig_sha256", Path(self.gpu_kubeconfig)),
+        ):
+            try:
+                binding[key] = sha256_bytes(path.read_bytes())
+            except OSError:
+                raise CheckError(f"cannot bind BLAST input {key}") from None
+        try:
+            binding["source_digest"] = source_digest()
+        except Exception:
+            # Source identity errors may carry subprocess output.
+            raise CheckError("cannot bind BLAST source identity") from None
+        return binding
+
+    def verify_input_binding(self) -> None:
+        if self.input_binding() != self._input_binding:
+            raise CheckError("BLAST input identity changed during the audit")
 
     def aws(self, *args: str) -> Any:
         return json_command(("aws", *args, "--region", self.region, "--output", "json"))
@@ -352,26 +591,34 @@ class BlastRunnerBase:
         ``cluster_id``; the release binding still applies.
         """
 
-        if self._identity is None:
-            document = self.cpu_json(
-                "-n",
-                self.namespace,
-                "get",
-                "configmap",
-                RELEASE_STATE_CONFIGMAP,
-                "-o",
-                "json",
-            )
-            try:
-                state = json.loads(document["data"]["state.json"])
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise CheckError("regional release state is not valid JSON") from exc
-            self._identity = {
-                "release_id": str(state.get("release_id") or ""),
-                "cluster_id": (
-                    self.targets[0].cluster_id if len(self.targets) == 1 else None
-                ),
-            }
+        document = self.cpu_json(
+            "-n",
+            self.namespace,
+            "get",
+            "configmap",
+            RELEASE_STATE_CONFIGMAP,
+            "-o",
+            "json",
+        )
+        try:
+            state = json.loads(document["data"]["state.json"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise CheckError("regional release state is not valid JSON") from exc
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("release_id"), str)
+            or not state["release_id"]
+        ):
+            raise CheckError("regional release identity is missing")
+        current = {
+            "release_id": state["release_id"],
+            "cluster_id": self.targets[0].cluster_id
+            if len(self.targets) == 1
+            else None,
+        }
+        if self._identity is not None and self._identity != current:
+            raise CheckError("regional release identity changed during the audit")
+        self._identity = current
         return dict(self._identity)
 
     def record_case(
@@ -390,6 +637,7 @@ class BlastRunnerBase:
             "verdict": status,
             "executed_at": utc_now(),
             "checks": dict(checks),
+            "input_binding": dict(self._input_binding),
             "limitations": list(limitations)
             or [
                 "The audit proves the current live configuration and identities; "
@@ -399,13 +647,27 @@ class BlastRunnerBase:
         }
         if error is not None:
             payload["error"] = error
+        identity_error = None
         try:
             payload.update(self.evidence_identity())
         except Exception as exc:  # the identity read is itself a live call
-            payload["evidence_identity_error"] = f"{type(exc).__name__}: {exc}"
+            identity_error = f"{type(exc).__name__}: {exc}"
+            payload["evidence_identity_error"] = identity_error
+            payload["verdict"] = "FAIL"
+        binding_error = None
+        try:
+            self.verify_input_binding()
+        except Exception as exc:
+            binding_error = f"{type(exc).__name__}: {exc}"
+            payload["evidence_binding_error"] = binding_error
+            payload["verdict"] = "FAIL"
         write_json(case_evidence_path(self.root_run_dir, case_id), payload)
         self.case_statuses.append(payload)
-        print(f"{case_id}: {status}", flush=True)
+        print(f"{case_id}: {payload['verdict']}", flush=True)
+        if identity_error is not None and status == "PASS":
+            raise CheckError("the audit lost its deployment identity")
+        if binding_error is not None and status == "PASS":
+            raise CheckError("the audit lost its input identity")
 
     def ready_cpu_pod(self) -> str:
         pods = self.cpu_json(
@@ -418,24 +680,10 @@ class BlastRunnerBase:
             "-o",
             "json",
         )
-        ready: list[Mapping[str, Any]] = []
-        for pod in pods.get("items", []):
-            metadata = pod.get("metadata", {})
-            status = pod.get("status", {})
-            conditions = status.get("conditions") or []
-            if (
-                not metadata.get("deletionTimestamp")
-                and status.get("phase") == "Running"
-                and any(
-                    item.get("type") == "Ready" and item.get("status") == "True"
-                    for item in conditions
-                )
-            ):
-                ready.append(pod)
+        ready = ready_pod_records(pods)
         if not ready:
             raise CheckError("no Ready control-plane API Pod")
-        ready.sort(key=lambda item: item["metadata"].get("creationTimestamp", ""))
-        return str(ready[-1]["metadata"]["name"])
+        return str(ready[-1]["name"])
 
     def ready_executor_pod(self, target: ClusterTarget) -> str:
         pods = self.gpu_json(
@@ -449,24 +697,10 @@ class BlastRunnerBase:
             "-o",
             "json",
         )
-        ready: list[Mapping[str, Any]] = []
-        for pod in pods.get("items", []):
-            metadata = pod.get("metadata", {})
-            status = pod.get("status", {})
-            conditions = status.get("conditions") or []
-            if (
-                not metadata.get("deletionTimestamp")
-                and status.get("phase") == "Running"
-                and any(
-                    item.get("type") == "Ready" and item.get("status") == "True"
-                    for item in conditions
-                )
-            ):
-                ready.append(pod)
+        ready = ready_pod_records(pods)
         if not ready:
             raise CheckError(f"no Ready executor Pod for cluster {target.cluster_id}")
-        ready.sort(key=lambda item: item["metadata"].get("creationTimestamp", ""))
-        return str(ready[-1]["metadata"]["name"])
+        return str(ready[-1]["name"])
 
     def kubeconfig_binding(
         self,
@@ -492,9 +726,15 @@ class BlastRunnerBase:
             raise CheckError("kubeconfig minified view is not singular")
         cluster_entry = clusters[0]
         cluster_data = cluster_entry.get("cluster", {})
+        if cluster_data.get("insecure-skip-tls-verify") not in (None, False):
+            raise CheckError("kubeconfig disables TLS verification")
+        if eks_description["cluster"].get("arn") != expected_arn:
+            raise CheckError("EKS description does not match the expected ARN")
         endpoint = str(cluster_data.get("server", ""))
         expected_endpoint = str(eks_description["cluster"]["endpoint"])
         context_cluster_name = str(contexts[0].get("context", {}).get("cluster", ""))
+        if context_cluster_name != cluster_entry.get("name"):
+            raise CheckError("kubeconfig context references a different cluster")
         expected_ca = str(
             eks_description["cluster"].get("certificateAuthority", {}).get("data", "")
         )
@@ -522,7 +762,7 @@ class BlastRunnerBase:
         )
         if endpoint != expected_endpoint:
             raise CheckError(f"kubeconfig endpoint does not match EKS {expected_arn}")
-        if expected_ca_bytes and kube_ca_bytes and not ca_matches:
+        if not ca_matches:
             raise CheckError(f"kubeconfig CA does not match EKS {expected_arn}")
         return {
             "expected_arn": expected_arn,
@@ -530,6 +770,18 @@ class BlastRunnerBase:
             "context_cluster_name": context_cluster_name,
             "endpoint_matches": endpoint == expected_endpoint,
             "ca_matches": ca_matches,
+        }
+
+    def preflight_binding(self) -> dict[str, Any]:
+        return {
+            **self.input_binding(),
+            "region": self.region,
+            "namespace": self.namespace,
+            "cpu_kubeconfig": self.cpu_kubeconfig,
+            "gpu_kubeconfig": self.gpu_kubeconfig,
+            "cpu_eks_arn": self.cpu_eks_arn,
+            "targets": [asdict(target) for target in self.targets],
+            "identity": self.evidence_identity(),
         }
 
     def reusable_preflight(self) -> dict[str, Any] | None:
@@ -550,6 +802,8 @@ class BlastRunnerBase:
             return None
         if not isinstance(cached, dict):
             return None
+        if captured_at.tzinfo is None:
+            return None
         age = (datetime.now(timezone.utc) - captured_at).total_seconds()
         if age < 0 or age > self.preflight_reuse_seconds:
             return None
@@ -562,11 +816,15 @@ class BlastRunnerBase:
         )
         if cached_clusters != sorted(target.cluster_id for target in self.targets):
             return None
+        if cached.get("binding") != self.preflight_binding():
+            return None
         return cached
 
     def preflight(self) -> None:
+        self.verify_input_binding()
         cached = self.reusable_preflight()
         if cached is not None:
+            self.verify_input_binding()
             write_json(
                 self.run_dir / "execution-scope.json",
                 {
@@ -647,6 +905,7 @@ class BlastRunnerBase:
 
         scope = {
             "captured_at": utc_now(),
+            "binding": self.preflight_binding(),
             "site": str(self.site_path),
             "aws_region": self.region,
             "aws_account": expected_account,
@@ -685,6 +944,7 @@ class BlastRunnerBase:
             ],
             "rollback": "none; this run creates no cluster or AWS resources",
         }
+        self.verify_input_binding()
         write_json(self.run_dir / "execution-scope.json", scope)
         write_json(self.root_run_dir / PREFLIGHT_CACHE_NAME, scope)
         print("preflight: PASS", flush=True)
@@ -728,7 +988,7 @@ class BlastRunnerBase:
     def run(self) -> int:
         started_at = utc_now()
         try:
-            if not self.predecessor.get("valid", True):
+            if self.predecessor.get("valid") is not True:
                 raise CheckError("formal predecessor evidence is not PASS")
             self.preflight()
             {

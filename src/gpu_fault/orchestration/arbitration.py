@@ -18,6 +18,7 @@ from gpu_fault.operation_registry import (
     WORKLOAD_SCOPED_OPERATIONS,
     ZERO_RANK_ACTION_OPERATIONS,
 )
+from gpu_fault.workflow_quarantine import terminal_quarantine_covered
 
 # GPU-scoped recovery actions. A fault that names no GPU yet asks for one of
 # these has an unresolved GPU identity; it is not a node-level fault.
@@ -58,6 +59,8 @@ def fault_scope_covered(
     from node-mutating steps only; an evidence step that froze a GPU's
     state has not repaired it (F-B6).
     """
+    if candidate is not None and not terminal_quarantine_covered(workflow, candidate):
+        return False
     resolved = resolved_step_indexes(workflow)
     selected = None if indexes is None else set(indexes)
     live = [

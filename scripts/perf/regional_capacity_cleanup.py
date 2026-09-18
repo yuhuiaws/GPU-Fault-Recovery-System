@@ -38,7 +38,9 @@ AUDIT_PURGE_STATEMENTS = (
     ),
     (
         "gpu_fault_action_workflows",
-        "DELETE FROM gpu_fault_objects WHERE kind='workflow' AND key LIKE %s",
+        "WITH victims AS MATERIALIZED ("
+        "SELECT key,payload FROM gpu_fault_control_records WHERE kind='workflow' AND key LIKE %s"
+        ") SELECT key FROM victims WHERE gpu_fault_delete_control_state('workflow',key,payload)",
         "action_workflow",
     ),
     (
@@ -107,7 +109,9 @@ AUDIT_PURGE_STATEMENTS = (
     ),
     (
         "gpu_fault_objects",
-        "DELETE FROM gpu_fault_objects WHERE payload->>'cluster_id' LIKE %s",
+        "WITH victims AS MATERIALIZED ("
+        "SELECT kind,key,payload FROM gpu_fault_control_records WHERE payload->>'cluster_id' LIKE %s"
+        ") SELECT key FROM victims WHERE gpu_fault_delete_control_state(kind,key,payload)",
         "cluster",
     ),
 )

@@ -8,7 +8,10 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any, Protocol
 
-from gpu_fault.channel_registry import WORKLOAD_OBSERVATIONS_PATH
+from gpu_fault.channel_registry import (
+    ATTEMPT_COVERAGE_PATH,
+    WORKLOAD_OBSERVATIONS_PATH,
+)
 from gpu_fault.processor.completion_signals import ProcessorCompletionSignals
 from gpu_fault.processor.models import ProcessorRequest
 
@@ -329,10 +332,25 @@ class ProcessorLaneRuntimeMixin:
 
     @staticmethod
     def _metric_path(path: str) -> str:
+        if path in {
+            ATTEMPT_COVERAGE_PATH,
+            "/v1/attempts/failure-detected",
+            "/v1/attempts/terminal",
+            "/v1/advisory-notifications/dispatch",
+            "/v1/installation-resources/sync",
+            "/v1/fleet/agents/heartbeat",
+        }:
+            return path
         for prefix in (
             "/v1/incidents/",
             "/v1/workflows/",
             "/v1/recovery-plans/",
+            "/v1/attempts/",
+            "/v1/advisory-notifications/",
+            "/v1/installation-resources/",
+            "/v1/training-health/",
+            "/v1/fleet/agents/",
+            "/v1/fleet/deployments/",
         ):
             if path.startswith(prefix):
                 return f"{prefix}{{id}}"

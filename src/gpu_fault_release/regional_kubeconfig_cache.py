@@ -1,25 +1,9 @@
-"""Per-process kubeconfig copies whose exec credentials are pre-fetched tokens.
+"""Private, expiring AWS EKS token copies for bounded direct kubectl calls.
 
-Every ``kubectl`` call costs ~1.2 s on the deploy host, ~0.8 s of which is the
-kubeconfig's exec credential plugin (``aws eks get-token``) that kubectl re-runs
-on EVERY invocation. A CONTROL_PLANE_ONLY ``config`` release issues ~250 calls,
-a full deploy far more, so the plugin alone is minutes of a release.
-
-The engine therefore runs each exec plugin ONCE, writes a private ``0600`` copy
-of the kubeconfig in which the ``exec`` entry is replaced by the static
-``token`` it returned, and points kubectl (``--kubeconfig`` for the CPU
-cluster, ``KUBECONFIG`` for the GPU ``--context`` calls and every child
-script) at the copy. EKS tokens live ~15 min and releases run 7-40 min, so the
-runner asks :meth:`ReleaseKubeconfigCache.refresh_if_needed` before each
-command: when any token is inside the lead window the tokens are fetched again
-and the copy is replaced atomically (``os.replace``), which a child script's
-next kubectl call -- kubectl reads the file per call -- picks up unchanged.
-
-Fail closed: a plugin that fails raises :class:`ReleaseError`; the engine never
-proceeds with a kubeconfig that has no credentials. Users without ``exec`` and
-files without any exec user are left as they are. ``--dry-run`` fetches
-nothing, and ``GPU_FAULT_KUBECONFIG_TOKEN_CACHE=false`` restores the per-call
-plugin behaviour.
+Generic exec plugins retain kubectl's native protocol. Child scripts and calls
+that can outlive the token use the original kubeconfig; process globals and
+source files are never rewritten. Credential fetches use the shared supervised
+command runner and never include plugin output in diagnostics.
 """
 
 from __future__ import annotations
@@ -34,20 +18,19 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, MutableMapping
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.execution import run_command
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 
 TOKEN_CACHE_ENV = "GPU_FAULT_KUBECONFIG_TOKEN_CACHE"
 DEFAULT_LEAD_SECONDS = 180.0
-# A plugin that omits ``expirationTimestamp`` gets a short lifetime, never a
-# permanent one: refreshing an unexpired token is cheap, a 401 mid-release is not.
-DEFAULT_TOKEN_LIFETIME_SECONDS = 600.0
 EXEC_TIMEOUT_SECONDS = 60.0
+MAX_CREDENTIAL_OUTPUT_BYTES = 8 * 1024 * 1024
 # kubeconfig file references are relative to the file's own directory; the copy
 # lives elsewhere, so they are made absolute against the source directory.
 RELATIVE_PATH_KEYS = (
@@ -64,21 +47,56 @@ def token_cache_enabled(environ: MutableMapping[str, str] | None = None) -> bool
     return value.strip().lower() not in _DISABLED_VALUES
 
 
-def _parse_expiry(value: object, now: float) -> float:
-    if not isinstance(value, str) or not value.strip():
-        return now + DEFAULT_TOKEN_LIFETIME_SECONDS
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
+def _parse_expiry(value: object, now: float) -> float | None:
+    if value is None:
+        return None
     try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ReleaseError(
-            f"exec credential plugin returned an unreadable expirationTimestamp: {value!r}"
-        ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError
+        expires = parsed.timestamp()
+        if expires <= now + EXEC_TIMEOUT_SECONDS:
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise ReleaseError("exec credential expiry is invalid or too soon") from None
+    return expires
+
+
+def _standard_eks_exec(user: dict[str, Any]) -> bool:
+    spec = user.get("exec")
+    if set(user) != {"exec"} or not isinstance(spec, dict):
+        return False
+    arguments = spec.get("args")
+    return (
+        # Bare aws is the generated EKS form and passes through the budget
+        # shim. Absolute/custom executables retain kubectl's native protocol.
+        spec.get("command") == "aws"
+        and isinstance(arguments, list)
+        and all(isinstance(item, str) for item in arguments)
+        and any(
+            arguments[index : index + 2] == ["eks", "get-token"]
+            for index in range(len(arguments) - 1)
+        )
+        and spec.get("provideClusterInfo", False) is False
+        and spec.get("interactiveMode") in (None, "Never", "IfAvailable")
+        and spec.get("apiVersion")
+        in (
+            "client.authentication.k8s.io/v1",
+            "client.authentication.k8s.io/v1beta1",
+        )
+        and not set(spec).difference(
+            {
+                "command",
+                "args",
+                "env",
+                "apiVersion",
+                "interactiveMode",
+                "provideClusterInfo",
+            }
+        )
+    )
 
 
 def _absolutize_paths(section: dict[str, Any], base: Path) -> None:
@@ -102,11 +120,13 @@ class KubeconfigTokenCache:
         self._now = now
         self._lock = threading.Lock()
         try:
-            document = yaml.safe_load(self.source.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
-            raise ReleaseError(f"cannot read kubeconfig {self.source}: {exc}") from exc
+            text = self.source.read_text(encoding="utf-8")
+            document = yaml.safe_load(text)
+        except (OSError, yaml.YAMLError):
+            raise ReleaseError(f"cannot read kubeconfig {self.source}") from None
         if not isinstance(document, dict):
             raise ReleaseError(f"kubeconfig {self.source} is not a mapping")
+        self._source_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
         self._document = document
         self._exec_users: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for entry in document.get("users") or []:
@@ -115,7 +135,13 @@ class KubeconfigTokenCache:
                 _absolutize_paths(user, self.source.parent)
                 exec_spec = user.get("exec")
                 if isinstance(exec_spec, dict):
-                    self._exec_users.append((user, exec_spec))
+                    command = exec_spec.get("command")
+                    if isinstance(command, str) and "/" in command:
+                        exec_spec["command"] = str(
+                            (self.source.parent / command).resolve()
+                        )
+                    if _standard_eks_exec(user):
+                        self._exec_users.append((user, exec_spec))
         for entry in document.get("clusters") or []:
             cluster = entry.get("cluster") if isinstance(entry, dict) else None
             if isinstance(cluster, dict):
@@ -134,6 +160,12 @@ class KubeconfigTokenCache:
         """Re-fetch every token when one expires within ``lead_seconds``."""
 
         with self._lock:
+            try:
+                current = hashlib.sha256(self.source.read_bytes()).hexdigest()
+            except OSError:
+                raise ReleaseError("source kubeconfig is no longer readable") from None
+            if current != self._source_sha256:
+                raise ReleaseError("source kubeconfig changed during release")
             if self.earliest_expiry is None:
                 return False
             if self.earliest_expiry - self._now() > lead_seconds:
@@ -142,14 +174,23 @@ class KubeconfigTokenCache:
             return True
 
     def _refresh(self) -> None:
+        # Publish all users together. A failed refresh never leaves the old
+        # token eligible for reuse on a later command.
+        self.earliest_expiry = 0.0
         earliest: float | None = None
+        updated: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for user, exec_spec in self._exec_users:
             token, expiry = _fetch_exec_credential(exec_spec, now=self._now)
-            user.pop("exec", None)
-            user["token"] = token
-            earliest = expiry if earliest is None else min(earliest, expiry)
-        self.earliest_expiry = earliest
+            updated.append(
+                (user, {"token": token} if expiry is not None else {"exec": exec_spec})
+            )
+            if expiry is not None:
+                earliest = expiry if earliest is None else min(earliest, expiry)
+        for user, replacement in updated:
+            user.clear()
+            user.update(replacement)
         self._write(yaml.safe_dump(self._document, sort_keys=False))
+        self.earliest_expiry = earliest
 
     def _write(self, text: str) -> None:
         handle, temp = tempfile.mkstemp(dir=self.path.parent, prefix=".kubeconfig-")
@@ -165,15 +206,26 @@ class KubeconfigTokenCache:
 
 def _fetch_exec_credential(
     exec_spec: dict[str, Any], *, now: Callable[[], float]
-) -> tuple[str, float]:
+) -> tuple[str, float | None]:
     command = exec_spec.get("command")
     if not isinstance(command, str) or not command:
         raise ReleaseError("kubeconfig exec entry has no command")
-    args = [str(item) for item in exec_spec.get("args") or []]
+    args = exec_spec.get("args") or []
+    if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
+        raise ReleaseError("kubeconfig exec arguments are invalid")
     environment = dict(os.environ)
-    for item in exec_spec.get("env") or []:
-        if isinstance(item, dict) and isinstance(item.get("name"), str):
-            environment[item["name"]] = str(item.get("value", ""))
+    entries = exec_spec.get("env") or []
+    if not isinstance(entries, list):
+        raise ReleaseError("kubeconfig exec environment is invalid")
+    for item in entries:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not item["name"]
+            or not isinstance(item.get("value"), str)
+        ):
+            raise ReleaseError("kubeconfig exec environment is invalid")
+        environment[item["name"]] = item["value"]
     environment["KUBERNETES_EXEC_INFO"] = json.dumps(
         {
             "apiVersion": exec_spec.get(
@@ -183,47 +235,52 @@ def _fetch_exec_credential(
             "spec": {"interactive": False},
         }
     )
-    label = " ".join([command, *args])
     try:
-        completed = subprocess.run(
+        completed = run_command(
             [command, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-            timeout=EXEC_TIMEOUT_SECONDS,
+            capture=True,
+            environment=environment,
+            timeout_seconds=EXEC_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ReleaseError(f"exec credential plugin failed: {label}: {exc}") from exc
+    except (OSError, TimeoutError, subprocess.TimeoutExpired):
+        raise ReleaseError("exec credential plugin failed") from None
     if completed.returncode:
-        detail = (completed.stderr or completed.stdout).strip().splitlines()
-        raise ReleaseError(
-            f"exec credential plugin exited {completed.returncode}: {label}"
-            + (f": {detail[-1]}" if detail else "")
+        raise ReleaseError(f"exec credential plugin exited {completed.returncode}")
+    if (
+        sum(
+            len(value.encode("utf-8"))
+            for value in (completed.stdout or "", completed.stderr or "")
         )
+        > MAX_CREDENTIAL_OUTPUT_BYTES
+    ):
+        raise ReleaseError("exec credential output exceeds its size limit")
     try:
         credential = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise ReleaseError(
-            f"exec credential plugin did not return JSON: {label}"
-        ) from exc
+    except json.JSONDecodeError:
+        raise ReleaseError("exec credential plugin did not return JSON") from None
+    if (
+        not isinstance(credential, dict)
+        or credential.get("kind") != "ExecCredential"
+        or credential.get("apiVersion") != exec_spec.get("apiVersion")
+    ):
+        raise ReleaseError("exec credential response identity is invalid")
     status = credential.get("status") if isinstance(credential, dict) else None
     if not isinstance(status, dict):
-        raise ReleaseError(f"exec credential plugin returned no status: {label}")
+        raise ReleaseError("exec credential plugin returned no status")
+    if set(status).difference({"token", "expirationTimestamp"}):
+        raise ReleaseError("exec credential returned unsupported status fields")
     token = status.get("token")
     if not isinstance(token, str) or not token:
-        raise ReleaseError(f"exec credential plugin returned no status.token: {label}")
+        raise ReleaseError("exec credential plugin returned no status.token")
     return token, _parse_expiry(status.get("expirationTimestamp"), now())
 
 
 class ReleaseKubeconfigCache:
     """The engine process's cached kubeconfigs: CPU path plus ``KUBECONFIG``.
 
-    ``cpu_kubeconfig`` is the path to hand kubectl for the CPU cluster (the
-    cached copy, or the original when the cache is off, the release is a dry
-    run, or the file has no exec user). ``KUBECONFIG`` in ``environ`` is
-    rewritten in place -- the GPU ``--context`` calls and every child script
-    read it from the process environment -- and restored by :meth:`cleanup`.
+    ``command_inputs`` selects copies only for direct kubectl commands whose
+    full budget fits the credentials' explicit lifetime. Other commands keep
+    native authentication, including scripts that start their own kubectl.
     """
 
     def __init__(
@@ -239,6 +296,8 @@ class ReleaseKubeconfigCache:
         self._directory: Path | None = None
         self._caches: dict[Path, KubeconfigTokenCache] = {}
         self._now = now
+        self._original_cpu_kubeconfig = cpu_kubeconfig
+        self._cached_gpu_kubeconfig = self._original_kubeconfig
         self.cpu_kubeconfig = cpu_kubeconfig
         self.active = not dry_run and token_cache_enabled(self._environ)
         if not self.active:
@@ -248,7 +307,7 @@ class ReleaseKubeconfigCache:
         try:
             self.cpu_kubeconfig = self._cached_path(cpu_kubeconfig)
             if self._original_kubeconfig:
-                self._environ["KUBECONFIG"] = os.pathsep.join(
+                self._cached_gpu_kubeconfig = os.pathsep.join(
                     self._cached_path(item)
                     for item in self._original_kubeconfig.split(os.pathsep)
                 )
@@ -271,7 +330,7 @@ class ReleaseKubeconfigCache:
             cache = KubeconfigTokenCache(
                 source, directory=self._directory, now=self._now
             )
-            if not cache.has_exec_users:
+            if not cache.has_exec_users or cache.earliest_expiry is None:
                 return original
             self._caches[key] = cache
         return str(cache.path)
@@ -287,11 +346,38 @@ class ReleaseKubeconfigCache:
         for cache in self._caches.values():
             cache.refresh_if_needed(lead_seconds)
 
+    def command_inputs(
+        self,
+        arguments: list[str],
+        environment: dict[str, str] | None,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[list[str], dict[str, str] | None]:
+        if not self.active or not arguments or Path(arguments[0]).name != "kubectl":
+            return arguments, environment
+        values = dict(self._environ if environment is None else environment)
+        if values.get("KUBECONFIG") != self._original_kubeconfig:
+            return arguments, environment
+        self.refresh_if_needed()
+        if any(
+            cache.earliest_expiry is not None
+            and cache.earliest_expiry - self._now()
+            <= timeout_seconds + DEFAULT_LEAD_SECONDS
+            for cache in self._caches.values()
+        ):
+            return arguments, environment
+        prepared = list(arguments)
+        for index, word in enumerate(prepared):
+            if word == "--kubeconfig" and index + 1 < len(prepared):
+                if prepared[index + 1] == self._original_cpu_kubeconfig:
+                    prepared[index + 1] = self.cpu_kubeconfig
+            elif word == f"--kubeconfig={self._original_cpu_kubeconfig}":
+                prepared[index] = f"--kubeconfig={self.cpu_kubeconfig}"
+        if self._cached_gpu_kubeconfig is not None:
+            values["KUBECONFIG"] = self._cached_gpu_kubeconfig
+        return prepared, values
+
     def cleanup(self) -> None:
-        if self._original_kubeconfig is None:
-            self._environ.pop("KUBECONFIG", None)
-        else:
-            self._environ["KUBECONFIG"] = self._original_kubeconfig
         if self._directory is not None:
             shutil.rmtree(self._directory, ignore_errors=True)
             self._directory = None

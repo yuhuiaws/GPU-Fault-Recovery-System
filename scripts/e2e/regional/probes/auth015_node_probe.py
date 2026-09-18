@@ -11,6 +11,9 @@ from typing import Any, Iterable
 
 MAX_SCAN_BYTES = 1024 * 1024
 SAFE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# HostProbeFixture executes this script after chroot into the node root.
+SCAN_ROOTS = (Path("/tmp"), Path("/etc/gpu-fault"), Path("/var/lib/kubelet/pods"))
+PROC_ROOT = Path("/proc")
 
 
 class ProbeError(RuntimeError):
@@ -22,20 +25,24 @@ def digest(value: bytes) -> str:
 
 
 def candidate_files() -> Iterable[Path]:
-    roots = (
-        Path("/host/tmp"),
-        Path("/host/etc/gpu-fault"),
-        Path("/host/var/lib/kubelet/pods"),
-    )
-    for root in roots:
+    def unreadable(error: OSError) -> None:
+        raise ProbeError("a host scan directory could not be inspected") from error
+
+    for root in SCAN_ROOTS:
         if not root.is_dir():
-            continue
-        for path in root.rglob("*"):
-            try:
-                if path.is_file() and path.stat().st_size <= MAX_SCAN_BYTES:
-                    yield path
-            except OSError:
-                continue
+            raise ProbeError("a required host scan directory is missing")
+        for directory, _subdirs, filenames in os.walk(root, onerror=unreadable):
+            for filename in filenames:
+                path = Path(directory) / filename
+                try:
+                    if path.is_file():
+                        if path.stat().st_size > MAX_SCAN_BYTES:
+                            raise ProbeError(
+                                "a host scan file exceeds the bounded scan size"
+                            )
+                        yield path
+                except OSError as exc:
+                    raise ProbeError("a host scan file could not be inspected") from exc
 
 
 def value_tokens(path: Path, payload: bytes) -> Iterable[tuple[str, bytes]]:
@@ -45,7 +52,7 @@ def value_tokens(path: Path, payload: bytes) -> Iterable[tuple[str, bytes]]:
             _key, separator, value = line.partition(b"=")
             if separator:
                 yield f"{path}:env", value.strip().strip(b"'\"")
-    if "/proc/" in str(path) and path.name == "environ":
+    if path.name == "environ":
         for item in payload.split(b"\0"):
             _key, separator, value = item.partition(b"=")
             if separator:
@@ -53,17 +60,20 @@ def value_tokens(path: Path, payload: bytes) -> Iterable[tuple[str, bytes]]:
 
 
 def process_environments() -> Iterable[tuple[str, bytes]]:
-    proc = Path("/host/proc")
+    proc = PROC_ROOT
     if not proc.is_dir():
-        return
+        raise ProbeError("host proc directory is missing")
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         path = entry / "environ"
         try:
             payload = path.read_bytes()
-        except OSError:
+        except FileNotFoundError:
+            # A process may exit between listing its PID and reading environ.
             continue
+        except OSError as exc:
+            raise ProbeError("a process environment could not be inspected") from exc
         yield from value_tokens(path, payload)
 
 
@@ -75,8 +85,8 @@ def scan(master_sha256: str) -> dict[str, Any]:
     for path in candidate_files():
         try:
             payload = path.read_bytes()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise ProbeError("a host scan file could not be read") from exc
         for label, value in value_tokens(path, payload):
             if not value:
                 continue
@@ -89,11 +99,13 @@ def scan(master_sha256: str) -> dict[str, Any]:
         scanned += 1
         if digest(value) == master_sha256:
             matches.append(label)
+    if scanned == 0:
+        raise ProbeError("host scan inspected no nonempty values")
     return {
         "master_matches": sorted(set(matches)),
         "values_scanned": scanned,
-        "host_tmp_exists": Path("/host/tmp").is_dir(),
-        "systemd_environment_exists": Path("/host/etc/gpu-fault").is_dir(),
+        "host_tmp_exists": SCAN_ROOTS[0].is_dir(),
+        "systemd_environment_exists": SCAN_ROOTS[1].is_dir(),
     }
 
 

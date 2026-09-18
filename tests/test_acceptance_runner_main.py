@@ -147,7 +147,15 @@ class Recorder:
     def install_abort_signals(self) -> None:
         self._note("install_abort_signals")
 
-    # -- the plain (settings-less) surface -----------------------------------
+    # -- the plain execution surface ----------------------------------------
+
+    def plain_preflight(self, settings: FakeSettings, case_dir: Path) -> dict[str, Any]:
+        self._note("plain_preflight", settings, case_dir)
+        return {
+            "errors": list(self.errors),
+            "identity": {"release_id": "release-test", "cluster_id": "physical-test"},
+            "predecessor": {"case_id": "previous-case", "valid": True},
+        }
 
     def plain_plan_details(self) -> dict[str, Any]:
         self._note("plain_plan_details")
@@ -155,6 +163,15 @@ class Recorder:
 
     def run_case(self, run_dir: Path, attempt: int, deadline: datetime) -> int:
         self._note("run_case", run_dir, attempt, deadline)
+        live_driver_guard.write_json_atomic(
+            run_dir / "cases" / CASE_ID / f"{CASE_ID}.json",
+            {
+                "case_id": CASE_ID,
+                "attempt": attempt,
+                "verdict": "FAIL",
+                "error": "body failure",
+            },
+        )
         return 5
 
     def build_plan(self, **kwargs: Any) -> dict[str, Any]:
@@ -194,13 +211,15 @@ class Recorder:
             execute_case=self.execute_case,
         )
 
-    def plain(self) -> PlainCaseRunner:
+    def plain(self) -> PlainCaseRunner[FakeSettings]:
         return PlainCaseRunner(
             case_id=CASE_ID,
             confirmation=CONFIRMATION,
             parser=self.parser,
             plan_details=self.plain_plan_details,
             run_case=self.run_case,
+            configure=self.configure,
+            read_only_preflight=self.plain_preflight,
         )
 
 
@@ -259,6 +278,8 @@ def test_dry_run_prints_the_plan_and_exits_zero_on_a_clean_preflight(
     assert preflight_args == (recorder.settings, case_dir)
     _, plan_kwargs = recorder.call("build_plan")
     assert plan_kwargs == {
+        "arguments": recorder.call("configure")[0][0],
+        "preflight_passed": True,
         "run_dir": tmp_path,
         "case_id": CASE_ID,
         "attempt": 1,
@@ -287,6 +308,7 @@ def test_dry_run_still_prints_the_plan_but_exits_one_on_preflight_errors(
     assert "execute_case" not in recorder.names
     _, plan_kwargs = recorder.call("build_plan")
     assert plan_kwargs["attempt"] == 3
+    assert plan_kwargs["preflight_passed"] is False
     printed = json.loads(capsys.readouterr().out)
     assert printed["details"]["preflight"]["errors"] == ["target node is not Ready"]
 
@@ -332,36 +354,58 @@ def test_execute_authorizes_then_runs_the_case_with_the_deadline(
     assert capsys.readouterr().out == ""
 
 
-def test_plain_case_prints_the_static_plan_after_installing_the_profile(
+def test_plain_case_prints_a_preflight_bound_plan_after_installing_the_profile(
     recorder: Recorder,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # The settings-less spine (CMD/NET hold cases) has no preflight and no
-    # environment snapshot, but it must still install the site profile before
-    # the parser exists: tests/regional/test_site_profile.py trusts this.
     _argv(monkeypatch, tmp_path, "--plan", "--attempt", "4")
 
     result = run_plain_case(recorder.plain())
 
-    assert result == 0
+    assert result == 0, "the explicit plain preflight passed"
     assert recorder.names == [
         "install_site_profile",
         "parser",
+        "install_abort_signals",
+        "configure",
+        "plain_preflight",
         "plain_plan_details",
         "build_plan",
-    ]
+    ], "plain planning must use the configured, abortable preflight"
     _, plan_kwargs = recorder.call("build_plan")
+    arguments = plan_kwargs["arguments"]
+    assert isinstance(arguments, argparse.Namespace), "plan must bind parsed arguments"
+    assert (arguments.run_dir, arguments.attempt, arguments.plan) == (
+        tmp_path,
+        4,
+        True,
+    ), "the parsed case attempt must be bound"
     assert plan_kwargs == {
+        "arguments": arguments,
+        "preflight_passed": True,
         "run_dir": tmp_path,
         "case_id": CASE_ID,
         "attempt": 4,
         "confirmation": CONFIRMATION,
-        "details": {"static": "plan"},
-    }
+        "environment": recorder.settings.environment(),
+        "details": {
+            "static": "plan",
+            "preflight": {
+                "errors": [],
+                "identity": {
+                    "release_id": "release-test",
+                    "cluster_id": "physical-test",
+                },
+                "predecessor": {"case_id": "previous-case", "valid": True},
+            },
+        },
+    }, "the plan must include the actual identity preflight and environment"
     printed = json.loads(capsys.readouterr().out)
-    assert printed["details"] == {"static": "plan"}, "the plan must be printed"
+    assert printed["details"] == plan_kwargs["details"], (
+        "the bound plan must be printed"
+    )
 
 
 def test_plain_case_authorizes_then_runs_with_the_deadline(
@@ -384,19 +428,46 @@ def test_plain_case_authorizes_then_runs_with_the_deadline(
 
     result = run_plain_case(recorder.plain())
 
-    assert result == 5
+    assert result == 5, "the case failure exit code must survive result binding"
     assert recorder.names == [
         "install_site_profile",
         "parser",
+        "install_abort_signals",
+        "configure",
+        "authorize_execution",
+        "plain_preflight",
+        "plain_plan_details",
         "authorize_execution",
         "run_case",
+    ], "fresh preflight must be reauthorized before the body"
+    authorizations = [
+        (args, kwargs)
+        for name, args, kwargs in recorder.calls
+        if name == "authorize_execution"
     ]
-    authorize_args, authorize_kwargs = recorder.call("authorize_execution")
-    assert authorize_args[0].confirm == CONFIRMATION
-    assert authorize_kwargs == {"case_id": CASE_ID, "confirmation": CONFIRMATION}
+    assert all(args[0].confirm == CONFIRMATION for args, _kwargs in authorizations), (
+        "both authorization checks must use the parsed confirmation"
+    )
+    assert authorizations[0][1] == {
+        "case_id": CASE_ID,
+        "confirmation": CONFIRMATION,
+        "environment": recorder.settings.environment(),
+    }, "initial authorization must bind the configured environment"
+    assert authorizations[1][1]["details"]["preflight"]["errors"] == [], (
+        "final authorization must bind the fresh preflight"
+    )
     run_args, _ = recorder.call("run_case")
-    assert run_args == (tmp_path, 2, DEADLINE)
+    assert run_args == (tmp_path, 2, DEADLINE), "the legacy body signature is unchanged"
     assert capsys.readouterr().out == "", "execution prints no plan"
+    evidence = json.loads(
+        (tmp_path / "cases" / CASE_ID / f"{CASE_ID}.json").read_text()
+    )
+    assert evidence["error"] == "body failure", (
+        "the body's failure evidence must survive"
+    )
+    assert evidence["cluster_id"] == "physical-test", (
+        "the result must bind physical identity"
+    )
 
 
 def test_the_umask_is_restricted_before_the_case_directory_exists(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, cast
 
@@ -14,9 +16,19 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.auth015_custody_inputs import (  # noqa: E402
+    Auth015CustodyInputs,
+    custody_input_identity,
+    verify_custody_inputs,
+)
+from scripts.e2e.regional.auth015_release import (  # noqa: E402
+    load_release_inputs,
+    verify_release_inputs,
+)
 from scripts.e2e.regional.identity_acceptance_auth import (  # noqa: E402
     auth015_focused_tests,
     run_auth007,
+    run_auth008,
     run_auth010,
     run_auth013,
     run_auth014,
@@ -39,6 +51,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
     build_plan,
+    details_sha256,
     install_site_profile,
     record_focused_tests,
     reusable_focused_tests,
@@ -53,6 +66,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 
 CASE_IDS = (
     "GF-REGIONAL-AUTH-007",
+    "GF-REGIONAL-AUTH-008",
     "GF-REGIONAL-AUTH-010",
     "GF-REGIONAL-AUTH-013",
     "GF-REGIONAL-AUTH-014",
@@ -77,11 +91,20 @@ def case_plan(
         "GF-REGIONAL-AUTH-007": (
             "disable one test registration, roll ingress/control-worker, then restore"
         ),
+        "GF-REGIONAL-AUTH-008": (
+            "create one run-owned B FREEZE_EVIDENCE command for the probe-only owner; "
+            "check A isolation and B eligibility, then cancel the command and "
+            "terminalize its isolated workflow through public Store APIs; "
+            "no physical adapter or allowlist mutation"
+        ),
         "GF-REGIONAL-AUTH-010": "anonymous read-only route matrix",
         "GF-REGIONAL-AUTH-013": "TLS handshakes with empty CA and wrong hostname",
         "GF-REGIONAL-AUTH-014": "anonymous route audit plus external SG evidence",
         "GF-REGIONAL-AUTH-015": (
-            "rotate one staging node key, scan two nodes, then restore key Secrets"
+            "verify prospective independently authorized custody receipts and "
+            "deployed non-dispatching command/result signatures; sign a fresh "
+            "independent KMS activation receipt; no key, node or Secret mutation. "
+            "An initial installation alone cannot PASS the rotation requirement"
         ),
         "GF-REGIONAL-AUTH-016": (
             "rotate one test cluster token through a bounded overlap window, then "
@@ -90,8 +113,8 @@ def case_plan(
         "GF-REGIONAL-ISO-003": "cross-cluster Fleet calls that must be rejected",
         "GF-REGIONAL-ISO-004": "cross-cluster spare-health query that must be rejected",
         "GF-REGIONAL-ISO-005": (
-            "create a pause Deployment in a forbidden namespace, temporarily widen "
-            "only the control-plane allowlist, then restore"
+            "exercise deployed CPU/GPU namespace guards in isolated memory with "
+            "an allowed-namespace positive control; no live allowlist change"
         ),
     }
     return {
@@ -140,6 +163,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--secondary-cluster-id", default="")
     value.add_argument("--node", action="append", default=[])
     value.add_argument("--fleet-master-file", type=Path)
+    value.add_argument("--auth015-release-proof", type=Path)
+    value.add_argument("--auth015-custody-proof", type=Path)
+    value.add_argument("--auth015-custody-trust-sha256", default="")
     value.add_argument("--host-probe-image", default="")
     value.add_argument("--outside-probe-evidence", type=Path)
     value.add_argument("--predecessor-evidence", default="")
@@ -153,6 +179,7 @@ def validate_case_arguments(
     primary = site.target(arguments.cluster_id)
     secondary_cases = {
         "GF-REGIONAL-AUTH-007",
+        "GF-REGIONAL-AUTH-008",
         "GF-REGIONAL-ISO-003",
         "GF-REGIONAL-ISO-004",
     }
@@ -166,7 +193,32 @@ def validate_case_arguments(
         if secondary.cluster_id == primary.cluster_id:
             raise IdentityAcceptanceError("primary and secondary clusters must differ")
     nodes = tuple(arguments.node)
+    if (
+        getattr(arguments, "auth015_release_proof", None) is not None
+        or getattr(arguments, "auth015_custody_proof", None) is not None
+        or bool(getattr(arguments, "auth015_custody_trust_sha256", ""))
+    ) and arguments.case != "GF-REGIONAL-AUTH-015":
+        raise IdentityAcceptanceError(
+            "AUTH015 proof arguments are only valid for AUTH-015"
+        )
     if arguments.case == "GF-REGIONAL-AUTH-015":
+        custody = getattr(arguments, "auth015_custody_proof", None)
+        custody_pin = getattr(arguments, "auth015_custody_trust_sha256", "")
+        if custody is not None or custody_pin:
+            if (
+                len(nodes) != 2
+                or len(set(nodes)) != 2
+                or custody is None
+                or not custody_pin
+                or getattr(arguments, "auth015_release_proof", None) is None
+                or arguments.fleet_master_file is not None
+                or arguments.host_probe_image
+            ):
+                raise IdentityAcceptanceError(
+                    "AUTH015 custody requires two nodes, release/custody proofs and an "
+                    "external trust pin; master-file and host-probe inputs are forbidden"
+                )
+            return primary, secondary, nodes
         if (
             len(nodes) != 2
             or len(set(nodes)) != 2
@@ -208,6 +260,35 @@ def main() -> int:
     # must have been earned against the same pair, and the successor will ask
     # the same of this case's evidence.
     identity = site.regional(primary).evidence_identity()
+    if not identity["release_id"].strip():
+        raise IdentityAcceptanceError("the deployed release identity is missing")
+    release_inputs = None
+    release_binding = None
+    custody_inputs = None
+    custody_binding = None
+    if arguments.auth015_release_proof is not None:
+        release_inputs = load_release_inputs(
+            arguments.auth015_release_proof, expected_release_id=identity["release_id"]
+        )
+        release_binding = verify_release_inputs(release_inputs).input_identity
+        release_inputs = replace(release_inputs, expected_identity=release_binding)
+    if arguments.auth015_custody_proof is not None:
+        custody_inputs = Auth015CustodyInputs(
+            arguments.auth015_custody_proof,
+            arguments.auth015_custody_trust_sha256,
+        )
+        _chain, head, _crypto = verify_custody_inputs(custody_inputs)
+        binding = head.authorization.statement.binding
+        if (
+            binding.release.release_id != identity["release_id"]
+            or binding.site.cluster_id != primary.cluster_id
+            or not set(nodes) <= set(binding.nodes)
+        ):
+            raise IdentityAcceptanceError(
+                "AUTH015 custody inputs name a different target"
+            )
+        custody_binding = custody_input_identity(custody_inputs)
+        custody_inputs = replace(custody_inputs, expected_identity=custody_binding)
     predecessor_id, path = predecessor_path(
         arguments.run_dir,
         arguments.case,
@@ -224,12 +305,20 @@ def main() -> int:
     environment = {
         "GPU_FAULT_IDENTITY_CASE": arguments.case,
         "GPU_FAULT_SITE_FILE": str(arguments.site.resolve()),
+        "GPU_FAULT_CONTROL_KUBECONFIG": str(site.cpu_kubeconfig),
+        "KUBECONFIG": str(site.gpu_kubeconfig),
+        "SITE_INPUTS_SHA256": hashlib.sha256(arguments.site.read_bytes()).hexdigest(),
+        "DEPLOYED_RELEASE_ID": identity["release_id"],
         "GPU_FAULT_PRIMARY_CLUSTER_ID": primary.cluster_id,
         "GPU_FAULT_SECONDARY_CLUSTER_ID": (
             secondary.cluster_id if secondary is not None else ""
         ),
         "GPU_FAULT_TARGET_NODES": ",".join(nodes),
     }
+    if release_binding is not None:
+        environment["AUTH015_RELEASE_INPUTS_SHA256"] = details_sha256(release_binding)
+    if custody_binding is not None:
+        environment["AUTH015_CUSTODY_INPUTS_SHA256"] = details_sha256(custody_binding)
     case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not arguments.execute:
@@ -242,10 +331,15 @@ def main() -> int:
             evidence_identity=identity,
         )
         if arguments.case == "GF-REGIONAL-AUTH-015":
+            details["deployed_protocol_release_inputs"] = release_binding
+            details["custody_inputs"] = custody_binding
             # Run the focused pytest here so --execute can reuse the result
             # against an unchanged tree instead of paying for it twice.
             record_focused_tests(details, auth015_focused_tests())
+        focused_ok = details.get("focused_tests", {"passed": True}).get("passed")
         plan = build_plan(
+            arguments=arguments,
+            preflight_passed=(predecessor.get("valid") is True and focused_ok is True),
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
@@ -254,22 +348,35 @@ def main() -> int:
             details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        focused_ok = details.get("focused_tests", {"passed": True}).get("passed")
-        return 0 if predecessor.get("valid", False) and focused_ok is True else 1
+        return 0 if predecessor.get("valid") is True and focused_ok is True else 1
     if arguments.confirm != confirmation:
         raise IdentityAcceptanceError(f"confirmation must be exactly {confirmation}")
+    evidence_path = case_evidence_path(arguments.run_dir, arguments.case)
+    result = {
+        "schema_version": 2,
+        "report_type": "fault-acceptance",
+        "case_id": arguments.case,
+        "attempt": arguments.attempt,
+        "started_at": utc_now(),
+        **identity,
+    }
     authorize_execution(
         arguments,
         case_id=arguments.case,
         confirmation=confirmation,
         environment=environment,
     )
+    write_json_atomic(
+        evidence_path, {**result, "verdict": "NOT_RUN", "status": "RUNNING"}
+    )
     if not predecessor.get("valid", False):
         raise IdentityAcceptanceError("formal predecessor evidence is not PASS")
-    started_at = utc_now()
     try:
         handlers: dict[str, Callable[[], dict[str, Any]]] = {
             "GF-REGIONAL-AUTH-007": lambda: run_auth007(
+                site, primary, cast(ClusterTarget, secondary), case_dir=case_dir
+            ),
+            "GF-REGIONAL-AUTH-008": lambda: run_auth008(
                 site, primary, cast(ClusterTarget, secondary), case_dir=case_dir
             ),
             "GF-REGIONAL-AUTH-010": lambda: run_auth010(site, primary),
@@ -293,6 +400,8 @@ def main() -> int:
                 host_probe_image=arguments.host_probe_image,
                 case_dir=case_dir,
                 focused_tests=reusable_focused_tests(case_dir / "plan.json"),
+                release_inputs=release_inputs,
+                custody_inputs=custody_inputs,
             ),
             "GF-REGIONAL-AUTH-016": lambda: run_auth016(
                 site, primary, case_dir=case_dir
@@ -333,21 +442,17 @@ def main() -> int:
             ],
         }
     result = {
-        "schema_version": 2,
-        "report_type": "fault-acceptance",
-        "case_id": arguments.case,
+        **result,
         "verdict": outcome.get("verdict", "FAIL"),
-        "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
-        **identity,
         **{
             key: value
             for key, value in outcome.items()
             if key not in {"verdict", *identity}
         },
     }
-    write_json_atomic(case_evidence_path(arguments.run_dir, arguments.case), result)
+    write_json_atomic(evidence_path, result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 

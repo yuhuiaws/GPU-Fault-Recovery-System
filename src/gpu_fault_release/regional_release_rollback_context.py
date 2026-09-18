@@ -12,6 +12,8 @@ from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 from gpu_fault_release.regional_release_diff import ReleaseComponent
+from gpu_fault_release.regional_release_images import previous_executor_image
+from gpu_fault_release.regional_release_interfaces import RollbackTargetArguments
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
@@ -80,7 +82,14 @@ def rollback_target_arguments(
     executor_artifact: str,
     executor_compatibility: str,
     runtime_image: str,
-) -> dict[str, Any]:
+) -> RollbackTargetArguments:
+    cpu_image = require_digest_pinned_image(
+        "rollback target CPU runtime", runtime_image
+    )
+    if previous.get("runtime_image") != cpu_image:
+        raise ReleaseError(
+            "rollback CPU runtime differs from the captured previous image"
+        )
     return {
         "artifact": artifact,
         "config_digest": config_digest,
@@ -90,9 +99,7 @@ def rollback_target_arguments(
         "node_compatibility": (
             metadata.get("required-agent-compatibility-digest") or artifact
         ),
-        "runtime_image": require_digest_pinned_image(
-            "rollback target runtime", runtime_image
-        ),
+        "runtime_image": previous_executor_image(previous),
         "node_installer_image": require_digest_pinned_image(
             "rollback target Node Installer",
             previous.get("node_installer_image") or release.node_installer_image,
@@ -105,6 +112,11 @@ def rollback_identity_context(
     previous: dict[str, Any],
     compensation: RollbackCompensationPlan,
 ) -> tuple[dict[str, Any], str, str, str, str, str, str, str]:
+    cpu_backup = (previous.get("secret_backups") or {}).get("cpu")
+    if cpu_backup and cpu_backup.get("source") != "gpu-fault-email":
+        raise ReleaseError(
+            "previous CPU Secret backup is outside the email scope; database credentials cannot be rolled back"
+        )
     metadata = previous.get("metadata") or {}
     agent_identities = previous.get("agent_identities") or {}
     if compensation.needs_controller:
@@ -268,7 +280,11 @@ def build_rollback_environment(
         )
     )
     environment = {
-        **os.environ,
+        **{
+            name: value
+            for name, value in os.environ.items()
+            if name not in {"GPU_FAULT_NOTIFICATION_CHANNEL", "GPU_FAULT_SNS_TOPIC_ARN"}
+        },
         **admin_config_renderer_environment(rollback_config.admin_config),
         # A rolled-back role without its alert channel would fail the
         # startup guard, so the channel travels with the rollback too.
@@ -305,6 +321,9 @@ def build_rollback_environment(
         "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": str(
             rollback_config.notifications.acknowledge_external_alert_channel
         ).lower(),
+        "GPU_FAULT_SES_CONFIGURATION_SET": (
+            rollback_config.notifications.ses_configuration_set or ""
+        ),
         "GPU_FAULT_NOTIFICATION_CONFIG_SHA256": notification_digest(
             rollback_config.notifications
         ),

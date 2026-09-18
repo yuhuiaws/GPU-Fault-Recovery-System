@@ -18,6 +18,7 @@ from gpu_fault.app.admission_runtime import (
     NulInRequestBody,
     declared_body_oversize,
 )
+from gpu_fault.app.request_body import read_bounded_request_body
 from gpu_fault.app.runtime import ProcessorDispatchState
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
@@ -221,7 +222,15 @@ async def _prepare_request(
         dependencies.state.oversize_rejections += 1
         return oversize
     decode_started = time.monotonic()
-    body = await request.body()
+    try:
+        body = await read_bounded_request_body(
+            request, dependencies.processor_max_request_bytes
+        )
+    except StoreIoCapacityExceeded as exc:
+        return _decode_capacity_response(exc, dependencies)
+    except OverflowError:
+        dependencies.state.oversize_rejections += 1
+        return _oversize_response(dependencies)
     fault_ingress = dependencies.is_fault_ingress_path(request.url.path)
     decode_pool = (
         dependencies.fault_decode_io if fault_ingress else dependencies.decode_io

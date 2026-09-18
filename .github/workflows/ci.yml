@@ -70,7 +70,6 @@ jobs:
       # Supply-chain gates (S8/S10). Tool versions come from the Makefile; the
       # targets are strict here because GitHub sets CI=true.
       - run: make ci-supply-chain-tools PYTHON=python
-      - run: make cfn-lint-check PYTHON=python
       - run: make promtool-check PYTHON=python
       - run: make pip-audit-check PYTHON=python
       - run: >-
@@ -221,8 +220,9 @@ jobs:
           POSTGRES_PASSWORD: gpu_fault
           POSTGRES_DB: gpu_fault_test
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
         options: >-
+          --label "gpu-fault.test-owner=gpu-fault-ci-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-postgres"
           --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
           --health-interval 5s
           --health-timeout 5s
@@ -230,7 +230,7 @@ jobs:
     env:
       CI_TEST_RUNNER_LABEL: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
       GPU_FAULT_TEST_POSTGRES_URL: >-
-        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+        postgresql://gpu_fault@127.0.0.1:5432/gpu_fault_test
       PYTEST_DURATIONS: "50"
       PYTEST_XDIST_DIST: worksteal
       PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
@@ -252,6 +252,10 @@ jobs:
           '.[dev,collectors,postgres,performance]'
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         if: github.event_name == 'push'
+      - name: Prepare private PostgreSQL process grant
+        run: >-
+          python scripts/ci_postgres_grant.py prepare
+          --container "${{ job.services.postgres.id }}"
       - name: Restore signed PostgreSQL coverage shard
         id: restore_shard
         if: github.event_name == 'push'
@@ -273,6 +277,7 @@ jobs:
           COVERAGE_SHARD=postgres
           COVERAGE_SHARD_ROOT=artifacts/coverage-shard
           COVERAGE_INCLUDE_STRESS=1
+          COVERAGE_POSTGRES_CONTAINER="${{ job.services.postgres.id }}"
       - name: Verify reused PostgreSQL shard signature
         if: >-
           github.event_name == 'push' &&
@@ -329,6 +334,11 @@ jobs:
           path: artifacts/coverage-shard/
           if-no-files-found: error
           retention-days: 30
+      - name: Clean private PostgreSQL process grant
+        if: always()
+        run: >-
+          python scripts/ci_postgres_grant.py cleanup
+          --container "${{ job.services.postgres.id }}"
 
   unit:
     needs:

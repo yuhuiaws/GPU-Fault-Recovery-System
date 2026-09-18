@@ -23,6 +23,7 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 NOW = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
 EXECUTABLE = {
@@ -32,7 +33,15 @@ EXECUTABLE = {
 }
 
 
-@pytest.fixture(params=["memory", "sqlite", "postgres"])
+@pytest.fixture(
+    params=[
+        "memory",
+        "sqlite",
+        "postgres-legacy",
+        "postgres-dual",
+        "postgres-dedicated",
+    ]
+)
 def store(request, tmp_path):
     if request.param == "memory":
         yield build_store()
@@ -46,9 +55,19 @@ def store(request, tmp_path):
         return
     if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
     for postgres in postgres_store_instance():
-        yield postgres
-    _truncate()
+        try:
+            with psycopg.connect(
+                os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+            ) as connection:
+                select_mode(
+                    connection, "workflow", request.param.removeprefix("postgres-")
+                )
+            yield postgres
+        finally:
+            _truncate()
 
 
 def _workflow(store, request_id: str, *, created_at: datetime, **updates):
@@ -145,6 +164,41 @@ def test_the_cursor_breaks_ties_on_request_id(store):
 
     assert [item.request_id for item in first] == ["wf-a"]
     assert [item.request_id for item in rest] == ["wf-b", "wf-c"]
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+@pytest.mark.parametrize("naive", [False, True])
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_cursor_timestamp_style_and_direction_match_the_scan(
+    store, newest_first: bool, naive: bool, page_size: int
+) -> None:
+    now = NOW.replace(tzinfo=None) if naive else NOW
+    eligible = now - timedelta(minutes=1)
+    for request_id in ("wf-c", "wf-a", "wf-d", "wf-b"):
+        _workflow(
+            store,
+            request_id,
+            created_at=eligible - timedelta(hours=1),
+            not_before=eligible,
+        )
+    expected = sorted(("wf-a", "wf-b", "wf-c", "wf-d"), reverse=newest_first)
+    seen: list[str] = []
+    after = None
+    for _ in range(len(expected) + 1):
+        rows = store.list_workflows(
+            EXECUTABLE,
+            limit=page_size,
+            newest_first=newest_first,
+            dispatchable_at=now,
+            after=after,
+        )
+        if not rows:
+            break
+        seen.extend(row.request_id for row in rows)
+        after = rows[-1]
+    else:
+        pytest.fail("dispatch cursor repeated a page instead of reaching its end")
+    assert seen == expected
 
 
 def test_the_cursor_is_only_defined_over_the_dispatch_order(store):

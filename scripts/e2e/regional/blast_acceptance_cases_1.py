@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from scripts.e2e.regional.blast_acceptance_base import (
@@ -13,20 +15,39 @@ from scripts.e2e.regional.blast_acceptance_base import (
     arn_parts,
     as_list,
     command,
+    containment_source,
+    default_e2e_dir,
     notification_channel,
+    observed_in_windows,
     parse_time,
     policy_statement_summary,
     resources_for,
+    sha256_bytes,
     statement_actions,
     statement_not_actions,
     write_json,
     write_text,
 )
+from scripts.e2e.regional.blast_rbac_scope import (
+    RBAC_INVENTORY,
+    bound_rules,
+    unexpected_grants,
+)
+
+AUTHORIZATION_RESOURCE_GROUPS = {
+    "nodes": "",
+    "pods": "",
+    "secrets": "",
+    "configmaps": "",
+    "jobs": "batch",
+}
 
 
 class BlastCasesOne(BlastRunnerBase):
     @staticmethod
     def node_security_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload.get("items"), list) or not payload["items"]:
+            raise CheckError("CPU node baseline is empty or malformed")
         result: dict[str, Any] = {}
         for node in payload.get("items", []):
             metadata = node.get("metadata", {})
@@ -48,7 +69,11 @@ class BlastCasesOne(BlastRunnerBase):
                     str(item["effect"]),
                 ),
             )
-            result[str(metadata.get("name", ""))] = {
+            name, uid = metadata.get("name"), metadata.get("uid")
+            if not name or not uid or name in result:
+                raise CheckError("CPU node identity is missing or duplicated")
+            result[str(name)] = {
+                "uid": uid,
                 "taints": taints,
                 "unschedulable": bool(spec.get("unschedulable", False)),
                 "gpu_fault_labels": {
@@ -141,15 +166,45 @@ class BlastCasesOne(BlastRunnerBase):
 
     def blast_001(self) -> None:
         case_id = "GF-REGIONAL-BLAST-001"
+        if self.e2e_dir.resolve() != default_e2e_dir(self.root_run_dir).resolve():
+            raise CheckError("BLAST-001 workload evidence must belong to this run")
+        if (
+            self.trusted_cpu_baseline.resolve()
+            != (self.e2e_dir / "cpu-nodes-before.json").resolve()
+        ):
+            raise CheckError("BLAST-001 baseline must be the producer's own snapshot")
         execution_card = json.loads(
             (self.e2e_dir / "execution-card.json").read_text(encoding="utf-8")
         )
         window = execution_card.get("maintenance_window") or {}
         start_text = str(window.get("start", ""))
         end_text = str(window.get("end", ""))
-        if not start_text:
-            raise CheckError("E2E-001 execution card has no start time")
-        start = parse_time(start_text)
+        if (
+            execution_card.get("case_id") != "GF-REGIONAL-E2E-001"
+            or execution_card.get("verdict") != "PASS"
+            or execution_card.get("cleanup_complete") is not True
+            or execution_card.get("release_id")
+            != self.evidence_identity()["release_id"]
+            or execution_card.get("cluster_id")
+            not in {target.cluster_id for target in self.targets}
+        ):
+            raise CheckError(
+                "E2E-001 handoff is not a successful, cleaned, deployment-bound run"
+            )
+        start, end = parse_time(start_text), parse_time(end_text)
+        if (
+            start.tzinfo is None
+            or end.tzinfo is None
+            or not start < end <= datetime.now(timezone.utc)
+        ):
+            raise CheckError("E2E-001 observation window is invalid")
+        state_path = self.e2e_dir / "control-plane-current.json"
+        if execution_card.get("baseline_sha256") != sha256_bytes(
+            self.trusted_cpu_baseline.read_bytes()
+        ) or execution_card.get("state_sha256") != sha256_bytes(
+            state_path.read_bytes()
+        ):
+            raise CheckError("E2E-001 baseline or workflow handoff changed")
 
         current_nodes = self.cpu_json("get", "nodes", "-o", "json")
         write_json(self.run_dir / "BLAST-001-cpu-nodes-after.json", current_nodes)
@@ -160,12 +215,30 @@ class BlastCasesOne(BlastRunnerBase):
         )
         baseline_snapshot = self.node_security_snapshot(baseline_nodes)
         baseline_identical = baseline_snapshot == current_snapshot
+        containment = containment_source(
+            self.root_run_dir,
+            predecessor=self.predecessor,
+            release_id=str(execution_card["release_id"]),
+            cluster_id=str(execution_card["cluster_id"]),
+            cpu_snapshot=baseline_snapshot,
+        )
+        containment_start = parse_time(containment["window_start"])
+        containment_end = parse_time(containment["window_end"])
+        if end > containment_start:
+            raise CheckError("DESTR-001 must follow E2E-001 in the same run")
+
+        windows = ((start, end), (containment_start, containment_end))
 
         managed_field_hits = self.managed_field_writes(
             current_nodes,
             baseline_nodes=baseline_nodes,
             since=start,
         )
+        managed_field_hits = [
+            hit
+            for hit in managed_field_hits
+            if not hit.get("time") or observed_in_windows(str(hit["time"]), windows)
+        ]
 
         jobs = self.cpu_json("get", "jobs", "-A", "-o", "json")
         gpu_fault_jobs = []
@@ -186,7 +259,7 @@ class BlastCasesOne(BlastRunnerBase):
             if item["gpu_fault_labels"]:
                 gpu_fault_jobs.append(item)
                 created = metadata.get("creationTimestamp")
-                if created and parse_time(str(created)) >= start:
+                if not created or observed_in_windows(str(created), windows):
                     gpu_fault_jobs_in_window.append(item)
 
         events = self.cpu_json("get", "events", "-A", "-o", "json")
@@ -205,7 +278,7 @@ class BlastCasesOne(BlastRunnerBase):
                 or event.get("firstTimestamp")
                 or metadata.get("creationTimestamp")
             )
-            if event_time and parse_time(str(event_time)) < start:
+            if event_time and not observed_in_windows(str(event_time), windows):
                 continue
             eviction_events.append(
                 {
@@ -218,36 +291,30 @@ class BlastCasesOne(BlastRunnerBase):
                 }
             )
 
-        e2e_state = json.loads(
-            (self.e2e_dir / "control-plane-current.json").read_text(encoding="utf-8")
-        )
-        workflow_operations = sorted(
+        e2e_state = json.loads(state_path.read_text(encoding="utf-8"))
+        workload_operations = sorted(
             {
                 str(step.get("operation"))
                 for workflow in e2e_state.get("workflows", [])
-                for group in (
-                    workflow.get("official_steps") or [],
-                    workflow.get("safety_steps") or [],
-                    workflow.get("step_executions") or [],
-                )
-                for step in group
-                if step.get("operation")
+                if workflow.get("status") == "SUCCEEDED"
+                for step in workflow.get("step_executions") or []
+                if step.get("operation") and step.get("status") == "SUCCEEDED"
             }
         )
-        required_operations_present = all(
-            item in workflow_operations
-            for item in (
-                "MARK_UNSCHEDULABLE",
-                "STOP_WORKLOADS",
-                "RESTART_WORKLOAD",
-            )
+        workflow_operations = sorted(
+            set(workload_operations) | set(containment["operations"])
         )
+        required_operations_present = {"STOP_WORKLOADS", "RESTART_WORKLOAD"} <= set(
+            workload_operations
+        ) and containment["operations"] == ["MARK_UNSCHEDULABLE"]
 
         checks = {
             "e2e_evidence_dir": str(self.e2e_dir),
             "e2e_window_start": start_text,
             "e2e_window_end": end_text,
             "workflow_operations": workflow_operations,
+            "workload_operations": workload_operations,
+            "containment_source": containment,
             "required_operations_present": required_operations_present,
             "trusted_baseline": str(self.trusted_cpu_baseline),
             "trusted_baseline_identical": baseline_identical,
@@ -270,12 +337,14 @@ class BlastCasesOne(BlastRunnerBase):
         status = "PASS" if passed else "FAIL"
         limitations = [
             "The CPU node baseline is the snapshot E2E-001 wrote immediately "
-            "before its injection (cpu-nodes-before.json) unless the operator "
-            "supplied another --trusted-cpu-baseline; managedFields writes are "
+            "before its injection (cpu-nodes-before.json); managedFields writes are "
             "counted only when they are new relative to that baseline and "
-            "inside the E2E window.",
-            "This case reuses E2E-001's fault window and does not trigger a "
-            "reset or workload restart of its own.",
+            "inside either producer's window.",
+            "E2E-001 proves workload operations; DESTR-001 supplies the successful "
+            "MARK_UNSCHEDULABLE command and CPU before/after evidence. This audit "
+            "does not trigger a reset or workload restart.",
+            "Current managedFields and retained Jobs/events cannot prove the "
+            "absence of transient changes already removed from API history.",
         ]
         self.record_case(
             case_id,
@@ -286,6 +355,7 @@ class BlastCasesOne(BlastRunnerBase):
                 "gpu_fault_jobs_created_in_window": len(gpu_fault_jobs_in_window),
                 "eviction_events_in_window": len(eviction_events),
                 "required_e2e_operations_present": required_operations_present,
+                "successful_containment_source": containment["case_id"],
             },
             limitations=limitations,
         )
@@ -299,31 +369,110 @@ class BlastCasesOne(BlastRunnerBase):
         service_account: str,
         verbs: Sequence[str],
         resources: Sequence[str],
+        namespace: str | None = None,
     ) -> dict[str, dict[str, bool]]:
-        matrix: dict[str, dict[str, bool]] = {}
-        for verb in verbs:
-            matrix[verb] = {}
-            for resource in resources:
-                result = command(
-                    (
-                        "kubectl",
-                        *kube_prefix,
-                        "auth",
-                        "can-i",
-                        verb,
-                        resource,
-                        f"--as={service_account}",
-                        "--all-namespaces",
-                    ),
-                    check=False,
-                )
-                answer = result.stdout.strip().lower()
-                if result.returncode not in {0, 1} or answer not in {"yes", "no"}:
+        matrix: dict[str, dict[str, bool]] = {verb: {} for verb in verbs}
+        queries = [(verb, resource) for verb in verbs for resource in resources]
+        if not queries:
+            return matrix
+
+        def review(verb: str, resource: str) -> bool:
+            name, separator, group = resource.partition(".")
+            if not separator:
+                if name not in AUTHORIZATION_RESOURCE_GROUPS:
                     raise CheckError(
-                        f"auth can-i returned {answer!r} for {verb} {resource}"
+                        f"authorization API group is unknown for {resource}"
                     )
-                matrix[verb][resource] = answer == "yes"
+                group = AUTHORIZATION_RESOURCE_GROUPS[name]
+            attributes = {
+                "verb": verb,
+                "resource": name,
+                "group": group,
+                "namespace": namespace or "",
+            }
+            request = {
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SelfSubjectAccessReview",
+                "spec": {"resourceAttributes": attributes},
+            }
+            # A raw review preserves the API group even before its CRD is installed.
+            result = command(
+                (
+                    "kubectl",
+                    *kube_prefix,
+                    f"--as={service_account}",
+                    "create",
+                    "--raw=/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                    "-f",
+                    "-",
+                ),
+                input_text=json.dumps(request),
+                check=False,
+            )
+            if result.returncode:
+                raise CheckError(f"authorization review failed for {verb} {resource}")
+            try:
+                response = json.loads(result.stdout)
+                status = response["status"]
+                echoed = response["spec"]["resourceAttributes"]
+                valid = (
+                    response["apiVersion"] == request["apiVersion"]
+                    and response["kind"] == request["kind"]
+                    and isinstance(status, dict)
+                    and isinstance(echoed, dict)
+                    and all(
+                        echoed.get(key, "") == attributes.get(key, "")
+                        for key in (
+                            "verb",
+                            "resource",
+                            "group",
+                            "namespace",
+                            "name",
+                            "subresource",
+                        )
+                    )
+                    and type(status.get("allowed")) is bool
+                    and type(status.get("denied", False)) is bool
+                    and not (status["allowed"] and status.get("denied"))
+                    and not status.get("evaluationError")
+                )
+            except (ValueError, KeyError, TypeError):
+                valid = False
+            if not valid:
+                raise CheckError(
+                    f"authorization review is incomplete for {verb} {resource}"
+                )
+            return bool(status["allowed"])
+
+        with ThreadPoolExecutor(max_workers=min(8, len(queries))) as pool:
+            futures = [
+                pool.submit(copy_context().run, review, verb, resource)
+                for verb, resource in queries
+            ]
+            try:
+                for (verb, resource), future in zip(queries, futures, strict=True):
+                    matrix[verb][resource] = future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
         return matrix
+
+    def namespace_names(self, target: Any = None) -> list[str]:
+        document = (
+            self.cpu_json("get", "namespaces", "-o", "json")
+            if target is None
+            else self.gpu_json(target, "get", "namespaces", "-o", "json")
+        )
+        items = document.get("items")
+        if not isinstance(items, list) or not items:
+            raise CheckError("namespace permission inventory is missing")
+        names = [(item.get("metadata") or {}).get("name") for item in items]
+        if any(not isinstance(name, str) or not name for name in names) or len(
+            set(names)
+        ) != len(names):
+            raise CheckError("namespace permission inventory is malformed")
+        return sorted(str(name) for name in names)
 
     def iam_role_policies(
         self, role_arn: str
@@ -424,8 +573,15 @@ class BlastCasesOne(BlastRunnerBase):
         )
         association = detail.get("association") or {}
         role_arn = str(association.get("roleArn", ""))
-        if not role_arn:
-            raise CheckError("control-plane Pod Identity has no role ARN")
+        if (
+            not role_arn
+            or association.get("namespace") != self.namespace
+            or association.get("serviceAccount") != "gpu-fault-control-plane"
+            or association.get("clusterName") != self.cpu_cluster_name
+        ):
+            raise CheckError(
+                "control-plane Pod Identity does not bind the audited ServiceAccount"
+            )
         evidence = {
             "association_id": association_id,
             "namespace": association.get("namespace"),
@@ -449,7 +605,15 @@ class BlastCasesOne(BlastRunnerBase):
 
     @staticmethod
     def sagemaker_patterns(patterns: Iterable[str]) -> list[str]:
-        return [item for item in patterns if item.lower().startswith("sagemaker:")]
+        return [
+            item
+            for item in patterns
+            if ":" in item
+            and allow_statement_matches(
+                {"Effect": "Allow", "Action": item.split(":", 1)[0] + ":*"},
+                "sagemaker:DescribeCluster",
+            )
+        ]
 
     @staticmethod
     def sagemaker_read_only(sagemaker_patterns: Iterable[str]) -> bool:
@@ -469,6 +633,13 @@ class BlastCasesOne(BlastRunnerBase):
     def blast_002(self) -> None:
         case_id = "GF-REGIONAL-BLAST-002"
         pod = self.ready_cpu_pod()
+        pod_document = self.cpu_json(
+            "-n", self.namespace, "get", "pod", pod, "-o", "json"
+        )
+        if (pod_document.get("spec") or {}).get(
+            "serviceAccountName"
+        ) != "gpu-fault-control-plane":
+            raise CheckError("CPU Pod does not use the audited ServiceAccount")
         filesystem_probe = self.cpu_text(
             "-n",
             self.namespace,
@@ -500,10 +671,40 @@ class BlastCasesOne(BlastRunnerBase):
             verbs=("patch", "delete", "create", "update"),
             resources=("nodes", "pods", "jobs"),
         )
-        write_json(self.run_dir / "BLAST-002-rbac.json", matrix)
-        rbac_all_denied = not any(
-            allowed for resources in matrix.values() for allowed in resources.values()
+        namespace_matrices = {
+            namespace: self.auth_can_i(
+                kube_prefix=("--kubeconfig", self.cpu_kubeconfig),
+                service_account=service_account,
+                verbs=("create", "patch", "update", "delete"),
+                resources=("pods", "jobs", "pytorchjobs.kubeflow.org"),
+                namespace=namespace,
+            )
+            for namespace in self.namespace_names()
+        }
+        write_json(
+            self.run_dir / "BLAST-002-rbac.json",
+            {"cluster": matrix, "namespaces": namespace_matrices},
         )
+        rbac_all_denied = not any(
+            allowed
+            for scope in [matrix, *namespace_matrices.values()]
+            for resources in scope.values()
+            for allowed in resources.values()
+        )
+        binding_errors = unexpected_grants(
+            bound_rules(
+                self.cpu_json("get", RBAC_INVENTORY, "-A", "-o", "json"),
+                service_account,
+            ),
+            expected_cluster={},
+            expected_namespaces={},
+            cpu=True,
+        )
+        write_json(
+            self.run_dir / "BLAST-002-bound-rbac.json",
+            {"unexpected_grants": binding_errors},
+        )
+        rbac_all_denied = rbac_all_denied and not binding_errors
 
         role_arn, pod_identity = self.cpu_control_plane_role_arn()
         write_json(self.run_dir / "BLAST-002-pod-identity.json", pod_identity)
@@ -530,10 +731,9 @@ class BlastCasesOne(BlastRunnerBase):
         # audit reads the deployed channel and requires that one permission to be
         # present and scoped and the other absent, instead of demanding SES on a
         # topic-only site (which would fail the correct SNS posture).
-        channel = notification_channel(self.notification_config())
-        sns_topic_arn = str(
-            self.notification_config().get("GPU_FAULT_SNS_TOPIC_ARN") or ""
-        ).strip()
+        notification = self.notification_config()
+        channel = notification_channel(notification)
+        sns_topic_arn = str(notification.get("GPU_FAULT_SNS_TOPIC_ARN") or "").strip()
         account_id = arn_parts(self.cpu_eks_arn)[1]
         sns_send_statements = [
             item for item in statements if allow_statement_matches(item, "sns:Publish")
@@ -543,29 +743,24 @@ class BlastCasesOne(BlastRunnerBase):
             for item in statements
             if allow_statement_matches(item, "ses:SendEmail")
         ]
-        sns_scoped = bool(sns_send_statements) and all(
-            resources_for(item)
+        sender = str((self.config.get("notifications") or {}).get("email_sender") or "")
+        sender_arn = f"arn:aws:ses:{self.region}:{account_id}:identity/{sender}"
+        sns_scoped = (
+            sns_topic_arn.startswith(f"arn:aws:sns:{self.region}:{account_id}:")
+            and not any(marker in sns_topic_arn for marker in ("*", "?"))
+            and bool(sns_send_statements)
             and all(
-                resource != "*"
-                and (
-                    resource == sns_topic_arn
-                    if sns_topic_arn
-                    else resource.startswith(f"arn:aws:sns:{self.region}:{account_id}:")
-                )
-                for resource in resources_for(item)
+                set(resources_for(item)) == {sns_topic_arn}
+                for item in sns_send_statements
             )
-            for item in sns_send_statements
         )
         ses_scoped = bool(ses_send_statements) and all(
-            resources_for(item)
-            and all(
-                resource != "*"
-                and resource.startswith(
-                    f"arn:aws:ses:{self.region}:{account_id}:identity/"
-                )
-                for resource in resources_for(item)
+            bool(sender)
+            and set(resources_for(item)) == {sender_arn}
+            and ((item.get("Condition") or {}).get("StringEquals") or {}).get(
+                "ses:FromAddress"
             )
-            and bool(item.get("Condition"))
+            == sender
             for item in ses_send_statements
         )
         if channel == "sns":
@@ -610,6 +805,7 @@ class BlastCasesOne(BlastRunnerBase):
             "PASS" if passed else "FAIL",
             checks={
                 "control_plane_write_rbac_all_denied": rbac_all_denied,
+                "unexpected_bound_grants": binding_errors,
                 "home_kube_absent": "home_kube=absent" in filesystem_probe,
                 "kubeconfig_env_unset": "kubeconfig_env=unset" in filesystem_probe,
                 "forbidden_hyperpod_mutations_present": forbidden,

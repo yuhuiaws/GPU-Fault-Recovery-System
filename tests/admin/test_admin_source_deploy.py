@@ -70,7 +70,7 @@ def test_source_deploy_hides_release_and_artifact_paths(
         commands.append(([str(item) for item in command], kwargs))
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(admin_source_deploy.subprocess, "run", run)
+    monkeypatch.setattr(admin_source_deploy, "run_driver", run)
 
     result = admin_source_deploy.run_source_deploy(
         cpu_cluster_arn="cpu",

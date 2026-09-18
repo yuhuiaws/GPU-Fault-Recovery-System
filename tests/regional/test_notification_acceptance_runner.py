@@ -212,7 +212,17 @@ def _record_entry(
 def _write_case_evidence(run_dir: Path, case_id: str, body: dict[str, Any]) -> None:
     path = run_dir / "cases" / case_id / f"{case_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"case_id": case_id, **body}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": case_id,
+                "release_id": "unit-release",
+                "cluster_id": "cluster-a",
+                **body,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_action_completed_records_are_read_from_this_runs_evidence(
@@ -336,8 +346,17 @@ def _fake_drill(kind: str, drill_id: str, **_: Any) -> dict[str, Any]:
         "kind": kind,
         "drill_id": drill_id,
         "executed_at": "2026-09-07T12:00:00+00:00",
+        "completed_at": "2026-09-07T12:00:01+00:00",
+        "initial_completed_at": "2026-09-07T12:00:00+00:00",
+        "duplicate_window_start": "2026-09-07T12:00:00.500000+00:00",
+        "duplicate_window_end": "2026-09-07T12:00:01+00:00",
         "notification_id": f"n-{drill_id}",
-        "statuses": ["SENT"] * 4,
+        "statuses": ["SENT", "DUPLICATE", "DUPLICATE", "DUPLICATE"],
+        "notification_count": 1,
+        "notifier_calls": 1,
+        "completion_calls": 4,
+        "command_statuses": ["SUCCEEDED"] * 4,
+        "injection_path": drill_probe.INJECTION_PATH,
         "provider_message_id_present": True,
         "provider_message_id_stable": True,
     }
@@ -349,7 +368,14 @@ def _install_notify001_fakes(
     drills: list[str] = []
 
     def fake_drill(
-        site: Any, target: Any, *, kind: str, drill_id: str, pod: Any = None
+        site: Any,
+        target: Any,
+        *,
+        kind: str,
+        drill_id: str,
+        pod: Any = None,
+        maintenance_window_end=None,
+        duplicate_delay_seconds=0,
     ) -> dict[str, Any]:
         drills.append(kind)
         return _fake_drill(kind, drill_id)
@@ -361,7 +387,7 @@ def _install_notify001_fakes(
     monkeypatch.setattr(
         notification,
         "live_action_completed_records",
-        lambda site, target, *, run_dir, pod: {
+        lambda site, target, *, run_dir, pod, release_id=None: {
             "candidates": {},
             "records": live_records,
         },
@@ -399,7 +425,12 @@ def test_notify001_reuses_live_records_and_still_proves_dedup_with_one_drill(
     dedup = _evidence(
         tmp_path,
         "dedup.json",
-        {"send_count_delta": 0, "duplicate_inbox_count": 0, **window},
+        {
+            "send_count_delta": 0,
+            "duplicate_inbox_count": 0,
+            **window,
+            "window_start": "2026-09-07T12:00:00+00:00",
+        },
     )
 
     result = notification.run_notify001(
@@ -441,8 +472,8 @@ def test_notify001_falls_back_to_drills_and_fails_on_a_duplicate_live_record(
     )
 
     assert result["sources"] == {"gpu-reset": "drill", "workload-restart": "live"}
-    # The gpu-reset fallback drill doubles as the deduplication drill.
-    assert drills == ["gpu-reset"]
+    # The final dedicated drill follows all fallback sends.
+    assert drills == ["gpu-reset", "gpu-reset"]
     assert result["checks"]["gpu_reset_sent"] is True
     assert result["checks"]["workload_restart_deduplicated"] is False
     assert result["checks"]["receipt_confirmed_outside_the_solution"] is False
@@ -505,7 +536,7 @@ def test_drill_reuses_the_resolved_control_worker_pod(
     monkeypatch.setattr(notification, "control_worker_pod", unexpected_lookup)
     site = SimpleNamespace(
         pod_json=lambda plane, target, pod, script, *args, timeout: (
-            calls.append(pod) or {"statuses": ["SENT"]}
+            calls.append(pod) or _fake_drill("gpu-reset", "d1")
         )
     )
 
@@ -543,19 +574,15 @@ def test_drill_probe_reports_when_it_sent(
     # One real send, three deduplicated repeats sharing its provider ID.
     assert payload["statuses"][0] == "SENT" and len(payload["statuses"]) == 4
     assert payload["provider_message_id_stable"] is True
+    assert payload["notifier_calls"] == 1
+    assert payload["notification_count"] == 1
+    assert payload["statuses"][1:] == ["DUPLICATE"] * 3
     executed_at = datetime.fromisoformat(payload["executed_at"])
     assert executed_at.tzinfo is not None
     assert datetime.now(timezone.utc) - executed_at < timedelta(minutes=5)
 
 
-def test_main_records_evidence_identity_and_plan_text_names_supersession() -> None:
-    source = Path(notification.__file__).read_text(encoding="utf-8")
-
-    # The predecessor is judged against, and the result carries, this
-    # deployment's release/cluster identity.
-    assert "predecessor_evidence(path, predecessor_id, **identity)" in source
-    assert "**identity," in source
-
+def test_plan_text_names_supersession() -> None:
     plan = notification.case_plan(
         "GF-REGIONAL-NOTIFY-002",
         target=SimpleNamespace(cluster_id="c", context="x"),

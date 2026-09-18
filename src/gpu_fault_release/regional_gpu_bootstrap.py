@@ -20,6 +20,7 @@ from gpu_fault_release.regional_release_rendering import (
     render_dcgm_exporter_manifest,
 )
 from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 ROOT = repository_root()
 ENDPOINT_CHECK_POLL_SECONDS = 5.0
@@ -436,7 +437,7 @@ def verify_gpu_control_plane_endpoint(release: Any, target: ClusterTarget) -> No
             "containers": [
                 {
                     "name": "check",
-                    "image": release.runtime_image,
+                    "image": release.executor_image,
                     "command": ["python", "-c", probe_source("gpu_endpoint_gate")],
                     "env": [
                         {
@@ -592,16 +593,16 @@ def verify_gpu_control_plane_endpoint(release: Any, target: ClusterTarget) -> No
 
 
 def quiesce_gpu_executor(release: Any, target: ClusterTarget) -> None:
-    exists = release.runner.probe(
-        release._gpu(
-            target,
-            "-n",
-            release.config.namespace,
-            "get",
+    exists = probe_resource(
+        release.runner,
+        release._gpu(target),
+        ResourceRef(
             "deployment",
+            "Deployment",
             inventory.GPU_EXECUTOR_DEPLOYMENT,
+            release.config.namespace,
         ),
-    )
+    ).exists()
     if not exists:
         return
     release.runner.run(

@@ -92,6 +92,12 @@ def test_gpu_reset_retries_transient_nvidia_smi_client(tmp_path) -> None:
 
     assert result.status is NodeActionStatus.SUCCEEDED
     assert result.details["reset_attempts"] == 2
+    assert result.details["reset_successes"] == 1, (
+        "the busy refusal did not complete a physical reset"
+    )
+    assert result.details["reset_busy_refusals"] == 1, (
+        "the signed result distinguishes the rejected invocation from success"
+    )
     assert [item for item in runner.commands if "--gpu-reset" in item] == [
         ["nvidia-smi", "--gpu-reset", "-i", "GPU-a"],
         ["nvidia-smi", "--gpu-reset", "-i", "GPU-a"],
@@ -199,6 +205,12 @@ def test_full_fabric_reset_verifies_inventory_and_is_idempotent(tmp_path) -> Non
     assert first.status is NodeActionStatus.SUCCEEDED
     assert second == first
     assert first.details["reset_scope"] == ("ALL_LOCAL_GPUS_AND_NVSWITCHES")
+    assert first.details["reset_successes"] == 1, (
+        "the fabric command is one successful physical invocation"
+    )
+    assert first.details["reset_busy_refusals"] == 0, (
+        "a first-invocation success must not invent busy refusals"
+    )
     assert [item for item in runner.commands if "--gpu-reset" in item] == [
         ["nvidia-smi", "--gpu-reset"]
     ]

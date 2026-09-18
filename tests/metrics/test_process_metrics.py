@@ -60,15 +60,20 @@ def _rendered(slot: int, pid: int, **values: str) -> process_metrics.Rendered:
     return rendered
 
 
-def _value(lines: list[str], sample: str) -> str:
-    matches = [line for line in lines if line.startswith(sample + " ")]
+def _value(lines: list[str], sample: str, **labels: str) -> str:
+    matches = [
+        entry
+        for entries in process_metrics.parse_lines(lines).samples.values()
+        for entry in entries
+        if entry.name == sample and dict(entry.labels) == labels
+    ]
     assert len(matches) == 1, (sample, matches)
-    return matches[0].split(" ", 1)[1]
+    return matches[0].value
 
 
 def test_the_five_strategies_combine_two_processes_correctly() -> None:
     for family, strategy in (
-        (SUM_FAMILY, Strategy.SUM),
+        (SUM_FAMILY, Strategy.PER_PROCESS),
         (MAX_FAMILY, Strategy.MAX),
         (MIN_FAMILY, Strategy.MIN),
         (ANY_FAMILY, Strategy.ANY),
@@ -100,7 +105,8 @@ def test_the_five_strategies_combine_two_processes_correctly() -> None:
 
     lines = process_metrics.aggregate(local, [other])
 
-    assert _value(lines, SUM_FAMILY) == "7"
+    assert _value(lines, SUM_FAMILY, process="2") == "3"
+    assert _value(lines, SUM_FAMILY, process="0") == "4"
     assert _value(lines, MAX_FAMILY) == "1700000200.000"
     assert _value(lines, MIN_FAMILY) == "0"
     # ANY prefers the answering process's fresh render over a sibling's file.
@@ -110,8 +116,8 @@ def test_the_five_strategies_combine_two_processes_correctly() -> None:
     assert lines.count(f"# TYPE {SUM_FAMILY} counter") == 1, "one header per family"
 
 
-def test_a_single_source_is_emitted_verbatim() -> None:
-    """Sharing off, or a lone process: the render must not change shape."""
+def test_a_single_source_uses_slot_zero_without_changing_gauges() -> None:
+    """A lone process still has an explicit counter reset domain."""
 
     source = [
         "# HELP gpu_fault_processor_healthy Whether this replica can claim.",
@@ -127,12 +133,30 @@ def test_a_single_source_is_emitted_verbatim() -> None:
 
     lines = process_metrics.pod_coherent_lines(source, environ={})
 
-    assert lines[: len(source)] == source
+    assert lines[:5] == source[:5]
+    assert (
+        _value(lines, "gpu_fault_store_io_admission_wait_seconds_sum", process="0")
+        == "0.250000"
+    )
+    assert (
+        _value(lines, "gpu_fault_store_io_admission_wait_seconds_count", process="0")
+        == "3"
+    )
+    assert (
+        _value(lines, "gpu_fault_store_io_admission_wait_seconds_max", process="0")
+        == "0.100000"
+    )
+    assert (
+        _value(
+            lines, "gpu_fault_store_io_rejections_total", reason="capacity", process="0"
+        )
+        == "2"
+    )
     assert f"{PROCESSES_METRIC} 1" in lines
     assert f"{DEGRADED_METRIC} 0" in lines
 
 
-def test_summaries_add_their_sums_and_counts_but_take_the_largest_max() -> None:
+def test_summaries_keep_each_process_sum_count_and_high_water_mark() -> None:
     local = process_metrics.parse_lines(
         [
             f"# TYPE {SUMMARY_FAMILY} summary",
@@ -157,11 +181,18 @@ def test_summaries_add_their_sums_and_counts_but_take_the_largest_max() -> None:
 
     lines = process_metrics.aggregate(local, [other])
 
-    assert _value(lines, f"{SUMMARY_FAMILY}_sum") == "0.750000"
-    assert _value(lines, f"{SUMMARY_FAMILY}_count") == "4"
-    assert _value(lines, f"{SUMMARY_FAMILY}_max") == "0.400000"
-    assert 'gpu_fault_processor_request_processing_seconds_bucket{le="1"} 5' in lines
-    assert 'gpu_fault_processor_request_processing_seconds_bucket{le="+Inf"} 7' in lines
+    for slot, total, count, maximum in (
+        ("0", "0.250000", "3", "0.100000"),
+        ("1", "0.500000", "1", "0.400000"),
+    ):
+        assert _value(lines, f"{SUMMARY_FAMILY}_sum", process=slot) == total
+        assert _value(lines, f"{SUMMARY_FAMILY}_count", process=slot) == count
+        assert _value(lines, f"{SUMMARY_FAMILY}_max", process=slot) == maximum
+    bucket = "gpu_fault_processor_request_processing_seconds_bucket"
+    assert _value(lines, bucket, le="1", process="0") == "4"
+    assert _value(lines, bucket, le="+Inf", process="0") == "6"
+    assert _value(lines, bucket, le="1", process="1") == "1"
+    assert _value(lines, bucket, le="+Inf", process="1") == "1"
 
 
 def test_labelled_series_only_one_process_has_still_reach_the_scrape() -> None:
@@ -182,10 +213,10 @@ def test_labelled_series_only_one_process_has_still_reach_the_scrape() -> None:
     lines = process_metrics.aggregate(local, [other])
 
     assert (
-        'gpu_fault_control_record_archive_withheld_total{reason="open workflow"} 3'
+        'gpu_fault_control_record_archive_withheld_total{reason="open workflow",process="1"} 3'
         in lines
     )
-    assert "gpu_fault_only_theirs_total 9" in lines
+    assert 'gpu_fault_only_theirs_total{process="1"} 9' in lines
     assert (
         "# HELP gpu_fault_only_theirs_total Only the sibling has this family." in lines
     )
@@ -217,11 +248,18 @@ def _publish_as(directory: Path, pid: int, slot: int, lines: list[str]) -> None:
     process_metrics.publish(directory, rendered, pid=pid, slot=slot)
 
 
-def test_the_scrape_merges_live_processes_and_forgets_dead_ones(tmp_path: Path) -> None:
+@pytest.mark.parametrize("corrupt_alive", [False, True], ids=["dead-json", "live-json"])
+def test_the_scrape_merges_live_processes_and_forgets_dead_ones(
+    tmp_path: Path, corrupt_alive: bool
+) -> None:
     live = _other_process()
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
+    corrupt = _other_process()
     try:
+        if not corrupt_alive:
+            corrupt.kill()
+            corrupt.wait()
         _publish_as(
             tmp_path, live.pid, 1, [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 1"]
         )
@@ -229,15 +267,17 @@ def test_the_scrape_merges_live_processes_and_forgets_dead_ones(tmp_path: Path) 
             tmp_path, dead.pid, 2, [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 100"]
         )
         (tmp_path / "not-a-pid.json").write_text("{}")
-        (tmp_path / f"{live.pid + 1}.json").write_text("{not json")
+        # A neighboring PID can belong to another worker in a parallel test run.
+        (tmp_path / f"{corrupt.pid}.json").write_text("{not json")
 
         lines = process_metrics.pod_coherent_lines(
             [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 2"], directory=tmp_path
         )
 
-        assert _value(lines, SUM_FAMILY) == "3"
+        assert _value(lines, SUM_FAMILY, process="0") == "2"
+        assert _value(lines, SUM_FAMILY, process="1") == "1"
         assert f"{PROCESSES_METRIC} 2" in lines
-        assert f"{DEGRADED_METRIC} 0" in lines
+        assert f"{DEGRADED_METRIC} {int(corrupt_alive)}" in lines
         assert not (tmp_path / f"{dead.pid}.json").exists(), (
             "a dead process's samples must not be counted after its restart"
         )
@@ -247,6 +287,9 @@ def test_the_scrape_merges_live_processes_and_forgets_dead_ones(tmp_path: Path) 
     finally:
         live.kill()
         live.wait()
+        if corrupt.poll() is None:
+            corrupt.kill()
+        corrupt.wait()
         process_metrics.SLOTS.release()
 
 
@@ -258,7 +301,7 @@ def test_an_unusable_directory_degrades_to_the_local_render(tmp_path: Path) -> N
         [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 7"], directory=blocked / "inner"
     )
 
-    assert _value(lines, SUM_FAMILY) == "7"
+    assert _value(lines, SUM_FAMILY, process="0") == "7"
     assert f"{DEGRADED_METRIC} 1" in lines
     assert f"{PROCESSES_METRIC} 1" in lines
 
@@ -356,9 +399,10 @@ def test_metrics_read_the_whole_pod_not_the_answering_process(
         text = _scrape(app)
 
         for line in (
-            "gpu_fault_workflow_lifetime_exceeded_total 2",
-            'gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded"} 2',
-            'gpu_fault_control_record_archive_withheld_total{reason="incident has external successor"} 3',
+            'gpu_fault_workflow_lifetime_exceeded_total{process="0"} 1',
+            'gpu_fault_workflow_lifetime_exceeded_total{process="3"} 1',
+            'gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded",process="3"} 2',
+            'gpu_fault_control_record_archive_withheld_total{reason="incident has external successor",process="3"} 3',
             "gpu_fault_processor_healthy 0",
             'gpu_fault_processor_notification_shard{process="3"} 7',
             f"{PROCESSES_METRIC} 2",

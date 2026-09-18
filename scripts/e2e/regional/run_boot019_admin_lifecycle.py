@@ -5,7 +5,6 @@ import base64
 import hashlib
 import json
 import ssl
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -18,7 +17,8 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from gpu_fault.admin import cluster_join as admin_cluster_join  # noqa: E402
+from gpu_fault.admin import cluster_join_commit  # noqa: E402
+from gpu_fault.admin.bootstrap_common import Arn, BootstrapError  # noqa: E402
 from gpu_fault.admin.cluster_join import JoinClusterRequest, join_cluster  # noqa: E402
 from gpu_fault.admin.cluster_removal import (  # noqa: E402
     RemoveClusterRequest,
@@ -30,6 +30,25 @@ from gpu_fault.admin.resource_registry import (  # noqa: E402
 from gpu_fault.admin.site import RenderedSite, load_site  # noqa: E402
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder  # noqa: E402
+from scripts.e2e.regional.boot019_revocation import RevocationCredentials  # noqa: E402
+from scripts.e2e.regional.boot_membership_observation import (  # noqa: E402
+    membership_observation,
+    membership_transition_errors,
+)
+from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
+    add_live_arguments,
+    authorize_execution,
+    build_plan,
+    install_site_profile,
+)
+from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
+    case_evidence_path,
+    predecessor_path,
+)
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    RegionalLiveFixture,
+    predecessor_evidence,
+)
 
 CASE_ID = "GF-REGIONAL-BOOT-019"
 CONFIRMATION = "RUN_BOOT019_ADMIN_LIFECYCLE"
@@ -74,7 +93,7 @@ class AdminLifecycleBackend(Protocol):
 
     def uninstall(self) -> dict[str, Any]: ...
 
-    def cleanup_sensitive_files(self) -> None: ...
+    def cleanup_sensitive_files(self, *, completed: bool = False) -> None: ...
 
 
 def _assert_consistent_snapshot(
@@ -124,6 +143,13 @@ def assert_uninstall_result(result: dict[str, Any]) -> None:
         if status == "DELETE_PENDING"
     )
     _require(not pending, "final registry still has DELETE_PENDING entries", pending)
+    _require(
+        all(
+            status in {"DELETED", "DETACHED", "PRESERVED"}
+            for status in dict(statuses or {}).values()
+        ),
+        "final registry contains a nonterminal or unknown status",
+    )
     # The reinstall contract: the Aurora cluster (and so the site's records)
     # survives a keep-CPU uninstall that did not ask for ``--reset-database``.
     _require(
@@ -137,9 +163,23 @@ def run_admin_lifecycle(
     backend: AdminLifecycleBackend,
     recorder: EvidenceRecorder,
 ) -> dict[str, Any]:
+    recorder.document["status"] = "RUNNING"
+    recorder.note("verdict", "FAIL")
     try:
+        _require(
+            not {
+                "join_failure_before_site_commit",
+                "join_failure_after_site_commit",
+            }.intersection(recorder.document["stages"]),
+            "legacy site-commit evidence cannot authorize the activation contract",
+        )
         baseline = recorder.stage("baseline", backend.snapshot)
         baseline_ids = set(baseline["site_cluster_ids"])
+        release_id = baseline.get("release_id")
+        _require(
+            isinstance(release_id, str) and bool(release_id),
+            "baseline release identity is missing",
+        )
         _require(
             len(baseline_ids) == 1,
             "BOOT-019 requires an isolated site with exactly one managed GPU cluster",
@@ -148,18 +188,19 @@ def run_admin_lifecycle(
         _assert_consistent_snapshot(baseline, baseline_ids)
 
         pre_commit = recorder.stage(
-            "join_failure_before_site_commit",
-            lambda: backend.join("before-site-commit"),
+            "join_failure_before_activation",
+            lambda: backend.join("before-activation"),
         )
         _require(pre_commit["phase"] == "ROLLED_BACK", "pre-commit phase", pre_commit)
-        _assert_consistent_snapshot(backend.snapshot(), baseline_ids)
+        if "join_failure_after_activation" not in recorder.document["stages"]:
+            _assert_consistent_snapshot(backend.snapshot(), baseline_ids)
 
         post_commit = recorder.stage(
-            "join_failure_after_site_commit",
-            lambda: backend.join("after-site-commit"),
+            "join_failure_after_activation",
+            lambda: backend.join("after-activation"),
         )
         _require(
-            post_commit["phase"] == "FAILED_AFTER_COMMIT",
+            post_commit["phase"] == "FAILED_AFTER_ACTIVATION",
             "post-commit phase",
             post_commit,
         )
@@ -172,6 +213,12 @@ def run_admin_lifecycle(
         joined_ids = baseline_ids | {joined_id}
         after_join = recorder.stage("joined_snapshot", backend.snapshot)
         _assert_consistent_snapshot(after_join, joined_ids)
+        _require(
+            not membership_transition_errors(
+                baseline["membership_cpu"], after_join["membership_cpu"]
+            ),
+            "join changed CPU roles outside the failure-domain publication",
+        )
 
         token_capture = recorder.stage(
             "joined_token_captured",
@@ -199,6 +246,12 @@ def run_admin_lifecycle(
         )
         after_remove = recorder.stage("post_remove_snapshot", backend.snapshot)
         _assert_consistent_snapshot(after_remove, baseline_ids)
+        _require(
+            not membership_transition_errors(
+                after_join["membership_cpu"], after_remove["membership_cpu"]
+            ),
+            "remove changed CPU roles outside the failure-domain publication",
+        )
 
         last_cluster_id = next(iter(baseline_ids))
         last_removed = recorder.stage(
@@ -215,17 +268,41 @@ def run_admin_lifecycle(
         )
         empty = recorder.stage("empty_registry_snapshot", backend.snapshot)
         _assert_consistent_snapshot(empty, set())
+        _require(
+            not membership_transition_errors(
+                after_remove["membership_cpu"], empty["membership_cpu"]
+            ),
+            "last remove changed CPU roles outside the failure-domain publication",
+        )
 
         uninstall_result = recorder.stage("uninstall_keep_cpu", backend.uninstall)
         assert_uninstall_result(uninstall_result)
-        return recorder.complete()
     except BaseException as exc:
         recorder.fail(exc)
         raise
     finally:
-        # The captured cluster token is a live credential until the cluster is
-        # removed; whatever happened above, it must not outlive the run.
-        backend.cleanup_sensitive_files()
+        # Failed runs retain only run-bound 0600 credentials needed to prove
+        # revocation after a new process resumes; ordinary evidence has digests.
+        try:
+            backend.cleanup_sensitive_files()
+        except BaseException as exc:
+            recorder.fail(exc)
+            raise
+    try:
+        backend.cleanup_sensitive_files(completed=True)
+    except BaseException as exc:
+        recorder.fail(exc)
+        raise
+    recorder.document.update(
+        {
+            "schema_version": 1,
+            "report_type": "fault-acceptance",
+            "release_id": release_id,
+            "cluster_id": next(iter(baseline_ids)),
+            "verdict": "PASS",
+        }
+    )
+    return recorder.complete()
 
 
 class LiveAdminLifecycleBackend:
@@ -245,10 +322,11 @@ class LiveAdminLifecycleBackend:
         self.allowed_namespaces = allowed_namespaces
         self.join_state_dir = join_state_dir
         self.run_dir = run_dir
-        # Captured tokens stay in memory: a copy under run_dir would be a valid
-        # cluster credential on disk until the cluster is removed, and the old
-        # code only deleted it on success.
         self._captured_tokens: dict[str, bytes] = {}
+        self._captures: dict[str, dict[str, Any]] = {}
+        self._credential_custody = RevocationCredentials(
+            run_dir, site_path=site_path, join_arn=gpu_cluster_arn
+        )
 
     def _site(self) -> RenderedSite:
         return load_site(self.site_path, repository_root=ROOT)
@@ -267,38 +345,45 @@ class LiveAdminLifecycleBackend:
         )
 
     def join(self, fault: str | None = None) -> dict[str, Any]:
+        if fault not in {None, "before-activation", "after-activation"}:
+            raise AcceptanceCheckError("unknown join fault boundary")
         state = self._join_state()
-        if fault == "before-site-commit" and state.get("phase") == "ROLLED_BACK":
+        if fault == "before-activation" and state.get("phase") == "ROLLED_BACK":
             return {
                 **state,
                 "cluster_id": state["evidence"]["DISCOVERED"]["cluster_id"],
             }
-        if fault == "after-site-commit" and state.get("phase") == "FAILED_AFTER_COMMIT":
+        if (
+            fault == "after-activation"
+            and state.get("phase") == "FAILED_AFTER_ACTIVATION"
+        ):
             return {
                 **state,
                 "cluster_id": state["evidence"]["DISCOVERED"]["cluster_id"],
             }
 
-        original_deploy = admin_cluster_join._deploy_and_commit
-        original_commit = admin_cluster_join._commit_site
+        original_complete = cluster_join_commit.complete_step
         try:
-            if fault == "before-site-commit":
+            if fault is not None:
+                boundary = (
+                    "REGISTRY_UPDATED"
+                    if fault == "before-activation"
+                    else "ACTIVATION_STARTED"
+                )
 
-                def fail_before_commit(*_args: Any, **_kwargs: Any) -> None:
-                    raise InjectedAcceptanceFailure(
-                        "BOOT-019 injected failure before site commit"
-                    )
+                def complete_then_fail(
+                    path: Path,
+                    state: dict[str, Any],
+                    step: str,
+                    evidence: dict[str, Any] | None = None,
+                ) -> None:
+                    original_complete(path, state, step, evidence)
+                    if step == boundary:
+                        raise InjectedAcceptanceFailure(
+                            f"BOOT-019 injected failure after {boundary}"
+                        )
 
-                admin_cluster_join._deploy_and_commit = fail_before_commit
-            elif fault == "after-site-commit":
-
-                def commit_then_fail(*args: Any, **kwargs: Any) -> None:
-                    original_commit(*args, **kwargs)
-                    raise InjectedAcceptanceFailure(
-                        "BOOT-019 injected failure after site commit"
-                    )
-
-                admin_cluster_join._commit_site = commit_then_fail
+                cluster_join_commit.complete_step = complete_then_fail
             try:
                 return dict(join_cluster(self._join_request()))
             except InjectedAcceptanceFailure:
@@ -308,8 +393,7 @@ class LiveAdminLifecycleBackend:
                     "cluster_id": state["evidence"]["DISCOVERED"]["cluster_id"],
                 }
         finally:
-            admin_cluster_join._deploy_and_commit = original_deploy
-            admin_cluster_join._commit_site = original_commit
+            cluster_join_commit.complete_step = original_complete
 
     def _kubectl_json(self, *arguments: str) -> dict[str, Any]:
         site = self._site()
@@ -321,12 +405,11 @@ class LiveAdminLifecycleBackend:
             "-o",
             "json",
         ]
-        output = subprocess.run(
+        output = RegionalLiveFixture.run(
             command,
             cwd=ROOT,
             check=True,
-            text=True,
-            capture_output=True,
+            timeout=300,
         ).stdout
         value = json.loads(output)
         if not isinstance(value, dict):
@@ -376,11 +459,13 @@ class LiveAdminLifecycleBackend:
         desired = int(deployment["spec"].get("replicas") or 0)
         ready = int(deployment.get("status", {}).get("readyReplicas") or 0)
         return {
+            "release_id": state.get("release_id"),
             "site_cluster_ids": site_ids,
             "registry_secret_cluster_ids": secret_ids,
             "release_state_cluster_ids": sorted(state.get("cluster_ids") or []),
             "installation_registry_cluster_ids": active_registry_ids,
             "cpu_control_plane_ready": desired > 0 and ready == desired,
+            "membership_cpu": membership_observation(site),
         }
 
     def capture_joined_token(self, cluster_id: str) -> dict[str, Any]:
@@ -392,13 +477,16 @@ class LiveAdminLifecycleBackend:
         )
         token = Path(record["token_file"]).read_bytes()
         self._captured_tokens[cluster_id] = token
-        return {
-            "cluster_id": cluster_id,
-            "token_storage": "memory",
-            "token_sha256": hashlib.sha256(token).hexdigest(),
+        capture = {
+            **self._credential_custody.capture(cluster_id, token),
             "control_plane_url": record["control_plane_url"],
             "ca_file": record["ca_file"],
+            "ca_sha256": hashlib.sha256(
+                Path(record["ca_file"]).read_bytes()
+            ).hexdigest(),
         }
+        self._captures[cluster_id] = capture
+        return capture
 
     def remove(self, cluster_id: str) -> dict[str, Any]:
         return dict(
@@ -413,12 +501,12 @@ class LiveAdminLifecycleBackend:
 
     def probe_revoked_token(self, capture: dict[str, Any]) -> dict[str, Any]:
         cluster_id = str(capture["cluster_id"])
-        stored = self._captured_tokens.get(cluster_id)
-        if stored is None:
-            raise AcceptanceCheckError(
-                f"no captured token for {cluster_id}; capture and probe must run "
-                "in the same process"
-            )
+        stored = self._credential_custody.load(capture)
+        if hashlib.sha256(
+            Path(capture["ca_file"]).read_bytes()
+        ).hexdigest() != capture.get("ca_sha256"):
+            raise AcceptanceCheckError("revocation TLS trust identity changed")
+        self._captures[cluster_id] = capture
         token = stored.decode("utf-8").strip()
         request = urllib.request.Request(
             str(capture["control_plane_url"]).rstrip("/")
@@ -457,12 +545,15 @@ class LiveAdminLifecycleBackend:
         )
         return {**result, "final_registry_statuses": final_registry_statuses(result)}
 
-    def cleanup_sensitive_files(self) -> None:
+    def cleanup_sensitive_files(self, *, completed: bool = False) -> None:
         self._captured_tokens.clear()
-        # Earlier runs of this runner wrote the token under run_dir/secure; a
-        # file left by one of them is removed here as well.
-        for path in (self.run_dir / "secure").glob("*.revoked-token"):
-            path.unlink(missing_ok=True)
+        if completed:
+            for capture in self._captures.values():
+                self._credential_custody.remove(capture)
+            self._captures.clear()
+
+    def resume_revocation_capture(self, capture: dict[str, Any]) -> None:
+        self._captures[str(capture["cluster_id"])] = capture
 
 
 def final_registry_statuses(result: dict[str, Any]) -> dict[str, str]:
@@ -482,9 +573,93 @@ def final_registry_statuses(result: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def epoch_targets(
+    site_path: Path,
+    protected_path: Path,
+    join_arn: str,
+    *,
+    resume: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if site_path.resolve() == protected_path.resolve():
+        raise AcceptanceCheckError("BOOT-019 cannot use the protected site")
+    lifecycle = load_site(site_path, repository_root=ROOT).release_config
+    protected = load_site(protected_path, repository_root=ROOT).release_config
+
+    def eks_arn(value: Any) -> str:
+        try:
+            parsed = Arn.parse(value) if isinstance(value, str) else None
+            valid = (
+                parsed is not None
+                and parsed.service == "eks"
+                and bool(parsed.resource_name)
+            )
+        except BootstrapError:
+            valid = False
+        if not valid:
+            raise AcceptanceCheckError(
+                "BOOT-019 isolation requires explicit physical EKS ARNs"
+            )
+        return str(value).strip()
+
+    cpu = eks_arn(lifecycle.get("cpu_eks_arn"))
+    protected_cpu = eks_arn(protected.get("cpu_eks_arn"))
+    gpu = [eks_arn(item.get("eks_cluster_arn")) for item in lifecycle["clusters"]]
+    protected_gpu = [
+        eks_arn(item.get("eks_cluster_arn")) for item in protected["clusters"]
+    ]
+    join = eks_arn(join_arn)
+    original = None
+    if resume is not None:
+        original = (resume.get("inputs") or {}).get("epoch_targets")
+        if (
+            resume.get("case_id") != CASE_ID
+            or not isinstance(original, dict)
+            or original.get("lifecycle_cpu_eks_arn") != cpu
+            or original.get("join_gpu_eks_arn") != join
+            or original.get("protected_cpu_eks_arn") != protected_cpu
+            or original.get("protected_gpu_eks_arns") != sorted(protected_gpu)
+        ):
+            raise AcceptanceCheckError("BOOT-019 resume target identity changed")
+        baseline = original.get("lifecycle_gpu_eks_arns")
+        if not isinstance(baseline, list) or len(baseline) != 1:
+            raise AcceptanceCheckError("BOOT-019 resume lacks its baseline")
+        stages = resume.get("stages") or {}
+        permitted = [set(baseline)]
+        if "join_failure_before_activation" in stages:
+            permitted.append({*baseline, join})
+        if "post_remove_snapshot" in stages:
+            permitted.append(set())
+        if set(gpu) not in permitted or len(gpu) != len(set(gpu)):
+            raise AcceptanceCheckError(
+                "BOOT-019 membership does not match its recorded phase"
+            )
+        gpu = [eks_arn(item) for item in baseline]
+    if len(gpu) != 1 or not protected_gpu:
+        raise AcceptanceCheckError(
+            "BOOT-019 requires one disposable baseline GPU and a protected fleet"
+        )
+    if (
+        cpu == protected_cpu
+        or set([cpu, *gpu, join]).intersection({protected_cpu, *protected_gpu})
+        or len({cpu, *gpu, join}) != 3
+    ):
+        raise AcceptanceCheckError(
+            "BOOT-019 targets overlap the protected or baseline clusters"
+        )
+    return {
+        "lifecycle_cpu_eks_arn": cpu,
+        "lifecycle_gpu_eks_arns": gpu,
+        "join_gpu_eks_arn": join,
+        "protected_cpu_eks_arn": protected_cpu,
+        "protected_gpu_eks_arns": sorted(protected_gpu),
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
+    add_live_arguments(value, confirmation=CONFIRMATION)
     value.add_argument("--site", required=True, type=Path)
+    value.add_argument("--protected-site", required=True, type=Path)
     value.add_argument("--gpu-cluster-arn", required=True)
     value.add_argument("--cluster-id")
     value.add_argument(
@@ -492,41 +667,92 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=["gpu-fault-system", "training"],
     )
-    value.add_argument("--run-dir", required=True, type=Path)
-    value.add_argument("--execute", action="store_true")
-    value.add_argument("--confirm")
+    value.add_argument("--predecessor-evidence", default="")
     return value
 
 
 def main() -> int:
+    install_site_profile()
     arguments = parser().parse_args()
+    case_path = case_evidence_path(arguments.run_dir, CASE_ID)
+    resume = (
+        json.loads(case_path.read_text(encoding="utf-8"))
+        if case_path.exists()
+        else None
+    )
+    targets = epoch_targets(
+        arguments.site,
+        arguments.protected_site,
+        arguments.gpu_cluster_arn,
+        **({"resume": resume} if resume is not None else {}),
+    )
+    previous_id, previous_path = predecessor_path(
+        arguments.run_dir, CASE_ID, arguments.predecessor_evidence
+    )
+    predecessor = (
+        predecessor_evidence(previous_path, previous_id)
+        if previous_id is not None and previous_path is not None
+        else {"valid": True, "verdict": "NOT_REQUIRED"}
+    )
+    environment = {
+        "GPU_FAULT_SITE_FILE": str(arguments.site.resolve()),
+        "GPU_FAULT_PROTECTED_SITE_FILE": str(arguments.protected_site.resolve()),
+    }
     plan = {
         "case_id": CASE_ID,
         "site": str(arguments.site),
         "gpu_cluster_arn": arguments.gpu_cluster_arn,
         "run_dir": str(arguments.run_dir),
+        "site_sha256": hashlib.sha256(arguments.site.read_bytes()).hexdigest(),
+        "protected_site": str(arguments.protected_site.resolve()),
+        "protected_site_sha256": hashlib.sha256(
+            arguments.protected_site.read_bytes()
+        ).hexdigest(),
+        "epoch_targets": targets,
+        "predecessor": predecessor,
         "stages": [
-            "inject pre-commit join failure and verify rollback",
-            "inject post-commit join failure and verify fail-forward resume",
+            "inject pre-activation join failure and verify rollback",
+            "inject post-activation-intent failure and verify fail-forward resume",
             "remove the joined cluster and reject its old token",
             "remove the final GPU cluster and verify explicit empty registry",
             "uninstall solution resources while preserving CPU/GPU clusters",
         ],
     }
     if not arguments.execute:
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
-    if arguments.confirm != CONFIRMATION:
-        raise SystemExit(f"--execute requires --confirm {CONFIRMATION}")
-    arguments.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        document = build_plan(
+            arguments=arguments,
+            preflight_passed=predecessor.get("valid") is True,
+            run_dir=arguments.run_dir,
+            case_id=CASE_ID,
+            attempt=arguments.attempt,
+            confirmation=CONFIRMATION,
+            environment=environment,
+            details=plan,
+        )
+        print(json.dumps(document, indent=2, sort_keys=True))
+        return 0 if predecessor.get("valid") is True else 1
+    authorize_execution(
+        arguments,
+        case_id=CASE_ID,
+        confirmation=CONFIRMATION,
+        environment=environment,
+        details=plan,
+    )
+    if predecessor.get("valid") is not True:
+        raise AcceptanceCheckError("formal predecessor evidence is not PASS")
+    case_path = case_evidence_path(arguments.run_dir, CASE_ID)
+    case_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     inputs = {
+        "acceptance_contract": 4,
         "site": str(arguments.site.resolve()),
+        "protected_site": str(arguments.protected_site.resolve()),
+        "epoch_targets": targets,
         "gpu_cluster_arn": arguments.gpu_cluster_arn,
         "cluster_id": arguments.cluster_id,
         "allowed_namespaces": sorted(set(arguments.allowed_namespace)),
     }
     recorder = EvidenceRecorder(
-        arguments.run_dir / f"{CASE_ID}.json",
+        case_path,
         case_id=CASE_ID,
         inputs=inputs,
     )
@@ -535,9 +761,12 @@ def main() -> int:
         gpu_cluster_arn=arguments.gpu_cluster_arn,
         cluster_id=arguments.cluster_id,
         allowed_namespaces=tuple(sorted(set(arguments.allowed_namespace))),
-        join_state_dir=arguments.run_dir / "join-state",
-        run_dir=arguments.run_dir,
+        join_state_dir=case_path.parent / "join-state",
+        run_dir=case_path.parent,
     )
+    capture = recorder.document["stages"].get("joined_token_captured")
+    if isinstance(capture, dict):
+        backend.resume_revocation_capture(capture)
     result = run_admin_lifecycle(backend, recorder)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

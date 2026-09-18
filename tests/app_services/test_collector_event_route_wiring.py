@@ -28,7 +28,7 @@ from gpu_fault.channel_registry import (
     FABRIC_MANAGER_PATH,
     NVIDIA_KERNEL_PATH,
 )
-from gpu_fault.hma import (
+from gpu_fault.nvidia_logs import (
     UNPARSED_SXID_REASON,
     UNPARSED_XID_REASON,
     FabricManagerLogEvent,

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
+import re
 import subprocess
 import sys
-import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,6 +14,13 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
     compute_agent_config_digest,
+)
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import run_command as bounded_command
+from gpu_fault.admin.postgres_grant import PostgresTestAllocation
+from gpu_fault.admin.release_postgres import (
+    isolated_postgres_allocation,
+    require_postgres_cleanup,
 )
 from gpu_fault.admin.release_consent import (
     ACCEPT_SCHEMA_CHANGE_ENV,
@@ -27,6 +33,14 @@ DEFAULT_ADOT_IMAGE_AMD64 = (
     "sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c"
 )
 STAGING_IMPACT_PLAN = Path("dist/staging-impact-plan.json")
+# ECR RepositoryName service-model grammar, including its 2..256 character limit.
+ECR_DIGEST_REFERENCE = re.compile(
+    r"(?P<registry>[0-9]{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)"
+    r"\.amazonaws\.com(?P<china>\.cn)?/"
+    r"(?P<repository>(?=[^@]{2,256}@)[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*)"
+    r"@(?P<digest>sha256:[0-9a-f]{64})"
+)
 
 
 def _private_file(path: Path, description: str) -> Path:
@@ -111,49 +125,150 @@ def load_reusable_signed_release(
         runtime_profile=runtime_profile,
         allow_staging=staging_only,
     )
-    runtime_reference = str(release["images"]["runtime"])
-    if not runtime_reference.startswith(runtime_repository.rstrip("/") + "@sha256:"):
-        return None
-    if not runtime_image_exists(region=region, reference=runtime_reference):
+    references = []
+    for name in ("runtime", "executor", "node_dependencies"):
+        runtime_reference = str(release["images"].get(name) or "")
+        if not runtime_reference and name != "runtime":
+            continue
+        if not runtime_reference.startswith(
+            runtime_repository.rstrip("/") + "@sha256:"
+        ):
+            return None
+        references.append(runtime_reference)
+    # Legacy shared-image callers retain the single-image compatibility helper.
+    exists = (
+        runtime_image_exists(region=region, reference=references[0])
+        if len(references) == 1
+        else runtime_images_exist(region=region, references=references)
+    )
+    if not exists:
         return None
     return {**release, "release_reused": True}
 
 
-def runtime_image_exists(*, region: str, reference: str) -> bool:
-    repository_uri, separator, digest = reference.partition("@")
-    registry, slash, repository_name = repository_uri.partition("/")
-    if (
-        not separator
-        or not slash
-        or not registry
-        or not repository_name
-        or not digest.startswith("sha256:")
-    ):
-        raise BootstrapError("signed runtime image reference is invalid")
-    completed = subprocess.run(
+def runtime_images_exist(*, region: str, references: Sequence[str]) -> bool:
+    """Prove the complete signed digest set with one repository-scoped ECR read."""
+    registry = ""
+    repository = ""
+    digests: set[str] = set()
+    for reference in references:
+        match = ECR_DIGEST_REFERENCE.fullmatch(reference)
+        if (
+            match is None
+            or match["region"] != region
+            or bool(match["china"]) != region.startswith("cn-")
+        ):
+            raise BootstrapError("signed runtime image reference is invalid")
+        if digests and (registry, repository) != (
+            match["registry"],
+            match["repository"],
+        ):
+            raise BootstrapError("signed runtime images must share one ECR repository")
+        registry, repository = match["registry"], match["repository"]
+        digests.add(match["digest"])
+    if not digests or len(digests) > 100:
+        raise BootstrapError("signed runtime image digest batch is invalid")
+    completed = _run_runtime_image_check(
         [
             "aws",
             "ecr",
             "describe-images",
             "--region",
             region,
+            "--registry-id",
+            registry,
             "--repository-name",
-            repository_name,
+            repository,
             "--image-ids",
-            f"imageDigest={digest}",
+            *(f"imageDigest={digest}" for digest in sorted(digests)),
+            "--no-paginate",
             "--output",
             "json",
         ],
-        check=False,
-        capture_output=True,
-        text=True,
     )
-    if completed.returncode == 0:
-        return True
-    error = (completed.stderr or "").strip()
-    if "ImageNotFoundException" in error or "RepositoryNotFoundException" in error:
-        return False
-    raise BootstrapError(f"cannot verify signed runtime image: {error}")
+    if completed.returncode:
+        error = (completed.stderr or "").strip()
+        code = re.fullmatch(
+            r"An error occurred \((\w+)\) when calling the DescribeImages operation:"
+            r"[^\r\n]*",
+            error,
+        )
+        if completed.returncode in {1, 254, 255} and (code[1] if code else error) in {
+            "ImageNotFoundException",
+            "RepositoryNotFoundException",
+        }:
+            return False
+        detail = (
+            "AWS credential helper failed; check credential_process and tool installation"
+            if any(
+                marker in error.lower()
+                for marker in (
+                    "credential_process",
+                    "credential helper",
+                    "error when retrieving credentials",
+                    "error getting credentials",
+                )
+            )
+            else diagnostic_text(error) or "ECR returned no error detail"
+        )
+        raise BootstrapError(
+            f"cannot verify signed runtime images: {detail}; "
+            "check AWS CLI credentials, ECR read permissions and connectivity"
+        )
+    try:
+        value = json.loads(completed.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise BootstrapError("signed runtime image inventory is invalid JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("imageDetails"), list)
+        or value.get("nextToken") not in (None, "")
+    ):
+        raise BootstrapError("signed runtime image inventory is invalid or incomplete")
+    observed: set[str] = set()
+    for image in value["imageDetails"]:
+        if not isinstance(image, dict):
+            raise BootstrapError("signed runtime image inventory entry is invalid")
+        digest = image.get("imageDigest")
+        if (
+            image.get("registryId") != registry
+            or image.get("repositoryName") != repository
+            or not isinstance(digest, str)
+            or digest not in digests
+            or digest in observed
+        ):
+            raise BootstrapError("signed runtime image inventory identity differs")
+        observed.add(digest)
+    if observed != digests:
+        raise BootstrapError("signed runtime image inventory is incomplete")
+    return True
+
+
+def _run_runtime_image_check(
+    arguments: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return bounded_command(arguments)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        raise BootstrapError(
+            "cannot verify signed runtime image: ECR request exceeded its "
+            "deployment time budget"
+        ) from None
+    except OSError:
+        raise BootstrapError(
+            "cannot verify signed runtime image: cannot execute AWS CLI; "
+            "check the deployment tools and executable permissions"
+        ) from None
+    except UnicodeError:
+        raise BootstrapError(
+            "cannot verify signed runtime image: ECR returned invalid text; "
+            "check AWS CLI output"
+        ) from None
+
+
+def runtime_image_exists(*, region: str, reference: str) -> bool:
+    """Compatibility entry point with the same identity proof as split images."""
+    return runtime_images_exist(region=region, references=(reference,))
 
 
 # Deploy-scoped consent the CLI exports for the release engine. The release
@@ -163,6 +278,69 @@ def runtime_image_exists(*, region: str, reference: str) -> bool:
 # branch (deploy #18, 2026-09-09); with ``--supersede-failed-transaction`` 35
 # deploy/resume decision tests demanded a supersede (deploy #22). The gates
 # judge the tree, not this deploy's consent, so the consent stays out of them.
+#: The Makefile resolves ``PROMTOOL`` (and the audit tools) from the venv that
+#: ``SUPPLY_CHAIN_PYTHON`` lives in; ``make ci-supply-chain-tools`` builds that
+#: venv, by default under ``SUPPLY_CHAIN_TOOLS_DEFAULT``.
+SUPPLY_CHAIN_PYTHON_ENV = "SUPPLY_CHAIN_PYTHON"
+PROMTOOL_ENV = "PROMTOOL"
+SITE_TOOLCHAIN_DIRECTORY = "toolchain"
+SUPPLY_CHAIN_TOOLS_DEFAULT = Path("/tmp/gpu-fault-supply-chain-tools")
+
+
+def _supply_chain_tools(venv: Path) -> tuple[Path, Path] | None:
+    python, promtool = venv / "bin" / "python", venv / "bin" / "promtool"
+    if all(path.is_file() and os.access(path, os.X_OK) for path in (python, promtool)):
+        return python, promtool
+    return None
+
+
+def supply_chain_tools_environment(
+    environment: Mapping[str, str], *, state_dir: Path
+) -> dict[str, str]:
+    """Bind the release gates' pinned tools to the site, not to the caller's shell.
+
+    The gates ran ``make promtool-preflight`` with whatever ``SUPPLY_CHAIN_PYTHON``
+    the operator's shell happened to export. A site whose ``<state-dir>/toolchain``
+    held the pinned promtool still failed its redeploy from a fresh shell
+    (2026-09-17), because nothing recorded where the tools were. Resolution
+    order: the caller's explicit venv (its promtool must exist -- an explicit
+    but incomplete venv is refused, never silently replaced), then the site's
+    own ``<state-dir>/toolchain``, then the Makefile default; none of them is
+    a fail-closed error naming the setup command.
+    """
+
+    bound = dict(environment)
+    explicit = bound.get(SUPPLY_CHAIN_PYTHON_ENV, "").strip()
+    if explicit:
+        # The venv is where ``bin/python`` lives, never where its symlink chain
+        # ends (``python -> python3.12 -> /usr/bin/python3.12`` left the gates
+        # looking for ``/usr/bin/promtool``, 2026-09-18).
+        tools = _supply_chain_tools(
+            Path(os.path.abspath(Path(explicit).expanduser())).parent.parent
+        )
+        if tools is None:
+            raise BootstrapError(
+                f"{SUPPLY_CHAIN_PYTHON_ENV}={explicit} names a venv without an "
+                "executable bin/python and bin/promtool; run "
+                "make ci-supply-chain-tools SUPPLY_CHAIN_TOOLS_VENV=<that venv>"
+            )
+        bound.setdefault(PROMTOOL_ENV, str(tools[1]))
+        return bound
+    site_toolchain = state_dir / SITE_TOOLCHAIN_DIRECTORY
+    for candidate in (site_toolchain, SUPPLY_CHAIN_TOOLS_DEFAULT):
+        tools = _supply_chain_tools(candidate)
+        if tools is not None:
+            bound[SUPPLY_CHAIN_PYTHON_ENV] = str(tools[0])
+            bound[PROMTOOL_ENV] = str(tools[1])
+            return bound
+    raise BootstrapError(
+        "the release gates need the pinned supply-chain tools (promtool): none "
+        f"under {site_toolchain} or {SUPPLY_CHAIN_TOOLS_DEFAULT}; run "
+        f"make ci-supply-chain-tools SUPPLY_CHAIN_TOOLS_VENV={site_toolchain} "
+        f"(or set {SUPPLY_CHAIN_PYTHON_ENV})"
+    )
+
+
 RELEASE_GATE_EXCLUDED_ENVIRONMENT = frozenset(
     {
         ACCEPT_SCHEMA_CHANGE_ENV,
@@ -193,61 +371,9 @@ def release_gate_environment(
 
 @contextmanager
 def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
-    configured = os.getenv("GPU_FAULT_TEST_POSTGRES_URL", "").strip()
-    if configured:
-        yield configured
-        return
-    name = f"gpu-fault-release-postgres-{os.getpid()}"
-    # Password authentication, like Aurora: the release gate's CP-3 tests
-    # rotate a role's password and expect the server to refuse the stale one.
-    # Under ``POSTGRES_HOST_AUTH_METHOD=trust`` no password is ever checked, so
-    # ``test_postgres_reconnect`` could not observe a rotation (deploy #15,
-    # 2026-09-09). The password is ephemeral; the container dies with the gate.
-    password = secrets.token_urlsafe(18)
-    runner.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            "127.0.0.1::5432",
-            "-e",
-            f"POSTGRES_PASSWORD={password}",
-            "postgres:16",
-        ],
-        mutate=True,
-    )
-    try:
-        for _attempt in range(60):
-            ready = subprocess.run(
-                ["docker", "exec", name, "pg_isready", "-U", "postgres"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if ready.returncode == 0:
-                break
-            time.sleep(1)
-        else:
-            raise BootstrapError("temporary PostgreSQL 16 did not become ready")
-        port = runner.run(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}',
-                name,
-            ]
-        )
-        yield f"postgresql://postgres:{password}@127.0.0.1:{port}/postgres"
-    finally:
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    """Compatibility view; builds also consume the allocation's private grant."""
+    with isolated_postgres_allocation(runner) as allocation:
+        yield allocation.url
 
 
 def verify_prebuilt_release(
@@ -291,21 +417,26 @@ def prepare_staging_impact_plan(
     *,
     repository_root: Path,
     impact_base: str,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     path = repository_root / STAGING_IMPACT_PLAN
     path.parent.mkdir(parents=True, exist_ok=True)
-    output = runner.run(
-        [
-            sys.executable,
-            str(repository_root / "scripts/select-affected-tests.py"),
-            "--base",
-            impact_base,
-            "--format",
-            "json",
-            "--write-plan",
-            str(path),
-        ],
-        cwd=repository_root,
+    command = [
+        sys.executable,
+        str(repository_root / "scripts/select-affected-tests.py"),
+        "--base",
+        impact_base,
+        "--format",
+        "json",
+        "--write-plan",
+        str(path),
+    ]
+    # Selection runs the promtool preflight itself, so it needs the same
+    # site-bound tools as the gates.
+    output = (
+        runner.run(command, cwd=repository_root)
+        if environment is None
+        else runner.run(command, cwd=repository_root, env=dict(environment))
     )
     try:
         plan = json.loads(output)
@@ -425,6 +556,7 @@ def build_signed_release(
 ) -> dict[str, Any]:
     if staging_only and not impact_base.strip():
         raise BootstrapError("staging release requires a non-empty impact base")
+    require_postgres_cleanup(state_dir)
     if _git_output(
         repository_root,
         "status",
@@ -479,11 +611,13 @@ def build_signed_release(
     )
     impact_plan_path: Path | None = None
     postgres_required = promoted_candidate is None
+    tools_environment = supply_chain_tools_environment(os.environ, state_dir=state_dir)
     if staging_only:
         impact_plan_path, impact_plan = prepare_staging_impact_plan(
             runner,
             repository_root=repository_root,
             impact_base=impact_base,
+            environment=tools_environment,
         )
         postgres_required = bool(impact_plan["postgres"])
     signing_dir = state_dir / "release-signing"
@@ -564,11 +698,19 @@ def build_signed_release(
             ]
         )
     postgres_context = (
-        isolated_postgres_url(runner) if postgres_required else nullcontext("")
+        isolated_postgres_allocation(
+            runner, repository_root=repository_root, state_dir=state_dir
+        )
+        if postgres_required
+        else nullcontext(PostgresTestAllocation(""))
     )
-    with postgres_context as postgres_url:
-        environment = release_gate_environment(
-            os.environ, postgres_url=str(postgres_url), cosign_password=password
+    with postgres_context as postgres:
+        environment = postgres.build_environment(
+            release_gate_environment(
+                tools_environment,
+                postgres_url=postgres.url,
+                cosign_password=password,
+            )
         )
         runner.run(
             command,
@@ -627,9 +769,14 @@ def load_prebuilt_release(
             "staging-only release requires explicit staging authorization"
         )
     images = dict((release.get("delivery") or {}).get("images") or {})
+    image_names = ["runtime", "node_installer", "dcgm_exporter", "adot"]
+    if release["schema_version"] == 4:
+        image_names.extend(("executor", "node_dependencies"))
+    elif release["schema_version"] != 3:
+        raise BootstrapError("unsupported release manifest schema version")
     required_images = {
         name: str((images.get(name) or {}).get("reference") or "")
-        for name in ("runtime", "node_installer", "dcgm_exporter", "adot")
+        for name in image_names
     }
     if any("@sha256:" not in value for value in required_images.values()):
         raise BootstrapError("release manifest image identity is incomplete")

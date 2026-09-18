@@ -1,13 +1,16 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "domain": "unit",
   "coverage": {
     "branch": true,
     "floor": 78,
+    "objective_floor": 95,
     "sources": [
       "src/gpu_fault",
       "src/gpu_fault_release",
-      "deploy/control-plane/tools"
+      "deploy/control-plane/tools",
+      "scripts/e2e/regional",
+      "tools"
     ],
     "deployment_only_sources": [
       "src/gpu_fault_release",
@@ -26,6 +29,7 @@
       "src/gpu_fault/admin/capacity_evidence.py",
       "src/gpu_fault/admin/config.py",
       "src/gpu_fault/admin/config_parser.py",
+      "src/gpu_fault/admin/python_environment.py",
       "src/gpu_fault/admin/operation_lock.py",
       "src/gpu_fault/admin/site.py",
       "src/gpu_fault/failure_domains.py"
@@ -85,10 +89,14 @@
           "src/gpu_fault_release/regional_kubeconfig_cache.py",
           "src/gpu_fault_release/regional_manifest_snapshot.py",
           "src/gpu_fault_release/regional_monitoring_safety.py",
+          "src/gpu_fault_release/regional_node_batch.py",
           "src/gpu_fault_release/regional_notifications.py",
           "src/gpu_fault_release/regional_observability_rollback.py",
+          "src/gpu_fault_release/regional_observability_drift.py",
           "src/gpu_fault_release/regional_runtime_profile.py",
+          "src/gpu_fault_release/regional_resource_probe.py",
           "src/gpu_fault_release/regional_schema_change.py",
+          "src/gpu_fault_release/regional_secret_checks.py",
           "src/gpu_fault_release/regional_validation_evidence.py"
         ],
         "group_floor": 71,
@@ -107,11 +115,18 @@
   },
   "tests": {
     "coverage_excluded_files": [
+      "tests/metrics/test_closed_loop_promql.py",
+      "tests/metrics/test_observability_evidence_promql.py",
+      "tests/metrics/test_review_dashboard_promql.py",
       "tests/regional/test_complete_acceptance_entries.py",
       "tests/regional/test_regional_acceptance_fixtures.py",
       "tests/regional/test_regional_acceptance_spec.py",
       "tests/regional/test_regional_case_index.py",
       "tests/test_change_impact.py",
+      "tests/test_alert_rules_promtool.py",
+      "tests/test_artifact_consistency.py",
+      "tests/test_ci_pytest_evidence.py",
+      "tests/test_ci_postgres_grant.py",
       "tests/test_ci_gate.py",
       "tests/test_ci_unit_gate.py",
       "tests/test_deployment_manual_contracts.py",
@@ -124,13 +139,34 @@
       "tests/test_script_assets.py"
     ],
     "postgres_files": [
+      "tests/metrics/test_kernel_pcie_composite_postgres.py",
+      "tests/orchestration/test_provider_correlation_postgres.py",
+      "tests/regional/test_retained_store_schema_postgres.py",
+      "tests/regional/test_postgres_main_integration_seeds.py",
+      "tests/regional/test_postgres_runtime_action_uncertainty.py",
+      "tests/store/test_postgres_activation_inhibition.py",
+      "tests/store/test_postgres_collector_status_concurrency.py",
+      "tests/store/test_postgres_health_signal_semantics.py",
+      "tests/store/test_postgres_incident_audit_contents.py",
+      "tests/store/test_postgres_incident_audit_plans.py",
       "tests/store/test_postgres_store.py",
       "tests/store/test_postgres_processor_claim.py",
       "tests/store/test_postgres_reconnect.py",
+      "tests/store/test_postgres_raw_evidence_refresh.py",
+      "tests/store/test_postgres_retention_refresh.py",
+      "tests/store/test_postgres_state_table_lock_order.py",
+      "tests/store/test_postgres_terminal_quarantine.py",
       "tests/store/test_store_contracts.py"
     ],
     "fault_runner_files": [
-      "tests/test_case_scheduler.py"
+      "tests/test_case_scheduler.py",
+      "tests/test_fault_result_completeness.py",
+      "tests/test_cov95_evidence_discovery.py",
+      "tests/test_cov95_evidence_identity.py",
+      "tests/test_cov95_fault_runner.py",
+      "tests/test_pytest_reporter_contract.py",
+      "tests/test_scenario_coverage.py",
+      "tests/test_scenario_test_evidence.py"
     ],
     "deployment_prefixes": [
       "tests/admin/",
@@ -184,7 +220,12 @@
       "Makefile",
       "config/ci-unit-gate.json",
       "scripts/ci_coverage_gate.py",
+      "scripts/ci_coverage_config.py",
+      "scripts/ci_coverage_floors.py",
+      "scripts/ci_pytest_evidence.py",
+      "scripts/ci_postgres_grant.py",
       "scripts/ci_unit_gate.py",
+      "tools/coverage_objectives.py",
       "tools/pytest_case_reporter.py",
       "tools/pytest_result_identity.py"
     ]
@@ -203,6 +244,7 @@
       "identity_groups": [
         "dependencies",
         "protocol",
+        "fault_runner_source",
         "runtime_source",
         "runtime_tests",
         "shared_tests"
@@ -213,6 +255,7 @@
       "identity_groups": [
         "dependencies",
         "protocol",
+        "fault_runner_source",
         "runtime_source",
         "runtime_tests",
         "shared_tests"
@@ -223,6 +266,7 @@
       "identity_groups": [
         "dependencies",
         "protocol",
+        "fault_runner_source",
         "runtime_source",
         "runtime_tests",
         "shared_tests"
@@ -233,6 +277,7 @@
       "identity_groups": [
         "dependencies",
         "protocol",
+        "fault_runner_source",
         "runtime_source",
         "deployment_source",
         "deployment_tests",
@@ -255,6 +300,7 @@
       "identity_groups": [
         "dependencies",
         "protocol",
+        "fault_runner_source",
         "runtime_source",
         "postgres_tests",
         "shared_tests"

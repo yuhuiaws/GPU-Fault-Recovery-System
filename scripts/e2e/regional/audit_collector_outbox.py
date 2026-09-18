@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
+import sys
 import tempfile
+from datetime import datetime, timezone
 from email.message import Message
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
 import gpu_fault.collectors.sinks as collector_sinks
 from gpu_fault.collectors import CollectorError, HttpEventSink
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.e2e.regional.acceptance_runner_common import write_json_atomic  # noqa: E402
+from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # noqa: E402
+from scripts.e2e.regional.ha_evidence import isolated_chain  # noqa: E402
+from scripts.e2e.regional.regional_case_contract import case_evidence_path  # noqa: E402
+
+CASE_ID = "GF-REGIONAL-NET-005"
 
 
 class OutboxAuditFailure(RuntimeError):
@@ -24,7 +39,7 @@ def expect(condition: bool, message: str, observed: Any = None) -> None:
     raise OutboxAuditFailure(detail)
 
 
-def main() -> None:
+def audit_outbox() -> dict[str, Any]:
     original = collector_sinks.urlopen
     try:
         with tempfile.TemporaryDirectory() as directory:
@@ -172,21 +187,56 @@ def main() -> None:
                     "unwritable outbox unexpectedly buffered an event"
                 )
 
-            print(
-                "PASS",
-                {
-                    "replay_order": replay_order,
-                    "background_replay_order": background_replay_order,
-                    "background_drained_without_new_live_event": True,
-                    "bounded_sequences": bounded_sequences,
-                    "unwritable_buffered": False,
-                    "dead_letter_replayable": dead["replayable"],
-                    "dead_letter_error": dead["error"],
-                },
-            )
+            return {
+                "replay_order": replay_order,
+                "background_replay_order": background_replay_order,
+                "background_drained_without_new_live_event": True,
+                "bounded_sequences": bounded_sequences,
+                "unwritable_buffered": False,
+                "dead_letter_replayable": dead["replayable"],
+                "dead_letter_error": dead["error"],
+            }
     finally:
         collector_sinks.urlopen = original
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Audit local Collector outbox delivery contracts."
+    )
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--release-id", default="")
+    parser.add_argument("--cluster-id", default="")
+    arguments = parser.parse_args(argv or [])
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "report_type": "fault-acceptance",
+        "case_id": CASE_ID,
+        "verdict": "FAIL",
+        "validation_scope": "isolated-source",
+        "live_validation": False,
+        "identity_source": "not supplied",
+        **current_acceptance_scope().result_fields(),
+        "formal_sequence_satisfied": False,
+    }
+    try:
+        if arguments.run_dir is not None:
+            result.update(current_acceptance_scope().result_fields())
+            result.update(isolated_chain(arguments, CASE_ID))
+        elif arguments.release_id or arguments.cluster_id:
+            raise OutboxAuditFailure("enclosing acceptance identity requires --run-dir")
+        result.update(audit_outbox())
+        result["verdict"] = "PASS"
+    except Exception as exc:
+        result["verdict"] = "FAIL"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    result["status"] = "COMPLETED"
+    result["executed_at"] = datetime.now(timezone.utc).isoformat()
+    if arguments.run_dir is not None:
+        write_json_atomic(case_evidence_path(arguments.run_dir, CASE_ID), result)
+    print(result["verdict"], result)
+    return 0 if result["verdict"] == "PASS" else 1
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))

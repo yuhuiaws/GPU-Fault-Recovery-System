@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.channel_registry import (
     GPU_INVENTORY_PATH,
     GPU_METRICS_PATH,
@@ -13,6 +16,7 @@ from gpu_fault.channel_registry import (
     NODE_LOG_PATH,
     SPOOLABLE_CHANNEL_PATHS,
 )
+from gpu_fault.gpu_composites import GPU_COMPOSITE_TRANSACTION
 from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricBatch,
@@ -20,14 +24,17 @@ from gpu_fault.gpu_metrics import (
 )
 from gpu_fault.host_health import (
     HostTelemetryBatch,
-    NodeHealthCategory,
-    NodeHealthFinding,
     NodeHealthIngestionResult,
     NodeLogBatch,
 )
-from gpu_fault.models import RecoveryAction, Severity
-from gpu_fault.store.shared.health_signals import finding_health_signal_key
+from gpu_fault.store.shared.health_signals import (
+    finding_health_signal_fingerprint,
+    finding_health_signal_key,
+)
 from gpu_fault.telemetry import CollectorKind, EvidenceKind
+
+if TYPE_CHECKING:
+    from gpu_fault.watcher import AttemptObservation
 
 LOGGER = logging.getLogger(__name__)
 TelemetryBatch = GpuMetricBatch | HostTelemetryBatch | NodeLogBatch
@@ -81,7 +88,27 @@ class TelemetryIngestionService:
             )
 
     def _persist_gpu_metrics(
-        self, batch: GpuMetricBatch, observations=None
+        self,
+        batch: GpuMetricBatch,
+        observations: list[AttemptObservation] | None = None,
+    ) -> tuple[GpuMetricBatch, GpuMetricsIngestionResult]:
+        transaction = (
+            self.context.store.collector_ingestion_transaction(
+                batch.cluster_id, batch.node_id, GPU_COMPOSITE_TRANSACTION
+            )
+            if any(
+                sample.canonical_name in {"pcie_replay_total", "xid_last_error"}
+                for sample in batch.samples
+            )
+            else nullcontext()
+        )
+        with transaction:
+            return self._persist_gpu_metrics_locked(batch, observations)
+
+    def _persist_gpu_metrics_locked(
+        self,
+        batch: GpuMetricBatch,
+        observations: list[AttemptObservation] | None = None,
     ) -> tuple[GpuMetricBatch, GpuMetricsIngestionResult]:
         """The half of gpu-metrics ingestion that must be one commit.
 
@@ -167,75 +194,7 @@ class TelemetryIngestionService:
         decisions = [
             self.fault_ingestion.ingest_xid(event) for event in result.xid_events
         ]
-        node_findings = []
-        for finding in result.new_findings:
-            severity = (
-                Severity.CRITICAL
-                if finding.severity.value == "CRITICAL"
-                else Severity.WARNING
-            )
-            action = (
-                RecoveryAction(finding.automatic_action)
-                if finding.automatic_action
-                else self.context.orchestrator.gpu_metric_action(
-                    cluster_id=finding.cluster_id,
-                    node_id=finding.node_id,
-                    metric_name=finding.canonical_name,
-                    has_explicit_gpu=bool(finding.gpu_uuid),
-                    default=(
-                        RecoveryAction.QUARANTINE
-                        if severity is Severity.CRITICAL
-                        else RecoveryAction.RUN_DIAGNOSTICS
-                    ),
-                )
-            )
-            node_findings.append(
-                NodeHealthFinding(
-                    finding_id=finding.finding_id,
-                    event_id=f"gpu-{finding.finding_id}",
-                    cluster_id=finding.cluster_id,
-                    node_id=finding.node_id,
-                    observed_at=finding.observed_at,
-                    category=NodeHealthCategory.GPU,
-                    severity=severity,
-                    reason=(
-                        finding.reason
-                        if finding.finding_kind == "METRIC"
-                        else (
-                            f"{finding.reason}; correlation_rule="
-                            f"{finding.correlation_rule_id}; "
-                            "component_metrics="
-                            f"{','.join(finding.component_metrics)}; "
-                            f"confidence={finding.confidence}"
-                        )
-                    ),
-                    recommended_action=action,
-                    metric_name=finding.canonical_name,
-                    value=finding.value,
-                    device=(
-                        finding.gpu_uuid
-                        or finding.pci_bdf
-                        or (
-                            ",".join(finding.affected_gpu_uuids)
-                            if finding.affected_gpu_uuids
-                            else None
-                        )
-                    ),
-                    pci_bdf=finding.pci_bdf,
-                    gpu_uuids=(
-                        finding.affected_gpu_uuids
-                        or ([finding.gpu_uuid] if finding.gpu_uuid else [])
-                    ),
-                    evidence_ref=finding.evidence_ref,
-                    runtime_profile_version=(finding.runtime_profile_version),
-                    workload_state=finding.workload_state,
-                    affected_workload_ids=(finding.affected_workload_ids),
-                    policy_version=finding.policy_version,
-                    policy_source=finding.policy_source,
-                    policy_reference=finding.policy_reference,
-                    official_action=finding.official_action,
-                )
-            )
+        node_findings = gpu_node_health_findings(self.context, result.new_findings)
         if node_findings:
             self.node_health.ingest(batch.batch_id, node_findings)
         return result.model_copy(update={"decisions": decisions})
@@ -300,7 +259,9 @@ class TelemetryIngestionService:
         notified_at = batch.received_at or batch.observed_at
         for finding in result.findings:
             self.context.store.mark_health_signal_notified(
-                finding_health_signal_key(finding), notified_at=notified_at
+                finding_health_signal_key(finding),
+                notified_at=notified_at,
+                semantic_fingerprint=finding_health_signal_fingerprint(finding),
             )
         self.context.dispatcher.wake()
         return result

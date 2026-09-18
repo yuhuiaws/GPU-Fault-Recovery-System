@@ -34,6 +34,7 @@ from tests._builders import (
     workflow_step,
     workflow_step_execution,
 )
+from tests.metrics._assertions import assert_sample
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 
@@ -68,13 +69,11 @@ def test_collector_metrics_use_background_snapshot_only() -> None:
     assert collector_silence_lines(runtime) == ["snapshot 1"]
 
 
-def test_store_rejection_counter_is_split_by_reason_with_no_process_label() -> None:
+def test_store_rejection_counter_preserves_reason_and_bounded_process_slot() -> None:
     """One zero series per reason from the first scrape, and no ``process_id``.
 
-    The per-process label used to keep the four uvicorn workers' counts from
-    overwriting each other; the Pod-level merge now sums them per reason, and
-    the alert rules select on ``reason``, so a bare or process-labelled series
-    would be invisible to both.
+    The bounded slot preserves each counter's reset domain while reason remains
+    available to the existing alerts. No unbounded process identifier is added.
     """
     app = create_app(ApplicationContext(store=build_store()))
 
@@ -91,11 +90,15 @@ def test_store_rejection_counter_is_split_by_reason_with_no_process_label() -> N
         if line.startswith("gpu_fault_store_io_rejections_total")
     ]
 
-    assert series == [
-        'gpu_fault_store_io_rejections_total{reason="backend_unavailable"} 0',
-        'gpu_fault_store_io_rejections_total{reason="capacity"} 0',
-        'gpu_fault_store_io_rejections_total{reason="deadline"} 0',
-    ], series
+    assert len(series) == 3
+    for reason in ("backend_unavailable", "capacity", "deadline"):
+        assert_sample(
+            metrics,
+            "gpu_fault_store_io_rejections_total",
+            0,
+            reason=reason,
+            process="0",
+        )
     assert "gpu_fault_store_io_rejections_by_reason_total" not in metrics, (
         "the by_reason family is folded into the reason label"
     )

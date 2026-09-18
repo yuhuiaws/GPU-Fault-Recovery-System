@@ -1,7 +1,6 @@
 # ruff: noqa: F401
 from __future__ import annotations
 
-import base64
 import gzip
 import io
 import json
@@ -23,7 +22,6 @@ from gpu_fault.collectors import (
     CONNECTION_POOL,
     NVIDIA_SMI_CORE_FIELDS,
     NVIDIA_SMI_REMAP_FIELDS,
-    CloudWatchHmaCollector,
     CollectorContext,
     CollectorError,
     DcgmMetricsCollector,
@@ -31,12 +29,10 @@ from gpu_fault.collectors import (
     HostTelemetryCollector,
     HttpEventSink,
     KernelLogCollector,
-    KubernetesHmaNodeCollector,
     KubernetesNodeResourceCollector,
     NodeLogCollector,
     NvidiaSmiMetricsCollector,
     SqsEventSink,
-    SqsHmaConsumer,
     TrainingProgressCollector,
     context_from_environment,
     discover_gpu_product,
@@ -48,7 +44,6 @@ from gpu_fault.collectors import (
     stable_phase_seconds,
 )
 from gpu_fault.gpu_metrics import GpuMetricSample
-from gpu_fault.hma import HMA_FAULT_DETAILS, HMA_FAULT_REASONS, HMA_HEALTH_STATUS
 
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
 
@@ -175,23 +170,6 @@ def completed_nvidia_smi(
     return subprocess.CompletedProcess(
         args=["nvidia-smi"], returncode=returncode, stdout=stdout, stderr=stderr
     )
-
-
-def cloudwatch_envelope(
-    log_events: list[dict[str, Any]],
-    *,
-    stream: str = "worker-1/SagemakerHealthMonitoringAgent",
-) -> dict[str, Any]:
-    payload = json.dumps(
-        {
-            "messageType": "DATA_MESSAGE",
-            "owner": "123456789012",
-            "logGroup": "/aws/sagemaker/Clusters/hp-cluster",
-            "logStream": stream,
-            "logEvents": log_events,
-        }
-    ).encode()
-    return {"awslogs": {"data": base64.b64encode(gzip.compress(payload)).decode()}}
 
 
 def write_fake_rank(

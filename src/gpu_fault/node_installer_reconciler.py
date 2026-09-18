@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import base64
-import copy
 import hashlib
-import hmac
 import logging
 import os
 import re
@@ -13,22 +10,29 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml  # type: ignore[import-untyped,unused-ignore]
-
 from gpu_fault.dataplane_metrics import MetricFamily, start_metrics_server
-from gpu_fault.dcgm_exporter_cadence import DCGM_EXPORTER_COLLECT_INTERVAL_MS
-from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.logging_setup import configure_logging
+from gpu_fault.node_installer_rendering import (
+    INSTALLER_ARTIFACT_ANNOTATION,
+    INSTALLER_BUNDLE_ANNOTATION,
+    INSTALLER_DIGEST_ANNOTATION,
+    INSTALLER_JOB_LABEL,
+    INSTALLER_TEMPLATE_ANNOTATION,
+    TEMPLATE_CONTENT_SHA256_ENV as TEMPLATE_CONTENT_SHA256_ENV,
+    InstallerIdentity,
+    InstallerNode,
+    load_installer_template,
+    render_installer_job,
+    validate_installer_template,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 INSTALLER_VERSION_ANNOTATION = "gpu-fault.io/installer-version"
-INSTALLER_DIGEST_ANNOTATION = "gpu-fault.io/installer-config-digest"
-INSTALLER_ARTIFACT_ANNOTATION = "gpu-fault.io/installer-artifact-sha256"
-INSTALLER_BUNDLE_ANNOTATION = "gpu-fault.io/installer-bundle-sha256"
-INSTALLER_TEMPLATE_ANNOTATION = "gpu-fault.io/installer-template-sha256"
 INSTALLER_NODE_UID_ANNOTATION = "gpu-fault.io/installer-node-uid"
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
+INSTALLER_ACTIVATION_ANNOTATION = "gpu-fault.io/node-key-activation"
+INSTALLER_ACTIVATED_ANNOTATION = "gpu-fault.io/node-key-activated"
 # The boot the installation was recorded on. HyperPod UpdateClusterSoftware
 # re-images a node in place: same Node object, same UID, every annotation kept,
 # and an empty root where the Agent used to be. The UID check cannot see that;
@@ -53,6 +57,8 @@ INSTALLER_RETRY_AFTER_ANNOTATION = "gpu-fault.io/installer-retry-after"
 #: survived a removal and a re-added cluster inherited up to an hour of
 #: backoff on its first failed install.
 INSTALLER_NODE_ANNOTATIONS: tuple[str, ...] = (
+    INSTALLER_ACTIVATION_ANNOTATION,
+    INSTALLER_ACTIVATED_ANNOTATION,
     INSTALLER_VERSION_ANNOTATION,
     INSTALLER_DIGEST_ANNOTATION,
     INSTALLER_ARTIFACT_ANNOTATION,
@@ -67,7 +73,6 @@ INSTALLER_NODE_ANNOTATIONS: tuple[str, ...] = (
 )
 DEFAULT_AGENT_PORT = 9099
 DEFAULT_REBOOT_GRACE_SECONDS = 600
-INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
 # (connect, read) seconds for every apiserver call. Without it a half-open
 # connection to the apiserver blocks the reconcile loop forever while the Pod
 # stays Running and Ready.
@@ -385,6 +390,9 @@ class NodeInstallerReconciler:
         template_sha256: str,
         job_template: dict[str, Any],
         dcgm_metrics_url_template: str,
+        template_content_sha256: str | None = None,
+        node_dependency_image: str = "",
+        node_wheelhouse_sha256: str = "",
         node_action_keys_secret: str = ("gpu-fault-node-action-keys"),
         retry_seconds: int = 300,
         max_unavailable: int = 1,
@@ -427,6 +435,20 @@ class NodeInstallerReconciler:
         self.job_template = job_template
         self.dcgm_metrics_url_template = dcgm_metrics_url_template
         self.node_action_keys_secret = node_action_keys_secret
+        self.installer_identity = InstallerIdentity(
+            namespace=namespace,
+            config_digest=config_digest,
+            artifact_sha256=self.artifact_sha256,
+            bundle_sha256=self.bundle_sha256,
+            template_sha256=self.template_sha256,
+            node_action_keys_secret=node_action_keys_secret,
+            deadline_seconds=job_active_deadline_seconds,
+            metrics_url_template=dcgm_metrics_url_template,
+            template_content_sha256=template_content_sha256,
+            node_dependency_image=node_dependency_image,
+            node_wheelhouse_sha256=node_wheelhouse_sha256,
+        )
+        validate_installer_template(job_template, self.installer_identity)
         self.retry_seconds = retry_seconds
         if max_unavailable < 1:
             raise ValueError("installer max_unavailable must be positive")
@@ -588,8 +610,15 @@ class NodeInstallerReconciler:
             and annotations.get(INSTALLER_NODE_UID_ANNOTATION) == node_uid
         )
         installer_state = annotations.get(INSTALLER_STATE_ANNOTATION)
+        activation = annotations.get(INSTALLER_ACTIVATION_ANNOTATION, "")
+        if activation and re.fullmatch(r"[0-9a-f]{64}", activation) is None:
+            raise ValueError("node key activation identity is invalid")
+        activation_matches = (
+            not activation
+            or annotations.get(INSTALLER_ACTIVATED_ANNOTATION) == activation
+        )
         boot_id = _boot_id(node)
-        if identity_matches and installer_state == "Succeeded":
+        if identity_matches and activation_matches and installer_state == "Succeeded":
             recorded_boot = annotations.get(INSTALLER_BOOT_ID_ANNOTATION)
             if boot_id is None or recorded_boot == boot_id:
                 return "current"
@@ -635,6 +664,7 @@ class NodeInstallerReconciler:
             (
                 f"{self.config_digest}:{self.artifact_sha256}:"
                 f"{self.bundle_sha256}:{self.template_sha256}"
+                + (f":node-key:{activation}" if activation else "")
             ),
         )
         try:
@@ -874,6 +904,9 @@ class NodeInstallerReconciler:
             INSTALLER_NODE_UID_ANNOTATION: node_uid,
             INSTALLER_STATE_ANNOTATION: state,
         }
+        activation = annotations.get(INSTALLER_ACTIVATION_ANNOTATION)
+        if activation and state == "Succeeded":
+            desired[INSTALLER_ACTIVATED_ANNOTATION] = activation
         if boot_id is not None:
             desired[INSTALLER_BOOT_ID_ANNOTATION] = boot_id
         if target_attempts > 0:
@@ -892,9 +925,25 @@ class NodeInstallerReconciler:
             desired[INSTALLER_RETRY_AFTER_ANNOTATION] = None
         if _annotations_match(annotations, desired):
             return
+        metadata: dict[str, Any] = {"annotations": desired}
+        if activation:
+            current = self.core.read_node(node_name, _request_timeout=REQUEST_TIMEOUT)
+            current_metadata = _metadata(current)
+            current_annotations = _value(current_metadata, "annotations", {}) or {}
+            resource_version = _value(current_metadata, "resource_version") or _value(
+                current_metadata, "resourceVersion"
+            )
+            if (
+                _value(current_metadata, "uid") != node_uid
+                or not resource_version
+                or current_annotations.get(INSTALLER_ACTIVATION_ANNOTATION)
+                != activation
+            ):
+                raise ValueError("node key activation changed during reconciliation")
+            metadata.update({"uid": node_uid, "resourceVersion": resource_version})
         self.core.patch_node(
             node_name,
-            {"metadata": {"annotations": desired}},
+            {"metadata": metadata},
             _request_timeout=REQUEST_TIMEOUT,
         )
         for key, value in desired.items():
@@ -906,95 +955,19 @@ class NodeInstallerReconciler:
             self.metrics.inc("retries_scheduled_total")
 
     def _build_job(self, node: Any, job_name: str) -> dict[str, Any]:
-        body = copy.deepcopy(self.job_template)
         metadata = _metadata(node)
-        node_name = str(_value(metadata, "name"))
-        node_uid = str(_value(metadata, "uid"))
         labels = dict(_value(metadata, "labels", {}) or {})
-        instance_type = labels.get("node.kubernetes.io/instance-type", "")
-        expected_gpus, expected_efa = gpu_instance_inventory(instance_type)
-        node_ip = _internal_ip(node)
-        metrics_url = self.dcgm_metrics_url_template.replace(
-            "{node_name}", node_name
-        ).replace("{node_ip}", node_ip)
-
-        body.setdefault("metadata", {})["name"] = job_name
-        body["metadata"]["namespace"] = self.namespace
-        body["metadata"]["annotations"] = {
-            INSTALLER_DIGEST_ANNOTATION: self.config_digest,
-            INSTALLER_ARTIFACT_ANNOTATION: self.artifact_sha256,
-            INSTALLER_BUNDLE_ANNOTATION: self.bundle_sha256,
-            INSTALLER_TEMPLATE_ANNOTATION: self.template_sha256,
-        }
-        body["metadata"]["labels"] = {
-            INSTALLER_JOB_LABEL: "true",
-            "gpu-fault.io/node-uid": node_uid,
-            "gpu-fault.io/config-digest": hashlib.sha256(
-                self.config_digest.encode()
-            ).hexdigest()[:16],
-        }
-        body["spec"]["activeDeadlineSeconds"] = self.job_active_deadline_seconds
-        pod_template = body["spec"]["template"]
-        pod_template.setdefault("metadata", {})["labels"] = dict(
-            body["metadata"]["labels"]
-        )
-        pod_spec = pod_template["spec"]
-        pod_spec["nodeName"] = node_name
-        node_secret = next(
-            (
-                item
-                for item in pod_spec.get("volumes", [])
-                if item.get("name") == "node-secret"
+        return render_installer_job(
+            self.job_template,
+            InstallerNode(
+                name=str(_value(metadata, "name")),
+                uid=str(_value(metadata, "uid")),
+                address=_internal_ip(node),
+                instance_type=str(labels.get("node.kubernetes.io/instance-type", "")),
             ),
-            None,
+            self.installer_identity,
+            job_name,
         )
-        if node_secret is None:
-            raise ValueError("installer template has no node-secret volume")
-        node_secret["secret"] = {
-            "secretName": self.node_action_keys_secret,
-            "items": [
-                {
-                    "key": node_name,
-                    "path": "node-action-secret",
-                }
-            ],
-        }
-        container = next(
-            item for item in pod_spec["containers"] if item["name"] == "installer"
-        )
-        updates = {
-            "TARGET_NODE_NAME": node_name,
-            "TARGET_NODE_IP": node_ip,
-            "TARGET_NODE_UID": node_uid,
-            "NODE_INSTANCE_TYPE": instance_type,
-            "EXPECTED_GPU_COUNT": str(expected_gpus),
-            "EXPECTED_EFA_DEVICE_COUNT": str(expected_efa),
-            "DCGM_METRICS_URL_B64": base64.b64encode(metrics_url.encode()).decode(),
-            # The exporter on this node is our DaemonSet, whose period the
-            # installer cannot see from the host: without it `--dcgm-exporter
-            # existing` leaves the collector's exporter-interval seconds unset
-            # and its duty-cycle check never runs in production.
-            "DCGM_EXPORTER_INTERVAL_MS": str(DCGM_EXPORTER_COLLECT_INTERVAL_MS),
-        }
-        unfilled = dict(updates)
-        for env in container.get("env", []):
-            name = env.get("name")
-            if name in unfilled:
-                env.clear()
-                env.update(name=name, value=unfilled.pop(name))
-        if unfilled:
-            # The template is pinned by digest, so an entry it lacks is a deploy
-            # defect, not a per-node condition: a Job created anyway would run
-            # the installer without that value and install the wrong thing
-            # silently (the exporter period, say, leaves the collector's
-            # duty-cycle check off). Not a ValueError -- the caller reads that
-            # as "this node is unsupported" and moves on to the next one.
-            raise RuntimeError(
-                "installer job template has no env entry for "
-                + ", ".join(sorted(unfilled))
-                + "; the pinned template predates the reconciler filling it"
-            )
-        return body
 
 
 def _required_env(name: str) -> str:
@@ -1002,9 +975,6 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required")
     return value
-
-
-TEMPLATE_CONTENT_SHA256_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"
 
 
 def load_job_template(
@@ -1026,26 +996,9 @@ def load_job_template(
     the cluster's copy.
     """
 
-    raw = template_data if isinstance(template_data, bytes) else template_data.encode()
-    if not raw.strip():
-        raise RuntimeError(f"{origin} is empty")
-    expected = (expected_sha256 or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise RuntimeError(
-            f"{TEMPLATE_CONTENT_SHA256_ENV} is required and must be the SHA-256 "
-            f"of the installer template text ({origin})"
-        )
-    actual = hashlib.sha256(raw).hexdigest()
-    if not hmac.compare_digest(actual, expected):
-        raise RuntimeError(
-            f"installer template {origin} does not match "
-            f"{TEMPLATE_CONTENT_SHA256_ENV}: expected {expected[:12]}..., "
-            f"loaded {actual[:12]}...; refusing to start"
-        )
-    template = yaml.safe_load(raw)
-    if not isinstance(template, dict):
-        raise RuntimeError(f"installer template {origin} is not a Job document")
-    return template
+    return load_installer_template(
+        template_data, expected_sha256=expected_sha256, origin=origin
+    )
 
 
 def main() -> None:
@@ -1106,6 +1059,9 @@ def main() -> None:
         bundle_sha256=os.getenv("GPU_FAULT_INSTALLER_BUNDLE_SHA256") or None,
         template_sha256=_required_env("GPU_FAULT_INSTALLER_TEMPLATE_SHA256"),
         job_template=job_template,
+        template_content_sha256=_required_env(TEMPLATE_CONTENT_SHA256_ENV),
+        node_dependency_image=os.environ.get("GPU_FAULT_NODE_DEPENDENCY_IMAGE", ""),
+        node_wheelhouse_sha256=os.environ.get("GPU_FAULT_NODE_WHEELHOUSE_SHA256", ""),
         dcgm_metrics_url_template=os.environ.get(
             "GPU_FAULT_DCGM_METRICS_URL",
             "http://127.0.0.1:9400/metrics",

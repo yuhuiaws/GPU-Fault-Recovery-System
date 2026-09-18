@@ -3,11 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
-import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, replace
+from contextvars import copy_context
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -17,7 +16,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap import (
-    _ensure_base_secrets,
+    _ensure_base_secrets as _ensure_base_secrets,
     _gpu_nat_eips,
     discover_cluster,
 )
@@ -26,43 +25,37 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     ClusterIdentity,
     CommandRunner,
-    ensure_namespace,
+    ensure_namespace as ensure_namespace,
     safe_name,
-    write_secret,
+    write_secret as write_secret,
 )
 from gpu_fault.admin.bootstrap_services import (
     ensure_adot_writer_role,
     ensure_executor_role,
     provision_node_action_keys,
 )
-from gpu_fault.admin.cluster_join_engine import (
-    sync_cluster_release_state,
-    verify_joined_clusters,
-    verify_report_summary,
-)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
     clear_verified_step,
     join_activation_is_irreversible,
-    membership_runtime_snapshot,
+    membership_runtime_snapshot as membership_runtime_snapshot,
     verification_is_stale,
 )
-from gpu_fault.admin.cluster_join_network import (
-    ensure_nlb_ingress,
-    rollback_network,
-    wait_zone_association,
-)
 from gpu_fault.admin.cluster_join_readonly import cached_network_baseline
-from gpu_fault.admin.cluster_join_rollback import (
-    clear_stale_installer_annotations,
-    ensure_kube_context,
-    nothing_installed,
-    restore_current_context,
-    rollback_iam_role,
+from gpu_fault.admin.cluster_join_network import (
+    ensure_nlb_ingress as _ensure_nlb_ingress,
+    wait_zone_association as _wait_zone_association,
+)
+from gpu_fault.admin.cluster_join_nodes import (
+    BoundNodeKeyRunner,
+    NodeClaims,
+    read_node_claims,
+    verify_join_node_names,
 )
 from gpu_fault.admin.cluster_join_state import (
     complete_step as _complete,
+    note_join_failure,
 )
 from gpu_fault.admin.cluster_join_state import (
     completed_state_is_current as _completed_state_is_current,
@@ -76,14 +69,30 @@ from gpu_fault.admin.cluster_join_state import (
 from gpu_fault.admin.cluster_join_state import (
     step_done as _done,
 )
-from gpu_fault.admin.cluster_join_readiness import wait_join_collector_readiness
+from gpu_fault.admin.cluster_join_types import (
+    DEFAULT_ALLOWED_NAMESPACES as DEFAULT_ALLOWED_NAMESPACES,
+    JoinAttempt as JoinAttempt,
+    JoinClusterRequest as JoinClusterRequest,
+    JoinExecution as JoinExecution,
+    JoinInputs as JoinInputs,
+)
+from gpu_fault.admin.cluster_readiness import wait_collector_readiness
 from gpu_fault.admin.cluster_removal import (
-    _clear_installer_annotations,
-    _cluster_network,
-    _remove_node_action_keys,
+    _clear_installer_annotations as _clear_installer_annotations,
+    _remove_node_action_keys as _remove_node_action_keys,
     _sync_release_state,
 )
+from gpu_fault.admin.cluster_removal_network import (
+    cluster_network as _cluster_network,
+    wait_vpc_association_absent,
+)
 from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import (
+    recovery_deadline,
+    run_command as run_command,
+    run_driver as run_driver,
+)
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
@@ -97,44 +106,29 @@ from gpu_fault.admin.resource_registry import (
     sync_installation_resource_snapshot,  # noqa: F401 - commit adapter seam
     write_installation_resource_snapshot,  # noqa: F401 - commit adapter seam
 )
+from gpu_fault.admin.resource_registry_dns import (
+    association_identity,
+    vpc_association_entry,
+)
 from gpu_fault.admin.site import (
     RenderedSite,
     effective_environment,
     load_site,
     materialized_release_config,
 )
+from gpu_fault.admin.process_supervisor import (
+    ProcessSupervisionLost,
+    ensure_supervision_safe,
+    interruption_scope,
+)
 from gpu_fault.installation_resources import InstallationResourceSnapshot
 
-DEFAULT_ALLOWED_NAMESPACES = ("gpu-fault-system", "training")
 _KUBECONFIG_THREAD_LOCK = Lock()
+_wait_vpc_association_absent = wait_vpc_association_absent
 
 
-@dataclass(frozen=True)
-class JoinClusterRequest:
-    site: RenderedSite
-    gpu_cluster_arn: str
-    cluster_id: str | None = None
-    allowed_namespaces: tuple[str, ...] = DEFAULT_ALLOWED_NAMESPACES
-    state_dir: Path | None = None
-
-
-@dataclass(frozen=True)
-class JoinExecution:
-    target: ClusterIdentity
-    cluster_id: str
-    discovery: dict[str, Any]
-    local: dict[str, Any]
-    prerequisites: dict[str, Any]
-    candidate: RenderedSite
-
-
-@dataclass
-class JoinAttempt:
-    request: JoinClusterRequest
-    state_dir: Path
-    state_path: Path
-    state: dict[str, Any]
-    execution: JoinExecution | None = None
+class JoinTargetIdentityError(BootstrapError):
+    """The recorded target cannot safely authorize mutation or compensation."""
 
 
 def _fetch_installation_registry(
@@ -170,31 +164,13 @@ def _sync_join_release_state(
     *,
     cluster_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Refresh the release state after membership changed.
-
-    With a ``cluster_id`` (the join commit) only that cluster is captured and
-    merged into the committed state; without one (rollback, repair of an old
-    record) the engine's full ``sync-state`` runs.
-    """
-
-    if cluster_id is None:
-        _sync_release_state(site)
-        return None
-    return sync_cluster_release_state(site, cluster_id=cluster_id)
-
-
-def _verify_candidate(
-    candidate: RenderedSite,
-    readiness: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """The join-scoped verify; ``readiness`` is COLLECTORS_READY evidence per cluster."""
-
-    return verify_joined_clusters(candidate, readiness=readiness)
-
-
-def _collectors_ready_evidence(state: dict[str, Any]) -> dict[str, Any]:
-    value = (state.get("evidence") or {}).get("COLLECTORS_READY")
-    return dict(value) if isinstance(value, dict) else {}
+    """Keep the full snapshot's split-image and exact fleet-identity checks."""
+    if cluster_id is not None and not any(
+        item["cluster_id"] == cluster_id for item in site.release_config["clusters"]
+    ):
+        raise BootstrapError("release-state sync target is not a managed cluster")
+    _sync_release_state(site)
+    return {"capture_scope": "site"}
 
 
 def _run_rollout(
@@ -211,7 +187,7 @@ def _run_rollout(
         arguments = [str(rollout), mode, "--config", str(config)]
         if cluster_id is not None:
             arguments[2:2] = ["--cluster-id", cluster_id]
-        result = subprocess.run(
+        result = run_driver(
             arguments,
             cwd=site.repository_root,
             env=effective_environment(site),
@@ -224,6 +200,7 @@ def _run_rollout(
 def _identity(value: dict[str, Any]) -> ClusterIdentity:
     normalized = dict(value)
     normalized["subnet_ids"] = tuple(normalized.get("subnet_ids") or ())
+    normalized["subnet_cidrs"] = tuple(normalized.get("subnet_cidrs") or ())
     return ClusterIdentity(**normalized)
 
 
@@ -267,9 +244,16 @@ def _validate_target(
         raise BootstrapError("GPU cluster Region does not match the existing site")
     if target.account_id != cpu.account:
         raise BootstrapError("GPU cluster account does not match the existing site")
+    if target.eks_arn == request.site.release_config["cpu_eks_arn"]:
+        raise JoinTargetIdentityError("the CPU EKS cannot be joined as a GPU cluster")
+    if target.node_recovery != "None" or target.role != "gpu":
+        raise JoinTargetIdentityError("GPU join requires NodeRecovery=None")
     for item in request.site.release_config["clusters"]:
         if item["eks_cluster_arn"] == target.eks_arn:
-            if item["cluster_id"] == cluster_id:
+            if (
+                item["cluster_id"] == cluster_id
+                and item["hyperpod_cluster_name"] == target.hyperpod_name
+            ):
                 return
             raise BootstrapError(
                 f"GPU EKS cluster is already managed as {item['cluster_id']}"
@@ -280,6 +264,24 @@ def _validate_target(
             raise BootstrapError(f"cluster_id already exists: {cluster_id}")
         if item["context"] == target.context:
             raise BootstrapError(f"kube context already exists: {target.context}")
+
+
+def validate_saved_join_target(
+    request: JoinClusterRequest,
+    discovery: dict[str, Any],
+    runner: CommandRunner,
+) -> None:
+    try:
+        recorded = _identity(discovery["target"])
+        current, cluster_id, _existing = _discover_join_target(request, runner)
+    except Exception as exc:
+        raise JoinTargetIdentityError(
+            "cannot confirm the recorded GPU join target"
+        ) from exc
+    if current != recorded or cluster_id != discovery.get("cluster_id"):
+        raise JoinTargetIdentityError(
+            "GPU join target identity changed since discovery"
+        )
 
 
 def _gpu_kubeconfig(site: RenderedSite) -> Path:
@@ -326,28 +328,52 @@ def _list_nodes(
     *,
     kubeconfig: Path,
     target: ClusterIdentity,
+    identities: dict[str, str] | None = None,
 ) -> list[str]:
-    document = json.loads(
-        runner.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(kubeconfig),
-                "--context",
-                target.context,
-                "get",
-                "nodes",
-                "-l",
-                "sagemaker.amazonaws.com/cluster-name=" + target.hyperpod_name,
-                "-o",
-                "json",
-            ]
-        )
+    from gpu_fault.admin.cluster_join_nodes import read_target_node_inventory
+
+    inventory = read_target_node_inventory(runner, kubeconfig, target)
+    if identities is not None:
+        identities.update(inventory)
+    return sorted(inventory)
+
+
+def probe_join_namespace(
+    runner: CommandRunner,
+    *,
+    site: RenderedSite,
+    kubeconfig: Path,
+    context: str,
+) -> str | None:
+    output = runner.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(kubeconfig),
+            "--context",
+            context,
+            "get",
+            "namespace",
+            str(site.release_config["namespace"]),
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ],
+        env=effective_environment(site),
     )
-    nodes = sorted(str(item["metadata"]["name"]) for item in document.get("items", []))
-    if not nodes:
-        raise BootstrapError("target GPU HyperPod has no Kubernetes nodes")
-    return nodes
+    if not output.strip():
+        return None
+    document = json.loads(output)
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or document.get("kind") != "Namespace"
+        or metadata.get("name") != site.release_config["namespace"]
+        or not isinstance(metadata.get("uid"), str)
+        or not metadata["uid"]
+    ):
+        raise JoinTargetIdentityError("GPU join namespace identity is unavailable")
+    return str(metadata["uid"])
 
 
 def _export_registry(site: RenderedSite, path: Path) -> None:
@@ -373,6 +399,7 @@ def _existing_cluster_networks(
     with ThreadPoolExecutor(max_workers=min(4, len(clusters))) as executor:
         futures = {
             executor.submit(
+                copy_context().run,
                 _cluster_network,
                 runner,
                 region=region,
@@ -397,6 +424,7 @@ def _ensure_network(
     site: RenderedSite,
     target: ClusterIdentity,
     existing_networks: list[dict[str, Any]] | None = None,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     region = str(site.release_config["aws_region"])
     baseline = (
@@ -408,11 +436,6 @@ def _ensure_network(
         value for network in baseline for value in network.get("nat_eips", [])
     }
     eips = list(_gpu_nat_eips(runner, target))
-    created_eips = ensure_nlb_ingress(
-        region=region,
-        security_group=str(site.release_config["nlb"]["security_group"]),
-        eips=eips,
-    )
     hosted_zone_id = str(
         (site.release_config.get("dns") or {}).get("hosted_zone_id") or ""
     )
@@ -429,8 +452,36 @@ def _ensure_network(
         (str(item.get("VPCRegion") or ""), str(item.get("VPCId") or ""))
         for item in zone.get("VPCs", [])
     }
-    association_created = False
+    progress: dict[str, Any] = {
+        "vpc_id": target.vpc_id,
+        "vpc_region": target.region,
+        "nat_eips": eips,
+        "created_ingress_eips": [],
+        "existing_vpc_ids": sorted({str(item["vpc_id"]) for item in baseline}),
+        "hosted_zone_id": hosted_zone_id,
+        "association_created": False,
+        "pending_mutation": None,
+        "complete": False,
+    }
+
+    def record(pending: str | None) -> None:
+        progress["pending_mutation"] = pending
+        if checkpoint is not None:
+            checkpoint(dict(progress))
+
+    for eip in eips:
+        record(f"ingress:{eip}")
+        created = _ensure_nlb_ingress(
+            region=region,
+            security_group=str(site.release_config["nlb"]["security_group"]),
+            eips=[eip],
+        )
+        progress["created_ingress_eips"] = sorted(
+            {*progress["created_ingress_eips"], *(set(created) - existing_eips)}
+        )
+        record(None)
     if (target.region, target.vpc_id) not in associated:
+        record("vpc-association")
         runner.run(
             [
                 "aws",
@@ -446,21 +497,17 @@ def _ensure_network(
             mutate=True,
             capture=False,
         )
-        association_created = True
-        wait_zone_association(
+        progress["association_created"] = True
+        record(None)
+        _wait_zone_association(
             runner,
             region=region,
             hosted_zone_id=hosted_zone_id,
             vpc_id=target.vpc_id,
         )
-    return {
-        "vpc_id": target.vpc_id,
-        "nat_eips": eips,
-        "created_ingress_eips": sorted(set(created_eips) - existing_eips),
-        "existing_vpc_ids": sorted({str(item["vpc_id"]) for item in baseline}),
-        "hosted_zone_id": hosted_zone_id,
-        "association_created": association_created,
-    }
+    progress["complete"] = True
+    record(None)
+    return progress
 
 
 def _parallel_prerequisites(
@@ -476,6 +523,63 @@ def _parallel_prerequisites(
     network_baseline: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     cached = dict((state.get("evidence") or {}).get("PREREQUISITES_READY") or {})
+    record_lock = Lock()
+    from gpu_fault.admin.node_key_custody_admin import site_custody_context
+    from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
+
+    custody = load_admin_custody(request.site.source.parent)
+
+    def checkpoint_network(progress: dict[str, Any]) -> None:
+        with record_lock:
+            cached["network"] = progress
+            state.setdefault("evidence", {})["PREREQUISITES_READY"] = dict(cached)
+            write_json_atomic(state_path, state)
+
+    network = cached.get("network")
+    if isinstance(network, dict) and not network.get("complete", True):
+        raise BootstrapError("incomplete join network mutation requires rollback first")
+
+    def node_keys() -> dict[str, str]:
+        proof = (state.get("evidence") or {}).get("NODE_NAMES_VERIFIED") or {}
+        nodes = proof.get("nodes")
+        node_uids = proof.get("node_uids")
+        if (
+            proof.get("cluster_id") != cluster_id
+            or not isinstance(nodes, list)
+            or not nodes
+            or not isinstance(node_uids, dict)
+            or set(node_uids) != set(nodes)
+        ):
+            raise BootstrapError(
+                "Node Action key provisioning has no verified node ownership"
+            )
+
+        def started() -> None:
+            with record_lock:
+                _complete(state_path, state, "NODE_KEYS_STARTED")
+
+        custody_arguments: dict[str, Any] = {}
+        if custody is not None:
+            custody_arguments["custody_context"] = replace(
+                site_custody_context(
+                    request.site, target, cluster_id, gpu_kubeconfig=gpu_kubeconfig
+                ),
+                on_write=started,
+            )
+        else:
+            started()
+        return provision_node_action_keys(
+            BoundNodeKeyRunner(runner, node_uids),
+            repository_root=request.site.repository_root,
+            cpu_kubeconfig=Path(str(request.site.release_config["cpu_kubeconfig"])),
+            gpu_kubeconfig=gpu_kubeconfig,
+            namespace=str(request.site.release_config["namespace"]),
+            cluster=target,
+            cluster_id=cluster_id,
+            fleet_master_file=fleet_master_file,
+            **custody_arguments,
+        )
+
     tasks: dict[str, Callable[[], Any]] = {
         "executor_role": lambda: ensure_executor_role(
             runner,
@@ -488,33 +592,41 @@ def _parallel_prerequisites(
             site=request.site,
             target=target,
             existing_networks=network_baseline,
+            checkpoint=checkpoint_network,
         ),
-        "node_keys": lambda: provision_node_action_keys(
-            runner,
-            repository_root=request.site.repository_root,
-            cpu_kubeconfig=Path(str(request.site.release_config["cpu_kubeconfig"])),
-            gpu_kubeconfig=gpu_kubeconfig,
-            namespace=str(request.site.release_config["namespace"]),
-            cluster=target,
-            cluster_id=cluster_id,
-            fleet_master_file=fleet_master_file,
-        ),
+        "node_keys": node_keys,
     }
+    if custody is not None:
+        # A key-shape-only checkpoint cannot satisfy an explicit custody request.
+        # Prepare/prove keys before starting new IAM or network mutations.
+        cached["node_keys"] = node_keys()
+        state.setdefault("evidence", {})["PREREQUISITES_READY"] = dict(cached)
+        write_json_atomic(state_path, state)
     pending = {name: task for name, task in tasks.items() if name not in cached}
     failures = []
     with ThreadPoolExecutor(max_workers=max(1, len(pending))) as executor:
-        futures = {executor.submit(task): name for name, task in pending.items()}
+        futures = {
+            executor.submit(copy_context().run, task): name
+            for name, task in pending.items()
+        }
         for future in as_completed(futures):
             name = futures[future]
             try:
-                cached[name] = future.result()
-                state.setdefault("evidence", {})["PREREQUISITES_READY"] = cached
-                write_json_atomic(state_path, state)
-            except Exception as exc:
+                result = future.result()
+                with record_lock:
+                    cached[name] = result
+                    state.setdefault("evidence", {})["PREREQUISITES_READY"] = dict(
+                        cached
+                    )
+                    write_json_atomic(state_path, state)
+            except (Exception, KeyboardInterrupt) as exc:
                 failures.append((name, exc))
     if failures:
         names = ", ".join(sorted(name for name, _exc in failures))
-        error = failures[0][1]
+        error = next(
+            (exc for _name, exc in failures if isinstance(exc, KeyboardInterrupt)),
+            failures[0][1],
+        )
         error.add_note(f"join prerequisite task(s) failed: {names}")
         raise error
     # The data-plane ADOT writer role follows the executor role on purpose: both
@@ -606,10 +718,18 @@ def _write_candidate_site(
 
 def _bootstrap_state_path(site: RenderedSite) -> Path | None:
     site_id = str(site.release_config["site_name"])
-    candidates = [site.source.parent / "bootstrap-state.json"]
-    candidates.extend(
-        sorted((Path.home() / ".gpu-fault/bootstrap").glob("*/bootstrap-state.json"))
-    )
+    local = site.source.parent / "bootstrap-state.json"
+    if site.registry_site_id != site_id and not local.is_file():
+        return None
+    if find_bootstrap_state(site) is None:
+        return None
+    candidates = [local]
+    if site.registry_site_id == site_id:
+        candidates.extend(
+            sorted(
+                (Path.home() / ".gpu-fault/bootstrap").glob("*/bootstrap-state.json")
+            )
+        )
     matches = []
     for path in candidates:
         if not path.is_file():
@@ -654,16 +774,32 @@ def _update_bootstrap_state(
             *network.get("nat_eips", []),
         }
     )
-    if network["vpc_id"] not in set(network.get("existing_vpc_ids") or []):
+    if network.get("association_created") is True:
+        region = str(site.release_config["aws_region"])
+        if network.get("vpc_region", region) != region:
+            raise BootstrapError("joined Route53 association Region differs from site")
         pki = resources.setdefault("pki", {})
+        if pki.get("hosted_zone_id") != network.get("hosted_zone_id"):
+            raise BootstrapError("joined Route53 association hosted zone differs")
         associations = list(pki.get("vpc_associations") or [])
-        if not any(item.get("vpc_id") == network["vpc_id"] for item in associations):
+        matching = [
+            item
+            for item in associations
+            if association_identity(item) == (region, network["vpc_id"])
+        ]
+        if len(matching) > 1:
+            raise BootstrapError("joined Route53 association checkpoint is ambiguous")
+        if matching:
+            if matching[0].get("ownership") != "CREATED":
+                raise BootstrapError("joined Route53 association ownership conflicts")
+        else:
             associations.append(
-                {
-                    "vpc_id": network["vpc_id"],
-                    "vpc_region": site.release_config["aws_region"],
-                    "ownership": "CREATED",
-                }
+                vpc_association_entry(
+                    vpc_id=str(network["vpc_id"]),
+                    vpc_region=region,
+                    cluster_ids=[cluster_id],
+                    ownership="CREATED",
+                )
             )
         pki["vpc_associations"] = associations
     completed = set(value.get("completed_tasks") or [])
@@ -673,54 +809,9 @@ def _update_bootstrap_state(
     value.setdefault("joined_clusters", {})[cluster_id] = {
         "joined_at": datetime.now(timezone.utc).isoformat(),
         "vpc_id": network["vpc_id"],
+        "vpc_region": site.release_config["aws_region"],
     }
     write_json_atomic(path, value)
-
-
-def _cleanup_candidate(
-    candidate: RenderedSite,
-    *,
-    cluster_id: str,
-    state_dir: Path,
-    attempt: int,
-) -> None:
-    errors = []
-    with materialized_release_config(candidate) as config:
-        if nothing_installed(candidate, config):
-            # The release failed before it installed anything (live
-            # 2026-09-12: at the endpoint gate); the cleanup script refuses an
-            # empty inventory, and there is nothing for it to undo.
-            return
-        result = subprocess.run(
-            [
-                str(
-                    candidate.repository_root
-                    / "deploy/control-plane/regional/prepare-clean-redeploy.sh"
-                ),
-                "--config",
-                str(config),
-                "--scope",
-                "gpu",
-                "--cluster-id",
-                cluster_id,
-                "--mode",
-                "clean",
-                "--node-mode",
-                "uninstall",
-                "--state-file",
-                str(state_dir / f"rollback-kubernetes-{attempt:03d}.json"),
-                "--execute",
-            ],
-            cwd=candidate.repository_root,
-            env=effective_environment(candidate),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    if result.returncode:
-        errors.append("GPU cleanup: " + (result.stderr or "").strip())
-    if errors:
-        raise BootstrapError("; ".join(errors))
 
 
 def _rollback(
@@ -730,153 +821,14 @@ def _rollback(
     state_path: Path,
     state: dict[str, Any],
 ) -> None:
-    evidence = state.get("evidence") or {}
-    discovery = evidence.get("DISCOVERED") or {}
-    cluster_id = str(discovery.get("cluster_id") or "")
-    errors = []
-    local = evidence.get("LOCAL_INPUTS_READY") or {}
-    nodes = list(local.get("nodes") or [])
-    target = discovery.get("target") or {}
-    context = str(target.get("context") or "")
-    kubeconfig = Path(str(local.get("gpu_kubeconfig") or _gpu_kubeconfig(request.site)))
-    if context:
-        # A retried rollback finds the context its first run deleted; every
-        # Kubernetes-side undo below needs it back.
-        try:
-            with _KUBECONFIG_THREAD_LOCK:
-                ensure_kube_context(kubeconfig, target)
-        except Exception as exc:
-            errors.append(f"kube context restore: {exc}")
-    candidate_path = Path(
-        str((evidence.get("CANDIDATE_READY") or {}).get("site_file") or "")
-    )
-    candidate: RenderedSite | None = None
-    # A release that started may have registered the cluster before it failed;
-    # its registry entry is undone exactly like a joined cluster's.
-    released = _done(state, "JOINED") or _done(state, "RELEASE_STARTED")
-    if cluster_id and candidate_path.is_file():
-        try:
-            candidate = load_site(
-                candidate_path,
-                repository_root=request.site.repository_root,
-            )
-            if released:
-                _run_rollout(candidate, "fail-cluster", cluster_id=cluster_id)
-            _cleanup_candidate(
-                candidate,
-                cluster_id=cluster_id,
-                state_dir=state_dir,
-                attempt=int(state.get("attempt") or 1),
-            )
-        except Exception as exc:
-            errors.append(f"kubernetes/control rollback: {exc}")
-    try:
-        _clear_installer_annotations(request.site, dict(target), nodes)
-    except Exception as exc:
-        errors.append(f"installer annotation rollback: {exc}")
-    try:
-        _remove_node_action_keys(request.site, nodes)
-    except Exception as exc:
-        errors.append(f"node key rollback: {exc}")
-    if context:
-        namespace = str(request.site.release_config["namespace"])
-        result = subprocess.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(kubeconfig),
-                "--context",
-                context,
-                "delete",
-                "namespace",
-                namespace,
-                "--ignore-not-found",
-                "--wait=true",
-                "--timeout=10m",
-            ],
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode:
-            errors.append("namespace rollback: " + (result.stderr or "").strip())
-    prerequisites = evidence.get("PREREQUISITES_READY") or {}
-    network = prerequisites.get("network")
-    if isinstance(network, dict):
-        try:
-            rollback_network(network, request.site)
-        except Exception as exc:
-            errors.append(f"network rollback: {exc}")
-    for prerequisite, label in (
-        ("executor_role", "Executor"),
-        ("adot_writer_role", "ADOT writer"),
-    ):
-        rollback_iam_role(prerequisites.get(prerequisite), label=label, errors=errors)
-    token_file = Path(str(local.get("token_file") or ""))
-    secure = state_dir / "secure"
-    for path in {
-        token_file,
-        secure / f"{cluster_id}.token",
-        Path(str(local.get("fleet_master_file") or "")),
-        secure / "fleet-master",
-    }:
-        if path.is_file():
-            path.unlink()
-    if context:
-        result = subprocess.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(kubeconfig),
-                "config",
-                "delete-context",
-                context,
-            ],
-            text=True,
-            capture_output=True,
-        )
-        message = (result.stdout or "") + "\n" + (result.stderr or "")
-        if result.returncode and "not found" not in message.lower():
-            errors.append("kube context rollback: " + result.stderr.strip())
-        else:
-            restore_current_context(kubeconfig, deleted=context, errors=errors)
-    if not errors and candidate is not None:
-        try:
-            from gpu_fault.admin.cluster_join_commit import rollback_membership
+    from gpu_fault.admin.cluster_join_rollback import rollback
 
-            execution = JoinExecution(
-                target=_identity(dict(target)),
-                cluster_id=cluster_id,
-                discovery=dict(discovery),
-                local=dict(local),
-                prerequisites=dict(prerequisites),
-                candidate=candidate,
-            )
-            rollback_membership(
-                request,
-                execution=execution,
-                joined=released,
-            )
-        except Exception as exc:
-            errors.append(f"membership rollback: {exc}")
-    if errors:
-        state["phase"] = "ROLLBACK_FAILED"
-        state["rollback_errors"] = errors
-    else:
-        state["phase"] = "ROLLED_BACK"
-        state["completed_steps"] = [
-            item
-            for item in state.get("completed_steps", [])
-            if item in {"PRECHECKED", "DISCOVERED"}
-        ]
-        state["evidence"] = {
-            key: value
-            for key, value in evidence.items()
-            if key in {"PRECHECKED", "DISCOVERED"}
-        }
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    write_json_atomic(state_path, state)
-    if errors:
-        raise BootstrapError("; ".join(errors))
+    rollback(
+        request,
+        state_dir=state_dir,
+        state_path=state_path,
+        state=state,
+    )
 
 
 def _prepare_execution(
@@ -888,13 +840,17 @@ def _prepare_execution(
     state: dict[str, Any],
     candidate_preflight: bool = True,
     network_baseline: list[dict[str, Any]] | None = None,
-) -> JoinExecution | dict[str, Any]:
+    local_inputs_only: bool = False,
+    node_claims: NodeClaims | None = None,
+) -> JoinInputs | JoinExecution | dict[str, Any]:
     if not _done(state, "PRECHECKED"):
         # The candidate verify after the rollout covers every cluster in the
         # site, the existing ones included; a baseline verify of the site first
         # was a second full verify that could only repeat that answer.
         _complete(state_path, state, "PRECHECKED")
-    if not _done(state, "DISCOVERED"):
+    if _done(state, "DISCOVERED"):
+        validate_saved_join_target(request, state["evidence"]["DISCOVERED"], runner)
+    else:
         target, cluster_id, existing = _discover_join_target(request, runner)
         if existing is not None:
             _complete(
@@ -946,73 +902,50 @@ def _prepare_execution(
             ),
         )
     if not _done(state, "LOCAL_INPUTS_READY"):
-        gpu_kubeconfig = _gpu_kubeconfig(request.site)
-        gpu_kubeconfig.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with _KUBECONFIG_THREAD_LOCK:
-            runner.run(
-                [
-                    "aws",
-                    "eks",
-                    "update-kubeconfig",
-                    "--region",
-                    target.region,
-                    "--name",
-                    target.eks_name,
-                    "--kubeconfig",
-                    str(gpu_kubeconfig),
-                    "--alias",
-                    target.context,
-                ],
-                mutate=True,
-                capture=False,
-            )
-        if gpu_kubeconfig.exists():
-            gpu_kubeconfig.chmod(0o600)
-        ensure_namespace(
-            runner,
-            kubeconfig=gpu_kubeconfig,
-            context=target.context,
-            namespace=str(request.site.release_config["namespace"]),
-        )
-        # The cluster token is site state and lives beside the tokens bootstrap
-        # wrote, in the site's ``secure/``; the join directory is disposable
-        # transaction state. The fleet-master copy stays in the join directory:
-        # rollback deletes it, and the site's own copy has to survive that.
-        secure = state_dir / "secure"
-        secure.mkdir(mode=0o700, parents=True, exist_ok=True)
-        site_secure = request.site.source.parent / "secure"
-        site_secure.mkdir(mode=0o700, parents=True, exist_ok=True)
-        token_file = site_secure / f"{cluster_id}.token"
-        write_secret(token_file, secrets.token_hex(32))
-        fleet_master_file = _ensure_base_secrets(
-            runner,
-            cpu_kubeconfig=Path(str(request.site.release_config["cpu_kubeconfig"])),
-            namespace=str(request.site.release_config["namespace"]),
-            secure_dir=secure,
-        )
-        ca_file = _shared_ca_file(request.site)
-        nodes = _list_nodes(
-            runner,
-            kubeconfig=gpu_kubeconfig,
+        from gpu_fault.admin.cluster_join_inputs import prepare_local_inputs
+
+        prepare_local_inputs(
+            request,
+            runner=runner,
             target=target,
-        )
-        clear_stale_installer_annotations(
-            request.site, {"context": target.context}, nodes
-        )
-        _complete(
-            state_path,
-            state,
-            "LOCAL_INPUTS_READY",
-            {
-                "gpu_kubeconfig": str(gpu_kubeconfig),
-                "token_file": str(token_file),
-                "fleet_master_file": str(fleet_master_file),
-                "ca_file": str(ca_file),
-                "nodes": nodes,
-            },
+            cluster_id=cluster_id,
+            state_dir=state_dir,
+            state_path=state_path,
+            state=state,
         )
     local = state["evidence"]["LOCAL_INPUTS_READY"]
-    if not _done(state, "PREREQUISITES_READY"):
+    namespace_uid = local.get("namespace_uid")
+    if (
+        not isinstance(namespace_uid, str)
+        or not namespace_uid
+        or probe_join_namespace(
+            runner,
+            site=request.site,
+            kubeconfig=Path(str(local["gpu_kubeconfig"])),
+            context=target.context,
+        )
+        != namespace_uid
+    ):
+        raise JoinTargetIdentityError(
+            "GPU join namespace changed since local input preparation"
+        )
+    inputs = JoinInputs(target, cluster_id, discovery, local)
+    if local_inputs_only:
+        return inputs
+    if not join_activation_is_irreversible(state):
+        verify_join_node_names(
+            request,
+            inputs,
+            claims=node_claims or read_node_claims(request.site, runner),
+            state_path=state_path,
+            state=state,
+            runner=runner,
+        )
+    from gpu_fault.admin.node_key_custody_admin_config import configured_custody
+
+    if not _done(state, "PREREQUISITES_READY") or configured_custody(
+        request.site.source.parent
+    ):
         prerequisites = _parallel_prerequisites(
             request,
             runner=runner,
@@ -1062,6 +995,16 @@ def _prepare_execution(
         Path(state["evidence"]["CANDIDATE_READY"]["site_file"]),
         repository_root=request.site.repository_root,
     )
+    if join_activation_is_irreversible(state) or _done(
+        state, "FAILURE_DOMAINS_STARTED"
+    ):
+        verified = (state.get("evidence") or {}).get("VERIFIED") or {}
+        verified_path = verified.get("candidate_site_file")
+        if verified_path:
+            candidate = load_site(
+                Path(str(verified_path)),
+                repository_root=request.site.repository_root,
+            )
     return JoinExecution(
         target=target,
         cluster_id=cluster_id,
@@ -1118,7 +1061,9 @@ def _write_batch_candidate_site(
         key=lambda item: str(item.get("clusterId") or ""),
     )
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = state_dir / "site.batch-candidate.yaml"
+    content = yaml.safe_dump(document, sort_keys=False)
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    path = state_dir / f"site.batch-candidate-{digest[:16]}.yaml"
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -1127,7 +1072,7 @@ def _write_batch_candidate_site(
         suffix=".tmp",
         delete=False,
     ) as temporary:
-        yaml.safe_dump(document, temporary, sort_keys=False)
+        temporary.write(content)
         temporary_path = Path(temporary.name)
     temporary_path.chmod(0o600)
     temporary_path.replace(path)
@@ -1142,19 +1087,20 @@ def _deploy_cluster(
 ) -> None:
     cluster_id = execution.cluster_id
     if not _done(state, "JOINED"):
-        _complete(state_path, state, "RELEASE_STARTED")
+        _complete(state_path, state, "JOIN_STARTED")
         _run_rollout(execution.candidate, "join-cluster", cluster_id=cluster_id)
         _complete(state_path, state, "JOINED")
     if not _done(state, "COLLECTORS_READY"):
-        # Fast kinds reported, slow kinds scheduled; the evidence names both so
-        # the operator can see what the gate waited for and what it deferred.
-        nodes = [str(item) for item in execution.local.get("nodes") or []]
-        readiness = wait_join_collector_readiness(
-            execution.candidate,
-            cluster_id,
-            expected_nodes=nodes or None,
+        readiness = wait_collector_readiness(execution.candidate, cluster_id)
+        _complete(
+            state_path,
+            state,
+            "COLLECTORS_READY",
+            {
+                "nodes": len(readiness.get("nodes") or []),
+                "ready": readiness.get("ready"),
+            },
         )
-        _complete(state_path, state, "COLLECTORS_READY", readiness)
 
 
 def _verify_join_candidate(
@@ -1172,27 +1118,30 @@ def _verify_join_candidate(
         clear_verified_step(state_path, state)
     if not _done(state, "VERIFIED"):
         before = membership_runtime_snapshot(execution.candidate)
-        report = _verify_candidate(
-            execution.candidate,
-            {execution.cluster_id: _collectors_ready_evidence(state)},
-        )
+        _run_rollout(execution.candidate, "verify")
         after = membership_runtime_snapshot(execution.candidate)
-        evidence = build_verified_membership_evidence(
-            before,
-            after,
-            candidate_site_sha256=execution.candidate.source_sha256,
-            source_site_sha256=str(state["source_site_sha256"]),
-            source_site_non_membership_sha256=str(
-                state["source_site_non_membership_sha256"]
-            ),
-            candidate_cluster_ids=[
-                str(item["cluster_id"])
-                for item in execution.candidate.release_config["clusters"]
-            ],
-            cluster_id=execution.cluster_id,
+        _complete(
+            state_path,
+            state,
+            "VERIFIED",
+            {
+                **build_verified_membership_evidence(
+                    before,
+                    after,
+                    candidate_site_sha256=execution.candidate.source_sha256,
+                    source_site_sha256=str(state["source_site_sha256"]),
+                    source_site_non_membership_sha256=str(
+                        state["source_site_non_membership_sha256"]
+                    ),
+                    candidate_cluster_ids=[
+                        str(item["cluster_id"])
+                        for item in execution.candidate.release_config["clusters"]
+                    ],
+                    cluster_id=execution.cluster_id,
+                ),
+                "candidate_site_file": str(execution.candidate.source),
+            },
         )
-        evidence["verify"] = verify_report_summary(report)
-        _complete(state_path, state, "VERIFIED", evidence)
 
 
 def _activate_and_commit(
@@ -1220,7 +1169,7 @@ def commit_membership(
     state_path: Path,
     state: dict[str, Any],
 ) -> None:
-    """Activate the cluster, commit the site, then refresh what depends on membership."""
+    """Commit and activate, reusing a batch's pre-activation map barrier."""
 
     from gpu_fault.admin.cluster_join_commit import activate_and_commit
 
@@ -1231,10 +1180,10 @@ def commit_membership(
         state_path=state_path,
         state=state,
     )
-    # Membership is final: the failure-domain map must now cover the new
-    # cluster's nodes, rendered from the committed site rather than the
-    # candidate so a concurrent batch join is not narrowed to one member.
-    refresh_failure_domain_map(request.site)
+    if not _done(state, "FAILURE_DOMAINS_READY"):
+        # Single joins render the committed set; a batch already published
+        # the full verified set and must not narrow it after each activation.
+        refresh_failure_domain_map(request.site)
 
 
 def refresh_failure_domain_map(site: RenderedSite) -> None:
@@ -1253,6 +1202,15 @@ def _deploy_and_commit(
     state_path: Path,
     state: dict[str, Any],
 ) -> None:
+    if join_activation_is_irreversible(state):
+        _activate_and_commit(
+            request,
+            execution=execution,
+            state_dir=state_dir,
+            state_path=state_path,
+            state=state,
+        )
+        return
     _deploy_cluster(
         execution=execution,
         state_path=state_path,
@@ -1294,29 +1252,77 @@ def _site_contains_cluster(path: Path, cluster_id: str) -> bool:
 def _record_join_failure(
     attempt: JoinAttempt,
     execution: JoinExecution | None,
+    *,
+    error: BaseException,
 ) -> None:
     del execution
+    if attempt.state.get("phase") in {"ROLLBACK_STARTED", "ROLLBACK_FAILED"}:
+        return
     activation_started = join_activation_is_irreversible(attempt.state)
     attempt.state["phase"] = (
         "FAILED_AFTER_ACTIVATION" if activation_started else "FAILED"
     )
+    note_join_failure(attempt.state, error)
     attempt.state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(attempt.state_path, attempt.state)
     if not activation_started and attempt.request.site.release_config.get(
         "auto_rollback", True
     ):
-        _rollback(
-            attempt.request,
-            state_dir=attempt.state_dir,
-            state_path=attempt.state_path,
-            state=attempt.state,
-        )
+        with recovery_deadline("join rollback"):
+            ensure_supervision_safe(allow_interrupted=True)
+            _rollback(
+                attempt.request,
+                state_dir=attempt.state_dir,
+                state_path=attempt.state_path,
+                state=attempt.state,
+            )
+
+
+def record_join_supervision_loss(attempt: JoinAttempt) -> None:
+    attempt.state["phase"] = "SUPERVISION_LOST"
+    attempt.state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json_atomic(attempt.state_path, attempt.state)
+
+
+def resume_join_rollback(attempt: JoinAttempt, runner: CommandRunner) -> bool:
+    state = attempt.state
+    if state.get("phase") in {"ROLLBACK_STARTED", "ROLLBACK_FAILED"} or _done(
+        state, "REMOTE_ROLLBACK_COMPLETED"
+    ):
+        if not _done(state, "REMOTE_ROLLBACK_COMPLETED") and _done(state, "DISCOVERED"):
+            validate_saved_join_target(
+                attempt.request, state["evidence"]["DISCOVERED"], runner
+            )
+        with recovery_deadline("resume join rollback"):
+            _rollback(
+                attempt.request,
+                state_dir=attempt.state_dir,
+                state_path=attempt.state_path,
+                state=state,
+            )
+    if state.get("phase") != "ROLLED_BACK":
+        return False
+    attempt.request = replace(
+        attempt.request,
+        site=load_site(
+            attempt.request.site.source,
+            repository_root=attempt.request.site.repository_root,
+        ),
+    )
+    _reset_completed_state(
+        attempt.request,
+        state_dir=attempt.state_dir,
+        state_path=attempt.state_path,
+        state=state,
+    )
+    return True
 
 
 def _complete_join(
     attempt: JoinAttempt,
     execution: JoinExecution,
 ) -> dict[str, Any]:
+    ensure_supervision_safe()
     attempt.state["phase"] = "COMPLETED"
     attempt.state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(attempt.state_path, attempt.state)
@@ -1340,14 +1346,18 @@ def _join_cluster_locked(
 ) -> dict[str, Any]:
     state_dir, state_path, state = _state(request)
     attempt = JoinAttempt(request, state_dir, state_path, state)
-    if state.get("phase") == "ROLLBACK_FAILED":
-        # Finish the undo the last run could not; it raises if it still cannot.
-        _rollback(request, state_dir=state_dir, state_path=state_path, state=state)
-    if state.get("phase") == "ROLLED_BACK":
-        # Its recorded discovery describes the world that made it fail.
-        _reset_completed_state(
-            request, state_dir=state_dir, state_path=state_path, state=state
+    if state.get("phase") == "SUPERVISION_LOST":
+        raise ProcessSupervisionLost(
+            "previous join command ownership is unproven; automatic retry is forbidden"
         )
+    from gpu_fault.admin.node_key_custody_admin_entry import (
+        CUSTODY_PAUSE_ERRORS,
+        assert_site_custody_current,
+        record_join_custody_pause,
+    )
+
+    active_runner = runner or CommandRunner()
+    assert_site_custody_current(request.site, active_runner)
     if state.get("phase") == "COMPLETED":
         if _completed_state_is_current(request, state):
             if not _done(state, "RELEASE_STATE_UPDATED"):
@@ -1378,9 +1388,10 @@ def _join_cluster_locked(
             state_path=state_path,
             state=state,
         )
-    active_runner = runner or CommandRunner()
     execution: JoinExecution | None = None
     try:
+        resume_join_rollback(attempt, active_runner)
+        request = attempt.request
         prepared = _prepare_execution(
             request,
             runner=active_runner,
@@ -1390,6 +1401,8 @@ def _join_cluster_locked(
         )
         if isinstance(prepared, dict):
             return prepared
+        if not isinstance(prepared, JoinExecution):
+            raise BootstrapError("join preparation did not produce a candidate")
         execution = prepared
         _deploy_and_commit(
             request,
@@ -1398,12 +1411,30 @@ def _join_cluster_locked(
             state_path=state_path,
             state=state,
         )
-    except Exception:
-        _record_join_failure(attempt, execution)
+        return _complete_join(attempt, execution)
+    except ProcessSupervisionLost as exc:
+        try:
+            record_join_supervision_loss(attempt)
+        except Exception:
+            exc.add_note("join could not persist the unproven command ownership")
         raise
-
-    assert execution is not None
-    return _complete_join(attempt, execution)
+    except JoinTargetIdentityError:
+        state["phase"] = "BLOCKED_IDENTITY"
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        write_json_atomic(state_path, state)
+        raise
+    except CUSTODY_PAUSE_ERRORS as exc:
+        record_join_custody_pause(state_path, state, exc)
+        raise
+    except (Exception, KeyboardInterrupt) as exc:
+        try:
+            _record_join_failure(attempt, execution, error=exc)
+        except Exception as rollback_error:
+            exc.add_note(
+                "join rollback failed: " + diagnostic_text(str(rollback_error))
+            )
+            raise exc from rollback_error
+        raise
 
 
 def join_cluster(
@@ -1411,6 +1442,6 @@ def join_cluster(
     *,
     runner: CommandRunner | None = None,
 ) -> dict[str, Any]:
-    with membership_operation_lock(request.site):
+    with membership_operation_lock(request.site), interruption_scope(wait_all=True):
         current = reload_site_for_mutation(request.site)
         return _join_cluster_locked(replace(request, site=current), runner=runner)

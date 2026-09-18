@@ -16,6 +16,14 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.ledger import NodeActionLedger, canonical_digest
+from gpu_fault.node_agent.late_ownership import (
+    OWNERSHIP_PROTOCOL,
+    NodeOwnershipGate,
+    OwnershipRefused,
+    execute_with_final_ownership,
+    final_ownership_boundary,
+    ownership_required,
+)
 from gpu_fault.collectors.outbox_maintenance import DEFAULT_OUTBOX_DIRECTORY
 from gpu_fault.node_agent.operations import (
     ClientOperationsMixin,
@@ -144,6 +152,7 @@ class NodeActionExecutor(
         agent_generation: int | None = None,
         now: Callable[[], datetime] = (lambda: datetime.now(timezone.utc)),
         sleep: Callable[[float], None] = time.sleep,
+        require_final_ownership: bool = False,
     ) -> None:
         if len(secret) < 32:
             raise ValueError("node action shared secret must be at least 32 characters")
@@ -237,6 +246,15 @@ class NodeActionExecutor(
         self.agent_generation = agent_generation
         self.now = now
         self.sleep = sleep
+        self.ownership_gate = (
+            NodeOwnershipGate(
+                secret=secret,
+                boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                now=now,
+            )
+            if require_final_ownership
+            else None
+        )
         self.quiesce_manager = quiesce_manager
         if service_quiesce_enabled and quiesce_manager is None:
             raise ValueError("service quiesce requires a quiesce manager")
@@ -323,6 +341,18 @@ class NodeActionExecutor(
             raise ValueError("node action command has expired")
         if command.expires_at - command.issued_at > timedelta(minutes=5):
             raise ValueError("node action TTL exceeds five minutes")
+        if ownership_required(command.operation):
+            if (
+                self.ownership_gate is not None
+                and command.ownership_guard != OWNERSHIP_PROTOCOL
+            ):
+                raise OwnershipRefused(
+                    "OWNERSHIP_PROTOCOL_REQUIRED", boundary="AGENT_ADMISSION"
+                )
+            if command.ownership_guard is not None and self.ownership_gate is None:
+                raise OwnershipRefused(
+                    "OWNERSHIP_PROTOCOL_UNAVAILABLE", boundary="AGENT_ADMISSION"
+                )
         self._reject_command_id_reuse(command)
         return command
 
@@ -495,7 +525,7 @@ class NodeActionExecutor(
         exit_code: int | None = None
         try:
             handler = getattr(self, operation_handler_name(command.operation))
-            details = handler(command)
+            details = execute_with_final_ownership(self, envelope, handler)
             result = NodeActionResult(
                 command_id=command.command_id,
                 operation=command.operation,
@@ -518,8 +548,8 @@ class NodeActionExecutor(
                 status=NodeActionStatus.FAILED,
                 # A failure that got part way through carries what it did:
                 # which GPUs a multi-GPU reset finished, which one's outcome
-                # nobody can read and which were never attempted decides
-                # reboot versus replace, and only the node knows it. An
+                # nobody can read and which were never attempted. Unknown
+                # outcomes require an operator, not another hardware action. An
                 # install killed at its deadline carries the unknown-outcome
                 # flags the escalation ladder hands to an operator. A refused
                 # outbox maintenance carries the lock holder it met.
@@ -531,6 +561,7 @@ class NodeActionExecutor(
                             ResetProgressError,
                             InstallOutcomeUnknownError,
                             CollectorOutboxRefused,
+                            OwnershipRefused,
                         ),
                     )
                     else {}
@@ -610,6 +641,7 @@ class NodeActionExecutor(
             )
         return unpersisted
 
+    @final_ownership_boundary
     def _execute_quiesce(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.reset_enabled:
             raise RuntimeError("GPU reset is disabled by node configuration")
@@ -637,6 +669,7 @@ class NodeActionExecutor(
     def _execute_health_snapshot(self, _command: NodeActionCommand) -> dict[str, Any]:
         return self._trigger_health_snapshot()
 
+    @final_ownership_boundary
     def _execute_reset_gpu(self, command: NodeActionCommand) -> dict[str, Any]:
         window_claimed = False
         if self.service_quiesce_enabled:
@@ -684,6 +717,7 @@ class NodeActionExecutor(
             attempt=None if row is None else row[1],
         )
 
+    @final_ownership_boundary
     def _execute_reset_all(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.service_quiesce_enabled:
             raise RuntimeError("full fabric reset requires GPU service quiesce")

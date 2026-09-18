@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -16,8 +17,15 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
     bounded_reasons,
+    resolved_step_indexes,
 )
+from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.workflow_merge import (
+    WorkflowMergeService,
+    workflow_is_mutable,
+)
+from gpu_fault.workflow_quarantine import inherit_terminal_quarantine
 from gpu_fault.store import NotFoundError
 
 
@@ -61,22 +69,32 @@ class ReplacementState:
 
 
 class NodeLifecycleOperationService:
+    activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
+
     def __init__(
         self,
         store,
         builder,
-        arbiter,
-        brancher,
+        merger: WorkflowMergeService,
         callbacks: NodeLifecycleCallbacks,
         *,
         aggregation_window_seconds: int,
     ) -> None:
         self.store = store
         self.builder = builder
-        self.arbiter = arbiter
-        self.brancher = brancher
+        self.merger = merger
+        self.arbiter = merger.arbiter
+        self.brancher = merger.brancher
         self.callbacks = callbacks
         self.aggregation_window_seconds = aggregation_window_seconds
+        self.dispositions = DispositionApplier(
+            arbiter=self.arbiter,
+            brancher=self.brancher,
+            aggregation_deadlines=callbacks.aggregation_deadlines,
+            prepare_preempting_successor=callbacks.prepare_preempting_successor,
+            preempt_parallel_job_branch=merger.preempt_parallel_branch,
+            workflow_preemption_enabled=merger.preemption_enabled,
+        )
 
     def ingest_grouped_node_replacement(
         self,
@@ -185,8 +203,8 @@ class NodeLifecycleOperationService:
             and existing_workflow is not None
             and existing_workflow.not_before is not None
             and existing_workflow.not_before > now
-            and existing_workflow.status is WorkflowStatus.PENDING
-            and existing_workflow.execution_owner_id is None
+            and workflow_is_mutable(existing_workflow)
+            and self._same_activation_authority(context.finding, existing_workflow)
         )
         if merge:
             not_before, maximum = self.callbacks.aggregation_deadlines(
@@ -234,6 +252,19 @@ class NodeLifecycleOperationService:
             gpu_uuids=sorted(set(context.finding.gpu_uuids)),
             reasons=[context.finding.reason],
             primary_event_id=context.finding.event_id,
+        )
+
+    @staticmethod
+    def _same_activation_authority(
+        finding: NodeHealthFinding, workflow: WorkflowRequest
+    ) -> bool:
+        inhibited = any(
+            "activation_forbidden" in step.parameters
+            for step in workflow.official_steps
+        )
+        incoming = "activation_forbidden" in finding.diagnostic_parameters
+        return inhibited == incoming and (
+            not inhibited or finding.recommended_action is RecoveryAction.REPLACE_NODE
         )
 
     def _compile_steps(
@@ -295,12 +326,19 @@ class NodeLifecycleOperationService:
                 parameters = restart
             elif step.operation is WorkflowOperation.STOP_WORKLOADS:
                 parameters = {"termination_initiator_incident_id": state.incident_id}
-            elif (
-                step.operation is WorkflowOperation.REPLACE_NODE
-                and finding.diagnostic_parameters.get("replacement_strategy")
-                == "HEALTHY_WARM_SPARE_ONLY"
-            ):
-                parameters = {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
+            elif step.operation is WorkflowOperation.REPLACE_NODE:
+                if (
+                    finding.diagnostic_parameters.get("replacement_strategy")
+                    == "HEALTHY_WARM_SPARE_ONLY"
+                ):
+                    parameters = {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
+                if "activation_forbidden" in finding.diagnostic_parameters:
+                    parameters = {
+                        **parameters,
+                        "activation_forbidden": finding.diagnostic_parameters[
+                            "activation_forbidden"
+                        ],
+                    }
             elif step.operation in requirements and requirements[step.operation]:
                 parameters = {
                     **parameters,
@@ -337,6 +375,15 @@ class NodeLifecycleOperationService:
             existing_workflow,
             now,
         )
+        if (
+            state.merge_existing
+            and existing_incident is not None
+            and existing_workflow is not None
+            and self._mixed_recovery_intent(context.finding, existing_workflow)
+        ):
+            return self._merge_mixed(
+                context, state, existing_incident, existing_workflow, now
+            )
         steps, errors = self._compile_steps(
             context,
             state,
@@ -380,6 +427,9 @@ class NodeLifecycleOperationService:
             now,
             generation=generation,
         )
+        quarantine_source = existing_workflow if state.merge_existing else incumbent
+        if quarantine_source is not None:
+            workflow = inherit_terminal_quarantine(quarantine_source, workflow)
         parallel = self._parallel_branch(
             context,
             state,
@@ -398,6 +448,119 @@ class NodeLifecycleOperationService:
                 incumbent,
                 workflow,
             )
+        return incident, workflow
+
+    @staticmethod
+    def _mixed_recovery_intent(
+        finding: NodeHealthFinding, workflow: WorkflowRequest
+    ) -> bool:
+        operation = (
+            WorkflowOperation.RESTART_NODE
+            if finding.recommended_action is RecoveryAction.REBOOT_NODE
+            else WorkflowOperation.REPLACE_NODE
+        )
+        return any(
+            step.operation
+            in {WorkflowOperation.RESTART_NODE, WorkflowOperation.REPLACE_NODE}
+            and step.operation is not operation
+            and index not in workflow.superseded_step_indexes
+            for index, step in enumerate(workflow.official_steps)
+        )
+
+    def _merge_mixed(
+        self,
+        context: ReplacementContext,
+        merged_state: ReplacementState,
+        existing_incident: FaultIncident,
+        existing_workflow: WorkflowRequest,
+        now: datetime,
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        candidate_state = self._state(context, None, None, now)
+        steps, errors = self._compile_steps(context, candidate_state, existing_workflow)
+        generation = max(
+            existing_incident.fencing_token, existing_workflow.fencing_token
+        )
+        candidate = self._incident(
+            context, candidate_state, errors, now, generation=generation
+        )
+        candidate_workflow = self._workflow(
+            context, candidate_state, steps, errors, None, now, generation=generation
+        )
+        disposition = self.merger.disposition(
+            existing_workflow,
+            candidate_workflow,
+            context.finding.node_id,
+            set(context.finding.gpu_uuids),
+        )
+        if disposition is Disposition.REPLACE_IN_PLACE:
+            # The arbiter authorized replacing this still-unissued whole plan.
+            # Recompile its complete fault scope, not only the latest reporter.
+            steps, errors = self._compile_steps(
+                context, merged_state, existing_workflow
+            )
+            candidate_workflow = self._workflow(
+                context,
+                candidate_state,
+                steps,
+                errors,
+                None,
+                now,
+                generation=generation,
+            )
+        workflow, winner = self.dispositions.apply(
+            disposition,
+            node_id=context.finding.node_id,
+            candidate=candidate,
+            candidate_workflow=candidate_workflow,
+            existing_incident=existing_incident,
+            existing_workflow=existing_workflow,
+            gpu_uuids=set(context.finding.gpu_uuids),
+            mutable=True,
+            now=now,
+        )
+        immutable = resolved_step_indexes(workflow) | {
+            execution.step_index for execution in workflow.step_executions
+        }
+        workflow = workflow.model_copy(
+            update={
+                "incident_id": existing_incident.incident_id,
+                "official_steps": [
+                    step.model_copy(
+                        update={
+                            "parameters": {
+                                **step.parameters,
+                                "termination_initiator_incident_id": existing_incident.incident_id,
+                            }
+                        }
+                    )
+                    if step.operation is WorkflowOperation.STOP_WORKLOADS
+                    and index not in immutable
+                    else step
+                    for index, step in enumerate(workflow.official_steps)
+                ],
+            }
+        )
+        incident = existing_incident.model_copy(
+            update={
+                "node_ids": merged_state.fault_nodes,
+                "gpu_uuids": merged_state.gpu_uuids,
+                "workflow_request_id": workflow.request_id,
+                "fencing_token": workflow.fencing_token,
+                "official_action": winner.official_action,
+                "effective_action": winner.effective_action,
+                "policy_source": winner.policy_source,
+                "policy_version": winner.policy_version,
+                "policy_reference": winner.policy_reference,
+                "state": (
+                    IncidentState.ACTION_PENDING
+                    if workflow.status
+                    in {WorkflowStatus.PENDING, WorkflowStatus.RUNNING}
+                    else IncidentState.ESCALATED
+                ),
+                "reasons": bounded_reasons(merged_state.reasons),
+                "updated_at": now,
+            }
+        )
         return incident, workflow
 
     @staticmethod
@@ -421,7 +584,12 @@ class NodeLifecycleOperationService:
             attempt_id=context.observation.attempt_id,
             workload_identity_source="SOLE_ACTIVE_ATTEMPT_ON_NODE",
             policy_version="site-node-health-policy/v1",
-            policy_source="SITE_NODE_HEALTH",
+            policy_source=(
+                finding.policy_source
+                if finding.policy_source == "SITE_SYNTHETIC_REPLACEMENT_TEST"
+                and "activation_forbidden" in finding.diagnostic_parameters
+                else "SITE_NODE_HEALTH"
+            ),
             official_action=None,
             effective_action=finding.recommended_action,
             drill_id=finding.drill_id,
@@ -483,6 +651,7 @@ class NodeLifecycleOperationService:
         if (
             active is None
             or active[1].request_id == workflow.request_id
+            or not self._same_activation_authority(context.finding, active[1])
             or not (
                 active[1].status is WorkflowStatus.RUNNING
                 or active[1].not_before is None

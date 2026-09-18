@@ -4,7 +4,7 @@ import copy
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -12,13 +12,19 @@ from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_join_evidence import (
     final_membership_identity,
+    join_activation_is_irreversible,
     validate_verified_membership,
 )
-from gpu_fault.admin.cluster_join_state import complete_step, step_done
+from gpu_fault.admin.cluster_join_state import complete_step as complete_step
+from gpu_fault.admin.cluster_join_state import step_done
+from gpu_fault.admin.cluster_join_failure_domains import require_join_failure_domains
 from gpu_fault.admin.resource_registry import LegacyInstallationRegistryMissing
+from gpu_fault.admin.resource_registry_dns import (
+    reconcile_vpc_association_resource,
+    vpc_association_resource,
+)
 from gpu_fault.admin.site import RenderedSite, load_site
 from gpu_fault.installation_resources import (
-    TERMINAL_INSTALLATION_RESOURCE_STATUSES,
     InstallationResource,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
@@ -72,7 +78,7 @@ def _joined_resources(
     cluster_id = execution.cluster_id
     role = dict(execution.prerequisites["executor_role"])
     network = dict(execution.prerequisites["network"])
-    site_id = str(site.release_config["site_name"])
+    site_id = site.registry_site_id
     region = str(site.release_config["aws_region"])
     account_id = target.account_id
     eks_key = f"cluster/{cluster_id}/eks"
@@ -161,25 +167,25 @@ def _joined_resources(
             attributes={"cluster_name": target.eks_name},
         )
     )
-    if network["vpc_id"] not in set(network.get("existing_vpc_ids") or []):
+    if network.get("association_created") is True:
+        if (
+            network["vpc_id"] != target.vpc_id
+            or network.get("vpc_region", region) != target.region
+            or target.region != region
+            or network.get("hosted_zone_id")
+            != (site.release_config.get("dns") or {}).get("hosted_zone_id")
+            and (site.release_config.get("dns") or {}).get("hosted_zone_id")
+        ):
+            raise BootstrapError("joined Route53 association target binding differs")
         resources.append(
-            _resource(
+            vpc_association_resource(
                 site_id=site_id,
-                key=f"aws/route53/vpc-association/{cluster_id}",
-                resource_type="route53_vpc_association",
-                resource_id=(
-                    f"{network['hosted_zone_id']}:{region}:{network['vpc_id']}"
-                ),
+                hosted_zone_id=str(network["hosted_zone_id"]),
+                vpc_id=str(network["vpc_id"]),
+                vpc_region=target.region,
                 region=region,
                 account_id=account_id,
                 ownership=InstallationResourceOwnership.CREATED,
-                policy=InstallationResourceDeletePolicy.DETACH,
-                dependencies=["aws/route53/zone"],
-                attributes={
-                    "hosted_zone_id": str(network["hosted_zone_id"]),
-                    "vpc_id": str(network["vpc_id"]),
-                    "vpc_region": region,
-                },
             )
         )
     return resources
@@ -193,10 +199,7 @@ def _sealed(
         site_id=site_id,
         resources=sorted(resources, key=lambda item: item.resource_key),
     )
-    return cast(
-        InstallationResourceSnapshot,
-        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
-    )
+    return snapshot.model_copy(update={"source_sha256": snapshot.digest()})
 
 
 def registry_delta(
@@ -205,15 +208,7 @@ def registry_delta(
     *,
     site_id: str,
 ) -> tuple[InstallationResourceSnapshot, InstallationResourceSnapshot]:
-    """``(delta, merged)``: what this join adds, and the before snapshot with it.
-
-    The delta is exactly ``_joined_resources``; it is what reaches Aurora, so
-    the registry API upserts the joined cluster's rows instead of re-saving
-    every row of the site (89 s on 2026-09-12). The consistency check against
-    the ``DISCOVERED`` snapshot is cheap and local: same site, and a key the
-    snapshot already holds must name the same resource, or the registry is
-    describing another cluster's life under this cluster's keys.
-    """
+    """Revive this join's rows without rewriting any immutable registry identity."""
 
     if before.site_id != site_id:
         raise BootstrapError(
@@ -221,32 +216,31 @@ def registry_delta(
             f"not {site_id!r}"
         )
     existing = {item.resource_key: item for item in before.resources}
-    # A row remove-cluster left in a terminal status (DETACHED, DELETED,
-    # PRESERVED) is the cluster's previous life, not a claim on the key: a
-    # re-join replaces it. A live row must name the same resource; a bootstrap
-    # row that recorded no ARN (live 2026-09-13: the HyperPod row) is compared
-    # on type and id alone.
-    conflicts = sorted(
-        item.resource_key
-        for item in resources
-        if (previous := existing.get(item.resource_key)) is not None
-        and previous.status not in TERMINAL_INSTALLATION_RESOURCE_STATUSES
-        and (
-            (previous.resource_type, previous.resource_id)
-            != (item.resource_type, item.resource_id)
-            or (
-                previous.resource_arn is not None
-                and previous.resource_arn != item.resource_arn
+    reconciled = []
+    conflicts = []
+    for item in resources:
+        if item.resource_type == "route53_vpc_association":
+            item = reconcile_vpc_association_resource(
+                item, before.resources, revive=True
             )
-        )
-    )
+        previous = existing.get(item.resource_key)
+        if previous is not None:
+            # Legacy bootstrap omitted an ARN. Discovery still proves the live
+            # ARN, but a status update must preserve the stored nullable field.
+            if previous.resource_arn is None:
+                item = item.model_copy(update={"resource_arn": None})
+            if item.immutable_identity() != previous.immutable_identity():
+                conflicts.append(item.resource_key)
+                continue
+            item = item.model_copy(update={"created_at": previous.created_at})
+        reconciled.append(item)
     if conflicts:
         raise BootstrapError(
             "registry before-snapshot already holds a different resource under: "
-            + ", ".join(conflicts)
+            + ", ".join(sorted(conflicts))
         )
-    merged = {**existing, **{item.resource_key: item for item in resources}}
-    return _sealed(site_id, list(resources)), _sealed(site_id, list(merged.values()))
+    merged = {**existing, **{item.resource_key: item for item in reconciled}}
+    return _sealed(site_id, reconciled), _sealed(site_id, list(merged.values()))
 
 
 def _sync_registry(
@@ -256,19 +250,15 @@ def _sync_registry(
     state_dir: Path,
     resources: list[InstallationResource],
 ) -> tuple[InstallationResourceSnapshot, InstallationResourceSnapshot]:
-    """Write the join's delta to Aurora; return ``(delta, merged)``.
-
-    Idempotent: a resumed attempt re-sends the same rows (an upsert) and
-    rewrites the same ``installation-resources-after`` file. The live registry
-    is read once, by ``FINAL_VERIFIED``, which is where the joined rows are
-    proven ACTIVE and the site's ``installation-resources.json`` is refreshed.
-    """
-
-    before = join._load_installation_snapshot(before_path)
+    """Only upsert joined rows; retain unrelated live rows in the audit snapshot."""
+    try:
+        before = join._fetch_installation_registry(site)
+    except LegacyInstallationRegistryMissing:
+        before = join._load_installation_snapshot(before_path)
     delta, merged = registry_delta(
         before,
         resources,
-        site_id=str(site.release_config["site_name"]),
+        site_id=site.registry_site_id,
     )
     join._sync_installation_snapshot(site, delta)
     join._write_installation_snapshot(
@@ -380,16 +370,48 @@ def _remove_joined_resources(
         live = join._fetch_installation_registry(site)
     except LegacyInstallationRegistryMissing:
         return
-    keys = {item.resource_key for item in _joined_resources(site, execution=execution)}
+    expected = {
+        bound.resource_key: bound
+        for item in _joined_resources(site, execution=execution)
+        for bound in [
+            reconcile_vpc_association_resource(item, live.resources)
+            if item.resource_type == "route53_vpc_association"
+            else item
+        ]
+    }
+    resources = []
+    now = datetime.now(timezone.utc)
+    for resource in live.resources:
+        target = expected.get(resource.resource_key)
+        if target is None:
+            resources.append(resource)
+            continue
+        if resource.resource_arn is None:
+            target = target.model_copy(update={"resource_arn": None})
+        if resource.immutable_identity() != target.immutable_identity():
+            raise BootstrapError("joined resource identity changed before rollback")
+        status = (
+            InstallationResourceStatus.DELETED
+            if resource.delete_policy is InstallationResourceDeletePolicy.DELETE
+            else InstallationResourceStatus.DETACHED
+        )
+        resources.append(
+            resource.model_copy(
+                update={"status": status, "updated_at": now, "error": None}
+            )
+            if resource.status is not status or resource.error is not None
+            else resource
+        )
     snapshot = InstallationResourceSnapshot(
         site_id=live.site_id,
-        resources=[item for item in live.resources if item.resource_key not in keys],
+        resources=resources,
     )
-    snapshot = cast(
-        InstallationResourceSnapshot,
-        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
+    snapshot = snapshot.model_copy(update={"source_sha256": snapshot.digest()})
+    delta = _sealed(
+        live.site_id, [item for item in resources if item.resource_key in expected]
     )
-    join._sync_installation_snapshot(site, snapshot)
+    if delta.resources:
+        join._sync_installation_snapshot(site, delta)
     join._write_installation_snapshot(site, snapshot)
 
 
@@ -402,18 +424,26 @@ def activate_and_commit(
     state: dict[str, Any],
 ) -> None:
     cluster_id = execution.cluster_id
-    activation_started = step_done(state, "ACTIVATION_STARTED")
+    activation_started = join_activation_is_irreversible(state)
     verified = (state.get("evidence") or {}).get("VERIFIED")
     if not isinstance(verified, dict):
         raise BootstrapError("join candidate has no verification evidence")
-    if not activation_started:
-        validate_verified_membership(
-            evidence=verified,
-            state=state,
-            current_site=request.site,
-            candidate_site=execution.candidate,
-            cluster_id=cluster_id,
-        )
+    validate_verified_membership(
+        evidence=verified,
+        state=state,
+        current_site=request.site,
+        candidate_site=execution.candidate,
+        cluster_id=cluster_id,
+        check_runtime=False,
+        allow_expired=activation_started,
+    )
+    require_join_failure_domains(
+        request,
+        execution=execution,
+        state_dir=state_dir,
+        state_path=state_path,
+        state=state,
+    )
     if not step_done(state, "SITE_UPDATED"):
         _commit_site(
             request,
@@ -521,6 +551,7 @@ def activate_and_commit(
             verified_at=str(
                 verified.get("verified_at") or datetime.now(timezone.utc).isoformat()
             ),
+            verification_evidence=verified,
         )
         complete_step(
             state_path,
@@ -551,7 +582,8 @@ def rollback_membership(
             repository_root=request.site.repository_root,
         )
     )
-    if cluster_was_committed:
+    # A previous rollback can restore the site before sync-state times out.
+    if cluster_was_committed or joined:
         join._sync_join_release_state(restored_site)
     _remove_joined_resources(restored_site, execution=execution)
     if joined:

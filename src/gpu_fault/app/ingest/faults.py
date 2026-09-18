@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
-from gpu_fault.gpu_metrics import GpuInventorySnapshot
-from gpu_fault.hma import (
-    UNCLASSIFIED_SXID_REASON,
-    UNPARSED_SXID_REASON,
-    UNPARSED_XID_REASON,
-    UNSCHEDULABLE_WITHOUT_CODE_REASON,
-    HmaNormalizedBatch,
-    HmaProviderSignal,
-    unresolved_reason_kind,
+from gpu_fault.gpu_composites import (
+    GPU_COMPOSITE_TRANSACTION,
+    is_pcie_kernel_xid,
+    pci_bdf_matches,
 )
+from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
     NodeHealthCategory,
     NodeHealthFinding,
     NodeHealthIngestionResult,
 )
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
+from gpu_fault.nvidia_logs import (
+    UNCLASSIFIED_SXID_REASON,
+    UNPARSED_SXID_REASON,
+    UNPARSED_XID_REASON,
+    UNSCHEDULABLE_WITHOUT_CODE_REASON,
+    FaultSignal,
+    NormalizedFaultBatch,
+    unresolved_reason_kind,
+)
+from gpu_fault.orchestration.provider_correlation import bind_marker_incident
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
@@ -29,8 +37,8 @@ from gpu_fault.policy import (
 )
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
 from gpu_fault.store import NotFoundError
-from gpu_fault.telemetry import WorkloadContext
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
+from gpu_fault.telemetry import WorkloadContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,7 +65,7 @@ class FaultIngestionService:
 
     def ingest_unresolved_signals(
         self,
-        normalized: HmaNormalizedBatch,
+        normalized: NormalizedFaultBatch,
         *,
         batch_id: str,
     ) -> NodeHealthIngestionResult | None:
@@ -152,7 +160,7 @@ class FaultIngestionService:
 
     def _unresolved_signal_finding(
         self,
-        signal: HmaProviderSignal,
+        signal: FaultSignal,
         *,
         kind: str,
         reasons: list[str],
@@ -178,6 +186,7 @@ class FaultIngestionService:
             metric_name=kind,
             value=1.0,
             raw_message=raw_message,
+            # Preserve the historical evidence URI namespace across the rename.
             evidence_ref=f"hma://{signal.source.value.lower()}/{signal.signal_id}",
             diagnostic_parameters={
                 "unresolved_reasons": list(reasons),
@@ -189,9 +198,7 @@ class FaultIngestionService:
             ),
         )
 
-    def _unresolved_signal_profile_version(
-        self, signal: HmaProviderSignal
-    ) -> str | None:
+    def _unresolved_signal_profile_version(self, signal: FaultSignal) -> str | None:
         """The runtime profile the unresolved line's finding executes under.
 
         The health family refuses to compile without one -- even the
@@ -410,11 +417,7 @@ class FaultIngestionService:
             candidates = {
                 device.gpu_uuid
                 for device in snapshot.devices
-                if (
-                    (sample_slot := self._pci_slot(device.pci_bdf)) is not None
-                    and sample_slot[:2] == event_slot[:2]
-                    and (event_slot[2] is None or sample_slot[2] == event_slot[2])
-                )
+                if (pci_bdf_matches(event.pci_bdf, device.pci_bdf))
             }
             if len(candidates) == 1:
                 return event.model_copy(update={"gpu_uuid": candidates.pop()})
@@ -431,8 +434,7 @@ class FaultIngestionService:
                 or not sample.gpu_uuid
                 or age < -timedelta(seconds=30)
                 or age > self.context.legacy_gpu_metrics_inventory_max_age
-                or sample_slot[:2] != event_slot[:2]
-                or (event_slot[2] is not None and sample_slot[2] != event_slot[2])
+                or not pci_bdf_matches(event.pci_bdf, sample.pci_bdf)
             ):
                 continue
             candidates.add(sample.gpu_uuid)
@@ -482,10 +484,11 @@ class FaultIngestionService:
             decision,
             cluster_id=event.cluster_id,
         )
-        report_processor_replay_phase("xid_marker")
-        self.context.completion.add_marker(decision.marker)
         report_processor_replay_phase("xid_incident_workflow")
         incident, workflow = self.context.orchestrator.ingest(event, decision)
+        decision = bind_marker_incident(decision, incident.incident_id)
+        report_processor_replay_phase("xid_marker")
+        self.context.completion.add_marker(decision.marker)
         report_processor_replay_phase("xid_notification")
         if decision.disposition is ActionDisposition.NOT_APPLICABLE:
             notification = self.context.advisory_notifications.preview_not_applicable(
@@ -532,11 +535,27 @@ class FaultIngestionService:
         event = self._enrich_fault_identity(event)
         if event.ingested_at is None:
             event = event.model_copy(update={"ingested_at": datetime.now(timezone.utc)})
-        report_processor_replay_phase("xid_correlation")
-        decision = self.context.xid_correlation.ingest(event)
-        if decision.disposition is ActionDisposition.PENDING_CORRELATION:
-            return decision
-        return self.finalize_xid(event, decision)
+        transaction = (
+            self.context.store.collector_ingestion_transaction(
+                event.cluster_id, event.node_id, GPU_COMPOSITE_TRANSACTION
+            )
+            if is_pcie_kernel_xid(event)
+            else nullcontext()
+        )
+        with transaction:
+            report_processor_replay_phase("xid_correlation")
+            decision = self.context.xid_correlation.ingest(event)
+            if decision.disposition is ActionDisposition.PENDING_CORRELATION:
+                return decision
+            finalized = self.finalize_xid(event, decision)
+            if is_pcie_kernel_xid(event):
+                findings = self.context.gpu_metrics.correlate_kernel_xid(event)
+                if findings:
+                    NodeHealthIngestionService(self.context).ingest(
+                        event.event_id,
+                        gpu_node_health_findings(self.context, findings),
+                    )
+            return finalized
 
     def ingest_sxid(self, event: SxidEvent) -> FaultPolicyDecision:
         report_processor_replay_phase("sxid_identity")

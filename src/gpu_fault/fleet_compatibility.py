@@ -7,7 +7,7 @@ from pydantic import Field, field_validator
 from gpu_fault.digests import SHA256_PATTERN, normalized_sha256
 from gpu_fault.models import StrictModel, WorkflowOperation
 
-CURRENT_AGENT_PROTOCOL_VERSION = 3
+CURRENT_AGENT_PROTOCOL_VERSION = 4
 NODE_ACTION_KEY_VERSION_SHARED = 1
 NODE_ACTION_KEY_VERSION_DERIVED = 2
 

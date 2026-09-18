@@ -39,6 +39,7 @@ from tests.regional._release_orchestrator_support import (
     manifest_config_file,
 )
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 # `build_rollback_environment` is re-exported by the orchestration module but
 # defined here, and a function resolves its globals in the module that defines
@@ -48,9 +49,12 @@ from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODUL
 class PreflightRunner:
     dry_run = False
 
-    def __init__(self, *, gpu_eks_arn=GPU_EKS_ARN, gpu_node_recovery="None") -> None:
+    def __init__(
+        self, *, gpu_eks_arn=GPU_EKS_ARN, gpu_node_recovery="None", retired_hma=False
+    ) -> None:
         self.gpu_eks_arn = gpu_eks_arn
         self.gpu_node_recovery = gpu_node_recovery
+        self.retired_hma = retired_hma
 
     def run(self, args, **kwargs):
         del kwargs
@@ -77,6 +81,16 @@ class PreflightRunner:
                 '{"items":[{"metadata":{"name":"gpu-node-a"},"status":'
                 '{"addresses":[{"type":"InternalIP","address":"10.0.1.10"}]}}]}'
             )
+        if "get" in args and "deployments" in args:
+            return json.dumps(
+                {
+                    "items": (
+                        [{"metadata": {"name": "gpu-fault-hma-watcher"}}]
+                        if self.retired_hma
+                        else []
+                    )
+                }
+            )
         raise AssertionError(f"unexpected preflight command: {args}")
 
 
@@ -88,6 +102,17 @@ def test_preflight_binds_contexts_and_hyperpod_to_config(
     monkeypatch.setattr(release, "_validate_executor_iam_role", lambda _target: None)
 
     MODULE.ensure_region_contexts(release)
+
+
+def test_preflight_refuses_legacy_hma_before_first_application_deploy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, PreflightRunner(retired_hma=True))
+    monkeypatch.setattr(release, "_validate_executor_iam_role", lambda _target: None)
+
+    with pytest.raises(MODULE.ReleaseError, match="retired HMA collectors remain"):
+        MODULE.ensure_region_contexts(release)
 
 
 def test_preflight_rejects_wrong_context_and_managed_gpu_recovery(
@@ -194,7 +219,11 @@ def test_join_cluster_requires_an_idle_remote_command_queue() -> None:
 
 
 def rollback_environment(
-    monkeypatch: pytest.MonkeyPatch, *, metadata: dict[str, str], allow_email: bool
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    metadata: dict[str, str],
+    allow_email: bool,
+    ses_configuration_set: str | None = None,
 ) -> dict[str, str]:
     monkeypatch.setattr(
         ROLLBACK_CONTEXT_MODULE,
@@ -221,6 +250,7 @@ def rollback_environment(
             notifications=SimpleNamespace(
                 allow_email=allow_email,
                 acknowledge_external_alert_channel=not allow_email,
+                ses_configuration_set=ses_configuration_set,
             ),
             notification_environment=lambda: {
                 "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
@@ -271,6 +301,7 @@ def test_rollback_preserves_the_alerting_configuration(
     is told about the next fault.
     """
 
+    monkeypatch.setenv("GPU_FAULT_SES_CONFIGURATION_SET", "inherited-set")
     enabled = rollback_environment(monkeypatch, metadata={}, allow_email=True)
     acknowledged = rollback_environment(monkeypatch, metadata={}, allow_email=False)
 
@@ -284,6 +315,11 @@ def test_rollback_preserves_the_alerting_configuration(
         "be told which channel the snapshot shipped with"
     )
     assert enabled["GPU_FAULT_SNS_TOPIC_ARN"] == SNS_TOPIC_ARN
+    assert enabled["GPU_FAULT_SES_CONFIGURATION_SET"] == ""
+    declared = rollback_environment(
+        monkeypatch, metadata={}, allow_email=True, ses_configuration_set="alerts-set"
+    )
+    assert declared["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
 
 
 def test_last_cluster_can_be_removed_from_the_cpu_registry(
@@ -351,7 +387,11 @@ def test_deploy_selects_initial_or_upgrade_path(
         module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
     )
     calls: list[str] = []
-    monkeypatch.setattr(release.runner, "probe", lambda _args, **_kwargs: state_exists)
+    monkeypatch.setattr(
+        release.runner,
+        "probe_output",
+        lambda args, **_kw: resource_probe_result(args, present=state_exists),
+    )
     monkeypatch.setattr(release, "bootstrap", lambda: calls.append("bootstrap"))
     monkeypatch.setattr(release, "upgrade", lambda **_kwargs: calls.append("upgrade"))
     monkeypatch.setattr(release, "noop", lambda _diff: calls.append("noop"))
@@ -403,7 +443,11 @@ def test_deploy_pins_approved_plan_only_when_resuming(
         module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
     )
     pins: list[str | None] = []
-    monkeypatch.setattr(release.runner, "probe", lambda _args, **_kwargs: state_exists)
+    monkeypatch.setattr(
+        release.runner,
+        "probe_output",
+        lambda args, **_kw: resource_probe_result(args, present=state_exists),
+    )
     monkeypatch.setattr(release, "bootstrap", lambda: None)
     monkeypatch.setattr(release, "upgrade", lambda **_kwargs: None)
     monkeypatch.setattr(release, "noop", lambda _diff: None)

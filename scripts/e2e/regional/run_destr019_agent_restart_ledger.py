@@ -136,9 +136,12 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
     }
 
 
-def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
+def _probe(
+    settings: Settings, run_id: str, script: Path, case_dir: Path
+) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -162,7 +165,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     runtime_identity = fixture.runtime_identity()
-    probe = _probe(settings, "destr019-preflight", AGENT_PROBE_SCRIPT)
+    probe = _probe(settings, "destr019-preflight", AGENT_PROBE_SCRIPT, case_dir)
     try:
         probe.create()
         host = probe.execute("snapshot", "--run-id", "destr019-preflight", timeout=120)
@@ -308,8 +311,8 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
         case_dir=case_dir,
         preflight=preflight,
         run_id=run_id,
-        agent_probe=_probe(settings, f"{run_id}-agent", AGENT_PROBE_SCRIPT),
-        injector=_probe(settings, f"{run_id}-inject", INJECT_PROBE_SCRIPT),
+        agent_probe=_probe(settings, f"{run_id}-agent", AGENT_PROBE_SCRIPT, case_dir),
+        injector=_probe(settings, f"{run_id}-inject", INJECT_PROBE_SCRIPT, case_dir),
     )
     run.marker = f"destr019-{int(time.time())}-a{attempt}"
     run.baseline_node = dict(preflight["node"])
@@ -353,7 +356,12 @@ def _quiet_control_plane(run: _LiveRun) -> None:
 
     state = run.regional.store_snapshot(node=run.settings.node, queue_attempts=1)
     write_json_atomic(run.case_dir / "store-before-restart.json", state)
-    if (state.get("remote_commands") or {}).get("open_by_cluster"):
+    commands = state.get("remote_commands")
+    if (
+        not isinstance(commands, dict)
+        or "open_by_cluster" not in commands
+        or commands["open_by_cluster"]
+    ):
         raise RegionalFixtureError(
             "remote commands are open; an Agent restart could interrupt one"
         )
@@ -536,14 +544,24 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before case setup")
         health_before = _baseline(run)
         errors = verdicts.health_errors(health_before, label="before restart")
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
         errors.extend(_migration_drill(run))
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError(
                 "approved maintenance window ended before restart"
             )
         errors.extend(_restart(run))
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before XID injection")
         state = _inject_and_observe(run)
         errors.extend(_audit_errors(run, state))
         errors.extend(_provider_errors(run))

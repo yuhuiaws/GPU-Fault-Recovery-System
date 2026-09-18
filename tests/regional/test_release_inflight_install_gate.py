@@ -42,6 +42,7 @@ from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_probes as PROBES
 from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import rollout as MODULE
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
 ENV = "GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS"
@@ -151,8 +152,8 @@ class Runner:
             raise self.result
         return self.result
 
-    def probe(self, _args, **_kwargs) -> bool:
-        return True
+    def probe_output(self, args, **_kwargs) -> tuple[int, str, str]:
+        return resource_probe_result(args)
 
 
 def _release(
@@ -220,8 +221,8 @@ class RoleRunner:
             raise answer
         return answer
 
-    def probe(self, _args, **_kwargs) -> bool:
-        return True
+    def probe_output(self, args, **_kwargs) -> tuple[int, str, str]:
+        return resource_probe_result(args)
 
 
 def _role_release(runner: RoleRunner) -> SimpleNamespace:
@@ -960,7 +961,7 @@ def test_upgrade_checks_for_in_flight_installs_after_the_idle_probe() -> None:
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
     with pytest.raises(_Reached):
@@ -988,7 +989,7 @@ def test_a_refused_upgrade_writes_no_state(monkeypatch: pytest.MonkeyPatch) -> N
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
     with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
@@ -1035,7 +1036,7 @@ def test_the_upgrade_keeps_the_gates_verdict_for_its_first_checkpoint(
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
-        changed=frozenset({"control_plane_wheel"}),
+        changed=frozenset({"cpu_worker_manifests"}),
     )
 
     with pytest.raises(_Reached):
@@ -1065,16 +1066,26 @@ def _rollback_double(calls: list[str], **stubs: Any) -> SimpleNamespace:
 def _plan_reached(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
     def plan(*_args, **_kwargs):
         calls.append("compensation-plan")
+        return ORCHESTRATION.RollbackCompensationPlan(frozenset(), {}, False)
+
+    def restore(*_args, **_kwargs):
+        calls.append("restore-boundary")
         raise _Reached()
 
     monkeypatch.setattr(ORCHESTRATION, "build_rollback_compensation_plan", plan)
+    monkeypatch.setattr(
+        ORCHESTRATION,
+        "_rollback_identity_context",
+        lambda *_a, **_k: ({}, "", "", "", "", "", "", ""),
+    )
+    monkeypatch.setattr(ORCHESTRATION, "_rollback_target_arguments", restore)
 
 
 def test_rollback_checks_for_in_flight_installs_after_the_credential_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After the Aurora refresh -- a rotation-window failure gets its chance to
-    be named first -- and before any restore is planned. A manual rollback
+    be named first -- and before any workload restore. A manual rollback
     fails closed on a store that cannot answer."""
 
     calls: list[str] = []
@@ -1086,9 +1097,10 @@ def test_rollback_checks_for_in_flight_installs_after_the_credential_refresh(
         )
 
     assert calls == [
+        "compensation-plan",
         "aurora-refresh",
         "inflight-installs:rollback:refuse",
-        "compensation-plan",
+        "restore-boundary",
     ]
 
 
@@ -1106,9 +1118,10 @@ def test_the_automatic_rollback_tells_the_gate_to_proceed_on_an_unreadable_store
         )
 
     assert calls == [
+        "compensation-plan",
         "aurora-refresh",
         "inflight-installs:rollback:proceed",
-        "compensation-plan",
+        "restore-boundary",
     ]
 
 
@@ -1163,7 +1176,7 @@ def test_a_rollback_re_entered_after_the_control_plane_restore_skips_the_gate(
             release, state={"metadata": {}, "cpu_wheel": "w"}
         )
 
-    assert calls == ["aurora-refresh", "compensation-plan"]
+    assert calls == ["compensation-plan", "aurora-refresh", "restore-boundary"]
 
 
 def test_a_refused_rollback_touches_nothing_after_the_refresh(
@@ -1176,15 +1189,13 @@ def test_a_refused_rollback_touches_nothing_after_the_refresh(
             GATE.InflightInstallsRefused("rollback refused: workflow-7f3a")
         ),
     )
-    monkeypatch.setattr(
-        ORCHESTRATION,
-        "build_rollback_compensation_plan",
-        lambda *_a, **_k: pytest.fail("the rollback was planned"),
-    )
+    _plan_reached(monkeypatch, calls)
 
     with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
         ORCHESTRATION.rollback_release(release, state={"metadata": {}})
-    assert calls == ["aurora-refresh"], "the credential refresh is not a restore"
+    assert calls == ["compensation-plan", "aurora-refresh"], (
+        "the gate allowed a workload restore"
+    )
 
 
 def _failing_upgrade(
@@ -1204,6 +1215,9 @@ def _failing_upgrade(
     )
     monkeypatch.setattr(
         ORCHESTRATION, "_validate_upgrade_transaction", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION, "prepare_upgrade_credentials", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(
         ORCHESTRATION,

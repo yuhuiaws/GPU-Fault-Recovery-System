@@ -11,6 +11,7 @@ import uvicorn
 
 from gpu_fault.app import ApplicationContext, create_app
 from tests._builders import asgi_client, build_context, processor_request
+from tests.metrics._assertions import assert_sample
 
 
 def test_unhealthy_processor_fails_health_check_and_exports_metrics(
@@ -40,7 +41,9 @@ def test_unhealthy_processor_fails_health_check_and_exports_metrics(
         == "processor request execution deadline exceeded"
     )
     assert "gpu_fault_processor_healthy 0" in metrics.text
-    assert "gpu_fault_processor_deadline_exceeded_total 1" in metrics.text
+    assert_sample(
+        metrics.text, "gpu_fault_processor_deadline_exceeded_total", 1, process="0"
+    )
 
 
 def test_processor_api_backpressure_and_metrics(monkeypatch) -> None:
@@ -138,13 +141,21 @@ def test_processor_api_fault_reserve_rejects_observation_not_fault(monkeypatch) 
     assert observation.status_code == 429
     assert observation.json()["scope"] == "cluster_reserved"
     assert fault.status_code == 202
-    assert (
-        'gpu_fault_processor_admission_rejections_total{scope="cluster_reserved"} 1'
-    ) in metrics.text
-    assert (
-        "gpu_fault_processor_admission_rejections_by_cluster_total"
-        '{cluster_id="cluster-a",scope="cluster_reserved"} 1'
-    ) in metrics.text
+    assert_sample(
+        metrics.text,
+        "gpu_fault_processor_admission_rejections_total",
+        1,
+        scope="cluster_reserved",
+        process="0",
+    )
+    assert_sample(
+        metrics.text,
+        "gpu_fault_processor_admission_rejections_by_cluster_total",
+        1,
+        cluster_id="cluster-a",
+        scope="cluster_reserved",
+        process="0",
+    )
 
 
 def test_processor_rejects_oversize_body_before_queue_write(monkeypatch) -> None:
@@ -173,7 +184,9 @@ def test_processor_rejects_oversize_body_before_queue_write(monkeypatch) -> None
     assert rejected.status_code == 413
     assert rejected.json()["max_bytes"] == 64
     assert context.store.processor_queue_stats()["depth"] == 0
-    assert "gpu_fault_processor_oversize_rejections_total 1" in metrics.text
+    assert_sample(
+        metrics.text, "gpu_fault_processor_oversize_rejections_total", 1, process="0"
+    )
 
 
 @pytest.mark.parametrize(

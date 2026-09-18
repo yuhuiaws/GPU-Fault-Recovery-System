@@ -35,6 +35,17 @@ from gpu_fault.node_agent.protocol import (
     SignedNodeAction,
     verify_result_query,
 )
+from gpu_fault.node_agent.late_ownership import (
+    OWNERSHIP_PROTOCOL,
+    OwnershipRefused,
+)
+from gpu_fault.node_agent.late_ownership_http import (
+    authorize_pending_ownership,
+    awaiting_action_retry,
+    pending_ownership_challenge,
+    queued_ownership_failure,
+    result_query_refusal,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +91,14 @@ def _result_query_signature_required() -> bool:
 def _node_action_rejection(
     error: ValueError,
 ) -> tuple[int, dict[str, Any]]:
+    if isinstance(error, OwnershipRefused):
+        return 409, {
+            "code": "OWNERSHIP_REFUSED",
+            "message": str(error),
+            "retryable": False,
+            "requires_new_command": False,
+            **error.action_details,
+        }
     message = str(error)
     normalized = message.lower()
     if "invalid node action signature" in normalized:
@@ -232,6 +251,7 @@ def create_node_agent_app(
     heartbeat_reporter: AgentHeartbeatReporter | None = None,
 ) -> FastAPI:
     agent = _reconciled_agent(executor)
+    ownership_gate = getattr(agent, "ownership_gate", None)
     reporter = (
         heartbeat_reporter
         if heartbeat_reporter is not None
@@ -279,16 +299,16 @@ def create_node_agent_app(
         try:
             completed: NodeActionResult = future.result()
             return completed
-        except ValueError as exc:
-            LOGGER.warning(
-                "node action rejected inside the action pool command_id=%s "
-                "operation=%s reason=%s",
-                command_id,
-                command.operation.value,
-                exc,
-            )
-            return None
         except Exception as exc:
+            if isinstance(exc, ValueError) and command.ownership_guard is None:
+                LOGGER.warning(
+                    "node action rejected inside the action pool command_id=%s "
+                    "operation=%s reason=%s",
+                    command_id,
+                    command.operation.value,
+                    exc,
+                )
+                return None
             # Not the action failing -- ``execute`` reports that as a FAILED
             # result -- but the pool wrapper around it, most often a ledger
             # write. What may be written depends on whether an attempt was
@@ -341,7 +361,8 @@ def create_node_agent_app(
                 operation=command.operation,
                 status=NodeActionStatus.FAILED,
                 error=error,
-                retryable=True,
+                retryable=command.ownership_guard is None,
+                details=queued_ownership_failure(command, exc),
                 attempt=row[1] + 1 if row is not None else 1,
             )
             try:
@@ -383,6 +404,9 @@ def create_node_agent_app(
                 return NodeActionSubmission(
                     command_id=command_id,
                     state=NodeActionExecutionState.PENDING,
+                    ownership_challenge=pending_ownership_challenge(
+                        ownership_gate, command_id
+                    ),
                 )
             result = finished_result(command_id, command, future)
             drop_future(command_id, future)
@@ -401,16 +425,6 @@ def create_node_agent_app(
             command_id=command_id,
             state=NodeActionExecutionState(result.status.value),
             result=result,
-        )
-
-    def awaiting_retry(state: NodeActionSubmission) -> bool:
-        """A retryable failure is not an answer; the resubmit runs attempt+1."""
-
-        result = state.result
-        return (
-            result is not None
-            and result.status is NodeActionStatus.FAILED
-            and result.retryable
         )
 
     def finalize_action(
@@ -439,6 +453,8 @@ def create_node_agent_app(
             yield
         finally:
             stop.set()
+            if ownership_gate is not None:
+                ownership_gate.cancel_all()
             if worker is not None:
                 worker.join(timeout=reporter.interval_seconds + 2)
             action_pool.shutdown(wait=False, cancel_futures=False)
@@ -473,6 +489,8 @@ def create_node_agent_app(
                 payload["status"] = "degraded"
                 status_code = 503
         payload["ledger"] = ledger_state
+        if ownership_gate is not None:
+            payload["ownership_guard_protocol"] = OWNERSHIP_PROTOCOL
         heartbeat_health = getattr(reporter, "health_snapshot", None)
         payload["heartbeat"] = (
             heartbeat_health() if callable(heartbeat_health) else {"configured": False}
@@ -490,11 +508,16 @@ def create_node_agent_app(
     ) -> NodeActionSubmission:
         try:
             command = agent.validate_submission(envelope)
+            state = authorize_pending_ownership(
+                ownership_gate, envelope, command, submission_state
+            )
+            if state is not None:
+                return state
         except ValueError as exc:
             status_code, detail = _node_action_rejection(exc)
             raise HTTPException(status_code=status_code, detail=detail) from exc
         existing = submission_state(command.command_id)
-        if existing is not None and not awaiting_retry(existing):
+        if existing is not None and not awaiting_action_retry(existing):
             return existing
         with action_lock:
             future = action_futures.get(command.command_id)
@@ -532,25 +555,17 @@ def create_node_agent_app(
         # never has to be touched. An unsigned query is answered either
         # way when it is false, which is the whole point -- it is a
         # migration escape hatch, not a mode.
-        if require_signed_result_query or signature is not None:
-            try:
-                verify_result_query(
-                    command_id,
-                    issued_at,
-                    signature,
-                    agent.secret,
-                    max_skew_seconds=result_query_max_skew_seconds,
-                )
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=401,
-                    detail={
-                        "code": "INVALID_SIGNATURE",
-                        "message": str(exc),
-                        "retryable": False,
-                        "requires_new_command": False,
-                    },
-                ) from exc
+        rejection = result_query_refusal(
+            verify_result_query,
+            command_id,
+            issued_at,
+            signature,
+            agent.secret,
+            required=require_signed_result_query or ownership_gate is not None,
+            max_skew_seconds=result_query_max_skew_seconds,
+        )
+        if rejection is not None:
+            raise HTTPException(status_code=401, detail=rejection)
         state = submission_state(command_id)
         if state is None:
             raise HTTPException(

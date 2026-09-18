@@ -73,7 +73,7 @@ def _parse(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -95,16 +95,6 @@ def _executions_of(
     executions: list[dict[str, Any]], operation: str
 ) -> list[dict[str, Any]]:
     return [item for item in executions if item.get("operation") == operation]
-
-
-def _interval(executions: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
-    starts = [_parse(item.get("started_at")) for item in executions]
-    ends = [_parse(item.get("updated_at")) for item in executions]
-    starts = [item for item in starts if item is not None]
-    ends = [item for item in ends if item is not None]
-    if not starts or not ends:
-        return None
-    return min(starts), max(ends)
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +135,15 @@ def workflow_errors(
 
     steps = workflow.get("official_steps") or []
     executions = workflow.get("step_executions") or []
+    for item in executions:
+        if item.get("operation") not in (*BRANCH_OPERATIONS, *SHARED_ONCE_OPERATIONS):
+            continue
+        started = _parse(item.get("started_at"))
+        ended = _parse(item.get("updated_at"))
+        if started is None or ended is None or ended < started:
+            errors.append(
+                f"{item.get('operation')} execution has incomplete or unordered timestamps"
+            )
     operations = [step.get("operation") for step in steps]
     for operation in SHARED_ONCE_OPERATIONS:
         if operations.count(operation) != 1:
@@ -230,19 +229,8 @@ def workflow_errors(
                     f"(RESTORE_SCHEDULING index {tail}): {sorted(depends)}"
                 )
 
-    intervals = {
-        node: _interval(_branch_executions(steps, executions, node)) for node in nodes
-    }
-    first, second = (intervals[node] for node in nodes)
-    if first is not None and second is not None:
-        overlap = min(first[1], second[1]) > max(first[0], second[0])
-        if not overlap:
-            errors.append(
-                "the two node branches did not run in parallel: "
-                f"{nodes[0]} {first[0].isoformat()}..{first[1].isoformat()}, "
-                f"{nodes[1]} {second[0].isoformat()}..{second[1].isoformat()}"
-            )
-
+    # These are dispatch timestamps. Physical overlap is separately checked
+    # against the identity-bound Agent exec witnesses in the data-plane phase.
     count = restart_budget.get("restart_count")
     budget = restart_budget.get("budget")
     if count != 1 or budget != 1:

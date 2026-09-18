@@ -23,7 +23,7 @@ from gpu_fault.regional import (
 )
 from gpu_fault.regional_registry_runtime import (
     active_registry_member_ids,
-    registry_revision_converged,
+    registry_revision_missing_member_ids,
 )
 
 router = APIRouter(prefix="/v1/regional/registry", tags=["regional-registry"])
@@ -160,19 +160,13 @@ def _status(
         observed_at=observed_at,
         stale_seconds=stale_seconds,
     )
-    by_id = {member.member_id: member for member in members}
-    acked = sorted(
-        member_id
-        for member_id in revision.required_member_ids
-        if (
-            (member := by_id.get(member_id)) is not None
-            and member.ready
-            and member.generation == revision.generation
-            and member.content_sha256 == revision.content_sha256
-            and member.member_id in active_ids
-        )
+    missing = registry_revision_missing_member_ids(
+        revision,
+        members,
+        observed_at=observed_at,
+        stale_seconds=stale_seconds,
     )
-    missing = sorted(set(revision.required_member_ids) - set(acked))
+    acked = sorted(set(active_ids) - set(missing))
     return RegionalRegistryStatus(
         generation=revision.generation,
         content_sha256=revision.content_sha256,
@@ -184,12 +178,7 @@ def _status(
         missing_member_ids=missing,
         active_member_ids=active_ids,
         members=members,
-        converged=registry_revision_converged(
-            revision,
-            members,
-            observed_at=observed_at,
-            stale_seconds=stale_seconds,
-        ),
+        converged=not missing,
     )
 
 

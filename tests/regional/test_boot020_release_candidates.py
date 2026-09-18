@@ -41,6 +41,7 @@ def test_chain_changes_one_dimension_per_step() -> None:
         _base(),
         live_manifest="/live/m.json",
         candidate_manifests=manifests,
+        replicas_delta=-1,
         full_agent_config_digest="f" * 64,
     )
 
@@ -49,7 +50,7 @@ def test_chain_changes_one_dimension_per_step() -> None:
     assert chain["noop"]["admin_config"] == _base()["admin_config"]
 
     control = chain["control-plane"]
-    assert control["admin_config"]["config"]["capacity"]["control_worker_replicas"] == 7
+    assert control["admin_config"]["config"]["capacity"]["control_worker_replicas"] == 5
     assert (
         control["admin_config"]["role_sha256"]["worker"]
         != _base()["admin_config"]["role_sha256"]["worker"]

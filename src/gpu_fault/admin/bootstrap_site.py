@@ -23,6 +23,7 @@ from gpu_fault.admin.bootstrap_common import (
 )
 
 INITIAL_DEPLOY_TARGET = "initial_deploy_target"
+_TARGET_PROVIDER_FIELDS = ("eks_arn", "hyperpod_arn", "hyperpod_name")
 
 
 def finalize_bootstrap_site(
@@ -104,46 +105,162 @@ def _target_identity(
     }
 
 
+def _validated_initial_target(value: object) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("status") not in ("PENDING", "COMPLETE")
+        or not isinstance(value.get("gpu_clusters"), list)
+    ):
+        raise BootstrapError("initial deploy target checkpoint is invalid")
+    fields = ("input_arn", *_TARGET_PROVIDER_FIELDS)
+    for item in [value.get("cpu"), *value["gpu_clusters"]]:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != set(fields)
+            or any(
+                not isinstance(item[key], str)
+                or not item[key]
+                or item[key] != item[key].strip()
+                for key in fields
+            )
+            or item["input_arn"] not in (item["eks_arn"], item["hyperpod_arn"])
+        ):
+            raise BootstrapError("initial deploy target checkpoint is invalid")
+        try:
+            eks, hyperpod = Arn.parse(item["eks_arn"]), Arn.parse(item["hyperpod_arn"])
+            valid = (
+                eks.service == "eks"
+                and hyperpod.service == "sagemaker"
+                and eks.resource_name
+                and hyperpod.resource_name
+                and (eks.partition, eks.region, eks.account)
+                == (hyperpod.partition, hyperpod.region, hyperpod.account)
+            )
+        except BootstrapError:
+            valid = False
+        if not valid:
+            raise BootstrapError("initial deploy target checkpoint is invalid")
+    keys = [(item["eks_arn"], item["hyperpod_name"]) for item in value["gpu_clusters"]]
+    if len(keys) != len(set(keys)):
+        raise BootstrapError("initial deploy target checkpoint contains duplicate GPUs")
+    return value
+
+
+def _initial_target_is_managed(
+    state: BootstrapState,
+    existing_site: Mapping[str, Any],
+    stored: Mapping[str, Any],
+    existing_keys: set[tuple[str, str]],
+) -> bool:
+    missing = [
+        item
+        for item in stored["gpu_clusters"]
+        if (item["eks_arn"], item["hyperpod_name"]) not in existing_keys
+    ]
+    if not missing:
+        return True
+    # Name-only bootstrap removal rows do not prove detachment. Reuse the
+    # removal journal's full site/target bindings and completed safety barriers.
+    if load_existing_site(state.path.parent) != existing_site:
+        return False
+    from gpu_fault.admin.cluster_removal_state import (
+        read_removal_state,
+        resolve_saved_removal,
+        validate_saved_site,
+    )
+    from gpu_fault.admin.site import load_site
+
+    site = load_site(state.path.parent / "site.yaml")
+    for item in missing:
+        cluster_id = resolve_saved_removal(site, item["eks_arn"])
+        if cluster_id is None:
+            return False
+        removal = read_removal_state(
+            state.path.parent / "remove-cluster" / safe_name(cluster_id) / "state.json"
+        )
+        validate_saved_site(site, cluster_id, removal)
+        provider = removal["evidence"]["DISCOVERED"]["provider_identity"]
+        target = removal["target"]
+        if (
+            removal["phase"] != "COMPLETED"
+            or target.get("eks_cluster_arn") != item["eks_arn"]
+            or target.get("hyperpod_cluster_name") != item["hyperpod_name"]
+            or provider.get("eks_arn") != item["eks_arn"]
+            or provider.get("hyperpod_arn") != item["hyperpod_arn"]
+            or provider.get("cpu_eks_arn") != stored["cpu"]["eks_arn"]
+        ):
+            raise BootstrapError(
+                "initial deploy target removal checkpoint is incomplete or differs"
+            )
+    return True
+
+
 def bind_initial_deploy_target(
     state: BootstrapState,
     existing_site: Mapping[str, Any] | None,
     cpu: ClusterIdentity,
     gpu_clusters: Sequence[ClusterIdentity],
 ) -> list[ClusterIdentity]:
+    """Settle a fulfilled target while retaining in-flight and removal bindings."""
     requested = _target_identity(cpu, gpu_clusters)
     requested_keys = [_cluster_key(cluster) for cluster in gpu_clusters]
     if len(requested_keys) != len(set(requested_keys)):
         raise BootstrapError("initial deploy target contains duplicate GPU clusters")
     resources = state.value.get("resources")
+    if not isinstance(resources, Mapping):
+        raise BootstrapError("initial deploy target checkpoint resources are invalid")
     stored = (
-        resources.get(INITIAL_DEPLOY_TARGET) if isinstance(resources, Mapping) else None
+        _validated_initial_target(resources[INITIAL_DEPLOY_TARGET])
+        if INITIAL_DEPLOY_TARGET in resources
+        else None
     )
-    status = str(stored.get("status") or "") if isinstance(stored, Mapping) else ""
-    if status == "COMPLETE":
-        validate_existing_cluster_identity(
-            existing_site,
-            cpu=cpu,
-            gpu_clusters=gpu_clusters,
+    status = stored["status"] if stored is not None else ""
+    if stored is not None:
+        if any(
+            stored["cpu"][key] != requested["cpu"][key]
+            for key in _TARGET_PROVIDER_FIELDS
+        ):
+            raise BootstrapError(
+                "CPU cluster identity differs from the initial deploy target checkpoint"
+            )
+        if status == "PENDING":
+            current = dict(zip(requested_keys, requested["gpu_clusters"], strict=True))
+            for item in stored["gpu_clusters"]:
+                found = current.get((item["eks_arn"], item["hyperpod_name"]))
+                if found is not None and any(
+                    item[key] != found[key] for key in _TARGET_PROVIDER_FIELDS
+                ):
+                    raise BootstrapError(
+                        "GPU cluster identity differs from the initial deploy target checkpoint"
+                    )
+    validate_existing_cluster_identity(
+        existing_site,
+        cpu=cpu,
+        gpu_clusters=gpu_clusters,
+        allow_gpu_subset=status != "COMPLETE",
+    )
+    existing_keys = (
+        set(_site_gpu_keys(existing_site)) if existing_site is not None else set()
+    )
+    if status == "COMPLETE" and existing_site is None:
+        raise BootstrapError(
+            "completed initial deploy target checkpoint requires its existing site"
         )
-    else:
-        if stored is not None:
-            if not isinstance(stored, Mapping):
-                raise BootstrapError("initial deploy target checkpoint is invalid")
-            stored_identity = {
-                key: stored.get(key)
-                for key in ("schema_version", "cpu", "gpu_clusters")
-            }
-            if stored_identity != requested:
-                raise BootstrapError(
-                    "initial deploy target differs from the persisted checkpoint"
-                )
-        validate_existing_cluster_identity(
-            existing_site,
-            cpu=cpu,
-            gpu_clusters=gpu_clusters,
-            allow_gpu_subset=True,
-        )
-    existing_keys = set(_site_gpu_keys(existing_site)) if existing_site else set()
+    if stored is not None and status == "PENDING":
+        stored_identity = {
+            key: stored[key] for key in ("schema_version", "cpu", "gpu_clusters")
+        }
+        if stored_identity != requested and (
+            existing_site is None
+            or not _initial_target_is_managed(
+                state, existing_site, stored, existing_keys
+            )
+        ):
+            raise BootstrapError(
+                "initial deploy target differs from the persisted checkpoint"
+            )
     complete = existing_site is not None and existing_keys == set(requested_keys)
     state.record(
         INITIAL_DEPLOY_TARGET,
@@ -419,9 +536,10 @@ def preserve_existing_site_contract(
     # by declaring ``autoRollback: false`` in the site. Regenerating it as
     # ``true`` on every deploy would silently revert that decision between the
     # moment it is made and the rollout that needs it, so the declared value
-    # wins. A non-boolean is left to the generated default and rejected later by
-    # ``SiteSpec``, which reports the offending field.
+    # wins. Invalid policy must fail before generation discards the original value.
     declared_rollback = existing_spec.get("autoRollback")
+    if declared_rollback is not None and not isinstance(declared_rollback, bool):
+        raise BootstrapError("existing site spec.autoRollback must be a boolean")
     if isinstance(declared_rollback, bool):
         generated_spec["autoRollback"] = declared_rollback
     existing_clusters = {

@@ -16,6 +16,9 @@ import re
 from typing import Any
 
 _CREATE_INDEX = re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)")
+CONTROL_STATE_INDEX_KIND = re.compile(
+    r"\bWHERE\s+kind\s*=\s*'(remote_command|workflow)'", re.I
+)
 
 
 def _declare_index(cursor: Any, statement: str) -> None:
@@ -32,6 +35,17 @@ def _declare_index(cursor: Any, statement: str) -> None:
     match = _CREATE_INDEX.search(statement)
     if match is None:
         raise ValueError("not a CREATE INDEX ... IF NOT EXISTS statement")
+    state_kind = CONTROL_STATE_INDEX_KIND.search(statement)
+    if state_kind is not None:
+        cursor.execute("SELECT to_regclass('gpu_fault_control_state_modes')")
+        if cursor.fetchone()[0] is not None:
+            cursor.execute(
+                "SELECT legacy_purged FROM gpu_fault_control_state_modes WHERE kind=%s AND mode='dedicated'",
+                (state_kind.group(1),),
+            )
+            retired = cursor.fetchone()
+            if retired and retired[0]:
+                return
     cursor.execute("SELECT to_regclass(%s)", (match.group(1),))
     if cursor.fetchone()[0] is None:
         cursor.execute(statement)

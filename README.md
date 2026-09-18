@@ -86,8 +86,9 @@ make deploy-host-setup-online
 make PYTHON=.venv/bin/python check
 ```
 
-`deploy-host-setup-online`是开发checkout的公共初始化入口，内部封装
-`scripts/setup-deploy-host.sh --venv .venv --allow-network`。
+`deploy-host-setup-online`校验路径和版本后，用系统Python 3.12并行准备锁定Python/admin CLI与独立工具venv，
+无需另跑命令或添加`make -j`；promtool下载与工具包安装重叠。任一路失败均等待已启动任务结束后返回失败。
+工具通过版本及缓存archive摘要校验后复用，缺失或不符才修复；在线Python初始化仍会重建环境并可能联网。
 生产部署机必须使用CI生成并验签的离线bundle，见[CI 发布流程](docs/CI发布流程.md)。
 初始化后，Make默认自动使用`.venv/bin/python`；无本地venv的源码包回退到`python3`，
 CI和高级调用仍可用`PYTHON=...`显式覆盖。
@@ -102,16 +103,13 @@ make artifact-check
 make test-parallel
 ```
 
-`make check` 的最终全量测试同样使用4个xdist worker。隔离PostgreSQL 16测试库不参与
-并行；设置`GPU_FAULT_TEST_POSTGRES_URL`后单独运行`make test-postgres`。
+本地全量入口先检查固定版本的`PROMTOOL`并传给子进程；`make check`默认使用4至16个worker。
+外部PostgreSQL不进入xdist；设置`GPU_FAULT_TEST_POSTGRES_URL`后独立运行`make test-postgres`。
 
 `make artifact-check` 构建三个独立 wheel、Node bundle 和内容寻址
 `dist/current-release.json`，并验证模块边界、摘要与重复构建确定性。
 
 ## 部署：先区分角色
-
-单EC2源码staging、首次建站、失败续跑和后续升级统一使用四参数
-`gpu-fault-admin deploy`，具体见文档入口。
 
 所有生产部署开始前必须满足以下共同前提：
 
@@ -132,6 +130,10 @@ gpu-fault-admin deploy \
 
 多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、
 签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
+首次部署后的日常变更使用`<state-dir>/deployer-venv/bin/gpu-fault-admin`。
+未绑定站点的开发checkout不能替代该CLI执行已有站点的变更；普通源码deploy和真正
+只读的查询按各自入口校验，rollback不享有普通源码deploy的豁免。见
+[管理员日常运维](docs/管理员日常运维.md)的管理员入口说明。
 
 ### 开发者：修改代码或Profile后发布
 

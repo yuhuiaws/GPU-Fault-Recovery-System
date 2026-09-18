@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -14,12 +15,68 @@ from gpu_fault.processor import ProcessorRequest
 from gpu_fault.store import SqliteStore
 
 
+def take_over(database: str, claim_file: str, owner: str) -> dict:
+    claim = json.loads(Path(claim_file).read_text())
+    store = SqliteStore(database)
+    try:
+        claimed = store.claim_active_processor_requests(
+            owner,
+            now=datetime.now(timezone.utc),
+            lease_duration=timedelta(seconds=30),
+            limit=1,
+        )
+        if len(claimed) != 1 or claimed[0].request_id != claim["request_id"]:
+            raise RuntimeError("replacement process could not claim the same request")
+        takeover = claimed[0]
+        stale_rejected = False
+        try:
+            store.complete_active_processor_request(
+                claim["request_id"],
+                claim["owner_id"],
+                int(claim["lane_epoch"]),
+                claim["lease_token"],
+                response_status=200,
+                response_content_type="application/json",
+                response_body_base64=base64.b64encode(b'{"late":true}').decode(),
+            )
+        except ValueError:
+            stale_rejected = True
+        store.complete_active_processor_request(
+            takeover.request_id,
+            str(takeover.lease_owner),
+            int(takeover.leader_epoch),
+            str(takeover.lease_token),
+            response_status=200,
+            response_content_type="application/json",
+            response_body_base64=base64.b64encode(b'{"completed":true}').decode(),
+        )
+        final = store.get_processor_request(takeover.request_id)
+        return {
+            "second_owner": takeover.lease_owner,
+            "second_lane_epoch": takeover.leader_epoch,
+            "second_process_id": os.getpid(),
+            "stale_result_rejected": stale_rejected,
+            "final_status": final.status.value,
+            "final_response_status": final.response_status,
+        }
+    finally:
+        store.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True)
     parser.add_argument("--claim-file", required=True)
     parser.add_argument("--fail-release", action="store_true")
+    parser.add_argument("--takeover", action="store_true")
+    parser.add_argument("--owner", default="ha008-takeover")
     args = parser.parse_args()
+    if args.takeover:
+        print(
+            json.dumps(take_over(args.database, args.claim_file, args.owner)),
+            flush=True,
+        )
+        return
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(name)s %(message)s",
@@ -77,6 +134,7 @@ def main() -> None:
                 "owner_id": processor.owner_id,
                 "lane_epoch": claimed.leader_epoch,
                 "lease_token": claimed.lease_token,
+                "process_id": os.getpid(),
             },
             sort_keys=True,
         )

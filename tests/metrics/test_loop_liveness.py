@@ -143,7 +143,7 @@ def test_the_periodic_runner_stamps_every_tick_and_every_job_it_ran(
     )
     assert any(
         line.startswith(
-            'gpu_fault_periodic_job_last_run_timestamp_seconds{job="cleanup"} '
+            'gpu_fault_periodic_job_last_run_timestamp_seconds{periodic_job="cleanup"} '
         )
         for line in lines
     ), lines
@@ -434,7 +434,7 @@ def test_periodic_errors_carry_last_seen_stamps_by_kind_and_job(monkeypatch) -> 
     )
     assert any(
         line.startswith(
-            'gpu_fault_periodic_job_error_last_seen_timestamp_seconds{job="training"} '
+            'gpu_fault_periodic_job_error_last_seen_timestamp_seconds{periodic_job="training"} '
         )
         for line in lines
     ), lines

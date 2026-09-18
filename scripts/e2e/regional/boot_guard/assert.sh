@@ -9,7 +9,7 @@
 #     failureThreshold=120 × periodSeconds=5 = 600 秒，会白等 10 分钟。
 #  2. 只读**唯一** Pod 的日志；label 下有多个 Pod 时直接拒绝判定（exit 2），
 #     否则文本与 readiness 可能来自不同 Pod，产生假 PASS / 假 FAIL。
-set -uo pipefail
+set -euo pipefail
 
 : "${CPU_KUBECONFIG:?}"
 : "${NAMESPACE:?}"
@@ -19,32 +19,40 @@ SEL="app=gpu-fault-api-guard-probe"
 elapsed=0
 
 while (( elapsed < deadline )); do
-  mapfile -t pods < <(kubectl --kubeconfig "${CPU_KUBECONFIG}" \
-    -n "${NAMESPACE}" get pod -l "${SEL}" \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
-  if (( ${#pods[@]} > 1 )); then
-    echo "FAIL: label 下有 ${#pods[@]} 个 Pod，证据归属不明（先跑 reset.sh）"
-    printf '  %s\n' "${pods[@]}"
+  inventory="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+    -n "${NAMESPACE}" get pod -l "${SEL}" -o json)"
+  count="$(jq -er 'if (.items | type) == "array" then .items | length else error("invalid Pod inventory") end' <<<"${inventory}")"
+  if (( count > 1 )); then
+    echo "FAIL: probe Pod identity is ambiguous; reset is required"
     exit 2
   fi
-  if (( ${#pods[@]} == 1 )) && [[ -n "${pods[0]}" ]]; then
-    pod="${pods[0]}"
+  if (( count == 1 )); then
+    pod="$(jq -er '.items[0].metadata.name | select(type == "string" and length > 0)' <<<"${inventory}")"
+    uid="$(jq -er '.items[0].metadata.uid | select(type == "string" and length > 0)' <<<"${inventory}")"
     logs="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      logs "${pod}" --tail=400 2>/dev/null)
-$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      logs "${pod}" --previous --tail=400 2>/dev/null)"
+      logs "${pod}" --tail=400)"
+    restarts="$(jq -er '[.items[0].status.containerStatuses[]?.restartCount] | if length > 0 then add else 0 end' <<<"${inventory}")"
+    if (( restarts > 0 )); then
+      previous="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+        logs "${pod}" --previous --tail=400)"
+      logs="${logs}"$'\n'"${previous}"
+    fi
     if grep -qF "${expect}" <<<"${logs}"; then
-      ready="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-        get pod "${pod}" \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
-      state="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-        get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].state}')"
-      echo "pod=${pod}; MATCHED expected text; ready=${ready}; state=${state}"
-      if [[ "${ready}" != "True" ]]; then
+      current="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+        get pod "${pod}" -o json)"
+      if ! jq -e --arg uid "${uid}" \
+        '.metadata.uid == $uid and .metadata.deletionTimestamp == null' \
+        <<<"${current}" >/dev/null; then
+        echo "FAIL: probe Pod changed during observation"
+        exit 1
+      fi
+      ready="$(jq -er '[.status.conditions[]? | select(.type == "Ready") | .status] | if length == 1 then .[0] else error("Ready condition missing or ambiguous") end' <<<"${current}")"
+      echo "pod=${pod}; MATCHED expected text; ready=${ready}"
+      if [[ "${ready}" == "False" ]]; then
         echo "PASS"
         exit 0
       fi
-      echo "FAIL: pod became Ready despite the guard"
+      echo "FAIL: probe readiness is True or unknown"
       exit 1
     fi
   fi

@@ -46,6 +46,20 @@ def test_test_and_performance_variables_are_not_runtime_configuration() -> None:
     )
 
 
+def test_fabric_manager_receipt_tag_is_not_an_environment_setting() -> None:
+    from gpu_fault.collectors.logs.fabric_manager_receipts import FM_RECEIPT_PREFIX
+    from gpu_fault.env_validation import unknown_gpu_fault_environment
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    tag = FM_RECEIPT_PREFIX.strip()
+    assert generator["concrete_name"](tag) is False, (
+        "a log protocol tag must not enter the configuration inventory"
+    )
+    assert unknown_gpu_fault_environment({tag: "1"}) == [tag], (
+        "the packaged production inventory must still reject a receipt tag"
+    )
+
+
 def test_value_kinds_follow_the_coercion_at_the_read_site() -> None:
     """The schema is derived from the code, so it cannot drift from it."""
 

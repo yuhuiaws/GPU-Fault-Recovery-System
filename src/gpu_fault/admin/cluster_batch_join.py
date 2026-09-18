@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,15 +21,25 @@ from gpu_fault.admin.cluster_join import (
     JoinAttempt,
     JoinClusterRequest,
     JoinExecution,
+    JoinInputs,
 )
-from gpu_fault.admin.cluster_join_engine import verify_report_summary
+from gpu_fault.admin.cluster_join_nodes import (
+    NodeClaims,
+    assert_batch_node_names_unique,
+    read_node_claims,
+    verify_join_node_names,
+)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
+    advance_batch_verification,
     build_verified_membership_evidence,
     clear_verified_step,
+    join_activation_is_irreversible,
     membership_runtime_snapshot,
-    verification_is_stale,
 )
+from gpu_fault.admin.cluster_join_failure_domains import publish_batch_failure_domains
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.cluster_join_state import (
     complete_step,
     completed_state_is_current,
@@ -40,14 +51,18 @@ from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
 )
-from gpu_fault.admin.site import RenderedSite
+from gpu_fault.admin.process_supervisor import (
+    ProcessSupervisionLost,
+    interruption_scope,
+)
+from gpu_fault.admin.site import RenderedSite, load_site
 
 # Read-only discovery and the per-cluster prerequisite work (IAM role, network
 # allow-list, node keys) fan out this wide. How many clusters *roll* at once is
 # not decided here: the release engine owns cluster parallelism through
 # ``spec.release.upgradeMaxParallelClusters`` and its own node wave caps, and
 # the batch reads that value (see ``deploy_concurrency``).
-PREPARE_PHASE_WORKERS = 4
+PREPARE_PHASE_WORKERS = DEPLOY_CONCURRENCY.candidate_clusters
 REGISTRY_SNAPSHOT_BEFORE = "installation-resources-before.json"
 
 
@@ -66,7 +81,11 @@ def deploy_concurrency(site: RenderedSite) -> int:
     """Clusters rolled at once: the site's ``upgradeMaxParallelClusters``."""
 
     configured = site.release_config["release"].get("upgrade_max_parallel_clusters")
-    return max(1, int(configured if configured is not None else 1))
+    if configured is None:
+        return 1
+    if type(configured) is not int or not 1 <= configured <= 8:
+        raise BootstrapError("join cluster parallelism must be an integer within 1..8")
+    return configured
 
 
 def _execution(attempt: JoinAttempt) -> JoinExecution:
@@ -102,23 +121,9 @@ def _initialize_context(
     for request in requests:
         attempt_state_dir, state_path, state = load_join_state(request)
         attempt = JoinAttempt(request, attempt_state_dir, state_path, state)
-        if state.get("phase") == "ROLLBACK_FAILED":
-            try:
-                join._rollback(
-                    request,
-                    state_dir=attempt_state_dir,
-                    state_path=state_path,
-                    state=state,
-                )
-            except BootstrapError as exc:
-                _record_failure(context, attempt, None, exc)
-                continue
-        if state.get("phase") == "ROLLED_BACK":
-            reset_completed_state(
-                request,
-                state_dir=attempt_state_dir,
-                state_path=state_path,
-                state=state,
+        if state.get("phase") == "SUPERVISION_LOST":
+            raise ProcessSupervisionLost(
+                "previous batch join ownership is unproven; automatic retry is forbidden"
             )
         if state.get("phase") == "COMPLETED":
             if completed_state_is_current(request, state):
@@ -165,11 +170,17 @@ def _run_readonly_tasks(
     ) as executor:
         if undiscovered and registry_path is not None:
             tasks[
-                executor.submit(join._export_registry, context.site, registry_path)
+                executor.submit(
+                    copy_context().run,
+                    join._export_registry,
+                    context.site,
+                    registry_path,
+                )
             ] = ("registry", None)
             for attempt in undiscovered:
                 tasks[
                     executor.submit(
+                        copy_context().run,
                         join._discover_join_target,
                         attempt.request,
                         context.runner_factory(),
@@ -177,6 +188,7 @@ def _run_readonly_tasks(
                 ] = ("discovery", attempt)
         tasks[
             executor.submit(
+                copy_context().run,
                 join._existing_cluster_networks,
                 context.runner_factory(),
                 context.site,
@@ -303,8 +315,11 @@ def _checkpoint_readonly_results(
 def _prepare_executions(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
+    *,
+    local_only: bool = False,
+    node_claims: NodeClaims | None = None,
 ) -> list[JoinAttempt]:
-    def prepare(attempt: JoinAttempt) -> JoinExecution | dict[str, Any]:
+    def prepare(attempt: JoinAttempt) -> JoinInputs | JoinExecution | dict[str, Any]:
         return join._prepare_execution(
             attempt.request,
             runner=context.runner_factory(),
@@ -313,42 +328,106 @@ def _prepare_executions(
             state=attempt.state,
             candidate_preflight=False,
             network_baseline=context.network_baseline,
+            local_inputs_only=local_only,
+            node_claims=node_claims,
         )
 
     prepared_attempts = []
+    failures: list[tuple[JoinAttempt, BaseException]] = []
     with ThreadPoolExecutor(
         max_workers=min(PREPARE_PHASE_WORKERS, len(attempts))
     ) as executor:
-        futures = {executor.submit(prepare, attempt): attempt for attempt in attempts}
+        futures = {
+            executor.submit(copy_context().run, prepare, attempt): attempt
+            for attempt in attempts
+        }
         for future in as_completed(futures):
             attempt = futures[future]
             try:
                 prepared = future.result()
-            except Exception as exc:
-                _record_failure(context, attempt, None, exc)
+                if isinstance(prepared, dict):
+                    context.results.append(prepared)
+                    continue
+                if local_only:
+                    if not isinstance(prepared, JoinInputs):
+                        raise BootstrapError(
+                            "batch join did not produce a node inventory"
+                        )
+                    attempt.inputs = prepared
+                else:
+                    if not isinstance(prepared, JoinExecution):
+                        raise BootstrapError("batch join did not produce a candidate")
+                    attempt.execution = prepared
+            except (Exception, KeyboardInterrupt) as exc:
+                failures.append((attempt, exc))
                 continue
-            if isinstance(prepared, dict):
-                context.results.append(prepared)
-                continue
-            attempt.execution = prepared
             prepared_attempts.append(attempt)
+    for attempt, error in failures:
+        _record_failure(context, attempt, None, error)
+    interruption = next(
+        (error for _attempt, error in failures if isinstance(error, KeyboardInterrupt)),
+        None,
+    )
+    if interruption is not None:
+        for attempt in prepared_attempts:
+            _record_failure(context, attempt, attempt.execution, interruption)
+        raise interruption
     return prepared_attempts
+
+
+def _prepare_with_node_barrier(
+    context: BatchJoinContext, attempts: list[JoinAttempt]
+) -> list[JoinAttempt]:
+    local = _prepare_executions(context, attempts, local_only=True)
+    if not local:
+        return []
+    try:
+        inventories = []
+        for attempt in local:
+            if attempt.inputs is None:
+                raise BootstrapError("batch join is missing its target node inventory")
+            inventories.append(attempt.inputs)
+        assert_batch_node_names_unique(inventories)
+        claims = read_node_claims(context.site, context.runner_factory())
+        for attempt, inputs in zip(local, inventories, strict=True):
+            if not join_activation_is_irreversible(attempt.state):
+                verify_join_node_names(
+                    attempt.request,
+                    inputs,
+                    claims=claims,
+                    state_path=attempt.state_path,
+                    state=attempt.state,
+                    runner=context.runner_factory(),
+                )
+    except (Exception, KeyboardInterrupt) as exc:
+        for attempt in local:
+            _record_failure(context, attempt, None, exc)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return []
+    return _prepare_executions(context, local, node_claims=claims)
 
 
 def _record_failure(
     context: BatchJoinContext,
     attempt: JoinAttempt,
     execution: JoinExecution | None,
-    error: Exception,
+    error: BaseException,
 ) -> None:
+    if isinstance(error, join.JoinTargetIdentityError):
+        attempt.state["phase"] = "BLOCKED_IDENTITY"
+        write_json_atomic(attempt.state_path, attempt.state)
+        context.failures[attempt.request.gpu_cluster_arn] = diagnostic_text(str(error))
+        return
     try:
-        join._record_join_failure(attempt, execution)
+        join._record_join_failure(attempt, execution, error=error)
     except Exception as rollback_error:
         context.failures[attempt.request.gpu_cluster_arn] = (
-            f"{error}; rollback failed: {rollback_error}"
+            f"{diagnostic_text(str(error))}; rollback failed: "
+            + diagnostic_text(str(rollback_error))
         )
     else:
-        context.failures[attempt.request.gpu_cluster_arn] = str(error)
+        context.failures[attempt.request.gpu_cluster_arn] = diagnostic_text(str(error))
 
 
 def _preflight_candidate(
@@ -357,16 +436,20 @@ def _preflight_candidate(
 ) -> list[JoinAttempt]:
     if not attempts:
         return []
-    candidate = join._write_batch_candidate_site(
-        context.site,
-        [_execution(item) for item in attempts],
-        state_dir=context.candidate_dir,
-    )
     try:
+        candidate = join._write_batch_candidate_site(
+            load_site(
+                context.site.source, repository_root=context.site.repository_root
+            ),
+            [_execution(item) for item in attempts],
+            state_dir=context.candidate_dir,
+        )
         join._run_rollout(candidate, "preflight")
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         for attempt in attempts:
             _record_failure(context, attempt, attempt.execution, exc)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         return []
     for attempt in attempts:
         attempt.execution = replace(
@@ -383,11 +466,13 @@ def _deploy_clusters(
     deployed: list[JoinAttempt] = []
     if not attempts:
         return deployed
+    failures: list[tuple[JoinAttempt, BaseException]] = []
     with ThreadPoolExecutor(
         max_workers=min(deploy_concurrency(context.site), len(attempts))
     ) as executor:
         futures = {
             executor.submit(
+                copy_context().run,
                 join._deploy_cluster,
                 execution=_execution(attempt),
                 state_path=attempt.state_path,
@@ -399,10 +484,20 @@ def _deploy_clusters(
             attempt = futures[future]
             try:
                 future.result()
-            except Exception as exc:
-                _record_failure(context, attempt, attempt.execution, exc)
+            except (Exception, KeyboardInterrupt) as exc:
+                failures.append((attempt, exc))
                 continue
             deployed.append(attempt)
+    for attempt, error in failures:
+        _record_failure(context, attempt, attempt.execution, error)
+    interruption = next(
+        (error for _attempt, error in failures if isinstance(error, KeyboardInterrupt)),
+        None,
+    )
+    if interruption is not None:
+        for attempt in deployed:
+            _record_failure(context, attempt, attempt.execution, interruption)
+        raise interruption
     return deployed
 
 
@@ -412,45 +507,23 @@ def _verify_deployed(
 ) -> list[JoinAttempt]:
     if not attempts:
         return []
-    for attempt in attempts:
-        verified = (attempt.state.get("evidence") or {}).get("VERIFIED")
-        if step_done(attempt.state, "VERIFIED") and verification_is_stale(
-            verified if isinstance(verified, dict) else {}
-        ):
-            clear_verified_step(attempt.state_path, attempt.state)
-    candidate = join._write_batch_candidate_site(
-        context.site,
-        [_execution(item) for item in attempts],
-        state_dir=context.candidate_dir,
-    )
-    before = membership_runtime_snapshot(candidate)
     try:
-        report = join._verify_candidate(
-            candidate,
-            {
-                _execution(attempt).cluster_id: join._collectors_ready_evidence(
-                    attempt.state
-                )
-                for attempt in attempts
-            },
+        candidate = join._write_batch_candidate_site(
+            load_site(
+                context.site.source, repository_root=context.site.repository_root
+            ),
+            [_execution(item) for item in attempts],
+            state_dir=context.candidate_dir,
         )
-    except Exception as exc:
-        for attempt in attempts:
-            _record_failure(context, attempt, attempt.execution, exc)
-        return []
-    after = membership_runtime_snapshot(candidate)
-    verify_summary = verify_report_summary(report)
-    verified_at = datetime.now(timezone.utc)
-    candidate_cluster_ids = [
-        str(item["cluster_id"]) for item in candidate.release_config["clusters"]
-    ]
-    for attempt in attempts:
-        attempt.execution = replace(
-            _execution(attempt),
-            candidate=candidate,
-        )
-        if not step_done(attempt.state, "VERIFIED"):
-            evidence = build_verified_membership_evidence(
+        before = membership_runtime_snapshot(candidate)
+        join._run_rollout(candidate, "verify")
+        after = membership_runtime_snapshot(candidate)
+        verified_at = datetime.now(timezone.utc)
+        candidate_cluster_ids = [
+            str(item["cluster_id"]) for item in candidate.release_config["clusters"]
+        ]
+        records = [
+            build_verified_membership_evidence(
                 before,
                 after,
                 candidate_site_sha256=candidate.source_sha256,
@@ -463,8 +536,31 @@ def _verify_deployed(
                 batch_id=context.batch_id,
                 verified_at=verified_at,
             )
-            evidence["verify"] = verify_summary
-            complete_step(attempt.state_path, attempt.state, "VERIFIED", evidence)
+            for attempt in attempts
+        ]
+        for attempt, record in zip(attempts, records, strict=True):
+            attempt.execution = replace(
+                _execution(attempt),
+                candidate=candidate,
+            )
+            complete_step(
+                attempt.state_path,
+                attempt.state,
+                "VERIFIED",
+                {**record, "candidate_site_file": str(candidate.source)},
+            )
+        try:
+            publish_batch_failure_domains(attempts)
+        except JoinVerificationExpired:
+            # The commit loop owns the bounded, shared re-verification path.
+            # Expiry here must not roll back healthy, still-PENDING data planes.
+            pass
+    except (Exception, KeyboardInterrupt) as exc:
+        for attempt in attempts:
+            _record_failure(context, attempt, attempt.execution, exc)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        return []
     return attempts
 
 
@@ -488,6 +584,7 @@ def _commit_clusters(
                 state_path=attempt.state_path,
                 state=attempt.state,
             )
+            context.results.append(join._complete_join(attempt, execution))
         except JoinVerificationExpired as exc:
             # Earlier commits of this batch used up the window. The clusters
             # still waiting share one candidate file, so all of them are
@@ -505,10 +602,37 @@ def _commit_clusters(
                 clear_verified_step(item.state_path, item.state)
             pending = ordered(_verify_deployed(context, remaining))
             continue
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             _record_failure(context, attempt, execution, exc)
+            if isinstance(exc, KeyboardInterrupt):
+                for remaining_attempt in pending:
+                    _record_failure(
+                        context, remaining_attempt, remaining_attempt.execution, exc
+                    )
+                raise
+            pending = ordered(_verify_deployed(context, pending))
             continue
-        context.results.append(join._complete_join(attempt, execution))
+        reversible = [
+            item for item in pending if not join_activation_is_irreversible(item.state)
+        ]
+        try:
+            for item in reversible:
+                evidence = item.state["evidence"]["VERIFIED"]
+                complete_step(
+                    item.state_path,
+                    item.state,
+                    "VERIFIED",
+                    advance_batch_verification(
+                        evidence,
+                        committed_evidence=attempt.state["evidence"]["VERIFIED"],
+                        final_identity=attempt.state["evidence"]["FINAL_VERIFIED"],
+                        cluster_id=execution.cluster_id,
+                    ),
+                )
+        except Exception as exc:
+            for item in reversible:
+                _record_failure(context, item, item.execution, exc)
+            pending = [item for item in pending if item not in reversible]
 
 
 def _finish(context: BatchJoinContext) -> dict[str, Any]:
@@ -553,20 +677,55 @@ def _join_clusters_locked(
     context, attempts = _initialize_context(requests, runner_factory=runner_factory)
     if not attempts:
         return _finish(context)
-    discoveries, registry_path = _run_readonly_tasks(context, attempts)
-    attempts = _checkpoint_readonly_results(
-        context,
-        attempts,
-        discoveries,
-        registry_path,
-    )
-    if not attempts:
-        return _finish(context)
-    prepared = _prepare_executions(context, attempts)
-    prepared = _preflight_candidate(context, prepared)
-    deployed = _deploy_clusters(context, prepared)
-    verified = _verify_deployed(context, deployed)
-    _commit_clusters(context, verified)
+    try:
+        recovered = []
+        for attempt in attempts:
+            try:
+                join.resume_join_rollback(attempt, context.runner_factory())
+            except (Exception, KeyboardInterrupt) as exc:
+                _record_failure(context, attempt, None, exc)
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                continue
+            recovered.append(attempt)
+        if not recovered:
+            return _finish(context)
+        context.site = load_site(
+            context.site.source, repository_root=context.site.repository_root
+        )
+        for attempt in recovered:
+            attempt.request = replace(attempt.request, site=context.site)
+        discoveries, registry_path = _run_readonly_tasks(context, recovered)
+        active = _checkpoint_readonly_results(
+            context,
+            recovered,
+            discoveries,
+            registry_path,
+        )
+        if not active:
+            return _finish(context)
+        prepared = _prepare_with_node_barrier(context, active)
+        irreversible = [
+            attempt
+            for attempt in prepared
+            if join_activation_is_irreversible(attempt.state)
+        ]
+        _commit_clusters(context, irreversible)
+        prepared = [attempt for attempt in prepared if attempt not in irreversible]
+        prepared = _preflight_candidate(context, prepared)
+        deployed = _deploy_clusters(context, prepared)
+        verified = _verify_deployed(context, deployed)
+        _commit_clusters(context, verified)
+    except ProcessSupervisionLost as exc:
+        for attempt in attempts:
+            if attempt.state.get("phase") != "COMPLETED":
+                try:
+                    join.record_join_supervision_loss(attempt)
+                except Exception:
+                    exc.add_note(
+                        "batch join could not persist unproven command ownership"
+                    )
+        raise
     return _finish(context)
 
 
@@ -577,8 +736,33 @@ def join_clusters(
 ) -> dict[str, Any]:
     if not requests:
         return {"phase": "COMPLETED", "joined": [], "already_managed": []}
-    with membership_operation_lock(requests[0].site):
+    if any(
+        request.site.source.resolve() != requests[0].site.source.resolve()
+        for request in requests
+    ):
+        raise BootstrapError("batch join requests must use the same managed site")
+    with membership_operation_lock(requests[0].site), interruption_scope(wait_all=True):
         current = reload_site_for_mutation(requests[0].site)
+        from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
+
+        if load_admin_custody(current.source.parent) is not None:
+            results = []
+            for request in requests:
+                current = reload_site_for_mutation(current)
+                results.append(
+                    join._join_cluster_locked(
+                        replace(request, site=current), runner=runner_factory()
+                    )
+                )
+            return {
+                "phase": "COMPLETED",
+                "joined": [
+                    item for item in results if item.get("phase") != "ALREADY_MANAGED"
+                ],
+                "already_managed": [
+                    item for item in results if item.get("phase") == "ALREADY_MANAGED"
+                ],
+            }
         return _join_clusters_locked(
             tuple(replace(request, site=current) for request in requests),
             runner_factory=runner_factory,

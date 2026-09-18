@@ -1,7 +1,8 @@
 """The ``gpu_fault_objects`` wakeup trigger fires on the same condition the
 in-process hub does, and ``run_wakeup_listener`` delivers it.
 
-Schema v14. One row trigger on ``gpu_fault_objects`` publishes
+Schema v14's row trigger on ``gpu_fault_objects`` and the v15/v16 dedicated
+table triggers publish the same notifications in all three migration modes:
 ``gpu_fault_workflow_dispatch`` for a workflow row that became executable (or
 whose scan-ordering fields changed) and ``gpu_fault_remote_command`` for every
 remote-command status transition. Lease renewals and step-evidence writes stay
@@ -22,6 +23,7 @@ import pytest
 
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
 from gpu_fault.regional import RemoteActionCommand
+from gpu_fault.state_table_migrate import backfill_state_table, set_state_table_mode
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.contracts import WakeupChannel
 from tests._builders import fault_incident, workflow_request, workflow_step
@@ -36,12 +38,29 @@ WAIT = 3.0
 QUIET = 0.5
 
 
-@pytest.fixture
-def store():
+@pytest.fixture(params=["legacy", "dual", "dedicated"])
+def store(request):
+    import psycopg
+
     assert POSTGRES_URL is not None
-    instance = PostgresStore(POSTGRES_URL)
     _truncate()
+    instance = PostgresStore(POSTGRES_URL)
     try:
+        if request.param != "legacy":
+            with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+                for kind in ("remote_command", "workflow"):
+                    set_state_table_mode(
+                        connection, kind, "dual", expected_mode="legacy"
+                    )
+                    if request.param == "dedicated":
+                        backfill_state_table(connection, kind)
+                        set_state_table_mode(
+                            connection,
+                            kind,
+                            "dedicated",
+                            expected_mode="dual",
+                            confirm_dedicated=True,
+                        )
         yield instance
     finally:
         instance.close()

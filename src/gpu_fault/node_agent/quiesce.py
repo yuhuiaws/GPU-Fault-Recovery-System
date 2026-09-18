@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.node_agent.late_ownership import require_physical_ownership
+
 import hashlib
 import json
 import logging
@@ -75,6 +77,26 @@ def read_boot_id(path: Path = BOOT_ID_PATH) -> str:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def _arm_quiesce_failsafe(
+    manager: GpuServiceQuiesceManager, timer_unit: str, state_path: Path
+) -> None:
+    require_physical_ownership()
+    manager._run(
+        [
+            "systemd-run",
+            f"--unit={timer_unit}",
+            f"--on-active={manager.failsafe_seconds}s",
+            f"--on-unit-active={manager.retry_seconds}s",
+            "--timer-property=AccuracySec=1s",
+            "--property=Type=oneshot",
+            manager.restore_command,
+            "--state-file",
+            str(state_path),
+        ],
+        check=True,
+    )
 
 
 class GpuServiceQuiesceManager:
@@ -640,20 +662,7 @@ class GpuServiceQuiesceManager:
             }
             self._write_state(state_path, state)
             try:
-                self._run(
-                    [
-                        "systemd-run",
-                        f"--unit={timer_unit}",
-                        f"--on-active={self.failsafe_seconds}s",
-                        f"--on-unit-active={self.retry_seconds}s",
-                        "--timer-property=AccuracySec=1s",
-                        "--property=Type=oneshot",
-                        self.restore_command,
-                        "--state-file",
-                        str(state_path),
-                    ],
-                    check=True,
-                )
+                _arm_quiesce_failsafe(self, timer_unit, state_path)
             except Exception:
                 state_path.unlink(missing_ok=True)
                 raise
@@ -762,7 +771,7 @@ class GpuServiceQuiesceManager:
         for state_path in sorted(self.state_dir.glob("quiesce-*.json")):
             try:
                 state = self._read_state(state_path) or {}
-            except RuntimeError as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 report["failed"].append(
                     {"state_path": str(state_path), "error": str(exc)}
                 )

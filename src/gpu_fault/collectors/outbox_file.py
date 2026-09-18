@@ -352,7 +352,7 @@ class OutboxFile:
             return False
 
     def append(self, record: dict[str, Any]) -> int:
-        """Add one record with a single append and one ``fsync``.
+        """Add one record, syncing new directory entries before its first write.
 
         Append-only is what makes buffering during an outage O(1) instead of a
         full re-parse and rewrite per event (F4). A crash between the write and
@@ -373,6 +373,13 @@ class OutboxFile:
         line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
         lines_added = 1
         with open(self.path, "a", encoding="utf-8") as handle:
+            if os.fstat(handle.fileno()).st_size == 0:
+                # ``locked()`` may have created ancestors before this call.
+                # Publish the empty file and its whole ancestry before writing:
+                # a failed sync leaves it empty, so even a fresh writer retries.
+                parent = self.path.absolute().parent
+                for directory in (parent, *parent.parents):
+                    self._fsync_directory(directory, required=True)
             if self.ends_mid_line():
                 LOGGER.warning(
                     "collector outbox %s ends in a partial record; closing that "
@@ -419,26 +426,33 @@ class OutboxFile:
             raise
         self._fsync_directory()
 
-    def _fsync_directory(self) -> None:
-        """Persist the rename itself; a failure here is not a failed write."""
+    def _fsync_directory(
+        self, directory: Path | None = None, *, required: bool = False
+    ) -> None:
+        """Sync directory entries; first-file publication must fail closed."""
 
+        directory = self.path.parent if directory is None else directory
         try:
-            descriptor = os.open(self.path.parent, os.O_RDONLY)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         except OSError as exc:
             LOGGER.warning(
-                "cannot open collector outbox directory %s to fsync the rename: %s",
-                self.path.parent,
+                "cannot open collector outbox directory %s to fsync its entries: %s",
+                directory,
                 exc,
             )
+            if required:
+                raise
             return
         try:
             os.fsync(descriptor)
         except OSError as exc:
             LOGGER.warning(
                 "collector outbox directory %s could not be fsynced: %s",
-                self.path.parent,
+                directory,
                 exc,
             )
+            if required:
+                raise
         finally:
             os.close(descriptor)
 

@@ -8,6 +8,9 @@ from typing import Any
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
+    CheckValue,
+    _check,
+    _report,
     # The same tolerant wrapper the checks use: a release object that predates
     # the read cache, or a test double standing in for one, has no
     # `_read_snapshot` and gets a `nullcontext` instead of an AttributeError.
@@ -15,20 +18,46 @@ from gpu_fault_release.regional_admin_checks import (
 )
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
+    build_preflight_report,
     build_quick_health_report,
 )
-from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_aurora_refresh import (
+    validate_aurora_refresh_snapshot,
+)
+from gpu_fault_release.regional_release_config import ReleaseError, canonical_sha256
 from gpu_fault_release.regional_release_diff import (
+    PLAN_ORDER,
     ReleaseChangeKind,
+    ReleaseComponent,
     ReleaseDiff,
+    ReleaseExecutionPlan,
     build_execution_plan,
     classify_release,
     diff_from_changed,
 )
 from gpu_fault_release.regional_release_narration import narrate_step
-from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
+from gpu_fault_release.regional_release_orchestration import (
+    SUPERSEDABLE_PHASES,
+    _validate_upgrade_transaction,
+    inherit_superseded_previous,
+)
+from gpu_fault_release.regional_release_prerequisite_repair import (
+    bootstrap_workflow_proof,
+    matches_pre_repair_state,
+    prepare_prerequisite_repair,
+)
+from gpu_fault_release.regional_release_progress import (
+    BOOTSTRAP_PHASES as BOOTSTRAP_PHASES,
+)
+from gpu_fault_release.regional_release_progress import (
+    build_rollback_compensation_plan,
+)
 from gpu_fault_release.regional_release_reporting import build_release_status
 from gpu_fault_release.regional_release_transaction import commit_live_release
+from gpu_fault_release.regional_release_workflow_safety import (
+    workflow_safety_snapshot,
+)
+from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = repository_root()
@@ -45,12 +74,10 @@ RESUMABLE_PHASES = frozenset(
     {
         "preflight",
         "uploaded",
-        # The candidate node preflight runs beside the control-plane phases and
-        # is joined before the data plane, so it can be the recorded phase of a
-        # release that has already staged the CPU roles. Omitting it made a crash
-        # there look terminal, which discards `completed_phases` and
-        # `cluster_attempts` and starts the whole transaction over.
+        # Candidate preflight gates DDL and runtime mutation. Its durable stamp
+        # must remain resumable without discarding the transaction checkpoints.
         "candidate-preflight-ready",
+        "aurora-refresh-ready",
         "schema-ready",
         "registry-staged",
         "cpu-staged",
@@ -68,6 +95,8 @@ RESUMABLE_PHASES = frozenset(
 ROLLBACK_PHASES = frozenset(
     {
         "rollback-started",
+        "rollback-aurora-refresh-restoring",
+        "rollback-aurora-refresh-restored",
         "rollback-controller-staging",
         "rollback-controller-staged",
         "rollback-observability-restoring",
@@ -87,19 +116,6 @@ ROLLBACK_PHASES = frozenset(
         "rollback-verifying",
         "rollback-verified",
         "rollback-failed",
-    }
-)
-BOOTSTRAP_PHASES = frozenset(
-    {
-        "bootstrap-started",
-        "bootstrap-cpu-ready",
-        "bootstrap-endpoint-ready",
-        "bootstrap-data-plane-progress",
-        "bootstrap-failed",
-        "bootstrap-cleanup-started",
-        "bootstrap-cleanup-progress",
-        "bootstrap-cleanup-failed",
-        "bootstrap-cleaned",
     }
 )
 
@@ -165,17 +181,16 @@ def _terminal_failed_transaction(state: dict[str, Any]) -> bool:
 
 
 def _control_plane_installed(release: Any) -> bool:
-    return bool(
-        release.runner.probe(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
-                inventory.CPU_INGRESS_DEPLOYMENT,
-            )
-        )
-    )
+    return probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef(
+            "deployment",
+            "Deployment",
+            inventory.CPU_INGRESS_DEPLOYMENT,
+            release.config.namespace,
+        ),
+    ).exists()
 
 
 def _bootstrap_required(release: Any, state: dict[str, Any] | None) -> bool:
@@ -383,9 +398,15 @@ def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
     return classify_release(release, state).as_dict()
 
 
-def _require_expected_state(state: dict[str, Any]) -> None:
+def _require_expected_state(state: dict[str, Any], release: Any = None) -> None:
     expected = os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip()
-    if expected and release_state_sha256(state) != expected:
+    if (
+        expected
+        and release_state_sha256(state) != expected
+        and not (
+            release is not None and matches_pre_repair_state(release, state, expected)
+        )
+    ):
         raise ReleaseError(
             "regional release state changed after the deployment diff was calculated"
         )
@@ -522,15 +543,13 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
 
 
 def run_deploy(release: Any) -> None:
-    state_exists = release.runner.probe(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "configmap",
-            STATE_CONFIG_MAP,
+    state_exists = probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef(
+            "configmap", "ConfigMap", STATE_CONFIG_MAP, release.config.namespace
         ),
-    )
+    ).exists()
     expected_state = os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip()
     if expected_state and not state_exists:
         raise ReleaseError(
@@ -562,7 +581,7 @@ def run_deploy(release: Any) -> None:
         release.bootstrap()
         return
     assert state is not None
-    _require_expected_state(state)
+    _require_expected_state(state, release)
     phase = str(state.get("phase") or "")
     if _rollback_pending(state):
         release.rollback()
@@ -634,6 +653,138 @@ def run_deploy(release: Any) -> None:
     release.upgrade(diff=diff)
 
 
+def _rollback_preflight_plan(
+    release: Any, state: dict[str, Any]
+) -> ReleaseExecutionPlan:
+    previous = state.get("previous")
+    if (
+        not isinstance(previous, dict)
+        or not previous
+        or canonical_sha256(previous) != state.get("previous_snapshot_sha256")
+    ):
+        raise ReleaseError("rollback preflight requires a trusted previous snapshot")
+    compensation = build_rollback_compensation_plan(
+        state, (target.cluster_id for target in release.config.clusters)
+    )
+    if compensation.global_has(ReleaseComponent.AURORA_REFRESH):
+        validate_aurora_refresh_snapshot(release, previous.get("aurora_refresh"))
+    if compensation.global_has(ReleaseComponent.OBSERVABILITY):
+        monitoring = previous.get("observability")
+        if not isinstance(monitoring, dict) or not isinstance(
+            monitoring.get("adot"), dict
+        ):
+            raise ReleaseError(
+                "rollback preflight requires a complete monitoring snapshot"
+            )
+    return ReleaseExecutionPlan(
+        tuple(item for item in PLAN_ORDER if compensation.global_has(item))
+    )
+
+
+def complete_deploy_workflow_preflight(
+    release: Any, report: dict[str, Any], *, bootstrap: bool
+) -> dict[str, Any]:
+    def check() -> CheckValue:
+        proof = (
+            bootstrap_workflow_proof(release)
+            if bootstrap
+            else workflow_safety_snapshot(release)
+        )
+        return CheckValue("fresh database/workflow safety proof passed", proof)
+
+    return _report(
+        "preflight", release, [*report["checks"], _check("workflow_safety", check)]
+    )
+
+
+def build_deploy_preflight_report(release: Any) -> dict[str, Any]:
+    """Only the deploy driver may defer resources its actual plan will repair."""
+    state_exists = probe_resource(
+        release.runner,
+        release._cpu(),
+        ResourceRef(
+            "configmap", "ConfigMap", STATE_CONFIG_MAP, release.config.namespace
+        ),
+    ).exists()
+    state = release._load_state() if state_exists else None
+    if state is not None and (
+        not isinstance(state, dict)
+        or not isinstance(state.get("release_id"), str)
+        or not state["release_id"]
+        or state.get("phase")
+        not in (
+            BOOTSTRAP_PHASES
+            | RESUMABLE_PHASES
+            | ROLLBACK_PHASES
+            | {"complete", "rolled-back"}
+        )
+    ):
+        raise ReleaseError(
+            "deployment preflight release state is incomplete or unknown"
+        )
+    if state is None and os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip():
+        raise ReleaseError(
+            "regional release state disappeared before deployment preflight"
+        )
+    bootstrap = _bootstrap_required(release, state)
+    if bootstrap:
+        if not release.config.clusters:
+            raise ReleaseError(
+                "initial regional bootstrap requires at least one GPU cluster"
+            )
+        diff = diff_from_changed(
+            {"aurora_refresh_manifests", "observability_manifests"}
+        )
+    else:
+        assert state is not None
+        _require_expected_state(state, release)
+        if supersede_requested():
+            _require_supersede_target(release, state)
+        else:
+            _refuse_foreign_candidate_resume(release, state)
+        if _rollback_pending(state):
+            return build_preflight_report(
+                release, repair_plan=_rollback_preflight_plan(release, state)
+            )
+        decision = next_deploy(release, state)
+        if decision.get("action", "upgrade") not in {"upgrade", "resume"}:
+            return build_preflight_report(release)
+        planned_diff = stored_release_diff({"release_diff": decision})
+        if planned_diff is None:
+            raise ReleaseError("deployment preflight has no verified release plan")
+        diff = planned_diff
+    plan = build_execution_plan(diff)
+    repair = plan.has(ReleaseComponent.AURORA_REFRESH)
+    report = build_preflight_report(
+        release, repair_plan=plan, bootstrap=bootstrap, include_workflow=not repair
+    )
+    if not repair or not report["healthy"]:
+        return report
+    previous_override = None
+    if not bootstrap:
+        assert state is not None
+        supersede = state if supersede_requested() else None
+        _validate_upgrade_transaction(
+            release,
+            diff,
+            plan,
+            resume=bool(decision.get("resume")) and supersede is None,
+            supersede=supersede,
+        )
+        if supersede is not None:
+            previous_override = inherit_superseded_previous(release, supersede)
+    prepare_prerequisite_repair(
+        release,
+        diff=diff,
+        plan=plan,
+        bootstrap=bootstrap,
+        previous_override=previous_override,
+        resume=not bootstrap and bool(decision.get("resume")) and supersede is None,
+        commit_live=not bootstrap and bool(decision.get("commits_live_release_id")),
+    )
+    return complete_deploy_workflow_preflight(release, report, bootstrap=bootstrap)
+
+
 def build_release_diff(release: Any) -> dict[str, Any]:
     state = release._load_state()
     return {
@@ -645,7 +796,7 @@ def build_release_diff(release: Any) -> dict[str, Any]:
 
 def stage_noop_release(release: Any) -> None:
     state = release._load_state()
-    _require_expected_state(state)
+    _require_expected_state(state, release)
     if _bootstrap_required(release, state):
         raise ReleaseError(
             "stage-noop refused: the control plane is not installed; deploy bootstraps it"

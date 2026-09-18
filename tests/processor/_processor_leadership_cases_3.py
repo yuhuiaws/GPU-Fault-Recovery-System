@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.app.process_metrics import parse_lines
 from gpu_fault.processor import (
     ProcessorCoordinator,
     ProcessorLanePolicy,
@@ -129,14 +130,14 @@ def test_replay_tracker_exposes_the_receiving_handler_phase(monkeypatch) -> None
     )[0]
     entered = Event()
     release = Event()
-    normalize = context.hma.normalize_kernel
+    normalize = context.nvidia_logs.normalize_kernel
 
     def blocked_normalize(event):
         entered.set()
         release.wait(5)
         return normalize(event)
 
-    monkeypatch.setattr(context.hma, "normalize_kernel", blocked_normalize)
+    monkeypatch.setattr(context.nvidia_logs, "normalize_kernel", blocked_normalize)
 
     async def scenario():
         async with asgi_client(app) as client:
@@ -1033,9 +1034,13 @@ def test_event_loop_lag_monitor_advances(monkeypatch) -> None:
                 return response.text
 
     metrics = asyncio.run(scenario())
-    line = next(
-        item
-        for item in metrics.splitlines()
-        if item.startswith("gpu_fault_event_loop_lag_seconds_count ")
-    )
-    assert int(line.rsplit(" ", 1)[1]) >= 1
+    samples = [
+        sample
+        for sample in parse_lines(metrics.splitlines()).samples[
+            "gpu_fault_event_loop_lag_seconds"
+        ]
+        if sample.name == "gpu_fault_event_loop_lag_seconds_count"
+    ]
+    assert len(samples) == 1
+    assert dict(samples[0].labels) == {"process": "0"}
+    assert int(samples[0].value) >= 1

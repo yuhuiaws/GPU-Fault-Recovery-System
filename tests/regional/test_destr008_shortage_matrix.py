@@ -17,6 +17,7 @@ import pytest
 
 from scripts.e2e.regional import run_destr008_warm_spare_shortage as destr008
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
+from tests.regional._destr008_scenario import bind_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 REGIONAL = ROOT / "scripts/e2e/regional"
@@ -65,7 +66,21 @@ class _RestoreRecorder:
         return {"node": node, "lifecycle_state": "ACTIVE"}
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
-        return {"name": node, "annotations": {"gpu-fault.io/incident-id": self.owner}}
+        return {
+            "name": node,
+            "uid": "node-uid",
+            "annotations": {"gpu-fault.io/incident-id": self.owner},
+        }
+
+    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
+        return {
+            "incident_id": incident_id,
+            "cluster_id": "cluster-a",
+            "job_id": "job-a",
+            "attempt_id": "attempt-a",
+            "node_ids": ["node-a"],
+            "event_id": incident_id.removeprefix("inc-"),
+        }
 
     def wait_incident_idle(self, incident_id: str) -> dict[str, Any]:
         self.waited.append(incident_id)
@@ -77,7 +92,16 @@ class _RestoreRecorder:
         self.restored_incidents.append(incident_id)
         return {"workflow_request_id": f"workflow-validated-restore-{incident_id}"}
 
-    def wait_workflow_id(self, workflow_id: str) -> dict[str, Any]:
+    def wait_workflow_id(
+        self, workflow_id: str, *, timeout_seconds: int = 900
+    ) -> dict[str, Any]:
+        if workflow_id == "workflow-a":
+            return {
+                "request_id": workflow_id,
+                "runtime_profile_version": "hyperpod-v1",
+                "incident_id": "incident-a",
+                "status": "FAILED",
+            }
         return {"request_id": workflow_id, "status": "SUCCEEDED"}
 
 
@@ -119,8 +143,22 @@ def test_destr008_cleanup_restores_nothing_when_the_node_is_unowned(
 class _ServiceRecorder:
     """Stands in for the host-probe fixture the service scenarios drive."""
 
-    def __init__(self, warm: Any, *, node: str, image: str, case_id: str, run_id: str):
+    def __init__(
+        self,
+        warm: Any,
+        *,
+        node: str,
+        image: str,
+        case_id: str,
+        run_id: str,
+        state_directory: Path,
+        node_uid: str,
+        plan_sha256: str,
+        release_id: str,
+        maintenance_expires_at: datetime,
+    ):
         self.node = node
+        self.state_directory = state_directory
         self.created = False
         self.stops: list[dict[str, Any]] = []
         self.failsafe_at: datetime | None = None
@@ -170,16 +208,15 @@ def _fixture(
 
     monkeypatch.setattr(destr008, "WarmSpareServiceFixture", build)
     warm = _WaitRecorder()
-    return (
-        destr008.ScenarioFixture(
-            _settings(tmp_path),
-            warm,
-            scenario=scenario,
-            run_id=f"destr008-{scenario}-2",
-        ),
+    fixture = destr008.ScenarioFixture(
+        _settings(tmp_path),
         warm,
-        built,
+        scenario=scenario,
+        run_id=f"destr008-{scenario}-2",
+        state_directory=tmp_path / "host-probes",
     )
+    bind_fixture(fixture)
+    return fixture, warm, built
 
 
 @pytest.mark.parametrize(
@@ -202,6 +239,7 @@ def test_a_service_scenario_stops_the_unit_only_after_the_workload_is_running(
     fixture, warm, built = _fixture(monkeypatch, tmp_path, scenario)
 
     early = fixture.apply()
+    assert built[0].state_directory == tmp_path / "host-probes"
 
     assert built[0].created is True, built
     assert built[0].stops == [], built[0].stops
@@ -236,7 +274,17 @@ def test_a_service_scenario_stops_the_unit_only_after_the_workload_is_running(
 class _HolderRecorder:
     """The GPU holder Pod: named on construction, created on demand."""
 
-    def __init__(self, warm: Any, *, node: str, run_id: str) -> None:
+    def __init__(
+        self,
+        warm: Any,
+        *,
+        node: str,
+        run_id: str,
+        state_directory: Path,
+        node_uid: str,
+        plan_sha256: str,
+        release_id: str,
+    ) -> None:
         self.node = node
         self.name = f"holder-{run_id}"
         self.created = False
@@ -382,7 +430,10 @@ def _shortage_state(
             "official_steps": [
                 {
                     "operation": "REPLACE_NODE",
-                    "parameters": {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"},
+                    "parameters": {
+                        "replacement_strategy": "HEALTHY_WARM_SPARE_ONLY",
+                        "activation_forbidden": True,
+                    },
                 }
             ],
             "step_executions": [

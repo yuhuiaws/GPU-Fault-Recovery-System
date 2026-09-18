@@ -53,11 +53,33 @@ def test_cleanup_inventory_covers_production_manifests_bidirectionally() -> None
         unregistered = {
             resource for resource in actual - registered if resource[0] not in implicit
         }
-        stale = registered - actual
+        retired = {
+            (item["kind"], item["name"])
+            for item in section["resources"]
+            if item.get("retired")
+        }
+        stale = registered - actual - retired
         assert not unregistered, (
             f"{plane} manifests lack cleanup entries: {unregistered}"
         )
         assert not stale, f"{plane} cleanup entries lack manifests: {stale}"
+        assert not retired & actual, "retired resources must not be deployable"
+
+
+def test_retired_hma_resources_remain_cleanup_only() -> None:
+    retired = [item for item in inventory()["gpu"]["resources"] if item.get("retired")]
+    assert {(item["kind"], item["name"]) for item in retired} == {
+        ("deployment", "gpu-fault-hma-watcher"),
+        ("deployment", "gpu-fault-hma-cloudwatch-consumer"),
+        ("clusterrole", "gpu-fault-hma-watcher"),
+        ("clusterrolebinding", "gpu-fault-hma-watcher"),
+        ("serviceaccount", "gpu-fault-hma-watcher"),
+        ("serviceaccount", "gpu-fault-hma-cloudwatch-consumer"),
+    }
+    for item in retired:
+        assert item["clean"] == "delete"
+        assert "deploy" not in item
+        assert "manifest" not in item
 
 
 def test_cleanup_inventory_declares_order_and_cluster_scope() -> None:

@@ -59,6 +59,7 @@ def _patterns(value: object, field: str) -> tuple[str, ...]:
 def _component_patterns(value: object) -> dict[str, tuple[str, ...]]:
     raw = _mapping(value, "component_inputs")
     expected = {
+        "aurora_refresh",
         "collector",
         "cpu",
         "cpu_ingress",
@@ -216,7 +217,11 @@ def bind_runtime_image(
     root: Path,
     identity: dict[str, Any],
     descriptor: dict[str, Any],
+    *,
+    component: str | None = None,
 ) -> dict[str, Any]:
+    if descriptor.get("schema_version") == 3 and component is None:
+        return bind_image_set(root, identity, descriptor)
     if descriptor.get("schema_version") != 2:
         raise ReleaseIdentityError("runtime image descriptor schema_version must be 2")
     source_identity = str(descriptor.get("source_identity_sha256") or "")
@@ -230,7 +235,9 @@ def bind_runtime_image(
             "runtime image descriptor must contain an immutable registry reference"
         )
     expected_files = {
-        "dockerfile_sha256": root / "deploy/image/Dockerfile",
+        "dockerfile_sha256": root
+        / "deploy/image"
+        / ("Dockerfile.component" if component else "Dockerfile"),
         "dependency_lock_sha256": root / "requirements/runtime.lock",
     }
     for field, path in expected_files.items():
@@ -278,14 +285,19 @@ def bind_runtime_image(
             "runtime image descriptor is local-only and cannot back a release"
         )
     raw_components = descriptor.get("components")
+    distributions = (
+        {component: RUNTIME_COMPONENT_DISTRIBUTIONS[component]}
+        if component in RUNTIME_COMPONENT_DISTRIBUTIONS
+        else RUNTIME_COMPONENT_DISTRIBUTIONS
+    )
     if not isinstance(raw_components, dict) or set(raw_components) != set(
-        RUNTIME_COMPONENT_DISTRIBUTIONS
+        distributions
     ):
         raise ReleaseIdentityError(
             "runtime image descriptor component identities are incomplete"
         )
     components: dict[str, dict[str, str]] = {}
-    for name, distribution in RUNTIME_COMPONENT_DISTRIBUTIONS.items():
+    for name, distribution in distributions.items():
         value = raw_components.get(name)
         if not isinstance(value, dict) or value.get("distribution") != distribution:
             raise ReleaseIdentityError(
@@ -316,6 +328,83 @@ def bind_runtime_image(
         "components": components,
     }
     bound["runtime_prebuilt"] = True
+    bound["sha256"] = canonical_sha256(bound)
+    return bound
+
+
+def bind_image_set(
+    root: Path, identity: dict[str, Any], descriptor: dict[str, Any]
+) -> dict[str, Any]:
+    images = _mapping(descriptor.get("images"), "image set")
+    if (
+        set(images) != {"control_plane", "executor", "node_dependencies"}
+        or descriptor.get("deployable") is not True
+        or descriptor.get("source_identity_sha256") != identity.get("sha256")
+    ):
+        raise ReleaseIdentityError(
+            "image set is incomplete or does not match the source"
+        )
+    bound = copy.deepcopy(identity)
+    bound.pop("sha256", None)
+    components = _mapping(descriptor.get("components"), "image set components")
+    if set(components) != set(RUNTIME_COMPONENT_DISTRIBUTIONS):
+        raise ReleaseIdentityError("image set component identities are incomplete")
+    for component in RUNTIME_COMPONENT_DISTRIBUTIONS:
+        image = _mapping(images[component], f"{component} image")
+        validated = bind_runtime_image(root, identity, image, component=component)
+        if image["components"][component] != components[component]:
+            raise ReleaseIdentityError("image set component identities differ")
+        arguments = image["image_inputs"]["build_args"]
+        if (
+            arguments.get("COMPONENT") != component.replace("_", "-")
+            or arguments.get("DISTRIBUTION")
+            != RUNTIME_COMPONENT_DISTRIBUTIONS[component]
+        ):
+            raise ReleaseIdentityError("image component build arguments differ")
+        name = "runtime" if component == "control_plane" else "executor"
+        bound["images"][name] = validated["images"]["runtime"]
+    node = _mapping(images["node_dependencies"], "node dependency image")
+    inputs = _mapping(node.get("image_inputs"), "node dependency inputs")
+    reference = str(node.get("reference") or "")
+    inventory_sha = str(node.get("wheelhouse_sha256") or "")
+    base = identity["images"]["node_installer"]["reference"]
+    if (
+        node.get("schema_version") != 2
+        or node.get("deployable") is not True
+        or node.get("source_identity_sha256") != identity["sha256"]
+        or node.get("platform") != "linux/amd64"
+        or not DIGEST_IMAGE_PATTERN.fullmatch(reference)
+        or not SHA256_PATTERN.fullmatch(inventory_sha)
+        or inputs.get("schema_version") != 1
+        or inputs.get("platform") != "linux/amd64"
+        or inputs.get("components") != {}
+        or node.get("components") != {}
+        or inputs.get("wheelhouse_sha256") != inventory_sha
+        or inputs.get("base_images") != [base]
+        or inputs.get("build_args") != {"NODE_INSTALLER_BASE_IMAGE": base}
+        or canonical_sha256(inputs) != node.get("image_input_sha256")
+    ):
+        raise ReleaseIdentityError("node dependency image identity is invalid")
+    for field, path in {
+        "dockerfile_sha256": "deploy/image/Dockerfile.node-dependencies",
+        "dependency_lock_sha256": "requirements/node-runtime.lock",
+        "tools_lock_sha256": "requirements/node-tools.lock",
+        "wheelhouse_builder_sha256": "scripts/node_wheelhouse.py",
+    }.items():
+        if inputs.get(field) != sha256_bytes((root / path).read_bytes()):
+            raise ReleaseIdentityError(f"node dependency {field} differs from checkout")
+    bound["images"]["node_dependencies"] = {
+        "reference": reference,
+        "source": str(node.get("repository") or ""),
+        "digest": reference.rsplit("@sha256:", 1)[1],
+        "source_identity_sha256": identity["sha256"],
+        "image_input_sha256": node["image_input_sha256"],
+        "wheelhouse_sha256": inventory_sha,
+        "dependency_lock_sha256": inputs["dependency_lock_sha256"],
+        "tools_lock_sha256": inputs["tools_lock_sha256"],
+    }
+    bound["runtime_prebuilt"] = True
+    bound["image_layout"] = "split-v1"
     bound["sha256"] = canonical_sha256(bound)
     return bound
 

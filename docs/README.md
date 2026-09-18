@@ -51,6 +51,7 @@
 | [区域模式端到端验收测试用例](区域模式端到端验收测试用例.md) | 规格 | 随当前实现修订；用例 ID 和标题锚点保持稳定 |
 | [区域用例索引](区域用例索引.md) | 生成物 | 只展示执行顺序与规格入口，不包含内部执行状态 |
 | [变更影响与测试选择](变更影响与测试选择.md) | 开发门禁 | 从代码路径反向选择pytest和受影响区域用例 |
+| [覆盖率与场景需求矩阵](components/scenario-coverage.md) | 质量统计 | 分开度量语句、分支、机制需求与真机验证；保留未实现项 |
 | [故障模拟测试手册](故障模拟测试手册.md) | 操作手册 | 与故障目录和注入清单同步 |
 | [性能压测验收方案](性能压测验收方案.md) | 容量验收 | 只定义模型、门槛和证据格式；真实结果保存在私有证据库 |
 
@@ -104,6 +105,22 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
   release pin、三层资源注册表和管理员接口要求。
 - [扩展指南](扩展指南.md)：新增 operation、channel、Store、adapter、handler 或
   metrics 时的代码登记点；生产交付继续进入开发者部署实现。
+- [Workflow/Remote Command 专表实现](components/postgres-state-tables.md)：两阶段
+  DDL、迁移 CLI、验证边界，以及保全的原 F2 设计。
+- [区域验收 Runner 逐例审查](components/regional-acceptance-review.md)：既有 188 条用例的
+  实现分析、重复性判断与后续三条增补；历史全量结果和当前覆盖率整改分开，不是 live 通过证据。
+- [热备不足独立取消与防护](components/destr008-cancellation.md)：限时夹具、producer
+  撤销、命令静默、资源保管及只清理续跑；服务窗口细节见
+  [Service Window](components/destr008-service-window.md)。
+- [跨重启独立恢复](components/destr014-recovery-safeguard.md)：DESTR-014 的持久化
+  恢复、原 runtime/inode 绑定和到期限制。
+- [Node Key Custody Evidence](components/node-key-custody-evidence.md)：独立签名的
+  安装期保管链、管理员登记、后继轮换及真实 Agent 激活验证。
+- [Physical Late-Ownership Acceptance](components/late-ownership-acceptance.md)：
+  Agent 出队后的归属许可、独立执行跟踪、三种受控场景与非原子性限制。
+- [Atomic Ownership Fence Design](components/atomic-ownership-fence-design.md):
+  Explored but not adopted: external writers remain independent, and the stronger
+  atomic ownership guarantee remains unimplemented.
 - [Validation limitations](validation-limitations.md)：当前验证边界。
 
 贡献入口见仓库根目录 [CONTRIBUTING.md](../CONTRIBUTING.md)。

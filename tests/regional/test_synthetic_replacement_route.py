@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import synthetic_replacement_route as helper
+from tests.regional._site_topology import site_topology_leaks
 
 
 class _Regional:
@@ -21,12 +22,14 @@ class _Regional:
         container: str = helper.CONTAINER,
         pods: tuple[str, ...] = ("api-a", "api-b"),
         gate_lags: bool = False,
+        replicas: int | None = None,
     ) -> None:
         self.present = present
         self.value = value
         self.value_from = value_from
         self.container = container
         self.pods = pods
+        self.replicas = len(pods) if replicas is None else replicas
         # A rollout that has not reached every replica: the Deployment says one
         # thing and a still-running old Pod reports another.
         self.gate_lags = gate_lags
@@ -50,9 +53,13 @@ class _Regional:
         if arguments[0] == "get":
             return json.dumps(
                 {
-                    "metadata": {"generation": 7, "resourceVersion": "1"},
+                    "metadata": {
+                        "uid": "api-deployment-uid",
+                        "generation": 7,
+                        "resourceVersion": "1",
+                    },
                     "spec": {
-                        "replicas": len(self.pods),
+                        "replicas": self.replicas,
                         "template": {
                             "spec": {
                                 "containers": [
@@ -60,6 +67,13 @@ class _Regional:
                                 ]
                             }
                         },
+                    },
+                    "status": {
+                        "observedGeneration": 7,
+                        "replicas": self.replicas,
+                        "readyReplicas": len(self.pods),
+                        "updatedReplicas": self.replicas,
+                        "availableReplicas": len(self.pods),
                     },
                 }
             )
@@ -128,10 +142,13 @@ def test_a_window_closes_back_to_the_recorded_literal(tmp_path: Path) -> None:
     assert regional.value == "false"
 
 
-def test_opening_refuses_a_route_someone_else_already_enabled(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", ["true", "TRUE", " true ", "1", "yes", "on"])
+def test_opening_refuses_a_route_someone_else_already_enabled(
+    value: str, tmp_path: Path
+) -> None:
     # Two owners of one switch means the first one to finish closes it under the
     # second, whose case is still driving replacements through it.
-    regional = _Regional(present=True, value="true")
+    regional = _Regional(present=True, value=value)
 
     with pytest.raises(helper.RegionalFixtureError, match="already true"):
         helper.open_window(_settings(tmp_path), regional, helper.survey(regional))
@@ -289,6 +306,174 @@ def test_the_managed_variable_cannot_be_chosen_on_the_command_line() -> None:
 def test_helper_carries_no_site_topology() -> None:
     source = Path(helper.__file__).read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
     assert "hyperpod-i-" not in source
+
+
+class _RollingRegional(_Regional):
+    def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+        if arguments[:2] == ("exec", "api-gone"):
+            raise helper.RegionalFixtureError(
+                "command failed (1): kubectl exec api-gone; stderr=Error from "
+                'server (NotFound): pods "api-gone" not found'
+            )
+        return super().kubectl(plane, *arguments, **kwargs)
+
+
+def test_a_replica_removed_by_the_rolling_update_drops_out_of_the_gate_reading() -> (
+    None
+):
+    regional = _RollingRegional(pods=("api-gone", "api-alive"))
+    assert helper.pod_gates(regional) == [{"pod": "api-alive", "enabled": None}]
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "connection refused",
+        "python3: not found",
+        'Error from server (NotFound): secrets "api-gone" not found',
+        'Error from server (Forbidden): pods "api-gone" not found',
+        'Error from server (NotFound): pods "api-gone" not found\npermission denied',
+    ],
+)
+def test_unrelated_exec_failures_are_not_treated_as_removed_replicas(
+    diagnostic: str,
+) -> None:
+    class Broken(_Regional):
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+            raise helper.RegionalFixtureError(
+                f"command failed (1): kubectl exec; stderr={diagnostic}"
+            )
+
+    with pytest.raises(helper.RegionalFixtureError):
+        helper.pod_gates(Broken())
+
+
+def test_redacted_command_errors_retain_the_replica_disappearance_classification() -> (
+    None
+):
+    from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
+    class Removed(_Regional):
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+            raise RegionalCommandFailed(
+                1, f'Error from server (NotFound): pods "{arguments[1]}" not found'
+            )
+
+    assert helper.pod_gates(Removed()) == []
+
+
+def test_rollout_removal_requires_a_replacement_before_convergence(
+    tmp_path: Path,
+) -> None:
+    regional = _RollingRegional(pods=("api-gone", "api-alive"))
+    sleeps = []
+
+    def replace_removed(seconds: int) -> None:
+        sleeps.append(seconds)
+        regional.pods = ("api-alive", "api-new")
+
+    settings = helper.Settings(tmp_path / "baseline.json", 30)
+    gates = helper.converge_gates(
+        settings, regional, enabled=False, sleep=replace_removed
+    )
+    assert sleeps == [5], "the lone survivor must not authorize convergence"
+    assert {item["pod"] for item in gates} == {"api-alive", "api-new"}
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        ("api-gone", "api-alive"),
+        ("api-gone",),
+        ("api-alive",),
+        ("api-alive", "api-alive"),
+        (),
+    ],
+)
+def test_missing_or_duplicate_replicas_never_prove_route_convergence(
+    pods: tuple[str, ...], tmp_path: Path
+) -> None:
+    regional = _RollingRegional(pods=pods, replicas=2)
+    with pytest.raises(helper.RegionalFixtureError, match="report the route disabled"):
+        helper.converge_gates(_settings(tmp_path), regional, enabled=False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "not-json",
+        "[]",
+        "null",
+        "{}",
+        '{"enabled":false}',
+        '{"enabled":[]}',
+        '{"enabled":1}',
+        '{"enabled":"not-a-boolean"}',
+    ],
+)
+def test_malformed_gate_responses_cannot_be_mistaken_for_a_disabled_route(
+    payload: str,
+) -> None:
+    class Malformed(_Regional):
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+            return payload
+
+    with pytest.raises(helper.RegionalFixtureError, match="route gate"):
+        helper.pod_gates(Malformed())
+
+
+@pytest.mark.parametrize("value", ["TRUE", " true ", "1", "yes", "on"])
+def test_runtime_true_spellings_cannot_be_graded_as_a_closed_route(
+    value: str, tmp_path: Path
+) -> None:
+    regional = _Regional(present=True, value=value)
+    with pytest.raises(helper.RegionalFixtureError, match="report the route disabled"):
+        helper.converge_gates(_settings(tmp_path), regional, enabled=False)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {},
+        {"observedGeneration": 6},
+        {"readyReplicas": 1},
+        {"updatedReplicas": 1},
+        {"availableReplicas": 1},
+        {"readyReplicas": "2"},
+        {"replicas": 3},
+    ],
+)
+def test_incomplete_rollout_health_cannot_be_blessed_by_agreeing_gates(
+    status: dict[str, Any], tmp_path: Path
+) -> None:
+    class Incomplete(_Regional):
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+            output = super().kubectl(plane, *arguments, **kwargs)
+            if arguments[0] == "get":
+                value = json.loads(output)
+                value["status"] = {**value["status"], **status} if status else {}
+                return json.dumps(value)
+            return output
+
+    with pytest.raises(helper.RegionalFixtureError, match="report the route disabled"):
+        helper.converge_gates(_settings(tmp_path), Incomplete(), enabled=False)
+
+
+def test_replica_loss_cannot_converge_by_reducing_the_deployment_target(
+    tmp_path: Path,
+) -> None:
+    regional = _Regional(pods=("api-alive",), replicas=2)
+
+    def shrink(_seconds: int) -> None:
+        regional.replicas = 1
+
+    with pytest.raises(helper.RegionalFixtureError, match="replica target changed"):
+        helper.converge_gates(
+            helper.Settings(tmp_path / "baseline.json", 30),
+            regional,
+            enabled=False,
+            sleep=shrink,
+        )

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from gpu_fault_release.rollout import RegionalRelease
 
 from gpu_fault.hyperpod_spares import (
     SPARE_POOL_STATE_ANNOTATION,
@@ -13,6 +16,7 @@ from gpu_fault.hyperpod_spares import (
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
+from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_rendering import build_reconciler_environment
 
 ROOT = repository_root()
@@ -43,6 +47,11 @@ class NodeMutationPreflight:
     max_unavailable: int
     runtime_image: str | None
     node_installer_image: str | None
+    template_content_sha256: str | None = None
+
+    @property
+    def node_dependency_target(self) -> NodeDependencyTarget:
+        return NodeDependencyTarget.for_phase(self.phase)
 
 
 def is_parked_warm_spare(metadata: dict[str, Any]) -> bool:
@@ -76,7 +85,7 @@ def is_parked_warm_spare(metadata: dict[str, Any]) -> bool:
 
 
 def validate_target_node_state(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     node_names: tuple[str, ...],
 ) -> None:
@@ -154,7 +163,7 @@ def validate_target_node_state(
 
 
 def run_node_installer_preflight(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     candidate: NodeMutationPreflight,
 ) -> None:
@@ -171,11 +180,13 @@ def run_node_installer_preflight(
         bundle_sha256=candidate.bundle_sha256,
         template_sha256=candidate.template_sha256,
         template_config_map=candidate.template_config_map,
+        template_content_sha256=candidate.template_content_sha256,
         allowed_node_names=candidate.node_names,
         max_unavailable=candidate.max_unavailable,
         sync_registry=False,
         runtime_image=candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
+        node_dependency_target=candidate.node_dependency_target,
     )
     environment.update(
         {
@@ -209,7 +220,7 @@ def run_node_installer_preflight(
 
 
 def ensure_node_candidate_preflight(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     candidate: NodeMutationPreflight,
 ) -> None:
@@ -218,7 +229,7 @@ def ensure_node_candidate_preflight(
 
 
 def ensure_pre_node_mutation_barrier(
-    release: Any,
+    release: RegionalRelease,
     target: ClusterTarget,
     candidate: NodeMutationPreflight,
     *,

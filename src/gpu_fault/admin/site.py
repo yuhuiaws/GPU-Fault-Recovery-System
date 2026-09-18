@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -17,6 +18,7 @@ from gpu_fault.admin.config import (
     load_desired_admin_config,
 )
 from gpu_fault.admin.config_parser import boolean_field
+from gpu_fault.admin.python_environment import python_environment
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
@@ -26,6 +28,7 @@ AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 OCI_IMAGE_PATTERN = re.compile(r"^[^\s#]+$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class SiteConfigError(ValueError):
@@ -90,6 +93,20 @@ def _subject_prefix(value: object, path: str) -> str:
     normalized = value.strip()
     if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
         raise SiteConfigError(f"{path} must be a single line of at most 64 characters")
+    return normalized
+
+
+def _ses_configuration_set(value: object, path: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SiteConfigError(f"{path} must be a string")
+    normalized = value.strip()
+    if not SES_CONFIGURATION_SET_PATTERN.fullmatch(normalized):
+        raise SiteConfigError(
+            f"{path} must be an SES configuration set name: "
+            "1-64 letters, digits, hyphens or underscores"
+        )
     return normalized
 
 
@@ -606,16 +623,18 @@ class ImageSiteConfig:
     node_installer: str | None = None
     dcgm_exporter: str | None = None
     adot: str | None = None
+    executor: str | None = None
 
     @classmethod
     def from_value(cls, value: object) -> ImageSiteConfig:
         data = _mapping(
             value or {},
             "spec.images",
-            allowed={"runtime", "nodeInstaller", "dcgmExporter", "adot"},
+            allowed={"runtime", "executor", "nodeInstaller", "dcgmExporter", "adot"},
         )
         items = {
             "runtime": _optional_text(data.get("runtime"), "spec.images.runtime"),
+            "executor": _optional_text(data.get("executor"), "spec.images.executor"),
             "node_installer": _optional_text(
                 data.get("nodeInstaller"),
                 "spec.images.nodeInstaller",
@@ -630,6 +649,20 @@ class ImageSiteConfig:
             if image is not None and not OCI_IMAGE_PATTERN.fullmatch(image):
                 raise SiteConfigError(f"spec.images.{name} contains whitespace or #")
         return cls(**items)
+
+
+def site_image_references(references: Mapping[str, str]) -> dict[str, str]:
+    return {
+        field: references[name]
+        for field, name in (
+            ("runtime", "runtime"),
+            ("executor", "executor"),
+            ("nodeInstaller", "node_installer"),
+            ("dcgmExporter", "dcgm_exporter"),
+            ("adot", "adot"),
+        )
+        if references.get(name)
+    }
 
 
 @dataclass(frozen=True)
@@ -739,6 +772,7 @@ class NotificationSiteConfig:
     ``channel: sns``). On ``sns`` only ``adminEmail`` is required, and naming
     one implies ``allowEmail``; a leftover ``emailSender``/``emailRecipients``
     is carried but not required, so flipping a live site edits one key.
+    ``sesConfigurationSet`` is optional and retained, unused, on ``sns``.
     """
 
     allow_email: bool = False
@@ -748,6 +782,7 @@ class NotificationSiteConfig:
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
     channel: str = NOTIFICATION_CHANNEL_SNS
+    ses_configuration_set: str | None = None
 
     @classmethod
     def from_value(cls, value: object) -> NotificationSiteConfig:
@@ -762,6 +797,7 @@ class NotificationSiteConfig:
                 "emailRecipients",
                 "emailSubjectPrefix",
                 "channel",
+                "sesConfigurationSet",
             },
         )
         channel = data.get("channel")
@@ -806,6 +842,10 @@ class NotificationSiteConfig:
             data.get("emailSubjectPrefix"),
             "spec.notifications.emailSubjectPrefix",
         )
+        ses_configuration_set = _ses_configuration_set(
+            data.get("sesConfigurationSet"),
+            "spec.notifications.sesConfigurationSet",
+        )
         if not allow_email and not acknowledge:
             raise SiteConfigError(
                 "notifications must enable email or acknowledge an external alert channel"
@@ -829,6 +869,7 @@ class NotificationSiteConfig:
             email_recipients=email_recipients,
             email_subject_prefix=email_subject_prefix,
             channel=channel,
+            ses_configuration_set=ses_configuration_set,
         )
 
 
@@ -1109,6 +1150,18 @@ class RenderedSite:
     def metadata_name(self) -> str:
         return str(self.release_config["site_name"])
 
+    @property
+    def registry_site_id(self) -> str:
+        from gpu_fault.installation_lifecycle import (
+            InstallationLifecycleError,
+            registry_site_id,
+        )
+
+        try:
+            return registry_site_id(self.source, self.release_config)
+        except InstallationLifecycleError as exc:
+            raise SiteConfigError(str(exc)) from exc
+
 
 def _resolve(root: Path, value: str) -> Path:
     path = Path(value).expanduser()
@@ -1243,6 +1296,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "email_recipients": list(site.spec.notifications.email_recipients),
             "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
             "channel": site.spec.notifications.channel,
+            "ses_configuration_set": site.spec.notifications.ses_configuration_set,
         },
         "admin_config": {
             "config": admin_config.as_dict(),
@@ -1255,6 +1309,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
     }
     image_values = {
         "GPU_FAULT_RUNTIME_IMAGE": site.spec.images.runtime,
+        "GPU_FAULT_EXECUTOR_IMAGE": site.spec.images.executor,
         "GPU_FAULT_NODE_INSTALLER_IMAGE": site.spec.images.node_installer,
         "GPU_FAULT_DCGM_EXPORTER_IMAGE": site.spec.images.dcgm_exporter,
         "GPU_FAULT_ADOT_IMAGE": site.spec.images.adot,
@@ -1277,12 +1332,26 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
 
 @contextmanager
 def materialized_release_config(site: RenderedSite) -> Iterator[Path]:
+    from gpu_fault.installation_lifecycle import (
+        InstallationLifecycleError,
+        release_lifecycle_inputs,
+    )
+
+    try:
+        lifecycle = release_lifecycle_inputs(site.source, site.release_config)
+    except InstallationLifecycleError as exc:
+        raise SiteConfigError(str(exc)) from exc
+
     with tempfile.TemporaryDirectory(prefix="gpu-fault-admin-") as directory:
         root = Path(directory)
         root.chmod(0o700)
         path = root / "regional-release.json"
         path.write_text(
-            json.dumps(site.release_config, indent=2, sort_keys=True),
+            json.dumps(
+                {**site.release_config, **lifecycle},
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         path.chmod(0o600)
@@ -1290,9 +1359,12 @@ def materialized_release_config(site: RenderedSite) -> Iterator[Path]:
 
 
 def effective_environment(site: RenderedSite) -> dict[str, str]:
-    return {
-        **os.environ,
-        **site.environment,
-        "PYTHONPATH": str(site.repository_root / "src"),
-        "GPU_FAULT_REPO_ROOT": str(site.repository_root),
-    }
+    return python_environment(
+        {
+            **os.environ,
+            **site.environment,
+            "PYTHONPATH": str(site.repository_root / "src"),
+            "GPU_FAULT_REPO_ROOT": str(site.repository_root),
+        },
+        executable=sys.executable,
+    )

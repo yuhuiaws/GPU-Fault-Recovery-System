@@ -106,6 +106,7 @@ def test_the_deadman_is_bound_to_exactly_its_webhook() -> None:
         image="img",
         deadman_seconds=840,
         run_id="r",
+        restore_at=10000.0,
     )
     spec = job["spec"]["template"]["spec"]
     assert spec["serviceAccountName"] == names["service_account"]
@@ -114,13 +115,11 @@ def test_the_deadman_is_bound_to_exactly_its_webhook() -> None:
     assert job["spec"]["activeDeadlineSeconds"] > 840, "the Job outlives its deadline"
     env = {item["name"]: item["value"] for item in spec["containers"][0]["env"]}
     assert env == {
-        "NET007_DEADMAN_SECONDS": "840",
+        "NET007_RESTORE_AT": "10000.0",
         "NET007_WEBHOOK_NAME": names["webhook"],
+        "NET007_RUN_ID": "r",
     }
-    assert "delete_validating_webhook_configuration" in net007.DEADMAN_SCRIPT, (
-        "the deadman must delete the webhook itself"
-    )
-    assert "404" in net007.DEADMAN_SCRIPT, "an already-removed webhook is success"
+    assert spec["containers"][0]["command"][0] == "/opt/gpu-fault/executor/bin/python"
 
 
 # --------------------------------------------------------------------------- #
@@ -139,13 +138,20 @@ def _sample(
     return {
         "observed_at": "2026-09-08T12:00:00+00:00",
         "workflow_status": "RUNNING",
+        "workflow_request_id": "workflow-1",
         "step_executions": [
             {"step_index": 0, "operation": "FREEZE_EVIDENCE", "status": "SUCCEEDED"},
-            {"step_index": 1, "operation": operation, "status": step_status},
+            {
+                "step_index": 1,
+                "operation": operation,
+                "status": step_status,
+                "details": {"remote_command_id": "cmd-1"},
+            },
         ],
         "remote_commands": [
             {
                 "command_id": "cmd-1",
+                "step_index": 1,
                 "operation": operation,
                 "status": command_status,
                 "result_details": details,
@@ -161,12 +167,29 @@ def test_the_proof_needs_the_command_waiting_on_a_marker_and_the_step_waiting() 
         "operation": "MARK_UNSCHEDULABLE",
         "marker": "retryable_adapter_error",
         "command_id": "cmd-1",
+        "workflow_request_id": "workflow-1",
+        "step_index": 1,
         "status_source": "executor-retryable-adapter-error",
     }
     assert verdicts.outage_errors([_sample()]) == []
     transport = _sample(marker="retryable_transport_error")
     assert (
         verdicts.outage_evidence([transport])["marker"] == "retryable_transport_error"
+    )
+
+
+@pytest.mark.parametrize("mismatch", ["workflow", "step", "command"])
+def test_outage_proof_requires_a_bound_workflow_step_and_command(mismatch: str) -> None:
+    sample = _sample()
+    if mismatch == "workflow":
+        sample["workflow_request_id"] = None
+    elif mismatch == "step":
+        sample["remote_commands"][0]["step_index"] = 99
+    else:
+        sample["step_executions"][1]["details"]["remote_command_id"] = "foreign"
+    assert verdicts.outage_evidence([sample]) is None
+    assert verdicts.outage_errors([sample]), (
+        f"non-waiting outage evidence was accepted: {sample}"
     )
 
 
@@ -219,6 +242,37 @@ def test_the_recovery_contract_passes_when_the_waited_step_succeeded() -> None:
     assert (
         verdicts.recovery_errors(_bundle(), waited_operation="MARK_UNSCHEDULABLE") == []
     )
+
+
+@pytest.mark.parametrize("mismatch", ["workflow", "step", "command"])
+def test_another_success_cannot_stand_in_for_the_waited_command(mismatch: str) -> None:
+    bundle = _bundle()
+    step = bundle["workflow"]["step_executions"][1]
+    step.update(step_index=1, operation_id="remote/cmd-1")
+    bundle["remote_commands"] = [
+        {
+            "command_id": "cmd-1",
+            "step_index": 1,
+            "status": "SUCCEEDED",
+            "operation": "MARK_UNSCHEDULABLE",
+        }
+    ]
+    proof = verdicts.outage_evidence([_sample()])
+    assert not verdicts.recovery_errors(
+        bundle, waited_operation="MARK_UNSCHEDULABLE", waited_evidence=proof
+    ), "the same waiting command's successful recovery must satisfy the proof"
+    if mismatch == "workflow":
+        bundle["workflow"]["request_id"] = "different-workflow"
+    elif mismatch == "step":
+        step["step_index"] = 99
+    else:
+        bundle["remote_commands"][0]["command_id"] = "different-command"
+    assert any(
+        "same waiting workflow, step and command" in error
+        for error in verdicts.recovery_errors(
+            bundle, waited_operation="MARK_UNSCHEDULABLE", waited_evidence=proof
+        )
+    ), "a different command must not satisfy the outage's recovery proof"
 
 
 def test_each_recovery_defect_is_named() -> None:

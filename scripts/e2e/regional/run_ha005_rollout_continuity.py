@@ -4,17 +4,43 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import shlex
 import sys
 import threading
 import time
+from contextvars import copy_context
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+ROOT = Path(__file__).resolve().parents[3]
+for _path in (ROOT, ROOT / "src"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 if __package__:
+    from .ha_telemetry_evidence import (
+        RETRYABLE_HTTP,
+        admission_errors,
+        telemetry_replay_errors,
+        wire_errors,
+    )
+    from .ha_evidence import chain_preflight, require_chain, result_identity
+    from .ha_cleanup import (
+        ProcessSupervisionLost,
+        attempt_cleanup,
+        record_supervision_loss,
+        run_cleanup,
+    )
+    from .ha_plan_preflight import require_window, residual_preflight
+    from .ha_store_probe import cpu_store_probe
+    from .regional_pod_inventory import ready_pod_records
+    from .ha_probe_resources import OwnedProbeResources
     from .acceptance_runner_common import write_json_atomic
+    from .acceptance_scope import current_acceptance_scope
+    from .regional_live_fixture import component_python
     from .live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -22,7 +48,26 @@ if __package__:
         install_site_profile,
     )
 else:
+    from ha_telemetry_evidence import (
+        RETRYABLE_HTTP,
+        admission_errors,
+        telemetry_replay_errors,
+        wire_errors,
+    )
+    from ha_evidence import chain_preflight, require_chain, result_identity
+    from ha_cleanup import (
+        ProcessSupervisionLost,
+        attempt_cleanup,
+        record_supervision_loss,
+        run_cleanup,
+    )
+    from ha_plan_preflight import require_window, residual_preflight
+    from ha_store_probe import cpu_store_probe
+    from regional_pod_inventory import ready_pod_records
+    from ha_probe_resources import OwnedProbeResources
     from acceptance_runner_common import write_json_atomic
+    from acceptance_scope import current_acceptance_scope
+    from regional_live_fixture import component_python
     from live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -30,13 +75,12 @@ else:
         install_site_profile,
     )
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts" / "perf"))
 
 _action_capacity = importlib.import_module("regional_action_capacity_suite")
 _registry = importlib.import_module("regional_capacity_registry")
 _capacity_suite = importlib.import_module("regional_capacity_suite")
+run_manifest = importlib.import_module("regional_capacity_resources").run_manifest
 STORE_DSN_SNIPPET: str = _registry.STORE_DSN_SNIPPET
 executor_identity = _action_capacity.executor_identity
 NAMESPACE = _registry.NAMESPACE
@@ -45,7 +89,6 @@ dataplane = _registry.dataplane
 load_registry = _registry.load_registry
 register = _registry.register
 teardown = _capacity_suite.teardown
-upsert_configmap = _capacity_suite.upsert_configmap
 
 SCRIPT = Path(__file__).with_name("probes") / "ha005_probe.py"
 CONFIGMAP = "gpu-fault-ha005-probe"
@@ -74,6 +117,17 @@ OUTBOX_NOT_EXERCISED_LIMITATION = (
 )
 
 
+def case_budget_seconds(all_deployments: bool) -> int:
+    return (
+        300
+        + 180
+        + 600 * (len(ALL_DEPLOYMENTS) if all_deployments else 1)
+        + 300
+        + 180
+        + 300
+    )
+
+
 class CaseError(RuntimeError):
     pass
 
@@ -84,27 +138,7 @@ def log(message: str) -> None:
 
 
 def cpu_python(script: str, *arguments: str) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    output = control(
-        "exec",
-        "-i",
-        pod,
-        "--",
-        "python3",
-        "-",
-        *arguments,
-        stdin=script.encode(),
-        timeout=180,
-    )
-    return json.loads(output.splitlines()[-1])
+    return cpu_store_probe(control, script, *arguments)
 
 
 def database_residuals() -> dict:
@@ -116,7 +150,7 @@ import os
 import psycopg
 queries = {
     "objects": (
-        "SELECT count(*) FROM gpu_fault_objects "
+        "SELECT count(*) FROM gpu_fault_control_records "
         "WHERE payload->>'cluster_id' LIKE 'perf-cap-%' "
         "OR key LIKE '%ha005-%'"
     ),
@@ -193,7 +227,6 @@ def kubernetes_residuals() -> dict:
             "--ignore-not-found",
             "-o",
             "name",
-            check=False,
         ).strip()
         resources[f"{kind}/{name}"] = bool(output)
     return {"count": sum(resources.values()), "resources": resources}
@@ -219,7 +252,7 @@ def pod_manifest(image: str, identity: dict[str, object], run_id: str) -> dict:
                     "name": "probe",
                     "image": image,
                     "command": [
-                        "/opt/gpu-fault/executor/bin/python",
+                        component_python("gpu"),
                         f"/scripts/{SCRIPT.name}",
                     ],
                     "env": [
@@ -347,7 +380,14 @@ def rollout_complete(snapshot: dict, old_uids: set[str]) -> bool:
     replicas = int(snapshot.get("replicas") or 0)
     current_uids = {value["uid"] for _name, value in snapshot.get("pods", [])}
     return (
-        int(snapshot.get("ready") or 0) == replicas
+        replicas > 0
+        and len(current_uids) == replicas
+        and len(snapshot.get("pods", [])) == replicas
+        and all(
+            value.get("uid") and value.get("ready") is True
+            for _, value in snapshot["pods"]
+        )
+        and int(snapshot.get("ready") or 0) == replicas
         and int(snapshot.get("updated") or 0) == replicas
         and int(snapshot.get("available") or 0) == replicas
         and snapshot.get("observed_generation") == snapshot.get("generation")
@@ -363,9 +403,8 @@ def continuity_errors(
 ) -> list[str]:
     """The probe/receipt assertions HA-005 and HA-009 share.
 
-    One place for: attempts minus 202s equals recorded failures; every failure
-    was buffered; the outbox drained; no 401/403/500; every accepted
-    processor_request_id completed once with an internal 200.
+    Queue admissions need processor receipts. Routine spool admissions instead
+    prove the final coalescable summary and drained spool after the producer stops.
     """
 
     counters = final_probe.get("counters", {})
@@ -374,14 +413,32 @@ def continuity_errors(
     failures = int(counters.get("event_failures", 0))
     buffered = int(counters.get("event_buffered", 0))
     errors = []
+    counter_names = (
+        "event_attempts",
+        "event_accepted",
+        "event_failures",
+        "event_buffered",
+        "claim_success",
+    )
+    if any(
+        type(counters.get(name, 0)) is not int or counters.get(name, 0) < 0
+        for name in counter_names
+    ):
+        errors.append("event counters are invalid")
     if attempts - accepted != failures:
         errors.append("event attempts minus accepted does not equal failures")
     if buffered != failures:
         errors.append("not every event failure was durably buffered")
     if final_probe.get("outbox") != {"records": 0, "replayable": 0}:
         errors.append("probe outbox is not empty after recovery")
-    if not accepted_ids:
-        errors.append("probe captured no processor request IDs")
+    errors.extend(admission_errors(final_probe, accepted_ids))
+    errors.extend(wire_errors(final_probe))
+    errors.extend(telemetry_replay_errors(final_probe, receipts.get("telemetry") or {}))
+    receipt_ids = [item.get("request_id") for item in receipts.get("requests", [])]
+    if set(receipt_ids) != set(accepted_ids) or len(receipt_ids) != len(accepted_ids):
+        errors.append("processor receipts do not cover each accepted ID exactly once")
+    if int(counters.get("claim_success", 0)) <= 0:
+        errors.append("probe observed no successful claim")
     if receipts.get("missing"):
         errors.append("accepted processor request IDs are missing")
     if any(
@@ -390,11 +447,50 @@ def continuity_errors(
     ):
         errors.append("an accepted processor request did not complete with 200")
     if any(
-        key in {"http-401", "http-403", "http-500"} and int(value) > 0
+        key.startswith("http-")
+        and key.removeprefix("http-") not in {str(code) for code in RETRYABLE_HTTP}
+        and int(value) > 0
         for key, value in final_probe.get("error_types", {}).items()
     ):
-        errors.append("probe observed 401, 403 or 500")
+        errors.append("probe observed a nonretryable HTTP error")
     return errors
+
+
+def telemetry_replay_receipt(final_probe: dict) -> dict:
+    script = r"""
+import json
+import sys
+from gpu_fault.app import ApplicationContext
+from gpu_fault.telemetry import CollectorKind
+store = ApplicationContext.from_environment().store
+cluster_id, node_id = sys.argv[1:]
+items = [
+    item for item in store.list_collector_statuses(cluster_id, node_id)
+    if item.collector is CollectorKind.HOST_TELEMETRY
+]
+if len(items) != 1:
+    print(json.dumps({"missing": True}))
+else:
+    receipt = items[0].model_dump(mode="json")
+    depths = getattr(store, "telemetry_spool_depths", store.telemetry_spool_stats)()
+    receipt["spool_depth"] = depths["by_cluster"].get(cluster_id, 0)
+    print(json.dumps(receipt))
+"""
+    return cpu_python(
+        script, final_probe["cluster_id"], f"ha005-node-{final_probe['run_id']}"
+    )
+
+
+def wait_telemetry_replay(final_probe: dict, timeout_seconds: int = 180) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        receipt = telemetry_replay_receipt(final_probe)
+        errors = telemetry_replay_errors(final_probe, receipt)
+        if not errors:
+            return receipt
+        if time.monotonic() >= deadline:
+            raise CaseError("telemetry replay did not converge: " + "; ".join(errors))
+        time.sleep(2)
 
 
 def outbox_exercised(final_probe: dict) -> bool:
@@ -415,6 +511,7 @@ def deployment_snapshot(name: str = INGRESS_DEPLOYMENT) -> dict:
             "json",
         )
     )
+    ready_names = {item["name"] for item in ready_pod_records(pods)}
     return {
         "name": name,
         "generation": value["metadata"].get("generation"),
@@ -427,10 +524,7 @@ def deployment_snapshot(name: str = INGRESS_DEPLOYMENT) -> dict:
             {
                 item["metadata"]["name"]: {
                     "uid": item["metadata"]["uid"],
-                    "ready": bool(
-                        item.get("status", {}).get("containerStatuses")
-                        and item["status"]["containerStatuses"][0].get("ready")
-                    ),
+                    "ready": item["metadata"]["name"] in ready_names,
                     "restarts": int(
                         (item.get("status", {}).get("containerStatuses") or [{}])[
                             0
@@ -496,6 +590,8 @@ class ReceiptLedger:
         *,
         interval_seconds: float = 60.0,
     ) -> None:
+        if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+            raise CaseError("receipt poll interval must be finite and positive")
         self.receipts: dict[str, dict] = {}
         self.polls = 0
         self.last_error: str | None = None
@@ -504,9 +600,12 @@ class ReceiptLedger:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._failure: ProcessSupervisionLost | None = None
 
     def collect(self, request_ids: list[str]) -> dict:
         with self._lock:
+            if self._failure is not None:
+                raise self._failure
             pending = [
                 item for item in request_ids if not _settled(self.receipts.get(item))
             ]
@@ -524,18 +623,37 @@ class ReceiptLedger:
     def _poll(self) -> None:
         while not self._stop.wait(self._interval):
             try:
-                self.collect(list(self._read_accepted_ids()))
+                request_ids = list(self._read_accepted_ids())
+                if self._stop.is_set():
+                    return
+                self.collect(request_ids)
+            except ProcessSupervisionLost as exc:
+                with self._lock:
+                    self._failure = exc
+                self._stop.set()
+                return
             except Exception as exc:  # the final wait decides; this only records
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.last_error = type(exc).__name__
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._poll, daemon=True)
+        if self._thread is not None or self._stop.is_set():
+            raise CaseError("receipt poller cannot be started twice")
+        context = copy_context()
+        self._thread = threading.Thread(
+            target=lambda: context.run(self._poll), daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread.ident is not None:
             self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                self._failure = ProcessSupervisionLost(
+                    "receipt poller did not stop; command completion is unproven"
+                )
+        if self._failure is not None:
+            raise self._failure
 
     def wait(self, request_ids: list[str], timeout_seconds: int = 180) -> dict:
         deadline = time.monotonic() + timeout_seconds
@@ -585,10 +703,14 @@ def _restart_and_observe(
     name: str,
     *,
     timeout_seconds: int = 600,
+    maintenance_window_end: datetime | None = None,
 ) -> dict:
     deployment_before = deployment_snapshot(name)
     old_uids = {value["uid"] for _name, value in deployment_before["pods"]}
     requested_at = datetime.now(timezone.utc)
+    if maintenance_window_end is None:
+        raise CaseError("rollout requires the approved maintenance window")
+    require_window(maintenance_window_end, required_seconds=timeout_seconds)
     log(f"starting {name} rollout restart")
     control("rollout", "restart", f"deployment/{name}")
     timeline = []
@@ -613,9 +735,11 @@ def _restart_and_observe(
         forbidden = {
             key: value
             for key, value in probe.get("error_types", {}).items()
-            if key in {"http-401", "http-403", "http-500"} and int(value) > 0
+            if key.startswith("http-")
+            and key.removeprefix("http-") not in {str(code) for code in RETRYABLE_HTTP}
+            and int(value) > 0
         }
-        if forbidden:
+        if forbidden or wire_errors(probe):
             raise CaseError(f"forbidden probe responses: {forbidden}")
         complete = rollout_complete(snapshot, old_uids)
         if elapsed >= next_log:
@@ -660,12 +784,23 @@ def _run_rollout_case(
         raise CaseError(f"registry preflight residuals: {registry_preflight}")
     if kubernetes_preflight["count"] != 0:
         raise CaseError(f"Kubernetes preflight residuals: {kubernetes_preflight}")
+    resources = OwnedProbeResources(
+        case_dir / f"probe-resources-{run_id}.json",
+        lambda args, body: dataplane(
+            *args, stdin=body.encode() if body is not None else None
+        ),
+    )
+    state["resources"] = resources
+    state["cleanup_armed"] = True
 
+    artifacts = case_dir / f"capacity-{run_id}"
+    artifacts.mkdir(exist_ok=True)
     register(
         1,
-        case_dir,
+        artifacts,
         run_id=run_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(seconds=case_budget_seconds(all_deployments)),
         allow_live_registry=True,
         live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
     )
@@ -674,25 +809,40 @@ def _run_rollout_case(
         dataplane("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")
     )
     image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
-    upsert_configmap(CONFIGMAP, text={SCRIPT.name: SCRIPT.read_text()})
-    dataplane("delete", "pod", POD, "--ignore-not-found", check=False)
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(pod_manifest(image, identity, run_id)).encode(),
+    resources.create(
+        run_manifest(
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": CONFIGMAP, "namespace": NAMESPACE},
+                "data": {SCRIPT.name: SCRIPT.read_text()},
+            },
+            run_id,
+        )
     )
+    state["probe_created"] = True
+    manifest = pod_manifest(image, identity, run_id)
+    manifest["spec"]["activeDeadlineSeconds"] = case_budget_seconds(all_deployments)
+    resources.create(run_manifest(manifest, run_id))
     dataplane("wait", "--for=condition=Ready", f"pod/{POD}", "--timeout=180s")
     state["probe_created"] = True
     wait_file("/state/ready.json", 60)
     wait_file("/state/stats.json", 60)
+    ledger = ReceiptLedger(lambda: read_probe().get("accepted_request_ids", []))
+    state["ledger"] = ledger
+    ledger.start()
     probe_baseline = wait_probe_samples()
     write_json_atomic(case_dir / "probe-baseline.json", probe_baseline)
     targets = rollout_targets(all_deployments)
     skipped = [
         name for name in ALL_DEPLOYMENTS if all_deployments and name not in targets
     ]
-    rollouts = [_restart_and_observe(case_dir, name) for name in targets]
+    rollouts = [
+        _restart_and_observe(
+            case_dir, name, maintenance_window_end=state["maintenance_window_end"]
+        )
+        for name in targets
+    ]
 
     attempts_at_recovery = int(read_probe()["counters"].get("event_attempts", 0))
     deadline = time.monotonic() + 300
@@ -725,6 +875,7 @@ def _run_rollout_case(
         rollouts,
         probe_baseline,
         skipped_deployments=skipped,
+        ledger=ledger,
     )
 
 
@@ -735,15 +886,20 @@ def _rollout_result(
     probe_baseline: dict,
     *,
     skipped_deployments: list[str] | None = None,
+    ledger: ReceiptLedger | None = None,
 ) -> dict:
-    final_probe = read_probe()
+    final_probe = stop_probe()
     write_json_atomic(case_dir / "probe-final.json", final_probe)
     probe_logs = dataplane("logs", POD, check=False, timeout=120)
     (case_dir / "probe.log").write_text(probe_logs)
     (case_dir / "probe.log").chmod(0o600)
-    dataplane("exec", POD, "--", "touch", "/state/stop", check=False)
-    accepted_ids = sorted(set(final_probe.get("accepted_request_ids", [])))
-    receipts = wait_receipts(accepted_ids)
+    accepted_ids = list(final_probe.get("accepted_request_ids", []))
+    if ledger is not None:
+        ledger.stop()
+        receipts = ledger.wait(accepted_ids)
+    else:
+        receipts = wait_receipts(accepted_ids)
+    receipts["telemetry"] = wait_telemetry_replay(final_probe)
     write_json_atomic(case_dir / "processor-receipts.json", receipts)
     errors = continuity_errors(final_probe, receipts, accepted_ids=accepted_ids)
     for rollout in rollouts:
@@ -783,28 +939,65 @@ def _rollout_result(
     }
 
 
+def stop_probe(*, timeout_seconds: int = 60) -> dict:
+    dataplane("exec", POD, "--", "touch", "/state/stop")
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        final = read_probe()
+        if final.get("stopped") is True:
+            return final
+        time.sleep(1)
+    raise CaseError("probe did not stop before final continuity evidence")
+
+
 def _cleanup_rollout_case(
     case_dir: Path,
     run_id: str,
     result: dict,
     probe_created: bool,
+    resources: OwnedProbeResources | None,
 ) -> None:
+    if resources is None:
+        result["verdict"] = "FAIL"
+        result["cleanup_preserved"] = "probe resources have no ownership receipt"
+        return
     if probe_created:
         log_path = case_dir / "probe.log"
         if not log_path.is_file():
-            probe_logs = dataplane("logs", POD, check=False, timeout=120)
-            log_path.write_text(probe_logs)
-            log_path.chmod(0o600)
-        dataplane("exec", POD, "--", "touch", "/state/stop", check=False)
-    dataplane("delete", "pod", POD, "--ignore-not-found", check=False)
-    dataplane("delete", "configmap", CONFIGMAP, "--ignore-not-found", check=False)
+            attempt_cleanup(
+                result,
+                "probe log",
+                lambda: (
+                    log_path.write_text(dataplane("logs", POD, timeout=120)),
+                    log_path.chmod(0o600),
+                ),
+            )
+        attempt_cleanup(
+            result,
+            "stop probe",
+            lambda: dataplane("exec", POD, "--", "touch", "/state/stop"),
+        )
+    pod_stopped = True
+    for kind, name in (("Pod", POD), ("ConfigMap", CONFIGMAP)):
+        deleted = attempt_cleanup(
+            result,
+            f"delete {kind}",
+            lambda kind=kind, name=name: resources.delete(kind, name),
+        )
+        if kind == "Pod":
+            pod_stopped = deleted
+    if not pod_stopped:
+        result["cleanup_preserved"] = (
+            "probe shutdown unverified; retain registry and rows"
+        )
+        return
     try:
         teardown(
             purge=True,
             deregister_clusters=True,
             allow_live_registry=True,
             live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
-            artifacts=case_dir,
+            artifacts=case_dir / f"capacity-{run_id}",
             run_id=run_id,
         )
     except Exception as exc:
@@ -835,27 +1028,53 @@ def run_case(
     maintenance_window_end: datetime,
     *,
     all_deployments: bool = False,
+    chain: dict | None = None,
 ) -> int:
-    if datetime.now(timezone.utc) >= maintenance_window_end:
-        raise CaseError("approved maintenance window has ended")
+    if not all_deployments and not current_acceptance_scope().selective:
+        raise CaseError("formal HA-005 requires --all-deployments")
+    require_window(
+        maintenance_window_end, required_seconds=case_budget_seconds(all_deployments)
+    )
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
     run_id = f"ha005-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
-    state = {"probe_created": False}
+    state = {
+        "probe_created": False,
+        "cleanup_armed": False,
+        "maintenance_window_end": maintenance_window_end,
+    }
     try:
         result = _run_rollout_case(
             case_dir, run_id, attempt, state, all_deployments=all_deployments
         )
+    except ProcessSupervisionLost:
+        record_supervision_loss(result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _cleanup_rollout_case(
-            case_dir,
-            run_id,
-            result,
-            bool(state["probe_created"]),
-        )
+        ledger = state.get("ledger")
+        if ledger is not None:
+            try:
+                ledger.stop()
+            except Exception as exc:
+                result["ledger_cleanup_error"] = type(exc).__name__
+                record_supervision_loss(result)
+        if state["cleanup_armed"]:
+            run_cleanup(
+                result,
+                lambda: _cleanup_rollout_case(
+                    case_dir,
+                    run_id,
+                    result,
+                    bool(state["probe_created"]),
+                    state.get("resources"),
+                ),
+            )
+    result.update(result_identity(chain))
+    result["coverage_scope"] = (
+        "all-enabled-roles" if all_deployments else "ingress-only"
+    )
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -871,6 +1090,8 @@ def main() -> int:
         help="rollout restart every enabled control-plane Deployment, not only ingress",
     )
     args = parser.parse_args()
+    if not args.all_deployments and not current_acceptance_scope().selective:
+        raise CaseError("formal HA-005 requires --all-deployments")
     os.umask(0o077)
     mutation = (
         "rollout restart every enabled control-plane Deployment "
@@ -879,12 +1100,20 @@ def main() -> int:
         else f"rollout restart deployment/{INGRESS_DEPLOYMENT}"
     )
     if not args.execute:
+        chain = chain_preflight(args, CASE_ID)
+        preflight = residual_preflight(
+            database_residuals, registry_residuals, kubernetes_residuals
+        )
         plan = build_plan(
             run_dir=args.run_dir,
             case_id=CASE_ID,
             attempt=args.attempt,
             confirmation=CONFIRMATION,
+            arguments=args,
+            preflight_passed=not preflight["errors"] and not chain["errors"],
             details={
+                "preflight": preflight,
+                "chain": chain,
                 "risk": "live-service-action",
                 "synthetic_cluster_id": "perf-cap-000",
                 "mutation": mutation,
@@ -898,14 +1127,23 @@ def main() -> int:
             },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
+        return 0 if plan["preflight_passed"] is True else 1
     deadline = authorize_execution(
         args,
         case_id=CASE_ID,
         confirmation=CONFIRMATION,
     )
+    plan = json.loads((args.run_dir / "cases" / CASE_ID / "plan.json").read_text())
+    chain = chain_preflight(args, CASE_ID)
+    require_chain(plan["details"].get("chain", {}), chain)
+    if plan["details"].get("all_deployments") is not bool(args.all_deployments):
+        raise CaseError("rollout scope changed since the plan was approved")
     return run_case(
-        args.run_dir, args.attempt, deadline, all_deployments=bool(args.all_deployments)
+        args.run_dir,
+        args.attempt,
+        deadline,
+        all_deployments=bool(args.all_deployments),
+        chain=chain,
     )
 
 

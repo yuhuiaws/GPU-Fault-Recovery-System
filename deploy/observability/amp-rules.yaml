@@ -343,6 +343,30 @@ groups:
             gpu_fault.app.metric_contributors; the usual cause is a store read
             failing (pool timeout, failover, schema drift). Treat the missing
             families as unknown, not zero.
+      - alert: GpuFaultMetricsAggregationIncomplete
+        expr: >-
+          max by (control_plane_cluster, region, pod, service_role) (
+            (gpu_fault_metrics_aggregation_degraded == 1)
+            or
+            (
+              (up{job="gpu-fault-control-plane"} == 1)
+              unless on (control_plane_cluster, region, pod, instance, service_role)
+              gpu_fault_metrics_aggregation_degraded
+            )
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A control-plane Pod has incomplete process metric coverage
+          runbook_url: docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete
+          description: >-
+            Pod {{ $labels.pod }} ({{ $labels.service_role }}) lacks fresh,
+            complete metric publications from its live processes. Publications
+            expire after 60 seconds; missing, malformed or future-dated peers
+            and unusable shared storage are unknown coverage, not healthy
+            processors. Inspect the process-metrics publisher and shared slot
+            directory before trusting this Pod's counters or health gauges.
       - alert: GpuFaultProcessorQueueDepthHigh
         expr: max(gpu_fault_processor_queue_depth) > 7000
         for: 5m
@@ -557,10 +581,10 @@ groups:
       # delayed by at least one lease -- a fact no queue-depth rule can see,
       # because the depth does not change when a lease is reclaimed.
       #
-      # `sum by` over `increase`: the counter is summed over a Pod's processes,
-      # so a process that restarts drops the Pod's series and every replica
-      # reclaims on behalf of
-      # the same queue. Ten minutes is long enough that one lease expiry from a
+      # `sum by` over `increase`: bounded process slots keep independent reset
+      # domains, so a child restart never resets its surviving siblings.
+      # Every replica reclaims on behalf of the same queue. Ten minutes is
+      # long enough that one lease expiry from a
       # rolling restart is still visible and short enough to name the deploy.
       - alert: GpuFaultProcessorExpiredLeasesReclaimed
         expr: >-
@@ -591,11 +615,29 @@ groups:
       # alone being non-zero is the defect.
       - alert: GpuFaultProcessorCounterDrift
         expr: >-
-          max by (control_plane_cluster, region)
-          (min_over_time(gpu_fault_processor_counter_drift_abs[5m])) > 0
-          or
-          max by (control_plane_cluster, region)
-          (min_over_time(gpu_fault_processor_counter_mismatched_clusters[5m])) > 0
+          min_over_time((
+            max by (control_plane_cluster, region) (
+              (
+                (gpu_fault_processor_counter_drift_abs > bool 0)
+                + (gpu_fault_processor_counter_mismatched_clusters > bool 0)
+              )
+              and (gpu_fault_processor_counter_drift_abs >= 0)
+              and (gpu_fault_processor_counter_mismatched_clusters >= 0)
+              and (gpu_fault_processor_counter_drift_scan_timestamp_seconds > 0)
+              and (
+                gpu_fault_processor_counter_drift_scan_timestamp_seconds
+                == on (control_plane_cluster, region) group_left
+                max by (control_plane_cluster, region)
+                (gpu_fault_processor_counter_drift_scan_timestamp_seconds)
+              )
+              and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds >= 0)
+              and (gpu_fault_processor_counter_drift_scan_max_age_seconds > 0)
+              and (
+                time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds
+                <= gpu_fault_processor_counter_drift_scan_max_age_seconds
+              )
+            )
+          )[5m:1m]) > 0
         for: 0m
         labels:
           severity: warning
@@ -609,7 +651,43 @@ groups:
             gpu_fault_processor_counter_drift_abs for the size and
             gpu_fault_processor_counter_mismatched_clusters for the spread;
             the counters are rebuilt from the table by the backfill path, not
-            by editing counter rows.
+            by editing counter rows. Only the newest successful scan is used,
+            so an old lease holder cannot keep a repaired discrepancy firing.
+      - alert: GpuFaultProcessorCounterDriftScanUnavailable
+        expr: >-
+          max by (control_plane_cluster, region)
+          (up{job="gpu-fault-control-plane",service_role="gpu-fault-control-worker"} == 1)
+          unless on (control_plane_cluster, region)
+          max by (control_plane_cluster, region) (
+            (gpu_fault_processor_counter_drift_scan_timestamp_seconds > 0)
+            and (
+              gpu_fault_processor_counter_drift_scan_timestamp_seconds
+              == on (control_plane_cluster, region) group_left
+              max by (control_plane_cluster, region)
+              (gpu_fault_processor_counter_drift_scan_timestamp_seconds)
+            )
+            and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds >= 0)
+            and (gpu_fault_processor_counter_drift_scan_max_age_seconds > 0)
+            and (
+              time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds
+              <= gpu_fault_processor_counter_drift_scan_max_age_seconds
+            )
+            and (gpu_fault_processor_counter_drift_abs >= 0)
+            and (gpu_fault_processor_counter_mismatched_clusters >= 0)
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The latest processor counter drift scan is unavailable
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable
+          description: >-
+            No complete, current successful counter scan is available. The
+            measurement expires after three configured scan intervals, with a
+            120 second minimum; publishing an old value does not refresh it.
+            Check the periodic counter_drift task and its lease, job errors and
+            metric contributor. A quiet drift alert does not prove alignment
+            while the scan is missing, stale or future-dated.
       - alert: GpuFaultTelemetrySpoolListenerDown
         expr: min(gpu_fault_telemetry_spool_notifications_enabled{pod=~"gpu-fault-telemetry-spool-worker-.*"}) == 0
         for: 2m
@@ -856,10 +934,8 @@ groups:
       # dropped without a decision (ARCH-G1). The counter lives in the
       # processor, which publishes no last-seen timestamp for it, so this rule
       # has the same sampled-counter exposure as
-      # GpuFaultProcessorLeaseRenewalFailing above: the Pod's /metrics sums
-      # the counter over its four processes, so scrapes no longer interleave,
-      # but one process restarting drops the sum and increase() reads that as
-      # a reset. A missed alert, never a false one.
+      # GpuFaultProcessorLeaseRenewalFailing above. /metrics keeps the bounded
+      # process slot on each counter, and increase() runs before aggregation.
       - alert: GpuFaultProcessorFaultEventsRejected
         expr: >-
           sum by (control_plane_cluster, region)
@@ -890,7 +966,7 @@ groups:
           (gpu_fault_periodic_lease_error_last_seen_timestamp_seconds) < 900
           or
           time()
-          - max by (control_plane_cluster, region, job)
+          - max by (control_plane_cluster, region, periodic_job)
           (gpu_fault_periodic_job_error_last_seen_timestamp_seconds) < 900
         for: 0m
         labels:
@@ -899,7 +975,7 @@ groups:
           summary: A periodic service job raised or could not take its task lease
           runbook_url: docs/管理员日常运维.md#gpufaultperiodicserviceerrors
           description: >-
-            {{ if $labels.job }}The periodic job {{ $labels.job }} raised an
+            {{ if $labels.periodic_job }}The periodic job {{ $labels.periodic_job }} raised an
             exception{{ else }}A periodic tick could not take a task lease from
             the store{{ end }} {{ $value | humanizeDuration }} ago;
             gpu_fault_periodic_job_errors_total and
@@ -1195,7 +1271,7 @@ groups:
       - alert: GpuFaultRemoteCommandStaleFenceSwept
         expr: >-
           sum by (control_plane_cluster, region)
-          (increase(gpu_fault_periodic_cleanup_rows_total{job="stale_fence_remote_commands"}[30m])) > 0
+          (increase(gpu_fault_periodic_cleanup_rows_total{periodic_job="stale_fence_remote_commands"}[30m])) > 0
         for: 0m
         labels:
           severity: warning
@@ -1254,8 +1330,8 @@ groups:
       # BLOCKED workflow is normal; a backlog means nobody is acting on them.
       #
       # This used to read `gpu_fault_workflow_total{status="BLOCKED"} > 3`, which
-      # is the trap `GpuFaultClosedLoopSlow` below documents, in its absolute
-      # form. That gauge counts every workflow ever persisted, and BLOCKED is
+      # confuses retained history with current recovery state. That gauge
+      # counts every workflow still persisted, and BLOCKED is
       # terminal, so the bucket falls only when an operator runs
       # `gpu-fault-admin workflow-reconcile` or the incident is archived out of
       # the table. A backlog that was handled correctly therefore kept the
@@ -1352,7 +1428,7 @@ groups:
             The hourly gpu-fault-aurora-credential-refresh CronJob last
             verified and published the master password more than three hours
             ago, so the mounted Secret may not survive the next rotation.
-            gpu_fault_aurora_credential_refresh_last_attempt_failed says
+            gpu_fault_aurora_credential_refresh_last_run_ok says
             whether it is failing or simply not being scheduled; read the
             failure_reason in last-refresh-status.json and the newest Job's log,
             then run the Job by hand once the cause is fixed.
@@ -1361,7 +1437,7 @@ groups:
       # failures rather than on age.
       - alert: GpuFaultAuroraCredentialRefreshFailing
         expr: >-
-          max by (control_plane_cluster, region)
+          min by (control_plane_cluster, region)
           (gpu_fault_aurora_credential_refresh_last_run_ok) == 0
         for: 15m
         labels:
@@ -1377,6 +1453,23 @@ groups:
             Secret's last-refresh-status.json and the Job log; typical causes
             are the Secrets Manager read, the verify connection (network,
             CA bundle) or RBAC on the Secret patch.
+      - alert: GpuFaultAuroraCredentialRefreshStatusUnknown
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_aurora_credential_refresh_status_unreadable) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Configured Aurora credential refresh evidence is unknown
+          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown
+          description: >-
+            A configured DSN-file consumer cannot validate its refresh status:
+            the file is missing, unreadable, malformed or future-dated.
+            This is neither a successful refresh nor proof that the last Job
+            failed. Inspect the status projection and refresher Job without
+            exposing credentials. Intentionally unconfigured roles emit no
+            refresh metrics and do not trigger this warning.
       - alert: GpuFaultBranchEscalationBudgetRefused
         expr: >-
           sum by (control_plane_cluster, region)
@@ -1481,39 +1574,28 @@ groups:
             their releases kept failing for longer than the retry horizon. The
             lane is no longer blocked, but the request's side effects were never
             confirmed; read the completion body for the failure reason.
-      # `gpu_fault_closed_loop_milestone_seconds` is emitted as `_count`/`_sum`
-      # over every persisted workflow, so its lifetime average never recovers
-      # once one slow incident lands. `delta` over a 6h window gives the mean
-      # for the workflows that reached the milestone recently instead. The
-      # window is long because containment milestones are rare events, and
-      # `clamp_min` keeps the denominator away from zero. Record retention can
-      # move the gauge down, in which case the ratio goes negative and the alert
-      # stays silent — a missed alert, never a false one.
-      #
-      # Both halves aggregate before `delta` for the same reason as the two rules
-      # around it: the summary is a Store-derived aggregate that every replica
-      # publishes, so a per-series ratio is the same number repeated once per
-      # replica, and a replica that restarts inside the window contributes a step
-      # from zero to the whole persisted history.
+      # A delta of retained snapshot sums/counts is not an event mean: expiring
+      # two 100s rows while adding two 600s rows reports 1000s, not 600s.
+      # The application deduplicates first milestone successes by event time
+      # over six hours and emits NaN for empty/incomplete means. Aggregate the
+      # already-paired mean, never independent replica maxima of sum and count.
+      # Cached scans keep their original timestamp; 120s allows the default
+      # 60s scan TTL plus scrape/delivery delay, not arbitrarily stale history.
       - alert: GpuFaultClosedLoopSlow
         expr: >-
-          delta(
+          max by (control_plane_cluster, region) (
+            gpu_fault_closed_loop_milestone_window_mean_seconds{milestone="containment"}
+            and
+            (gpu_fault_closed_loop_milestone_window_complete{milestone="containment"} == 1)
+            and
+            (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} > 0)
+            and ignoring (milestone)
             (
-              max by (control_plane_cluster, region)
-              (gpu_fault_closed_loop_milestone_seconds_sum{milestone="containment"})
-            )[6h:5m]
-          )
-          /
-          clamp_min(
-            delta(
-              (
-                max by (control_plane_cluster, region)
-                (gpu_fault_closed_loop_milestone_seconds_count{milestone="containment"})
-              )[6h:5m]
-            ),
-            1
-          )
-          > 900
+              (time() - gpu_fault_closed_loop_window_end_timestamp_seconds >= 0)
+              and
+              (time() - gpu_fault_closed_loop_window_end_timestamp_seconds <= 120)
+            )
+          ) > 900
         for: 15m
         labels:
           severity: warning
@@ -1521,10 +1603,54 @@ groups:
           summary: Recent GPU fault containment took over 15 minutes on average
           runbook_url: docs/管理员日常运维.md#gpufaultclosedloopslow
           description: >-
-            Containment is the first closed-loop milestone: the faulty GPU node
-            stops accepting new work. Detection-to-containment above 15 minutes
-            means later training attempts kept landing on a node already known
-            to be faulty.
+            The mean workflow-creation-to-first-containment duration for
+            successes in the six-hour event-time window exceeds 15 minutes.
+            Each workflow contributes once; inherited steps are not new
+            successes. Inspect dispatch delay and containment step outcomes.
+            Empty windows do not fire. Incomplete or stale data is reported by
+            GpuFaultClosedLoopWindowIncomplete, not treated as recovery passing.
+      - alert: GpuFaultClosedLoopWindowIncomplete
+        expr: >-
+          max by (control_plane_cluster, region) (
+            (
+              gpu_fault_workflow_scan_limit
+              or
+              (up{job="gpu-fault-control-plane",service_role="gpu-fault-control-worker"} == 1)
+            )
+            unless on (control_plane_cluster, region, job, namespace, pod, instance)
+            (
+              (gpu_fault_closed_loop_milestone_window_complete{milestone="containment"} == 1)
+              and
+              (
+                (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} == 0)
+                or
+                (
+                  (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} > 0)
+                  and
+                  (gpu_fault_closed_loop_milestone_window_mean_seconds{milestone="containment"} >= 0)
+                )
+              )
+              and ignoring (milestone)
+              (
+                (time() - gpu_fault_closed_loop_window_end_timestamp_seconds >= 0)
+                and
+                (time() - gpu_fault_closed_loop_window_end_timestamp_seconds <= 120)
+              )
+            )
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Recent GPU fault containment latency is unknown
+          runbook_url: docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete
+          description: >-
+            At least one control-worker lacks a complete, fresh six-hour
+            containment window. Check workflow scan truncation and its recency
+            window, retained milestone history, control-record retention and
+            metrics contributor errors. A scan older than 120 seconds is stale.
+            Do not interpret the absence of GpuFaultClosedLoopSlow as passing
+            while this warning fires, or delete Store rows to clear it.
       # Notifications are how an administrator learns that a workflow needs a
       # decision (GPU count change, spare exhaustion, mechanical check). A
       # failed delivery is therefore a silent stall of the human half of the
@@ -1539,21 +1665,19 @@ groups:
       # gpu_fault_notification_delivery_total{status="RETRY"} and is watched by
       # the age and drain rules below instead.
       #
-      # `gpu_fault_notification_total` is a Store-derived gauge, not a per-Pod
-      # counter, so `delta` has to be taken over the aggregate: applied per
-      # series it also reports the step a restarted replica makes when its first
-      # scrape publishes the whole history at once. The subquery aggregates
-      # first and then measures the 15m change of that single series. `for`
-      # holds the page through one scrape of a replica that is still catching
-      # up; a dead letter stays visible in the window for the full 15m.
+      # A retained FAILED census can stay flat while old results expire and
+      # new failures arrive. Use recorded terminal failure event time instead.
+      # max_over_time preserves an observed event across child/Pod restarts;
+      # its event age, not the scrape time, bounds the fifteen-minute window.
       - alert: GpuFaultNotificationDeliveryFailing
         expr: >-
-          delta(
-            (
-              max by (control_plane_cluster, region)
-              (gpu_fault_notification_total{status="FAILED"})
-            )[15m:1m]
-          ) > 0
+          (
+            time() - max by (control_plane_cluster, region)
+            (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds[15m]))
+          ) < 900
+          and
+          max by (control_plane_cluster, region)
+          (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds[15m])) > 0
         for: 5m
         labels:
           severity: critical
@@ -1561,14 +1685,15 @@ groups:
           summary: Business notifications were given up on undelivered
           runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing
           description: >-
-            {{ $value | printf "%.0f" }} notification(s) reached a terminal FAILED result in the
-            last 15 minutes: the outbox exhausted its delivery attempts
+            A notification reached a recorded terminal FAILED result
+            {{ $value | humanizeDuration }} ago: the outbox exhausted its delivery attempts
             (gpu_fault_notification_dead_lettered_total) or an inline send
             failed with nothing behind it to retry. An administrator decision
             request was not delivered and nothing will retry it on its own.
-            Check the SES identity and sending quota, then re-send through
-            POST /v1/advisory-notifications/dispatch; a workflow waiting on that
-            decision is not progressing.
+            Check the SES identity and sending quota and inspect the terminal
+            result. A DEAD delivery needs explicit operator requeue before
+            dispatch can retry it; reading or dispatching the old row does not
+            create a new failure event.
       # The leading edge of the rule above. A notification in PENDING, RETRY or
       # LEASED is one the outbox still owes; the shelf life
       # (GPU_FAULT_NOTIFICATION_TTL_SECONDS, 6h) is when it is thrown away

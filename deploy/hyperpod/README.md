@@ -83,11 +83,13 @@ with `GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER`,
 `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`.
 
 The Kubernetes HMA Node watcher and CloudWatch HMA forwarding pipeline are
-disabled by default. Their current control-plane path only acts on XID/SXID,
-which are covered by the node kernel and Fabric Manager collectors. Keep
-`GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR=false` and
-`GPU_FAULT_ENABLE_CLOUDWATCH_HMA_COLLECTOR=false` unless validating those
-forwarding paths in an isolated environment.
+retired, including their commands, API routes and deployment assets. The node
+kernel and Fabric Manager collectors remain enabled. AWS-managed HMA, node
+quiesce coordination and warm-spare health-label checks are not removed.
+Historical installations must drain or archive pending events with their old
+release before retiring the two solution-owned Deployments and upgrading.
+See the operations manual section 7.4; AWS stacks and queues are not deleted
+by removing these assets.
 
 The numbered steps:
 

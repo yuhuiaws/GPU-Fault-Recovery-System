@@ -11,10 +11,8 @@ Two node-local jobs the control plane cannot do for the runner:
   poll-and-arm and the holder itself run as ``systemd-run`` transient units so
   they survive the ``kubectl exec`` channel (see memory
   ``host-probe-cannot-stop-its-own-transport``).
-* On the sibling node (node-c), ``systemctl disable`` the Node Agent unit
-  *without* ``--now`` before injection, recording the prior enabled/active
-  state, so the real reboot returns a node whose Agent never re-registers a new
-  boot id -- RESTART_NODE stays WAITING to its managed-recovery timeout.
+* Sibling Agent boot activation is now owned by ``destr014_recovery_probe``.
+  This probe's legacy unbound disable/restore entries refuse Agent mutations.
 
 Every shell command is on an allow-list; unknown units and devices are refused.
 Nothing here executes a GPU reset, a reboot, or touches any service other than
@@ -482,44 +480,17 @@ def holder_status(arguments: argparse.Namespace) -> None:
 
 
 def disable_agent_restart(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id, "run ID")
-    before = _agent_unit_state()
-    baseline = agent_baseline_record(
-        enabled_state=before.get("UnitFileState", ""),
-        active_state=before.get("ActiveState", ""),
-    )
-    path = state_path(run_id)
-    update_state(path, {"agent_baseline": baseline})
-    # Disable *without* --now: the running Agent keeps answering until the
-    # reboot, and does not come back after it.
-    run(checked_command(["systemctl", "disable", AGENT_UNIT], run_id))
-    after = _agent_unit_state()
-    emit(
-        {
-            "run_id": run_id,
-            "agent_baseline": baseline,
-            "agent_state_after_disable": after,
-        }
+    # Only destr014_recovery_probe owns the persistent arm/disable protocol.
+    # This legacy entry point has no binding and must never create new debt.
+    raise ProbeError(
+        "Node Agent disable requires the bound reboot-surviving recovery safeguard"
     )
 
 
 def restore_agent(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id, "run ID")
-    state = read_state(state_path(run_id))
-    baseline = state.get("agent_baseline")
-    if not isinstance(baseline, dict):
-        raise ProbeError("no recorded Node Agent baseline for this run")
-    for action in restore_actions(baseline):
-        run(checked_command(["systemctl", action, AGENT_UNIT], run_id), timeout=120)
-    after = _agent_unit_state()
-    if "start" in restore_actions(baseline) and after.get("ActiveState") != "active":
-        raise ProbeError("Node Agent did not return active after restore")
-    emit(
-        {
-            "run_id": run_id,
-            "agent_baseline": baseline,
-            "agent_state_after_restore": after,
-        }
+    raise ProbeError(
+        "unbound legacy Node Agent restore is refused; "
+        "the persistent recovery journal or manual reconciliation is required"
     )
 
 

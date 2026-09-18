@@ -11,13 +11,69 @@ from __future__ import annotations
 
 import fnmatch
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-if __package__:
-    from scripts.ci_gate_artifacts import CoverageGateError
+if TYPE_CHECKING or __package__:
+    from scripts.ci_gate_artifacts import CoverageGateError, repository_files
 else:
-    from ci_gate_artifacts import CoverageGateError
+    from ci_gate_artifacts import CoverageGateError, repository_files
+
+ROOT = Path(__file__).resolve().parents[1]
+OBJECTIVE_TARGET = 95
+COVERAGE_SCOPES = {
+    "production": (
+        "src/gpu_fault",
+        "src/gpu_fault_release",
+        "deploy/control-plane/tools",
+    ),
+    "runner": ("scripts/e2e/regional", "tools"),
+}
+
+
+@dataclass(frozen=True)
+class CoverageCounts:
+    statements: int
+    covered_lines: int
+    branches: int
+    covered_branches: int
+
+    @classmethod
+    def from_summary(cls, summary: object, *, source: str) -> CoverageCounts:
+        if not isinstance(summary, dict):
+            raise CoverageGateError(f"coverage summary is missing for {source}")
+        fields = (
+            "num_statements",
+            "covered_lines",
+            "missing_lines",
+            "num_branches",
+            "covered_branches",
+            "missing_branches",
+        )
+        if any(type(summary.get(key)) is not int or summary[key] < 0 for key in fields):
+            raise CoverageGateError(f"coverage counters are invalid for {source}")
+        if (
+            summary["covered_lines"] + summary["missing_lines"]
+            != summary["num_statements"]
+            or summary["covered_branches"] + summary["missing_branches"]
+            != summary["num_branches"]
+        ):
+            raise CoverageGateError(f"coverage counters disagree for {source}")
+        return cls(
+            summary["num_statements"],
+            summary["covered_lines"],
+            summary["num_branches"],
+            summary["covered_branches"],
+        )
+
+    @property
+    def measured(self) -> int:
+        return self.statements + self.branches
+
+    @property
+    def covered(self) -> int:
+        return self.covered_lines + self.covered_branches
 
 
 def validate_module_floors(raw: Sequence[Any]) -> None:
@@ -41,8 +97,8 @@ def validate_module_floors(raw: Sequence[Any]) -> None:
             or not isinstance(entry.get("description"), str)
             or not isinstance(entry.get("globs"), list)
             or not entry["globs"]
-            or not isinstance(entry.get("group_floor"), int)
-            or not isinstance(entry.get("file_floor"), int)
+            or type(entry.get("group_floor")) is not int
+            or type(entry.get("file_floor")) is not int
             or not 0 < entry["file_floor"] <= entry["group_floor"] <= 100
         ):
             raise CoverageGateError("coverage module floor entry is invalid")
@@ -57,6 +113,7 @@ def module_floor_violations(
     coverage_json: Path,
     *,
     config: Mapping[str, Any],
+    root: Path = ROOT,
 ) -> list[str]:
     """Per-group and per-file coverage failures a whole-repository floor hides.
 
@@ -73,8 +130,23 @@ def module_floor_violations(
         files = report["files"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise CoverageGateError("coverage JSON report is unreadable") from exc
+    if not isinstance(files, dict):
+        raise CoverageGateError("coverage JSON file inventory is invalid")
+    sources = {
+        path.relative_to(root).as_posix()
+        for path in repository_files(root)
+        if path.suffix == ".py"
+    }
     violations = []
     for entry in config["coverage"]["module_floors"]:
+        expected = {
+            relative
+            for relative in sources
+            if any(
+                fnmatch.fnmatchcase(relative, str(pattern))
+                for pattern in entry["globs"]
+            )
+        }
         matched = {
             relative: value
             for relative, value in files.items()
@@ -83,6 +155,20 @@ def module_floor_violations(
                 for pattern in entry["globs"]
             )
         }
+        missing = sorted(expected - matched.keys())
+        unexpected = sorted(matched.keys() - expected)
+        if missing or unexpected:
+            if missing:
+                violations.append(
+                    f"coverage module floor {entry['id']} has unmeasured sources: "
+                    + ", ".join(missing)
+                )
+            if unexpected:
+                violations.append(
+                    f"coverage module floor {entry['id']} reports unknown sources: "
+                    + ", ".join(unexpected)
+                )
+            continue
         if not matched:
             violations.append(
                 f"coverage module floor {entry['id']} matched no measured file"
@@ -91,19 +177,16 @@ def module_floor_violations(
         covered = 0
         total = 0
         for relative, value in sorted(matched.items()):
-            summary = value.get("summary") or {}
-            statements = int(summary.get("num_statements") or 0)
-            branches = int(summary.get("num_branches") or 0)
-            missing = int(summary.get("missing_lines") or 0)
-            partial = int(summary.get("num_partial_branches") or 0)
-            measurable = statements + branches
-            reached = measurable - missing - partial
+            counts = CoverageCounts.from_summary(
+                value.get("summary") if isinstance(value, dict) else None,
+                source=relative,
+            )
+            measurable = counts.measured
+            reached = counts.covered
             covered += reached
             total += measurable
             if measurable == 0:
-                # A module with nothing to measure (only imports and constants)
-                # cannot fall below a floor, and failing it would push authors
-                # towards deleting the file rather than testing it.
+                # Empty modules cannot supply a meaningful per-file percentage.
                 continue
             percent = 100.0 * reached / measurable
             if percent < entry["file_floor"]:

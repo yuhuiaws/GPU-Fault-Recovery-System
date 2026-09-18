@@ -368,6 +368,32 @@ async def send_advisory_notification(
 
 
 @router.post(
+    "/v1/advisory-notifications/{notification_id}/requeue",
+    response_model=NotificationResult,
+)
+@authorization_bucket("execution-token")
+async def requeue_advisory_notification(
+    notification_id: str,
+    execution_token: str | None = Header(default=None, alias=EXECUTION_TOKEN_HEADER),
+    dependencies: IncidentRouterDependencies = Depends(get_incident_dependencies),
+) -> NotificationResult:
+    """Explicit operator retry; ordinary send never revives a dead letter."""
+    expected = dependencies.context.execution_token
+    if (
+        not expected
+        or not execution_token
+        or not secrets.compare_digest(execution_token, expected)
+    ):
+        raise HTTPException(status_code=403, detail="invalid execution token")
+    result: NotificationResult = await _store_call(
+        dependencies,
+        dependencies.context.advisory_notifications.requeue,
+        notification_id,
+    )
+    return result
+
+
+@router.post(
     "/v1/advisory-notifications/dispatch",
     response_model=NotificationDispatchReport,
 )

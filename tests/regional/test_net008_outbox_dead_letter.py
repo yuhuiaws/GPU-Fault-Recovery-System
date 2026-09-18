@@ -183,7 +183,11 @@ def test_the_stream_identity_contract_catches_a_reopen() -> None:
 
 def test_the_blackout_and_purge_contracts() -> None:
     blocked = {"connectivity": {"10.0.0.1": False}, "timer": {"ActiveState": "active"}}
-    unblocked = {"rules": [], "connectivity": {"10.0.0.1": True}}
+    unblocked = {
+        "rules": [],
+        "connectivity": {"10.0.0.1": True},
+        "timer": {"ActiveState": "inactive"},
+    }
     assert verdicts.blackout_errors(blocked, unblocked) == []
     assert "stayed reachable" in _text(
         verdicts.blackout_errors(

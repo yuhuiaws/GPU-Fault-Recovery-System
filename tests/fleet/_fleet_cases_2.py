@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.app import ApplicationContext
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     AgentTransitionRequest,
     BarrierCoordinator,
     BarrierState,
@@ -435,7 +436,7 @@ def test_agent_heartbeat_reporter_signs_payload() -> None:
     assert captured[0][0] == "http://control-plane"
     envelope = captured[0][1]
     assert envelope.signature == sign_agent_heartbeat(envelope.heartbeat, SECRET)
-    assert envelope.heartbeat.agent_protocol_version == 3
+    assert envelope.heartbeat.agent_protocol_version == CURRENT_AGENT_PROTOCOL_VERSION
     service = envelope.heartbeat.collector_services["gpu-fault-kernel-collector"]
     assert service.active.value == "active"
     assert service.enabled.value == "enabled"
@@ -618,10 +619,7 @@ def test_collector_readiness_accepts_reported_service_state() -> None:
 
 
 def test_collector_readiness_waits_out_the_first_report_window_of_a_new_agent() -> None:
-    """Live 2026-09-12: the first verify after a fresh bootstrap ran one minute
-    after the agents came up and failed on the 5-minute health-summary kinds
-    that had not reported yet. A kind that has never reported is silent only
-    once its threshold has elapsed since the Agent first appeared."""
+    """First-report cadence is diagnostic, not evidence for readiness."""
 
     store = build_store()
     # The readiness route reads the wall clock, so the registry must too.
@@ -646,11 +644,15 @@ def test_collector_readiness_waits_out_the_first_report_window_of_a_new_agent() 
             fresh = (
                 await client.get("/v1/collector-readiness/cluster-a", headers=token)
             ).json()
-            assert fresh["ready"] is True, "nothing is due yet on a brand-new Agent"
+            assert fresh["ready"] is False, "readiness requires an actual first report"
             assert all(
                 item["pending_first_report"] is True and item["last_success_at"] is None
                 for item in fresh["nodes"][0]["collectors"].values()
             ), "every kind is waiting for its first report, none has reported"
+            assert all(
+                item["ready"] is False
+                for item in fresh["nodes"][0]["collectors"].values()
+            ), "pending collectors must not authorize release readiness"
 
             (agent,) = store.list_agents("cluster-a")
             store.save_agent(

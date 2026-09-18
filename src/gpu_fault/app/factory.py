@@ -668,7 +668,6 @@ def _install_core_routes(
             store_io=store_io,
             ingest_xid=fault_ingestion.ingest_xid,
             ingest_sxid=fault_ingestion.ingest_sxid,
-            enrich_sxid_scope=fault_ingestion._enrich_sxid_scope,
         )
     )
     app.include_router(gpu_event_router)

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
+
+if TYPE_CHECKING:
+    from gpu_fault.regional import RemoteActionCommand
 
 LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 1
 # Version 3 understands a compound command (``RemoteActionCommand.batched_steps``)
@@ -12,8 +16,49 @@ LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 1
 # ``wait_seconds`` took (design §8.1): the control plane only mints compound
 # commands once every accepted executor version is at least this one, and the
 # claim never hands a compound command to an executor that advertised less.
-CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 3
+# Version 4 honors per-command, solely inhibiting synthetic replacement authority.
+CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 4
 REMOTE_STEP_BATCHING_PROTOCOL_VERSION = 3
+ACTIVATION_INHIBITION_PROTOCOL_VERSION = 4
+ACTIVATION_FORBIDDEN_PARAMETER = "activation_forbidden"
+ACTIVATION_INHIBITION_CAPABILITY = "synthetic-replacement-activation-inhibition"
+ACTIVATION_INHIBITION_VERSION = 1
+
+
+def activation_inhibition_identity(
+    command: RemoteActionCommand,
+) -> tuple[tuple[int, str], ...]:
+    """Presence, including malformed values, is immutable command authority."""
+    return tuple(
+        (
+            index,
+            json.dumps(
+                step.parameters[ACTIVATION_FORBIDDEN_PARAMETER],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+        for index, step in [
+            (command.step_index, command.step),
+            *((item.step_index, item.step) for item in command.batched_steps),
+        ]
+        if ACTIVATION_FORBIDDEN_PARAMETER in step.parameters
+    )
+
+
+def command_protocol_eligible(
+    command: RemoteActionCommand, executor_protocol_version: int
+) -> bool:
+    """An older executor must never receive authority it cannot interpret."""
+    inhibited = any(
+        ACTIVATION_FORBIDDEN_PARAMETER in step.parameters
+        for step in [command.step, *(item.step for item in command.batched_steps)]
+    )
+    return not inhibited or (
+        type(executor_protocol_version) is int
+        and executor_protocol_version >= ACTIVATION_INHIBITION_PROTOCOL_VERSION
+    )
 
 
 @dataclass(frozen=True)

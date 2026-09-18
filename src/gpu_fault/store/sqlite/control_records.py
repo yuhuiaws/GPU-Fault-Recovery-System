@@ -24,6 +24,7 @@ from gpu_fault.store.shared.evidence_pins import (
     evidence_pinned,
     pinning_incident_state_values,
 )
+from gpu_fault.store.shared.primitives import StatementGuard
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -41,6 +42,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
     _put: Callable[..., Any]
     _state_key: Callable[..., Any]
     _state_transaction: Callable[..., Any]
+    _statement_guard: StatementGuard
 
     def cleanup_hot_state(
         self,
@@ -158,14 +160,13 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         # (architecture review 2026-09-07, item D6; ``evidence_pins``). The
         # pinning incidents are the non-RECOVERED ones, a small set.
         placeholders = ", ".join("?" for _ in pinning_incident_state_values())
-        pinning = [
-            FaultIncident.model_validate_json(row[0])
-            for row in self._db.execute(
+        with self._statement_guard():
+            rows = self._db.execute(
                 "SELECT payload FROM objects WHERE kind='incident'"
                 f" AND json_extract(payload, '$.state') IN ({placeholders})",
                 pinning_incident_state_values(),
             ).fetchall()
-        ]
+        pinning = [FaultIncident.model_validate_json(row[0]) for row in rows]
         expired = sorted(
             (
                 item
@@ -223,22 +224,21 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         )
 
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
-        rows = self._db.execute(
-            """
+        query = """
             SELECT json_extract(payload, '$.status'), count(*)
             FROM objects
             WHERE kind='decision'
             GROUP BY 1
             """
-        ).fetchall()
+        with self._statement_guard():
+            rows = self._db.execute(query).fetchall()
         counts = {status: 0 for status in DecisionStatus}
         for status, count in rows:
             counts[DecisionStatus(status)] = int(count)
         return counts
 
     def count_completion_events_without_decision(self) -> int:
-        row = self._db.execute(
-            """
+        query = """
             SELECT count(*)
             FROM objects AS event
             WHERE event.kind='event'
@@ -248,23 +248,23 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                     AND decision.key=event.key
               )
             """
-        ).fetchone()
+        with self._statement_guard():
+            row = self._db.execute(query).fetchone()
         return int(row[0])
 
     def list_markers(self) -> list[NodeMarker]:
         return self._list("marker")
 
     def list_markers_for_incident(self, incident_id: str) -> list[NodeMarker]:
-        rows = self._db.execute(
-            """
+        query = """
             SELECT payload
             FROM objects
             WHERE kind='marker'
               AND json_extract(payload, '$.incident_id')=?
             ORDER BY json_extract(payload, '$.observed_at'), key
-            """,
-            (incident_id,),
-        ).fetchall()
+            """
+        with self._statement_guard():
+            rows = self._db.execute(query, (incident_id,)).fetchall()
         return [NodeMarker.model_validate_json(row[0]) for row in rows]
 
     def cleanup_inactive_markers(self, *, older_than: datetime, limit: int) -> int:
@@ -362,6 +362,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         fabric_partitions: set[str],
         observed_from: datetime,
         observed_to: datetime,
+        cluster_id: str | None = None,
         limit: int = 1000,
     ) -> list[NodeMarker]:
         """Actionable markers whose scope touches an allocation, newest first.
@@ -380,6 +381,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                 if marker.active
                 and marker.trusted
                 and marker.recommended_action is not None
+                and (cluster_id is None or marker.cluster_id == cluster_id)
                 and observed_from <= marker.observed_at <= observed_to
                 and (
                     set(marker.scope.node_ids).intersection(node_ids)

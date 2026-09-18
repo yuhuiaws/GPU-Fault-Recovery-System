@@ -14,6 +14,7 @@ ARTIFACT_SHA256="${GPU_FAULT_INSTALLER_ARTIFACT_SHA256:-}"
 BUNDLE_SHA256="${GPU_FAULT_INSTALLER_BUNDLE_SHA256:-}"
 TEMPLATE_SOURCE_SHA256="${GPU_FAULT_INSTALLER_TEMPLATE_SHA256:-}"
 TEMPLATE_CONFIG_MAP_OVERRIDE="${GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP:-}"
+TEMPLATE_CONTENT_SHA256="${GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256:-}"
 NODE_COMPATIBILITY_DIGEST="${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-}"
 MAX_UNAVAILABLE="${GPU_FAULT_INSTALLER_MAX_UNAVAILABLE:-1}"
 ACTIVE_DEADLINE_SECONDS="$(
@@ -37,15 +38,12 @@ NODE_ACTION_KEYS_SECRET="$(
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-}"
+NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
+NODE_WHEELHOUSE_SHA256="${GPU_FAULT_NODE_WHEELHOUSE_SHA256:-}"
 PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
-# Products an earlier run of the same release left behind, as advisory hints:
-# the node set (by digest) whose action keys it provisioned, and the template
-# ConfigMap it rendered. Both are honoured only after this run's own checks --
-# the live node list must still hash to the recorded digest, and the ConfigMap
-# must still carry the content its name promises -- so a stale hint costs one
-# read and falls back to the full path. PRODUCTS_FILE is where this run reports
-# its own products (names and digests only, never key material) for the next.
+# Older callers may supply product hints. They do not replace live key proof
+# or a trusted full template pin; reports contain identities, never key material.
 REUSE_NODE_SET_SHA256="${GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256:-}"
 REUSE_TEMPLATE_CONFIG_MAP="${GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP:-}"
 PRODUCTS_FILE="${GPU_FAULT_RECONCILER_PRODUCTS_FILE:-}"
@@ -87,6 +85,19 @@ done
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP\n' >&2
     exit 2
 }
+if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
+    [[ "${TEMPLATE_CONTENT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+        printf 'ERROR: explicit installer template requires a trusted GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256\n' >&2
+        exit 2
+    }
+fi
+if [[ -n "${NODE_DEPENDENCY_IMAGE}${NODE_WHEELHOUSE_SHA256}" ]]; then
+    [[ "${NODE_DEPENDENCY_IMAGE}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ &&
+        "${NODE_WHEELHOUSE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+        printf 'ERROR: node dependency image and inventory must be digest pinned\n' >&2
+        exit 2
+    }
+fi
 [[ "${MAX_UNAVAILABLE}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_MAX_UNAVAILABLE\n' >&2
     exit 2
@@ -146,53 +157,92 @@ kubectl_context() {
     command kubectl --context "${KUBECTL_CONTEXT}" "$@"
 }
 
+MANIFEST="$(mktemp)"
+CONFIG_MAP_MANIFEST="$(mktemp)"
+RECONCILER_MANIFEST="$(mktemp)"
+PREFLIGHT_OUTPUT_DIR="$(mktemp -d)"
+NODE_INPUTS_FILE="${PREFLIGHT_OUTPUT_DIR}/nodes.json"
+trap 'wait; rm -f "${MANIFEST}" "${CONFIG_MAP_MANIFEST}" "${RECONCILER_MANIFEST}"; rm -rf "${PREFLIGHT_OUTPUT_DIR}"' EXIT
+
+validate_selected_template() {
+    python3 - "${MANIFEST}" "${TEMPLATE_CONTENT_SHA256}" "${NAMESPACE}" \
+        "${CONFIG_DIGEST}" "${ARTIFACT_SHA256}" "${BUNDLE_SHA256}" \
+        "${TEMPLATE_SOURCE_SHA256}" "${NODE_ACTION_KEYS_SECRET}" \
+        "${ACTIVE_DEADLINE_SECONDS}" "${DCGM_METRICS_URL}" \
+        "${NODE_DEPENDENCY_IMAGE}" "${NODE_WHEELHOUSE_SHA256}" <<'PY'
+from pathlib import Path
+import sys
+from gpu_fault.node_installer_rendering import InstallerIdentity, load_installer_template
+
+identity = InstallerIdentity(
+    namespace=sys.argv[3],
+    config_digest=sys.argv[4],
+    artifact_sha256=sys.argv[5],
+    bundle_sha256=sys.argv[6],
+    template_sha256=sys.argv[7],
+    node_action_keys_secret=sys.argv[8],
+    deadline_seconds=int(sys.argv[9]),
+    metrics_url_template=sys.argv[10],
+    template_content_sha256=sys.argv[2],
+    node_dependency_image=sys.argv[11],
+    node_wheelhouse_sha256=sys.argv[12],
+)
+load_installer_template(
+    Path(sys.argv[1]).read_bytes(),
+    expected_sha256=identity.template_content_sha256,
+    origin="selected installer Job",
+    identity=identity,
+)
+PY
+}
+
+# The override pin comes from the previous Reconciler, not this mutable object.
+# Keep the verified bytes for both admission and the per-node preflight batch.
+if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
+    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
+    kubectl_context -n "${NAMESPACE}" get configmap \
+        "${TEMPLATE_CONFIG_MAP}" -o json |
+        python3 -c '
+import json
+import sys
+
+text = (json.load(sys.stdin).get("data") or {}).get("job.yaml")
+if not isinstance(text, str) or not text.strip():
+    raise SystemExit("template ConfigMap has no job.yaml")
+sys.stdout.write(text)
+' >"${MANIFEST}"
+    validate_selected_template
+    kubectl_context apply --dry-run=server -f "${MANIFEST}" >/dev/null
+fi
+
 kubectl_context -n "${NAMESPACE}" get configmap \
     "${INSTALLER_CONFIG_MAP}" >/dev/null
 kubectl_context -n "${NAMESPACE}" get configmap \
     "${WHEEL_CONFIG_MAP}" >/dev/null
 kubectl_context -n "${NAMESPACE}" get secret \
     gpu-fault-regional-connection >/dev/null
-mapfile -t NODES < <(
-    kubectl_context get nodes \
-        -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
-)
+NODE_INVENTORY_JSON="$(kubectl_context get nodes \
+    -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" -o json)"
+mapfile -t NODES < <(jq -r '.items | sort_by(.metadata.name)[] | .metadata.name' \
+    <<<"${NODE_INVENTORY_JSON}")
 (( ${#NODES[@]} > 0 )) || {
     printf 'ERROR: no HyperPod node found for %s\n' \
         "${HYPERPOD_CLUSTER}" >&2
     exit 1
 }
-# The identity of the fleet this run acts on. A hint from an earlier run is
-# only honoured when the live fleet still hashes to what that run provisioned
-# for; a node added or removed since produces a different digest and the full
-# path runs again. The preflight never reuses: it is the run that has to prove
-# the inputs from scratch.
+# This digest describes names only and cannot authorize key or template reuse.
 NODE_SET_SHA256="$(printf '%s\n' "${NODES[@]}" | sort | sha256sum | awk '{print $1}')"
-REUSE_PRODUCTS="false"
-if [[ "${PREFLIGHT_ONLY}" != "true" && -n "${REUSE_NODE_SET_SHA256}" &&
-    "${REUSE_NODE_SET_SHA256}" == "${NODE_SET_SHA256}" ]]; then
-    REUSE_PRODUCTS="true"
-fi
 
 NODE_ACTION_KEYS_PROVISIONED="false"
 if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" ]]; then
-    if [[ "${REUSE_PRODUCTS}" == "true" ]]; then
-        # Provisioning derives one key per node from the fleet master and
-        # mirrors the Secret to the control plane; both are functions of the
-        # node set alone, which has not changed since this release did them.
-        # The node-scoped key verification below still runs on the live Secret.
-        printf 'reusing node action keys in %s/%s provisioned earlier in this release\n' \
-            "${NAMESPACE}" "${NODE_ACTION_KEYS_SECRET}"
-    else
-        GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
-        GPU_FAULT_NAMESPACE="${NAMESPACE}" \
-        GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
-        GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
-        GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
-        GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
-            "${SCRIPT_DIR}/provision-node-action-keys.sh"
-        NODE_ACTION_KEYS_PROVISIONED="true"
-    fi
+    GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
+    GPU_FAULT_NAMESPACE="${NAMESPACE}" \
+    GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
+    GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
+    GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
+    GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
+        "${SCRIPT_DIR}/provision-node-action-keys.sh"
+    NODE_ACTION_KEYS_PROVISIONED="true"
 else
     kubectl_context -n "${NAMESPACE}" get secret \
         "${NODE_ACTION_KEYS_SECRET}" >/dev/null || {
@@ -304,11 +354,26 @@ if active:
 fi
 
 NODE="${NODES[0]}"
-MANIFEST="$(mktemp)"
-CONFIG_MAP_MANIFEST="$(mktemp)"
-RECONCILER_MANIFEST="$(mktemp)"
-JOB_MANIFEST="$(mktemp)"
-trap 'rm -f "${MANIFEST}" "${CONFIG_MAP_MANIFEST}" "${RECONCILER_MANIFEST}" "${JOB_MANIFEST}"' EXIT
+install -m 0600 /dev/null "${NODE_INPUTS_FILE}"
+# The Secret values have been validated above; only topology and reference
+# identities enter the rendering snapshot, never credentials.
+jq --arg cluster "${CLUSTER_ID}" --arg context "${KUBECTL_CONTEXT}" \
+    --arg namespace "${NAMESPACE}" --arg keys "${NODE_ACTION_KEYS_SECRET}" '
+    {
+        schema_version: 1, cluster_id: $cluster, context: $context,
+        namespace: $namespace, node_action_keys_secret: $keys,
+        connection_secret: "gpu-fault-regional-connection", references_validated: true,
+        nodes: (.items | map({
+            key: .metadata.name,
+            value: {
+                metadata: {uid: .metadata.uid, labels: {
+                    "node.kubernetes.io/instance-type": .metadata.labels["node.kubernetes.io/instance-type"]
+                }},
+                status: {addresses: [.status.addresses[] | select(.type == "InternalIP")]}
+            }
+        }) | from_entries)
+    }
+' <<<"${NODE_INVENTORY_JSON}" >"${NODE_INPUTS_FILE}"
 
 render_installer_job() {
     local node="$1"
@@ -332,59 +397,18 @@ render_installer_job() {
     GPU_FAULT_DCGM_METRICS_URL="${DCGM_METRICS_URL}" \
     GPU_FAULT_REQUIRE_ROLLBACK_SLOT="${REQUIRE_ROLLBACK_SLOT}" \
         "${SCRIPT_DIR}/run-hyperpod-installer-job.sh" \
-        --node "${node}" "$@"
+        --node "${node}" --node-inputs "${NODE_INPUTS_FILE}" "$@"
 }
 
-# The digest of the job.yaml a template ConfigMap holds right now, computed
-# from the object rather than assumed.
-template_config_map_content_sha256() {
-    kubectl_context -n "${NAMESPACE}" get configmap "$1" -o json |
-        python3 -c '
-import hashlib
-import json
-import sys
-
-text = (json.load(sys.stdin).get("data") or {}).get("job.yaml") or ""
-if not text.strip():
-    raise SystemExit("template ConfigMap has no job.yaml")
-print(hashlib.sha256(text.encode()).hexdigest())
-'
-}
-
-# TEMPLATE_CONTENT_SHA256 pins the exact job.yaml bytes the reconciler will
-# load, so a later edit to the template ConfigMap cannot become a privileged
-# Pod on every node. In the render path it is the digest of the file we put in
-# the ConfigMap; with an override it is the digest of what that ConfigMap
-# holds right now, computed from the object rather than assumed.
+# Newly rendered bytes have local release provenance. An override never enters
+# this branch and cannot replace its captured pin with a hash of current bytes.
 TEMPLATE_RENDERED="false"
-TEMPLATE_CONFIG_MAP=""
-if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
-    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
-    TEMPLATE_CONTENT_SHA256="$(
-        template_config_map_content_sha256 "${TEMPLATE_CONFIG_MAP}"
-    )"
-elif [[ "${REUSE_PRODUCTS}" == "true" && -n "${REUSE_TEMPLATE_CONFIG_MAP}" ]]; then
-    # A template rendered earlier in this release for the same inputs and the
-    # same node set. The render path names the ConfigMap after its content, so
-    # a name whose suffix no longer matches the live digest means the object
-    # was edited or replaced: it is not reused, and the render below recreates
-    # it from the inputs.
-    if reused_sha256="$(
-        template_config_map_content_sha256 "${REUSE_TEMPLATE_CONFIG_MAP}" \
-            2>/dev/null
-    )" && [[ "${REUSE_TEMPLATE_CONFIG_MAP}" == \
-        "gpu-fault-node-installer-template-${reused_sha256:0:12}" ]]; then
-        TEMPLATE_CONFIG_MAP="${REUSE_TEMPLATE_CONFIG_MAP}"
-        TEMPLATE_CONTENT_SHA256="${reused_sha256}"
-        printf 'reusing template ConfigMap %s rendered earlier in this release\n' \
-            "${TEMPLATE_CONFIG_MAP}"
-    fi
-fi
-if [[ -z "${TEMPLATE_CONFIG_MAP}" ]]; then
+if [[ -z "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
     TEMPLATE_RENDERED="true"
     render_installer_job "${NODE}" --render-only >"${MANIFEST}"
     TEMPLATE_SHA256="$(sha256sum "${MANIFEST}" | awk '{print $1}')"
     TEMPLATE_CONTENT_SHA256="${TEMPLATE_SHA256}"
+    validate_selected_template
     TEMPLATE_CONFIG_MAP="gpu-fault-node-installer-template-${TEMPLATE_SHA256:0:12}"
 
     kubectl_context -n "${NAMESPACE}" create configmap \
@@ -420,48 +444,59 @@ sed \
     "${REPO_DIR}/deploy/dataplane/node-installer-reconciler.yaml" \
     >"${RECONCILER_MANIFEST}"
 
+python3 - "${RECONCILER_MANIFEST}" "${NODE_DEPENDENCY_IMAGE}" \
+    "${NODE_WHEELHOUSE_SHA256}" "${NODE_ACTION_KEYS_SECRET}" \
+    "${TEMPLATE_CONTENT_SHA256}" "${TEMPLATE_SOURCE_SHA256}" \
+    "${ARTIFACT_SHA256}" "${BUNDLE_SHA256}" "${CONFIG_DIGEST}" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+from gpu_fault.node_installer_rendering import literal_environment, named_object
+
+path = Path(sys.argv[1])
+documents = list(yaml.safe_load_all(path.read_bytes()))
+deployment = next(
+    item for item in documents
+    if item.get("kind") == "Deployment"
+    and item.get("metadata", {}).get("name") == "gpu-fault-node-installer-reconciler"
+)
+container = named_object(
+    deployment["spec"]["template"]["spec"]["containers"], "reconciler", "Reconciler containers"
+)
+literal_environment(container)
+updates = {
+    "GPU_FAULT_NODE_DEPENDENCY_IMAGE": sys.argv[2],
+    "GPU_FAULT_NODE_WHEELHOUSE_SHA256": sys.argv[3],
+    "GPU_FAULT_NODE_ACTION_KEYS_SECRET": sys.argv[4],
+    "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256": sys.argv[5],
+    "GPU_FAULT_INSTALLER_TEMPLATE_SHA256": sys.argv[6],
+    "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": sys.argv[7],
+    "GPU_FAULT_INSTALLER_BUNDLE_SHA256": sys.argv[8],
+    "GPU_FAULT_INSTALLER_CONFIG_DIGEST": sys.argv[9],
+}
+container["env"] = [
+    item for item in container["env"] if item["name"] not in updates
+] + [{"name": name, "value": value} for name, value in updates.items()]
+path.write_text(yaml.safe_dump_all(documents, sort_keys=False))
+PY
+
 if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
     kubectl_context apply --dry-run=server \
         -f "${RECONCILER_MANIFEST}" >/dev/null
-    for node in "${NODES[@]}"; do
-        render_installer_job "${node}" --render-only >"${JOB_MANIFEST}"
-        kubectl_context apply --dry-run=server \
-            -f "${JOB_MANIFEST}" >/dev/null
-        render_installer_job "${node}" --preflight-only --render-only \
-            >"${JOB_MANIFEST}"
-        kubectl_context apply --dry-run=server \
-            -f "${JOB_MANIFEST}" >/dev/null
-    done
-    # One read-only preflight Job per node, all at once. The Jobs are
-    # independent: each is pinned to its node and named after node + artifact,
-    # and none of them mutates the host. Each one spends most of its ~35s on
-    # Pod scheduling and its own 2s poll, so a serial loop cost the fleet size
-    # times that for no ordering benefit (measured 148.8s for four nodes).
-    # Output is captured per node so the verdict below stays the last line of
-    # stdout, which the caller parses.
-    PREFLIGHT_OUTPUT_DIR="$(mktemp -d)"
-    trap 'rm -f "${MANIFEST}" "${CONFIG_MAP_MANIFEST}" "${RECONCILER_MANIFEST}" "${JOB_MANIFEST}"; rm -rf "${PREFLIGHT_OUTPUT_DIR}"' EXIT
-    preflight_pids=()
-    for node in "${NODES[@]}"; do
-        render_installer_job "${node}" --preflight-only \
-            >"${PREFLIGHT_OUTPUT_DIR}/${node}.log" 2>&1 &
-        preflight_pids+=("$!")
-    done
-    preflight_failed=()
-    for index in "${!NODES[@]}"; do
-        if ! wait "${preflight_pids[${index}]}"; then
-            preflight_failed+=("${NODES[${index}]}")
-        fi
-    done
-    for node in "${NODES[@]}"; do
-        printf -- '--- node preflight %s ---\n' "${node}"
-        cat "${PREFLIGHT_OUTPUT_DIR}/${node}.log"
-    done
-    if ((${#preflight_failed[@]})); then
-        printf 'ERROR: node preflight failed on: %s\n' \
-            "${preflight_failed[*]}" >&2
-        exit 1
-    fi
+    python3 -m gpu_fault_release.regional_node_batch \
+        --inputs "${NODE_INPUTS_FILE}" --template "${MANIFEST}" \
+        --output "${PREFLIGHT_OUTPUT_DIR}" --context "${KUBECTL_CONTEXT}" \
+        --namespace "${NAMESPACE}" --cluster-id "${CLUSTER_ID}" \
+        --node-action-keys-secret "${NODE_ACTION_KEYS_SECRET}" \
+        --connection-secret gpu-fault-regional-connection \
+        --config-digest "${CONFIG_DIGEST}" --artifact-sha256 "${ARTIFACT_SHA256}" \
+        --bundle-sha256 "${BUNDLE_SHA256}" --template-sha256 "${TEMPLATE_SOURCE_SHA256}" \
+        --template-content-sha256 "${TEMPLATE_CONTENT_SHA256}" \
+        --node-dependency-image "${NODE_DEPENDENCY_IMAGE}" \
+        --node-wheelhouse-sha256 "${NODE_WHEELHOUSE_SHA256}" \
+        --require-rollback-slot "${REQUIRE_ROLLBACK_SLOT}" \
+        --metrics-url-template "${DCGM_METRICS_URL}" \
+        --deadline-seconds "${ACTIVE_DEADLINE_SECONDS}" --workers 8 --run-preflights
     printf '{"node_count":%d,"status":"PASSED","template_config_map":"%s"}\n' \
         "${#NODES[@]}" "${TEMPLATE_CONFIG_MAP}"
     exit 0

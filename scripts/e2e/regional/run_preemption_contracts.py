@@ -1,10 +1,10 @@
 """Run one deterministic PREEMPT-001..009 contract fixture.
 
-Each case is a fixed set of pytest node ids; the verdict is the pytest exit
-code. Given ``--run-dir`` the case also writes ``cases/<id>/<id>.json`` so the
+Each case is a fixed set of pytest selectors with complete, source-bound
+execution receipts. Given ``--run-dir`` it writes ``cases/<id>/<id>.json`` so the
 PREEMPT chain (PREEMPT-012's predecessor resolution in particular) can find a
-PASS where the formal order expects one. Stdout is unchanged: the pytest output
-followed by one JSON line.
+PASS where the formal order expects one. Stdout contains pytest output
+followed by one source-bound JSON verdict line.
 """
 
 from __future__ import annotations
@@ -22,6 +22,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from tools.pytest_result_identity import PytestReceipt  # noqa: E402
+from tools.run_fault_test_cases import (  # noqa: E402
+    build_isolated_environment,
+    run_reported_pytest,
+)
 
 CASE_NODEIDS = {
     "GF-REGIONAL-PREEMPT-001": (
@@ -73,18 +79,11 @@ CASE_NODEIDS = {
     ),
 }
 
-PytestRunner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
+PytestRunner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
-def _run_pytest(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+def _run_pytest(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, **kwargs)
 
 
 def case_evidence(
@@ -92,18 +91,35 @@ def case_evidence(
     completed: subprocess.CompletedProcess[str],
     *,
     release_id: str = "",
+    receipt: PytestReceipt | None = None,
+    receipt_error: str | None = None,
 ) -> dict[str, Any]:
     """The evidence document for one PREEMPT contract case."""
 
+    errors = (
+        ["pytest execution receipt is missing"]
+        if receipt is None
+        else receipt.complete_selection_errors(list(CASE_NODEIDS[case_id]), root=ROOT)
+    )
+    if receipt_error:
+        errors.append(receipt_error)
+    if completed.returncode:
+        errors.append("pytest did not finish successfully")
+    session = receipt.session if receipt is not None else None
     document: dict[str, Any] = {
         "schema_version": 1,
         "report_type": "fault-acceptance",
         "case_id": case_id,
-        "verdict": "PASS" if completed.returncode == 0 else "FAIL",
+        "verdict": "PASS" if not errors else "FAIL",
         "executed_at": datetime.now(timezone.utc).isoformat(),
         "fixture": "deterministic pytest contract; no cluster touched",
         "pytest_nodeids": list(CASE_NODEIDS[case_id]),
         "pytest_returncode": completed.returncode,
+        "source_identity": (session or {}).get("source_identity"),
+        "pytest_session": session,
+        "pytest_records": receipt.records if receipt is not None else {},
+        "receipt_errors": errors,
+        "proof_scope": "local-contract",
         "pytest_output_sha256": hashlib.sha256(
             (completed.stdout or "").encode("utf-8")
         ).hexdigest(),
@@ -120,8 +136,17 @@ def run_case(
     release_id: str = "",
     runner: PytestRunner = _run_pytest,
 ) -> int:
-    command = [sys.executable, "-m", "pytest", "-q", *CASE_NODEIDS[case_id]]
-    completed = runner(command)
+    command = [sys.executable, "-m", "pytest", "-q", *CASE_NODEIDS[case_id], "-n", "0"]
+    completed, receipt, receipt_error = run_reported_pytest(
+        command, environment=build_isolated_environment(), runner=runner
+    )
+    document = case_evidence(
+        case_id,
+        completed,
+        release_id=release_id,
+        receipt=receipt,
+        receipt_error=receipt_error,
+    )
     print(completed.stdout, end="")
     if run_dir is not None:
         from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
@@ -129,19 +154,22 @@ def run_case(
 
         write_json_atomic(
             case_evidence_path(run_dir, case_id),
-            case_evidence(case_id, completed, release_id=release_id),
+            document,
         )
     print(
         json.dumps(
             {
                 "case_id": case_id,
-                "verdict": "PASS" if completed.returncode == 0 else "FAIL",
+                "verdict": document["verdict"],
                 "pytest_nodeids": list(CASE_NODEIDS[case_id]),
+                "source_identity": document["source_identity"],
+                "receipt_errors": document["receipt_errors"],
+                "proof_scope": "local-contract",
             },
             sort_keys=True,
         )
     )
-    return completed.returncode
+    return 0 if document["verdict"] == "PASS" else (completed.returncode or 1)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--release-id",
         default="",
-        help="release the evidence is bound to (from the release state ConfigMap)",
+        help="release annotation only; this local contract does not verify a deployment",
     )
     return parser
 

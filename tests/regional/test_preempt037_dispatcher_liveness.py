@@ -50,9 +50,11 @@ def test_the_expression_is_evaluated_like_the_rule() -> None:
         verdicts.stalled([_metrics(now - 10, now)], now=now, threshold_seconds=300)
         is False
     )
-    assert (
-        verdicts.stalled([_metrics(None, now)], now=now, threshold_seconds=300) is True
-    ), "a replica that never ticked reads as stalled"
+    with pytest.raises(ValueError, match="missing replica metric"):
+        verdicts.stalled([_metrics(None, now)], now=now, threshold_seconds=300)
+    assert verdicts.stalled([_metrics(0, now)], now=now, threshold_seconds=300), (
+        "a reported zero timestamp is different from a missing metric"
+    )
     assert (
         verdicts.stalled(
             [_metrics(now - 900, now), _metrics(now - 10, now)],

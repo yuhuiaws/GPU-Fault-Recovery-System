@@ -8,6 +8,8 @@ node and CloudTrail snapshots and touches no cluster.
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,10 @@ if str(ROOT) not in sys.path:
 
 from gpu_fault.adapters.common import (  # noqa: E402
     quarantine_taint_value as product_quarantine_taint_value,
+)
+from gpu_fault.recovery_safety import (  # noqa: E402
+    recovery_safety_errors,
+    unresolved_details,
 )
 from scripts.e2e.regional.warm_spare_fixture import QUARANTINE_TAINT  # noqa: E402
 
@@ -47,6 +53,49 @@ ZERO_SPARE_REPLACE_ERROR = (
     "warm-spare replacement is required; provider node replacement API "
     "fallback is disabled"
 )
+
+
+def canonical_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
+    store = preflight.get("store") or {}
+    return {
+        "release_id": preflight.get("release_id"),
+        "fault_node_uid": (preflight.get("fault_node") or {}).get("uid"),
+        "fault_node_boot_id": (preflight.get("fault_node") or {}).get("boot_id"),
+        "sibling_node_uid": (preflight.get("sibling_node") or {}).get("uid"),
+        "sibling_node_boot_id": (preflight.get("sibling_node") or {}).get("boot_id"),
+        "sibling_recovery_identity_sha256": canonical_digest(
+            preflight.get("recovery_agent")
+        ),
+        "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
+        "provider_inventory_sha256": (preflight.get("provider_inventory") or {}).get(
+            "sha256"
+        ),
+        "executor_env_baseline_sha256": (
+            preflight.get("executor_env_window") or {}
+        ).get("baseline_sha256"),
+    }
+
+
+def identity_digest(identity: dict[str, Any]) -> str:
+    return canonical_digest(identity)
+
+
+def evidence_components(details: dict[str, Any]) -> dict[str, str]:
+    return {
+        name: canonical_digest(details.get(name))
+        for name in ("preflight_identity", "workflow", "incident", "provider_events")
+        if name in details
+    }
+
+
+def case_digest(components: dict[str, str]) -> str:
+    return canonical_digest(components)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,20 +178,26 @@ def workflow_errors(
     fault_node: str,
     sibling_node: str,
     failure_reason: str | None,
+    reboot_outcome: str = "confirmed-failure",
 ) -> list[str]:
     errors: list[str] = []
-    if workflow.get("status") != "FAILED":
-        errors.append("workflow status is not FAILED")
-    if incident.get("state") != "QUARANTINED":
-        errors.append("incident state is not QUARANTINED")
+    if reboot_outcome not in {"confirmed-failure", "unknown"}:
+        return ["DESTR-014 reboot outcome scenario is unsupported"]
+    unknown = reboot_outcome == "unknown"
+    status = "BLOCKED" if unknown else "FAILED"
+    if workflow.get("status") != status:
+        errors.append(f"workflow status is not {status}")
+    if unknown and workflow.get("blocked_kind") != "NEEDS_OPERATOR":
+        errors.append("unknown reboot did not retain NEEDS_OPERATOR ownership")
+    expected_states = {"ESCALATED", "QUARANTINED"} if unknown else {"QUARANTINED"}
+    if incident.get("state") not in expected_states:
+        errors.append(f"incident state is not one of {sorted(expected_states)}")
     if not workflow.get("dag_enabled"):
         errors.append("workflow is not dag_enabled")
     counts = workflow.get("branch_escalation_counts") or {}
-    if counts != {fault_node: 1, sibling_node: 1}:
-        errors.append(
-            "branch_escalation_counts is not "
-            f"{{{fault_node}: 1, {sibling_node}: 1}}: {counts}"
-        )
+    expected_counts = {fault_node: 1} if unknown else {fault_node: 1, sibling_node: 1}
+    if counts != expected_counts:
+        errors.append(f"branch_escalation_counts is not {expected_counts}: {counts}")
     exhausted = workflow.get("exhausted_branch_ids") or []
     if len(exhausted) != 1 or not str(exhausted[0]).startswith(
         f"branch:{sibling_node}"
@@ -151,7 +206,7 @@ def workflow_errors(
             "exhausted_branch_ids is not exactly one "
             f"branch:{sibling_node} entry: {exhausted}"
         )
-    if not str(failure_reason or "").startswith(EXHAUSTION_PREFIX):
+    if not unknown and not str(failure_reason or "").startswith(EXHAUSTION_PREFIX):
         errors.append(
             f"failure reason does not start with {EXHAUSTION_PREFIX!r}: "
             f"{failure_reason!r}"
@@ -219,11 +274,34 @@ def workflow_errors(
     )
     if sibling_reboot is None:
         errors.append(f"{sibling_node} has no FAILED RESTART_NODE execution")
-    elif "step_waiting_timeout_seconds" not in (sibling_reboot.get("details") or {}):
-        errors.append(
-            f"{sibling_node} RESTART_NODE did not fail by bounded waiting "
-            "(step_waiting_timeout_seconds absent)"
-        )
+    else:
+        details = sibling_reboot.get("details") or {}
+        if unknown:
+            if not unresolved_details(details):
+                errors.append(
+                    "unknown reboot lacks physical-outcome uncertainty evidence"
+                )
+            if "step_waiting_timeout_seconds" not in details:
+                errors.append("unknown reboot lacks its bounded waiting receipt")
+        elif unresolved_details(details) or (
+            details.get("node_action_not_started") is not True
+        ):
+            errors.append(
+                "replacement requires a confirmed no-start reboot failure; "
+                "timeout or absent confirmation cannot authorize another action"
+            )
+
+    if unknown:
+        forbidden = {"REPLACE_NODE", "RESTORE_SCHEDULING", "RESTART_WORKLOAD"}
+        if any(
+            step.get("operation") == "REPLACE_NODE"
+            and _step_node(step) == [sibling_node]
+            for step in steps
+        ):
+            errors.append("unknown reboot incorrectly added a replacement rung")
+        if any(item.get("operation") in forbidden for item in sibling_execs):
+            errors.append("unknown sibling executed replacement or readmission")
+        return errors
 
     replace_step = next(
         (
@@ -257,6 +335,19 @@ def workflow_errors(
             f"error {ZERO_SPARE_REPLACE_ERROR!r}: {replace_exec.get('error')!r}"
         )
     return errors
+
+
+def recovery_cleanup_hold(state: dict[str, Any]) -> bool:
+    """No cancellation, timeout or incomplete read proves physical quiescence."""
+    workflow, commands = state.get("workflow"), state.get("commands")
+    if (
+        not isinstance(workflow, dict)
+        or workflow.get("status") not in {"SUCCEEDED", "FAILED", "SUPERSEDED"}
+        or workflow.get("blocked_kind") == "NEEDS_OPERATOR"
+        or not isinstance(commands, list)
+    ):
+        return True
+    return bool(recovery_safety_errors([workflow], commands))
 
 
 def host_errors(

@@ -118,11 +118,14 @@ def _run_cmd017_case(
     preflight = preflight_metadata(attempt, maintenance_window_end)
     seeded.write_json(case_dir / "preflight.json", preflight)
     seeded.preflight_residuals(probe, case_dir)
+    state["registry_started"] = True
     seeded.register_synthetic_cluster(case_dir, run_id)
-    ready = seeded.create_probe_pod(probe, case_dir)
+    state["probe_started"] = True
+    ready = seeded.create_probe_pod(probe, case_dir, run_id=run_id)
     errors = verdicts.ready_errors(ready)
     if errors:
         raise seeded.SeededCommandError("probe ready contract: " + "; ".join(errors))
+    state["seed"] = seeded.seed_identity(run_id)
     seed = seeded.seed_command(
         run_id,
         owner=probe.owner,
@@ -171,7 +174,7 @@ def _run_cmd017_case(
     # Stop the claimant, then read the command once more: it must still be open
     # -- a hold is not an outcome -- so that the purge below is deleting a
     # WAITING record, never a terminal one that pretended to be a reset.
-    seeded.dataplane("delete", "pod", probe.pod, "--ignore-not-found", check=False)
+    seeded.delete_owned_resource("pod", probe.pod, run_id)
     final = seeded.command_snapshot(str(seed["command_id"]))
     seeded.write_json(case_dir / "final-command.json", final)
 
@@ -219,7 +222,7 @@ def run_case(run_dir: Path, attempt: int, maintenance_window_end: datetime) -> i
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        seeded.cleanup(probe, case_dir, run_id, result, state["seed"])
+        seeded.cleanup(probe, case_dir, run_id, result, state["seed"], state=state)
     seeded.write_json(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -250,6 +253,14 @@ def plan_details() -> dict[str, Any]:
     }
 
 
+from scripts.e2e.regional.live_driver_guard import environment_snapshot  # noqa: E402
+from scripts.e2e.regional.plain_case_identity import (  # noqa: E402
+    add_plain_identity_arguments,
+    configure_plain_case,
+    plain_case_preflight,
+)
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
@@ -258,6 +269,7 @@ def parser() -> argparse.ArgumentParser:
         )
     )
     add_live_arguments(value, confirmation=CONFIRMATION)
+    add_plain_identity_arguments(value)
     return value
 
 
@@ -267,6 +279,12 @@ CASE = PlainCaseRunner(
     parser=parser,
     plan_details=plan_details,
     run_case=run_case,
+    configure=configure_plain_case,
+    read_only_preflight=lambda settings, case_dir: plain_case_preflight(
+        settings,
+        case_dir,
+        read_environment=environment_snapshot,
+    ),
 )
 
 

@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from threading import Event as ThreadEvent
 from typing import Any, Callable
+from uuid import uuid4
 
 from gpu_fault.store.shared.telemetry_models import (
     TELEMETRY_SPOOL_MAX_ATTEMPTS,
@@ -141,10 +142,10 @@ class PostgresTelemetrySpoolMixin:
             by_cluster[scope] = by_cluster.get(scope, 0) + admitted
         admitted_rows: list[tuple[object, ...]] = []
         admitted_indexes: list[int] = []
+        rejected_by_key: dict[str, str] = {}
         for index, request in enumerate(requests):
             key = request.spool_key()
             if winner_by_key[key] != index:
-                results[index] = (request, "coalesced")
                 continue
             scope = request.cluster_id or "__unscoped__"
             # The projection cannot tell an insert from a coalesce, so a
@@ -154,9 +155,11 @@ class PostgresTelemetrySpoolMixin:
             # past the cap.
             if depth >= max_depth:
                 results[index] = (None, "global")
+                rejected_by_key[key] = "global"
                 continue
             if by_cluster.get(scope, 0) >= max_cluster_depth:
                 results[index] = (None, "cluster")
+                rejected_by_key[key] = "cluster"
                 continue
             depth += 1
             by_cluster[scope] = by_cluster.get(scope, 0) + 1
@@ -233,6 +236,15 @@ class PostgresTelemetrySpoolMixin:
                 request,
                 "coalesced" if revisions.get(request.spool_key(), 0) > 0 else None,
             )
+        # A duplicate is acknowledged only after its winning sample was admitted.
+        for index, request in enumerate(requests):
+            key = request.spool_key()
+            if winner_by_key[key] != index:
+                rejection = rejected_by_key.get(key)
+                results[index] = (
+                    request if rejection is None else None,
+                    rejection or "coalesced",
+                )
         return results
 
     def claim_telemetry_spool(
@@ -252,6 +264,9 @@ class PostgresTelemetrySpoolMixin:
             return []
         path_filter = "" if path is None else "AND path=%s"
         path_parameters = () if path is None else (path,)
+        # Reuse the owner column for an opaque owner-qualified claim generation.
+        # Payload revision and retry attempts must not become lease generations.
+        lease_token = f"{owner_id}:{uuid4().hex}"
         with self._db.cursor() as cursor:
             cursor.execute(
                 f"""
@@ -308,7 +323,7 @@ class PostgresTelemetrySpoolMixin:
                     *path_parameters,
                     limit,
                     byte_limit,
-                    owner_id,
+                    lease_token,
                     now + lease_duration,
                     now,
                 ),
@@ -327,6 +342,7 @@ class PostgresTelemetrySpoolMixin:
                     json.loads(row[7]) if isinstance(row[7], (str, bytes)) else row[7]
                 ),
                 payload_bytes=row[8],
+                lease_token=lease_token,
             )
             for row in rows
         ]
@@ -341,14 +357,17 @@ class PostgresTelemetrySpoolMixin:
                 USING (
                     SELECT
                         unnest(%s::text[]) AS spool_key,
-                        unnest(%s::bigint[]) AS revision
+                        unnest(%s::bigint[]) AS revision,
+                        unnest(%s::text[]) AS lease_token
                 ) AS fence
                 WHERE spool.spool_key=fence.spool_key
                   AND spool.revision=fence.revision
+                  AND spool.lease_owner=fence.lease_token
                 """,
                 (
                     [item.spool_key for item in items],
                     [item.revision for item in items],
+                    [item.lease_token for item in items],
                 ),
             )
             return cursor.rowcount
@@ -372,16 +391,19 @@ class PostgresTelemetrySpoolMixin:
                 FROM (
                     SELECT
                         unnest(%s::text[]) AS spool_key,
-                        unnest(%s::bigint[]) AS revision
+                        unnest(%s::bigint[]) AS revision,
+                        unnest(%s::text[]) AS lease_token
                 ) AS fence
                 WHERE spool.spool_key=fence.spool_key
                   AND spool.revision=fence.revision
+                  AND spool.lease_owner=fence.lease_token
                 """,
                 (
                     now,
                     now,
                     [item.spool_key for item in items],
                     [item.revision for item in items],
+                    [item.lease_token for item in items],
                 ),
             )
             return cursor.rowcount
@@ -401,27 +423,28 @@ class PostgresTelemetrySpoolMixin:
         )
         keys = [item.spool_key for item in items]
         revisions = [item.revision for item in items]
+        lease_tokens = [item.lease_token for item in items]
         with self._db.transaction():
             with self._db.cursor() as cursor:
                 # Dropped first, so the release below only sees rows that
                 # still have budget left. Both statements carry the
-                # revision fence: a sample that arrived while this replay
-                # was failing has already reset the row's availability and
-                # its attempt count, and neither the backoff nor the drop
-                # is its to inherit.
+                # payload and claim fences: neither a newer sample nor a
+                # replacement owner may inherit this replay's backoff or drop.
                 cursor.execute(
                     """
                     DELETE FROM gpu_fault_telemetry_spool AS spool
                     USING (
                         SELECT
                             unnest(%s::text[]) AS spool_key,
-                            unnest(%s::bigint[]) AS revision
+                            unnest(%s::bigint[]) AS revision,
+                            unnest(%s::text[]) AS lease_token
                     ) AS fence
                     WHERE spool.spool_key=fence.spool_key
                       AND spool.revision=fence.revision
+                      AND spool.lease_owner=fence.lease_token
                       AND spool.attempts >= %s
                     """,
-                    (keys, revisions, limit),
+                    (keys, revisions, lease_tokens, limit),
                 )
                 dropped = cursor.rowcount
                 cursor.execute(
@@ -433,12 +456,14 @@ class PostgresTelemetrySpoolMixin:
                     FROM (
                         SELECT
                             unnest(%s::text[]) AS spool_key,
-                            unnest(%s::bigint[]) AS revision
+                            unnest(%s::bigint[]) AS revision,
+                            unnest(%s::text[]) AS lease_token
                     ) AS fence
                     WHERE spool.spool_key=fence.spool_key
                       AND spool.revision=fence.revision
+                      AND spool.lease_owner=fence.lease_token
                     """,
-                    (now + backoff, now, keys, revisions),
+                    (now + backoff, now, keys, revisions, lease_tokens),
                 )
                 released = cursor.rowcount
         return released, dropped

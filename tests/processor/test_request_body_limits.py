@@ -22,6 +22,7 @@ from gpu_fault.app.admission_runtime import (
     max_compressed_request_bytes,
 )
 from tests._builders import asgi_client
+from tests.metrics._assertions import assert_sample
 
 
 def _gzip_bomb(output_bytes: int) -> bytes:
@@ -151,7 +152,9 @@ def test_processor_rejects_a_gzip_bomb_over_the_wire(monkeypatch) -> None:
     assert rejected.status_code == 413
     assert rejected.json()["max_bytes"] == 65536
     assert context.store.processor_queue_stats()["depth"] == 0
-    assert "gpu_fault_processor_oversize_rejections_total 1" in metrics.text
+    assert_sample(
+        metrics.text, "gpu_fault_processor_oversize_rejections_total", 1, process="0"
+    )
 
 
 def test_processor_rejects_a_declared_oversize_compressed_body(monkeypatch) -> None:

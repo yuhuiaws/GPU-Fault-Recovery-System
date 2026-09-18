@@ -7,10 +7,12 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import TYPE_CHECKING, Any, Mapping, cast
 from urllib.parse import urlsplit
-from uuid import uuid4
 from weakref import WeakKeyDictionary
+
+if TYPE_CHECKING:
+    from gpu_fault.admin.node_key_custody_admin_probe import AdminNodeKeyContext
 
 from gpu_fault.admin.artifact_configmaps import (
     COMPRESSED_ARTIFACT_SUFFIX,
@@ -34,14 +36,25 @@ from gpu_fault.admin.bootstrap_platform_probes import (
     assert_monitoring_install_current,
     assert_node_action_keys_current,
 )
-from gpu_fault.admin.grafana import GrafanaSettings, ensure_grafana_dashboards
+from gpu_fault_release.regional_release_config import amp_writer_role_name
+from gpu_fault.admin.grafana import GrafanaSettings
+from gpu_fault.admin.grafana import (
+    ensure_grafana_dashboards as ensure_grafana_dashboards,
+)
 from gpu_fault.admin.monitoring_subscriptions import (
     ensure_monitoring_subscriptions,
+)
+from gpu_fault.admin.monitoring_policy import (
+    SNS_TOPIC_GENERATION_TAG as SNS_TOPIC_GENERATION_TAG,
+    amp_workspace_arn,
+    ensure_amp_sns_publish_policy,
+    ensure_sns_topic as ensure_sns_topic,
+    site_sns_topic_arn as site_sns_topic_arn,
+    validate_amp_workspace,
 )
 from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
 from gpu_fault.admin.site import archive_s3_prefix_arn
 
-SNS_TOPIC_GENERATION_TAG = "gpu-fault:topic-generation"
 # One Pod Identity add-on result per deploy run, keyed by the runner the run was
 # handed. Three call sites ensure the same add-on (`revalidate_pod_identity_agent`,
 # the control-plane role and the load balancer controller) and each one used to
@@ -900,26 +913,34 @@ def _ensure_amp_workspace(
     site_id: str,
 ) -> tuple[str, bool]:
     alias = safe_name(f"gpu-fault-{site_id}", maximum=100)
-    workspaces = cast(
-        list[dict[str, Any]],
-        runner.aws_json(
-            cpu.region,
-            "amp",
-            "list-workspaces",
-            "--alias",
-            alias,
-        ).get("workspaces", []),
-    )
+    workspaces = runner.aws_json(
+        cpu.region, "amp", "list-workspaces", "--alias", alias
+    ).get("workspaces")
+    if not isinstance(workspaces, list) or len(workspaces) > 1:
+        raise BootstrapError("AMP workspace inventory is unavailable or ambiguous")
     if workspaces:
-        workspace_id = str(workspaces[0]["workspaceId"])
-        workspace_arn = str(workspaces[0]["arn"])
+        summary = workspaces[0]
+        if not isinstance(summary, dict) or not isinstance(
+            summary.get("workspaceId"), str
+        ):
+            raise BootstrapError("AMP workspace inventory has an invalid identity")
+        workspace_id = summary["workspaceId"]
+        validate_amp_workspace(
+            summary, cpu=cpu, site_id=site_id, workspace_id=workspace_id
+        )
+        workspace_arn = amp_workspace_arn(cpu, workspace_id)
         tags = runner.aws_json(
             cpu.region,
             "amp",
             "list-tags-for-resource",
             "--resource-arn",
             workspace_arn,
-        ).get("tags", {})
+        ).get("tags")
+        if not isinstance(tags, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in tags.items()
+        ):
+            raise BootstrapError("AMP workspace tags are unavailable")
         tagged = assert_site_tag(
             tags,
             site_id=site_id,
@@ -943,126 +964,45 @@ def _ensure_amp_workspace(
                 capture=False,
             )
     else:
-        workspace_id = str(
+        created = runner.aws_json(
+            cpu.region,
+            "amp",
+            "create-workspace",
+            "--alias",
+            alias,
+            "--tags",
+            f"gpu-fault:site-id={site_id}",
+            mutate=True,
+        )
+        workspace_id = created.get("workspaceId")
+        if not isinstance(workspace_id, str) or created.get("arn") != amp_workspace_arn(
+            cpu, workspace_id
+        ):
+            raise BootstrapError("created AMP workspace identity differs from the site")
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        workspace = validate_amp_workspace(
             runner.aws_json(
                 cpu.region,
                 "amp",
-                "create-workspace",
-                "--alias",
-                alias,
-                "--tags",
-                f"gpu-fault:site-id={site_id}",
-                mutate=True,
-            )["workspaceId"]
+                "describe-workspace",
+                "--workspace-id",
+                workspace_id,
+            ).get("workspace"),
+            cpu=cpu,
+            site_id=site_id,
+            workspace_id=workspace_id,
         )
-    deadline = time.monotonic() + 600
-    while time.monotonic() < deadline:
-        workspace = runner.aws_json(
-            cpu.region,
-            "amp",
-            "describe-workspace",
-            "--workspace-id",
-            workspace_id,
-        )["workspace"]
-        status = (workspace.get("status") or {}).get("statusCode")
+        state = workspace.get("status")
+        status = state.get("statusCode") if isinstance(state, dict) else None
         if status == "ACTIVE":
             break
-        if status in {"CREATION_FAILED", "DELETING"}:
-            raise BootstrapError(f"AMP workspace entered {status}")
+        if status not in {"CREATING", "UPDATING"}:
+            raise BootstrapError("AMP workspace is not in an admissible state")
         time.sleep(5)
     else:
         raise BootstrapError("AMP workspace did not become ACTIVE")
     return workspace_id, False
-
-
-def site_sns_topic_arn(cpu: ClusterIdentity, site_id: str) -> str:
-    """The ARN ``ensure_sns_topic`` creates or finds for this site.
-
-    Deterministic so the control-plane role can be granted ``sns:Publish`` on
-    it in the same parallel phase that creates the topic.
-    """
-
-    topic_name = safe_name(f"gpu-fault-{site_id}-alerts", maximum=256)
-    return f"arn:aws:sns:{cpu.region}:{cpu.account_id}:{topic_name}"
-
-
-def ensure_sns_topic(
-    runner: CommandRunner,
-    *,
-    cpu: ClusterIdentity,
-    site_id: str,
-) -> tuple[str, bool, str]:
-    expected_topic_arn = site_sns_topic_arn(cpu, site_id)
-    topic_name = expected_topic_arn.rsplit(":", 1)[1]
-    topic_reused = (
-        describe_or_absent(
-            runner,
-            cpu.region,
-            "sns",
-            "get-topic-attributes",
-            "--topic-arn",
-            expected_topic_arn,
-            not_found=("NotFound",),
-        )
-        is not None
-    )
-    if topic_reused:
-        topic_arn = expected_topic_arn
-        tags = runner.aws_json(
-            cpu.region,
-            "sns",
-            "list-tags-for-resource",
-            "--resource-arn",
-            topic_arn,
-        ).get("Tags", [])
-        tags_by_key = tag_map(tags)
-        tagged = assert_site_tag(
-            tags,
-            site_id=site_id,
-            description=f"SNS topic {topic_arn}",
-            allow_missing=True,
-        )
-        generation = str(tags_by_key.get(SNS_TOPIC_GENERATION_TAG) or "")
-        if generation and not re.fullmatch(r"[0-9a-f]{32}", generation):
-            raise BootstrapError(f"SNS topic {topic_arn} has an invalid generation tag")
-        tag_values = []
-        if not tagged:
-            tag_values.append(f"Key={SITE_TAG_KEY},Value={site_id}")
-        if not generation:
-            generation = uuid4().hex
-            tag_values.append(f"Key={SNS_TOPIC_GENERATION_TAG},Value={generation}")
-        if tag_values:
-            runner.run(
-                [
-                    "aws",
-                    "sns",
-                    "tag-resource",
-                    "--region",
-                    cpu.region,
-                    "--resource-arn",
-                    topic_arn,
-                    "--tags",
-                    *tag_values,
-                ],
-                mutate=True,
-                capture=False,
-            )
-    else:
-        generation = uuid4().hex
-        topic_arn = runner.aws_text(
-            cpu.region,
-            "sns",
-            "create-topic",
-            "--name",
-            topic_name,
-            "--tags",
-            f"Key=gpu-fault:site-id,Value={site_id}",
-            f"Key={SNS_TOPIC_GENERATION_TAG},Value={generation}",
-            "--query",
-            "TopicArn",
-            mutate=True,
-        )
-    return topic_arn, False, generation
 
 
 def ensure_monitoring_resources(
@@ -1082,6 +1022,14 @@ def ensure_monitoring_resources(
         runner,
         cpu=cpu,
         site_id=site_id,
+    )
+    ensure_amp_sns_publish_policy(
+        runner,
+        cpu=cpu,
+        site_id=site_id,
+        workspace_id=workspace_id,
+        topic_arn=topic_arn,
+        topic_generation=topic_generation,
     )
     email_subscription = ensure_monitoring_subscriptions(
         runner,
@@ -1126,9 +1074,10 @@ def install_monitoring(
     alert_email: str | None,
     probe_only: bool = False,
     grafana: GrafanaSettings | None = None,
+    runtime_managed_by_release: bool = False,
 ) -> dict[str, Any]:
     topic_name = monitoring["sns_topic_arn"].rsplit(":", 1)[-1]
-    role_name = safe_name(f"gpu-fault-{site_id}-amp-writer", maximum=64)
+    role_name = amp_writer_role_name(site_id)
     role = _ensure_role(
         runner,
         account_id=cpu.account_id,
@@ -1158,7 +1107,11 @@ def install_monitoring(
     }
     if alert_email:
         environment["GPU_FAULT_ALERT_EMAIL"] = alert_email
-    if probe_only:
+    if runtime_managed_by_release:
+        # The release owns these versioned objects on first install as well.
+        # Bootstrap only reconciles their registered IAM and association.
+        output = ""
+    elif probe_only:
         # The installer is a mutating script, so a probe cannot run it; the probe
         # reads back what it converges instead. The IAM role and the Pod Identity
         # association around this branch prove themselves through the read-only
@@ -1210,6 +1163,7 @@ def install_monitoring(
         "service_account": association["service_account"],
         "installer_output": output,
         "grafana": dashboards,
+        "runtime_managed_by_release": runtime_managed_by_release,
     }
 
 
@@ -1280,49 +1234,49 @@ def install_aurora_refresh(
     runtime_image: str,
     aurora: Mapping[str, Any],
     probe_only: bool = False,
-) -> dict[str, str]:
-    manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
-    wheel = Path(manifest["wheel"])
-    if not wheel.is_absolute():
-        wheel = repository_root / wheel
-    wheel_configmap = _upload_wheel_configmap(
-        runner,
-        cpu_kubeconfig=cpu_kubeconfig,
-        namespace=namespace,
-        wheel=wheel,
-    )
-    source = (
-        repository_root / "deploy/control-plane/regional/aurora-credential-refresh.yaml"
-    ).read_text(encoding="utf-8")
-    rendered = (
-        source.replace("gpu-fault-control-plane-wheel-0100", wheel_configmap)
-        .replace(
-            "public.ecr.aws/docker/library/python:3.12-slim",
-            runtime_image,
-        )
-        .replace(
-            "REPLACE_WITH_AURORA_MASTER_SECRET_ARN",
-            aurora["master_secret_arn"],
-        )
-        .replace("namespace: gpu-fault-system", f"namespace: {namespace}")
-    )
-    if probe_only:
-        assert_aurora_refresh_current(
+    runtime_managed_by_release: bool = False,
+) -> dict[str, Any]:
+    from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refresh
+
+    wheel_configmap = ""
+    if not runtime_managed_by_release:
+        manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
+        wheel = Path(manifest["wheel"])
+        if not wheel.is_absolute():
+            wheel = repository_root / wheel
+        wheel_configmap = _upload_wheel_configmap(
             runner,
             cpu_kubeconfig=cpu_kubeconfig,
             namespace=namespace,
-            wheel_configmap=wheel_configmap,
+            wheel=wheel,
+        )
+        rendered = render_aurora_refresh(
+            namespace=namespace,
+            wheel_config_map=wheel_configmap,
             runtime_image=runtime_image,
             master_secret_arn=str(aurora["master_secret_arn"]),
+            source=(
+                repository_root
+                / "deploy/control-plane/regional/aurora-credential-refresh.yaml"
+            ).read_text(),
         )
-    else:
-        ensure_rds_ca_bundle(
-            runner,
-            repository_root=repository_root,
-            cpu_kubeconfig=cpu_kubeconfig,
-            namespace=namespace,
-        )
-        kubectl_apply(runner, cpu_kubeconfig, rendered)
+        if probe_only:
+            assert_aurora_refresh_current(
+                runner,
+                cpu_kubeconfig=cpu_kubeconfig,
+                namespace=namespace,
+                wheel_configmap=wheel_configmap,
+                runtime_image=runtime_image,
+                master_secret_arn=str(aurora["master_secret_arn"]),
+            )
+        else:
+            ensure_rds_ca_bundle(
+                runner,
+                repository_root=repository_root,
+                cpu_kubeconfig=cpu_kubeconfig,
+                namespace=namespace,
+            )
+            kubectl_apply(runner, cpu_kubeconfig, rendered)
     role_name = safe_name(f"gpu-fault-{site_id}-aurora-refresh", maximum=64)
     statements: list[dict[str, Any]] = [
         {
@@ -1356,11 +1310,9 @@ def install_aurora_refresh(
         role_arn=role["role_arn"],
     )
     job = "gpu-fault-aurora-credential-refresh-verify"
-    if probe_only:
-        # The verify Job is one-shot proof that the CronJob this release rendered
-        # can read the master Secret. The probe already confirmed that exact
-        # CronJob is live, so re-running the Job would only repeat a proof the
-        # checkpoint still holds.
+    if probe_only or runtime_managed_by_release:
+        # Managed bootstrap has prepared IAM, not proved AWSCURRENT. The
+        # release must install and run the candidate before starting consumers.
         return {
             **role,
             "association_id": association["association_id"],
@@ -1369,6 +1321,7 @@ def install_aurora_refresh(
             "namespace": association["namespace"],
             "service_account": association["service_account"],
             "wheel_configmap": wheel_configmap,
+            "runtime_managed_by_release": runtime_managed_by_release,
         }
     runner.run(
         [
@@ -1402,15 +1355,18 @@ def install_aurora_refresh(
     )
     runner.run(
         [
+            "bash",
+            str(
+                repository_root
+                / "deploy/control-plane/tools/wait-for-kubernetes-job.sh"
+            ),
+            "420",
+            job,
             "kubectl",
             "--kubeconfig",
             str(cpu_kubeconfig),
             "-n",
             namespace,
-            "wait",
-            "--for=condition=complete",
-            f"job/{job}",
-            "--timeout=420s",
         ],
         mutate=True,
         capture=False,
@@ -1437,7 +1393,47 @@ def provision_node_action_keys(
     cluster_id: str,
     fleet_master_file: Path,
     probe_only: bool = False,
+    custody_context: AdminNodeKeyContext | None = None,
 ) -> dict[str, str]:
+    if custody_context is not None:
+        from gpu_fault.admin.node_key_custody_admin import (
+            key_map_lock,
+            provision_admin_custody,
+        )
+
+        if (
+            custody_context.cluster != cluster
+            or custody_context.cluster_id != cluster_id
+            or custody_context.cpu_kubeconfig != cpu_kubeconfig
+            or custody_context.gpu_kubeconfig != gpu_kubeconfig
+            or custody_context.namespace != namespace
+            or custody_context.repository_root != repository_root
+        ):
+            raise BootstrapError(
+                "node-key custody context differs from provisioning inputs"
+            )
+        with key_map_lock(custody_context):
+            result = provision_admin_custody(
+                runner,
+                custody_context,
+                fleet_master_file=fleet_master_file,
+                probe_only=probe_only,
+            )
+            if result is not None:
+                return result
+            if not probe_only and custody_context.on_write is not None:
+                custody_context.on_write()
+            return provision_node_action_keys(
+                runner,
+                repository_root=repository_root,
+                cpu_kubeconfig=cpu_kubeconfig,
+                gpu_kubeconfig=gpu_kubeconfig,
+                namespace=namespace,
+                cluster=cluster,
+                cluster_id=cluster_id,
+                fleet_master_file=fleet_master_file,
+                probe_only=probe_only,
+            )
     if probe_only:
         # The script is mutating and needs the fleet master file, so a probe
         # cannot run it. What it converges is one scoped key per current node, so

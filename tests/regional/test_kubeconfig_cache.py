@@ -9,6 +9,8 @@ fails closed when the plugin fails.
 
 from __future__ import annotations
 
+import os
+import shutil
 import stat
 import sys
 import time
@@ -41,13 +43,27 @@ print(json.dumps({
 
 @pytest.fixture
 def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    script = tmp_path / "fake-get-token.py"
-    script.write_text(PLUGIN, encoding="utf-8")
+    script = tmp_path / "aws"
+    script.write_text(f"#!{sys.executable}\n{PLUGIN}", encoding="utf-8")
+    script.chmod(0o700)
     monkeypatch.setenv("PLUGIN_LOG", str(tmp_path / "plugin.log"))
     monkeypatch.delenv("PLUGIN_FAIL", raising=False)
     monkeypatch.delenv("PLUGIN_LIFETIME", raising=False)
     monkeypatch.setenv("PLUGIN_TOKEN", "one")
     monkeypatch.delenv(CACHE.TOKEN_CACHE_ENV, raising=False)
+    run = CACHE.run_command
+
+    def fixture_command(arguments, **kwargs):
+        assert arguments[0] == "aws"
+        source = Path(shutil.which("aws", path=kwargs["environment"]["PATH"]) or "")
+        assert source.name == "aws" and source.is_relative_to(tmp_path), (
+            "credential tests may execute only their own local fixture"
+        )
+        executable = source.with_name("exec-credential-fixture.py")
+        shutil.copyfile(source, executable)
+        return run([sys.executable, str(executable), *arguments[1:]], **kwargs)
+
+    monkeypatch.setattr(CACHE, "run_command", fixture_command)
     return script
 
 
@@ -84,9 +100,22 @@ def _kubeconfig(path: Path, plugin: Path, *, name: str = "cpu") -> Path:
                 "user": {
                     "exec": {
                         "apiVersion": "client.authentication.k8s.io/v1beta1",
-                        "command": sys.executable,
-                        "args": [str(plugin), "--region", "us-west-2", "eks"],
-                        "env": [{"name": "AWS_PROFILE", "value": "deploy"}],
+                        "command": "aws",
+                        "args": [
+                            "--region",
+                            "us-west-2",
+                            "eks",
+                            "get-token",
+                            "--cluster-name",
+                            name,
+                        ],
+                        "env": [
+                            {"name": "AWS_PROFILE", "value": "deploy"},
+                            {
+                                "name": "PATH",
+                                "value": f"{plugin.parent}:{os.environ.get('PATH', '')}",
+                            },
+                        ],
                     }
                 },
             },
@@ -131,9 +160,9 @@ def test_exec_users_become_static_tokens_and_the_rest_is_untouched(
         )
         for key in ("clusters", "contexts", "current-context", "preferences"):
             assert document[key] == original[key], f"{key} must survive unchanged"
-        assert _plugin_calls(tmp_path) == ["--region us-west-2 eks"], (
-            "the plugin runs exactly once with the kubeconfig's own args"
-        )
+        assert _plugin_calls(tmp_path) == [
+            "--region us-west-2 eks get-token --cluster-name cpu"
+        ], "the plugin runs exactly once with the kubeconfig's own args"
         assert _load(source) == original, "the site's kubeconfig is never rewritten"
     assert not cached.parent.exists(), "cleanup removes the private directory"
 
@@ -142,13 +171,16 @@ def test_the_plugin_env_entries_reach_the_plugin(
     tmp_path: Path, plugin: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("AWS_PROFILE", raising=False)
-    script = tmp_path / "env-plugin.py"
+    script = tmp_path / "env-plugin" / "aws"
+    script.parent.mkdir()
     script.write_text(
-        PLUGIN.replace(
+        f"#!{sys.executable}\n"
+        + PLUGIN.replace(
             '" ".join(sys.argv[1:])', 'os.environ.get("AWS_PROFILE", "<unset>")'
         ),
         encoding="utf-8",
     )
+    script.chmod(0o700)
     source = _kubeconfig(tmp_path / "cpu.kubeconfig", script)
     with CACHE.ReleaseKubeconfigCache(str(source)):
         assert _plugin_calls(tmp_path) == ["deploy"], (
@@ -203,11 +235,12 @@ def test_a_failing_plugin_is_a_release_error_not_a_credential_less_kubeconfig(
 ) -> None:
     monkeypatch.setenv("PLUGIN_FAIL", "1")
     source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
-    with pytest.raises(ReleaseError, match="exited 3.*expired credentials"):
+    with pytest.raises(ReleaseError, match="exited 3") as caught:
         CACHE.ReleaseKubeconfigCache(str(source))
-    assert _plugin_calls(tmp_path) == ["--region us-west-2 eks"], (
-        "the failure comes from the plugin the kubeconfig names"
-    )
+    assert "expired credentials" not in str(caught.value)
+    assert _plugin_calls(tmp_path) == [
+        "--region us-west-2 eks get-token --cluster-name cpu"
+    ], "the failure comes from the plugin the kubeconfig names"
 
 
 def test_a_failed_construction_leaves_no_temp_directory(
@@ -253,26 +286,29 @@ def test_opt_out_environment_restores_the_per_call_plugin(
     assert CACHE.token_cache_enabled({}) is True, "the cache is on by default"
 
 
-def test_kubeconfig_env_is_cached_for_gpu_contexts_and_restored_on_cleanup(
+def test_kubeconfig_env_is_cached_only_for_bounded_direct_gpu_calls(
     tmp_path: Path, plugin: Path
 ) -> None:
     cpu = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin, name="cpu")
     gpu = _kubeconfig(tmp_path / "gpu.kubeconfig", plugin, name="gpu")
     environ = {"KUBECONFIG": str(gpu)}
     with CACHE.ReleaseKubeconfigCache(str(cpu), environ=environ) as cache:
-        assert environ["KUBECONFIG"] != str(gpu), (
-            "GPU --context calls and child scripts read KUBECONFIG, so it must "
-            "point at the cached copy"
+        command, environment = cache.command_inputs(
+            ["kubectl", "--context", "gpu", "get", "nodes"], None, timeout_seconds=60
         )
-        gpu_users = _users(_load(environ["KUBECONFIG"]))
+        assert command == ["kubectl", "--context", "gpu", "get", "nodes"]
+        assert environment is not None
+        assert environ["KUBECONFIG"] == str(gpu)
+        assert environment["KUBECONFIG"] != str(gpu)
+        gpu_users = _users(_load(environment["KUBECONFIG"]))
         assert gpu_users["gpu-exec"]["token"] == "k8s-aws-v1.one", (
             "the GPU copy carries a static token"
         )
         assert (
-            Path(environ["KUBECONFIG"]).parent == Path(cache.cpu_kubeconfig).parent
+            Path(environment["KUBECONFIG"]).parent == Path(cache.cpu_kubeconfig).parent
         ), "both copies share the one private directory"
         assert len(_plugin_calls(tmp_path)) == 2, "one plugin run per kubeconfig"
-    assert environ["KUBECONFIG"] == str(gpu), "cleanup restores KUBECONFIG"
+    assert environ["KUBECONFIG"] == str(gpu), "source authentication never changes"
 
 
 def test_a_kubeconfig_without_exec_users_keeps_its_original_path(
@@ -327,11 +363,91 @@ def test_runner_calls_the_refresh_hook_before_each_real_command(
     calls: list[str] = []
     runner = ROLLOUT.Runner(before_command=lambda: calls.append("refresh"))
     runner.run([sys.executable, "-c", "pass"])
-    assert runner.probe([sys.executable, "-c", "pass"]) is True, "probe still works"
+    assert runner.condition([sys.executable, "-c", "pass", "wait"]) is True
     runner.probe_output([sys.executable, "-c", "pass"])
-    assert calls == ["refresh"] * 3, "run, probe and probe_output all refresh first"
+    assert calls == ["refresh"] * 3, "run, condition and probe_output prepare first"
 
     dry = ROLLOUT.Runner(dry_run=True, before_command=lambda: calls.append("dry"))
     dry.run(["kubectl", "apply"])
     assert "dry" not in calls, "a dry-run command spawns nothing, so no refresh"
     capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"command": "custom-auth"},
+        {"command": "/usr/local/bin/aws"},
+        {"provideClusterInfo": True},
+        {"interactiveMode": "Always"},
+        {"apiVersion": "client.authentication.k8s.io/v1alpha1"},
+        {"unknownOption": True},
+    ],
+)
+def test_nonstandard_plugins_retain_native_exec_protocol(
+    tmp_path: Path, plugin: Path, overrides: dict
+) -> None:
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    document = _load(source)
+    document["users"][0]["user"]["exec"].update(overrides)
+    source.write_text(yaml.safe_dump(document))
+    with CACHE.ReleaseKubeconfigCache(str(source)) as cache:
+        assert cache.cpu_kubeconfig == str(source)
+        assert _plugin_calls(tmp_path) == []
+
+
+def test_missing_expiry_is_not_an_invented_token_lifetime(
+    tmp_path: Path, plugin: Path
+) -> None:
+    plugin.write_text(
+        f"#!{sys.executable}\n"
+        + PLUGIN.replace('"expirationTimestamp": expiry', '"unused": expiry').replace(
+            ',\n               "unused": expiry', ""
+        )
+    )
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    with CACHE.ReleaseKubeconfigCache(str(source)) as cache:
+        assert cache.cpu_kubeconfig == str(source)
+    assert "exec" in _users(_load(source))["cpu-exec"]
+
+
+@pytest.mark.parametrize("lifetime", ["-1", "30"])
+def test_expired_or_short_lived_token_is_rejected(
+    tmp_path: Path, plugin: Path, monkeypatch: pytest.MonkeyPatch, lifetime: str
+) -> None:
+    monkeypatch.setenv("PLUGIN_LIFETIME", lifetime)
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    with pytest.raises(ReleaseError, match="expiry"):
+        CACHE.ReleaseKubeconfigCache(str(source))
+
+
+def test_scripts_and_long_calls_keep_native_authentication(
+    tmp_path: Path, plugin: Path
+) -> None:
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    with CACHE.ReleaseKubeconfigCache(str(source)) as cache:
+        for arguments, timeout in (
+            (["bash", "child.sh"], 600),
+            (["kubectl", "--kubeconfig", str(source), "exec", "pod"], 900),
+        ):
+            command, environment = cache.command_inputs(
+                arguments, None, timeout_seconds=timeout
+            )
+            assert command == arguments
+            assert environment is None
+        command, _ = cache.command_inputs(
+            ["kubectl", "--kubeconfig", str(source), "get", "nodes"],
+            None,
+            timeout_seconds=60,
+        )
+        assert command[2] == cache.cpu_kubeconfig
+
+
+def test_cached_authentication_rejects_source_identity_drift(
+    tmp_path: Path, plugin: Path
+) -> None:
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    with CACHE.ReleaseKubeconfigCache(str(source)) as cache:
+        source.write_text(source.read_text() + "\n# changed\n")
+        with pytest.raises(ReleaseError, match="kubeconfig changed"):
+            cache.refresh_if_needed()

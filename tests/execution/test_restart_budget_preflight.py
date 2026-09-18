@@ -31,10 +31,12 @@ from gpu_fault.regional import (
     RemoteCommandStatus,
     cluster_token_sha256,
 )
+from gpu_fault.restart_containment import RestartContainmentProof
 from gpu_fault.store import InMemoryStore
 from tests._builders import (
     active_workflow_executor,
     build_store,
+    contained_stop_receipt,
     copy_model,
     fault_incident,
     workflow_request,
@@ -1052,3 +1054,197 @@ def test_a_retry_after_a_hold_does_not_inherit_the_hold_marker() -> None:
     assert "restart_submitted" not in record.details
     # The wait is still live; the budget stays reserved.
     assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+
+
+PASSIVE_RESTART_PARAMETERS = {
+    "cluster_id": "cluster-a",
+    "job_id": "training-a",
+    "source_attempt_id": "attempt-a",
+    "source_gpu_count": 1,
+    "restart_budget": 1,
+    "requires_incident_state": "RECOVERED",
+    "incident_id": "containment-a",
+    "incident_node_ids": ["node-a"],
+}
+
+
+def _containment_records(
+    store: InMemoryStore,
+    receipt: dict[str, object],
+    *,
+    status: WorkflowStatus = WorkflowStatus.SUCCEEDED,
+    stop_status: WorkflowStepStatus = WorkflowStepStatus.SUCCEEDED,
+) -> None:
+    """The passive containment (FREEZE, STOP) the recovery chains behind."""
+    store.save_incident(
+        fault_incident(
+            "containment-a",
+            "event-containment",
+            event_type="TRAINING_ATTEMPT_FAILURE_DETECTED",
+            state=IncidentState.RECOVERED,
+            fencing_token=1,
+            workflow_request_id="containment-workflow",
+            attempt_id="attempt-a",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    store.save_workflow(
+        workflow_request(
+            "containment-workflow",
+            "containment-a",
+            status,
+            fencing_token=1,
+            official_steps=[
+                workflow_step(WorkflowOperation.FREEZE_EVIDENCE),
+                workflow_step(
+                    WorkflowOperation.STOP_WORKLOADS,
+                    workload_ids=["training/job/training-a"],
+                ),
+            ],
+            completed_step_indexes=[0, 1],
+            step_executions=[
+                workflow_step_execution(
+                    1,
+                    WorkflowOperation.STOP_WORKLOADS,
+                    stop_status,
+                    details={"stop_ownership_receipt_v1": receipt},
+                )
+            ],
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+
+def _passive_recovery(
+    store: InMemoryStore,
+    *,
+    parameters: dict[str, object] | None = None,
+    predecessor_workflow_id: str | None = "containment-workflow",
+) -> tuple[WorkflowRequest, WorkflowStepSpec]:
+    """The one-step passive recovery workflow, reserved and stored."""
+    incident = fault_incident(
+        "incident-a",
+        "event-a",
+        event_type="TRAINING_ATTEMPT_TERMINAL",
+        state=IncidentState.ACTION_PENDING,
+        fencing_token=1,
+        attempt_id="attempt-a",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        workload_ids=["training/job/training-a"],
+        parameters=dict(
+            PASSIVE_RESTART_PARAMETERS if parameters is None else parameters
+        ),
+    )
+    workflow = workflow_request(
+        "workflow-a",
+        incident.incident_id,
+        fencing_token=1,
+        official_steps=[step],
+        predecessor_workflow_id=predecessor_workflow_id,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    store.save_incident(copy_model(incident, workflow_request_id=workflow.request_id))
+    store.save_workflow(workflow)
+    store.reserve_job_restart(
+        "cluster-a", "training-a", 1, "workflow-a/0/RESTART_WORKLOAD"
+    )
+    return workflow, step
+
+
+def test_issue_authorization_signs_the_predecessor_containment_receipt() -> None:
+    # A passive recovery workflow has no STOP of its own; the data-plane guard
+    # still binds the restart to a contained receipt, so dispatch signs the
+    # predecessor containment's receipt into the authorization.
+    store = build_store()
+    receipt = contained_stop_receipt()
+    _containment_records(store, receipt)
+    workflow, step = _passive_recovery(store)
+
+    granted = issue_restart_authorization(
+        store,
+        store.get_incident(workflow.incident_id),
+        step,
+        "workflow-a/0/RESTART_WORKLOAD",
+        workflow=workflow,
+    )
+
+    assert isinstance(granted, RestartAuthorization), granted
+    assert granted.containment == RestartContainmentProof(
+        workflow_id="containment-workflow", incident_id="containment-a", receipt=receipt
+    ), "the predecessor's contained receipt rides on the authorization verbatim"
+    assert granted.reservation_id == "workflow-a/0/RESTART_WORKLOAD", (
+        "the reservation itself is unchanged"
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "no-workflow",
+        "no-predecessor",
+        "predecessor-missing",
+        "predecessor-failed",
+        "stop-waiting",
+        "uncontained",
+        "foreign-workload",
+        "foreign-attempt",
+        "foreign-incident",
+        "no-premise",
+    ],
+)
+def test_issue_authorization_signs_no_containment_it_cannot_prove(defect) -> None:
+    store = build_store()
+    receipt = contained_stop_receipt(
+        **{
+            "uncontained": {"contained": False},
+            "foreign-workload": {"workload_id": "training/job/other"},
+            "foreign-attempt": {"attempt_id": "attempt-b"},
+        }.get(defect, {})
+    )
+    _containment_records(
+        store,
+        receipt,
+        status=(
+            WorkflowStatus.FAILED
+            if defect == "predecessor-failed"
+            else WorkflowStatus.SUCCEEDED
+        ),
+        stop_status=(
+            WorkflowStepStatus.WAITING
+            if defect == "stop-waiting"
+            else WorkflowStepStatus.SUCCEEDED
+        ),
+    )
+    parameters = dict(PASSIVE_RESTART_PARAMETERS)
+    if defect == "foreign-incident":
+        parameters["incident_id"] = "other"
+    elif defect == "no-premise":
+        parameters.pop("requires_incident_state")
+    workflow, step = _passive_recovery(
+        store,
+        parameters=parameters,
+        predecessor_workflow_id={
+            "no-predecessor": None,
+            "predecessor-missing": "gone",
+        }.get(defect, "containment-workflow"),
+    )
+
+    granted = issue_restart_authorization(
+        store,
+        store.get_incident(workflow.incident_id),
+        step,
+        "workflow-a/0/RESTART_WORKLOAD",
+        workflow=None if defect == "no-workflow" else workflow,
+    )
+
+    assert isinstance(granted, RestartAuthorization), granted
+    assert granted.containment is None, (
+        "an unproven containment is left to the data-plane guard to refuse"
+    )

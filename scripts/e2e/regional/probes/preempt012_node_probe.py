@@ -177,7 +177,7 @@ def arm(arguments: argparse.Namespace) -> dict[str, Any]:
             f"--on-active={arguments.delay_seconds}s",
             "--timer-property=AccuracySec=1s",
             "--property=Type=oneshot",
-            "/opt/gpu-fault/venv/bin/python",
+            "/opt/gpu-fault/current/venv/bin/python",
             arguments.probe_script,
             "cycle",
             "--run-id",

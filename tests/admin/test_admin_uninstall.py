@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import threading
-import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,16 +13,16 @@ from gpu_fault.admin import aws_commands as admin_aws_commands
 from gpu_fault.admin import uninstall as admin_uninstall
 from gpu_fault.admin.aws_cleanup import ordered_aurora_instances
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.grafana import CREATED_TAG_KEY, CREATED_TAG_VALUE
 from gpu_fault.admin.site import load_site
 from gpu_fault.admin.uninstall import (
-    AuroraDeletion,
     UninstallRequest,
+    _delete_aurora_last,
     _delete_non_aurora_resources,
     _effective_policy,
     _kubectl_prefix,
     _load_or_export_registry,
     _terminal_resource,
-    _uninstall_locked,
 )
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -33,6 +31,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceSnapshot,
 )
 from tests.admin.test_admin_site import site_file
+from tests.admin.test_uninstall_lifecycle import STATE, Harness
 
 
 def _resource(
@@ -75,7 +74,7 @@ def test_aws_verification_does_not_treat_access_denied_as_absent(
             arguments, 254, stdout="", stderr="AccessDenied: not authorized"
         )
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", denied)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", denied)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
 
     with pytest.raises(BootstrapError, match="verification failed"):
@@ -93,7 +92,7 @@ def test_external_ses_identity_is_supported_and_probed(tmp_path, monkeypatch) ->
             arguments, 0, stdout='{"IdentityType":"EMAIL_ADDRESS"}', stderr=""
         )
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", available)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", available)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     identity = _resource(
         "aws/ses/administrator-email-identity",
@@ -121,17 +120,31 @@ def test_external_ses_identity_is_supported_and_probed(tmp_path, monkeypatch) ->
 def test_created_ecr_repository_is_deleted_and_verified(tmp_path, monkeypatch) -> None:
     site = load_site(site_file(tmp_path))
     calls: list[list[str]] = []
+    state = {"deleted": False}
 
     def ecr(arguments, **kwargs):
         del kwargs
         calls.append(list(arguments))
-        if "describe-repositories" in arguments:
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout='{"Account":"123456789012"}', stderr=""
+            )
+        if "list-tags-for-resource" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout='{"tags":{"gpu-fault:site-id":"test-site"}}',
+                stderr="",
+            )
+        if "delete-repository" in arguments:
+            state["deleted"] = True
+        if "describe-repositories" in arguments and state["deleted"]:
             return subprocess.CompletedProcess(
                 arguments, 254, stdout="", stderr="RepositoryNotFoundException"
             )
         return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", ecr)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", ecr)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     repository = _resource(
         "aws/ecr/runtime", "ecr_repository", "gpu-fault/runtime-test"
@@ -161,20 +174,29 @@ def test_last_sqs_topic_binding_clears_the_policy_attribute(
             }
         ],
     }
-    queue_reads = iter(
-        ({"Attributes": {"Policy": json.dumps(policy)}}, {"Attributes": {}})
-    )
+    queue = {"policy": json.dumps(policy)}
 
     def sqs(arguments, **kwargs):
         del kwargs
         calls.append(list(arguments))
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout='{"Account":"123456789012"}', stderr=""
+            )
         if "get-queue-attributes" in arguments:
             return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(next(queue_reads)), stderr=""
+                arguments,
+                0,
+                stdout=json.dumps({"Attributes": {"Policy": queue["policy"]}}),
+                stderr="",
             )
+        if "set-queue-attributes" in arguments:
+            queue["policy"] = json.loads(
+                arguments[arguments.index("--attributes") + 1]
+            )["Policy"]
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", sqs)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", sqs)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     binding = _resource(
         "aws/sqs/topic-policy-binding",
@@ -201,12 +223,29 @@ def test_legacy_alerts_queue_rows_are_still_deleted_by_uninstall(
     site = load_site(site_file(tmp_path))
     topic_arn = "arn:aws:sns:us-east-1:123456789012:test-alerts"
     queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"
-    queue = {"deleted": False, "policy": json.dumps({"Statement": [{"C": topic_arn}]})}
+    queue = {
+        "deleted": False,
+        "policy": json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "sqs:SendMessage",
+                        "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
+                    }
+                ]
+            }
+        ),
+    }
     calls: list[list[str]] = []
 
     def sqs(arguments, **kwargs):
         del kwargs
         calls.append(list(arguments))
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout='{"Account":"123456789012"}', stderr=""
+            )
         if "sqs" not in arguments:
             raise AssertionError(arguments)
         if queue["deleted"]:
@@ -223,6 +262,13 @@ def test_legacy_alerts_queue_rows_are_still_deleted_by_uninstall(
                 stdout=json.dumps({"Attributes": {"Policy": queue["policy"]}}),
                 stderr="",
             )
+        if "list-queue-tags" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout='{"Tags":{"gpu-fault:site-id":"test-site"}}',
+                stderr="",
+            )
         if "set-queue-attributes" in arguments:
             attributes = json.loads(arguments[arguments.index("--attributes") + 1])
             queue["policy"] = attributes["Policy"]
@@ -230,7 +276,7 @@ def test_legacy_alerts_queue_rows_are_still_deleted_by_uninstall(
             queue["deleted"] = True
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", sqs)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", sqs)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     binding = _resource(
         "aws/sqs/topic-policy-binding",
@@ -314,15 +360,14 @@ def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
     _delete_non_aurora_resources(
         cleaner, snapshot, cpu_disposition="keep", state_path=state_path, state=state
     )
+    state["phase"] = "READY_TO_DELETE_AURORA"
     request = UninstallRequest(
         site=site,
         cpu_disposition="keep",
         confirmation="UNINSTALL_GPU_FAULT",
         reset_database=True,
     )
-    aurora = AuroraDeletion(cleaner, snapshot, request, state)
-    aurora.start()
-    aurora.finish()
+    _delete_aurora_last(cleaner, snapshot, request, state)
 
     assert calls == ["aws/nlb", "aws/aurora/cluster", "aws/aurora/parameter-group"]
 
@@ -336,11 +381,25 @@ def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
 
     site = load_site(site_file(tmp_path))
     calls: list[list[str]] = []
+    state = {"deleted": False}
 
     def rds(arguments, **kwargs):
         del kwargs
         calls.append(list(arguments))
-        if "describe-db-cluster-parameter-groups" in arguments:
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout='{"Account":"123456789012"}', stderr=""
+            )
+        if "list-tags-for-resource" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout='{"TagList":{"gpu-fault:site-id":"test-site"}}',
+                stderr="",
+            )
+        if "delete-db-cluster-parameter-group" in arguments:
+            state["deleted"] = True
+        if "describe-db-cluster-parameter-groups" in arguments and state["deleted"]:
             return subprocess.CompletedProcess(
                 arguments,
                 254,
@@ -349,7 +408,7 @@ def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
             )
         return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", rds)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", rds)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     group = _resource(
         "aws/aurora/parameter-group", "rds_cluster_parameter_group", "test-aurora-pg"
@@ -361,7 +420,10 @@ def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
     )
     cleaner.delete(group)
 
-    assert calls[0] == [
+    deletion = next(
+        call for call in calls if "delete-db-cluster-parameter-group" in call
+    )
+    assert deletion == [
         "aws",
         "rds",
         "delete-db-cluster-parameter-group",
@@ -370,6 +432,9 @@ def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
         "--db-cluster-parameter-group-name",
         "test-aurora-pg",
     ]
+    assert calls.index(deletion) > next(
+        index for index, call in enumerate(calls) if "list-tags-for-resource" in call
+    )
 
     def already_gone(arguments, **kwargs):
         del kwargs
@@ -380,7 +445,7 @@ def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
             stderr="An error occurred (DBParameterGroupNotFound) ...",
         )
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", already_gone)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", already_gone)
 
     cleaner.delete(group)
 
@@ -413,11 +478,47 @@ def test_created_grafana_workspace_is_deleted_and_absence_is_fine(
 ) -> None:
     site = load_site(site_file(tmp_path))
     calls: list[list[str]] = []
+    state = {"workspace_deleted": False, "account_deleted": False}
 
     def grafana(arguments, **kwargs):
         del kwargs
         calls.append(list(arguments))
-        if "describe-workspace" in arguments or "delete-workspace" in arguments:
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout='{"Account":"123456789012"}', stderr=""
+            )
+        if "list-tags-for-resource" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps(
+                    {
+                        "tags": {
+                            "gpu-fault:site-id": "test-site",
+                            CREATED_TAG_KEY: CREATED_TAG_VALUE,
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if "list-workspace-service-accounts" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps(
+                    {
+                        "serviceAccounts": []
+                        if state["account_deleted"]
+                        else [{"id": "9", "name": "gpu-fault-test"}]
+                    }
+                ),
+                stderr="",
+            )
+        if "delete-workspace-service-account" in arguments:
+            state["account_deleted"] = True
+        if "delete-workspace" in arguments:
+            state["workspace_deleted"] = True
+        if "describe-workspace" in arguments and state["workspace_deleted"]:
             return subprocess.CompletedProcess(
                 arguments,
                 254,
@@ -426,12 +527,14 @@ def test_created_grafana_workspace_is_deleted_and_absence_is_fine(
             )
         return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", grafana)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", grafana)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
     workspace = _resource("aws/grafana/workspace", "grafana_workspace", "g-created01")
     account = _resource(
         "aws/grafana/service-account", "grafana_service_account", "9"
-    ).model_copy(update={"attributes": {"workspace_id": "g-created01"}})
+    ).model_copy(
+        update={"attributes": {"workspace_id": "g-created01", "name": "gpu-fault-test"}}
+    )
 
     cleaner.validate_supported([workspace, account])
     cleaner.delete(account)
@@ -489,8 +592,8 @@ def test_legacy_reused_solution_resource_is_adopted_for_deletion() -> None:
     )
 
     assert policy is InstallationResourceDeletePolicy.DELETE
-    assert terminal.ownership is InstallationResourceOwnership.CREATED
-    assert terminal.delete_policy is InstallationResourceDeletePolicy.DELETE
+    assert terminal.immutable_identity() == resource.immutable_identity()
+    assert terminal.status is admin_uninstall.InstallationResourceStatus.DELETED
 
 
 def test_cpu_bound_addon_is_removed_with_cpu_cluster() -> None:
@@ -516,8 +619,25 @@ def test_legacy_online_registry_is_backfilled_without_manual_cleanup(
 ) -> None:
     site = load_site(site_file(tmp_path))
     snapshot = InstallationResourceSnapshot(
-        site_id="test-site", resources=[_resource("aws/nlb", "nlb", "test-nlb")]
+        site_id="test-site",
+        resources=[
+            _resource("aws/nlb", "nlb", "test-nlb"),
+            _resource("cluster/cpu-eks", "cpu_eks", "control").model_copy(
+                update={"resource_arn": site.release_config["cpu_eks_arn"]}
+            ),
+            _resource("cluster/cpu-hyperpod", "cpu_hyperpod", "control"),
+            _resource("cluster/gpu-a/eks", "gpu_eks", "gpu-a").model_copy(
+                update={
+                    "resource_arn": site.release_config["clusters"][0][
+                        "eks_cluster_arn"
+                    ]
+                }
+            ),
+            _resource("cluster/gpu-a/hyperpod", "gpu_hyperpod", "hp-gpu-a"),
+            _resource("aws/aurora/cluster", "aurora_cluster", "gpu-fault-aurora"),
+        ],
     )
+    snapshot = snapshot.model_copy(update={"source_sha256": snapshot.digest()})
     direct_syncs = []
 
     def missing(*_args, **_kwargs):
@@ -624,11 +744,12 @@ def test_keep_mode_never_calls_delete_db_cluster(tmp_path) -> None:
     request = UninstallRequest(
         site=site, cpu_disposition="keep", confirmation="UNINSTALL_GPU_FAULT"
     )
-    state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
+    state = {
+        "final_snapshot_identifier": "test-final",
+        "phase": "READY_TO_DELETE_AURORA",
+    }
 
-    aurora = AuroraDeletion(Cleaner(), snapshot, request, state)
-    aurora.start()
-    retained = aurora.finish()
+    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
 
     assert retained is None, "no final snapshot exists when nothing was deleted"
     assert calls == [], "a reinstall must not touch the Aurora stack"
@@ -660,11 +781,12 @@ def test_reset_database_runs_the_aurora_phase(tmp_path) -> None:
         confirmation="UNINSTALL_GPU_FAULT",
         reset_database=True,
     )
-    state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
+    state = {
+        "final_snapshot_identifier": "test-final",
+        "phase": "READY_TO_DELETE_AURORA",
+    }
 
-    aurora = AuroraDeletion(Cleaner(), snapshot, request, state)
-    aurora.start()
-    retained = aurora.finish()
+    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
 
     assert retained is not None, "the retained final snapshot must be reported"
     assert retained.resource_id == "test-final", "snapshot id comes from the cleaner"
@@ -694,31 +816,154 @@ def test_uninstall_request_refuses_contradictory_flags(
         )
 
 
-def test_a_failed_kubernetes_cleanup_record_is_archived_before_the_rerun(
-    tmp_path,
+@pytest.mark.parametrize("site_tag", ["test-site", "another-site"])
+def test_legacy_effective_delete_requires_live_ownership_and_keeps_registry_identity(
+    tmp_path, monkeypatch, site_tag
 ) -> None:
-    """The cleanup script refuses an existing state file and its state tool
-    refuses a phase moving backwards, so the live uninstall of 2026-09-12 (drain
-    timed out at QUEUES_DRAINED) could never have resumed over its own record.
-    A record short of CLEANUP_COMPLETED is moved aside; a complete one is
-    left alone by the caller."""
+    site = load_site(site_file(tmp_path))
+    resource = _resource(
+        "aws/sns/topic",
+        "sns_topic",
+        "arn:aws:sns:us-east-1:123456789012:test",
+        policy=InstallationResourceDeletePolicy.PRESERVE,
+    ).model_copy(update={"ownership": InstallationResourceOwnership.REUSED})
+    snapshot = InstallationResourceSnapshot(site_id="test-site", resources=[resource])
+    calls = []
+    state = {"deleted": False}
 
-    path = tmp_path / "kubernetes-cleanup.json"
-    document = {
-        "phase": "QUEUES_DRAINED",
-        "status": "FAILED",
-        "updated_at": "2026-09-12T11:56:17.123456+00:00",
-    }
-    path.write_text(json.dumps(document), encoding="utf-8")
+    def aws(arguments, **_kwargs):
+        calls.append(arguments)
+        if "get-caller-identity" in arguments:
+            output = {"Account": "123456789012"}
+        elif "list-tags-for-resource" in arguments:
+            output = {"Tags": {"gpu-fault:site-id": site_tag}}
+        elif "delete-topic" in arguments:
+            state["deleted"] = True
+            output = {}
+        elif "get-topic-attributes" in arguments and state["deleted"]:
+            return subprocess.CompletedProcess(
+                arguments, 254, stdout="", stderr="An error occurred (NotFound)"
+            )
+        else:
+            output = {"Attributes": {}}
+        return subprocess.CompletedProcess(
+            arguments, 0, stdout=json.dumps(output), stderr=""
+        )
 
-    archive = admin_uninstall.archive_unfinished_cleanup_state(path, document)
-
-    assert not path.exists(), "the rerun must start from a fresh state file"
-    assert archive.name == "kubernetes-cleanup.failed-20260912T115617.json", (
-        archive.name
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", aws)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    arguments = dict(
+        cpu_disposition="keep",
+        state_path=tmp_path / "state.json",
+        state={"phase": "STARTED"},
     )
-    assert json.loads(archive.read_text(encoding="utf-8"))["status"] == "FAILED", (
-        "the failed record must be kept as evidence"
+    if site_tag == "test-site":
+        _delete_non_aurora_resources(cleaner, snapshot, **arguments)
+        assert state["deleted"]
+    else:
+        with pytest.raises(BootstrapError):
+            _delete_non_aurora_resources(cleaner, snapshot, **arguments)
+        assert not state["deleted"]
+    assert resource.ownership is InstallationResourceOwnership.REUSED
+    assert resource.delete_policy is InstallationResourceDeletePolicy.PRESERVE
+    assert any("list-tags-for-resource" in call for call in calls), (
+        "legacy resource deletion must check live ownership tags"
+    )
+
+
+def test_a_failed_kubernetes_cleanup_record_is_resumed_without_rebinding(
+    tmp_path, monkeypatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    request = harness.request()
+    path = harness.site.source.parent / "uninstall/kubernetes-cleanup.json"
+    harness.fail_cleanup = BootstrapError("injected cleanup interruption")
+    run = harness.run
+    failed_documents = []
+    resumed_paths = []
+
+    def cleanup(arguments, **keywords):
+        if Path(arguments[0]).name != "prepare-clean-redeploy.sh":
+            return run(arguments, **keywords)
+        state_file = Path(arguments[arguments.index("--state-file") + 1])
+        assert state_file == path
+        if not failed_documents:
+            try:
+                return run(arguments, **keywords)
+            except BootstrapError:
+                document = STATE.read_state(path)
+                STATE.record_resource(
+                    document,
+                    resource_scope="gpu:gpu-a",
+                    context="gpu-a",
+                    kind="namespace",
+                    name="gpu-fault-system",
+                    previous="original-namespace",
+                )
+                for phase in (
+                    "PREFLIGHT",
+                    "CLUSTERS_DRAINING",
+                    "GPU_DATA_PLANE_SOURCES_STOPPED",
+                ):
+                    STATE.transition(
+                        document, phase=phase, status="COMPLETED", message="fixture"
+                    )
+                STATE.transition(
+                    document,
+                    phase="QUEUES_DRAINED",
+                    status="FAILED",
+                    message="injected cleanup interruption",
+                )
+                STATE.atomic_write(path, document)
+                failed_documents.append(STATE.read_state(path))
+                raise
+        document = STATE.read_state(path)
+        assert document == failed_documents[0], (
+            "uninstall rebound or replaced the failed cleanup journal before retry"
+        )
+        resumed_paths.append(state_file)
+        harness.events.append("cleanup")
+        completed = set(STATE.completed_phases(document))
+        for phase in STATE.required_phases(document):
+            if phase not in completed:
+                STATE.transition(
+                    document, phase=phase, status="COMPLETED", message="fixture"
+                )
+        STATE.transition(
+            document, phase="CLEANUP_COMPLETED", status="COMPLETED", message="fixture"
+        )
+        STATE.atomic_write(path, document)
+        return ""
+
+    monkeypatch.setattr(harness, "run", cleanup)
+    with pytest.raises(BootstrapError, match="injected cleanup interruption"):
+        admin_uninstall.uninstall(request, runner=harness)
+    assert harness.state()["phase"] == "REGISTRY_EXPORTED"
+    assert harness.events == ["cleanup", "cleanup-owned"]
+    original = failed_documents[0]
+    assert original["phase"] == "QUEUES_DRAINED"
+    assert original["status"] == "FAILED"
+    assert STATE.completed_phases(original) == [
+        "PREFLIGHT",
+        "CLUSTERS_DRAINING",
+        "GPU_DATA_PLANE_SOURCES_STOPPED",
+    ]
+
+    admin_uninstall.uninstall(request, runner=harness)
+
+    result = STATE.read_state(path)
+    assert harness.state()["phase"] == "COMPLETED"
+    assert result["original_resources"] == original["original_resources"]
+    assert result["run_id"] == original["run_id"]
+    assert result["config_sha256"] == original["config_sha256"]
+    assert result["phase_order"] == original["phase_order"]
+    assert result["history"][: len(original["history"])] == original["history"]
+    assert resumed_paths == [path]
+    assert list(path.parent.glob("kubernetes-cleanup*.json")) == [path]
+    assert harness.exports == 1, "retry exported a new registry instead of resuming"
+    assert harness.events.count("cleanup") == 2
+    assert harness.events.index("delete:aws/nlb") > harness.events.index(
+        "cleanup-owned"
     )
 
 
@@ -746,423 +991,6 @@ def test_a_reset_reinstall_may_skip_the_final_aurora_snapshot(tmp_path) -> None:
     assert request.final_snapshot_policy == "skip"
 
 
-def test_aurora_deletion_orders_readers_then_writer_and_does_not_wait_for_each(
-    tmp_path, monkeypatch
-) -> None:
-    """AWS: delete readers first, then the writer (a writer deleted under a
-    live reader fails over to it), and the cluster delete is accepted as soon
-    as no instance is in a non-deleting state. Waiting for each instance to
-    disappear before the next delete serialised two full deletions (live
-    2026-09-12: 18 of 24 min). Deletion protection goes first, while the
-    cluster is still available."""
-
-    site = load_site(site_file(tmp_path))
-    calls: list[str] = []
-    state = {"protected": True, "cluster": True, "deleting": set()}
-
-    def fake_run(arguments, **_kwargs):
-        line = " ".join(arguments)
-        calls.append(line)
-        if "modify-db-cluster" in line:
-            state["protected"] = False
-            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-        if "describe-db-clusters" in line:
-            if not state["cluster"]:
-                return subprocess.CompletedProcess(
-                    arguments, 254, stdout="", stderr="DBClusterNotFoundFault"
-                )
-            body = {
-                "DBClusters": [
-                    {
-                        "DBClusterIdentifier": "test-aurora",
-                        "Status": "available",
-                        "DeletionProtection": state["protected"],
-                        "DBClusterMembers": [
-                            {"DBInstanceIdentifier": "writer", "IsClusterWriter": True},
-                            {
-                                "DBInstanceIdentifier": "reader",
-                                "IsClusterWriter": False,
-                            },
-                        ],
-                    }
-                ]
-            }
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "describe-db-instances" in line and "--filters" in line:
-            body = {
-                "DBInstances": [
-                    {"DBInstanceIdentifier": "writer", "DBInstanceStatus": "available"},
-                    {"DBInstanceIdentifier": "reader", "DBInstanceStatus": "available"},
-                ]
-            }
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "describe-db-instances" in line:
-            name = arguments[arguments.index("--db-instance-identifier") + 1]
-            status = "deleting" if name in state["deleting"] else "available"
-            body = {
-                "DBInstances": [
-                    {"DBInstanceIdentifier": name, "DBInstanceStatus": status}
-                ]
-            }
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "delete-db-instance" in line:
-            state["deleting"].add(
-                arguments[arguments.index("--db-instance-identifier") + 1]
-            )
-            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-        if "delete-db-cluster" in line:
-            assert state["deleting"] == {"writer", "reader"}, (
-                "the cluster delete must wait until every instance is deleting"
-            )
-            state["cluster"] = False
-            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-        if "describe-db-cluster-snapshots" in line:
-            body = {"DBClusterSnapshots": [{"Status": "available"}]}
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", fake_run)
-    monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
-    cleaner = admin_aws_cleanup.ResourceCleaner(site)
-
-    retained = cleaner.delete_aurora(
-        _resource("aws/aurora/cluster", "aurora_cluster", "test-aurora"),
-        final_snapshot_policy="retain",
-        final_snapshot_identifier="test-final",
-    )
-
-    assert retained == "test-final"
-
-    def first(*fragments: str) -> int:
-        return next(i for i, c in enumerate(calls) if all(f in c for f in fragments))
-
-    order = [
-        first("modify-db-cluster"),
-        first("delete-db-instance", "reader"),
-        first("delete-db-instance", "writer"),
-        first("delete-db-cluster"),
-    ]
-    assert order == sorted(order), (
-        "protection off, reader, writer, cluster -- in that order"
-    )
-    assert "--final-db-snapshot-identifier test-final" in next(
-        c for c in calls if "delete-db-cluster" in c
-    )
-
-
-class _InMemoryAws:
-    """A cleaner over an in-memory AWS: ``present`` holds the keys that exist.
-
-    Non-Aurora deletes block until the Aurora deletion has been issued, so a
-    serial orchestration (Aurora after the other deletes) deadlocks into the
-    timeout instead of passing by luck. ``hold_seconds`` keeps the Aurora
-    thread busy so a join, or its absence, is observable.
-    """
-
-    def __init__(self) -> None:
-        self.present: set[str] = set()
-        self.events: list[str] = []
-        self.aurora_issued = threading.Event()
-        self.aurora_returned = False
-        self.aurora_failure: Exception | None = None
-        self.failing_key: str | None = None
-        self.hold_seconds = 0.0
-
-    def validate_supported(self, resources) -> None:
-        self.present.update(resource.resource_key for resource in resources)
-
-    def exists(self, resource) -> bool:
-        return (
-            resource.resource_type == "rds_snapshot"
-            or resource.resource_key in self.present
-        )
-
-    def delete(self, resource) -> None:
-        key = resource.resource_key
-        if key.startswith("aws/aurora/"):
-            if not self.aurora_returned:
-                raise AssertionError(f"{key} deleted while the cluster still used it")
-        elif not self.aurora_issued.wait(timeout=10):
-            raise AssertionError(f"{key} deleted before the Aurora deletion was issued")
-        if key == self.failing_key:
-            raise BootstrapError(f"{key} refused")
-        self.present.discard(key)
-        self.events.append(f"deleted:{key}")
-
-    def delete_aurora(
-        self, cluster, *, final_snapshot_policy, final_snapshot_identifier
-    ) -> str | None:
-        self.events.append("aurora:issued")
-        self.aurora_issued.set()
-        time.sleep(self.hold_seconds)
-        if self.aurora_failure is not None:
-            raise self.aurora_failure
-        for key in (
-            "aws/aurora/cluster",
-            "aws/aurora/instance/writer",
-            "aws/aurora/secret",
-        ):
-            self.present.discard(key)
-        self.aurora_returned = True
-        self.events.append("aurora:gone")
-        return final_snapshot_identifier if final_snapshot_policy == "retain" else None
-
-    def wait_absent(self, resource, *, timeout_seconds=900) -> None:
-        del resource, timeout_seconds
-
-    def delete_cpu_cluster(self, cpu_hyperpod, cpu_eks) -> None:
-        self.present.discard(cpu_hyperpod.resource_key)
-        self.present.discard(cpu_eks.resource_key)
-
-
-def _orchestration(tmp_path: Path, monkeypatch, aws: _InMemoryAws) -> UninstallRequest:
-    """Wire ``_uninstall_locked`` to ``aws``: registry, cleanup and kubectl faked."""
-
-    site = load_site(site_file(tmp_path))
-    snapshot = InstallationResourceSnapshot(
-        site_id="test-site",
-        resources=[
-            _resource("aws/nlb", "nlb", "test-nlb"),
-            _resource("aws/sns/topic", "sns_topic", "arn:aws:sns:us-east-1:1:t"),
-            _resource(
-                "aws/eks/cpu",
-                "cpu_eks",
-                "control",
-                policy=InstallationResourceDeletePolicy.PRESERVE,
-            ),
-            _resource(
-                "aws/hyperpod/cpu",
-                "cpu_hyperpod",
-                "control",
-                policy=InstallationResourceDeletePolicy.PRESERVE,
-            ),
-            _resource(
-                "aws/eks/gpu-a",
-                "gpu_eks",
-                "gpu-a",
-                policy=InstallationResourceDeletePolicy.PRESERVE,
-            ),
-            *_aurora_stack(),
-        ],
-    )
-
-    def cleanup(request, runner, state_file):
-        del request, runner
-        state_file.write_text(
-            json.dumps({"phase": "CLEANUP_COMPLETED", "status": "COMPLETED"}),
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(admin_uninstall, "ResourceCleaner", lambda _site: aws)
-    monkeypatch.setattr(
-        admin_uninstall, "_load_or_export_registry", lambda _request, _dir: snapshot
-    )
-    monkeypatch.setattr(admin_uninstall, "_run_cleanup", cleanup)
-    monkeypatch.setattr(
-        admin_uninstall,
-        "verify_installed_registry_cleanup",
-        lambda _site, _document: {"registered_kubernetes_resources_verified_absent": 3},
-    )
-    monkeypatch.setattr(
-        admin_uninstall,
-        "write_installation_resource_snapshot",
-        lambda _site, _value, *, path=None: path,
-    )
-    return UninstallRequest(
-        site=site,
-        cpu_disposition="keep",
-        confirmation="UNINSTALL_GPU_FAULT",
-        reset_database=True,
-    )
-
-
-def _state(request: UninstallRequest) -> dict:
-    path = request.site.source.parent / "uninstall" / "state.json"
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def test_the_aurora_deletion_is_issued_before_the_non_aurora_deletes_finish(
-    tmp_path, monkeypatch
-) -> None:
-    """Aurora only needs the Kubernetes cleanup (no Pod holding a connection),
-    not Route53, the NLB, IAM or ECR, and its wait took 18 of the 24 live
-    minutes (2026-09-12). The cluster deletion is issued first and the other
-    deletes run while it proceeds; what the cluster stood on is deleted only
-    after it is gone, and the report and state file are unchanged."""
-
-    aws = _InMemoryAws()
-    request = _orchestration(tmp_path, monkeypatch, aws)
-
-    report = _uninstall_locked(request)
-
-    assert aws.events[0] == "aurora:issued", aws.events
-    assert aws.events.index("aurora:gone") < aws.events.index(
-        "deleted:aws/aurora/parameter-group"
-    ), "the parameter group is deleted only once the cluster is gone"
-    assert {"deleted:aws/nlb", "deleted:aws/sns/topic"} <= set(aws.events)
-    assert report["aurora_cluster"] == "deleted"
-    assert (
-        report["aurora_final_snapshot"] == _state(request)["final_snapshot_identifier"]
-    )
-    assert report["registry_entries_deleted"] == 8, report
-    assert report["registry_entries_preserved"] == 4, report
-    assert report["delete_policy_residuals"] == 0
-    assert _state(request)["phase"] == "COMPLETED"
-
-
-def test_a_non_aurora_failure_joins_the_aurora_thread_before_it_is_reported(
-    tmp_path, monkeypatch
-) -> None:
-    aws = _InMemoryAws()
-    aws.failing_key = "aws/nlb"
-    aws.hold_seconds = 0.5
-    request = _orchestration(tmp_path, monkeypatch, aws)
-
-    with pytest.raises(BootstrapError, match="aws/nlb refused"):
-        _uninstall_locked(request)
-
-    assert aws.aurora_returned is True, (
-        "the uninstall reported the NLB failure without waiting for Aurora"
-    )
-    assert _state(request)["phase"] != "COMPLETED"
-
-
-def test_an_aurora_failure_fails_the_uninstall_after_the_other_deletes_succeeded(
-    tmp_path, monkeypatch
-) -> None:
-    aws = _InMemoryAws()
-    aws.aurora_failure = BootstrapError("delete-db-cluster refused")
-    request = _orchestration(tmp_path, monkeypatch, aws)
-
-    with pytest.raises(BootstrapError, match="delete-db-cluster refused"):
-        _uninstall_locked(request)
-
-    assert "deleted:aws/nlb" in aws.events, "the other deletes ran to completion"
-    assert _state(request)["phase"] == "READY_TO_DELETE_AURORA"
-    assert "deleted:aws/aurora/parameter-group" not in aws.events, (
-        "nothing the cluster stands on may be deleted after a failed cluster delete"
-    )
-
-
-def test_both_failures_are_reported_when_aurora_and_a_non_aurora_delete_fail(
-    tmp_path, monkeypatch
-) -> None:
-    aws = _InMemoryAws()
-    aws.failing_key = "aws/nlb"
-    aws.aurora_failure = BootstrapError("delete-db-cluster refused")
-    request = _orchestration(tmp_path, monkeypatch, aws)
-
-    with pytest.raises(
-        BootstrapError,
-        match="aws/nlb refused; the Aurora deletion also failed: delete-db-cluster",
-    ):
-        _uninstall_locked(request)
-
-
-def test_a_rerun_over_a_deleting_aurora_cluster_only_waits(
-    tmp_path, monkeypatch
-) -> None:
-    """If the process dies while the cluster is deleting, the rerun finds the
-    cluster and its instances in ``deleting``: it must issue no further
-    delete, only wait for the cluster and its final snapshot, then take down
-    the subnet group, security group and parameter group as usual."""
-
-    site = load_site(site_file(tmp_path))
-    describes = {"clusters": 0}
-
-    def fake_run(arguments, **_kwargs):
-        line = " ".join(arguments)
-        if "describe-db-clusters" in line:
-            describes["clusters"] += 1
-            if describes["clusters"] > 2:
-                return subprocess.CompletedProcess(
-                    arguments, 254, stdout="", stderr="DBClusterNotFoundFault"
-                )
-            body = {
-                "DBClusters": [
-                    {
-                        "DBClusterIdentifier": "test-aurora",
-                        "Status": "deleting",
-                        "DeletionProtection": False,
-                        "DBClusterMembers": [
-                            {"DBInstanceIdentifier": "writer", "IsClusterWriter": True}
-                        ],
-                    }
-                ]
-            }
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "describe-db-instances" in line and "--filters" in line:
-            body = {
-                "DBInstances": [
-                    {"DBInstanceIdentifier": "writer", "DBInstanceStatus": "deleting"}
-                ]
-            }
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "describe-db-cluster-snapshots" in line:
-            body = {"DBClusterSnapshots": [{"Status": "available"}]}
-            return subprocess.CompletedProcess(
-                arguments, 0, stdout=json.dumps(body), stderr=""
-            )
-        if "describe" in line:
-            return subprocess.CompletedProcess(
-                arguments,
-                254,
-                stdout="",
-                stderr=(
-                    "DBInstanceNotFound ResourceNotFoundException "
-                    "DBSubnetGroupNotFoundFault InvalidGroup.NotFound "
-                    "DBParameterGroupNotFound"
-                ),
-            )
-        if any(
-            verb in line
-            for verb in (
-                "delete-db-instance",
-                "delete-db-cluster ",
-                "modify-db-cluster",
-            )
-        ):
-            raise AssertionError(f"a deleting cluster was re-deleted: {line}")
-        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", fake_run)
-    monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
-    request = UninstallRequest(
-        site=site,
-        cpu_disposition="keep",
-        confirmation="UNINSTALL_GPU_FAULT",
-        reset_database=True,
-    )
-    snapshot = InstallationResourceSnapshot(
-        site_id="test-site", resources=_aurora_stack()
-    )
-    aurora = AuroraDeletion(
-        admin_aws_cleanup.ResourceCleaner(site),
-        snapshot,
-        request,
-        {"final_snapshot_identifier": "test-final", "phase": "KUBERNETES_VERIFIED"},
-    )
-
-    aurora.start()
-    retained = aurora.finish()
-
-    assert retained is not None, "the final snapshot must still be reported"
-    assert retained.resource_id == "test-final"
-    assert describes["clusters"] > 2, "the rerun must wait for the cluster to vanish"
-
-
 def test_certificate_deletion_waits_for_acm_to_release_the_listener(
     tmp_path, monkeypatch
 ) -> None:
@@ -1175,6 +1003,17 @@ def test_certificate_deletion_waits_for_acm_to_release_the_listener(
 
     def acm(arguments, **kwargs):
         del kwargs
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, '{"Account":"123456789012"}', ""
+            )
+        if "list-tags-for-certificate" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                '{"Tags":[{"Key":"gpu-fault:site-id","Value":"test-site"}]}',
+                "",
+            )
         if "delete-certificate" in arguments:
             deletes[0] += 1
             if deletes[0] <= 2:
@@ -1186,15 +1025,23 @@ def test_certificate_deletion_waits_for_acm_to_release_the_listener(
                 )
             return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
         if "describe-certificate" in arguments:
+            if deletes[0] < 3:
+                return subprocess.CompletedProcess(
+                    arguments, 0, '{"Certificate":{}}', ""
+                )
             return subprocess.CompletedProcess(
                 arguments, 254, stdout="", stderr="ResourceNotFoundException"
             )
         raise AssertionError(f"unexpected aws call: {arguments}")
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", acm)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", acm)
     monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
-    certificate = _resource("aws/acm/certificate", "acm_certificate", "arn:acm/a")
+    certificate = _resource(
+        "aws/acm/certificate",
+        "acm_certificate",
+        "arn:aws:acm:us-east-1:123456789012:certificate/test",
+    )
 
     cleaner.delete(certificate)
 
@@ -1210,12 +1057,32 @@ def test_certificate_deletion_still_raises_on_any_other_failure(
 
     def acm(arguments, **kwargs):
         del kwargs
+        if "get-caller-identity" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, '{"Account":"123456789012"}', ""
+            )
+        if "list-tags-for-certificate" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                '{"Tags":[{"Key":"gpu-fault:site-id","Value":"test-site"}]}',
+                "",
+            )
+        if "describe-certificate" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, '{"Certificate":{}}', "")
+        assert "delete-certificate" in arguments
         return subprocess.CompletedProcess(
             arguments, 254, stdout="", stderr="AccessDeniedException: no"
         )
 
-    monkeypatch.setattr(admin_aws_commands.subprocess, "run", acm)
+    monkeypatch.setattr(admin_aws_commands, "bounded_command", acm)
     cleaner = admin_aws_cleanup.ResourceCleaner(site)
 
     with pytest.raises(BootstrapError, match="AccessDeniedException"):
-        cleaner.delete(_resource("aws/acm/certificate", "acm_certificate", "arn:acm/a"))
+        cleaner.delete(
+            _resource(
+                "aws/acm/certificate",
+                "acm_certificate",
+                "arn:aws:acm:us-east-1:123456789012:certificate/test",
+            )
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ from gpu_fault_release import regional_release_resume_validation as RESUME
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _fixture(*, candidate_agent: str = "a" * 64):
+def _fixture(
+    *, candidate_agent: str = "a" * 64, aurora_drift: Callable[[], bool] | None = None
+):
     target = SimpleNamespace(cluster_id="gpu-a", context="gpu-a")
     previous_agent = "a" * 64
     previous_executor = "b" * 64
@@ -41,6 +44,7 @@ def _fixture(*, candidate_agent: str = "a" * 64):
         executor_wheel_sha=previous_executor,
         _config_map_data=lambda _name: dict(metadata),
         _target_node_names=lambda _target: ("node-a",),
+        _aurora_refresh_drift=aurora_drift or (lambda: False),
     )
     previous = {
         "metadata": dict(metadata),
@@ -74,6 +78,32 @@ def test_resume_validator_accepts_unchanged_pending_cluster() -> None:
     RESUME.validate_resume_checkpoint(
         release, loaded=loaded, previous=previous, plan=plan
     )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("drift", [False, True])
+def test_resume_rechecks_completed_aurora_refresher_before_skipping_its_phase(
+    completed: bool, drift: bool
+) -> None:
+    reads: list[bool] = []
+    release, previous, loaded, _plan, _metadata = _fixture(
+        aurora_drift=lambda: reads.append(True) or drift
+    )
+    if completed:
+        loaded["completed_phases"] = ["aurora-refresh-ready"]
+    plan = RESUME.ReleaseExecutionPlan(
+        nodes=(RESUME.ReleaseComponent.AURORA_REFRESH, RESUME.ReleaseComponent.VERIFY)
+    )
+    if completed and drift:
+        with pytest.raises(RESUME.ReleaseError, match="refresher drifted"):
+            RESUME.validate_resume_checkpoint(
+                release, loaded=loaded, previous=previous, plan=plan
+            )
+    else:
+        RESUME.validate_resume_checkpoint(
+            release, loaded=loaded, previous=previous, plan=plan
+        )
+    assert reads == ([True] if completed else [])
 
 
 def test_resume_validator_rejects_node_set_drift() -> None:

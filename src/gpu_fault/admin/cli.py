@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+from gpu_fault.admin.execution import operation_budget, run_driver
+from gpu_fault.admin.api_budget import ApiBudgetError
+
 import argparse
+import copy
 import hashlib
 import json
 import os
 import subprocess
 import sys
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 from gpu_fault.admin import operator_identity
+from gpu_fault.admin.deploy_host_binding import (
+    DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
+    enforce_deploy_host_state_dir,
+    is_readonly_command,
+)
 from gpu_fault.admin.aurora_capacity import (
     await_aurora_capacity,
     reconcile_aurora_capacity,
@@ -28,12 +38,13 @@ from gpu_fault.admin.cluster_join import (
     join_cluster,
 )
 from gpu_fault.admin.cluster_removal import (
+    CONFIRMATION as REMOVE_CLUSTER_CONFIRMATION,
     RemoveClusterRequest,
     remove_cluster,
-    resolve_cluster_id,
+    resolve_removal_cluster_id,
 )
 from gpu_fault.admin.command_log import (
-    ADMIN_LOG_ENVIRONMENT,
+    ADMIN_LOG_ENVIRONMENT as ADMIN_LOG_ENVIRONMENT,
     ADMIN_LOG_KIND_MUTATING,
     ADMIN_LOG_KIND_READONLY,
     announce,
@@ -57,13 +68,17 @@ from gpu_fault.admin.config_file import (
     write_admin_config_file,
 )
 from gpu_fault.admin.config_parser import AdminConfigError
-from gpu_fault.admin.deploy_command import DeployHooks, run_deploy
+from gpu_fault.admin.config_recovery import (
+    ConfigRecovery,
+    config_failure_recovery,
+    record_config_failure,
+)
+from gpu_fault.admin.deploy_command import DeployHooks, add_deploy_command, run_deploy
 from gpu_fault.admin.failure_domain_map import (
     add_failure_domain_map_command,
     run_failure_domain_map_command,
 )
 from gpu_fault.admin.grafana import (
-    add_grafana_arguments,
     grafana_environment,
     grafana_request_fields,
 )
@@ -76,11 +91,19 @@ from gpu_fault.admin.collector_outbox import (
     run_collector_outbox_command,
 )
 from gpu_fault.admin.incident_close import run_incident_close
-from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+    site_mutation_identity as _admin_config_site_identity,
+)
+from gpu_fault.admin.node_key_custody_admin_entry import (
+    add_custody_command,
+    assert_site_custody_current,
+    run_custody_command,
+)
 from gpu_fault.admin.release_child import (
     run_automatic_release as _run_automatic_release,
 )
-from gpu_fault.admin.notification_precheck import WAIT_FLAG
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
     approve_profile_plan_inline,
@@ -113,6 +136,11 @@ from gpu_fault.admin.site import (
     materialized_release_config,
 )
 from gpu_fault.admin.source_deploy import run_source_deploy
+from gpu_fault.admin.status_report import (
+    print_status_report as print_status_report,
+    status_document as status_document,
+)
+from gpu_fault.admin.node_key_custody_models import CustodyError
 from gpu_fault.admin.submit_remediation import (
     add_submit_remediation_command,
     run_submit_remediation_command,
@@ -120,7 +148,6 @@ from gpu_fault.admin.submit_remediation import (
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.admin import warm_spare
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
-from gpu_fault_release.regional_admin_commands import status_header_lines
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
     QUICK_VALIDATION_EVIDENCE_FILE,  # noqa: F401  # re-exported; tests pin it
@@ -148,7 +175,6 @@ INTERNAL_READONLY_COMMANDS = ("preflight", "verify")
 # The managed commands that write nothing; their console logs rotate under
 # ``logs/readonly/`` so they cannot age out a failed deploy's log (I3).
 READONLY_COMMANDS = frozenset(PUBLIC_READONLY_COMMANDS + INTERNAL_READONLY_COMMANDS)
-DEPLOY_HOST_STATE_BINDING = "gpu-fault-managed-state-dir.json"
 
 
 RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
@@ -216,43 +242,6 @@ def quick_validation_evidence_environment(
     return {QUICK_VALIDATION_EVIDENCE_ENV: str(path)}
 
 
-def _bound_deploy_host_state_dir(prefix: Path | None = None) -> Path | None:
-    binding = (prefix or Path(sys.prefix)).resolve() / DEPLOY_HOST_STATE_BINDING
-    if not binding.is_file():
-        return None
-    try:
-        value = json.loads(binding.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SiteConfigError("deploy-host state-dir binding is invalid") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise SiteConfigError("deploy-host state-dir binding schema is invalid")
-    state_dir = value.get("state_dir")
-    if not isinstance(state_dir, str) or not state_dir.strip():
-        raise SiteConfigError("deploy-host state-dir binding has no state directory")
-    return Path(state_dir).expanduser().resolve()
-
-
-def enforce_deploy_host_state_dir(arguments: argparse.Namespace) -> None:
-    bound = _bound_deploy_host_state_dir()
-    if bound is None:
-        return
-    provided = cast(Path | None, getattr(arguments, "state_dir", None))
-    if provided is not None:
-        if provided.expanduser().resolve() == bound:
-            return
-        raise SiteConfigError(
-            f"installed deploy-host is bound to --state-dir {bound}; "
-            f"refusing {provided.expanduser().resolve()}"
-        )
-    explicit = cast(Path | None, getattr(arguments, "file", None))
-    if explicit is not None and explicit.expanduser().resolve() == bound / "site.yaml":
-        return
-    raise SiteConfigError(
-        f"installed deploy-host is bound to --state-dir {bound}; "
-        f"{arguments.command} requires that managed state"
-    )
-
-
 def _add_managed_site_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--state-dir",
@@ -270,45 +259,6 @@ def _add_managed_site_arguments(command: argparse.ArgumentParser) -> None:
         "--repo-root",
         type=Path,
         help=argparse.SUPPRESS,
-    )
-
-
-def _add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
-    """The flags that turn the one deploy command into its other two actions."""
-
-    deploy.add_argument(
-        "--rollback",
-        action="store_true",
-        help=(
-            "roll the site back one step, to the release recorded as previous; "
-            "refused while a transaction is in flight or when there is no "
-            "previous release; takes no other deploy option"
-        ),
-    )
-    deploy.add_argument(
-        "--approve-profile-plan",
-        metavar="PLAN_SHA256",
-        help=(
-            "approve the pending Runtime Profile plan with this plan_sha256 "
-            "(printed when the deploy stopped for review) and continue the "
-            "same deploy; requires --reference"
-        ),
-    )
-    deploy.add_argument(
-        "--reference",
-        metavar="REFERENCE",
-        help="approved change or maintenance-window reference for the approval",
-    )
-    deploy.add_argument(
-        WAIT_FLAG,
-        dest="wait_for_email_confirmation",
-        type=int,
-        default=0,
-        metavar="MINUTES",
-        help=(
-            "wait up to MINUTES for the SNS subscription (and the SES sender on a "
-            "spec.notifications.channel: ses site) to confirm instead of stopping"
-        ),
     )
 
 
@@ -550,82 +500,7 @@ def parser() -> argparse.ArgumentParser:
                 "checks; this is the report acceptance evidence records"
             ),
         )
-    deploy = commands.add_parser(
-        "deploy",
-        usage=(
-            "gpu-fault-admin deploy --state-dir STATE_DIR "
-            "[--cpu-cluster-arn CPU_ARN --gpu-cluster-arn GPU_ARN ... "
-            "--admin-email EMAIL] [--rollback] "
-            "[--approve-profile-plan PLAN_SHA256 --reference REFERENCE]"
-        ),
-        description=(
-            "Bootstrap a new site (all four inputs), upgrade the site recorded "
-            "under STATE_DIR (--state-dir alone), add a GPU cluster (the managed "
-            "ARNs plus the new one), roll back one step (--rollback) or approve "
-            "the pending Runtime Profile plan and continue "
-            "(--approve-profile-plan): one command"
-        ),
-    )
-    deploy.add_argument("-f", "--file", type=Path, help=argparse.SUPPRESS)
-    deploy.add_argument(
-        "--cpu-cluster-arn",
-        metavar="CPU_ARN",
-        help=(
-            "existing CPU EKS or HyperPod cluster ARN; required on the first "
-            "deploy, read from the site afterwards"
-        ),
-    )
-    deploy.add_argument(
-        "--gpu-cluster-arn",
-        action="append",
-        default=[],
-        metavar="GPU_ARN",
-        help=(
-            "existing GPU EKS or HyperPod cluster ARN; repeat for more clusters. "
-            "On a managed site the set must be the managed clusters or a superset "
-            "of them: the extra clusters are joined after the release"
-        ),
-    )
-    deploy.add_argument("--repo-root", type=Path, help=argparse.SUPPRESS)
-    deploy.add_argument(
-        "--state-dir",
-        type=Path,
-        metavar="STATE_DIR",
-        help=("private state directory used for both first deployment and upgrades"),
-    )
-    deploy.add_argument(
-        "--config",
-        dest="admin_config_file",
-        type=Path,
-        metavar="ADMIN_CONFIG",
-        help=(
-            "private AdminConfig YAML for first deployment; existing sites "
-            "must use gpu-fault-admin config"
-        ),
-    )
-    deploy.add_argument(
-        "--admin-email",
-        dest="alert_email",
-        metavar="EMAIL",
-        help=(
-            "administrator email for SES fault notifications and SNS alerts; "
-            "required on the first deploy, read from the site afterwards"
-        ),
-    )
-    _add_deploy_action_arguments(deploy)
-    add_grafana_arguments(deploy)
-    deploy.add_argument(
-        "--staging-only-release",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    add_release_consent_arguments(deploy)
-    deploy.add_argument("--impact-base", default="origin/main", help=argparse.SUPPRESS)
-    deploy.add_argument(
-        "--prepared-source-release",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
+    add_deploy_command(commands)
     _add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
     add_failure_domain_map_command(commands, _add_managed_site_arguments)
@@ -655,6 +530,7 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         help="additional workload namespace; may be repeated",
     )
+    add_custody_command(commands)
     detach = commands.add_parser(
         "remove-cluster",
         usage=(
@@ -676,6 +552,7 @@ def parser() -> argparse.ArgumentParser:
     detach.add_argument(
         "--confirm",
         required=True,
+        choices=(REMOVE_CLUSTER_CONFIRMATION,),
         help="must be REMOVE_GPU_CLUSTER",
     )
     remove = commands.add_parser(
@@ -774,10 +651,11 @@ def _run_remove_cluster(arguments: argparse.Namespace) -> int:
     result = remove_cluster(
         RemoveClusterRequest(
             site=site,
-            cluster_id=resolve_cluster_id(
+            cluster_id=resolve_removal_cluster_id(
                 site, arguments.gpu_cluster_arn, discover=discover
             ),
             confirmation=arguments.confirm,
+            gpu_cluster_arn=arguments.gpu_cluster_arn,
         )
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -914,6 +792,8 @@ def _run_readonly_managed_command(
             None if arguments.command == "status" else arguments.repo_root
         ),
     )
+    if arguments.command == "preflight":
+        assert_site_custody_current(current_site, CommandRunner())
     stack = ExitStack()
     effective_site_file = site_file
     if arguments.command == "status":
@@ -963,7 +843,7 @@ def _run_readonly_managed_command(
         )
         is_status = arguments.command == "status"
         with materialized_release_config(site) as config:
-            completed = subprocess.run(
+            completed = run_driver(
                 [
                     str(rollout),
                     COMMANDS[arguments.command],
@@ -991,55 +871,6 @@ def _run_readonly_managed_command(
         return completed.returncode
 
 
-def status_document(stdout: str) -> dict[str, Any] | None:
-    text = stdout.strip()
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        lines = text.splitlines()
-        starts = [index for index, line in enumerate(lines) if line.strip() == "{"]
-        if not starts:
-            return None
-        try:
-            value = json.loads("\n".join(lines[starts[0] :]))
-        except json.JSONDecodeError:
-            return None
-    return value if isinstance(value, dict) else None
-
-
-def print_status_report(stdout: str | None) -> None:
-    """Five readable lines on stderr, then the engine's stdout byte for byte.
-
-    The JSON document is what scripts parse (`staging_live_evidence`, the
-    acceptance recorders), so it is passed through unchanged; the header is the
-    part an administrator reads.
-    """
-
-    report = status_document(stdout or "")
-    log_path = os.environ.get(ADMIN_LOG_ENVIRONMENT, "").strip()
-    destination = "stdout" + (f" (also in {log_path})" if log_path else "")
-    lines = (
-        status_header_lines(report, json_destination=destination)
-        if report is not None
-        else ["status printed no JSON report; see the output below"]
-    )
-    print(
-        "\n".join(f"gpu-fault-admin status: {line}" for line in lines), file=sys.stderr
-    )
-    sys.stderr.flush()
-    if stdout:
-        sys.stdout.write(stdout)
-        sys.stdout.flush()
-
-
-def _admin_config_site_identity(site: RenderedSite) -> dict[str, str]:
-    return {
-        "site_name": str(site.release_config["site_name"]),
-        "aws_region": str(site.release_config["aws_region"]),
-        "cpu_eks_arn": str(site.release_config["cpu_eks_arn"]),
-    }
-
-
 def _admin_config_candidate(
     arguments: argparse.Namespace,
     current: AdminConfig,
@@ -1058,6 +889,12 @@ def _admin_config_candidate(
     if configured_file is None:
         configured_file = admin_config_file_path(arguments.state_dir)
         if not configured_file.is_file():
+            if arguments.dry_run:
+                raise AdminConfigError(
+                    f"missing {configured_file}; run "
+                    f"{config_command(arguments.state_dir)} without --dry-run "
+                    "to initialize the editable configuration"
+                )
             write_admin_config_file(configured_file, current, overwrite=False)
             raise AdminConfigError(
                 f"created {configured_file}; edit it and rerun "
@@ -1106,7 +943,7 @@ def _validate_live_release_identity(
     *,
     state_dir: Path,
     uncommitted_target_sha256: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Refuse to apply unless the live release is this signed one and is settled.
 
     ``uncommitted_target_sha256`` is the pending apply's config digest: the one
@@ -1127,7 +964,7 @@ def _validate_live_release_identity(
             "completed",
         }:
             raise SiteConfigError("live regional release is not complete")
-        return
+        return copy.deepcopy(state)
     finish = (
         f"finish it with gpu-fault-admin deploy --state-dir {state_dir} before "
         f"rerunning {config_command(state_dir)}"
@@ -1165,6 +1002,7 @@ def _validate_live_release_identity(
         "verified",
     }:
         raise SiteConfigError("uncommitted live release phase cannot be resumed")
+    return copy.deepcopy(state)
 
 
 def _approver_identity() -> str:
@@ -1236,53 +1074,6 @@ def _rollback_site_aurora(
     )
 
 
-def _fail_admin_config_apply(
-    state_dir: Path,
-    site: RenderedSite,
-    apply: AdminConfigApply,
-    *,
-    release_id: str,
-    error: str,
-    restore_before: bool = True,
-) -> AdminConfigError | None:
-    """Undo the Aurora change and record the failure; a failed undo is returned.
-
-    ``restore_before=False`` is the failure after the roles already run the
-    target (the Aurora scale-up did not finish ramping): the window stays where
-    it was asked to go, ``desired.json`` stays the target, and the pending
-    record waits for the rerun to finish the wait.
-    """
-
-    rollback_result: dict[str, Any] | None = None
-    rollback_error: Exception | None = None
-    if restore_before:
-        try:
-            rollback_result = _rollback_site_aurora(
-                site, apply.aurora_changed, apply.before, apply.desired
-            )
-        except Exception as exc:  # noqa: BLE001
-            rollback_error = exc
-    if rollback_error is not None:
-        error += (
-            "; Aurora rollback failed: "
-            f"{type(rollback_error).__name__}: {rollback_error}"
-        )
-    complete_admin_config_apply(
-        state_dir,
-        config_sha256=apply.config_sha256,
-        release_id=release_id,
-        success=False,
-        error=error,
-        details=(
-            {"aurora_rollback": rollback_result}
-            if rollback_result is not None
-            else None
-        ),
-        restore_before=restore_before,
-    )
-    return AdminConfigError(error) if rollback_error is not None else None
-
-
 def _roll_admin_config(
     arguments: argparse.Namespace,
     site: RenderedSite,
@@ -1291,20 +1082,38 @@ def _roll_admin_config(
     *,
     release_id: str,
     staging_only: bool,
+    baseline: dict[str, Any],
     lock_fd: int | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
-    """Aurora modify, role rollout, then the scale-up wait; undone on failure.
-
-    The window change is issued first and the roles roll while a scale-up's
-    instances ramp: the two are independent and the ramp is the slow part. A
-    failure before the roles are live rolls Aurora back and restores the
-    previous ``desired.json``; a failure after (the ramp did not finish in
-    time) keeps the target, which is what the roles now run, and leaves the
-    pending record for the rerun to finish waiting.
-    """
+    """Apply capacity and roles; compensate only with a proven old role state."""
 
     aurora: dict[str, Any] | None = None
     rolled = False
+    started_at = datetime.now(UTC)
+
+    def fail(error: str) -> AdminConfigError | None:
+        recovery = (
+            ConfigRecovery(False, "RELEASE_SUCCEEDED")
+            if rolled
+            else config_failure_recovery(
+                apply,
+                baseline=baseline,
+                read_state=lambda: _live_release_state(site),
+                site_file=site_file,
+                started_at=started_at,
+            )
+        )
+        return record_config_failure(
+            arguments.state_dir,
+            apply,
+            release_id=release_id,
+            error=error,
+            recovery=recovery,
+            restore_aurora=lambda: _rollback_site_aurora(
+                site, apply.aurora_changed, apply.before, apply.desired
+            ),
+        )
+
     try:
         if apply.aurora_changed:
             aurora = _request_site_aurora(
@@ -1333,25 +1142,12 @@ def _roll_admin_config(
                 "; the control-plane roles already run the new config, rerun "
                 f"{config_command(arguments.state_dir)} to finish waiting for Aurora"
             )
-        failure = _fail_admin_config_apply(
-            arguments.state_dir,
-            site,
-            apply,
-            release_id=release_id,
-            error=error,
-            restore_before=not rolled,
-        )
+        failure = fail(error)
         if failure is not None or rolled:
-            raise AdminConfigError(error) from exc
+            raise failure or AdminConfigError(error) from exc
         raise
     if returncode:
-        failure = _fail_admin_config_apply(
-            arguments.state_dir,
-            site,
-            apply,
-            release_id=release_id,
-            error=f"release-deploy exited with status {returncode}",
-        )
+        failure = fail(f"release-deploy exited with status {returncode}")
         if failure is not None:
             raise failure
         return returncode, None
@@ -1385,7 +1181,7 @@ def _apply_admin_config(
         release_identity=release_identity,
         desired=desired,
     )
-    _validate_live_release_identity(
+    baseline = _validate_live_release_identity(
         site,
         release_identity,
         state_dir=state_dir,
@@ -1418,6 +1214,7 @@ def _apply_admin_config(
         apply,
         release_id=release_id,
         staging_only=staging_only,
+        baseline=baseline,
         lock_fd=lock_fd,
     )
     if returncode:
@@ -1464,6 +1261,7 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
         print(json.dumps({"status": "DRY_RUN", **plan}, indent=2, sort_keys=True))
         return 0
     with administrator_operation_lock(arguments.state_dir) as lock_fd:
+        site = reload_site_for_mutation(site)
         return _apply_admin_config(arguments, site, site_file, lock_fd=lock_fd)
 
 
@@ -1491,6 +1289,8 @@ def _run_deploy(arguments: argparse.Namespace) -> int:
 
 
 def run(arguments: argparse.Namespace) -> int:
+    if arguments.command == "node-key-custody":
+        return run_custody_command(arguments)
     if arguments.command == "config":
         return _run_admin_config(arguments)
     if arguments.command == "join-cluster":
@@ -1540,6 +1340,8 @@ def run(arguments: argparse.Namespace) -> int:
     if site_file is None:
         raise SiteConfigError(f"{arguments.command} requires -f site.yaml")
     site = load_site(site_file, repository_root=arguments.repo_root)
+    if arguments.command == "deploy":
+        assert_site_custody_current(site, CommandRunner())
     if arguments.command == "deploy" and getattr(arguments, "alert_email", None):
         raise SiteConfigError(
             "notification AWS changes must be applied through IaC and "
@@ -1564,15 +1366,15 @@ def run(arguments: argparse.Namespace) -> int:
             **release_consent_environment(arguments),
         }
         if arguments.command == "deploy":
-            preflight = subprocess.run(
-                [str(rollout), "preflight", "--config", str(config)],
+            preflight = run_driver(
+                [str(rollout), "preflight", "--for-deploy", "--config", str(config)],
                 cwd=site.repository_root,
                 env=environment,
                 check=False,
             )
             if preflight.returncode:
                 return preflight.returncode
-        completed = subprocess.run(
+        completed = run_driver(
             [
                 str(rollout),
                 COMMANDS[arguments.command],
@@ -1592,11 +1394,19 @@ def run(arguments: argparse.Namespace) -> int:
 
 def _run_reporting_failures(arguments: argparse.Namespace) -> int:
     try:
-        enforce_deploy_host_state_dir(arguments)
-        return run(arguments)
+        command = str(getattr(arguments, "command", "admin"))
+        with operation_budget(
+            f"admin/{command}",
+            readonly=is_readonly_command(
+                arguments, readonly_commands=READONLY_COMMANDS
+            ),
+        ):
+            return run(arguments)
     except (
         AdminConfigError,
         BootstrapError,
+        CustodyError,
+        ApiBudgetError,
         OSError,
         ProfileApprovalError,
         SiteConfigError,
@@ -1612,6 +1422,10 @@ def _run_reporting_failures(arguments: argparse.Namespace) -> int:
 def main() -> int:
     arguments = parser().parse_args()
     command = str(getattr(arguments, "command", "admin"))
+    try:
+        enforce_deploy_host_state_dir(arguments, readonly_commands=READONLY_COMMANDS)
+    except SiteConfigError as exc:
+        return report_failure("gpu-fault-admin", exc)
     with command_log(
         getattr(arguments, "state_dir", None),
         command=command,
@@ -1619,7 +1433,7 @@ def main() -> int:
         # cannot age out the log of the deploy that failed.
         kind=(
             ADMIN_LOG_KIND_READONLY
-            if command in READONLY_COMMANDS
+            if is_readonly_command(arguments, readonly_commands=READONLY_COMMANDS)
             else ADMIN_LOG_KIND_MUTATING
         ),
     ) as log_path:

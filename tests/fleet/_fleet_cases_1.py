@@ -7,6 +7,7 @@ import pytest
 
 from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.fleet import (
+    CURRENT_AGENT_PROTOCOL_VERSION,
     NODE_ACTION_KEY_VERSION_DERIVED,
     AgentLifecycleState,
     AgentTransitionRequest,
@@ -987,7 +988,7 @@ def test_fleet_accepts_legacy_agent_identity_without_optional_digests() -> None:
         FleetDeploymentRequest(
             cluster_id="cluster-a",
             node_ids=["node-a"],
-            desired_agent_protocol_version=3,
+            desired_agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
             desired_agent_version="0.9.0",
             desired_artifact_sha256=ARTIFACT,
             desired_compatibility_digest=ARTIFACT,
@@ -1002,7 +1003,7 @@ def test_fleet_accepts_legacy_agent_identity_without_optional_digests() -> None:
     assert deployment.status is DeploymentStatus.SUCCEEDED
     assert deployment.desired_bundle_sha256 is None
     assert deployment.desired_template_sha256 is None
-    assert deployment.desired_agent_protocol_version == 3
+    assert deployment.desired_agent_protocol_version == CURRENT_AGENT_PROTOCOL_VERSION
 
 
 def test_deployment_id_is_idempotent_and_contract_bound() -> None:

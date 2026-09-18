@@ -9,35 +9,67 @@ import re
 import subprocess
 import sys
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.perf.regional_capacity_registry import STORE_DSN_SNIPPET  # noqa: E402
+
 if __package__:
+    from .regional_commands import run_fixture_command
+    from .ha_evidence import chain_preflight, require_chain, result_identity
+    from .ha_kubernetes import delete_pod
+    from .regional_pod_inventory import ready_pod_records
+    from .ha_probe_resources import OwnedProbeResources
+    from .ha_cleanup import ProcessSupervisionLost, record_supervision_loss, run_cleanup
+    from .ha001_closure import closure_errors, closure_seed, closure_summary
+    from .ha001_role_health import validate_role_health
+    from .ha_store_probe import store_probe_script
+    from .ha_plan_preflight import require_window
     from .acceptance_runner_common import write_json_atomic
-    from .acceptance_scope import current_acceptance_scope
-    from ...perf.regional_capacity_registry import STORE_DSN_SNIPPET
     from .live_driver_guard import (
         add_live_arguments,
-        applied_site_profile,
         install_site_profile,
     )
-    from .live_driver_guard import authorize_execution as guard_authorize_execution
-    from .regional_live_fixture import install_abort_signals, run_case_main
+    from .live_driver_guard import (
+        authorize_execution as guard_authorize_execution,
+        build_plan as guard_build_plan,
+    )
+    from .regional_live_fixture import (
+        component_python,
+        install_abort_signals,
+        run_case_main,
+    )
 else:
+    from regional_commands import run_fixture_command
+    from ha_evidence import chain_preflight, require_chain, result_identity
+    from ha_kubernetes import delete_pod
+    from regional_pod_inventory import ready_pod_records
+    from ha_probe_resources import OwnedProbeResources
+    from ha_cleanup import ProcessSupervisionLost, record_supervision_loss, run_cleanup
+    from ha001_closure import closure_errors, closure_seed, closure_summary
+    from ha001_role_health import validate_role_health
+    from ha_store_probe import store_probe_script
+    from ha_plan_preflight import require_window
     from acceptance_runner_common import write_json_atomic
-    from acceptance_scope import current_acceptance_scope
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "perf"))
-    from regional_capacity_registry import STORE_DSN_SNIPPET
     from live_driver_guard import (
         add_live_arguments,
-        applied_site_profile,
         install_site_profile,
     )
-    from live_driver_guard import authorize_execution as guard_authorize_execution
-    from regional_live_fixture import install_abort_signals, run_case_main
+    from live_driver_guard import (
+        authorize_execution as guard_authorize_execution,
+        build_plan as guard_build_plan,
+    )
+    from regional_live_fixture import (
+        component_python,
+        install_abort_signals,
+        run_case_main,
+    )
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "ha001_probe.py"
 CPU_KUBECONFIG = Path()
@@ -49,6 +81,7 @@ CASE_ID = "GF-REGIONAL-HA-001"
 CONFIGMAP = "gpu-fault-ha001-probe"
 PROBE_POD = "gpu-fault-ha001-probe"
 OWNER = "gpu-fault-ha-test"
+SEED_LEASE_SECONDS = 30 * 60
 CONFIRMATION = "HA001_DELETE_CONTROL_PODS"
 INGRESS_APP = "gpu-fault-api-ha"
 WORKER_APP = "gpu-fault-control-worker"
@@ -134,20 +167,7 @@ def run(
     check: bool = True,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        argv,
-        input=stdin,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
-    if check and result.returncode != 0:
-        raise CaseError(
-            f"command failed ({result.returncode}): {' '.join(argv)}; "
-            f"stderr={result.stderr.strip()}"
-        )
-    return result
+    return run_fixture_command(argv, input_text=stdin, check=check, timeout=timeout)
 
 
 def cpu(
@@ -196,22 +216,7 @@ def gpu(
 
 def ready_pods(app: str) -> list[dict]:
     value = json.loads(cpu("get", "pod", "-l", f"app={app}", "-o", "json"))
-    result = []
-    for item in value.get("items", []):
-        statuses = item.get("status", {}).get("containerStatuses", [])
-        if item.get("status", {}).get("phase") != "Running":
-            continue
-        if not statuses or not all(bool(status.get("ready")) for status in statuses):
-            continue
-        result.append(
-            {
-                "name": item["metadata"]["name"],
-                "uid": item["metadata"]["uid"],
-                "node": item["spec"].get("nodeName"),
-                "started_at": item.get("status", {}).get("startTime"),
-            }
-        )
-    return sorted(result, key=lambda item: item["name"])
+    return ready_pod_records(value)
 
 
 def first_ready_cpu_pod(app: str) -> str:
@@ -240,10 +245,10 @@ def cpu_python(script: str, *arguments: str, attempts: int = 3) -> dict:
                 "-i",
                 pod,
                 "--",
-                "python3",
+                component_python("cpu"),
                 "-",
                 *arguments,
-                stdin=script,
+                stdin=store_probe_script(script),
                 timeout=120,
             )
             return json.loads(output.splitlines()[-1])
@@ -465,7 +470,7 @@ print(json.dumps({
                     "-i",
                     str(pod["name"]),
                     "--",
-                    "python3",
+                    component_python("cpu"),
                     "-",
                     str(ports[app]),
                     stdin=script,
@@ -476,7 +481,8 @@ print(json.dumps({
     return roles
 
 
-def build_plan(run_dir: Path, attempt: int) -> dict:
+def build_plan(run_dir: Path, attempt: int, *, arguments: argparse.Namespace) -> dict:
+    chain = chain_preflight(arguments, CASE_ID)
     topology = deployment_and_pdb_snapshot()
     replicas = declared_replicas(topology)
     ingress = ready_pods(INGRESS_APP)
@@ -488,21 +494,23 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
         )
     if len(workers) < 2:
         raise CaseError("the plan deletes two control-worker Pods; fewer are Ready")
+    if len(ingress) < 3:
+        raise CaseError("deleting ingress requires at least three Ready replicas")
     minimum_ready = minimum_ready_from_replicas(replicas)
     limits = {
         app: failure_window_limit(topology["deployments"][app])
         for app in (INGRESS_APP, WORKER_APP)
     }
-    scope = current_acceptance_scope()
+    role_errors = [*chain["errors"], *validate_roles(role_snapshot(), replicas)]
     plan = {
-        "schema_version": 3,
-        "case_id": CASE_ID,
-        "attempt": attempt,
-        "confirmation": CONFIRMATION,
-        "environment": environment_values(),
-        "site_profile": applied_site_profile(),
-        **scope.plan_fields(),
-        "mutation_performed": False,
+        "risk": "live-control-plane-pod-deletion",
+        "mutation": (
+            "delete one ingress and two control-worker Pods in three staged "
+            "phases; Pod deletion only, with no Deployment spec or node "
+            "change, and the ReplicaSets recreate the deleted Pods"
+        ),
+        "errors": role_errors,
+        "chain": chain,
         "region": AWS_REGION,
         "cpu_kubeconfig": str(CPU_KUBECONFIG),
         "gpu_context": GPU_CONTEXT,
@@ -550,10 +558,16 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
         },
         "limitations": LIMITATIONS,
     }
-    case_dir = run_dir / "cases" / CASE_ID
-    case_dir.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(case_dir / "plan.json", plan)
-    return plan
+    return guard_build_plan(
+        run_dir=run_dir,
+        case_id=CASE_ID,
+        attempt=attempt,
+        confirmation=CONFIRMATION,
+        arguments=arguments,
+        preflight_passed=not role_errors,
+        environment=environment_values(),
+        details=plan,
+    )
 
 
 def env_value(deployment: dict, name: str) -> str:
@@ -590,7 +604,7 @@ def probe_manifest(deployment: dict) -> dict:
                     "name": "probe",
                     "image": container["image"],
                     "command": [
-                        "/opt/gpu-fault/executor/bin/python",
+                        component_python("gpu"),
                         f"/scripts/{PROBE_SCRIPT.name}",
                     ],
                     "resources": {
@@ -670,7 +684,7 @@ def probe_manifest(deployment: dict) -> dict:
     }
 
 
-def create_probe() -> None:
+def create_probe(resources: OwnedProbeResources) -> None:
     deployment = json.loads(
         gpu("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")
     )
@@ -680,9 +694,8 @@ def create_probe() -> None:
         "metadata": {"name": CONFIGMAP, "namespace": NAMESPACE},
         "data": {PROBE_SCRIPT.name: PROBE_SCRIPT.read_text()},
     }
-    gpu("apply", "-f", "-", stdin=json.dumps(configmap))
-    gpu("delete", "pod", PROBE_POD, "--ignore-not-found", check=False)
-    gpu("apply", "-f", "-", stdin=json.dumps(probe_manifest(deployment)))
+    resources.create(configmap)
+    resources.create(probe_manifest(deployment))
     gpu("wait", "--for=condition=Ready", f"pod/{PROBE_POD}", "--timeout=180s")
     wait_probe_file("/state/ready.json", 60)
 
@@ -725,13 +738,9 @@ def control_sample(include_queue: bool) -> dict:
     )
     counts = {"ingress_ready": 0, "worker_ready": 0, "spool_ready": 0}
     names = {"ingress_pods": [], "worker_pods": [], "spool_pods": []}
-    for item in pods.get("items", []):
-        statuses = item.get("status", {}).get("containerStatuses", [])
-        ready = (
-            item.get("status", {}).get("phase") == "Running"
-            and bool(statuses)
-            and all(bool(status.get("ready")) for status in statuses)
-        )
+    ready_names = {item["name"] for item in ready_pod_records(pods)}
+    for item in pods["items"]:
+        ready = item["metadata"]["name"] in ready_names
         app = item.get("metadata", {}).get("labels", {}).get("app")
         if app == "gpu-fault-api-ha":
             names["ingress_pods"].append(item["metadata"]["name"])
@@ -926,7 +935,7 @@ def delete_and_observe(
         raise CaseError(f"target changed before deletion: {target['name']}")
     requested_at = datetime.now(timezone.utc)
     log(f"deleting {target['app']} Pod {target['name']} on node {target['node']}")
-    cpu("delete", "pod", str(target["name"]), "--wait=false")
+    delete_pod(lambda args, body: cpu(*args, stdin=body), NAMESPACE, target)
     phase = observe_phase(
         str(target["phase"]),
         OBSERVATION_CAP_SECONDS,
@@ -965,6 +974,7 @@ def seed_closure(run_id: str, cluster_id: str) -> dict:
     script = r"""
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     FaultIncident,
@@ -976,15 +986,13 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner = sys.argv[1:]
-incident_id = f"incident-{run_id}"
-event_id = f"event-{run_id}"
-workflow_id = f"workflow-{run_id}"
-operations = [
-    WorkflowOperation.FREEZE_EVIDENCE,
-    WorkflowOperation.STOP_WORKLOADS,
-    WorkflowOperation.RESTART_WORKLOAD,
-]
+run_id, cluster_id, owner, seed_json, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
+seed = json.loads(seed_json)
+incident_id = seed["incident_id"]
+event_id = seed["event_id"]
+workflow_id = seed["workflow_id"]
+operations = [WorkflowOperation(value) for value in seed["operations"]]
 steps = [
     WorkflowStepSpec(operation=operation, execution_owner=owner)
     for operation in operations
@@ -1002,24 +1010,25 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# A terminal seed would orphan its open commands. The foreign lease keeps
+# the dispatcher from driving this simulated workflow before owned cleanup.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
-    status=WorkflowStatus.BLOCKED,
+    status=WorkflowStatus.PENDING,
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=steps,
-    blocked_reasons=["synthetic HA-001 executor-only closure"],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 store = ApplicationContext.from_environment().store
 store.save_incident(incident)
 store.save_workflow(workflow)
-command_ids = []
 for index, step in enumerate(steps):
-    command_id = f"remote-{run_id}-{index}"
-    command_ids.append(command_id)
     store.ensure_remote_command(RemoteActionCommand(
-        command_id=command_id,
+        command_id=seed["command_ids"][index],
         cluster_id=cluster_id,
         workflow_request_id=workflow_id,
         incident_id=incident_id,
@@ -1030,15 +1039,21 @@ for index, step in enumerate(steps):
         workflow=workflow,
         incident=incident,
     ))
-print(json.dumps({
-    "incident_id": incident_id,
-    "event_id": event_id,
-    "workflow_id": workflow_id,
-    "command_ids": command_ids,
-    "operations": [item.value for item in operations],
-}, sort_keys=True))
+print(json.dumps(seed, sort_keys=True))
 """
-    return cpu_python(script, run_id, cluster_id, OWNER, attempts=1)
+    expected = closure_seed(run_id)
+    observed = cpu_python(
+        script,
+        run_id,
+        cluster_id,
+        OWNER,
+        json.dumps(expected),
+        str(SEED_LEASE_SECONDS),
+        attempts=1,
+    )
+    if observed != expected:
+        raise CaseError("synthetic closure seed acknowledgement identity changed")
+    return observed
 
 
 def closure_status(seed: dict) -> dict:
@@ -1093,83 +1108,8 @@ def wait_closure(seed: dict, timeout_seconds: int = 120) -> dict:
     raise CaseError(f"synthetic closure did not complete: {last}")
 
 
-def closure_summary(seed: dict, closure: dict, ledger: dict) -> dict:
-    """Facts about the closure derived from the control plane's own records.
-
-    ``succeeded_by_step_index`` counts SUCCEEDED remote commands per
-    step_index; ``lease_owners_by_command`` is who completed each command;
-    ``physical_executions`` counts commands whose result says the adapter ran
-    the action (``cached`` False) rather than replaying its ledger.
-    """
-
-    commands = closure.get("commands") or []
-    succeeded = [item for item in commands if item.get("status") == "SUCCEEDED"]
-    by_step: Counter[str] = Counter(str(item.get("step_index")) for item in succeeded)
-    owners = {
-        str(item.get("command_id")): item.get("last_lease_owner")
-        or item.get("lease_owner")
-        for item in commands
-    }
-    physical = sum(
-        1
-        for item in succeeded
-        if (item.get("result_details") or {}).get("cached") is False
-    )
-    return {
-        "workflow_id": closure.get("workflow_id"),
-        "workflow_status_observed": closure.get("workflow_status_observed"),
-        "command_statuses": {
-            str(item.get("command_id")): item.get("status") for item in commands
-        },
-        "succeeded_by_step_index": dict(sorted(by_step.items())),
-        "lease_owners_by_command": owners,
-        "physical_executions": physical,
-        "ledger_physical_count": ledger.get("physical_count"),
-        "ledger_operations": ledger.get("operations"),
-        "expected_operations": seed.get("operations"),
-    }
-
-
-def closure_errors(seed: dict, summary: dict, *, executor_id: str) -> list[str]:
-    """Why the closure evidence does not show each step executed exactly once."""
-
-    errors = []
-    command_ids = [str(value) for value in seed.get("command_ids", [])]
-    expected_steps = {str(index): 1 for index in range(len(command_ids))}
-    if summary["succeeded_by_step_index"] != expected_steps:
-        errors.append(
-            "synthetic closure does not have exactly one SUCCEEDED command per "
-            f"step_index: {summary['succeeded_by_step_index']}"
-        )
-    for command_id in command_ids:
-        if summary["command_statuses"].get(command_id) != "SUCCEEDED":
-            errors.append(f"synthetic command {command_id} is not SUCCEEDED")
-        owner = summary["lease_owners_by_command"].get(command_id)
-        if not owner:
-            errors.append(f"synthetic command {command_id} has no lease owner")
-        elif owner != executor_id:
-            errors.append(
-                f"synthetic command {command_id} was completed by {owner}, "
-                f"not the probe executor {executor_id}"
-            )
-    if summary["physical_executions"] != len(command_ids):
-        errors.append(
-            "synthetic closure commands were not each executed physically once: "
-            f"{summary['physical_executions']} != {len(command_ids)}"
-        )
-    if summary["ledger_physical_count"] != len(command_ids):
-        errors.append(
-            f"synthetic closure ledger physical count is not {len(command_ids)}"
-        )
-    if summary["ledger_operations"] != summary["expected_operations"]:
-        errors.append("synthetic closure operations are incomplete or reordered")
-    return errors
-
-
 def cleanup_closure(seed: dict) -> dict:
-    script = (
-        STORE_DSN_SNIPPET
-        + r"""
+    script = r"""
 import json
 import sys
 import psycopg
@@ -1190,12 +1130,12 @@ with psycopg.connect(store_dsn(), autocommit=True) as connection:
         ("incident", incident_id),
     ]:
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s",
+            "SELECT gpu_fault_delete_control_state(%s,%s)",
             (kind, key),
         )
-        deleted[f"{kind}/{key}"] = cursor.rowcount
+        deleted[f"{kind}/{key}"] = int(cursor.fetchone()[0])
     cursor.execute(
-        "SELECT count(*) FROM gpu_fault_objects WHERE key LIKE %s",
+        "SELECT count(*) FROM gpu_fault_control_records WHERE key LIKE %s",
         ("%ha001-%",),
     )
     objects = int(cursor.fetchone()[0])
@@ -1211,13 +1151,11 @@ print(json.dumps({
     "remaining_links": links,
 }, sort_keys=True))
 """
-    )
     result = cpu_python(
-        script,
-        str(seed["incident_id"]),
-        str(seed["event_id"]),
-        str(seed["workflow_id"]),
+        STORE_DSN_SNIPPET + script,
+        *[str(seed[key]) for key in ("incident_id", "event_id", "workflow_id")],
         *[str(value) for value in seed["command_ids"]],
+        attempts=1,
     )
     if result["remaining_objects"] or result["remaining_links"]:
         raise CaseError(f"synthetic closure cleanup left residuals: {result}")
@@ -1227,39 +1165,9 @@ print(json.dumps({
 def validate_roles(snapshot: dict, replicas: dict[str, int]) -> list[str]:
     """Every replica in its declared role, active-active, with no leadership."""
 
-    errors = []
-    ingress = snapshot.get(INGRESS_APP, [])
-    workers = snapshot.get(WORKER_APP, [])
-    if len(ingress) != replicas[INGRESS_APP]:
-        errors.append(
-            f"ingress role snapshot does not contain {replicas[INGRESS_APP]} Pods"
-        )
-    if len(workers) != replicas[WORKER_APP]:
-        errors.append(
-            f"worker role snapshot does not contain {replicas[WORKER_APP]} Pods"
-        )
-    for item in ingress:
-        health = item.get("health", {})
-        if health.get("service_role") != "ingress":
-            errors.append(f"{item['name']} is not ingress")
-        if health.get("processor_role") != "inactive":
-            errors.append(f"{item['name']} processor is not inactive")
-        if item.get("processor_active_consumer") != 0.0:
-            errors.append(f"{item['name']} active-consumer metric is not zero")
-    for item in workers:
-        health = item.get("health", {})
-        if health.get("service_role") != "worker":
-            errors.append(f"{item['name']} is not worker")
-        if health.get("processor_role") != "active-consumer":
-            errors.append(f"{item['name']} processor is not active-consumer")
-        if item.get("processor_active_consumer") != 1.0:
-            errors.append(f"{item['name']} active-consumer metric is not one")
-    for item in [*ingress, *workers]:
-        # active-active has no leader; a non-null leadership record means a
-        # replica is running the leader/standby mode the catalog rules out.
-        if item.get("health", {}).get("leadership", "missing") is not None:
-            errors.append(f"{item['name']} reports leadership; expected null")
-    return errors
+    return validate_role_health(
+        snapshot, replicas, ingress_app=INGRESS_APP, worker_app=WORKER_APP
+    )
 
 
 def verify_plan_targets(plan: dict) -> None:
@@ -1279,7 +1187,7 @@ import psycopg
 with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     cursor.execute(
-        "SELECT count(*) FROM gpu_fault_objects WHERE key LIKE %s",
+        "SELECT count(*) FROM gpu_fault_control_records WHERE key LIKE %s",
         ("%ha001-%",),
     )
     objects = int(cursor.fetchone()[0])
@@ -1304,7 +1212,6 @@ def probe_resources() -> dict:
             "--ignore-not-found",
             "-o",
             "name",
-            check=False,
         ).strip()
         resources[f"{kind}/{name}"] = bool(output)
     return {"count": sum(resources.values()), "resources": resources}
@@ -1317,6 +1224,7 @@ def cleanup_steps(
     case_dir: Path,
     result: dict,
     expected_replicas: dict[str, int],
+    owned_resources: OwnedProbeResources | None = None,
 ) -> list[str]:
     """Run every cleanup step, each on its own, and return what failed.
 
@@ -1335,22 +1243,30 @@ def cleanup_steps(
             errors.append(f"{label}: {type(exc).__name__}: {exc}")
             return None
 
-    if probe_created:
+    if probe_created and owned_resources is None:
+        errors.append("probe resources have no ownership receipt; preserving them")
+    if probe_created and owned_resources is not None:
         attempt(
             "stop probe",
             lambda: gpu("exec", PROBE_POD, "--", "touch", "/state/stop", check=False),
         )
-    attempt(
-        "delete probe pod",
-        lambda: gpu("delete", "pod", PROBE_POD, "--ignore-not-found", check=False),
+        attempt(
+            "delete probe pod",
+            lambda: owned_resources.delete("Pod", PROBE_POD),
+        )
+        attempt(
+            "delete probe configmap",
+            lambda: owned_resources.delete("ConfigMap", CONFIGMAP),
+        )
+    resources = (
+        attempt("verify probe shutdown", probe_resources) if probe_created else None
     )
-    attempt(
-        "delete probe configmap",
-        lambda: gpu(
-            "delete", "configmap", CONFIGMAP, "--ignore-not-found", check=False
-        ),
-    )
-    if seed:
+    if (
+        seed
+        and owned_resources is not None
+        and resources is not None
+        and resources["count"] == 0
+    ):
 
         def closure() -> None:
             cleanup = cleanup_closure(seed)
@@ -1358,6 +1274,8 @@ def cleanup_steps(
             write_json_atomic(case_dir / "synthetic-closure-cleanup.json", cleanup)
 
         attempt("cleanup closure", closure)
+    elif seed:
+        errors.append("probe shutdown unverified; preserving synthetic closure")
     for app in (INGRESS_APP, WORKER_APP):
         attempt(
             f"rollout status {app}",
@@ -1392,21 +1310,32 @@ def cleanup_steps(
     return errors
 
 
-def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
+def execute_case(
+    run_dir: Path,
+    attempt: int,
+    confirmation: str,
+    *,
+    maintenance_window_end: datetime | None = None,
+    chain: dict | None = None,
+) -> int:
     if confirmation != CONFIRMATION:
         raise CaseError(f"confirmation must be exactly {CONFIRMATION}")
     case_dir = run_dir / "cases" / CASE_ID
     plan_path = case_dir / "plan.json"
     if not plan_path.is_file():
         raise CaseError("run --plan before --execute")
-    plan = json.loads(plan_path.read_text())
-    if int(plan.get("attempt", -1)) != attempt:
+    envelope = json.loads(plan_path.read_text())
+    if int(envelope.get("attempt", -1)) != attempt:
         raise CaseError("plan attempt does not match execute attempt")
+    plan = envelope.get("details") or {}
     if "replicas" not in plan or "failure_window_limits" not in plan:
         raise CaseError(
             "plan predates the derived replica/failure-window fields; re-plan"
         )
     verify_plan_targets(plan)
+    if maintenance_window_end is None:
+        raise CaseError("approved maintenance window is missing")
+    require_window(maintenance_window_end)
     replicas = {app: int(value) for app, value in plan["replicas"].items()}
     minimum_ready = minimum_ready_from_replicas(replicas)
     limits = {
@@ -1421,6 +1350,7 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
     run_id = f"ha001-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     seed: dict = {}
     probe_created = False
+    owned_resources = None
     result: dict = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -1430,8 +1360,14 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
     try:
         if database_residuals() != {"objects": 0, "links": 0}:
             raise CaseError("HA-001 database preflight found residuals")
-        create_probe()
+        if probe_resources()["count"] != 0:
+            raise CaseError("HA-001 probe resources already exist")
+        owned_resources = OwnedProbeResources(
+            case_dir / f"probe-resources-a{attempt}.json",
+            lambda args, body: gpu(*args, stdin=body),
+        )
         probe_created = True
+        create_probe(owned_resources)
         wait_probe_file("/state/stats.json", 60)
         ready = read_probe("/state/ready.json")
         write_json_atomic(case_dir / "probe-ready.json", ready)
@@ -1453,6 +1389,7 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
         deletions: list[dict] = []
 
         def delete_target(target: dict) -> None:
+            require_window(maintenance_window_end)
             app = str(target["app"])
             phase = delete_and_observe(
                 target,
@@ -1468,8 +1405,9 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
         for target in plan["targets"][:2]:
             delete_target(target)
 
-        seed = seed_closure(run_id, str(ready["cluster_id"]))
+        seed = closure_seed(run_id)
         write_json_atomic(case_dir / "synthetic-closure-seed.json", seed)
+        seed_closure(run_id, str(ready["cluster_id"]))
         closure = wait_closure(seed)
         write_json_atomic(case_dir / "synthetic-closure-commands.json", closure)
 
@@ -1549,19 +1487,26 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
             "synthetic_closure": summary,
             "probe_final": final_probe,
         }
+    except ProcessSupervisionLost:
+        record_supervision_loss(result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup_errors = cleanup_steps(
-            probe_created=probe_created,
-            seed=seed,
-            case_dir=case_dir,
-            result=result,
-            expected_replicas=replicas,
+        cleanup_errors = run_cleanup(
+            result,
+            lambda: cleanup_steps(
+                probe_created=probe_created,
+                seed=seed,
+                case_dir=case_dir,
+                result=result,
+                expected_replicas=replicas,
+                owned_resources=owned_resources,
+            ),
         )
         result["cleanup_errors"] = cleanup_errors
         if cleanup_errors:
             result["verdict"] = "FAIL"
+    result.update(result_identity(chain))
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -1574,6 +1519,7 @@ def main() -> int:
     parser.add_argument("--cpu-kubeconfig", default="")
     parser.add_argument("--gpu-kubeconfig", default="")
     parser.add_argument("--gpu-context", default="")
+    parser.add_argument("--cluster-id", default="")
     parser.add_argument("--namespace", default="gpu-fault-system")
     parser.add_argument("--region", default="")
     args = parser.parse_args()
@@ -1581,20 +1527,25 @@ def main() -> int:
     configure(args)
     install_abort_signals()
     if not args.execute:
-        plan = build_plan(args.run_dir, args.attempt)
+        plan = build_plan(args.run_dir, args.attempt, arguments=args)
         print(json.dumps(plan, sort_keys=True))
-        return 0
+        return 0 if plan["preflight_passed"] is True else 1
     deadline = guard_authorize_execution(
         args,
         case_id=CASE_ID,
         confirmation=CONFIRMATION,
         environment=environment_values(),
     )
-    plan_path = args.run_dir / "cases" / CASE_ID / "plan.json"
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    plan["maintenance_window_end"] = deadline.isoformat()
-    write_json_atomic(plan_path, plan)
-    return execute_case(args.run_dir, args.attempt, args.confirm)
+    chain = chain_preflight(args, CASE_ID)
+    plan = json.loads((args.run_dir / "cases" / CASE_ID / "plan.json").read_text())
+    require_chain(plan["details"].get("chain", {}), chain)
+    return execute_case(
+        args.run_dir,
+        args.attempt,
+        args.confirm,
+        maintenance_window_end=deadline,
+        chain=chain,
+    )
 
 
 if __name__ == "__main__":

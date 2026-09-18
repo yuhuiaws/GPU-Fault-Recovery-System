@@ -241,6 +241,13 @@ def marker_blocks_spare(
         # The marker outlived its incident record. Nothing proves recovery
         # happened, so the node stays out: fail closed.
         return True
+    if not marker.cluster_id:
+        return True
+    if (
+        getattr(incident, "cluster_id", None),
+        getattr(incident, "incident_id", None),
+    ) != (marker.cluster_id, marker.incident_id):
+        raise ValueError("spare marker incident identity does not match")
     workflow_request_id = getattr(incident, "workflow_request_id", None)
     if workflow_request_id is None:
         return True
@@ -248,6 +255,13 @@ def marker_blocks_spare(
         workflow = store.get_workflow(workflow_request_id)
     except KeyError:
         return True
+    fencing_token = getattr(incident, "fencing_token", None)
+    if fencing_token is None or (
+        getattr(workflow, "request_id", None),
+        getattr(workflow, "incident_id", None),
+        getattr(workflow, "fencing_token", None),
+    ) != (workflow_request_id, marker.incident_id, fencing_token):
+        raise ValueError("spare marker workflow identity or fencing does not match")
     return workflow.status is not WorkflowStatus.SUCCEEDED
 
 

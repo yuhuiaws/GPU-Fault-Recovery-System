@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-from gpu_fault.admin.cluster_join_readiness import evaluate_join_readiness
+import pytest
+
+from gpu_fault.admin import cluster_readiness
 from gpu_fault.admin.cluster_join_state import complete_step
+from gpu_fault.admin.site import load_site
+from tests.admin.test_admin_site import site_file
 
 
 def test_each_completed_step_keeps_its_own_timestamp(tmp_path: Path) -> None:
@@ -32,40 +37,46 @@ def test_each_completed_step_keeps_its_own_timestamp(tmp_path: Path) -> None:
     )
 
 
-def test_the_readiness_gate_records_what_it_waited_for_and_deferred(
-    tmp_path: Path,
+def test_readiness_completion_records_the_real_gate_result_and_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An operator reading ``step_completed_at.COLLECTORS_READY`` also needs to
-    see which collector kinds that timestamp covers and which it left to the
-    verify/status path."""
+    """A readiness timestamp covers every required report, not only fast kinds."""
 
+    site = load_site(site_file(tmp_path))
     collectors = {
         "GPU_INVENTORY": {
             "ready": True,
             "last_success_at": "t",
             "unit_state": "active",
         },
-        "GPU_METRICS": {
-            "ready": False,
-            "last_success_at": None,
-            "unit_state": "active",
-        },
+        "GPU_METRICS": {"ready": True, "last_success_at": "t", "unit_state": "active"},
     }
-    verdict = evaluate_join_readiness(
-        {"nodes": [{"node_id": "node-1", "collectors": collectors}]},
-        expected_nodes=["node-1"],
-        fleet={"ready": True, "nodes": []},
+    report = {
+        "cluster_id": "gpu-a",
+        "ready": True,
+        "nodes": [{"node_id": "node-1", "ready": True, "collectors": collectors}],
+    }
+    monkeypatch.setattr(
+        cluster_readiness,
+        "run_command",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, json.dumps(report) if "exec" in arguments else "cpu-pod", ""
+        ),
     )
+    ready = cluster_readiness.wait_collector_readiness(site, "gpu-a")
     path = tmp_path / "state.json"
     state: dict[str, object] = {"completed_steps": [], "evidence": {}}
 
-    complete_step(path, state, "COLLECTORS_READY", verdict.evidence())
+    complete_step(
+        path,
+        state,
+        "COLLECTORS_READY",
+        {"nodes": len(ready["nodes"]), "ready": ready["ready"]},
+    )
 
     stored = json.loads(path.read_text(encoding="utf-8"))
     evidence = stored["evidence"]["COLLECTORS_READY"]
     assert stored["step_completed_at"]["COLLECTORS_READY"] == stored["updated_at"]
     assert evidence["ready"] is True
-    assert "GPU_INVENTORY" in evidence["waited_kinds"]
-    assert evidence["deferred_kinds"]["GPU_METRICS"]["verified_as"] == "scheduled"
-    assert evidence["deferred_kinds"]["GPU_METRICS"]["reported_nodes"] == 0
-    assert evidence["deferred_kinds"]["GPU_METRICS"]["scheduled_nodes"] == 1
+    assert evidence["nodes"] == 1
+    assert ready == report, "the readiness gate must preserve every collector verdict"

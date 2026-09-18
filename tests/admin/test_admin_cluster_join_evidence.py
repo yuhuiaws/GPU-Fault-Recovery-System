@@ -74,14 +74,10 @@ def test_verified_membership_evidence_rejects_runtime_drift() -> None:
         )
 
 
-def test_commit_validation_checks_the_evidence_without_a_live_read(
+def test_commit_validation_checks_fresh_runtime_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A join takes three runtime snapshots: before and after the verify, and
-    the final one after activation. The commit gate between them is a check of
-    the recorded evidence against the transaction files, not a fourth and fifth
-    read of the control plane.
-    """
+    """A cached proof cannot authorize activation after the live registry drifts."""
 
     source, candidate = _candidate_sites(tmp_path)
     baseline = _snapshot(
@@ -101,11 +97,13 @@ def test_commit_validation_checks_the_evidence_without_a_live_read(
         batch_id="batch-a",
         verified_at=verified_at,
     )
-    monkeypatch.setattr(
-        evidence,
-        "membership_runtime_snapshot",
-        lambda _site: pytest.fail("the commit gate re-read the live runtime"),
-    )
+    snapshots = []
+
+    def snapshot(_site):
+        snapshots.append(baseline)
+        return baseline
+
+    monkeypatch.setattr(evidence, "membership_runtime_snapshot", snapshot)
     state = {
         "source_site_sha256": source.source_sha256,
         "source_site_non_membership_sha256": (
@@ -122,10 +120,22 @@ def test_commit_validation_checks_the_evidence_without_a_live_read(
         cluster_id="gpu-c",
         now=verified_at + timedelta(seconds=30),
     )
+    assert snapshots == [baseline]
 
     with pytest.raises(BootstrapError, match="cluster set drifted"):
         evidence.validate_verified_membership(
             evidence={**record, "candidate_cluster_ids": ["gpu-a", "gpu-c"]},
+            state=state,
+            current_site=source,
+            candidate_site=candidate,
+            cluster_id="gpu-c",
+            now=verified_at + timedelta(seconds=30),
+        )
+
+    baseline["registry_generation"] += 1
+    with pytest.raises(BootstrapError, match="drifted before activation"):
+        evidence.validate_verified_membership(
+            evidence=record,
             state=state,
             current_site=source,
             candidate_site=candidate,

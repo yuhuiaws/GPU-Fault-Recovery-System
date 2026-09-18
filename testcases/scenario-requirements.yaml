@@ -1,0 +1,950 @@
+schema_version: 1
+requirements:
+  - id: GF-REQ-POLICY-CATALOG
+    family: fault-policy
+    title: Pinned catalog, product applicability and driver-version gates
+    source: [src/gpu_fault/policy/catalog.py]
+    covers: [fault:xid-catalog, fault:product, fault:driver-version]
+    conditions: [normal, safety]
+    assertions:
+      - Every pinned rule and product family has its exact official decision.
+      - Unknown products and insufficient versions cannot authorize a mutation.
+    cases: [GF-REGIONAL-COLLECT-007, GF-POL-011]
+    checks:
+      - nodeid: tests/policy/test_policy.py::test_every_catalog_rule_resolves_as_the_catalog_says
+        expected: 688
+      - nodeid: tests/policy/test_policy.py::test_catalog_minimum_version_is_enforced
+    critical: true
+  - id: GF-REQ-POLICY-CORRELATION
+    family: fault-policy
+    title: Correlation, dynamic recovery labels and unknown XIDs
+    source: [src/gpu_fault/policy/catalog.py, src/gpu_fault/xid_correlation.py]
+    covers: [fault:xid45, fault:xid48, fault:xid154, fault:unknown]
+    conditions: [normal, repeat, timeout, safety]
+    assertions:
+      - XID45 waits for its companion and follows the stronger official action.
+      - XID48 companion handling cannot weaken containment.
+      - Unknown XIDs are quarantined and retries remain idempotent.
+      - Raw-event retention cannot erase a retained finalized decision or incident binding.
+    cases: [GF-POL-001, GF-POL-002, GF-POL-003, GF-POL-009]
+    checks:
+      - nodeid: tests/policy/test_policy.py::test_unknown_xid_is_quarantined_and_idempotent
+      - nodeid: tests/metrics/test_xid_correlation.py::test_xid45_waits_and_follows_later_companion_across_replicas
+      - nodeid: tests/policy/test_policy.py::test_xid_48_exact_workflow_handles_solo_and_63_companion
+      - nodeid: tests/policy/test_policy.py::test_xid_154_dynamic_action_takes_precedence
+      - nodeid: tests/policy/test_cov95_runtime_correlation.py::test_redelivery_after_raw_event_retention_reuses_the_final_decision
+    critical: true
+  - id: GF-REQ-POLICY-NVLINK
+    family: fault-policy
+    title: NVLink bit decoding and XID74 escalation thresholds
+    source: [src/gpu_fault/policy/nvlink74.py, src/gpu_fault/policy/catalog.py, src/gpu_fault/policy/engine.py]
+    covers: [fault:nvlink5, fault:xid74]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - All pinned NVLink5 rows decode across both driver layouts and error-status alternatives.
+      - Safe-only, unknown and repeated XID74 branches retain distinct outcomes.
+      - Secondary RXPIPE bit patterns retain their pinned action and exact error-status gate.
+    cases: [GF-REGIONAL-COLLECT-006, GF-XID74-DECODE-002, GF-XID74-UNKNOWN-012]
+    checks:
+      - nodeid: tests/policy/test_policy.py::test_every_nvlink5_decode_rule_resolves_as_the_catalog_says
+        expected: 192
+      - nodeid: tests/policy/test_policy.py::test_xid74_register_workflow_is_deterministic
+        expected: 4
+      - nodeid: tests/policy/test_policy.py::test_xid74_register_branch_matrix[unknown-register]
+      - nodeid: tests/policy/test_cov95_runtime_nvlink_policy.py::test_nvlink5_rxpipe_secondary_pattern_selects_the_pinned_reset_action
+        expected: 12
+      - nodeid: tests/policy/test_cov95_runtime_nvlink_policy.py::test_secondary_nvlink_pattern_still_requires_an_exact_error_status
+        expected: 4
+  - id: GF-REQ-POLICY-SXID
+    family: fault-policy
+    title: SXID scope, topology and all-fabric versus participating-GPU recovery
+    source: [src/gpu_fault/policy/catalog.py]
+    covers: [fault:sxid-access, fault:sxid-trunk, fault:sxid-topology]
+    conditions: [normal, safety]
+    assertions:
+      - Access and trunk faults keep their different reset scopes.
+      - Missing or untrusted fabric inventory blocks execution.
+    cases: [GF-POL-007, GF-POL-008, GF-SXID-TRUNK-002, GF-SXID-TOPOLOGY-008]
+    checks:
+      - nodeid: tests/policy/test_policy.py::test_fatal_access_sxid_requires_participating_gpu_reset
+      - nodeid: tests/policy/test_policy.py::test_fatal_trunk_sxid_is_not_mapped_to_single_gpu_reset
+      - nodeid: tests/policy/test_policy.py::test_fatal_trunk_sxid_requires_complete_fabric_scope
+      - nodeid: tests/orchestration/test_sxid_topology.py::test_unknown_scope_resolves_from_exact_trusted_port_topology
+    critical: true
+  - id: GF-REQ-OP-EVIDENCE
+    family: operation
+    title: Evidence capture and bounded diagnostic failures
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/diagnostics.py]
+    covers: [operation:FREEZE_EVIDENCE, operation:COLLECT_DIAGNOSTIC_BUNDLE, operation:COLLECT_HUNG_TRIAGE]
+    conditions: [normal, failure, timeout]
+    assertions:
+      - A diagnostic bundle preserves partial failures without enabling recovery.
+      - Hung triage is bounded, read-only and tolerates unreachable participants.
+    cases: [GF-SXID-DIAGNOSTICS-011, GF-REGIONAL-PREEMPT-024]
+    checks:
+      - nodeid: tests/node_agent/test_diagnostics.py::test_diagnostic_bundle_records_partial_failures
+      - nodeid: tests/node_agent/test_diagnostics.py::test_hung_triage_collects_bounded_read_only_rank_signals
+      - nodeid: tests/execution/test_misc.py::test_hung_triage_tolerates_unreachable_node
+  - id: GF-REQ-OP-RESET
+    family: operation
+    title: Scoped GPU reset, active clients, retries and ambiguous timeouts
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/remediation.py, src/gpu_fault/node_agent/operations/reset.py, src/gpu_fault/recovery_safety.py, scripts/e2e/regional/collector_reset_evidence.py]
+    covers: [operation:RESET_GPU, operation:QUIESCE_GPU_SERVICES, operation:VERIFY_NO_GPU_CLIENTS, operation:RESTORE_GPU_SERVICES]
+    conditions: [normal, repeat, timeout, failure, safety]
+    assertions:
+      - Active GPU clients refuse reset and each retry rechecks the scope.
+      - A timed-out physical action is not blindly submitted again.
+      - Known failures may compensate quiesce; an unresolved physical outcome retains the hold and requires reconciliation.
+      - Busy refusals and successful reset invocations are accounted separately without admitting duplicate or unknown execution.
+    cases: [GF-REGIONAL-DESTR-001, GF-REGIONAL-PREEMPT-008]
+    checks:
+      - nodeid: tests/node_agent/test_remediation.py::test_gpu_reset_is_idempotent_and_rechecks_clients
+      - nodeid: tests/node_agent/test_remediation.py::test_gpu_reset_refuses_active_compute_client
+      - nodeid: tests/node_agent/test_remediation.py::test_gpu_reset_timeout_is_not_retryable_and_runs_once
+      - nodeid: tests/execution/test_misc.py::test_failed_reset_runs_restore_compensation_before_terminal
+      - nodeid: tests/execution/test_cov95_runtime_dag_cleanup.py::test_dag_reset_failure_finishes_compensation_before_landing_the_failure
+        expected: 2
+      - nodeid: tests/regional/test_collector_reset_evidence.py::test_known_busy_refusals_do_not_count_as_successful_physical_resets
+        expected: 6
+      - nodeid: tests/regional/test_collector_reset_evidence.py::test_busy_retry_evidence_never_accepts_duplicate_or_unknown_execution
+        expected: 13
+      - nodeid: tests/regional/test_independent_recovery_safety.py::test_cpu_and_both_cleanup_entries_refuse_the_same_uncertain_workflow
+        expected: 4
+      - nodeid: tests/regional/test_independent_recovery_safety.py::test_cpu_cancellation_refresh_never_substitutes_for_actual_completion
+        expected: 4
+    critical: true
+  - id: GF-REQ-OP-FABRIC
+    family: operation
+    title: Full fabric reset and Fabric Manager recovery
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/remediation.py]
+    covers: [operation:RESET_ALL_GPUS_NVSWITCHES, operation:RESTART_FABRIC_MANAGER]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - Full reset requires exact inventory and keeps idempotent command identity.
+      - Fabric Manager restart is fenced and verified after execution.
+    cases: [GF-SXID-AGENT-004, GF-REGIONAL-DESTR-010]
+    checks:
+      - nodeid: tests/node_agent/test_remediation.py::test_full_fabric_reset_verifies_inventory_and_is_idempotent
+      - nodeid: tests/node_agent/test_remediation.py::test_full_fabric_reset_rejects_inventory_mismatch
+      - nodeid: tests/node_agent/test_remediation.py::test_fabric_manager_restart_is_fenced_and_verified
+    critical: true
+  - id: GF-REQ-OP-PROVIDER
+    family: operation
+    title: Reboot ownership and ambiguous provider submission
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/adapters/hyperpod/confirmation.py]
+    covers: [operation:RESTART_NODE, operation:RESTART_VM]
+    conditions: [normal, repeat, restart, failure, safety]
+    assertions:
+      - HyperPod RESTART_VM maps to reboot rather than EC2 stop/start.
+      - Durable submission prevents duplicate reboot after adapter restart.
+      - An interrupted provider submission remains fail closed.
+      - A health interruption resets the stabilization window before confirmation.
+    cases: [GF-POL-HYPERPOD-RESTART-VM-001, GF-REGIONAL-DESTR-002]
+    checks:
+      - nodeid: tests/orchestration/test_misc.py::test_hyperpod_restart_vm_uses_node_reboot_not_stop_start
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_durable_submission_survives_adapter_restart
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_interrupted_submission_fails_closed_instead_of_resubmitting
+      - nodeid: tests/policy/test_policy.py::test_unowned_restart_vm_workflow_remains_fail_closed
+      - nodeid: tests/hyperpod/test_cov95_provider_extra_confirmation.py::test_confirmation_restarts_stabilization_after_an_observed_health_interruption
+        expected: 4
+    critical: true
+  - id: GF-REQ-OP-SPARE
+    family: operation
+    title: Warm spare compatibility, concurrent reservation and activation
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/hyperpod_spares.py]
+    covers: [operation:REPLACE_NODE]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - Only healthy compatible idle spares satisfy a reservation.
+      - A partial conflicting reservation rolls back and activation rechecks workloads.
+      - Shortage blocks and alerts without provider replacement.
+      - Legacy replacement confirmation still requires scheduler-isolation proof.
+      - A blocking spare marker can only use its matching incident, workflow and recovery fence.
+    cases: [GF-SPARE-001, GF-SPARE-002, GF-REGIONAL-DESTR-003]
+    checks:
+      - nodeid: tests/hyperpod/test_hyperpod_spares.py::test_allocates_one_healthy_compatible_spare_per_fault_node
+      - nodeid: tests/hyperpod/test_hyperpod_spares.py::test_concurrent_reservation_conflict_rolls_back_partial_set
+      - nodeid: tests/hyperpod/test_hyperpod_spares.py::test_activation_rechecks_gpu_pods_before_uncordon
+      - nodeid: tests/hyperpod/test_hyperpod_spares.py::test_insufficient_healthy_spares_blocks_and_alerts_admin
+      - nodeid: tests/hyperpod/test_cov95_provider_extra_confirmation.py::test_legacy_replacement_cannot_confirm_without_scheduler_isolation_proof
+      - nodeid: tests/hyperpod/test_cov95_runtime_spare_markers.py::test_only_matching_recovery_identity_can_clear_a_live_spare_marker
+        expected: 5
+    critical: true
+  - id: GF-REQ-OP-EFA-PLUGINS
+    family: operation
+    title: Driver binding and accelerator plugin convergence
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/remediation.py]
+    covers: [operation:REMEDIATE_EFA_DRIVER, operation:RESTART_EFA_DEVICE_PLUGIN, operation:RESTART_GPU_DEVICE_PLUGIN]
+    conditions: [normal, failure, safety]
+    assertions:
+      - Missing PCI devices cannot be repaired by a blind module reload.
+      - EFA binding failures retain a partial error report.
+      - Plugin recovery must reconcile annotations and accelerator allocatable.
+      - Managed training retains its Pod/attempt identity and advances valid collectives during and after plugin loss.
+    cases: [GF-REGIONAL-COLLECT-017, GF-REGIONAL-DESTR-021]
+    checks:
+      - nodeid: tests/node_agent/test_remediation.py::test_efa_driver_remediation_accepts_already_bound_inventory
+      - nodeid: tests/node_agent/test_remediation.py::test_efa_driver_remediation_refuses_missing_pci_device
+      - nodeid: tests/node_agent/test_remediation.py::test_efa_driver_remediation_reports_partial_bind_errors
+      - nodeid: tests/regional/test_destr021_adversarial_node_metadata.py::test_the_stale_foreign_annotation_is_taken_over_and_cleared
+      - nodeid: tests/regional/test_collect017_training_progress.py::test_unchanged_samples_wait_until_every_original_pod_advances
+      - nodeid: tests/regional/test_collect017_training_progress.py::test_stalled_collectives_cannot_pass_with_unchanged_uids
+      - nodeid: tests/regional/test_collect017_training_progress.py::test_identity_and_collective_failures_stop_immediately
+        expected: 14
+      - nodeid: tests/regional/test_collect017_training_progress.py::test_incident_must_bind_the_same_cluster_job_attempt_and_planned_workflow
+  - id: GF-REQ-OP-VERSIONED-REPAIR
+    family: operation
+    title: Pinned driver and firmware repairs
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/remediation.py]
+    covers: [operation:REMEDIATE_DRIVER, operation:UPDATE_SOFTWARE_FIRMWARE]
+    conditions: [normal, failure, safety]
+    assertions:
+      - Repair executes only the approved target and verifies the resulting version.
+      - Missing firmware targets fail closed and failed repair escalates to support.
+    cases: [GF-SXID-DRIVER-012, GF-REGIONAL-COLLECT-010]
+    checks:
+      - nodeid: tests/node_agent/test_remediation.py::test_driver_remediation_is_pinned_and_target_verified
+      - nodeid: tests/node_agent/test_remediation.py::test_firmware_update_requires_exact_verified_version
+      - nodeid: tests/orchestration/test_misc.py::test_failed_firmware_remediation_escalates_directly_to_support
+        expected: 3
+    critical: true
+  - id: GF-REQ-OP-DIAGNOSTIC-DECISION
+    family: operation
+    title: Field/DCGM diagnostics, NVLink workflow and manual mechanical approval
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/node_agent/operations/diagnostics.py]
+    covers: [operation:RUN_DCGM_DIAGNOSTIC, operation:RUN_FIELD_DIAGNOSTIC, operation:RUN_NVLINK74_WORKFLOW, operation:CHECK_MECHANICALS, operation:ESCALATE_SUPPORT]
+    conditions: [normal, failure, safety]
+    assertions:
+      - Diagnostics use a pinned executable and exact target.
+      - Zero exit status does not override a diagnostic failure report.
+      - Mechanical approval is bound to the incident fence.
+      - NVLink support notifications use deterministic templates.
+    cases: [GF-MET-011, GF-XID74-EMAIL-004, GF-REGIONAL-COLLECT-009]
+    checks:
+      - nodeid: tests/node_agent/test_diagnostics.py::test_quick_dcgm_diagnostic_returns_structured_outcome
+        expected: 4
+      - nodeid: tests/node_agent/test_diagnostics.py::test_field_diagnostic_runs_pinned_command_for_exact_link
+      - nodeid: tests/node_agent/test_diagnostics.py::test_field_diagnostic_rejects_failure_report_with_zero_exit
+      - nodeid: tests/execution/test_misc.py::test_mechanical_inspection_waits_for_incident_fenced_annotation
+      - nodeid: tests/execution/test_notification.py::test_xid74_support_uses_nvlink_template
+  - id: GF-REQ-OP-WORKLOAD
+    family: operation
+    title: Contain, stop, checkpoint and restart one managed workload
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/adapters/kubernetes/restart_operations.py]
+    covers: [operation:MARK_UNSCHEDULABLE, operation:CHECKPOINT_WORKLOADS, operation:STOP_WORKLOADS, operation:RESTART_WORKLOAD]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - All workload participants stop before either fault GPU is reset.
+      - A changed source UID or unapproved GPU count refuses restart.
+      - Restart budget and durable reservation prevent duplicate attempts.
+      - A passive restart is bound to its source decision and successful plan, any required containment, and fresh replacement Pod identities.
+    cases: [GF-E2E-003, GF-RST-001, GF-RST-002, GF-RST-003, GF-REGIONAL-COLLECT-021]
+    checks:
+      - nodeid: tests/hyperpod/test_e2e_distributed_xid_reset.py::test_three_node_job_stops_before_two_fault_gpu_resets
+      - nodeid: tests/execution/test_restart_safety.py::test_restart_rejects_source_uid_drift_before_budget_or_mutation
+      - nodeid: tests/execution/test_restart_safety.py::test_gpu_count_change_waits_for_explicit_admin_approval
+      - nodeid: tests/execution/test_restart_safety.py::test_restart_budget_blocks_second_restart_for_same_job
+      - nodeid: tests/execution/test_restart_safety.py::test_restart_reservation_is_idempotent_and_persistent
+      - nodeid: tests/regional/test_collect021_passive_completion.py::test_replacement_pod_visibility_waits_for_completion_and_watcher_lag
+      - nodeid: tests/regional/test_collect021_passive_completion.py::test_each_required_plan_binding_is_checked
+        expected: 35
+      - nodeid: tests/regional/test_collect021_passive_completion.py::test_unproven_replacement_does_not_pass_even_when_pods_exist
+        expected: 14
+      - nodeid: tests/regional/test_cov95_collect_training_runners.py::test_late_xid_waits_for_legitimate_passive_containment_before_final_node_check
+    critical: true
+  - id: GF-REQ-OP-VALIDATION
+    family: operation
+    title: Fresh post-action validation before restoring scheduling
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/workflow_quarantine.py, src/gpu_fault/execution/terminal_state.py]
+    covers: [operation:VALIDATE_GPU, operation:VALIDATE_HOST, operation:VALIDATE_FABRIC, operation:TRIGGER_HEALTH_SNAPSHOT, operation:RESTORE_SCHEDULING, operation:QUARANTINE]
+    conditions: [normal, timeout, failure, safety]
+    assertions:
+      - Validation waits for telemetry newer than the physical action.
+      - Failed node or fabric evidence cannot restore scheduling.
+      - Quarantine ends shared restart rather than silently cancelling the fault.
+      - A healthy node's readmission cannot clear another node's terminal incident or ownership hold.
+      - Readmission requires a matching successful phase receipt even when completion indexes are partial.
+      - Proven spare recovery can recover an incident without releasing its original failed node or an explicit persistent hold.
+    cases: [GF-REGIONAL-PREEMPT-026, GF-REGIONAL-PREEMPT-030, GF-HOST-004]
+    checks:
+      - nodeid: tests/execution/test_validation.py::test_gpu_validation_waits_for_post_action_telemetry
+      - nodeid: tests/execution/test_validation.py::test_host_validation_waits_for_post_reboot_telemetry
+      - nodeid: tests/execution/test_validation.py::test_gpu_validation_reports_every_failed_node
+      - nodeid: tests/execution/test_validation.py::test_fabric_validation_ignores_findings_outside_reset_scope
+      - nodeid: tests/host_health/test_host_health.py::test_host_telemetry_endpoint_builds_quarantine_workflow
+      - nodeid: tests/execution/test_terminal_quarantine_ownership_alignment.py::test_executed_mixed_branch_retains_quarantined_incident
+        expected: 4
+      - nodeid: tests/execution/test_terminal_quarantine_ownership_alignment.py::test_terminal_takeover_observes_node_hold_even_on_previously_misclassified_rows
+        expected: 12
+      - nodeid: tests/execution/test_terminal_quarantine_recovery_proof.py::test_partial_indexes_cannot_erase_phase_bound_quarantine
+        expected: 6
+      - nodeid: tests/execution/test_terminal_quarantine_recovery_proof.py::test_only_matching_completed_phase_can_release_the_held_node
+        expected: 24
+      - nodeid: tests/execution/test_terminal_quarantine_recovery_proof.py::test_successful_spare_recovery_and_original_node_ownership_are_distinct
+        expected: 6
+    critical: true
+  - id: GF-REQ-OP-OUTBOX
+    family: operation
+    title: Scoped collector outbox maintenance
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/collectors/outbox_maintenance.py, src/gpu_fault/node_agent/operations/collector_outbox.py]
+    covers: [operation:COLLECTOR_OUTBOX_MAINTENANCE]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - Dead-letter maintenance addresses only the selected collector and generation.
+      - Rejected records cannot become acknowledged successful delivery.
+      - A foreign owner or uncertain generation cannot reach node transport.
+    cases: [GF-REGIONAL-NET-008]
+    checks:
+      - nodeid: tests/regional/test_cov95_net_outbox_operation.py::test_outbox_operation_selects_live_generation_not_quiesce_generation
+        expected: 3
+      - nodeid: tests/regional/test_cov95_net_outbox_operation.py::test_outbox_generation_uncertainty_refuses_before_transport
+        expected: 2
+      - nodeid: tests/regional/test_cov95_net_outbox_operation.py::test_outbox_wrong_owner_is_not_dispatched_by_workflow_executor
+      - nodeid: tests/collectors/test_http.py::test_http_event_sink_dead_letters_permanent_rejection
+  - id: GF-REQ-INGEST-KERNEL
+    family: ingestion
+    title: Kernel fault delivery, retry and malformed-record visibility
+    source: [src/gpu_fault/channel_registry.py, src/gpu_fault/collectors/logs/kernel.py]
+    covers: [channel:/v1/collector-events/nvidia-kernel]
+    conditions: [normal, repeat, restart, failure]
+    assertions:
+      - Sequence and boot identity remain stable across buffered retries.
+      - Stream errors reopen safely and unparsed XID lines become visible findings.
+      - Kernel clock tolerance applies once to exact marker-bound evidence, never to unrelated control-plane activity.
+    cases: [GF-XID-001, GF-REGIONAL-COLLECT-018]
+    checks:
+      - nodeid: tests/collectors/test_logs.py::test_kernel_collector_filters_and_uses_stable_kmsg_id
+      - nodeid: tests/collectors/test_logs.py::test_kernel_collector_continues_after_retryable_event_is_buffered
+      - nodeid: tests/collectors/test_logs.py::test_kernel_collector_reopens_after_stream_error
+      - nodeid: tests/app_services/test_collector_event_route_wiring.py::test_kernel_route_reports_an_xid_line_without_a_code
+      - nodeid: tests/regional/test_collector_window_marker_clock.py::test_kernel_clock_allowance_is_applied_once_and_only_to_the_matching_line
+        expected: 2
+  - id: GF-REQ-INGEST-FM
+    family: ingestion
+    title: Fabric Manager cursor durability and rotated log recovery
+    source: [src/gpu_fault/channel_registry.py, src/gpu_fault/collectors/logs/fabric_manager.py, src/gpu_fault/collectors/logs/fabric_manager_cursor.py, src/gpu_fault/collectors/logs/fabric_manager_receipts.py]
+    covers: [channel:/v1/collector-events/fabric-manager]
+    conditions: [normal, repeat, restart, failure]
+    assertions:
+      - Failed delivery retains the unread cursor.
+      - Corrupt or stale cursors and renamed logs recover without replaying history.
+      - Observed copytruncate cannot reuse an already-emitted record identity.
+      - Producer receipts distinguish source replay from sink retry, retain complete progress and explicitly expose logging omissions.
+    cases: [GF-SXID-COLLECTOR-006, GF-SXID-COLLECTOR-007, GF-REGIONAL-COLLECT-022]
+    checks:
+      - nodeid: tests/collectors/test_logs.py::test_fabric_manager_file_cursor_rolls_back_on_delivery_failure
+      - nodeid: tests/collectors/test_logs.py::test_fabric_manager_corrupt_state_does_not_replay_existing_file
+      - nodeid: tests/collectors/test_logs.py::test_fabric_manager_journal_recovers_from_stale_cursor
+      - nodeid: tests/collectors/test_logs.py::test_fabric_manager_reads_the_tail_of_a_renamed_log
+      - nodeid: tests/collectors/test_alignment_fm_generation.py::test_empty_truncation_is_checkpointed_before_a_later_append
+      - nodeid: tests/collectors/test_alignment_fm_generation.py::test_missing_checkpoint_does_not_recycle_a_previous_truncation_generation
+      - nodeid: tests/collectors/test_alignment_fm_producer_receipts.py::test_restart_changes_producer_invocation_and_proves_zero_source_replay
+      - nodeid: tests/collectors/test_alignment_fm_producer_receipts.py::test_normal_idle_polls_are_aggregated_at_the_existing_summary_cadence
+      - nodeid: tests/collectors/test_alignment_fm_producer_receipts.py::test_logging_budget_limits_volume_without_losing_faults_or_hiding_omissions
+  - id: GF-REQ-INGEST-GPU
+    family: ingestion
+    title: GPU inventory, metrics baseline and composite fault detection
+    source: [src/gpu_fault/channel_registry.py]
+    covers: [channel:/v1/collector-events/gpu-inventory, channel:/v1/collector-events/gpu-metrics]
+    conditions: [normal, repeat, restart, failure]
+    assertions:
+      - Counter resets and stale samples cannot roll back a shared baseline.
+      - Composite health survives service restart and avoids duplicate workflows.
+      - Mixed GPU products are not silently accepted.
+      - GPU identity findings preserve structured severity and negative inventory identities in acceptance evidence.
+      - Persistent Collector instances independently confirm changed temperature severity/action using the same device limits as ingestion; rejected edges remain retryable.
+    cases: [GF-DISC-002, GF-MET-002, GF-MET-004, GF-MET-021, GF-MET-022]
+    checks:
+      - nodeid: tests/collectors/test_gpu.py::test_nvidia_smi_rejects_mixed_gpu_products
+      - nodeid: tests/metrics/test_gpu_metrics.py::test_metrics_service_uses_counter_delta_and_handles_reset
+      - nodeid: tests/metrics/test_gpu_metrics.py::test_stale_xid_metric_cannot_roll_back_shared_baseline
+      - nodeid: tests/metrics/test_gpu_metrics.py::test_composite_state_survives_service_restart
+      - nodeid: tests/metrics/test_gpu_metrics.py::test_composite_finding_suppresses_duplicate_component_workflows
+      - nodeid: tests/regional/test_collector_evidence_alignment.py::test_current_marker_model_supplies_the_critical_identity_proof
+      - nodeid: tests/regional/test_collector_evidence_alignment.py::test_incident_prose_does_not_replace_a_matching_critical_marker
+        expected: 5
+      - nodeid: tests/regional/test_collector_evidence_alignment.py::test_structured_negative_findings_cannot_hide_behind_unrelated_reason_text
+        expected: 6
+      - nodeid: tests/collectors/test_alignment_dcgm_semantic_edges.py::test_persistent_warning_then_critical_delivers_each_action_once
+        expected: 2
+      - nodeid: tests/collectors/test_alignment_dcgm_semantic_edges.py::test_device_thresholds_below_fallback_share_producer_and_ingestion_actions
+        expected: 5
+      - nodeid: tests/collectors/test_alignment_dcgm_semantic_edges.py::test_rejected_semantic_edge_is_retried_on_the_next_unchanged_scrape
+        expected: 2
+  - id: GF-REQ-INGEST-HOST
+    family: ingestion
+    title: Host telemetry and node log fault classification
+    source: [src/gpu_fault/channel_registry.py]
+    covers: [channel:/v1/collector-events/host-telemetry, channel:/v1/collector-events/node-logs]
+    conditions: [normal, repeat, failure]
+    assertions:
+      - Active filesystem, SMART and RDMA failures choose scoped recovery.
+      - MCE and NCCL log classification remains distinct from routine telemetry.
+      - Chunked training logs are not lost at payload boundaries.
+    cases: [GF-HOST-001, GF-HOST-002, GF-HOST-004, GF-HOST-005]
+    checks:
+      - nodeid: tests/host_health/test_host_health.py::test_metric_policy_emits_only_active_transition
+      - nodeid: tests/host_health/test_host_health.py::test_rdma_link_down_requests_fabric_diagnostics
+      - nodeid: tests/host_health/test_host_health.py::test_node_log_endpoint_classifies_mce_and_nccl
+      - nodeid: tests/collectors/test_logs.py::test_node_log_collector_chunks_training_log_without_loss
+  - id: GF-REQ-INGEST-HEALTH
+    family: ingestion
+    title: Collector errors versus successful health summaries
+    source: [src/gpu_fault/channel_registry.py]
+    covers: [channel:/v1/collector-events/collector-health]
+    conditions: [normal, timeout, failure]
+    assertions:
+      - Error-bearing health summaries are not reported as silent or healthy.
+      - A successful zero-error summary only refreshes success.
+      - Missing or invalid replica census samples cannot prove zero silent nodes.
+    cases: [GF-REGIONAL-COLLECT-018, GF-REGIONAL-COLLECT-019]
+    checks:
+      - nodeid: tests/app_services/test_collector_event_route_wiring.py::test_kernel_health_summary_failure_counts_become_collector_errors
+      - nodeid: tests/app_services/test_collector_event_route_wiring.py::test_all_zero_kernel_health_summary_only_refreshes_success
+      - nodeid: tests/regional/test_collect019_nvidia_smi_hang.py::test_the_erroring_status_contract_passes_on_timeout_then_breaker
+      - nodeid: tests/regional/test_collector_evidence_alignment.py::test_silence_proof_requires_present_nonnegative_samples_on_every_replica
+        expected: 8
+  - id: GF-REQ-INGEST-WORKLOAD
+    family: ingestion
+    title: Workload completion, training observations and idle coverage
+    source: [src/gpu_fault/channel_registry.py]
+    covers: [channel:/v1/workload-observations, channel:/v1/training-progress, channel:/v1/attempts/coverage]
+    conditions: [normal, repeat, timeout, failure, safety]
+    assertions:
+      - Stopped and controller-terminated attempts cannot recurse into recovery.
+      - Missing allocation blocks automatic restart.
+      - Idle requires fresh complete watcher coverage; watcher loss means UNKNOWN.
+    cases: [GF-TRAIN-004, GF-TRAIN-005, GF-TRAIN-006, GF-REGIONAL-DESTR-023, GF-REGIONAL-DESTR-024]
+    checks:
+      - nodeid: tests/completion/test_completion_service.py::test_stopped_attempt_does_not_restart
+      - nodeid: tests/completion/test_completion_service.py::test_controller_initiated_failed_exit_does_not_recurse
+      - nodeid: tests/completion/test_completion_service.py::test_missing_allocation_blocks_automatic_restart
+      - nodeid: tests/regional/test_destr023_idle_cluster_reset.py::test_fresh_coverage_refuses_idle_that_a_leftover_job_could_explain
+      - nodeid: tests/regional/test_destr024_watcher_down_fail_closed.py::test_a_workflow_that_ran_is_the_failure_the_case_exists_to_catch
+    critical: true
+  - id: GF-REQ-PROTOCOL-COMMAND
+    family: protocol
+    title: Remote claim bounds, FIFO ordering and immutable terminal results
+    source: [src/gpu_fault/store/shared/remote_commands.py]
+    covers: [protocol:claim, protocol:result, protocol:idempotency]
+    conditions: [normal, repeat, timeout, safety]
+    assertions:
+      - Claim limits and leases respect their lower and upper bounds.
+      - Owner-filtered FIFO order is stable.
+      - Terminal results are idempotent and cannot be rewritten.
+    cases: [GF-REGIONAL-CMD-001, GF-REGIONAL-CMD-002, GF-REGIONAL-CMD-004, GF-REGIONAL-CMD-005, GF-REGIONAL-CMD-007]
+    checks:
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd001_max_commands_is_enforced_at_both_ends_of_its_range
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd002_lease_seconds_bounds_and_the_deadline_it_returns
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd004_a_claim_only_takes_commands_for_the_owners_it_asked_for
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd005_the_claim_order_is_fifo_and_ties_break_deterministically
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd007_a_terminal_result_is_idempotent_and_cannot_be_rewritten
+    critical: true
+  - id: GF-REQ-PROTOCOL-RECLAIM
+    family: protocol
+    title: Fenced retry identity and waiting command reclaim
+    source: [src/gpu_fault/store/shared/remote_commands.py]
+    covers: [protocol:fence, protocol:waiting, protocol:delegation]
+    conditions: [repeat, timeout, restart, safety]
+    assertions:
+      - A retry reuses identity but a new fence does not.
+      - Reusing an ID for different content is rejected.
+      - Reclaimed WAITING commands retain previous physical-action details.
+    cases: [GF-REGIONAL-CMD-012, GF-REGIONAL-CMD-013, GF-REGIONAL-CMD-014]
+    checks:
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd012_the_command_identity_is_reused_on_retry_and_new_on_a_fence
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd012_a_reused_command_id_with_different_content_is_refused
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd013_waiting_can_be_reclaimed_and_carries_the_previous_details
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd014_the_delegating_step_states_the_control_plane_did_not_mutate
+    critical: true
+  - id: GF-REQ-PROTOCOL-SPOOL
+    family: protocol
+    title: Fault-priority admission and telemetry replay backpressure
+    source: [src/gpu_fault/channel_registry.py, src/gpu_fault/processor/coordinator.py]
+    covers: [protocol:queue-priority, protocol:spool, protocol:backpressure]
+    conditions: [normal, repeat, timeout, restart, failure]
+    assertions:
+      - Only eligible routine telemetry is spooled; fault reserve remains available.
+      - Superseding a leased sample does not lose the newer sample.
+      - Lost notifications recover through bounded fallback polling.
+      - Failed replay retries and eventually terminates.
+      - An old spool claim cannot complete, retry, drop or abandon a replacement's live claim.
+    cases: [GF-REGIONAL-CAP-003, GF-REGIONAL-CAP-005]
+    checks:
+      - nodeid: tests/processor/test_telemetry_spool.py::test_only_routine_samples_on_three_paths_can_be_spooled
+      - nodeid: tests/processor/test_telemetry_spool.py::test_a_leased_row_can_be_superseded_without_losing_the_new_sample
+      - nodeid: tests/processor/test_telemetry_spool.py::test_spool_fallback_poll_recovers_a_missed_notification
+      - nodeid: tests/processor/test_telemetry_spool.py::test_a_failed_replay_comes_back_and_then_gives_up
+      - nodeid: tests/store/test_cov95_runtime_spool_fencing.py::test_old_spool_claim_cannot_mutate_a_still_live_replacement
+        expected: 16
+      - nodeid: tests/store/test_cov95_runtime_postgres_spool_fencing.py::test_postgres_old_spool_claim_cannot_mutate_a_still_live_replacement
+        expected: 8
+  - id: GF-REQ-RECOVERY-DAG
+    family: recovery
+    title: Parallel node branches and a single gated workload restart
+    source: [src/gpu_fault/orchestration/coordinator.py, src/gpu_fault/execution/executor.py]
+    covers: [recovery:dag, recovery:barrier, recovery:join]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - Concurrent access faults join one attempt-scoped reset workflow.
+      - Failed branches do not release the join, while independent branches progress.
+    cases: [GF-SXID-ACCESS-GROUP-009, GF-REGIONAL-PREEMPT-019, GF-REGIONAL-DESTR-015]
+    checks:
+      - nodeid: tests/orchestration/test_multi_node_sxid.py::test_concurrent_access_sxids_merge_into_one_attempt_reset
+      - nodeid: tests/execution/test_executor.py::test_dag_branch_failure_still_dispatches_other_ready_branch
+      - nodeid: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
+    critical: true
+  - id: GF-REQ-RECOVERY-PREEMPT
+    family: recovery
+    title: Higher-rank preemption and in-flight physical actions
+    source: [src/gpu_fault/execution/executor.py, src/gpu_fault/operation_registry.py]
+    covers: [recovery:dominance, recovery:preemption, recovery:handoff]
+    conditions: [normal, repeat, restart, safety]
+    assertions:
+      - Only a strictly higher recovery rank may preempt.
+      - Submitted physical work finishes or compensates before its successor.
+      - Restoring a predecessor cannot overwrite the successor incident pointer.
+    cases: [GF-REGIONAL-PREEMPT-004, GF-REGIONAL-PREEMPT-006, GF-REGIONAL-PREEMPT-007, GF-REGIONAL-PREEMPT-010]
+    checks:
+      - nodeid: tests/orchestration/test_merge.py::test_preemption_requires_strictly_higher_recovery_rank
+      - nodeid: tests/execution/test_misc.py::test_submitted_reset_restores_before_reboot_preemption
+      - nodeid: tests/execution/test_misc.py::test_submitted_reboot_finishes_before_replace_successor
+      - nodeid: tests/execution/test_misc.py::test_predecessor_terminal_save_preserves_successor_incident_pointer
+        expected: 3
+    critical: true
+  - id: GF-REQ-RECOVERY-LIFETIME
+    family: recovery
+    title: Workflow deadline and user withdrawal
+    source: [src/gpu_fault/execution/executor.py, src/gpu_fault/orchestration/coordinator.py, src/gpu_fault/service.py]
+    covers: [recovery:lifetime, recovery:withdrawal, recovery:late-event]
+    conditions: [timeout, failure, safety]
+    assertions:
+      - Lifetime expiry fails closed, cancels commands and escalates only to support.
+      - Withdrawal finishes in-flight work and restores nodes without restarting the job.
+      - A failed withdrawal cannot commit a terminal decision that suppresses retry.
+      - Finalization cannot absorb an uncontained late node.
+    cases: [GF-REGIONAL-PREEMPT-020, GF-REGIONAL-PREEMPT-032, GF-REGIONAL-PREEMPT-033]
+    checks:
+      - nodeid: tests/orchestration/test_job_workflow_lifetime.py::test_a_single_node_workflow_past_its_lifetime_escalates_only_to_support
+      - nodeid: tests/execution/test_workload_withdrawal.py::test_a_withdrawn_dag_finishes_in_flight_work_releases_nodes_and_stops
+      - nodeid: tests/orchestration/test_cross_fault_arbitration.py::test_late_node_after_restart_finalization_uses_new_workflow
+        expected: 2
+      - nodeid: tests/test_cov95_recovery_services.py::test_failed_withdrawal_cannot_commit_a_terminal_decision_that_suppresses_retry
+        expected: 4
+      - nodeid: tests/completion/test_cov95_withdrawal_postgres.py::test_postgres_failed_withdrawal_remains_retryable
+        expected: 2
+    critical: true
+  - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD
+    family: recovery
+    title: Reboot-surviving safeguard and explicit unknown-outcome protection
+    source: [scripts/e2e/regional/run_destr014_branch_exhaustion.py, scripts/e2e/regional/destr014_recovery.py, scripts/e2e/regional/destr014_cleanup.py, scripts/e2e/regional/probes/destr014_recovery_probe.py]
+    covers: [recovery:physical-branch-exhaustion]
+    conditions: [restart, failure, safety]
+    assertions:
+      - Independent recovery remains armed across reboot and controller loss.
+      - A failed sibling cannot restart the job or leave an orphaned physical action.
+      - Only the independently acknowledged original host/runtime may disable or restore the Agent.
+      - Expired or ambiguous ownership cannot authorize a late action or successful cleanup.
+      - Agent restoration and timeout cancellation do not resolve unknown physical outcomes or authorize workload/isolation cleanup.
+      - Failed incident-quiescence reads cannot authorize workload cleanup even when no holder was armed.
+    cases: [GF-REGIONAL-DESTR-014]
+    runners: [scripts/e2e/regional/run_destr014_branch_exhaustion.py]
+    checks:
+      - nodeid: tests/regional/test_destr014_recovery_probe.py::test_recovery_survives_reboot_and_controller_loss_then_proves_cleanup
+      - nodeid: tests/regional/test_destr014_recovery_probe.py::test_expired_recovery_never_issues_late_agent_start_and_cannot_report_cleanup
+      - nodeid: tests/regional/test_destr014_recovery_controller.py::test_controller_loss_after_disable_ack_preserves_recovery_time_across_reboot
+      - nodeid: tests/regional/test_destr014_recovery_runner.py::test_live_runner_preserves_unknown_reboot_hold_after_agent_recovery
+      - nodeid: tests/regional/test_destr014_recovery_runner.py::test_interrupted_attempt_restarts_as_cleanup_only_with_the_same_binding
+      - nodeid: tests/regional/test_independent_recovery_safety.py::test_destr014_sql_terminal_state_does_not_resolve_a_cancelled_command
+        expected: 3
+      - nodeid: tests/regional/test_independent_recovery_safety.py::test_destr014_retained_hold_survives_terminal_reads_and_cleanup_retry
+        expected: 3
+      - nodeid: tests/regional/test_destr014_recovery_edges.py::test_timer_stop_must_be_proved_before_removing_units
+      - nodeid: tests/regional/test_destr014_recovery_cleanup.py::test_failed_quiescence_without_a_holder_still_defers_workload_cleanup
+      - nodeid: tests/regional/test_destr014_recovery_cleanup.py::test_unknown_drill_cannot_borrow_known_looking_rows_as_cleanup_authority
+    level: regional
+    critical: true
+  - id: GF-REQ-RECOVERY-EXPIRING-SPARE
+    family: recovery
+    title: Expiring spare fixture cancellation and fencing
+    source: [scripts/e2e/regional/run_destr008_warm_spare_shortage.py, scripts/e2e/regional/destr008_safety.py, scripts/e2e/regional/destr008_cancellation.py, scripts/e2e/regional/probes/destr008_cancellation_probe.py, scripts/e2e/regional/probes/destr008_inhibition_probe.py, src/gpu_fault/hyperpod_spares.py, src/gpu_fault/regional_compatibility.py]
+    covers: [recovery:expired-spare-fixture]
+    conditions: [timeout, failure, safety]
+    assertions:
+      - TTL expiry irreversibly revokes producer authority and prevents a late failover.
+      - Cleanup cannot race a still-live reservation owner.
+      - Unknown POST or creation acknowledgements cannot authorize a new action or metadata adoption.
+      - Every scenario needs complete resource closure; cleanup success cannot rewrite an original failure.
+    cases: [GF-REGIONAL-DESTR-008]
+    runners: [scripts/e2e/regional/run_destr008_warm_spare_shortage.py]
+    checks:
+      - nodeid: tests/regional/test_destr008_main_safety.py::test_main_bounded_case_requires_real_safety_before_fixture_and_post
+        expected: 3
+      - nodeid: tests/regional/test_destr008_main_safety.py::test_main_unknown_post_retains_independent_inhibition_and_never_restores
+        expected: 3
+      - nodeid: tests/regional/test_destr008_cancellation_cleanup.py::test_cleanup_gets_fresh_quiescence_but_original_case_stays_failed
+      - nodeid: tests/regional/test_destr008_cancellation_cleanup.py::test_source_bound_late_ack_is_accepted_only_by_explicit_cleanup_resume
+      - nodeid: tests/regional/test_destr008_safety_edges.py::test_cpu_retirement_failure_is_not_cleanup_complete_and_can_resume
+      - nodeid: tests/regional/test_destr008_execution_entry.py::test_full_matrix_does_not_pass_without_each_cleanup_receipt
+        expected: 2
+      - nodeid: tests/regional/test_destr008_cpu_capability.py::test_all_real_workers_are_inspected_without_constructing_a_store
+      - nodeid: tests/regional/test_destr008_gpu_holder.py::test_fresh_interpreters_only_resume_cleanup_never_create_again
+        expected: 3
+      - nodeid: tests/store/test_postgres_activation_inhibition.py::test_native_sql_filters_inhibited_commands_before_limit
+        expected: 108
+    level: regional
+    critical: true
+  - id: GF-REQ-SECURITY-PROVIDER
+    family: security
+    title: No provider replacement or competing automatic recovery
+    source: [src/gpu_fault/operation_registry.py, scripts/e2e/regional/audit_destr013_replacement_invariant.py]
+    covers: [safety:no-provider-replace, safety:node-recovery-none, safety:single-recovery-owner]
+    conditions: [safety]
+    assertions:
+      - Replace enablement is rejected and BatchReplaceClusterNodes is unreachable.
+      - Automatic NodeRecovery and unknown workload ownership block custom takeover.
+    cases: [GF-REGIONAL-DESTR-012, GF-REGIONAL-DESTR-013]
+    checks:
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_programmatic_replace_enable_is_rejected
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_provider_replace_submission_is_code_level_unreachable
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_automatic_node_recovery_override_is_rejected
+      - nodeid: tests/hyperpod/test_hyperpod.py::test_unknown_workload_recovery_blocks_custom_takeover
+    critical: true
+  - id: GF-REQ-SECURITY-CLUSTER
+    family: security
+    title: Cluster-bound identity and non-enumerating command lookup
+    source: [scripts/e2e/regional/audit_auth_boundary.py, scripts/e2e/regional/auth016_lifecycle.py, src/gpu_fault/cluster_executor/regional_client.py, src/gpu_fault/service.py]
+    covers: [safety:cluster-binding, safety:command-enumeration]
+    conditions: [normal, safety]
+    assertions:
+      - A foreign command and an unknown command return the same not-found result.
+      - Invalid result payloads leave state unchanged.
+      - Nested cluster identity mismatches are denied before any agent or command write.
+      - Marker cluster scope is filtered before pagination and cannot borrow another tenant's recovery evidence.
+      - Rotation proof authenticates every bound credential consumer using its actual configured CA; invalid TLS identity cannot fall back to unrelated trust.
+    cases: [GF-REGIONAL-CMD-008, GF-REGIONAL-CMD-009, GF-REGIONAL-AUTH-001, GF-REGIONAL-AUTH-006, GF-REGIONAL-AUTH-016]
+    checks:
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd008_an_illegal_result_is_rejected_and_changes_nothing
+      - nodeid: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd009_an_unknown_and_a_foreign_command_are_the_same_404
+      - nodeid: tests/regional/test_cov95_identity_security_requirements.py::test_invalid_results_preserve_the_entire_leased_command
+      - nodeid: tests/regional/test_cov95_identity_security_requirements.py::test_foreign_and_unknown_command_lookup_are_non_enumerating_and_nonmutating
+      - nodeid: tests/regional/test_cov95_identity_audit.py::test_auth_nested_identity_and_node_scoped_signature_use_actual_models[nested-cluster]
+      - nodeid: tests/test_cov95_recovery_services.py::test_terminal_cannot_use_a_foreign_or_unbound_marker_on_a_same_named_node
+        expected: 2
+      - nodeid: tests/store/test_cov95_runtime_marker_scope.py::test_cluster_bound_marker_window_filters_before_limit
+        expected: 12
+      - nodeid: tests/store/test_cov95_runtime_postgres_control_records.py::test_cluster_bound_marker_window_filters_before_limit
+        expected: 6
+      - nodeid: tests/regional/test_security_auth016_manifest_trust.py::test_each_manifest_trust_environment_authenticates_the_exact_consumer
+        expected: 3
+      - nodeid: tests/regional/test_security_auth016_manifest_trust.py::test_tls_identity_failure_cannot_be_retried_with_other_trust
+        expected: 6
+    critical: true
+  - id: GF-REQ-SECURITY-NODE-KEY
+    family: security
+    title: Derived keys are scoped to one node
+    source: [src/gpu_fault/fleet.py, src/gpu_fault/node_agent/app.py, src/gpu_fault/node_agent/executor.py, src/gpu_fault/node_agent/protocol.py]
+    covers: [safety:node-key-scope]
+    conditions: [normal, safety]
+    assertions:
+      - One node key cannot sign a heartbeat, command or result query for another node.
+      - Rejected signatures perform no dispatch or result lookup.
+    cases: [GF-REGIONAL-AUTH-015]
+    checks:
+      - nodeid: tests/fleet/test_fleet.py::test_derived_node_key_cannot_sign_for_another_node
+      - nodeid: tests/regional/test_cov95_identity_node_signatures.py::test_wrong_node_key_rejects_command_before_ledger_or_dispatch
+      - nodeid: tests/regional/test_cov95_identity_node_signatures.py::test_wrong_node_key_cannot_read_command_results
+    critical: true
+  - id: GF-REQ-SECURITY-DEPLOYED-CUSTODY
+    family: security
+    title: Installation-time custody and deployed node-signature evidence
+    source: [src/gpu_fault/admin/node_key_custody.py, src/gpu_fault/admin/node_key_custody_admin.py, src/gpu_fault/admin/node_key_custody_activation.py, src/gpu_fault/admin/node_key_custody_activation_state.py, src/gpu_fault/admin/node_key_custody_writer.py, deploy/node/provision_node_action_keys.py, scripts/e2e/regional/auth015_custody.py, scripts/e2e/regional/run_identity_acceptance.py]
+    covers: [safety:master-custody, safety:deployed-signature]
+    conditions: [normal, restart, failure, safety]
+    assertions:
+      - Independently signed prospective evidence proves the trusted provisioning path never exports fleet master to GPU Secrets or hosts.
+      - Deployed command and result-query paths reject a sibling node key.
+      - The actual bound Agent accepts the rotated key and refuses its predecessor without dispatching an action.
+      - Historical snapshots, missing activation or an incomplete signed start cannot become installation provenance.
+      - The coordinator and actual key writer share the original activation deadline, and expired submissions or partial unknown writes cannot acquire completion proof.
+      - Completed fencing cannot authorize resumed mutation after the exact installer wave is lost; only final unfence acknowledgement recovery may accept its restored baseline.
+      - CPU capture and projection use the actual recognized renderer containers, not an ingress-only name.
+    cases: [GF-REGIONAL-AUTH-015]
+    runners: [scripts/e2e/regional/run_identity_acceptance.py]
+    checks:
+      - nodeid: tests/deploy/test_node_key_custody_provisioning.py::test_real_provisioning_captures_signed_prospective_custody_and_rotation
+      - nodeid: tests/deploy/test_node_key_custody_provisioning.py::test_custody_create_ack_loss_cannot_be_reconstructed_from_current_membership
+        expected: 2
+      - nodeid: tests/regional/test_auth015_custody_activation.py::test_prospective_install_rotate_and_independent_runtime_witness_chain
+      - nodeid: tests/regional/test_auth015_custody_activation.py::test_current_secret_membership_without_deployed_activation_cannot_pass
+      - nodeid: tests/regional/test_auth015_custody_entry.py::test_guarded_entry_binds_custody_inputs_and_dispatches_real_readonly_witness
+      - nodeid: tests/admin/test_node_key_custody_admin_deploy.py::test_admin_deploy_prepares_real_identities_then_resumes_signed_provisioning
+      - nodeid: tests/admin/test_node_key_custody_admin_preflight.py::test_public_admin_preflight_never_prepares_or_signs_custody
+        expected: 2
+      - nodeid: tests/admin/test_independent_security_key_writer.py::test_resume_near_deadline_cannot_write_keys_after_it
+        expected: 3
+      - nodeid: tests/admin/test_independent_security_key_writer.py::test_expiry_between_secret_writes_preserves_partial_intent_without_completion
+      - nodeid: tests/admin/test_independent_security_key_writer.py::test_writer_finishing_inside_the_original_window_can_activate
+      - nodeid: tests/admin/test_independent_security_owned_wave.py::test_resume_rejects_an_already_lost_wave_before_any_later_mutation
+        expected: 3
+      - nodeid: tests/admin/test_independent_security_owned_wave.py::test_wave_loss_after_operation_reads_is_rechecked_at_the_actual_patch
+        expected: 2
+      - nodeid: tests/admin/test_independent_security_owned_wave.py::test_unfence_ack_loss_only_resumes_cleanup_not_earlier_mutations
+      - nodeid: tests/admin/test_independent_security_cpu_roles.py::test_capture_and_projection_accept_the_actual_rendered_cpu_container
+        expected: 3
+      - nodeid: tests/admin/test_independent_security_cpu_roles.py::test_full_activation_refreshes_ingress_worker_and_spool_using_their_rendered_names
+    level: regional
+    critical: true
+  - id: GF-REQ-SECURITY-RUNNER
+    family: security
+    title: Approved plan identity, predecessor evidence and cleanup ownership
+    source: [scripts/e2e/regional/live_driver_guard.py, scripts/e2e/regional/regional_live_fixture.py]
+    covers: [safety:maintenance-plan, safety:evidence-binding, safety:runner-cleanup]
+    conditions: [normal, restart, failure, safety]
+    assertions:
+      - Failed plans cannot authorize execution and planned targets cannot change.
+      - Lost supervision persists across runner restart.
+      - A new retry invalidates old success before mutation.
+    cases: [GF-REGIONAL-BOOT-019, GF-REGIONAL-BOOT-020]
+    checks:
+      - nodeid: tests/regional/test_live_evidence_safety.py::test_failed_plan_cannot_authorize_execution
+      - nodeid: tests/regional/test_live_evidence_safety.py::test_an_execute_cannot_change_the_planned_node
+      - nodeid: tests/regional/test_acceptance_recovery_journal.py::test_lost_supervision_survives_a_new_run_initialization
+      - nodeid: tests/regional/test_acceptance_recovery_journal.py::test_retry_invalidates_old_success_before_running_any_stage
+    critical: true
+  - id: GF-REQ-SECURITY-LATE-OWNERSHIP
+    family: security
+    title: Physical ownership drift and late sibling after STOP
+    source: [src/gpu_fault/adapters/kubernetes/stop_ownership.py, src/gpu_fault/node_agent/late_ownership.py, scripts/e2e/regional/late_ownership_live.py, scripts/e2e/regional/late_ownership_ordinary.py]
+    covers: [safety:late-stop-sibling, safety:physical-ownership-drift]
+    conditions: [failure, safety]
+    assertions:
+      - An ownership change between containment and physical action is rejected.
+      - A late sibling after STOP cannot bypass all-participant containment.
+    cases: [GF-REGIONAL-PREEMPT-033, GF-REGIONAL-DESTR-015]
+    runners: [scripts/e2e/regional/run_late_ownership_acceptance.py]
+    checks:
+      - nodeid: tests/regional/test_late_ownership_physical_boundary.py::test_queued_guard_rejection_has_independent_physical_no_action_receipt
+        expected: 4
+      - nodeid: tests/regional/test_late_ownership_agent_boundary.py::test_product_checks_again_after_agent_queue_before_physical_reset
+        expected: 3
+      - nodeid: tests/regional/test_late_ownership_dispatch.py::test_real_ownership_refusal_cannot_trigger_either_escalation_ladder
+        expected: 3
+      - nodeid: tests/regional/test_late_ownership_live.py::test_live_assembly_drives_actual_channel_order_and_never_calls_stopped_kubelet
+        expected: 3
+      - nodeid: tests/regional/test_late_ownership_stop_transition.py::test_actual_stop_transition_permits_only_owned_mutation_and_cleanup
+        expected: 2
+    level: regional
+    critical: true
+    gap: The native post-queue guard and independent exec witness cover controlled changes before the final read and permit, but arbitrary ownership changes after a sequential Kubernetes read or permit are not held by a coordinating fence through the physical call.
+  - id: GF-REQ-LIFECYCLE-DEPLOY
+    family: lifecycle
+    title: First deployment, minimal upgrade, resume and rollback
+    source: [src/gpu_fault_release/regional_release_orchestration.py, scripts/e2e/regional/run_boot020_release_rolling.py]
+    covers: [lifecycle:first-deploy, lifecycle:upgrade, lifecycle:resume, lifecycle:rollback]
+    conditions: [normal, repeat, restart, failure]
+    assertions:
+      - Release diff and compatibility pins select the necessary updates.
+      - Missing earlier proof cannot be skipped during resume.
+      - Failed candidates recover through the declared rollback path.
+    cases: [GF-REGIONAL-BOOT-020]
+    checks:
+      - nodeid: tests/regional/test_boot020_runner.py::test_boot020_runner_covers_diff_resume_and_rollback
+      - nodeid: tests/regional/test_boot020_runner.py::test_boot020_runner_refuses_to_resume_without_earlier_evidence
+      - nodeid: tests/regional/test_boot020_runner.py::test_boot020_start_stage_cannot_skip_an_unpassed_terminal_assertion
+    level: regional
+    runners: [scripts/e2e/regional/run_boot020_release_rolling.py]
+  - id: GF-REQ-LIFECYCLE-MEMBERSHIP
+    family: lifecycle
+    title: Join, remove and the final empty-cluster state
+    source: [src/gpu_fault/admin/cluster_join.py, src/gpu_fault/admin/cluster_removal.py]
+    covers: [lifecycle:join, lifecycle:remove, lifecycle:empty-site]
+    conditions: [normal, repeat, failure]
+    assertions:
+      - Administrative lifecycle executes the full membership transition.
+      - Empty sites remain verifiable without treating failed generation reads as NOOP.
+      - HyperPod aliases must resolve through the same operation's saved EKS identity, not a guessed ARN or stale journal.
+    cases: [GF-REGIONAL-BOOT-019]
+    checks:
+      - nodeid: tests/regional/test_regional_acceptance_fixtures.py::test_boot019_runner_executes_and_records_the_full_lifecycle
+      - nodeid: tests/regional/test_boot_lifecycle_proofs.py::test_lifecycle_cannot_prove_noop_with_missing_generations
+        expected: 5
+      - nodeid: tests/regional/test_acceptance_alignment_boot029_aliases.py::test_completion_matches_saved_hyperpod_alias_without_discovery
+        expected: 3
+      - nodeid: tests/regional/test_acceptance_alignment_boot029_aliases.py::test_alias_match_cannot_reuse_a_preexisting_completed_attempt
+        expected: 3
+    level: regional
+    runners: [scripts/e2e/regional/run_boot019_admin_lifecycle.py]
+  - id: GF-REQ-LIFECYCLE-UNINSTALL
+    family: lifecycle
+    title: Full uninstall and resumable owned-resource teardown
+    source: [src/gpu_fault/admin/uninstall.py, src/gpu_fault/admin/aws_cleanup.py]
+    covers: [lifecycle:uninstall]
+    conditions: [normal, restart, failure, safety]
+    assertions:
+      - Foreign resources remain untouched and read failures cannot prove absence.
+      - Resumed uninstall preserves journals and completes every ownership boundary.
+    cases: [GF-REGIONAL-BOOT-032]
+    runners: [scripts/e2e/regional/run_boot032_full_uninstall.py]
+    checks:
+      - nodeid: tests/regional/test_cov95_boot032_lifecycle.py::test_checked_native_uninstall_pauses_resumes_and_replays_read_only
+      - nodeid: tests/regional/test_cov95_boot032_resource_identity.py::test_same_global_iam_arn_across_two_legal_regions_blocks_uninstall
+      - nodeid: tests/regional/test_cov95_boot032_retry.py::test_native_supervision_loss_blocks_every_future_attempt
+      - nodeid: tests/regional/test_cov95_boot032_retry.py::test_completed_pass_is_invalidated_before_new_readback_failure
+      - nodeid: tests/regional/test_cov95_boot032_entry.py::test_actual_local_process_incarnations_differ_after_restart
+    level: regional
+  - id: GF-REQ-LIFECYCLE-REMOTE-TABLE
+    family: lifecycle
+    title: Remote-command migration, old-writer fencing and HOT lease renewal
+    source: [src/gpu_fault/state_table_migrate.py, src/gpu_fault/store/postgres/ddl_remote_command_state.py]
+    covers: [lifecycle:remote-command-migration]
+    conditions: [normal, repeat, restart, failure, safety]
+    assertions:
+      - Legacy, dual and dedicated modes preserve authoritative command state.
+      - Cutover blocks open commands and fences a waiting old writer.
+      - Dedicated lease-only updates are HOT without growing TOAST.
+      - The actual schema CLI uses current projected credentials and preserves prior migration history across the reviewed schema transition.
+    cases: [GF-REGIONAL-BOOT-030]
+    checks:
+      - nodeid: tests/store/test_postgres_state_tables.py::test_migration_resumes_and_captures_new_rows_behind_its_cursor
+      - nodeid: tests/store/test_postgres_state_tables.py::test_cutover_refuses_open_commands_and_unconfirmed_changes
+      - nodeid: tests/store/test_postgres_state_tables.py::test_a_waiting_old_writer_cannot_cross_cutover
+        expected: 2
+      - nodeid: tests/store/test_postgres_state_tables.py::test_dedicated_lease_renewals_are_hot_and_do_not_grow_toast
+      - nodeid: tests/regional/test_acceptance_alignment_store_lifecycle_postgres.py::test_real_schema_cli_uses_projected_dsn_and_preserves_v17_history
+      - nodeid: tests/regional/test_acceptance_alignment_strict_credentials.py::test_one_successful_projected_read_is_used_without_a_cached_reread
+        expected: 4
+      - nodeid: tests/regional/test_acceptance_alignment_strict_credentials.py::test_bad_projection_refuses_before_database_io_without_env_fallback
+        expected: 10
+    level: regional
+    runners: [scripts/e2e/regional/run_state_table_acceptance.py]
+    critical: true
+  - id: GF-REQ-LIFECYCLE-WORKFLOW-TABLE
+    family: lifecycle
+    title: Workflow migration, dispatch/reconcile reads and lease renewal
+    source: [src/gpu_fault/state_table_migrate.py, src/gpu_fault/store/postgres/ddl_workflow_state.py]
+    covers: [lifecycle:workflow-migration]
+    conditions: [normal, repeat, restart, failure, safety]
+    assertions:
+      - Dispatch cursors and reconcile queries read the selected authoritative mode.
+      - Cutover requires drained leases and backfill retires only its own legacy kind.
+      - Dedicated lease updates preserve updated_at and remain HOT.
+      - A retained same-state installation handoff runs native schema ensure before admitting business CPU processes.
+    cases: [GF-REGIONAL-BOOT-031]
+    checks:
+      - nodeid: tests/store/test_postgres_workflow_state_tables.py::test_workflow_lease_only_updates_are_hot_and_preserve_updated_at
+      - nodeid: tests/store/test_postgres_workflow_state_tables.py::test_workflow_dispatch_cursor_and_predecessor_filters_survive_migration
+        expected: 3
+      - nodeid: tests/store/test_postgres_workflow_state_tables.py::test_reconcile_queries_read_workflows_from_the_selected_storage
+        expected: 3
+      - nodeid: tests/store/test_postgres_workflow_state_tables.py::test_workflow_cutover_requires_drained_leases
+      - nodeid: tests/regional/test_acceptance_alignment_store_lifecycle_postgres.py::test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu
+    level: regional
+    runners: [scripts/e2e/regional/run_state_table_acceptance.py]
+    critical: true
+  - id: GF-REQ-AVAILABILITY-CPU
+    family: availability
+    title: CPU failover, continuous readiness and PDB disruption bounds
+    source: [scripts/e2e/regional/run_ha001_control_plane_failover.py, scripts/e2e/regional/run_ha002_pdb_topology.py]
+    covers: [availability:cpu-failover, availability:pdb]
+    conditions: [normal, restart, failure]
+    assertions:
+      - Readiness measurements exclude terminating and non-ready replicas.
+      - Continuous sampling proves the failover interval, not just two endpoints.
+      - Cleanup joins probe processes and releases only owned disruptions.
+    cases: [GF-REGIONAL-HA-001, GF-REGIONAL-HA-002]
+    checks:
+      - nodeid: tests/regional/test_ha_runner_fail_closed.py::test_two_endpoints_are_not_a_continuous_failover_timeline
+      - nodeid: tests/regional/test_ha_runner_fail_closed.py::test_readiness_outage_uses_the_previous_state_for_irregular_samples
+      - nodeid: tests/regional/test_ha_runner_fail_closed.py::test_sampler_cleanup_waits_and_still_stops_the_other_sampler
+    level: regional
+    runners: [scripts/e2e/regional/run_ha001_control_plane_failover.py, scripts/e2e/regional/run_ha002_pdb_topology.py]
+  - id: GF-REQ-AVAILABILITY-AURORA
+    family: availability
+    title: Aurora outage and projected credential rotation
+    source: [scripts/e2e/regional/run_ha009_aurora_credential_rotation.py, scripts/e2e/regional/run_ha010_aurora_blackout_liveness.py]
+    covers: [availability:aurora-failover, availability:credential-rotation]
+    conditions: [normal, timeout, restart, failure]
+    assertions:
+      - Database blackout changes readiness rather than causing process restarts.
+      - Credential rotation refreshes projected credentials without Deployment rollout.
+      - New SQL connections are verified per CPU role, without claiming every pool was exercised.
+    cases: [GF-REGIONAL-HA-003, GF-REGIONAL-HA-009, GF-REGIONAL-HA-010]
+    checks:
+      - nodeid: tests/regional/test_ha010_aurora_blackout_liveness.py::test_a_healthz_500_is_a_crash_not_a_refusal
+      - nodeid: tests/regional/test_aurora_credential_refresh.py::test_rotation_updates_the_secret_and_leaves_every_deployment_alone
+    level: regional
+    runners: [scripts/e2e/regional/run_ha009_aurora_credential_rotation.py, scripts/e2e/regional/run_ha010_aurora_blackout_liveness.py]
+  - id: GF-REQ-AVAILABILITY-NOTIFY
+    family: availability
+    title: Notification deduplication, backlog suppression and delivery states
+    source: [scripts/e2e/regional/run_notification_acceptance.py, scripts/e2e/regional/run_notify007_delivery_states.py]
+    covers: [availability:notification-retry, availability:notification-deduplication]
+    conditions: [normal, repeat, restart, failure]
+    assertions:
+      - Duplicate remote results do not create another completion mail.
+      - Enabling the dispatcher suppresses historical backlog.
+      - Transient delivery remains RETRY and only exhausted retry becomes DEAD.
+      - Only explicit execution-token requeue revives DEAD; send remains bounded and SENT remains idempotent.
+    cases: [GF-REGIONAL-NOTIFY-001, GF-REGIONAL-NOTIFY-003, GF-REGIONAL-NOTIFY-007]
+    checks:
+      - nodeid: tests/regional/test_regional_control_plane.py::test_regional_api_sends_gpu_reset_completion_once
+      - nodeid: tests/notifications/test_notifications.py::test_first_dispatch_suppresses_the_pre_enable_backlog
+        expected: 2
+      - nodeid: tests/regional/test_notify007_delivery_states.py::test_the_retry_phase_contract_passes_when_retry_is_not_failed
+      - nodeid: tests/notifications/test_acceptance_alignment_requeue.py::test_dead_letter_requeue_exercises_http_auth_send_requeue_dispatch_and_dedup
+      - nodeid: tests/notifications/test_acceptance_alignment_requeue.py::test_requeue_is_in_the_real_application_execution_token_inventory
+    level: regional
+    runners: [scripts/e2e/regional/run_notification_acceptance.py, scripts/e2e/regional/run_notify007_delivery_states.py]
+  - id: GF-REQ-AVAILABILITY-BUSY-CPU
+    family: availability
+    title: CPU takeover while processor and spool work are in flight
+    source: [src/gpu_fault/processor/coordinator.py, scripts/e2e/regional/run_ha001_control_plane_failover.py]
+    covers: [availability:busy-cpu-takeover]
+    conditions: [restart, failure]
+    assertions:
+      - In-flight durable work is reclaimed once after owner loss.
+      - Old-owner completion is fenced and backlog drains without loss.
+    cases: [GF-REGIONAL-HA-001, GF-REGIONAL-HA-008, GF-REGIONAL-HA-011]
+    runners: [scripts/e2e/regional/run_ha011_busy_cpu_takeover.py]
+    checks:
+      - nodeid: tests/regional/test_cov95_ha_busy_worker.py::test_busy_cpu_owner_loss_reclaims_and_fences_late_work
+        expected: 4
+      - nodeid: tests/processor/test_cov95_busy_takeover_postgres.py::test_postgres_busy_owner_loss_reclaims_once_and_fences_late_completion
+        expected: 2
+      - nodeid: tests/regional/test_cov95_ha011_resources.py::test_full_runner_public_boundary_succeeds_only_after_verification_and_cleanup
+      - nodeid: tests/regional/test_cov95_scenario_peer_ha_cleanup.py::test_acknowledged_namespace_identity_still_fences_cleanup_after_failed_creation_readback
+        expected: 2
+      - nodeid: tests/regional/test_cov95_ha011_postgres.py::test_postgres_real_worker_crash_preserves_live_fence_and_drains_backlog
+        expected: 2
+    level: regional
+  - id: GF-REQ-AVAILABILITY-NOTIFY-AMBIGUITY
+    family: availability
+    title: Provider acceptance before durable notification commit
+    source: [src/gpu_fault/notification_service.py, scripts/e2e/regional/run_notify008_commit_ambiguity.py]
+    covers: [availability:notification-accept-before-commit]
+    conditions: [restart, failure]
+    assertions:
+      - Provider acceptance followed by process loss remains explicitly ambiguous.
+      - Restart must not invent an exactly-once external delivery guarantee.
+    cases: [GF-REGIONAL-NOTIFY-006, GF-REGIONAL-NOTIFY-007, GF-REGIONAL-NOTIFY-008]
+    runners: [scripts/e2e/regional/run_notify008_commit_ambiguity.py]
+    checks:
+      - nodeid: tests/regional/test_cov95_notify_commit_window.py::test_backend_neutral_provider_commit_crash_contract
+        expected: 24
+      - nodeid: tests/notifications/test_cov95_commit_window_postgres.py::test_postgres_provider_commit_crash_contract
+        expected: 12
+      - nodeid: tests/regional/test_cov95_notify008_lifecycle.py::test_fake_regional_lifecycle_arms_only_after_admission_and_proves_cleanup
+        expected: 5
+      - nodeid: tests/regional/test_cov95_notify008_lifecycle.py::test_admitted_credential_injection_prevents_arm_and_database_work
+      - nodeid: tests/regional/test_cov95_notify008_retry_evidence.py::test_authorized_retry_invalidates_prior_pass_before_any_fallible_preflight
+        expected: 5
+      - nodeid: tests/regional/test_cov95_notify008_process.py::test_real_inline_worker_loss_and_reconstruction_with_sqlite_simulator
+        expected: 6
+      - nodeid: tests/regional/test_cov95_notify008_process.py::test_real_outbox_process_loss_obeys_actual_lease_before_reclaim
+        expected: 3
+      - nodeid: tests/regional/test_cov95_notify008_process.py::test_worker_self_deadline_terminates_a_paused_runtime_without_supervisor_kill
+      - nodeid: tests/regional/test_cov95_notify008_postgres.py::test_postgres_runtime_process_loss_and_independent_acceptance
+        expected: 12
+      - nodeid: tests/regional/test_cov95_notify008_component.py::test_identity_accepts_the_actual_control_plane_wheel_and_its_shared_admin_closure
+    level: regional

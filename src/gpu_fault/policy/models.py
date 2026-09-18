@@ -363,6 +363,8 @@ class DistributedXidBatch(StrictModel):
             raise ValueError("distributed XID events must share one runtime profile")
         if any(item.job_id not in {None, self.job_id} for item in self.events):
             raise ValueError("distributed XID events target another job")
+        if any(item.attempt_id not in {None, self.attempt_id} for item in self.events):
+            raise ValueError("distributed XID events target another attempt")
         if any(item.workload_state is not WorkloadState.ACTIVE for item in self.events):
             raise ValueError("distributed XID recovery requires an ACTIVE workload")
         allocation_gpus: dict[str, set[str]] = {}

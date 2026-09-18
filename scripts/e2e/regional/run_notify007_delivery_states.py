@@ -5,9 +5,9 @@ ARCH-E1 made ``result=FAILED`` a terminal verdict: the outbox writes it only
 when a delivery is retired DEAD or an inline send fails with nothing to retry.
 A retryable provider failure stays on the delivery row as RETRY, which the
 new ``gpu_fault_notification_delivery_total{status}`` gauge reports, and the
-critical page ``GpuFaultNotificationDeliveryFailing`` reads FAILED results
-only. Before E1 one provider hiccup on a row the outbox retried a minute later
-fired that page.
+critical page ``GpuFaultNotificationDeliveryFailing`` reads recent terminal
+failure event time, not retained FAILED-row counts. Before E1 one provider
+hiccup on a row the outbox retried a minute later fired that page.
 
 The drill (``probes/notify007_delivery_drill.py``) runs in a control-worker
 Pod against an isolated in-memory store with the Pod's real SES notifier
@@ -54,6 +54,7 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python,
     RegionalFixtureError,
     RegionalLiveFixture,
     install_abort_signals,
@@ -66,7 +67,12 @@ CASE_ID = verdicts.CASE_ID
 CONFIRMATION = verdicts.CONFIRMATION
 DRILL_PROBE = Path(__file__).with_name("probes") / "notify007_delivery_drill.py"
 RULES = ROOT / "deploy" / "observability" / "amp-rules.yaml"
-RUNBOOK = ROOT / "docs" / "管理员日常运维.md"
+RUNBOOK = ROOT / verdicts.RUNBOOK_DOCUMENT
+CPU_ROLE_BY_APP = {
+    CONTROL_WORKER_APP: "worker",
+    API_APP: "ingress",
+    "gpu-fault-telemetry-spool-worker": "spool-worker",
+}
 
 
 def stop_conditions() -> list[str]:
@@ -80,26 +86,42 @@ def stop_conditions() -> list[str]:
     ]
 
 
-def control_plane_metrics(regional: RegionalLiveFixture) -> list[str]:
-    texts: list[str] = []
+def control_plane_metrics(regional: RegionalLiveFixture) -> dict[str, str]:
+    texts: dict[str, str] = {}
     for app, port in (
         (CONTROL_WORKER_APP, WORKER_METRICS_PORT),
         (API_APP, API_METRICS_PORT),
+        ("gpu-fault-telemetry-spool-worker", 8082),
     ):
-        for pod in regional.ready_pods("cpu", app):
+        deployment = json.loads(
+            regional.kubectl("cpu", "get", "deployment", app, "-o", "json")
+        )
+        replicas = deployment["spec"]["replicas"]
+        if type(replicas) is not int or replicas < 0:
+            raise RegionalFixtureError(f"{app} has no valid replica count")
+        pods = regional.ready_pods("cpu", app)
+        if len(pods) != replicas or (
+            not pods and app != "gpu-fault-telemetry-spool-worker"
+        ):
+            raise RegionalFixtureError(f"{app} is missing Ready replicas")
+        for pod in pods:
+            if not pod.get("name") or not pod.get("uid"):
+                raise RegionalFixtureError(f"{app} has a Pod without identity")
             output = regional.kubectl(
                 "cpu",
                 "exec",
                 "-i",
                 str(pod["name"]),
                 "--",
-                "python3",
+                component_python("cpu"),
                 "-",
                 str(port),
                 input_text=METRICS_PROBE,
                 timeout=60,
             )
-            texts.append(str(json.loads(output.splitlines()[-1])["metrics"]))
+            texts[f"{app}/{pod['name']}/{pod['uid']}"] = str(
+                json.loads(output.splitlines()[-1])["metrics"]
+            )
     return texts
 
 
@@ -116,19 +138,37 @@ def run_drill(regional: RegionalLiveFixture, *, drill_id: str) -> dict[str, Any]
     )
 
 
+def metric_roles(texts: dict[str, str]) -> dict[str, str]:
+    roles = {
+        identity: CPU_ROLE_BY_APP.get(identity.split("/", 1)[0], "")
+        for identity in texts
+    }
+    if "worker" not in roles.values() or "" in roles.values():
+        raise RegionalFixtureError(
+            "notification metrics have no complete role identity"
+        )
+    return roles
+
+
 def execute(
     regional: RegionalLiveFixture, case_dir: Path, attempt: int
 ) -> dict[str, Any]:
     drill_id = f"notify007-{attempt}-{int(time.time())}"
     before = control_plane_metrics(regional)
+    roles = metric_roles(before)
     drill = run_drill(regional, drill_id=drill_id)
     write_json_atomic(case_dir / "drill.json", drill)
     after = control_plane_metrics(regional)
     stages = {
         "retry": verdicts.retry_phase_errors(drill.get("retry") or {}),
         "dead": verdicts.dead_phase_errors(drill.get("dead") or {}),
-        "exported_families": verdicts.exported_family_errors(after),
-        "production_untouched": verdicts.production_untouched_errors(before, after),
+        "exported_families": [
+            *verdicts.exported_family_errors(before, roles=roles),
+            *verdicts.exported_family_errors(after, roles=metric_roles(after)),
+        ],
+        "production_untouched": verdicts.production_untouched_errors(
+            before, after, roles=roles
+        ),
         "alert_rule": verdicts.alert_rule_errors(
             RULES.read_text(encoding="utf-8"), RUNBOOK.read_text(encoding="utf-8")
         ),
@@ -141,6 +181,7 @@ def execute(
         "stages": stages,
         "drill_id": drill_id,
         "drill": drill,
+        "metric_roles": roles,
         "limitations": [
             "The delivery rows live in an isolated in-memory store; the production "
             "gauges are read only to prove the families exist and did not move.",
@@ -174,25 +215,42 @@ def main() -> int:
     os.umask(0o077)
     install_abort_signals()
     settings = settings_from_arguments(arguments)
+    regional = RegionalLiveFixture(settings)
+    identity = regional.evidence_identity()
     predecessor_id, path = predecessor_path(
         arguments.run_dir, CASE_ID, arguments.predecessor_evidence
     )
     predecessor = (
-        predecessor_evidence(path, predecessor_id)
+        predecessor_evidence(path, predecessor_id, **identity)
         if predecessor_id is not None and path is not None
         else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
     )
     environment = {**settings.environment(), "GPU_FAULT_NOTIFICATION_CASE": CASE_ID}
     if not arguments.execute:
+        metrics = control_plane_metrics(regional)
+        try:
+            roles = metric_roles(metrics)
+        except RegionalFixtureError as exc:
+            preflight_errors = [str(exc)]
+        else:
+            preflight_errors = verdicts.exported_family_errors(metrics, roles=roles)
+            preflight_errors.extend(
+                verdicts.production_untouched_errors(metrics, metrics, roles=roles)
+            )
+        if predecessor.get("valid") is not True:
+            preflight_errors.append("predecessor evidence is not valid")
         plan = build_plan(
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,
             confirmation=CONFIRMATION,
+            arguments=arguments,
+            preflight_passed=not preflight_errors,
             environment=environment,
             details={
                 "risk": "live-non-destructive",
                 "predecessor": predecessor,
+                "preflight_errors": preflight_errors,
                 "mutation": (
                     "run one isolated in-memory outbox drill in a control-worker Pod; "
                     "one labelled DRILL email is sent; no production row is written"
@@ -202,7 +260,7 @@ def main() -> int:
             },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        return 0 if not preflight_errors else 1
     if arguments.confirm != CONFIRMATION:
         raise RegionalFixtureError(f"confirmation must be exactly {CONFIRMATION}")
     authorize_execution(
@@ -213,7 +271,6 @@ def main() -> int:
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
-    regional = RegionalLiveFixture(settings)
     try:
         outcome = execute(regional, case_dir, arguments.attempt)
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
@@ -226,6 +283,7 @@ def main() -> int:
         "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
+        **identity,
         **{key: value for key, value in outcome.items() if key != "verdict"},
     }
     write_json_atomic(case_evidence_path(arguments.run_dir, CASE_ID), result)

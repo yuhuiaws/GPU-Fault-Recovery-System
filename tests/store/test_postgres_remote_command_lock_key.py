@@ -23,6 +23,11 @@ from tests.store._postgres_processor_claim_support import (  # noqa: F401
     POSTGRES_URL,
     _command,
     _reload,
+)
+from tests.store.test_postgres_remote_runtime import (  # noqa: F401
+    database,
+    migration_database,
+    mode,
     store,
 )
 

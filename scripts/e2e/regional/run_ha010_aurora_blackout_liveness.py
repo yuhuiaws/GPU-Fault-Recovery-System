@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import ha010_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003  # noqa: E402
+from scripts.e2e.regional.aurora_binding import regional_binding  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -49,6 +50,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    component_python,
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -58,6 +60,14 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     runtime_identity_errors,
     settings_from_arguments,
 )
+
+from scripts.e2e.regional.ha_cleanup import (  # noqa: E402
+    ProcessSupervisionLost,
+    record_supervision_loss,
+    run_cleanup,
+)
+from scripts.e2e.regional.ha_kubernetes import delete_pod  # noqa: E402
+from scripts.e2e.regional.ha_plan_preflight import require_window  # noqa: E402
 
 CASE_ID = verdicts.CASE_ID
 PREDECESSOR_CASE_ID = verdicts.PREDECESSOR_CASE_ID
@@ -172,8 +182,11 @@ def pod_record(pod: dict[str, Any]) -> dict[str, Any]:
         "uid": pod["metadata"]["uid"],
         "node": (pod.get("spec") or {}).get("nodeName"),
         "phase": (pod.get("status") or {}).get("phase"),
-        "ready": bool(statuses)
-        and all(bool(status.get("ready")) for status in statuses),
+        "ready": not pod["metadata"].get("deletionTimestamp")
+        and (pod.get("status") or {}).get("phase") == "Running"
+        and ready_at is not None
+        and bool(statuses)
+        and all(status.get("ready") is True for status in statuses),
         "restarts": sum(int(status.get("restartCount") or 0) for status in statuses),
         "waiting_reasons": sorted(set(reasons)),
         "ready_at": ready_at,
@@ -207,7 +220,15 @@ def deployments_scaled_to_zero(regional: RegionalLiveFixture) -> frozenset[str]:
         replicas = regional.kubectl(
             "cpu", "get", "deployment", deployment, "-o", "jsonpath={.spec.replicas}"
         ).strip()
-        if replicas in {"", "0"}:
+        try:
+            count = json.loads(replicas)
+        except ValueError:
+            raise RegionalFixtureError(
+                f"{deployment} replica count is unavailable"
+            ) from None
+        if type(count) is not int or count < 0:
+            raise RegionalFixtureError(f"{deployment} replica count is invalid")
+        if count == 0:
             zero.add(deployment)
     return frozenset(zero)
 
@@ -227,7 +248,7 @@ def healthz_by_pod(
                 "-i",
                 str(record["name"]),
                 "--",
-                "python3",
+                component_python("cpu"),
                 "-",
                 str(record["port"]),
                 input_text=HEALTHZ_READ,
@@ -248,7 +269,7 @@ def live_env(
         "-i",
         pod,
         "--",
-        "python3",
+        component_python("cpu"),
         "-",
         *names,
         input_text=ENV_READ,
@@ -269,11 +290,14 @@ def _first_ready_pod(pods: dict[str, list[dict[str, Any]]], deployment: str) -> 
 # --------------------------------------------------------------------------- #
 def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
+    binding = regional_binding(regional, settings.rds_cluster_id).read()
     pods = pods_by_deployment(regional)
     state = regional.store_snapshot()
     rds = rds_snapshot(settings)
     healthz = healthz_by_pod(regional, pods)
-    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
+    predecessor = predecessor_evidence(
+        settings.predecessor_path, PREDECESSOR_CASE_ID, **regional.evidence_identity()
+    )
     runtime_identity = regional.runtime_identity()
     api_pod = _first_ready_pod(pods, verdicts.ROLLED_DEPLOYMENT)
     env = live_env(
@@ -307,6 +331,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     except ValueError as exc:
         errors.append(str(exc))
     result = {
+        "aurora_binding": binding,
         "release_id": state.get("release_id"),
         "pods": pods,
         "healthz": healthz,
@@ -328,6 +353,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
 
 def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
     return {
+        "aurora_binding": preflight["aurora_binding"],
         "release_id": preflight["release_id"],
         "rds_writer": (preflight.get("rds") or {}).get("writer"),
         "rds_members": [
@@ -424,16 +450,17 @@ class Sampler:
             except ValueError:
                 payload = {}
         return {
+            **payload,
             "pod": self.pod,
             "returncode": self.process.returncode,
             "stderr": stderr[-2000:],
             "started_at": self.started_at.isoformat(),
-            **payload,
         }
 
     def stop(self) -> None:
         if self.process.poll() is None:
             self.process.kill()
+        self.process.wait(timeout=10)
 
 
 def start_sampler(
@@ -452,7 +479,7 @@ def start_sampler(
         "-i",
         str(record["name"]),
         "--",
-        "python3",
+        component_python("cpu"),
         "-",
         str(record["port"]),
         str(duration_seconds),
@@ -465,7 +492,17 @@ def start_sampler(
         stderr=subprocess.PIPE,
         text=True,
     )
-    feed_script(process, PROBE_SCRIPT.read_text(encoding="utf-8"))
+    try:
+        feed_script(process, PROBE_SCRIPT.read_text(encoding="utf-8"))
+    except BaseException:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+        raise
     return Sampler(
         pod=str(record["name"]),
         process=process,
@@ -541,6 +578,9 @@ def _start_samplers(run: _LiveRun) -> None:
 
 def request_failover(run: _LiveRun) -> dict[str, Any]:
     _quiet_control_plane(run)
+    regional_binding(run.regional, run.settings.rds_cluster_id).read(
+        run.preflight["aurora_binding"]
+    )
     run.failover_requested_at = datetime.now(timezone.utc)
     failover = ha003.aws_rds(
         _rds(run.settings),
@@ -553,13 +593,17 @@ def request_failover(run: _LiveRun) -> dict[str, Any]:
         run.preflight["pods"], verdicts.ROLLED_DEPLOYMENT
     )
     run.deleted_at = datetime.now(timezone.utc)
-    run.regional.kubectl(
-        "cpu",
-        "delete",
-        "pod",
-        run.deleted_pod,
-        "--wait=false",
-        timeout=120,
+    record = next(
+        item
+        for item in run.preflight["pods"][verdicts.ROLLED_DEPLOYMENT]
+        if item["name"] == run.deleted_pod
+    )
+    delete_pod(
+        lambda args, body: run.regional.kubectl(
+            "cpu", *args, input_text=body, timeout=120
+        ),
+        run.settings.regional.namespace,
+        record,
     )
     write_json_atomic(
         run.case_dir / "deleted-pod.json",
@@ -662,6 +706,8 @@ def _timeline_errors(
             # Its exec channel died with the Pod; the replacement is judged
             # separately and the deletion itself is the case's own act.
             continue
+        if report.get("returncode") != 0:
+            errors.append(f"{pod}: sampler did not exit successfully")
         errors.extend(
             verdicts.sampler_errors(
                 list(report.get("samples") or []),
@@ -680,8 +726,7 @@ def execute_case(
     attempt: int,
     maintenance_window_end: datetime,
 ) -> int:
-    """Drive the live case. Not exercised by the unit suite; the verdicts it
-    calls are. Every cleanup failure downgrades the verdict to FAIL."""
+    """Drive the case; every cleanup failure downgrades the verdict to FAIL."""
 
     run = _prepare_live_run(settings, run_dir, attempt)
     result: dict[str, Any] = {
@@ -690,8 +735,10 @@ def execute_case(
         "verdict": "FAIL",
         "rds_cluster_id": settings.rds_cluster_id,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        **run.regional.evidence_identity(),
     }
     try:
+        require_window(maintenance_window_end)
         write_json_atomic(run.case_dir / "pods-before.json", run.preflight["pods"])
         _start_samplers(run)
         if datetime.now(timezone.utc) >= maintenance_window_end:
@@ -706,6 +753,7 @@ def execute_case(
         write_json_atomic(run.case_dir / "pods-after.json", pods_after)
         healthz_after = healthz_by_pod(run.regional, pods_after)
         write_json_atomic(run.case_dir / "healthz-after.json", healthz_after)
+        _quiet_control_plane(run)
         if run.deleted_at is None:
             raise RegionalFixtureError("the deletion moment was not recorded")
         errors = _timeline_errors(run, reports)
@@ -747,20 +795,25 @@ def execute_case(
                 "budgets": run.preflight["budgets"],
             }
         )
+    except ProcessSupervisionLost:
+        record_supervision_loss(result)
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["traceback"] = traceback.format_exc()[-4000:]
     finally:
-        cleanup = _cleanup(run)
+        if result.get("supervision_lost"):
+            cleanup = cleanup_case(run, remote_allowed=False)
+        else:
+            cleanup = run_cleanup(result, lambda: cleanup_case(run))
         result["cleanup"] = cleanup
-        if cleanup["errors"]:
+        if cleanup is not None and cleanup["errors"]:
             result["verdict"] = "FAIL"
     write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def _cleanup(run: _LiveRun) -> dict[str, Any]:
+def cleanup_case(run: _LiveRun, *, remote_allowed: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
 
     def guard(label: str, action: Any) -> None:
@@ -772,11 +825,22 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     def stop_samplers() -> dict[str, bool]:
         stopped = {}
         for sampler in run.samplers:
-            sampler.stop()
-            stopped[sampler.pod] = sampler.process.poll() is not None
+            try:
+                sampler.stop()
+                stopped[sampler.pod] = sampler.process.poll() is not None
+                if not stopped[sampler.pod]:
+                    raise RegionalFixtureError("sampler is still running")
+            except Exception as exc:
+                stopped[sampler.pod] = False
+                result["errors"].append(
+                    f"stop sampler {sampler.pod}: {type(exc).__name__}: {exc}"
+                )
         return stopped
 
     guard("samplers_stopped", stop_samplers)
+    if not remote_allowed:
+        result["errors"].append("supervision lost; remote cleanup was not attempted")
+        return result
 
     def deployments_ready() -> bool:
         _wait_deployments_ready(run)

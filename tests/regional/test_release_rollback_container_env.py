@@ -12,8 +12,8 @@ Deployment-level ``env``/``envFrom`` were not captured at all.
 These tests pin the three halves of the fix: the capture stores every
 container's ``env``/``envFrom`` verbatim from one read per Deployment, the
 rollback validates the snapshot before it mutates anything and hands it to the
-renderer through a file, and a transaction opened before the capture existed
-falls back to the old behaviour and says so in the durable rollback record.
+renderer through a file, and a CPU-only transaction opened before env capture
+existed falls back to the old behaviour and records that in the rollback record.
 """
 
 from __future__ import annotations
@@ -33,10 +33,7 @@ from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release.regional_release_config import ReleaseError
-from tests.regional.test_release_rollback_state import (
-    _rollback_previous,
-    stub_rollback_phases,
-)
+from tests.regional.test_release_rollback_state import _rollback_previous
 
 NAMESPACE = "gpu-fault-system"
 PREVIOUS_RUNTIME = "registry.example/runtime@sha256:" + "e" * 64
@@ -364,7 +361,9 @@ def _rollback_environment(
             aws_region="us-west-2",
             namespace=NAMESPACE,
             notifications=SimpleNamespace(
-                allow_email=True, acknowledge_external_alert_channel=False
+                allow_email=True,
+                acknowledge_external_alert_channel=False,
+                ses_configuration_set="alerts-set",
             ),
             notification_environment=lambda: {
                 "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
@@ -390,6 +389,7 @@ def test_build_rollback_environment_points_the_renderer_at_the_snapshot_file(
     )
     assert environment[VARIABLE] == "/tmp/inputs/previous.json"
     assert environment["GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS"] == "false"
+    assert environment["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
 
 
 def test_build_rollback_environment_never_inherits_the_variable_from_the_shell(
@@ -429,7 +429,14 @@ def _restore_fake(
     mutations: list[str], saved: list[tuple[str, dict[str, Any]]]
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        state={},
+        state={
+            "execution_plan": {"nodes": ["cpu-finalize", "verify"]},
+            "component_progress": {
+                "schema_version": 1,
+                "global": {"cpu-finalize": {"status": "STARTED"}},
+                "clusters": {},
+            },
+        },
         runtime_image="candidate-runtime",
         node_installer_image="registry.example/installer:candidate",
         config=SimpleNamespace(
@@ -468,7 +475,9 @@ def _previous(**extra: Any) -> dict[str, Any]:
     return {
         **_rollback_previous(),
         "admin_config": {},
-        "secret_backups": {"cpu": {"source": "gpu-fault-aurora", "backup": "bk"}},
+        "agent_identities": {},
+        "clusters": {},
+        "secret_backups": {"cpu": {"source": "gpu-fault-email", "backup": "bk"}},
         "cpu_role_config_maps": {"gpu-fault-api-ha-config-core": {"A": "1"}},
         **extra,
     }
@@ -565,7 +574,7 @@ def test_restore_rollback_cpu_hands_the_captured_env_to_the_renderer(
 def test_restore_rollback_cpu_falls_back_and_records_it_for_old_snapshots(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A transaction opened before the capture existed still rolls back.
+    """CPU-only compensation can restore a snapshot that predates env capture.
 
     It renders from the current template as before -- the only thing the
     engine can do without a snapshot -- and leaves a durable trace so a later
@@ -603,6 +612,37 @@ def test_restore_rollback_cpu_refuses_a_malformed_snapshot_before_any_mutation(
     assert builds == [] and applied == []
 
 
+@pytest.mark.parametrize("component", ["agent", "reconciler"])
+def test_cpu_env_snapshot_cannot_authorize_an_untrusted_node_template(
+    monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    builds, applied = _intercept_render(monkeypatch)
+    mutations: list[str] = []
+    saved: list[tuple[str, dict[str, Any]]] = []
+    release = _restore_fake(mutations, saved)
+    release.state["execution_plan"]["nodes"].insert(0, component)
+    release.state["component_progress"]["clusters"] = {
+        "gpu-a": {component: {"status": "STARTED"}}
+    }
+    previous = _previous(
+        cpu_role_container_env=_expected_snapshot(),
+        clusters={
+            "gpu-a": {
+                "bundle": "old-bundle",
+                "bundle_sha256": "4" * 64,
+                "template": "old-template",
+                "template_sha256": "3" * 64,
+            }
+        },
+    )
+
+    with pytest.raises(ReleaseError, match="captured trusted content pin"):
+        ORCHESTRATION.rollback_release(release, state=previous)
+
+    assert mutations == [] and saved == []
+    assert builds == [] and applied == []
+
+
 def test_rollback_records_the_cpu_restore_details_in_the_timing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -613,31 +653,17 @@ def test_rollback_records_the_cpu_restore_details_in_the_timing(
     lines are gone.
     """
 
-    stub_rollback_phases(monkeypatch)
     monkeypatch.setattr(
         ORCHESTRATION,
         "_restore_rollback_cpu",
         lambda *_args, **_kwargs: {"cpu_container_env": "current-template"},
     )
-    saved: list[tuple[str, dict[str, Any]]] = []
-    release = SimpleNamespace(
-        state={},
-        runtime_image="candidate-runtime",
-        node_installer_image="registry.example/installer:candidate",
-        config=SimpleNamespace(
-            clusters=(SimpleNamespace(cluster_id="gpu-a"),),
-            schema_rollback_compatible=True,
-        ),
-        _save_state=lambda phase, **updates: saved.append((phase, updates)),
-        _refresh_aurora_credentials=lambda *_args, **_kwargs: None,
-        _require_no_inflight_installs=lambda *_args, **_kwargs: None,
-    )
-
-    ORCHESTRATION.rollback_release(release, state=_rollback_previous())
+    saved = _restore(monkeypatch, [], _previous())
 
     phases = dict(saved)["rollback-cpu-restored"]["rollback_timing"]["phases"]
     assert phases["cpu_restore"]["status"] == "COMPLETED"
     assert phases["cpu_restore"]["details"] == {"cpu_container_env": "current-template"}
-    assert "details" not in phases["controller_stage"], (
+    assert "controller_stage" not in phases and "data_restore" not in phases
+    assert "details" not in phases["rollout_cleanup"], (
         "phases that return nothing must not grow an empty details block"
     )

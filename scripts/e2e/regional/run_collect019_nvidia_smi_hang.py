@@ -31,6 +31,10 @@ from scripts.e2e.regional import collect019_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    bounded_window_case,
+    require_action_time,
+)
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     collector_setting,
 )
@@ -41,7 +45,7 @@ from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
     run_case_main,
     run_window_case,
 )
-from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalFixtureError,
 )
 
@@ -84,6 +88,7 @@ def plan_details(settings: WindowSettings, preflight: dict[str, Any]) -> dict[st
     }
 
 
+@bounded_window_case
 def execute(
     settings: WindowSettings,
     fixture: CollectorWindowFixture,
@@ -91,7 +96,7 @@ def execute(
     attempt: int,
     deadline: datetime,
 ) -> dict[str, Any]:
-    del deadline
+    require_action_time(180)
     run_id = f"c019-a{attempt}-{int(time.time())}"
     baseline = fixture.snapshot()
     write_json_atomic(case_dir / "host-baseline.json", baseline)
@@ -160,7 +165,9 @@ def execute(
     finally:
         closed: dict[str, Any] = {}
         if window_open:
-            closed = fixture.execute("close-window", "--run-id", run_id, timeout=300)
+            closed = fixture.execute(
+                "close-window", "--run-id", run_id, "--unit", verdicts.UNIT, timeout=300
+            )
             write_json_atomic(case_dir / "window-close.json", closed)
         stages["closed"] = verdicts.closed_errors(closed) if window_open else []
 

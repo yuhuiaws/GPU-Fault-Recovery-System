@@ -10,7 +10,12 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from gpu_fault.env import env_bool
 from gpu_fault.log_rules import NODE_LOG_RULES
@@ -24,6 +29,7 @@ from gpu_fault.models import (
     WorkloadState,
     recovery_action_sort_key,
 )
+from gpu_fault.store.shared.health_signals import finding_health_signal_fingerprint
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +120,58 @@ class NodeHealthCategory(StrEnum):
     BMC = "BMC"
 
 
+_GPU_METRIC_FAULT_CLASSES = {
+    "gpu_temperature_c": "GPU_THERMAL",
+    "gpu_temperature_celsius": "GPU_THERMAL",
+    "memory_temperature_c": "GPU_THERMAL",
+    "gpu_slowdown_temperature_c": "GPU_THERMAL",
+    "gpu_shutdown_temperature_c": "GPU_THERMAL",
+    "gpu_max_operating_temperature_c": "GPU_THERMAL",
+    "memory_max_operating_temperature_c": "GPU_THERMAL",
+    "thermal_violation_total_us": "GPU_THERMAL",
+    "power_violation_total_us": "GPU_THERMAL",
+    "power_usage_w": "GPU_THERMAL",
+    "power_limit_w": "GPU_THERMAL",
+    "ecc_sbe_volatile_total": "GPU_MEMORY",
+    "ecc_dbe_volatile_total": "GPU_MEMORY",
+    "ecc_sbe_aggregate_total": "GPU_MEMORY",
+    "ecc_dbe_aggregate_total": "GPU_MEMORY",
+    "dcgm_ecc_dbe_delta": "GPU_MEMORY",
+    "retired_pages_sbe_total": "GPU_MEMORY",
+    "retired_pages_dbe_total": "GPU_MEMORY",
+    "retired_pages_pending": "GPU_MEMORY",
+    "row_remap_correctable_total": "GPU_MEMORY",
+    "row_remap_uncorrectable_total": "GPU_MEMORY",
+    "row_remap_pending": "GPU_MEMORY",
+    "row_remap_failure": "GPU_MEMORY",
+    "nvlink_crc_flit_error_total": "GPU_FABRIC",
+    "nvlink_crc_data_error_total": "GPU_FABRIC",
+    "nvlink_replay_error_total": "GPU_FABRIC",
+    "nvlink_recovery_error_total": "GPU_FABRIC",
+    "nvlink_crc_aggregate_error_total": "GPU_FABRIC",
+    "nvlink_recovery_aggregate_error_total": "GPU_FABRIC",
+    "nvlink_replay_aggregate_error_total": "GPU_FABRIC",
+    "gpu_inventory_mismatch": "GPU_INVENTORY",
+    "gpu_inventory_identity_changed": "GPU_INVENTORY",
+    "gpu_expected_count_unknown": "GPU_INVENTORY",
+    "gpu_kubernetes_allocatable_mismatch": "GPU_INVENTORY",
+    # These signals do not establish a narrower hardware failure domain.
+    "dcgm_field_completeness": "GPU",
+    "host_gpu_utilization_percent": "GPU",
+    "gpu_utilization_percent": "GPU",
+    "pcie_replay_total": "GPU",
+}
+_GPU_COMPOSITE_FAULT_CLASSES = {
+    "THERMAL_STRESS": "GPU_THERMAL",
+    "POWER_LIMIT_THROTTLING": "GPU_THERMAL",
+    "GPU_MEMORY_DEGRADATION": "GPU_MEMORY",
+    "CORRECTABLE_MEMORY_DEGRADATION": "GPU_MEMORY",
+    "NVLINK_LINK_DEGRADATION": "GPU_FABRIC",
+    "MULTI_GPU_NVLINK_FABRIC_FAILURE": "GPU_FABRIC",
+    "PCIE_XID_LINK_FAILURE": "GPU",
+}
+
+
 class NodeHealthFinding(StrictModel):
     finding_id: str
     event_id: str
@@ -153,38 +211,17 @@ class NodeHealthFinding(StrictModel):
     )
 
     def fault_class(self) -> str:
-        diagnostic_reason = self.diagnostic_parameters.get("diagnostic_reason", "")
-        description = " ".join(
-            item
-            for item in (
-                self.metric_name or "",
-                self.reason,
-                str(diagnostic_reason),
-            )
-            if item
-        ).lower()
         if self.category is NodeHealthCategory.GPU:
-            if any(token in description for token in ("nvlink", "nvswitch", "sxid")):
-                return "GPU_FABRIC"
-            if any(
-                token in description
-                for token in (
-                    "ecc",
-                    "memory",
-                    "retired",
-                    "row_remap",
-                    "row-remap",
-                )
-            ):
-                return "GPU_MEMORY"
-            if any(
-                token in description for token in ("temperature", "thermal", "power")
-            ):
-                return "GPU_THERMAL"
-            if any(
-                token in description for token in ("inventory", "missing", "fallen off")
-            ):
-                return "GPU_INVENTORY"
+            metric = (self.metric_name or "").strip().lower()
+            if metric in _GPU_METRIC_FAULT_CLASSES:
+                return _GPU_METRIC_FAULT_CLASSES[metric]
+            rule = (
+                metric.removeprefix("composite:").upper()
+                if metric.startswith("composite:")
+                else self.diagnostic_parameters.get("correlation_rule_id")
+            )
+            if isinstance(rule, str):
+                return _GPU_COMPOSITE_FAULT_CLASSES.get(rule.upper(), "GPU")
             return "GPU"
         if self.category in {
             NodeHealthCategory.RDMA,
@@ -271,6 +308,23 @@ class SyntheticNodeReplacementRequest(StrictModel):
     reason: str
     replacement_strategy: Literal["HEALTHY_WARM_SPARE_ONLY"] = "HEALTHY_WARM_SPARE_ONLY"
     synthetic: Literal[True] = True
+    activation_forbidden: Literal[True] | None = Field(default=None, frozen=True)
+
+    @field_validator("activation_forbidden", mode="before")
+    @classmethod
+    def require_literal_inhibition(cls, value: object) -> object:
+        if value is not True:
+            raise ValueError("activation_forbidden, when present, must be literal true")
+        return value
+
+    @model_serializer(mode="wrap")
+    def omit_unrequested_inhibition(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = handler(self)
+        if "activation_forbidden" not in self.model_fields_set:
+            value.pop("activation_forbidden", None)
+        return value
 
 
 _HOST_VALIDATION_LATEST_METRICS = {
@@ -278,6 +332,50 @@ _HOST_VALIDATION_LATEST_METRICS = {
     "memory_used_percent",
     "filesystem_used_percent",
 }
+
+
+def efa_inventory_rule(
+    sample: HostMetricSample,
+) -> tuple[
+    float,
+    NodeHealthCategory,
+    Severity,
+    RecoveryAction,
+    str,
+]:
+    """Resolve EFA recovery semantics without policy state or Store access."""
+    failure_mode = sample.labels.get("failure_mode", "PCI_DEVICE_MISSING")
+    action, reason = {
+        "DRIVER_UNBOUND": (
+            RecoveryAction.REMEDIATE_EFA_DRIVER,
+            "EFA PCI device is present but the efa driver is not bound",
+        ),
+        "LINK_INACTIVE": (
+            RecoveryAction.RUN_DIAGNOSTICS,
+            "EFA device and driver are present but the RDMA port is not ACTIVE/LinkUp",
+        ),
+        "EXCESS_DEVICE": (
+            RecoveryAction.RUN_DIAGNOSTICS,
+            "active EFA device inventory exceeds the configured node invariant",
+        ),
+        "PCI_DEVICE_MISSING": (
+            RecoveryAction.REBOOT_NODE,
+            "EFA PCI device inventory is below the configured node invariant",
+        ),
+    }.get(
+        failure_mode,
+        (
+            RecoveryAction.REBOOT_NODE,
+            "active EFA inventory mismatch has an unknown failure mode",
+        ),
+    )
+    return (
+        1.0,
+        NodeHealthCategory.RDMA,
+        Severity.CRITICAL,
+        action,
+        reason,
+    )
 
 
 class _BatchManagedAttempt:
@@ -832,6 +930,9 @@ class NodeHealthPolicy:
             event_id = (
                 f"{batch.batch_id}-{sample.name}-{self._safe(sample.device or 'node')}"
             )
+            parameters = dict(sample.labels)
+            if sample.name == "efa_inventory_mismatch":
+                parameters.setdefault("failure_mode", "PCI_DEVICE_MISSING")
             transition_findings.append(
                 NodeHealthFinding(
                     finding_id=f"finding-{event_id}",
@@ -850,12 +951,17 @@ class NodeHealthPolicy:
                     runtime_profile_version=(batch.runtime_profile_version),
                     workload_state=batch.workload_state,
                     affected_workload_ids=(batch.affected_workload_ids),
-                    diagnostic_parameters=dict(sample.labels),
+                    diagnostic_parameters=parameters,
                 )
             )
         self.store.observe_telemetry_metrics(latest_metrics)
         emitted = self.store.claim_health_signal_transitions(
-            transitions, received_at=batch.received_at
+            transitions,
+            received_at=batch.received_at,
+            semantic_fingerprints=[
+                finding_health_signal_fingerprint(finding)
+                for finding in transition_findings
+            ],
         )
         findings.extend(
             finding
@@ -865,49 +971,7 @@ class NodeHealthPolicy:
         findings.extend(self._evaluate_efa_traffic(batch, managed_attempt))
         return findings
 
-    @staticmethod
-    def _efa_inventory_rule(
-        sample: HostMetricSample,
-    ) -> tuple[
-        float,
-        NodeHealthCategory,
-        Severity,
-        RecoveryAction,
-        str,
-    ]:
-        failure_mode = sample.labels.get("failure_mode", "PCI_DEVICE_MISSING")
-        action, reason = {
-            "DRIVER_UNBOUND": (
-                RecoveryAction.REMEDIATE_EFA_DRIVER,
-                "EFA PCI device is present but the efa driver is not bound",
-            ),
-            "LINK_INACTIVE": (
-                RecoveryAction.RUN_DIAGNOSTICS,
-                "EFA device and driver are present but the RDMA port is "
-                "not ACTIVE/LinkUp",
-            ),
-            "EXCESS_DEVICE": (
-                RecoveryAction.RUN_DIAGNOSTICS,
-                "active EFA device inventory exceeds the configured node invariant",
-            ),
-            "PCI_DEVICE_MISSING": (
-                RecoveryAction.REBOOT_NODE,
-                "EFA PCI device inventory is below the configured node invariant",
-            ),
-        }.get(
-            failure_mode,
-            (
-                RecoveryAction.REBOOT_NODE,
-                "active EFA inventory mismatch has an unknown failure mode",
-            ),
-        )
-        return (
-            1.0,
-            NodeHealthCategory.RDMA,
-            Severity.CRITICAL,
-            action,
-            reason,
-        )
+    _efa_inventory_rule = staticmethod(efa_inventory_rule)
 
     def _prepare_sustained_metric(
         self,

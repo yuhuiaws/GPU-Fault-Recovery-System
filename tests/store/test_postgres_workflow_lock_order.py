@@ -37,6 +37,7 @@ from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
 )
+from tests.store.test_postgres_workflow_state_tables import select_mode
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"),
@@ -44,10 +45,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def store():
-    yield from postgres_store_instance()
-    _truncate()
+@pytest.fixture(params=["legacy", "dual", "dedicated"])
+def store(request):
+    import psycopg
+
+    for postgres in postgres_store_instance():
+        try:
+            with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+                select_mode(connection, "workflow", request.param)
+            yield postgres
+        finally:
+            _truncate()
 
 
 NOW = datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)
@@ -73,16 +81,27 @@ def _hold_incident_row(incident_id: str):
 
 def _workflow_rows_are_free(connection, request_ids: list[str]) -> None:
     with connection.cursor() as cursor:
-        for request_id in request_ids:
-            cursor.execute(
-                """
-                SELECT 1 FROM gpu_fault_objects
-                WHERE kind='workflow' AND key=%s
-                FOR UPDATE NOWAIT
-                """,
-                (request_id,),
+        cursor.execute(
+            "SELECT mode FROM gpu_fault_control_state_modes WHERE kind='workflow'"
+        )
+        mode = cursor.fetchone()[0]
+        queries = []
+        if mode != "dedicated":
+            queries.append(
+                "SELECT 1 FROM gpu_fault_objects "
+                "WHERE kind='workflow' AND key=%s FOR UPDATE NOWAIT"
             )
-            assert cursor.fetchone() is not None, f"workflow {request_id} not seeded"
+        if mode != "legacy":
+            queries.append(
+                "SELECT 1 FROM gpu_fault_workflows "
+                "WHERE request_id=%s FOR UPDATE NOWAIT"
+            )
+        for request_id in request_ids:
+            for query in queries:
+                cursor.execute(query, (request_id,))
+                assert cursor.fetchone() is not None, (
+                    f"workflow {request_id} not seeded in {mode} storage"
+                )
 
 
 def _blocked_on_incident_then_completes(
@@ -181,7 +200,9 @@ def test_leased_save_of_workflow_and_incident_locks_the_incident_first(store):
 
 
 def _create(existing_incident, existing_workflow):
-    assert existing_incident is None and existing_workflow is None
+    assert existing_incident is None and existing_workflow is None, (
+        "the initial merge must not reuse existing incident or workflow state"
+    )
     incident = fault_incident(
         "inc-lo",
         "event-1",
@@ -204,7 +225,9 @@ def _create(existing_incident, existing_workflow):
 
 
 def _widen(existing_incident, existing_workflow):
-    assert existing_incident is not None and existing_workflow is not None
+    assert existing_incident is not None and existing_workflow is not None, (
+        "the widening merge must read both existing records"
+    )
     return (
         copy_model(existing_incident, node_ids=["node-a", "node-b"]),
         copy_model(
@@ -401,15 +424,7 @@ def test_a_workflow_reparented_while_its_incident_was_locked_is_a_stale_write(st
     try:
         worker.join(0.5)
         assert worker.is_alive(), "the reconcile did not wait for the incident row"
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE gpu_fault_objects
-                SET payload=jsonb_set(payload, '{incident_id}', to_jsonb(%s::text))
-                WHERE kind='workflow' AND key=%s
-                """,
-                ("inc-other", BLOCKED_ID),
-            )
+        store.amend_workflow(BLOCKED_ID, {"incident_id": "inc-other"})
         connection.commit()
     finally:
         connection.close()

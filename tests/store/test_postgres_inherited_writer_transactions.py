@@ -33,6 +33,7 @@ POSTGRES_PACKAGE = "gpu_fault.store.postgres"
 ROUND_TRIP_METHODS = frozenset(
     {
         "_put",
+        "_put_fields",
         "_link",
         "_delete",
         "_get",
@@ -48,7 +49,7 @@ ROUND_TRIP_METHODS = frozenset(
 # Cursor / connection statements: ``self._db.execute(...)``,
 # ``cursor.execute(...)`` and the like.
 EXECUTE_METHODS = frozenset({"execute", "executemany"})
-WRITE_METHODS = frozenset({"_put", "_link", "_delete"})
+WRITE_METHODS = frozenset({"_put", "_put_fields", "_link", "_delete"})
 TRANSACTION_CONTEXTS = frozenset({"_state_transaction", "transaction"})
 
 # The inherited writers as reviewed for item D2. A new inherited writer has to
@@ -60,6 +61,9 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "add_marker",
         "amend_workflow",
         "apply_efa_traffic_admin_action",
+        # ExitStack keeps cancellation and nested audit on one transaction;
+        # reviewed with the 60 PostgreSQL orphan rollback/concurrency cases.
+        "cancel_orphaned_remote_commands",
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",

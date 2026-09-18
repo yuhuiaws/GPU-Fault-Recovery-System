@@ -10,6 +10,7 @@ probe reads the facts its ensure step would converge and raises
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
 )
+from gpu_fault.admin.node_key_proof import read_node_key_proof
+from gpu_fault_release.regional_admin_commands import BOOTSTRAP_PHASES
 
 
 def kubectl_projection(
@@ -44,6 +47,43 @@ def kubectl_projection(
 
 
 AMP_RULE_NAMESPACE = "gpu-fault-control-plane-capacity"
+
+
+def release_owns_monitoring(
+    runner: CommandRunner, *, cpu_kubeconfig: Path, namespace: str
+) -> bool:
+    raw = kubectl_projection(
+        runner,
+        kubeconfig=cpu_kubeconfig,
+        namespace=namespace,
+        arguments=[
+            "get",
+            "configmap",
+            "gpu-fault-regional-release-state",
+            "-o",
+            "json",
+        ],
+    )
+    if not raw:
+        return False
+    try:
+        document = json.loads(raw)
+        state = json.loads(document["data"]["state.json"])
+    except (ValueError, TypeError, KeyError) as exc:
+        raise BootstrapError(
+            "cannot determine monitoring owner: invalid release state"
+        ) from exc
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("phase"), str)
+        or not state["phase"]
+        or not isinstance(state.get("release_id"), str)
+        or not state["release_id"]
+    ):
+        raise BootstrapError(
+            "cannot determine monitoring owner: incomplete release state"
+        )
+    return state["phase"] not in BOOTSTRAP_PHASES
 
 
 def assert_monitoring_install_current(
@@ -205,36 +245,6 @@ def _node_action_keys_secret() -> str:
     )
 
 
-def _node_action_key_names(
-    runner: CommandRunner,
-    *,
-    kubeconfig: Path,
-    namespace: str,
-    secret_name: str,
-    context: str | None = None,
-) -> tuple[str, ...]:
-    """List the Secret's key names, which are node names, never key material.
-
-    The go-template iterates `.data` and prints only the map keys, so no node
-    action key value ever reaches the command output or the transcript.
-    """
-
-    output = kubectl_projection(
-        runner,
-        kubeconfig=kubeconfig,
-        namespace=namespace,
-        context=context,
-        arguments=[
-            "get",
-            "secret",
-            secret_name,
-            "-o",
-            'go-template={{range $name, $_ := .data}}{{$name}}{{"\\n"}}{{end}}',
-        ],
-    )
-    return tuple(sorted(line.strip() for line in output.splitlines() if line.strip()))
-
-
 def assert_node_action_keys_current(
     runner: CommandRunner,
     *,
@@ -245,11 +255,8 @@ def assert_node_action_keys_current(
 ) -> None:
     """Assert every current HyperPod node already has a scoped key on both sides.
 
-    The provisioning script derives key material deterministically and reuses
-    what the Secret already holds, so its only input that no static digest can
-    describe is the live node set. This probe reads that node set and compares it
-    against the Secret key names on the GPU cluster and on the control-plane
-    mirror; a node that joined or left means the ensure step still has work.
+    The GPU map must match this cluster; the CPU map is a site-wide union.
+    Private digest comparison also detects divergence after a partial rotation.
     """
 
     if os.environ.get("GPU_FAULT_ROTATE_NODE_ACTION_KEY"):
@@ -275,22 +282,27 @@ def assert_node_action_keys_current(
         # a cluster with no nodes; either way the ensure step is the component
         # that knows how to fail closed on it.
         raise BootstrapMutationRequired(f"{cluster.hyperpod_name} node inventory")
-    on_gpu = _node_action_key_names(
+    on_gpu = read_node_key_proof(
         runner,
-        kubeconfig=gpu_kubeconfig,
-        namespace=namespace,
+        ["kubectl", "--kubeconfig", str(gpu_kubeconfig), "--context", cluster.context],
+        namespace,
         secret_name=secret_name,
-        context=cluster.context,
     )
-    if on_gpu != nodes:
+    if on_gpu is None or set(on_gpu.digests) != set(nodes) or on_gpu.rotation_pending:
         raise BootstrapMutationRequired(f"{cluster.hyperpod_name} node action keys")
-    on_cpu = _node_action_key_names(
+    on_cpu = read_node_key_proof(
         runner,
-        kubeconfig=cpu_kubeconfig,
-        namespace=namespace,
+        ["kubectl", "--kubeconfig", str(cpu_kubeconfig)],
+        namespace,
         secret_name=secret_name,
     )
-    if on_cpu != nodes:
+    if on_cpu is not None and on_cpu.uid == on_gpu.uid:
+        raise BootstrapError("CPU and GPU node-key Secrets have the same identity")
+    if (
+        on_cpu is None
+        or on_cpu.rotation_pending
+        or any(on_cpu.digests.get(node) != on_gpu.digests[node] for node in nodes)
+    ):
         raise BootstrapMutationRequired(
             f"{cluster.hyperpod_name} node action key mirror"
         )

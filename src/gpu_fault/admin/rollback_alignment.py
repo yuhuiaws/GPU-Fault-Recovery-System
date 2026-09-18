@@ -263,12 +263,15 @@ def rollback_management_document(
 
     for key, value in (
         ("runtime", image_reference("runtime")),
+        ("executor", image_reference("executor")),
         ("nodeInstaller", image_reference("node_installer")),
         ("dcgmExporter", image_reference("dcgm_exporter")),
         ("adot", image_reference("adot")),
     ):
         if value:
             images[key] = str(value)
+        elif key == "executor":
+            images.pop(key, None)
     admin_config = _restored_admin_config(
         site_file.parent,
         previous.get("admin_config"),

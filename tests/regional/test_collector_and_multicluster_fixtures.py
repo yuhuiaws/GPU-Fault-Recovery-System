@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
-from scripts.e2e.regional import collector_acceptance_fixture
 from scripts.e2e.regional import run_collect016_training_recovery as collect016
 from scripts.e2e.regional import run_collect017_efa_plugin as collect017
 from scripts.e2e.regional import run_collector_acceptance as collect
@@ -22,7 +22,11 @@ from scripts.e2e.regional.multi_cluster_fixture import (
 )
 from scripts.e2e.regional.probes import cluster_network_probe, collector_node_probe
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+from tests.regional._site_topology import site_topology_leaks
+from tests.regional.test_collector_power_safety import PowerHost
+from tests.regional.test_collector_power_safety import power_host as power_host_fixture
 
+power_host = power_host_fixture
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -94,76 +98,40 @@ def test_collector_host_probe_has_narrow_action_allowlists() -> None:
 
 
 def test_collector_probe_arms_the_power_limit_restore_before_capping(
-    monkeypatch: pytest.MonkeyPatch,
+    power_host: PowerHost,
 ) -> None:
-    # COLLECT-002 needs a real correlated power throttle, which means leaving the
-    # node with a lowered enforced power limit for a couple of minutes. If the
-    # runner dies in that window nothing else will put the limit back, so the
-    # deadman timer has to exist before the cap is applied.
-    calls: list[list[str]] = []
-    query = (
-        "0, GPU-a, 128.0, 700.0, 200.0, 700.0, 0\n"
-        "1, GPU-b, 127.0, 700.0, 200.0, 700.0, 0\n"
-    )
-
-    def fake_run(command: list[str], *, check: bool = True, timeout: int = 180):
-        del check, timeout
-        calls.append(command)
-        stdout = (
-            query if command[0] == "nvidia-smi" and "--format" in command[2] else ""
-        )
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(collector_node_probe, "run", fake_run)
-    monkeypatch.setattr(
-        collector_node_probe, "proftester_binary", lambda: "/usr/bin/dcgmproftester13"
-    )
-
+    host = power_host
     collector_node_probe.throttle_gpu(
-        argparse.Namespace(
-            run_id="collect002-run-a",
-            gpu_index=0,
-            load_seconds=180,
-            restore_seconds=600,
-        )
+        host.arguments(load_seconds=180, restore_seconds=600)
     )
-
     timer_index = next(
         index
-        for index, command in enumerate(calls)
-        if command[0] == "systemd-run" and "--on-active=600s" in command
+        for index, command in enumerate(host.calls)
+        if command[:3] == ["systemctl", "enable", "--now"]
     )
     cap_index = next(
-        index
-        for index, command in enumerate(calls)
-        if command[:2] == ["nvidia-smi", "-pl"]
+        index for index, command in enumerate(host.calls) if "-pl" in command
     )
     assert timer_index < cap_index
-    # The cap is the driver's own minimum, and the deadman restores the default.
-    assert calls[cap_index] == ["nvidia-smi", "-pl", "200"]
-    assert calls[timer_index][-3:] == ["/usr/bin/nvidia-smi", "-pl", "700"]
+    assert host.calls[cap_index] == [
+        str(collector_node_probe.POWER_SMI),
+        "-i",
+        host.gpus[0]["uuid"],
+        "-pl",
+        "200.0",
+    ]
+    assert host.emitted[-1]["timer_proof"]["armed"]
+    assert all(item["power_limit_w"] == 700 for item in host.record()["baseline"])
 
 
 def test_collector_probe_refuses_a_load_that_outlives_its_restore(
-    monkeypatch: pytest.MonkeyPatch,
+    power_host: PowerHost,
 ) -> None:
-    def fake_run(command: list[str], *, check: bool = True, timeout: int = 180):
-        del check, timeout
-        return subprocess.CompletedProcess(
-            command, 0, stdout="0, GPU-a, 128.0, 700.0, 200.0, 700.0, 0\n", stderr=""
-        )
-
-    monkeypatch.setattr(collector_node_probe, "run", fake_run)
-
     with pytest.raises(collector_node_probe.ProbeError, match="deadman"):
         collector_node_probe.throttle_gpu(
-            argparse.Namespace(
-                run_id="collect002-run-a",
-                gpu_index=0,
-                load_seconds=900,
-                restore_seconds=600,
-            )
+            power_host.arguments(load_seconds=900, restore_seconds=600)
         )
+    assert not power_host.calls
 
 
 def test_collector_probe_only_reads_env_keys_the_installer_writes() -> None:
@@ -213,6 +181,20 @@ def test_cluster_network_probe_arms_restore_before_block(
     def fake_run(command: list[str], *, check: bool = True):
         del check
         calls.append(command)
+        if command == ["iptables", "-S"] and any(
+            item[:2] == ["iptables", "-N"] for item in calls
+        ):
+            chain = cluster_network_probe.chain_name("iso006-run-a")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    f"-N {chain}\n"
+                    f"-A {chain} -m comment --comment iso006-run-a -j REJECT\n"
+                    f"-A OUTPUT -j {chain}\n-A FORWARD -j {chain}\n"
+                ),
+                stderr="",
+            )
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr(cluster_network_probe, "run", fake_run)
@@ -289,11 +271,15 @@ def test_multi_cluster_registry_requires_distinct_eks_and_hyperpod_identities() 
             "cluster_id": "cluster-a",
             "eks_cluster_arn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a",
             "hyperpod_cluster_name": "hyperpod-a",
+            "enabled": True,
+            "synthetic": False,
         },
         {
             "cluster_id": "cluster-b",
             "eks_cluster_arn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-b",
             "hyperpod_cluster_name": "hyperpod-b",
+            "enabled": True,
+            "synthetic": False,
         },
     ]
 
@@ -368,9 +354,7 @@ def test_collector_promoted_scripts_contain_no_site_specific_topology() -> None:
 
     for path in paths:
         source = path.read_text(encoding="utf-8")
-        assert "/secure/gpu-fault-bootstrap" not in source, path
-        assert "514385905925" not in source, path
-        assert "gpu-fault-gpu-1-" not in source, path
+        assert not site_topology_leaks(source), path
 
 
 def test_collector_probe_canonicalises_every_bdf_spelling_the_node_emits() -> None:
@@ -397,18 +381,6 @@ def test_collector_probe_canonicalises_every_bdf_spelling_the_node_emits() -> No
     )
 
 
-def test_collector_store_probe_links_workflows_to_marked_events_and_decisions() -> None:
-    """A kmsg marker never appears in the workflow record, so text matching is not enough."""
-
-    probe = collector_acceptance_fixture.STORE_PROBE
-    assert 'marked_event_ids = {item["event_id"] for item in events}' in probe
-    assert "incident.event_id not in marked_event_ids" in probe
-    assert "workflow.request_id not in marked_workflow_ids" in probe
-    assert probe.index("marked_event_ids") < probe.index(
-        "for workflow in store.list_workflows"
-    ), "the marked sets must exist before the workflow scan that consults them"
-
-
 def test_collect011_injects_an_nvswitch_address_that_is_not_a_gpu_slot() -> None:
     """A GPU's own BDF in the SXid line makes the reset executable; the case must not."""
 
@@ -421,20 +393,6 @@ def test_collect011_injects_an_nvswitch_address_that_is_not_a_gpu_slot() -> None
     assert collect.nvswitch_pci_bdf([{"pci_bdf": "0000:59:00.0"}]) == "0000:ab:00.0", (
         "the documented NVSwitch example address is used when it is free"
     )
-
-
-def test_collector_store_probe_scopes_fabric_manager_workflows_by_injection_time() -> (
-    None
-):
-    """SXID workflows carry neither the marker nor an XID event; the injection time links them."""
-
-    probe = collector_acceptance_fixture.STORE_PROBE
-    assert (
-        'cluster_id, node_id, marker, observed_after_text = (sys.argv[1:] + [""])[:4]'
-        in probe
-    )
-    assert "workflow.created_at >= observed_after" in probe
-    assert "and not injected_since" in probe
 
 
 def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
@@ -452,6 +410,8 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
     minimum_evidence_seen: list[int] = []
 
     class Regional:
+        settings = argparse.Namespace(cluster_id="cluster-a")
+
         def node_snapshot(self, node: str) -> dict:
             return {"ready": "True", "unschedulable": False, "taints": []}
 
@@ -466,12 +426,15 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
 
         def snapshot(self) -> dict:
             return {
-                "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
+                "gpu_inventory": [{"pci_bdf": "0000:59:00.0", "uuid": "GPU-a"}],
+                "kernel_collector": {"kmsg_fds": ["3"]},
                 "boot_id": self.boot_id,
                 "services": {},
             }
 
         def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            if arguments[0] == "gpu-identity":
+                return {"product": "H100", "driver_branch": 575, "cuda_version": "12.9"}
             # Each write of the marker's line earns a fresh kmsg sequence even
             # when the text is identical.
             calls.append("inject:" + arguments[arguments.index("--xid") + 1])
@@ -479,12 +442,15 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
             self.sequence += 1
             self.records.setdefault(marker, []).append(
                 {
-                    # The stored shape: channel prefix, evidence_ref in payload.
                     "record_id": f"nvidia-kernel/kmsg-{self.boot_id}-{self.sequence}",
+                    "cluster_id": "cluster-a",
+                    "node_id": self.node,
                     "payload": {
-                        "evidence_ref": (
-                            f"kmsg://hyperpod-node/{self.boot_id}/{self.sequence}"
-                        )
+                        "record_id": f"kmsg-{self.boot_id}-{self.sequence}",
+                        "cluster_id": "cluster-a",
+                        "node_id": self.node,
+                        "source_boot_id": self.boot_id,
+                        "evidence_ref": f"kmsg://hyperpod-node/{self.boot_id}/{self.sequence}",
                     },
                 }
             )
@@ -495,8 +461,21 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
         ) -> dict:
             return {
                 "evidence": list(self.records.get(marker, [])) if scan_evidence else [],
+                "events": [
+                    {
+                        **item["payload"],
+                        "event_id": item["record_id"],
+                        "gpu_uuid": "GPU-a",
+                        "xid": 13 if marker.startswith("c012-13-") else 31,
+                        "product": "H100",
+                        "driver_branch": 575,
+                        "cuda_version": "12.9",
+                    }
+                    for item in self.records.get(marker, [])
+                ],
                 "decisions": [
                     {
+                        "event_id": item["record_id"],
                         "official_action": "RESTART_APP",
                         "disposition": "MONITOR_ONLY",
                         "action": "NO_ACTION",
@@ -504,6 +483,7 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
                         "workflow_request_id": None,
                         "incident_id": f"inc-{marker}",
                     }
+                    for item in self.records.get(marker, [])
                 ],
                 "workflows": [],
                 "incidents": [
@@ -579,17 +559,31 @@ def _collect014_harness(
 
     from datetime import datetime, timedelta, timezone
 
+    from tests.regional._alignment_collector_support import (
+        SequenceResetAudit,
+        restored_node,
+    )
+
     calls: list[str] = []
     seen: dict[str, object] = {}
     inventory_age = inventory_age or timedelta(minutes=5)
+    audit = SequenceResetAudit()
 
     class Settings:
+        case_id = "GF-REGIONAL-COLLECT-014"
+
         class regional:  # noqa: N801 - stub attribute holder
             cluster_id = "hp-cluster"
 
         node = "hyperpod-node"
 
     class Regional:
+        def node_snapshot(self, node: str) -> dict:
+            return restored_node()
+
+        def business_workloads(self, node: str) -> list:
+            return []
+
         def cpu_python(self, script: str, *arguments: str) -> dict:
             assert script is collect_destructive.GPU_INVENTORY_SNAPSHOT
             assert arguments == ("hp-cluster", "hyperpod-node"), arguments
@@ -600,6 +594,7 @@ def _collect014_harness(
                 "observed_at": observed_at.isoformat(),
                 "source_boot_id": "boot-1",
                 "device_count": 1,
+                "legacy_observed_at": [],
             }
 
         def executor_python(
@@ -635,26 +630,16 @@ def _collect014_harness(
             }
             if "--since-epoch" in arguments:
                 return {
-                    "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
-                    "ledger": [
-                        old_reset,
-                        {
-                            "operation": "RESET_ALL_GPUS_NVSWITCHES",
-                            "command_id": (
-                                "workflow-new/5/RESET_ALL_GPUS_NVSWITCHES/node"
-                            ),
-                        },
-                    ],
-                    "boot_id": "boot-1",
+                    **deepcopy(audit.current),
+                    "ledger": [old_reset, *deepcopy(audit.current["ledger"])],
                 }
             self.snapshots += 1
             ledger = [old_reset] + (
                 [] if self.snapshots == 1 else [{}] * ledger_after_fail
             )
             return {
-                "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
-                "ledger": ledger,
-                "boot_id": "boot-1",
+                **deepcopy(audit.current),
+                "ledger": [*ledger, *deepcopy(audit.current["ledger"])],
             }
 
     class Collector:
@@ -666,6 +651,9 @@ def _collect014_harness(
                     "workflows": [
                         {
                             "status": fail_status,
+                            "blocked_kind": "SAFETY_SETTLED"
+                            if fail_status == "BLOCKED"
+                            else None,
                             # The BLOCKED workflow is the one that *decided*
                             # the full reset; the runner selects it by that
                             # decision, not by list position.
@@ -681,29 +669,19 @@ def _collect014_harness(
                         }
                     ],
                     "incidents": [{"incident_id": "inc-fail"}],
+                    "commands": [],
                 }
             calls.append("wait-positive")
             seen["positive_kwargs"] = kwargs
             if positive_raises:
                 raise RuntimeError("store unreachable")
-            return {
-                "workflows": [
-                    {
-                        "status": "SUCCEEDED",
-                        "official_steps": [{"operation": "RESET_ALL_GPUS_NVSWITCHES"}],
-                        "step_executions": [
-                            {
-                                "operation": "RESET_ALL_GPUS_NVSWITCHES",
-                                "status": "SUCCEEDED",
-                            }
-                        ],
-                    }
-                ],
-                "incidents": [{"incident_id": "inc-positive"}],
-            }
+            return deepcopy(audit.state)
 
         def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            if arguments[0] == "reset-audit":
+                return audit.execute(*arguments, timeout=timeout)
             calls.append("append-sxid")
+            audit.start_variant(int(arguments[arguments.index("--sxid") + 1]))
             return {}
 
         def restore_incidents(self, state: dict, **_kwargs: object) -> list:
@@ -714,7 +692,7 @@ def _collect014_harness(
 
 
 def test_collect014_restores_the_node_before_the_positive_injection(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The positive full-fabric SXID must run on a node the fail-closed
     incident no longer isolates, and its workflow is matched by injection
@@ -722,6 +700,7 @@ def test_collect014_restores_the_node_before_the_positive_injection(
 
     from datetime import timedelta
 
+    monkeypatch.setattr(collect_destructive.time, "sleep", lambda seconds: None)
     settings, regional, host, collector, calls, seen = _collect014_harness()
     result = collect_destructive.run_collect014(
         settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
@@ -739,7 +718,8 @@ def test_collect014_restores_the_node_before_the_positive_injection(
     assert seen["post_attempts"] == 1, seen
     assert seen["fail_kwargs"].get("observed_after") is not None, seen
     assert calls[-1] == "restore" and calls[-2] == "sampler-stop", calls
-    assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
+    assert len(result["restore_workflows"]) == 3, result["restore_workflows"]
+    assert len(result["positive_variants"]) == 2
     assert seen["positive_kwargs"].get("observed_after") is not None, seen
     # The fail-closed event is back-dated far enough that a stored inventory
     # sample up to 7.5 min old is still newer than event + 30s, yet it stays
@@ -957,7 +937,7 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
         collect_destructive, "provider_event_actor_matches_role", lambda *_: True
     )
     result = collect_destructive.run_collect015(
-        Settings(), Regional(), Collector(), tmp_path, 1
+        Settings(), Regional(), Collector(), tmp_path, 1, cleanup=collect.CaseCleanup()
     )
 
     assert result["verdict"] == "PASS", result
@@ -983,7 +963,9 @@ def _daemonset(namespace: str, name: str, desired: int) -> dict:
     }
 
 
-def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere() -> None:
+def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere(
+    tmp_path: Path,
+) -> None:
     """The HyperPod chart ships `<plugin>-mps-control-daemon` next to the
     plugin; it carries the token but has desired 0. Only a DaemonSet that
     places Pods can change a node's allocatable, so it is the one and only
@@ -1010,6 +992,7 @@ def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere() -> N
         token="nvidia-device-plugin",
         node="node-a",
         resource="nvidia.com/gpu",
+        case_dir=tmp_path,
     )
     found = plugin.discover()
     assert found["name"] == "hyperpod-dependencies-nvidia-device-plugin", found

@@ -4,7 +4,8 @@ The verb covers five things with one parser: the first bootstrap (all four
 inputs), the upgrade (``--state-dir`` alone), adding a GPU cluster (the managed
 ARNs plus the new one), rolling back one step (``--rollback``) and approving a
 pending Runtime Profile plan and continuing (``--approve-profile-plan``). The
-CLI module keeps the parser and the dispatch; the decisions live here.
+CLI module assembles the parser and dispatch; deploy arguments and decisions
+live here.
 
 Every collaborator the command shells out to or that touches AWS arrives in
 :class:`DeployHooks`, looked up by the CLI at call time, so the CLI module
@@ -15,23 +16,149 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_checkpoint import load_hyperpod_hints
-from gpu_fault.admin.bootstrap_common import BootstrapRequest, CommandRunner
+from gpu_fault.admin.bootstrap_common import (
+    BootstrapError,
+    BootstrapRequest,
+    CommandRunner,
+)
 from gpu_fault.admin.bootstrap_site import load_existing_site
 from gpu_fault.admin.cluster_join import JoinClusterRequest
 from gpu_fault.admin.config_file import initialize_desired_admin_config
+from gpu_fault.admin.deploy_identity import INITIAL_REQUEST_FILE, initial_deploy_request
+from gpu_fault.admin.grafana import add_grafana_arguments
+from gpu_fault.admin.installation_lifecycle import retire_completed_site
 from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.notification_precheck import WAIT_FLAG
+from gpu_fault.admin.release_consent import add_release_consent_arguments
 from gpu_fault.admin.site import SiteConfigError
 
 # Written by ``scripts/staging_deploy.py`` (``staging_state_hygiene``) after a
 # successful source deploy; ``mode`` says whether a release was applied.
 SOURCE_DEPLOY_SUCCESS_STATE = "source-deploy-success.json"
+
+
+def add_deploy_command(commands: Any) -> None:
+    deploy = commands.add_parser(
+        "deploy",
+        usage=(
+            "gpu-fault-admin deploy --state-dir STATE_DIR "
+            "[--cpu-cluster-arn CPU_ARN --gpu-cluster-arn GPU_ARN ... "
+            "--admin-email EMAIL] [--rollback] "
+            "[--approve-profile-plan PLAN_SHA256 --reference REFERENCE]"
+        ),
+        description=(
+            "Bootstrap a new site (all four inputs), upgrade the site recorded "
+            "under STATE_DIR (--state-dir alone), add a GPU cluster (the managed "
+            "ARNs plus the new one), roll back one step (--rollback) or approve "
+            "the pending Runtime Profile plan and continue "
+            "(--approve-profile-plan): one command"
+        ),
+    )
+    deploy.add_argument("-f", "--file", type=Path, help=argparse.SUPPRESS)
+    deploy.add_argument(
+        "--cpu-cluster-arn",
+        metavar="CPU_ARN",
+        help=(
+            "existing CPU EKS or HyperPod cluster ARN; required on the first "
+            "deploy, read from the site afterwards"
+        ),
+    )
+    deploy.add_argument(
+        "--gpu-cluster-arn",
+        action="append",
+        default=[],
+        metavar="GPU_ARN",
+        help=(
+            "existing GPU EKS or HyperPod cluster ARN; repeat for more clusters. "
+            "On a managed site the set must be the managed clusters or a superset "
+            "of them: the extra clusters are joined after the release"
+        ),
+    )
+    deploy.add_argument("--repo-root", type=Path, help=argparse.SUPPRESS)
+    deploy.add_argument(
+        "--state-dir",
+        type=Path,
+        metavar="STATE_DIR",
+        help=("private state directory used for both first deployment and upgrades"),
+    )
+    deploy.add_argument(
+        "--config",
+        dest="admin_config_file",
+        type=Path,
+        metavar="ADMIN_CONFIG",
+        help=(
+            "private AdminConfig YAML for first deployment; existing sites "
+            "must use gpu-fault-admin config"
+        ),
+    )
+    deploy.add_argument(
+        "--admin-email",
+        dest="alert_email",
+        metavar="EMAIL",
+        help=(
+            "administrator email for SES fault notifications and SNS alerts; "
+            "required on the first deploy, read from the site afterwards"
+        ),
+    )
+    add_deploy_action_arguments(deploy)
+    add_grafana_arguments(deploy)
+    deploy.add_argument(
+        "--staging-only-release",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    add_release_consent_arguments(deploy)
+    deploy.add_argument("--impact-base", default="origin/main", help=argparse.SUPPRESS)
+    deploy.add_argument(
+        "--prepared-source-release",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+
+def add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
+    """The flags that turn the one deploy command into its other two actions."""
+    deploy.add_argument(
+        "--rollback",
+        action="store_true",
+        help=(
+            "roll the site back one step, to the release recorded as previous; "
+            "refused while a transaction is in flight or when there is no "
+            "previous release; takes no other deploy option except "
+            "--allow-inflight-installs"
+        ),
+    )
+    deploy.add_argument(
+        "--approve-profile-plan",
+        metavar="PLAN_SHA256",
+        help=(
+            "approve the pending Runtime Profile plan with this plan_sha256 "
+            "(printed when the deploy stopped for review) and continue the "
+            "same deploy; requires --reference"
+        ),
+    )
+    deploy.add_argument(
+        "--reference",
+        metavar="REFERENCE",
+        help="approved change or maintenance-window reference for the approval",
+    )
+    deploy.add_argument(
+        WAIT_FLAG,
+        dest="wait_for_email_confirmation",
+        type=int,
+        default=0,
+        metavar="MINUTES",
+        help=(
+            "wait up to MINUTES for the SNS subscription (and the SES sender on a "
+            "spec.notifications.channel: ses site) to confirm instead of stopping"
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -102,12 +229,12 @@ def resolve_deploy_identity(
     gpu_arns = tuple(str(value) for value in getattr(arguments, "gpu_cluster_arn", []))
     admin_email = str(getattr(arguments, "alert_email", None) or "")
     if existing is None:
-        if not cpu_arn or not gpu_arns:
-            raise SiteConfigError(
-                "deploy requires --cpu-cluster-arn and at least one --gpu-cluster-arn"
-            )
-        if not admin_email:
-            raise SiteConfigError("deploy requires --admin-email")
+        cpu_arn, gpu_arns, admin_email = initial_deploy_request(
+            state_dir,
+            cpu_arn=cpu_arn,
+            gpu_arns=gpu_arns,
+            admin_email=admin_email,
+        )
         return cpu_arn, gpu_arns, admin_email, ()
     cpu_eks, cpu_aliases, aliases, site_email = managed_site_deploy_inputs(
         existing, state_dir
@@ -383,6 +510,7 @@ def refuse_deploy_during_uninstall(state_dir: Path) -> None:
 # resource registry and the last quick verdicts. Kept: admin-config/, the
 # release-signing keys, the deployer venv, kubeconfigs and logs.
 RETIRED_AFTER_UNINSTALL = (
+    INITIAL_REQUEST_FILE,
     "site.yaml",
     "bootstrap-state.json",
     "source-deploy.json",
@@ -392,47 +520,28 @@ RETIRED_AFTER_UNINSTALL = (
     "installation-resources.json.sha256",
     "quick-validation.json",
     "public-release-verdict.json",
+    "release-deploy",
+    "join-cluster",
+    "remove-cluster",
 )
 
 
 def retire_site_after_uninstall(state_dir: Path) -> Path | None:
-    """A completed uninstall turns the directory back into a new site.
+    """Retire one whole completed transaction, preserving its audit and DB handoff."""
+    with administrator_operation_lock(state_dir):
+        return _retire_site_after_uninstall_locked(state_dir)
 
-    ``bootstrap-state.json`` trusts a completed task and never runs it again,
-    and the source deploy classifies a directory with ``site.yaml`` and a
-    signed success record as an installed site to upgrade -- yet the uninstall
-    deleted Aurora, the IAM roles, the AMP workspace, the ECR repositories and
-    the certificate those records describe. Live 2026-09-13: the deploy after
-    an uninstall skipped every creation task, ran the upgrade preflight and
-    failed on each missing resource. The first deploy after a COMPLETED
-    uninstall moves those records into ``retired-<stamp>/`` (kept for the
-    audit trail) and consumes the uninstall record, so the bootstrap starts as
-    a new site and a later deploy leaves the fresh records alone. Returns the
-    archive directory, or None when there was nothing to retire.
-    """
 
-    record = state_dir / "uninstall" / "state.json"
-    if not record.is_file():
-        return None
+def _retire_site_after_uninstall_locked(state_dir: Path) -> Path | None:
     try:
-        phase = str(json.loads(record.read_text(encoding="utf-8")).get("phase") or "")
-    except (OSError, ValueError):
+        archive = retire_completed_site(state_dir, RETIRED_AFTER_UNINSTALL)
+    except BootstrapError as exc:
+        raise SiteConfigError(str(exc)) from exc
+    if archive is None:
         return None
-    if phase != "COMPLETED":
-        return None
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    archive = state_dir / f"retired-{stamp}"
-    archive.mkdir(mode=0o700)
-    moved = []
-    for name in RETIRED_AFTER_UNINSTALL:
-        path = state_dir / name
-        if path.is_file():
-            path.replace(archive / name)
-            moved.append(name)
-    record.replace(record.with_name(f"state.consumed-{stamp}.json"))
     print(
-        f"gpu-fault-admin: the site was uninstalled; {len(moved)} site record(s) "
-        f"retired into {archive.name}, every resource will be created again",
+        f"gpu-fault-admin: completed installation retired into {archive.name}; "
+        "bootstrap will revalidate retained resources",
         file=sys.stderr,
         flush=True,
     )
@@ -449,8 +558,9 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     if arguments.state_dir is None:
         raise SiteConfigError("deploy requires --state-dir")
     state_dir = arguments.state_dir.expanduser().resolve()
-    refuse_deploy_during_uninstall(state_dir)
-    retire_site_after_uninstall(state_dir)
+    with administrator_operation_lock(state_dir):
+        refuse_deploy_during_uninstall(state_dir)
+        _retire_site_after_uninstall_locked(state_dir)
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)

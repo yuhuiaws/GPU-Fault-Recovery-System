@@ -29,9 +29,12 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
+from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
+from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault_release.regional_release_config import ClusterTarget
 
 
@@ -75,10 +78,12 @@ def run_gpu_stage(
         return
     failures: list[tuple[GpuStageStep, Exception]] = []
     with ThreadPoolExecutor(
-        max_workers=len(steps),
+        max_workers=min(DEPLOY_CONCURRENCY.read_only_checks, len(steps)),
         thread_name_prefix=f"gpu-stage-{cluster_id}",
     ) as pool:
-        futures = [(step, pool.submit(step.action)) for step in steps]
+        futures = [
+            (step, pool.submit(copy_context().run, step.action)) for step in steps
+        ]
         for step, future in futures:
             try:
                 future.result()
@@ -88,7 +93,8 @@ def run_gpu_stage(
         return
     for step, error in failures[1:]:
         print(
-            f"{cluster_id}: {step.name} also failed while the stage ran: {error}",
+            f"{cluster_id}: {step.name} also failed while the stage ran: "
+            f"{diagnostic_text(str(error))}",
             file=sys.stderr,
             flush=True,
         )

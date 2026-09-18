@@ -115,7 +115,10 @@ def test_the_finish_half_derives_the_key_the_sustained_rule_claimed() -> None:
     latches must be the one ``evaluate_metrics`` claimed, or the latch is a
     no-op and the warning repeats on every sample."""
 
-    from gpu_fault.store.shared.health_signals import finding_health_signal_key
+    from gpu_fault.store.shared.health_signals import (
+        finding_health_signal_fingerprint,
+        finding_health_signal_key,
+    )
 
     context = ApplicationContext(store=InMemoryStore())
     policy = context.node_health
@@ -143,7 +146,11 @@ def test_the_finish_half_derives_the_key_the_sustained_rule_claimed() -> None:
     assert state.active is True
     assert state.notified is not True
 
-    context.store.mark_health_signal_notified(key, notified_at=later)
+    context.store.mark_health_signal_notified(
+        key,
+        notified_at=later,
+        semantic_fingerprint=finding_health_signal_fingerprint(finding),
+    )
     assert (
         policy.evaluate_metrics(low_memory("mem-3", later + timedelta(seconds=30)))
         == []

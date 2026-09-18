@@ -13,10 +13,21 @@ import yaml
 from gpu_fault.admin import cluster_batch_join as admin_cluster_batch_join
 from gpu_fault.admin import cluster_join as admin_cluster_join
 from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
+from gpu_fault.admin import cluster_join_inputs as admin_cluster_join_inputs
+from gpu_fault.admin import cluster_readiness as admin_cluster_readiness
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_batch_join import join_clusters
-from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution, join_cluster
+from gpu_fault.admin.cluster_join import (
+    JoinClusterRequest,
+    JoinExecution,
+    JoinInputs,
+    join_cluster,
+    wait_collector_readiness,
+)
 from gpu_fault.admin.cluster_join_evidence import JoinVerificationExpired
+from gpu_fault.admin.cluster_join_nodes import NodeClaims
+from gpu_fault.admin.resource_registry import build_installation_snapshot
+from gpu_fault.admin.resource_registry_dns import vpc_association_entry
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -32,31 +43,8 @@ JOINED_KEYS = {
     "aws/iam/executor/hp-gpu-b/role",
     "aws/iam/adot-writer/hp-gpu-b/role",
     "aws/iam/executor/hp-gpu-b/oidc-provider",
-    "aws/route53/vpc-association/hp-gpu-b",
+    "aws/route53/vpc-association/us-east-1/vpc-gpu-b",
 }
-
-
-def _readiness_evidence(nodes: int = 4) -> dict:
-    """What the COLLECTORS_READY gate records: fast kinds waited, slow deferred."""
-
-    return {
-        "ready": True,
-        "node_count": nodes,
-        "nodes": [f"node-{index}" for index in range(nodes)],
-        "waited_kinds": ["GPU_INVENTORY", "HOST_TELEMETRY"],
-        "deferred_kinds": {"GPU_METRICS": {"verified_as": "scheduled"}},
-        "fleet_ready": True,
-    }
-
-
-def _verify_report() -> dict:
-    return {
-        "mode": "verify",
-        "healthy": True,
-        "summary": {"PASS": 8, "WARN": 0, "FAIL": 0, "SKIP": 0},
-        "checks": [{"name": "control_api", "status": "PASS"}],
-        "scope": {"skipped_checks": {"monitoring": "..."}},
-    }
 
 
 GPU_B_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
@@ -128,7 +116,7 @@ class Runner:
         return ""
 
 
-def _joined_prerequisites() -> dict:
+def _joined_prerequisites(*, association_created: bool = True) -> dict:
     """What ``_parallel_prerequisites`` records for gpu-b: both per-cluster roles,
     the network it joined and its node keys."""
 
@@ -156,7 +144,7 @@ def _joined_prerequisites() -> dict:
             "created_ingress_eips": ["192.0.2.20"],
             "existing_vpc_ids": ["vpc-gpu-a"],
             "hosted_zone_id": "Z123",
-            "association_created": True,
+            "association_created": association_created,
         },
         "node_keys": {"cluster_id": "hp-gpu-b"},
     }
@@ -186,27 +174,78 @@ def _assert_adot_writer_committed(snapshot: InstallationResourceSnapshot, site) 
     )
 
 
-def _assert_commit_evidence_is_scoped(state: dict, state_dir: Path) -> None:
+def _assert_commit_evidence_is_scoped(
+    state: dict, state_dir: Path, expected_keys: set[str]
+) -> None:
     """Each commit step records the scope it worked at, for the operator."""
 
     evidence = state["evidence"]
-    assert evidence["COLLECTORS_READY"]["deferred_kinds"] == {
-        "GPU_METRICS": {"verified_as": "scheduled"}
-    }, "the operator cannot see which collector kinds the gate deferred"
+    assert evidence["COLLECTORS_READY"]["ready"] is True
+    assert not evidence["COLLECTORS_READY"].get("deferred_kinds"), (
+        "join commit must not defer any required collector evidence"
+    )
     assert evidence["REGISTRY_UPDATED"]["mode"] == "delta"
-    assert set(evidence["REGISTRY_UPDATED"]["delta_keys"]) == JOINED_KEYS
-    assert evidence["RELEASE_STATE_UPDATED"]["capture_scope"] == "cluster:hp-gpu-b"
-    assert evidence["VERIFIED"]["verify"]["skipped_checks"] == ["monitoring"]
+    assert set(evidence["REGISTRY_UPDATED"]["delta_keys"]) == expected_keys
+    assert evidence["RELEASE_STATE_UPDATED"]["capture_scope"] == "site"
+    assert evidence["VERIFIED"]["candidate_site_file"]
     after = admin_cluster_join.load_installation_resource_snapshot(
         state_dir / "installation-resources-after-001.json"
     )
-    assert {item.resource_key for item in after.resources} == JOINED_KEYS | {
+    assert {item.resource_key for item in after.resources} == expected_keys | {
         "aws/nlb"
     }, "the after snapshot is the before snapshot plus the delta"
 
 
+def _write_bootstrap_dns_checkpoint(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "site_id": "test-site",
+                "resources": {
+                    "nlb_network": {"vpc_id": "vpc-cpu"},
+                    "pki": {
+                        "hosted_zone_id": "Z123",
+                        "zone_ownership": "CREATED",
+                        "vpc_associations": [
+                            vpc_association_entry(
+                                vpc_id=vpc,
+                                vpc_region="us-east-1",
+                                cluster_ids=[] if vpc == "vpc-cpu" else ["gpu-a"],
+                                ownership="CREATED",
+                                native=vpc == "vpc-cpu",
+                            )
+                            for vpc in ("vpc-cpu", "vpc-gpu-a")
+                        ],
+                    },
+                },
+            }
+        )
+    )
+    path.chmod(0o600)
+
+
+def _assert_join_dns_checkpoint(
+    site, bootstrap_path: Path, snapshot: InstallationResourceSnapshot, created: bool
+) -> None:
+    bootstrap = json.loads(bootstrap_path.read_text())
+    written_associations = bootstrap["resources"]["pki"]["vpc_associations"]
+    assert (
+        any(item["vpc_id"] == "vpc-gpu-b" for item in written_associations) is created
+    )
+    rebuilt = build_installation_snapshot(site, bootstrap, existing=snapshot)
+    for row in snapshot.resources:
+        if row.resource_type == "route53_vpc_association":
+            rebuilt_row = next(
+                item
+                for item in rebuilt.resources
+                if item.resource_key == row.resource_key
+            )
+            assert rebuilt_row.immutable_identity() == row.immutable_identity()
+
+
+@pytest.mark.parametrize("association_created", [True, False])
 def test_join_cluster_is_atomic_resumable_and_registers_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, association_created: bool
 ) -> None:
     path = site_file(tmp_path)
     site = load_site(path)
@@ -215,6 +254,12 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     rollout_calls: list[tuple[str, str | None]] = []
     synced: list[InstallationResourceSnapshot] = []
     release_state_syncs: list[list[str]] = []
+    prerequisites = _joined_prerequisites(association_created=association_created)
+    expected_keys = JOINED_KEYS.copy()
+    if not association_created:
+        expected_keys.remove("aws/route53/vpc-association/us-east-1/vpc-gpu-b")
+    bootstrap_path = tmp_path / "bootstrap-state.json"
+    _write_bootstrap_dns_checkpoint(bootstrap_path)
 
     monkeypatch.setattr(
         admin_cluster_join,
@@ -227,19 +272,16 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         admin_cluster_join, "discover_cluster", lambda *_args, **_kwargs: _target()
     )
 
-    def export_registry(_site, output):
-        admin_cluster_join.write_installation_resource_snapshot(
-            site, _snapshot(), path=output
-        )
-        return _snapshot()
-
-    monkeypatch.setattr(
-        admin_cluster_join, "fetch_installation_resource_registry", export_registry
-    )
     monkeypatch.setattr(
         admin_cluster_join, "_gpu_kubeconfig", lambda _site: gpu_kubeconfig
     )
     monkeypatch.setattr(admin_cluster_join, "ensure_namespace", lambda *_a, **_k: None)
+    namespace_reads = iter([None, "namespace-b", "namespace-b"])
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "probe_join_namespace",
+        lambda *_args, **_kwargs: next(namespace_reads),
+    )
 
     def base_secrets(_runner, *, secure_dir, **_kwargs):
         path = secure_dir / "fleet-master"
@@ -253,11 +295,19 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "_shared_ca_file",
         lambda current: Path(current.release_config["clusters"][0]["ca_file"]),
     )
+
+    def nodes(*_args, **kwargs):
+        kwargs["identities"]["node-b"] = "uid-node-b"
+        return ["node-b"]
+
+    monkeypatch.setattr(admin_cluster_join, "_list_nodes", nodes)
     monkeypatch.setattr(
-        admin_cluster_join, "_list_nodes", lambda *_args, **_kwargs: ["node-b"]
+        admin_cluster_join, "read_node_claims", lambda *_args: NodeClaims()
     )
     monkeypatch.setattr(
-        admin_cluster_join, "clear_stale_installer_annotations", lambda *_a: None
+        admin_cluster_join_inputs,
+        "clear_stale_installer_annotations",
+        lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
         admin_cluster_join,
@@ -267,26 +317,14 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     monkeypatch.setattr(
         admin_cluster_join,
         "_parallel_prerequisites",
-        lambda *_args, **_kwargs: _joined_prerequisites(),
-    )
-    monkeypatch.setattr(
-        admin_cluster_join, "_update_bootstrap_state", lambda *_args, **_kwargs: None
+        lambda *_args, **_kwargs: prerequisites,
     )
     monkeypatch.setattr(
         admin_cluster_join,
-        "sync_cluster_release_state",
-        lambda current, *, cluster_id: release_state_syncs.append(
+        "_sync_release_state",
+        lambda current: release_state_syncs.append(
             [item["cluster_id"] for item in current.release_config["clusters"]]
-        )
-        or {"capture_scope": f"cluster:{cluster_id}"},
-    )
-    monkeypatch.setattr(
-        admin_cluster_join,
-        "_verify_candidate",
-        lambda _candidate, readiness: rollout_calls.append(
-            ("verify", ",".join(sorted(readiness)))
-        )
-        or _verify_report(),
+        ),
     )
     failure_domain_renders: list[list[str]] = []
     monkeypatch.setattr(
@@ -301,14 +339,12 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
             ]
         ),
     )
-    readiness_waits: list[list[str] | None] = []
+    readiness_waits: list[str] = []
     monkeypatch.setattr(
         admin_cluster_join,
-        "wait_join_collector_readiness",
-        lambda _site, _cluster_id, *, expected_nodes: readiness_waits.append(
-            expected_nodes
-        )
-        or _readiness_evidence(),
+        "wait_collector_readiness",
+        lambda _site, cluster_id: readiness_waits.append(cluster_id)
+        or {"ready": True, "nodes": [{"node_id": "node-b", "ready": True}]},
     )
     monkeypatch.setattr(
         admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
@@ -369,7 +405,7 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "gpu-a",
         "hp-gpu-b",
     ]
-    assert keys == JOINED_KEYS, (
+    assert keys == expected_keys, (
         "the registry write must be exactly the join's delta, not the whole site"
     )
     assert len(synced) == 1, "a resumed COMPLETED join re-sent the registry delta"
@@ -377,12 +413,10 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert rollout_calls == [
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),
-        ("verify", "hp-gpu-b"),
+        ("verify", None),
         ("activate-cluster", "hp-gpu-b"),
     ], "the join ran a baseline verify the candidate verify already answers"
-    assert readiness_waits == [["node-b"]], (
-        "the readiness gate must be asked about the cluster's HyperPod nodes"
-    )
+    assert readiness_waits == ["hp-gpu-b"]
     assert release_state_syncs == [["gpu-a", "hp-gpu-b"]]
     assert failure_domain_renders == [["gpu-a", "hp-gpu-b"]], (
         "the failure-domain map is re-rendered once, from the committed site"
@@ -396,7 +430,10 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert token_file.is_file(), "the cluster token file was not written"
     assert state["evidence"]["FINAL_VERIFIED"]["registry_generation"] == 3
     assert state["evidence"]["FINAL_VERIFIED"]["live_release_state_sha256"] == "a" * 64
-    _assert_commit_evidence_is_scoped(state, state_dir)
+    _assert_commit_evidence_is_scoped(state, state_dir, expected_keys)
+    _assert_join_dns_checkpoint(
+        updated, bootstrap_path, synced[-1], association_created
+    )
     assert yaml.safe_load(path.read_text())["spec"]["gpuKubeconfig"] == str(
         gpu_kubeconfig
     )
@@ -445,10 +482,15 @@ def _prerequisite_stubs(
     return executor_done
 
 
-def _prerequisites(site, *, tmp_path: Path, state: dict) -> dict:
+def _prerequisites(site, *, tmp_path: Path, state: dict, runner=None) -> dict:
+    state.setdefault("evidence", {})["NODE_NAMES_VERIFIED"] = {
+        "cluster_id": "hp-gpu-b",
+        "nodes": ["node-b"],
+        "node_uids": {"node-b": "uid-node-b"},
+    }
     return admin_cluster_join._parallel_prerequisites(
         JoinClusterRequest(site=site, gpu_cluster_arn=GPU_B_ARN, state_dir=tmp_path),
-        runner=Runner(),
+        runner=runner or Runner(),
         target=_target(),
         cluster_id="hp-gpu-b",
         gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
@@ -623,6 +665,24 @@ def test_join_cluster_failure_after_site_commit_restores_original_site(
     assert len(load_site(path).release_config["clusters"]) == 1
 
 
+def test_join_waits_for_collector_freshness(monkeypatch: pytest.MonkeyPatch) -> None:
+    reports = iter(
+        [
+            {"ready": False, "nodes": [{"ready": False}]},
+            {"ready": True, "nodes": [{"ready": True}]},
+        ]
+    )
+    monkeypatch.setattr(
+        admin_cluster_readiness,
+        "_collector_readiness_report",
+        lambda *_args: next(reports),
+    )
+    result = wait_collector_readiness(
+        object(), "gpu-b", timeout_seconds=1, interval_seconds=0
+    )
+    assert result["ready"] is True
+
+
 def test_completed_join_state_starts_a_new_attempt_after_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -769,7 +829,14 @@ def _batch_execution(
         target=target,
         cluster_id=cluster_id,
         discovery={"registry_snapshot": str(tmp_path / "registry.json")},
-        local={"gpu_kubeconfig": str(gpu_kubeconfig)},
+        local={
+            "gpu_kubeconfig": str(gpu_kubeconfig),
+            "fleet_master_file": site.release_config["clusters"][0][
+                "fleet_master_file"
+            ],
+            "nodes": [f"node-{index}"],
+            "node_uids": {f"node-{index}": f"uid-{index}"},
+        },
         prerequisites={
             "executor_role": {
                 "role_arn": (f"arn:aws:iam::123456789012:role/{cluster_id}-executor"),
@@ -797,18 +864,23 @@ def _patch_batch_discovery(
     monkeypatch: pytest.MonkeyPatch, executions, verified: list[str] | None = None
 ) -> None:
     monkeypatch.setattr(
-        admin_cluster_join,
-        "_prepare_execution",
-        lambda request, **_kwargs: executions[request.gpu_cluster_arn],
+        admin_cluster_batch_join,
+        "publish_batch_failure_domains",
+        lambda _attempts: None,
     )
-    monkeypatch.setattr(
-        admin_cluster_join,
-        "_verify_candidate",
-        lambda _candidate, _readiness: (
-            verified.append("verify") if verified is not None else None
-        )
-        or _verify_report(),
-    )
+
+    def prepare(request, **kwargs):
+        execution = executions[request.gpu_cluster_arn]
+        if kwargs.get("local_inputs_only"):
+            return JoinInputs(
+                execution.target,
+                execution.cluster_id,
+                execution.discovery,
+                execution.local,
+            )
+        return execution
+
+    monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
     monkeypatch.setattr(
         admin_cluster_join,
         "_discover_join_target",
@@ -827,6 +899,25 @@ def _patch_batch_discovery(
     monkeypatch.setattr(
         admin_cluster_batch_join, "membership_runtime_snapshot", _membership_snapshot
     )
+    monkeypatch.setattr(
+        admin_cluster_batch_join, "read_node_claims", lambda *_args: NodeClaims()
+    )
+
+
+def _batch_commit_receipt(state, cluster_id: str) -> str:
+    verified = state["evidence"]["VERIFIED"]
+    before = verified.get("post_verification_runtime") or verified
+    state["evidence"]["FINAL_VERIFIED"] = {
+        **before,
+        "registry_generation": before["registry_generation"] + 1,
+        "registry_content_sha256": "d" * 64,
+        "registry_cluster_states": {
+            **before["registry_cluster_states"],
+            cluster_id: "ACTIVE",
+        },
+    }
+    state["completed_steps"].extend(["ACTIVATION_STARTED", "ACTIVATED"])
+    return cluster_id
 
 
 def test_batch_join_rolls_as_many_clusters_as_the_release_allows(
@@ -881,8 +972,8 @@ def test_batch_join_rolls_as_many_clusters_as_the_release_allows(
     monkeypatch.setattr(
         admin_cluster_join,
         "_activate_and_commit",
-        lambda _request, *, execution, **_kwargs: committed.append(
-            execution.cluster_id
+        lambda _request, *, execution, state, **_kwargs: committed.append(
+            _batch_commit_receipt(state, execution.cluster_id)
         ),
     )
 
@@ -940,7 +1031,11 @@ def test_batch_join_rolls_one_cluster_at_a_time_by_default(
 
     monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", deploy)
     monkeypatch.setattr(
-        admin_cluster_join, "_activate_and_commit", lambda *_args, **_kwargs: None
+        admin_cluster_join,
+        "_activate_and_commit",
+        lambda _request, *, execution, state, **_kwargs: _batch_commit_receipt(
+            state, execution.cluster_id
+        ),
     )
 
     result = join_clusters(requests, runner_factory=Runner)
@@ -979,15 +1074,15 @@ def test_batch_join_keeps_successful_clusters_when_one_rollout_fails(
     monkeypatch.setattr(
         admin_cluster_join,
         "_record_join_failure",
-        lambda attempt, execution: rolled_back.append(
+        lambda attempt, execution, *, error: rolled_back.append(
             execution.cluster_id if execution is not None else "unknown"
         ),
     )
     monkeypatch.setattr(
         admin_cluster_join,
         "_activate_and_commit",
-        lambda _request, *, execution, **_kwargs: committed.append(
-            execution.cluster_id
+        lambda _request, *, execution, state, **_kwargs: committed.append(
+            _batch_commit_receipt(state, execution.cluster_id)
         ),
     )
 
@@ -1041,7 +1136,7 @@ def test_batch_join_re_verifies_expired_evidence_instead_of_rolling_back(
     monkeypatch.setattr(
         admin_cluster_join,
         "_record_join_failure",
-        lambda attempt, execution: rolled_back.append(
+        lambda attempt, execution, *, error: rolled_back.append(
             execution.cluster_id if execution is not None else "unknown"
         ),
     )
@@ -1051,7 +1146,7 @@ def test_batch_join_re_verifies_expired_evidence_instead_of_rolling_back(
             expired_once.append(execution.cluster_id)
             raise JoinVerificationExpired("join verification evidence expired")
         assert "VERIFIED" in state["completed_steps"], "commit ran without evidence"
-        committed.append(execution.cluster_id)
+        committed.append(_batch_commit_receipt(state, execution.cluster_id))
 
     monkeypatch.setattr(admin_cluster_join, "_activate_and_commit", activate)
 
@@ -1109,9 +1204,8 @@ def test_join_re_verifies_expired_evidence_instead_of_rolling_back(
     monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", lambda **_kwargs: None)
     monkeypatch.setattr(
         admin_cluster_join,
-        "_verify_candidate",
-        lambda _candidate, _readiness: rollout_modes.append("verify")
-        or _verify_report(),
+        "_run_rollout",
+        lambda _site, mode, **_kwargs: rollout_modes.append(mode),
     )
     monkeypatch.setattr(
         admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
@@ -1159,6 +1253,8 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     activations: list[str] = []
 
     def rollout(_site, mode, *, cluster_id=None):
+        if mode == "verify":
+            verifies.append("verify")
         if mode == "activate-cluster":
             activations.append(mode)
             if len(activations) == 1:
@@ -1172,6 +1268,12 @@ def test_join_resumes_after_a_crash_between_commit_steps(
         admin_cluster_join, "_gpu_kubeconfig", lambda _site: gpu_kubeconfig
     )
     monkeypatch.setattr(admin_cluster_join, "ensure_namespace", lambda *_a, **_k: None)
+    namespace_reads = iter([None, "namespace-b", "namespace-b", "namespace-b"])
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "probe_join_namespace",
+        lambda *_a, **_k: next(namespace_reads),
+    )
 
     def base_secrets(_runner, *, secure_dir, **_kwargs):
         secret = secure_dir / "fleet-master"
@@ -1185,11 +1287,22 @@ def test_join_resumes_after_a_crash_between_commit_steps(
         "_shared_ca_file",
         lambda current: Path(current.release_config["clusters"][0]["ca_file"]),
     )
+
+    def nodes(*_args, **kwargs):
+        kwargs["identities"]["node-b"] = "uid-node-b"
+        return ["node-b"]
+
+    monkeypatch.setattr(admin_cluster_join, "_list_nodes", nodes)
     monkeypatch.setattr(
-        admin_cluster_join, "_list_nodes", lambda *_args, **_kwargs: ["node-b"]
+        admin_cluster_join, "read_node_claims", lambda *_args: NodeClaims()
     )
     monkeypatch.setattr(
-        admin_cluster_join, "clear_stale_installer_annotations", lambda *_a: None
+        admin_cluster_join, "verify_join_node_names", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join_inputs,
+        "clear_stale_installer_annotations",
+        lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
         admin_cluster_join, "_existing_cluster_networks", lambda *_a, **_k: []
@@ -1204,22 +1317,16 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     )
     monkeypatch.setattr(
         admin_cluster_join,
-        "sync_cluster_release_state",
-        lambda _current, *, cluster_id: release_state_syncs.append(cluster_id) or {},
+        "_sync_release_state",
+        lambda _current: release_state_syncs.append("site"),
     )
     monkeypatch.setattr(
         admin_cluster_join, "refresh_failure_domain_map", lambda _current: None
     )
     monkeypatch.setattr(
         admin_cluster_join,
-        "wait_join_collector_readiness",
-        lambda *_args, **_kwargs: _readiness_evidence(1),
-    )
-    monkeypatch.setattr(
-        admin_cluster_join,
-        "_verify_candidate",
-        lambda _candidate, readiness: verifies.append(",".join(readiness))
-        or _verify_report(),
+        "wait_collector_readiness",
+        lambda *_args, **_kwargs: {"ready": True, "nodes": [{"ready": True}]},
     )
     monkeypatch.setattr(
         admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
@@ -1242,7 +1349,7 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     monkeypatch.setattr(
         admin_cluster_join,
         "fetch_installation_resource_registry",
-        lambda _site, output=None: synced[-1],
+        lambda _site, output=None: synced[-1] if synced else _snapshot(),
     )
     before = state_dir / "installation-resources-before-001.json"
     before.parent.mkdir(parents=True, exist_ok=True)
@@ -1272,8 +1379,8 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     assert result["phase"] == "COMPLETED"
     assert activations == ["activate-cluster", "activate-cluster"]
     assert len(synced) == 1, "the resumed attempt re-sent the registry delta"
-    assert release_state_syncs == ["hp-gpu-b"], "sync-state ran again on resume"
-    assert verifies == ["hp-gpu-b"], "fresh VERIFIED evidence was verified again"
+    assert release_state_syncs == ["site"], "sync-state ran again on resume"
+    assert verifies == ["verify"], "fresh VERIFIED evidence was verified again"
     state = json.loads((state_dir / "state.json").read_text())
     assert "FINAL_VERIFIED" in state["completed_steps"]
     assert state["evidence"]["FINAL_VERIFIED"]["registry_lifecycle"] == "ACTIVE"

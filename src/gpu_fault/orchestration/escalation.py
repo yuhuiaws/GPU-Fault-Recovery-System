@@ -332,6 +332,54 @@ def _chain_termination_reason(
     )
 
 
+def _escalation_gpu_scope(
+    workflow: WorkflowRequest,
+    source: FaultIncident,
+    failed_nodes: list[str],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Resolve failed-node GPUs without assigning a sibling's scope to them."""
+
+    explicit: dict[str, list[str]] = {}
+    derived: dict[str, list[str]] = {}
+    for step in workflow.official_steps:
+        mapping = step.parameters.get("gpu_uuids_by_node", {})
+        if isinstance(mapping, dict):
+            for node_id, values in mapping.items():
+                if (
+                    node_id in step.node_ids
+                    and isinstance(values, list)
+                    and values
+                    and all(isinstance(value, str) and value for value in values)
+                ):
+                    explicit.setdefault(node_id, []).extend(values)
+        # Job DAG branches carry node-local GPUs directly on single-node steps.
+        if len(step.node_ids) == 1 and step.gpu_uuids:
+            derived.setdefault(step.node_ids[0], []).extend(step.gpu_uuids)
+    by_node = {
+        node_id: list(dict.fromkeys(explicit.get(node_id) or derived[node_id]))
+        for node_id in explicit.keys() | derived.keys()
+    }
+    all_gpus = list(
+        dict.fromkeys(
+            [
+                *source.gpu_uuids,
+                *(gpu for step in workflow.official_steps for gpu in step.gpu_uuids),
+                *(gpu for node_id in sorted(by_node) for gpu in by_node[node_id]),
+            ]
+        )
+    )
+    assigned = {gpu for values in by_node.values() for gpu in values}
+    if any(not by_node.get(node_id) for node_id in failed_nodes) or (
+        set(all_gpus) - assigned
+    ):
+        # Partial ownership is not evidence that an unassigned GPU is a sibling.
+        return all_gpus, {}
+    scoped = {node_id: by_node[node_id] for node_id in failed_nodes}
+    return list(
+        dict.fromkeys(gpu for values in scoped.values() for gpu in values)
+    ), scoped
+
+
 class HardwareEscalationService:
     def __init__(self, store, builder) -> None:
         self.store = store
@@ -386,7 +434,7 @@ class HardwareEscalationService:
                 ):
                     return False
                 recommendations = result.get("recommended_actions", [])
-                if {
+                if not isinstance(recommendations, list) or {
                     item.get("action_code")
                     for item in recommendations
                     if isinstance(item, dict)
@@ -667,35 +715,9 @@ class HardwareEscalationService:
                 for workload_id in step.workload_ids
             )
         )
-        gpu_uuids_by_node: dict[str, list[str]] = {}
-        for step in workflow.official_steps:
-            mapping = step.parameters.get("gpu_uuids_by_node", {})
-            if isinstance(mapping, dict):
-                for node_id, values in mapping.items():
-                    if isinstance(values, list):
-                        gpu_uuids_by_node.setdefault(node_id, []).extend(
-                            str(value) for value in values
-                        )
-        gpu_uuids = list(
-            dict.fromkeys(
-                gpu_uuid
-                for node_id in ordered_failed_nodes
-                for gpu_uuid in gpu_uuids_by_node.get(node_id, [])
-            )
+        gpu_uuids, gpu_uuids_by_node = _escalation_gpu_scope(
+            workflow, source, ordered_failed_nodes
         )
-        if not gpu_uuids:
-            gpu_uuids = list(
-                dict.fromkeys(
-                    [
-                        *source.gpu_uuids,
-                        *(
-                            gpu_uuid
-                            for step in workflow.official_steps
-                            for gpu_uuid in step.gpu_uuids
-                        ),
-                    ]
-                )
-            )
         failed = ", ".join(sorted(operation.value for operation in failed_operations))
         node_reason = "; ".join(
             (

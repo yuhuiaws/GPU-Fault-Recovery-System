@@ -30,9 +30,20 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.admin.deadlines import (  # noqa: E402
+    DeploymentDeadlineExceeded,
+    deadline_scope,
+    remaining_timeout,
+)
 from scripts.e2e.regional import collect018_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
+)
+from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
+    WINDOW,
+    bounded_window_case,
+    finite_seconds,
+    require_action_time,
 )
 from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
     CollectorWindowFixture,
@@ -41,7 +52,7 @@ from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
     run_window_case,
     utc_now,
 )
-from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalFixtureError,
 )
 
@@ -90,33 +101,16 @@ def _first_bdf(snapshot: dict[str, Any]) -> str:
     return str(inventory[0]["pci_bus_id"])
 
 
-def execute(
-    settings: WindowSettings,
+def align_kernel_heartbeat(
     fixture: CollectorWindowFixture,
+    statuses_before: list[dict[str, Any]],
+    *,
     case_dir: Path,
-    attempt: int,
-    deadline: datetime,
 ) -> dict[str, Any]:
-    del deadline
-    marker = f"c018-{int(time.time())}-a{attempt}"
-    started_at = utc_now()
-    baseline = fixture.snapshot()
-    write_json_atomic(case_dir / "host-baseline.json", baseline)
-    metrics_before = fixture.control_plane_metrics()
-    statuses_before = fixture.collector_statuses()
-    stages: dict[str, list[str]] = {}
-    evidence: dict[str, Any] = {
-        "marker": marker,
-        "host_baseline": baseline,
-        "statuses_before": statuses_before,
-    }
-
-    # Phase A: the rejected payload. Post it just after a kernel heartbeat,
-    # never just before one: the heartbeat's success clears the entry.
     heartbeat_age = verdicts.kernel_heartbeat_age_seconds(
         statuses_before, now=utc_now()
     )
-    evidence["heartbeat_age_before_seconds"] = heartbeat_age
+    evidence: dict[str, Any] = {"heartbeat_age_before_seconds": heartbeat_age}
     if verdicts.heartbeat_is_imminent(heartbeat_age):
         previous_row = verdicts.kernel_status(statuses_before) or {}
         aligned = fixture.wait_until(
@@ -137,6 +131,102 @@ def execute(
             name="heartbeat-align",
         )
         evidence["heartbeat_aligned"] = aligned is not None
+        if aligned is None:
+            raise RegionalFixtureError(
+                "kernel heartbeat alignment is unproven; refusing post"
+            )
+    return evidence
+
+
+def wait_silence_metrics(
+    fixture: CollectorWindowFixture,
+    *,
+    metrics_before: list[str],
+    cluster_id: str,
+    node: str,
+    case_dir: Path,
+) -> list[str]:
+    """Wait for the leased census snapshot without extending any active budget."""
+
+    timeline: dict[str, Any] = {"entries": [], "settled": False}
+    path = case_dir / "erroring-gauge-timeline.json"
+    write_json_atomic(path, timeline)
+    try:
+        timeout = remaining_timeout(verdicts.SILENCE_SNAPSHOT_TIMEOUT_SECONDS)
+        window = WINDOW.get()
+        if window is not None:
+            timeout = finite_seconds(min(timeout, window.remaining()))
+        with deadline_scope("COLLECT-018 erroring gauge", timeout):
+            while True:
+                remaining_timeout(timeout)
+                require_action_time()
+                metrics = fixture.control_plane_metrics()
+                remaining_timeout(timeout)
+                require_action_time()
+                errors = verdicts.silence_errors(
+                    metrics_before, metrics, cluster_id=cluster_id, node=node
+                )
+                remaining_timeout(timeout)
+                require_action_time()
+                timeline["entries"].append(
+                    {"observed_at": utc_now().isoformat(), "errors": errors}
+                )
+                timeline["settled"] = not errors
+                write_json_atomic(path, timeline)
+                remaining_timeout(timeout)
+                require_action_time()
+                if not errors:
+                    return metrics
+                pause = min(5, remaining_timeout(timeout))
+                if window is not None:
+                    pause = finite_seconds(min(pause, window.remaining()))
+                time.sleep(pause)
+    except Exception as exc:
+        timeline.update(settled=False, error_type=type(exc).__name__)
+        write_json_atomic(path, timeline)
+        if isinstance(exc, DeploymentDeadlineExceeded):
+            raise RegionalFixtureError(
+                "COLLECT-018 erroring gauge did not settle within its total deadline"
+            ) from None
+        raise
+
+
+@bounded_window_case
+def execute(
+    settings: WindowSettings,
+    fixture: CollectorWindowFixture,
+    case_dir: Path,
+    attempt: int,
+    deadline: datetime,
+) -> dict[str, Any]:
+    require_action_time(180)
+    marker = f"c018-{int(time.time())}-a{attempt}"
+    started_at = utc_now()
+    baseline = fixture.snapshot()
+    write_json_atomic(case_dir / "host-baseline.json", baseline)
+    metrics_before = fixture.control_plane_metrics()
+    statuses_before = fixture.collector_statuses()
+    stages: dict[str, list[str]] = {}
+    evidence: dict[str, Any] = {
+        "marker": marker,
+        "host_baseline": baseline,
+        "statuses_before": statuses_before,
+    }
+
+    # Phase A: the rejected payload. Post it just after a kernel heartbeat,
+    # never just before one: the heartbeat's success clears the entry.
+    evidence.update(align_kernel_heartbeat(fixture, statuses_before, case_dir=case_dir))
+    record_id = f"acceptance-rejected-{marker}"
+    write_json_atomic(
+        case_dir / "seed-intent.json",
+        {
+            "marker": marker,
+            "record_id": record_id,
+            "cluster_id": settings.regional.cluster_id,
+            "node_id": settings.node,
+        },
+    )
+    require_action_time(300)
     posted = fixture.execute(
         "post-rejected-event",
         "--marker",
@@ -147,7 +237,10 @@ def execute(
     )
     write_json_atomic(case_dir / "posted.json", posted)
     evidence["posted"] = posted
-    record_id = str(posted.get("record_id") or f"acceptance-rejected-{marker}")
+    if posted.get("record_id") != record_id:
+        raise RegionalFixtureError(
+            "rejected-event receipt changed the caller-known record ID"
+        )
     rejected_statuses = fixture.wait_until(
         lambda: (
             {"records": records}
@@ -179,15 +272,29 @@ def execute(
         metrics_before, metrics_after
     )
     stages["rejection_log"] = verdicts.rejection_log_errors(logs, record_id)
+    # Keep the synchronous counter proof on its original sample; only the
+    # census gauges may wait for a later periodic snapshot.
+    metrics_silence = wait_silence_metrics(
+        fixture,
+        metrics_before=metrics_before,
+        cluster_id=settings.regional.cluster_id,
+        node=settings.node,
+        case_dir=case_dir,
+    )
     stages["not_silent"] = verdicts.silence_errors(
         metrics_before,
-        metrics_after,
+        metrics_silence,
         cluster_id=settings.regional.cluster_id,
         node=settings.node,
     )
     evidence["statuses_after_rejection"] = statuses_after
 
     # Phase B: the code-less Xid line.
+    if any(stages.values()):
+        raise RegionalFixtureError(
+            "rejection phase failed; refusing the unparsed-line injection"
+        )
+    require_action_time(180)
     unparsed_since = utc_now()
     written = fixture.execute(
         "write-kmsg",
@@ -204,7 +311,9 @@ def execute(
             value
             if (
                 value := fixture.node_activity(
-                    unparsed_since, evidence_kind="NVIDIA_KERNEL"
+                    unparsed_since,
+                    evidence_kind="NVIDIA_KERNEL",
+                    evidence_marker=marker,
                 )
             )
             and value.get("incidents")
@@ -219,7 +328,9 @@ def execute(
         poll_seconds=5,
         case_dir=case_dir,
         name="unparsed-finding",
-    ) or fixture.node_activity(unparsed_since, evidence_kind="NVIDIA_KERNEL")
+    ) or fixture.node_activity(
+        unparsed_since, evidence_kind="NVIDIA_KERNEL", evidence_marker=marker
+    )
     write_json_atomic(case_dir / "unparsed-activity.json", activity)
     metrics_final = fixture.control_plane_metrics()
     stages["unparsed_finding"] = verdicts.unparsed_finding_errors(
@@ -236,6 +347,7 @@ def execute(
     ]
 
     # Phase C: one accepted batch clears the erroring state.
+    require_action_time(180)
     fixture.execute(
         "write-kmsg",
         "--kind",

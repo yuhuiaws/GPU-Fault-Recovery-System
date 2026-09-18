@@ -2,32 +2,29 @@
 
 \if :{?incident_id}
 \else
-  \echo 'incident_id is required: psql -v incident_id=inc-...'
-  \quit 2
+  DO $audit_incident_argument_guard$
+  BEGIN
+      RAISE EXCEPTION 'incident_id is required: psql -v incident_id=inc-...';
+  END
+  $audit_incident_argument_guard$;
 \endif
 
 WITH
-workflow_ids AS (
-    SELECT key
-    FROM gpu_fault_objects
-    WHERE kind='workflow'
-      AND payload->>'incident_id'=:'incident_id'
-),
 notification_ids AS (
     SELECT key
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='notification'
       AND payload->>'incident_id'=:'incident_id'
 ),
 plan_ids AS (
     SELECT key
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='plan'
       AND payload->>'incident_id'=:'incident_id'
 ),
 decision_ids AS (
     SELECT key, payload
-    FROM gpu_fault_objects
+    FROM gpu_fault_control_records
     WHERE kind='decision'
       AND payload->>'recovery_plan_id' IN (
           SELECT key FROM plan_ids
@@ -45,10 +42,10 @@ event_ids AS (
 ),
 related_objects AS (
     SELECT kind, key, payload
-    FROM gpu_fault_objects
-    WHERE
+    FROM gpu_fault_control_records
+    WHERE kind NOT IN ('workflow', 'remote_command')
+      AND (
         (kind='incident' AND key=:'incident_id')
-        OR (kind='workflow' AND key IN (SELECT key FROM workflow_ids))
         OR (
             kind IN (
                 'notification',
@@ -71,10 +68,6 @@ related_objects AS (
             AND payload->>'incident_id'=:'incident_id'
         )
         OR (
-            kind='remote_command'
-            AND payload->>'incident_id'=:'incident_id'
-        )
-        OR (
             kind IN (
                 'xid_correlation_event',
                 'xid_policy_decision',
@@ -82,6 +75,15 @@ related_objects AS (
             )
             AND key IN (SELECT key FROM event_ids)
         )
+      )
+    UNION ALL
+    SELECT kind, key, payload
+    FROM gpu_fault_workflow_records
+    WHERE incident_id=:'incident_id'
+    UNION ALL
+    SELECT kind, key, payload
+    FROM gpu_fault_remote_command_records
+    WHERE incident_id=:'incident_id'
 ),
 related_links AS (
     SELECT kind, key, value

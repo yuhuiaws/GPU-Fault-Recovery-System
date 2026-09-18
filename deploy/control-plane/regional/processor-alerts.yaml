@@ -217,3 +217,158 @@ spec:
               gpu_fault_remediation_budget_cluster_active_claims with
               gpu_fault_remediation_budget_cluster_limit and read the oldest
               waiting workflow.
+    - name: gpu-fault-recovery-outcome
+      rules:
+        - alert: GpuFaultClosedLoopSlow
+          expr: >-
+            max by (control_plane_cluster, region) (
+              gpu_fault_closed_loop_milestone_window_mean_seconds{milestone="containment"}
+              and
+              (gpu_fault_closed_loop_milestone_window_complete{milestone="containment"} == 1)
+              and
+              (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} > 0)
+              and ignoring (milestone)
+              (
+                (time() - gpu_fault_closed_loop_window_end_timestamp_seconds >= 0)
+                and
+                (time() - gpu_fault_closed_loop_window_end_timestamp_seconds <= 120)
+              )
+            ) > 900
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Recent GPU fault containment took over 15 minutes on average
+            runbook_url: docs/管理员日常运维.md#gpufaultclosedloopslow
+            description: >-
+              The mean workflow-creation-to-first-containment duration for
+              successes in the six-hour event-time window exceeds 15 minutes.
+              Each workflow contributes once; inherited steps are not new
+              successes. Inspect dispatch delay and containment step outcomes.
+              Empty windows do not fire. Incomplete or stale data is reported by
+              GpuFaultClosedLoopWindowIncomplete, not treated as recovery passing.
+        - alert: GpuFaultClosedLoopWindowIncomplete
+          expr: >-
+            max by (control_plane_cluster, region) (
+              (
+                gpu_fault_workflow_scan_limit
+                or
+                (up{job="gpu-fault-control-plane",service_role="gpu-fault-control-worker"} == 1)
+              )
+              unless on (control_plane_cluster, region, job, namespace, pod, instance)
+              (
+                (gpu_fault_closed_loop_milestone_window_complete{milestone="containment"} == 1)
+                and
+                (
+                  (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} == 0)
+                  or
+                  (
+                    (gpu_fault_closed_loop_milestone_window_count{milestone="containment"} > 0)
+                    and
+                    (gpu_fault_closed_loop_milestone_window_mean_seconds{milestone="containment"} >= 0)
+                  )
+                )
+                and ignoring (milestone)
+                (
+                  (time() - gpu_fault_closed_loop_window_end_timestamp_seconds >= 0)
+                  and
+                  (time() - gpu_fault_closed_loop_window_end_timestamp_seconds <= 120)
+                )
+              )
+            )
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Recent GPU fault containment latency is unknown
+            runbook_url: docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete
+            description: >-
+              At least one control-worker lacks a complete, fresh six-hour
+              containment window. Check workflow scan truncation and its recency
+              window, retained milestone history, control-record retention and
+              metrics contributor errors. A scan older than 120 seconds is stale.
+              Do not interpret the absence of GpuFaultClosedLoopSlow as passing
+              while this warning fires, or delete Store rows to clear it.
+    - name: gpu-fault-observability-evidence
+      rules:
+        - alert: GpuFaultMetricsAggregationIncomplete
+          expr: "max by (control_plane_cluster, region, pod, service_role) (\n  (gpu_fault_metrics_aggregation_degraded == 1)\n  or\n  (\n    (up{job=\"gpu-fault-control-plane\"} == 1)\n    unless on (control_plane_cluster, region, pod, instance, service_role)\n    gpu_fault_metrics_aggregation_degraded\n  )\n)"
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A control-plane Pod has incomplete process metric coverage
+            runbook_url: docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete
+            description: Pod {{ $labels.pod }} ({{ $labels.service_role }}) lacks fresh, complete metric publications from its live processes. Publications expire after 60 seconds; missing, malformed or future-dated peers and unusable shared storage are unknown coverage, not healthy processors. Inspect the process-metrics publisher and shared slot directory before trusting this Pod's counters or health gauges.
+        - alert: GpuFaultProcessorCounterDrift
+          expr: "min_over_time((\n  max by (control_plane_cluster, region) (\n    (\n      (gpu_fault_processor_counter_drift_abs > bool 0)\n      + (gpu_fault_processor_counter_mismatched_clusters > bool 0)\n    )\n    and (gpu_fault_processor_counter_drift_abs >= 0)\n    and (gpu_fault_processor_counter_mismatched_clusters >= 0)\n    and (gpu_fault_processor_counter_drift_scan_timestamp_seconds > 0)\n    and (\n      gpu_fault_processor_counter_drift_scan_timestamp_seconds\n      == on (control_plane_cluster, region) group_left\n      max by (control_plane_cluster, region)\n      (gpu_fault_processor_counter_drift_scan_timestamp_seconds)\n    )\n    and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds >= 0)\n    and (gpu_fault_processor_counter_drift_scan_max_age_seconds > 0)\n    and (\n      time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds\n      <= gpu_fault_processor_counter_drift_scan_max_age_seconds\n    )\n  )\n)[5m:1m]) > 0"
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Processor queue shard counters disagree with the queue table
+            runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdrift
+            description: For five minutes the shard counters have not matched a real count of PENDING/LEASED rows, so per-cluster queue depth and quota decisions are being made on a wrong number. Read gpu_fault_processor_counter_drift_abs for the size and gpu_fault_processor_counter_mismatched_clusters for the spread; the counters are rebuilt from the table by the backfill path, not by editing counter rows. Only the newest successful scan is used, so an old lease holder cannot keep a repaired discrepancy firing.
+        - alert: GpuFaultProcessorCounterDriftScanUnavailable
+          expr: "max by (control_plane_cluster, region) (up{job=\"gpu-fault-control-plane\",service_role=\"gpu-fault-control-worker\"} == 1) unless on (control_plane_cluster, region) max by (control_plane_cluster, region) (\n  (gpu_fault_processor_counter_drift_scan_timestamp_seconds > 0)\n  and (\n    gpu_fault_processor_counter_drift_scan_timestamp_seconds\n    == on (control_plane_cluster, region) group_left\n    max by (control_plane_cluster, region)\n    (gpu_fault_processor_counter_drift_scan_timestamp_seconds)\n  )\n  and (time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds >= 0)\n  and (gpu_fault_processor_counter_drift_scan_max_age_seconds > 0)\n  and (\n    time() - gpu_fault_processor_counter_drift_scan_timestamp_seconds\n    <= gpu_fault_processor_counter_drift_scan_max_age_seconds\n  )\n  and (gpu_fault_processor_counter_drift_abs >= 0)\n  and (gpu_fault_processor_counter_mismatched_clusters >= 0)\n)"
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: The latest processor counter drift scan is unavailable
+            runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable
+            description: No complete, current successful counter scan is available. The measurement expires after three configured scan intervals, with a 120 second minimum; publishing an old value does not refresh it. Check the periodic counter_drift task and its lease, job errors and metric contributor. A quiet drift alert does not prove alignment while the scan is missing, stale or future-dated.
+        - alert: GpuFaultPeriodicServiceErrors
+          expr: time() - max by (control_plane_cluster, region) (gpu_fault_periodic_lease_error_last_seen_timestamp_seconds) < 900 or time() - max by (control_plane_cluster, region, periodic_job) (gpu_fault_periodic_job_error_last_seen_timestamp_seconds) < 900
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: A periodic service job raised or could not take its task lease
+            runbook_url: docs/管理员日常运维.md#gpufaultperiodicserviceerrors
+            description: '{{ if $labels.periodic_job }}The periodic job {{ $labels.periodic_job }} raised an exception{{ else }}A periodic tick could not take a task lease from the store{{ end }} {{ $value | humanizeDuration }} ago; gpu_fault_periodic_job_errors_total and gpu_fault_periodic_lease_errors_total say how often. The runner keeps going, so the job is skipped for the tick and the service it provides (training health, spare health, cleanup, reclaim) is late by one interval per failure. Read the control-worker log for the traceback.'
+        - alert: GpuFaultRemoteCommandStaleFenceSwept
+          expr: sum by (control_plane_cluster, region) (increase(gpu_fault_periodic_cleanup_rows_total{periodic_job="stale_fence_remote_commands"}[30m])) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: A remote command was failed by the stale-fence sweep
+            runbook_url: docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept
+            description: '{{ $value | printf "%.0f" }} LEASED remote command(s) whose workflow moved to another fencing token had their lease lapse without the data plane reporting a result, and the periodic sweep failed them with status_source=stale-fence (D-9). Each one is a node action that ran on a superseded generation with nobody collecting its outcome: read result_details.stale_fence_swept on the command and check the node for an overlapping action before treating the workflow''s current generation as clean.'
+        - alert: GpuFaultAuroraCredentialRefreshStale
+          expr: max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_success_age_seconds) > 10800
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The Aurora credential refresher has not succeeded for three hours
+            runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstale
+            description: The hourly gpu-fault-aurora-credential-refresh CronJob last verified and published the master password more than three hours ago, so the mounted Secret may not survive the next rotation. gpu_fault_aurora_credential_refresh_last_run_ok says whether it is failing or simply not being scheduled; read the failure_reason in last-refresh-status.json and the newest Job's log, then run the Job by hand once the cause is fixed.
+        - alert: GpuFaultAuroraCredentialRefreshFailing
+          expr: min by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_run_ok) == 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: The Aurora credential refresher's last run failed
+            runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshfailing
+            description: The most recent gpu-fault-aurora-credential-refresh run finished with a non-ok status and no later run has succeeded in fifteen minutes, so the mounted Secret will not follow the next master password rotation. The error text (password redacted) is in the Secret's last-refresh-status.json and the Job log; typical causes are the Secrets Manager read, the verify connection (network, CA bundle) or RBAC on the Secret patch.
+        - alert: GpuFaultAuroraCredentialRefreshStatusUnknown
+          expr: max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_status_unreadable) == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Configured Aurora credential refresh evidence is unknown
+            runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown
+            description: 'A configured DSN-file consumer cannot validate its refresh status: the file is missing, unreadable, malformed or future-dated. This is neither a successful refresh nor proof that the last Job failed. Inspect the status projection and refresher Job without exposing credentials. Intentionally unconfigured roles emit no refresh metrics and do not trigger this warning.'
+        - alert: GpuFaultNotificationDeliveryFailing
+          expr: "(\n  time() - max by (control_plane_cluster, region)\n  (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds[15m]))\n) < 900 and max by (control_plane_cluster, region) (max_over_time(gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds[15m])) > 0"
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Business notifications were given up on undelivered
+            runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing
+            description: 'A notification reached a recorded terminal FAILED result {{ $value | humanizeDuration }} ago: the outbox exhausted its delivery attempts (gpu_fault_notification_dead_lettered_total) or an inline send failed with nothing behind it to retry. An administrator decision request was not delivered and nothing will retry it on its own. Check the SES identity and sending quota and inspect the terminal result. A DEAD delivery needs explicit operator requeue before dispatch can retry it; reading or dispatching the old row does not create a new failure event.'

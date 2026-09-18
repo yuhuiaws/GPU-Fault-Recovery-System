@@ -68,6 +68,7 @@ def _marker(
 ) -> NodeMarker:
     return NodeMarker(
         marker_id="marker-1",
+        cluster_id="cluster-a",
         source="test-agent",
         trusted=True,
         incident_id=incident_id,

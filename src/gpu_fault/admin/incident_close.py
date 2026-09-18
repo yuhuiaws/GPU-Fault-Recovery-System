@@ -286,6 +286,8 @@ def quarantined_selector(
 def gather_isolation_evidence(
     site: RenderedSite,
     pending: Sequence[dict[str, Any]],
+    *,
+    inventories: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
     """Node isolation evidence for the incidents the Pod reported as
     ``evidence_required``, one ``kubectl get nodes`` per cluster.
@@ -318,6 +320,8 @@ def gather_isolation_evidence(
             for item in items:
                 refusals[str(item["incident_id"])] = str(exc)
             continue
+        if inventories is not None:
+            inventories[cluster_id] = inventory
         for item in items:
             evidence[str(item["incident_id"])] = node_isolation_evidence(
                 site,
@@ -382,6 +386,7 @@ def _release_orphaned_annotations(
     evidence: dict[str, list[dict[str, Any]]],
     *,
     dry_run: bool,
+    inventories: dict[str, dict[str, dict[str, Any]]],
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """Strip (or, with ``dry_run``, pretend to strip) the orphaned isolation
     annotations of every pending incident and refresh its evidence.
@@ -403,30 +408,114 @@ def _release_orphaned_annotations(
         nodes = orphaned_isolation_nodes(incident_id, items)
         if not nodes:
             continue
-        orphaned[incident_id] = nodes
-        if dry_run:
-            evidence[incident_id] = _without_isolation_annotations(items, nodes)
-            continue
         cluster_id = str(item.get("cluster_id") or "")
         try:
-            inventory = cluster_nodes(site, cluster_id)
+            previous = inventories.get(cluster_id, {})
+            inventory = previous if dry_run else cluster_nodes(site, cluster_id)
+            # Validate the full node set before beginning any patch.
             for node_id in nodes:
                 raw = inventory.get(node_id)
-                if raw is None:
+                expected = previous.get(node_id)
+                if raw is None or expected is None:
                     raise BootstrapError(
                         f"node {node_id} disappeared from {cluster_id} before its "
                         "isolation annotations could be stripped"
                     )
-                strip_node_isolation_annotations(site, cluster_id, raw)
+                strip_node_isolation_annotations(
+                    site,
+                    cluster_id,
+                    raw,
+                    incident_id=incident_id,
+                    expected_node=expected,
+                    dry_run=True,
+                )
+            if dry_run:
+                orphaned[incident_id] = nodes
+                evidence[incident_id] = _without_isolation_annotations(items, nodes)
+                continue
+            for node_id in nodes:
+                strip_node_isolation_annotations(
+                    site,
+                    cluster_id,
+                    inventory[node_id],
+                    incident_id=incident_id,
+                    expected_node=previous[node_id],
+                )
+                orphaned.setdefault(incident_id, []).append(node_id)
+            refreshed = cluster_nodes(site, cluster_id)
+            for node_id in nodes:
+                metadata = refreshed.get(node_id, {}).get("metadata", {})
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("uid") != previous[node_id]["metadata"]["uid"]
+                    or not isinstance(metadata.get("annotations", {}), dict)
+                    or any(
+                        metadata.get("annotations", {}).get(key) is not None
+                        for key in ISOLATION_ANNOTATIONS
+                    )
+                ):
+                    raise BootstrapError(
+                        f"node {node_id} isolation annotation removal was not verified"
+                    )
             evidence[incident_id] = node_isolation_evidence(
                 site,
                 cluster_id,
                 [str(node) for node in item.get("node_ids") or []],
+                inventory=refreshed,
             )
         except BootstrapError as exc:
             refusals[incident_id] = str(exc)
             evidence.pop(incident_id, None)
     return orphaned, refusals
+
+
+def _annotation_release_refusals(
+    site: RenderedSite,
+    payload: dict[str, Any],
+    pending: Sequence[dict[str, Any]],
+    evidence: dict[str, list[dict[str, Any]]],
+) -> dict[str, str]:
+    """Check Store occupancy before modifying any incident's node annotations."""
+
+    projected = {
+        incident_id: _without_isolation_annotations(items, nodes)
+        for incident_id, items in evidence.items()
+        if (nodes := orphaned_isolation_nodes(incident_id, items))
+    }
+    if not projected:
+        return {}
+    preview = _run_reconcile(
+        site,
+        {
+            **{key: value for key, value in payload.items() if key != "selector"},
+            "dry_run": True,
+            "incident_ids": sorted(projected),
+            "evidence": projected,
+        },
+        script=INCIDENT_CLOSE_SCRIPT,
+    )
+    rows = preview.get("results")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise BootstrapError("annotation release preview returned invalid results")
+    by_id = {str(row.get("incident_id")): row for row in rows}
+    if len(by_id) != len(rows) or set(by_id) != set(projected):
+        raise BootstrapError("annotation release preview identities changed")
+    originals = {str(item["incident_id"]): item for item in pending}
+    refusals: dict[str, str] = {}
+    for incident_id, row in by_id.items():
+        original = originals[incident_id]
+        if (
+            row.get("outcome") != "would-close"
+            or row.get("open_workflow_id")
+            or row.get("state") != original.get("state")
+            or row.get("cluster_id") != original.get("cluster_id")
+            or sorted(row.get("node_ids") or [])
+            != sorted(original.get("node_ids") or [])
+        ):
+            refusals[incident_id] = str(
+                row.get("reason") or "incident is not eligible for annotation release"
+            )
+    return refusals
 
 
 def _with_evidence(
@@ -448,10 +537,20 @@ def _with_evidence(
     pending = [item for item in results if item.get("evidence_required")]
     if not pending:
         return result
-    evidence, refusals = gather_isolation_evidence(site, pending)
+    inventories: dict[str, dict[str, dict[str, Any]]] = {}
+    evidence, refusals = gather_isolation_evidence(
+        site, pending, inventories=inventories
+    )
     dry_run = bool(payload.get("dry_run"))
+    if not dry_run:
+        preflight_refusals = _annotation_release_refusals(
+            site, payload, pending, evidence
+        )
+        refusals.update(preflight_refusals)
+        for incident_id in preflight_refusals:
+            evidence.pop(incident_id, None)
     orphaned, strip_refusals = _release_orphaned_annotations(
-        site, pending, evidence, dry_run=dry_run
+        site, pending, evidence, dry_run=dry_run, inventories=inventories
     )
     refusals = {**refusals, **strip_refusals}
     strip_key = "would_strip_isolation_nodes" if dry_run else "stripped_isolation_nodes"
@@ -483,11 +582,7 @@ def _with_evidence(
         replacements.get(str(item.get("incident_id")), item) for item in results
     ]
     result["isolation_evidence"] = evidence
-    result[strip_key] = {
-        incident_id: nodes
-        for incident_id, nodes in orphaned.items()
-        if incident_id not in strip_refusals
-    }
+    result[strip_key] = orphaned
     return result
 
 

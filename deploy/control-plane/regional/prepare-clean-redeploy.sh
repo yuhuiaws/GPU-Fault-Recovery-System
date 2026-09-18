@@ -3,7 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 RESOURCE_INVENTORY="${SCRIPT_DIR}/cleanup-inventory.json"
+CLEANUP_KUBERNETES_TOOL="${REPO_ROOT}/deploy/control-plane/tools/cleanup_kubernetes.py"
+CLEANUP_PROBE="${REPO_ROOT}/deploy/control-plane/tools/cleanup_activity.py"
 CLEANUP_STATE_TOOL="$(
     printf '%s' \
         "${REPO_ROOT}/deploy/control-plane/tools/cleanup_state.py"
@@ -41,8 +44,8 @@ Options:
                             Stop node systemd units, run the installed node
                             uninstaller, or leave node units unchanged.
                             Default: stop.
-  --state-file FILE         New mode-0600 JSON audit file. Required with
-                            --execute.
+  --state-file FILE         Mode-0600 JSON audit file. Reuse only to resume
+                            the same cleanup. Required with --execute.
   --confirm-reset VALUE     Required for --mode reset --execute. Value must be
                             RESET_GPU_FAULT_INSTALLATION.
   --timeout-seconds N       Drain and rollout timeout. Default: 600.
@@ -67,10 +70,6 @@ die() {
 log() {
     printf '[clean-redeploy] %s\n' "$*"
 }
-
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=prepare-clean-redeploy-delete.sh
-source "${SCRIPT_DIR}/prepare-clean-redeploy-delete.sh"
 
 while (($# > 0)); do
     case "$1" in
@@ -165,8 +164,6 @@ fi
 if [[ "${EXECUTE}" == true ]]; then
     [[ -n "${STATE_FILE}" ]] ||
         die "--state-file is required with --execute"
-    [[ ! -e "${STATE_FILE}" ]] ||
-        die "state file already exists: ${STATE_FILE}"
     if [[ "${MODE}" == reset &&
         "${CONFIRM_RESET}" != RESET_GPU_FAULT_INSTALLATION ]]; then
         die "--mode reset --execute requires --confirm-reset RESET_GPU_FAULT_INSTALLATION"
@@ -181,6 +178,9 @@ FLEET_INVENTORY_FILE=
 STATE_INITIALIZED=false
 STATE_COMPLETE=false
 CURRENT_PHASE=PREFLIGHT
+RESUMING=false
+RESUME_OUTPUT=
+declare -A COMPLETED_PHASES=()
 cleanup_runtime_inventory() {
     if [[ -n "${RUNTIME_INVENTORY_FILE}" ]]; then
         rm -f "${RUNTIME_INVENTORY_FILE}"
@@ -210,21 +210,40 @@ trap cleanup_on_exit EXIT
 if [[ "${OFFLINE_PLAN}" != true ]]; then
     command -v kubectl >/dev/null 2>&1 || die "kubectl is required"
     RUNTIME_INVENTORY_FILE="$(mktemp)"
-    registry_arguments=(
-        --config "${CONFIG}"
-        --inventory "${RESOURCE_INVENTORY}"
-    )
-    if [[ "${EXECUTE}" == true ]]; then
-        registry_arguments+=(--apply)
+    if [[ "${EXECUTE}" == true && -e "${STATE_FILE}" ]]; then
+        resume_arguments=(
+            resume --path "${STATE_FILE}" --config "${CONFIG}"
+            --scope "${SCOPE}" --mode "${MODE}" --node-mode "${NODE_MODE}"
+            --inventory-output "${RUNTIME_INVENTORY_FILE}"
+        )
+        for cluster_id in "${SELECTED_CLUSTER_IDS[@]}"; do
+            resume_arguments+=(--cluster-id "${cluster_id}")
+        done
+        RESUME_OUTPUT="$(python3 "${CLEANUP_STATE_TOOL}" "${resume_arguments[@]}")"
+        RESUMING=true
+        while read -r phase; do
+            [[ -n "${phase}" ]] && COMPLETED_PHASES["${phase}"]=true
+        done < <(python3 -c \
+            'import json,sys; print(*json.load(sys.stdin)["completed_phases"], sep="\n")' \
+            <<<"${RESUME_OUTPUT}")
+        CURRENT_PHASE="$(python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["phase"])' <<<"${RESUME_OUTPUT}")"
+        if [[ "${COMPLETED_PHASES[CLEANUP_COMPLETED]:-false}" == true ]]; then
+            STATE_COMPLETE=true
+        fi
+    else
+        # Collecting a cleanup plan must not rewrite registries outside the
+        # selected mutation scope (or resurrect them during a retry).
+        PYTHONDONTWRITEBYTECODE=1 python3 \
+            "${REPO_ROOT}/deploy/control-plane/tools/collect_installed_resource_registry.py" \
+            --config "${CONFIG}" --inventory "${RESOURCE_INVENTORY}" \
+            >"${RUNTIME_INVENTORY_FILE}"
     fi
-    PYTHONDONTWRITEBYTECODE=1 python3 \
-        "${REPO_ROOT}/deploy/control-plane/tools/collect_installed_resource_registry.py" \
-        "${registry_arguments[@]}" >"${RUNTIME_INVENTORY_FILE}"
     EFFECTIVE_INVENTORY="${RUNTIME_INVENTORY_FILE}"
 fi
 
 CONFIG_OUTPUT="$(
-    python3 - "${CONFIG}" "${EFFECTIVE_INVENTORY}" \
+    python3 - "${CONFIG}" "${EFFECTIVE_INVENTORY}" "${SCOPE}" \
         "${SELECTED_CLUSTER_IDS[@]}" <<'PY'
 import json
 import re
@@ -233,7 +252,8 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 inventory_path = Path(sys.argv[2])
-selected = sys.argv[3:]
+scope = sys.argv[3]
+selected = sys.argv[4:]
 try:
     value = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as exc:
@@ -242,18 +262,6 @@ try:
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as exc:
     raise SystemExit(f"invalid cleanup resource inventory: {exc}")
-unregistered = inventory.get("unregistered_resources") or []
-if unregistered:
-    details = ", ".join(
-        f"{item['context']}:{item.get('namespace') or '_cluster'}:"
-        f"{item['kind']}/{item['name']}"
-        for item in unregistered
-    )
-    raise SystemExit(
-        "unregistered live gpu-fault resources require "
-        "classification before cleanup: " + details
-    )
-
 cpu_kubeconfig = value.get("cpu_kubeconfig")
 namespace = value.get("namespace", "gpu-fault-system")
 clusters = value.get("clusters")
@@ -263,8 +271,8 @@ if not isinstance(namespace, str) or not re.fullmatch(
     r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace
 ):
     raise SystemExit("namespace is not a valid DNS label")
-if not isinstance(clusters, list) or not clusters:
-    raise SystemExit("clusters must be a non-empty list")
+if not isinstance(clusters, list):
+    raise SystemExit("clusters must be a list")
 
 by_id = {}
 for item in clusters:
@@ -292,6 +300,27 @@ if selected:
 else:
     cluster_ids = list(by_id)
 
+contexts = {by_id[key] for key in cluster_ids}
+if (
+    len(by_id) > 1
+    and str(inventory.get("generated_by", "")).endswith("collect_installed_resource_registry.py")
+    and not contexts.issubset((inventory.get("gpu") or {}).get("by_context", {}))
+):
+    raise SystemExit("live cleanup inventory lacks per-context GPU resource ownership")
+unregistered = [
+    item for item in inventory.get("unregistered_resources") or []
+    if scope == "all" or item.get("plane") == "gpu" and item.get("context") in contexts
+]
+if unregistered:
+    details = ", ".join(
+        f"{item['context']}:{item.get('namespace') or '_cluster'}:"
+        f"{item['kind']}/{item['name']}"
+        for item in unregistered
+    )
+    raise SystemExit(
+        "unregistered live gpu-fault resources require classification before cleanup: " + details
+    )
+
 print(f"META\t{namespace}\t{cpu_kubeconfig}")
 for cluster_id in cluster_ids:
     print(f"CLUSTER\t{cluster_id}\t{by_id[cluster_id]}")
@@ -314,8 +343,8 @@ for plane in ("cpu", "gpu"):
     if not isinstance(section, dict):
         raise SystemExit(f"cleanup resource inventory lacks {plane}")
     resources = section.get("resources")
-    if not isinstance(resources, list) or not resources:
-        raise SystemExit(f"cleanup resource inventory {plane}.resources is empty")
+    if not isinstance(resources, list):
+        raise SystemExit(f"cleanup resource inventory {plane}.resources is invalid")
     seen = set()
     for resource in resources:
         if not isinstance(resource, dict):
@@ -325,6 +354,7 @@ for plane in ("cpu", "gpu"):
         scope = resource.get("scope")
         phase = resource.get("phase")
         clean = resource.get("clean")
+        guarded_delete = resource.get("guarded_delete", "")
         fields = (kind, name, scope, phase, clean)
         if not all(isinstance(field, str) and field for field in fields):
             raise SystemExit(f"{plane} resource entry has an empty field")
@@ -340,26 +370,53 @@ for plane in ("cpu", "gpu"):
             raise SystemExit(f"invalid cleanup phase: {phase}")
         if clean not in valid_clean:
             raise SystemExit(f"invalid cleanup action: {clean}")
-        identity = (kind, name)
+        if (
+            not isinstance(guarded_delete, str)
+            or guarded_delete not in {"", "workload-rbac"}
+            or guarded_delete and (
+                plane != "gpu" or kind not in {"role", "rolebinding"}
+                or scope != "namespaced" or phase != "support" or clean != "delete"
+            )
+        ):
+            raise SystemExit("invalid guarded cleanup resource")
+        resource_namespace = resource.get("namespace") or namespace
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", resource_namespace):
+            raise SystemExit("resource namespace is invalid")
+        identity = (scope, resource_namespace if scope == "namespaced" else "", kind, name)
         if identity in seen:
             raise SystemExit(f"duplicate {plane} resource: {kind}/{name}")
         seen.add(identity)
-        print(
-            "RESOURCE",
-            plane,
-            kind,
-            name,
-            scope,
-            phase,
-            clean,
-            sep="\t",
-        )
+        resource_contexts = ["cpu"] if plane == "cpu" else [by_id[key] for key in cluster_ids]
+        for resource_context in resource_contexts:
+            per_context = section.get("by_context", {}).get(resource_context)
+            if per_context is not None and not any(
+                (item["scope"], item.get("namespace") or namespace, item["kind"], item["name"])
+                == (scope, resource_namespace, kind, name)
+                for item in per_context["resources"]
+            ):
+                continue
+            if guarded_delete and (
+                not isinstance(per_context, dict)
+                or not isinstance(per_context.get("workload_rbac"), dict)
+            ):
+                raise SystemExit("guarded workload RBAC lacks context-specific proof")
+            if per_context is not None and any(
+                (item["scope"], item.get("namespace") or namespace, item["kind"], item["name"])
+                == (scope, resource_namespace, kind, name)
+                and item.get("guarded_delete", "") != guarded_delete
+                for item in per_context["resources"]
+            ):
+                raise SystemExit("context-specific cleanup guard differs from inventory")
+            print(
+                "RESOURCE", plane, kind, name, scope, phase, clean,
+                resource_namespace, resource_context, guarded_delete, sep="\t",
+            )
     if plane == "cpu":
         preferences = section.get("database_pod_preference")
-        if not isinstance(preferences, list) or not preferences:
-            raise SystemExit("cpu.database_pod_preference is empty")
+        if not isinstance(preferences, list):
+            raise SystemExit("cpu.database_pod_preference is invalid")
         for name in preferences:
-            if ("deployment", name) not in seen:
+            if ("namespaced", namespace, "deployment", name) not in seen:
                 raise SystemExit(
                     f"database pod preference is not a CPU deployment: {name}"
                 )
@@ -406,7 +463,7 @@ GPU_DAEMONSETS=()
 GPU_DELETE_RESOURCES=()
 GPU_NODE_ANNOTATIONS=()
 GPU_NODE_LABELS=()
-while IFS=$'\t' read -r record first second third fourth fifth sixth; do
+while IFS=$'\t' read -r record first second third fourth fifth sixth seventh eighth ninth; do
     case "${record}" in
         META)
             NAMESPACE=${first}
@@ -417,46 +474,47 @@ while IFS=$'\t' read -r record first second third fourth fifth sixth; do
             CLUSTER_CONTEXTS+=("${second}")
             ;;
         RESOURCE)
-            resource_record="${second}"$'\t'"${third}"$'\t'"${fourth}"
+            resource_record="${second}"$'\t'"${third}"$'\t'"${fourth}"$'\t'"${seventh}"$'\t'"${eighth}"
+            resource_target="${third}"$'\t'"${seventh}"$'\t'"${eighth}"
             if [[ "${first}" == cpu ]]; then
                 CPU_RESOURCES+=("${resource_record}")
                 if [[ "${second}" == deployment ]]; then
-                    CPU_DEPLOYMENTS+=("${third}")
+                    CPU_DEPLOYMENTS+=("${resource_target}")
                     case "${fifth}" in
                         ingress)
-                            CPU_INGRESS_DEPLOYMENTS+=("${third}")
+                            CPU_INGRESS_DEPLOYMENTS+=("${resource_target}")
                             ;;
                         consumer)
-                            CPU_CONSUMER_DEPLOYMENTS+=("${third}")
+                            CPU_CONSUMER_DEPLOYMENTS+=("${resource_target}")
                             ;;
                         auxiliary)
-                            CPU_AUX_DEPLOYMENTS+=("${third}")
+                            CPU_AUX_DEPLOYMENTS+=("${resource_target}")
                             ;;
                     esac
                 elif [[ "${second}" == daemonset ]]; then
-                    CPU_DAEMONSETS+=("${third}")
+                    CPU_DAEMONSETS+=("${resource_target}")
                 elif [[ "${second}" == cronjob ]]; then
-                    CPU_CRONJOBS+=("${third}")
+                    CPU_CRONJOBS+=("${resource_target}")
                 fi
-                if [[ "${sixth}" == delete ]]; then
-                    CPU_DELETE_RESOURCES+=("${resource_record}"$'\t'"${fifth}")
+                if [[ "${sixth}" == delete && -z "${ninth}" ]]; then
+                    CPU_DELETE_RESOURCES+=("${resource_record}")
                 elif [[ "${fifth}" == nlb ]]; then
-                    CPU_NLB_SERVICES+=("${third}")
+                    CPU_NLB_SERVICES+=("${resource_target}")
                 fi
             else
                 GPU_RESOURCES+=("${resource_record}")
                 if [[ "${second}" == deployment ]]; then
-                    GPU_DEPLOYMENTS+=("${third}")
+                    GPU_DEPLOYMENTS+=("${resource_target}")
                     if [[ "${fifth}" == producer ]]; then
-                        GPU_PRODUCER_DEPLOYMENTS+=("${third}")
+                        GPU_PRODUCER_DEPLOYMENTS+=("${resource_target}")
                     elif [[ "${fifth}" == executor ]]; then
-                        GPU_EXECUTOR_DEPLOYMENTS+=("${third}")
+                        GPU_EXECUTOR_DEPLOYMENTS+=("${resource_target}")
                     fi
                 elif [[ "${second}" == daemonset ]]; then
-                    GPU_DAEMONSETS+=("${third}")
+                    GPU_DAEMONSETS+=("${resource_target}")
                 fi
-                if [[ "${sixth}" == delete ]]; then
-                    GPU_DELETE_RESOURCES+=("${resource_record}"$'\t'"${fifth}")
+                if [[ "${sixth}" == delete && -z "${ninth}" ]]; then
+                    GPU_DELETE_RESOURCES+=("${resource_record}")
                 fi
             fi
             ;;
@@ -477,8 +535,6 @@ done <<<"${CONFIG_OUTPUT}"
 
 [[ -n "${NAMESPACE}" && -n "${CPU_KUBECONFIG}" ]] ||
     die "regional release config did not produce CPU settings"
-(( ${#CLUSTER_IDS[@]} > 0 )) ||
-    die "regional release config did not select a GPU cluster"
 
 print_plan() {
     printf 'DRY RUN: no Kubernetes object or node service will be changed.\n'
@@ -504,27 +560,32 @@ print_plan() {
     cat <<'EOF'
 Ordered plan:
   1. Verify every Kubernetes context and capture the current replica/resource
-     state in a mode-0600 TSV file.
+     state in a mode-0600 JSON file bound to the cleanup phase order.
   2. Fail closed if Aurora contains an active workflow or open remote command.
+EOF
+    if [[ "${SCOPE}" == all ]]; then
+        printf '     Publish DRAINING for all GPU clusters in one fleet-ACKed registry revision.\n'
+    fi
+    cat <<'EOF'
   3. Stop every GPU producer Deployment and DaemonSet found in the live
      installed-resource registries.
-  4. Restore any quiesced host services, then stop or uninstall all node
-     collectors, Node Agent, certificate timer, DCGM exporter, and GPU
-     persistence service.
 EOF
     if [[ "${SCOPE}" == all ]]; then
         cat <<'EOF'
-  5. Scale registered CPU ingress Deployments to zero, wait for processor and
-     telemetry spool rows to drain, then stop registered consumers.
-  6. Stop each registered GPU executor only after remote commands drain.
+  4. Keep CPU ingress and consumers running until workflow, remote-command,
+     processor and telemetry spool rows are all drained; leftovers block cleanup.
+  5. Stop registered CPU consumers, then scale CPU ingress Deployments to zero.
+  6. Stop GPU Executors, then restore quiesced host services and stop or uninstall
+     node collectors, Node Agent, certificate timer, DCGM exporter and persistence.
   7. Stop ADOT, suspend Aurora credential refresh, and remove the control-plane
      sysctl DaemonSet.
 EOF
     else
         cat <<'EOF'
-  5. Keep the CPU control plane running while selected-cluster processor,
+  4. Keep the CPU control plane running while selected-cluster processor,
      spool, workflow, and remote-command rows drain.
-  6. Stop the selected cluster's registered GPU executor.
+  5. Stop the selected clusters' GPU Executors, then restore quiesced host services
+     and stop or uninstall their node components.
 EOF
     fi
     if [[ "${MODE}" == clean || "${MODE}" == reset ]]; then
@@ -556,24 +617,41 @@ command -v kubectl >/dev/null 2>&1 || die "kubectl is required"
     die "CPU kubeconfig does not exist: ${CPU_KUBECONFIG}"
 
 install -d -m 0700 "$(dirname "${STATE_FILE}")"
-PYTHONDONTWRITEBYTECODE=1 python3 \
-    "${CLEANUP_STATE_TOOL}" init \
-    --path "${STATE_FILE}" \
-    --config "${CONFIG}" \
-    --inventory "${EFFECTIVE_INVENTORY}" \
-    --scope "${SCOPE}" \
-    --mode "${MODE}" \
-    --node-mode "${NODE_MODE}" >/dev/null
+if [[ "${RESUMING}" != true ]]; then
+    init_arguments=(
+        init --path "${STATE_FILE}" --config "${CONFIG}"
+        --inventory "${EFFECTIVE_INVENTORY}" --scope "${SCOPE}"
+        --mode "${MODE}" --node-mode "${NODE_MODE}"
+    )
+    for cluster_id in "${SELECTED_CLUSTER_IDS[@]}"; do
+        init_arguments+=(--cluster-id "${cluster_id}")
+    done
+    python3 "${CLEANUP_STATE_TOOL}" "${init_arguments[@]}" >/dev/null
+fi
 STATE_INITIALIZED=true
 
 cpu_kubectl() {
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" "$@"
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --context cpu \
+        --timeout-seconds "${KUBECTL_COMMAND_TIMEOUT:-${TIMEOUT_SECONDS}}" \
+        command -- "$@"
 }
 
 gpu_kubectl() {
     local context=$1
     shift
-    kubectl --context "${context}" "$@"
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --context "gpu:${context}" \
+        --timeout-seconds "${KUBECTL_COMMAND_TIMEOUT:-${TIMEOUT_SECONDS}}" \
+        command -- "$@"
+}
+
+parse_target() {
+    IFS=$'\t' read -r TARGET_NAME TARGET_NAMESPACE TARGET_CONTEXT <<<"$1"
+}
+
+phase_complete() {
+    [[ "${COMPLETED_PHASES[$1]:-false}" == true ]]
 }
 
 record_state() {
@@ -603,34 +681,39 @@ transition_state() {
         --phase "${phase}" \
         --status "${status}" \
         --message "${message}" >/dev/null
+    if [[ "${status}" == COMPLETED ]]; then
+        COMPLETED_PHASES["${phase}"]=true
+    fi
 }
 
 capture_cpu_state() {
     local name
     local value
     for name in "${CPU_DEPLOYMENTS[@]}"; do
-        if value="$(
-            cpu_kubectl -n "${NAMESPACE}" get deployment "${name}" \
-                -o jsonpath='{.spec.replicas}' 2>/dev/null
-        )"; then
+        parse_target "${name}"
+        value="$(cpu_kubectl -n "${TARGET_NAMESPACE}" get deployment "${TARGET_NAME}" \
+            --ignore-not-found -o jsonpath='{.spec.replicas}')"
+        if [[ -n "${value}" ]]; then
             record_state cpu "${CPU_KUBECONFIG}" deployment \
-                "${name}" "${value:-0}"
+                "${TARGET_NAMESPACE}/${TARGET_NAME}" "${value}"
         fi
     done
     for name in "${CPU_DAEMONSETS[@]}"; do
-        if cpu_kubectl -n "${NAMESPACE}" get daemonset \
-            "${name}" >/dev/null 2>&1; then
+        parse_target "${name}"
+        value="$(cpu_kubectl -n "${TARGET_NAMESPACE}" get daemonset \
+            "${TARGET_NAME}" --ignore-not-found -o name)"
+        if [[ -n "${value}" ]]; then
             record_state cpu "${CPU_KUBECONFIG}" daemonset \
-                "${name}" present
+                "${TARGET_NAMESPACE}/${TARGET_NAME}" present
         fi
     done
     for name in "${CPU_CRONJOBS[@]}"; do
-        if value="$(
-            cpu_kubectl -n "${NAMESPACE}" get cronjob \
-                "${name}" -o jsonpath='{.spec.suspend}' 2>/dev/null
-        )"; then
+        parse_target "${name}"
+        value="$(cpu_kubectl -n "${TARGET_NAMESPACE}" get cronjob \
+            "${TARGET_NAME}" --ignore-not-found -o jsonpath='{.spec.suspend}')"
+        if [[ -n "${value}" ]]; then
             record_state cpu "${CPU_KUBECONFIG}" cronjob \
-                "${name}" "${value:-false}"
+                "${TARGET_NAMESPACE}/${TARGET_NAME}" "${value}"
         fi
     done
 }
@@ -641,33 +724,31 @@ capture_gpu_state() {
     local name
     local value
     for name in "${GPU_DEPLOYMENTS[@]}"; do
-        if value="$(
-            gpu_kubectl "${context}" -n "${NAMESPACE}" \
-                get deployment "${name}" \
-                -o jsonpath='{.spec.replicas}' 2>/dev/null
-        )"; then
+        parse_target "${name}"
+        [[ "${TARGET_CONTEXT}" == "${context}" ]] || continue
+        value="$(gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+            get deployment "${TARGET_NAME}" --ignore-not-found -o jsonpath='{.spec.replicas}')"
+        if [[ -n "${value}" ]]; then
             record_state "gpu:${cluster_id}" "${context}" deployment \
-                "${name}" "${value:-0}"
+                "${TARGET_NAMESPACE}/${TARGET_NAME}" "${value}"
         fi
     done
     for name in "${GPU_DAEMONSETS[@]}"; do
-        if gpu_kubectl "${context}" -n "${NAMESPACE}" \
-            get daemonset "${name}" >/dev/null 2>&1; then
+        parse_target "${name}"
+        [[ "${TARGET_CONTEXT}" == "${context}" ]] || continue
+        value="$(gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+            get daemonset "${TARGET_NAME}" --ignore-not-found -o name)"
+        if [[ -n "${value}" ]]; then
             record_state "gpu:${cluster_id}" "${context}" daemonset \
-                "${name}" present
+                "${TARGET_NAMESPACE}/${TARGET_NAME}" present
         fi
     done
-    value="$(
-        gpu_kubectl "${context}" get nodes --no-headers 2>/dev/null |
-            wc -l | tr -d ' '
-    )"
-    record_state "gpu:${cluster_id}" "${context}" nodes \
-        selected-for-node-cleanup "${value}"
 }
 
 deployment_replicas_cpu() {
-    cpu_kubectl -n "${NAMESPACE}" get deployment "$1" \
-        -o jsonpath='{.spec.replicas}' 2>/dev/null || true
+    parse_target "$1"
+    cpu_kubectl -n "${TARGET_NAMESPACE}" get deployment "${TARGET_NAME}" \
+        --ignore-not-found -o jsonpath='{.spec.replicas}'
 }
 
 find_database_pod() {
@@ -678,52 +759,54 @@ find_database_pod() {
     for name in "${CPU_DATABASE_POD_PREFERENCE[@]}"; do
         pod="$(
             cpu_kubectl -n "${NAMESPACE}" get pod -l "app=${name}" \
-                --field-selector=status.phase=Running -o json 2>/dev/null |
-                python3 -c 'import json,sys
-for i in json.load(sys.stdin).get("items", []):
-    if not i["metadata"].get("deletionTimestamp") and all(c.get("ready") for c in i.get("status", {}).get("containerStatuses", [])):
-        print(i["metadata"]["name"]); break' 2>/dev/null || true
-        )"
+                --field-selector=status.phase=Running -o json |
+                python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+if not isinstance(document, dict) or not isinstance(document.get("items"), list):
+    raise SystemExit("invalid control-plane Pod list")
+for item in document["items"]:
+    metadata = item.get("metadata")
+    status = item.get("status")
+    if not isinstance(metadata, dict) or not metadata.get("name") or not isinstance(status, dict):
+        raise SystemExit("invalid control-plane Pod identity or status")
+    containers = status.get("containerStatuses")
+    if (
+        not metadata.get("deletionTimestamp")
+        and status.get("phase") == "Running"
+        and isinstance(containers, list)
+        and containers
+        and all(isinstance(member, dict) and member.get("ready") is True for member in containers)
+    ):
+        print(metadata["name"])
+        break
+'
+        )" || return
         if [[ -n "${pod}" ]]; then
             printf '%s\n' "${pod}"
             return 0
         fi
     done
-    return 1
+    return 0
 }
 
 wait_for_cpu_rollouts() { # a role still rolling would hand us terminating Pods
     local deployment
+    local replicas
     for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}" "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
-        [[ "$(deployment_replicas_cpu "${deployment}")" =~ ^[1-9] ]] || continue
-        cpu_kubectl -n "${NAMESPACE}" rollout status "deployment/${deployment}" \
+        parse_target "${deployment}"
+        [[ "${TARGET_CONTEXT}" == cpu ]] || die "invalid CPU rollout context"
+        replicas="$(deployment_replicas_cpu "${deployment}")" || return
+        [[ -n "${replicas}" ]] || continue
+        [[ "${replicas}" =~ ^[0-9]+$ ]] ||
+            die "invalid replicas for control-plane deployment ${TARGET_NAME}"
+        ((replicas > 0)) || continue
+        cpu_kubectl -n "${TARGET_NAMESPACE}" rollout status "deployment/${TARGET_NAME}" \
             --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
-            die "control-plane deployment ${deployment} did not settle before cleanup"
+            die "control-plane deployment ${TARGET_NAME} did not settle before cleanup"
     done
-}
-
-reuse_previous_fleet_inventory() {
-    # An earlier run of this reset already stopped the control plane, so no
-    # Pod can export the fleet inventory again -- but that run attached the
-    # export to its state file, which the caller moves aside as
-    # <state>.failed-<stamp>.json before retrying (live uninstall,
-    # 2026-09-12). Reuse the newest such snapshot instead of refusing.
-    local candidate
-    local snapshot
-    [[ -n "${STATE_FILE}" ]] || return 1
-    candidate="$(
-        find "$(dirname "${STATE_FILE}")" -maxdepth 1 -type f \
-            -name "$(basename "${STATE_FILE%.json}").failed-*.json" \
-            -printf '%T@ %p\n' 2>/dev/null |
-            sort -rn | head -n 1 | cut -d' ' -f2- || true
-    )"
-    [[ -n "${candidate}" ]] || return 1
-    snapshot="$(
-        PYTHONDONTWRITEBYTECODE=1 python3 "${CLEANUP_STATE_TOOL}" reuse-fleet \
-            --path "${STATE_FILE}" --from "${candidate}" 2>/dev/null | head -n 1
-    )"
-    [[ "${snapshot}" =~ ^[0-9]+$ ]] || return 1
-    log "control plane already stopped by an earlier run; reused its fleet inventory (${snapshot} agent record(s)) from ${candidate}"
 }
 
 capture_fleet_inventory() {
@@ -731,34 +814,8 @@ capture_fleet_inventory() {
     local missing
     FLEET_INVENTORY_FILE="$(mktemp)"
     cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- \
-        python -c '
-import json
-import os
-import sys
-
-import psycopg
-
-cluster_ids = set(sys.argv[1:])
-with psycopg.connect(
-    os.environ["GPU_FAULT_STORE_URL"],
-    connect_timeout=10,
-) as connection:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT payload
-            FROM gpu_fault_objects
-            WHERE kind='\''agent'\''
-            ORDER BY key
-            """
-        )
-        agents = [
-            row[0]
-            for row in cursor.fetchall()
-            if row[0].get("cluster_id") in cluster_ids
-        ]
-print(json.dumps(agents, sort_keys=True))
-' "${CLUSTER_IDS[@]}" >"${FLEET_INVENTORY_FILE}"
+        python -c "$(cat "${CLEANUP_PROBE}")" fleet "${SCOPE}" \
+        "${CLUSTER_IDS[@]}" >"${FLEET_INVENTORY_FILE}"
     PYTHONDONTWRITEBYTECODE=1 python3 \
         "${CLEANUP_STATE_TOOL}" attach-fleet \
         --path "${STATE_FILE}" \
@@ -791,86 +848,7 @@ database_snapshot() {
     local query_scope=$2
     shift 2
     cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- \
-        env GPU_FAULT_CLEAN_QUERY_SCOPE="${query_scope}" \
-        python -c '
-import os
-import sys
-
-import psycopg
-
-cluster_ids = sys.argv[1:]
-scoped = os.environ["GPU_FAULT_CLEAN_QUERY_SCOPE"] == "gpu"
-if scoped and not cluster_ids:
-    raise SystemExit("scoped cleanup requires cluster ids")
-
-def count(cursor, base, cluster_clause="", cluster_params=()):
-    statement = base
-    params = ()
-    if scoped:
-        statement += cluster_clause
-        params = cluster_params
-    try:
-        cursor.execute(statement, params)
-    except psycopg.errors.UndefinedTable:
-        return 0
-    return int(cursor.fetchone()[0])
-
-with psycopg.connect(
-    os.environ["GPU_FAULT_STORE_URL"],
-    connect_timeout=10,
-) as connection:
-    with connection.cursor() as cursor:
-        active_workflows = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_objects AS workflow
-            JOIN gpu_fault_objects AS incident
-              ON incident.kind = '\''incident'\''
-             AND incident.key = workflow.payload->>'\''incident_id'\''
-            WHERE workflow.kind = '\''workflow'\''
-              AND workflow.payload->>'\''status'\''
-                  IN ('\''PENDING'\'', '\''RUNNING'\'', '\''SAFETY_PENDING'\'')
-            """,
-            " AND incident.payload->>'\''cluster_id'\'' = ANY(%s)",
-            (cluster_ids,),
-        )
-        open_commands = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_objects
-            WHERE kind = '\''remote_command'\''
-              AND payload->>'\''status'\''
-                  IN ('\''PENDING'\'', '\''WAITING'\'', '\''LEASED'\'')
-            """,
-            " AND payload->>'\''cluster_id'\'' = ANY(%s)",
-            (cluster_ids,),
-        )
-        processor_rows = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_processor_queue
-            WHERE status IN ('\''PENDING'\'', '\''LEASED'\'')
-            """,
-            " AND cluster_id = ANY(%s)",
-            (cluster_ids,),
-        )
-        spool_rows = count(
-            cursor,
-            "SELECT count(*) FROM gpu_fault_telemetry_spool WHERE true",
-            " AND cluster_id = ANY(%s)",
-            (cluster_ids,),
-        )
-print(
-    active_workflows,
-    open_commands,
-    processor_rows,
-    spool_rows,
-    sep="\t",
-)
-' "${CLUSTER_IDS[@]}"
+        python -c "$(cat "${CLEANUP_PROBE}")" counts "${query_scope}" "${CLUSTER_IDS[@]}"
 }
 
 assert_no_active_work() {
@@ -884,8 +862,10 @@ assert_no_active_work() {
     IFS=$'\t' read -r active_workflows open_commands \
         processor_rows spool_rows <<<"${snapshot}"
     [[ "${active_workflows}" =~ ^[0-9]+$ &&
-        "${open_commands}" =~ ^[0-9]+$ ]] ||
-        die "could not parse Aurora safety snapshot: ${snapshot}"
+        "${open_commands}" =~ ^[0-9]+$ &&
+        "${processor_rows}" =~ ^[0-9]+$ &&
+        "${spool_rows}" =~ ^[0-9]+$ ]] ||
+        die "could not parse Aurora safety snapshot"
     if ((active_workflows != 0 || open_commands != 0)); then
         die "active workflows=${active_workflows}, open remote commands=${open_commands}; finish or block them before cleanup"
     fi
@@ -901,16 +881,23 @@ wait_for_shared_queues() {
     local processor_rows
     local spool_rows
     while ((SECONDS < deadline)); do
-        snapshot="$(database_snapshot "${pod}" "${SCOPE}")"
+        snapshot="$(KUBECTL_COMMAND_TIMEOUT=$((deadline - SECONDS)) \
+            database_snapshot "${pod}" "${SCOPE}")"
+        ((SECONDS < deadline)) || break
         IFS=$'\t' read -r active_workflows open_commands \
             processor_rows spool_rows <<<"${snapshot}"
+        [[ "${active_workflows}" =~ ^[0-9]+$ &&
+            "${open_commands}" =~ ^[0-9]+$ &&
+            "${processor_rows}" =~ ^[0-9]+$ &&
+            "${spool_rows}" =~ ^[0-9]+$ ]] ||
+            die "could not parse Aurora drain snapshot"
         if [[ "${active_workflows}" == 0 && "${open_commands}" == 0 &&
             "${processor_rows}" == 0 && "${spool_rows}" == 0 ]]; then
             log "Aurora queues are drained"
             return 0
         fi
         log "waiting: workflows=${active_workflows} remote_commands=${open_commands} processor_rows=${processor_rows} spool_rows=${spool_rows}"
-        sleep 5
+        sleep "$((deadline - SECONDS < 5 ? deadline - SECONDS : 5))"
     done
     die "Aurora queues did not drain within ${TIMEOUT_SECONDS}s"
 }
@@ -920,90 +907,36 @@ scale_cpu_deployment_zero() {
     local replicas
     replicas="$(deployment_replicas_cpu "${name}")"
     [[ -n "${replicas}" ]] || return 0
-    cpu_kubectl -n "${NAMESPACE}" scale "deployment/${name}" --replicas=0
-    if ((replicas > 0)); then
-        cpu_kubectl -n "${NAMESPACE}" wait --for=delete pod \
-            -l "app=${name}" --timeout="${TIMEOUT_SECONDS}s"
-    fi
+    parse_target "${name}"
+    [[ "${replicas}" =~ ^[0-9]+$ ]] || die "invalid CPU deployment replica count"
+    cpu_kubectl -n "${TARGET_NAMESPACE}" scale "deployment/${TARGET_NAME}" --replicas=0
+    cpu_kubectl -n "${TARGET_NAMESPACE}" wait --for=delete pod \
+        -l "app=${TARGET_NAME}" --timeout="${TIMEOUT_SECONDS}s"
 }
 
 scale_gpu_deployment_zero() {
     local context=$1
     local name=$2
     local replicas
+    parse_target "${name}"
+    [[ "${TARGET_CONTEXT}" == "${context}" ]] || return 0
     replicas="$(
-        gpu_kubectl "${context}" -n "${NAMESPACE}" \
-            get deployment "${name}" \
-            -o jsonpath='{.spec.replicas}' 2>/dev/null || true
+        gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+            get deployment "${TARGET_NAME}" --ignore-not-found \
+            -o jsonpath='{.spec.replicas}'
     )"
     [[ -n "${replicas}" ]] || return 0
-    gpu_kubectl "${context}" -n "${NAMESPACE}" \
-        scale "deployment/${name}" --replicas=0
-    if ((replicas > 0)); then
-        gpu_kubectl "${context}" -n "${NAMESPACE}" \
-            wait --for=delete pod -l "app=${name}" \
-            --timeout="${TIMEOUT_SECONDS}s"
-    fi
-}
-
-fail_orphaned_remote_commands() {
-    # LEASED commands whose lease has lapsed after every executor was scaled
-    # to zero have no claimant left to complete, renew or acknowledge a
-    # cancellation; the drain would wait on them forever. Reset is a wipe, so
-    # they are failed here with an audit source, and the consumers then fail
-    # their workflow steps in the ordinary way.
-    local pod=$1
-    local failed
-    failed="$(
-        cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- python -c '
-import os
-import sys
-from datetime import datetime, timezone
-
-import psycopg
-
-cluster_ids = sys.argv[1:]
-now = datetime.now(timezone.utc)
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], connect_timeout=10) as connection:
-    with connection.cursor() as cursor:
-        statement = """
-            UPDATE gpu_fault_objects
-               SET payload = payload || jsonb_build_object(
-                       '\''status'\'', '\''FAILED'\'',
-                       '\''status_source'\'', '\''clean-redeploy-orphan'\'',
-                       '\''error'\'', %(reason)s::text,
-                       '\''updated_at'\'', %(now)s::text)
-             WHERE kind = '\''remote_command'\''
-               AND payload->>'\''status'\'' = '\''LEASED'\''
-               AND (payload->>'\''lease_expires_at'\'')::timestamptz < %(now)s::timestamptz
-        """
-        params = {
-            "reason": "orphaned by clean-redeploy: no executor remains to complete the lease",
-            "now": now.isoformat(),
-        }
-        if cluster_ids:
-            statement += " AND payload->>'\''cluster_id'\'' = ANY(%(clusters)s::text[])"
-            params["clusters"] = cluster_ids
-        try:
-            cursor.execute(statement, params)
-        except psycopg.errors.UndefinedTable:
-            print(0)
-            raise SystemExit(0)
-        print(cursor.rowcount)
-    connection.commit()
-' "${CLUSTER_IDS[@]}"
-    )"
-    [[ "${failed}" =~ ^[0-9]+$ ]] ||
-        die "could not fail orphaned remote commands: ${failed}"
-    if ((failed > 0)); then
-        log "failed ${failed} orphaned LEASED remote command(s) with no executor left to complete them"
-    fi
+    [[ "${replicas}" =~ ^[0-9]+$ ]] || die "invalid GPU deployment replica count"
+    gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+        scale "deployment/${TARGET_NAME}" --replicas=0
+    gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+        wait --for=delete pod -l "app=${TARGET_NAME}" \
+        --timeout="${TIMEOUT_SECONDS}s"
 }
 
 run_node_cleanup() {
     local cluster_id=$1
     local context=$2
-    local cleanup_name=gpu-fault-clean-redeploy-node-cleanup
     local host_script
     local host_script_b64
     host_script="$(
@@ -1023,9 +956,31 @@ else
     )"
 fi
 
+for unit in ${units}; do
+    case "${unit}" in
+        *[!A-Za-z0-9_.@-]*)
+            echo "invalid installed unit name" >&2
+            exit 1
+            ;;
+        gpu-fault-*.service | gpu-fault-*.timer) ;;
+        *)
+            echo "invalid installed unit name" >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [ "${mode}" = uninstall ] && [ -x /opt/gpu-fault/uninstall ]; then
     /opt/gpu-fault/uninstall
 else
+    if [ "${mode}" = uninstall ]; then
+        for path in /opt/gpu-fault /etc/gpu-fault /var/lib/gpu-fault; do
+            if [ -e "${path}" ] || [ -L "${path}" ]; then
+                echo "node runtime remains but its uninstaller is unavailable" >&2
+                exit 1
+            fi
+        done
+    fi
     for state_file in /var/lib/gpu-fault/quiesce/quiesce-*.json; do
         [ -e "${state_file}" ] || continue
         restore=/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services
@@ -1038,9 +993,6 @@ else
         fi
         "${restore}" --state-file "${state_file}"
     done
-    if [ "${mode}" = uninstall ]; then
-        echo "/opt/gpu-fault/uninstall was absent; discovered units were stopped only" >&2
-    fi
 fi
 
 for unit in ${units}; do
@@ -1055,13 +1007,24 @@ for unit in ${units}; do
     if [ "${mode}" = uninstall ]; then
         rm -f "/etc/systemd/system/${unit}"
     fi
-    if systemctl is-active --quiet "${unit}"; then
+    active_status=0
+    systemctl is-active --quiet "${unit}" || active_status=$?
+    if [ "${active_status}" -eq 0 ]; then
         echo "unit remains active: ${unit}" >&2
+        exit 1
+    elif [ "${active_status}" -ne 3 ] && [ "${active_status}" -ne 4 ]; then
+        echo "cannot verify stopped unit: ${unit}" >&2
         exit 1
     fi
 done
 if [ "${mode}" = uninstall ]; then
     systemctl daemon-reload
+    for path in /opt/gpu-fault /etc/gpu-fault /var/lib/gpu-fault; do
+        if [ -e "${path}" ] || [ -L "${path}" ]; then
+            echo "node runtime files remain after uninstall" >&2
+            exit 1
+        fi
+    done
 fi
 HOST_SCRIPT
     )"
@@ -1069,86 +1032,72 @@ HOST_SCRIPT
         printf '%s\n' "${host_script}" | base64 | tr -d '\n'
     )"
 
-    log "${cluster_id}: applying node cleanup DaemonSet (${NODE_MODE})"
-    gpu_kubectl "${context}" -n "${NAMESPACE}" delete daemonset \
-        "${cleanup_name}" --ignore-not-found >/dev/null
-    gpu_kubectl "${context}" apply -f - <<YAML
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: ${cleanup_name}
-  namespace: ${NAMESPACE}
-  labels:
-    app: ${cleanup_name}
-spec:
-  selector:
-    matchLabels:
-      app: ${cleanup_name}
-  template:
-    metadata:
-      labels:
-        app: ${cleanup_name}
-    spec:
-      hostPID: true
-      tolerations:
-        - operator: Exists
-      containers:
-        - name: cleanup
-          image: ${NODE_CLEANUP_IMAGE}
-          securityContext:
-            privileged: true
-          command: ["/bin/sh", "-c"]
-          args:
-            - |-
-              printf '%s' '${host_script_b64}' | base64 -d |
-                chroot /host /bin/sh -s -- '${NODE_MODE}'
-              touch /tmp/cleanup-complete
-              sleep 86400
-          readinessProbe:
-            exec:
-              command: ["/bin/sh", "-c", "test -f /tmp/cleanup-complete"]
-            periodSeconds: 2
-          volumeMounts:
-            - name: host
-              mountPath: /host
-              mountPropagation: HostToContainer
-      volumes:
-        - name: host
-          hostPath:
-            path: /
-            type: Directory
-YAML
-    local desired
-    desired="$(
-        gpu_kubectl "${context}" -n "${NAMESPACE}" get daemonset \
-            "${cleanup_name}" \
-            -o jsonpath='{.status.desiredNumberScheduled}'
-    )"
-    [[ "${desired}" =~ ^[1-9][0-9]*$ ]] ||
-        die "${cluster_id}: node cleanup scheduled on no nodes"
-    gpu_kubectl "${context}" -n "${NAMESPACE}" rollout status \
-        "daemonset/${cleanup_name}" --timeout="${TIMEOUT_SECONDS}s"
-    gpu_kubectl "${context}" -n "${NAMESPACE}" delete daemonset \
-        "${cleanup_name}" --wait=true --timeout="${TIMEOUT_SECONDS}s"
+    log "${cluster_id}: running owned node cleanup DaemonSet (${NODE_MODE})"
+    GPU_FAULT_CLEANUP_HOST_SCRIPT_B64="${host_script_b64}" \
+        python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --context "gpu:${context}" --cluster-id "${cluster_id}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" --image "${NODE_CLEANUP_IMAGE}" \
+        --node-mode "${NODE_MODE}" node-cleanup
 }
 
 stop_gpu_producers() {
     local cluster_id=$1
     local context=$2
     local name
+    log "${cluster_id}: stopping GPU producer workloads"
     for name in "${GPU_PRODUCER_DEPLOYMENTS[@]}"; do
         scale_gpu_deployment_zero "${context}" "${name}"
     done
     for name in "${GPU_DAEMONSETS[@]}"; do
-        gpu_kubectl "${context}" -n "${NAMESPACE}" delete daemonset \
-            "${name}" --ignore-not-found
+        parse_target "${name}"
+        [[ "${TARGET_CONTEXT}" == "${context}" ]] || continue
+        gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" delete daemonset \
+            "${TARGET_NAME}" --ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s"
     done
-    # Node components are stopped after the drain and after the executors
-    # (see GPU_EXECUTORS_STOPPED): uninstalling agents while the control
-    # plane could still turn their disappearance into incidents, and the
-    # executors could still claim the resulting commands, left commands
-    # LEASED with no claimant once ingress went down and the drain never
-    # finished (live uninstall, 2026-09-12).
+}
+
+clean_gpu_objects() {
+    local context=$1
+    local entry
+    local kind
+    local name
+    local resource_scope
+    local resource_namespace
+    local resource_context
+    for entry in "${GPU_DELETE_RESOURCES[@]}"; do
+        IFS=$'\t' read -r kind name resource_scope resource_namespace resource_context <<<"${entry}"
+        [[ "${resource_context}" == "${context}" ]] || continue
+        if [[ "${resource_scope}" == cluster ]]; then
+            gpu_kubectl "${context}" delete "${kind}" "${name}" \
+                --ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s"
+        else
+            gpu_kubectl "${context}" -n "${resource_namespace}" \
+                delete "${kind}" "${name}" --ignore-not-found \
+                --wait=true --timeout="${TIMEOUT_SECONDS}s"
+        fi
+    done
+}
+
+clean_cpu_objects() {
+    local entry
+    local kind
+    local name
+    local resource_scope
+    local resource_namespace
+    local resource_context
+    for entry in "${CPU_DELETE_RESOURCES[@]}"; do
+        IFS=$'\t' read -r kind name resource_scope resource_namespace resource_context <<<"${entry}"
+        [[ "${resource_context}" == cpu ]] || die "invalid CPU resource context"
+        if [[ "${resource_scope}" == cluster ]]; then
+            cpu_kubectl delete "${kind}" "${name}" --ignore-not-found \
+                --wait=true --timeout="${TIMEOUT_SECONDS}s"
+        else
+            cpu_kubectl -n "${resource_namespace}" \
+                delete "${kind}" "${name}" --ignore-not-found \
+                --wait=true --timeout="${TIMEOUT_SECONDS}s"
+        fi
+    done
 }
 
 assert_no_quarantined_nodes() {
@@ -1178,87 +1127,36 @@ print(
         die "${cluster_id}: ${count} node(s) retain gpu-fault.io/quarantined; resolve their health and restore scheduling before reset"
 }
 
-release_parked_spares() {
-    # A declared warm spare is the spare label plus a cordon this deployment
-    # placed. Stripping the label alone leaves an anonymous cordon behind, and
-    # the next bootstrap's node barrier refuses the node as operator-cordoned
-    # (live 2026-09-12). Restore the recorded baseline: uncordon unless the
-    # node was already unschedulable before the declaration.
-    local context=$1
-    local node
-    while IFS= read -r node; do
-        [[ -n "${node}" ]] || continue
-        log "releasing warm spare cordon on ${node}"
-        gpu_kubectl "${context}" uncordon "${node}"
-    done < <(
-        gpu_kubectl "${context}" get nodes -l gpu-fault.io/spare=true -o json |
-            python3 -c '
-import json, sys
-for item in json.load(sys.stdin).get("items", []):
-    meta = item.get("metadata", {})
-    before = (meta.get("annotations") or {}).get("gpu-fault.io/previous-unschedulable")
-    if item.get("spec", {}).get("unschedulable") and str(before).lower() != "true":
-        print(meta.get("name", ""))
-'
-    )
-}
-
 clear_node_metadata() {
     local context=$1
-    local annotation
-    local label
-    local arguments=()
-    local nodes=()
-    # `--all` walks every node the context can reach and would strip metadata
-    # from nodes owned by other tenants of a shared cluster, not just this
-    # deployment's. A node is ours iff it still carries one of the gpu-fault.io
-    # labels or annotations this deployment set, so resolve that exact set from
-    # the target cluster's API and touch nothing outside it. This whole step
-    # already runs only under `--mode reset --execute`, which is gated by
-    # `--confirm-reset RESET_GPU_FAULT_INSTALLATION`.
-    mapfile -t nodes < <(
-        gpu_kubectl "${context}" get nodes -o json |
-            GPU_FAULT_METADATA_KEYS="$(
-                printf '%s\n' "${GPU_NODE_ANNOTATIONS[@]}" "${GPU_NODE_LABELS[@]}"
-            )" python3 -c '
-import json
-import os
-import sys
-
-keys = {k for k in os.environ.get("GPU_FAULT_METADATA_KEYS", "").splitlines() if k}
-document = json.load(sys.stdin)
-for item in document.get("items", []):
-    meta = item.get("metadata", {})
-    present = set(meta.get("labels") or {}) | set(meta.get("annotations") or {})
-    if present & keys:
-        print(meta.get("name", ""))
-'
-    )
-    ((${#nodes[@]})) || return 0
-    release_parked_spares "${context}"
-    for annotation in "${GPU_NODE_ANNOTATIONS[@]}"; do
-        arguments+=("${annotation}-")
-    done
-    gpu_kubectl "${context}" annotate nodes "${nodes[@]}" --overwrite \
-        "${arguments[@]}"
-    arguments=()
-    for label in "${GPU_NODE_LABELS[@]}"; do
-        arguments+=("${label}-")
-    done
-    gpu_kubectl "${context}" label nodes "${nodes[@]}" --overwrite \
-        "${arguments[@]}"
+    local cluster_id=$2
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --context "gpu:${context}" --cluster-id "${cluster_id}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" clear-node-metadata
 }
 
 delete_control_plane_nlb_service() {
     local name
     for name in "${CPU_NLB_SERVICES[@]}"; do
-        if cpu_kubectl -n "${NAMESPACE}" get service "${name}" \
-            >/dev/null 2>&1; then
-            cpu_kubectl -n "${NAMESPACE}" delete service \
-                "${name}" --wait=true \
-                --timeout="${TIMEOUT_SECONDS}s"
-        fi
+        parse_target "${name}"
+        cpu_kubectl -n "${TARGET_NAMESPACE}" delete service \
+            "${TARGET_NAME}" --ignore-not-found --wait=true \
+            --timeout="${TIMEOUT_SECONDS}s"
     done
+}
+
+delete_solution_namespaces() {
+    local context
+    for context in "${CLUSTER_CONTEXTS[@]}"; do
+        python3 "${CLEANUP_KUBERNETES_TOOL}" \
+            --config "${CONFIG}" --state-file "${STATE_FILE}" \
+            --context "gpu:${context}" --timeout-seconds "${TIMEOUT_SECONDS}" \
+            delete-namespace
+    done
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" delete-namespace
 }
 
 verify_gpu_stopped() {
@@ -1266,210 +1164,220 @@ verify_gpu_stopped() {
     local name
     local replicas
     for name in "${GPU_DEPLOYMENTS[@]}"; do
+        parse_target "${name}"
+        [[ "${TARGET_CONTEXT}" == "${context}" ]] || continue
         replicas="$(
-            gpu_kubectl "${context}" -n "${NAMESPACE}" \
-                get deployment "${name}" \
-                -o jsonpath='{.spec.replicas}' 2>/dev/null || true
+            gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" \
+                get deployment "${TARGET_NAME}" --ignore-not-found \
+                -o jsonpath='{.spec.replicas}'
         )"
         [[ -z "${replicas}" || "${replicas}" == 0 ]] ||
             die "${context}: deployment ${name} still has ${replicas} replicas"
     done
-    for name in \
-        "${GPU_DAEMONSETS[@]}" \
-        gpu-fault-clean-redeploy-node-cleanup; do
-        if gpu_kubectl "${context}" -n "${NAMESPACE}" get daemonset \
-            "${name}" >/dev/null 2>&1; then
-            die "${context}: daemonset ${name} remains"
+    for name in "${GPU_DAEMONSETS[@]}"; do
+        parse_target "${name}"
+        [[ "${TARGET_CONTEXT}" == "${context}" ]] || continue
+        replicas="$(gpu_kubectl "${context}" -n "${TARGET_NAMESPACE}" get daemonset \
+            "${TARGET_NAME}" --ignore-not-found -o name)"
+        if [[ -n "${replicas}" ]]; then
+            die "${context}: daemonset ${TARGET_NAME} remains"
         fi
     done
+}
+
+run_phase() {
+    local phase=$1
+    shift
+    if phase_complete "${phase}"; then
+        return 0
+    fi
+    transition_state "${phase}" IN_PROGRESS "running ${phase}"
+    "$@"
+    transition_state "${phase}" COMPLETED "completed ${phase}"
+}
+
+require_database_pod() {
+    DATABASE_POD="$(find_database_pod)"
+    [[ -n "${DATABASE_POD}" ]] ||
+        die "no running CPU pod is available for the Aurora safety check"
+}
+
+capture_preflight() {
+    local index
+    if [[ "${SCOPE}" == all ]]; then
+        wait_for_cpu_rollouts
+        capture_cpu_state
+    fi
+    for index in "${!CLUSTER_IDS[@]}"; do
+        capture_gpu_state "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
+    done
+    require_database_pod
+    capture_fleet_inventory "${DATABASE_POD}"
+    assert_no_active_work "${DATABASE_POD}"
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" capture
+    for index in "${!CLUSTER_IDS[@]}"; do
+        python3 "${CLEANUP_KUBERNETES_TOOL}" \
+            --config "${CONFIG}" --state-file "${STATE_FILE}" \
+            --context "gpu:${CLUSTER_CONTEXTS[index]}" \
+            --cluster-id "${CLUSTER_IDS[index]}" \
+            --timeout-seconds "${TIMEOUT_SECONDS}" capture
+    done
+}
+
+stop_all_gpu_producers() {
+    local index
+    for index in "${!CLUSTER_IDS[@]}"; do
+        stop_gpu_producers "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
+    done
+}
+
+drain_registry_clusters() {
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" drain-registry
+}
+
+stop_ingress() {
+    local deployment
+    for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}"; do
+        scale_cpu_deployment_zero "${deployment}"
+    done
+}
+
+drain_queues() {
+    require_database_pod
+    wait_for_shared_queues "${DATABASE_POD}"
+}
+
+stop_node_runtimes() {
+    local index
+    [[ "${NODE_MODE}" != skip ]] || return 0
+    for index in "${!CLUSTER_IDS[@]}"; do
+        if [[ "${SCOPE}" == gpu ]]; then
+            drain_queues
+        fi
+        run_node_cleanup "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
+    done
+}
+
+stop_consumers() {
+    local deployment
+    for deployment in "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
+        scale_cpu_deployment_zero "${deployment}"
+    done
+}
+
+stop_executors() {
+    local context
+    local deployment
+    for context in "${CLUSTER_CONTEXTS[@]}"; do
+        for deployment in "${GPU_EXECUTOR_DEPLOYMENTS[@]}"; do
+            scale_gpu_deployment_zero "${context}" "${deployment}"
+        done
+    done
+}
+
+stop_auxiliaries() {
+    local deployment cronjob daemonset present
+    for deployment in "${CPU_AUX_DEPLOYMENTS[@]}"; do
+        scale_cpu_deployment_zero "${deployment}"
+    done
+    for cronjob in "${CPU_CRONJOBS[@]}"; do
+        parse_target "${cronjob}"
+        present="$(cpu_kubectl -n "${TARGET_NAMESPACE}" get cronjob \
+            "${TARGET_NAME}" --ignore-not-found -o name)"
+        if [[ -n "${present}" ]]; then
+            cpu_kubectl -n "${TARGET_NAMESPACE}" patch cronjob \
+                "${TARGET_NAME}" --type=merge \
+                -p '{"spec":{"suspend":true}}'
+        fi
+    done
+    for daemonset in "${CPU_DAEMONSETS[@]}"; do
+        parse_target "${daemonset}"
+        cpu_kubectl -n "${TARGET_NAMESPACE}" delete daemonset \
+            "${TARGET_NAME}" --ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s"
+    done
+}
+
+delete_application_objects() {
+    local context index
+    for index in "${!CLUSTER_IDS[@]}"; do
+        python3 "${CLEANUP_KUBERNETES_TOOL}" \
+            --config "${CONFIG}" --state-file "${STATE_FILE}" \
+            --context "gpu:${CLUSTER_CONTEXTS[index]}" \
+            --cluster-id "${CLUSTER_IDS[index]}" \
+            --timeout-seconds "${TIMEOUT_SECONDS}" delete-workload-rbac
+    done
+    for context in "${CLUSTER_CONTEXTS[@]}"; do
+        clean_gpu_objects "${context}"
+    done
+    if [[ "${SCOPE}" == all ]]; then
+        clean_cpu_objects
+    fi
+}
+
+reset_namespaces() {
+    local index
+    for index in "${!CLUSTER_IDS[@]}"; do
+        clear_node_metadata "${CLUSTER_CONTEXTS[index]}" "${CLUSTER_IDS[index]}"
+    done
+    delete_control_plane_nlb_service
+    delete_solution_namespaces
 }
 
 log "validating Kubernetes contexts"
 cpu_kubectl get --raw=/readyz >/dev/null
 for index in "${!CLUSTER_IDS[@]}"; do
     gpu_kubectl "${CLUSTER_CONTEXTS[index]}" get --raw=/readyz >/dev/null
+    if [[ "${MODE}" == reset ]]; then
+        assert_no_quarantined_nodes "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
+    fi
 done
-if [[ "${MODE}" == reset ]]; then
-    for index in "${!CLUSTER_IDS[@]}"; do
-        assert_no_quarantined_nodes \
-            "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
-    done
-fi
 
-if [[ "${SCOPE}" == all ]]; then
-    capture_cpu_state
+if phase_complete PREFLIGHT; then
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --timeout-seconds "${TIMEOUT_SECONDS}" verify-targets
 fi
-for index in "${!CLUSTER_IDS[@]}"; do
-    capture_gpu_state "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
-done
-log "captured pre-clean state in ${STATE_FILE}"
-
-if [[ "${SCOPE}" == all ]]; then wait_for_cpu_rollouts; fi
-DATABASE_POD="$(find_database_pod || true)"
-# PRESENT: the Deployments exist (a previous run may have scaled them to
-# zero). RUNNING: at least one still has replicas, so a Pod can exist and
-# work can still be created.
-CPU_RUNTIME_PRESENT=false
-CPU_RUNTIME_RUNNING=false
-for deployment in \
-    "${CPU_INGRESS_DEPLOYMENTS[@]}" \
-    "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
-    replicas="$(deployment_replicas_cpu "${deployment}")"
-    if [[ -n "${replicas}" ]]; then
-        CPU_RUNTIME_PRESENT=true
-        if ((replicas > 0)); then
-            CPU_RUNTIME_RUNNING=true
-        fi
-    fi
-done
-if [[ -n "${DATABASE_POD}" ]]; then
-    capture_fleet_inventory "${DATABASE_POD}"
-elif [[ "${MODE}" == reset ]]; then
-    if [[ "${CPU_RUNTIME_RUNNING}" == true ]] ||
-        ! reuse_previous_fleet_inventory; then
-        die "reset requires a running control-plane pod to export fleet inventory (or an earlier run's ${STATE_FILE%.json}.failed-*.json to reuse)"
-    fi
-fi
-if [[ -n "${DATABASE_POD}" ]]; then
-    if [[ "${MODE}" == reset && "${EXECUTE}" == true ]]; then
-        fail_orphaned_remote_commands "${DATABASE_POD}"
-    fi
-    assert_no_active_work "${DATABASE_POD}"
-elif [[ "${SCOPE}" == gpu || "${CPU_RUNTIME_RUNNING}" == true ]]; then
-    die "no running CPU control-plane pod is available for the Aurora safety check"
+if phase_complete CLEANUP_COMPLETED; then
+    STATE_COMPLETE=true
 else
-    log "CPU runtime is already stopped; nothing can enqueue work, Aurora runtime checks are skipped"
-fi
-transition_state \
-    PREFLIGHT COMPLETED \
-    "contexts, quarantine state, inventory, and active work verified"
-
-transition_state \
-    GPU_DATA_PLANE_SOURCES_STOPPED IN_PROGRESS \
-    "stopping GPU producers"
-for index in "${!CLUSTER_IDS[@]}"; do
-    stop_gpu_producers \
-        "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
-done
-transition_state \
-    GPU_DATA_PLANE_SOURCES_STOPPED COMPLETED \
-    "GPU producers stopped"
-
-if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
-    transition_state \
-        INGRESS_STOPPED IN_PROGRESS \
-        "stopping CPU ingress"
-    for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}"; do
-        scale_cpu_deployment_zero "${deployment}"
-    done
-    transition_state \
-        INGRESS_STOPPED COMPLETED \
-        "CPU ingress stopped"
-    if [[ "${CPU_RUNTIME_RUNNING}" == true ]]; then
-        DATABASE_POD="$(find_database_pod || true)"
-        [[ -n "${DATABASE_POD}" ]] ||
-            die "no worker pod remains to verify the Aurora drain"
-        transition_state \
-            QUEUES_DRAINED IN_PROGRESS \
-            "waiting for processor, spool, workflow, and remote command drain"
-        wait_for_shared_queues "${DATABASE_POD}"
-        transition_state \
-            QUEUES_DRAINED COMPLETED \
-            "processor, spool, workflow, and remote command state drained"
-    else
-        transition_state \
-            QUEUES_DRAINED COMPLETED \
-            "control plane already stopped by an earlier run; nothing can enqueue work"
-    fi
-    transition_state \
-        CONTROL_CONSUMERS_STOPPED IN_PROGRESS \
-        "stopping CPU consumers"
-    for deployment in "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
-        scale_cpu_deployment_zero "${deployment}"
-    done
-    transition_state \
-        CONTROL_CONSUMERS_STOPPED COMPLETED \
-        "CPU consumers stopped"
-elif [[ "${SCOPE}" == gpu ]]; then
-    transition_state \
-        QUEUES_DRAINED IN_PROGRESS \
-        "waiting for selected GPU cluster queues to drain"
-    wait_for_shared_queues "${DATABASE_POD}"
-    transition_state \
-        QUEUES_DRAINED COMPLETED \
-        "selected GPU cluster queues drained"
-fi
-
-transition_state \
-    GPU_EXECUTORS_STOPPED IN_PROGRESS \
-    "stopping GPU executors and node components"
-for context in "${CLUSTER_CONTEXTS[@]}"; do
-    for deployment in "${GPU_EXECUTOR_DEPLOYMENTS[@]}"; do
-        scale_gpu_deployment_zero "${context}" "${deployment}"
-    done
-done
-# No second orphan pass here: the consumers are already stopped, so no pod
-# can reach the store, and nothing dispatches new commands any more.
-if [[ "${NODE_MODE}" != skip ]]; then
-    for index in "${!CLUSTER_IDS[@]}"; do
-        run_node_cleanup "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
-    done
-fi
-transition_state \
-    GPU_EXECUTORS_STOPPED COMPLETED \
-    "GPU executors and node components stopped"
-
-if [[ "${SCOPE}" == all ]]; then
-    transition_state \
-        CPU_AUXILIARIES_STOPPED IN_PROGRESS \
-        "stopping CPU auxiliary components"
-    for deployment in "${CPU_AUX_DEPLOYMENTS[@]}"; do
-        scale_cpu_deployment_zero "${deployment}"
-    done
-    for cronjob in "${CPU_CRONJOBS[@]}"; do
-        if cpu_kubectl -n "${NAMESPACE}" get cronjob \
-            "${cronjob}" >/dev/null 2>&1; then
-            cpu_kubectl -n "${NAMESPACE}" patch cronjob \
-                "${cronjob}" --type=merge \
-                -p '{"spec":{"suspend":true}}'
+    python3 "${CLEANUP_KUBERNETES_TOOL}" \
+        --config "${CONFIG}" --state-file "${STATE_FILE}" \
+        --timeout-seconds 90 cleanup-owned
+    if [[ "${RESUMING}" == true && "${SCOPE}" == all ]] &&
+        phase_complete CLUSTERS_DRAINING &&
+        ! phase_complete CONTROL_CONSUMERS_STOPPED; then
+        # A completed checkpoint does not prove admission or queue state
+        # stayed unchanged while the cleanup process was absent.
+        drain_registry_clusters
+        if phase_complete QUEUES_DRAINED; then
+            drain_queues
         fi
-    done
-    for daemonset in "${CPU_DAEMONSETS[@]}"; do
-        cpu_kubectl -n "${NAMESPACE}" delete daemonset \
-            "${daemonset}" --ignore-not-found
-    done
-    transition_state \
-        CPU_AUXILIARIES_STOPPED COMPLETED \
-        "CPU auxiliary components stopped"
-fi
-
-if [[ "${MODE}" == clean || "${MODE}" == reset ]]; then
-    transition_state \
-        APPLICATION_OBJECTS_DELETED IN_PROGRESS \
-        "deleting registered application objects"
-    for context in "${CLUSTER_CONTEXTS[@]}"; do
-        clean_plane_objects "${context}" GPU_DELETE_RESOURCES
-    done
-    if [[ "${SCOPE}" == all ]]; then
-        clean_plane_objects "" CPU_DELETE_RESOURCES
     fi
-    transition_state \
-        APPLICATION_OBJECTS_DELETED COMPLETED \
-        "registered application objects deleted"
-fi
-
-if [[ "${MODE}" == reset ]]; then
-    for context in "${CLUSTER_CONTEXTS[@]}"; do
-        clear_node_metadata "${context}"
-    done
-    transition_state \
-        NAMESPACES_DELETED IN_PROGRESS \
-        "deleting NLB Service and solution namespaces"
-    delete_control_plane_nlb_service
-    delete_solution_namespaces
-    transition_state \
-        NAMESPACES_DELETED COMPLETED \
-        "NLB Service and solution namespaces deleted"
+    run_phase PREFLIGHT capture_preflight
+    if [[ "${SCOPE}" == all ]]; then
+        run_phase CLUSTERS_DRAINING drain_registry_clusters
+    fi
+    run_phase GPU_DATA_PLANE_SOURCES_STOPPED stop_all_gpu_producers
+    run_phase QUEUES_DRAINED drain_queues
+    if [[ "${SCOPE}" == all ]]; then
+        run_phase CONTROL_CONSUMERS_STOPPED stop_consumers
+        run_phase INGRESS_STOPPED stop_ingress
+    fi
+    run_phase GPU_EXECUTORS_STOPPED stop_executors
+    run_phase NODE_RUNTIMES_STOPPED stop_node_runtimes
+    if [[ "${SCOPE}" == all ]]; then
+        run_phase CPU_AUXILIARIES_STOPPED stop_auxiliaries
+    fi
+    if [[ "${MODE}" == clean || "${MODE}" == reset ]]; then
+        run_phase APPLICATION_OBJECTS_DELETED delete_application_objects
+    fi
+    if [[ "${MODE}" == reset ]]; then
+        run_phase NAMESPACES_DELETED reset_namespaces
+    fi
 fi
 
 for context in "${CLUSTER_CONTEXTS[@]}"; do
@@ -1483,9 +1391,11 @@ if [[ "${SCOPE}" == all ]]; then
     done
 fi
 
-transition_state \
-    CLEANUP_COMPLETED COMPLETED \
-    "Kubernetes and node cleanup completed"
+if [[ "${STATE_COMPLETE}" != true ]]; then
+    transition_state \
+        CLEANUP_COMPLETED COMPLETED \
+        "Kubernetes and node cleanup completed"
+fi
 STATE_COMPLETE=true
 
 log "cleanup completed"

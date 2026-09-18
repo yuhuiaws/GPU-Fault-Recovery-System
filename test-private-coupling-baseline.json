@@ -142,7 +142,6 @@
   "tests/notifications/_notifications_cases_1.py:service._incident_lock": 2,
   "tests/notifications/_notifications_cases_2.py:store._lock": 1,
   "tests/notifications/_notifications_cases_2.py:store._notification_deliveries": 2,
-  "tests/notifications/_notifications_cases_3.py:HyperPodHmaNormalizer._drill_id": 1,
   "tests/notifications/_support.py:store._get_optional": 1,
   "tests/notifications/_support.py:store._notification_deliveries": 1,
   "tests/notifications/test_send_is_idempotent_for_queued_deliveries.py:store._notification_deliveries": 1,

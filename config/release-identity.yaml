@@ -5,6 +5,8 @@ images_lock: config/release-images.lock.json
 manifest_inputs:
   - .dockerignore
   - deploy/image/Dockerfile
+  - deploy/image/Dockerfile.component
+  - deploy/image/Dockerfile.node-dependencies
   - requirements/build.in
   - requirements/build.lock
   - requirements/runtime.lock
@@ -29,14 +31,20 @@ manifest_inputs:
   - deploy/observability/adot-control-plane.yaml
   - deploy/observability/amp-alertmanager.yaml
   - deploy/observability/amp-rules.yaml
+  - deploy/observability/amp-sns-publish-policy.json
 renderer_inputs:
   - deploy/image/Dockerfile
+  - deploy/image/Dockerfile.component
+  - deploy/image/Dockerfile.node-dependencies
   - deploy/control-plane/tools/apply-control-plane-role-split.sh
   - deploy/control-plane/tools/render-control-plane-role-split.sh
   - deploy/control-plane/tools/render_control_plane_role_split.py
   - src/gpu_fault_release/regional_dns.py
   - src/gpu_fault_release/regional_gpu_bootstrap.py
   - src/gpu_fault_release/regional_release_rendering.py
+  - src/gpu_fault_release/regional_release_images.py
+  - src/gpu_fault_release/regional_node_batch.py
+  - src/gpu_fault/node_installer_rendering.py
   - deploy/node/deploy-node-installer-reconciler.sh
   - scripts/build-release-artifacts.py
   - scripts/component_wheels.py
@@ -47,6 +55,8 @@ runtime_image_inputs:
   - pyproject.toml
   - LICENSE
   - deploy/image/Dockerfile
+  - deploy/image/Dockerfile.component
+  - deploy/image/Dockerfile.node-dependencies
   - requirements/build.lock
   - requirements/runtime.lock
   - scripts/build-release-runtime-image.py
@@ -54,20 +64,39 @@ runtime_image_inputs:
   - scripts/component_artifact_cache.py
   - scripts/component_wheels.py
   - scripts/release_image.py
+  - scripts/release_image_set.py
+  - scripts/verify_release_images.py
+  - scripts/node_wheelhouse.py
+  - requirements/node-runtime.lock
+  - requirements/node-tools.lock
 node_template_inputs:
   - deploy/control-plane/regional/cleanup-inventory.json
   - deploy/control-plane/tools/sync_installed_resource_registry.py
   - deploy/dataplane/dcgm-counters.csv
   - deploy/node/*.sh
+  - deploy/node/provision_node_action_keys.py
+  - src/gpu_fault/admin/node_key_custody*.py
+  - src/gpu_fault/admin/node_key_proof.py
+  - deploy/node/runtime_integrity.py
+  - requirements/node-runtime.lock
+  - requirements/node-tools.lock
+  - src/gpu_fault/node_installer_rendering.py
+  - src/gpu_fault/gpu_instance_inventory.py
+  - src/gpu_fault/dcgm_exporter_cadence.py
+  - src/gpu_fault_release/regional_release_images.py
   - deploy/systemd/*.service
   - deploy/systemd/*.timer
 component_inputs:
+  aurora_refresh:
+    - deploy/control-plane/regional/aurora-credential-refresh.yaml
+    - src/gpu_fault_release/regional_release_aurora_refresh.py
   cpu:
     - deploy/control-plane/base/control-plane-deployment.yaml
     - deploy/control-plane/base/role-split-input.kustomization.yaml
     - deploy/control-plane/regional/regional-control-plane-patch.yaml
     - deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
     - deploy/control-plane/tools/apply-control-plane-role-split.sh
+    - deploy/control-plane/tools/apply_control_plane_deployment.py
     - deploy/control-plane/tools/render-control-plane-role-split.sh
     - deploy/control-plane/tools/render_control_plane_role_split.py
   cpu_ingress:
@@ -110,6 +139,13 @@ component_inputs:
     - deploy/control-plane/tools/sync_installed_resource_registry.py
     - deploy/dataplane/node-installer-reconciler.yaml
     - deploy/node/*.sh
+    - deploy/node/runtime_integrity.py
+    - requirements/node-runtime.lock
+    - requirements/node-tools.lock
+    - src/gpu_fault/node_installer_rendering.py
+    - src/gpu_fault_release/regional_release_images.py
+    - src/gpu_fault/gpu_instance_inventory.py
+    - src/gpu_fault/dcgm_exporter_cadence.py
     - deploy/systemd/*.service
     - deploy/systemd/*.timer
   observability:
@@ -122,5 +158,6 @@ component_inputs:
     - deploy/observability/adot-control-plane.yaml
     - deploy/observability/amp-alertmanager.yaml
     - deploy/observability/amp-rules.yaml
+    - deploy/observability/amp-sns-publish-policy.json
   schema:
     - deploy/migrations/*.yaml

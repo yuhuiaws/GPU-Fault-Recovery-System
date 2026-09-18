@@ -30,7 +30,11 @@ class _Cursor:
 
     def execute(self, statement: str, parameters: tuple = ()) -> None:
         self.statements.append(statement)
-        if statement.startswith("SELECT to_regclass"):
+        if "pg_try_advisory_lock" in statement or "pg_advisory_unlock" in statement:
+            self._result = [(True,)]
+        elif statement == "SELECT to_regclass('gpu_fault_control_state_modes')":
+            self._result = [(None,)]
+        elif statement.startswith("SELECT to_regclass"):
             table = parameters[0]
             self._result = [(table if table in self.tables else None,)]
         elif "pg_index" in statement:
@@ -46,8 +50,17 @@ class _Cursor:
 
 
 def _connection(tables: set[str]) -> tuple[SimpleNamespace, _Cursor]:
+    from psycopg.pq import TransactionStatus
+
     cursor = _Cursor(tables)
-    return SimpleNamespace(autocommit=True, cursor=lambda: cursor), cursor
+    return (
+        SimpleNamespace(
+            autocommit=True,
+            info=SimpleNamespace(transaction_status=TransactionStatus.IDLE),
+            cursor=lambda: cursor,
+        ),
+        cursor,
+    )
 
 
 def test_indexes_of_absent_tables_are_left_to_the_ensure_job() -> None:
@@ -57,7 +70,10 @@ def test_indexes_of_absent_tables_are_left_to_the_ensure_job() -> None:
 
     assert report["built"] == []
     assert report["missing_after"] == [], "nothing the ensure Job cannot create"
-    assert sorted(report["awaiting_table"]) == sorted(MODULE.declared_index_names())
+    assert sorted(report["awaiting_table"]) == sorted(
+        MODULE.declared_index_statements()
+    )
+    assert report["deferred_until_schema"] == report["awaiting_table"]
     assert not any("CREATE INDEX" in s for s in cursor.statements), (
         "no index may be built before its table exists"
     )
@@ -73,6 +89,7 @@ def test_indexes_of_existing_tables_are_still_built_online() -> None:
 
     assert name in report["built"]
     assert name not in report["awaiting_table"]
+    assert report["deferred_until_schema"] == report["awaiting_table"]
     assert any(
         s.startswith("CREATE") and "CONCURRENTLY" in s and f" {name} " in s
         for s in cursor.statements

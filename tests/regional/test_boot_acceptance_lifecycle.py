@@ -26,6 +26,37 @@ def _completed(returncode: int, stdout: str = "") -> subprocess.CompletedProcess
     return subprocess.CompletedProcess(["x"], returncode, stdout=stdout, stderr="")
 
 
+@pytest.mark.parametrize("violation", ["none", "early-business", "missing-business"])
+def test_boot016_allows_parallel_foundations_but_orders_business_resources(
+    violation: str,
+) -> None:
+    def deployment(name: str, hour: int) -> dict[str, Any]:
+        return {
+            "metadata": {
+                "name": name,
+                "creationTimestamp": f"2026-09-12T{hour:02d}:00:00Z",
+            }
+        }
+
+    registry = {"metadata": {"creationTimestamp": "2026-09-12T12:00:00Z"}}
+    cpu = [deployment(name, 13) for name in lifecycle.inventory.CPU_RUNTIME_DEPLOYMENTS]
+    cpu.append(deployment("gpu-fault-adot", 10))
+    gpu = [
+        deployment(name, 13)
+        for _manifest, name in lifecycle.inventory.GPU_ROLLOUT_DEPLOYMENTS
+    ]
+    if violation == "early-business":
+        cpu[0]["metadata"]["creationTimestamp"] = "2026-09-12T11:00:00Z"
+    elif violation == "missing-business":
+        gpu.pop()
+
+    assert lifecycle.registry_precedes_business_deployments(
+        registry, cpu, {"disposable": gpu}
+    ) is (violation == "none"), (
+        "early foundations are allowed; missing/early business Deployments are not"
+    )
+
+
 def _arguments(tmp_path: Path, **overrides: Any) -> Namespace:
     values: dict[str, Any] = {
         "bootstrap_state_dir": tmp_path / "state",
@@ -120,6 +151,8 @@ def test_boot016_honours_retain_and_never_uninstalls_a_pass(
         "retained": True,
         "uninstall_ran": False,
         "uninstall_returncode": None,
+        "disposition": "RETAINED",
+        "cleanup_verified": False,
     }
     assert "failure_cleanup" not in retained["checks"]
 
@@ -320,6 +353,8 @@ METADATA = {
     "required-regional-executor-compatibility-digest": EXEC,
     "required-agent-artifact-sha256": NODE_WHEEL,
     "required-agent-compatibility-digest": NODE_DIGEST,
+    "required-agent-config-digest": "4" * 64,
+    "required-node-action-key-version": "2",
 }
 AGENTS = [
     {
@@ -327,6 +362,8 @@ AGENTS = [
         "node_id": "node-1",
         "artifact_sha256": NODE_WHEEL,
         "compatibility_digest": NODE_DIGEST,
+        "config_digest": "4" * 64,
+        "node_action_key_version": 2,
     }
 ]
 
@@ -452,6 +489,97 @@ def test_boot018_builds_the_two_umask_checkouts_concurrently(
 
     assert sorted(started) == ["002", "077"]
     assert not barrier.broken, "both builds reached the barrier before it timed out"
+
+
+def test_boot017_rechecks_the_predecessor_document_verdict(tmp_path: Path) -> None:
+    document = {
+        "case_id": "GF-REGIONAL-BOOT-016",
+        "verdict": "FAIL",
+        "state_dir": str(tmp_path / "state"),
+        "checks": {"status_passed": True},
+    }
+
+    result = lifecycle.boot016_reuse(
+        _predecessor("PASS", tmp_path / "case.json"),
+        expected_state_dir=tmp_path / "state",
+        read_document=lambda _path: document,
+    )
+
+    assert result["reused"] == "NOT_EVALUATED", "a stale PASS wrapper must not win"
+
+
+@pytest.mark.parametrize(("live_differs", "tamper_exit"), [(True, 1), (False, 2)])
+def test_boot018_binds_local_artifacts_and_specific_tamper_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_differs: bool,
+    tamper_exit: int,
+) -> None:
+    manifest = {
+        "release_id": "local",
+        "bundle_sha256": "b" * 64,
+        "components": MANIFEST["components"],
+    }
+
+    def build(mask: str, *, base: Path, case_dir: Path) -> dict[str, Any]:
+        checkout = base / f"repo-{mask}"
+        target = checkout / "src/gpu_fault/app/builtin_metric_contributors.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("value = 1\n", encoding="utf-8")
+        return {"checkout": checkout, "manifest": manifest}
+
+    live_manifest = json.loads(json.dumps(manifest))
+    if live_differs:
+        live_manifest["components"]["control_plane"]["module_digest"] = "9" * 64
+    live_digest = live_manifest["components"]["control_plane"]["module_digest"]
+    monkeypatch.setattr(lifecycle, "build_release_under_umask", build)
+    monkeypatch.setattr(lifecycle, "run", lambda *_a, **_k: _completed(tamper_exit))
+    monkeypatch.setattr(
+        lifecycle,
+        "admin_command",
+        lambda *_a, **_k: _completed(0, json.dumps(_report(live_digest, EXEC))),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_live_release_identity",
+        lambda _state: {
+            "manifest": live_manifest,
+            "metadata": METADATA,
+            "agents": AGENTS,
+            "identity": {"release_id": "live", "cluster_id": "cluster-a"},
+        },
+    )
+
+    result = lifecycle.boot018_body(tmp_path / "state", tmp_path / "case")
+
+    assert result["verdict"] == "FAIL", "independent consistency is insufficient"
+    assert result["checks"]["rebuilt_artifacts_match_live_release"] is (
+        not live_differs
+    ), "the source build must be the release actually deployed"
+    assert result["checks"]["tamper_negative_failed"] is (tamper_exit == 1), (
+        "pytest collection/usage errors do not prove tamper detection"
+    )
+
+
+def test_runtime_identity_requires_config_and_key_pins() -> None:
+    agents = [{**AGENTS[0], "config_digest": "f" * 64, "node_action_key_version": 99}]
+    metadata = {
+        **METADATA,
+        "required-agent-config-digest": "4" * 64,
+        "required-node-action-key-version": "2",
+    }
+
+    result = lifecycle.runtime_identity_matches_release(
+        _report(CPU, EXEC), manifest=MANIFEST, metadata=metadata, agents=agents
+    )
+
+    assert result["passed"] is False, "artifact equality must not hide config/key drift"
+    assert any("config" in reason for reason in result["reasons"]), (
+        "config mismatch must be independently observable"
+    )
+    assert any("key" in reason for reason in result["reasons"]), (
+        "key version mismatch must be independently observable"
+    )
 
 
 def test_runtime_identity_reads_the_checks_status_full_nests_under_health() -> None:

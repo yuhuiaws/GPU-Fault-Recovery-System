@@ -119,6 +119,8 @@ def release_errors(release: dict[str, Any], *, first_id: str) -> list[str]:
     if release.get("cancelled") is not True:
         errors.append("the newly minted command was not cancelled before purge")
     cancelled = release.get("cancelled_command") or {}
+    if cancelled.get("command_id") != minted:
+        errors.append("the cancelled command is not the newly minted sibling")
     if cancelled.get("status") != "FAILED":
         errors.append(
             f"the cancelled command is {cancelled.get('status')!r}, expected FAILED"

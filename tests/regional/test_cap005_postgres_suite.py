@@ -9,7 +9,7 @@ import pytest
 
 from scripts.e2e.regional import run_cap005_postgres_suite as cap005
 
-BASE_URL = "postgresql://user:secret@aurora.example/gpu_fault"
+BASE_URL = "postgresql://localhost:55432/postgres"
 
 
 def test_isolation_needs_the_test_url_to_name_the_generated_database() -> None:
@@ -24,7 +24,7 @@ def test_isolation_needs_the_test_url_to_name_the_generated_database() -> None:
     )
     assert isolated["isolated"] is True
     assert isolated["test_url_database"] == database
-    assert isolated["production_database"] == "gpu_fault"
+    assert isolated["production_database"] == "postgres"
 
 
 def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None):
@@ -39,10 +39,20 @@ def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None)
             raise drop_error
 
     def run_pytest(
-        argv: list[str], *, cwd: Path, env: dict[str, str], junit: Path
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        junit: Path,
+        isolated_postgres_url: str | None = None,
     ) -> int:
         calls.append(f"pytest {argv[0]}")
         assert env["GPU_FAULT_TEST_POSTGRES_URL"] != BASE_URL
+        assert isolated_postgres_url == (
+            env["GPU_FAULT_TEST_POSTGRES_URL"]
+            if argv[1:3] == ["-m", "pytest"]
+            else None
+        ), "the generated database opt-in belongs only to the direct contract child"
         junit.write_text(
             '<testsuite tests="3" failures="1" errors="0" skipped="0"/>',
             encoding="utf-8",
@@ -50,6 +60,7 @@ def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None)
         return 1
 
     monkeypatch.setattr(cap005, "_create_database", create)
+    monkeypatch.setattr(cap005, "validate_server", lambda _url: None)
     monkeypatch.setattr(cap005, "_drop_database", drop)
     monkeypatch.setattr(cap005, "_database_exists", lambda _u, _d: False)
     monkeypatch.setattr(cap005, "_run_pytest", run_pytest)
@@ -82,7 +93,7 @@ def test_a_drop_failure_is_merged_into_the_report(tmp_path: Path, monkeypatch) -
     summary = cap005.run_suite(BASE_URL, tmp_path)
 
     assert summary["status"] == "FAIL"
-    assert "drop database: RuntimeError: still connected" in summary["errors"]
+    assert summary["errors"][-1] == "drop database: RuntimeError"
     assert summary["database_dropped"] is False
     assert "suites" in summary, "the suite counts must survive a failed drop"
 
@@ -106,6 +117,10 @@ def test_main_raises_after_printing_the_summary(
         ({"postgres": None}, "left no JUnit report"),
         (
             {"postgres": {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}},
+            "ran no tests",
+        ),
+        (
+            {"postgres": {"tests": -1, "failures": 0, "errors": 0, "skipped": 0}},
             "ran no tests",
         ),
         (

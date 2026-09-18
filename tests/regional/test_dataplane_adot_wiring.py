@@ -12,8 +12,11 @@ snapshot existed, by re-rendering with the previous ADOT image (pinned here).
 
 from __future__ import annotations
 
+import base64
 import json
 import shutil
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,11 +51,13 @@ class _Runner:
         self.calls.append((list(arguments), kwargs))
         return ""
 
-    def probe(self, arguments: list[str], **_kwargs: Any) -> bool:
+    def probe_output(
+        self, arguments: list[str], **_kwargs: Any
+    ) -> tuple[int, str, str]:
         # No Deployment on the cluster: the skip branch's scale-down probe
         # answers "absent" and nothing is scaled.
         self.probes.append(list(arguments))
-        return False
+        return 0, "", ""
 
 
 def _config(
@@ -248,7 +253,13 @@ def test_an_observability_only_plan_still_visits_the_gpu_clusters() -> None:
 def test_the_mutation_preflight_dry_runs_the_collector_for_the_plan() -> None:
     calls: list[str] = []
     release = SimpleNamespace(
-        config=SimpleNamespace(clusters=(TARGET,), agent_config_digest="c" * 64),
+        config=SimpleNamespace(
+            clusters=(TARGET,),
+            agent_config_digest="c" * 64,
+            namespace="gpu-fault-system",
+        ),
+        _gpu=lambda _target, *arguments: list(arguments),
+        _get_json=lambda _arguments: {"items": []},
         executor_wheel_cm="wheel",
         bundle_cm="bundle",
         node_wheel_sha="a" * 64,
@@ -324,16 +335,37 @@ def test_bootstrap_cleanup_scales_the_collector_down(
 
 
 class _InstallerRunner:
-    """Records the installer invocation and reads the rendered rules file while
-    it still exists (the release removes the temporary directory afterwards)."""
+    """Record monitoring configuration and model deferred expected-rule writes."""
 
     dry_run = False
 
-    def __init__(self) -> None:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
         self.installs: list[tuple[list[str], dict[str, str], str | None]] = []
         self.other: list[list[str]] = []
+        self.expected_rules: str | None = None
+        self.expected_rule_changes: list[tuple[list[str], str | None]] = []
+        self.expected_rule_reads: list[list[str]] = []
+        self.on_configure: Callable[[], None] = lambda: None
 
     def run(self, arguments: list[str], **kwargs: Any) -> str:
+        if arguments[:2] == ["aws", "amp"]:
+            assert arguments[arguments.index("--name") + 1] == (
+                DATAPLANE.DATAPLANE_EXPECTED_RULE_NAMESPACE
+            )
+            verb = arguments[2]
+            if verb == "delete-rule-groups-namespace":
+                self.expected_rules = None
+            else:
+                assert verb in {
+                    "create-rule-groups-namespace",
+                    "put-rule-groups-namespace",
+                }
+                path = arguments[arguments.index("--data") + 1].removeprefix("fileb://")
+                self.expected_rules = Path(path).read_text(encoding="utf-8")
+            self.expected_rule_changes.append((list(arguments), self.expected_rules))
+            self.calls.append("expected-rules")
+            return ""
         if arguments[:2] != ["bash", str(DATAPLANE.AMP_MONITORING_INSTALLER)]:
             self.other.append(list(arguments))
             return ""
@@ -342,10 +374,36 @@ class _InstallerRunner:
             path = Path(arguments[arguments.index("--dataplane-expected-rules") + 1])
             handed = path.read_text(encoding="utf-8")
         self.installs.append((list(arguments), dict(kwargs.get("env") or {}), handed))
+        self.on_configure()
+        self.calls.append("monitoring-configured")
         return ""
 
-    def probe(self, _arguments: list[str], **_kwargs: Any) -> bool:
-        return False
+    def probe_output(
+        self, arguments: list[str], **_kwargs: Any
+    ) -> tuple[int, str, str]:
+        if arguments[:2] == ["aws", "amp"]:
+            assert arguments[2] == "describe-rule-groups-namespace"
+            assert arguments[arguments.index("--name") + 1] == (
+                DATAPLANE.DATAPLANE_EXPECTED_RULE_NAMESPACE
+            )
+            self.expected_rule_reads.append(list(arguments))
+            if self.expected_rules is None:
+                return 254, "", "ResourceNotFoundException"
+            return (
+                0,
+                json.dumps(
+                    {
+                        "ruleGroupsNamespace": {
+                            "status": {"statusCode": "ACTIVE"},
+                            "data": base64.b64encode(
+                                self.expected_rules.encode("utf-8")
+                            ).decode(),
+                        }
+                    }
+                ),
+                "",
+            )
+        return 0, "", ""
 
 
 def _site_target(cluster_id: str, *, role: str | None = ROLE_ARN) -> SimpleNamespace:
@@ -362,13 +420,15 @@ class _SiteRelease(SimpleNamespace):
     the class binds -- and whose every other step only records its name."""
 
     _apply_observability = DATAPLANE.apply_observability
+    _apply_control_plane_observability = DATAPLANE.apply_control_plane_observability
+    _apply_dataplane_expected_rules = DATAPLANE.apply_dataplane_expected_rules
     _target = MODULE.RegionalRelease._target
 
 
 def _site_release(
     calls: list[str], *, clusters: tuple[SimpleNamespace, ...]
 ) -> _SiteRelease:
-    runner = _InstallerRunner()
+    runner = _InstallerRunner(calls)
     recorded = _gpu_recorder(calls)
     # The class method is the real step; the recorder's stand-in must not
     # shadow it as an instance attribute.
@@ -388,9 +448,12 @@ def _site_release(
         _require_cpu_secrets=lambda **_kwargs: None,
         _initialize_registry=lambda: calls.append("registry"),
         _upload_release=lambda *_args, **_kwargs: calls.append("upload"),
+        _prepare_bootstrap_workflows=lambda: calls.append("aurora-refresh"),
         _ensure_schema=lambda: calls.append("schema"),
         _apply_cpu=lambda **_kwargs: calls.append("cpu"),
         _apply_nlb=lambda: calls.append("nlb"),
+        _prepare_nlb=lambda: calls.append("nlb-create"),
+        _wait_nlb=lambda: calls.append("nlb-ready"),
         _validate_release=lambda: calls.append("validate"),
         _update_registry=lambda _target, *, remove: None,
         _upload_config_map=lambda *_args, **_kwargs: None,
@@ -408,6 +471,7 @@ def _site_release(
         },
     )
     release.config = SimpleNamespace(
+        site_name="site-test",
         clusters=clusters,
         namespace="gpu-fault-system",
         aws_region="us-east-1",
@@ -451,7 +515,7 @@ def test_the_observability_step_runs_the_installer_with_the_rendered_rules(
     (arguments, environment, handed), *rest = _installs(release)
     assert rest == [], "the installer ran more than once"
     assert arguments[:2] == ["bash", str(DATAPLANE.AMP_MONITORING_INSTALLER)]
-    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert arguments[2:4] == ["--runtime-only", "--dataplane-expected-rules"], arguments
     assert handed == DATAPLANE.render_dataplane_expected_rules(release)
     assert handed is not None and 'gpu_cluster="gpu-a"' in handed
     expected_environment = {
@@ -462,6 +526,8 @@ def test_the_observability_step_runs_the_installer_with_the_rendered_rules(
         "SNS_TOPIC_NAME": "gpu-fault-alerts",
         "NAMESPACE": "gpu-fault-system",
         "RULE_NAMESPACE": "gpu-fault-control-plane-capacity",
+        "IAM_ROLE_NAME": "gpu-fault-site-test-amp-writer",
+        "SERVICE_ACCOUNT": "gpu-fault-adot",
         "GPU_FAULT_ADOT_IMAGE": release.adot_image,
         "GPU_FAULT_ENABLE_ADOT": "true",
         "GPU_FAULT_ENABLE_AMP": "true",
@@ -478,28 +544,70 @@ def test_the_observability_step_runs_the_installer_with_the_rendered_rules(
 def test_bootstrap_puts_the_expected_rules_once_the_clusters_are_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MEDIUM-1: the admin bootstrap runs the installer bare (it does not know
-    the expected set), and every ``save_state`` records the current
-    observability digest, so a freshly bootstrapped site with a role never got
-    its ``gpu-fault-dataplane-expected`` namespace until an unrelated
-    observability input moved the digest. The engine's bootstrap renders them."""
+    """Configure monitoring independently, then publish the expected set once."""
     calls: list[str] = []
+    gpu_started = threading.Event()
+    monitoring_started = threading.Event()
+
+    def gpu(_release, completed: set[str]) -> None:
+        gpu_started.set()
+        assert monitoring_started.wait(5), "monitoring did not overlap GPU bootstrap"
+        completed.add("gpu-a")
+        calls.append("gpu-clusters")
+
+    def configure() -> None:
+        assert "save:bootstrap-endpoint-ready" in calls
+        monitoring_started.set()
+        assert gpu_started.wait(5), "GPU bootstrap waited for monitoring to finish"
+
     monkeypatch.setattr(MODULE, "ensure_runtime_profile", lambda _r: None)
-    monkeypatch.setattr(
-        MODULE,
-        "bootstrap_gpu_clusters",
-        lambda _release, _completed: calls.append("gpu-clusters"),
-    )
+    monkeypatch.setattr(MODULE, "bootstrap_gpu_clusters", gpu)
     release = _site_release(calls, clusters=(_site_target("gpu-a"),))
+    release.runner.on_configure = configure
 
     MODULE.RegionalRelease.bootstrap(release)
 
     installs = _installs(release)
     assert len(installs) == 1, f"the bootstrap ran the installer {len(installs)}x"
-    arguments, _environment, handed = installs[0]
-    assert arguments[2] == "--dataplane-expected-rules", arguments
-    assert handed is not None and 'gpu_cluster="gpu-a"' in handed
+    arguments, environment, handed = installs[0]
+    assert arguments == [
+        "bash",
+        str(DATAPLANE.AMP_MONITORING_INSTALLER),
+        "--runtime-only",
+    ]
+    assert handed is None, "the parallel installer must leave expected rules alone"
+    assert environment["CPU_KUBECONFIG"] == release.config.cpu_kubeconfig
+    assert environment["NAMESPACE"] == release.config.namespace
+    assert environment["AMP_WORKSPACE_ID"] == release.config.health.amp_workspace_id
+    (publication, rendered), *rest = release.runner.expected_rule_changes
+    assert rest == [], "expected rules were published more than once"
+    assert publication[2] == "create-rule-groups-namespace"
+    assert rendered == DATAPLANE.render_dataplane_expected_rules(release)
+    assert rendered is not None and 'gpu_cluster="gpu-a"' in rendered
+    for command in [publication, *release.runner.expected_rule_reads]:
+        assert command[command.index("--name") + 1] == (
+            DATAPLANE.DATAPLANE_EXPECTED_RULE_NAMESPACE
+        )
+        assert command[command.index("--region") + 1] == release.config.aws_region
+        assert command[command.index("--workspace-id") + 1] == (
+            release.config.health.amp_workspace_id
+        )
+    assert calls.count("registry") == 1
+    assert (
+        calls.index("registry")
+        < calls.index("nlb-create")
+        < calls.index("schema")
+        < calls.index("cpu")
+        < calls.index("nlb-ready")
+        < calls.index("gpu-clusters")
+    ), calls
     assert calls.index("gpu-clusters") < calls.index("validate")
+    assert (
+        max(calls.index("gpu-clusters"), calls.index("monitoring-configured"))
+        < calls.index("expected-rules")
+        < calls.index("validate")
+        < calls.index("save:complete")
+    ), calls
     assert release.runner.other and "apply" in release.runner.other[0], (
         "the prerequisites apply did not run"
     )
@@ -510,15 +618,39 @@ def test_bootstrap_of_a_role_less_site_asks_for_deletion(
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(MODULE, "ensure_runtime_profile", lambda _r: None)
-    monkeypatch.setattr(MODULE, "bootstrap_gpu_clusters", lambda *_a: None)
+    monkeypatch.setattr(
+        MODULE, "bootstrap_gpu_clusters", lambda *_a: calls.append("gpu-clusters")
+    )
     release = _site_release(calls, clusters=(_site_target("gpu-a", role=None),))
+    release.runner.expected_rules = "groups: []\n"
 
     MODULE.RegionalRelease.bootstrap(release)
 
     (arguments, _environment, handed), *rest = _installs(release)
     assert rest == []
-    assert arguments[2:] == ["--no-dataplane-expected-rules"], arguments
+    assert arguments == [
+        "bash",
+        str(DATAPLANE.AMP_MONITORING_INSTALLER),
+        "--runtime-only",
+    ]
     assert handed is None
+    (deletion, rendered), *changes = release.runner.expected_rule_changes
+    assert changes == []
+    assert deletion[2] == "delete-rule-groups-namespace"
+    assert rendered is None and release.runner.expected_rules is None
+    assert deletion[deletion.index("--name") + 1] == (
+        DATAPLANE.DATAPLANE_EXPECTED_RULE_NAMESPACE
+    )
+    assert deletion[deletion.index("--region") + 1] == release.config.aws_region
+    assert deletion[deletion.index("--workspace-id") + 1] == (
+        release.config.health.amp_workspace_id
+    )
+    assert (
+        max(calls.index("gpu-clusters"), calls.index("monitoring-configured"))
+        < calls.index("expected-rules")
+        < calls.index("validate")
+        < calls.index("save:complete")
+    ), calls
 
 
 def test_join_re_renders_the_expected_rules_with_the_joined_cluster(
@@ -537,7 +669,7 @@ def test_join_re_renders_the_expected_rules_with_the_joined_cluster(
 
     (arguments, _environment, handed), *rest = _installs(release)
     assert rest == []
-    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert arguments[2:4] == ["--runtime-only", "--dataplane-expected-rules"], arguments
     assert handed is not None
     assert 'gpu_cluster="gpu-b"' in handed and 'gpu_cluster="gpu-a"' in handed
     assert calls.index("node-runtime") < len(calls), calls
@@ -561,7 +693,7 @@ def test_remove_re_renders_the_expected_rules_without_the_removed_cluster(
 
     (arguments, _environment, handed), *rest = _installs(release)
     assert rest == []
-    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert arguments[2:4] == ["--runtime-only", "--dataplane-expected-rules"], arguments
     assert handed is not None
     assert 'gpu_cluster="gpu-a"' in handed and 'gpu_cluster="gpu-b"' not in handed
     assert "scale" in calls, "the collector was not scaled down"
@@ -579,7 +711,9 @@ def test_remove_of_the_last_expected_cluster_asks_for_deletion(
 
     (arguments, _environment, handed), *rest = _installs(release)
     assert rest == []
-    assert arguments[2:] == ["--no-dataplane-expected-rules"], arguments
+    assert arguments[2:] == ["--runtime-only", "--no-dataplane-expected-rules"], (
+        arguments
+    )
     assert handed is None
 
 
@@ -795,7 +929,8 @@ def test_a_release_with_the_role_applies_the_collector_and_without_it_skips(
     # The skip only probes for a leftover collector to scale down (F10 fix 1,
     # F4); with none present it applies and scales nothing.
     assert skipped.runner.calls == []
-    assert [arguments[-3:] for arguments in skipped.runner.probes] == [
-        ["get", "deployment", DATAPLANE_ADOT_DEPLOYMENT]
-    ]
+    assert [
+        arguments[arguments.index("get") : arguments.index("get") + 3]
+        for arguments in skipped.runner.probes
+    ] == [["get", "deployment", DATAPLANE_ADOT_DEPLOYMENT]]
     assert "gpu-a: data-plane ADOT collector not applied" in capsys.readouterr().err

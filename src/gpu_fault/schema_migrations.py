@@ -142,6 +142,29 @@ def _apply_registry_v3(cursor: MigrationCursor) -> None:
     )
 
 
+def _apply_remote_command_state_v15(cursor: MigrationCursor) -> None:
+    # The idempotent DDL creates empty state tables in legacy mode. Migration
+    # activation and backfill remain explicit operator steps.
+    cursor.execute("SELECT 1")
+
+
+def _apply_workflow_state_v16(cursor: MigrationCursor) -> None:
+    # Workflow activation is independent of remote-command activation.
+    cursor.execute("SELECT 1")
+
+
+def _apply_control_state_conditional_delete_v17(cursor: MigrationCursor) -> None:
+    # The ensure stage installs the current routed delete function without
+    # backfilling rows or changing the operator-selected storage modes.
+    cursor.execute("SELECT 1")
+
+
+def _apply_control_state_legacy_reset_v18(cursor: MigrationCursor) -> None:
+    # Only explicit legacy-to-dual maintenance can reset a stale native copy.
+    # Schema ensure installs the fence without changing modes or copying data.
+    cursor.execute("SELECT 1")
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -263,6 +286,30 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="objects-wakeup-notify-trigger",
         ddl_checksum="b87cc5f1a92677cd3e09e38d3e57659cdad0e0a2db628236778f870485382944",
         apply=_apply_objects_wakeup_trigger_v14,
+    ),
+    SchemaMigration(
+        version=15,
+        name="remote-command-state-table-and-cutover-fences",
+        ddl_checksum="626b7821766314027649f8076d62957a9d2f04252369b03529ca99c0ba2cdfbd",
+        apply=_apply_remote_command_state_v15,
+    ),
+    SchemaMigration(
+        version=16,
+        name="workflow-state-table-and-independent-cutover",
+        ddl_checksum="7faf556dc4611b8788e5019986d1775b357acbdc9c889460cf242b76baba392b",
+        apply=_apply_workflow_state_v16,
+    ),
+    SchemaMigration(
+        version=17,
+        name="control-state-dual-projection-conditional-delete",
+        ddl_checksum="680337fb88edd807fe6e2a0598eaaa91d61faba24a4a136ed7ec0835e0f5f782",
+        apply=_apply_control_state_conditional_delete_v17,
+    ),
+    SchemaMigration(
+        version=18,
+        name="control-state-legacy-copy-reset-without-truncate",
+        ddl_checksum="2d18a5af51bc051d72e525cd1508bb2aa0b9f933eeeceaa232529779443e4a80",
+        apply=_apply_control_state_legacy_reset_v18,
     ),
 )
 

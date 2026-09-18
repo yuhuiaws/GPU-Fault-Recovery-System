@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from math import ceil
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_fleet_rollout import (
-    MAX_UPGRADE_UNAVAILABLE,
     FleetWaveContext,
     NodeRolloutPolicy,
     ensure_rollout_wave_safe,
@@ -33,34 +31,6 @@ FLEET_WAVE_PLANS_STATE_KEY = "fleet_wave_plans"
 JOIN_SINGLE_WAVE_REASON = "no-live-agents"
 
 
-def join_single_wave_policy(node_count: int) -> NodeRolloutPolicy:
-    """Every node in one wave, for a join whose cluster holds no live agent.
-
-    The wave policy exists to bound how much *serving* capacity a wave takes
-    away: the one-node canary, the per-domain spread and the size cap all
-    ration nodes that are doing work for the control plane. In a join the
-    safety gate protects only the nodes that hold a live agent
-    (``live_agent_node_names``), and when there is none -- a fresh join, or a
-    re-join after remove-cluster left only expired records -- there is no
-    capacity to ration: no wave can make the cluster less available than it
-    already is, and N waves are exactly as safe as one, at N times the fixed
-    cost (measured 2026-09-12: ~20s of safety polling and hand-off per wave
-    on top of the install itself).
-
-    ``MAX_UPGRADE_UNAVAILABLE`` still caps the wave: it is the ceiling on how
-    many installer Jobs the Reconciler runs at once, a limit on the installer
-    and the API rather than on availability, and it holds here for the same
-    reason it holds for an upgrade.
-    """
-
-    width = max(1, min(node_count, MAX_UPGRADE_UNAVAILABLE))
-    return NodeRolloutPolicy(
-        max_unavailable=width,
-        first_wave_max_unavailable=width,
-        max_unavailable_per_failure_domain=width,
-    )
-
-
 def record_join_wave_plan(
     release: Any,
     target: ClusterTarget,
@@ -69,29 +39,23 @@ def record_join_wave_plan(
     node_count: int,
     policy: NodeRolloutPolicy,
 ) -> dict[str, Any]:
-    """Say, and keep, why this join (or first bootstrap) rolls no canary wave.
+    """Record the unchanged node budget even when no Agent is serving yet."""
 
-    The narration is for the operator watching the release; the state entry
-    is for whoever reads the rollout record afterwards and wonders why a join
-    installed four nodes at once when an upgrade would have taken two waves.
-    Plans of other releases are dropped: the record explains this release.
-    """
-
-    waves = ceil(node_count / max(1, policy.max_unavailable))
     plan = {
         "release_id": release.release_id,
         "phase": phase,
         "reason": JOIN_SINGLE_WAVE_REASON,
         "node_count": node_count,
-        "waves": waves,
         "max_unavailable": policy.max_unavailable,
         "first_wave_max_unavailable": policy.first_wave_max_unavailable,
+        "max_unavailable_per_failure_domain": (
+            policy.max_unavailable_per_failure_domain
+        ),
     }
     narrate_step(
         "fleet-wave-plan",
         cluster=target.cluster_id,
         phase=phase,
-        waves=waves,
         nodes=node_count,
         max_unavailable=policy.max_unavailable,
         reason=JOIN_SINGLE_WAVE_REASON,
@@ -215,10 +179,17 @@ def _finalize_node_runtime(
         template_config_map=(
             steady_template_config_map or candidate.template_config_map
         ),
+        template_content_sha256=(
+            candidate.template_content_sha256
+            if not steady_template_config_map
+            or steady_template_config_map == candidate.template_config_map
+            else None
+        ),
         allowed_node_names=None,
         max_unavailable=candidate.max_unavailable,
         runtime_image=steady_runtime_image or candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
+        node_dependency_target=candidate.node_dependency_target,
     )
     if final_identity != paused_identity:
         raise ReleaseError(
@@ -257,8 +228,10 @@ def _dry_run_node_runtime(
         bundle_sha256=candidate.bundle_sha256,
         template_sha256=candidate.template_sha256,
         template_config_map=candidate.template_config_map,
+        template_content_sha256=candidate.template_content_sha256,
         runtime_image=candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
+        node_dependency_target=candidate.node_dependency_target,
     )
     release._wait_agents(
         target,
@@ -290,6 +263,7 @@ def _node_runtime_candidate(
     template_config_map: str | None,
     runtime_image: str | None,
     node_installer_image: str | None,
+    template_content_sha256: str | None,
 ) -> tuple[NodeMutationPreflight, NodeRolloutPolicy, dict[str, str]]:
     expected_profile = runtime_profile_version or release.config.runtime_profile_version
     expected_compatibility = (
@@ -338,6 +312,7 @@ def _node_runtime_candidate(
             max_unavailable=policy.max_unavailable,
             runtime_image=runtime_image,
             node_installer_image=node_installer_image,
+            template_content_sha256=template_content_sha256,
         ),
         policy,
         failure_domains,
@@ -361,6 +336,7 @@ def preflight_node_runtime(
     template_config_map: str | None = None,
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
+    template_content_sha256: str | None = None,
 ) -> None:
     candidate, _policy, _failure_domains = _node_runtime_candidate(
         release,
@@ -378,6 +354,7 @@ def preflight_node_runtime(
         template_config_map=template_config_map,
         runtime_image=runtime_image,
         node_installer_image=node_installer_image,
+        template_content_sha256=template_content_sha256,
     )
     ensure_node_candidate_preflight(release, target, candidate)
 
@@ -405,6 +382,7 @@ def roll_node_runtime(
     agent_identity: dict[str, Any] | None = None,
     mutation_started: Callable[[], None] | None = None,
     candidate_preflight_completed: bool = False,
+    template_content_sha256: str | None = None,
 ) -> tuple[str, str]:
     candidate, policy, failure_domains = _node_runtime_candidate(
         release,
@@ -422,6 +400,7 @@ def roll_node_runtime(
         template_config_map=template_config_map,
         runtime_image=runtime_image,
         node_installer_image=node_installer_image,
+        template_content_sha256=template_content_sha256,
     )
     expected_profile = candidate.runtime_profile_version
     expected_compatibility = candidate.node_compatibility_digest
@@ -453,10 +432,8 @@ def roll_node_runtime(
         # "missing" to the probe, so a canary wave could never converge.
         safety_node_names = live_agent_node_names(release, target, node_names)
         if not safety_node_names:
-            # And with nothing to protect there is nothing to ration either:
-            # one wave for the whole fleet, read before the paused Reconciler
-            # is deployed so its concurrency and the fleet record agree.
-            policy = join_single_wave_policy(len(node_names))
+            # No live Agent exempts uninstalled nodes from the lease check,
+            # not from the canary, failure-domain or site installer budgets.
             record_join_wave_plan(
                 release, target, phase=phase, node_count=len(node_names), policy=policy
             )
@@ -474,11 +451,13 @@ def roll_node_runtime(
         bundle_sha256=bundle_sha256,
         template_sha256=template_sha256,
         template_config_map=template_config_map,
+        template_content_sha256=template_content_sha256,
         allowed_node_names=(),
         max_unavailable=policy.max_unavailable,
         sync_registry=False,
         runtime_image=runtime_image,
         node_installer_image=node_installer_image,
+        node_dependency_target=candidate.node_dependency_target,
     )
     legacy_identity = finish_legacy_node_runtime_rollback(
         release,
@@ -499,6 +478,8 @@ def roll_node_runtime(
         steady_template_config_map=steady_template_config_map,
         node_installer_image=node_installer_image,
         max_unavailable=policy.max_unavailable,
+        node_dependency_target=candidate.node_dependency_target,
+        template_content_sha256=template_content_sha256,
     )
     if legacy_identity is not None:
         return legacy_identity
@@ -536,6 +517,7 @@ def roll_node_runtime(
             node_installer_image=node_installer_image,
             allow_legacy_identity=allow_legacy_identity,
             agent_identity=agent_identity,
+            template_content_sha256=template_content_sha256,
         ),
         deployment,
     )

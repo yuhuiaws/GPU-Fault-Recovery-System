@@ -140,6 +140,62 @@ def _resolved_dispatch_scan_limit(configured: int | None) -> int:
     return limit
 
 
+def _release_throttled(
+    service: AdvisoryNotificationService,
+    deliveries: list[NotificationDelivery],
+    *,
+    owner_id: str,
+    retry_seconds: int,
+) -> None:
+    now = datetime.now(timezone.utc)
+    retry_at = now + timedelta(seconds=retry_seconds)
+    for delivery in deliveries:
+        try:
+            service.store.release_notification_delivery(
+                delivery.notification_id,
+                owner_id=owner_id,
+                lease_epoch=delivery.lease_epoch,
+                now=now,
+                retry_at=retry_at,
+            )
+        except Exception:
+            service.delivery_errors_total += 1
+            service.delivery_error_last_seen_timestamp_seconds = now.timestamp()
+            LOGGER.warning(
+                "throttled notification %s could not be released; its lease "
+                "will expire on its own; continuing with the remaining claims",
+                delivery.notification_id,
+                exc_info=True,
+            )
+
+
+def _mark_terminal_failure(
+    service: AdvisoryNotificationService, observed_at: datetime
+) -> None:
+    with service._terminal_failure_lock:
+        service.terminal_failure_last_seen_timestamp_seconds = max(
+            service.terminal_failure_last_seen_timestamp_seconds,
+            observed_at.timestamp(),
+        )
+
+
+def _send_inline_notification(
+    service: AdvisoryNotificationService, notification: AdvisoryNotification
+) -> NotificationResult:
+    try:
+        result = service.notifier.send(notification)
+    except Exception as exc:
+        result = NotificationResult(
+            notification_id=notification.notification_id,
+            status=NotificationStatus.FAILED,
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+    service.store.save_notification_result(result)
+    if result.status is NotificationStatus.FAILED:
+        _mark_terminal_failure(service, datetime.now(timezone.utc))
+    return result
+
+
 def _dispatch_remote_node_action_completion(
     service: AdvisoryNotificationService,
     command: Any,
@@ -405,6 +461,8 @@ class AdvisoryNotificationService:
         # gpu_fault_notification_delivery_error_last_seen_timestamp_seconds.
         self.delivery_errors_total = 0
         self.delivery_error_last_seen_timestamp_seconds = 0.0
+        self.terminal_failure_last_seen_timestamp_seconds = 0.0
+        self._terminal_failure_lock = RLock()
         self.last_cycle_timestamp_seconds = 0.0
         LOGGER.info(
             "notification delivery: %s",
@@ -719,16 +777,7 @@ class AdvisoryNotificationService:
                 return result
             if self.async_delivery:
                 return self._queue_for_delivery(notification)
-            try:
-                result = self.notifier.send(notification)
-            except Exception as exc:
-                result = NotificationResult(
-                    notification_id=notification.notification_id,
-                    status=NotificationStatus.FAILED,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-            self.store.save_notification_result(result)
-            return result
+            return _send_inline_notification(self, notification)
 
     def _queue_for_delivery(
         self, notification: AdvisoryNotification
@@ -858,7 +907,8 @@ class AdvisoryNotificationService:
                 # batch back untouched and let the next poll retry one.
                 remaining = deliveries[index:]
                 throttled = len(remaining)
-                self._release_throttled(
+                _release_throttled(
+                    self,
                     remaining,
                     owner_id=owner_id,
                     retry_seconds=retry_base_seconds,
@@ -1155,23 +1205,8 @@ class AdvisoryNotificationService:
                     )
             raise _BookkeepingFailed(result) from exc
 
-    def _release_throttled(
-        self,
-        deliveries,
-        *,
-        owner_id: str,
-        retry_seconds: int,
-    ) -> None:
-        now = datetime.now(timezone.utc)
-        retry_at = now + timedelta(seconds=retry_seconds)
-        for delivery in deliveries:
-            self.store.release_notification_delivery(
-                delivery.notification_id,
-                owner_id=owner_id,
-                lease_epoch=delivery.lease_epoch,
-                now=now,
-                retry_at=retry_at,
-            )
+        if terminal and result.status is NotificationStatus.FAILED:
+            _mark_terminal_failure(self, now)
 
     def _expire_delivery(
         self,

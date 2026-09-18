@@ -52,6 +52,7 @@ def _activity(**overrides: Any) -> dict[str, Any]:
         "incidents": [
             {
                 "incident_id": "inc-1",
+                "event_id": "snapshot-gpu_inventory_identity_changed",
                 "state": "RECOVERED",
                 "reasons": [
                     f"GPU inventory identity changed between snapshots: removed=['{DROPPED}'] added=[]"
@@ -86,8 +87,10 @@ def _activity(**overrides: Any) -> dict[str, Any]:
         ],
         "markers": [
             {
-                "marker_id": "m-1",
+                "marker_id": "marker-snapshot-gpu_inventory_identity_changed",
                 "incident_id": "inc-1",
+                "scope": {"gpu_uuids": [DROPPED]},
+                "severity": "critical",
                 "retired_at": "2030-01-01T00:00:00+00:00",
                 "retired_reason": "restored",
             }

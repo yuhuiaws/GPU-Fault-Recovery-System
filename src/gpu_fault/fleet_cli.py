@@ -6,8 +6,10 @@ import os
 import shlex
 import subprocess
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote
@@ -46,9 +48,11 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
 
     agents = commands.add_parser("agents")
+    agents.add_argument("--execution-token", required=True)
     agents.add_argument("--cluster-id")
 
     readiness = commands.add_parser("readiness")
+    readiness.add_argument("--execution-token", required=True)
     readiness.add_argument("--cluster-id", required=True)
     readiness.add_argument("--nodes", required=True, type=_nodes)
 
@@ -68,6 +72,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--max-unavailable", type=int, default=1)
 
     deployment = commands.add_parser("deployment")
+    deployment.add_argument("--execution-token", required=True)
     deployment.add_argument("--deployment-id", required=True)
 
     wave = commands.add_parser("next-wave")
@@ -103,9 +108,9 @@ def _request(
     base_url: str,
     path: str,
     *,
-    payload: dict | None = None,
+    payload: dict[str, Any] | None = None,
     token: str | None = None,
-):
+) -> Any:
     headers = {"Accept": "application/json"}
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -144,8 +149,8 @@ def _node_status(
     status: str,
     reason: str | None = None,
     *,
-    requester=_request,
-):
+    requester: Callable[..., dict[str, Any]] = _request,
+) -> dict[str, Any]:
     return requester(
         base_url,
         _deployment_path(deployment_id) + "/nodes/" + quote(node_id, safe=""),
@@ -156,11 +161,14 @@ def _node_status(
 
 def _transport(
     command_template: str,
-    deployment: dict,
+    deployment: dict[str, Any],
     node_id: str,
     *,
-    runner=subprocess.run,
+    timeout_seconds: float,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> tuple[str, str | None]:
+    if timeout_seconds <= 0:
+        return node_id, "transport deadline expired before start"
     values = {
         "node_id": node_id,
         "cluster_id": deployment["cluster_id"],
@@ -188,7 +196,10 @@ def _transport(
             capture_output=True,
             text=True,
             env=environment,
+            timeout=timeout_seconds,
         )
+    except subprocess.TimeoutExpired:
+        return node_id, "transport timed out; remote completion is unknown"
     except OSError as exc:
         return node_id, f"{type(exc).__name__}: {exc}"
     if completed.returncode == 0:
@@ -211,18 +222,19 @@ def run_deployment(
     *,
     poll_interval_seconds: int,
     wave_timeout_seconds: int,
-    requester=_request,
-    runner=subprocess.run,
-    sleep=time.sleep,
-    monotonic=time.monotonic,
-) -> dict:
+    requester: Callable[..., dict[str, Any]] = _request,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
     path = _deployment_path(deployment_id)
     while True:
-        deployment = requester(base_url, path)
+        deployment = requester(base_url, path, token=token)
         if deployment["status"] == "FAILED":
             raise SystemExit("fleet deployment is FAILED")
         if deployment["status"] == "SUCCEEDED":
             break
+        deadline = monotonic() + wave_timeout_seconds
         lease = requester(
             base_url,
             path + "/next-wave",
@@ -237,6 +249,7 @@ def run_deployment(
                         command_template,
                         deployment,
                         node_id,
+                        timeout_seconds=deadline - monotonic(),
                         runner=runner,
                     ),
                     node_ids,
@@ -261,9 +274,8 @@ def run_deployment(
                 )
             )
 
-        deadline = monotonic() + wave_timeout_seconds
         while True:
-            deployment = requester(base_url, path)
+            deployment = requester(base_url, path, token=token)
             by_node = {item["node_id"]: item for item in deployment["nodes"]}
             failed = [
                 node_id
@@ -295,7 +307,7 @@ def run_deployment(
                 raise SystemExit(
                     "timed out waiting for target heartbeat: " + ",".join(waiting)
                 )
-            sleep(poll_interval_seconds)
+            sleep(min(poll_interval_seconds, max(0, deadline - monotonic())))
         if deployment["status"] == "SUCCEEDED":
             break
 
@@ -306,6 +318,7 @@ def run_deployment(
             "cluster_id": deployment["cluster_id"],
             "node_ids": [item["node_id"] for item in deployment["nodes"]],
         },
+        token=token,
     )
     if not readiness["ready"]:
         raise SystemExit(
@@ -320,7 +333,9 @@ def main() -> None:
     base_url = args.control_plane_url
     if args.command == "agents":
         query = "?cluster_id=" + quote(args.cluster_id) if args.cluster_id else ""
-        result = _request(base_url, "/v1/fleet/agents" + query)
+        result = _request(
+            base_url, "/v1/fleet/agents" + query, token=args.execution_token
+        )
     elif args.command == "readiness":
         result = _request(
             base_url,
@@ -329,6 +344,7 @@ def main() -> None:
                 "cluster_id": args.cluster_id,
                 "node_ids": args.nodes,
             },
+            token=args.execution_token,
         )
     elif args.command == "create-deployment":
         result = _request(
@@ -354,6 +370,7 @@ def main() -> None:
         result = _request(
             base_url,
             _deployment_path(args.deployment_id),
+            token=args.execution_token,
         )
     elif args.command == "next-wave":
         result = _request(

@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault.admin import deploy_host_binding, release_child
 from gpu_fault.admin.bootstrap_common import BootstrapResult
 from gpu_fault.admin.site import (
     RegionalSite,
@@ -196,12 +197,12 @@ def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None
     assert rendered.release_config["release"]["upgrade_max_parallel_clusters"] == 1
     assert rendered.environment["GPU_FAULT_RUNTIME_IMAGE"].startswith(
         "registry.example/runtime"
-    )
+    ), "rendered runtime image must use the configured registry"
 
     with materialized_release_config(rendered) as path:
         assert path.stat().st_mode & 0o777 == 0o600
         assert json.loads(path.read_text()) == rendered.release_config
-    assert not path.exists()
+    assert not path.exists(), "materialized release config must be removed on exit"
 
 
 def test_runtime_profile_template_defaults_to_active_source(tmp_path: Path) -> None:
@@ -248,6 +249,7 @@ def test_site_email_notification_contract(tmp_path: Path) -> None:
         "email_recipients": ["ops@example.com", "oncall@example.com"],
         "email_subject_prefix": "[PROD]",
         "channel": "ses",
+        "ses_configuration_set": None,
     }
 
 
@@ -407,13 +409,16 @@ def test_admin_deploy_runs_preflight_before_bootstrap(
         calls.append([str(item) for item in command])
         return subprocess.CompletedProcess(command, 0)
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_cli, "run_driver", fake_run)
     arguments = argparse.Namespace(
         command="deploy", file=path, repo_root=None, show_effective_config=False
     )
 
     assert admin_cli.run(arguments) == 0
     assert [call[1] for call in calls] == ["preflight", "deploy"]
+    assert "--for-deploy" in calls[0], (
+        "the actual administrator deployment did not select plan-aware preflight"
+    )
 
 
 def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) -> None:
@@ -425,7 +430,7 @@ def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) ->
         calls.append([str(item) for item in command])
         return subprocess.CompletedProcess(command, 1)
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_cli, "run_driver", fake_run)
     arguments = argparse.Namespace(
         command="deploy", file=path, repo_root=None, show_effective_config=False
     )
@@ -448,7 +453,7 @@ def test_admin_read_only_commands_map_to_regional_modes(
         calls.append([str(item) for item in arguments])
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_cli, "run_driver", fake_run)
     if command == "status":
         monkeypatch.setattr(admin_cli, "_live_release_state", lambda _site: {})
     arguments = argparse.Namespace(
@@ -486,8 +491,8 @@ def test_status_uses_previous_management_baseline_after_verified_rollback(
 
     monkeypatch.setattr(admin_cli, "materialized_rollback_status_site", materialized)
     monkeypatch.setattr(
-        admin_cli.subprocess,
-        "run",
+        admin_cli,
+        "run_driver",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(arguments, 0),
     )
     arguments = argparse.Namespace(
@@ -531,14 +536,16 @@ def test_status_reports_when_previous_rollback_baseline_is_unlocatable(
         yield site  # pragma: no cover
 
     monkeypatch.setattr(admin_cli, "materialized_rollback_status_site", materialized)
-    seen: list = []
-    monkeypatch.setattr(
-        admin_cli.subprocess,
-        "run",
-        lambda arguments, **_kwargs: (
-            seen.append(arguments) or subprocess.CompletedProcess(arguments, 0)
-        ),
-    )
+    seen: list[list[str]] = []
+    report = {"mode": "status", "healthy": True, "summary": {"PASS": 1}, "checks": []}
+
+    def driver(arguments, **_kwargs):
+        seen.append(list(arguments))
+        config = Path(arguments[arguments.index("--config") + 1])
+        assert json.loads(config.read_text()) == load_site(site).release_config
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(report), "")
+
+    monkeypatch.setattr(admin_cli, "run_driver", driver)
     arguments = argparse.Namespace(
         command="status",
         file=None,
@@ -548,8 +555,12 @@ def test_status_reports_when_previous_rollback_baseline_is_unlocatable(
     )
 
     assert admin_cli.run(arguments) == 0
-    assert seen, "status did not run the engine after the baseline fell back"
-    assert "could not materialise the rolled-back baseline" in capsys.readouterr().err
+    assert [command[1] for command in seen] == ["status"], (
+        "status must run the engine against the recorded site after baseline fallback"
+    )
+    output = capsys.readouterr()
+    assert "could not materialise the rolled-back baseline" in output.err
+    assert json.loads(output.out) == report
 
 
 def test_console_script_is_published() -> None:
@@ -568,7 +579,7 @@ def test_deploy_host_binding_rejects_another_state_before_dispatch(
     canonical = tmp_path / "canonical"
     wrong = tmp_path / "wrong"
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     arguments = argparse.Namespace(
         command="status",
@@ -587,7 +598,7 @@ def test_deploy_host_binding_allows_canonical_state(
 ) -> None:
     canonical = tmp_path / "canonical"
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     arguments = argparse.Namespace(
         command="status",
@@ -613,7 +624,7 @@ def test_admin_main_enforces_binding_before_dispatch(
     arguments = argparse.Namespace(command="status", state_dir=wrong, file=None)
     monkeypatch.setattr(admin_cli, "parser", Parser)
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     monkeypatch.setattr(
         admin_cli,
@@ -756,7 +767,7 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         calls.append(([str(item) for item in arguments], kwargs))
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(release_child, "run_driver", fake_run)
     monkeypatch.setattr(
         admin_cli,
         "join_clusters",

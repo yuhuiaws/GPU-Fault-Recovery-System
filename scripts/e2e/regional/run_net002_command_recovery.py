@@ -3,11 +3,11 @@
 
 One seeded ``FREEZE_EVIDENCE`` command for the synthetic cluster, one probe
 executor Pod whose loopback proxy *holds* every connection while a block
-marker exists. The action runs behind the block, the result post and the
-lease renewals hang at the proxy, the block outlasts the lease, and when it
-lifts the control plane refuses both with 409 (stale lease). The same
-executor then reclaims the command and finishes it from its idempotency
-ledger, so the physical action happened exactly once.
+marker exists. The action runs behind the block, result submission waits
+at its gate, and lease renewals cannot pass the proxy. After the block
+outlasts the lease, the first result must receive its own stale-lease 409
+receipt. The same executor then reclaims the command and finishes it from
+its idempotency ledger, so the physical action happened exactly once.
 
 Plan-only by default; ``--execute`` needs the exact confirmation and a PASS
 from the formal predecessor.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -54,10 +55,13 @@ PRODUCTION_HTTP_TIMEOUT_SECONDS = 15
 POD_DEADLINE_SECONDS = 900
 LIMITATIONS = [
     f"HTTP timeout {HTTP_TIMEOUT_SECONDS}s (production "
-    f"{PRODUCTION_HTTP_TIMEOUT_SECONDS}s) is used to reach the 409 path"
+    f"{PRODUCTION_HTTP_TIMEOUT_SECONDS}s) is used to reach the 409 path",
+    "After the result gate releases, only the probe result caller's thread-local "
+    "HTTP pool is closed to avoid an expired keepalive; TLS verification is unchanged",
 ]
 STALE_LEASE_409 = "rejected request (409)"
 STALE_LEASE_DETAIL = "remote command lease is missing, stale, or changed"
+STALE_LEASE_DETAILS = (STALE_LEASE_DETAIL, "remote command lease is stale")
 
 CaseError = fixture.NetCommandError
 write_json = fixture.write_json
@@ -190,8 +194,11 @@ def _run_net002_case(
     preflight = preflight_metadata(attempt, maintenance_window_end)
     write_json(case_dir / "preflight.json", preflight)
     fixture.preflight_residuals(probe, case_dir)
+    state["registry_started"] = True
     fixture.register_synthetic_cluster(case_dir, run_id)
-    ready = fixture.create_probe_pod(probe, case_dir)
+    state["probe_started"] = True
+    ready = fixture.create_probe_pod(probe, case_dir, run_id=run_id)
+    state["seed"] = fixture.seeded.seed_identity(run_id)
     seed = fixture.seed_command(
         run_id, owner=OWNER, operation=OPERATION, node_ids=NODE_IDS
     )
@@ -222,6 +229,7 @@ def _run_net002_case(
         time.sleep(min(1.0, BLOCK_SECONDS - elapsed))
     expired = fixture.command_snapshot(str(seed["command_id"]))
     write_json(case_dir / "expired-command.json", expired)
+    unblock_requested_at = datetime.now(timezone.utc)
     fixture.remove(probe, "/state/block")
     unblocked_at = datetime.now(timezone.utc)
     blocked_seconds = time.monotonic() - blocked_started
@@ -230,12 +238,21 @@ def _run_net002_case(
         probe, "/state/result-submit-released.json"
     )
     write_json(case_dir / "result-submit-released.json", result_submit_released)
+    receipt_path = "/state/first-result-submission.json"
+    fixture.wait_file(probe, receipt_path, HTTP_TIMEOUT_SECONDS + 10)
+    first_result_submission = fixture.read_state(probe, receipt_path)
+    write_json(case_dir / "first-result-submission.json", first_result_submission)
     final = fixture.wait_command(str(seed["command_id"]), "SUCCEEDED", 180)
     write_json(case_dir / "final-command.json", final)
     executor_state = wait_reclaimed_state(probe, 30)
     write_json(case_dir / "executor-state.json", executor_state)
     ledger = fixture.read_state(probe, "/state/ledger.json")
     write_json(case_dir / "ledger.json", ledger)
+    first_result_submission_after_reclaim = fixture.read_state(probe, receipt_path)
+    write_json(
+        case_dir / "first-result-submission-after-reclaim.json",
+        first_result_submission_after_reclaim,
+    )
     logs = fixture.pod_logs(probe)
     (case_dir / "executor.log").write_text(logs, encoding="utf-8")
     (case_dir / "executor.log").chmod(0o600)
@@ -249,6 +266,12 @@ def _run_net002_case(
         logs,
         blocked_seconds,
         unblocked_at,
+        expected_command_id=str(seed["command_id"]),
+        unblock_requested_at=unblock_requested_at,
+        result_submit_waiting=result_submit_waiting,
+        result_submit_released=result_submit_released,
+        first_result_submission=first_result_submission,
+        first_result_submission_after_reclaim=first_result_submission_after_reclaim,
     )
     phase = fixture.pod_phase(probe)
     if phase != "Running":
@@ -263,6 +286,7 @@ def _run_net002_case(
         "http_timeout_seconds": ready.get("http_timeout_seconds"),
         "network_interruption": {
             "blocked_at": blocked_at.isoformat(),
+            "unblock_requested_at": unblock_requested_at.isoformat(),
             "unblocked_at": unblocked_at.isoformat(),
             "blocked_seconds": round(blocked_seconds, 3),
             "intended_block_seconds": BLOCK_SECONDS,
@@ -273,6 +297,8 @@ def _run_net002_case(
         "command": final,
         "result_submit_waiting": result_submit_waiting,
         "result_submit_released": result_submit_released,
+        "first_result_submission": first_result_submission,
+        "first_result_submission_after_reclaim": first_result_submission_after_reclaim,
         "action_gate_observed": action_gate_observed,
         "executor_state": executor_state,
         "ledger": ledger,
@@ -290,6 +316,13 @@ def net002_errors(
     logs: str,
     blocked_seconds: float,
     unblocked_at: datetime,
+    *,
+    expected_command_id: str,
+    unblock_requested_at: datetime,
+    result_submit_waiting: dict[str, Any],
+    result_submit_released: dict[str, Any],
+    first_result_submission: dict[str, Any],
+    first_result_submission_after_reclaim: dict[str, Any],
 ) -> list[str]:
     errors: list[str] = []
     if ledger.get("physical_count") != 1:
@@ -314,6 +347,10 @@ def net002_errors(
         errors.append("probe executor lease length is not the approved value")
     if ready.get("result_submission_gate") is not True:
         errors.append("result submission gate is not configured")
+    if ready.get("first_result_submission_receipt") is not True:
+        errors.append("first result submission receipt is not configured")
+    if ready.get("result_gate_closes_caller_transport_pool") is not True:
+        errors.append("result gate caller transport reset is not configured")
     if ready.get("action_requires_network_block") is not True:
         errors.append("simulated action is not ordered after network injection")
     # The HTTP timeout is recorded (it is why the 409 path is reachable at
@@ -338,10 +375,89 @@ def net002_errors(
         errors.append("command did not remain leased throughout the interruption")
     if expired.get("lease_expires_at") != leased.get("lease_expires_at"):
         errors.append("command lease changed during the interruption")
-    if STALE_LEASE_409 not in logs or STALE_LEASE_DETAIL not in logs:
+    errors.extend(
+        first_result_errors(
+            expected_command_id,
+            unblock_requested_at,
+            result_submit_waiting,
+            result_submit_released,
+            first_result_submission,
+            first_result_submission_after_reclaim,
+        )
+    )
+    if not expected_command_id or any(
+        command.get("command_id") != expected_command_id
+        for command in (leased, expired, final)
+    ):
+        errors.append("command snapshots do not match the intended command")
+    # Logs remain supplementary; neither renewal failures nor these counters
+    # can replace the command-bound, first-result receipt above.
+    if STALE_LEASE_409 not in logs or not any(
+        detail in logs for detail in STALE_LEASE_DETAILS
+    ):
         errors.append("executor log has no stale-lease HTTP 409")
     if (final.get("result_details") or {}).get("cached") is not True:
         errors.append("reclaimed command did not use the idempotency ledger")
+    return errors
+
+
+def first_result_errors(
+    command_id: str,
+    unblock_requested_at: datetime,
+    waiting: dict[str, Any],
+    released: dict[str, Any],
+    receipt: dict[str, Any],
+    after_reclaim: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    if not receipt:
+        return ["first result submission receipt is missing"]
+    if not command_id or any(
+        item.get("command_id") != command_id for item in (waiting, released, receipt)
+    ):
+        errors.append("first result submission does not match the intended command")
+    if (
+        type(receipt.get("submission_index")) is not int
+        or receipt["submission_index"] != 1
+    ):
+        errors.append("result submission receipt is not the first attempt")
+    if (
+        type(receipt.get("status_code")) is not int
+        or receipt["status_code"] != 409
+        or receipt.get("stale_lease_reason") not in STALE_LEASE_DETAILS
+    ):
+        errors.append("first result submission has no stale-lease HTTP 409 receipt")
+    if receipt.get("caller_transport_pool_closed") is not True:
+        errors.append("first result did not close the gated caller transport pool")
+    if receipt != after_reclaim:
+        errors.append("first result submission receipt changed after reclaim")
+
+    raw_times = [
+        waiting.get("observed_at_epoch"),
+        released.get("observed_at_epoch"),
+        receipt.get("gate_released_at_epoch"),
+        receipt.get("submitted_at_epoch"),
+        receipt.get("observed_at_epoch"),
+    ]
+    times: list[float] = []
+    for value in raw_times:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            errors.append(
+                "first result submission receipt has missing or invalid timestamps"
+            )
+            return errors
+        times.append(value)
+    waiting_at, released_at, gate_at, submitted_at, observed_at = times
+    if not (
+        waiting_at <= released_at == gate_at <= submitted_at <= observed_at
+        and released_at >= unblock_requested_at.timestamp()
+    ):
+        errors.append("first result submission was not recorded after unblock")
     return errors
 
 
@@ -367,7 +483,7 @@ def run_case(
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        fixture.cleanup(probe, case_dir, run_id, result, state["seed"])
+        fixture.cleanup(probe, case_dir, run_id, result, state["seed"], state=state)
     result["predecessor"] = predecessor
     try:
         result.update(fixture.evidence_identity(cluster_id))
@@ -397,7 +513,7 @@ def plan_details(predecessor: dict[str, Any]) -> dict[str, Any]:
         "pod_active_deadline_seconds": POD_DEADLINE_SECONDS,
         "mutations": [
             "temporary synthetic registry entry",
-            "controlled CPU registry rollouts",
+            "converged CPU registry revision publication without Deployment rollout",
             "temporary GPU probe Pod and ConfigMap",
         ],
         "hard_stop": (

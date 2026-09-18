@@ -24,6 +24,8 @@ class Runner:
     def run(self, args, **_kwargs):
         self.runs.append(list(args))
         if "get" in args and "pod" in args:
+            if self.installed is not True:
+                return ingress_pod_list_json("")
             return ingress_pod_list_json("cpu-pod") if "json" in args else "cpu-pod"
         return self.result
 
@@ -290,41 +292,32 @@ def test_the_probe_and_the_product_agree_on_what_makes_a_settled_incident_record
     )
 
 
-def test_workflow_safety_passes_on_a_first_bootstrap_without_a_control_plane() -> None:
-    # The first regional preflight runs before gpu-fault-api-ha exists, so the
-    # in-Pod probe cannot run; with no control plane nothing destructive can be
-    # active, and the check must not fail the bootstrap.
+def test_workflow_safety_needs_store_proof_when_no_control_plane_exists() -> None:
     target = release("unused", installed=False)
 
-    snapshot = SAFETY.workflow_safety_snapshot(target)
-
-    assert snapshot["blocker_count"] == 0
-    assert snapshot["control_plane"] == "not installed"
-    assert target.runner.runs == []
+    with pytest.raises(SAFETY.ReleaseError, match="no running CPU ingress Pod"):
+        SAFETY.workflow_safety_snapshot(target)
+    assert all("exec" not in command for command in target.runner.runs), (
+        "there is no Pod to carry an evidence read"
+    )
 
 
 def test_workflow_safety_still_fails_when_the_deployment_is_unreadable() -> None:
     target = release("unused")
-    target.runner.probe_output = lambda *_args, **_kwargs: (
-        1,
-        "",
-        "Unable to connect to the server: dial tcp: i/o timeout",
+    target.runner.run = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(SAFETY.ReleaseError("CPU ingress Pod read failed"))
     )
 
-    with pytest.raises(SAFETY.ReleaseError, match="CPU ingress Deployment"):
+    with pytest.raises(SAFETY.ReleaseError, match="CPU ingress Pod read failed"):
         SAFETY.workflow_safety_snapshot(target)
     assert target.runner.runs == []
 
 
-def test_workflow_safety_passes_over_a_control_plane_a_cleanup_scaled_to_zero() -> None:
-    """Live 2026-09-13: a failed bootstrap's cleanup leaves the Deployments in
-    place at zero replicas; the retry's preflight must not ask a Pod that cannot
-    exist. Scaled to zero is "nothing running", like not installed."""
-
+def test_scaled_down_control_plane_does_not_prove_no_durable_workflows() -> None:
     target = release("unused", installed="scaled-to-zero")
 
-    snapshot = SAFETY.workflow_safety_snapshot(target)
-
-    assert snapshot["blocker_count"] == 0
-    assert snapshot["control_plane"] == "not installed"
-    assert target.runner.runs == []
+    with pytest.raises(SAFETY.ReleaseError, match="no running CPU ingress Pod"):
+        SAFETY.workflow_safety_snapshot(target)
+    assert all("exec" not in command for command in target.runner.runs), (
+        "scaled-down Pods cannot prove durable workflows absent"
+    )

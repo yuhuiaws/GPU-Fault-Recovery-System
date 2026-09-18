@@ -27,6 +27,11 @@ from scripts.e2e.regional.probes import preempt012_node_probe as probe
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTEXT_ENVIRONMENT = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "AWS_CONFIG_FILE": "/dev/null",
+    "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+    "AWS_EC2_METADATA_DISABLED": "true",
+    "KUBECONFIG": "/dev/null",
     "GPU_FAULT_EXECUTOR_MODE": "active",
     "GPU_FAULT_ALLOW_SINGLE_CLUSTER": "true",
     "GPU_FAULT_ALLOWED_OPERATIONS": "FREEZE_EVIDENCE",

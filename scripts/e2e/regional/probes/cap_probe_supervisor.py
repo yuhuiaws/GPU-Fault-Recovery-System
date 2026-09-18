@@ -11,9 +11,6 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-import psycopg
-from psycopg import sql
-
 from gpu_fault.store import PostgresStore
 
 
@@ -35,6 +32,9 @@ def database_url(base_url: str, database: str) -> str:
 
 
 def drop_database(base_url: str, database: str) -> None:
+    import psycopg
+    from psycopg import sql
+
     with psycopg.connect(base_url, autocommit=True) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -56,6 +56,9 @@ def stop(_signum: int, _frame: object) -> None:
 
 
 def main() -> int:
+    import psycopg
+    from psycopg import sql
+
     base_url = os.environ["GPU_FAULT_BASE_STORE_URL"]
     database = os.environ["CAP_DATABASE_NAME"]
     test_url = database_url(base_url, database)

@@ -43,7 +43,6 @@ import argparse
 import json
 import os
 import secrets
-import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -60,16 +59,32 @@ from gpu_fault.admin.bootstrap_common import (
     write_secret,
 )
 from gpu_fault.admin.cluster_removal import resolve_cluster_id
-from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.execution import run_command
+from gpu_fault.admin.membership_lock import (
+    administrator_operation_lock,
+    reload_site_for_mutation,
+)
 from gpu_fault.admin.operator_identity import resolve_operator_identity
 from gpu_fault.admin.release_state import live_release_state
+from gpu_fault.admin.release_engine import build_release as build_release
+from gpu_fault.admin.rotate_token_acceptance import (
+    CPU_INGRESS_LABEL as CPU_INGRESS_LABEL,
+    RETIRING_TOKEN_LOG_FRAGMENT as RETIRING_TOKEN_LOG_FRAGMENT,
+    collect_retiring_token_authentications,
+    wait_for_quiet_token_authentications,
+)
+from gpu_fault.admin.rotate_token_policy import (
+    MAX_WINDOW_MINUTES,
+    MIN_WINDOW_MINUTES,
+    require_rotation_policy,
+    rotation_policy,
+)
 from gpu_fault.admin.site import (
     RenderedSite,
     effective_environment,
-    materialized_release_config,
 )
 from gpu_fault.fleet_deployment import FleetDeploymentRequest, deployment_waves
-from gpu_fault.regional import MAX_TOKEN_ROTATION_WINDOW, cluster_token_sha256
+from gpu_fault.regional import cluster_token_sha256
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_admin_commands import (
     BOOTSTRAP_PHASES,
@@ -80,7 +95,6 @@ from gpu_fault_release.regional_gpu_bootstrap import ensure_connection_secret
 from gpu_fault_release.regional_release_agent_convergence import wait_agents
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
-    ReleaseConfig,
     ReleaseError,
 )
 from gpu_fault_release.regional_release_fleet_rollout import (
@@ -110,15 +124,11 @@ STATE_SCHEMA_VERSION = 1
 STATE_ROOT = "rotate-token"
 PENDING_TOKEN_FILE = "pending.token"
 DEFAULT_WINDOW_MINUTES = 120
-MIN_WINDOW_MINUTES = 10
-MAX_WINDOW_MINUTES = int(MAX_TOKEN_ROTATION_WINDOW.total_seconds() // 60)
 DEFAULT_QUIET_SECONDS = 180
 DEFAULT_ACCEPTANCE_TIMEOUT_SECONDS = 1200
 DEPLOYMENT_ROLLOUT_TIMEOUT_SECONDS = 600
 REGISTRY_PUBLISH_TIMEOUT_SECONDS = 300
 REGISTRY_REVISIONS_PATH = "/v1/regional/registry/revisions"
-CPU_INGRESS_LABEL = "app=gpu-fault-api-ha"
-RETIRING_TOKEN_LOG_FRAGMENT = "authenticated with the retiring token"
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
 REINSTALL_STATE = "Retrying"
 STEADY_ALLOWED_NODES = "*"
@@ -177,16 +187,7 @@ class RotateTokenRequest:
     reference: str | None = None
 
     def __post_init__(self) -> None:
-        minutes = self.window.total_seconds() / 60
-        if minutes < MIN_WINDOW_MINUTES or self.window > MAX_TOKEN_ROTATION_WINDOW:
-            raise BootstrapError(
-                "rotate-token window must be between "
-                f"{MIN_WINDOW_MINUTES} and {MAX_WINDOW_MINUTES} minutes"
-            )
-        if self.quiet_seconds < 1 or self.acceptance_timeout_seconds < 1:
-            raise BootstrapError(
-                "rotate-token quiet period and acceptance timeout must be positive"
-            )
+        rotation_policy(self)
 
 
 @dataclass
@@ -236,6 +237,17 @@ def step_done(state: Mapping[str, Any], step: str) -> bool:
     return step in (state.get("steps") or {})
 
 
+def step_started(state: Mapping[str, Any], step: str) -> bool:
+    return step_done(state, step) or step in (state.get("started_steps") or {})
+
+
+def start_step(context: RotationContext, step: str) -> None:
+    started = context.state.setdefault("started_steps", {})
+    if step not in started:
+        started[step] = context.now().isoformat()
+        context.save()
+
+
 def complete_step(
     context: RotationContext,
     step: str,
@@ -272,10 +284,15 @@ def _start_or_resume_state(
     token_file: Path,
     now: Callable[[], datetime],
 ) -> tuple[Path, dict[str, Any]]:
+    policy = rotation_policy(request)
     path = rotation_state_path(request.site, request.cluster_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     existing = load_rotation_state(path)
     if existing is not None:
+        if existing.get("schema_version") != STATE_SCHEMA_VERSION or existing.get(
+            "status"
+        ) not in {STATUS_IN_PROGRESS, STATUS_COMPLETED, STATUS_ROLLED_BACK}:
+            raise BootstrapError("rotate-token state has an unknown schema or status")
         expected = {
             "site_id": request.site.release_config["site_name"],
             "cluster_id": request.cluster_id,
@@ -284,7 +301,19 @@ def _start_or_resume_state(
         for key, value in expected.items():
             if existing.get(key) != value:
                 raise BootstrapError(f"rotate-token state conflicts on {key}")
-        if existing.get("status") == STATUS_IN_PROGRESS:
+        cleanup_pending = existing.get("pending_token_cleanup_completed") is False
+        if existing.get("status") == STATUS_IN_PROGRESS or cleanup_pending:
+            require_rotation_policy(existing, policy)
+            if existing.get("site_sha256") != request.site.source_sha256:
+                raise BootstrapError(
+                    "rotate-token site changed since the rotation started"
+                )
+            if cleanup_pending and request.rollback != (
+                existing.get("status") == STATUS_ROLLED_BACK
+            ):
+                raise BootstrapError(
+                    "rotate-token cleanup must resume in the committed direction"
+                )
             return path, existing
         if request.rollback:
             raise BootstrapError(
@@ -298,12 +327,13 @@ def _start_or_resume_state(
     state: dict[str, Any] = {
         "schema_version": STATE_SCHEMA_VERSION,
         "site_id": request.site.release_config["site_name"],
+        "site_sha256": request.site.source_sha256,
         "cluster_id": request.cluster_id,
         "rotation_id": f"{stamp:%Y%m%dT%H%M%SZ}-{secrets.token_hex(4)}",
         "status": STATUS_IN_PROGRESS,
         "started_at": stamp.isoformat(),
         "token_file": str(token_file),
-        "window_minutes": int(request.window.total_seconds() // 60),
+        **policy,
         "reference": request.reference,
         "operator": resolve_operator_identity(),
         "steps": {},
@@ -329,22 +359,15 @@ def site_process_environment(site: RenderedSite) -> Iterator[None]:
     """
 
     previous = dict(os.environ)
-    os.environ.update(effective_environment(site))
+    selected = effective_environment(site)
+    for name in previous.keys() - selected.keys():
+        os.environ.pop(name, None)
+    os.environ.update(selected)
     try:
         yield
     finally:
         os.environ.clear()
         os.environ.update(previous)
-
-
-def build_release(site: RenderedSite) -> Any:
-    """The release engine bound to the site's current release configuration."""
-
-    from gpu_fault_release.rollout import RegionalRelease, Runner
-
-    with materialized_release_config(site) as config_path:
-        config = ReleaseConfig.load(config_path)
-    return RegionalRelease(config, Runner())
 
 
 def release_transaction_open(state: Mapping[str, Any]) -> str | None:
@@ -362,11 +385,16 @@ def release_transaction_open(state: Mapping[str, Any]) -> str | None:
         return phase
     if phase in BOOTSTRAP_PHASES and phase != "bootstrap-cleaned":
         return phase
-    if phase == "complete" and state.get("transaction_committed") is not True:
-        return phase
+    if phase == "complete":
+        if (
+            state.get("transaction_committed") is not True
+            or state.get("commit_cleanup_completed") is False
+        ):
+            return phase
+        return None
     if phase == "rolled-back" and state.get("rollback_cleanup_completed") is False:
         return phase
-    return None
+    return None if phase in {"rolled-back", "bootstrap-cleaned"} else phase or "unknown"
 
 
 def ensure_rotation_allowed(site: RenderedSite, release: Any) -> None:
@@ -673,6 +701,10 @@ def roll_node_tokens(
     """
 
     node_names = target_node_names(release, target)
+    if progress.get("node_names") is not None and set(progress["node_names"]) != set(
+        node_names
+    ):
+        raise BootstrapError("rotation node inventory changed since the first wave")
     completed = set(progress.get("completed_nodes") or [])
     remaining = tuple(
         name
@@ -718,6 +750,10 @@ def roll_node_tokens(
         )
         for wave in waves:
             ensure_rollout_wave_safe(release, target, wave=wave, node_names=node_names)
+            progress["started_nodes"] = sorted(
+                set(progress.get("started_nodes") or []).union(wave)
+            )
+            record()
             if hand_wave_to_reconciler(release, target, context, wave) is None:
                 raise BootstrapError(
                     f"{target.cluster_id} Reconciler did not accept the wave ConfigMap"
@@ -763,41 +799,15 @@ def retiring_token_authentications(
     *,
     since_seconds: int,
 ) -> list[str]:
-    """Control-plane log lines saying ``cluster_id`` still presented the old token.
+    """Matching retained log lines from stable Ready control-plane containers."""
 
-    The API warns once per request authenticated through the retiring slot;
-    that line is the only signal the control plane emits about which token a
-    caller holds, and REG-9's step 7 was a manual grep for it.
-    """
-
-    completed = subprocess.run(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(site.release_config["cpu_kubeconfig"]),
-            "-n",
-            str(site.release_config["namespace"]),
-            "logs",
-            "-l",
-            CPU_INGRESS_LABEL,
-            "--all-containers",
-            "--prefix",
-            "--tail=-1",
-            "--max-log-requests=20",
-            f"--since={int(since_seconds)}s",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=180,
+    return collect_retiring_token_authentications(
+        site,
+        cluster_id,
+        since_seconds=since_seconds,
+        run=run_command,
+        now=_utc_now,
     )
-    if completed.returncode:
-        raise BootstrapError(
-            "cannot read control-plane ingress logs: "
-            + (completed.stderr.strip() or "kubectl logs failed")
-        )
-    needle = f"regional cluster {cluster_id} {RETIRING_TOKEN_LOG_FRAGMENT}"
-    return [line for line in completed.stdout.splitlines() if needle in line]
 
 
 def wait_for_new_token_acceptance(
@@ -809,33 +819,21 @@ def wait_for_new_token_acceptance(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """Block until a full quiet period passes with no retiring-token login.
+    """Wait for a bounded quiet window with current-log prefix continuity.
 
-    The first quiet period is always waited out so the window inspected lies
-    entirely after the last data-plane mutation; a line inside it names a
-    caller that has not moved, and the wait continues until the timeout.
+    The initial quiet period starts after the last data-plane mutation.
+    Current log prefixes must cover the fixed window and match after reading.
     """
 
-    started = monotonic()
-    deadline = started + timeout_seconds
-    sleep(quiet_seconds)
-    while True:
-        lines = retiring_token_authentications(
-            site, cluster_id, since_seconds=quiet_seconds
-        )
-        if not lines:
-            return {
-                "quiet_seconds": quiet_seconds,
-                "waited_seconds": round(monotonic() - started, 1),
-            }
-        if monotonic() >= deadline:
-            raise BootstrapError(
-                f"{len(lines)} retiring-token authentications for {cluster_id} in "
-                f"the last {quiet_seconds}s after {timeout_seconds}s; an Agent or "
-                "Executor still holds the old token -- rerun to keep waiting, or "
-                "--rollback"
-            )
-        sleep(min(30.0, float(quiet_seconds)))
+    return wait_for_quiet_token_authentications(
+        site,
+        cluster_id,
+        quiet_seconds=quiet_seconds,
+        timeout_seconds=timeout_seconds,
+        read_logs=retiring_token_authentications,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
 
 
 def remote_command_losses(
@@ -865,6 +863,10 @@ def write_token_file(token_file: Path, token: str, *, now: datetime) -> Path:
     """
 
     retired = token_file.with_name(f"{token_file.name}.retired-{now:%Y%m%dT%H%M%SZ}")
+    if retired.exists() and cluster_token_sha256(
+        _read_token(retired)
+    ) != cluster_token_sha256(_read_token(token_file)):
+        raise BootstrapError("retired token file conflicts with the current token")
     temporary = token_file.with_name(f".{token_file.name}.rotating")
     if temporary.exists():
         temporary.unlink()
@@ -880,6 +882,11 @@ def write_token_file(token_file: Path, token: str, *, now: datetime) -> Path:
         os.chmod(retired, 0o600)
     os.replace(temporary, token_file)
     os.chmod(token_file, 0o600)
+    descriptor = os.open(token_file.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return retired
 
 
@@ -914,23 +921,45 @@ def _prepare(context: RotationContext) -> None:
 
 
 def _verify_pending_token(context: RotationContext) -> str:
-    """The pending token, only if the file still yields the recorded digest."""
+    """Verify the new credential and recover a journaled atomic file replacement."""
 
+    current_token = _read_token(context.token_file)
+    current = cluster_token_sha256(current_token)
+    if step_done(context.state, STEP_TOKEN_FILE_WRITTEN):
+        if current != context.state.get("new_token_sha256"):
+            raise BootstrapError(
+                "the committed token file no longer matches its digest"
+            )
+        return current_token
+    if step_started(
+        context.state, STEP_TOKEN_FILE_WRITTEN
+    ) and current == context.state.get("new_token_sha256"):
+        stamp = datetime.fromisoformat(
+            context.state["started_steps"][STEP_TOKEN_FILE_WRITTEN]
+        )
+        retired = context.token_file.with_name(
+            f"{context.token_file.name}.retired-{stamp:%Y%m%dT%H%M%SZ}"
+        )
+        if cluster_token_sha256(_read_token(retired)) != context.state.get(
+            "old_token_sha256"
+        ):
+            raise BootstrapError("retired token file no longer matches its digest")
+        complete_step(
+            context, STEP_TOKEN_FILE_WRITTEN, {"retired_token_file": str(retired)}
+        )
+        return current_token
+    if current != context.state.get("old_token_sha256"):
+        raise BootstrapError(
+            "the site's token file changed under the rotation; refusing to continue"
+        )
     pending = context.pending_token_file
     if not pending.is_file():
         raise BootstrapError(
-            f"pending token file {pending} is missing; the rotation cannot resume "
-            "-- use --rollback"
+            f"pending token file {pending} is missing; the rotation cannot resume"
         )
     token = _read_token(pending)
     if cluster_token_sha256(token) != context.state.get("new_token_sha256"):
         raise BootstrapError("pending token file no longer matches the recorded digest")
-    if not step_done(context.state, STEP_TOKEN_FILE_WRITTEN):
-        current = cluster_token_sha256(_read_token(context.token_file))
-        if current != context.state.get("old_token_sha256"):
-            raise BootstrapError(
-                "the site's token file changed under the rotation; refusing to continue"
-            )
     return token
 
 
@@ -1044,9 +1073,11 @@ def _accept(context: RotationContext) -> None:
 
 def _finish(context: RotationContext, new_token: str) -> None:
     if not step_done(context.state, STEP_TOKEN_FILE_WRITTEN):
-        retired = write_token_file(context.token_file, new_token, now=context.now())
-        if context.pending_token_file.exists():
-            context.pending_token_file.unlink()
+        start_step(context, STEP_TOKEN_FILE_WRITTEN)
+        stamp = datetime.fromisoformat(
+            context.state["started_steps"][STEP_TOKEN_FILE_WRITTEN]
+        )
+        retired = write_token_file(context.token_file, new_token, now=stamp)
         complete_step(
             context, STEP_TOKEN_FILE_WRITTEN, {"retired_token_file": str(retired)}
         )
@@ -1071,28 +1102,42 @@ def _finish(context: RotationContext, new_token: str) -> None:
                 "content_sha256": result.get("content_sha256"),
             }
         complete_step(context, STEP_RETIRING_DROPPED, evidence)
-    context.state["status"] = STATUS_COMPLETED
-    context.state["completed_at"] = context.now().isoformat()
+    _complete_rotation(context, STATUS_COMPLETED)
+
+
+def _complete_rotation(context: RotationContext, status: str) -> None:
+    context.state["status"] = status
+    context.state.setdefault("completed_at", context.now().isoformat())
+    context.state["pending_token_cleanup_completed"] = False
+    context.save()
+    context.pending_token_file.unlink(missing_ok=True)
+    context.state["pending_token_cleanup_completed"] = True
     context.save()
 
 
 def _rotate(context: RotationContext) -> None:
     state = context.state
+    if state.get("rollback_started_at") or any(
+        step_started(state, step) for step in ROLLBACK_STEPS
+    ):
+        raise BootstrapError("token rollback is in progress; resume with --rollback")
     if not step_done(state, STEP_PREPARED):
         _prepare(context)
-    elif not step_done(state, STEP_ACCEPTED):
-        ensure_rotation_allowed(context.request.site, context.release)
     new_token = _verify_pending_token(context)
+    if not step_done(state, STEP_TOKEN_FILE_WRITTEN):
+        ensure_rotation_allowed(context.request.site, context.release)
     if not step_done(state, STEP_OVERLAP_PUBLISHED):
         _publish_overlap(context)
     elif not step_done(state, STEP_TOKEN_FILE_WRITTEN):
         _ensure_window_open(context)
     if not step_done(state, STEP_SECRET_UPDATED):
+        start_step(context, STEP_SECRET_UPDATED)
         update_connection_secret(
             context.release, context.target, context.pending_token_file
         )
         complete_step(context, STEP_SECRET_UPDATED)
     if not step_done(state, STEP_DATA_PLANE_ROLLED):
+        start_step(context, STEP_DATA_PLANE_ROLLED)
         complete_step(
             context,
             STEP_DATA_PLANE_ROLLED,
@@ -1100,45 +1145,67 @@ def _rotate(context: RotationContext) -> None:
         )
     if not step_done(state, STEP_NODES_ROLLED):
         complete_step(context, STEP_NODES_ROLLED, _roll_nodes(context, only_nodes=None))
-    if not step_done(state, STEP_ACCEPTED):
+    if not step_done(state, STEP_TOKEN_FILE_WRITTEN):
         _accept(context)
     _finish(context, new_token)
 
 
 def _rollback(context: RotationContext) -> None:
     state = context.state
-    if step_done(state, STEP_TOKEN_FILE_WRITTEN):
+    if state.get("status") == STATUS_ROLLED_BACK:
+        _complete_rotation(context, STATUS_ROLLED_BACK)
+        return
+    if step_started(state, STEP_TOKEN_FILE_WRITTEN):
         raise BootstrapError(
-            "the rotation already accepted the new token and rewrote the site's "
-            "token file; run a new rotation instead of rolling back"
+            "the rotation recorded the token file write intent; rollback is "
+            "forbidden from this boundary even if the filesystem write has not "
+            "started; rerun without --rollback to finish"
         )
-    if step_done(state, STEP_SECRET_UPDATED) and not step_done(
+    if step_done(state, STEP_PREPARED):
+        if cluster_token_sha256(_read_token(context.token_file)) != state.get(
+            "old_token_sha256"
+        ):
+            raise BootstrapError("the site's token file changed; rollback is refused")
+        ensure_rotation_allowed(context.request.site, context.release)
+    if not state.get("rollback_started_at"):
+        state["rollback_started_at"] = context.now().isoformat()
+        context.save()
+    if step_done(state, STEP_OVERLAP_PUBLISHED) and not step_done(
+        state, ROLLBACK_REGISTRY_RESTORED
+    ):
+        _ensure_window_open(context)
+    if step_started(state, STEP_SECRET_UPDATED) and not step_done(
         state, ROLLBACK_SECRET_RESTORED
     ):
         ensure_connection_secret(context.release, context.target)
         complete_step(context, ROLLBACK_SECRET_RESTORED)
-    if step_done(state, STEP_DATA_PLANE_ROLLED) and not step_done(
-        state, ROLLBACK_DATA_PLANE_ROLLED
-    ):
+    if (
+        step_started(state, STEP_SECRET_UPDATED)
+        or step_started(state, STEP_DATA_PLANE_ROLLED)
+    ) and not step_done(state, ROLLBACK_DATA_PLANE_ROLLED):
         complete_step(
             context,
             ROLLBACK_DATA_PLANE_ROLLED,
             restart_data_plane(context.release, context.target),
         )
+    progress = state.get("node_rollout") or {}
     moved = frozenset(
-        str(item)
-        for item in (state.get("node_rollout") or {}).get("completed_nodes") or []
+        progress.get("forward_nodes")
+        or [
+            *(progress.get("completed_nodes") or []),
+            *(progress.get("started_nodes") or []),
+        ]
     )
     if moved and not step_done(state, ROLLBACK_NODES_ROLLED):
-        state["node_rollout"] = {
-            "completed_nodes": [],
-            "steady_wave_config": (state.get("node_rollout") or {}).get(
-                "steady_wave_config"
-            ),
-            "wave_config_map": (state.get("node_rollout") or {}).get("wave_config_map"),
-            "forward_nodes": sorted(moved),
-        }
-        context.save()
+        if "forward_nodes" not in progress:
+            state["node_rollout"] = {
+                "completed_nodes": [],
+                "steady_wave_config": progress.get("steady_wave_config"),
+                "wave_config_map": progress.get("wave_config_map"),
+                "node_names": progress.get("node_names"),
+                "forward_nodes": sorted(moved),
+            }
+            context.save()
         complete_step(
             context, ROLLBACK_NODES_ROLLED, _roll_nodes(context, only_nodes=moved)
         )
@@ -1154,11 +1221,7 @@ def _rollback(context: RotationContext) -> None:
             ROLLBACK_REGISTRY_RESTORED,
             {"generation": result.get("generation")},
         )
-    if context.pending_token_file.exists():
-        context.pending_token_file.unlink()
-    state["status"] = STATUS_ROLLED_BACK
-    state["completed_at"] = context.now().isoformat()
-    context.save()
+    _complete_rotation(context, STATUS_ROLLED_BACK)
 
 
 def rotation_summary(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1192,11 +1255,22 @@ def rotate_cluster_token(
     """Run (or resume, or roll back) the rotation for ``request.cluster_id``."""
 
     site = request.site
-    record = _site_cluster(site, request.cluster_id)
-    token_file = Path(str(record.get("token_file") or ""))
-    if not token_file.is_file():
-        raise BootstrapError(f"cluster token file is missing: {token_file}")
     with administrator_operation_lock(site.source.parent):
+        current = reload_site_for_mutation(site)
+        record = _site_cluster(current, request.cluster_id)
+        expected = _site_cluster(site, request.cluster_id)
+        if any(
+            record.get(key) != expected.get(key)
+            for key in ("context", "eks_cluster_arn", "hyperpod_cluster_name")
+        ):
+            raise BootstrapError(
+                "rotate-token target cluster identity changed before mutation"
+            )
+        site = current
+        request = replace(request, site=site)
+        token_file = Path(str(record.get("token_file") or ""))
+        if not token_file.is_file():
+            raise BootstrapError(f"cluster token file is missing: {token_file}")
         state_path, state = _start_or_resume_state(request, token_file, now)
         with site_process_environment(site):
             release = build_release(site)
@@ -1263,8 +1337,8 @@ def add_rotate_token_command(
         default=DEFAULT_QUIET_SECONDS,
         metavar="N",
         help=(
-            "seconds without a retiring-token login that prove the data plane "
-            f"moved (default {DEFAULT_QUIET_SECONDS})"
+            "seconds of quiet with stable current-log prefix coverage "
+            f"(default {DEFAULT_QUIET_SECONDS})"
         ),
     )
     command.add_argument(

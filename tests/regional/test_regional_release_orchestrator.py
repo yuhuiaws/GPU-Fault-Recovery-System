@@ -18,6 +18,7 @@ from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MO
 from tests.regional._release_orchestrator_support import (
     DNS_MODULE,
     REGION,
+    aurora_refresh_snapshot,
     config_file,
     phase_release,
 )
@@ -495,10 +496,16 @@ def test_agent_convergence_timeout_pauses_only_its_own_cluster(
 def test_control_plane_only_upgrade_skips_schema_and_gpu(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "prepare_upgrade_credentials",
+        lambda *_args, **_kwargs: None,
+    )
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     calls = []
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_get_json", lambda _arguments: {"items": []})
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
@@ -507,7 +514,12 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     )
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
-        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+        release,
+        "_capture_previous",
+        lambda **_kwargs: {"metadata": {}, "aurora_refresh": aurora_refresh_snapshot()},
+    )
+    monkeypatch.setattr(
+        release, "_apply_aurora_refresh", lambda: calls.append(("aurora-refresh", True))
     )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(
@@ -577,13 +589,24 @@ def test_finalize_proves_fleet_pin_before_closing_the_window(
     asserted on the interleaving rather than on the calls in isolation.
     """
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "prepare_upgrade_credentials",
+        lambda *_args, **_kwargs: None,
+    )
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     calls: list[object] = []
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_get_json", lambda _arguments: {"items": []})
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
-        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+        release,
+        "_capture_previous",
+        lambda **_kwargs: {"metadata": {}, "aurora_refresh": aurora_refresh_snapshot()},
+    )
+    monkeypatch.setattr(
+        release, "_apply_aurora_refresh", lambda: calls.append(("aurora-refresh", True))
     )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(release, "_save_state", lambda _phase, **_updates: None)
@@ -645,6 +668,11 @@ def test_finalize_proves_fleet_pin_before_closing_the_window(
 def test_new_upgrade_discards_stale_rollback_checkpoints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "prepare_upgrade_credentials",
+        lambda *_args, **_kwargs: None,
+    )
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     release.state = {
@@ -660,11 +688,15 @@ def test_new_upgrade_discards_stale_rollback_checkpoints(
     }
     saves: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_get_json", lambda _arguments: {"items": []})
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
-        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+        release,
+        "_capture_previous",
+        lambda **_kwargs: {"metadata": {}, "aurora_refresh": aurora_refresh_snapshot()},
     )
+    monkeypatch.setattr(release, "_apply_aurora_refresh", lambda: None)
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(
         release,

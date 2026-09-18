@@ -12,10 +12,23 @@ phases:
     name: 可部署性
     maintenance_window: 分级
     entries:
-      - range: {prefix: BOOT, start: 11, end: 22}
+      - case: GF-REGIONAL-BOOT-016
+      - range: {prefix: BOOT, start: 11, end: 15}
+      - case: GF-REGIONAL-BOOT-017
+        predecessor: GF-REGIONAL-BOOT-016
+      - case: GF-REGIONAL-BOOT-018
+      - case: GF-REGIONAL-BOOT-019
+      - case: GF-REGIONAL-BOOT-020
+        predecessor: GF-REGIONAL-BOOT-018
+      - range: {prefix: BOOT, start: 21, end: 22}
       - case: GF-REGIONAL-BOOT-023
         predecessor: GF-REGIONAL-BOOT-020
+      - case: GF-REGIONAL-BOOT-030
+        predecessor: GF-REGIONAL-BOOT-023
+      - case: GF-REGIONAL-BOOT-031
+        predecessor: GF-REGIONAL-BOOT-030
       - case: GF-REGIONAL-BOOT-024
+        predecessor: GF-REGIONAL-BOOT-023
       - case: GF-REGIONAL-BOOT-025
         predecessor: GF-REGIONAL-BOOT-024
       - case: GF-REGIONAL-BOOT-026
@@ -27,7 +40,13 @@ phases:
       - case: GF-REGIONAL-BOOT-029
         predecessor: GF-REGIONAL-BOOT-028
     notes:
+      - BOOT-016 先创建持续验收站点，再运行依赖其资源的 BOOT-011..015；BOOT-017 显式复用 BOOT-016。
+      - BOOT-018 正式执行必须保留持续验收站点。BOOT-019 使用 CPU/GPU 均与受保护站点隔离的另一套可卸载站点。
+      - BOOT-020 回到持续验收站点，读取 BOOT-018 而不是 BOOT-019 的目标身份；两个站点不得混用。
+      - BOOT-021 只在自己的顺序位置生成正式证据，不能由 BOOT-012 提前签发。
       - BOOT-023 以 BOOT-020 PASS 为证据前置；BOOT-021/022 之间没有它要读的发布历史。
+      - BOOT-030/031 在持续验收站点只读核验两类专表，依次读取 BOOT-023/030 的证据。
+        它们不改变 BOOT-024 的 BOOT-023 前置，也不授权将持续验收站点用于生命周期卸载。
       - BOOT-024..029 是管理员生命周期链，按 remove-cluster → join-cluster 重接 → 二次 remove 与
         deploy 批量 join → uninstall keep + reset-database → 空集群全新 deploy 与续跑的顺序，
         每条以前一条 PASS 为证据前置（BOOT-024 读 BOOT-023）；只在隔离站点执行——该站点唯一的
@@ -103,7 +122,9 @@ phases:
     name: 爆炸半径
     maintenance_window: 否
     entries:
-      - range: {prefix: BLAST, start: 1, end: 4}
+      - range: {prefix: BLAST, start: 2, end: 4}
+    notes:
+      - BLAST-001 移至 DESTR-001 之后，复用实际节点隔离动作的证据；本阶段先验证权限与凭据边界。
   - sequence: 9
     name: 通知
     maintenance_window: 否
@@ -112,10 +133,13 @@ phases:
       # same result four times and asserts one provider_message_id.
       - case: GF-REGIONAL-NOTIFY-001
       - range: {prefix: NOTIFY, start: 3, end: 7}
+      - case: GF-REGIONAL-NOTIFY-008
+        predecessor: GF-REGIONAL-NOTIFY-007
     notes:
       - NOTIFY-001 复用已批准动作或隔离通知夹具，不为邮件验收重复执行 GPU reset；重复提交去重断言并入本条。
       - NOTIFY-007 的正式前置是 NOTIFY-005：NOTIFY-006 是 pytest 用例，不产出 cases/<id>/<id>.json 证据。
       - NOTIFY-007 在 control-worker Pod 内用隔离 InMemoryStore 演练投递状态，只发一封 DRILL 邮件，不写生产行。
+      - NOTIFY-008 使用独占CPU namespace、私有PostgreSQL和SIMULATED provider验证进程丢失窗口，不发送外部邮件。
   - sequence: 10
     name: 容量
     maintenance_window: 否
@@ -130,16 +154,19 @@ phases:
     name: 非破坏性 HA
     maintenance_window: 建议
     entries:
-      # HA-005 is in do_not_run: HA-009 imports and re-asserts all of it
-      # under the credential rotation it adds.
       - case: GF-REGIONAL-HA-001
       - case: GF-REGIONAL-HA-002
+      - case: GF-REGIONAL-HA-005
       - range: {prefix: HA, start: 6, end: 9}
       - case: GF-REGIONAL-HA-010
         predecessor: GF-REGIONAL-HA-001
+      - case: GF-REGIONAL-HA-011
+        predecessor: GF-REGIONAL-HA-010
     notes:
+      - HA-005 独立验证全部启用 CPU 角色的滚动连续性；HA-009 验证凭据轮换不发生滚动，二者不能互相替代。
       - HA-010 以 HA-001 PASS 为证据前置，在无任何 remote command 在飞时做一次 Aurora writer failover
         并删除一个 gpu-fault-api-ha 副本；不注入故障、不触碰 GPU 面。
+      - HA-011 只终止独占验收Pod中的worker子进程，验证processor/spool在途接管及旧owner fencing，不终止业务Pod。
   - sequence: 13
     name: 破坏性能力验收（含非破坏性 fail-closed 负向用例）
     maintenance_window: 是
@@ -149,7 +176,10 @@ phases:
       - range: {prefix: DESTR, start: 5, end: 7}
       - case: GF-REGIONAL-DESTR-010
       - case: GF-REGIONAL-DESTR-001
+      - case: GF-REGIONAL-BLAST-001
+        predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-002
+        predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-009
       - case: GF-REGIONAL-DESTR-012
       - case: GF-REGIONAL-DESTR-015
@@ -168,6 +198,12 @@ phases:
         predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-024
     notes:
+      - 普通 DESTR-015 PASS 且清理完成后，物理所有权补充验收单独审批并按
+        unchanged-owner、ownership-drift、late-sibling 顺序执行；使用独立且不嵌套的
+        run-dir，不覆盖普通 case 证据。统一归于 DESTR-015，PREEMPT-033 仅引用同一
+        组机制证据；不得插入 phase-6 或为别名重复物理试验。
+        --ordinary-destr015-evidence 显式绑定原普通用例的成功与清理结果，
+        --predecessor-evidence 仍保留 DESTR-012 前置证明。
       - DESTR-023 以 DESTR-001 PASS 为证据前置，在无任何受管作业、观测流全部过期、只剩 watcher 覆盖心跳的
         真正空闲集群上再做一次真实 GPU reset，证明节点不因 UNKNOWN 被 BLOCKED；不改任何控制面或 watcher 设置。
       - DESTR-024 以 DESTR-023 PASS 为前置，把 completion watcher 缩到 0 让心跳过期，注入同一 XID 46，
@@ -227,21 +263,29 @@ phases:
       - DESTR-013 必须最后执行，以覆盖前序维护窗口的 CloudTrail。
   - sequence: 16
     name: 多物理集群
-    maintenance_window: 否
+    maintenance_window: 是
     prerequisite: 至少两个 enabled 的物理 GPU 集群
     entries:
       - case: GF-REGIONAL-ISO-006
       - case: GF-REGIONAL-E2E-002
         predecessor: GF-REGIONAL-ISO-001
+      - case: GF-REGIONAL-ISO-007
+        predecessor: GF-REGIONAL-E2E-002
     notes:
       - E2E-002 以 ISO-001 PASS 为证据前置：ISO-001 是同一身份的单次注入隔离用例，E2E-002 是它的
         两次注入后继；ISO-006（整集群离线）证明的不是 E2E-002 所依赖的东西，所以不读 ISO-006 的证据。
+      - ISO-007 复用同一物理集群对，验证 A 的明确零预算拒绝不阻塞 B 的一次成功恢复；真实 workload restart 需要维护窗口。
   - sequence: 17
     name: 采集与判定覆盖
     maintenance_window: 分级
     entries:
-      - range: {prefix: COLLECT, start: 1, end: 7}
-      - range: {prefix: COLLECT, start: 9, end: 12}
+      - range: {prefix: COLLECT, start: 1, end: 5}
+      - case: GF-REGIONAL-COLLECT-022
+        predecessor: GF-REGIONAL-COLLECT-005
+      - range: {prefix: COLLECT, start: 6, end: 7}
+      - case: GF-REGIONAL-COLLECT-009
+        predecessor: GF-REGIONAL-COLLECT-005
+      - range: {prefix: COLLECT, start: 10, end: 12}
       - case: GF-REGIONAL-COLLECT-008
       - case: GF-REGIONAL-COLLECT-013
       - case: GF-REGIONAL-COLLECT-014
@@ -265,6 +309,16 @@ phases:
       - COLLECT-018/019/020 在一台空闲节点上开有界采集器窗口（合成 API 注入、nvidia-smi 影子、
         drop-in 环境），不触碰 GPU；COLLECT-020 会 cordon 该节点做 DCGM 诊断再由 validation-first
         restore 恢复，需要维护窗口，且仍排在 COLLECT-015 的 reboot 之前。
+  - sequence: 18
+    name: 独立站点完整卸载
+    maintenance_window: 是
+    entries:
+      - case: GF-REGIONAL-BOOT-032
+        predecessor: GF-REGIONAL-COLLECT-015
+    notes:
+      - 只操作预先独立部署并带本用例归属标签的可销毁站点，不卸载持续验收站点。
+      - 首次执行在原生Kubernetes清理验证后返回RESTART_REQUIRED；新进程按同一审批续跑，最终PASS前不得继续。
+      - CPU集群删除、Aurora最终快照、GPU集群保留及持续站点无变化必须全部核验，不能用API不可读代替删除证明。
 do_not_run:
   - case: GF-REGIONAL-BOOT-006
     reason: >-
@@ -288,10 +342,6 @@ do_not_run:
     reason: >-
       provider replace 开关、IAM implicitDeny 与 CloudTrail 否证由 GF-REGIONAL-DESTR-013
       在阶段末统一承担，"reboot 仍可独立启用"与逐副本开关报告已并入 DESTR-013；由 DESTR-013 取代。
-  - case: GF-REGIONAL-HA-005
-    reason: >-
-      GF-REGIONAL-HA-009 复用并重新断言 HA-005 的全部滚动连续性判定，
-      再叠加 Aurora 凭据轮换；由 HA-009 取代。
   - case: GF-REGIONAL-PREEMPT-013
     reason: >-
       三级连环抢占是 GF-REGIONAL-PREEMPT-014 五级链的严格子集；由 PREEMPT-014 取代。

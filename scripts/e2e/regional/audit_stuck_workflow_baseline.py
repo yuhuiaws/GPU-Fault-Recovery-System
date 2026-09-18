@@ -48,14 +48,14 @@ SELECT count(*),
        count(*) FILTER (
            WHERE w.payload->>'fencing_token' = i.payload->>'fencing_token'
        )
-FROM gpu_fault_objects w
+FROM gpu_fault_control_records w
 JOIN gpu_fault_objects i
   ON i.kind = 'incident' AND i.key = w.payload->>'incident_id'
 WHERE w.kind = 'workflow'
   AND w.payload->>'status' IN ('PENDING', 'SAFETY_PENDING')
   AND i.payload->>'workflow_request_id' <> w.key
   AND NOT EXISTS (
-      SELECT 1 FROM gpu_fault_objects s
+      SELECT 1 FROM gpu_fault_control_records s
       WHERE s.kind = 'workflow'
         AND s.payload->>'predecessor_workflow_id' = w.key
   )
@@ -69,7 +69,7 @@ WHERE status = 'LEASED' AND lease_expires_at < now()
 
 STUCK_PENDING_SQL = """
 SELECT count(*)
-FROM gpu_fault_objects w
+FROM gpu_fault_control_records w
 WHERE w.kind = 'workflow'
   AND w.payload->>'status' = 'PENDING'
   AND (w.payload->>'not_before' IS NULL OR w.payload->>'not_before' < %(now)s)
@@ -77,12 +77,12 @@ WHERE w.kind = 'workflow'
   AND (
       w.payload->>'predecessor_workflow_id' IS NULL
       OR NOT EXISTS (
-          SELECT 1 FROM gpu_fault_objects gone
+          SELECT 1 FROM gpu_fault_control_records gone
           WHERE gone.kind = 'workflow'
             AND gone.key = w.payload->>'predecessor_workflow_id'
       )
       OR EXISTS (
-          SELECT 1 FROM gpu_fault_objects p
+          SELECT 1 FROM gpu_fault_control_records p
           WHERE p.kind = 'workflow'
             AND p.key = w.payload->>'predecessor_workflow_id'
             AND p.payload->>'status' NOT IN ('PENDING', 'SAFETY_PENDING', 'RUNNING')
@@ -257,15 +257,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def store_dsn() -> str:
+    configured = os.environ.get("GPU_FAULT_STORE_URL_FILE")
     path = (
-        os.environ.get("GPU_FAULT_STORE_URL_FILE")
-        or "/etc/gpu-fault/aurora/postgres-url"
+        configured if configured is not None else "/etc/gpu-fault/aurora/postgres-url"
     )
+    if not path:
+        raise RuntimeError("configured store DSN file path is empty")
     try:
         with open(path, encoding="utf-8") as handle:
-            return handle.read().strip()
-    except OSError:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        if configured is not None:
+            raise
         return os.environ["GPU_FAULT_STORE_URL"]
+    if not value:
+        raise RuntimeError("store DSN file is empty")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:

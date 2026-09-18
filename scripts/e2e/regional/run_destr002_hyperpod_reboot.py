@@ -35,6 +35,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     predecessor_evidence,
     provider_event_actor_matches_role,
     required,
@@ -113,7 +114,7 @@ print(json.dumps({
 # Runs in the *replacement* executor Pod after the submitting one was deleted,
 # and reads the durable submission record through that Pod's own lifecycle
 # adapter store. It never calls `submit`: the adapter's dedupe rule for a
-# replay (HyperPodLifecycleAdapter._durable_duplicate) is "same idempotency
+# replay (HyperPodLifecycleAdapter._replay_durable_submission) is "same idempotency
 # key, same request identity, state SUBMITTED, result present", and reading
 # that record from the new Pod proves the same thing a second live submit
 # would -- without asking the provider to consider a second reboot. The key
@@ -151,9 +152,16 @@ checks = {
     "state_submitted": record.state == "SUBMITTED",
     "result_present": record.result is not None,
 }
+outcome = None
+if all(checks.values()):
+    outcome = lifecycle._replay_durable_submission(
+        HyperPodAction.REBOOT,
+        list(command["step"]["node_ids"]),
+        submission_key,
+    )
 print(json.dumps({
     "replay_mode": "store-level",
-    "duplicate": all(checks.values()),
+    "duplicate": outcome is not None and outcome.duplicate is True,
     "checks": checks,
     "record": record.model_dump(mode="json"),
 }, sort_keys=True, default=str))
@@ -562,6 +570,40 @@ def restart_executor(
     )
 
 
+def replay_from_replacement(
+    regional: RegionalLiveFixture,
+    command: dict[str, Any],
+    restart: dict[str, Any],
+) -> dict[str, Any]:
+    previous = {pod["uid"] for pod in restart["before"]}
+    candidates = [pod for pod in restart["after"] if pod["uid"] not in previous]
+    if len(candidates) != 1:
+        raise RegionalFixtureError("replacement executor Pod identity is not unique")
+    target = candidates[0]
+    current = json.loads(
+        regional.kubectl("gpu", "get", "pod", str(target["name"]), "-o", "json")
+    )
+    metadata = current.get("metadata") or {}
+    if metadata.get("uid") != target["uid"] or metadata.get("deletionTimestamp"):
+        raise RegionalFixtureError("replacement executor Pod UID changed before replay")
+    output = regional.kubectl(
+        "gpu",
+        "exec",
+        "-i",
+        str(target["name"]),
+        "--",
+        component_python("gpu"),
+        "-",
+        json.dumps(command, sort_keys=True),
+        input_text=STORE_REPLAY_PROBE,
+        timeout=180,
+    )
+    value = json.loads(output.splitlines()[-1])
+    if not isinstance(value, dict):
+        raise RegionalFixtureError("replacement executor replay returned no object")
+    return {**value, "executor_pod": target["name"], "executor_pod_uid": target["uid"]}
+
+
 def workflow_errors(
     state: dict[str, Any],
     *,
@@ -581,24 +623,40 @@ def workflow_errors(
     if workflow.get("status") != "SUCCEEDED":
         errors.append("reboot workflow is not SUCCEEDED")
     operations = [item.get("operation") for item in workflow.get("official_steps", [])]
-    for operation in (
+    required_operations = (
         "MARK_UNSCHEDULABLE",
         "RESTART_NODE",
         "VALIDATE_GPU",
         "VALIDATE_HOST",
         "VALIDATE_FABRIC",
         "RESTORE_SCHEDULING",
-    ):
-        if operation not in operations:
+    )
+    for operation in required_operations:
+        if operations.count(operation) != 1:
             errors.append(f"reboot workflow is missing {operation}")
+        succeeded = [
+            item
+            for item in workflow.get("step_executions") or []
+            if item.get("operation") == operation and item.get("status") == "SUCCEEDED"
+        ]
+        if len(succeeded) != 1:
+            errors.append(f"reboot workflow lacks one successful {operation} execution")
+    if [item for item in operations if item in required_operations] != list(
+        required_operations
+    ):
+        errors.append("reboot validation and scheduling order is not exact")
+    if {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "REPLACE_NODE"} & set(operations):
+        errors.append("reboot workflow contains an unexpected physical operation")
     if submission.get("state") != "SUBMITTED":
         errors.append("HyperPod submission record is not SUBMITTED")
     if submission.get("action") != "REBOOT":
         errors.append("HyperPod submission action is not REBOOT")
     if expected_artifact and agent.get("artifact_sha256") != expected_artifact:
         errors.append("Node Agent artifact changed across reboot")
-    if expected_boot_id and agent.get("boot_id") == expected_boot_id:
-        errors.append("fleet Agent boot ID did not change")
+    if expected_boot_id and (
+        not agent.get("boot_id") or agent.get("boot_id") == expected_boot_id
+    ):
+        errors.append("fleet Agent boot ID did not provably change")
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append("Node Agent did not return ACTIVE")
     return errors
@@ -695,9 +753,10 @@ def verify_plan_identity(
         raise RegionalFixtureError(f"DESTR-002 plan drifted: {planned} != {current}")
 
 
-def host_probe(settings: Settings, run_id: str) -> HostProbeFixture:
+def host_probe(settings: Settings, run_id: str, case_dir: Path) -> HostProbeFixture:
     return HostProbeFixture(
         HostProbeSettings(
+            state_directory=case_dir / "host-probes",
             kubeconfig=settings.regional.gpu_kubeconfig,
             context=settings.regional.gpu_context,
             namespace=settings.regional.namespace,
@@ -709,6 +768,31 @@ def host_probe(settings: Settings, run_id: str) -> HostProbeFixture:
             active_deadline_seconds=3600,
         )
     )
+
+
+def verify_duplicate_replay(
+    regional: RegionalLiveFixture,
+    command: dict[str, Any],
+    submission: dict[str, Any],
+    executor_restart: dict[str, Any],
+    case_dir: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    replay_errors: list[str] = []
+    replay_gate = duplicate_replay_gate(command, submission)
+    if replay_gate is not None:
+        duplicate = replay_gate
+        replay_errors.append(
+            f"durable HyperPod replay NOT_APPLIED: {replay_gate['reason']}"
+        )
+    else:
+        duplicate = replay_from_replacement(regional, command, executor_restart)
+        if duplicate.get("duplicate") is not True:
+            replay_errors.append(
+                "durable HyperPod submission record is not replayable from "
+                f"the replacement executor: {duplicate.get('checks')}"
+            )
+    write_json_atomic(case_dir / "duplicate-replay.json", duplicate)
+    return duplicate, replay_errors
 
 
 def execute_case(
@@ -729,7 +813,7 @@ def execute_case(
     regional = RegionalLiveFixture(settings.regional)
     run_id = f"destr002-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"destr002-{int(time.time())}-a{attempt}"
-    host = host_probe(settings, run_id)
+    host = host_probe(settings, run_id, case_dir)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -743,6 +827,8 @@ def execute_case(
     }
     injection_started: datetime | None = None
     try:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError("maintenance window ended before probe creation")
         host.create()
         baseline_host = host.execute("snapshot")
         write_json_atomic(case_dir / "host-baseline.json", baseline_host)
@@ -787,30 +873,19 @@ def execute_case(
         ]
         if len(reboot_commands) != 1:
             raise RegionalFixtureError("reboot remote command is not unique")
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before executor restart"
+            )
         executor_restart = restart_executor(regional, reboot_commands[0])
         write_json_atomic(case_dir / "executor-restart.json", executor_restart)
-        replay_errors: list[str] = []
-        replay_gate = duplicate_replay_gate(
+        duplicate, replay_errors = verify_duplicate_replay(
+            regional,
             reboot_commands[0],
             submitted.get("submission") or {},
+            executor_restart,
+            case_dir,
         )
-        if replay_gate is not None:
-            duplicate = replay_gate
-            replay_errors.append(
-                f"durable HyperPod replay NOT_APPLIED: {replay_gate['reason']}"
-            )
-        else:
-            duplicate = regional.executor_python(
-                STORE_REPLAY_PROBE,
-                json.dumps(reboot_commands[0], sort_keys=True),
-                timeout=180,
-            )
-            if duplicate.get("duplicate") is not True:
-                replay_errors.append(
-                    "durable HyperPod submission record is not replayable from "
-                    f"the replacement executor: {duplicate.get('checks')}"
-                )
-        write_json_atomic(case_dir / "duplicate-replay.json", duplicate)
         submitted_workflow_id = str(
             (submitted.get("workflow") or {}).get("request_id") or ""
         )

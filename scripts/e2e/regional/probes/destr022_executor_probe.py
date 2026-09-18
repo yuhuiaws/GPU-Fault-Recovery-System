@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 CLAIM_STATE_PATH_ENV = "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH"
@@ -48,6 +49,7 @@ def report(environ: dict[str, str], hostname: str) -> dict[str, Any]:
     claim_state, error = read_claim_state(path)
     return {
         "hostname": hostname,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
         "claim_state_path": path,
         "claim_state": claim_state,
         "claim_state_error": error,

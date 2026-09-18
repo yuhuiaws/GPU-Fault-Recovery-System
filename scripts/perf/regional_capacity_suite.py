@@ -19,8 +19,9 @@ Examples
     scripts/perf/regional_capacity_suite.py register --clusters 50 \
         --suite-id run-a --keep-registration
     scripts/perf/regional_capacity_suite.py run --case burst --clusters 50 \
-        --suite-id run-a
-    scripts/perf/regional_capacity_suite.py teardown --clusters 50
+        --suite-id run-a --run-dir <registration-artifacts>
+    scripts/perf/regional_capacity_suite.py teardown \
+        --suite-id run-a --run-dir <registration-artifacts>
 """
 
 from __future__ import annotations
@@ -37,85 +38,55 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-if __package__:
-    from .regional_capacity_cleanup import AUDIT_PURGE_STATEMENTS
-    from .regional_capacity_database import (
-        aurora_window as _aurora_window,
-    )
-    from .regional_capacity_database import (
-        postgres_counters as _postgres_counters,
-    )
-    from .regional_capacity_database import (
-        processor_priority_latency as _processor_priority_latency,
+if TYPE_CHECKING or __package__:
+    from . import regional_capacity_data as capacity_data
+    from . import regional_capacity_database as capacity_database
+    from . import regional_capacity_registry as capacity_registry
+    from . import regional_capacity_results as capacity_results
+    from .regional_capacity_cleanup import (
+        AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
     from .regional_capacity_job import build_job as _build_job
-    from .regional_capacity_registry import (
-        STORE_DSN_SNIPPET,
-        AWS_REGION,
-        CONNECTION_SECRET,
-        CONTROL_NAMESPACE,
-        DATAPLANE_CONTEXT,
-        NAMESPACE,
-        PERF_CLUSTER_PREFIX,
-        REGISTRY_SECRET,
-        TOKEN_SECRET,
-        control,
-        control_pods,
-        dataplane,
-        deregister,
-        register,
-        run,
-        validate_registered_synthetic_run,
-        validate_registry_target,
-    )
-    from .regional_capacity_results import (
-        aggregate,
-        artifact_dir,
-        collect_pod_json_logs,
-        drain_targets,
-        move_to_aborted,
-        write_status,
-    )
+    from .regional_capacity_resources import RunResources, run_manifest
 else:
-    from regional_capacity_cleanup import AUDIT_PURGE_STATEMENTS
-    from regional_capacity_database import (
-        aurora_window as _aurora_window,
-    )
-    from regional_capacity_database import (
-        postgres_counters as _postgres_counters,
-    )
-    from regional_capacity_database import (
-        processor_priority_latency as _processor_priority_latency,
+    import regional_capacity_data as capacity_data
+    import regional_capacity_database as capacity_database
+    import regional_capacity_registry as capacity_registry
+    import regional_capacity_results as capacity_results
+    from regional_capacity_cleanup import (
+        AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
     from regional_capacity_job import build_job as _build_job
-    from regional_capacity_registry import (
-        STORE_DSN_SNIPPET,
-        AWS_REGION,
-        CONNECTION_SECRET,
-        CONTROL_NAMESPACE,
-        DATAPLANE_CONTEXT,
-        NAMESPACE,
-        PERF_CLUSTER_PREFIX,
-        REGISTRY_SECRET,
-        TOKEN_SECRET,
-        control,
-        control_pods,
-        dataplane,
-        deregister,
-        register,
-        run,
-        validate_registered_synthetic_run,
-        validate_registry_target,
-    )
-    from regional_capacity_results import (
-        aggregate,
-        artifact_dir,
-        collect_pod_json_logs,
-        drain_targets,
-        move_to_aborted,
-        write_status,
-    )
+    from regional_capacity_resources import RunResources, run_manifest
+
+AWS_REGION = capacity_registry.AWS_REGION
+CONNECTION_SECRET = capacity_registry.CONNECTION_SECRET
+CONTROL_NAMESPACE = capacity_registry.CONTROL_NAMESPACE
+DATAPLANE_CONTEXT = capacity_registry.DATAPLANE_CONTEXT
+NAMESPACE = capacity_registry.NAMESPACE
+PERF_CLUSTER_PREFIX = capacity_registry.PERF_CLUSTER_PREFIX
+REGISTRY_SECRET = capacity_registry.REGISTRY_SECRET
+TOKEN_SECRET = capacity_registry.TOKEN_SECRET
+control = capacity_registry.control
+control_pods = capacity_registry.control_pods
+dataplane = capacity_registry.dataplane
+deregister = capacity_registry.deregister
+register = capacity_registry.register
+registered_cluster_ids = capacity_registry.registered_cluster_ids
+run = capacity_registry.run
+validate_registered_synthetic_run = capacity_registry.validate_registered_synthetic_run
+validate_registry_target = capacity_registry.validate_registry_target
+aggregate = capacity_results.aggregate
+artifact_dir = capacity_results.artifact_dir
+collect_pod_json_logs = capacity_results.collect_pod_json_logs
+drain_targets = capacity_results.drain_targets
+move_to_aborted = capacity_results.move_to_aborted
+write_status = capacity_results.write_status
+_aurora_window = capacity_database.aurora_window
+_postgres_counters = capacity_database.postgres_counters
+_processor_priority_latency = capacity_database.processor_priority_latency
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
@@ -165,10 +136,11 @@ def log(message: str) -> None:
 def upsert_configmap(
     name: str,
     *,
+    resources: RunResources,
     text: dict[str, str] | None = None,
     binary: dict[str, bytes] | None = None,
 ) -> None:
-    manifest = {
+    manifest: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {"name": name, "namespace": NAMESPACE},
@@ -179,67 +151,55 @@ def upsert_configmap(
         manifest["binaryData"] = {
             key: base64.b64encode(value).decode() for key, value in binary.items()
         }
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(manifest).encode(),
-    )
+    resources.create(manifest)
 
 
-def prepare_start_gate() -> None:
+def prepare_start_gate(*, resources: RunResources) -> None:
     upsert_configmap(
         START_GATE_CONFIGMAP,
+        resources=resources,
         text={"start_epoch": ""},
     )
-    manifest = {
-        "apiVersion": "v1",
-        "kind": "List",
-        "items": [
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
+    access: list[dict[str, Any]] = [
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {
+                "name": START_GATE_ROLE,
+                "namespace": NAMESPACE,
+            },
+            "rules": [
+                {
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "resourceNames": [START_GATE_CONFIGMAP],
+                    "verbs": ["get"],
+                }
+            ],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {
+                "name": START_GATE_ROLE_BINDING,
+                "namespace": NAMESPACE,
+            },
+            "subjects": [
+                {
+                    "kind": "ServiceAccount",
+                    "name": "gpu-fault-completion-watcher",
+                    "namespace": NAMESPACE,
+                }
+            ],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
                 "kind": "Role",
-                "metadata": {
-                    "name": START_GATE_ROLE,
-                    "namespace": NAMESPACE,
-                },
-                "rules": [
-                    {
-                        "apiGroups": [""],
-                        "resources": ["configmaps"],
-                        "resourceNames": [START_GATE_CONFIGMAP],
-                        "verbs": ["get"],
-                    }
-                ],
+                "name": START_GATE_ROLE,
             },
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "RoleBinding",
-                "metadata": {
-                    "name": START_GATE_ROLE_BINDING,
-                    "namespace": NAMESPACE,
-                },
-                "subjects": [
-                    {
-                        "kind": "ServiceAccount",
-                        "name": "gpu-fault-completion-watcher",
-                        "namespace": NAMESPACE,
-                    }
-                ],
-                "roleRef": {
-                    "apiGroup": "rbac.authorization.k8s.io",
-                    "kind": "Role",
-                    "name": START_GATE_ROLE,
-                },
-            },
-        ],
-    }
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(manifest).encode(),
-    )
+        },
+    ]
+    for item in access:
+        resources.create(item)
 
 
 def wait_for_load_pods(
@@ -294,22 +254,23 @@ def wait_for_load_pods(
     )
 
 
-def release_start_gate(start_epoch: float) -> None:
-    upsert_configmap(
+def release_start_gate(start_epoch: float, *, resources: RunResources) -> None:
+    resources.update_data(
         START_GATE_CONFIGMAP,
-        text={"start_epoch": f"{start_epoch:.6f}"},
+        {"start_epoch": f"{start_epoch:.6f}"},
     )
 
 
-def publish_fixtures(case: str) -> None:
+def publish_fixtures(case: str, *, resources: RunResources) -> None:
     script_name = CASES[case]["script"]
     payloads = {}
     for name in {script_name, *SUPPORT_SCRIPTS}:
         payloads[name] = (PERF_DIR / name).read_text()
-    upsert_configmap(SCRIPT_CONFIGMAP, text=payloads)
+    upsert_configmap(SCRIPT_CONFIGMAP, resources=resources, text=payloads)
     templates = json.loads((PERF_DIR / "payload-templates.json").read_text())
     upsert_configmap(
         TEMPLATE_CONFIGMAP,
+        resources=resources,
         binary={
             "templates.json.gz": gzip.compress(
                 json.dumps(templates).encode(),
@@ -846,19 +807,11 @@ def execute_case(
     label: str,
     include_telemetry: bool,
     prewarm_connections: bool,
+    resources: RunResources,
 ) -> dict:
     spec = CASES[case]
     job = spec["job"]
-    publish_fixtures(case)
-    dataplane(
-        "delete",
-        "job",
-        job,
-        "--ignore-not-found",
-        "--wait=true",
-        check=False,
-        timeout=300,
-    )
+    publish_fixtures(case, resources=resources)
     pods = control_pods()
     log(f"observing {len(pods)} control-plane pods")
     metrics_before = scrape_metrics(pods)
@@ -877,7 +830,7 @@ def execute_case(
     gated_start = case == "burst"
     start_epoch = 0.0 if gated_start else time.time() + lead_seconds
     if gated_start:
-        prepare_start_gate()
+        prepare_start_gate(resources=resources)
     manifest = build_job(
         case,
         clusters=clusters,
@@ -897,53 +850,53 @@ def execute_case(
         include_telemetry=include_telemetry,
         prewarm_connections=prewarm_connections,
     )
+    manifest = run_manifest(manifest, resources.run_id)
     (artifacts / "job.json").write_text(json.dumps(manifest, indent=1) + "\n")
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(manifest).encode(),
-    )
+    resources.create(manifest)
     sampler = TopSampler(artifacts / "control-plane-top.jsonl")
     sampler.start()
-    if gated_start:
-        wait_for_load_pods(
-            job,
-            clusters,
-            timeout_seconds=600,
+    try:
+        if gated_start:
+            wait_for_load_pods(
+                job,
+                clusters,
+                timeout_seconds=600,
+            )
+            start_epoch = time.time() + lead_seconds
+            release_start_gate(start_epoch, resources=resources)
+            log(
+                f"all {clusters} load pods ready; synchronized start in {lead_seconds}s"
+            )
+        else:
+            log(
+                f"job {job} created; synchronized start in "
+                f"{lead_seconds}s ({clusters} load pods)"
+            )
+        window_start = start_epoch
+        status = wait_for_job(job, spec["deadline"] + lead_seconds + 120)
+        window_end = time.time()
+        log(f"job status: {status}")
+        (artifacts / "metrics-after.json").write_text(
+            json.dumps(scrape_metrics(pods), indent=1) + "\n"
         )
-        start_epoch = time.time() + lead_seconds
-        release_start_gate(start_epoch)
-        log(f"all {clusters} load pods ready; synchronized start in {lead_seconds}s")
-    else:
-        log(
-            f"job {job} applied; synchronized start in "
-            f"{lead_seconds}s ({clusters} load pods)"
+        cgroup_after = scrape_cgroup(pods)
+        (artifacts / "cgroup-after.json").write_text(
+            json.dumps(cgroup_after, indent=1) + "\n"
         )
-    window_start = start_epoch
-    status = wait_for_job(job, spec["deadline"] + lead_seconds + 120)
-    window_end = time.time()
-    log(f"job status: {status}")
-    (artifacts / "metrics-after.json").write_text(
-        json.dumps(scrape_metrics(pods), indent=1) + "\n"
-    )
-    cgroup_after = scrape_cgroup(pods)
-    (artifacts / "cgroup-after.json").write_text(
-        json.dumps(cgroup_after, indent=1) + "\n"
-    )
-    pg_after = postgres_counters()
-    (artifacts / "postgres-after.json").write_text(
-        json.dumps(pg_after, indent=1) + "\n"
-    )
-    documents = collect_logs(job, artifacts / "pods")
-    drain = queue_drain(
-        pods,
-        target_queue_depth=target_queue_depth,
-        target_spool_depth=target_spool_depth,
-    )
-    priority_latency = processor_priority_latency()
-    sampler.stop()
-    sampler.join(timeout=30)
+        pg_after = postgres_counters()
+        (artifacts / "postgres-after.json").write_text(
+            json.dumps(pg_after, indent=1) + "\n"
+        )
+        documents = collect_logs(job, artifacts / "pods")
+        drain = queue_drain(
+            pods,
+            target_queue_depth=target_queue_depth,
+            target_spool_depth=target_spool_depth,
+        )
+        priority_latency = processor_priority_latency()
+    finally:
+        sampler.stop()
+        sampler.join(timeout=30)
     (artifacts / "queue-drain.json").write_text(json.dumps(drain, indent=1) + "\n")
     (artifacts / "processor-priority-latency.json").write_text(
         json.dumps(priority_latency, indent=1) + "\n"
@@ -1023,42 +976,39 @@ def execute_case(
     return summary
 
 
-def purge_audit_rows() -> None:
-    pods = [pod for pod in control_pods() if "api-ha" in pod]
-    if not pods:
-        log("no api pod available for purge")
-        return
-    script = f"""
-import os, psycopg
-{STORE_DSN_SNIPPET}
-prefix = {PERF_CLUSTER_PREFIX!r} + '%'
-patterns = {{
-    "cluster": prefix,
-    "cluster_contains": "%" + prefix,
-    "action_workflow": "workflow-actionperf-%",
-}}
-statements = {AUDIT_PURGE_STATEMENTS!r}
-with psycopg.connect(store_dsn(), autocommit=True) as conn:
-    cur = conn.cursor()
-    for table, sql, pattern_name in statements:
-        try:
-            cur.execute(sql, (patterns[pattern_name],))
-            print(f'{{table}} deleted={{cur.rowcount}}')
-        except Exception as exc:
-            print(f'{{table}} skipped: {{exc}}')
-"""
-    log("purging audit-cluster rows")
-    output = control(
-        "exec",
-        pods[0],
-        "--",
-        "python3",
-        "-c",
-        script,
-        check=False,
-        timeout=900,
+def purge_audit_rows(
+    *, run_id: str | None = None, artifacts: Path | None = None
+) -> dict:
+    """Remove only a registered run's quiescent data, never a shared prefix."""
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("capacity cleanup requires an explicit run identity")
+    if artifacts is None:
+        raise RuntimeError("capacity cleanup requires its registration receipt")
+    if __package__:
+        from .regional_capacity_data import invoke
+    else:
+        from regional_capacity_data import invoke
+    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
+    if (
+        intent.get("run_id") != run_id
+        or intent.get("data_empty_before_registration") is not True
+    ):
+        raise RuntimeError("capacity cleanup registration scope is unproven")
+    result = invoke(
+        control,
+        run_id=run_id,
+        cluster_ids=intent["cluster_ids"],
+        cleanup=True,
     )
-    print(output)
+    if type(result.get("total")) is not int or result["total"] != 0:
+        raise RuntimeError("capacity exact run-owned cleanup left data")
+    (artifacts / "capacity-data-cleanup.json").write_text(
+        json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return result
 
 
 def _teardown_once(
@@ -1069,52 +1019,58 @@ def _teardown_once(
     artifacts: Path | None,
     run_id: str | None,
 ) -> None:
-    for spec in CASES.values():
-        dataplane(
-            "delete",
-            "job",
-            spec["job"],
-            "--ignore-not-found",
-            check=False,
-            timeout=300,
-        )
-    dataplane(
-        "delete",
-        "configmap",
-        SCRIPT_CONFIGMAP,
-        TEMPLATE_CONFIGMAP,
-        START_GATE_CONFIGMAP,
-        "--ignore-not-found",
-        check=False,
+    if __package__:
+        from .regional_capacity_resources import RunResources
+    else:
+        from regional_capacity_resources import RunResources
+    from scripts.e2e.regional.seeded_command_fixture import (
+        RUN_LABEL,
+        delete_owned_resource,
+        resource_metadata,
     )
-    dataplane(
-        "delete",
-        "role",
-        START_GATE_ROLE,
-        "--ignore-not-found",
-        check=False,
-    )
-    dataplane(
-        "delete",
-        "rolebinding",
-        START_GATE_ROLE_BINDING,
-        "--ignore-not-found",
-        check=False,
-    )
-    dataplane(
-        "delete",
-        "secret",
-        TOKEN_SECRET,
-        "--ignore-not-found",
-        check=False,
-    )
+
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("capacity teardown requires an explicit run identity")
+    if artifacts is None:
+        raise RuntimeError("capacity teardown requires the run's registration intent")
+    intent_path = artifacts / "registry-registration-intent.json"
+    if not intent_path.exists():
+        raise RuntimeError("capacity teardown has no registration ownership receipt")
+    intent = json.loads(intent_path.read_text())
+    if intent.get("run_id") != run_id:
+        raise RuntimeError("capacity registration intent belongs to another run")
+    RunResources(artifacts, run_id, NAMESPACE, dataplane).delete_all()
+    token_uid = None
+    metadata = resource_metadata("secret", TOKEN_SECRET, client=dataplane)
+    if metadata:
+        proof = json.loads((artifacts / "registry-token-proof.json").read_text())
+        token_uid = proof.get("uid")
+        if (
+            proof.get("run_id") != run_id
+            or not token_uid
+            or metadata.get("uid") != token_uid
+            or metadata.get("labels", {}).get(RUN_LABEL) != run_id
+        ):
+            raise RuntimeError("capacity token ownership or UID changed")
     if purge:
-        purge_audit_rows()
+        purge_audit_rows(run_id=run_id, artifacts=artifacts)
     if deregister_clusters:
         deregister(
             scope=scope,
             artifacts=artifacts,
             run_id=run_id,
+        )
+        delete_owned_resource(
+            "secret",
+            TOKEN_SECRET,
+            run_id,
+            client=dataplane,
+            namespace=NAMESPACE,
+            expected_uid=token_uid,
+            require_uid=True,
         )
 
 
@@ -1153,6 +1109,37 @@ def teardown(
     ) from last_error
 
 
+def validate_registered_resources(artifacts: Path, run_id: str, count: int) -> None:
+    from scripts.e2e.regional.seeded_command_fixture import RUN_LABEL, resource_metadata
+
+    if registered_cluster_ids(artifacts, run_id) != [
+        f"{PERF_CLUSTER_PREFIX}{index:03d}" for index in range(count)
+    ]:
+        raise RuntimeError(
+            "capacity cluster selection differs from registration intent"
+        )
+    proof = json.loads((artifacts / "registry-token-proof.json").read_text())
+    if (
+        not isinstance(proof, dict)
+        or proof.get("run_id") != run_id
+        or not isinstance(proof.get("uid"), str)
+        or not proof["uid"]
+        or not isinstance(proof.get("resource_version"), str)
+        or not proof["resource_version"]
+    ):
+        raise RuntimeError(
+            "capacity token UID proof is missing or belongs to another run"
+        )
+    metadata = resource_metadata("secret", TOKEN_SECRET, client=dataplane)
+    if (
+        metadata.get("uid") != proof["uid"]
+        or metadata.get("resourceVersion") != proof["resource_version"]
+        or metadata.get("namespace") != NAMESPACE
+        or (metadata.get("labels") or {}).get(RUN_LABEL) != run_id
+    ):
+        raise RuntimeError("capacity token Secret changed since registration")
+
+
 def execute_capacity_command(
     args: argparse.Namespace,
     *,
@@ -1166,8 +1153,12 @@ def execute_capacity_command(
     failure: BaseException | None = None
     result = 0
     aborted_reason: str | None = None
+    resources = RunResources(artifacts, suite_id, NAMESPACE, dataplane)
+    registration_pending = False
+    run_validated = False
     try:
         if args.command in {"register", "all"}:
+            registration_pending = True
             register(
                 args.clusters,
                 artifacts,
@@ -1176,6 +1167,7 @@ def execute_capacity_command(
                 allow_live_registry=args.allow_live_registry,
                 live_registry_confirmation=args.confirm_live_registry,
             )
+            registration_pending = False
         elif args.command == "run":
             validate_registered_synthetic_run(
                 count=args.clusters,
@@ -1183,48 +1175,76 @@ def execute_capacity_command(
                 artifacts=artifacts,
                 scope=scope,
             )
+        if args.command in {"register", "all", "run"}:
+            validate_registered_resources(artifacts, suite_id, args.clusters)
+        run_validated = True
         if args.command == "register":
             write_status(artifacts, status="ok")
             return 0
 
-        summary = execute_case(
-            args.case,
-            clusters=args.clusters,
-            nodes_per_cluster=args.nodes_per_cluster,
-            xid_total=xid_total,
-            sxid_total=sxid_total,
-            gpu_evidence_total=args.gpu_evidence_total,
-            host_evidence_total=args.host_evidence_total,
-            training_heartbeat_total=args.training_heartbeat_total,
-            workload_observation_total=args.workload_observation_total,
-            correlate_attempt_faults=args.correlate_attempt_faults,
-            workers=args.workers,
-            duration_seconds=args.duration_seconds,
-            lead_seconds=args.lead_seconds,
-            cpu_request=args.cpu_request,
-            cpu_limit=args.cpu_limit,
-            artifacts=artifacts,
-            label=args.label or f"{args.case}-{args.clusters}c",
-            include_telemetry=not args.fault_only,
-            prewarm_connections=args.prewarm_connections,
-        )
-        print(json.dumps(summary, indent=1, sort_keys=True))
-        if summary.get("job_status") != "Complete":
-            result = 1
-            aborted_reason = f"job status: {summary.get('job_status')}"
+        if args.command in {"all", "run"}:
+            summary = execute_case(
+                args.case,
+                clusters=args.clusters,
+                nodes_per_cluster=args.nodes_per_cluster,
+                xid_total=xid_total,
+                sxid_total=sxid_total,
+                gpu_evidence_total=args.gpu_evidence_total,
+                host_evidence_total=args.host_evidence_total,
+                training_heartbeat_total=args.training_heartbeat_total,
+                workload_observation_total=args.workload_observation_total,
+                correlate_attempt_faults=args.correlate_attempt_faults,
+                workers=args.workers,
+                duration_seconds=args.duration_seconds,
+                lead_seconds=args.lead_seconds,
+                cpu_request=args.cpu_request,
+                cpu_limit=args.cpu_limit,
+                artifacts=artifacts,
+                label=args.label or f"{args.case}-{args.clusters}c",
+                include_telemetry=not args.fault_only,
+                prewarm_connections=args.prewarm_connections,
+                resources=resources,
+            )
+            print(json.dumps(summary, indent=1, sort_keys=True))
+            if summary.get("job_status") != "Complete":
+                result = 1
+                aborted_reason = f"job status: {summary.get('job_status')}"
     except BaseException as exc:
         failure = exc
     finally:
-        if args.command in {"all", "run"} and not args.keep_registration:
+        cleanup_required = registration_pending or (
+            run_validated and (args.command != "register" or failure is not None)
+        )
+        if (
+            cleanup_required
+            and (artifacts / "registry-registration-intent.json").exists()
+        ):
             try:
-                teardown(
-                    purge=not args.no_purge,
-                    deregister_clusters=True,
-                    allow_live_registry=args.allow_live_registry,
-                    live_registry_confirmation=args.confirm_live_registry,
-                    artifacts=artifacts,
-                    run_id=suite_id,
-                )
+                cluster_ids = registered_cluster_ids(artifacts, suite_id)
+                resources.delete_all()
+                if args.command == "purge" or not args.no_purge:
+                    remaining = purge_audit_rows(run_id=suite_id, artifacts=artifacts)
+                else:
+                    remaining = capacity_data.invoke(
+                        control,
+                        run_id=suite_id,
+                        cluster_ids=cluster_ids,
+                        cleanup=False,
+                    )
+                if type(remaining.get("total")) is not int or remaining["total"] != 0:
+                    raise RuntimeError("capacity exact run-owned cleanup is incomplete")
+                if args.command != "purge" and (
+                    not args.keep_registration
+                    or (failure is not None and args.command == "register")
+                ):
+                    teardown(
+                        purge=not args.no_purge,
+                        deregister_clusters=True,
+                        allow_live_registry=args.allow_live_registry,
+                        live_registry_confirmation=args.confirm_live_registry,
+                        artifacts=artifacts,
+                        run_id=suite_id,
+                    )
             except Exception as cleanup_error:
                 if failure is not None:
                     failure.add_note(f"capacity teardown also failed: {cleanup_error}")
@@ -1237,8 +1257,7 @@ def execute_capacity_command(
             status="aborted",
             reason=f"{type(failure).__name__}: {failure}",
         )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
+        log(f"aborted artifacts: {artifacts}")
         raise failure.with_traceback(failure.__traceback__)
     if result:
         write_status(
@@ -1246,14 +1265,13 @@ def execute_capacity_command(
             status="aborted",
             reason=aborted_reason or "capacity run aborted",
         )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
+        log(f"aborted artifacts: {artifacts}")
         return result
     write_status(artifacts, status="ok")
     return 0
 
 
-def main() -> int:
+def capacity_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="regional control-plane capacity suite"
     )
@@ -1318,15 +1336,69 @@ def main() -> int:
     parser.add_argument("--allow-live-registry", action="store_true")
     parser.add_argument("--confirm-live-registry")
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        help="original registration artifact directory for run, purge or teardown",
+    )
+    return parser
+
+
+def resume_capacity_command(args: argparse.Namespace, scope: str) -> int:
+    artifacts = args.run_dir
+    cluster_ids = registered_cluster_ids(artifacts, args.suite_id)
+    previous = json.loads((artifacts / "run.json").read_text())
+    expected = {
+        "suite_id": args.suite_id,
+        "registry_scope": scope,
+        "control_namespace": CONTROL_NAMESPACE,
+        "dataplane_namespace": NAMESPACE,
+        "registry_secret": REGISTRY_SECRET,
+        "connection_secret": CONNECTION_SECRET,
+        **release_identity(),
+    }
+    if not isinstance(previous, dict) or any(
+        previous.get(key) != value for key, value in expected.items()
+    ):
+        raise RuntimeError(
+            "capacity resume target or release differs from the original run"
+        )
+    if args.command == "run" and args.clusters != len(cluster_ids):
+        raise RuntimeError(
+            "capacity run cluster count differs from registration intent"
+        )
+    write_status(artifacts, status="running")
+    return execute_capacity_command(
+        args,
+        artifacts=artifacts,
+        suite_id=args.suite_id,
+        expires_at=datetime.now(timezone.utc),
+        scope=scope,
+        xid_total=args.xid_total
+        if args.xid_total is not None
+        else round(500 * args.clusters / 32),
+        sxid_total=args.sxid_total
+        if args.sxid_total is not None
+        else round(500 * args.clusters / 32),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = capacity_parser()
+    args = parser.parse_args(argv)
     if not DATAPLANE_CONTEXT:
         parser.error("GPU_FAULT_DATAPLANE_CONTEXT is required")
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
     if args.command == "register" and not args.keep_registration:
         parser.error("register requires --keep-registration")
-    if args.command == "run" and not args.suite_id:
-        parser.error("run requires the --suite-id used by register")
+    if args.command in {"run", "purge", "teardown"}:
+        if not args.suite_id or args.run_dir is None:
+            parser.error(
+                f"{args.command} requires the original --suite-id and --run-dir"
+            )
+    elif args.run_dir is not None:
+        parser.error("--run-dir is only valid for run, purge or teardown")
     try:
         scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,
@@ -1334,6 +1406,8 @@ def main() -> int:
         )
     except RuntimeError as exc:
         parser.error(str(exc))
+    if args.command in {"run", "purge", "teardown"}:
+        return resume_capacity_command(args, scope)
 
     # 32 clusters carry 500 XID and 500 SXID; every other scale keeps the
     # same per-cluster fault rate so request totals stay linear.
@@ -1349,18 +1423,6 @@ def main() -> int:
     )
     label = args.label or f"{args.case}-{args.clusters}c"
 
-    if args.command == "purge":
-        purge_audit_rows()
-        return 0
-    if args.command == "teardown":
-        teardown(
-            purge=not args.no_purge,
-            deregister_clusters=not args.keep_registration,
-            allow_live_registry=args.allow_live_registry,
-            live_registry_confirmation=args.confirm_live_registry,
-        )
-        return 0
-
     identity = release_identity()
     suite_id = args.suite_id or secrets.token_hex(8)
     artifacts = artifact_dir(
@@ -1368,6 +1430,10 @@ def main() -> int:
         label,
         identity["release_id"] or "unknown-release",
     )
+    if any(artifacts.iterdir()):
+        raise RuntimeError(
+            "capacity artifacts already exist; resume with the original --run-dir"
+        )
     log(f"artifacts: {artifacts}")
     started_at = datetime.now(timezone.utc).isoformat()
     expires_at = datetime.now(timezone.utc) + timedelta(

@@ -33,6 +33,8 @@ could drift from it:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -645,6 +647,13 @@ def sweep(store: Any, *, passes: int) -> list[list[str]]:
 # --------------------------------------------------------------------------- #
 # Read-backs
 # --------------------------------------------------------------------------- #
+def _record_digest(record: Any) -> str:
+    encoded = json.dumps(
+        record.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
     """The fields the verdicts read, per workflow, from a fresh Store read."""
 
@@ -652,6 +661,7 @@ def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
     for request_id in request_ids:
         workflow = store.get_workflow(request_id)
         snapshot[request_id] = {
+            "record_sha256": _record_digest(workflow),
             "status": workflow.status.value,
             "preemption_reason": workflow.preemption_reason or "",
             "preempted_by_workflow_id": workflow.preempted_by_workflow_id,
@@ -677,6 +687,7 @@ def incident_snapshot(store: Any, incident_ids: Iterable[str]) -> dict[str, Any]
     for incident_id in incident_ids:
         incident = store.get_incident(incident_id)
         snapshot[incident_id] = {
+            "record_sha256": _record_digest(incident),
             "state": incident.state.value,
             "workflow_request_id": incident.workflow_request_id,
             "fencing_token": incident.fencing_token,
@@ -693,6 +704,7 @@ def command_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
         workflow_request_ids=sorted(set(request_ids))
     ):
         snapshot[command.command_id] = {
+            "record_sha256": _record_digest(command),
             "status": command.status.value,
             "status_source": command.status_source,
             "error": command.error or "",
