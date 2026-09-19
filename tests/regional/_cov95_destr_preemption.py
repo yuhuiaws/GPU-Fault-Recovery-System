@@ -10,6 +10,7 @@ import pytest
 
 from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr016_preempting_reboot as case
+from scripts.e2e.regional.acceptance_runner_common import OPEN_INCIDENTS_PROBE
 from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional import test_destr016_preempting_reboot as data
@@ -278,7 +279,10 @@ class PreemptionRegional:
     def gpu_workloads(self) -> list[dict[str, Any]]:
         return deepcopy(self.h.preflight["gpu_workloads"])
 
-    def cpu_python(self, script: str, request_id: str) -> dict[str, Any]:
+    def cpu_python(self, script: str, *args: str) -> dict[str, Any]:
+        if script == OPEN_INCIDENTS_PROBE:
+            return {"open_incidents": []}
+        request_id = args[0]
         if script == case.WORKFLOW_BY_ID:
             if request_id == data.RESET_ID:
                 self.h.call("predecessor.read", request_id)

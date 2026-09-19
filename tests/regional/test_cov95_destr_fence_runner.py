@@ -158,6 +158,7 @@ def test_fence_waits_through_transient_missing_pin_and_old_generation(
         "incident.idle",
         "restore.create",
         "restore.wait",
+        "incident.close",
         "host.restore-quiesce",
         "fence.clear-state",
         "runtime.verify",

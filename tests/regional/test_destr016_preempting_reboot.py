@@ -859,6 +859,7 @@ def happy_preflight_arguments() -> dict[str, Any]:
         "gpu_workloads": [],
         "business_workloads": [],
         "event": None,
+        "open_incidents": [],
         "predecessor": {"valid": True},
         "tests": {"passed": True},
         "control_env": {
@@ -875,12 +876,40 @@ def test_a_healthy_idle_node_passes_the_preflight() -> None:
     assert destr016.preflight_errors(**happy_preflight_arguments()) == []
 
 
+def test_the_preflight_refuses_only_an_open_incident_that_names_the_node() -> None:
+    """The injected XID 46 must open a NEW reset workflow for the XID 79 to
+    preempt; a node an open incident still owns merges it there instead."""
+
+    def incident(state: str, node: str = NODE) -> dict[str, Any]:
+        return {"incident_id": "inc-old", "state": state, "node_ids": [node]}
+
+    def errors_for(item: dict[str, Any]) -> list[str]:
+        return destr016.preflight_errors(
+            **{**happy_preflight_arguments(), "open_incidents": [item]}
+        )
+
+    quarantined = errors_for(incident("QUARANTINED"))
+    assert len(quarantined) == 1, quarantined
+    assert "inc-old" in quarantined[0] and "QUARANTINED" in quarantined[0], quarantined
+    assert "workflow-reconcile --close-quarantined" in quarantined[0], quarantined
+    assert errors_for(incident("RECOVERED")) == []
+    assert errors_for(incident("ESCALATED", node="node-elsewhere")) == []
+
+
 @pytest.mark.parametrize(
     ("override", "expected"),
     [
         ({"predecessor": {"valid": False}}, "predecessor evidence is not PASS"),
         ({"tests": {"passed": False}}, "focused regression tests failed"),
         ({"event": {"xid": 46}}, "has a recent XID event"),
+        (
+            {
+                "open_incidents": [
+                    {"incident_id": "inc-old", "state": "ESCALATED", "node_ids": [NODE]}
+                ]
+            },
+            "workflow-reconcile --close-incident",
+        ),
         ({"queue": {"depth": 3}}, "processor queue is not empty"),
         (
             {"remote_commands": {"open_by_cluster": {"cluster-a": 1}}},

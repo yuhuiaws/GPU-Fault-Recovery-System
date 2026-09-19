@@ -168,3 +168,25 @@ def test_the_installed_module_digest_matches_the_staged_wheel_digest(tmp_path) -
         "the sibling engine is folded in identically on both sides"
     )
     assert with_engine != without_engine, "the engine is part of the identity"
+
+
+def test_node_runtime_does_not_ship_the_control_plane_orchestration_families() -> None:
+    """A module inside the node-runtime wheel changes the wheel digest, and a
+    changed digest re-rolls every GPU node. The orchestration families are
+    composed by the control-plane coordinator alone; no node entrypoint reaches
+    them. Yet ``gpu_fault.orchestration.families.__init__`` imported all eleven
+    eagerly, so the collector path ``training_health -> families.identity``
+    shipped the whole package to every node and a control-plane-only change to
+    ``node_lifecycle`` rolled the data plane (every deploy through #21,
+    2026-09-19)."""
+    node_runtime = component_wheels.component_modules("node_runtime")
+    control_plane = component_wheels.component_modules("control_plane")
+    for module in (
+        "gpu_fault.orchestration.families.node_lifecycle",
+        "gpu_fault.orchestration.families.health",
+        "gpu_fault.orchestration.families.grouped_health",
+        "gpu_fault.orchestration.families.drain",
+        "gpu_fault.orchestration.families.reset",
+    ):
+        assert module not in node_runtime, f"{module} is control-plane code"
+        assert module in control_plane, f"the coordinator still composes {module}"

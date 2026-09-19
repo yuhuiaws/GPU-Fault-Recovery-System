@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -463,3 +467,190 @@ def test_failed_atomic_write_does_not_become_persisted_execution_authority(
     assert value.path.read_bytes() == original
     assert json.loads(original)["prewarm_started"] is False
     assert reload_journal(value).record.prewarm_started is False
+
+
+ARCHIVE_TAG = re.compile(r"completed-\d{8}T\d{6}Z(?:-\d+)?")
+
+
+def completed_journal(directory: Path) -> journal.ExecutionJournal:
+    value = make_journal(directory)
+    start(value)
+    value.cleaned_scenario("active-gpu-pod")
+    value.cleaned_prewarm()
+    value.complete()
+    return value
+
+
+def execution_artifacts(directory: Path) -> dict[str, Path]:
+    scenario = directory / "scenarios" / "active-gpu-pod"
+    scenario.mkdir(mode=0o700, parents=True)
+    write_json_atomic(scenario / "active-gpu-pod.json", {"verdict": "FAIL"})
+    write_json_atomic(directory / "prewarm-owner.json", {"completed": True})
+    (directory / "prewarm-owner.lock").touch(mode=0o600)
+    return {
+        name: directory / name
+        for name in (
+            "execution-owner.json",
+            "execution-owner.lock",
+            "prewarm-owner.json",
+            "prewarm-owner.lock",
+            "scenarios",
+        )
+    }
+
+
+def drifted_binding(value: journal.ExecutionJournal) -> Callable[[], dict[str, Any]]:
+    binding = value.binding()
+    binding["connections"]["gpu"]["sha256"] = "e" * 64
+    return lambda: copy.deepcopy(binding)
+
+
+def archived_names(tag: str) -> dict[str, str]:
+    return {
+        "execution-owner.json": f"execution-owner.{tag}.json",
+        "execution-owner.lock": f"execution-owner.{tag}.lock",
+        "prewarm-owner.json": f"prewarm-owner.{tag}.json",
+        "prewarm-owner.lock": f"prewarm-owner.{tag}.lock",
+        "scenarios": f"scenarios.{tag}",
+    }
+
+
+def test_finished_execution_with_drifted_binding_is_archived_for_a_fresh_start(
+    tmp_path: Path,
+) -> None:
+    value = completed_journal(tmp_path)
+    paths = execution_artifacts(tmp_path)
+    original = value.path.read_bytes()
+    changed = drifted_binding(value)
+    with pytest.raises(RegionalFixtureError, match="input or connection drifted"):
+        journal.ExecutionJournal(value.path, changed)
+    lineage = journal.retire_completed_execution(tmp_path, value.path, binding=changed)
+    assert lineage is not None, "a finished execution that owns nothing must retire"
+    assert (lineage["attempt"], lineage["release_id"]) == (7, "release-original")
+    assert lineage["binding_matched"] is False
+    tag = ARCHIVE_TAG.search(lineage["archived"]["execution-owner.json"])
+    assert tag is not None, lineage
+    assert lineage["archived"] == archived_names(tag.group(0))
+    for name, path in paths.items():
+        assert not path.exists() and not path.is_symlink(), f"{name} must be archived"
+        assert (tmp_path / lineage["archived"][name]).exists(), f"{name} archive"
+    archive = tmp_path / lineage["archived"]["execution-owner.json"]
+    assert archive.read_bytes() == original
+    evidence = tmp_path / lineage["archived"]["scenarios"] / "active-gpu-pod"
+    assert (evidence / "active-gpu-pod.json").is_file(), (
+        "scenario evidence must move with its execution"
+    )
+    fresh = make_journal(tmp_path)
+    assert fresh.resuming is False and fresh.record.completed is False
+    fresh.start_prewarm()
+    assert reload_journal(fresh).record.prewarm_started is True
+
+
+@pytest.mark.parametrize(
+    "phase", ["scenario-started", "prewarm-started", "closed-without-completion"]
+)
+def test_unfinished_execution_is_never_retired_and_keeps_its_strict_binding(
+    tmp_path: Path, phase: str
+) -> None:
+    value = make_journal(tmp_path)
+    if phase == "prewarm-started":
+        value.start_prewarm()
+    else:
+        start(value)
+    if phase == "closed-without-completion":
+        value.cleaned_scenario("active-gpu-pod")
+        value.cleaned_prewarm()
+    paths = execution_artifacts(tmp_path)
+    original = value.path.read_bytes()
+    changed = drifted_binding(value)
+    for binding in (value.binding, changed):
+        retired = journal.retire_completed_execution(
+            tmp_path, value.path, binding=binding
+        )
+        assert retired is None, phase
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(paths), (
+        "an unfinished execution must keep every artifact in place"
+    )
+    with pytest.raises(RegionalFixtureError, match="input or connection drifted"):
+        journal.ExecutionJournal(value.path, changed)
+    assert value.path.read_bytes() == original
+
+
+@pytest.mark.parametrize("phase", ["matrix-cleaned", "never-started"])
+def test_finished_execution_is_retired_even_when_its_binding_still_matches(
+    tmp_path: Path, phase: str
+) -> None:
+    if phase == "matrix-cleaned":
+        value = completed_journal(tmp_path)
+    else:
+        value = make_journal(tmp_path)
+        value.cleaned_prewarm()
+        value.complete()
+    with pytest.raises(RegionalFixtureError, match="cleanup-only"):
+        reload_journal(value).start_prewarm()
+    lineage = journal.retire_completed_execution(
+        tmp_path, value.path, binding=value.binding
+    )
+    assert lineage is not None and lineage["binding_matched"] is True, lineage
+    assert set(lineage["archived"]) == {"execution-owner.json", "execution-owner.lock"}
+    assert not value.path.exists(), "the finished journal must leave the live name"
+    fresh = make_journal(tmp_path)
+    fresh.start_prewarm()
+    assert fresh.record.attempt == 7 and fresh.record.prewarm_started is True
+
+
+@pytest.mark.parametrize("content", ["{", '{"schema_version": 2}', "extra-field"])
+def test_peek_validates_the_document_shape_without_a_binding(
+    tmp_path: Path, content: str
+) -> None:
+    value = make_journal(tmp_path)
+    if content == "extra-field":
+        document = value.record.model_dump(mode="json")
+        document["unexpected_authority"] = True
+        write_json_atomic(value.path, document)
+    else:
+        value.path.write_text(content)
+    with pytest.raises(RegionalFixtureError, match="execution journal is invalid"):
+        journal.ExecutionJournal.peek(value.path)
+
+
+def test_peek_reads_a_finished_record_whose_binding_no_longer_matches(
+    tmp_path: Path,
+) -> None:
+    value = completed_journal(tmp_path)
+    changed = drifted_binding(value)
+    record = journal.ExecutionJournal.peek(value.path)
+    assert record.completed is True and record.binding == value.binding()
+    with pytest.raises(RegionalFixtureError, match="input or connection drifted"):
+        journal.ExecutionJournal(value.path, changed)
+
+
+def test_archive_names_never_overwrite_an_earlier_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(journal, "datetime", SimpleNamespace(now=lambda tz=None: fixed))
+    first = completed_journal(tmp_path)
+    execution_artifacts(tmp_path)
+    one = journal.retire_completed_execution(
+        tmp_path, first.path, binding=first.binding
+    )
+    second = completed_journal(tmp_path)
+    execution_artifacts(tmp_path)
+    two = journal.retire_completed_execution(
+        tmp_path, second.path, binding=second.binding
+    )
+    assert one is not None and two is not None
+    assert one["archived"] == archived_names("completed-20000101T000000Z")
+    assert two["archived"] == archived_names("completed-20000101T000000Z-1")
+    for lineage in (one, two):
+        for name in lineage["archived"].values():
+            assert (tmp_path / name).exists(), name
+
+
+def test_retiring_an_absent_journal_publishes_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "execution-owner.json"
+    assert journal.retire_completed_execution(path.parent, path) is None
+    assert not path.parent.exists(), (
+        "retiring nothing must not create a case directory or a lock file"
+    )

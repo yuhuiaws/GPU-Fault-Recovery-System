@@ -22,6 +22,16 @@ validated restore that released the spare's quarantine also uncordoned it
 exactly the recorded baseline, so a node cordoned before the declaration stays
 cordoned afterwards.
 
+Both mutations are bound to the ``resourceVersion`` the survey read. When the
+API server answers ``409 Conflict`` -- a kubelet heartbeat or a device plugin
+moved the node on in the meantime -- the node is re-read and the patch retried
+against the fresh version, at most ``PATCH_ATTEMPTS`` times in total and only
+while the spare label, the cordon, the spare reservation and the quarantine
+ownership still read as surveyed. A declaration whose patch never took effect
+leaves a record without ``declared_state``; the next declaration supersedes
+it, keeping it as history inside the new record, instead of demanding a
+``--release`` of nothing.
+
 Cluster access follows the other admin verbs: ``kubectl`` bound to the site's
 GPU kubeconfig and the cluster's context. The access object exposes the three
 ``CoreV1Api`` method names the flow uses, so a test -- or a Kubernetes client
@@ -34,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,7 +87,18 @@ FINISHED_POD_PHASES = frozenset({"Succeeded", "Failed"})
 DECLARE_CONFIRMATION = "DECLARE_WARM_SPARE_CORDON"
 RELEASE_CONFIRMATION = "RELEASE_WARM_SPARE_UNCORDON"
 RECORDS_PATH = Path("warm-spares")
+SUPERSEDED_KEY = "superseded_interrupted_declarations"
 MODES = ("check", "declare", "release")
+
+# A patch is bound to the resourceVersion the survey read. The API server
+# answers a stale one with ``409 Conflict`` -- kubectl prints ``Error from
+# server (Conflict): Operation cannot be fulfilled on nodes "<name>": the
+# object has been modified; please apply your changes to the latest version
+# and try again`` -- which a kubelet heartbeat or a device plugin registering
+# raises in the second between survey and patch. The patch is retried against
+# a fresh read, at most this many attempts in total.
+PATCH_ATTEMPTS = 3
+CONFLICT_PATTERN = re.compile(r"the object has been modified|\(Conflict\)")
 
 # Runs inside a CPU ingress Pod: the only place the Store is reachable from an
 # administrator command. Prints one JSON object; a missing Agent is a result,
@@ -101,6 +123,17 @@ else:
 
 class WarmSpareError(BootstrapError):
     """A refusal or failure of the warm-spare flow; reported on one line."""
+
+
+class WarmSpareConflict(WarmSpareError):
+    """The API server refused a patch because the node's ``resourceVersion`` moved.
+
+    Raised only for the optimistic-concurrency refusal itself (``409 Conflict``,
+    "the object has been modified"). :func:`_patch` answers it by re-reading the
+    node and retrying against the fresh version while the spare label, cordon,
+    reservation and quarantine ownership still read as surveyed. Every other
+    kubectl failure stays a plain :class:`WarmSpareError` and is never retried.
+    """
 
 
 class NodeApi(Protocol):
@@ -152,11 +185,18 @@ class KubectlNodeApi:
             timeout_seconds=120,
         )
         if completed.returncode:
+            failed = f"kubectl {' '.join(arguments[:3])} failed: "
+            if arguments[:1] == ("patch",) and CONFLICT_PATTERN.search(
+                completed.stderr or ""
+            ):
+                # Fully characterised, so the message names the conflict
+                # instead of echoing server output, redacted or not.
+                raise WarmSpareConflict(
+                    failed + "resource version conflict "
+                    "(the node changed between survey and patch)"
+                )
             detail = diagnostic_text(completed.stderr, sensitive=True)
-            raise WarmSpareError(
-                f"kubectl {' '.join(arguments[:3])} failed: "
-                f"{detail or 'no error output'}"
-            )
+            raise WarmSpareError(failed + (detail or "no error output"))
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
@@ -473,6 +513,73 @@ def without_survey(record: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if not key.endswith("_survey")}
 
 
+def _identity(snapshot: Mapping[str, Any], node: str) -> tuple[str, str]:
+    """``(uid, resourceVersion)`` of ``snapshot``; a refusal when either is missing."""
+
+    uid = snapshot.get("uid")
+    version = snapshot.get("resource_version")
+    if (
+        snapshot.get("name") != node
+        or not isinstance(uid, str)
+        or not uid
+        or not isinstance(version, str)
+        or not version
+    ):
+        raise WarmSpareError("warm-spare node identity or resource version is missing")
+    return uid, version
+
+
+def _version_for_retry(
+    api: NodeApi, node: str, *, expected: Mapping[str, Any], uid: str
+) -> str:
+    """The node's fresh ``resourceVersion`` after a conflict, if a retry is honest.
+
+    Honest means the concurrent writer touched nothing the patch is about to
+    change or that would have refused it: the same node (uid), the same spare
+    label, cordon, spare reservation and quarantine-ownership verdict the
+    survey read. Anything else -- a heartbeat, an allocatable count, another
+    label, the pool-state annotation the pool itself refreshes -- may differ.
+    A change to any guarded field is refused rather than overwritten: the
+    refusals were computed against the surveyed state.
+    """
+
+    fresh = node_snapshot(api.read_node(node))
+    fresh_uid, version = _identity(fresh, node)
+    if fresh_uid != uid:
+        raise WarmSpareError("warm-spare node identity changed during mutation")
+    changed: list[str] = []
+    surveyed_label = (expected.get("labels") or {}).get(SPARE_LABEL)
+    fresh_label = fresh["labels"].get(SPARE_LABEL)
+    if fresh_label != surveyed_label:
+        changed.append(f"spare label ({surveyed_label!r} -> {fresh_label!r})")
+    surveyed_unschedulable = bool(expected.get("unschedulable", False))
+    if fresh["unschedulable"] != surveyed_unschedulable:
+        changed.append(
+            f"unschedulable ({surveyed_unschedulable} -> {fresh['unschedulable']})"
+        )
+    surveyed_reservation = (expected.get("annotations") or {}).get(
+        SPARE_RESERVATION_ANNOTATION
+    )
+    fresh_reservation = fresh["annotations"].get(SPARE_RESERVATION_ANNOTATION)
+    if fresh_reservation != surveyed_reservation:
+        changed.append(
+            f"spare reservation ({surveyed_reservation!r} -> {fresh_reservation!r})"
+        )
+    surveyed_ownership = has_quarantine_ownership(expected)
+    fresh_ownership = has_quarantine_ownership(fresh)
+    if fresh_ownership != surveyed_ownership:
+        changed.append(
+            f"quarantine ownership ({surveyed_ownership} -> {fresh_ownership})"
+        )
+    if changed:
+        raise WarmSpareError(
+            "warm-spare patch refused after a resource version conflict: the node's "
+            + " and ".join(changed)
+            + " changed between survey and patch; re-run the check"
+        )
+    return version
+
+
 def _patch(
     api: NodeApi,
     node: str,
@@ -481,31 +588,70 @@ def _patch(
     unschedulable: bool,
     expected: Mapping[str, Any],
 ) -> dict[str, Any]:
-    uid = expected.get("uid")
-    version = expected.get("resource_version")
-    if (
-        expected.get("name") != node
-        or not isinstance(uid, str)
-        or not uid
-        or not isinstance(version, str)
-        or not version
-    ):
-        raise WarmSpareError("warm-spare node identity or resource version is missing")
-    api.patch_node(
-        node,
-        {
-            "metadata": {
-                "uid": uid,
-                "resourceVersion": version,
-                "labels": {SPARE_LABEL: spare_label},
-            },
-            "spec": {"unschedulable": unschedulable},
-        },
-    )
+    """Patch the spare label and the cordon, bound to a surveyed ``resourceVersion``.
+
+    A conflict means the node moved on between survey and patch: the node is
+    re-read and the patch retried against the fresh version -- at most
+    ``PATCH_ATTEMPTS`` attempts in total, and only while the spare label, the
+    cordon, the spare reservation and the quarantine ownership still read as
+    surveyed (:func:`_version_for_retry`). Any other failure propagates
+    unchanged.
+    """
+
+    uid, version = _identity(expected, node)
+    for attempt in range(1, PATCH_ATTEMPTS + 1):
+        try:
+            api.patch_node(
+                node,
+                {
+                    "metadata": {
+                        "uid": uid,
+                        "resourceVersion": version,
+                        "labels": {SPARE_LABEL: spare_label},
+                    },
+                    "spec": {"unschedulable": unschedulable},
+                },
+            )
+        except WarmSpareConflict as conflict:
+            if attempt == PATCH_ATTEMPTS:
+                raise WarmSpareError(
+                    f"kubectl patch node {node} failed: resource version conflict "
+                    f"on {PATCH_ATTEMPTS} consecutive attempts (the node kept "
+                    "changing between survey and patch); re-run the command"
+                ) from conflict
+            version = _version_for_retry(api, node, expected=expected, uid=uid)
+        else:
+            break
     observed = node_snapshot(api.read_node(node))
     if observed["name"] != node or observed["uid"] != uid:
         raise WarmSpareError("warm-spare node identity changed during mutation")
     return observed
+
+
+def interrupted_declaration(
+    record: Mapping[str, Any] | None, *, node: str, live: Mapping[str, Any]
+) -> bool:
+    """Whether ``record`` is an unreleased declaration whose patch never took effect.
+
+    ``declared_state`` is written only after the patch was verified on the
+    node, so a record without it -- whose baseline still equals the node's
+    current spare label and cordon -- changed nothing: there is nothing to
+    release, and the next declaration supersedes it. A record with a
+    ``declared_state``, or whose baseline differs from the live node, still
+    describes a mutation that only ``--release`` may put back.
+    """
+
+    if (
+        record is None
+        or record.get("released_at")
+        or "declared_state" in record
+        or record.get("node") != node
+    ):
+        return False
+    return record.get("baseline") == {
+        "labels": {SPARE_LABEL: live["labels"].get(SPARE_LABEL)},
+        "unschedulable": bool(live["unschedulable"]),
+    }
 
 
 def declare(
@@ -520,12 +666,28 @@ def declare(
     """Label and cordon ``node``; the baseline is on disk before the patch."""
 
     existing = read_record(record)
-    if existing is not None and not existing.get("released_at"):
-        raise WarmSpareError(
-            f"{record} still records an unreleased declaration; "
-            "release it before declaring again"
-        )
     before = survey["node"]
+    superseded: list[dict[str, Any]] = []
+    if existing is not None and not existing.get("released_at"):
+        if not interrupted_declaration(existing, node=node, live=before):
+            raise WarmSpareError(
+                f"{record} still records an unreleased declaration; "
+                "release it before declaring again"
+            )
+        # Nothing to release: the patch never took effect and the node still
+        # reads as that record's baseline. It stays as forensic history inside
+        # the new record -- flat, oldest first -- rather than being overwritten.
+        superseded = [
+            *(existing.get(SUPERSEDED_KEY) or []),
+            {
+                **{
+                    key: value
+                    for key, value in without_survey(existing).items()
+                    if key != SUPERSEDED_KEY
+                },
+                "superseded_at": now(),
+            },
+        ]
     document: dict[str, Any] = {
         "node": node,
         "cluster_id": survey.get("cluster_id"),
@@ -539,6 +701,8 @@ def declare(
         },
         "pre_declaration_survey": dict(survey),
     }
+    if superseded:
+        document[SUPERSEDED_KEY] = superseded
     # Written before the mutation, so an interrupted declaration still leaves
     # an exact record of what to put back.
     write_json_atomic(record, document)

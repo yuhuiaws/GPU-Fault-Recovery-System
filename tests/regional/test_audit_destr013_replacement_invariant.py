@@ -245,14 +245,116 @@ def test_invalid_timestamp_cannot_disappear_beside_valid_evidence(
         destr013.run_timestamps(tmp_path)
 
 
-@pytest.mark.parametrize("entries", [None, {}, "invalid", [None], [{}]])
+OBSERVED = {"observed_at": "2026-09-07T09:05:00Z"}
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param(None, id="null"),
+        pytest.param({}, id="object"),
+        pytest.param("invalid", id="string"),
+        pytest.param([OBSERVED, {"pod": "gpu-fault-api-ha-0"}], id="mixed-dict"),
+        pytest.param([OBSERVED, None], id="mixed-null"),
+        pytest.param([OBSERVED, "2026-09-07T09:06:00Z"], id="mixed-string"),
+    ],
+)
 def test_malformed_timeline_cannot_disappear(tmp_path: Path, entries: Any) -> None:
+    """A non-list, or a timeline with holes, is an integrity failure.
+
+    Once any element carries ``observed_at`` the list is a timeline, and every
+    other element must carry one too: an entry that lost its timestamp beside
+    kept ones is how a window's evidence would silently shrink.
+    """
+
     _write(
         tmp_path / "cases" / "GF-REGIONAL-DESTR-002" / "timeline.json",
         {"started_at": "2026-09-07T09:00:00Z", "entries": entries},
     )
     with pytest.raises(destr013.AuditError, match="timeline is malformed"):
         destr013.run_timestamps(tmp_path)
+
+
+def test_a_collectors_entries_list_is_not_a_timeline(tmp_path: Path) -> None:
+    """The control-plane log collector reuses ``entries`` for per-Pod verdicts.
+
+    Its document (absent/entries/inconclusive/silent/suspicious/verdict) lists
+    log classifications, none carrying ``observed_at``; the audit must read the
+    case's run timestamps from its other files and neither fail on this list
+    nor descend into the nested container timestamps.
+    """
+
+    case = tmp_path / "cases" / "GF-REGIONAL-DESTR-009"
+    _write(
+        case / "GF-REGIONAL-DESTR-009.json",
+        {"case_id": "GF-REGIONAL-DESTR-009", "started_at": "2026-09-07T09:00:00Z"},
+    )
+    _write(
+        case / "control-plane-logs.json",
+        {
+            "absent": ["gpu-fault-control-worker-0"],
+            "entries": [
+                {
+                    "classification": "silent",
+                    "line_count": 0,
+                    "pod": "gpu-fault-api-ha-0",
+                    "sha256": "0" * 64,
+                    "silence_evidence": {
+                        "container_name": "api",
+                        "container_started_at": "2020-01-01T00:00:00+00:00",
+                        "restart_count": 0,
+                    },
+                },
+                {
+                    "classification": "absent",
+                    "line_count": 0,
+                    "pod": "gpu-fault-control-worker-0",
+                    "sha256": "0" * 64,
+                },
+            ],
+            "inconclusive": [],
+            "silent": ["gpu-fault-api-ha-0"],
+            "suspicious": [],
+            "verdict": "CLEAN",
+        },
+    )
+
+    found = destr013.run_timestamps(tmp_path)
+
+    assert found == [
+        {
+            "path": "cases/GF-REGIONAL-DESTR-009/GF-REGIONAL-DESTR-009.json",
+            "key": "started_at",
+            "at": "2026-09-07T09:00:00+00:00",
+        }
+    ], found
+
+
+@pytest.mark.parametrize("entries_key", ["entries", "transitions"])
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param([], id="empty"),
+        pytest.param([{}], id="bare-object"),
+        pytest.param([{"probed_at": "2026-09-07T09:05:00Z"}], id="coverage-probe"),
+        pytest.param(["a log line"], id="strings"),
+    ],
+)
+def test_a_list_without_observed_at_is_not_a_timeline(
+    tmp_path: Path, entries_key: str, entries: Any
+) -> None:
+    """A list in which no element carries ``observed_at`` is skipped, not judged."""
+
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-024" / "coverage-idle-timeline.json",
+        {"started_at": "2026-09-07T09:00:00Z", entries_key: entries},
+    )
+
+    found = destr013.run_timestamps(tmp_path)
+
+    assert [(item["key"], item["at"]) for item in found] == [
+        ("started_at", "2026-09-07T09:00:00+00:00")
+    ], found
 
 
 @pytest.mark.parametrize("defect", ["unreadable", "invalid-json", "missing-case-time"])

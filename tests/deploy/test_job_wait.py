@@ -225,8 +225,12 @@ def test_persistent_transient_failure_exhausts_the_total_timeout(
 def test_successful_watch_supplies_completion_without_a_late_get(
     tmp_path: Path,
 ) -> None:
+    # Bash ``SECONDS`` has whole-second granularity, so a one-second budget can
+    # expire almost at once and the 0.9 s fake watch then loses to ``timeout``
+    # on a loaded test host (deploy gate #21, 2026-09-19). Three seconds keep
+    # the watch inside the deadline while the assertion stays the same.
     result, calls = run_wait(
-        tmp_path, job(), after=job("Complete"), seconds=1, watch_delay="0.9"
+        tmp_path, job(), after=job("Complete"), seconds=3, watch_delay="0.9"
     )
     assert result.returncode == 0, result.stderr
     assert sum("get job/" in call for call in calls) == 1

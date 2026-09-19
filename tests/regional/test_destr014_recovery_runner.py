@@ -756,3 +756,111 @@ def test_recovery_plan_binds_helper_and_nonrenewable_hold(
     assert window["hold_seconds"] > runner.settings.managed_recovery_timeout_seconds
     assert window["recovery_seconds"] == host_probe.RECOVERY_SECONDS
     assert len(window["helper_sha256"]) == 64
+
+
+def test_a_journal_from_a_replaced_boot_is_retired_and_the_run_starts_fresh(
+    runner: RunnerHarness,
+) -> None:
+    """The live wedge: an unfinished journal bound to the sibling's previous
+    boot refused every retry as "identity changed". With the node on a new boot
+    the stale journal owns no host state, so acquiring this attempt's journal
+    retires it aside; the case then runs fresh (not cleanup-only) and surfaces
+    the retired journal's lineage in the case result."""
+
+    seeded = case.recovery.RunJournal(
+        runner.journal_path,
+        {"run": "old", "run_id": "destr014-test-aold", "boot_id": "boot-earlier"},
+    )
+    seeded.acquire()
+    seeded.data["phase"] = "RECOVERY_REQUIRED"
+    seeded.data["host_request"] = "cleanup"
+    seeded.save()
+    seeded.close()
+
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert "cleanup-only" not in report.get("error", ""), (
+        "a retired journal must let the case run fresh, not resume cleanup-only"
+    )
+    assert "recovery.prepare" in runner.calls, "the fresh run must arm recovery"
+    retired = report["retired_journals"]
+    assert len(retired) == 1, retired
+    entry = retired[0]
+    assert entry["old_run_id"] == "destr014-test-aold"
+    assert entry["old_boot_id"] == "boot-earlier"
+    assert entry["old_phase"] == "RECOVERY_REQUIRED"
+    assert entry["old_host_request"] == "cleanup"
+    assert "rebooted-destr014-test-aold" in entry["archive"]
+    archived = sorted(runner.case_dir.glob("destr014-recovery-journal.rebooted-*.json"))
+    assert [p.name for p in archived] == [
+        "destr014-recovery-journal.rebooted-destr014-test-aold.json"
+    ], archived
+    saved = json.loads(runner.journal_path.read_text())
+    assert saved["phase"] == "CLOSED"
+    assert saved["run"]["retired_journals"] == retired
+
+
+def test_a_never_armed_journal_on_the_same_boot_is_retired_and_the_run_starts_fresh(
+    runner: RunnerHarness,
+) -> None:
+    """The live wedge (2026-09-19 attempt 7): attempt 6 died at the env-window
+    step before anything was armed on the sibling. Its RECOVERY_REQUIRED
+    journal sat on the unchanged boot, so the reboot rule could not retire it
+    and every later attempt was refused as "identity changed". A journal that
+    never touched the host is retired aside when this attempt acquires its own;
+    the case runs fresh (preflight re-read, recovery armed) and surfaces the
+    lineage with its reason in the case result."""
+
+    boot = runner.host.boot
+    seeded = case.recovery.RunJournal(
+        runner.journal_path,
+        {"run": "old", "run_id": "destr014-test-aold", "boot_id": boot},
+    )
+    seeded.acquire()
+    seeded.data["phase"] = "RECOVERY_REQUIRED"
+    seeded.checkpoint(
+        env_opened=False,
+        control_env_opened=True,
+        holder_armed=False,
+        agent_disabled=False,
+        injection_started=False,
+        physical_outcome_unknown=False,
+        hold_reasons=None,
+        sibling_reboot_proof={},
+        incident_id="",
+        follow_up_incident_id="",
+        marker="",
+        preflight=copy.deepcopy(runner.preflight),
+        started_at="started",
+    )
+    seeded.close()
+
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert "cleanup-only" not in report.get("error", ""), (
+        "a never-armed journal must let the case run fresh, not resume cleanup-only"
+    )
+    assert "preflight.read" in runner.calls, "the fresh run must re-read preflight"
+    assert "recovery.prepare" in runner.calls, "the fresh run must arm recovery"
+    retired = report["retired_journals"]
+    assert len(retired) == 1, retired
+    entry = retired[0]
+    assert entry["old_run_id"] == "destr014-test-aold"
+    assert entry["old_boot_id"] == boot
+    assert entry["old_phase"] == "RECOVERY_REQUIRED"
+    assert entry["old_host_request"] is None
+    assert entry["reason"] == "never armed on the host"
+    assert "abandoned-destr014-test-aold" in entry["archive"]
+    archived = sorted(
+        runner.case_dir.glob("destr014-recovery-journal.abandoned-*.json")
+    )
+    assert [p.name for p in archived] == [
+        "destr014-recovery-journal.abandoned-destr014-test-aold.json"
+    ], archived
+    assert json.loads(archived[0].read_text())["run"]["control_env_opened"] is True
+    assert not list(runner.case_dir.glob("destr014-recovery-journal.rebooted-*")), (
+        "an unchanged boot is not a reboot retirement"
+    )
+    saved = json.loads(runner.journal_path.read_text())
+    assert saved["phase"] == "CLOSED"
+    assert saved["run"]["retired_journals"] == retired

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -83,18 +84,35 @@ def test_full_matrix_does_not_pass_without_each_cleanup_receipt(
     assert journal(tmp_path)["scenarios"][case.SCENARIOS[-1]]["state"] == "STARTED"
 
 
-def test_existing_run_routes_only_to_cleanup_before_healthy_preflight(
+def unfinished_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[WarmHarness, list[str]]:
+    h, executed = entry(tmp_path, monkeypatch)
+    h.failures["scenario.execute"] = RuntimeError("controlled scenario failure")
+    assert h.execute(tmp_path)[0] == 1, "establish an unfinished local journal"
+    del h.failures["scenario.execute"]
+    record = journal(tmp_path)
+    assert record["scenarios"][case.SCENARIOS[0]]["state"] == "STARTED", record
+    assert not record["completed"], record
+    monkeypatch.setattr(
+        case,
+        "read_only_preflight",
+        lambda *_a, **_k: pytest.fail("cleanup must not enter injection preflight"),
+    )
+    return h, executed
+
+
+def test_unfinished_run_routes_only_to_cleanup_before_healthy_preflight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    h, executed = entry(tmp_path, monkeypatch)
-    assert h.execute(tmp_path)[0] == 0, "establish an actual completed local journal"
+    h, executed = unfinished_run(tmp_path, monkeypatch)
     case_dir = tmp_path / "cases" / case.CASE_ID
     original = (case_dir / f"{case.CASE_ID}.json").read_bytes()
     calls: list[int] = []
 
     def cleanup(_settings: Any, **kwargs: Any) -> dict[str, Any]:
         value = kwargs["journal"]
-        assert value.resuming and value.record.completed, value.record
+        assert value.resuming and not value.record.completed, value.record
         calls.append(value.record.attempt)
         return {
             "case_id": case.CASE_ID,
@@ -105,19 +123,77 @@ def test_existing_run_routes_only_to_cleanup_before_healthy_preflight(
         }
 
     monkeypatch.setattr(recovery, "resume_execution", cleanup)
-    monkeypatch.setattr(
-        case,
-        "read_only_preflight",
-        lambda *_a, **_k: pytest.fail("cleanup must not enter injection preflight"),
-    )
     code = case.execute_case(h.settings, tmp_path, 99, NOW)
     assert code == 1 and calls == [2], calls
-    assert executed == list(case.SCENARIOS), "recovery must not repeat any scenario"
+    assert executed == [case.SCENARIOS[0]], "recovery must not run any scenario"
     assert (case_dir / f"{case.CASE_ID}.json").read_bytes() == original, (
         "cleanup evidence must not overwrite original execution evidence"
     )
     report = json.loads((case_dir / "cleanup-attempt-99.json").read_text())
     assert report["verdict"] == "FAIL" and report["cleanup_only"], report
+    assert (case_dir / "execution-owner.json").is_file(), (
+        "an unfinished journal must stay under its live name"
+    )
+
+
+def test_unfinished_run_with_a_drifted_connection_requires_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h, executed = unfinished_run(tmp_path, monkeypatch)
+    (tmp_path / "gpu.config").write_text("rotated GPU transport\n", encoding="utf-8")
+    monkeypatch.setattr(
+        recovery,
+        "resume_execution",
+        lambda *_a, **_k: pytest.fail("a drifted binding must not authorize cleanup"),
+    )
+    with pytest.raises(RegionalFixtureError, match="input or connection drifted"):
+        case.execute_case(h.settings, tmp_path, 99, NOW)
+    record = journal(tmp_path)
+    assert record["scenarios"][case.SCENARIOS[0]]["state"] == "STARTED", record
+    assert executed == [case.SCENARIOS[0]], executed
+
+
+def test_finished_run_is_archived_and_the_next_attempt_starts_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h, executed = entry(tmp_path, monkeypatch)
+    code, first = h.execute(tmp_path)
+    assert code == 0 and "retired_execution" not in first, first
+    case_dir = tmp_path / "cases" / case.CASE_ID
+    finished = (case_dir / "execution-owner.json").read_bytes()
+    (case_dir / "scenarios" / case.SCENARIOS[0]).mkdir(mode=0o700, parents=True)
+    (case_dir / "prewarm-owner.json").write_text("{}", encoding="utf-8")
+    # The live defect: a deploy rewrote the kubeconfig after a finished run, so
+    # the finished journal no longer matched and every later attempt failed.
+    (tmp_path / "gpu.config").write_text("rotated GPU transport\n", encoding="utf-8")
+    monkeypatch.setattr(
+        recovery,
+        "resume_execution",
+        lambda *_a, **_k: pytest.fail("a finished execution has nothing to clean"),
+    )
+    code = case.execute_case(h.settings, tmp_path, 99, NOW + timedelta(hours=1))
+    result = json.loads((case_dir / f"{case.CASE_ID}.json").read_text())
+    assert code == 0 and result["verdict"] == "PASS" and result["attempt"] == 99
+    assert executed == 2 * list(case.SCENARIOS), executed
+    lineage = result["retired_execution"]
+    assert (lineage["attempt"], lineage["release_id"]) == (2, "release-test")
+    assert lineage["binding_matched"] is False
+    archived = lineage["archived"]
+    assert set(archived) == {
+        "execution-owner.json",
+        "execution-owner.lock",
+        "prewarm-owner.json",
+        "scenarios",
+    }
+    assert (case_dir / archived["execution-owner.json"]).read_bytes() == finished
+    assert (case_dir / archived["scenarios"] / case.SCENARIOS[0]).is_dir(), (
+        "the finished execution's scenario evidence must be archived, not lost"
+    )
+    assert not (case_dir / "scenarios").exists(), (
+        "archived artifacts leave the live name"
+    )
+    record = journal(tmp_path)
+    assert record["attempt"] == 99 and record["completed"], record
 
 
 @pytest.mark.parametrize("legacy", ["scenarios", "prewarm-owner.json"])

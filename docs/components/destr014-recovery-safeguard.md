@@ -58,6 +58,13 @@ Missing incident/quiescence evidence defers workload and environment cleanup.
 Loss of command supervision is durably recorded and forbids further commands,
 including cleanup from a fresh process; independent host recovery remains armed.
 Such runs require separate operator review, not deletion of the refusal marker.
+An unfinished journal from an earlier attempt whose recorded boot ID the node
+has since replaced owns no host state on the current boot -- the installer
+recreated the Agent and the probe's new-boot table already retired that boot's
+state -- so it is archived aside (`<stem>.rebooted-<run id>.json`) and the new
+attempt starts fresh, recording the retired journal's lineage under the new
+journal's `run.retired_journals`. A journal on the same boot, or one that lost
+supervision, still refuses.
 
 Cleanup verifies the whole persistent resource ownership set before deleting
 anything. It stops the timer and proves the independent service has stopped and

@@ -362,7 +362,10 @@ def test_journal_corruption_or_identity_drift_refuses_resumption(
     first.close()
     data = first.data
     if defect == "scope":
+        # A foreign scope that never touched the host is retired, not refused
+        # (see the never-armed tests below); drift only refuses once armed.
         data["scope"] = {"run": "other"}
+        data["run"] = {"holder_armed": True}
     elif defect == "schema":
         data["schema_version"] = 0
     elif defect == "phase":
@@ -570,14 +573,358 @@ def test_reboot_restore_proof_reads_only_the_host_record(
 def test_an_unfinished_journal_of_another_attempt_still_refuses(
     tmp_path: Path, phase: str
 ) -> None:
+    """An unfinished journal that armed the GPU device holder may own host
+    state; a later attempt is refused as identity drift, never moved aside."""
+
     path = tmp_path / "journal.json"
     first = controller.RunJournal(path, {"run": "one", "run_id": "a2"})
     first.acquire()
     first.data["phase"] = phase
-    first.save()
+    first.checkpoint(holder_armed=True)
     first.close()
     with pytest.raises(controller.RegionalFixtureError, match="identity changed"):
         controller.RunJournal(path, {"run": "one", "run_id": "a3"}).acquire()
-    assert path.exists() and not list(tmp_path.glob("journal.closed-*")), (
-        "an unfinished journal is never moved aside"
+    assert path.exists() and not list(tmp_path.glob("journal.*-*.json")), (
+        "an unfinished journal armed on the host is never moved aside"
     )
+
+
+@pytest.mark.parametrize("phase", ["OPEN", "RECOVERY_REQUIRED"])
+def test_a_rebooted_unfinished_journal_is_retired_and_records_its_lineage(
+    tmp_path: Path, phase: str
+) -> None:
+    """The live wedge (2026-09-18 attempt 4): a RECOVERY_REQUIRED journal bound
+    to the sibling's original boot refused every later attempt as "identity
+    changed" once the node rebooted. A journal armed on a boot the node no
+    longer runs owns no host state -- the recovery probe's new-boot table
+    already retired it -- so it is moved aside and the new attempt starts fresh,
+    keeping the lineage for cleanup/verdict evidence."""
+
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(
+        path, {"run": "one", "run_id": "a4", "boot_id": "boot-old"}
+    )
+    first.acquire()
+    first.data["phase"] = phase
+    first.data["host_request"] = "cleanup"
+    first.save()
+    first.close()
+
+    second = controller.RunJournal(
+        path, {"run": "one", "run_id": "a5", "boot_id": "boot-new"}
+    )
+    second.acquire()
+    try:
+        assert second.resumed is False, "a rebooted-away journal must not resume"
+        assert second.data["scope"]["boot_id"] == "boot-new"
+        archived = sorted(tmp_path.glob("journal.rebooted-*.json"))
+        assert [p.name for p in archived] == ["journal.rebooted-a4.json"], archived
+        assert json.loads(archived[0].read_text())["phase"] == phase
+        assert not list(tmp_path.glob("journal.closed-*")), (
+            "a rebooted journal uses the rebooted archive, not the closed one"
+        )
+        retired = second.data["run"]["retired_journals"]
+        assert len(retired) == 1, retired
+        entry = retired[0]
+        assert entry["archive"] == str(archived[0])
+        assert entry["old_run_id"] == "a4"
+        assert entry["old_phase"] == phase
+        assert entry["old_boot_id"] == "boot-old"
+        assert entry["old_host_request"] == "cleanup"
+        assert isinstance(entry["retired_at"], str) and entry["retired_at"]
+    finally:
+        second.close()
+
+
+def test_an_unfinished_journal_on_the_same_boot_still_refuses(tmp_path: Path) -> None:
+    """A journal whose boot id still matches and that disabled the sibling's
+    Agent may own host state; a new run id on the same boot is refused as
+    identity drift, never retired."""
+
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(
+        path, {"run": "one", "run_id": "a4", "boot_id": "boot-same"}
+    )
+    first.acquire()
+    first.data["phase"] = "RECOVERY_REQUIRED"
+    first.checkpoint(agent_disabled=True)
+    first.close()
+    with pytest.raises(controller.RegionalFixtureError, match="identity changed"):
+        controller.RunJournal(
+            path, {"run": "one", "run_id": "a5", "boot_id": "boot-same"}
+        ).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.*-*.json")), (
+        "a same-boot journal armed on the host is never moved aside"
+    )
+
+
+def test_a_rebooted_journal_that_lost_supervision_is_never_retired(
+    tmp_path: Path,
+) -> None:
+    """Lost supervision demands independent review; even on a new boot such a
+    journal is refused, never archived aside as a routine reboot retirement."""
+
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(
+        path, {"run": "one", "run_id": "a4", "boot_id": "boot-old"}
+    )
+    first.acquire()
+    first.data["phase"] = "RECOVERY_REQUIRED"
+    first.data["supervision_lost"] = True
+    first.save()
+    first.close()
+    with pytest.raises(controller.RegionalFixtureError):
+        controller.RunJournal(
+            path, {"run": "one", "run_id": "a5", "boot_id": "boot-new"}
+        ).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.rebooted-*")), (
+        "a supervision-lost journal must not be retired on a new boot"
+    )
+
+
+def test_a_closed_journal_on_a_new_boot_uses_the_closed_archive(tmp_path: Path) -> None:
+    """A CLOSED tombstone owns nothing regardless of boot; it keeps the closed
+    archive name and is not treated as a reboot retirement."""
+
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(
+        path, {"run": "one", "run_id": "a4", "boot_id": "boot-old"}
+    )
+    first.acquire()
+    first.data["phase"] = "CLOSED"
+    first.save()
+    first.close()
+    second = controller.RunJournal(
+        path, {"run": "one", "run_id": "a5", "boot_id": "boot-new"}
+    )
+    second.acquire()
+    try:
+        assert second.resumed is False, "a closed tombstone must not resume"
+        closed = sorted(tmp_path.glob("journal.closed-*.json"))
+        assert [p.name for p in closed] == ["journal.closed-a4.json"], closed
+        assert not list(tmp_path.glob("journal.rebooted-*")), (
+            "a CLOSED journal is archived as closed, not rebooted"
+        )
+        assert "retired_journals" not in second.data["run"]
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("old_scope", "new_scope"),
+    [
+        (
+            {"run": "one", "run_id": "a4"},
+            {"run": "one", "run_id": "a5", "boot_id": "boot-new"},
+        ),
+        (
+            {"run": "one", "run_id": "a4", "boot_id": "boot-old"},
+            {"run": "one", "run_id": "a5"},
+        ),
+        (
+            {"run": "one", "run_id": "a4", "boot_id": ""},
+            {"run": "one", "run_id": "a5", "boot_id": "boot-new"},
+        ),
+    ],
+)
+def test_reboot_retirement_needs_a_string_boot_id_on_both_scopes(
+    tmp_path: Path, old_scope: dict[str, Any], new_scope: dict[str, Any]
+) -> None:
+    """Without a non-empty boot id on both journals the reboot cannot be proven,
+    so an unfinished journal that injected keeps refusing rather than being
+    retired."""
+
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(path, old_scope)
+    first.acquire()
+    first.data["phase"] = "RECOVERY_REQUIRED"
+    first.checkpoint(injection_started=True)
+    first.close()
+    with pytest.raises(controller.RegionalFixtureError, match="identity changed"):
+        controller.RunJournal(path, new_scope).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.*-*.json")), (
+        "an armed journal without both boot ids is never retired"
+    )
+
+
+def unarmed_run(**overrides: Any) -> dict[str, Any]:
+    """The ``run`` record of an attempt that died at the env-window step: the
+    control-plane window was opened (the windows keep their own records and
+    guards) but nothing was armed, disabled or written on the host."""
+
+    return {
+        "agent_disabled": False,
+        "control_env_opened": True,
+        "env_opened": False,
+        "holder_armed": False,
+        "injection_started": False,
+        "physical_outcome_unknown": False,
+        "incident_id": "",
+        "marker": "",
+        "follow_up_incident_id": "",
+        "hold_reasons": None,
+        "sibling_reboot_proof": {},
+        "preflight": {"errors": []},
+        "started_at": "started",
+        **overrides,
+    }
+
+
+def seed_foreign_journal(
+    path: Path,
+    scope: dict[str, Any],
+    *,
+    phase: str = "RECOVERY_REQUIRED",
+    run: dict[str, Any] | None = None,
+    **records: Any,
+) -> None:
+    journal = controller.RunJournal(path, scope)
+    journal.acquire()
+    journal.data["phase"] = phase
+    journal.data["run"] = unarmed_run() if run is None else run
+    journal.data.update(records)
+    journal.save()
+    journal.close()
+
+
+SAME_BOOT_OLD = {"run": "one", "run_id": "a6", "boot_id": "boot-same"}
+SAME_BOOT_NEW = {"run": "one", "run_id": "a7", "boot_id": "boot-same"}
+
+
+@pytest.mark.parametrize("phase", ["OPEN", "RECOVERY_REQUIRED"])
+@pytest.mark.parametrize("env_opened", [False, True])
+def test_a_never_armed_journal_on_the_same_boot_is_retired_and_records_its_lineage(
+    tmp_path: Path, phase: str, env_opened: bool
+) -> None:
+    """The live wedge (2026-09-19 attempt 7): attempt 6 died at the env-window
+    step before anything was armed on the sibling, so its RECOVERY_REQUIRED
+    journal on the unchanged boot owned no host state, yet it refused every
+    later attempt as "identity changed" -- the boot never changed, so the
+    reboot rule could not retire it. A journal that provably never touched the
+    host is moved aside and the new attempt starts fresh with the lineage."""
+
+    path = tmp_path / "journal.json"
+    seed_foreign_journal(
+        path, SAME_BOOT_OLD, phase=phase, run=unarmed_run(env_opened=env_opened)
+    )
+    second = controller.RunJournal(path, SAME_BOOT_NEW)
+    second.acquire()
+    try:
+        assert second.resumed is False, "a never-armed journal must not resume"
+        assert second.data["scope"]["run_id"] == "a7"
+        archived = sorted(tmp_path.glob("journal.abandoned-*.json"))
+        assert [p.name for p in archived] == ["journal.abandoned-a6.json"], archived
+        saved = json.loads(archived[0].read_text())
+        assert saved["phase"] == phase and saved["scope"] == SAME_BOOT_OLD
+        assert saved["run"]["control_env_opened"] is True, (
+            "env-window flags do not block retirement; the windows have their "
+            "own records and guards"
+        )
+        assert not list(tmp_path.glob("journal.rebooted-*")), (
+            "an unchanged boot is not a reboot retirement"
+        )
+        assert not list(tmp_path.glob("journal.closed-*")), (
+            "an unfinished journal never uses the closed archive"
+        )
+        retired = second.data["run"]["retired_journals"]
+        assert len(retired) == 1, retired
+        entry = retired[0]
+        assert entry["archive"] == str(archived[0])
+        assert entry["old_run_id"] == "a6"
+        assert entry["old_phase"] == phase
+        assert entry["old_boot_id"] == "boot-same"
+        assert entry["old_host_request"] is None
+        assert entry["reason"] == "never armed on the host"
+        assert isinstance(entry["retired_at"], str) and entry["retired_at"]
+        assert json.loads(path.read_text())["run"]["retired_journals"] == retired
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        {"run": {"holder_armed": True}},
+        {"run": {"injection_started": True}},
+        {"run": {"agent_disabled": True}},
+        {"run": {"physical_outcome_unknown": True}},
+        {"run": {"incident_id": "inc-1"}},
+        {"run": {"marker": "destr014-1-a6"}},
+        {"run": {"follow_up_incident_id": "inc-support-after"}},
+        {"host_binding": {"boot_id": "boot-same"}},
+        {"host_ack": {"phase": "ARMED"}},
+        {"host_request": "prepare"},
+        {"host_cleanup": {"phase": "CLOSED"}},
+    ],
+    ids=[
+        "holder_armed",
+        "injection_started",
+        "agent_disabled",
+        "physical_outcome_unknown",
+        "incident_id",
+        "marker",
+        "follow_up_incident_id",
+        "host_binding",
+        "host_ack",
+        "host_request",
+        "host_cleanup",
+    ],
+)
+def test_a_journal_that_touched_the_host_is_never_retired_as_unarmed(
+    tmp_path: Path, mark: dict[str, Any]
+) -> None:
+    """Every checkpoint the runner writes before a host mutation (arming the
+    holder, disabling the Agent, writing the XIDs) and every record the
+    recovery window writes keeps the same-boot journal refusing exactly as
+    before; only a journal with none of them is retired."""
+
+    path = tmp_path / "journal.json"
+    records = {key: value for key, value in mark.items() if key != "run"}
+    seed_foreign_journal(
+        path, SAME_BOOT_OLD, run=unarmed_run(**mark.get("run", {})), **records
+    )
+    with pytest.raises(controller.RegionalFixtureError, match="identity changed"):
+        controller.RunJournal(path, SAME_BOOT_NEW).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.*-*.json")), (
+        "a journal that touched the host is never moved aside"
+    )
+    assert json.loads(path.read_text())["scope"] == SAME_BOOT_OLD
+
+
+def test_a_never_armed_journal_that_lost_supervision_is_never_retired(
+    tmp_path: Path,
+) -> None:
+    """Lost supervision demands independent review even when no host flag was
+    checkpointed: the journal is refused, never archived aside."""
+
+    path = tmp_path / "journal.json"
+    seed_foreign_journal(path, SAME_BOOT_OLD, supervision_lost=True)
+    with pytest.raises(controller.RegionalFixtureError):
+        controller.RunJournal(path, SAME_BOOT_NEW).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.*-*.json")), (
+        "a supervision-lost journal must not be retired as never armed"
+    )
+
+
+def test_a_never_armed_journal_from_a_replaced_boot_uses_the_rebooted_archive(
+    tmp_path: Path,
+) -> None:
+    """The reboot rule runs first: a never-armed journal from a boot the node
+    has replaced is retired once, as a reboot retirement, without a second
+    abandoned archive or a second lineage entry."""
+
+    path = tmp_path / "journal.json"
+    seed_foreign_journal(path, {"run": "one", "run_id": "a6", "boot_id": "boot-old"})
+    second = controller.RunJournal(
+        path, {"run": "one", "run_id": "a7", "boot_id": "boot-new"}
+    )
+    second.acquire()
+    try:
+        archives = sorted(p.name for p in tmp_path.glob("journal.*-*.json"))
+        assert archives == ["journal.rebooted-a6.json"], archives
+        retired = second.data["run"]["retired_journals"]
+        assert len(retired) == 1, retired
+        assert retired[0]["old_boot_id"] == "boot-old"
+        assert "reason" not in retired[0], retired
+    finally:
+        second.close()

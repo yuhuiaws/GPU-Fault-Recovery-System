@@ -823,3 +823,52 @@ def test_close_window_converges_on_a_configmap_sourced_baseline(tmp_path: Path) 
     ]
     assert polls == [], "a restored Deployment must converge on the first poll"
     assert json.loads(baseline_path.read_text())["replicas_after_close"]
+
+
+def test_close_window_retires_a_record_a_release_change_closed(tmp_path: Path) -> None:
+    """DESTR-014 attempt 6: the control-plane record of a dead attempt was OPEN
+    under the previous release, the deploys since had re-rendered the worker
+    Deployment, and the close was refused ("baseline is unbound or invalid")
+    until the file was deleted by hand."""
+    regional = _ClosableRegional()
+    baseline_path = tmp_path / "control-plane-env-window.json"
+    scope = env_window.window_scope(
+        regional,
+        plane=env_window.PLANE,
+        deployment=env_window.DEPLOYMENT,
+        container=env_window.CONTAINER,
+    )
+    scope["identity"] = {**scope["identity"], "release_id": "previous-release"}
+    baseline = env_window.deployment_env(regional)
+    baseline["generation"] -= 1
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "scope": scope,
+                "state": "OPEN",
+                "opened_at": "t0",
+                "assignments": {MANAGED: "600"},
+                "baseline": baseline,
+                "pre_window_survey": {"replicas": []},
+            }
+        )
+    )
+    settings = env_window.Settings(baseline=baseline_path, rollout_timeout_seconds=5)
+    calls_before = len(regional.calls)
+
+    report = env_window.close_window(settings, regional, {"observed_at": "t1"})
+
+    assert report["state"] == "RETIRED"
+    assert report["retired_by"] == "release change"
+    assert report["retired_live_release_id"] == "test-release"
+    assert report["live_state"]["uid"] == "test-worker-uid"
+    assert [call[1] for call in regional.calls[calls_before:]] == ["get"], (
+        "one Deployment read and no mutation"
+    )
+    assert not baseline_path.exists(), "the retired record is moved aside"
+    archive = Path(report["archive"])
+    assert archive.parent == tmp_path and archive.is_file(), archive
+    saved = json.loads(archive.read_text())
+    assert saved["scope"]["identity"]["release_id"] == "previous-release"
+    assert saved["retired_live_uid"] == "test-worker-uid"

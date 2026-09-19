@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,33 @@ RECOVERY_SECONDS = host.RECOVERY_SECONDS
 RESTORED = "RESTORED"
 RESTORED_BY_REBOOT = "RESTORED_BY_REBOOT"
 RESTORERS = frozenset({"probe", "reboot-installer"})
+# Journal fields that exist only once the host was touched. The recovery window
+# writes the ``host_*`` records from ``arm`` onwards (the last three never
+# appear without ``host_binding``; they are listed so the rule reads as "no host
+# record at all"). The runner checkpoints ``agent_disabled`` before disabling
+# the sibling's Agent, ``holder_armed`` before arming the GPU device holder,
+# ``injection_started``/``physical_outcome_unknown``/``marker`` before writing
+# the XIDs, and ``incident_id``/``follow_up_incident_id`` once the control plane
+# opened the resulting workflows. The env-window flags are deliberately absent:
+# the windows keep their own records and guards and are closed through them.
+HOST_RECORD_KEYS = (
+    "host_binding",
+    "host_ack",
+    "host_request",
+    "host_recovery_phase",
+    "host_boot_id_observed",
+    "host_cleanup",
+)
+HOST_MUTATION_FLAGS = (
+    "holder_armed",
+    "agent_disabled",
+    "injection_started",
+    "physical_outcome_unknown",
+    "incident_id",
+    "marker",
+    "follow_up_incident_id",
+)
+NEVER_ARMED = "never armed on the host"
 
 
 def recovery_phase(report: dict[str, Any]) -> str:
@@ -123,6 +151,7 @@ class RunJournal:
                 raise RegionalFixtureError("DESTR-014 recovery journal lock is invalid")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             data: Any = None
+            retired_journal: dict[str, Any] | None = None
             if self.path.exists() or self.path.is_symlink():
                 info = self.path.lstat()
                 if (
@@ -137,6 +166,12 @@ class RunJournal:
                 data = json.loads(self.path.read_text())
                 if self._archive_closed_foreign(data):
                     data = None
+                else:
+                    retired_journal = self._archive_rebooted_foreign(data)
+                    if retired_journal is None:
+                        retired_journal = self._archive_unarmed_foreign(data)
+                    if retired_journal is not None:
+                        data = None
             if data is not None:
                 if (
                     not isinstance(data, dict)
@@ -161,6 +196,11 @@ class RunJournal:
                     "phase": "OPEN",
                     "run": {},
                 }
+                if retired_journal is not None:
+                    # Keep the lineage of a retired journal (rebooted away or
+                    # never armed) so cleanup and verdict evidence can trace it
+                    # back to its archive.
+                    self.data["run"]["retired_journals"] = [retired_journal]
                 self.save()
             self.fd = fd
         except BaseException:
@@ -175,9 +215,12 @@ class RunJournal:
         scope (run id, plan digest, release) and used to be refused as
         "identity changed" -- attempt 3 of 2026-09-18 died there without
         touching the node. A CLOSED journal has finished its recovery and owns
-        nothing; it is kept next to the live one under its own run id. Any
-        unfinished journal (OPEN, RECOVERY_REQUIRED, supervision lost) still
-        refuses, because that one may own host state.
+        nothing; it is kept next to the live one under its own run id. An
+        unfinished journal that lost supervision, or one that may own host
+        state, still refuses here; an unfinished journal armed on a boot the
+        node has since replaced is retired instead by
+        ``_archive_rebooted_foreign``, and one that provably never touched the
+        host by ``_archive_unarmed_foreign``.
         """
 
         if (
@@ -187,17 +230,129 @@ class RunJournal:
             or data.get("scope") == self.scope
         ):
             return False
-        run_id = str((data.get("scope") or {}).get("run_id") or "unknown")
+        self.path.replace(self._archive_path("closed", data.get("scope")))
+        return True
+
+    def _archive_path(self, kind: str, old_scope: Any) -> Path:
+        """``<stem>.<kind>-<old run id><suffix>`` next to the live journal; a
+        second archive of the same run id gets this process id appended."""
+
+        run_id = "unknown"
+        if isinstance(old_scope, dict):
+            run_id = str(old_scope.get("run_id") or "unknown")
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in run_id)
         archive = self.path.with_name(
-            f"{self.path.stem}.closed-{safe}{self.path.suffix}"
+            f"{self.path.stem}.{kind}-{safe}{self.path.suffix}"
         )
         if archive.exists():
             archive = self.path.with_name(
-                f"{self.path.stem}.closed-{safe}-{os.getpid()}{self.path.suffix}"
+                f"{self.path.stem}.{kind}-{safe}-{os.getpid()}{self.path.suffix}"
             )
+        return archive
+
+    def _archive_rebooted_foreign(self, data: Any) -> dict[str, Any] | None:
+        """Retire an unfinished journal armed on a boot the node has replaced.
+
+        The journal lives at one path per case directory and guards host state
+        on the boot it was armed on (``scope.boot_id``). When a later attempt
+        finds an unfinished journal (OPEN or RECOVERY_REQUIRED) under another
+        scope whose boot id is a non-empty string differing from this attempt's,
+        the node has rebooted since: the node-installer recreated the Node Agent
+        and the recovery probe's new-boot decision table already declared that
+        boot's host state retired, so the old journal owns nothing on the
+        current boot (the live wedge of 2026-09-18 attempt 4, where a
+        RECOVERY_REQUIRED journal from a since-rebooted sibling refused every
+        later attempt as "identity changed"). It is moved aside to
+        ``<stem>.rebooted-<run id>`` (collision-safe, like the closed archive)
+        and its lineage is returned for the new journal's
+        ``run["retired_journals"]``. A journal whose boot id still matches (the
+        node did not reboot), one that lost supervision, a CLOSED tombstone, or
+        one where either scope is missing a string boot id is never retired
+        here -- such a journal may own host state and keeps refusing, unless
+        ``_archive_unarmed_foreign`` can prove it never touched the host.
+        """
+
+        if (
+            not isinstance(data, dict)
+            or data.get("phase") not in {"OPEN", "RECOVERY_REQUIRED"}
+            or data.get("supervision_lost")
+            or data.get("scope") == self.scope
+        ):
+            return None
+        old_scope = data.get("scope")
+        if not isinstance(old_scope, dict):
+            return None
+        old_boot = old_scope.get("boot_id")
+        new_boot = self.scope.get("boot_id")
+        if (
+            not isinstance(old_boot, str)
+            or not old_boot
+            or not isinstance(new_boot, str)
+            or not new_boot
+            or old_boot == new_boot
+        ):
+            return None
+        archive = self._archive_path("rebooted", old_scope)
         self.path.replace(archive)
-        return True
+        return {
+            "archive": str(archive),
+            "old_run_id": old_scope.get("run_id"),
+            "old_phase": data.get("phase"),
+            "old_boot_id": old_boot,
+            "old_host_request": data.get("host_request"),
+            "retired_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _archive_unarmed_foreign(self, data: Any) -> dict[str, Any] | None:
+        """Retire an unfinished journal that provably never touched the host.
+
+        Runs after ``_archive_rebooted_foreign`` declined, so the boot is
+        unchanged (or unprovable) and the only question left is whether the
+        old attempt armed anything. An attempt that died before its first host
+        mutation -- at the env-window step, say -- leaves an OPEN or
+        RECOVERY_REQUIRED journal whose ``run`` carries none of the checkpoints
+        the runner writes ahead of a host mutation (``HOST_MUTATION_FLAGS``) and
+        none of the recovery window's ``host_*`` records (``HOST_RECORD_KEYS``);
+        the live wedge of 2026-09-19 attempt 7 met such a journal from attempt
+        6 on the same boot and, since every later attempt has a new run id, it
+        would have refused the case forever as "identity changed". Such a
+        journal owns no host state: it is moved aside to
+        ``<stem>.abandoned-<run id>`` (collision-safe, like the other archives)
+        and its lineage returned for the new journal's
+        ``run["retired_journals"]`` with ``reason`` ``NEVER_ARMED``. The
+        env-window flags do not block retirement -- the windows keep their own
+        records and guards and are closed through them. Any present host
+        record, any truthy mutation flag, lost supervision, a CLOSED tombstone
+        or a malformed ``scope``/``run`` leaves the journal to refuse exactly as
+        before.
+        """
+
+        if (
+            not isinstance(data, dict)
+            or data.get("phase") not in {"OPEN", "RECOVERY_REQUIRED"}
+            or data.get("supervision_lost")
+            or data.get("scope") == self.scope
+        ):
+            return None
+        old_scope = data.get("scope")
+        run = data.get("run")
+        if not isinstance(old_scope, dict) or not isinstance(run, dict):
+            return None
+        if any(data.get(key) is not None for key in HOST_RECORD_KEYS) or any(
+            run.get(flag) for flag in HOST_MUTATION_FLAGS
+        ):
+            return None
+        archive = self._archive_path("abandoned", old_scope)
+        self.path.replace(archive)
+        return {
+            "archive": str(archive),
+            "old_run_id": old_scope.get("run_id"),
+            "old_phase": data.get("phase"),
+            "old_boot_id": old_scope.get("boot_id"),
+            "old_host_request": data.get("host_request"),
+            "retired_at": datetime.now(timezone.utc).isoformat(),
+            "reason": NEVER_ARMED,
+        }
 
     def save(self) -> None:
         write_json_atomic(self.path, self.data)

@@ -23,6 +23,7 @@ from gpu_fault.admin.warm_spare import (
     SPARE_POOL_STATE_ANNOTATION,
     SPARE_RESERVATION_ANNOTATION,
     AgentState,
+    WarmSpareConflict,
     WarmSpareError,
     WarmSpareRequest,
     declare,
@@ -130,6 +131,45 @@ class FakeCoreApi:
                 if node["metadata"]["labels"].get(key) == value
             ]
         }
+
+
+class ConflictingCoreApi(FakeCoreApi):
+    """``FakeCoreApi`` with the API server's optimistic concurrency.
+
+    A patch carrying a stale ``resourceVersion`` is refused as a conflict; one
+    carrying the current version applies and moves the version on, as the real
+    server does. ``attempts`` records the version every attempt carried, so a
+    test can tell a retry against a fresh read from a blind repeat.
+    """
+
+    def __init__(
+        self, *nodes: dict[str, Any], pods: list[dict[str, Any]] | None = None
+    ):
+        super().__init__(*nodes, pods=pods)
+        self.attempts: list[str | None] = []
+
+    def patch_node(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
+        metadata = self.nodes[name]["metadata"]
+        version = body.get("metadata", {}).get("resourceVersion")
+        self.attempts.append(version)
+        if version != metadata["resourceVersion"]:
+            raise WarmSpareConflict(
+                f"kubectl patch node {name} failed: resource version conflict "
+                "(the node changed between survey and patch)"
+            )
+        result = super().patch_node(name, body)
+        metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+        return result
+
+
+def _moved_on(api: FakeCoreApi, node: str = NODE) -> dict[str, Any]:
+    """Another writer updated ``node`` after the survey; returns the raw node."""
+
+    raw = api.nodes[node]
+    raw["metadata"]["resourceVersion"] = str(
+        int(raw["metadata"]["resourceVersion"]) + 5
+    )
+    return raw
 
 
 def _refusals(**overrides: Any) -> list[str]:
@@ -440,13 +480,30 @@ def test_declare_fails_when_the_patch_did_not_take_effect(tmp_path: Path) -> Non
         )
 
 
-def test_declare_refuses_to_overwrite_an_unreleased_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "record",
+    [
+        # The declaration took effect: declared_state is written only after
+        # the patch was verified on the node.
+        _record(
+            declared_state=_snapshot(labels={SPARE_LABEL: "true"}, unschedulable=True)
+        ),
+        # No declared_state, but the node no longer reads as the baseline the
+        # record holds: something did change, and release must put it back.
+        _record(baseline={"labels": {SPARE_LABEL: None}, "unschedulable": True}),
+        _record(baseline={"labels": {SPARE_LABEL: "true"}, "unschedulable": False}),
+    ],
+    ids=["took-effect", "cordon-baseline-differs", "label-baseline-differs"],
+)
+def test_declare_refuses_to_overwrite_an_unreleased_record(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
     # Overwriting would destroy the only record of what the node looked like
     # before it became a spare.
     api = FakeCoreApi(_raw_node(NODE))
     record_file = record_path(tmp_path, NODE)
     record_file.parent.mkdir(parents=True)
-    record_file.write_text(json.dumps(_record()), encoding="utf-8")
+    record_file.write_text(json.dumps(record), encoding="utf-8")
 
     with pytest.raises(WarmSpareError, match="unreleased declaration"):
         declare(
@@ -457,7 +514,71 @@ def test_declare_refuses_to_overwrite_an_unreleased_record(tmp_path: Path) -> No
             actor="alice",
             survey=_survey(api),
         )
-    assert api.patches == []
+    assert api.patches == [], "a refused declaration must not touch the node"
+    assert json.loads(record_file.read_text(encoding="utf-8")) == record, (
+        "a refused declaration must leave the existing record untouched"
+    )
+
+
+def test_declare_supersedes_an_interrupted_declaration_whose_patch_never_took_effect(
+    tmp_path: Path,
+) -> None:
+    # The live sequence behind this test: a declaration wrote its record, the
+    # patch hit a resource version conflict, and the node was never changed.
+    # The record has no declared_state and its baseline still describes the
+    # node, so there is nothing to release; the next declaration keeps it as
+    # forensic history instead of demanding a no-op --release first.
+    api = FakeCoreApi(_raw_node(NODE))
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    interrupted = _record(
+        reference="CHG-0",
+        actor="carol",
+        superseded_interrupted_declarations=[
+            {"reference": "CHG-00", "superseded_at": "2026-09-08T01:00:00Z"}
+        ],
+    )
+    record_file.write_text(json.dumps(interrupted), encoding="utf-8")
+
+    record = declare(
+        api,
+        node=NODE,
+        record=record_file,
+        reference="CHG-1",
+        actor="alice",
+        survey=_survey(api),
+    )
+
+    assert record["reference"] == "CHG-1", (
+        "the new declaration carries its own reference"
+    )
+    assert record["declared_state"]["labels"][SPARE_LABEL] == "true", (
+        "the fresh declaration must take effect"
+    )
+    assert len(api.patches) == 1, "exactly one patch: the fresh declaration"
+    earlier, superseded = record["superseded_interrupted_declarations"]
+    assert earlier == {
+        "reference": "CHG-00",
+        "superseded_at": "2026-09-08T01:00:00Z",
+    }, "history already carried by the interrupted record is kept, oldest first"
+    assert superseded["reference"] == "CHG-0", "the interrupted record is kept"
+    assert superseded["actor"] == "carol", "the interrupted record keeps its actor"
+    assert superseded["baseline"] == {
+        "labels": {SPARE_LABEL: None},
+        "unschedulable": False,
+    }, "the interrupted record keeps its baseline"
+    assert superseded["superseded_at"], "the history entry must say when"
+    assert "pre_declaration_survey" not in superseded, (
+        "history holds the document minus its surveys"
+    )
+    assert "superseded_interrupted_declarations" not in superseded, (
+        "history is kept flat, never nested"
+    )
+    written = json.loads(record_file.read_text(encoding="utf-8"))
+    assert (
+        written["superseded_interrupted_declarations"]
+        == (record["superseded_interrupted_declarations"])
+    ), "the history must be persisted with the new record"
 
 
 def test_release_restores_the_recorded_baseline_not_the_current_state(
@@ -616,6 +737,339 @@ def test_release_patch_is_bound_to_the_surveyed_resource_version(
         )
     assert api.patches == []
     assert api.nodes[NODE]["spec"]["unschedulable"] is True
+
+
+# --- resource version conflicts ----------------------------------------------
+
+
+def _declare(
+    api: FakeCoreApi, tmp_path: Path, survey: dict[str, Any]
+) -> dict[str, Any]:
+    return declare(
+        api,
+        node=NODE,
+        record=record_path(tmp_path, NODE),
+        reference="CHG-1",
+        actor="alice",
+        survey=survey,
+    )
+
+
+def test_declare_retries_a_stale_resource_version_against_a_fresh_read(
+    tmp_path: Path,
+) -> None:
+    # A kubelet heartbeat or a device plugin re-registering moves the node's
+    # resourceVersion without touching the label or the cordon. The
+    # declaration re-reads the node and retries with the fresh version.
+    api = ConflictingCoreApi(_raw_node(NODE))
+    before = _survey(api)
+    raw = _moved_on(api)
+    raw["metadata"]["annotations"]["node.alpha.kubernetes.io/ttl"] = "0"
+    raw["status"]["allocatable"]["nvidia.com/gpu"] = "0"
+
+    record = _declare(api, tmp_path, before)
+
+    assert api.attempts == ["1", "6"], (
+        "one attempt with the surveyed version, one with the freshly read one"
+    )
+    assert [body["metadata"]["resourceVersion"] for _name, body in api.patches] == [
+        "6"
+    ], "the patch that applied was bound to the fresh resource version"
+    assert api.nodes[NODE]["metadata"]["labels"][SPARE_LABEL] == "true", (
+        "the retried declaration must label the node"
+    )
+    assert api.nodes[NODE]["spec"]["unschedulable"] is True, (
+        "the retried declaration must cordon the node"
+    )
+    assert record["declared_state"]["resource_version"] == "7", (
+        "declared_state is read back after the retried patch"
+    )
+
+
+def test_release_retries_a_stale_resource_version_against_a_fresh_read(
+    tmp_path: Path,
+) -> None:
+    api = ConflictingCoreApi(
+        _raw_node(NODE, labels={SPARE_LABEL: "true"}, unschedulable=True)
+    )
+    before = _survey(api)
+    _moved_on(api)
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    record_file.write_text(json.dumps(_record()), encoding="utf-8")
+
+    record = release(
+        api,
+        node=NODE,
+        record=record_file,
+        reference="CHG-2",
+        actor="bob",
+        survey=before,
+    )
+
+    assert api.attempts == ["1", "6"], "the release retries once with the fresh version"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is False, (
+        "the retried release must uncordon the node"
+    )
+    assert SPARE_LABEL not in api.nodes[NODE]["metadata"]["labels"], (
+        "the retried release must remove the spare label"
+    )
+    assert record["released_at"], "the retried release must be recorded"
+
+
+@pytest.mark.parametrize(
+    ("labels", "unschedulable", "named"),
+    [({SPARE_LABEL: "true"}, False, "spare label"), ({}, True, "unschedulable")],
+    ids=["someone-labeled-it", "someone-cordoned-it"],
+)
+def test_a_conflict_retry_refuses_a_spare_label_or_cordon_changed_since_the_survey(
+    tmp_path: Path, labels: dict[str, str], unschedulable: bool, named: str
+) -> None:
+    # The retry is honest only while the concurrent change touched nothing the
+    # patch is about to change. A hand label or cordon between survey and patch
+    # is refused, never silently overwritten.
+    api = ConflictingCoreApi(_raw_node(NODE))
+    before = _survey(api)
+    raw = _moved_on(api)
+    raw["metadata"]["labels"].update(labels)
+    raw["spec"]["unschedulable"] = unschedulable
+
+    with pytest.raises(
+        WarmSpareError, match="changed between survey and patch"
+    ) as failure:
+        _declare(api, tmp_path, before)
+
+    assert named in str(failure.value), "the refusal names the field that changed"
+    assert api.attempts == ["1"], "no retry over a changed label or cordon"
+    assert api.patches == [], "nothing was written over the concurrent change"
+    assert api.nodes[NODE]["metadata"]["labels"].get(SPARE_LABEL) == labels.get(
+        SPARE_LABEL
+    ), "the node keeps the label the other writer left"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is unschedulable, (
+        "the node keeps the cordon state the other writer left"
+    )
+
+
+def test_a_conflict_retry_refuses_a_spare_reservation_that_appeared_since_the_survey(
+    tmp_path: Path,
+) -> None:
+    # The pool reserved this spare for an incident inside the conflict window.
+    # The release refusals were computed before that; retrying would hand a
+    # reserved spare back to the scheduler under a running workflow.
+    api = ConflictingCoreApi(
+        _raw_node(NODE, labels={SPARE_LABEL: "true"}, unschedulable=True)
+    )
+    before = _survey(api)
+    raw = _moved_on(api)
+    raw["metadata"]["annotations"][SPARE_RESERVATION_ANNOTATION] = "inc-new"
+    record_file = record_path(tmp_path, NODE)
+    record_file.parent.mkdir(parents=True)
+    record_file.write_text(json.dumps(_record()), encoding="utf-8")
+
+    with pytest.raises(
+        WarmSpareError, match="changed between survey and patch"
+    ) as failure:
+        release(
+            api,
+            node=NODE,
+            record=record_file,
+            reference="CHG-2",
+            actor="bob",
+            survey=before,
+        )
+
+    assert "spare reservation" in str(failure.value), (
+        "the refusal names the reservation that appeared"
+    )
+    assert api.attempts == ["1"], "no retry over a reservation that appeared"
+    assert api.patches == [], "nothing was written over the reservation"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is True, (
+        "the reserved spare stays cordoned"
+    )
+    assert api.nodes[NODE]["metadata"]["labels"][SPARE_LABEL] == "true", (
+        "the reserved spare keeps its label"
+    )
+    assert not json.loads(record_file.read_text(encoding="utf-8")).get("released_at"), (
+        "the refused release must not be recorded as released"
+    )
+
+
+@pytest.mark.parametrize(
+    "ownership",
+    [
+        {"taints": [{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}]},
+        {"annotations": {"gpu-fault.io/incident-id": "INC-9"}},
+    ],
+    ids=["quarantine-taint", "incident-annotation"],
+)
+def test_a_conflict_retry_refuses_quarantine_ownership_that_appeared_since_the_survey(
+    tmp_path: Path, ownership: dict[str, Any]
+) -> None:
+    # The control plane quarantined the node inside the conflict window: it
+    # now belongs to an incident, and the declaration must not label it a
+    # spare over that ownership.
+    api = ConflictingCoreApi(_raw_node(NODE))
+    before = _survey(api)
+    raw = _moved_on(api)
+    raw["spec"]["taints"] = ownership.get("taints", [])
+    raw["metadata"]["annotations"].update(ownership.get("annotations", {}))
+
+    with pytest.raises(
+        WarmSpareError, match="changed between survey and patch"
+    ) as failure:
+        _declare(api, tmp_path, before)
+
+    assert "quarantine ownership" in str(failure.value), (
+        "the refusal names the ownership that appeared"
+    )
+    assert api.attempts == ["1"], "no retry over quarantine ownership that appeared"
+    assert api.patches == [], "nothing was written over the quarantine"
+    assert SPARE_LABEL not in api.nodes[NODE]["metadata"]["labels"], (
+        "the quarantined node is not labeled a spare"
+    )
+    assert api.nodes[NODE]["spec"]["unschedulable"] is False, (
+        "the node's cordon is left to the incident that owns it"
+    )
+
+
+def _contended(api: ConflictingCoreApi) -> None:
+    """Something else writes the node between every read and our patch."""
+
+    original = api.patch_node
+
+    def contended(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        _moved_on(api, name)
+        return original(name, body)
+
+    api.patch_node = contended  # type: ignore[method-assign]
+
+
+def test_three_consecutive_conflicts_fail_with_a_conflict_naming_error(
+    tmp_path: Path,
+) -> None:
+    api = ConflictingCoreApi(_raw_node(NODE))
+    before = _survey(api)
+    _contended(api)
+
+    with pytest.raises(WarmSpareError, match="resource version conflict") as failure:
+        _declare(api, tmp_path, before)
+
+    assert not isinstance(failure.value, WarmSpareConflict), (
+        "the bounded failure is final, not another retryable conflict"
+    )
+    assert api.attempts == ["1", "6", "11"], (
+        "three attempts, each bound to the version last read"
+    )
+    assert api.patches == [], "nothing was written"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is False, "the node is unchanged"
+    assert "declared_state" not in json.loads(
+        record_path(tmp_path, NODE).read_text(encoding="utf-8")
+    ), "the record must not claim a declaration that never took effect"
+
+
+def test_a_non_conflict_patch_failure_is_not_retried(tmp_path: Path) -> None:
+    api = ConflictingCoreApi(_raw_node(NODE))
+    before = _survey(api)
+    calls: list[str] = []
+
+    def forbidden(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(body["metadata"]["resourceVersion"])
+        raise WarmSpareError(f"kubectl patch node {name} failed: Forbidden: <redacted>")
+
+    api.patch_node = forbidden  # type: ignore[method-assign]
+
+    with pytest.raises(WarmSpareError, match="Forbidden") as failure:
+        _declare(api, tmp_path, before)
+
+    assert calls == ["1"], "a non-conflict failure is never retried"
+    assert str(failure.value) == (
+        f"kubectl patch node {NODE} failed: Forbidden: <redacted>"
+    ), "a non-conflict failure propagates unchanged"
+
+
+def test_a_declaration_interrupted_by_conflicts_is_completed_by_the_next_command(
+    tmp_path: Path,
+) -> None:
+    # The operator's path through the command: the first --declare exhausts its
+    # attempts and leaves a record without declared_state; the next --declare
+    # supersedes that record instead of demanding a --release of nothing.
+    api = ConflictingCoreApi(_raw_node(NODE))
+    _contended(api)
+    with pytest.raises(WarmSpareError, match="resource version conflict"):
+        run_warm_spare(
+            _site(),
+            _request(
+                tmp_path,
+                mode="declare",
+                reference="CHG-1",
+                confirmation=DECLARE_CONFIRMATION,
+            ),
+            api=api,
+            agent_lookup=lambda *_: ACTIVE,
+        )
+    left_behind = json.loads(record_path(tmp_path, NODE).read_text(encoding="utf-8"))
+    assert "declared_state" not in left_behind, "the interrupted record has no state"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is False, "the node is unchanged"
+
+    del api.patch_node  # the cluster calms down
+    report = run_warm_spare(
+        _site(),
+        _request(
+            tmp_path,
+            mode="declare",
+            reference="CHG-2",
+            confirmation=DECLARE_CONFIRMATION,
+        ),
+        api=api,
+        agent_lookup=lambda *_: ACTIVE,
+    )
+
+    assert report["ready"] is True, "the second declaration succeeds without --release"
+    assert report["declaration"]["reference"] == "CHG-2", "the report is the new one"
+    (superseded,) = report["declaration"]["superseded_interrupted_declarations"]
+    assert superseded["reference"] == "CHG-1", "the interrupted declaration is history"
+    assert api.nodes[NODE]["spec"]["unschedulable"] is True, "the node is cordoned"
+    assert api.nodes[NODE]["metadata"]["labels"][SPARE_LABEL] == "true", (
+        "the node is labeled"
+    )
+
+
+def test_kubectl_conflict_stderr_is_a_named_conflict_that_stays_redacted() -> None:
+    marker = "synthetic-unstructured-auth-value-24680"
+
+    class Conflict:
+        stdout = ""
+        stderr = (
+            "Error from server (Conflict): Operation cannot be fulfilled on nodes "
+            f'"{NODE}": the object has been modified; please apply your changes to '
+            f"the latest version and try again\n{marker}"
+        )
+        returncode = 1
+
+    api = warm_spare.KubectlNodeApi(["kubectl"], run=lambda *_a, **_k: Conflict())
+
+    with pytest.raises(WarmSpareConflict) as failure:
+        api.patch_node(NODE, {"spec": {"unschedulable": True}})
+
+    message = str(failure.value)
+    assert message.startswith(f"kubectl patch node {NODE} failed: "), (
+        "the conflict names the failed kubectl verb"
+    )
+    assert "resource version conflict" in message, "the conflict is named as such"
+    assert marker not in message, "server output stays redacted"
+
+    class Forbidden:
+        stdout = ""
+        stderr = f"Error from server (Forbidden): nodes is forbidden\n{marker}"
+        returncode = 1
+
+    api = warm_spare.KubectlNodeApi(["kubectl"], run=lambda *_a, **_k: Forbidden())
+    with pytest.raises(WarmSpareError) as other:
+        api.patch_node(NODE, {"spec": {"unschedulable": True}})
+    assert not isinstance(other.value, WarmSpareConflict), (
+        "only the conflict wording is a retryable conflict"
+    )
+    assert "Forbidden" in str(other.value), "other failures keep their redacted code"
 
 
 def test_unknown_spare_pool_state_refuses_release() -> None:

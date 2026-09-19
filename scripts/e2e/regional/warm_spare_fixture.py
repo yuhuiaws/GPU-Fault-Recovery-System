@@ -214,6 +214,40 @@ print(json.dumps(result, sort_keys=True))
 """
 
 
+CLOSE_INCIDENT_WITH_EVIDENCE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.orchestration.incident_closure import (
+    IncidentNotClosable,
+    NodeIsolationEvidence,
+)
+
+incident_id, reason, operator, reference, evidence_json = sys.argv[1:6]
+context = ApplicationContext.from_environment()
+evidence = [
+    NodeIsolationEvidence.from_mapping(item) for item in json.loads(evidence_json)
+]
+try:
+    incident, closed = context.incident_closure.close_incident(
+        incident_id,
+        reason=reason,
+        operator=operator,
+        reference=reference or None,
+        evidence=evidence,
+    )
+except IncidentNotClosable as exc:
+    print(json.dumps({"closed": False, "refusal": str(exc), "state": None}))
+else:
+    print(json.dumps({
+        "closed": closed,
+        "refusal": None,
+        "state": incident.state.value,
+    }, sort_keys=True))
+"""
+
+
 RELEASE_SPARES = r"""
 import json
 import sys
@@ -856,6 +890,36 @@ class WarmSpareLiveFixture:
 
         return self.regional.cpu_python(
             CLOSE_INCIDENT_POST, incident_id, reason, operator, attempts=1
+        )
+
+    def close_incident_with_evidence(
+        self,
+        incident_id: str,
+        *,
+        reason: str,
+        operator: str,
+        reference: str | None,
+        evidence: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Close a QUARANTINED (or ESCALATED) incident on node isolation evidence.
+
+        The same service call ``gpu-fault-admin workflow-reconcile
+        --close-quarantined`` makes: the CLI reads the node through the GPU
+        kubeconfig and hands ``NodeIsolationEvidence`` to
+        ``IncidentClosureService.close_incident``; here the runner, which holds
+        that kubeconfig, supplies the evidence it just read. Returns
+        ``{"closed", "refusal", "state"}``; a refusal is the service's own
+        wording and is not retried.
+        """
+
+        return self.regional.cpu_python(
+            CLOSE_INCIDENT_WITH_EVIDENCE,
+            incident_id,
+            reason,
+            operator,
+            reference or "",
+            json.dumps(evidence, sort_keys=True),
+            attempts=1,
         )
 
     def wait_workflow_id(

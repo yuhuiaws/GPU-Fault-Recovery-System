@@ -19,8 +19,11 @@ pre-window env in a baseline file before mutating, waits until *every ready
 replica* reports the new values, and ``--close`` restores exactly what the
 baseline recorded -- a variable that was absent goes back to absent (delete),
 never to ``false``. It refuses to open a window already open under a baseline
-it did not write, and refuses to close one it has no record of. The variable
-allow-list is compiled in; it can change nothing else.
+it did not write, and refuses to close one it has no record of. A record another
+release left OPEN is retired (archived, never restored) only once the live
+Deployment proves a deploy already closed the window: re-rendered, with no
+assignment still in effect. The variable allow-list is compiled in; it can
+change nothing else.
 """
 
 from __future__ import annotations
@@ -49,6 +52,10 @@ from scripts.e2e.regional.deployment_window_guard import (  # noqa: E402
     managed_variables_match,
     require_window_record,
     retire_foreign_closed_record,
+    foreign_open_window_in_effect,
+    foreign_open_window_refusal,
+    retire_open_record_closed_by_release,
+    retired_window_report,
     window_scope,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -303,6 +310,19 @@ def open_window(
     )
     record = read_baseline(settings.baseline) if settings.baseline.is_file() else None
     record = retire_foreign_closed_record(settings.baseline, record, scope)
+    record = retire_open_record_closed_by_release(
+        settings.baseline, record, scope, report["deployment"]
+    )
+    if foreign_open_window_in_effect(record, scope, report["deployment"]):
+        assert record is not None
+        raise RegionalFixtureError(
+            foreign_open_window_refusal(
+                record,
+                deployment=DEPLOYMENT,
+                baseline_path=settings.baseline,
+                close_command="executor_env_window.py --close-foreign-release",
+            )
+        )
     if record is not None:
         require_window_record(record, scope, report["deployment"], ALLOWED_VARIABLES)
     decision = open_decision(record, report["deployment"], assignments)
@@ -384,13 +404,30 @@ def close_window(
     report: dict[str, Any],
     *,
     sleep: Any = time.sleep,
+    foreign_release_ok: bool = False,
 ) -> dict[str, Any]:
     record = read_baseline(settings.baseline)
     live = deployment_env(regional)
     scope = window_scope(
         regional, plane="gpu", deployment=DEPLOYMENT, container=CONTAINER
     )
-    require_window_record(record, scope, live, ALLOWED_VARIABLES)
+    if (
+        retire_open_record_closed_by_release(settings.baseline, record, scope, live)
+        is None
+    ):
+        # A later release re-rendered the Deployment and took the window with
+        # it (DESTR-014 attempt 6): the record owns nothing on the cluster, so
+        # there is nothing to restore and nothing is patched.
+        return retired_window_report(record, live)
+    if foreign_release_ok and foreign_open_window_in_effect(record, scope, live):
+        # The window another release opened is still in effect (kubectl
+        # apply keeps env the manifest never listed): restore the recorded
+        # baseline exactly as that release would, validating the record
+        # against its own scope, and say under which release it closed.
+        require_window_record(record, record["scope"], live, ALLOWED_VARIABLES)
+        record["closed_under_release"] = scope["identity"]["release_id"]
+    else:
+        require_window_record(record, scope, live, ALLOWED_VARIABLES)
     baseline = record["baseline"]
     names = record["assignments"]
     restored_already = managed_variables_match(live, baseline, names)
@@ -495,6 +532,15 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--open", action="store_true")
     mode.add_argument("--close", action="store_true")
     value.add_argument(
+        "--close-foreign-release",
+        action="store_true",
+        help=(
+            "with --close: also close a window another release opened when the "
+            "Deployment verifiably still carries it (same target UID, every "
+            "assignment live); never used by a case's own cleanup"
+        ),
+    )
+    value.add_argument(
         "--confirm",
         default="",
         help=(
@@ -527,7 +573,14 @@ def main() -> int:
             raise RegionalFixtureError(
                 f"--close requires --confirm {CLOSE_CONFIRMATION}"
             )
-        report["close"] = without_survey(close_window(settings, regional, report))
+        report["close"] = without_survey(
+            close_window(
+                settings,
+                regional,
+                report,
+                foreign_release_ok=bool(arguments.close_foreign_release),
+            )
+        )
     else:
         report["mode"] = "read-only"
 

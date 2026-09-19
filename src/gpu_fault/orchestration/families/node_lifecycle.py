@@ -143,6 +143,26 @@ class NodeLifecycleOperationService:
         ]
         if not candidates:
             return None
+        # A workload *name* (path) is reused across attempts: every DESTR-008
+        # sub-scenario submits ``gpu-fault-single-node-warm-spare`` under a
+        # fresh attempt id. When the finding names its own attempt (synthetic
+        # replacement findings carry ``job_id``/``attempt_id``; real kernel-log
+        # findings do not), bind to THAT attempt so the incident cannot latch a
+        # stale sibling observation that is merely fresher on ``observed_at``.
+        # Latching the wrong attempt makes STOP_WORKLOADS fail-closed with
+        # STOP_OWNERSHIP_DRIFT at the executor pre-submit boundary. Fall back to
+        # the path + freshest-observation behaviour when the finding names no
+        # attempt, or names one with no live observation (never drop a finding
+        # that would otherwise have grouped).
+        if finding.attempt_id is not None:
+            named = [
+                observation
+                for observation in candidates
+                if observation.attempt_id == finding.attempt_id
+                and (finding.job_id is None or observation.job_id == finding.job_id)
+            ]
+            if named:
+                candidates = named
         observation = max(
             candidates,
             key=lambda item: item.observed_at,

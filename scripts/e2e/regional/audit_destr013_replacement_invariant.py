@@ -268,12 +268,36 @@ def window_errors(
     return errors, provisional
 
 
+def timeline_entries(value: Any, label: str) -> list[dict[str, Any]]:
+    """The timeline under an ``entries``/``transitions`` key, or nothing.
+
+    The runners' two timeline shapes (``timeline.json`` entries and
+    ``step-timeline.json`` transitions) carry ``observed_at`` on every element.
+    Collectors reuse the same keys for lists that are not timelines -- per-Pod
+    log classifications, coverage probes keyed ``probed_at`` -- and an empty
+    list records nothing; none of those is judged, and none contributes a run
+    timestamp. A non-list, or a list where only some elements carry
+    ``observed_at``, is a timeline whose evidence went missing and stays an
+    integrity failure.
+    """
+
+    if not isinstance(value, list):
+        raise AuditError(f"destructive evidence timeline is malformed: {label}")
+    carries = [isinstance(entry, dict) and "observed_at" in entry for entry in value]
+    if not any(carries):
+        return []
+    if not all(carries):
+        raise AuditError(f"destructive evidence timeline is malformed: {label}")
+    return cast(list[dict[str, Any]], value)
+
+
 def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
     """Every run timestamp recorded under the destructive cases' evidence.
 
     Top-level keys of each JSON document, plus the ``observed_at`` of timeline
-    and step-transition entries. Nothing deeper: a store snapshot embeds
-    records (agents, profiles) whose own timestamps predate the run.
+    and step-transition entries (``timeline_entries`` decides which lists those
+    are). Nothing deeper: a store snapshot embeds records (agents, profiles)
+    whose own timestamps predate the run.
     """
 
     def unreadable(_error: OSError) -> None:
@@ -320,17 +344,11 @@ def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
             for entries_key in ("entries", "transitions"):
                 if entries_key not in document:
                     continue
-                entries = document[entries_key]
-                if not isinstance(entries, list) or any(
-                    not isinstance(entry, dict) or "observed_at" not in entry
-                    for entry in entries
-                ):
-                    raise AuditError(
-                        f"destructive evidence timeline is malformed: {label} {entries_key}"
-                    )
                 candidates.extend(
                     (f"{entries_key}[].observed_at", entry["observed_at"])
-                    for entry in entries
+                    for entry in timeline_entries(
+                        document[entries_key], f"{label} {entries_key}"
+                    )
                 )
             for key, raw in candidates:
                 parsed = parse_time(raw, f"destructive evidence {label} {key}")

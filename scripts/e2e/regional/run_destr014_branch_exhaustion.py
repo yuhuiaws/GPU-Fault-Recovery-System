@@ -1445,6 +1445,13 @@ def execute_case(
                 journal.save()
             finally:
                 journal.close()
+    # A journal armed on a boot the node has since replaced was retired aside
+    # when this attempt acquired its own journal; carry the lineage into the
+    # case result so cleanup/verdict evidence keeps the pointer to its archive.
+    if journal is not None:
+        retired = (journal.data.get("run") or {}).get("retired_journals")
+        if retired:
+            result["retired_journals"] = retired
     write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

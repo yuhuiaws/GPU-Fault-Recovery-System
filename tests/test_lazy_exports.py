@@ -1,6 +1,6 @@
 """One lazy-export hook for every package ``__init__`` (S21).
 
-Fifteen package ``__init__.py`` files publish their names through an
+Sixteen package ``__init__.py`` files publish their names through an
 ``_EXPORTS = {"Name": ("module", "attribute")}`` table resolved on first
 attribute access. The resolving ``__getattr__`` used to be pasted into each of
 them, three of them in a one-name variant and three raising ``KeyError`` for
@@ -47,6 +47,7 @@ LAZY_PACKAGES = frozenset(
         "gpu_fault.store",
         "gpu_fault.notifications",
         "gpu_fault.orchestration",
+        "gpu_fault.orchestration.families",
     }
 )
 

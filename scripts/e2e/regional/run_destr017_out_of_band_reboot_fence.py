@@ -51,6 +51,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    node_open_incidents,
     write_json_atomic,
 )
 from scripts.e2e.regional.destr017_store_probes import (  # noqa: E402
@@ -61,6 +62,7 @@ from scripts.e2e.regional.destr017_store_probes import (  # noqa: E402
 from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     EXPECTED_XID,
     FENCE_STEP_OPERATION,
+    QUARANTINE_TAINT,
     agent_errors,
     boot_errors,
     boot_reconcile_errors,
@@ -331,6 +333,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             "DESTR-002 predecessor evidence is not PASS",
             "the node is busy, tainted, owned, or its Node Agent is not ACTIVE",
+            "the node still carries an open incident, so the XID would be merged "
+            "into it and open no workflow",
             "the node already holds a quiesce state file or a GPU client",
             "an earlier run left an armed reboot timer on the node",
             "the estimated duration does not fit the node workflow lifetime",
@@ -417,6 +421,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         node=settings.node,
         observed_after=datetime.now(timezone.utc) - timedelta(hours=1),
     )
+    # The snapshot's incident is the one behind the node's latest event inside
+    # the lookback. An incident from an earlier day still owns the node and
+    # swallows the injected XID, so read the node's open incidents by state too.
+    state["open_incidents"] = node_open_incidents(
+        regional.cpu_python, settings.regional.cluster_id, settings.node
+    )
     runtime_identity = regional.runtime_identity()
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
@@ -465,6 +475,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         recent_events=recent_unresolved_xid_events(
             state.get("event"), state.get("incident")
         ),
+        open_incidents=state["open_incidents"],
         host_snapshot=host_snapshot,
         reboot_status=reboot_state,
         expected_gpu_count=EXPECTED_GPU_COUNT,
@@ -1289,7 +1300,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             run.settings.node, timeout_seconds=AGENT_RETURN_BUDGET_SECONDS
         ),
     )
-    guard("restore_isolation", lambda: _restore_isolation(run))
+    guard("restore_isolation", lambda: restore_isolation(run))
     on_host(
         "quiesce_residue",
         lambda: run.host.execute(
@@ -1350,7 +1361,7 @@ def _refuse_residual_map(residuals: dict[str, bool]) -> dict[str, bool]:
     return residuals
 
 
-def _restore_isolation(run: _LiveRun) -> dict[str, Any]:
+def restore_isolation(run: _LiveRun) -> dict[str, Any]:
     """Release the isolation through the validated-restore workflow.
 
     The support escalation takes the node's isolation annotations over from the
@@ -1365,20 +1376,39 @@ def _restore_isolation(run: _LiveRun) -> dict[str, Any]:
         (run.preflight["store"].get("profile") or {}).get("profile_version") or ""
     )
     snapshot = run.regional.node_snapshot(run.settings.node)
-    isolated = bool(
-        snapshot.get("unschedulable")
-        or snapshot.get("ownership_annotations")
-        or any(
-            str(taint.get("key") or "").startswith("gpu-fault.io/")
-            for taint in snapshot.get("taints") or []
-        )
-    )
+    isolated = node_isolated(snapshot)
     report["isolated"] = isolated
     ordered = [item for item in (run.successor_incident_id, run.incident_id) if item]
     if isolated and not ordered:
         raise RegionalFixtureError("the node is isolated but no incident is known")
     for incident_id in ordered:
         run.warm.wait_incident_idle(incident_id)
+        snapshot = run.regional.node_snapshot(run.settings.node)
+        state = str(run.warm.incident_by_id(incident_id).get("state") or "")
+        if state == "RECOVERED":
+            report[incident_id] = "RECOVERED"
+            continue
+        if state in EVIDENCE_CLOSABLE_INCIDENT_STATES and not node_isolated(snapshot):
+            # Nothing isolates the node any more (the owning successor's
+            # validated restore already lifted it), so the fenced record is
+            # closed the way the operator would: on node isolation evidence.
+            # A validated restore is refused here on purpose -- the fenced
+            # workflow's quiesce was never restored by the product, the reboot
+            # retired it -- and that refusal is not the product's exit.
+            closed = run.warm.close_incident_with_evidence(
+                incident_id,
+                reason="DESTR-017 validated cleanup: isolation absent after the "
+                "out-of-band reboot and the successor's validated restore",
+                operator="acceptance-fixture",
+                reference=None,
+                evidence=[isolation_evidence(run.settings.node, snapshot)],
+            )
+            if closed.get("refusal"):
+                raise RegionalFixtureError(
+                    f"evidence close of {incident_id} was refused: {closed['refusal']}"
+                )
+            report[incident_id] = f"CLOSED_ON_EVIDENCE:{closed.get('state')}"
+            continue
         created = run.warm.create_restore_workflow(
             incident_id=incident_id,
             node=run.settings.node,
@@ -1393,6 +1423,43 @@ def _restore_isolation(run: _LiveRun) -> dict[str, Any]:
                 f"{restored.get('status')}"
             )
     return report
+
+
+# The states ``IncidentClosureService.close_incident`` closes on node evidence
+# (QUARANTINED) or on operator authority alone (ESCALATED); every other state
+# still has a workflow that ends it.
+EVIDENCE_CLOSABLE_INCIDENT_STATES = frozenset({"QUARANTINED", "ESCALATED"})
+
+
+def node_isolated(snapshot: dict[str, Any]) -> bool:
+    return bool(
+        snapshot.get("unschedulable")
+        or snapshot.get("ownership_annotations")
+        or any(
+            str(taint.get("key") or "").startswith("gpu-fault.io/")
+            for taint in snapshot.get("taints") or []
+        )
+    )
+
+
+def isolation_evidence(node: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """``NodeIsolationEvidence.from_mapping`` input from the runner's node read."""
+
+    taint_value = next(
+        (
+            str(taint.get("value") or "")
+            for taint in snapshot.get("taints") or []
+            if taint.get("key") == QUARANTINE_TAINT
+        ),
+        None,
+    )
+    return {
+        "node_id": node,
+        "exists": True,
+        "unschedulable": bool(snapshot.get("unschedulable")),
+        "quarantine_taint_value": taint_value,
+        "isolation_annotations": dict(snapshot.get("ownership_annotations") or {}),
+    }
 
 
 CASE = CaseRunner(

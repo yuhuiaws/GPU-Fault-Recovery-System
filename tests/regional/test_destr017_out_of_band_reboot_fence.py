@@ -1201,6 +1201,7 @@ def _preflight(**overrides: Any) -> dict[str, Any]:
         "queue": {"depth": 0},
         "remote_commands": {"pending": 0, "leased": 0, "in_progress": 0},
         "recent_events": [],
+        "open_incidents": [],
         "host_snapshot": host_before(),
         "reboot_status": {"armed": False},
         "expected_gpu_count": 8,
@@ -1316,6 +1317,29 @@ def test_a_recent_xid_from_a_recovered_incident_does_not_block_a_rerun() -> None
     ]
     assert verdicts.recent_unresolved_xid_events(event, None) == [event]
     assert verdicts.recent_unresolved_xid_events(None, {"state": "RECOVERED"}) == []
+
+
+def test_the_preflight_refuses_a_node_still_owned_by_an_open_incident() -> None:
+    """A node an ESCALATED or QUARANTINED incident still owns merges the
+    injected XID into that incident and opens no workflow, however old the
+    incident is; the drill would wait its whole budget for a workflow that
+    cannot appear, so it must refuse before injecting and name the way out."""
+
+    def incident(state: str, node: str = NODE) -> dict[str, Any]:
+        return {"incident_id": INCIDENT, "state": state, "node_ids": [node]}
+
+    escalated = verdicts.preflight_errors(
+        **_preflight(open_incidents=[incident("ESCALATED")])
+    )
+    assert len(escalated) == 1, escalated
+    assert INCIDENT in escalated[0] and "ESCALATED" in escalated[0], escalated
+    assert "workflow-reconcile --close-incident" in escalated[0], escalated
+    quarantined = verdicts.preflight_errors(
+        **_preflight(open_incidents=[incident("QUARANTINED")])
+    )
+    assert any("--close-quarantined" in item for item in quarantined), quarantined
+    for harmless in (incident("RECOVERED"), incident("ESCALATED", node=OTHER)):
+        assert verdicts.preflight_errors(**_preflight(open_incidents=[harmless])) == []
 
 
 # --------------------------------------------------------------------------- #

@@ -50,6 +50,8 @@ from scripts.e2e.regional import (  # noqa: E402
     run_destr002_hyperpod_reboot as reboot_case,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    node_open_incidents,
+    open_incident_errors,
     processor_queue_backlog,
     write_json_atomic,
 )
@@ -197,6 +199,7 @@ def preflight_errors(
     gpu_workloads: list[dict[str, Any]],
     business_workloads: list[dict[str, Any]],
     event: dict[str, Any] | None,
+    open_incidents: list[dict[str, Any]],
     predecessor: dict[str, Any],
     tests: dict[str, Any],
     control_env: dict[str, Any],
@@ -229,6 +232,9 @@ def preflight_errors(
         errors.append(f"the GPU cluster already has a GPU workload: {gpu_workloads}")
     if event is not None:
         errors.append(f"{node} has a recent XID event")
+    # The XID 46 must open a NEW reset workflow for the XID 79 to preempt; a node
+    # an open incident still owns merges both into that incident instead.
+    errors.extend(open_incident_errors(node, open_incidents))
     reset = reboot_case.capability(profile, "gpuReset")
     if reset is None:
         errors.append("the runtime profile has no gpuReset capability")
@@ -520,6 +526,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS",
             "the node is busy, tainted, owned, or its Node Agent is not ACTIVE",
+            "the node still carries an open incident, so the XID would be merged "
+            "into it and open no workflow",
             "gpuReset is not OWN by the Node Agent, or nodeReboot not OWN by the "
             "HyperPod adapter",
             "the deployed step timeout leaves no room for both escalation "
@@ -613,6 +621,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         observed_after=datetime.now(timezone.utc) - timedelta(minutes=10),
         hyperpod_cluster=settings.hyperpod_cluster,
     )
+    # The snapshot's incident is the one behind the node's latest event inside
+    # the lookback; an older incident still owns the node and would swallow the
+    # injected XID, so read the node's open incidents by state as well.
+    state["open_incidents"] = node_open_incidents(
+        regional.cpu_python, settings.regional.cluster_id, settings.node
+    )
     node = regional.node_snapshot(settings.node)
     runtime_identity = regional.runtime_identity()
     tests = focused_tests(case_dir)
@@ -640,6 +654,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         gpu_workloads=regional.gpu_workloads(),
         business_workloads=workloads,
         event=state.get("event"),
+        open_incidents=state["open_incidents"],
         predecessor=predecessor,
         tests=tests,
         control_env=env,

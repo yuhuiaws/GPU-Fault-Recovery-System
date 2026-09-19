@@ -1,6 +1,6 @@
 """The lazy ``_EXPORTS`` tables and manifest entry points must resolve.
 
-Fifteen package ``__init__.py`` files under ``src/gpu_fault/`` publish names
+Sixteen package ``__init__.py`` files under ``src/gpu_fault/`` publish names
 through ``_EXPORTS = {"Name": ("module", "attribute")}`` and a module
 ``__getattr__``. Nothing executes those tuples until a caller asks for the
 name, so a typo or a moved function survives every import-time check and

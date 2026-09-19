@@ -92,7 +92,12 @@ shortage and sends no new POST. An explicit replacement CPU cleanup observer
 must first stop prior owned observer Jobs; it cannot reopen producer authority.
 The original failure is retained even if fresh cleanup succeeds. Separate
 `cleanup-attempt-<n>.json` reports do not overwrite or reissue execution PASS.
-Another execution requires a new approved run directory.
+A finished execution that owns nothing (journal `completed`, prewarm cleaned,
+no scenario `STARTED`) is archived instead: its journal, lock files,
+`scenarios/` and `prewarm-owner.json` move to `.completed-<stamp>` names, the
+next attempt in the same run directory starts a fresh execution, and the case
+result records the archived lineage as `retired_execution`. Only an unfinished
+execution keeps routing to cleanup-only recovery.
 
 Unresolved journals, source/identity drift, or unproven command quiescence require
 operator reconciliation. Interrupted metadata-only variants do not reconstruct

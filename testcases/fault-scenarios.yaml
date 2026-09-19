@@ -3485,9 +3485,9 @@ test_cases:
     verified:
       case_digest: 10b5f1094e2cb09efe62611e6af438afd4ad397aad0012022ec58bda6d7a9b4d
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 288658ba06a26cadcd3102f2b8b1a4915089f0baf090eee89357fabe6415bb55
+        executor: 9e8956dcfceda0fbbbf960c0f8aac769a3edb2e91a2171146a1f4009a830843d
+        node_runtime: 02eb0db00b89374bd42e3c94c19a50b6eaf58f9cdc41525bd8c0f5d4b9e1a301
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
@@ -4323,7 +4323,13 @@ test_cases:
   - 跟踪器在注入前完成校准与监督，结束后确认detach及资源清理；公开证据不保留原始argv，未知动作不得为清理而直接恢复quiesce
   - 物理补充试验仅证明入队后、最终许可前的受控变化被拒；三个独立结果及清理证明人工核对，不以单个变体或模型计数升级普通 PASS
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e3b55ce113a474bebff0366ff73c092655d80bc6b5ccc09042d2c8607a1970bd
+      components:
+        control_plane: 288658ba06a26cadcd3102f2b8b1a4915089f0baf090eee89357fabe6415bb55
+        executor: 9e8956dcfceda0fbbbf960c0f8aac769a3edb2e91a2171146a1f4009a830843d
+        node_runtime: 02eb0db00b89374bd42e3c94c19a50b6eaf58f9cdc41525bd8c0f5d4b9e1a301
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-015
   related_pytest: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
@@ -4410,7 +4416,13 @@ test_cases:
   - 清理后：未点火的 reboot 定时器已取消、设备占用已解除、节点 Ready 且 schedulable、无 gpu-fault taint 与 ownership 注解、GPU 数与基线一致、基线 active 的服务全部回到 active、quiesce state 与 gpu-fault timer 无残留、探针 Pod/ConfigMap 零残留
   - 隔离只允许经 validated-restore 工作流解除（先 support 后继 incident、再原 incident 走 already_restored 空操作路径），任何情况下不得手工删除 taint 或注解
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 477124f27c9402985d0c2c7e8e406c27f086eddbd401db67bd4f87af503f504b
+      components:
+        control_plane: 288658ba06a26cadcd3102f2b8b1a4915089f0baf090eee89357fabe6415bb55
+        executor: 9e8956dcfceda0fbbbf960c0f8aac769a3edb2e91a2171146a1f4009a830843d
+        node_runtime: 02eb0db00b89374bd42e3c94c19a50b6eaf58f9cdc41525bd8c0f5d4b9e1a301
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-017
   related_pytest: tests/regional/test_destr017_out_of_band_reboot_fence.py::test_the_fenced_workflow_contract_accepts_the_expected_terminal_record

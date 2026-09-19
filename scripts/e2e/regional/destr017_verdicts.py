@@ -27,7 +27,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+from scripts.e2e.regional.acceptance_runner_common import (
+    open_incident_errors,
+    processor_queue_backlog,
+)
 
 # The official steps a single idle node's RESET_GPU workflow compiles to.
 OFFICIAL_OPERATIONS = (
@@ -861,7 +864,9 @@ def recent_unresolved_xid_events(
     blocks the drill. An event whose incident has already RECOVERED does not:
     it is left-over evidence from an earlier attempt on the same idle node,
     and blocking on it would wedge the campaign for the full lookback window
-    every time a drill that reboots the node had to be retried.
+    every time a drill that reboots the node had to be retried. This reads the
+    lookback window only; an open incident older than that still owns the node
+    and is ``open_incident_errors``' business.
     """
 
     if not event:
@@ -881,6 +886,7 @@ def preflight_errors(
     queue: dict[str, Any],
     remote_commands: dict[str, Any],
     recent_events: list[dict[str, Any]],
+    open_incidents: list[dict[str, Any]],
     host_snapshot: dict[str, Any],
     reboot_status: dict[str, Any],
     expected_gpu_count: int,
@@ -945,6 +951,9 @@ def preflight_errors(
             f"{node} already has a recent XID event: "
             f"{[item.get('event_id') for item in recent_events]}"
         )
+    # An incident that still owns the node swallows the injected XID (node-scoped
+    # merge), so no workflow would ever pin a generation for the fence to refuse.
+    errors.extend(open_incident_errors(node, open_incidents))
     if len(host_snapshot.get("gpu_inventory") or []) != expected_gpu_count:
         errors.append(
             f"{node} does not report {expected_gpu_count} GPUs: "

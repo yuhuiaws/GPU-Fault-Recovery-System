@@ -172,6 +172,7 @@ def test_fence_preflight_requires_idle_owned_unwarned_target(
         "queue": {"depth": 0, "fault_backlog_depth": 0},
         "remote_commands": {},
         "recent_events": [],
+        "open_incidents": [],
         "host_snapshot": host,
         "reboot_status": {"armed": False},
         "expected_gpu_count": len(host["gpu_inventory"]),

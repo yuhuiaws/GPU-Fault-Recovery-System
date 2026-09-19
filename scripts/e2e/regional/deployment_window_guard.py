@@ -7,10 +7,15 @@ import json
 import os
 import re
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.admin.atomic_json import write_json_atomic
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+# ``retired_by`` of a window record a later release closed underneath it.
+RELEASE_CHANGE = "release change"
 
 
 def deployment_snapshot(
@@ -192,6 +197,204 @@ def retire_foreign_closed_record(
         )
     path.replace(archive)
     return None
+
+
+def foreign_open_window_in_effect(
+    record: dict[str, Any] | None, scope: Mapping[str, Any], live: Mapping[str, Any]
+) -> bool:
+    """Whether an OPEN/OPENING record from another release still describes the
+    live Deployment: same target UID and every assigned variable still reads
+    its window value.
+
+    ``kubectl apply`` keeps env entries the manifest never listed, so a window
+    a dead attempt left open survives the deploys that follow it (live
+    2026-09-19: the control-worker still carried the 09-18 DESTR-014 window
+    two releases later). Such a record is neither retired (the window is in
+    effect) nor closable under the strict scope check (its release id can never
+    return); this predicate lets ``close_window`` restore the recorded baseline
+    under the record's own scope, and ``open_window`` refuse with the way out.
+    Any doubt -- other state, a different target UID, a scope differing in more
+    than the release id, an assignment not exactly live -- answers False.
+    """
+
+    if record is None or record.get("state") not in {"OPEN", "OPENING"}:
+        return False
+    record_scope = record.get("scope")
+    baseline = record.get("baseline")
+    assignments = record.get("assignments")
+    live_variables = live.get("variables")
+    if (
+        not isinstance(record_scope, dict)
+        or not isinstance(record_scope.get("identity"), dict)
+        or not isinstance(scope.get("identity"), dict)
+        or not isinstance(baseline, dict)
+        or not isinstance(assignments, dict)
+        or not assignments
+        or any(not isinstance(value, str) for value in assignments.values())
+        or not isinstance(live_variables, dict)
+    ):
+        return False
+    recorded_release = record_scope["identity"].get("release_id")
+    live_release = scope["identity"].get("release_id")
+    if (
+        not isinstance(recorded_release, str)
+        or not recorded_release
+        or recorded_release == live_release
+        or scope_without_release(record_scope) != scope_without_release(scope)
+    ):
+        return False
+    if not baseline.get("uid") or live.get("uid") != baseline.get("uid"):
+        return False
+    return all(
+        live_variables.get(name) == {"present": True, "value": value}
+        for name, value in assignments.items()
+    )
+
+
+def foreign_open_window_refusal(
+    record: Mapping[str, Any],
+    *,
+    deployment: str,
+    baseline_path: Path,
+    close_command: str,
+) -> str:
+    """The refusal ``open_window`` raises for a foreign window still in effect."""
+
+    release = str(((record.get("scope") or {}).get("identity") or {}).get("release_id"))
+    names = sorted((record.get("assignments") or {}).keys())
+    return (
+        f"an env window opened under release {release} is still in effect on "
+        f"{deployment} ({', '.join(names)}); close it first with {close_command} "
+        f"--close --baseline {baseline_path}, then open the new window"
+    )
+
+
+def scope_without_release(scope: Mapping[str, Any]) -> dict[str, Any]:
+    """``scope`` with ``identity.release_id`` dropped: the part a deploy keeps."""
+
+    identity = scope.get("identity")
+    if not isinstance(identity, dict):
+        return dict(scope)
+    return {
+        **scope,
+        "identity": {
+            key: value for key, value in identity.items() if key != "release_id"
+        },
+    }
+
+
+def retire_open_record_closed_by_release(
+    path: Path,
+    record: dict[str, Any] | None,
+    scope: dict[str, Any],
+    live: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Archive an OPEN/OPENING record whose window a later release closed.
+
+    ``retire_foreign_closed_record`` leaves anything not CLOSED in place, since
+    an open window under another identity must never be silently replaced. But
+    a case that dies mid-window leaves an OPEN record under the release that
+    was live then, and the next deploy re-renders the Deployment: the
+    assignments are physically gone and the live scope's ``release_id`` can
+    never again equal the record's, so ``require_window_record`` refuses every
+    later attempt ("baseline is unbound or invalid") until someone deletes the
+    record by hand (DESTR-014 attempt 6).
+
+    The record is retired only when the cluster proves the window is gone:
+    the scope matches in every key but ``identity.release_id``; every assigned
+    variable was observed on the live Deployment and none still reads its
+    window value; and the Deployment was re-rendered (a UID or generation other
+    than the baseline's). A live env that still carries any assignment is a
+    window another identity holds open, and the record is returned unchanged
+    so the strict scope check keeps refusing it. So is anything not
+    OPEN/OPENING, malformed, or differing from ``scope`` in more than the
+    release id.
+
+    The record dict is annotated in place with why and where it went
+    (``retired_by``, ``retired_at``, ``retired_live_uid``,
+    ``retired_live_release_id``, ``retired_archive``) and rewritten before the
+    move, so the archived file explains itself and a caller still holding the
+    dict can report the archive path.
+    """
+
+    if record is None or record.get("state") not in {"OPEN", "OPENING"}:
+        return record
+    record_scope = record.get("scope")
+    baseline = record.get("baseline")
+    assignments = record.get("assignments")
+    live_variables = live.get("variables")
+    if (
+        not isinstance(record_scope, dict)
+        or not isinstance(record_scope.get("identity"), dict)
+        or not isinstance(scope.get("identity"), dict)
+        or not isinstance(baseline, dict)
+        or not isinstance(assignments, dict)
+        or not assignments
+        or any(not isinstance(value, str) for value in assignments.values())
+        or not isinstance(live_variables, dict)
+    ):
+        return record
+    recorded_release = record_scope["identity"].get("release_id")
+    live_release = scope["identity"].get("release_id")
+    if (
+        not isinstance(recorded_release, str)
+        or not recorded_release
+        or recorded_release == live_release
+        or scope_without_release(record_scope) != scope_without_release(scope)
+    ):
+        return record
+    if any(
+        name not in live_variables
+        or live_variables[name] == {"present": True, "value": value}
+        for name, value in assignments.items()
+    ):
+        return record
+    if live.get("uid") == baseline.get("uid") and live.get(
+        "generation"
+    ) == baseline.get("generation"):
+        return record
+    retired_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    stamp = re.sub(r"[^0-9A-Za-z]", "", retired_at)[:16] or "unknown"
+    archive = path.with_name(f"{path.stem}.retired-{stamp}{path.suffix}")
+    if archive.exists():
+        archive = path.with_name(
+            f"{path.stem}.retired-{stamp}-{os.getpid()}{path.suffix}"
+        )
+    record.update(
+        {
+            "retired_by": RELEASE_CHANGE,
+            "retired_at": retired_at,
+            "retired_live_uid": live.get("uid"),
+            "retired_live_release_id": live_release,
+            "retired_archive": str(archive),
+        }
+    )
+    write_json_atomic(path, record)
+    path.replace(archive)
+    return None
+
+
+def retired_window_report(
+    record: Mapping[str, Any], live: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The close report for a record ``retire_open_record_closed_by_release`` moved.
+
+    There is nothing to restore: the release change already put the Deployment
+    back to its rendered env, so the report carries the retirement, the archive
+    and the live env it was judged against, and no mutation is made.
+    """
+
+    return {
+        "state": "RETIRED",
+        "retired_by": record["retired_by"],
+        "retired_at": record["retired_at"],
+        "retired_live_uid": record["retired_live_uid"],
+        "retired_live_release_id": record["retired_live_release_id"],
+        "archive": record["retired_archive"],
+        "record_scope": record.get("scope"),
+        "assignments": record.get("assignments"),
+        "live_state": dict(live),
+    }
 
 
 def managed_variables_match(

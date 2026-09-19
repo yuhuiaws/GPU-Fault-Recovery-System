@@ -196,3 +196,96 @@ def replica_vanished(error: BaseException) -> bool:
     if re.search(r"forbidden|unauthorized|permission denied|accessdenied", text, re.I):
         return False
     return _VANISHED_REPLICA.fullmatch(text) is not None
+
+
+# --------------------------------------------------------------------------- #
+# Open incidents on the target node
+# --------------------------------------------------------------------------- #
+# Runs in the CPU API Pod (``RegionalLiveFixture.cpu_python``): every incident
+# of the cluster that names the node and has not RECOVERED. Read by state
+# through the store's own index, not through the node's recent XID events: the
+# incident a rerun trips over is older than any preflight's event lookback, and
+# the event that opened it may already have been pruned by the correlator.
+OPEN_INCIDENTS_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import IncidentState
+
+cluster_id, node_id = sys.argv[1:3]
+store = ApplicationContext.from_environment().store
+open_states = [
+    state for state in IncidentState if state is not IncidentState.RECOVERED
+]
+print(json.dumps({
+    "open_incidents": [
+        item.model_dump(mode="json")
+        for item in store.list_incidents_by_state(
+            cluster_id, open_states, node_ids={node_id}
+        )
+    ],
+}, sort_keys=True, default=str))
+"""
+
+# RECOVERED is the only incident state that has let go of its node. In every
+# other state the incident still owns it: the processor merges a new XID on that
+# node into the open incident (node-scoped merge; F-N1 once ESCALATED) and plans
+# nothing, so a drill that injects an XID and waits for a NEW workflow waits its
+# whole budget and only ever finds the old, finished one.
+CLOSED_INCIDENT_STATES = frozenset({"RECOVERED"})
+# The operator exits ``gpu-fault-admin workflow-reconcile`` offers, by the state
+# each one closes; the in-flight states have none and must run to their end.
+INCIDENT_CLOSE_LEVERS = {
+    "ESCALATED": "workflow-reconcile --close-incident",
+    "QUARANTINED": "workflow-reconcile --close-quarantined",
+}
+
+
+def node_open_incidents(
+    cpu_python: Callable[..., dict[str, Any]],
+    cluster_id: str,
+    node: str,
+) -> list[dict[str, Any]]:
+    """The node's open incidents, read through the fixture's CPU Pod probe path
+    (``RegionalLiveFixture.cpu_python``)."""
+
+    payload = cpu_python(OPEN_INCIDENTS_PROBE, cluster_id, node)
+    return list(payload.get("open_incidents") or [])
+
+
+def open_incident_errors(
+    node: str,
+    open_incidents: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Refuse a node an open incident still owns, and name the way out.
+
+    An incident whose ``node_ids`` are present and do not name ``node`` is
+    another node's. One without the field came from a node-scoped read and
+    counts: a missing field must never wave a real incident through.
+    """
+
+    errors: list[str] = []
+    for item in open_incidents:
+        state = str(item.get("state") or "")
+        node_ids = item.get("node_ids")
+        if state in CLOSED_INCIDENT_STATES:
+            continue
+        if node_ids is not None and node not in node_ids:
+            continue
+        lever = INCIDENT_CLOSE_LEVERS.get(state)
+        way_out = (
+            f"close it with {lever} before injecting"
+            if lever
+            else (
+                "wait for its workflow to end, then close it with "
+                "workflow-reconcile --close-incident (ESCALATED) or "
+                "--close-quarantined (QUARANTINED) before injecting"
+            )
+        )
+        errors.append(
+            f"{node} carries an open incident {item.get('incident_id')} ({state}); "
+            "a new XID on this node is merged into it instead of opening a "
+            f"workflow; {way_out}"
+        )
+    return errors

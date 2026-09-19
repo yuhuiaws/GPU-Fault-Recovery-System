@@ -8,14 +8,14 @@ from gpu_fault.operation_registry import (
     WORKLOAD_SCOPED_OPERATIONS,
 )
 from gpu_fault.orchestration import DagBrancher, RecoveryArbiter
-from gpu_fault.orchestration.families import (
-    EvidenceOperationService,
-    NodeConflictService,
+from gpu_fault.orchestration.families.conflicts import NodeConflictService
+from gpu_fault.orchestration.families.evidence import EvidenceOperationService
+from gpu_fault.orchestration.families.health import (
     NodeHealthCallbacks,
     NodeHealthIngestionService,
     NodeHealthPlanBuilder,
-    ValidationOperationService,
 )
+from gpu_fault.orchestration.families.validation import ValidationOperationService
 from gpu_fault.orchestration.workflow_merge import WorkflowMergeService
 from tests.orchestration._cov95_runtime_builder import builder
 

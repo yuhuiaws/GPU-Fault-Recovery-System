@@ -36,7 +36,7 @@
     "src/gpu_fault/admin/bootstrap.py": 1978,
     "src/gpu_fault/execution/dispatcher.py": 1692,
     "src/gpu_fault/execution/executor.py": 2556,
-    "src/gpu_fault/orchestration/coordinator.py": 1960,
+    "src/gpu_fault/orchestration/coordinator.py": 1970,
     "src/gpu_fault/policy/engine.py": 1520,
     "src/gpu_fault/processor/coordinator.py": 1808,
     "src/gpu_fault/store/postgres/ddl.py": 1753,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -117,11 +118,20 @@ class ExecutionJournal:
                     )
                 self._save()
 
-    def _read(self) -> ExecutionRecord:
+    @staticmethod
+    def peek(path: Path) -> ExecutionRecord:
+        """The validated record at ``path``, without comparing its binding.
+
+        Callers hold ``controller_ownership`` for the journal. This only says
+        what the document records, never whether the caller may act on it.
+        """
         try:
-            record = ExecutionRecord.model_validate(read_private_document(self.path))
+            return ExecutionRecord.model_validate(read_private_document(path))
         except (OSError, ValueError, TypeError):
             raise RegionalFixtureError("execution journal is invalid") from None
+
+    def _read(self) -> ExecutionRecord:
+        record = self.peek(self.path)
         if record.binding != self.binding():
             raise RegionalFixtureError("execution journal input or connection drifted")
         return record
@@ -187,3 +197,75 @@ class ExecutionJournal:
             self.record = self._read()
             self.record.completed = True
             self._save()
+
+
+def owns_nothing(record: ExecutionRecord) -> bool:
+    return (
+        record.completed
+        and record.prewarm_cleaned
+        and not any(item.state == "STARTED" for item in record.scenarios.values())
+    )
+
+
+def _archive_name(path: Path, tag: str) -> Path:
+    return path.with_name(f"{path.stem}.{tag}{path.suffix}")
+
+
+def _present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def retire_completed_execution(
+    case_dir: Path,
+    journal_path: Path,
+    *,
+    binding: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Archive a finished execution so the next attempt can start fresh.
+
+    A record that is ``completed`` with its prewarm cleaned and no scenario
+    STARTED owns no cluster resource, and it grants no re-execution either: an
+    ``ExecutionJournal`` opened on it only ever answers cleanup-only, and its
+    binding check fails outright once a deploy rewrote a kubeconfig. So the
+    journal, its lock, ``scenarios/`` and the prewarm owner move to
+    ``.completed-<stamp>`` names beside the originals and the lineage is
+    returned. Anything unfinished stays exactly in place (``None``) for the
+    strict, binding-checked resume path.
+    """
+
+    if not _present(journal_path):
+        return None
+    with controller_ownership(journal_path):
+        if not _present(journal_path):
+            return None
+        record = ExecutionJournal.peek(journal_path)
+        if not owns_nothing(record):
+            return None
+        matched = None if binding is None else record.binding == binding()
+        # Siblings first, the journal after them, its lock last: a crash in
+        # between leaves a still-finished journal that the next attempt retires
+        # again, never ownerless artifacts that would demand reconciliation.
+        sources = (
+            case_dir / "scenarios",
+            case_dir / "prewarm-owner.json",
+            case_dir / "prewarm-owner.lock",
+            journal_path,
+            journal_path.with_suffix(".lock"),
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        tag, collisions = f"completed-{stamp}", 0
+        while any(_present(_archive_name(source, tag)) for source in sources):
+            collisions += 1
+            tag = f"completed-{stamp}-{collisions}"
+        archived: dict[str, str] = {}
+        for source in sources:
+            if _present(source):
+                target = _archive_name(source, tag)
+                source.rename(target)
+                archived[source.name] = target.name
+    return {
+        "attempt": record.attempt,
+        "release_id": record.release_id,
+        "binding_matched": matched,
+        "archived": archived,
+    }

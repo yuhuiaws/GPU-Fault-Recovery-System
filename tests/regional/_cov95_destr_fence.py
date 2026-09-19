@@ -12,6 +12,7 @@ from gpu_fault.models import WorkflowStatus
 from scripts.e2e.regional import destr017_verdicts as verdicts
 from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as case
+from scripts.e2e.regional.acceptance_runner_common import OPEN_INCIDENTS_PROBE
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional import test_destr017_out_of_band_reboot_fence as data
 from tests.regional._cov95_destr_branches import ready_runtime
@@ -98,6 +99,12 @@ class FenceHarness:
             "incident": data.support_incident(),
         }
         self.extra_escalations: dict[str, Any] = {}
+        # Open incidents the preflight reads by state; a rerun that trips over
+        # one is refused before the holder is armed.
+        self.open_incidents: list[dict[str, Any]] = []
+        # The support successor owns the node's isolation until its validated
+        # restore; the fenced record is then closed on isolation evidence.
+        self.close_refusal: str | None = None
         self.events: list[dict[str, Any]] = []
         self.reconcile = {
             "mode": verdicts.RETIRED_GENERATION_PLAN_MODE,
@@ -315,8 +322,22 @@ class FenceRegional:
         return deepcopy(self.h.node)
 
     def cpu_python(self, script: str, *args: str) -> dict[str, Any]:
+        if script == OPEN_INCIDENTS_PROBE:
+            self.h.call("open_incidents", args)
+            return {"open_incidents": deepcopy(self.h.open_incidents)}
         if script == case.AFTERMATH_PROBE:
             self.h.call("aftermath", args)
+            # The support successor has quarantined the node by now: cleanup
+            # restores through it and closes the fenced record on evidence.
+            self.h.node.update(
+                unschedulable=True,
+                taints=[{"key": verdicts.QUARANTINE_TAINT, "value": "abc"}],
+                ownership_annotations={
+                    "gpu-fault.io/incident-id": (
+                        self.h.support["incident"]["incident_id"]
+                    )
+                },
+            )
             return {
                 "fenced": deepcopy(self.h.fenced),
                 "incident": data.fenced_incident(
@@ -394,6 +415,22 @@ class FenceWarm:
 
     def wait_incident_idle(self, incident: str) -> None:
         self.h.call("incident.idle", incident)
+
+    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
+        self.h.call("incident.read", incident_id)
+        if incident_id == data.INCIDENT:
+            state = "RECOVERED" if self.h.recovered else "QUARANTINED"
+        else:
+            state = str(self.h.support["incident"]["state"])
+        return {"incident_id": incident_id, "state": state}
+
+    def close_incident_with_evidence(
+        self, incident_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.h.call("incident.close", {"incident_id": incident_id, **kwargs})
+        if self.h.close_refusal:
+            return {"closed": False, "refusal": self.h.close_refusal, "state": None}
+        return {"closed": True, "refusal": None, "state": "RECOVERED"}
 
     def create_restore_workflow(self, **kwargs: Any) -> dict[str, Any]:
         self.h.call("restore.create", kwargs)

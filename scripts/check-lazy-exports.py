@@ -1,6 +1,6 @@
 """Resolve every lazy ``_EXPORTS`` tuple and every manifest-declared entry point.
 
-Fifteen package ``__init__.py`` files under ``src/gpu_fault/`` publish their
+Sixteen package ``__init__.py`` files under ``src/gpu_fault/`` publish their
 public names through ``_EXPORTS = {"Name": ("module", "attribute")}`` and a
 module-level ``__getattr__``. The tuple is only executed when a caller asks
 for the name, so a misspelled attribute or a function that moved survives
