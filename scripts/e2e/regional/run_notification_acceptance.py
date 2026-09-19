@@ -50,6 +50,7 @@ from scripts.e2e.regional.notification_evidence import (  # noqa: E402
     select_live_record as select_live_record,
     validate_duplicate_evidence,
     validate_external_evidence,
+    split_drill_tagged_live_records,
 )
 from scripts.e2e.regional.notify005_checks import (  # noqa: E402
     low_utilization_manifest,
@@ -324,22 +325,14 @@ def run_notify001(
     evidence: dict[str, dict[str, Any]] = {}
     drills: list[dict[str, Any]] = []
     record_times: list[datetime] = []
+    drill_tagged_live: dict[str, list[str]] = {}
     for kind in NOTIFICATION_KINDS:
         candidate_ids = {
             item["notification_id"] for item in live["candidates"].get(kind, [])
         }
-        unusable = [
-            item
-            for item in live["records"]
-            if (
-                item.get("kind") == kind or item.get("notification_id") in candidate_ids
-            )
-            and (
-                item.get("missing")
-                or item.get("status") != "SENT"
-                or not item.get("provider_message_id_present")
-            )
-        ]
+        drill_tagged_live[kind], unusable = split_drill_tagged_live_records(
+            live["records"], kind=kind, candidate_ids=candidate_ids
+        )
         if unusable:
             raise NotificationAcceptanceError(
                 f"{kind} has unverified live delivery; a drill cannot replace it"
@@ -419,6 +412,7 @@ def run_notify001(
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
+        "drill_tagged_live_records": drill_tagged_live,
         "sources": sources,
         "evidence": evidence,
         "live_candidates": live["candidates"],

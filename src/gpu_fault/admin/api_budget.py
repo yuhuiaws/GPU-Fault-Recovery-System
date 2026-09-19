@@ -160,25 +160,65 @@ def _process_stat(path: Path) -> tuple[str, int, str]:
         return "", 0, ""
 
 
+_EXIT_STATES = frozenset({"Z", "X"})
+
+
 def _pid_identity(pid: int) -> str:
     state, _parent, start = _process_stat(Path(f"/proc/{pid}/stat"))
-    return start if state not in {"", "Z", "X"} else ""
+    return start if state not in {"", *_EXIT_STATES} else ""
+
+
+# A zombie thread-group leader is not proof of exit. When a multi-threaded
+# program execs from a non-leader thread -- the Go launchers behind the snap
+# packaged aws and kubectl (`snap run`, `snap-exec`) do -- the kernel reports
+# the dying leader as Z under the process's pid and start time until the
+# exec'ing thread takes that pid over, a scheduler-latency-sized window. A real
+# zombie stays Z until its parent reaps it and then disappears. Confirm across
+# these delays before treating a zombie as an exit (live 2026-09-19: one such
+# read released a live aws CLI's reservation and failed the reaping sibling's
+# own command, `cannot release a running API command`).
+EXIT_CONFIRMATION_DELAYS = (0.002, 0.005, 0.01, 0.02, 0.03)
+_exit_confirmation = threading.Event()
+
+
+def _confirmation_wait(seconds: float) -> None:
+    # Not `time.sleep`: the confirmation is a probe detail, not admission timing.
+    _exit_confirmation.wait(seconds)
+
+
+def _live_task(pid: int) -> bool:
+    """Whether a task of the thread group still runs beside a zombie leader."""
+    try:
+        entries = list(Path(f"/proc/{pid}/task").iterdir())
+    except OSError:
+        return False
+    return any(
+        _process_stat(entry / "stat")[0] not in {"", *_EXIT_STATES} for entry in entries
+    )
 
 
 def _identity_gone(pid: int, start: str, *, allow_reuse: bool = True) -> bool:
     if not start:
         return False
-    try:
-        state, _parent, actual = _read_process_stat(Path(f"/proc/{pid}/stat"))
-    except (FileNotFoundError, ProcessLookupError):
-        return True
-    except (OSError, IndexError, ValueError):
-        return False
-    # Unknown identity is not evidence of exit. Keep capacity charged when
-    # procfs is unreadable rather than treating a failed probe as a dead CLI.
-    return bool(actual) and (
-        (actual != start and allow_reuse) or (actual == start and state in {"Z", "X"})
-    )
+    for delay in (0.0, *EXIT_CONFIRMATION_DELAYS):
+        if delay:
+            _confirmation_wait(delay)
+        try:
+            state, _parent, actual = _read_process_stat(Path(f"/proc/{pid}/stat"))
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        except (OSError, IndexError, ValueError):
+            # Unknown identity is not evidence of exit. Keep capacity charged
+            # when procfs is unreadable rather than treating a failed probe as
+            # a dead CLI.
+            return False
+        if not actual:
+            return False
+        if actual != start:
+            return allow_reuse
+        if state not in _EXIT_STATES or _live_task(pid):
+            return False
+    return True
 
 
 def _ancestors(pid: int) -> dict[int, str]:
@@ -339,14 +379,21 @@ def _lend_slot(
         os.close(descriptor)
 
 
-def _release_lease(database: sqlite3.Connection, identifier: str) -> str | None:
+def _release_lease(
+    database: sqlite3.Connection, identifier: str, *, owner: bool = True
+) -> str | None:
     child = _lease(database, identifier)
     if (
         child is not None
         and child.command_pid is not None
         and not _identity_gone(child.command_pid, child.command_start or "")
     ):
-        raise ApiBudgetError("cannot release a running API command")
+        if owner:
+            raise ApiBudgetError("cannot release a running API command")
+        # A reaper is a sibling, not the owner: its earlier probe saw a state
+        # that did not last, the command still runs and its reservation stays
+        # charged. Failing the reaper's own command would punish the wrong CLI.
+        return None
     borrowed = child is not None and (
         child.state == "cancelled"
         or (child.lent_to is not None and _lease(database, child.lent_to) is not None)
@@ -392,7 +439,7 @@ def _reap_leases(database: sqlite3.Connection) -> None:
             command_pid is not None
             and _identity_gone(command_pid, command_start, allow_reuse=owner_gone)
         ) or (command_pid is None and owner_gone):
-            _release_lease(database, identifier)
+            _release_lease(database, identifier, owner=False)
 
 
 def _settle_handoffs(database: sqlite3.Connection) -> None:

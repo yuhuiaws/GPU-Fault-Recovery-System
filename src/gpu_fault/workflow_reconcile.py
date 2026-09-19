@@ -287,6 +287,10 @@ def _close_never_changed(
         reference=reference,
         reconciled_at=applied_at,
     )
+    if updated_plan is None:
+        # Unreachable with a plan handed in; the resolver returns the plan it
+        # was given. Kept so the type says what this path writes.
+        raise ValueError("workflow has no source recovery plan")
     amended = store.amend_workflow(
         request_id,
         {
@@ -372,6 +376,7 @@ def apply_workflow_reconcile_plan(
     resolved_plan_ids: list[str] = []
     incident_ids: set[str] = set()
     for item in plan["items"]:
+        source_plan: RecoveryPlan | None
         try:
             if item["terminalization"] == NEVER_CHANGED:
                 updated_workflow, incident, source_plan = _close_never_changed(
@@ -403,7 +408,10 @@ def apply_workflow_reconcile_plan(
             continue
         incident_ids.add(incident.incident_id)
         applied.append(updated_workflow.request_id)
-        resolved_plan_ids.append(source_plan.plan_id)
+        if source_plan is not None:
+            # A record that was never plan-driven resolves no plan; its audit
+            # is the OPERATOR_RECONCILED event and the incident's reasons.
+            resolved_plan_ids.append(source_plan.plan_id)
         try:
             # The fifth terminalization path (F-C9): the superseded predecessor
             # may still hold a restart reservation planning took for it. The row

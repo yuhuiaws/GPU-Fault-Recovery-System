@@ -59,7 +59,9 @@ from gpu_fault_release.regional_release_prerequisite_handoff import (
     HANDOFF_AUDIT_KEY,
     bootstrap_handoff_audit,
     candidate_bootstrap_baseline,
+    upgrade_handoff_audit,
     validate_bootstrap_repair_handoff,
+    validate_upgrade_repair_handoff,
 )
 from gpu_fault_release.regional_release_transaction import save_recorded_state
 
@@ -118,7 +120,17 @@ def matches_pre_repair_state(
 ) -> bool:
     if not has_prerequisite_repair(state):
         return False
-    return bool(_validate_record(release, state)["baseline_sha256"] == expected)
+    record = _validate_record(release, state)
+    if record["baseline_sha256"] == expected:
+        return True
+    # The deploy diff was pinned while a predecessor journal was still live;
+    # the successor this candidate wrote in preflight recorded that digest.
+    supersedes = record.get("supersedes")
+    return bool(
+        isinstance(supersedes, dict)
+        and isinstance(supersedes.get("state_sha256"), str)
+        and supersedes["state_sha256"] == expected
+    )
 
 
 def _persist(release: RegionalRelease, record: dict[str, Any]) -> None:
@@ -234,6 +246,62 @@ def _advance_bootstrap_repair(
     return successor
 
 
+def _retire_orphaned_repair(
+    release: RegionalRelease, record: dict[str, Any], *, identity: dict[str, Any]
+) -> None:
+    """Restore the original refresher an abandoned upgrade candidate repaired over.
+
+    ``record`` must be the journal object held in ``release.state``: the Job
+    checkpoints persist through it. Nothing here removes the journal; a failure
+    leaves the original record for the next attempt to repeat the restoration.
+    """
+    # Even removed Jobs are rechecked before their CronJob owner can be restored.
+    for name, job in list(record["jobs"].items()):
+        cleanup_probe_job(release, job, repair_job_checkpoint(release, name))
+    ensure_supervision_safe()
+    validate_upgrade_repair_handoff(
+        release, release.state, identity=database_identity(release)
+    )
+    restore_aurora_refresh_snapshot(release, record["previous_refresher"])
+    if database_identity(release) != identity:
+        raise ReleaseError("upgrade prerequisite identity changed during restoration")
+
+
+def _advance_upgrade_repair(
+    release: RegionalRelease,
+    record: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    # The digest the deploy driver pinned: the committed state with the orphan.
+    superseded_state_sha256 = canonical_sha256(release.state)
+    _retire_orphaned_repair(release, record, identity=identity)
+    original_state = release.state
+    baseline = copy.deepcopy(
+        {key: value for key, value in original_state.items() if key != REPAIR_KEY}
+    )
+    successor = _new_record(
+        release,
+        baseline=baseline,
+        snapshot=record["previous_refresher"],
+        identity=identity,
+        bootstrap=False,
+        commit_live=False,
+    )
+    successor["supersedes"] = upgrade_handoff_audit(
+        record, state_sha256=superseded_state_sha256
+    )
+    # One checkpoint replaces the journal. Before it, a retry still finds the
+    # predecessor, revalidates it and repeats the restoration.
+    release.state = {**baseline, REPAIR_KEY: successor}
+    try:
+        _persist(release, successor)
+    except BaseException:
+        release.state = original_state
+        raise
+    return successor
+
+
 def _refresh(release: RegionalRelease) -> None:
     cronjob = read_aurora_refresh_cronjob(release)
     if cronjob is None:
@@ -312,14 +380,23 @@ def prepare_prerequisite_repair(
     predecessor = release.state.get(REPAIR_KEY)
     binding = predecessor.get("binding") if isinstance(predecessor, dict) else None
     handoff: dict[str, Any] | None = None
+    orphan: dict[str, Any] | None = None
     identity: dict[str, Any] | None = None
     if isinstance(binding, dict) and binding.get("release_id") != release.release_id:
-        if not bootstrap or resume or commit_live or previous_override is not None:
+        if resume or commit_live or previous_override is not None:
             raise ReleaseError("Aurora prerequisite repair candidate binding differs")
         identity = database_identity(release)
-        handoff = validate_bootstrap_repair_handoff(
-            release, release.state, identity=identity
-        )
+        if bootstrap:
+            handoff = validate_bootstrap_repair_handoff(
+                release, release.state, identity=identity
+            )
+        else:
+            # An upgrade candidate that died between READY and its application
+            # never returns (a release id is a digest of its tree), so the next
+            # candidate restores what it repaired over and takes the journal.
+            orphan = validate_upgrade_repair_handoff(
+                release, release.state, identity=identity
+            )
     release.pin_approved_manifest_plan(
         release.approved_manifest_digest
         or (
@@ -338,6 +415,8 @@ def prepare_prerequisite_repair(
         identity = database_identity(release)
     if handoff is not None:
         record = _advance_bootstrap_repair(release, handoff, identity=identity)
+    elif orphan is not None:
+        record = _advance_upgrade_repair(release, orphan, identity=identity)
     elif has_prerequisite_repair(release.state):
         record = _validate_record(release, release.state)
         if record["binding"]["database"] != identity:
@@ -423,9 +502,20 @@ def adopted_refresher_snapshot(release: RegionalRelease) -> dict[str, Any] | Non
 
 
 def restore_prerequisite_repair(release: RegionalRelease) -> None:
-    record = _validate_record(release, release.state)
-    _cleanup_jobs(release, record)
-    restore_aurora_refresh_snapshot(release, record["previous_refresher"])
+    record = release.state.get(REPAIR_KEY)
+    binding = record.get("binding") if isinstance(record, dict) else None
+    if isinstance(binding, dict) and binding.get("release_id") != release.release_id:
+        # Another candidate's abandoned upgrade repair over a committed release:
+        # the standalone rollback restores the original refresher it journaled.
+        identity = database_identity(release)
+        record = validate_upgrade_repair_handoff(
+            release, release.state, identity=identity
+        )
+        _retire_orphaned_repair(release, record, identity=identity)
+    else:
+        record = _validate_record(release, release.state)
+        _cleanup_jobs(release, record)
+        restore_aurora_refresh_snapshot(release, record["previous_refresher"])
     release.state.pop(REPAIR_KEY)
     save_recorded_state(release, str(release.state["phase"]))
 

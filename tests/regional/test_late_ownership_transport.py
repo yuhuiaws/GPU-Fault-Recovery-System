@@ -175,22 +175,42 @@ def test_only_a_fresh_guard_result_is_signed_and_refusal_preserves_accepted_poin
     state, outcome = exchange(
         adapter, envelope, pending, None if decision == "missing" else before
     )
-    assert state.command_id == envelope.command.command_id and len(sent) == 1
-    permit = sent[0].ownership_permit
-    assert permit.signature == permit_signature(permit, SECRET)
-    assert permit.allowed is (decision == "allow")
+    assert state.command_id == envelope.command.command_id
     assert current_ownership_challenge() is None
     assert outcome.status is WorkflowStepStatus.WAITING
     assert outcome.details["node_action_command_id"] == envelope.command.command_id
     assert outcome.details["node_action_accepted_nodes"] == ["node-a"]
-    if decision != "allow":
+    if decision in {"allow", "deny"}:
+        # A fresh pass and an observed violation are the two answers a
+        # replica may sign; both carry the accepted pointer forward.
+        assert len(sent) == 1
+        permit = sent[0].ownership_permit
+        assert permit.signature == permit_signature(permit, SECRET)
+        assert permit.allowed is (decision == "allow")
+    else:
+        # A lost lease, a malformed verdict and a missing validator are not
+        # evidence about the node: nothing is signed, and the challenge stays
+        # with the Agent for the next lease owner to answer on evidence.
+        assert sent == []
+        assert outcome.details["node_action_state"] == "OWNERSHIP_RECHECK_DEFERRED"
+        assert outcome.details["ownership_recheck_deferred"] is True
+        assert (
+            outcome.details["reason"]
+            == {
+                "lease": "OWNERSHIP_LEASE_LOST",
+                "unknown": "STOP_OWNERSHIP_UNVERIFIABLE",
+                "missing": "STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE",
+            }[decision]
+        )
+        assert "manual_confirmation_required" not in outcome.details
+    if decision == "deny":
         assert outcome.details["reason"] == "OWNERSHIP_DENIAL_UNCONFIRMED"
         assert outcome.details["outcome_unknown"] is True
         assert outcome.details["manual_confirmation_required"] is True
-        assert "node_action_not_started" not in outcome.details
-        assert "invalid text" not in str(outcome)
     else:
         assert "outcome_unknown" not in outcome.details
+    assert "node_action_not_started" not in outcome.details
+    assert "invalid text" not in str(outcome)
 
 
 @pytest.mark.parametrize("defect", ["http", "transport", "wrong-response"])

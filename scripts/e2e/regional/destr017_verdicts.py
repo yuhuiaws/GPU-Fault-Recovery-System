@@ -28,7 +28,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
-from scripts.e2e.regional.remote_command_shapes import command_operations
 
 # The official steps a single idle node's RESET_GPU workflow compiles to.
 OFFICIAL_OPERATIONS = (
@@ -333,6 +332,32 @@ def workflow_errors(
     return errors
 
 
+def reset_reached(command: dict[str, Any]) -> bool:
+    """Whether a remote command dispatched or reached a GPU reset.
+
+    Under the compound node-command protocol the reset workflow's carrier is
+    headed by QUIESCE_GPU_SERVICES and CARRIES RESET_GPU as a batched member
+    from the moment it is created, so carriage alone proves nothing (attempt 3
+    of 2026-09-18 was failed for exactly that carrier although the fence
+    stopped it at VERIFY_NO_GPU_CLIENTS). A reset was dispatched when it is the
+    command's own head step, or reached when the executor reported any result
+    for the batched reset member -- SUCCEEDED, FAILED or WAITING alike.
+    """
+
+    head = str((command.get("step") or {}).get("operation") or "")
+    if head in RESET_OPERATIONS:
+        return True
+    results = (command.get("result_details") or {}).get("batched_results") or {}
+    for entry in command.get("batched_steps") or []:
+        step = (entry or {}).get("step") or {}
+        if (
+            str(step.get("operation") or "") in RESET_OPERATIONS
+            and str((entry or {}).get("step_index")) in results
+        ):
+            return True
+    return False
+
+
 def command_errors(
     commands: list[dict[str, Any]],
     *,
@@ -348,7 +373,7 @@ def command_errors(
     errors: list[str] = []
     for command in commands:
         operation = str((command.get("step") or {}).get("operation") or "")
-        if RESET_OPERATIONS.intersection(command_operations(command)):
+        if reset_reached(command):
             errors.append(
                 f"a GPU reset command was dispatched to {node}: "
                 f"{command.get('command_id')}"

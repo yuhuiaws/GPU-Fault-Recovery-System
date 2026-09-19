@@ -26,16 +26,37 @@ generation, deadline passed), and submits:
     node was repaired by hand: a validated restore workflow (VALIDATE_GPU ->
     VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING) under the *same*
     incident and fencing token, built by
-    ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod. Refused
-    unless the incident is QUARANTINED with no open workflow and every node
-    carries the ``gpu-fault.io/quarantined`` taint this incident owns; a node
-    another incident quarantined is named. Until 2026-09-10 only the
-    acceptance fixture could create this workflow.
+    ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod, for the
+    nodes still isolated by this incident (its taint or its isolation
+    annotation); nodes already clean, or another incident's business, are
+    skipped and the plan says why (``gpu_fault.admin.remediation_plans``).
+    Refused unless the incident is QUARANTINED with no open workflow and at
+    least one node is still isolated by it; with none left the advice is to
+    close the incident. Until 2026-09-10 only the acceptance fixture could
+    create this workflow.
+``confirm-node-action``
+    the exit of a workflow parked BLOCKED / NEEDS_OPERATOR on a node action
+    whose outcome the executor never observed (``outcome_unknown`` on a
+    RESTART_NODE that reached its cap while the node's agent was down). The
+    operator names the node (``--node``); the CLI reads it through the GPU
+    kubeconfig, the Pod reads the fleet agent record and the remote commands,
+    and both compute the same verdict
+    (``gpu_fault.execution.node_action_confirmation``): Ready node, ACTIVE
+    agent with a live lease seen since the action started, kubelet and agent
+    agreeing on a boot id that differs from the one recorded before the reboot
+    (or, for other node actions, the agent's terminal answer relayed on the
+    remote command). The Pod records the confirmation on the step with a
+    compare-and-set and an ``OPERATOR_RECONCILED`` / ``NODE_ACTION_CONFIRMED``
+    event. The record stays BLOCKED: ``restore`` and ``workflow-reconcile``
+    (or an evidence close) end it -- this disposition only answers the
+    question they were waiting on.
 
 Resubmitting the same disposition is a no-op: the annotation is compared
 before it is written, and the terminal decision for the same attempt is
 returned as ``duplicate`` by the control plane rather than re-planned; a
-``restore`` rerun while its workflow is PENDING/RUNNING returns that id.
+``restore`` rerun while its workflow is PENDING/RUNNING returns that id; a
+``confirm-node-action`` rerun on a confirmed node names the earlier
+confirmation.
 """
 
 from __future__ import annotations
@@ -49,9 +70,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
 from gpu_fault.adapters.common import (
-    ANNOTATION_INCIDENT,
     ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
-    QUARANTINE_TAINT,
 )
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
@@ -62,33 +81,62 @@ from gpu_fault.admin.membership_lock import (
     reload_site_for_mutation,
 )
 from gpu_fault.admin.operator_identity import resolve_operator_identity
+from gpu_fault.admin.remediation_plans import (
+    BLOCKED_STATE,
+    DISPOSITION_CONFIRM_NODE_ACTION,
+    DISPOSITION_RESTORE,
+    OPEN_WORKFLOW_STATUSES,
+    QUARANTINED_STATE,
+    ConfirmNodeActionPlan,
+    RestorePlan,
+    build_confirm_node_action_plan,
+    build_restore_plan,
+)
+from gpu_fault.admin.remediation_script import REMEDIATION_SCRIPT
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import (
     cluster_nodes,
     gpu_kubectl_command,
     run_control_plane_script,
 )
-from gpu_fault.models import FaultIncident, RecoveryAction
-from gpu_fault.orchestration.incident_closure import owned_quarantine_taint_values
-from gpu_fault.orchestration.validated_restore import (
-    build_validated_restore_workflow,
-    is_validated_restore_workflow,
-    restore_reason,
-)
+from gpu_fault.models import RecoveryAction
+
+__all__ = [
+    "DISPOSITIONS",
+    "DISPOSITION_CONFIRM_NODE_ACTION",
+    "DISPOSITION_RESTORE",
+    "OPEN_WORKFLOW_STATUSES",
+    "QUARANTINED_STATE",
+    "REMEDIATION_SCRIPT",
+    "ConfirmNodeActionPlan",
+    "RemediationPlan",
+    "RestorePlan",
+    "SubmissionResult",
+    "SubmitRemediationRequest",
+    "add_submit_remediation_command",
+    "build_confirm_node_action_plan",
+    "build_remediation_plan",
+    "build_restore_plan",
+    "confirmation_payload",
+    "run_submit_remediation_command",
+    "submit_node_action_confirmation",
+    "submit_remediation",
+    "submit_restore",
+]
 
 STATE_ROOT = "submit-remediation"
 DISPOSITION_INSPECTED = "inspected"
-DISPOSITION_RESTORE = "restore"
 DISPOSITION_ACTIONS: dict[str, RecoveryAction | None] = {
     DISPOSITION_INSPECTED: None,
     "reset-gpu": RecoveryAction.RESET_GPU,
     "reboot-node": RecoveryAction.REBOOT_NODE,
     "quarantine": RecoveryAction.QUARANTINE,
 }
-DISPOSITIONS = (*DISPOSITION_ACTIONS, DISPOSITION_RESTORE)
-# A workflow in one of these still owns its node; ``restore`` waits for it.
-OPEN_WORKFLOW_STATUSES = frozenset({"PENDING", "RUNNING", "SAFETY_PENDING"})
-QUARANTINED_STATE = "QUARANTINED"
+DISPOSITIONS = (
+    *DISPOSITION_ACTIONS,
+    DISPOSITION_RESTORE,
+    DISPOSITION_CONFIRM_NODE_ACTION,
+)
 OPERATOR_MARKER_SOURCE = "operator-change"
 OPERATOR_MAPPING_VERSION = "operator-change-v1"
 OPERATOR_MARKER_TTL = timedelta(hours=1)
@@ -96,179 +144,6 @@ DEFAULT_ENVIRONMENT = "hyperpod-eks"
 WAITING_OPERATION = "CHECK_MECHANICALS"
 ACTIVE_WORKLOAD_PHASES = frozenset({"PENDING", "RUNNING"})
 INCIDENT_ANNOTATION = "gpu-fault.io/incident-id"
-
-REMEDIATION_SCRIPT = """
-import json
-import sys
-from datetime import datetime, timezone
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.models import (
-    NodeMarker,
-    TerminalEvent,
-    WorkflowOperation,
-    WorkflowStatus,
-)
-
-payload = json.load(sys.stdin)
-context = ApplicationContext.from_environment()
-store = context.store
-OPEN = {WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.SAFETY_PENDING}
-
-
-def dump(model):
-    return None if model is None else json.loads(model.model_dump_json())
-
-
-def load(incident_id):
-    incident = store.get_incident(incident_id)
-    workflow = (
-        store.get_workflow(incident.workflow_request_id)
-        if incident.workflow_request_id
-        else None
-    )
-    return incident, workflow
-
-
-def open_workflows(incident):
-    # Every open workflow of the incident on its nodes, the pointer included.
-    rows = {}
-    if incident.workflow_request_id:
-        current = store.get_workflow(incident.workflow_request_id)
-        if current.status in OPEN:
-            rows[current.request_id] = current
-    if incident.node_ids:
-        for owner, workflow in store.list_active_workflow_incidents(
-            incident.cluster_id, node_ids=set(incident.node_ids)
-        ):
-            if owner.incident_id == incident.incident_id and workflow.status in OPEN:
-                rows[workflow.request_id] = workflow
-    return [rows[key] for key in sorted(rows)]
-
-
-if payload["mode"] == "inspect":
-    incident, workflow = load(payload["incident_id"])
-    nodes = set(incident.node_ids)
-    observations = [
-        dump(state)
-        for state in store.list_attempt_observation_states(incident.cluster_id)
-        if str(getattr(state.observation.workload_phase, "value",
-                       state.observation.workload_phase)) in ("PENDING", "RUNNING")
-        and any(item.node_id in nodes for item in state.observation.containers)
-    ]
-    result = {
-        "incident": dump(incident),
-        "workflow": dump(workflow),
-        "open_workflows": [dump(item) for item in open_workflows(incident)],
-        "active_observations": observations,
-        "existing_markers": [
-            dump(item)
-            for item in store.list_markers_for_incident(payload["action_incident_id"])
-        ],
-        "acknowledgement_timeout_seconds": (
-            context.production_executor_config.step_waiting_limit(
-                WorkflowOperation.CHECK_MECHANICALS
-            )
-        ),
-    }
-elif payload["mode"] == "restore":
-    from gpu_fault.orchestration.validated_restore import (
-        build_validated_restore_workflow,
-        is_validated_restore_workflow,
-    )
-
-    incident, workflow = load(payload["incident_id"])
-    expected = payload["expected"]
-    observed = {
-        "fencing_token": incident.fencing_token,
-        "workflow_request_id": incident.workflow_request_id,
-        "state": incident.state.value,
-        "node_ids": sorted(incident.node_ids),
-    }
-    drift = {
-        key: {"expected": expected[key], "observed": observed[key]}
-        for key in expected
-        if expected[key] != observed[key]
-    }
-    if drift:
-        raise SystemExit(
-            "submit-remediation: incident moved since inspection: "
-            + json.dumps(drift, sort_keys=True)
-        )
-    still_open = open_workflows(incident)
-    existing = [
-        item for item in still_open if is_validated_restore_workflow(item.request_id)
-    ]
-    if existing:
-        result = {"no_op": True, "workflow": dump(existing[0]), "incident": dump(incident)}
-    elif still_open:
-        raise SystemExit(
-            "submit-remediation: incident still has an open workflow "
-            + ", ".join(f"{item.request_id} ({item.status.value})" for item in still_open)
-        )
-    else:
-        from gpu_fault.execution.node_rebinding import inventory_gpu_uuids
-
-        updated, created = build_validated_restore_workflow(
-            incident,
-            operator=payload["operator"],
-            reference=payload.get("reference"),
-            now=datetime.now(timezone.utc),
-            runtime_profile_version=payload.get("runtime_profile_version"),
-            node_gpu_uuids={
-                node_id: inventory_gpu_uuids(store, incident.cluster_id, node_id)
-                for node_id in incident.node_ids
-            },
-        )
-        store.save_incident_and_workflow(updated, created)
-        context.dispatcher.wake()
-        result = {"no_op": False, "workflow": dump(created), "incident": dump(updated)}
-elif payload["mode"] == "submit":
-    incident, workflow = load(payload["incident_id"])
-    expected = payload["expected"]
-    observed = {
-        "fencing_token": incident.fencing_token,
-        "workflow_request_id": incident.workflow_request_id,
-        "node_ids": sorted(incident.node_ids),
-    }
-    drift = {
-        key: {"expected": expected[key], "observed": observed[key]}
-        for key in expected
-        if expected[key] != observed[key]
-    }
-    if drift:
-        raise SystemExit(
-            "submit-remediation: incident moved since inspection: "
-            + json.dumps(drift, sort_keys=True)
-        )
-    terminal = TerminalEvent.model_validate(payload["terminal"])
-    existing = store.get_decision_by_event(terminal.event_key)
-    if existing is not None:
-        result = {"duplicate": True, "decision": dump(existing)}
-        plan = (
-            store.get_plan(existing.recovery_plan_id)
-            if existing.recovery_plan_id
-            else None
-        )
-    else:
-        context.completion.add_marker(NodeMarker.model_validate(payload["marker"]))
-        decision = context.completion.handle_terminal(terminal)
-        result = {"duplicate": bool(decision.duplicate), "decision": dump(decision)}
-        plan = (
-            store.get_plan(decision.recovery_plan_id)
-            if decision.recovery_plan_id
-            else None
-        )
-    result["plan"] = dump(plan)
-    result["workflow"] = (
-        dump(store.get_workflow(plan.workflow_request_id))
-        if plan is not None and plan.workflow_request_id
-        else None
-    )
-else:
-    raise ValueError("unsupported submit-remediation mode")
-print(json.dumps(result, sort_keys=True))
-"""
 
 
 def _utc_now() -> datetime:
@@ -282,6 +157,8 @@ class SubmitRemediationRequest:
     disposition: str
     reference: str | None = None
     plan_only: bool = False
+    # ``confirm-node-action`` only: the node whose action outcome is confirmed.
+    node_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.disposition not in DISPOSITIONS:
@@ -291,6 +168,23 @@ class SubmitRemediationRequest:
             )
         if not self.incident_id.strip():
             raise BootstrapError("submit-remediation requires --incident-id")
+        if self.disposition == DISPOSITION_CONFIRM_NODE_ACTION:
+            if not (self.node_id or "").strip():
+                raise BootstrapError(
+                    f"{DISPOSITION_CONFIRM_NODE_ACTION} requires --node <node_id>: "
+                    "the node whose action outcome the evidence confirms"
+                )
+            if not self.plan_only and not (self.reference or "").strip():
+                raise BootstrapError(
+                    f"{DISPOSITION_CONFIRM_NODE_ACTION} requires --reference (the "
+                    "approved change the confirmation is recorded under) unless "
+                    "--plan is given"
+                )
+        elif self.node_id:
+            raise BootstrapError(
+                f"--node applies to {DISPOSITION_CONFIRM_NODE_ACTION} only; "
+                f"{self.disposition} acts on every node of the incident"
+            )
 
 
 @dataclass(frozen=True)
@@ -342,51 +236,9 @@ class RemediationPlan:
         }
 
 
-@dataclass(frozen=True)
-class RestorePlan:
-    """The validated restore ``--disposition restore`` will create, derived
-    from the QUARANTINED incident record and the live nodes.
-
-    ``steps`` are the exact steps the product builder yields (operation,
-    owner, nodes, GPU scope); the request id is minted in the Pod at submit
-    time. ``existing_restore_workflow_id`` is set when such a workflow is
-    already PENDING/RUNNING under the incident: the rerun is a no-op.
-    """
-
-    incident_id: str
-    cluster_id: str
-    node_ids: tuple[str, ...]
-    gpu_uuids: tuple[str, ...]
-    fencing_token: int
-    workflow_request_id: str
-    state: str
-    reason: str
-    steps: tuple[dict[str, Any], ...]
-    existing_restore_workflow_id: str | None = None
-    warnings: tuple[str, ...] = ()
-    disposition: str = DISPOSITION_RESTORE
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "incident_id": self.incident_id,
-            "cluster_id": self.cluster_id,
-            "disposition": self.disposition,
-            "node_ids": list(self.node_ids),
-            "gpu_uuids": list(self.gpu_uuids),
-            "fencing_token": self.fencing_token,
-            "workflow_request_id": self.workflow_request_id,
-            "state": self.state,
-            "reason": self.reason,
-            "steps": [dict(item) for item in self.steps],
-            "existing_restore_workflow_id": self.existing_restore_workflow_id,
-            "next_operations": [str(item["operation"]) for item in self.steps],
-            "warnings": list(self.warnings),
-        }
-
-
 @dataclass
 class SubmissionResult:
-    plan: RemediationPlan | RestorePlan
+    plan: RemediationPlan | RestorePlan | ConfirmNodeActionPlan
     acknowledgement: dict[str, Any] = field(default_factory=dict)
     submission: dict[str, Any] | None = None
     no_op: bool = False
@@ -475,9 +327,20 @@ def _waiting_step(
         and item.get("phase") in (None, "official")
     ]
     if not waiting:
+        status = str(workflow.get("status"))
+        parked = ""
+        if status == BLOCKED_STATE:
+            kind = workflow.get("blocked_kind")
+            parked = (
+                f" (blocked_kind {kind}); a parked record is not acknowledged: "
+                "confirm an unknown node action outcome with --disposition "
+                f"{DISPOSITION_CONFIRM_NODE_ACTION} --node <node>, release its "
+                f"isolation with --disposition {DISPOSITION_RESTORE}, then end it "
+                "with gpu-fault-admin workflow-reconcile"
+            )
         raise BootstrapError(
             f"incident {incident_id} is not waiting on {WAITING_OPERATION}; "
-            f"workflow {workflow.get('request_id')} is {workflow.get('status')}"
+            f"workflow {workflow.get('request_id')} is {status}{parked}"
         )
     execution = max(waiting, key=lambda item: str(item.get("updated_at") or ""))
     index = int(execution["step_index"])
@@ -500,6 +363,16 @@ def _waiting_step(
 
 
 def _deadline_passed(workflow: Mapping[str, Any], now: datetime) -> str | None:
+    """The deadline a *live* investigation workflow has run past, if any.
+
+    Only an executable record (PENDING/RUNNING/SAFETY_PENDING) fails on its
+    own at its deadline; a BLOCKED record is parked and never does, so its
+    long-passed deadlines say nothing about acknowledging it -- the waiting
+    check refuses it with the parked-record levers instead.
+    """
+
+    if str(workflow.get("status")) not in OPEN_WORKFLOW_STATUSES:
+        return None
     for key in ("execution_deadline", "lifetime_deadline_at"):
         raw = workflow.get(key)
         if not raw:
@@ -794,166 +667,6 @@ def build_remediation_plan(
 # restore: the validated restore of a QUARANTINED incident
 
 
-def _quarantine_taint(node: Mapping[str, Any]) -> str | None:
-    spec = node.get("spec")
-    if not isinstance(spec, dict):
-        return None
-    for item in spec.get("taints") or []:
-        if isinstance(item, dict) and item.get("key") == QUARANTINE_TAINT:
-            return str(item.get("value") or "")
-    return None
-
-
-def _node_annotations(node: Mapping[str, Any]) -> dict[str, Any]:
-    metadata = cast(dict[str, Any], node.get("metadata") or {})
-    return dict(metadata.get("annotations") or {})
-
-
-def _validate_restore_record(
-    inspection: Mapping[str, Any],
-    *,
-    incident_id: str,
-    live_nodes: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any], str | None]:
-    """The restore preconditions, all before any write.
-
-    Returns the incident, its last workflow and the id of a validated restore
-    workflow already open under it (the idempotent rerun), or raises the
-    first refusal: not QUARANTINED; another workflow still open; a node
-    missing from the cluster, without the quarantine taint, or quarantined by
-    another incident (named); incident and workflow fencing tokens differing
-    (a stale generation the node's annotation would reject).
-    """
-
-    incident = cast(dict[str, Any] | None, inspection.get("incident"))
-    workflow = cast(dict[str, Any] | None, inspection.get("workflow"))
-    if incident is None:
-        raise BootstrapError(f"incident {incident_id} was not returned")
-    if str(incident.get("incident_id")) != incident_id:
-        raise BootstrapError("the control plane returned a different incident")
-    state = str(incident.get("state"))
-    if state != QUARANTINED_STATE:
-        raise BootstrapError(
-            f"incident {incident_id} is {state}, not {QUARANTINED_STATE}; "
-            f"{DISPOSITION_RESTORE} applies to a quarantined node only"
-        )
-    if workflow is None:
-        raise BootstrapError(
-            f"incident {incident_id} has no workflow; the quarantine it records "
-            "was not placed by this product"
-        )
-    if workflow.get("request_id") != incident.get("workflow_request_id"):
-        raise BootstrapError(
-            f"incident {incident_id} points at workflow "
-            f"{incident.get('workflow_request_id')} but "
-            f"{workflow.get('request_id')} was returned"
-        )
-    if int(workflow.get("fencing_token") or 0) != int(
-        incident.get("fencing_token") or 0
-    ):
-        raise BootstrapError(
-            f"stale generation: incident fencing token {incident.get('fencing_token')} "
-            f"differs from workflow {workflow.get('fencing_token')}"
-        )
-    node_ids = [str(item) for item in incident.get("node_ids") or []]
-    if not node_ids:
-        raise BootstrapError(f"incident {incident_id} names no nodes")
-    open_rows = (
-        [dict(workflow)] if workflow.get("status") in OPEN_WORKFLOW_STATUSES else []
-    )
-    for item in inspection.get("open_workflows") or []:
-        if isinstance(item, dict) and item.get("request_id") != workflow.get(
-            "request_id"
-        ):
-            open_rows.append(item)
-    existing = [
-        str(item.get("request_id"))
-        for item in open_rows
-        if is_validated_restore_workflow(str(item.get("request_id") or ""))
-    ]
-    if existing:
-        return incident, workflow, existing[0]
-    if open_rows:
-        raise BootstrapError(
-            f"incident {incident_id} still has an open workflow "
-            + ", ".join(
-                f"{item.get('request_id')} ({item.get('status')})" for item in open_rows
-            )
-            + "; wait for it to end or reconcile it first"
-        )
-    missing = sorted(set(node_ids) - set(live_nodes))
-    if missing:
-        raise BootstrapError(
-            f"incident nodes are missing from cluster {incident['cluster_id']}: "
-            + ", ".join(missing)
-        )
-    owned = owned_quarantine_taint_values(incident_id)
-    for node_id in node_ids:
-        node = live_nodes[node_id]
-        annotations = _node_annotations(node)
-        owner = annotations.get(ANNOTATION_INCIDENT)
-        taint = _quarantine_taint(node)
-        if owner and str(owner) != incident_id:
-            raise BootstrapError(
-                f"node {node_id} is isolated by incident {owner}, not {incident_id}"
-            )
-        if taint is None:
-            raise BootstrapError(
-                f"node {node_id} carries no {QUARANTINE_TAINT} taint; there is no "
-                f"isolation of {incident_id} to restore -- close the incident with "
-                "gpu-fault-admin workflow-reconcile --close-incident instead"
-            )
-        if taint not in owned:
-            # No incident-id annotation named another owner above, so the
-            # taint value is all that identifies who placed it.
-            raise BootstrapError(
-                f"node {node_id} is quarantined by another incident (taint {taint}), "
-                f"not {incident_id}"
-            )
-    return incident, workflow, None
-
-
-def build_restore_plan(
-    inspection: Mapping[str, Any],
-    *,
-    incident_id: str,
-    operator: str,
-    reference: str | None,
-    live_nodes: Mapping[str, Mapping[str, Any]],
-    now: datetime | None = None,
-) -> RestorePlan:
-    """Turn the QUARANTINED record into the restore it will get, or refuse."""
-
-    stamp = now or _utc_now()
-    incident, workflow, existing = _validate_restore_record(
-        inspection, incident_id=incident_id, live_nodes=live_nodes
-    )
-    record = FaultIncident.model_validate(incident)
-    _, preview = build_validated_restore_workflow(
-        record, operator=operator, reference=reference, now=stamp
-    )
-    return RestorePlan(
-        incident_id=incident_id,
-        cluster_id=str(incident["cluster_id"]),
-        node_ids=tuple(str(item) for item in incident["node_ids"]),
-        gpu_uuids=tuple(str(item) for item in incident.get("gpu_uuids") or []),
-        fencing_token=int(incident["fencing_token"]),
-        workflow_request_id=str(workflow["request_id"]),
-        state=str(incident["state"]),
-        reason=restore_reason(operator, reference),
-        steps=tuple(
-            {
-                "operation": step.operation.value,
-                "execution_owner": step.execution_owner,
-                "node_ids": list(step.node_ids),
-                "gpu_uuids": list(step.gpu_uuids),
-            }
-            for step in preview.official_steps
-        ),
-        existing_restore_workflow_id=existing,
-    )
-
-
 def submit_restore(
     site: RenderedSite,
     plan: RestorePlan,
@@ -961,7 +674,12 @@ def submit_restore(
     operator: str,
     reference: str | None,
 ) -> dict[str, Any]:
-    """Create the restore workflow in the Pod, re-checking the record first."""
+    """Create the restore workflow in the Pod, re-checking the record first.
+
+    ``node_ids`` names the nodes the plan found still isolated by the incident;
+    ``expected.node_ids`` still binds the incident's whole node set, so a node
+    added to the incident since the plan refuses the write.
+    """
 
     return run_control_plane_script(
         site,
@@ -974,6 +692,7 @@ def submit_restore(
                 "state": plan.state,
                 "node_ids": sorted(plan.node_ids),
             },
+            "node_ids": list(plan.restore_node_ids) or None,
             "operator": operator,
             "reference": reference,
             "runtime_profile_version": str(
@@ -1005,10 +724,11 @@ def _submit_restore(
     )
     result = SubmissionResult(plan=plan)
     operations = " -> ".join(str(item["operation"]) for item in plan.steps)
+    targets = ", ".join(plan.restore_node_ids) or "every node"
     if request.plan_only:
         result.message = (
-            f"plan only; nothing was written (would create {operations} under "
-            f"incident {plan.incident_id}, fencing token {plan.fencing_token})"
+            f"plan only; nothing was written (would create {operations} on {targets} "
+            f"under incident {plan.incident_id}, fencing token {plan.fencing_token})"
         )
         return result
     if plan.existing_restore_workflow_id:
@@ -1034,8 +754,151 @@ def _submit_restore(
         result.message = (
             f"workflow {workflow.get('request_id')} (fencing token "
             f"{workflow.get('fencing_token')}, {workflow.get('status')}) runs "
-            f"{operations}; incident {plan.incident_id} is now "
+            f"{operations} on {targets}; incident {plan.incident_id} is now "
             f"{(submission.get('incident') or {}).get('state')}"
+        )
+    record_submission(site, result, now=stamp)
+    return result
+
+
+# --------------------------------------------------------------------------
+# confirm-node-action: the operator's answer to an unknown node action outcome
+
+
+def confirmation_payload(
+    plan: ConfirmNodeActionPlan, *, operator: str, reference: str | None
+) -> dict[str, Any]:
+    """The ``confirm-node-action`` request the Pod script takes.
+
+    ``expected`` binds the record the operator approved (generation, epoch,
+    merge revision, status, node set); ``confirmations`` pair each step record
+    exactly as inspected with the confirmation the admin side derived for it,
+    so the Pod binds its write to that record and refuses one that changed;
+    ``node_evidence`` is what the admin side read from Kubernetes, handed over
+    verbatim -- the Pod has no kubeconfig and re-reads the fleet record itself.
+    The verdict is computed here, on the checkout's code, because the Pod runs
+    the deployed image, which may predate the disposition.
+    """
+
+    return {
+        "mode": DISPOSITION_CONFIRM_NODE_ACTION,
+        "incident_id": plan.incident_id,
+        "workflow_request_id": plan.workflow_request_id,
+        "node_id": plan.node_id,
+        "expected": {
+            "fencing_token": plan.fencing_token,
+            "workflow_request_id": plan.workflow_request_id,
+            "workflow_status": plan.workflow_status,
+            "execution_epoch": plan.execution_epoch,
+            "merge_revision": plan.merge_revision,
+            "node_ids": sorted(plan.node_ids),
+        },
+        "confirmations": [
+            {"execution": dict(execution), "confirmation": dict(confirmation)}
+            for execution, confirmation in zip(
+                plan.executions, plan.confirmations, strict=True
+            )
+        ],
+        "node_evidence": dict(plan.node_evidence),
+        "operator": operator,
+        "reference": reference,
+    }
+
+
+def submit_node_action_confirmation(
+    site: RenderedSite,
+    plan: ConfirmNodeActionPlan,
+    *,
+    operator: str,
+    reference: str | None,
+) -> dict[str, Any]:
+    """Record the confirmation in the Pod (``confirmation_payload``)."""
+
+    return run_control_plane_script(
+        site,
+        confirmation_payload(plan, operator=operator, reference=reference),
+        script=REMEDIATION_SCRIPT,
+    )
+
+
+def _describe_confirmations(items: tuple[dict[str, Any], ...]) -> str:
+    return ", ".join(
+        f"step {item['step_index']} {item['operation']}"
+        + (
+            f" (boot {item['previous_boot_id']} -> {item['observed_boot_id']})"
+            if item.get("previous_boot_id")
+            else ""
+        )
+        for item in items
+    )
+
+
+def _describe_already_confirmed(items: tuple[dict[str, Any], ...]) -> str:
+    return "; ".join(
+        f"{item['operation']} step {item.get('step_index')} confirmed by "
+        f"{item['actor']} under {item['reference']} at {item['confirmed_at']}"
+        for item in items
+    )
+
+
+def _submit_confirm_node_action(
+    request: SubmitRemediationRequest, *, now: Callable[[], datetime]
+) -> SubmissionResult:
+    site = request.site
+    stamp = now()
+    operator = resolve_operator_identity()
+    inspection = inspect_incident(
+        site, request.incident_id, disposition=request.disposition
+    )
+    incident = cast(dict[str, Any], inspection.get("incident") or {})
+    live_nodes = cluster_nodes(site, str(incident.get("cluster_id") or ""))
+    plan = build_confirm_node_action_plan(
+        inspection,
+        incident_id=request.incident_id,
+        node_id=str(request.node_id),
+        operator=operator,
+        reference=request.reference,
+        live_nodes=live_nodes,
+        now=stamp,
+    )
+    result = SubmissionResult(plan=plan)
+    described = _describe_confirmations(plan.confirmations)
+    if request.plan_only:
+        result.message = (
+            "plan only; nothing was written (would confirm "
+            f"{described or 'nothing'} on node {plan.node_id} of workflow "
+            f"{plan.workflow_request_id}, fencing token {plan.fencing_token})"
+        )
+        return result
+    if not plan.confirmations:
+        result.no_op = True
+        result.message = (
+            f"node {plan.node_id} of workflow {plan.workflow_request_id} is already "
+            f"confirmed ({_describe_already_confirmed(plan.already_confirmed)}); "
+            "nothing to do"
+        )
+        record_submission(site, result, now=stamp)
+        return result
+    submission = submit_node_action_confirmation(
+        site, plan, operator=operator, reference=request.reference
+    )
+    result.submission = submission
+    if submission.get("no_op"):
+        result.no_op = True
+        result.message = (
+            f"node {plan.node_id} of workflow {plan.workflow_request_id} was "
+            "confirmed in the control plane since the plan ("
+            + _describe_already_confirmed(
+                tuple(submission.get("already_confirmed") or ())
+            )
+            + "); nothing to do"
+        )
+    else:
+        result.message = (
+            f"confirmed {described} on node {plan.node_id} of workflow "
+            f"{plan.workflow_request_id} (fencing token {plan.fencing_token}); the "
+            "record stays BLOCKED until --disposition restore and workflow-reconcile, "
+            "or an evidence close (workflow-reconcile --close-quarantined), end it"
         )
     record_submission(site, result, now=stamp)
     return result
@@ -1185,10 +1048,14 @@ def submit_remediation(
     now: Callable[[], datetime] = _utc_now,
 ) -> SubmissionResult:
     """Inspect, validate, acknowledge and (for hardware dispositions) submit;
-    ``restore`` inspects, validates and creates the validated restore."""
+    ``restore`` inspects, validates and creates the validated restore;
+    ``confirm-node-action`` inspects, judges the evidence and records the
+    confirmation."""
 
     if request.disposition == DISPOSITION_RESTORE:
         return _submit_restore(request, now=now)
+    if request.disposition == DISPOSITION_CONFIRM_NODE_ACTION:
+        return _submit_confirm_node_action(request, now=now)
     site = request.site
     stamp = now()
     inspection = inspect_incident(
@@ -1274,13 +1141,16 @@ def add_submit_remediation_command(
         usage=(
             "gpu-fault-admin submit-remediation --state-dir STATE_DIR "
             "--incident-id INCIDENT_ID --disposition "
-            "{" + ",".join(DISPOSITIONS) + "} [--reference CHANGE_ID] [--plan]"
+            "{" + ",".join(DISPOSITIONS) + "} [--node NODE_ID] "
+            "[--reference CHANGE_ID] [--plan]"
         ),
         help=(
             "acknowledge a CHECK_MECHANICALS inspection and, for a hardware "
             "disposition, submit the operator marker and terminal trigger built "
             "from the incident record; restore: create the validated restore of "
-            "a QUARANTINED incident whose node was repaired by hand"
+            "a QUARANTINED incident for the nodes it still isolates; "
+            "confirm-node-action: record, on fleet and node evidence, the outcome "
+            "of a node action a BLOCKED workflow could not observe"
         ),
     )
     add_managed_site_arguments(command)
@@ -1289,8 +1159,10 @@ def add_submit_remediation_command(
         required=True,
         metavar="INCIDENT_ID",
         help=(
-            "the incident whose workflow is waiting on CHECK_MECHANICALS, or "
-            "(restore) the QUARANTINED incident that owns the node's isolation"
+            "the incident whose workflow is waiting on CHECK_MECHANICALS, "
+            "(restore) the QUARANTINED incident that owns the node's isolation, or "
+            "(confirm-node-action) the incident whose BLOCKED workflow left a node "
+            "action outcome unknown"
         ),
     )
     command.add_argument(
@@ -1301,13 +1173,30 @@ def add_submit_remediation_command(
             "inspected: inspection complete, no hardware action; reset-gpu, "
             "reboot-node, quarantine: compile a new fenced workflow for that action; "
             "restore: VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> "
-            "RESTORE_SCHEDULING under the same QUARANTINED incident"
+            "RESTORE_SCHEDULING under the same QUARANTINED incident for the nodes "
+            "still isolated by it; confirm-node-action: confirm the outcome of an "
+            "unknown RESTART_NODE (or other node action) on --node -- the node must "
+            "be Ready with its Node Agent ACTIVE on a boot id different from the one "
+            "recorded before the action -- so the parked record can be restored "
+            "and reconciled"
+        ),
+    )
+    command.add_argument(
+        "--node",
+        metavar="NODE_ID",
+        dest="node",
+        help=(
+            "confirm-node-action only: the node whose action outcome the evidence "
+            "confirms (one node per invocation)"
         ),
     )
     command.add_argument(
         "--reference",
         metavar="CHANGE_ID",
-        help="change ticket recorded on the marker and the evidence file",
+        help=(
+            "change ticket recorded on the marker and the evidence file; required "
+            "by confirm-node-action unless --plan is given"
+        ),
     )
     command.add_argument(
         "--plan",
@@ -1333,6 +1222,7 @@ def run_submit_remediation_command(
             disposition=str(arguments.disposition),
             reference=cast(str | None, arguments.reference),
             plan_only=plan_only,
+            node_id=cast(str | None, getattr(arguments, "node", None)),
         )
         result = submit_remediation(request)
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True))

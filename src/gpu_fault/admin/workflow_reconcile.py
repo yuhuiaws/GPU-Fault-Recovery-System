@@ -46,6 +46,17 @@ from gpu_fault.admin.site import RenderedSite
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 HISTORY_PATH = Path("workflow-reconcile/history")
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
+# The bridge for a record the *deployed* planner refuses for lacking a source
+# recovery plan while naming a verified restore successor. A job DAG's node
+# branch is never plan-driven; when it parks BLOCKED and a later validated
+# restore RECOVERS its incident, the successor proves the restore and the
+# checkout's resolver accepts the record (``workflow_resolution``). The image
+# whose ``apply_workflow_reconcile_plan`` still applies the plan gate is the one
+# such records block from being replaced (DESTR-014 and HA-004 held deploy #15
+# in the release preflight), so the admin side promotes the item and applies it
+# through ``apply-verified-restore`` with primitives every image has.
+VERIFIED_RESTORE_NON_PLAN = "verified-restore-non-plan"
+NON_PLAN_REASON = "workflow has no source recovery plan"
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
     "gpu-fault.io/fencing-token",
@@ -107,6 +118,123 @@ elif payload["mode"] == "apply":
         reference=payload["reference"],
         **options,
     )
+elif payload["mode"] == "apply-verified-restore":
+    # A record that was never plan-driven, superseded by its verified restore
+    # successor. The deployed ``apply_workflow_reconcile_plan`` may still apply
+    # the source-plan gate to it, so the write is made here with primitives
+    # every image has: the resolver's own eligibility minus that one reason,
+    # ``amend_workflow`` with the audit event in the same write (the path the
+    # never-changed close uses), and a compare-and-set ``save_incident``.
+    from datetime import datetime, timezone
+
+    from gpu_fault.models import (
+        WorkflowEventKind,
+        WorkflowStatus,
+        bounded_reasons,
+        build_operator_event,
+    )
+    from gpu_fault.workflow_resolution import (
+        restore_reconciliation_reasons,
+        verified_restore_successor,
+    )
+
+    NON_PLAN_REASON = "workflow has no source recovery plan"
+    now = datetime.now(timezone.utc)
+    applied = []
+    failures = {}
+    incidents = set()
+    for item in payload["items"]:
+        request_id = item["request_id"]
+        try:
+            workflow = store.get_workflow(request_id)
+            incident = store.get_incident(workflow.incident_id)
+            successor = verified_restore_successor(store, workflow)
+            if successor is None or successor.request_id != item["successor_workflow_id"]:
+                raise ValueError(
+                    "workflow has no verified restore successor "
+                    + str(item["successor_workflow_id"])
+                )
+            if workflow.fencing_token != item["fencing_token"]:
+                raise ValueError(
+                    f"workflow fencing token changed: expected {item['fencing_token']}, "
+                    f"found {workflow.fencing_token}"
+                )
+            if workflow.execution_epoch != item["execution_epoch"]:
+                raise ValueError(
+                    "workflow execution epoch changed: expected "
+                    f"{item['execution_epoch']}, found {workflow.execution_epoch}"
+                )
+            if workflow.source_plan_id:
+                raise ValueError(
+                    "workflow has a source recovery plan; the restore reconcile owns it"
+                )
+            reasons = [
+                reason
+                for reason in restore_reconciliation_reasons(
+                    workflow,
+                    incident,
+                    successor,
+                    None,
+                    store.list_remote_commands(workflow_request_ids=[request_id]),
+                    evaluated_at=now,
+                )
+                if reason != NON_PLAN_REASON
+            ]
+            if reasons:
+                raise ValueError("; ".join(reasons))
+            audit = (
+                f"operator reconciliation {payload['reference']}: superseded "
+                f"{request_id} after verified restore {successor.request_id}"
+            )
+            superseded = workflow.model_copy(update={"status": WorkflowStatus.SUPERSEDED})
+            store.amend_workflow(
+                request_id,
+                {
+                    "status": WorkflowStatus.SUPERSEDED,
+                    "preempted_by_workflow_id": successor.request_id,
+                    "preemption_reason": audit,
+                    "superseded_at": now,
+                    "remediation_budget_claims": [],
+                },
+                event=build_operator_event(
+                    superseded,
+                    WorkflowEventKind.OPERATOR_RECONCILED,
+                    actor=payload.get("actor"),
+                    reference=payload["reference"],
+                    previous_status=workflow.status,
+                    at=now,
+                    details={
+                        "terminalization": "verified-restore-non-plan",
+                        "successor_workflow_id": successor.request_id,
+                        "expected_fencing_token": item["fencing_token"],
+                        "expected_execution_epoch": item["execution_epoch"],
+                        "admin_plan_sha256": payload.get("admin_plan_sha256"),
+                    },
+                ),
+            )
+            store.save_incident(
+                incident.model_copy(
+                    update={
+                        "reasons": bounded_reasons([*incident.reasons, audit]),
+                        "updated_at": now,
+                    }
+                ),
+                expected=incident,
+            )
+            applied.append(request_id)
+            incidents.add(incident.incident_id)
+        except Exception as exc:  # per-item isolation, reported like the apply
+            failures[request_id] = f"{type(exc).__name__}: {exc}"
+    result = {
+        "mode": "workflow-reconcile-apply",
+        "applied_workflow_ids": applied,
+        "failed_workflow_ids": sorted(failures),
+        "failures": dict(sorted(failures.items())),
+        "restart_reservation_warnings": [],
+        "resolved_plan_ids": [],
+        "archive_eligible_incident_ids": sorted(incidents),
+        "records_deleted": 0,
+    }
 else:
     raise ValueError("unsupported workflow reconcile mode")
 print(json.dumps(result, sort_keys=True))
@@ -144,6 +272,82 @@ def _apply_payload(
         "actor": actor,
         "admin_plan_sha256": admin_plan_sha256,
     }
+
+
+def promote_non_plan_successor(item: dict[str, Any]) -> None:
+    """Mark a ``VERIFIED_RESTORE_NON_PLAN`` item eligible, in place.
+
+    Only the exact shape: the deployed planner refused the record for
+    ``NON_PLAN_REASON`` alone, named a verified restore successor and the record
+    carries no source plan. Anything else stays as the planner judged it.
+    """
+
+    if (
+        not item.get("eligible")
+        and [str(reason) for reason in item.get("reasons") or []] == [NON_PLAN_REASON]
+        and item.get("terminalization") == "verified-restore"
+        and item.get("successor_workflow_id")
+        and not item.get("source_plan_id")
+    ):
+        item["eligible"] = True
+        item["reasons"] = []
+        item["terminalization"] = VERIFIED_RESTORE_NON_PLAN
+
+
+def _bridge_payload(
+    *,
+    items: list[dict[str, Any]],
+    admin_plan_sha256: str,
+    reference: str,
+    actor: str,
+) -> dict[str, Any]:
+    """The ``apply-verified-restore`` request: the keys the approval bound."""
+
+    return {
+        "mode": "apply-verified-restore",
+        "items": [
+            {
+                "request_id": str(item["request_id"]),
+                "successor_workflow_id": str(item["successor_workflow_id"]),
+                "fencing_token": int(item["fencing_token"]),
+                "execution_epoch": int(item["execution_epoch"]),
+            }
+            for item in items
+        ],
+        "reference": reference,
+        "actor": actor,
+        "admin_plan_sha256": admin_plan_sha256,
+    }
+
+
+def _merge_apply_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """One apply result out of the runtime apply and the bridge apply."""
+
+    merged: dict[str, Any] = {
+        "mode": "workflow-reconcile-apply",
+        "applied_workflow_ids": [],
+        "failed_workflow_ids": [],
+        "failures": {},
+        "restart_reservation_warnings": [],
+        "resolved_plan_ids": [],
+        "archive_eligible_incident_ids": [],
+        "records_deleted": 0,
+    }
+    for result in results:
+        for key in (
+            "applied_workflow_ids",
+            "failed_workflow_ids",
+            "restart_reservation_warnings",
+            "resolved_plan_ids",
+            "archive_eligible_incident_ids",
+        ):
+            merged[key] = [*merged[key], *(result.get(key) or [])]
+        merged["failures"] = {**merged["failures"], **(result.get("failures") or {})}
+    merged["failed_workflow_ids"] = sorted(set(merged["failed_workflow_ids"]))
+    merged["archive_eligible_incident_ids"] = sorted(
+        set(merged["archive_eligible_incident_ids"])
+    )
+    return merged
 
 
 def run_control_plane_script(
@@ -603,6 +807,8 @@ def _finalize_plan(
     ):
         raise BootstrapError("workflow reconcile runtime plan is invalid")
     items = [dict(item) for item in raw_items]
+    for item in items:
+        promote_non_plan_successor(item)
     scheduling = _scheduling_evidence(site, items)
     for item in items:
         evidence = scheduling[str(item.get("request_id") or "")]
@@ -695,6 +901,75 @@ def _validate_request(
     return normalized
 
 
+def _apply(
+    site: RenderedSite,
+    current: dict[str, Any],
+    *,
+    eligible_ids: list[str],
+    reference: str,
+    actor: str,
+) -> dict[str, Any]:
+    """Apply the eligible items: the deployed apply for the records it
+    accepts, the bridge for ``VERIFIED_RESTORE_NON_PLAN`` items.
+
+    The deployed apply rebuilds its plan over exactly the ids it is handed and
+    compares the digest, so when bridged items are set apart the remaining ids
+    are re-planned on their own and checked for drift against ``current``
+    before that digest is sent. Both applies are per-record isolated in the
+    Pod; the results merge into one.
+    """
+
+    bridged = [
+        item
+        for item in current["items"]
+        if item.get("terminalization") == VERIFIED_RESTORE_NON_PLAN
+    ]
+    bridged_ids = {str(item["request_id"]) for item in bridged}
+    runtime_ids = [item for item in eligible_ids if item not in bridged_ids]
+    results: list[dict[str, Any]] = []
+    if runtime_ids:
+        runtime_plan = current
+        if bridged:
+            runtime_plan = _plan(site, workflow_ids=runtime_ids)
+            drift = _plan_drift(
+                [
+                    item
+                    for item in current["items"]
+                    if str(item.get("request_id")) in runtime_ids
+                ],
+                list(runtime_plan["items"]),
+            )
+            if drift:
+                raise BootstrapError(
+                    "workflow reconcile plan changed before apply: " + " | ".join(drift)
+                )
+        results.append(
+            _run_reconcile(
+                site,
+                _apply_payload(
+                    workflow_ids=runtime_ids,
+                    runtime_plan_sha256=runtime_plan["runtime_plan_sha256"],
+                    admin_plan_sha256=current["plan_sha256"],
+                    reference=reference,
+                    actor=actor,
+                ),
+            )
+        )
+    if bridged:
+        results.append(
+            _run_reconcile(
+                site,
+                _bridge_payload(
+                    items=bridged,
+                    admin_plan_sha256=current["plan_sha256"],
+                    reference=reference,
+                    actor=actor,
+                ),
+            )
+        )
+    return _merge_apply_results(results)
+
+
 def run_workflow_reconcile(
     site: RenderedSite,
     state_dir: Path,
@@ -782,15 +1057,12 @@ def run_workflow_reconcile(
         actor = operator_identity.resolve_operator_identity(
             fallback=operator_identity.local_operator_identity()
         )
-        result = _run_reconcile(
+        result = _apply(
             site,
-            _apply_payload(
-                workflow_ids=eligible_ids,
-                runtime_plan_sha256=current["runtime_plan_sha256"],
-                admin_plan_sha256=current["plan_sha256"],
-                reference=normalized_reference,
-                actor=actor,
-            ),
+            current,
+            eligible_ids=eligible_ids,
+            reference=normalized_reference,
+            actor=actor,
         )
         result["actor"] = actor
         result["admin_plan_sha256"] = current["plan_sha256"]

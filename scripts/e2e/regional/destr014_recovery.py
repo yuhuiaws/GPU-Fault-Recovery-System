@@ -18,6 +18,63 @@ from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 PROBE = Path(host.__file__)
 RECOVERY_SECONDS = host.RECOVERY_SECONDS
+# Controller journal phases of the host recovery: the probe republished its
+# saved link (RESTORED) or, on a new boot, the node-installer had already
+# re-enabled the Agent and the probe only retired itself (RESTORED_BY_REBOOT).
+RESTORED = "RESTORED"
+RESTORED_BY_REBOOT = "RESTORED_BY_REBOOT"
+RESTORERS = frozenset({"probe", "reboot-installer"})
+
+
+def recovery_phase(report: dict[str, Any]) -> str:
+    return (
+        RESTORED_BY_REBOOT
+        if report.get("restored_by") == "reboot-installer"
+        else RESTORED
+    )
+
+
+def reboot_restore_proof(
+    report: Any,
+    binding: dict[str, Any],
+    *,
+    agent_unit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What the host recovery record proves about the sibling's reboot.
+
+    The unknown-outcome hold asks one physical question -- did the node reboot
+    and come back with its Agent? -- and the record answers it without any
+    exec into a NotReady node: ``boot_id_observed`` is the boot the record was
+    sealed on, ``restored_by`` who put the Agent back (the probe's saved inode
+    or the installer's fresh link). Nothing is inferred from a Ready condition
+    or a CloudTrail receipt. ``agent_unit`` is the runner's own later snapshot.
+    """
+    gaps: list[str] = []
+    record = report if isinstance(report, dict) else {}
+    observed = record.get("boot_id_observed")
+    if record.get("phase") not in {"RESTORED", "CLOSED"}:
+        gaps.append("recovery record is not RESTORED or CLOSED")
+    if record.get("disable_started") is not True:
+        gaps.append("this recovery never disabled the Agent")
+    if not isinstance(observed, str) or not observed:
+        gaps.append("no boot id observed on the host")
+    elif observed == binding["boot_id"]:
+        gaps.append("boot id unchanged: the reboot never landed or was not observed")
+    if record.get("restored_by") not in RESTORERS:
+        gaps.append("no Agent restoration receipt")
+    if agent_unit is not None and (
+        not str(agent_unit.get("UnitFileState") or "").startswith("enabled")
+        or agent_unit.get("ActiveState") != "active"
+    ):
+        gaps.append("sibling Node Agent snapshot is not enabled and active")
+    return {
+        "proven": not gaps,
+        "gaps": gaps,
+        "boot_id_before": binding["boot_id"],
+        "boot_id_observed": observed,
+        "restored_by": record.get("restored_by"),
+        "phase": record.get("phase"),
+    }
 
 
 def require_report(
@@ -65,6 +122,7 @@ class RunJournal:
             ):
                 raise RegionalFixtureError("DESTR-014 recovery journal lock is invalid")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            data: Any = None
             if self.path.exists() or self.path.is_symlink():
                 info = self.path.lstat()
                 if (
@@ -77,6 +135,9 @@ class RunJournal:
                         "DESTR-014 recovery journal is not private"
                     )
                 data = json.loads(self.path.read_text())
+                if self._archive_closed_foreign(data):
+                    data = None
+            if data is not None:
                 if (
                     not isinstance(data, dict)
                     or data.get("schema_version") != 1
@@ -93,7 +154,7 @@ class RunJournal:
                     )
                 self.data = data
                 self.resumed = True
-            else:
+            if data is None:
                 self.data = {
                     "schema_version": 1,
                     "scope": self.scope,
@@ -105,6 +166,38 @@ class RunJournal:
         except BaseException:
             os.close(fd)
             raise
+
+    def _archive_closed_foreign(self, data: Any) -> bool:
+        """Move aside a CLOSED journal that another attempt of this case wrote.
+
+        The journal lives at one path per case directory, so a later attempt
+        finds the previous attempt's forensic tombstone under a different
+        scope (run id, plan digest, release) and used to be refused as
+        "identity changed" -- attempt 3 of 2026-09-18 died there without
+        touching the node. A CLOSED journal has finished its recovery and owns
+        nothing; it is kept next to the live one under its own run id. Any
+        unfinished journal (OPEN, RECOVERY_REQUIRED, supervision lost) still
+        refuses, because that one may own host state.
+        """
+
+        if (
+            not isinstance(data, dict)
+            or data.get("phase") != "CLOSED"
+            or data.get("supervision_lost")
+            or data.get("scope") == self.scope
+        ):
+            return False
+        run_id = str((data.get("scope") or {}).get("run_id") or "unknown")
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in run_id)
+        archive = self.path.with_name(
+            f"{self.path.stem}.closed-{safe}{self.path.suffix}"
+        )
+        if archive.exists():
+            archive = self.path.with_name(
+                f"{self.path.stem}.closed-{safe}-{os.getpid()}{self.path.suffix}"
+            )
+        self.path.replace(archive)
+        return True
 
     def save(self) -> None:
         write_json_atomic(self.path, self.data)
@@ -222,11 +315,23 @@ class AgentRecoveryWindow:
 
     def restore(self) -> dict[str, Any]:
         result = self.request("restore", {"RESTORED"})
-        if result.get("restore_reason") != "controller":
+        # The deadline safeguard firing first invalidates the scenario; the
+        # installer re-enabling the Agent on the rebooted node is the product
+        # acting, judged by the workflow verdicts, not a safeguard.
+        if (
+            result.get("restored_by") != "reboot-installer"
+            and result.get("restore_reason") != "controller"
+        ):
             raise RegionalFixtureError(
                 "DESTR-014 automatic safeguard fired before scenario completion"
             )
+        self.record_recovery_phase(result)
         return result
+
+    def record_recovery_phase(self, result: dict[str, Any]) -> None:
+        self.journal.data["host_recovery_phase"] = recovery_phase(result)
+        self.journal.data["host_boot_id_observed"] = result.get("boot_id_observed")
+        self.journal.save()
 
     def cleanup(self) -> dict[str, Any]:
         if "host_binding" not in self.journal.data:
@@ -236,5 +341,7 @@ class AgentRecoveryWindow:
         if not isinstance(residuals, dict) or any(residuals.values()):
             raise RegionalFixtureError("DESTR-014 recovery probe cleanup is incomplete")
         self.journal.data["host_cleanup"] = result
+        if result.get("restored_by") in RESTORERS:
+            self.record_recovery_phase(result)
         self.journal.save()
         return result

@@ -41,6 +41,11 @@ class RunnerHarness:
         self.fault_boot = "fault-before"
         self.terminal = False
         self.isolated = True
+        # What the product's reboot does to the sibling host: the reboot lands
+        # (new boot id) and, optionally, the node-installer reconciler
+        # re-enables the Agent before the runner comes back to it.
+        self.sibling_reboots = True
+        self.installer_restores = False
         self.pending_reads = 0
         self.restored_incidents: set[str] = set()
         self.live_release = "release-test"
@@ -294,7 +299,10 @@ class RunnerHarness:
                 assert saved["run"]["injection_started"] is True
                 assert saved["host_ack"]["phase"] == "DISABLED"
                 if command == "write-xid46":
-                    self.host.reboot()
+                    if self.sibling_reboots:
+                        self.host.reboot(renumber_devices=True)
+                        if self.installer_restores:
+                            self.host.installer_reinstall()
                     self.fault_boot = "fault-after"
                     self.terminal = True
             if command == "snapshot":
@@ -384,6 +392,139 @@ def test_live_runner_preserves_unknown_reboot_hold_after_agent_recovery(
         "the independent Agent recovery can close without clearing the workflow hold"
     )
     assert runner.host.enable.exists() and runner.host.agent_active
+    # The hold is the product's: the sibling's reboot itself is proven.
+    assert report["sibling_reboot_proof"]["proven"] is True, report
+    assert report["sibling_reboot_proof"]["restored_by"] == "probe"
+    assert report["hold_reasons"] and all(
+        reason.startswith("product:") for reason in report["hold_reasons"]
+    ), report["hold_reasons"]
+    assert report["cleanup"]["hold_reasons"] == report["hold_reasons"]
+
+
+def test_installer_restored_sibling_is_accepted_and_the_hold_mirrors_the_product(
+    runner: RunnerHarness,
+) -> None:
+    """The live attempt: the sibling rebooted, the node-installer reconciler
+    re-enabled its Agent before the runner returned, the probe refused the new
+    boot and the case recorded FAIL without a scenario verdict. The restore
+    must be accepted, the probe residue retired, the scenario judged, and the
+    remaining hold must be the product's (BLOCKED/NEEDS_OPERATOR), not the
+    runner's uncertainty about the sibling."""
+
+    from tests.regional.test_acceptance_reboot_hold_alignment import unknown_reboot
+
+    runner.workflow = unknown_reboot()
+    runner.installer_restores = True
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "BLOCKED", report
+    assert report["scenario_verdict"] == "PASS" and report["errors"] == []
+    assert report["operator_review_required"] is True
+    cleanup = report["cleanup"]
+    assert cleanup["operator_hold_preserved"] is True
+    assert cleanup["agent_recovery"]["phase"] == "CLOSED"
+    assert cleanup["agent_recovery"]["restored_by"] == "reboot-installer"
+    assert cleanup["agent_recovery"]["retired"] is True
+    proof = report["sibling_reboot_proof"]
+    assert proof["proven"] is True and proof["boot_id_observed"] == "boot-after"
+    assert proof["restored_by"] == "reboot-installer" and proof["gaps"] == []
+    assert report["hold_reasons"] == cleanup["hold_reasons"]
+    assert any("NEEDS_OPERATOR" in reason for reason in report["hold_reasons"]), report[
+        "hold_reasons"
+    ]
+    assert all(reason.startswith("product:") for reason in report["hold_reasons"]), (
+        "with the sibling proven, only the product's hold may remain"
+    )
+    assert "workload.delete" not in runner.calls
+    assert "isolation.restore" not in runner.calls
+    saved = json.loads(runner.journal_path.read_text())
+    assert saved["host_recovery_phase"] == "RESTORED_BY_REBOOT"
+    assert saved["run"]["sibling_reboot_proof"]["proven"] is True
+    assert saved["run"]["hold_reasons"] == report["hold_reasons"]
+    assert not runner.host.recovery.dropin.exists(), (
+        "the retired probe must not leave the 45 s start bound on the Agent"
+    )
+    assert not (host_probe.SYSTEMD / runner.host.recovery.timer).exists(), (
+        "the retired probe must leave no persistent timer"
+    )
+    assert runner.host.enable.exists() and runner.host.agent_active
+    assert not [
+        call
+        for call in runner.host.calls
+        if call[0] == "start" and call[-1] == host_probe.AGENT
+    ], "an installer-restored Agent is never restarted by the probe"
+
+
+def test_settled_product_rows_with_a_proven_reboot_release_the_hold(
+    runner: RunnerHarness,
+) -> None:
+    """Once the product no longer owns recovery (terminal workflow, settled
+    commands) and the sibling is back on a new boot with its Agent restored,
+    nothing is left for an operator to confirm: cleanup restores along the
+    product path. The scenario still fails on its own terms."""
+
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert report["operator_review_required"] is False
+    assert report["hold_reasons"] == [] and report["sibling_reboot_proof"]["proven"]
+    assert "operator_hold_preserved" not in report["cleanup"]
+    assert report["cleanup"]["errors"] == []
+    for name in (
+        "quiescence",
+        "workload.delete",
+        "agent.reactivate",
+        "isolation.restore",
+        "control.close",
+        "executor.close",
+    ):
+        assert name in runner.calls, name
+    saved = json.loads(runner.journal_path.read_text())
+    assert saved["phase"] == "CLOSED"
+    assert saved["run"]["physical_outcome_unknown"] is False
+    assert saved["run"]["sibling_reboot_proof"]["boot_id_observed"] == "boot-after"
+
+
+def test_a_cleanup_only_rerun_releases_the_hold_once_the_product_settles(
+    runner: RunnerHarness,
+) -> None:
+    from tests.regional.test_acceptance_reboot_hold_alignment import unknown_reboot
+
+    runner.workflow = unknown_reboot()
+    runner.installer_restores = True
+    code, first = runner.execute()
+    assert first["verdict"] == "BLOCKED" and first["cleanup"]["operator_hold_preserved"]
+    assert "workload.delete" not in runner.calls
+    # The operator reconciled the product side; the host record still holds
+    # the sibling's proof. The rerun is cleanup-only and never a second PASS.
+    runner.workflow = verdicts.happy_workflow()
+    before = len(runner.calls)
+    code, second = runner.execute()
+    assert code == 1 and "cleanup-only" in second["error"], second
+    assert second["cleanup"]["errors"] == [], second["cleanup"]
+    assert second["cleanup"]["operator_hold_released_by"]["proven"] is True
+    assert second["cleanup"]["operator_hold_released_by"]["restored_by"] == (
+        "reboot-installer"
+    )
+    calls = runner.calls[before:]
+    assert "recovery.cleanup" in calls and "recovery.prepare" not in calls
+    assert "workload.delete" in calls and "isolation.restore" in calls
+    assert "control.close" in calls and "executor.close" in calls
+    saved = json.loads(runner.journal_path.read_text())
+    assert saved["phase"] == "CLOSED"
+
+
+def test_a_cleanup_only_rerun_keeps_the_hold_while_the_product_still_owns_recovery(
+    runner: RunnerHarness,
+) -> None:
+    from tests.regional.test_acceptance_reboot_hold_alignment import unknown_reboot
+
+    runner.workflow = unknown_reboot()
+    runner.execute()
+    before = len(runner.calls)
+    code, second = runner.execute()
+    assert code == 1 and second["cleanup"]["operator_hold_preserved"] is True
+    assert "operator_hold_released_by" not in second["cleanup"]
+    assert "workload.delete" not in runner.calls[before:]
+    assert json.loads(runner.journal_path.read_text())["phase"] == "RECOVERY_REQUIRED"
 
 
 @pytest.mark.parametrize("command", ["prepare", "disable"])

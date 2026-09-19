@@ -13,6 +13,14 @@ DESTR-014 checks the unconfirmed-reboot hold without running the join.
 This case checks the happy path. Independent exec/exit witnesses measure
 overlap of reset process invocations, not GPU silicon operation intervals.
 
+``QUIESCE_GPU_SERVICES`` stops kubelet on the node it quiesces, and both nodes
+are quiesced in parallel, so from the first quiesce until the last
+``RESTORE_GPU_SERVICES`` no ``kubectl exec`` reaches either node. The witnesses
+therefore run detached on the hosts (``systemd-run`` units with durable
+records), armed by one exec before the injection and collected by one exec
+after both nodes are Ready again; the runner observes the workflow from the
+store alone in between and never execs a NotReady node, not even in cleanup.
+
 The runner defaults to ``--plan``; ``--execute`` needs ``--confirm
 DESTR015_EXECUTE``. The verdict functions are pure and unit-tested; the runner
 records digests only.
@@ -48,6 +56,16 @@ from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
     observed_value,
     replica_env,
 )
+from scripts.e2e.regional.destr015_detached_witness import (  # noqa: E402
+    DetachedResetWitness,
+    await_hosts_return,
+    collect_witness_intervals,
+    node_answers_for_cleanup,
+    witness_lifetime_seconds,
+)
+from scripts.e2e.regional.destr015_physical_evidence import (  # noqa: E402
+    ResetIntervalScope,
+)
 from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
     AGENT_OPERATIONS,
     cloudtrail_errors,
@@ -61,13 +79,6 @@ from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
     step_transitions,
     workflow_errors,
     workload_errors,
-)
-from scripts.e2e.regional.destr015_physical_evidence import (  # noqa: E402
-    ResetIntervalScope,
-    physical_overlap_errors,
-)
-from scripts.e2e.regional.destr015_physical_intervals import (  # noqa: E402
-    ResetIntervalWitness,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -431,8 +442,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "preflight_identity_digest": identity_digest(identity),
         "parallel_proof": {
             "source": "independent-linux-exec-trace",
+            "transport": "detached-systemd-unit-with-durable-host-records",
             "bound_to": "node-uid/boot/Agent-process/GPU/workflow/fencing",
-            "clock_bound": "sampled-clock-envelope-and-bounded-monotonic-RPC",
+            "clock_bound": (
+                "host-clock-envelope-plus-bounded-arm-and-collect-exchanges"
+            ),
+            "records_bound_to_arm_collect_window_on_one_boot": True,
+            "no_exec_between_quiesce_and_both_nodes_ready": True,
             "branch_or_command_overlap_is_not_physical_overlap": True,
         },
         "stop_conditions": [
@@ -443,7 +459,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the estimated duration does not fit the job workflow lifetime",
             "the two XID injections do not land in one DAG workflow",
             "a branch escalates, a step fails, or any reboot/replace appears",
-            "exec witness cannot attach or loses identity, clock bounds or coverage",
+            "a detached exec witness cannot be placed and armed before the "
+            "injection (refused, never replaced by control-plane timestamps)",
+            "a node does not return Ready after the parallel quiesce, so its "
+            "witness records cannot be collected and are treated as lost",
+            "witness records are unbound, span another boot, or fall outside "
+            "the arm..collect window on the host clock",
             "actual reset intervals do not overlap after clock uncertainty",
             "the join runs before both branches released their nodes, or twice",
             "the job is not restarted exactly once on the same two nodes",
@@ -454,7 +475,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "runner_waits_for_async_quiescence_before_workload_delete": True,
             "runner_deletes_test_PyTorchJob_only_after_quiescence": True,
             "runner_restores_a_node_left_isolated_via_validated_restore": True,
-            "runner_finally_deletes_probe_and_prewarm_Pods": True,
+            "runner_disarms_witnesses_and_deletes_probe_Pods_only_on_Ready_nodes": (
+                True
+            ),
+            "runner_never_execs_a_NotReady_node_in_cleanup": True,
+            "runner_finally_deletes_prewarm_Pods": True,
             "no_node_reboot_or_replacement_is_authorized": True,
         },
     }
@@ -732,7 +757,19 @@ class _LiveRun:
     incident_id: str = ""
     workflow_request_id: str = ""
     workload_submitted: bool = False
-    physical_witnesses: dict[str, ResetIntervalWitness] = field(default_factory=dict)
+    physical_witnesses: dict[str, DetachedResetWitness] = field(default_factory=dict)
+    # When each witness was armed (runner clock) and for how long: cleanup's
+    # failsafe for a node that never answers again reads both.
+    witness_armed_at: dict[str, datetime] = field(default_factory=dict)
+    witness_lifetime_seconds: int = 0
+    hosts_returned: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def hosts_may_be_isolated(self) -> bool:
+        """True once a witness was armed or a fault was written: from then on a
+        node may be NotReady and no exec may be attempted before it answers."""
+
+        return bool(self.marker) or bool(self.witness_armed_at)
 
 
 def _prepare_live_run(
@@ -916,49 +953,108 @@ def _inject_both(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     return states[0], states[1]
 
 
+def _witness_scope(run: _LiveRun, node: str) -> ResetIntervalScope:
+    baseline = run.baselines[node]
+    targets = [
+        row["uuid"]
+        for row in baseline["gpu_inventory"]
+        if str(row.get("pci_bdf")).lower() == run.bdf[node].lower()
+    ]
+    if len(targets) != 1:
+        raise RegionalFixtureError("physical witness requires one approved GPU")
+    return ResetIntervalScope(
+        run_id=run.run_id,
+        cluster_id=run.settings.regional.cluster_id,
+        release_id=run.preflight["release_id"],
+        node=node,
+        node_uid=run.preflight["nodes"][node]["uid"],
+        boot_id=baseline["boot_id"],
+        agent_generation=run.preflight["agents"][node]["generation"],
+        gpu_uuid=targets[0],
+        maintenance_end=run.maintenance_window_end,
+    )
+
+
+def _refuse_before_injection(
+    run: _LiveRun, node: str, witness: DetachedResetWitness, exc: BaseException
+) -> None:
+    """An arm that failed is recorded with the host's own account and stops the
+    case here: kubelet still answers, so the reason can be read, and no fault
+    is ever written without both witnesses in place."""
+
+    try:
+        status: dict[str, Any] = witness.status()
+    except Exception as inner:  # noqa: BLE001 - the refusal itself is the evidence
+        status = {"error": f"{type(inner).__name__}: {inner}"}
+    write_json_atomic(
+        run.case_dir / f"physical-witness-arm-refusal-{node}.json",
+        {
+            "node": node,
+            "error": f"{type(exc).__name__}: {exc}",
+            "status": status,
+            "exchanges": witness.exchanges,
+        },
+    )
+    raise RegionalFixtureError(
+        f"physical witness could not be placed on {node}; refusing before the "
+        f"injection: {type(exc).__name__}: {exc}"
+    ) from exc
+
+
 def _arm_physical_witnesses(run: _LiveRun) -> None:
+    """Arm both detached witnesses before any fault is written.
+
+    The witness runs on the host as a bounded systemd unit with durable records
+    (the quiesce that follows the injection takes kubelet down for minutes);
+    this is the last exec into either node until both are Ready again.
+    """
+
+    if datetime.now(timezone.utc) >= run.maintenance_window_end:
+        raise RegionalFixtureError(
+            "maintenance window ended before physical witness attachment"
+        )
+    run.witness_lifetime_seconds = witness_lifetime_seconds(
+        now=datetime.now(timezone.utc),
+        maintenance_end=run.maintenance_window_end,
+    )
     for node, probe in run.probes.items():
         if datetime.now(timezone.utc) >= run.maintenance_window_end:
             raise RegionalFixtureError(
                 "maintenance window ended before physical witness attachment"
             )
-        baseline = run.baselines[node]
-        targets = [
-            row["uuid"]
-            for row in baseline["gpu_inventory"]
-            if str(row.get("pci_bdf")).lower() == run.bdf[node].lower()
-        ]
-        if len(targets) != 1:
-            raise RegionalFixtureError("physical witness requires one approved GPU")
-        scope = ResetIntervalScope(
-            run_id=run.run_id,
-            cluster_id=run.settings.regional.cluster_id,
-            release_id=run.preflight["release_id"],
-            node=node,
-            node_uid=run.preflight["nodes"][node]["uid"],
-            boot_id=baseline["boot_id"],
-            agent_generation=run.preflight["agents"][node]["generation"],
-            gpu_uuid=targets[0],
-            maintenance_end=run.maintenance_window_end,
+        scope = _witness_scope(run, node)
+        witness = DetachedResetWitness(
+            run.regional,
+            probe,
+            scope,
+            lifetime_seconds=run.witness_lifetime_seconds,
         )
-        witness = ResetIntervalWitness(probe, scope)
         run.physical_witnesses[node] = witness
-        witness.start()
+        try:
+            receipt = witness.arm()
+        except Exception as exc:  # noqa: BLE001 - recorded, then refused
+            _refuse_before_injection(run, node, witness, exc)
+        run.witness_armed_at[node] = datetime.now(timezone.utc)
         write_json_atomic(
             run.case_dir / f"physical-witness-start-{node}.json",
-            {"scope": scope.model_dump(mode="json"), **witness.capture},
+            {
+                "scope": scope.model_dump(mode="json"),
+                "lifetime_seconds": run.witness_lifetime_seconds,
+                "receipt": receipt,
+                "exchanges": witness.exchanges,
+            },
         )
 
 
 def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
+    """Store/API reads only: both nodes are quiesced and unreachable here."""
+
     settings = run.settings
     transitions: dict[str, str] = {}
     timeline: list[dict[str, Any]] = []
     deadline = time.monotonic() + OBSERVATION_BUDGET_SECONDS
     state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        for witness in run.physical_witnesses.values():
-            witness.poll()
         state = run.regional.store_snapshot(
             node=settings.node_a,
             marker=run.marker,
@@ -1003,6 +1099,10 @@ def _data_plane_errors(
             pods=target["pods"], source_uids=run.source_uids, nodes=settings.nodes
         )
     )
+    # No exec has reached either node since the injection; both must answer
+    # again, and their probe Pods be confirmed, before anything on the host is
+    # read.
+    await_hosts_return(run)
     hosts: dict[str, dict[str, dict[str, Any]]] = {}
     for node, probe in run.probes.items():
         after = probe.execute(
@@ -1020,18 +1120,8 @@ def _data_plane_errors(
     errors.extend(
         host_errors(hosts, nodes=settings.nodes, expected_gpu_count=GPUS_PER_NODE)
     )
-    captures = {
-        node: witness.finish() for node, witness in run.physical_witnesses.items()
-    }
-    write_json_atomic(case_dir / "physical-reset-intervals.json", captures)
-    errors.extend(
-        physical_overlap_errors(
-            captures,
-            scopes={node: item.scope for node, item in run.physical_witnesses.items()},
-            workflow=state.get("workflow") or {},
-            hosts=hosts,
-        )
-    )
+    witness_errors, intervals = collect_witness_intervals(run, state, hosts)
+    errors.extend(witness_errors)
     snapshots = {node: run.regional.node_snapshot(node) for node in settings.nodes}
     write_json_atomic(case_dir / "nodes-after.json", snapshots)
     errors.extend(schedulability_errors(snapshots, nodes=settings.nodes))
@@ -1069,7 +1159,8 @@ def _data_plane_errors(
         for node in settings.nodes
     }
     summary["provider_events"] = {"count": len(provider), "provisional": provisional}
-    summary["physical_reset_intervals"] = captures
+    summary["physical_reset_intervals"] = intervals
+    summary["hosts_returned"] = run.hosts_returned
     return errors, summary
 
 
@@ -1168,6 +1259,12 @@ def execute_case(
 
 
 def _cleanup(run: _LiveRun) -> dict[str, Any]:
+    """Quiescence, workload, validated restore; then, per node and only once
+    the node answers again, the witness disarm and the probe removal; then the
+    prewarm Pods and the identity recheck. A node that stays NotReady is never
+    exec'd: its witness is recorded as assumed gone (boot id changed or
+    lifetime passed) or as unknown, and either way the case is FAIL."""
+
     settings = run.settings
     result: dict[str, Any] = {"errors": []}
 
@@ -1177,8 +1274,6 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
-    for node, witness in run.physical_witnesses.items():
-        guard(f"physical_witness_close:{node}", witness.close)
     if run.marker:
         guard(
             "quiescence",
@@ -1216,12 +1311,18 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         guard("restore_isolated_nodes", lambda: _restore_isolated_nodes(run))
     else:
         result["isolation_restore_deferred"] = True
-    guard("prewarm_cleanup", lambda: _refuse_residual_map(run.prewarm.cleanup()))
     for node, probe in run.probes.items():
+        if run.hosts_may_be_isolated and not node_answers_for_cleanup(
+            run, node, result
+        ):
+            continue
+        if node in run.physical_witnesses:
+            guard(f"witness_disarm:{node}", run.physical_witnesses[node].disarm)
         guard(
             f"probe_cleanup_{node}",
             lambda probe=probe: _refuse_residual_map(probe.cleanup()),
         )
+    guard("prewarm_cleanup", lambda: _refuse_residual_map(run.prewarm.cleanup()))
     guard(
         "runtime_identity",
         lambda: run.regional.verify_runtime_identity(

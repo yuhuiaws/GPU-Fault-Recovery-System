@@ -7,6 +7,8 @@ import pytest
 
 from scripts.e2e.regional.destr014_cleanup import _cleanup
 from scripts.e2e.regional.destr014_verdicts import (
+    operator_hold_reasons,
+    product_hold_reasons,
     recovery_cleanup_hold,
     workflow_errors,
 )
@@ -94,6 +96,31 @@ def test_confirmed_reboot_refusal_is_a_separate_replacement_exhaustion_contract(
     assert errors(workflow, scenario="confirmed-failure"), (
         "a timeout alone must not prove confirmed reboot refusal"
     )
+
+
+def test_hold_reasons_name_the_product_hold_and_the_missing_sibling_proof():
+    """The runner's hold has two sources and the report must say which one is
+    left: the product still owning recovery, and the sibling's reboot not being
+    proven by the host record."""
+    settled = {"workflow": happy_workflow(), "commands": []}
+    assert product_hold_reasons(settled) == []
+    assert recovery_cleanup_hold(settled) is False
+    blocked = {"workflow": unknown_reboot(), "commands": [{"status": "WAITING"}]}
+    reasons = product_hold_reasons(blocked)
+    assert recovery_cleanup_hold(blocked) is True
+    assert any("BLOCKED" in r and "NEEDS_OPERATOR" in r for r in reasons), reasons
+    assert any("not terminal" in r for r in reasons), reasons
+    assert product_hold_reasons({"workflow": None, "commands": []}) == [
+        "workflow or remote command inventory is incomplete"
+    ]
+    proven = {"proven": True, "gaps": []}
+    unproven = {"proven": False, "gaps": ["boot id unchanged"]}
+    assert operator_hold_reasons([], proven) == []
+    assert operator_hold_reasons(reasons, proven) == [f"product: {r}" for r in reasons]
+    assert operator_hold_reasons([], unproven) == [
+        "sibling reboot is unproven: boot id unchanged"
+    ]
+    assert len(operator_hold_reasons(reasons, unproven)) == len(reasons) + 1
 
 
 @pytest.mark.parametrize(

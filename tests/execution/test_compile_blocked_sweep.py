@@ -499,3 +499,151 @@ def test_compile_time_shape_cannot_hide_a_live_execution_lease(state: IncidentSt
 
     assert close_compile_blocked_workflows(store, now=now) == []
     assert store.get_workflow(WORKFLOW) == workflow
+
+
+# --------------------------------------------- third shape: verified restore
+
+
+def _verified_restore_pair(store, *, source_plan_id=None, unresolved: bool = False):
+    """A job DAG's parked node branch (never plan-driven unless told otherwise)
+    whose incident a later validated restore RECOVERED (DESTR-014 / HA-004)."""
+
+    parked = workflow_request(
+        "workflow-2a1858b1",
+        "inc-xid-79",
+        status=WorkflowStatus.BLOCKED,
+        blocked_kind=BlockedKind.NEEDS_OPERATOR,
+        fencing_token=4,
+        execution_epoch=3,
+        source_plan_id=source_plan_id,
+        dag_enabled=True,
+        official_steps=[
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE),
+            workflow_step(WorkflowOperation.RESTART_NODE),
+        ],
+        completed_step_indexes=[0],
+        completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
+        step_executions=[
+            workflow_step_execution(
+                1,
+                WorkflowOperation.RESTART_NODE,
+                WorkflowStepStatus.FAILED,
+                phase="official",
+                details=(
+                    {"outcome_unknown": True, "manual_confirmation_required": True}
+                    if unresolved
+                    else {
+                        "outcome_unknown": False,
+                        "manual_confirmation_required": False,
+                    }
+                ),
+            )
+        ],
+        blocked_reasons=["node branch escalation exhausted"],
+    )
+    restore = workflow_request(
+        "workflow-validated-restore-1",
+        "inc-xid-79",
+        status=WorkflowStatus.SUCCEEDED,
+        fencing_token=4,
+        completed_operations=[
+            WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_HOST,
+            WorkflowOperation.VALIDATE_FABRIC,
+            WorkflowOperation.RESTORE_SCHEDULING,
+        ],
+    )
+    incident = fault_incident(
+        "inc-xid-79",
+        "event-79",
+        state=IncidentState.RECOVERED,
+        workflow_request_id=restore.request_id,
+        fencing_token=4,
+    )
+    store.save_workflow(parked)
+    store.save_workflow(restore)
+    store.save_incident(incident)
+    return parked, restore, incident
+
+
+def test_a_parked_record_superseded_by_its_verified_restore_is_closed_on_the_tick() -> (
+    None
+):
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    parked, restore, _incident = _verified_restore_pair(store)
+
+    assert close_compile_blocked_workflows(store, now=now) == [parked.request_id]
+
+    closed = store.get_workflow(parked.request_id)
+    assert closed.status is WorkflowStatus.SUPERSEDED
+    assert closed.preempted_by_workflow_id == restore.request_id
+    assert "after verified restore" in (closed.preemption_reason or "")
+    event = closed.events[-1]
+    assert event.kind is WorkflowEventKind.OPERATOR_RECONCILED
+    assert event.actor == DISPATCHER_ACTOR
+    assert event.details["successor_workflow_id"] == restore.request_id
+    assert event.details["terminalization"] == "verified-restore"
+    assert store.list_active_workflow_incidents("cluster-a", node_ids={"node-a"}) == []
+    assert close_compile_blocked_workflows(store, now=now) == [], (
+        "a second tick is idle"
+    )
+
+
+def test_a_plan_driven_record_is_closed_the_same_way_and_its_plan_is_written() -> None:
+    from gpu_fault.models import PlanStatus, RecoveryPlan
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    store.save_plan(
+        RecoveryPlan(
+            plan_id="plan-79",
+            incident_id="inc-xid-79",
+            attempt_id="attempt-79",
+            trigger="test",
+            runtime_profile_version="profile-v1",
+            steps=[],
+            workflow_request_id="workflow-2a1858b1",
+            status=PlanStatus.FAILED,
+        )
+    )
+    parked, restore, _incident = _verified_restore_pair(store, source_plan_id="plan-79")
+
+    assert close_compile_blocked_workflows(store, now=now) == [parked.request_id]
+
+    plan = store.get_plan("plan-79")
+    assert plan.resolved_by_restore_workflow_id == restore.request_id
+    assert plan.reconciled_at == now
+
+
+def test_an_unresolved_node_action_keeps_the_record_from_the_verified_restore_close() -> (
+    None
+):
+    """A recovered incident does not prove the physical action ended; the
+    operator's confirm-node-action answers that first."""
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    parked, _restore, _incident = _verified_restore_pair(store, unresolved=True)
+
+    assert close_compile_blocked_workflows(store, now=now) == []
+    assert store.get_workflow(parked.request_id).status is WorkflowStatus.BLOCKED
+
+
+def test_a_successor_that_is_not_a_verified_restore_closes_nothing() -> None:
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    parked, restore, incident = _verified_restore_pair(store)
+    store.save_workflow(
+        restore.model_copy(
+            update={"completed_operations": [WorkflowOperation.VALIDATE_GPU]}
+        ),
+        expected=restore,
+    )
+
+    assert close_compile_blocked_workflows(store, now=now) == [], (
+        "without RESTORE_SCHEDULING the successor proved no restore; the settled "
+        "shape refuses a NEEDS_OPERATOR record that ran steps"
+    )
+    assert store.get_workflow(parked.request_id).status is WorkflowStatus.BLOCKED
+    assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED

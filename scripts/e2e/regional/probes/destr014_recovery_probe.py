@@ -172,30 +172,52 @@ def file_identity(path: Path) -> dict[str, Any]:
     return value
 
 
-def matches(path: Path, identity: dict[str, Any]) -> bool:
+def same_identity(
+    actual: dict[str, Any], expected: dict[str, Any], *, lenient: bool = False
+) -> bool:
+    """Whether a file is the recorded one.
+
+    ``lenient`` drops the device number: a reboot may enumerate the root
+    filesystem under another NVMe device number, while inode, content, mtime,
+    mode and link target still identify the recorded file on the same disk.
+    """
+    if actual == expected:
+        return True
+    if not lenient or not isinstance(expected, dict):
+        return False
+    return {k: v for k, v in actual.items() if k != "dev"} == {
+        k: v for k, v in expected.items() if k != "dev"
+    }
+
+
+def matches(path: Path, identity: dict[str, Any], *, lenient: bool = False) -> bool:
     try:
-        return file_identity(path) == identity
+        return same_identity(file_identity(path), identity, lenient=lenient)
     except FileNotFoundError:
         return False
 
 
-def remove_owned(path: Path, identity: dict[str, Any]) -> None:
+def remove_owned(
+    path: Path, identity: dict[str, Any], *, lenient: bool = False
+) -> None:
     if not path.exists() and not path.is_symlink():
         return
-    if not matches(path, identity):
+    if not matches(path, identity, lenient=lenient):
         raise RecoveryError("recovery resource was replaced; refusing removal")
     path.unlink()
     sync_directory(path.parent)
 
 
-def publish(source: Path, target: Path, identity: dict[str, Any]) -> None:
-    if not matches(source, identity):
+def publish(
+    source: Path, target: Path, identity: dict[str, Any], *, lenient: bool = False
+) -> None:
+    if not matches(source, identity, lenient=lenient):
         raise RecoveryError("recovery source was replaced")
     try:
         os.link(source, target, follow_symlinks=False)
         sync_directory(target.parent)
     except FileExistsError:
-        if not matches(target, identity):
+        if not matches(target, identity, lenient=lenient):
             raise RecoveryError("recovery destination has another owner") from None
 
 
@@ -422,14 +444,48 @@ class Recovery:
         self.save()  # Intent precedes publication, including a lost link() ACK.
         publish(source, target, identity)
 
+    @property
+    def rebooted(self) -> bool:
+        """The host runs a boot other than the one the binding was armed on."""
+        return boot_id() != self.binding["boot_id"]
+
+    def same(self, path: Path, identity: dict[str, Any]) -> bool:
+        return matches(path, identity, lenient=self.rebooted)
+
+    def enable_link_owner(self) -> str:
+        """Who owns the Agent enable link now.
+
+        ``saved``: the inode this recovery preserved. ``installer``: the
+        standard installer link (absolute target, any inode) recreated on a
+        new boot -- the product's node-installer re-enables the Agent when it
+        reinstalls after a reboot. ``missing`` or ``foreign`` otherwise; a
+        recreated link on the original boot is always foreign.
+        """
+        try:
+            identity = file_identity(ENABLE_LINK)
+        except FileNotFoundError:
+            return "missing"
+        if same_identity(identity, self.record["enable_link"], lenient=self.rebooted):
+            return "saved"
+        if self.rebooted and identity.get("link") == str(SYSTEMD / AGENT):
+            return "installer"
+        return "foreign"
+
     def verify_resources(self) -> None:
         for resource in self.record["resources"]:
-            if not matches(Path(resource["target"]), resource["identity"]):
+            if not self.same(Path(resource["target"]), resource["identity"]):
                 raise RecoveryError("persistent recovery resource changed")
 
     def verify_runtime(self, *, require_claim: bool = True) -> None:
-        if require_claim and not matches(ROOT / "active", self.record["claim"]):
+        if require_claim and not self.same(ROOT / "active", self.record["claim"]):
             raise RecoveryError("recovery claim owner changed")
+        if self.rebooted:
+            # A new boot cannot present the armed runtime: the installer
+            # rewrites the unit, its enable link and the venv on the way back
+            # and the baseline ctimes died with the old boot (every tick on the
+            # node refused here after the product's reboot). The Agent is
+            # judged per file where it matters: saved inode or installer link.
+            return
         if runtime_identity(self.binding, self.dropin) != self.record["baseline"]:
             raise RecoveryError("Node Agent or host incarnation changed")
 
@@ -553,9 +609,13 @@ class Recovery:
     def verify_timer(self) -> None:
         self.verify_resources()
         timer = unit_state(self.timer)
+        # A timer whose unit is executing right now reports SubState=running,
+        # not waiting; the independent tick is that unit, so both states mean
+        # the persistent timer is armed (verified on the node: every tick
+        # refused itself as "not armed" while the runner waited for the ACK).
         if (
             timer.get("ActiveState") != "active"
-            or timer.get("SubState") != "waiting"
+            or timer.get("SubState") not in {"waiting", "running"}
             or timer.get("UnitFileState") != "enabled"
             or timer.get("FragmentPath") != str(SYSTEMD / self.timer)
         ):
@@ -577,9 +637,14 @@ class Recovery:
                 else "UNFINISHED_RECOVERY"
             ),
             "ack": self.record.get("ack"),
+            "last_tick_error": self.record.get("last_tick_error"),
             "disable_started": self.record.get("disable_started"),
             "restored_at": self.record.get("restored_at"),
             "restore_reason": self.record.get("restore_reason"),
+            "restored_by": self.record.get("restored_by"),
+            "boot_id_observed": self.record.get("boot_id_observed"),
+            "expired_at": self.record.get("expired_at"),
+            "retired": bool(self.record.get("retired")),
             "start_requested": self.record.get("start_requested"),
             "timer": self.timer,
             "service": self.service,
@@ -643,59 +708,103 @@ class Recovery:
             self.save()
             return self.report()
 
+    def expire_locked(self) -> None:
+        self.record.update(
+            phase="EXPIRED", expired_at=time.time(), boot_id_observed=boot_id()
+        )
+        self.save()
+
     def restore_locked(self, reason: str) -> None:
         if self.record["phase"] in TERMINAL:
             return
-        self.record.update(phase="RESTORING", restore_reason=reason)
+        if self.record["phase"] != "RESTORING":
+            self.record["restore_reason"] = reason  # The first trigger owns it.
+        self.record["phase"] = "RESTORING"
         self.save()  # Seal disable before restoring, even if its ACK was lost.
+        observed = boot_id()
+        restored_by = None
         if self.record["disable_started"]:
             self.verify_runtime()
             self.verify_resources()
-            if time.time() >= self.binding["expires_at"]:
-                self.record["phase"] = "EXPIRED"
-                self.save()
-                raise RecoveryError("recovery window expired; manual recovery required")
-            publish(
-                self.directory / "agent-boot-link",
-                ENABLE_LINK,
-                self.record["enable_link"],
-            )
-            systemctl("daemon-reload")
-            unit = unit_state(AGENT)
-            if unit.get("ActiveState") != "active":
-                if not self.record["start_requested"]:
-                    if not no_job(unit):
-                        raise RecoveryError("another Node Agent job is in progress")
-                    self.verify_timer()
-                    if time.time() + START_SECONDS + 25 >= self.binding["expires_at"]:
-                        self.record["phase"] = "EXPIRED"
-                        self.save()
-                        raise RecoveryError("insufficient bounded Agent start window")
-                    self.record["start_requested"] = True
-                    self.save()
-                    if time.time() + START_SECONDS + 20 >= self.binding["expires_at"]:
-                        self.record["phase"] = "EXPIRED"
-                        self.save()
-                        raise RecoveryError(
-                            "Agent start window expired while saving intent"
-                        )
-                    # The owned drop-in caps even a start request whose ACK is lost.
-                    systemctl("start", "--no-block", "--job-mode=fail", AGENT)
-                deadline = time.monotonic() + START_SECONDS + 5
-                while time.monotonic() < deadline:
-                    unit = unit_state(AGENT)
-                    if unit.get("ActiveState") == "active" and no_job(unit):
-                        break
-                    time.sleep(1)
-            if (
-                unit.get("UnitFileState") != "enabled"
-                or unit.get("ActiveState") != "active"
-                or not no_job(unit)
-            ):
-                raise RecoveryError("Node Agent recovery is not complete")
-            self.verify_runtime()
-        self.record.update(phase="RESTORED", restored_at=time.time())
+            owner = self.enable_link_owner() if self.rebooted else "saved"
+            if owner == "foreign":
+                raise RecoveryError(
+                    "Node Agent enable link has an unknown owner; manual recovery required"
+                )
+            if owner == "installer":
+                self.accept_installer_restore()
+                restored_by = "reboot-installer"
+            else:
+                self.restore_saved_link()
+                self.verify_runtime()
+                restored_by = "probe"
+        self.record.update(
+            phase="RESTORED",
+            restored_at=time.time(),
+            restored_by=restored_by,
+            boot_id_observed=observed,
+        )
         self.save()
+
+    def accept_installer_restore(self) -> None:
+        """A new boot on which the standard installer already re-enabled the
+        Agent under a fresh link inode: nothing is left to restore, and that
+        link is not this recovery's to touch. Record what was observed."""
+        unit = unit_state(AGENT)
+        if (
+            unit.get("UnitFileState") != "enabled"
+            or unit.get("ActiveState") != "active"
+            or not no_job(unit)
+        ):
+            raise RecoveryError(
+                "installer-restored Node Agent is not enabled, active and idle yet"
+            )
+        self.record["enable_link_observed"] = file_identity(ENABLE_LINK)
+        self.save()
+
+    def restore_saved_link(self) -> None:
+        """Publish the preserved enable-link inode and start the same Agent if
+        it is not running; identical on the original boot and on a new one."""
+        if time.time() >= self.binding["expires_at"]:
+            self.expire_locked()
+            raise RecoveryError("recovery window expired; manual recovery required")
+        publish(
+            self.directory / "agent-boot-link",
+            ENABLE_LINK,
+            self.record["enable_link"],
+            lenient=self.rebooted,
+        )
+        systemctl("daemon-reload")
+        unit = unit_state(AGENT)
+        if unit.get("ActiveState") != "active":
+            if not self.record["start_requested"]:
+                if not no_job(unit):
+                    raise RecoveryError("another Node Agent job is in progress")
+                self.verify_timer()
+                if time.time() + START_SECONDS + 25 >= self.binding["expires_at"]:
+                    self.expire_locked()
+                    raise RecoveryError("insufficient bounded Agent start window")
+                self.record["start_requested"] = True
+                self.save()
+                if time.time() + START_SECONDS + 20 >= self.binding["expires_at"]:
+                    self.expire_locked()
+                    raise RecoveryError(
+                        "Agent start window expired while saving intent"
+                    )
+                # The owned drop-in caps even a start request whose ACK is lost.
+                systemctl("start", "--no-block", "--job-mode=fail", AGENT)
+            deadline = time.monotonic() + START_SECONDS + 5
+            while time.monotonic() < deadline:
+                unit = unit_state(AGENT)
+                if unit.get("ActiveState") == "active" and no_job(unit):
+                    break
+                time.sleep(1)
+        if (
+            unit.get("UnitFileState") != "enabled"
+            or unit.get("ActiveState") != "active"
+            or not no_job(unit)
+        ):
+            raise RecoveryError("Node Agent recovery is not complete")
 
     def retire_locked(self, *, independent: bool) -> None:
         if self.record["phase"] not in TERMINAL:
@@ -704,7 +813,7 @@ class Recovery:
         resources = self.record["resources"]
         for resource in resources:
             target = Path(resource["target"])
-            if (target.exists() or target.is_symlink()) and not matches(
+            if (target.exists() or target.is_symlink()) and not self.same(
                 target, resource["identity"]
             ):
                 raise RecoveryError("recovery cleanup found a replaced owner")
@@ -751,24 +860,41 @@ class Recovery:
                 "Agent start job is pending; recovery artifacts retained"
             )
         for resource in reversed(resources):
-            remove_owned(Path(resource["target"]), resource["identity"])
+            remove_owned(
+                Path(resource["target"]), resource["identity"], lenient=self.rebooted
+            )
         if names:
+            # The drop-in is gone from disk; reload so no later Agent start
+            # runs under the retired 45 s bound.
             systemctl("daemon-reload")
+        self.record["retired"] = True
+        self.save()
         if not independent:
             if "enable_link" in self.record:
                 self.verify_runtime(require_claim=self.record["phase"] != "CLOSED")
                 agent = unit_state(AGENT)
+                owner = self.enable_link_owner()
                 if (
-                    not matches(ENABLE_LINK, self.record["enable_link"])
+                    owner not in {"saved", "installer"}
                     or agent.get("UnitFileState") != "enabled"
                     or agent.get("ActiveState") != "active"
                     or not no_job(agent)
                 ):
                     raise RecoveryError("Node Agent restoration proof was lost")
+                if owner == "installer" and not self.record.get("restored_by"):
+                    # EXPIRED without a restore of its own, then the host came
+                    # back with the installer's Agent: that is the proof.
+                    self.record.update(
+                        restored_by="reboot-installer",
+                        enable_link_observed=file_identity(ENABLE_LINK),
+                        boot_id_observed=boot_id(),
+                    )
             self.record["phase"] = "CLOSED"
             self.save()
             if "claim" in self.record:
-                remove_owned(ROOT / "active", self.record["claim"])
+                remove_owned(
+                    ROOT / "active", self.record["claim"], lenient=self.rebooted
+                )
 
     def restore(self) -> dict[str, Any]:
         with self.locked():
@@ -784,16 +910,38 @@ class Recovery:
             return self.report()
 
     def tick(self) -> dict[str, Any]:
+        try:
+            return self._tick()
+        except RecoveryError as exc:
+            # The service discards its output; keep the reason where `status`
+            # can report it, so a runner that never sees ARMED learns why.
+            self.note_tick_error(str(exc))
+            raise
+
+    def note_tick_error(self, reason: str) -> None:
+        try:
+            with self.locked():
+                if self.record and self.record.get("phase") not in TERMINAL:
+                    self.record["last_tick_error"] = reason
+                    self.save()
+        except Exception:
+            pass
+
+    def _tick(self) -> dict[str, Any]:
         with self.locked():
             if not self.record or self.record["phase"] == "CLOSED":
                 return self.report()
             if self.record["phase"] in TERMINAL:
                 self.retire_locked(independent=True)
                 return self.report()
+            # Expiry and the deadline come before any check that only the
+            # original boot can pass.
             if time.time() >= self.binding["expires_at"]:
-                self.record["phase"] = "EXPIRED"
-                self.save()
+                self.expire_locked()
                 self.retire_locked(independent=True)
+                return self.report()
+            if self.rebooted:
+                self._tick_new_boot()
                 return self.report()
             self.verify_runtime()
             self.verify_timer()
@@ -808,6 +956,26 @@ class Recovery:
                     if self.record["phase"] in TERMINAL:
                         self.retire_locked(independent=True)
             return self.report()
+
+    def _tick_new_boot(self) -> None:
+        """The node rebooted under this recovery: no ACK or disable can follow,
+        only restoration. The installer may already have re-enabled the Agent
+        (accept it and retire, deadline or not: the 45 s start bound must not
+        outlive its purpose); a still-missing link waits for the deadline
+        exactly as on the original boot; a foreign link is refused and left
+        alone until expiry retires the probe."""
+        due = time.time() >= self.binding["restore_at"]
+        if (
+            self.record["disable_started"]
+            and not due
+            and self.enable_link_owner() == "missing"
+        ):
+            return
+        try:
+            self.restore_locked("deadline" if due else "reboot")
+        finally:
+            if self.record["phase"] in TERMINAL:
+                self.retire_locked(independent=True)
 
 
 def main(argv: list[str] | None = None) -> int:

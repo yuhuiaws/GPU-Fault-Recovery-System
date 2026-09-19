@@ -701,7 +701,7 @@ rules:
     fallback: true
 
   - id: workflow-reconcile
-    description: Stuck-workflow reconciliation -- the dispatcher's automatic sweeps (retired generations, compile-time BLOCKED no-ops, orphaned remote commands) and the administrator's restore reconcile (offline admin tooling; PREEMPT-036 drives the sweeps against an isolated store).
+    description: Stuck-workflow reconciliation -- the dispatcher's automatic sweeps (retired generations, compile-time BLOCKED no-ops, verified-restore supersession, orphaned remote commands), the administrator's restore reconcile (offline admin tooling; PREEMPT-036 drives the sweeps against an isolated store) and the operator confirmation of a node action whose outcome the executor never observed.
     paths:
       - src/gpu_fault/workflow_reconcile.py
       - src/gpu_fault/workflow_resolution.py
@@ -709,28 +709,36 @@ rules:
       - src/gpu_fault/compile_blocked.py
       - src/gpu_fault/orphaned_commands.py
       - src/gpu_fault/admin/workflow_reconcile.py
+      - src/gpu_fault/execution/node_action_confirmation.py
       - tests/test_workflow_reconcile.py
       - tests/test_workflow_reconcile_operator_exit.py
+      - tests/test_workflow_reconcile_non_plan_successor.py
       - tests/test_retired_generation_apply.py
       - tests/admin/test_admin_workflow_reconcile.py
       - tests/admin/test_admin_workflow_reconcile_cli.py
       - tests/admin/test_workflow_reconcile_epoch_cas.py
       - tests/execution/test_retired_generation.py
       - tests/execution/test_compile_blocked_sweep.py
+      - tests/execution/test_node_action_confirmation.py
       - tests/execution/test_orphaned_commands_sweep.py
+      - tests/orchestration/test_confirmed_node_action_release_path.py
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py
     pytest:
       - tests/test_workflow_reconcile.py
       - tests/test_workflow_reconcile_operator_exit.py
+      - tests/test_workflow_reconcile_non_plan_successor.py
       - tests/test_retired_generation_apply.py
       - tests/admin/test_admin_workflow_reconcile.py
       - tests/admin/test_admin_workflow_reconcile_cli.py
       - tests/admin/test_workflow_reconcile_epoch_cas.py
+      - tests/admin/test_admin_confirm_node_action.py
       - tests/execution/test_retired_generation.py
       - tests/execution/test_compile_blocked_sweep.py
+      - tests/execution/test_node_action_confirmation.py
       - tests/execution/test_orphaned_commands_sweep.py
+      - tests/orchestration/test_confirmed_node_action_release_path.py
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py

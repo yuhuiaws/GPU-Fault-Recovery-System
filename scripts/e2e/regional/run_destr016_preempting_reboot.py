@@ -919,7 +919,10 @@ def _pre_authorize(run: _LiveRun) -> None:
         node=run.settings.node,
         boot_id=str(run.baseline.get("boot_id") or ""),
         device=run.device,
-        drill_id=f"{run.run_id}-r",
+        # The holder was armed with ``--drill-id run_id``: the probe refuses a
+        # proof bound to any other drill id. The reset injection's ``-r`` id is
+        # the incident's and stays in the store proof, not here.
+        drill_id=run.run_id,
         marker=run.marker["reset"],
         maintenance_window_end=run.maintenance_window_end,
         maintenance_window_seconds=int(control_env["agent_maintenance_window_seconds"]),

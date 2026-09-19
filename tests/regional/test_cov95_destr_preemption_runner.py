@@ -33,9 +33,10 @@ def test_preemption_pre_authorizes_both_writes_and_never_execs_after_the_barrier
         "absorb": case.ABSORB_DELAY_SECONDS,
         "escalate": case.ESCALATE_DELAY_SECONDS,
     }, proof
-    assert proof["drill_id"] == f"{h.run_id}-r" and proof["boot_id"] == "boot-before", (
-        proof
-    )
+    # The proof binds the HOLDER (armed with ``--drill-id run_id``), not the
+    # reset injection's ``-r`` drill id: the probe refuses any other binding.
+    assert proof["drill_id"] == h.run_id == h.armed_drill_id, (proof, h.armed_drill_id)
+    assert proof["boot_id"] == "boot-before", proof
     assert proof["maintenance_window_seconds"] == 420, proof
     assert report["pre_authorization"] == proof, report
     names = h.names()

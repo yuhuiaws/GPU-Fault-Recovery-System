@@ -17,6 +17,7 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.adapters.kubernetes.stop_ownership import (
     guard_new_node_submission,
+    refusal_is_conclusive,
     regional_ownership_enforced,
 )
 from gpu_fault.adapters.kubernetes.stop_ownership import (
@@ -50,6 +51,7 @@ from gpu_fault.node_agent import (
 )
 from gpu_fault.node_agent.late_ownership import (
     OWNERSHIP_PROTOCOL,
+    OwnershipChallenge,
     command_identity,
     ownership_recheck_scope,
     ownership_required,
@@ -104,6 +106,17 @@ LEGACY_COMMAND_ID_SUFFIX = "/agent-"
 # the new shape -- so without this key one unanswered poll between the upgrade
 # and an agent restart erased the only exact pointer to the running install.
 LEGACY_COMMAND_IDS_KEY = "node_action_legacy_command_ids"
+# The ``node_action_state`` of a poll that met the Agent's final-ownership
+# challenge and answered nothing: the guard could not *complete* its recheck
+# (a Kubernetes read that raised, no validator on this replica, a lease this
+# executor can no longer vouch for). The challenge stays with the Agent for the
+# next lease owner -- or this one, next poll -- to answer on evidence. Only an
+# observed violation is ever signed as a denial, because the Agent treats a
+# denial as final for that challenge and fails the action terminally on it
+# (live 2026-09-18, GF-REGIONAL-HA-004: a reclaiming replica's failed node read
+# was signed as STOP_OWNERSHIP_UNVERIFIABLE and quarantined a healthy node).
+OWNERSHIP_RECHECK_DEFERRED_STATE = "OWNERSHIP_RECHECK_DEFERRED"
+_REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
 
 class _UnconfirmedSubmissionHTTPError(RuntimeError):
@@ -173,6 +186,89 @@ def _pending_outcome(
                 else {}
             ),
         },
+    )
+
+
+def _recheck_verdict(refused: WorkflowStepOutcome | None) -> tuple[str, bool]:
+    """``(reason, conclusive)`` for what the guard answered at the checkpoint.
+
+    ``("OK", True)`` is a grant. A conclusive refusal names a violation the
+    guard observed and is signed as a denial. Anything else is a check that did
+    not complete -- the lease hold (``LEASE_LOST``, including a shutdown), a
+    verdict without a public reason code, a reason the allowlist does not name
+    -- and is deferred to the next poll.
+    """
+
+    if refused is None:
+        return "OK", True
+    details = refused.details or {}
+    if details.get("node_action_state") == "LEASE_LOST":
+        return "OWNERSHIP_LEASE_LOST", False
+    reason = details.get("reason")
+    if (
+        not isinstance(reason, str)
+        or reason == "OK"
+        or _REASON_CODE.fullmatch(reason) is None
+    ):
+        return "STOP_OWNERSHIP_UNVERIFIABLE", False
+    return reason, refusal_is_conclusive(reason)
+
+
+def _recheck_deferral(
+    challenge: OwnershipChallenge,
+    refused: WorkflowStepOutcome | None,
+    reason: str,
+    pending_details: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The WAITING record of a challenge this poll left unanswered."""
+
+    details: dict[str, Any] = {
+        **(pending_details or {}),
+        "node_action_state": OWNERSHIP_RECHECK_DEFERRED_STATE,
+        "ownership_recheck_deferred": True,
+        "ownership_check_boundary": challenge.boundary,
+        "ownership_challenge_sequence": challenge.sequence,
+        "reason": reason,
+    }
+    cause = (refused.details or {}).get("refusal_cause") if refused else None
+    if isinstance(cause, str):
+        details["refusal_cause"] = cause
+    return details
+
+
+def _lease_hold_outcome(
+    context: WorkflowStepContext,
+    node_id: str,
+    hold_reason: str,
+    recorded: dict[str, Any],
+) -> WorkflowStepOutcome:
+    """WAITING while this executor may start nothing for the command.
+
+    The executor no longer holds (or was told to give up) its lease, or is
+    shutting down. Nothing new may start; whatever the agent is already doing
+    stays in its ledger for the next lease holder. A stopping replica posts this
+    outcome as the command's record, so when an earlier cycle recorded the
+    agent's acceptance the pointer is carried and the record does not claim
+    ``node_action_not_started``: the control plane reads that key as proof
+    that no mutation began.
+    """
+
+    details: dict[str, Any] = {
+        "node_action_state": "LEASE_LOST",
+        "waiting_node": node_id,
+        "reason": hold_reason,
+    }
+    command_id = recorded.get("node_action_command_id")
+    if node_id in node_action_accepted_nodes(recorded) and isinstance(command_id, str):
+        details["node_action_command_id"] = command_id
+        details[NODE_ACTION_ACCEPTED_NODES_KEY] = [node_id]
+        intent = recorded.get("node_action_intent_sha256")
+        if isinstance(intent, str):
+            details["node_action_intent_sha256"] = intent
+    else:
+        details["node_action_not_started"] = True
+    return WorkflowStepOutcome.waiting(
+        operation_id=context.idempotency_key, details=details
     )
 
 
@@ -671,18 +767,7 @@ class NodeActionTransportMixin:
                 return resumed
         hold_reason = lease_hold_reason()
         if hold_reason is not None:
-            # The executor no longer holds (or was told to give up) its lease
-            # on this command. Nothing new may start; whatever the agent is
-            # already doing stays in its ledger for the next lease holder.
-            return WorkflowStepOutcome.waiting(
-                operation_id=context.idempotency_key,
-                details={
-                    "node_action_state": "LEASE_LOST",
-                    "node_action_not_started": True,
-                    "waiting_node": node_id,
-                    "reason": hold_reason,
-                },
-            )
+            return _lease_hold_outcome(context, node_id, hold_reason, recorded)
         try:
             maintenance = self._maintenance_generations(context) is not None
             endpoint = self._endpoint(
@@ -1136,16 +1221,15 @@ class NodeActionTransportMixin:
             state.state is NodeActionExecutionState.PENDING
             and state.ownership_challenge is not None
         ):
-            state, refused = self._final_ownership_permit(
+            state = self._final_ownership_permit(
                 endpoint,
                 envelope,
                 state,
                 secret=secret,
                 ssl_context=ssl_context,
                 before_submit=before_submit,
+                pending_details=pending_details,
             )
-            if refused is not None:
-                return refused
         if state.state is NodeActionExecutionState.PENDING:
             # ``state.command_id`` rather than the envelope's: under the shim
             # they differ, and the pointer must name the row that is running.
@@ -1163,7 +1247,21 @@ class NodeActionTransportMixin:
         secret: str,
         ssl_context: ssl.SSLContext | None,
         before_submit: Callable[[], WorkflowStepOutcome | None] | None,
-    ) -> tuple[NodeActionSubmission, WorkflowStepOutcome | None]:
+        pending_details: dict[str, Any] | None = None,
+    ) -> NodeActionSubmission:
+        """Answer the Agent's pre-spawn challenge, or leave it for the next poll.
+
+        Three answers. A guard that passes signs a grant. A guard that names a
+        violation it observed (``refusal_is_conclusive``) signs a denial -- the
+        Agent treats that as final, so nothing short of evidence may earn it.
+        A guard that could not complete its check raises ``NodeActionPending``
+        as ``OWNERSHIP_RECHECK_DEFERRED``: no permit is sent, the challenge
+        stays pending on the Agent, and the next poll -- by this replica or by
+        whichever holds the lease after it -- runs the recheck again. The Agent
+        bounds the wait itself (``CHALLENGE_SECONDS``) and fails closed when
+        nobody answers in time.
+        """
+
         challenge = state.ownership_challenge
         if (
             challenge is None
@@ -1197,14 +1295,12 @@ class NodeActionTransportMixin:
                 "OWNERSHIP_RECHECK_UNVERIFIABLE",
                 accepted=True,
             ) from None
-        reason = "OK"
-        if refused is not None:
-            details = refused.details or {}
-            reason = str(details.get("reason") or "STOP_OWNERSHIP_UNVERIFIABLE")
-            if details.get("node_action_state") == "LEASE_LOST":
-                reason = "OWNERSHIP_LEASE_LOST"
-            if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None:
-                reason = "STOP_OWNERSHIP_UNVERIFIABLE"
+        reason, conclusive = _recheck_verdict(refused)
+        if not conclusive:
+            raise NodeActionPending(
+                state.command_id,
+                _recheck_deferral(challenge, refused, reason, pending_details),
+            )
         permit = sign_permit(
             challenge,
             secret,
@@ -1231,7 +1327,7 @@ class NodeActionTransportMixin:
             permit=True,
         )
         if refused is None:
-            return current, None
+            return current
         if current.result is None:
             pending = _unknown_response(
                 envelope.command.command_id,
@@ -1261,7 +1357,7 @@ class NodeActionTransportMixin:
                 )
             }
         )
-        return current, None
+        return current
 
     def _should_resubmit(self, state: NodeActionSubmission) -> bool:
         result = state.result

@@ -203,7 +203,12 @@ def test_failed_node_restore_or_incident_close_keeps_outer_cleanup_unfinished(
 def test_unknown_drill_cannot_borrow_known_looking_rows_as_cleanup_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Settled-looking product rows are not the sibling's physical outcome:
+    when the reboot never landed (boot id unchanged) the hold stays even though
+    every workflow and command row reads terminal."""
+
     runner = RunnerHarness(tmp_path, monkeypatch)
+    runner.sibling_reboots = False
     assert recovery_cleanup_hold(runner.snapshot()) is False, (
         "the stored fixture alone looks settled before the unknown injection"
     )
@@ -213,6 +218,9 @@ def test_unknown_drill_cannot_borrow_known_looking_rows_as_cleanup_authority(
     )
     assert report["cleanup"]["operator_hold_preserved"] is True
     assert report["cleanup"]["agent_recovery"]["phase"] == "CLOSED"
+    assert report["sibling_reboot_proof"]["proven"] is False
+    assert any("unchanged" in reason for reason in report["hold_reasons"]), report
+    assert "sibling node boot id did not change" in str(report["errors"])
     assert "workload.delete" not in runner.calls
     assert "isolation.restore" not in runner.calls
     saved = json.loads(runner.journal_path.read_text())

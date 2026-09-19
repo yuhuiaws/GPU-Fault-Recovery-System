@@ -331,11 +331,13 @@ class WorkflowStore(Protocol):
         reconciled_at: datetime,
         actor: str | None = None,
         approval: Mapping[str, object] | None = None,
-    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan | None]:
         """Terminalize a BLOCKED record whose successor restored the node.
 
         ``actor`` and ``approval`` go on the ``OPERATOR_RECONCILED`` event
-        appended in the same transaction (audit trail I1).
+        appended in the same transaction (audit trail I1). The plan is ``None``
+        for a record that was never plan-driven
+        (``workflow_resolution.restore_reconciliation_reasons``).
         """
         ...
 

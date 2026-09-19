@@ -295,8 +295,9 @@ def restore_reconciliation_reasons(
     # needs no restore successor, because there is nothing to restore. It still
     # needs its incident settled -- recovered elsewhere, or escalated to the
     # operator now closing it -- and every gate below this block still applies,
-    # including the source-plan gate: a workflow that was never plan-driven has
-    # no plan to carry the reconciliation audit, and stays ineligible by design.
+    # including the source-plan gate: on this path a workflow that was never
+    # plan-driven has no plan to carry the reconciliation audit and no
+    # successor to prove anything, and stays ineligible by design.
     never_changed = successor is None and workflow_never_changed_a_node(workflow)
     if incident is not None and never_changed:
         if incident.state not in SETTLED_INCIDENT_STATES:
@@ -318,8 +319,19 @@ def restore_reconciliation_reasons(
         or WorkflowOperation.RESTORE_SCHEDULING not in successor.completed_operations
     ):
         reasons.append("workflow restore successor is no longer valid")
+    # The source-plan gate exists to land the reconciliation audit on the plan
+    # a planner wrote. A record that was never plan-driven -- a job DAG's node
+    # branch that parked BLOCKED / NEEDS_OPERATOR when its escalation ladder
+    # was exhausted -- has no such plan, yet its verified restore successor
+    # (validated on the node, RESTORE_SCHEDULING complete, incident RECOVERED)
+    # proves the node was put back, and the OPERATOR_RECONCILED event on the
+    # workflow plus the incident's reasons carry the audit. Requiring a plan
+    # there kept both of DESTR-014's nodes out of fault handling with no lever
+    # left. The gate therefore applies to plan-driven records (the plan must
+    # exist and link back) and, above, to the never-changed path.
     if not workflow.source_plan_id:
-        reasons.append("workflow has no source recovery plan")
+        if successor is None:
+            reasons.append("workflow has no source recovery plan")
     elif source_plan is None:
         reasons.append("source recovery plan is missing")
     elif (
@@ -337,7 +349,7 @@ def reconciled_restore_records(
     workflow: WorkflowRequest,
     incident: FaultIncident,
     successor: WorkflowRequest | None,
-    source_plan: RecoveryPlan,
+    source_plan: RecoveryPlan | None,
     remote_commands: list[RemoteActionCommand],
     *,
     expected_fencing_token: int,
@@ -345,7 +357,7 @@ def reconciled_restore_records(
     expected_execution_epoch: int | None = None,
     reference: str,
     reconciled_at: datetime,
-) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan | None]:
     """Terminalize a BLOCKED record, re-verifying every condition first.
 
     The compare-and-set names the field that moved and both values, so a
@@ -353,6 +365,11 @@ def reconciled_restore_records(
     than a generic "plan changed". ``fencing_token`` and ``execution_epoch`` are
     the keys a re-plan or a claim moves and a merge does not; ``updated_at`` is
     what the Store contract still hands in today and is honoured when given.
+
+    ``source_plan`` is ``None`` only for a record that was never plan-driven
+    and is reconciled by its verified restore successor
+    (``restore_reconciliation_reasons``); the returned plan is then ``None``
+    and the audit is carried by the workflow's event and the incident.
 
     ``blocked_reasons`` is deliberately not appended to (P1-61D): it records why
     the workflow blocked, the audit lives in ``preemption_reason`` and on the
@@ -427,13 +444,17 @@ def reconciled_restore_records(
             "updated_at": reconciled_at,
         }
     )
-    updated_plan = source_plan.model_copy(
-        update={
-            "resolved_by_restore_workflow_id": (
-                successor.request_id if successor is not None else None
-            ),
-            "reconciliation_reference": reference,
-            "reconciled_at": reconciled_at,
-        }
+    updated_plan = (
+        None
+        if source_plan is None
+        else source_plan.model_copy(
+            update={
+                "resolved_by_restore_workflow_id": (
+                    successor.request_id if successor is not None else None
+                ),
+                "reconciliation_reference": reference,
+                "reconciled_at": reconciled_at,
+            }
+        )
     )
     return updated_workflow, updated_incident, updated_plan

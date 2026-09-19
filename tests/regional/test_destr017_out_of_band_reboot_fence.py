@@ -560,6 +560,52 @@ def test_no_remote_command_may_be_a_reset_or_a_succeeded_old_verify() -> None:
     assert any("recorded SUCCEEDED" in item for item in errors), errors
 
 
+def _carrier(batched_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """The compound node command the product really dispatches: QUIESCE head,
+    VERIFY / RESET_GPU / RESTORE riding as batched members from creation."""
+    return {
+        "command_id": "remote-carrier",
+        "status": "FAILED",
+        "step": {"operation": "QUIESCE_GPU_SERVICES"},
+        "batched_steps": [
+            {"step_index": 3, "step": {"operation": "VERIFY_NO_GPU_CLIENTS"}},
+            {"step_index": 4, "step": {"operation": "RESET_GPU"}},
+            {"step_index": 5, "step": {"operation": "RESTORE_GPU_SERVICES"}},
+        ],
+        "result_details": {"batched_results": batched_results},
+    }
+
+
+def test_a_carried_reset_the_executor_never_reached_is_not_a_dispatch() -> None:
+    """Attempt 3 of 2026-09-18 was failed for the carrier itself: the fence
+    stopped it at VERIFY (batched result 3 FAILED with the generation fence)
+    and RESET_GPU never got a result. Carriage is not execution."""
+    fenced = _carrier(
+        {
+            "2": {"status": "SUCCEEDED"},
+            "3": {"status": "FAILED", "error": "maintenance agent fence failed for n"},
+        }
+    )
+    assert verdicts.command_errors([fenced], node=NODE) == [], "carriage only"
+    assert verdicts.reset_reached(fenced) is False, "no result for the reset member"
+
+
+def test_a_carried_reset_with_any_result_is_a_dispatch() -> None:
+    for status in ("SUCCEEDED", "FAILED", "WAITING"):
+        reached = _carrier(
+            {
+                "2": {"status": "SUCCEEDED"},
+                "3": {"status": "SUCCEEDED"},
+                "4": {"status": status},
+            }
+        )
+        errors = verdicts.command_errors([reached], node=NODE)
+        assert any("GPU reset command was dispatched" in item for item in errors), (
+            status,
+            errors,
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Escalation
 # --------------------------------------------------------------------------- #

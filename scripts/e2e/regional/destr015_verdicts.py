@@ -15,6 +15,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.destr015_physical_evidence import (
+    CLOCK_MARGIN_NS,
+    MAX_CLOCK_DRIFT_PPM,
+    ResetIntervalScope,
+    physical_overlap_errors,
+)
+
 # Every hardware step one node branch must run, in order, exactly once.
 BRANCH_OPERATIONS = (
     "MARK_UNSCHEDULABLE",
@@ -504,3 +511,230 @@ def lifetime_errors(
             f"{lifetime_seconds}s job workflow lifetime"
         ]
     return []
+
+
+# --------------------------------------------------------------------------- #
+# Detached witness records
+# --------------------------------------------------------------------------- #
+# The keys of ``final`` that complete the legacy capture ``end`` the interval
+# arithmetic in ``destr015_physical_evidence`` reads.
+WITNESS_END_KEYS = (
+    "start_sha256",
+    "trace_complete",
+    "closed",
+    "lost_events",
+    "trace_sha256",
+    "trace_bytes",
+    "calibration_execs",
+    "actions",
+    "wall_minus_monotonic_min_ns",
+    "wall_minus_monotonic_max_ns",
+)
+WITNESS_END_REASONS = frozenset({"finish-request", "deadline"})
+EXCHANGE_KINDS = frozenset({"arm", "collect"})
+
+
+def _exchanges(exchanges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in exchanges if item.get("kind") in EXCHANGE_KINDS]
+
+
+def clock_binding(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
+    """The documented bound on ``runner_monotonic - host_monotonic``.
+
+    Derived from the arm and collect exchanges alone: each bounds the offset
+    between the runner's send and receive stamps around the host's sample, and
+    the host may drift at most ``MAX_CLOCK_DRIFT_PPM`` over the span plus the
+    fixed margin. This is evidence, never a substitute for the interval
+    arithmetic, which recomputes the same bound and refuses when it is empty.
+    """
+
+    clocks = _exchanges(exchanges)
+    keys = ("sent_ns", "received_ns", "monotonic_ns")
+    if len(clocks) < 2 or any(
+        type(item.get(key)) is not int for item in clocks for key in keys
+    ):
+        return {"bounded": False, "reason": "fewer than two integer clock exchanges"}
+    span = clocks[-1]["received_ns"] - clocks[0]["sent_ns"]
+    if span <= 0:
+        return {"bounded": False, "reason": "controller clock is reversed"}
+    drift = span * MAX_CLOCK_DRIFT_PPM // 1_000_000 + CLOCK_MARGIN_NS
+    lower = max(item["sent_ns"] - item["monotonic_ns"] - drift for item in clocks)
+    upper = min(item["received_ns"] - item["monotonic_ns"] + drift for item in clocks)
+    if lower > upper:
+        return {
+            "bounded": False,
+            "reason": "the exchanges admit no common clock offset",
+            "span_ns": span,
+            "drift_allowance_ns": drift,
+        }
+    return {
+        "bounded": True,
+        "exchanges": len(clocks),
+        "span_ns": span,
+        "drift_allowance_ns": drift,
+        "offset_min_ns": lower,
+        "offset_max_ns": upper,
+        "uncertainty_ns": upper - lower,
+        "max_clock_drift_ppm": MAX_CLOCK_DRIFT_PPM,
+        "margin_ns": CLOCK_MARGIN_NS,
+    }
+
+
+def _monotonic(value: Any) -> int | None:
+    stamp = (value or {}).get("monotonic_ns") if isinstance(value, dict) else None
+    return stamp if type(stamp) is int else None
+
+
+def _realtime(value: Any) -> int | None:
+    stamp = (value or {}).get("realtime_ns") if isinstance(value, dict) else None
+    return stamp if type(stamp) is int else None
+
+
+def witness_record_errors(
+    node: str,
+    *,
+    scope: ResetIntervalScope,
+    receipt: dict[str, Any] | None,
+    collection: dict[str, Any] | None,
+) -> list[str]:
+    """The witness's records were written on the host during the run.
+
+    Same boot id on the scope, the arm receipt, both records and the
+    collection; one witness id from ``armed`` to ``final``; and every record
+    stamped inside the arm..collect window on the host's own monotonic clock,
+    which the arm request, the unit and the collect request all share on one
+    boot. A record outside that window, or from another boot, is not this run's
+    evidence, however well its interval would fit.
+    """
+
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("armed"), dict):
+        return [f"{node} witness has no armed record"]
+    if not isinstance(collection, dict):
+        return [f"{node} witness was not collected"]
+    armed = receipt["armed"]
+    final = collection.get("final")
+    if not isinstance(final, dict):
+        unit = (collection.get("unit_state") or {}).get("ActiveState")
+        return [
+            f"{node} witness left no final record (unit {unit}); "
+            "its interval evidence is lost"
+        ]
+    errors: list[str] = []
+    if final.get("refusal"):
+        errors.append(f"{node} witness refused: {final['refusal']}")
+    if final.get("reason") not in WITNESS_END_REASONS:
+        errors.append(
+            f"{node} witness ended by {final.get('reason')}, not by collection "
+            "or its own deadline"
+        )
+    digest = scope.digest()
+    for label, record in (("armed", armed), ("final", final)):
+        if record.get("scope_sha256") != digest or record.get("run_id") != scope.run_id:
+            errors.append(f"{node} {label} record is not bound to this scope")
+    boots = {
+        receipt.get("boot_id"),
+        armed.get("boot_id"),
+        final.get("boot_id"),
+        collection.get("boot_id"),
+        (collection.get("state") or {}).get("boot_id"),
+    }
+    if boots != {scope.boot_id}:
+        errors.append(f"{node} witness records do not all carry the scope's boot id")
+    if not armed.get("witness_id") or armed.get("witness_id") != final.get(
+        "witness_id"
+    ):
+        errors.append(f"{node} final record belongs to another witness")
+    if armed.get("unit") != receipt.get("unit") or final.get("unit") != receipt.get(
+        "unit"
+    ):
+        errors.append(f"{node} witness records name another unit")
+    stamps = [
+        _monotonic(receipt.get("host_clock_start")),
+        _monotonic(armed),
+        _monotonic(final),
+        _monotonic(collection.get("host_clock")),
+    ]
+    if any(stamp is None for stamp in stamps) or any(
+        earlier > later
+        for earlier, later in zip(stamps, stamps[1:], strict=False)  # type: ignore[operator]
+    ):
+        errors.append(
+            f"{node} witness records were not written inside the arm..collect "
+            "window on the host clock"
+        )
+    walls = [
+        _realtime(receipt.get("host_clock_start")),
+        _realtime(armed),
+        _realtime(final),
+        _realtime(collection.get("host_clock")),
+    ]
+    if any(wall is None for wall in walls) or any(
+        earlier - CLOCK_MARGIN_NS > later
+        for earlier, later in zip(walls, walls[1:], strict=False)  # type: ignore[operator]
+    ):
+        errors.append(
+            f"{node} witness record realtime stamps leave the arm..collect window"
+        )
+    return errors
+
+
+def witness_capture(
+    receipt: dict[str, Any],
+    collection: dict[str, Any],
+    exchanges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fold the durable records into the capture shape the interval arithmetic
+    reads: the armed record's ``start``, the final record's closure, and the
+    arm/collect exchanges as the bounded clock calibration."""
+
+    start = dict(receipt["armed"]["start"])
+    final = collection["final"]
+    end = {**start, **{key: final.get(key) for key in WITNESS_END_KEYS}}
+    clocks = [
+        {
+            "sent_ns": item["sent_ns"],
+            "received_ns": item["received_ns"],
+            "monotonic_ns": item["monotonic_ns"],
+        }
+        for item in _exchanges(exchanges)
+    ]
+    return {"start": start, "end": end, "clock_exchanges": clocks}
+
+
+def physical_witness_errors(
+    witnesses: dict[str, dict[str, Any]],
+    *,
+    workflow: dict[str, Any],
+    hosts: dict[str, dict[str, dict[str, Any]]],
+) -> list[str]:
+    """``witnesses[node] = {"scope", "receipt", "collection", "exchanges"}``.
+
+    The record checks run first and alone: intervals folded from lost or
+    unbound records must never reach the overlap arithmetic, because that
+    arithmetic would otherwise grade an interval nobody proved was this run's.
+    """
+
+    errors: list[str] = []
+    for node, item in witnesses.items():
+        errors.extend(
+            witness_record_errors(
+                node,
+                scope=item["scope"],
+                receipt=item.get("receipt"),
+                collection=item.get("collection"),
+            )
+        )
+    if errors:
+        errors.append(
+            "the actual reset process intervals cannot be proven from lost or "
+            "unbound witness records"
+        )
+        return errors
+    captures = {
+        node: witness_capture(item["receipt"], item["collection"], item["exchanges"])
+        for node, item in witnesses.items()
+    }
+    scopes = {node: item["scope"] for node, item in witnesses.items()}
+    return physical_overlap_errors(
+        captures, scopes=scopes, workflow=workflow, hosts=hosts
+    )

@@ -179,6 +179,15 @@ def test_queue_accepts_only_acknowledged_waiting_renewal_races(
             assert status == 409, "the API must reject the released lease"
             events.append("renewal-rejected")
             rejected.set()
+        elif race == "none" and path.endswith(f"/{first_id}/renew") and status == 409:
+            # Nothing is orchestrated here, but the Executor renews every
+            # lease_seconds/3 (about 3.3 s) and a loaded host can delay the
+            # WAITING handback past a tick: the renewal then meets the released
+            # lease exactly as in the orchestrated races (deploy #19's gate,
+            # 2026-09-19). The proof counts such a rejection as one more raw
+            # loss; so does this test, instead of pinning a timing it does not
+            # control.
+            events.append("renewal-rejected")
         return status, body
 
     def executor(client: Any, *args: Any, **kwargs: Any) -> ClusterActionExecutor:
@@ -206,19 +215,20 @@ def test_queue_accepts_only_acknowledged_waiting_renewal_races(
     finally:
         assert len(executors) == 1, "the proof must use one production Executor"
         counters = executors[0].metrics_snapshot()
-        assert counters["lease_lost_total"] == (1 if race == "none" else 2), (
-            "raw losses must retain both the queued loss and any handback race"
-        )
-        assert counters["lease_renewal_failures"] == (0 if race == "none" else 1), (
-            "only the handback's overlapping renewal may fail inside the Executor"
-        )
+        incidental = events.count("renewal-rejected") if race == "none" else 0
+        assert counters["lease_lost_total"] == (
+            1 + incidental if race == "none" else 2
+        ), "raw losses must retain both the queued loss and any handback race"
+        assert counters["lease_renewal_failures"] == (
+            incidental if race == "none" else 1
+        ), "only the handback's overlapping renewal may fail inside the Executor"
         assert counters["results_withheld_total"] == 1, (
             "the expired queued command must still withhold its result"
         )
         assert (
             events
             == {
-                "none": [],
+                "none": ["renewal-rejected"] * incidental,
                 "before-ack": ["committed", "renewal-rejected", "acknowledged"],
                 "after-ack": ["committed", "acknowledged", "renewal-rejected"],
             }[race]

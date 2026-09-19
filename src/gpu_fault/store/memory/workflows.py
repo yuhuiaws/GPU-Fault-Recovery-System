@@ -65,6 +65,13 @@ ORPHAN_WORKFLOW_STATUSES = frozenset(
 )
 
 
+def _source_plan(store: Any, plan_id: str | None) -> RecoveryPlan | None:
+    """The plan a plan-driven record names; ``None`` for one that never had one
+    (the resolver decides whether that is acceptable for the shape)."""
+
+    return store.get_plan(plan_id) if plan_id else None
+
+
 class MemoryWorkflowMixin:
     # Attributes supplied by the composed concrete implementation.
     _incident_by_event: Any
@@ -215,14 +222,13 @@ class MemoryWorkflowMixin:
         reconciled_at: datetime,
         actor: str | None = None,
         approval: Mapping[str, object] | None = None,
-    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan | None]:
         with self._lock:
             workflow = self.get_workflow(workflow_request_id)
             incident = self.get_incident(workflow.incident_id)
             successor = self.get_workflow(successor_workflow_id)
-            if not workflow.source_plan_id:
-                raise ValueError("workflow has no source recovery plan")
-            source_plan = self.get_plan(workflow.source_plan_id)
+            # ``None`` for a record that was never plan-driven; the resolver rules.
+            source_plan = _source_plan(self, workflow.source_plan_id)
             updated_workflow, updated_incident, updated_plan = (
                 reconciled_restore_records(
                     workflow,
@@ -257,7 +263,8 @@ class MemoryWorkflowMixin:
             )
             self._workflows[workflow_request_id] = updated_workflow
             self._incidents[incident.incident_id] = updated_incident
-            self._plans[source_plan.plan_id] = updated_plan
+            if updated_plan is not None:
+                self._plans[updated_plan.plan_id] = updated_plan
             return updated_workflow, updated_incident, updated_plan
 
     def reconcile_retired_generation_workflow(

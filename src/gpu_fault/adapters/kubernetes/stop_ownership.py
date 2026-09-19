@@ -8,6 +8,7 @@ challenge; this module alone cannot close an asynchronous queue boundary.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -50,11 +51,44 @@ from gpu_fault.adapters.kubernetes.stop_boot_transition import (
 from gpu_fault.hyperpod import HyperPodAction, hyperpod_submission_idempotency_key
 from gpu_fault.restart_containment import STOP_OWNERSHIP_RECEIPT_KEY
 
+LOGGER = logging.getLogger(__name__)
+
 # One name for both layers: the control plane signs the predecessor
 # containment's receipt under it, the guard reads it back under it.
 STOP_RECEIPT_KEY = STOP_OWNERSHIP_RECEIPT_KEY
 SUBMISSION_BOUNDARY = "EXECUTOR_PRE_SUBMIT"
 GUARD_VERSION = "kubernetes-stop-ownership/v1"
+# Refusal reasons that report a violation this validator *observed*: the STOP
+# receipt no longer matches the cluster, a participant is active, an identity
+# moved or is gone. Only these may be signed into a denial at the Agent's final
+# checkpoint (``node_action.transport._final_ownership_permit``): a denial is
+# irrevocable for that challenge and the Agent fails the action terminally on
+# it. Every other reason -- a Kubernetes read that raised, a truncated list, a
+# replica without a validator, a lease this executor can no longer vouch for --
+# means the check could not be *completed*, and the next lease owner (or this
+# one a moment later) has to run it again on evidence. Signing those as denials
+# is how a reclaiming replica's failed node read quarantined a healthy node
+# (live 2026-09-18, GF-REGIONAL-HA-004).
+CONCLUSIVE_REFUSAL_REASONS = frozenset(
+    {
+        "STOP_OWNERSHIP_SCOPE_MISMATCH",
+        "STOP_OWNERSHIP_IDENTITY_UNKNOWN",
+        "STOP_OWNERSHIP_DRIFT",
+        "STOP_PARTICIPANTS_ACTIVE",
+        "STOP_PARTICIPANTS_CHANGED",
+        "STOP_OWNERSHIP_RECEIPT_MISSING",
+    }
+)
+# The reasons this module itself produces for a check it could not complete.
+# Listed for readers and tests; the decision above is an allowlist on purpose,
+# so a reason added later defers until it is named as conclusive.
+INCONCLUSIVE_REFUSAL_REASONS = frozenset(
+    {
+        "STOP_OWNERSHIP_UNVERIFIABLE",
+        "STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE",
+        "STOP_PARTICIPANTS_UNKNOWN",
+    }
+)
 # Match the exact API endpoints used by KubernetesPrimitivesMixin._read_workload.
 WORKLOAD_GVK = {
     "job": ("batch/v1", "Job"),
@@ -156,6 +190,38 @@ def refusal(reason: str) -> WorkflowStepOutcome:
             "ownership_check_boundary": SUBMISSION_BOUNDARY,
             "agent_queue_ownership_checked": False,
         },
+    )
+
+
+def refusal_is_conclusive(reason: object) -> bool:
+    """Whether ``reason`` names a violation the validator observed.
+
+    Anything else -- including a reason this build does not know -- is treated
+    as "could not verify" and must not become a signed denial.
+    """
+
+    return isinstance(reason, str) and reason in CONCLUSIVE_REFUSAL_REASONS
+
+
+def unverifiable_refusal(exc: BaseException, *, check: str) -> WorkflowStepOutcome:
+    """The fail-closed refusal for a check that raised, naming the class.
+
+    Only the exception *class* travels: enough to tell a closed API-server
+    connection from a validator defect on the next live run, never the message
+    (which may carry cluster names, node addresses or token material). The
+    live sequence this exists for left no trace of what the read raised, so
+    the log line is the other half of the record.
+    """
+
+    LOGGER.warning(
+        "STOP ownership %s could not be completed and refused closed: %s",
+        check,
+        type(exc).__name__,
+    )
+    outcome = refusal("STOP_OWNERSHIP_UNVERIFIABLE")
+    return replace(
+        outcome,
+        details={**(outcome.details or {}), "refusal_cause": type(exc).__name__},
     )
 
 
@@ -427,8 +493,8 @@ class KubernetesStopOwnershipValidator:
                 raise StopOwnershipError("STOP_PARTICIPANTS_ACTIVE")
         except StopOwnershipError as exc:
             return refusal(exc.reason)
-        except Exception:
-            return refusal("STOP_OWNERSHIP_UNVERIFIABLE")
+        except Exception as exc:
+            return unverifiable_refusal(exc, check="idle-node check")
         return None
 
     def _node(self, name: str) -> StopNodeIdentity:
@@ -798,8 +864,8 @@ class KubernetesStopOwnershipValidator:
                 }
         except StopOwnershipError as exc:
             return refusal(exc.reason)
-        except Exception:
-            return refusal("STOP_OWNERSHIP_UNVERIFIABLE")
+        except Exception as exc:
+            return unverifiable_refusal(exc, check="receipt recheck")
         return None
 
 
@@ -836,8 +902,8 @@ def capture_stop_ownership(
         return scope.validator.capture(context, prepared)
     except StopOwnershipError as exc:
         return refusal(exc.reason)
-    except Exception:
-        return refusal("STOP_OWNERSHIP_UNVERIFIABLE")
+    except Exception as exc:
+        return unverifiable_refusal(exc, check="receipt capture")
 
 
 def prepare_stop_ownership(
@@ -871,8 +937,8 @@ def finish_stop_ownership(
         return scope.validator.finish(context, receipt, outcome)
     except StopOwnershipError as exc:
         return refusal(exc.reason)
-    except Exception:
-        return refusal("STOP_OWNERSHIP_UNVERIFIABLE")
+    except Exception as exc:
+        return unverifiable_refusal(exc, check="containment finish")
 
 
 def node_submission_ownership_guard(

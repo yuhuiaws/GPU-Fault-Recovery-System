@@ -103,6 +103,11 @@ _ABANDONED_WORKER_POLL_SECONDS = 0.25
 # connectivity rather than the target's; the network-degraded back-off keys on
 # it alone.
 TRANSPORT_RETRYABLE_SOURCE = "executor-retryable-transport"
+# The ``status_source`` of a WAITING an executor posts for a command it claimed
+# but will not run because it is shutting down: the lease goes straight back to
+# the queue instead of parking for a window, and ``result_details`` is echoed
+# unchanged (see ``CommandLifecycle._release_on_shutdown``).
+SHUTDOWN_RELEASE_STATUS_SOURCE = "executor-released-on-shutdown"
 
 # The keys a retryable WAITING report adds on top of the adapter's own record.
 # They describe one failed attempt by one executor, not the operation, so the
@@ -189,9 +194,10 @@ class CommandLeaseWatch:
     ``_report_result`` between report attempts. ``hold_reason()`` is non-None
     once the executor can no longer vouch for the command: renewal failed
     ``failure_limit`` times in a row, the lease window passed without a renewal
-    landing, the control plane asked for cancellation, or this executor gave the
-    command up (``abandon``). The first two mean another executor may already
-    own the command; all four mean nothing new should start.
+    landing, the control plane asked for cancellation, this executor gave the
+    command up (``abandon``), or the process is shutting down (``shutdown``).
+    The first two mean another executor may already own the command; all five
+    mean nothing new should start.
     """
 
     def __init__(
@@ -201,6 +207,7 @@ class CommandLeaseWatch:
         failure_limit: int,
         clock: Callable[[], float],
         expires_at: float,
+        shutdown: Callable[[], str | None] | None = None,
     ) -> None:
         self.lease_seconds = lease_seconds
         self.failure_limit = failure_limit
@@ -210,6 +217,12 @@ class CommandLeaseWatch:
         self.consecutive_failures = 0
         self.lost_reason: str | None = None
         self.cancellation_reason: str | None = None
+        # Why this executor is winding down, or None. Read last by
+        # ``hold_reason`` so SIGTERM stops new node actions -- and new permit
+        # answers given as authority -- on the executing thread, without
+        # touching ``lost()``: the lease is still ours, so whatever the adapter
+        # already produced is posted and the command moves on at once.
+        self.shutdown = shutdown
 
     def renewed(self, response: Any, *, expires_at: float) -> str | None:
         """Record a successful renewal; return the cancellation reason if any."""
@@ -269,7 +282,9 @@ class CommandLeaseWatch:
                     f"lease expired locally after {self.lease_seconds}s "
                     "without a successful renewal"
                 )
-            return self.cancellation_reason
+            if self.cancellation_reason is not None:
+                return self.cancellation_reason
+        return None if self.shutdown is None else self.shutdown()
 
 
 class CommandLifecycle:
@@ -294,6 +309,7 @@ class CommandLifecycle:
             failure_limit=self.executor.lease_renewal_failure_limit,
             clock=self.executor.clock,
             expires_at=self.executor.clock(),
+            shutdown=self._shutdown_hold_reason,
         )
         try:
             watch.expires_at = self._confirmed_deadline(command, command)
@@ -305,6 +321,67 @@ class CommandLifecycle:
                 or "cancellation requested by the control plane"
             )
         return watch
+
+    def _shutdown_hold_reason(self) -> str | None:
+        """The lease guard's hold once a stop was requested, else None.
+
+        Nothing new may start on a process that is going away -- not a node
+        action, and not an answer to an Agent's ownership challenge given as
+        authority -- but the lease is still this executor's, so the outcome the
+        adapter returns (a WAITING hand-back carrying the agent's pointer) is
+        posted and the command moves to a sibling at once instead of after the
+        lease window.
+        """
+
+        if not self.executor.stop_requested:
+            return None
+        return f"executor shutdown requested: {self.executor.stop_reason or 'stop'}"
+
+    def _release_on_shutdown(self, command: RemoteActionCommand) -> bool:
+        """Hand a command this stopping executor will not run straight back.
+
+        The long-poll claim already on the wire when SIGTERM arrives can still
+        lease a command to the exiting process, and admission then refuses it.
+        Left alone that lease parks the command for a whole window (120 s in
+        production) with nobody working on it -- live 2026-09-18 a deleted
+        replica held HA-004's reset carrier for a lease while its siblings
+        waited. Posting WAITING returns it to the queue at once. The store
+        *replaces* ``result_details`` on completion, so the command's own
+        record is echoed verbatim and only ``status_source`` says why the lease
+        moved. A post that fails is logged and the lease lapses as before; no
+        retry loop on the way out.
+        """
+
+        if not command.lease_token:
+            return False
+        result = RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=RemoteCommandStatus.WAITING,
+            status_source=SHUTDOWN_RELEASE_STATUS_SOURCE,
+            details=dict(command.result_details),
+        )
+        try:
+            self.executor.client.complete(command, result)
+        except Exception as exc:
+            LOGGER.warning(
+                "regional command could not be released on shutdown; its lease "
+                "lapses on the control plane's schedule: command=%s cluster=%s "
+                "%s: %s",
+                command.command_id,
+                command.cluster_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        self.executor.metrics.result_posted(result.status)
+        LOGGER.warning(
+            "regional command released on shutdown before it started: "
+            "command=%s cluster=%s reason=%s",
+            command.command_id,
+            command.cluster_id,
+            self.executor.stop_reason,
+        )
+        return True
 
     def _confirmed_deadline(
         self,
@@ -381,6 +458,14 @@ class CommandLifecycle:
                 command.cluster_id,
                 watch.hold_reason() or "executor shutdown",
             )
+            if (
+                self.executor.stop_requested
+                and not watch.lost()
+                and watch.cancellation_reason is None
+            ):
+                # Refused only because this process is going away: the lease
+                # is confirmed ours and nothing ran, so give it back now.
+                self._release_on_shutdown(command)
             return CommandOutcome(RemoteCommandStatus.WAITING, False)
         stop = Event()
         renewer = Thread(

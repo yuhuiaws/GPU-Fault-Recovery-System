@@ -241,7 +241,7 @@ def _judge_step(
             idempotency_key=idempotency_key,
         )
         result = dispatch.outcome_result(
-            dispatch.execute_adapter(adapter, context),
+            dispatch.execute_adapter(adapter, context, command=view),
             lease_token,
             operation=step.operation,
         )

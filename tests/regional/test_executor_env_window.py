@@ -111,3 +111,59 @@ def test_restore_arguments_cover_the_lease_and_poll_baseline() -> None:
         "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS=120",
         "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS-",
     ]
+
+
+def _closed_record(scope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "scope": scope,
+        "state": "CLOSED",
+        "closed_at": "2026-09-18T08:19:45+00:00",
+        "assignments": {"GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS": "10"},
+        "baseline": {"uid": "u-1", "variables": {}},
+    }
+
+
+def test_a_closed_record_from_another_release_is_archived_not_refused(tmp_path) -> None:
+    """HA-004's re-run after a deploy met attempt 1's CLOSED window record under
+    the previous release identity and was refused ("baseline is unbound or
+    invalid"); a closed record owns nothing, so it is moved aside."""
+    from scripts.e2e.regional import deployment_window_guard as guard
+
+    path = tmp_path / "executor-env-window.json"
+    old_scope = {"plane": "gpu", "identity": {"release_id": "e22b92bb2ec4"}}
+    new_scope = {"plane": "gpu", "identity": {"release_id": "ce392e83fc98"}}
+    record = _closed_record(old_scope)
+    path.write_text(json.dumps(record))
+
+    assert guard.retire_foreign_closed_record(path, record, new_scope) is None
+    assert not path.exists(), "the foreign closed record must be moved aside"
+    archived = list(tmp_path.glob("executor-env-window.closed-*.json"))
+    assert len(archived) == 1 and json.loads(archived[0].read_text()) == record
+
+
+def test_only_closed_foreign_records_are_retired(tmp_path) -> None:
+    from scripts.e2e.regional import deployment_window_guard as guard
+
+    path = tmp_path / "executor-env-window.json"
+    scope = {"plane": "gpu", "identity": {"release_id": "ce392e83fc98"}}
+    same = _closed_record(scope)
+    path.write_text(json.dumps(same))
+    assert guard.retire_foreign_closed_record(path, same, scope) is same
+    assert path.exists(), "a closed record of this very identity stays in place"
+    open_foreign = {
+        **_closed_record({"plane": "gpu", "identity": {"release_id": "old"}}),
+        "state": "OPEN",
+    }
+    open_foreign.pop("closed_at")
+    path.write_text(json.dumps(open_foreign))
+    assert guard.retire_foreign_closed_record(path, open_foreign, scope) is open_foreign
+    assert path.exists(), "an open window from another identity is never moved aside"
+    with pytest.raises(env_window.RegionalFixtureError, match="unbound or invalid"):
+        guard.require_window_record(
+            open_foreign,
+            scope,
+            {"uid": "u-1"},
+            ["GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS"],
+        )
+    assert guard.retire_foreign_closed_record(path, None, scope) is None

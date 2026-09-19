@@ -78,10 +78,9 @@ def test_invalid_merge_stops_before_terminal_observation_or_restart(
         "prewarm.cleanup",
         "probe.cleanup",
         "runtime.verify",
-        "witness.start",
-        "witness.poll",
-        "witness.finish",
-        "witness.close",
+        "witness.arm",
+        "witness.collect",
+        "witness.disarm",
     ],
 )
 def test_parallel_runner_failure_reports_error_without_skipping_other_cleanup(

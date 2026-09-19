@@ -417,3 +417,52 @@ def test_malformed_persisted_receipt_never_authorizes_mutation(
         f"a malformed receipt must be rejected before any API access; "
         f"verbs={[a[0] for a, _ in api.calls]}"
     )
+
+
+def test_closed_record_of_a_superseded_script_is_adopted_not_refused(
+    tmp_path: Path, api: ProbeApi
+) -> None:
+    """A later attempt sweeping an earlier attempt's identity meets that
+    attempt's CLOSED receipt under the old probe digest (DESTR-017's fence probe
+    refused its own preflight this way after the probe was rewritten). Closed
+    with no script left, the record owns nothing: adopt it under the new digest
+    and let cleanup report a clean node."""
+
+    original = host_probe(tmp_path)
+    original.create()
+    original.execute("snapshot")
+    original.cleanup()
+    receipt = json.loads(original.state_path.read_text())
+    assert receipt["closed"] is True and receipt["script_may_exist"] is False
+    original.settings.probe_script.write_text("print('{\"different\": true}')\n")
+    changed = module.HostProbeFixture(original.settings)
+    assert changed.state_path == original.state_path
+    api.calls.clear()
+    residual = changed.cleanup()
+    assert not any(residual.values()), residual
+    adopted = json.loads(changed.state_path.read_text())
+    assert adopted["scope"]["script_sha256"] != receipt["scope"]["script_sha256"]
+    assert adopted["superseded_script_sha256"] == receipt["scope"]["script_sha256"]
+    assert adopted["closed"] is True
+
+
+def test_superseded_script_adoption_needs_an_identical_closed_scope(
+    tmp_path: Path, api: ProbeApi
+) -> None:
+    original = host_probe(tmp_path)
+    original.create()
+    original.execute("snapshot")
+    original.cleanup()
+    receipt = json.loads(original.state_path.read_text())
+    # Same digest change, but the record was left OPEN: still refused.
+    receipt["closed"] = False
+    original.state_path.write_text(json.dumps(receipt), encoding="utf-8")
+    original.settings.probe_script.write_text("print('{\"different\": true}')\n")
+    with pytest.raises(module.HostProbeError, match="ownership record"):
+        module.HostProbeFixture(original.settings).cleanup()
+    # Closed, but another scope field differs (a different node): refused.
+    receipt["closed"] = True
+    receipt["scope"]["node"] = "node-b"
+    original.state_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(module.HostProbeError, match="ownership record"):
+        module.HostProbeFixture(original.settings).cleanup()

@@ -47,6 +47,7 @@ from gpu_fault.cluster_executor import (
     ClusterExecutorError,
     executor_from_environment,
 )
+from gpu_fault.cluster_executor.lease import SHUTDOWN_RELEASE_STATUS_SOURCE
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent import NodeActionResult, NodeActionStatus
@@ -474,7 +475,12 @@ def test_sigterm_stops_claiming_and_stops_renewing(monkeypatch) -> None:
     assert client.renewals == [], (
         "an in-flight command must stop being renewed so the lease lapses fast"
     )
-    assert client.completed == [], "shutdown preceded admission, so nothing ran"
+    # Shutdown preceded admission, so nothing ran -- and the lease the claim
+    # took is handed straight back rather than parked for a whole window.
+    released = client.reported("command-a")
+    assert released.status is RemoteCommandStatus.WAITING
+    assert released.status_source == SHUTDOWN_RELEASE_STATUS_SOURCE
+    assert released.details == {}, "a never-run command's record stays empty"
     assert executor.results_withheld_total == 1
 
     claims_before = len(client.claims)

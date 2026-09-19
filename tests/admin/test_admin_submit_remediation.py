@@ -1085,3 +1085,208 @@ def test_cli_accepts_the_restore_disposition(
 
     assert module.run_submit_remediation_command(arguments, site=site) == 0
     assert (captured[0].disposition, captured[0].plan_only) == ("restore", True)
+
+
+# --------------------------------------------------------------------------
+# restore: per-node decisions on a multi-node incident
+
+
+def _two_node_inspection(**overrides) -> dict:
+    inspection = _quarantined_inspection(**overrides)
+    inspection["incident"]["node_ids"] = ["node-a", "node-b"]
+    inspection["incident"]["gpu_uuids"] = [GPU, "GPU-B"]
+    inspection["node_gpu_uuids"] = {"node-a": [GPU], "node-b": ["GPU-B"]}
+    return inspection
+
+
+def _clean_node(name: str, *, unschedulable: bool = False) -> dict:
+    return {
+        name: {
+            "metadata": {"name": name, "annotations": {}},
+            "spec": {"unschedulable": unschedulable, "taints": []},
+        }
+    }
+
+
+def test_restore_plans_only_the_nodes_still_isolated_by_this_incident() -> None:
+    """DESTR-014's shape: the workflow restored node-b itself, node-a is still
+    quarantined. The plan restores node-a and says why node-b is skipped."""
+
+    plan = _restore_plan(
+        _two_node_inspection(), nodes={**_quarantined_nodes(), **_clean_node("node-b")}
+    )
+
+    assert plan.node_ids == ("node-a", "node-b"), "the incident's nodes, unchanged"
+    assert plan.restore_node_ids == ("node-a",)
+    decisions = {item["node_id"]: item for item in plan.node_decisions}
+    assert decisions["node-a"]["decision"] == "restore"
+    assert decisions["node-b"]["decision"] == "skip"
+    assert f"carries no {QUARANTINE_TAINT} taint" in decisions["node-b"]["reason"]
+    assert all(step["node_ids"] == ["node-a"] for step in plan.steps), plan.steps
+    assert all(step["gpu_uuids"] == [] for step in plan.steps), (
+        "a subset restore validates node-wide, exactly as the deployed builder "
+        "does: the plan must not promise a GPU scope the Pod will not create"
+    )
+    assert plan.as_dict()["restore_node_ids"] == ["node-a"]
+    assert [item["decision"] for item in plan.as_dict()["node_decisions"]] == [
+        "restore",
+        "skip",
+    ]
+
+
+def test_restore_with_no_isolated_node_left_advises_closing_the_incident() -> None:
+    with pytest.raises(BootstrapError) as refused:
+        _restore_plan(
+            _two_node_inspection(),
+            nodes={**_clean_node("node-a"), **_clean_node("node-b")},
+        )
+
+    message = str(refused.value)
+    assert "no node of incident inc-quarantined-9 is still isolated by it" in message
+    assert "node-a" in message and "node-b" in message
+    assert "--close-quarantined" in message
+
+
+def test_restore_targets_a_node_that_kept_only_the_incidents_annotations() -> None:
+    """Taint and cordon lifted by hand, annotations left behind: the restore's
+    ownership check reads the annotations, so the product can still release
+    the node itself instead of an evidence close."""
+
+    orphaned = {
+        "node-a": {
+            "metadata": {
+                "name": "node-a",
+                "annotations": {
+                    "gpu-fault.io/incident-id": QUARANTINED,
+                    "gpu-fault.io/fencing-token": "3",
+                },
+            },
+            "spec": {"unschedulable": False, "taints": []},
+        }
+    }
+
+    plan = _restore_plan(
+        _two_node_inspection(), nodes={**orphaned, **_clean_node("node-b")}
+    )
+
+    assert plan.restore_node_ids == ("node-a",)
+    [decision] = [item for item in plan.node_decisions if item["node_id"] == "node-a"]
+    assert decision["decision"] == "restore"
+    assert "annotation" in decision["reason"]
+
+
+def test_restore_skips_a_node_another_incident_isolated_and_names_it() -> None:
+    plan = _restore_plan(
+        _two_node_inspection(),
+        nodes={
+            **_quarantined_nodes(),
+            **_quarantined_nodes(
+                name="node-b",
+                taint_value=quarantine_taint_value("inc-other"),
+                annotations={"gpu-fault.io/incident-id": "inc-other"},
+            ),
+        },
+    )
+
+    assert plan.restore_node_ids == ("node-a",)
+    [decision] = [item for item in plan.node_decisions if item["node_id"] == "node-b"]
+    assert decision["decision"] == "skip"
+    assert "isolated by incident inc-other" in decision["reason"]
+
+
+def test_restore_warns_about_a_bare_cordon_it_cannot_release() -> None:
+    plan = _restore_plan(
+        _two_node_inspection(),
+        nodes={**_quarantined_nodes(), **_clean_node("node-b", unschedulable=True)},
+    )
+
+    assert plan.restore_node_ids == ("node-a",)
+    assert any("node-b is cordoned" in item for item in plan.warnings), plan.warnings
+
+
+def test_restore_submission_names_the_nodes_it_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path)
+    payloads: list[dict] = []
+    monkeypatch.setattr(
+        module,
+        "run_control_plane_script",
+        lambda site, payload, *, script: payloads.append(payload) or {"no_op": False},
+    )
+    plan = _restore_plan(
+        _two_node_inspection(), nodes={**_quarantined_nodes(), **_clean_node("node-b")}
+    )
+
+    module.submit_restore(site, plan, operator=TEST_OPERATOR_ARN, reference="CHG-R9")
+
+    [payload] = payloads
+    assert payload["node_ids"] == ["node-a"]
+    assert payload["expected"]["node_ids"] == ["node-a", "node-b"], (
+        "the drift check still binds the incident's whole node set"
+    )
+
+
+def test_the_in_pod_restore_mode_restores_the_named_subset_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import sys
+
+    from gpu_fault.app import ApplicationContext
+    from gpu_fault.models import IncidentState
+    from tests._builders import build_store, copy_model
+    from tests.orchestration._incident_closure_support import _escalated_reset
+
+    store = build_store()
+    incident, _ = _escalated_reset(
+        store, incident_id="inc-two", node_ids=("node-a", "node-b")
+    )
+    store.save_incident(
+        copy_model(incident, state=IncidentState.QUARANTINED), expected=incident
+    )
+    context = ApplicationContext(store=store)
+    monkeypatch.setattr(context.dispatcher, "wake", lambda: None)
+    monkeypatch.setattr(
+        ApplicationContext, "from_environment", classmethod(lambda cls: context)
+    )
+
+    def run(payload: dict) -> dict:
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        exec(compile(module.REMEDIATION_SCRIPT, "<submit-remediation>", "exec"), {})
+        return json.loads(capsys.readouterr().out)
+
+    payload = {
+        "mode": "restore",
+        "incident_id": "inc-two",
+        "expected": {
+            "fencing_token": incident.fencing_token,
+            "workflow_request_id": incident.workflow_request_id,
+            "state": "QUARANTINED",
+            "node_ids": ["node-a", "node-b"],
+        },
+        "node_ids": ["node-a"],
+        "operator": "ops@example",
+        "reference": "CHG-1",
+        "runtime_profile_version": "hyperpod-v1",
+    }
+    result = run(payload)
+
+    workflow = store.get_workflow(result["workflow"]["request_id"])
+    assert all(step.node_ids == ["node-a"] for step in workflow.official_steps), (
+        "only the named subset is restored"
+    )
+    assert store.get_incident("inc-two").node_ids == ["node-a", "node-b"]
+
+    with pytest.raises(SystemExit, match="not nodes of incident"):
+        run(
+            {
+                **payload,
+                "node_ids": ["node-z"],
+                "expected": {
+                    **payload["expected"],
+                    "workflow_request_id": workflow.request_id,
+                    "state": "ACTION_PENDING",
+                },
+            }
+        )

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from scripts.e2e.regional import control_plane_env_window as control_window
 from scripts.e2e.regional import destr014_recovery as recovery
 from scripts.e2e.regional import executor_env_window as env_window
+from scripts.e2e.regional.destr014_verdicts import product_hold_reasons
 from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
 from scripts.e2e.regional.managed_workload_fixture import (
     ImagePrewarmFixture,
@@ -47,6 +49,75 @@ def recreate_probe(probe: HostProbeFixture) -> None:
     probe.create()
 
 
+def wait_agent_unit(
+    probe: HostProbeFixture, run_id: str, *, timeout_seconds: int = 120
+) -> dict[str, Any]:
+    """The sibling's host snapshot once its Node Agent unit is enabled and
+    active again, or the last sample when the wait runs out."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        snapshot = probe.execute("snapshot", "--run-id", run_id)
+        unit = snapshot.get("agent_unit") or {}
+        if unit.get("ActiveState") == "active" and str(
+            unit.get("UnitFileState") or ""
+        ).startswith("enabled"):
+            return snapshot
+        if time.monotonic() >= deadline:
+            return snapshot
+        time.sleep(5)
+
+
+def resume_hold_review(run: Any) -> None:
+    """A cleanup-only rerun re-reads the product's share of the hold; the
+    sibling's share comes from the host record the cleanup closes. A failed
+    read leaves the hold exactly where the journal put it."""
+
+    if not run.physical_outcome_unknown or not run.injection_started or not run.marker:
+        return
+    try:
+        state = run.regional.store_snapshot(
+            node=run.settings.fault_node,
+            marker=run.marker,
+            observed_after=run.started_at,
+            job_id=run.settings.job_id,
+            attempt_id=run.settings.attempt_id,
+            hyperpod_cluster=run.settings.hyperpod_cluster,
+        )
+    except ProcessSupervisionLost:
+        raise
+    except Exception:  # noqa: BLE001 - an unreadable product side keeps the hold
+        run.product_hold_reasons = None
+        return
+    run.product_hold_reasons = product_hold_reasons(state)
+
+
+def _released_by_host_record(
+    result: dict[str, Any],
+    recovery_window: recovery.AgentRecoveryWindow,
+    product_hold_reasons: Sequence[str] | None,
+) -> bool:
+    """Whether the closed host record lifts a hold the product no longer holds.
+
+    ``None`` product reasons mean the product side was not re-read (nothing
+    can be released); an empty list means it has settled, and the sibling's
+    reboot is then proven or not by the record cleanup just closed.
+    """
+
+    report = result.get("agent_recovery")
+    if (
+        product_hold_reasons is None
+        or product_hold_reasons
+        or not isinstance(report, dict)
+        or "host_binding" not in recovery_window.journal.data
+    ):
+        return False
+    proof = recovery.reboot_restore_proof(report, recovery_window.binding)
+    if proof["proven"]:
+        result["operator_hold_released_by"] = proof
+    return bool(proof["proven"])
+
+
 def _cleanup(
     *,
     regional: RegionalLiveFixture,
@@ -69,6 +140,8 @@ def _cleanup(
     profile_version: str,
     recovery_window: recovery.AgentRecoveryWindow | None = None,
     operator_hold: bool = False,
+    hold_reasons: Sequence[str] = (),
+    product_hold_reasons: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
 
@@ -91,12 +164,20 @@ def _cleanup(
         )
     if recovery_window is not None:
         guard("agent_recovery", recovery_window.cleanup)
+        # A cleanup-only rerun after the operator settled the product side:
+        # the host record it just closed proves the sibling's reboot (new boot
+        # id, Agent restored), so the hold has nothing left to protect.
+        if operator_hold and _released_by_host_record(
+            result, recovery_window, product_hold_reasons
+        ):
+            operator_hold = False
     elif agent_disabled:
         result["errors"].append(
             "Agent recovery binding is missing; legacy restore is not authorized"
         )
     if operator_hold:
         result["operator_hold_preserved"] = True
+        result["hold_reasons"] = list(hold_reasons)
         result["errors"].append(
             "physical outcome unresolved; workload, isolation and configuration "
             "restoration require operator reconciliation"

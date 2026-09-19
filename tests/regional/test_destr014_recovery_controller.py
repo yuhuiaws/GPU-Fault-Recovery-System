@@ -430,3 +430,154 @@ os._exit(17)
         fresh.save()
     finally:
         fresh.close()
+
+
+def test_a_closed_journal_of_another_attempt_is_archived_not_refused(
+    tmp_path: Path,
+) -> None:
+    """Attempt 3 of 2026-09-18 met attempt 2's CLOSED journal (forensic
+    tombstone) at the case's single journal path and was refused as "identity
+    changed" before touching the node. A closed journal owns nothing: keep it
+    under its run id and start the new attempt's journal fresh."""
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(path, {"run": "one", "run_id": "destr014-x-a2"})
+    first.acquire()
+    first.data["phase"] = "CLOSED"
+    first.save()
+    first.close()
+
+    second = controller.RunJournal(path, {"run": "one", "run_id": "destr014-x-a3"})
+    second.acquire()
+    assert second.resumed is False, "the new attempt must not resume the tombstone"
+    assert second.data["scope"]["run_id"] == "destr014-x-a3", second.data
+    archived = sorted(tmp_path.glob("journal.closed-*.json"))
+    assert [p.name for p in archived] == ["journal.closed-destr014-x-a2.json"], archived
+    assert json.loads(archived[0].read_text())["phase"] == "CLOSED", archived
+
+
+def test_controller_accepts_the_installer_restored_agent_on_a_new_boot(
+    setup: Any,
+) -> None:
+    """Live: the runner's ``restore`` after the product's reboot met an Agent
+    the node-installer had already re-enabled under a new link inode; the
+    probe refused ("incarnation changed"), cleanup died at ``agent_recovery``
+    and the scenario was never judged."""
+
+    setup.window.arm(setup.host.scope)
+    setup.window.disable()
+    setup.host.reboot(renumber_devices=True)
+    setup.host.installer_reinstall()
+    restored = setup.window.restore()
+    assert restored["phase"] == "RESTORED", restored
+    assert restored["restored_by"] == "reboot-installer", restored
+    assert restored["boot_id_observed"] == "boot-after", restored
+    assert setup.journal.data["host_recovery_phase"] == controller.RESTORED_BY_REBOOT
+    assert setup.journal.data["host_boot_id_observed"] == "boot-after"
+    closed = setup.window.cleanup()
+    assert closed["phase"] == "CLOSED" and closed["retired"] is True, closed
+    saved = json.loads(setup.journal.path.read_text())
+    assert saved["host_recovery_phase"] == "RESTORED_BY_REBOOT"
+    assert saved["host_cleanup"]["restored_by"] == "reboot-installer"
+    assert not (probe.SYSTEMD / setup.host.recovery.timer).exists(), (
+        "the installer-restored Agent needs no persistent timer"
+    )
+    assert not setup.host.recovery.dropin.exists(), (
+        "the 45 s start bound must not outlive the recovery"
+    )
+
+
+def test_controller_restore_by_the_saved_copy_on_a_new_boot_is_a_plain_restore(
+    setup: Any,
+) -> None:
+    setup.window.arm(setup.host.scope)
+    setup.window.disable()
+    setup.host.reboot(renumber_devices=True)
+    setup.host.installer_reinstall(enable=False)
+    restored = setup.window.restore()
+    assert restored["restored_by"] == "probe", restored
+    assert restored["restore_reason"] == "controller", restored
+    assert setup.journal.data["host_recovery_phase"] == "RESTORED"
+    assert setup.window.cleanup()["phase"] == "CLOSED"
+    assert setup.host.enable.exists() and setup.host.agent_active
+
+
+def test_installer_restore_noticed_by_the_tick_is_not_the_safeguard_firing(
+    setup: Any,
+) -> None:
+    setup.window.arm(setup.host.scope)
+    setup.window.disable()
+    setup.host.reboot()
+    setup.host.installer_reinstall()
+    setup.host.now = setup.host.scope["restore_at"] - 60
+    ticked = setup.host.tick()
+    assert ticked["phase"] == "RESTORED" and ticked["restore_reason"] == "reboot"
+    restored = setup.window.restore()
+    assert restored["restored_by"] == "reboot-installer", restored
+    assert setup.journal.data["host_recovery_phase"] == "RESTORED_BY_REBOOT"
+    assert setup.window.cleanup()["phase"] == "CLOSED"
+
+
+def test_cleanup_records_the_reboot_restore_when_restore_never_ran(setup: Any) -> None:
+    setup.window.arm(setup.host.scope)
+    setup.window.disable()
+    setup.host.reboot()
+    setup.host.installer_reinstall()
+    closed = setup.window.cleanup()
+    assert closed["phase"] == "CLOSED" and closed["restored_by"] == "reboot-installer"
+    assert setup.journal.data["host_recovery_phase"] == "RESTORED_BY_REBOOT"
+    assert setup.journal.data["host_boot_id_observed"] == "boot-after"
+
+
+@pytest.mark.parametrize(
+    ("change", "gap"),
+    [
+        ({}, None),
+        ({"phase": "CLOSED"}, None),
+        ({"boot_id_observed": "boot-before"}, "unchanged"),
+        ({"boot_id_observed": None}, "no boot id"),
+        ({"phase": "DISABLED"}, "not RESTORED or CLOSED"),
+        ({"restored_by": None}, "restoration receipt"),
+        ({"disable_started": False}, "never disabled"),
+    ],
+)
+def test_reboot_restore_proof_reads_only_the_host_record(
+    change: dict[str, Any], gap: str | None
+) -> None:
+    report = {
+        "phase": "RESTORED",
+        "disable_started": True,
+        "boot_id_observed": "boot-after",
+        "restored_by": "probe",
+        **change,
+    }
+    proof = controller.reboot_restore_proof(report, binding())
+    assert proof["proven"] is (gap is None), proof
+    assert proof["boot_id_before"] == "boot-before"
+    if gap is not None:
+        assert any(gap in item for item in proof["gaps"]), proof
+    assert controller.reboot_restore_proof({}, binding())["proven"] is False
+    assert (
+        controller.reboot_restore_proof(
+            report,
+            binding(),
+            agent_unit={"UnitFileState": "enabled", "ActiveState": "inactive"},
+        )["proven"]
+        is False
+    ), "an inactive Agent snapshot is not a restored sibling"
+
+
+@pytest.mark.parametrize("phase", ["OPEN", "RECOVERY_REQUIRED"])
+def test_an_unfinished_journal_of_another_attempt_still_refuses(
+    tmp_path: Path, phase: str
+) -> None:
+    path = tmp_path / "journal.json"
+    first = controller.RunJournal(path, {"run": "one", "run_id": "a2"})
+    first.acquire()
+    first.data["phase"] = phase
+    first.save()
+    first.close()
+    with pytest.raises(controller.RegionalFixtureError, match="identity changed"):
+        controller.RunJournal(path, {"run": "one", "run_id": "a3"}).acquire()
+    assert path.exists() and not list(tmp_path.glob("journal.closed-*")), (
+        "an unfinished journal is never moved aside"
+    )

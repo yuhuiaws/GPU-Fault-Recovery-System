@@ -455,6 +455,15 @@ class CpuApi:
             if self.raw_override is not None:
                 return self.raw_override
             kind = args[1]
+            if kind == "--raw" and args[2].endswith(("/replicasets", "/pods")):
+                # The population survey reads the server's typed list through
+                # the raw API (kubectl v1.35 prints a client-side v1/List with no
+                # resourceVersion for ``get -o json``); serve the same objects.
+                assert args[2].startswith(
+                    ("/apis/apps/v1/namespaces/", "/api/v1/namespaces/")
+                ), args
+                kind = "replicaset" if args[2].endswith("/replicasets") else "pod"
+                args = ("get", kind, "-o", "json")
             if kind in {"pod", "replicaset"} and args[2:4] == ("-o", "json"):
                 if kind == "pod" and self.list_override is not None:
                     return json.dumps(self.list_override)

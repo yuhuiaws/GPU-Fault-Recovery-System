@@ -573,3 +573,344 @@ def test_the_pod_script_only_forwards_what_the_deployed_apply_accepts() -> None:
     assert "blocked_kinds" not in reconcile.RECONCILE_SCRIPT, (
         "--blocked-kind was removed from the command; the script must not send it"
     )
+
+
+# ------------------------------------------------ verified-restore-non-plan bridge
+
+
+def _non_plan_item(request_id: str = "workflow-2a1858b1", **overrides) -> dict:
+    """What the deployed planner says about a job DAG's parked node branch whose
+    incident a later validated restore RECOVERED: eligible for nothing but the
+    plan it never had."""
+
+    values = {
+        "incident_id": "inc-xid-79",
+        # The node-evidence fake answers for ``node-a``; the record's nodes
+        # must be read as restored for the promotion to survive the admin's
+        # scheduling check, which is the point under test elsewhere.
+        "node_ids": ["node-a"],
+        "fencing_token": 4,
+        "execution_epoch": 3,
+        "successor_workflow_id": "workflow-validated-restore-1",
+        "source_plan_id": None,
+        "source_plan_status": None,
+        "terminalization": "verified-restore",
+        "eligible": False,
+        "reasons": ["workflow has no source recovery plan"],
+    }
+    values.update(overrides)
+    return _item(request_id, **values)
+
+
+def test_a_non_plan_record_with_a_verified_successor_is_promoted_in_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        reconcile,
+        "_run_reconcile",
+        _pod(calls, plans=[_runtime_plan(_non_plan_item())]),
+    )
+    monkeypatch.setattr(
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
+    )
+
+    plan = reconcile.run_workflow_reconcile(
+        _site(tmp_path), tmp_path, workflow_ids=("workflow-2a1858b1",), dry_run=True
+    )
+
+    [item] = plan["items"]
+    assert item["eligible"] is True, item["reasons"]
+    assert item["terminalization"] == reconcile.VERIFIED_RESTORE_NON_PLAN
+    assert item["reasons"] == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "reasons": [
+                "workflow has no source recovery plan",
+                "incident is not RECOVERED",
+            ]
+        },
+        {"terminalization": "never-changed"},
+        {"successor_workflow_id": None},
+        {"source_plan_id": "plan-a"},
+    ],
+)
+def test_only_the_exact_non_plan_shape_is_promoted(changes: dict) -> None:
+    item = _non_plan_item(**changes)
+
+    reconcile.promote_non_plan_successor(item)
+
+    assert item["eligible"] is False
+    assert item["terminalization"] != reconcile.VERIFIED_RESTORE_NON_PLAN
+
+
+def test_the_bridge_applies_promoted_records_with_the_bound_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict] = []
+
+    def run(_site_value, payload, **_kwargs):
+        calls.append(payload)
+        if payload["mode"] == "plan":
+            return _runtime_plan(_non_plan_item())
+        assert payload["mode"] == "apply-verified-restore", payload["mode"]
+        return {
+            "mode": "workflow-reconcile-apply",
+            "applied_workflow_ids": [item["request_id"] for item in payload["items"]],
+            "failed_workflow_ids": [],
+            "failures": {},
+            "resolved_plan_ids": [],
+            "archive_eligible_incident_ids": ["inc-xid-79"],
+            "records_deleted": 0,
+        }
+
+    monkeypatch.setattr(reconcile, "_run_reconcile", run)
+    monkeypatch.setattr(
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
+    )
+
+    result = reconcile.run_workflow_reconcile(
+        _site(tmp_path),
+        tmp_path,
+        workflow_ids=("workflow-2a1858b1",),
+        reference="CHG-2026-0919-05",
+    )
+
+    assert [call["mode"] for call in calls] == [
+        "plan",
+        "plan",
+        "apply-verified-restore",
+    ]
+    bridge = calls[-1]
+    assert bridge["items"] == [
+        {
+            "request_id": "workflow-2a1858b1",
+            "successor_workflow_id": "workflow-validated-restore-1",
+            "fencing_token": 4,
+            "execution_epoch": 3,
+        }
+    ]
+    assert bridge["reference"] == "CHG-2026-0919-05"
+    assert bridge["actor"] == TEST_OPERATOR_ARN
+    assert bridge["admin_plan_sha256"] == result["plan_sha256"]
+    assert result["applied_workflow_ids"] == ["workflow-2a1858b1"]
+    assert result["resolved_plan_ids"] == []
+    assert result["archive_eligible_incident_ids"] == ["inc-xid-79"]
+
+
+def test_runtime_and_bridged_records_are_applied_apart_and_merged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deployed apply digests exactly the ids it is handed, so the runtime
+    records are re-planned on their own before their digest is sent."""
+
+    calls: list[dict] = []
+    both = _runtime_plan(_item(), _non_plan_item())
+    runtime_only = _runtime_plan(_item())
+    runtime_only["plan_sha256"] = "c" * 64
+
+    def run(_site_value, payload, **_kwargs):
+        calls.append(payload)
+        if payload["mode"] == "plan":
+            return (
+                runtime_only
+                if payload["workflow_ids"] == ["workflow-blocked"]
+                else both
+            )
+        if payload["mode"] == "apply":
+            return {
+                "mode": "workflow-reconcile-apply",
+                "applied_workflow_ids": list(payload["workflow_ids"]),
+                "failed_workflow_ids": [],
+                "failures": {},
+                "resolved_plan_ids": ["plan-a"],
+                "archive_eligible_incident_ids": ["incident-a"],
+                "records_deleted": 0,
+            }
+        return {
+            "mode": "workflow-reconcile-apply",
+            "applied_workflow_ids": [],
+            "failed_workflow_ids": ["workflow-2a1858b1"],
+            "failures": {
+                "workflow-2a1858b1": "ValueError: workflow has open remote commands"
+            },
+            "resolved_plan_ids": [],
+            "archive_eligible_incident_ids": [],
+            "records_deleted": 0,
+        }
+
+    monkeypatch.setattr(reconcile, "_run_reconcile", run)
+    monkeypatch.setattr(
+        reconcile, "run_command", lambda *_args, **_kwargs: _node_result()
+    )
+
+    result = reconcile.run_workflow_reconcile(
+        _site(tmp_path),
+        tmp_path,
+        workflow_ids=("workflow-blocked", "workflow-2a1858b1"),
+        reference="CHG-2026-0919-05",
+    )
+
+    assert [call["mode"] for call in calls] == [
+        "plan",
+        "plan",
+        "plan",
+        "apply",
+        "apply-verified-restore",
+    ]
+    runtime_apply = calls[3]
+    assert runtime_apply["workflow_ids"] == ["workflow-blocked"]
+    assert runtime_apply["plan_sha256"] == "c" * 64, (
+        "bound to the digest the deployed apply will recompute over these ids"
+    )
+    assert result["applied_workflow_ids"] == ["workflow-blocked"]
+    assert result["failed_workflow_ids"] == ["workflow-2a1858b1"]
+    assert "open remote commands" in result["failures"]["workflow-2a1858b1"]
+    assert result["resolved_plan_ids"] == ["plan-a"]
+
+
+def test_the_bridge_mode_supersedes_the_record_with_deployed_primitives(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``apply-verified-restore`` against an in-memory control plane: the
+    resolver's eligibility minus the plan gate, ``amend_workflow`` with the
+    audit event, a compare-and-set ``save_incident``; a record the resolver
+    refuses for any other reason is reported, not written."""
+
+    import io
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.app import ApplicationContext
+    from gpu_fault.models import (
+        BlockedKind,
+        IncidentState,
+        WorkflowEventCode,
+        WorkflowEventKind,
+        WorkflowOperation,
+        WorkflowStatus,
+    )
+    from tests._builders import (
+        build_store,
+        fault_incident,
+        workflow_request,
+        workflow_step,
+    )
+
+    now = datetime.now(timezone.utc)
+    store = build_store()
+    parked = workflow_request(
+        "workflow-2a1858b1",
+        "inc-xid-79",
+        status=WorkflowStatus.BLOCKED,
+        blocked_kind=BlockedKind.NEEDS_OPERATOR,
+        fencing_token=4,
+        execution_epoch=3,
+        official_steps=[workflow_step(WorkflowOperation.RESTART_NODE)],
+        remediation_budget_claims=["claim-1"],
+        updated_at=now - timedelta(hours=1),
+    )
+    restore = workflow_request(
+        "workflow-validated-restore-1",
+        "inc-xid-79",
+        status=WorkflowStatus.SUCCEEDED,
+        fencing_token=4,
+        completed_operations=[
+            WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.RESTORE_SCHEDULING,
+        ],
+    )
+    incident = fault_incident(
+        "inc-xid-79",
+        "event-79",
+        state=IncidentState.RECOVERED,
+        workflow_request_id=restore.request_id,
+        fencing_token=4,
+    )
+    store.save_workflow(parked)
+    store.save_workflow(restore)
+    store.save_incident(incident)
+    owned = workflow_request(
+        "workflow-owned",
+        "inc-owned",
+        status=WorkflowStatus.BLOCKED,
+        fencing_token=1,
+        execution_owner_id="executor-1",
+    )
+    owned_restore = workflow_request(
+        "workflow-validated-restore-owned",
+        "inc-owned",
+        status=WorkflowStatus.SUCCEEDED,
+        fencing_token=1,
+        completed_operations=[WorkflowOperation.RESTORE_SCHEDULING],
+    )
+    store.save_workflow(owned)
+    store.save_workflow(owned_restore)
+    store.save_incident(
+        fault_incident(
+            "inc-owned",
+            "event-owned",
+            state=IncidentState.RECOVERED,
+            workflow_request_id=owned_restore.request_id,
+            fencing_token=1,
+        )
+    )
+    context = ApplicationContext(store=store)
+    monkeypatch.setattr(
+        ApplicationContext, "from_environment", classmethod(lambda cls: context)
+    )
+    payload = {
+        "mode": "apply-verified-restore",
+        "items": [
+            {
+                "request_id": "workflow-2a1858b1",
+                "successor_workflow_id": "workflow-validated-restore-1",
+                "fencing_token": 4,
+                "execution_epoch": 3,
+            },
+            {
+                "request_id": "workflow-owned",
+                "successor_workflow_id": "workflow-validated-restore-owned",
+                "fencing_token": 1,
+                "execution_epoch": 0,
+            },
+        ],
+        "reference": "CHG-2026-0919-05",
+        "actor": TEST_OPERATOR_ARN,
+        "admin_plan_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exec(compile(reconcile.RECONCILE_SCRIPT, "<workflow-reconcile>", "exec"), {})
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["applied_workflow_ids"] == ["workflow-2a1858b1"]
+    assert result["failed_workflow_ids"] == ["workflow-owned"]
+    assert "execution owner" in result["failures"]["workflow-owned"]
+    assert result["resolved_plan_ids"] == []
+    assert result["archive_eligible_incident_ids"] == ["inc-xid-79"]
+    closed = store.get_workflow("workflow-2a1858b1")
+    assert closed.status is WorkflowStatus.SUPERSEDED
+    assert closed.preempted_by_workflow_id == "workflow-validated-restore-1"
+    assert closed.remediation_budget_claims == []
+    assert "after verified restore workflow-validated-restore-1" in (
+        closed.preemption_reason or ""
+    )
+    event = closed.events[-1]
+    assert event.kind is WorkflowEventKind.OPERATOR_RECONCILED
+    assert event.code == WorkflowEventCode.OPERATOR_RECONCILED.value
+    assert event.actor == TEST_OPERATOR_ARN
+    assert event.details["terminalization"] == reconcile.VERIFIED_RESTORE_NON_PLAN
+    assert event.details["admin_plan_sha256"] == "d" * 64
+    assert event.details["previous_status"] == "BLOCKED"
+    assert any(
+        "CHG-2026-0919-05" in reason
+        for reason in store.get_incident("inc-xid-79").reasons
+    ), "the incident carries the reconciliation audit"
+    assert store.get_workflow("workflow-owned").status is WorkflowStatus.BLOCKED
+    assert (
+        store.list_active_workflow_incidents("cluster-a", node_ids={"node-a"}) == []
+    ), "the superseded record no longer holds the node"

@@ -17,8 +17,12 @@ from scripts.e2e.regional.regional_live_fixture import (
     component_python,
 )
 
+# (plane, Deployment name, app label). The ingress role's manifest FILE is
+# ``gpu-fault-api-ha-ingress.yaml`` but the Deployment it declares is named
+# ``gpu-fault-api-ha``; the live preflight refused every DESTR-008 attempt with
+# ``NotFound`` while this tuple named the file instead of the object.
 TARGETS = (
-    ("cpu", "gpu-fault-api-ha-ingress", "gpu-fault-api-ha"),
+    ("cpu", "gpu-fault-api-ha", "gpu-fault-api-ha"),
     ("gpu", "gpu-fault-cluster-executor", "gpu-fault-cluster-executor"),
 )
 PROBE_SOURCE = Path(__file__).with_name("probes") / "destr008_inhibition_probe.py"

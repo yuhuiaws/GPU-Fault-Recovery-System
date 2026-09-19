@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import re
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
@@ -158,6 +161,37 @@ def require_window_record(
             raise RegionalFixtureError(
                 "deployment window baseline variables are malformed"
             )
+
+
+def retire_foreign_closed_record(
+    path: Path, record: dict[str, Any] | None, scope: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Archive a CLOSED window record that another site/release identity wrote.
+
+    Records are kept per case directory, so a re-run after a deploy meets the
+    previous attempt's CLOSED record under the old release identity; requiring
+    that record to match the new scope refused HA-004's re-run outright
+    ("deployment window baseline is unbound or invalid"). A closed record owns
+    nothing on the cluster: move it aside and start from no record. Anything
+    not CLOSED keeps the strict scope check -- an open window from another
+    identity is exactly what must never be silently replaced.
+    """
+
+    if (
+        record is None
+        or record.get("state") != "CLOSED"
+        or not record.get("closed_at")
+        or record.get("scope") == scope
+    ):
+        return record
+    stamp = re.sub(r"[^0-9A-Za-z]", "", str(record["closed_at"]))[:16] or "unknown"
+    archive = path.with_name(f"{path.stem}.closed-{stamp}{path.suffix}")
+    if archive.exists():
+        archive = path.with_name(
+            f"{path.stem}.closed-{stamp}-{os.getpid()}{path.suffix}"
+        )
+    path.replace(archive)
+    return None
 
 
 def managed_variables_match(

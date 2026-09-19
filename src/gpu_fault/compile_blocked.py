@@ -37,7 +37,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action,
+    node_actions_operator_confirmed,
+)
 from gpu_fault.models import (
     IncidentState,
     WorkflowEventKind,
@@ -50,11 +53,22 @@ from gpu_fault.models import (
 from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
+from gpu_fault.store.shared.errors import StaleWriteError
+from gpu_fault.workflow_resolution import verified_restore_successor
 
 LOGGER = logging.getLogger(__name__)
 
 DISPATCHER_ACTOR = "dispatcher"
 CLOSE_MARKER = "closed compile-time BLOCKED workflow"
+#: The third shape the sweep closes: a BLOCKED record whose incident a later
+#: validated restore RECOVERED (``verified_restore_successor``). The operator's
+#: ``workflow-reconcile`` terminalizes exactly this shape; the sweep does it
+#: unattended through the same Store transaction, so a job DAG's node branch
+#: that parked NEEDS_OPERATOR does not hold its nodes -- and the release
+#: preflight -- after the product itself validated and restored them
+#: (DESTR-014, HA-004, 2026-09-18). A node action still unresolved keeps the
+#: record: the operator confirms it first (``confirm-node-action``).
+VERIFIED_RESTORE_REFERENCE = "dispatcher-sweep-verified-restore"
 #: The second shape the sweep closes: a BLOCKED record -- dispatched or not --
 #: whose incident an operator (or a validated restore) has since closed
 #: RECOVERED. Nothing waits on it any more (``close_incident`` refuses while a
@@ -272,9 +286,14 @@ def settled_incident_blocked_reasons(
         > (evaluated_at or datetime.now(timezone.utc))
     ):
         reasons.append("workflow execution lease has not expired")
-    if workflow_is_open(
-        workflow.status, workflow.blocked_kind
-    ) and not never_executed_operator_block(workflow):
+    if (
+        workflow_is_open(workflow.status, workflow.blocked_kind)
+        and not never_executed_operator_block(workflow)
+        # A NEEDS_OPERATOR record whose physical uncertainty an operator has
+        # since confirmed on evidence holds its node as paperwork only; with
+        # its incident RECOVERED (below) nothing waits on it (DESTR-014).
+        and not node_actions_operator_confirmed(workflow)
+    ):
         reasons.append("workflow still occupies its nodes")
     if has_unresolved_node_action(workflow):
         reasons.append("workflow has an unresolved physical action")
@@ -390,6 +409,59 @@ def close_settled_incident_blocked_workflow(
     return True
 
 
+def close_verified_restore_blocked_workflow(
+    store: Any,
+    workflow: WorkflowRequest,
+    *,
+    now: datetime,
+) -> bool:
+    """Supersede one BLOCKED record by its verified restore; ``False`` otherwise.
+
+    The successor is what ``workflow_resolution.verified_restore_successor``
+    accepts: the incident RECOVERED and pointing at a SUCCEEDED workflow of the
+    same generation that completed RESTORE_SCHEDULING. The write is the Store's
+    ``reconcile_restored_workflow`` -- the operator's own transaction, which
+    re-verifies every resolver condition, writes the plan when the record is
+    plan-driven and appends the ``OPERATOR_RECONCILED`` event -- with the
+    dispatcher as actor. A record whose node action is still unresolved is
+    left alone: a recovered incident does not prove the physical action ended,
+    and the operator's ``confirm-node-action`` is the lever for that.
+    """
+
+    if workflow.status is not WorkflowStatus.BLOCKED or has_unresolved_node_action(
+        workflow
+    ):
+        return False
+    successor = verified_restore_successor(store, workflow)
+    if successor is None:
+        return False
+    try:
+        store.reconcile_restored_workflow(
+            workflow.request_id,
+            successor.request_id,
+            expected_fencing_token=workflow.fencing_token,
+            expected_execution_epoch=workflow.execution_epoch,
+            reference=VERIFIED_RESTORE_REFERENCE,
+            reconciled_at=now,
+            actor=DISPATCHER_ACTOR,
+            approval={"terminalization": "verified-restore"},
+        )
+    except StaleWriteError:
+        raise
+    except ValueError:
+        # Ineligible per the resolver (an owner, a lease, a WAITING step, an
+        # open command): not this shape, not an error.
+        return False
+    LOGGER.warning(
+        "BLOCKED workflow superseded by its verified restore by the dispatcher: "
+        "workflow=%s incident=%s successor=%s",
+        workflow.request_id,
+        workflow.incident_id,
+        successor.request_id,
+    )
+    return True
+
+
 def close_compile_blocked_workflows(
     store: Any,
     *,
@@ -398,11 +470,11 @@ def close_compile_blocked_workflows(
 ) -> list[str]:
     """The dispatcher's sweep: close every BLOCKED record nothing waits on.
 
-    Two shapes: the compile-time no-op (never dispatched, incident settled) and
-    the BLOCKED record of an incident already RECOVERED. One isolated write per
-    record; a failure on one is logged and leaves that record for the next tick
-    without stopping the others. Returns the ids closed this tick. Nothing is
-    deleted.
+    Three shapes: the compile-time no-op (never dispatched, incident settled),
+    the BLOCKED record a verified restore superseded, and the BLOCKED record of
+    an incident already RECOVERED. One isolated write per record; a failure on
+    one is logged and leaves that record for the next tick without stopping
+    the others. Returns the ids closed this tick. Nothing is deleted.
     """
 
     closed_ids: list[str] = []
@@ -411,13 +483,15 @@ def close_compile_blocked_workflows(
     ):
         try:
             if never_dispatched_reasons(workflow):
-                closed = close_settled_incident_blocked_workflow(
-                    store, workflow, now=now
-                )
-            else:
-                closed = close_compile_blocked_workflow(
+                closed = close_verified_restore_blocked_workflow(
                     store, workflow, now=now
                 ) or close_settled_incident_blocked_workflow(store, workflow, now=now)
+            else:
+                closed = (
+                    close_compile_blocked_workflow(store, workflow, now=now)
+                    or close_verified_restore_blocked_workflow(store, workflow, now=now)
+                    or close_settled_incident_blocked_workflow(store, workflow, now=now)
+                )
         except Exception:  # noqa: BLE001 - keep sweeping, leave the record as read
             LOGGER.exception(
                 "compile-time BLOCKED close failed, workflow left as it was: %s",

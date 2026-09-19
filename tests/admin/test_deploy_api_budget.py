@@ -770,17 +770,13 @@ def test_reaping_an_exited_cli_distinguishes_disappearance_from_unknown_reads(
         with monkeypatch.context() as reads:
             reads.setattr(Path, "stat", observed_stat)
             reads.setattr(Path, "read_text", observed_read)
-            if last_read == "missing":
-                with budget.api_slot("http"):
-                    assert len(observations) >= 2, (
-                        "the fixture must exercise disappearance during the repeated probe"
-                    )
-            else:
-                with pytest.raises(budget.ApiBudgetError, match="running API command"):
-                    with budget.api_slot("http"):
-                        pytest.fail(
-                            "unknown process identity must not release a reservation"
-                        )
+            # A reaper is a sibling of the lease's owner: an unknown re-read
+            # keeps the reservation charged but never fails the reaper's own
+            # command (the owner alone refuses to release a running CLI).
+            with budget.api_slot("http"):
+                assert len(observations) >= 2, (
+                    "the fixture must exercise disappearance during the repeated probe"
+                )
         with sqlite3.connect(root / "budget.sqlite3") as database:
             held = database.execute("SELECT id FROM leases").fetchall()
             finished = database.execute(

@@ -850,6 +850,11 @@ class WorkflowEventCode(StrEnum):
     # Operator reconciliation (``record_operator_event`` via the Store)
     OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
     OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
+    # An operator confirmed, on fleet and Kubernetes evidence, the outcome of
+    # a node action the executor could not observe (``submit-remediation
+    # --disposition confirm-node-action``); kind OPERATOR_RECONCILED. The
+    # step stays FAILED; only its ``outcome_unknown`` is answered.
+    NODE_ACTION_CONFIRMED = "NODE_ACTION_CONFIRMED"
     # The incident this workflow belonged to was closed RECOVERED after the
     # workflow had ended (``IncidentClosureService``): by the restore that
     # freed its node (kind TERMINAL) or by an operator (kind

@@ -337,17 +337,50 @@ def workflow_errors(
     return errors
 
 
+def product_hold_reasons(state: dict[str, Any]) -> list[str]:
+    """Why the product still owns recovery, spelled out.
+
+    The same complete-inventory rule the CPU restore gate applies
+    (``recovery_safety_errors``): a workflow that is not terminal or retains
+    NEEDS_OPERATOR, a remote command that is not terminal, or a receipt whose
+    physical outcome is unresolved. Empty means the product has let go.
+    """
+    workflow, commands = state.get("workflow"), state.get("commands")
+    if not isinstance(workflow, dict) or not isinstance(commands, list):
+        return ["workflow or remote command inventory is incomplete"]
+    reasons: list[str] = []
+    status, kind = workflow.get("status"), workflow.get("blocked_kind")
+    if status not in {"SUCCEEDED", "FAILED", "SUPERSEDED"}:
+        reasons.append(f"workflow is {status}" + (f"/{kind}" if kind else ""))
+    elif kind == "NEEDS_OPERATOR":
+        reasons.append("workflow retains NEEDS_OPERATOR")
+    for error in recovery_safety_errors([workflow], commands):
+        if error not in reasons:
+            reasons.append(error)
+    return reasons
+
+
 def recovery_cleanup_hold(state: dict[str, Any]) -> bool:
     """No cancellation, timeout or incomplete read proves physical quiescence."""
-    workflow, commands = state.get("workflow"), state.get("commands")
-    if (
-        not isinstance(workflow, dict)
-        or workflow.get("status") not in {"SUCCEEDED", "FAILED", "SUPERSEDED"}
-        or workflow.get("blocked_kind") == "NEEDS_OPERATOR"
-        or not isinstance(commands, list)
-    ):
-        return True
-    return bool(recovery_safety_errors([workflow], commands))
+    return bool(product_hold_reasons(state))
+
+
+def operator_hold_reasons(
+    product_reasons: list[str], sibling_proof: dict[str, Any]
+) -> list[str]:
+    """Everything an operator would still have to confirm before restoration.
+
+    Two sources: the product's own hold (``product_hold_reasons``) and the
+    sibling's physical outcome, which the host recovery record proves when
+    the node runs a new boot with its Agent restored. Both empty releases the
+    hold; a truly unknown outcome (node never back, boot id unchanged, Agent
+    neither restored nor restorable) keeps it.
+    """
+    reasons = [f"product: {reason}" for reason in product_reasons]
+    if not sibling_proof.get("proven"):
+        gaps = sibling_proof.get("gaps") or ["no host recovery record"]
+        reasons.append("sibling reboot is unproven: " + "; ".join(gaps))
+    return reasons
 
 
 def host_errors(

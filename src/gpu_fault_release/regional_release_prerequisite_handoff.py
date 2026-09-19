@@ -1,4 +1,13 @@
-"""A cleaned, unadopted bootstrap may retire its original Aurora repair."""
+"""An unadopted Aurora repair may be retired by the candidate that follows it.
+
+Two shapes exist. A cleaned bootstrap hands its repair to another candidate
+(``validate_bootstrap_repair_handoff``). An upgrade candidate that died after
+its repair reached READY but before its application transaction began leaves
+an orphan over a committed release; that candidate never returns, because a
+release id is a digest of the tree, so the next candidate retires the orphan
+(``validate_upgrade_repair_handoff``). Both restore the original refresher
+from the journal's snapshot before anything of the new candidate is applied.
+"""
 
 from __future__ import annotations
 
@@ -202,3 +211,105 @@ def bootstrap_handoff_audit(record: dict[str, Any]) -> dict[str, Any]:
         "record_sha256": canonical_sha256(record),
         "restored_at": datetime.now(UTC).isoformat(),
     }
+
+
+def validate_upgrade_repair_handoff(
+    release: RegionalRelease,
+    state: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate an upgrade repair whose candidate died before its application.
+
+    The journal is trusted only against its own fully hashed baseline: the live
+    state minus the journal must still be the committed, quiescent release the
+    repair was prepared over (``complete``, committed, cleanup done, and not the
+    abandoned candidate), so nothing that candidate did outlived it except the
+    refresher objects the journal's snapshot restores. Bootstrap, commit-live
+    and in-flight application transactions are refused here; they keep their
+    own paths.
+    """
+    record = state.get(AURORA_PREREQUISITE_REPAIR_KEY)
+    if not isinstance(record, dict) or type(record.get("schema_version")) is not int:
+        raise ReleaseError("upgrade prerequisite handoff record is invalid")
+    binding = record.get("binding")
+    if (
+        record["schema_version"] != 1
+        or not isinstance(binding, dict)
+        or set(binding) not in (_BINDING_FIELDS, _BINDING_FIELDS | {"bootstrap"})
+        or binding.get("bootstrap", False) is not False
+        or binding.get("commit_live") is not False
+        or canonical_sha256(binding) != record.get("binding_sha256")
+        or not isinstance(binding.get("release_id"), str)
+        or not binding["release_id"]
+        or binding["release_id"] == release.release_id
+        or re.fullmatch(r"[a-f0-9]{32}", str(record.get("attempt_id") or "")) is None
+        or not isinstance(record.get("status"), str)
+        or record.get("status") not in {"PREPARED", "APPLYING", "READY", "FAILED"}
+        or binding.get("execution_plan")
+        != ReleaseExecutionPlan(
+            (ReleaseComponent.AURORA_REFRESH, ReleaseComponent.VERIFY)
+        ).as_dict()
+    ):
+        raise ReleaseError("upgrade prerequisite handoff binding is invalid")
+    baseline = validated_prerequisite_baseline(state, record)
+    live_release_id = state.get("release_id")
+    for value in (state, baseline):
+        if (
+            value.get("phase") != "complete"
+            or value.get("transaction_committed") is not True
+            or value.get("release_lifecycle") != "COMMITTED"
+            or value.get("commit_cleanup_completed") is not True
+            or not isinstance(live_release_id, str)
+            or not live_release_id
+            or value.get("release_id") != live_release_id
+            or live_release_id == binding["release_id"]
+        ):
+            raise ReleaseError(
+                "upgrade prerequisite handoff requires a committed release that "
+                "never adopted the abandoned candidate"
+            )
+    if (
+        binding.get("cpu_eks_arn") != release.config.cpu_eks_arn
+        or binding.get("namespace") != release.config.namespace
+        or binding.get("database") != identity
+    ):
+        raise ReleaseError("upgrade prerequisite handoff site or database drifted")
+    if (
+        re.fullmatch(r"[a-f0-9]{64}", str(binding["manifest_sha256"])) is None
+        or not isinstance(binding["wheel_config_map"], str)
+        or not binding["wheel_config_map"]
+        or canonical_sha256(record.get("previous_refresher"))
+        != record.get("snapshot_sha256")
+    ):
+        raise ReleaseError("upgrade prerequisite predecessor snapshot differs")
+    require_digest_pinned_image("previous upgrade refresher", binding["runtime_image"])
+    validate_aurora_refresh_snapshot(release, record.get("previous_refresher"))
+    jobs = record.get("jobs")
+    if (
+        not isinstance(jobs, dict)
+        or set(jobs) - {"credential", "store"}
+        or any(
+            not isinstance(job, dict)
+            or not isinstance(job.get("status"), str)
+            or job.get("status") not in {"PLANNED", "RUNNING", "REMOVED"}
+            or not isinstance(job.get("owner_uid"), str)
+            or not job["owner_uid"]
+            for job in jobs.values()
+        )
+    ):
+        raise ReleaseError("upgrade prerequisite handoff Job journal is invalid")
+    return record
+
+
+def upgrade_handoff_audit(
+    record: dict[str, Any], *, state_sha256: str
+) -> dict[str, Any]:
+    """The predecessor audit plus the state digest the deploy diff was pinned to.
+
+    The deploy driver pins the release-state digest it planned against and the
+    apply step compares it again; a repair's own transition is bridged by the
+    record's ``baseline_sha256``. After a handoff the state the driver saw held
+    the predecessor journal, so the successor carries that digest as well.
+    """
+    return {**bootstrap_handoff_audit(record), "state_sha256": state_sha256}

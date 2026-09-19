@@ -2,6 +2,7 @@
   "tests/admin/test_admin_bootstrap_site.py:admin_bootstrap._ensure_public_subnets": 1,
   "tests/admin/test_admin_bootstrap_site.py:admin_bootstrap._site_document": 1,
   "tests/admin/test_admin_cluster_join.py:admin_cluster_join._parallel_prerequisites": 1,
+  "tests/admin/test_api_budget_exec_transient.py:budget._identity_gone": 2,
   "tests/app_services/test_admission_regional_auth.py:AdmissionRuntimeFactory._decode_json_body": 2,
   "tests/app_services/test_cleanup_budget.py:runner._cleanup_round": 2,
   "tests/app_services/test_cleanup_budget.py:runner._owns_task_lease": 2,

@@ -499,12 +499,13 @@ class TransactionalWorkflowMixin:
         reconciled_at: datetime,
         actor: str | None = None,
         approval: Mapping[str, object] | None = None,
-    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan | None]:
         """Terminalize a BLOCKED record whose successor restored the node.
 
         ``actor`` (the operator's STS ARN) and ``approval`` (the plan digests
         the operator approved) go on the ``OPERATOR_RECONCILED`` event appended
-        in this same transaction (I1); a refused write records nothing.
+        in this same transaction (I1); a refused write records nothing. A
+        record that was never plan-driven locks and writes no plan row.
         """
 
         with self._state_transaction(f"workflow_reconcile/{workflow_request_id}"):
@@ -517,9 +518,11 @@ class TransactionalWorkflowMixin:
             workflow = rows[workflow_request_id]
             successor = rows[successor_workflow_id]
             self._require_incident_pointer(workflow, incident)
-            if not workflow.source_plan_id:
-                raise ValueError("workflow has no source recovery plan")
-            source_plan = self._locked("plan", workflow.source_plan_id)
+            source_plan = (
+                self._locked("plan", workflow.source_plan_id)
+                if workflow.source_plan_id
+                else None
+            )
             updated_workflow, updated_incident, updated_plan = (
                 reconciled_restore_records(
                     workflow,
@@ -554,7 +557,8 @@ class TransactionalWorkflowMixin:
             )
             self._put("workflow", workflow_request_id, updated_workflow)
             self._put("incident", incident.incident_id, updated_incident)
-            self._put("plan", source_plan.plan_id, updated_plan)
+            if updated_plan is not None:
+                self._put("plan", updated_plan.plan_id, updated_plan)
             return updated_workflow, updated_incident, updated_plan
 
     def reconcile_retired_generation_workflow(

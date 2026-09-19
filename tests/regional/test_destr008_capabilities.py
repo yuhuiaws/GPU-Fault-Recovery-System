@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 from scripts.e2e.regional import destr008_capabilities as checks
 from scripts.e2e.regional.regional_live_fixture import (
@@ -418,3 +419,33 @@ def test_probe_source_mutation_during_read_is_rejected(
     monkeypatch.setattr(checks, "PROBE_SOURCE", path)
     with pytest.raises(RuntimeError, match="changed while reading"):
         checks.probe_source()
+
+
+ROOT = Path(__file__).resolve().parents[2]
+ROLE_MANIFESTS = {
+    "cpu": ROOT
+    / "deploy/control-plane/regional/generated/gpu-fault-api-ha-ingress.yaml",
+    "gpu": ROOT / "deploy/dataplane/cluster-action-executor.yaml",
+}
+
+
+def test_capability_targets_name_the_deployed_deployment_objects() -> None:
+    """The probe fetches ``get deployment <name>``: the name must be the object's
+    ``metadata.name`` in the role manifest, not the manifest file name (the
+    ingress file is ``gpu-fault-api-ha-ingress.yaml`` for a Deployment called
+    ``gpu-fault-api-ha``; the live preflight answered NotFound for the file name)."""
+
+    for plane, name, label in checks.TARGETS:
+        documents = [
+            item
+            for item in yaml.safe_load_all(ROLE_MANIFESTS[plane].read_text())
+            if isinstance(item, dict) and item.get("kind") == "Deployment"
+        ]
+        names = {item["metadata"]["name"] for item in documents}
+        assert name in names, (plane, name, sorted(names))
+        deployment = next(
+            item for item in documents if item["metadata"]["name"] == name
+        )
+        assert (
+            deployment["spec"]["template"]["metadata"]["labels"].get("app") == label
+        ), (plane, label)

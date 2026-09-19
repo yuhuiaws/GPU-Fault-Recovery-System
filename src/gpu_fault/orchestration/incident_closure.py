@@ -51,7 +51,10 @@ from gpu_fault.compile_blocked import (
     OPEN_REMOTE_STATUSES,
     close_settled_incident_blocked_workflow,
 )
-from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action,
+    node_actions_operator_confirmed,
+)
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
     FaultIncident,
@@ -547,7 +550,15 @@ class IncidentClosureService:
                 [],
             )
         open_workflow = self._open_workflow(incident)
-        if open_workflow is not None:
+        if open_workflow is not None and not (
+            # A BLOCKED / NEEDS_OPERATOR record whose node action an operator
+            # confirmed on evidence holds the node as paperwork only. When the
+            # node evidence also clears every node, the operator closing the
+            # incident is the act the record was waiting for, and the close
+            # settles it (``_settle_blocked_workflow``). Without clearing
+            # evidence the record keeps refusing the close (DESTR-014).
+            isolation_reasons and self._operator_settled(open_workflow)
+        ):
             status = open_workflow.status.value
             if open_workflow.blocked_kind is not None:
                 status = f"{status}/{open_workflow.blocked_kind.value}"
@@ -559,6 +570,36 @@ class IncidentClosureService:
                 [],
             )
         return None, None, isolation_reasons
+
+    def _operator_settled(self, workflow: WorkflowRequest) -> bool:
+        """A parked record whose only hold on the node is its status.
+
+        Every reason ``_open_workflow`` may have returned it for must be absent
+        except the occupying status itself: no owner, no live lease, no
+        WAITING step, no open remote command, and the physical uncertainty
+        answered by an operator confirmation (``node_actions_operator_confirmed``).
+        """
+
+        if not node_actions_operator_confirmed(workflow):
+            return False
+        if (
+            workflow.execution_owner_id is not None
+            or (
+                workflow.execution_lease_expires_at is not None
+                and workflow.execution_lease_expires_at > datetime.now(timezone.utc)
+            )
+            or any(
+                item.status is WorkflowStepStatus.WAITING
+                for item in workflow.step_executions
+            )
+        ):
+            return False
+        return not any(
+            command.status in OPEN_REMOTE_STATUSES
+            for command in self.store.list_remote_commands(
+                workflow_request_ids=[workflow.request_id]
+            )
+        )
 
     def _open_workflow(self, incident: FaultIncident) -> WorkflowRequest | None:
         """A workflow of ``incident`` that still gates the node, if any.

@@ -10,6 +10,7 @@ import pytest
 
 from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr016_preempting_reboot as case
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional import test_destr016_preempting_reboot as data
 from tests.regional._cov95_destr_branches import ready_runtime
@@ -334,8 +335,24 @@ class PreemptionProbe:
             return deepcopy(self.h.after if self.h.rebooted else self.h.baseline)
         if action == "write-xid46":
             self.h.injected = True
+        if action == "arm-holder":
+            self.h.armed_drill_id = args[args.index("--drill-id") + 1]
+            self.h.armed_device = args[args.index("--device") + 1]
         if action == "pre-authorize":
             proof = json.loads(args[args.index("--authorization") + 1])
+            # The real probe (check_pre_authorization) refuses a proof whose
+            # drill id or device is not the armed holder's; the live run of
+            # 2026-09-18 died there with the reset injection's "-r" drill id.
+            if proof.get("drill_id") != getattr(self.h, "armed_drill_id", None):
+                raise HostProbeError(
+                    "host probe failed (exit 1); output withheld"
+                    " [fake: pre-authorization does not bind this holder]"
+                )
+            if proof.get("device") != getattr(self.h, "armed_device", None):
+                raise HostProbeError(
+                    "host probe failed (exit 1); output withheld"
+                    " [fake: pre-authorization device is not the holder's]"
+                )
             self.h.pre_authorization = proof
             self.h.call("pre-authorization", proof)
         if action == "holder-status":

@@ -135,6 +135,7 @@ class HostProbeFixture:
                 ):
                     raise HostProbeError("host probe ownership record is not private")
                 record = json.loads(self.state_path.read_text())
+                record = self._adopt_superseded_record(record)
                 if (
                     not isinstance(record, dict)
                     or record.get("schema_version") != 1
@@ -174,6 +175,34 @@ class HostProbeFixture:
             os.close(descriptor)
             self._lock_fd = None
             raise
+
+    def _adopt_superseded_record(self, record: Any) -> Any:
+        """A CLOSED record left by an earlier version of the same probe script.
+
+        Records are keyed by (case, run, node); a later attempt sweeping an
+        earlier attempt's identity meets that record with the old
+        ``script_sha256`` (DESTR-017's fence probe after the 2026-09-18
+        redesign refused its own preflight this way). A closed record with no
+        script left on the node owns nothing, so it is adopted under the
+        current script digest; anything open, or differing in any other scope
+        field, is still refused.
+        """
+
+        if (
+            not isinstance(record, dict)
+            or record.get("closed") is not True
+            or record.get("script_may_exist") is not False
+            or not isinstance(record.get("scope"), dict)
+        ):
+            return record
+        theirs = {k: v for k, v in record["scope"].items() if k != "script_sha256"}
+        ours = {k: v for k, v in self._scope.items() if k != "script_sha256"}
+        if theirs != ours or record["scope"] == self._scope:
+            return record
+        adopted = dict(record)
+        adopted["superseded_script_sha256"] = record["scope"].get("script_sha256")
+        adopted["scope"] = dict(self._scope)
+        return adopted
 
     def _release(self) -> None:
         if self._lock_fd is not None:

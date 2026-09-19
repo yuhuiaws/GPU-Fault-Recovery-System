@@ -31,7 +31,7 @@
     "scripts/e2e/regional/run_collector_acceptance.py": 1860,
     "scripts/e2e/regional/run_collector_destructive.py": 1594,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1552,
-    "scripts/e2e/regional/run_notification_acceptance.py": 1632,
+    "scripts/e2e/regional/run_notification_acceptance.py": 1626,
     "scripts/e2e/regional/run_workload_acceptance.py": 2220,
     "src/gpu_fault/admin/bootstrap.py": 1978,
     "src/gpu_fault/execution/dispatcher.py": 1692,

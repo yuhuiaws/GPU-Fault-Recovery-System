@@ -57,6 +57,8 @@ from scripts.e2e.regional.destr014_cleanup import (  # noqa: E402
     _ledger as _ledger,
     _restore_isolated_nodes as _restore_isolated_nodes,
     recreate_probe as recreate_probe,
+    resume_hold_review,
+    wait_agent_unit,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     replica_vanished,
@@ -130,9 +132,10 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     host_errors,
     injection_errors,
     lifetime_errors,
+    operator_hold_reasons,
+    product_hold_reasons,
     quarantine_taint_value,
     reset_reached_commit,
-    recovery_cleanup_hold,
     schedulability_errors,
     step_transitions,
     workflow_errors,
@@ -812,6 +815,11 @@ class _LiveRun:
     resumed: bool = False
     injection_started: bool = False
     physical_outcome_unknown: bool = False
+    # The two sources of the hold, recorded for the operator: the product's
+    # (None until the workflow was read) and the sibling's host proof.
+    product_hold_reasons: list[str] | None = None
+    hold_reasons: list[str] | None = None
+    sibling_reboot_proof: dict[str, Any] = field(default_factory=dict)
 
 
 def _checkpoint(run: _LiveRun) -> None:
@@ -823,6 +831,8 @@ def _checkpoint(run: _LiveRun) -> None:
             agent_disabled=run.agent_disabled,
             injection_started=run.injection_started,
             physical_outcome_unknown=run.physical_outcome_unknown,
+            hold_reasons=run.hold_reasons,
+            sibling_reboot_proof=run.sibling_reboot_proof,
             incident_id=run.incident_id,
             follow_up_incident_id=run.follow_up_incident_id,
             marker=run.marker,
@@ -973,6 +983,10 @@ def _build_live_run(
         run.started_at = datetime.fromisoformat(
             saved.get("started_at") or run.started_at.isoformat()
         )
+        if isinstance(saved.get("hold_reasons"), list):
+            run.hold_reasons = [str(item) for item in saved["hold_reasons"]]
+        if isinstance(saved.get("sibling_reboot_proof"), dict):
+            run.sibling_reboot_proof = dict(saved["sibling_reboot_proof"])
     return run
 
 
@@ -1174,10 +1188,12 @@ def _control_plane_errors(
         or state.get("workflow_failure_reason"),
         reboot_outcome="unknown",
     )
-    # A missing/partial read is not a known failure. Persist the hold before
-    # any cleanup, including a cleanup-only restart of this runner.
-    run.physical_outcome_unknown = (
-        run.physical_outcome_unknown or recovery_cleanup_hold(state)
+    # A missing/partial read is not a known failure. The product's share of
+    # the hold is read here and persisted before any cleanup; the sibling's
+    # physical proof only exists once the data plane has its Agent back.
+    run.product_hold_reasons = product_hold_reasons(state)
+    run.physical_outcome_unknown = run.physical_outcome_unknown or bool(
+        run.product_hold_reasons
     )
     # The support escalation that follows an exhausted branch lives on its own
     # incident/workflow pair keyed by the failed workflow's id; read that pair
@@ -1196,25 +1212,6 @@ def _control_plane_errors(
     ):
         errors.append("unknown reboot generated an executable recovery successor")
     return errors, workflow, incident
-
-
-def _wait_agent_unit(
-    probe: HostProbeFixture, run_id: str, *, timeout_seconds: int = 120
-) -> dict[str, Any]:
-    """The sibling's host snapshot once its Node Agent unit is enabled and
-    active again, or the last sample when the wait runs out."""
-
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        snapshot = probe.execute("snapshot", "--run-id", run_id)
-        unit = snapshot.get("agent_unit") or {}
-        if unit.get("ActiveState") == "active" and str(
-            unit.get("UnitFileState") or ""
-        ).startswith("enabled"):
-            return snapshot
-        if time.monotonic() >= deadline:
-            return snapshot
-        time.sleep(5)
 
 
 def _data_plane_errors(
@@ -1243,8 +1240,21 @@ def _data_plane_errors(
     _checkpoint(run)
     # ``systemctl start`` returns before the unit reports active; judge the
     # settled state, not the first sample (attempt 9, 2026-09-09).
-    sibling_agent_after = _wait_agent_unit(run.sibling_probe, run_id)
+    sibling_agent_after = wait_agent_unit(run.sibling_probe, run_id)
     write_json_atomic(run.case_dir / "sibling-agent-after.json", sibling_agent_after)
+    # The sibling's physical outcome: a new boot with its Agent restored, read
+    # from the host record and this snapshot. It settles the runner's share of
+    # the hold; the product's share stays whatever the workflow read said.
+    run.sibling_reboot_proof = recovery.reboot_restore_proof(
+        restored,
+        run.recovery_window.binding,
+        agent_unit=sibling_agent_after.get("agent_unit") or {},
+    )
+    run.hold_reasons = operator_hold_reasons(
+        run.product_hold_reasons or [], run.sibling_reboot_proof
+    )
+    run.physical_outcome_unknown = bool(run.hold_reasons)
+    _checkpoint(run)
     errors.extend(
         host_errors(
             fault_baseline={
@@ -1328,6 +1338,7 @@ def execute_case(
         if run.resumed:
             cleanup_permitted = False
             _resume_identity_guard(run)
+            resume_hold_review(run)
             cleanup_permitted = True
             raise RegionalFixtureError(
                 "resumed DESTR-014 attempt is cleanup-only; scenario was not rerun"
@@ -1346,11 +1357,14 @@ def execute_case(
             "provider_events": provider,
         }
         components = evidence_components(details)
+        held = run.physical_outcome_unknown
         result.update(
             {
-                "verdict": "BLOCKED" if not errors else "FAIL",
+                "verdict": ("BLOCKED" if held else "PASS") if not errors else "FAIL",
                 "scenario_verdict": "PASS" if not errors else "FAIL",
-                "operator_review_required": run.physical_outcome_unknown,
+                "operator_review_required": held,
+                "hold_reasons": run.hold_reasons,
+                "sibling_reboot_proof": run.sibling_reboot_proof,
                 "proof_scope": "unknown-reboot-hold",
                 "errors": errors,
                 "incident_id": run.incident_id,
@@ -1399,6 +1413,8 @@ def execute_case(
                     agent_disabled=run.agent_disabled,
                     recovery_window=getattr(run, "recovery_window", None),
                     operator_hold=getattr(run, "physical_outcome_unknown", False),
+                    hold_reasons=getattr(run, "hold_reasons", None) or (),
+                    product_hold_reasons=getattr(run, "product_hold_reasons", None),
                     profile_version=str(
                         (run.preflight["store"].get("profile") or {}).get(
                             "profile_version"

@@ -459,12 +459,37 @@ def history_capability_script() -> str:
     )
 
 
+RAW_LIST_PATHS = {
+    ("replicaset", "apps/v1"): "/apis/apps/v1/namespaces/{namespace}/replicasets",
+    ("pod", "v1"): "/api/v1/namespaces/{namespace}/pods",
+}
+
+
+def raw_list_path(kind: str, api_version: str, namespace: str) -> str:
+    """The server's own typed list for ``kind``.
+
+    ``kubectl get <kind> -o json`` (client v1.35 here) always prints a
+    client-side ``v1/List`` with an empty ``resourceVersion``, so the
+    population check below -- typed list kind, a resource version to bind the
+    survey to, no ``continue`` -- can only be satisfied by the API's list
+    itself, read through ``kubectl get --raw``.
+    """
+
+    try:
+        return RAW_LIST_PATHS[kind, api_version].format(namespace=namespace)
+    except KeyError:
+        raise RegionalFixtureError(
+            f"CPU capability population has no raw list for {kind}"
+        ) from None
+
+
 def _runtime_list(
     regional: RegionalLiveFixture, kind: str, api_version: str, list_kind: str
 ) -> list[dict[str, Any]]:
+    path = raw_list_path(kind, api_version, regional.settings.namespace)
     try:
         value = _object(
-            json.loads(regional.kubectl("cpu", "get", kind, "-o", "json", timeout=30))
+            json.loads(regional.kubectl("cpu", "get", "--raw", path, timeout=30))
         )
     except (TypeError, ValueError):
         raise RegionalFixtureError(

@@ -1,23 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr009_workload_restart as workload_case
 from scripts.e2e.regional import run_destr015_parallel_branch_join as case
 from scripts.e2e.regional.destr015_physical_evidence import (
     ResetIntervalScope,
     evidence_digest,
 )
-from scripts.e2e.regional.regional_live_fixture import RUNTIME_IDENTITY_DEPLOYMENTS
+from scripts.e2e.regional.late_ownership_barrier import BoundaryDenied
+from scripts.e2e.regional.regional_live_fixture import (
+    RUNTIME_IDENTITY_DEPLOYMENTS,
+    RegionalFixtureError,
+)
 from tests.regional._cov95_destr_warm import NOW, Clock, profile, regional_settings
 from tests.regional.test_acceptance_physical_interval_alignment import (
-    BASE,
     SECOND,
     interval_fixture,
 )
@@ -29,6 +34,17 @@ from tests.regional.test_destr015_parallel_branch_join import (
     happy_incident,
     happy_workflow,
 )
+
+# The fake hosts' monotonic clocks start here and advance in lockstep with the
+# harness clock; the runner's own stamps start at RUNNER_BASE. Both are
+# arbitrary, the verdict only ever reads differences and exchange pairs.
+HOST_BASE_NS = 50 * SECOND
+RUNNER_BASE_NS = 1000 * SECOND
+# The minutes the two parallel reset branches take on the real cluster between
+# the arm and the collection; the fake advances the clock by this much when the
+# records are collected so the host and runner spans agree.
+COLLECT_ELAPSED_SECONDS = 100
+WITNESS_STATE_ROOT = "/var/lib/gpu-fault-acceptance/destr015"
 
 
 def ready_runtime() -> dict[str, Any]:
@@ -174,6 +190,15 @@ class BranchHarness:
         self.events: list[dict[str, Any]] = []
         self.log_text = "healthy control plane"
         self.restore_status = "SUCCEEDED"
+        # The kubelet outage the parallel quiesce causes: after the XID writes
+        # every node is NotReady for this many harness seconds (``None`` keeps
+        # the nodes Ready, ``inf`` never brings one back). ``arm_refusal`` is
+        # the host's own reason for refusing to place a witness.
+        self.outage_seconds: float | None = None
+        self.permanent_outage: set[str] = set()
+        self.reboot_during_outage: set[str] = set()
+        self.not_ready_until: dict[str, float] = {}
+        self.arm_refusal: dict[str, str] = {}
         self.regional = BranchRegional(self)
         self.workload = BranchWorkload(self)
         self.prewarm = BranchPrewarm(self)
@@ -185,7 +210,7 @@ class BranchHarness:
         monkeypatch.setattr(
             case, "HostProbeFixture", lambda settings: BranchProbe(self, settings.node)
         )
-        monkeypatch.setattr(case, "ResetIntervalWitness", BranchWitness)
+        monkeypatch.setattr(case, "DetachedResetWitness", BranchWitness)
         monkeypatch.setattr(case, "focused_tests", self.focused)
         monkeypatch.setattr(case, "predecessor_evidence", self.predecessor)
         monkeypatch.setattr(case, "replica_env", self.replica_env)
@@ -195,12 +220,37 @@ class BranchHarness:
         for module in (case, workload_case):
             monkeypatch.setattr(module, "time", self.clock)
             monkeypatch.setattr(module, "datetime", self.clock)
+        # The reachability decision reads the clock too: cleanup's failsafe must
+        # measure the same time the harness advances.
+        monkeypatch.setattr(authorization, "datetime", self.clock)
 
     def call(self, name: str, detail: Any = None) -> None:
         self.calls.append((name, deepcopy(detail)))
         self.clock.sleep(self.advance_at.get(name, 0))
         if name in self.failures:
             raise self.failures[name]
+
+    def node_ready(self, node: str) -> bool:
+        """What kubelet answers right now: Ready unless the quiesce outage holds."""
+
+        if self.nodes[node].get("ready") != "True":
+            return False
+        return self.clock.elapsed >= self.not_ready_until.get(node, 0.0)
+
+    def begin_outage(self) -> None:
+        for node in NODES:
+            if node in self.permanent_outage:
+                self.not_ready_until[node] = float("inf")
+            elif self.outage_seconds is not None:
+                self.not_ready_until[node] = self.clock.elapsed + self.outage_seconds
+            if node in self.reboot_during_outage:
+                self.nodes[node]["boot_id"] = f"boot-{node}-rebooted"
+
+    def runner_ns(self) -> int:
+        return RUNNER_BASE_NS + int(self.clock.elapsed * SECOND)
+
+    def host_ns(self) -> int:
+        return HOST_BASE_NS + int(self.clock.elapsed * SECOND)
 
     def focused(self, _path: Path, **kwargs: Any) -> dict[str, Any]:
         return {"passed": self.tests_pass, "focused_tests_reused": bool(kwargs)}
@@ -239,44 +289,246 @@ class BranchHarness:
 
 
 class BranchWitness:
-    """Complete physical receipts at the transport boundary, real verdict downstream."""
+    """The detached witness at the transport boundary; real verdicts downstream.
 
-    def __init__(self, probe: Any, scope: ResetIntervalScope) -> None:
-        self.h = probe.h
+    Mirrors the probe refusals the runner depends on: ``arm`` refuses a
+    lifetime outside the probe's bounds or a scope whose boot id is not this
+    host's, ``collect`` refuses a changed boot id, and every request is a
+    ``kubectl exec`` that a NotReady node cannot answer. The records it returns
+    have the shape the real probe writes, with a host clock that advances in
+    lockstep with the harness clock, so the interval arithmetic downstream is
+    the real one.
+    """
+
+    def __init__(
+        self,
+        regional: Any,
+        probe: Any,
+        scope: ResetIntervalScope,
+        *,
+        lifetime_seconds: int,
+    ) -> None:
+        self.h: BranchHarness = probe.h
+        self.regional = regional
         self.scope = scope
-        self.capture = interval_fixture()[0]["node-a"]
-        shift = int(NOW.timestamp() * SECOND) - BASE
-        start = self.capture["start"]
+        self.node = scope.node
+        self.lifetime_seconds = lifetime_seconds
+        self.bundle_sha256 = "f" * 64
+        self.receipt: dict[str, Any] | None = None
+        self.collection: dict[str, Any] | None = None
+        self.last_status: dict[str, Any] | None = None
+        self.exchanges: list[dict[str, Any]] = []
+        self.armed_at: Any = None
+        self.arm_mono_ns = 0
+        self.wall_ns = 0
+        self._last: tuple[dict[str, int], dict[str, int]] = ({}, {})
+        capture = interval_fixture()[0]["node-a"]
+        start = capture["start"]
         start.update(scope_sha256=scope.digest(), witness_id=f"witness-{scope.node}")
         start["tracee"]["boot_id"] = scope.boot_id
         start["producer"]["boot_id"] = scope.boot_id
-        end = self.capture["end"]
-        end.update(**start, start_sha256=evidence_digest(start))
-        end["wall_minus_monotonic_min_ns"] += shift
-        end["wall_minus_monotonic_max_ns"] += shift
-        action = end["actions"][0]
-        action["gpu_uuid"] = scope.gpu_uuid
-        delay = 0 if scope.node == NODES[0] else 5 * SECOND
-        action["started_ns"] += shift + delay
-        action["ended_ns"] += shift + delay
-        self.h.physical_captures[scope.node] = self.capture
+        self.start = start
+        self.end_template = capture["end"]
+        digest = hashlib.sha256(scope.run_id.encode()).hexdigest()[:16]
+        self.unit = f"gpu-fault-destr015-witness-{digest}.service"
+        self.state_dir = f"{WITNESS_STATE_ROOT}/{scope.run_id}"
 
-    def start(self) -> None:
-        self.h.call("witness.start", self.scope.node)
-        for row in self.h.hosts_after[self.scope.node]["ledger"]:
+    def _exec(self, kind: str) -> tuple[int, dict[str, int]]:
+        self.h.call(f"witness.{kind}", self.node)
+        if not self.h.node_ready(self.node):
+            raise BoundaryDenied(
+                f"physical witness {kind}: exec into {self.node} failed; "
+                "kubelet is not answering (node NotReady)"
+            )
+        return self.h.runner_ns(), self._host_clock()
+
+    def _host_clock(self) -> dict[str, int]:
+        mono = self.h.host_ns()
+        return {"monotonic_ns": mono, "realtime_ns": self.wall_ns + mono}
+
+    def _finish(self, kind: str, sent: int, start_clock: dict[str, int]) -> None:
+        self.h.clock.sleep(1)
+        clock = self._host_clock()
+        self.exchanges.append(
+            {
+                "kind": kind,
+                "sent_ns": sent,
+                "received_ns": self.h.runner_ns(),
+                "monotonic_ns": clock["monotonic_ns"],
+                "realtime_ns": clock["realtime_ns"],
+                "runner_sent_realtime_ns": int(self.h.clock.time() * SECOND) - SECOND,
+                "runner_received_realtime_ns": int(self.h.clock.time() * SECOND),
+            }
+        )
+        self._last = (start_clock, clock)
+
+    def arm(self) -> dict[str, Any]:
+        sent, start_clock = self._exec("arm")
+        if not 600 <= self.lifetime_seconds <= 7200:
+            raise BoundaryDenied(
+                "physical witness arm refused: witness lifetime is outside its bounds"
+            )
+        if self.scope.boot_id != self.h.baselines[self.node]["boot_id"]:
+            raise BoundaryDenied(
+                "physical witness arm refused: host boot id differs from the scope"
+            )
+        if self.h.arm_refusal.get(self.node):
+            raise BoundaryDenied(
+                f"physical witness arm refused: {self.h.arm_refusal[self.node]}"
+            )
+        # The host's realtime clock is pinned so the reset lands inside the
+        # ledger command window the fake host snapshot reports (NOW..NOW+40s).
+        self.wall_ns = int(NOW.timestamp() * SECOND) - self.h.host_ns() - SECOND
+        start_clock = self._host_clock()
+        armed_mono = start_clock["monotonic_ns"] + SECOND // 2
+        armed = {
+            "case_id": case.CASE_ID,
+            "record": "armed",
+            "run_id": self.scope.run_id,
+            "node": self.node,
+            "scope_sha256": self.scope.digest(),
+            "unit": self.unit,
+            "invocation_id": f"invocation-{self.node}",
+            "witness_id": self.start["witness_id"],
+            "boot_id": self.scope.boot_id,
+            "monotonic_ns": armed_mono,
+            "realtime_ns": self.wall_ns + armed_mono,
+            "start": deepcopy(self.start),
+            "ledger_baseline_command_ids": [],
+        }
+        self._finish("arm", sent, start_clock)
+        self.arm_mono_ns = self._last[1]["monotonic_ns"]
+        self.receipt = {
+            "run_id": self.scope.run_id,
+            "node": self.node,
+            "unit": self.unit,
+            "state_dir": self.state_dir,
+            "lifetime_seconds": self.lifetime_seconds,
+            "boot_id": self.scope.boot_id,
+            "program_sha256": self.bundle_sha256,
+            "armed": armed,
+            "host_clock_start": self._last[0],
+            "host_clock": self._last[1],
+            "runner_clock": {"monotonic_ns": sent, "realtime_ns": 0},
+            "unit_state": {"ActiveState": "active", "SubState": "running"},
+        }
+        self.armed_at = self.h.clock.now(timezone.utc)
+        for row in self.h.hosts_after[self.node]["ledger"]:
             if row["operation"] == "RESET_GPU":
                 row["gpu_uuids"] = [self.scope.gpu_uuid]
+        self.h.physical_captures[self.node] = deepcopy(self.receipt)
+        return self.receipt
 
-    def poll(self) -> None:
-        self.h.call("witness.poll", self.scope.node)
+    def _final(self, mono: int) -> dict[str, Any]:
+        # The reset the tracer saw: two seconds after the arm response (four
+        # for the second node), nine seconds long, so the two intervals overlap
+        # by five seconds after the clock uncertainty is charged.
+        delay = 2 * SECOND if self.node == NODES[0] else 4 * SECOND
+        began = self.arm_mono_ns + delay + self.wall_ns
+        end = deepcopy(self.end_template)
+        end.update(**self.start, start_sha256=evidence_digest(self.start))
+        action = end["actions"][0]
+        action.update(
+            gpu_uuid=self.scope.gpu_uuid, started_ns=began, ended_ns=began + 9 * SECOND
+        )
+        return {
+            "case_id": case.CASE_ID,
+            "record": "final",
+            "run_id": self.scope.run_id,
+            "node": self.node,
+            "scope_sha256": self.scope.digest(),
+            "unit": self.unit,
+            "invocation_id": f"invocation-{self.node}",
+            "witness_id": self.start["witness_id"],
+            "boot_id": self.scope.boot_id,
+            "monotonic_ns": mono,
+            "realtime_ns": self.wall_ns + mono,
+            "reason": "finish-request",
+            "start_sha256": end["start_sha256"],
+            "trace_complete": True,
+            "closed": True,
+            "lost_events": 0,
+            "trace_sha256": end["trace_sha256"],
+            "trace_bytes": end["trace_bytes"],
+            "calibration_execs": end["calibration_execs"],
+            "actions": end["actions"],
+            "wall_minus_monotonic_min_ns": self.wall_ns,
+            "wall_minus_monotonic_max_ns": self.wall_ns,
+            "refusal": None,
+            "ledger_reset_rows": [],
+        }
 
-    def finish(self) -> dict[str, Any]:
-        self.h.call("witness.finish", self.scope.node)
-        return deepcopy(self.capture)
+    def collect(self) -> dict[str, Any]:
+        if self.receipt is None:
+            raise BoundaryDenied("physical witness was never armed")
+        # The parallel reset took minutes on the cluster before the runner could
+        # reach the node again.
+        self.h.clock.sleep(COLLECT_ELAPSED_SECONDS)
+        sent, start_clock = self._exec("collect")
+        if self.h.nodes[self.node]["boot_id"] != self.scope.boot_id:
+            raise BoundaryDenied(
+                "physical witness collect refused: host boot id changed since the "
+                "witness was armed; its records are not this boot's"
+            )
+        final = self._final(start_clock["monotonic_ns"] + SECOND // 2)
+        self._finish("collect", sent, start_clock)
+        self.collection = {
+            "run_id": self.scope.run_id,
+            "node": self.node,
+            "unit": self.unit,
+            "state_dir": self.state_dir,
+            "boot_id": self.scope.boot_id,
+            "state": {
+                "run_id": self.scope.run_id,
+                "node": self.node,
+                "phase": "ARMED",
+                "scope_sha256": self.scope.digest(),
+                "boot_id": self.scope.boot_id,
+                "unit": self.unit,
+                "lifetime_seconds": self.lifetime_seconds,
+            },
+            "armed": deepcopy(self.receipt["armed"]),
+            "final": final,
+            "finish_requested": start_clock,
+            "unit_state": {"ActiveState": "inactive", "SubState": "dead"},
+            "host_clock_start": self._last[0],
+            "host_clock": self._last[1],
+        }
+        self.h.physical_captures[self.node] = deepcopy(self.collection)
+        return self.collection
 
-    def close(self) -> dict[str, bool]:
-        self.h.call("witness.close", self.scope.node)
-        return {"closed": True}
+    def disarm(self) -> dict[str, Any]:
+        self._exec("disarm")
+        return {
+            "run_id": self.scope.run_id,
+            "unit": self.unit,
+            "unit_state": {"ActiveState": "inactive"},
+            "state_present": self.receipt is not None,
+            "boot_id": self.h.nodes[self.node]["boot_id"],
+        }
+
+    def status(self) -> dict[str, Any]:
+        self._exec("status")
+        self.last_status = {
+            "run_id": self.scope.run_id,
+            "unit": self.unit,
+            "unit_state": {"ActiveState": "inactive"},
+            "state": {"phase": "REFUSED", "refusal": self.h.arm_refusal.get(self.node)},
+            "armed": None,
+            "final": None,
+            "boot_id": self.h.nodes[self.node]["boot_id"],
+        }
+        return self.last_status
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "scope": self.scope.model_dump(mode="json"),
+            "lifetime_seconds": self.lifetime_seconds,
+            "bundle_sha256": self.bundle_sha256,
+            "receipt": self.receipt,
+            "collection": self.collection,
+            "exchanges": list(self.exchanges),
+        }
 
 
 class BranchRegional:
@@ -293,7 +545,29 @@ class BranchRegional:
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         self.h.call("node.snapshot", node)
-        return deepcopy(self.h.nodes[node])
+        snapshot = deepcopy(self.h.nodes[node])
+        if not self.h.node_ready(node):
+            snapshot["ready"] = "False"
+        return snapshot
+
+    def wait_node_ready(
+        self, node: str, *, timeout_seconds: int, expected_boot_id: str | None = None
+    ) -> dict[str, Any]:
+        self.h.call(
+            "node.wait_ready", {"node": node, "timeout_seconds": timeout_seconds}
+        )
+        deadline = self.h.clock.monotonic() + timeout_seconds
+        while True:
+            snapshot = self.node_snapshot(node)
+            rebooted = expected_boot_id is None or (
+                bool(snapshot.get("boot_id"))
+                and snapshot["boot_id"] != expected_boot_id
+            )
+            if snapshot.get("ready") == "True" and rebooted:
+                return snapshot
+            if self.h.clock.monotonic() >= deadline:
+                raise RegionalFixtureError(f"node did not return Ready: {snapshot}")
+            self.h.clock.sleep(10)
 
     def store_snapshot(self, **kwargs: Any) -> dict[str, Any]:
         self.h.call("store", kwargs)
@@ -410,7 +684,7 @@ class BranchWorkload:
         self.restart_state = state
 
     def wait_restarted(self, uids: set[str], **kwargs: Any) -> dict[str, Any]:
-        assert self.restart_state is not None
+        assert self.restart_state is not None, "a restart needs its authorizing state"
         self.h.call("workload.restarted", {"source_uids": uids, **kwargs})
         return {"pods": branch_pods(restarted=True)}
 
@@ -438,16 +712,30 @@ class BranchPrewarm:
 
 
 class BranchProbe:
+    """The host probe Pod on one node. Every action is a ``kubectl exec`` (or a
+    Ready wait), which a NotReady node cannot answer: the fake refuses exactly
+    where the real transport would fail, so a runner that execs into a
+    quiesced node fails the test instead of passing on a fake that answers."""
+
     def __init__(self, harness: BranchHarness, node: str) -> None:
         self.h = harness
         self.node = node
         self.host_script = "/fake/probe.py"
 
+    def _require_kubelet(self, action: str) -> None:
+        if not self.h.node_ready(self.node):
+            raise RegionalFixtureError(
+                f"{action}: exec into {self.node} failed; kubelet is not answering "
+                "(node NotReady)"
+            )
+
     def create(self) -> None:
         self.h.call("probe.create", self.node)
+        self._require_kubelet("probe.create")
 
     def execute(self, action: str, *args: str, **kwargs: Any) -> dict[str, Any]:
         self.h.call(f"probe.{action}", {"node": self.node, "args": args, **kwargs})
+        self._require_kubelet(f"probe.{action}")
         if action == "snapshot":
             return deepcopy(
                 self.h.hosts_after[self.node]
@@ -456,11 +744,14 @@ class BranchProbe:
             )
         if action == "write-xid46":
             self.h.injected.add(self.node)
+            if len(self.h.injected) == len(NODES):
+                self.h.begin_outage()
             return {"xid": 46, "node": self.node}
         raise AssertionError(f"unhandled fake host action: {action}")
 
     def cleanup(self) -> dict[str, bool]:
         self.h.call("probe.cleanup", self.node)
+        self._require_kubelet("probe.cleanup")
         return dict(self.h.probe_residuals)
 
 

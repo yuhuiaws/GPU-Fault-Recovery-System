@@ -610,3 +610,60 @@ def test_plan_text_names_supersession() -> None:
     assert plan["mutation"].startswith("superseded by GF-REGIONAL-NOTIFY-001"), plan[
         "mutation"
     ]
+
+
+def test_notify001_ignores_drill_tagged_live_records_skipped_by_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESTR-001/HA-003/HA-004 inject with a drill id, so their real reset's
+    GPU_RESET_COMPLETED record is SKIPPED by the drill policy. That is not an
+    unverified live delivery: the runner must fall back to its drill and only
+    list the record (attempt 3 of 2026-09-18 wrongly refused here)."""
+    skipped = {
+        **_live("gpu-reset"),
+        "notification_id": "n-destr001-reset",
+        "drill_id": "destr001-remaining-a2-r",
+        "status": "SKIPPED",
+        "provider_message_id_present": False,
+    }
+    drills = _install_notify001_fakes(
+        monkeypatch, live_records=[skipped, _live("workload-restart")]
+    )
+
+    result = notification.run_notify001(
+        SimpleNamespace(),
+        SimpleNamespace(cluster_id="cluster-a"),
+        attempt=1,
+        run_dir=tmp_path,
+        receipt_evidence=None,
+        ses_window_evidence=None,
+    )
+
+    assert result["sources"] == {"gpu-reset": "drill", "workload-restart": "live"}
+    assert result["drill_tagged_live_records"] == {
+        "gpu-reset": ["n-destr001-reset"],
+        "workload-restart": [],
+    }
+    assert drills == ["gpu-reset", "gpu-reset"]
+
+
+def test_notify001_still_refuses_a_real_record_that_was_not_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    undelivered = {
+        **_live("gpu-reset"),
+        "status": "SKIPPED",
+        "provider_message_id_present": False,
+    }
+    _install_notify001_fakes(monkeypatch, live_records=[undelivered])
+    with pytest.raises(
+        notification.NotificationAcceptanceError, match="unverified live delivery"
+    ):
+        notification.run_notify001(
+            SimpleNamespace(),
+            SimpleNamespace(cluster_id="cluster-a"),
+            attempt=1,
+            run_dir=tmp_path,
+            receipt_evidence=None,
+            ses_window_evidence=None,
+        )

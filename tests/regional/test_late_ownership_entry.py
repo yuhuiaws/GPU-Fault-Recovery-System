@@ -187,7 +187,9 @@ def test_module_footer_delegates_to_mocked_guard_without_any_cli_or_live_io(
     assert calls == ["mocked-guard"]
 
 
-@pytest.mark.parametrize("role", ["executor", "node", "reset-interval"])
+@pytest.mark.parametrize(
+    "role", ["executor", "node", "reset-interval", "reset-interval-detached"]
+)
 def test_bundle_contains_only_pinned_owned_acceptance_sources(monkeypatch, role):
     program, digest = bundle.probe_program(role)
     assert len(digest) == 64

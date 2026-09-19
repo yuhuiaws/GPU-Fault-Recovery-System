@@ -37,7 +37,10 @@ from tests.orchestration._cov95_runtime_resolution import (
             {"execution_lease_expires_at": NOW + timedelta(seconds=1)},
             "lease has not expired",
         ),
-        ("workflow", {"source_plan_id": None}, "no source recovery plan"),
+        # A plan-driven record must link to the plan it names; a record that
+        # was never plan-driven is reconciled by its verified successor and
+        # is pinned in tests/test_workflow_reconcile_non_plan_successor.py.
+        ("workflow", {"source_plan_id": "other-plan"}, "plan linkage is invalid"),
         ("incident", {"state": IncidentState.ACTION_PENDING}, "not RECOVERED"),
         (
             "incident",

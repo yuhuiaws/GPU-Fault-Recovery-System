@@ -52,6 +52,10 @@ class HostHarness:
         self.cgroup = ""
         self.running: dict[str, bool] = {}
         self.overrides: dict[str, dict[str, str]] = {}
+        # A reboot may enumerate the root NVMe device under another number;
+        # every lstat on the new boot reports a shifted st_dev so the identity
+        # checks are exercised the way the host would present them.
+        self.device_shift = 0
         self.scope = binding()
         self.base = tmp_path
         root = tmp_path / "persistent"
@@ -105,9 +109,19 @@ class HostHarness:
                 return SimpleNamespace(
                     st_mode=stat.S_IFLNK | 0o777,
                     st_uid=info.st_uid,
-                    st_dev=info.st_dev,
+                    st_dev=info.st_dev + self.device_shift,
                     st_ino=info.st_ino,
                     st_nlink=info.st_nlink,
+                )
+            if self.device_shift:
+                return SimpleNamespace(
+                    st_mode=info.st_mode,
+                    st_uid=info.st_uid,
+                    st_dev=info.st_dev + self.device_shift,
+                    st_ino=info.st_ino,
+                    st_nlink=info.st_nlink,
+                    st_mtime_ns=info.st_mtime_ns,
+                    st_ctime_ns=info.st_ctime_ns,
                 )
             return info
 
@@ -241,14 +255,33 @@ class HostHarness:
         data.update(values)
         probe.atomic_state(self.recovery.state_path, data)
 
-    def reboot(self) -> None:
+    def reboot(self, *, renumber_devices: bool = False) -> None:
         self.boot = "boot-after"
+        if renumber_devices:
+            self.device_shift += 1
         self.agent_active = self.enable.exists()
         self.running.clear()
         self.running[self.recovery.timer] = (
             probe.SYSTEMD / "timers.target.wants" / self.recovery.timer
         ).exists()
         self.invocation = "post-reboot-invocation"
+
+    def installer_reinstall(self, *, enable: bool = True) -> None:
+        """The product's node-installer reconciler on the new boot: it rewrites
+        the unit file and the runtime entrypoint (new content, new ctime) and,
+        unless told otherwise, recreates the enable link under a fresh inode
+        pointing at the installer unit and starts the Agent."""
+
+        self.fragment.write_text("[Service]\nType=simple\n# reinstalled\n")
+        entrypoint = Path(self.links[probe.CURRENT]) / "venv/bin/gpu-fault-node-agent"
+        entrypoint.write_text("entrypoint reinstalled")
+        if not enable:
+            return
+        if self.enable.exists():
+            self.enable.unlink()
+            self.links.pop(self.enable, None)
+        self.symlink(str(self.fragment), self.enable)
+        self.agent_active = True
 
 
 @pytest.fixture
@@ -391,8 +424,10 @@ def test_lost_acks_and_crashes_are_recoverable_without_replaying_disable(
         if point == "restore-link-ack":
             original_publish = probe.publish
 
-            def lost_link(source: Path, target: Path, identity: dict[str, Any]) -> None:
-                original_publish(source, target, identity)
+            def lost_link(
+                source: Path, target: Path, identity: dict[str, Any], **kwargs: Any
+            ) -> None:
+                original_publish(source, target, identity, **kwargs)
                 if target == host.enable:
                     raise TimeoutError("link ACK lost")
 
@@ -480,8 +515,10 @@ def test_install_link_ack_loss_has_durable_ownership_for_partial_cleanup(
 ) -> None:
     original = probe.publish
 
-    def lost(source: Path, target: Path, identity: dict[str, Any]) -> None:
-        original(source, target, identity)
+    def lost(
+        source: Path, target: Path, identity: dict[str, Any], **kwargs: Any
+    ) -> None:
+        original(source, target, identity, **kwargs)
         if source.name == resource:
             raise TimeoutError("publish ACK lost")
 
@@ -845,3 +882,263 @@ def test_nonregular_file_and_unsafe_directory_are_rejected(tmp_path: Path) -> No
     path.chmod(0o666)
     with pytest.raises(probe.RecoveryError, match="not owned"):
         probe.file_identity(path)
+
+
+def test_tick_accepts_the_timer_running_its_own_unit(host: HostHarness) -> None:
+    """While the independent tick executes, systemd reports the timer's
+    SubState as ``running`` (verified on a HyperPod node); the tick must not
+    refuse itself as "not armed" -- that refusal starved every ACK live."""
+
+    host.recovery.prepare()
+    host.overrides[host.recovery.timer] = {"SubState": "running"}
+    report = host.tick()
+    assert report["phase"] == "ARMED", report
+    assert report["ack"] and report["ack"]["boot_id"], report
+    assert report["last_tick_error"] is None, report
+
+
+def test_a_refused_tick_leaves_its_reason_for_status(host: HostHarness) -> None:
+    """The service discards stdout/stderr, so the reason a tick refused must
+    survive in the journal where the runner's ``status`` poll can read it."""
+
+    host.recovery.prepare()
+    host.overrides[host.recovery.timer] = {"SubState": "elapsed"}
+    with pytest.raises(probe.RecoveryError):
+        host.tick()
+    assert host.read()["last_tick_error"] == "persistent recovery timer is not armed"
+    # Once the timer is healthy again, ``status`` still reports what refused.
+    del host.overrides[host.recovery.timer]
+    assert (
+        host.recovery.status()["last_tick_error"]
+        == "persistent recovery timer is not armed"
+    )
+    assert host.tick()["phase"] == "ARMED"
+
+
+def _agent_starts(host: HostHarness) -> list[tuple[str, ...]]:
+    return [c for c in host.calls if c[0] == "start" and c[-1] == probe.AGENT]
+
+
+def _spy_systemctl(host: HostHarness) -> list[tuple[tuple[str, ...], bool]]:
+    """Every systemctl call paired with whether the owned drop-in still existed."""
+
+    seen: list[tuple[tuple[str, ...], bool]] = []
+    original = host.systemctl
+
+    def spy(*args: str) -> dict[str, str]:
+        seen.append((args, host.recovery.dropin.exists()))
+        return original(*args)
+
+    host.monkeypatch.setattr(probe, "systemctl", spy)
+    return seen
+
+
+def test_new_boot_accepts_the_installer_restored_agent_and_retires(
+    host: HostHarness,
+) -> None:
+    """Live: the product's reboot brought the node back, the node-installer
+    reconciler re-enabled the Agent under a new link inode and rewrote the
+    unit, and every tick on the new boot refused with "Node Agent or host
+    incarnation changed" while the 45 s start bound stayed installed. A new
+    boot cannot present the armed identity; the installer's Agent is the
+    restoration and the probe's only remaining job is to retire itself."""
+
+    host.arm()
+    host.recovery.disable()
+    host.reboot(renumber_devices=True)
+    host.installer_reinstall()
+    installer_link = probe.file_identity(host.enable)
+    seen = _spy_systemctl(host)
+    host.now = host.scope["restore_at"] - 60
+    report = host.tick()
+    assert report["phase"] == "RESTORED", report
+    assert report["restored_by"] == "reboot-installer", report
+    assert report["boot_id_observed"] == "boot-after", report
+    assert report["retired"] is True, report
+    assert probe.file_identity(host.enable) == installer_link, (
+        "the installer's enable link is not the probe's to touch"
+    )
+    assert not host.recovery.dropin.exists(), (
+        "the owned start bound must leave with the probe"
+    )
+    assert not (probe.SYSTEMD / host.recovery.timer).exists(), (
+        "the installer-restored Agent needs no persistent timer"
+    )
+    assert not (probe.SYSTEMD / host.recovery.service).exists(), (
+        "the recovery service unit must be retired"
+    )
+    assert host.systemctl("show", probe.AGENT)["JobTimeoutUSec"] == "infinity"
+    assert (("daemon-reload",), False) in seen, (
+        "systemd must reload after the drop-in is gone, before any later Agent start"
+    )
+    assert _agent_starts(host) == [], "an installer-restored Agent is never restarted"
+    closed = probe.Recovery(host.scope).cleanup()
+    assert closed["phase"] == "CLOSED" and closed["restored_by"] == "reboot-installer"
+    assert probe.file_identity(host.enable) == installer_link, (
+        "cleanup must not replace the installer's link with the saved inode"
+    )
+
+
+def test_new_boot_restores_a_missing_link_from_the_saved_copy_at_the_deadline(
+    host: HostHarness,
+) -> None:
+    """The installer rewrote the unit on the new boot but did not re-enable it:
+    the saved inode is still the only enable link this recovery may publish,
+    and only from the deadline on, exactly as on the original boot."""
+
+    original = probe.file_identity(host.enable)
+    host.arm()
+    host.recovery.disable()
+    host.reboot(renumber_devices=True)
+    host.installer_reinstall(enable=False)
+    host.now = host.scope["restore_at"] - 1
+    assert host.tick()["phase"] == "DISABLED"
+    assert not host.enable.exists(), "no enable before the deadline on any boot"
+    host.now += 1
+    report = host.tick()
+    assert report["phase"] == "RESTORED", report
+    assert report["restored_by"] == "probe", report
+    assert report["restore_reason"] == "deadline", report
+    assert report["boot_id_observed"] == "boot-after" and report["retired"] is True
+    saved = probe.file_identity(host.enable)
+    assert {k: v for k, v in saved.items() if k != "dev"} == {
+        k: v for k, v in original.items() if k != "dev"
+    }, "the restored link must be the saved inode, not a fresh one"
+    assert host.agent_active, "the deadline restore must start the Agent"
+    assert _agent_starts(host) == [
+        ("start", "--no-block", "--job-mode=fail", probe.AGENT)
+    ]
+    assert not host.recovery.dropin.exists(), "retirement must release the drop-in"
+    assert probe.Recovery(host.scope).cleanup()["phase"] == "CLOSED"
+
+
+def test_new_boot_expiry_retires_without_a_late_start_despite_identity_drift(
+    host: HostHarness,
+) -> None:
+    host.arm()
+    host.recovery.disable()
+    host.reboot(renumber_devices=True)
+    host.installer_reinstall(enable=False)
+    host.now = host.scope["expires_at"]
+    report = host.tick()
+    assert report["phase"] == "EXPIRED", report
+    assert report["retired"] is True and report["boot_id_observed"] == "boot-after"
+    assert report["expired_at"] == host.now, report
+    assert not host.enable.exists() and not host.agent_active
+    assert _agent_starts(host) == [], "expiry must never issue a late Agent start"
+    assert not (probe.SYSTEMD / host.recovery.timer).exists(), (
+        "expiry must retire the persistent timer on the new boot"
+    )
+    assert not host.recovery.dropin.exists(), "expiry must release the owned drop-in"
+    with pytest.raises(probe.RecoveryError, match="restoration proof"):
+        probe.Recovery(host.scope).cleanup()
+
+
+def test_new_boot_expired_recovery_closes_once_the_installer_brought_the_agent_back(
+    host: HostHarness,
+) -> None:
+    host.arm()
+    host.recovery.disable()
+    host.reboot()
+    host.now = host.scope["expires_at"]
+    assert host.tick()["phase"] == "EXPIRED"
+    host.installer_reinstall()
+    report = probe.Recovery(host.scope).cleanup()
+    assert report["phase"] == "CLOSED", report
+    assert report["restored_by"] == "reboot-installer", report
+    assert report["expired_at"] == host.scope["expires_at"], report
+    assert _agent_starts(host) == []
+
+
+def test_original_boot_keeps_refusing_identity_drift_and_recreated_links(
+    host: HostHarness,
+) -> None:
+    host.arm()
+    host.recovery.disable()
+    host.installer_reinstall(enable=False)
+    with pytest.raises(probe.RecoveryError, match="incarnation changed"):
+        host.recovery.restore()
+    assert not host.enable.exists(), "drifted identity must not publish the link"
+    assert host.read()["phase"] == "RESTORING"
+    host.fragment.write_text("[Service]\nType=simple\n")
+    host.symlink(str(host.fragment), host.enable)
+    recreated = probe.file_identity(host.enable)
+    with pytest.raises(probe.RecoveryError):
+        probe.Recovery(host.scope).cleanup()
+    assert probe.file_identity(host.enable) == recreated, (
+        "a recreated link on the original boot is never adopted or replaced"
+    )
+    assert host.read()["phase"] != "CLOSED"
+
+
+def test_new_boot_foreign_enable_link_is_never_touched(host: HostHarness) -> None:
+    host.arm()
+    host.recovery.disable()
+    host.reboot()
+    host.symlink(str(probe.SYSTEMD / "other.service"), host.enable)
+    foreign = probe.file_identity(host.enable)
+    host.now = host.scope["restore_at"]
+    with pytest.raises(probe.RecoveryError, match="unknown owner"):
+        host.tick()
+    assert host.read()["last_tick_error"] == (
+        "Node Agent enable link has an unknown owner; manual recovery required"
+    )
+    assert probe.file_identity(host.enable) == foreign
+    assert (probe.SYSTEMD / host.recovery.timer).exists(), (
+        "an unresolved recovery keeps its timer until expiry"
+    )
+    host.now = host.scope["expires_at"]
+    assert host.tick()["phase"] == "EXPIRED"
+    assert probe.file_identity(host.enable) == foreign
+    assert not (probe.SYSTEMD / host.recovery.timer).exists(), (
+        "expiry retires the probe's own timer even beside a foreign link"
+    )
+    with pytest.raises(probe.RecoveryError, match="restoration proof"):
+        probe.Recovery(host.scope).cleanup()
+    assert _agent_starts(host) == []
+
+
+def test_new_boot_before_disable_retires_the_armed_recovery(host: HostHarness) -> None:
+    host.arm()
+    host.reboot()
+    with pytest.raises(probe.RecoveryError, match="independent"):
+        host.recovery.disable()
+    report = host.tick()
+    assert report["phase"] == "RESTORED" and report["restored_by"] is None, report
+    assert report["retired"] is True and host.enable.exists()
+    assert probe.Recovery(host.scope).cleanup()["phase"] == "CLOSED"
+
+
+def test_new_boot_installer_agent_still_starting_is_retried_not_adopted(
+    host: HostHarness,
+) -> None:
+    host.arm()
+    host.recovery.disable()
+    host.reboot()
+    host.installer_reinstall()
+    host.agent_active = False
+    with pytest.raises(probe.RecoveryError, match="not enabled, active and idle"):
+        host.tick()
+    assert host.read()["phase"] == "RESTORING"
+    assert host.recovery.dropin.exists(), "an unproven Agent keeps the start bound"
+    host.agent_active = True
+    report = host.tick()
+    assert report["phase"] == "RESTORED" and report["restored_by"] == "reboot-installer"
+    assert _agent_starts(host) == []
+
+
+def test_new_boot_report_carries_the_boot_and_retirement_receipts(
+    host: HostHarness,
+) -> None:
+    host.arm()
+    report = host.recovery.status()
+    assert report["boot_id_observed"] is None and report["retired"] is False
+    assert report["restored_by"] is None and report["expired_at"] is None
+    host.recovery.disable()
+    host.reboot()
+    host.installer_reinstall()
+    host.tick()
+    status = probe.Recovery(host.scope).status()
+    assert status["boot_id_observed"] == "boot-after"
+    assert status["restored_by"] == "reboot-installer"
+    assert status["retired"] is True

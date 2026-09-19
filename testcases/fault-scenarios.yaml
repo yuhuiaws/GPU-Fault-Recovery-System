@@ -3461,8 +3461,8 @@ test_cases:
     verified:
       case_digest: f549089ca028420ab4f8d7c8300980c9bbfb5a26d4fc7ea0e81f0dd7bf224e11
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        control_plane: 14e1f1ea8ab545a11d9f66a464d735f1c4344fd23d6d2edbd913e1aef092fc95
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
         node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
@@ -3974,7 +3974,7 @@ test_cases:
     verified:
       case_digest: 64810a8685612b1dff602e3db4740e1098e51303518777c49e94122461aa49d7
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        control_plane: 14e1f1ea8ab545a11d9f66a464d735f1c4344fd23d6d2edbd913e1aef092fc95
         executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
         node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
@@ -4362,7 +4362,13 @@ test_cases:
   - 节点回到 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；GPU 容量回到基线；quiesce state 文件与 NVIDIA compute client 无残留，基线 active 的服务全部回到 active
   - 清理后：持有者与 arm 单元已幂等解除、探针 Pod 与 ConfigMap 无残留、远端命令静默；若节点仍隔离，只允许经 validated-restore 工作流解除，任何清理失败直接判 FAIL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4a4d0394c3e7a8440e2dce837442a513c07704e53041719225a88f2205538525
+      components:
+        control_plane: 14e1f1ea8ab545a11d9f66a464d735f1c4344fd23d6d2edbd913e1aef092fc95
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-016
   related_pytest: tests/regional/test_destr016_preempting_reboot.py::test_destr016_workflow_contract_preempts_the_reset_and_reboots_once
@@ -4761,8 +4767,8 @@ test_cases:
     verified:
       case_digest: 6b0293fd73df64e2e7349a24e54c8bebc876d99005998bee1d952ac0b7d9a3f9
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        control_plane: 14e1f1ea8ab545a11d9f66a464d735f1c4344fd23d6d2edbd913e1aef092fc95
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
         node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-001

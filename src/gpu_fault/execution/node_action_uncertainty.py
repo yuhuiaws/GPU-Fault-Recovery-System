@@ -10,6 +10,7 @@ from gpu_fault.models import (
     StepPhase,
     WorkflowOperation,
     WorkflowRequest,
+    WorkflowStatus,
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
@@ -24,6 +25,43 @@ if TYPE_CHECKING:
     from gpu_fault.store.contracts import ControlPlaneStore
 
 UNRESOLVED_NODE_ACTION = "NODE_ACTION_OUTCOME_UNRESOLVED"
+# ``details`` key under which ``gpu-fault-admin submit-remediation --disposition
+# confirm-node-action`` records the operator's confirmation of a node action
+# whose outcome the executor never observed (DESTR-014: the node rebooted while
+# its agent was down, so the RESTART_NODE failed at its cap with
+# ``outcome_unknown``). Written by ``execution.node_action_confirmation``; read
+# here so a confirmed record resolves everywhere the uncertainty is judged.
+OPERATOR_CONFIRMED_KEY = "operator_confirmed"
+# A confirmation is only one when it says who, under which reference, when,
+# on which node and for which operation; anything less is not honoured.
+OPERATOR_CONFIRMATION_REQUIRED_KEYS = (
+    "actor",
+    "reference",
+    "confirmed_at",
+    "node_id",
+    "operation",
+)
+
+
+def operator_confirmation(details: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The operator confirmation ``details`` carries, or ``None``.
+
+    The reader side of ``OPERATOR_CONFIRMED_KEY``: the writer records the
+    evidence it judged verbatim, and this only checks the attribution is
+    complete. A confirmation beats the uncertainty flags beside it -- the
+    operator judged later evidence than the receipt that set them, and a
+    refreshed receipt for the *same* command must not reopen the question
+    (``refresh_remote_action_state`` keeps a confirmed record as written).
+    """
+
+    value = details.get(OPERATOR_CONFIRMED_KEY)
+    if not isinstance(value, Mapping):
+        return None
+    for key in OPERATOR_CONFIRMATION_REQUIRED_KEYS:
+        item = value.get(key)
+        if not isinstance(item, str) or not item:
+            return None
+    return dict(value)
 
 
 def unresolved_node_action(execution: WorkflowStepExecution) -> bool:
@@ -40,6 +78,8 @@ def unresolved_node_action(execution: WorkflowStepExecution) -> bool:
 
 
 def _unresolved_details(details: Mapping[str, Any]) -> bool:
+    if operator_confirmation(details) is not None:
+        return False
     if any(
         details.get(name) is True
         for name in (
@@ -234,7 +274,14 @@ def refresh_remote_action_state(
             if unresolved:
                 executions.append(snapshot)
             continue
-        if previous.status is WorkflowStepStatus.SUCCEEDED:
+        if (
+            previous.status is WorkflowStepStatus.SUCCEEDED
+            or operator_confirmation(previous.details) is not None
+        ):
+            # A finished step, or one whose outcome an operator confirmed on
+            # evidence, is not rewritten by a receipt for the same command.
+            # A *different* command still unresolved on this step is a new
+            # question and is appended as its own record.
             if (
                 unresolved
                 and previous.adapter_operation_id != snapshot.adapter_operation_id
@@ -279,6 +326,45 @@ def has_unresolved_node_action(
         if unresolved_node_action(execution):
             return True
     return False
+
+
+def latest_node_action_executions(
+    workflow: WorkflowRequest,
+) -> list[WorkflowStepExecution]:
+    """The newest record of every node-mutating step, in execution order.
+
+    The same identity rule ``has_unresolved_node_action`` applies: one record
+    per (phase, step index, operation), the last written one answering.
+    """
+
+    seen: set[tuple[StepPhase | None, int, WorkflowOperation]] = set()
+    latest: list[WorkflowStepExecution] = []
+    for execution in reversed(workflow.step_executions):
+        identity = (execution.phase, execution.step_index, execution.operation)
+        if identity in seen or execution.operation not in NODE_MUTATING_OPERATIONS:
+            continue
+        seen.add(identity)
+        latest.append(execution)
+    latest.reverse()
+    return latest
+
+
+def node_actions_operator_confirmed(workflow: WorkflowRequest) -> bool:
+    """Whether a BLOCKED record's physical uncertainty was answered by hand.
+
+    True when the record is BLOCKED, at least one of its node actions carries
+    an operator confirmation and none is still unresolved. Such a record holds
+    its node only as paperwork: the incident close (on node evidence) and the
+    dispatcher's settled-incident sweep may end it, where an unconfirmed
+    NEEDS_OPERATOR record must keep occupying the node (F-A4). Not BLOCKED
+    means not parked, and the predicate does not apply.
+    """
+
+    if workflow.status is not WorkflowStatus.BLOCKED:
+        return False
+    latest = latest_node_action_executions(workflow)
+    confirmed = any(operator_confirmation(item.details) is not None for item in latest)
+    return confirmed and not any(unresolved_node_action(item) for item in latest)
 
 
 def restoration_refusal(

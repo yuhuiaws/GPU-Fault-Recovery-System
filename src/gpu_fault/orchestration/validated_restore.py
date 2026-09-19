@@ -132,13 +132,18 @@ def build_validated_restore_workflow(
     incident's nodes). The incident's GPU scope goes on the steps only when
     the steps cover exactly the incident's nodes: a restore of some other node
     (the fixture restoring a spare) must not name GPUs that node does not have
-    (DESTR-003, 2026-09-08). ``node_gpu_uuids`` can split GPU/fabric validation
-    into single-node steps when every incident GPU has exactly one target owner
-    and every target has inventory. It never removes an incident GPU: absence
-    from inventory may be the hardware failure being validated. Unknown,
-    incomplete or ambiguous ownership keeps the original scope and its per-GPU
-    telemetry requirement. The incident moves to ACTION_PENDING, points at the
-    workflow, and records ``reason`` (default ``restore_reason``).
+    (DESTR-003, 2026-09-08), and a restore of a *subset* of the incident's
+    nodes (``submit-remediation --disposition restore`` after the workflow
+    itself restored the others) validates node-wide for the same reason -- a
+    GPU the incident named may sit on a node outside the subset, and a scope
+    that can only time out looks like a sick node (DESTR-014, 2026-09-14).
+    ``node_gpu_uuids`` can split GPU/fabric validation into single-node steps
+    when every incident GPU has exactly one target owner and every target has
+    inventory. It never removes an incident GPU: absence from inventory may be
+    the hardware failure being validated. Unknown, incomplete or ambiguous
+    ownership keeps the original scope and its per-GPU telemetry requirement.
+    The incident moves to ACTION_PENDING, points at the workflow, and records
+    ``reason`` (default ``restore_reason``).
     """
 
     step_nodes = sorted(set(node_ids if node_ids is not None else incident.node_ids))

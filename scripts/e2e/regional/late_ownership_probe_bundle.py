@@ -17,7 +17,13 @@ ENTRIES = {
     "executor": "scripts/e2e/regional/probes/late_ownership_executor_probe.py",
     "node": "scripts/e2e/regional/probes/late_ownership_node_probe.py",
     "reset-interval": "scripts/e2e/regional/probes/destr015_physical_probe.py",
+    "reset-interval-detached": "scripts/e2e/regional/probes/destr015_witness_probe.py",
 }
+# The detached DESTR-015 witness runs as a systemd unit on the host, so its
+# program is this same pinned bundle copied to durable storage by ``arm``; the
+# streaming ``reset-interval`` role keeps its stdio protocol untouched.
+TRACE_ROLES = frozenset({"node", "reset-interval", "reset-interval-detached"})
+Role = Literal["executor", "node", "reset-interval", "reset-interval-detached"]
 
 
 def stdin_loader(program: str) -> str:
@@ -33,17 +39,26 @@ def stdin_loader(program: str) -> str:
     )
 
 
-def probe_program(
-    role: Literal["executor", "node", "reset-interval"],
-) -> tuple[str, str]:
+def probe_files(role: Role) -> tuple[str, ...]:
+    """The pinned acceptance sources one probe role ships, entry included."""
     files: tuple[str, ...] = (*COMMON, ENTRIES[role])
-    if role in {"node", "reset-interval"}:
+    if role in TRACE_ROLES:
         files += (
             "scripts/e2e/regional/late_ownership_trace.py",
             "scripts/e2e/regional/probes/late_ownership_tracer_child.py",
         )
-    if role == "reset-interval":
+    if role in {"reset-interval", "reset-interval-detached"}:
         files += ("scripts/e2e/regional/destr015_physical_evidence.py",)
+    if role == "reset-interval-detached":
+        # The detached witness reuses the streaming probe's clock envelope and
+        # reset-event parser as a library; that module's stdio entrypoint is
+        # never invoked by the unit.
+        files += (ENTRIES["reset-interval"],)
+    return files
+
+
+def probe_program(role: Role) -> tuple[str, str]:
+    files = probe_files(role)
     sources = {name: (ROOT / name).read_text(encoding="utf-8") for name in files}
     raw = json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(raw).hexdigest()

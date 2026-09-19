@@ -140,6 +140,7 @@ class CommandDispatch:
                     request=self.execution_request(command),
                     idempotency_key=command.idempotency_key,
                 ),
+                command=command,
             )
             return self.outcome_result(
                 outcome, lease_token, operation=command.step.operation
@@ -148,16 +149,27 @@ class CommandDispatch:
             return self._classify_failure(exc, command, lease_token)
 
     def execute_adapter(
-        self, adapter: Any, context: WorkflowStepContext
+        self,
+        adapter: Any,
+        context: WorkflowStepContext,
+        *,
+        command: RemoteActionCommand | None = None,
     ) -> WorkflowStepOutcome:
         hold = lease_hold_reason()
         if hold is not None:
+            # A shutdown hold is posted as the command's record (the lease is
+            # still ours), so the previous cycle's continuation state rides
+            # along exactly as it does for every other executor-manufactured
+            # WAITING; ``command`` is the step's own view of the record.
+            details: dict[str, Any] = {
+                "lease_guard_blocked": True,
+                "reason": hold,
+                "adapter_started": False,
+            }
             return WorkflowStepOutcome.waiting(
-                details={
-                    "lease_guard_blocked": True,
-                    "reason": hold,
-                    "adapter_started": False,
-                }
+                details=(
+                    details if command is None else self._hold_details(command, details)
+                )
             )
         with stop_ownership_scope(
             getattr(self.executor, "stop_ownership_validator", None)

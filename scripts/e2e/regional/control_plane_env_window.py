@@ -97,6 +97,7 @@ from scripts.e2e.regional.deployment_window_guard import (  # noqa: E402
     deployment_snapshot,
     managed_variables_match,
     require_window_record,
+    retire_foreign_closed_record,
     window_scope,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -570,6 +571,7 @@ def open_window(
         regional, plane=PLANE, deployment=DEPLOYMENT, container=CONTAINER
     )
     record = read_baseline(settings.baseline) if settings.baseline.is_file() else None
+    record = retire_foreign_closed_record(settings.baseline, record, scope)
     if record is not None:
         require_window_record(record, scope, report["deployment"], ALLOWED_VARIABLES)
     decision = open_decision(record, report["deployment"], assignments)

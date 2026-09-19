@@ -262,3 +262,38 @@ def action_completed_records_from_evidence(
                 }
             )
     return records
+
+
+def split_drill_tagged_live_records(
+    records: Sequence[dict[str, Any]], *, kind: str, candidate_ids: set[str]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """(drill-tagged record ids, records that count as unverified live delivery).
+
+    A real action performed under a drill id (DESTR-001, HA-003 and HA-004
+    inject with ``--drill-id``) gets its ACTION_COMPLETED record SKIPPED by the
+    drill policy: there was never a live delivery to verify, so such a record
+    neither proves nor blocks the kind -- the drill does. Only a non-drill
+    record that is missing, not SENT or without a provider id is unverified.
+    """
+
+    of_kind = [
+        item
+        for item in records
+        if item.get("kind") == kind or item.get("notification_id") in candidate_ids
+    ]
+    drill_tagged = sorted(
+        str(item.get("notification_id"))
+        for item in of_kind
+        if item.get("drill_id") and not item.get("missing")
+    )
+    unusable = [
+        item
+        for item in of_kind
+        if not item.get("drill_id")
+        and (
+            item.get("missing")
+            or item.get("status") != "SENT"
+            or not item.get("provider_message_id_present")
+        )
+    ]
+    return drill_tagged, unusable
