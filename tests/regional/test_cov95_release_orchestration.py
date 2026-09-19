@@ -218,6 +218,46 @@ def test_cpu_rollback_replays_captured_config_and_preserves_restore_flags(
     assert names.index("verify-rollback") < names.index("delete-backups")
 
 
+def test_cpu_apply_grants_release_metadata_reads_before_rendering_roles(
+    release: EngineRelease, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control-plane Pods poll the pin ConfigMap themselves (fleet pin hot
+    reload), so every CPU apply re-applies the read grant before the role-split
+    apply can bring up Pods that poll -- an upgraded site has it before its
+    first hot-reloading Pods start, and bootstrap is not the only path."""
+
+    monkeypatch.setattr(
+        rollout, "build_cpu_apply_environment", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        rollout,
+        "render_and_apply_cpu_roles",
+        lambda _release, _environment: release.effects.append(("roles", None)),
+    )
+    orchestration.run_upgrade_phases(
+        release,
+        diff=diff_from_changed({"regional_cluster_registry"}),
+        plan=ReleaseExecutionPlan((Component.CPU_STAGE, Component.VERIFY)),
+        previous=release.previous,
+        completed_phases=set(),
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+    names = [name for name, _details in release.effects]
+    assert names.count("release-metadata-rbac") == 1
+    assert names.index("release-metadata-rbac") < names.index("roles")
+    manifest = release.rbac_manifests[0]
+    assert "name: gpu-fault-control-plane-release-metadata" in manifest
+    assert 'resourceNames: ["gpu-fault-release-metadata"]' in manifest
+    assert "name: gpu-fault-control-plane\n" in manifest, (
+        "the grant must bind the control-plane ServiceAccount"
+    )
+    arguments, _kwargs = next(
+        call for call in release.runner.calls if call[1].get("input_text") == manifest
+    )
+    assert arguments[:3] == ["kubectl", "--kubeconfig", "/secure/cpu.kubeconfig"]
+
+
 def test_cpu_rollback_requires_readable_previous_artifact(
     release: EngineRelease,
 ) -> None:

@@ -123,7 +123,12 @@ def apply_with_environment(
         return original_run(arguments, **kwargs)
 
     monkeypatch.setattr(cpu_apply.subprocess, "run", run)
-    return cpu_apply.apply_roles(tmp_path, targets=targets, force=False)
+    # ``apply_roles`` also reports the helper invocations (the pin convergence
+    # wait); the SES delivery checks read only the documents and kubectl calls.
+    documents, calls, _python_calls = cpu_apply.apply_roles(
+        tmp_path, targets=targets, force=False
+    )
+    return documents, calls
 
 
 @pytest.mark.parametrize("value", [None, "alerts-set"])

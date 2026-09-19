@@ -574,6 +574,14 @@ class HostProbeFixture:
                     r"[A-Za-z_][A-Za-z0-9_]*:[1-9][0-9]*", site
                 ):
                     diagnostic += f" at {site}"
+            # A probe's own failure line is ``{"error": <ExceptionType>}``. The
+            # type name alone is safe to show and is the one clue left once the
+            # output is withheld; anything wordier (a message, a path) is not.
+            error = payload.get("error")
+            if isinstance(error, str) and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", error
+            ):
+                diagnostic += f"; error {error}"
             raise HostProbeError(
                 f"host probe failed (exit {completed.returncode}{diagnostic}); output withheld"
             )

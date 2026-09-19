@@ -104,6 +104,7 @@ from gpu_fault.xid_correlation import XidCorrelationCoordinator
 if TYPE_CHECKING:
     from gpu_fault.app.ingest.faults import FaultIngestionService
     from gpu_fault.fleet_endpoint import EndpointNetworks
+    from gpu_fault.fleet_pins import FleetPinRuntime
     from gpu_fault.regional import RegionalClusterRegistration
     from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 
@@ -313,6 +314,9 @@ class ApplicationContext:
         # Bound by the factory in regional mode so /metrics can render the
         # Secret-vs-durable registry drift gauge (ARCH-H3).
         self.regional_registry_runtime: RegionalRegistryRuntime | None = None
+        # The fleet pin snapshot (``fleet_pins.py``). Bound by the factory, or
+        # by a test that injects its own reader, before the lifespan starts.
+        self.fleet_pin_runtime: FleetPinRuntime | None = None
         # Set by `_managed_observer` in regional mode so a registry runtime can
         # be bound later and unseen clusters get an observer on first sight.
         self.regional_managed_observer = None
@@ -391,6 +395,21 @@ class ApplicationContext:
             observer.observers = _LazyClusterObservers(
                 observer.observers, resolver=resolve_observer
             )
+
+    def step_batching_policy(self) -> RemoteStepBatchingPolicy:
+        """The compound-command gate as of now; asked at mint time.
+
+        The remote adapter is built once at start-up, but whether an older
+        executor is still admitted follows the release ConfigMap, so the
+        adapter asks here per dispatch instead of keeping a start-up copy.
+        Before the runtime is bound the process environment answers, exactly
+        as the start-up copy did.
+        """
+
+        runtime = self.fleet_pin_runtime
+        if runtime is None:
+            return RemoteStepBatchingPolicy.from_environment()
+        return runtime.step_batching_policy()
 
     @classmethod
     def from_environment(cls) -> ApplicationContext:
@@ -678,7 +697,7 @@ class ApplicationContext:
             regional_remote_adapter = RegionalRemoteWorkflowAdapter(
                 context.store,
                 owners=remote_owners,
-                step_batching=RemoteStepBatchingPolicy.from_environment(),
+                step_batching=context.step_batching_policy,
             )
             adapters.append(regional_remote_adapter)
         if not context.regional_mode and settings.node_action_adapter_enabled:

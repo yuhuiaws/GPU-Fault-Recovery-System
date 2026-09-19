@@ -551,6 +551,22 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"' in script
     assert "PIN_FINALIZATION" not in script
     assert "gpu-fault.io/pin-config-sha256" in script
+    # A pin change no longer rolls a tier: the digest is recorded on the
+    # Deployment, not the Pod template, and the Pods prove they serve it on
+    # /healthz. The wait runs after the role applies, before the verifier,
+    # with the digest the script computed the way the Pods compute it (jq's
+    # trailing newline excluded).
+    assert '.metadata.annotations["gpu-fault.io/pin-config-sha256"] = $pin' in script
+    assert '"gpu-fault.io/pin-config-sha256": $pin' not in script, (
+        "the pin digest on the Pod template rolls every replica per release"
+    )
+    assert "PIN_METADATA_SHA256=\"$(jq -cjS '.data'" in script
+    assert 'python3 "${SCRIPT_DIR}/wait_control_plane_pins.py"' in script
+    assert '--expected-sha256 "${PIN_METADATA_SHA256}"' in script
+    assert "GPU_FAULT_FLEET_PIN_CONVERGENCE_TIMEOUT_SECONDS" in script
+    applies = script.index("    apply_consumer_roles\n    apply_ingress_role\nfi\n")
+    verify = script.index('python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"')
+    assert applies < script.index("\nwait_for_pin_convergence\n", applies) < verify
     assert "kubectl.kubernetes.io/restartedAt" in script
     assert 'PRESERVE_ROLE_CONFIG_MAPS}" != "true"' in script
     assert 'name="$(basename "${config}" .yaml)"' in script

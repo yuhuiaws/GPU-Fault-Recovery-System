@@ -20,6 +20,7 @@ class AdminRouterDependencies:
     service_role: str
     environment: Mapping[str, str]
     regional_registry_runtime: Any | None
+    fleet_pin_runtime: Any | None = None
 
 
 def get_admin_dependencies() -> AdminRouterDependencies:
@@ -82,6 +83,15 @@ async def healthz(
         "regional_registry": (
             dependencies.regional_registry_runtime.status()
             if dependencies.regional_registry_runtime is not None
+            else None
+        ),
+        # The pin snapshot this process serves (``FleetPinRuntime``): the
+        # release tooling waits for every Pod to report the ConfigMap's digest
+        # here. Never a readiness criterion -- a stale snapshot is the
+        # previously validated pin set, so a failed read only sets ``error``.
+        "fleet_pins": (
+            dependencies.fleet_pin_runtime.status()
+            if dependencies.fleet_pin_runtime is not None
             else None
         ),
     }
@@ -163,8 +173,15 @@ async def version(
 ) -> dict[str, Any]:
     """Report the code and fleet pins loaded by this process."""
 
+    runtime = dependencies.fleet_pin_runtime
+    # Pins come from the served snapshot, which follows the release ConfigMap
+    # without a restart; every other field keeps its start-up source.
+    pins: Mapping[str, str] = (
+        runtime.environment() if runtime is not None else dependencies.environment
+    )
     return {
         "version": __version__,
+        "fleet_pins": runtime.status() if runtime is not None else None,
         "module_digest": module_digest(),
         "service_role": (
             dependencies.environment.get("GPU_FAULT_SERVICE_ROLE") or "combined"
@@ -173,52 +190,47 @@ async def version(
             "regional" if dependencies.context.regional_mode else "single-cluster"
         ),
         "required_agent_artifact_sha256": (
-            dependencies.environment.get("GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256")
-            or None
+            pins.get("GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256") or None
         ),
         "compatible_agent_artifact_sha256s": sorted(
             value.strip()
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_AGENT_ARTIFACT_SHA256S",
                 "",
             ).split(",")
             if value.strip()
         ),
         "required_agent_compatibility_digest": (
-            dependencies.environment.get(
-                "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST"
-            )
-            or None
+            pins.get("GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST") or None
         ),
         "compatible_agent_compatibility_digests": sorted(
             value.strip()
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS",
                 "",
             ).split(",")
             if value.strip()
         ),
         "required_agent_protocol_version": int(
-            dependencies.environment.get(
+            pins.get(
                 "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION",
                 "3",
             )
         ),
         "compatible_agent_protocol_versions": sorted(
             int(value.strip())
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS",
                 "",
             ).split(",")
             if value.strip()
         ),
         "required_agent_config_digest": (
-            dependencies.environment.get("GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST")
-            or None
+            pins.get("GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST") or None
         ),
         "compatible_agent_config_digests": sorted(
             value.strip()
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_AGENT_CONFIG_DIGESTS",
                 "",
             ).split(",")
@@ -229,48 +241,43 @@ async def version(
             or None
         ),
         "required_node_action_key_version": int(
-            dependencies.environment.get(
+            pins.get(
                 "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION",
                 "2",
             )
         ),
         "required_regional_executor_protocol_version": int(
-            dependencies.environment.get(
+            pins.get(
                 "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION",
                 "2",
             )
         ),
         "compatible_regional_executor_protocol_versions": sorted(
             int(value.strip())
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS",
                 "",
             ).split(",")
             if value.strip()
         ),
         "required_regional_executor_artifact_sha256": (
-            dependencies.environment.get(
-                "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256"
-            )
-            or None
+            pins.get("GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256") or None
         ),
         "compatible_regional_executor_artifact_sha256s": sorted(
             value.strip()
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S",
                 "",
             ).split(",")
             if value.strip()
         ),
         "required_regional_executor_compatibility_digest": (
-            dependencies.environment.get(
-                "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST"
-            )
+            pins.get("GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST")
             or None
         ),
         "compatible_regional_executor_compatibility_digests": sorted(
             value.strip()
-            for value in dependencies.environment.get(
+            for value in pins.get(
                 "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS",
                 "",
             ).split(",")

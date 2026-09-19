@@ -443,6 +443,7 @@ def _site_release(
         executor_wheel_sha="e" * 64,
         _ensure_contexts=lambda: None,
         _apply_rds_ca_bundle=lambda: calls.append("rds-ca"),
+        _apply_release_metadata_rbac=lambda: calls.append("release-metadata-rbac"),
         _bootstrap_cpu_is_current=lambda: False,
         _save_state=lambda phase, **_updates: calls.append(f"save:{phase}"),
         _require_cpu_secrets=lambda **_kwargs: None,

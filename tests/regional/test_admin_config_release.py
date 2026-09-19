@@ -69,7 +69,11 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
 
     release.upgrade(diff=diff)
 
-    render_call, apply_call = runner.calls
+    grant_call, render_call, apply_call = runner.calls
+    # The Pods the apply brings up poll the pin ConfigMap; the read grant is
+    # re-applied ahead of every role render (fleet pin hot reload).
+    assert grant_call[0][-3:] == ["apply", "-f", "-"]
+    assert "kind: RoleBinding" in grant_call[1]["input_text"]
     assert "render-control-plane-role-split.sh" in render_call[0][1]
     assert "apply-control-plane-role-split.sh" in apply_call[0][1]
     assert apply_call[1]["env"]["GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS"] == "worker"

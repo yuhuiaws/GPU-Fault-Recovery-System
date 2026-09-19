@@ -69,3 +69,37 @@ def test_host_guard_diagnostic_is_whitelisted_and_does_not_expose_error_message(
     assert not any(fixture.cleanup().values()), (
         "test_host_guard_diagnostic_is_whitelisted_and_does_not_expose_error_message: expected no any(fixture.cleanup().values())"
     )
+
+
+@pytest.mark.parametrize(
+    ("error", "exposed"),
+    [
+        ("RecoveryError", True),
+        ("FileNotFoundError", True),
+        ("Recovery failed at /var/lib/private", False),
+        ("private-error-detail", False),
+    ],
+    ids=["type", "builtin-type", "sentence", "hyphenated"],
+)
+def test_host_failure_names_the_sanitized_error_type_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: str, exposed: bool
+) -> None:
+    """A probe that fails prints ``{"error": <ExceptionType>}``; the fixture
+    withholds the rest of the output, so the type name is the one clue an
+    operator gets (DESTR-014 a8 spent a diagnosis on a bare "exit 1"). Only an
+    identifier passes: a sentence or a path-bearing message stays withheld."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    api.probe_stdout = json.dumps({"error": error, "recovery_required": True})
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("status")
+    message = str(caught.value)
+    assert message.endswith("; output withheld"), message
+    assert (f"; error {error})" in message) is exposed, message
+    if not exposed:
+        assert error not in message, message
+    assert "recovery_required" not in message, message

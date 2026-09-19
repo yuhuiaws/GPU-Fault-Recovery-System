@@ -1,0 +1,41 @@
+# The control-plane Pods poll the gpu-fault-release-metadata ConfigMap
+# themselves (gpu_fault.fleet_pins) and swap the pin window in place, so a
+# release that changes only data-plane artifacts no longer rolls any
+# control-plane tier; apply-control-plane-role-split.sh instead waits until
+# every Pod reports the new digest on /healthz. That poll needs this grant.
+#
+# resourceNames confines the grant to the one ConfigMap: the ServiceAccount
+# gains no read on the role config maps, the wheel or anything else in the
+# namespace. The release engine applies this right after the prerequisites on
+# bootstrap and again before every CPU role apply, so an upgraded site has it
+# before its first hot-reloading Pods start polling.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-fault-control-plane-release-metadata
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: support
+    gpu-fault.io/cleanup-order: "100"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["gpu-fault-release-metadata"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gpu-fault-control-plane-release-metadata
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: support
+    gpu-fault.io/cleanup-order: "100"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gpu-fault-control-plane-release-metadata
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-control-plane
+    namespace: gpu-fault-system

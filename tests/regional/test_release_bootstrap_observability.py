@@ -74,6 +74,7 @@ class MonitoringRunner(ROLLOUT.Runner):
         self.installs: list[list[str]] = []
         self.mutations: list[str] = []
         self.reads: list[list[str]] = []
+        self.applies: list[tuple[list[str], str]] = []
         self.configure = lambda: None
         self.on_mutation = lambda: None
 
@@ -113,8 +114,9 @@ class MonitoringRunner(ROLLOUT.Runner):
             return ""
         assert arguments[0] == "kubectl" and "apply" in arguments
         assert kwargs.get("input_text"), (
-            "only the stubbed prerequisites apply is allowed"
+            "only the prerequisite manifests may be applied here"
         )
+        self.applies.append((list(arguments), str(kwargs["input_text"])))
         return ""
 
     def probe_output(
@@ -342,6 +344,38 @@ def test_role_less_bootstrap_deletes_existing_rules_only_after_both_workers_fini
     assert harness.runner.mutations == ["delete-rule-groups-namespace"]
     assert harness.runner.expected_rules is None
     assert harness.calls[-2:] == ["validate", "complete"]
+
+
+def test_bootstrap_grants_release_metadata_reads_right_after_the_prerequisites(
+    harness: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control-plane Pods poll ``gpu-fault-release-metadata`` themselves
+    (fleet pin hot reload), so the read grant lands with the prerequisites, in
+    the site's namespace, before anything can start a Pod that polls."""
+
+    release = harness.release
+    release.config = replace(release.config, namespace="isolated-cpu")
+    harness.runner.expected_rules = b"groups: []\n"
+    monkeypatch.setattr(ROLLOUT, "bootstrap_gpu_clusters", lambda *_args: None)
+
+    release.bootstrap()
+
+    applies = harness.runner.applies
+    arguments, manifest = applies[0]
+    assert "kind: Namespace" in manifest and "kind: RoleBinding" in manifest, (
+        "the read grant must ride the prerequisites apply itself"
+    )
+    assert not any("kind: RoleBinding" in text for _arguments, text in applies[1:]), (
+        "bootstrap must not apply the grant a second time before the store ensure"
+    )
+    assert arguments[:3] == ["kubectl", "--kubeconfig", release.config.cpu_kubeconfig]
+    assert "name: gpu-fault-control-plane-release-metadata" in manifest
+    assert 'resourceNames: ["gpu-fault-release-metadata"]' in manifest
+    assert "namespace: isolated-cpu" in manifest
+    assert "namespace: gpu-fault-system" not in manifest
+    assert "name: gpu-fault-control-plane\n" in manifest, (
+        "the grant must bind the control-plane ServiceAccount"
+    )
 
 
 def test_parallel_configuration_refuses_static_namespace_alias_before_invocation(

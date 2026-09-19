@@ -6,7 +6,7 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import (
     Field,
@@ -739,15 +739,27 @@ class RegionalRemoteWorkflowAdapter:
         *,
         owners: set[str],
         operations: set[WorkflowOperation] | None = None,
-        step_batching: RemoteStepBatchingPolicy | None = None,
+        step_batching: RemoteStepBatchingPolicy
+        | Callable[[], RemoteStepBatchingPolicy]
+        | None = None,
     ) -> None:
         self.store = store
         self.owners = owners
         self.operations = operations or set(WorkflowOperation)
         # None keeps one command per step: a caller that did not say which
         # executor versions it admits has not proven they can run a compound
-        # command (``RemoteStepBatchingPolicy``).
-        self.step_batching = step_batching or RemoteStepBatchingPolicy.disabled()
+        # command (``RemoteStepBatchingPolicy``). A callable is asked at mint
+        # time, so the gate follows the pin window the release ConfigMap holds
+        # now (``FleetPinRuntime``) rather than a start-up copy of it.
+        self._step_batching: Callable[[], RemoteStepBatchingPolicy]
+        if step_batching is None:
+            disabled = RemoteStepBatchingPolicy.disabled()
+            self._step_batching = lambda: disabled
+        elif callable(step_batching):
+            self._step_batching = step_batching
+        else:
+            fixed = step_batching
+            self._step_batching = lambda: fixed
         # How many dispatches were held because another command for the same
         # (workflow, step index, step space) was still open (item D5). Read by
         # the metrics family like the dispatcher's counters.
@@ -756,6 +768,10 @@ class RegionalRemoteWorkflowAdapter:
         # beyond their head (性能 C); exported next to the hold counter.
         self.batched_commands_total = 0
         self.batched_steps_total = 0
+
+    @property
+    def step_batching(self) -> RemoteStepBatchingPolicy:
+        return self._step_batching()
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner in self.owners and step.operation in self.operations

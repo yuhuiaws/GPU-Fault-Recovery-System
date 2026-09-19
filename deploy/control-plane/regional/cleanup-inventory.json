@@ -133,6 +133,14 @@
         "clean": "delete"
       },
       {
+        "kind": "role",
+        "name": "gpu-fault-control-plane-release-metadata",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
         "kind": "rolebinding",
         "name": "gpu-fault-adot-discovery",
         "scope": "namespaced",
@@ -143,6 +151,14 @@
       {
         "kind": "rolebinding",
         "name": "gpu-fault-aurora-credential-refresh",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "rolebinding",
+        "name": "gpu-fault-control-plane-release-metadata",
         "scope": "namespaced",
         "phase": "support",
         "order": 100,

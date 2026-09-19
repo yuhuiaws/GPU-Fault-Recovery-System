@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from gpu_fault_release.regional_release_images import previous_executor_image
-from gpu_fault.admin.api_budget import ApiBudgetError, deployment_api_budget
-from gpu_fault.admin.execution import deployment_deadline
-
-from gpu_fault.admin.diagnostics import diagnostic_text
-from gpu_fault.admin.execution import (
-    OVERALL_DEPLOY_SECONDS,
-    command_timeout,
-    deadline_scope,
-    run_command,
-)
-
 import argparse
 import hashlib
 import json
@@ -23,28 +11,36 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Unpack
 
+from gpu_fault.admin.api_budget import ApiBudgetError, deployment_api_budget
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault.admin.command_log import child_failure, report_failure
+from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.execution import (
+    OVERALL_DEPLOY_SECONDS,
+    command_timeout,
+    deadline_scope,
+    deployment_deadline,
+    run_command,
+)
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
-from gpu_fault_release.regional_release_runtime_identity import (
-    forget_cpu_ingress_pod,
-)
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
     build_preflight_report,
     report_exit_code,
 )
 from gpu_fault_release.regional_admin_commands import (
-    build_deploy_preflight_report,
     apply_rds_ca_bundle,
+    apply_release_metadata_rbac,
     bootstrap_cpu_is_current,
+    build_deploy_preflight_report,
     build_release_diff,
     build_release_summary,
     build_status,
     compact_report,
     ensure_schema,
     full_report_requested,
+    release_metadata_rbac_manifest,
     run_deploy,
     run_resume,
     stage_noop_release,
@@ -68,7 +64,6 @@ from gpu_fault_release.regional_endpoint_rollback import (
     capture_endpoint_snapshot,
     restore_endpoint_snapshot,
 )
-from gpu_fault_release.regional_kubeconfig_cache import ReleaseKubeconfigCache
 from gpu_fault_release.regional_gpu_bootstrap import (
     apply_gpu_adot_collector,
     apply_gpu_dcgm_exporter,
@@ -81,6 +76,7 @@ from gpu_fault_release.regional_gpu_bootstrap import (
     settle_installer_jobs,
     verify_gpu_control_plane_endpoint,
 )
+from gpu_fault_release.regional_kubeconfig_cache import ReleaseKubeconfigCache
 from gpu_fault_release.regional_notifications import (
     ensure_notification_secret,
     notification_digest,
@@ -105,15 +101,11 @@ from gpu_fault_release.regional_release_bootstrap import (
     bootstrap_observability,
     cleanup_bootstrap,
 )
-from gpu_fault_release.regional_release_prerequisite_repair import (
-    prepare_bootstrap_prerequisite_entry,
-    prepare_bootstrap_workflows,
-)
 from gpu_fault_release.regional_release_config import (
-    amp_writer_role_name,
     ClusterTarget,
     ReleaseConfig,
     ReleaseError,
+    amp_writer_role_name,
     resolve_release_image,
 )
 from gpu_fault_release.regional_release_diff import (
@@ -161,16 +153,17 @@ from gpu_fault_release.regional_release_gpu_rollout import (
 from gpu_fault_release.regional_release_gpu_stage import (
     stage_join_gpu_prerequisites,
 )
-from gpu_fault_release.regional_release_interfaces import (
-    GpuRolloutOptions,
-    RollbackOptions,
-    UpgradeOptions,
-)
 from gpu_fault_release.regional_release_iam import (
     validate_executor_iam_documents as validate_executor_iam_documents,
 )
 from gpu_fault_release.regional_release_iam import (
     validate_executor_iam_role,
+)
+from gpu_fault_release.regional_release_images import previous_executor_image
+from gpu_fault_release.regional_release_interfaces import (
+    GpuRolloutOptions,
+    RollbackOptions,
+    UpgradeOptions,
 )
 from gpu_fault_release.regional_release_narration import (
     narrate_release_end,
@@ -182,7 +175,6 @@ from gpu_fault_release.regional_release_node_runtime_rollout import (
 )
 from gpu_fault_release.regional_release_online_registry import (
     activate_join_registry,
-    drain_registry_cluster as drain_registry_cluster,
     drain_registry_clusters,
     fail_join_registry,
     prepare_join_registry,
@@ -192,7 +184,9 @@ from gpu_fault_release.regional_release_online_registry import (
     purge_registry_cluster,
     revoke_registry_cluster,
 )
-from gpu_fault_release.regional_release_progress import bootstrap_completion_state
+from gpu_fault_release.regional_release_online_registry import (
+    drain_registry_cluster as drain_registry_cluster,
+)
 from gpu_fault_release.regional_release_orchestration import (
     bootstrap_gpu_clusters,
     rollback_release,
@@ -202,7 +196,12 @@ from gpu_fault_release.regional_release_orchestration import (
     build_rollback_environment as build_rollback_environment,
 )
 from gpu_fault_release.regional_release_preflight import ensure_region_contexts
+from gpu_fault_release.regional_release_prerequisite_repair import (
+    prepare_bootstrap_prerequisite_entry,
+    prepare_bootstrap_workflows,
+)
 from gpu_fault_release.regional_release_probes import command_label
+from gpu_fault_release.regional_release_progress import bootstrap_completion_state
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,
     desired_registry,
@@ -228,6 +227,9 @@ from gpu_fault_release.regional_release_rendering import (
 from gpu_fault_release.regional_release_reporting import build_release_plan
 from gpu_fault_release.regional_release_resume_validation import (
     validate_resume_checkpoint,
+)
+from gpu_fault_release.regional_release_runtime_identity import (
+    forget_cpu_ingress_pod,
 )
 from gpu_fault_release.regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
@@ -640,6 +642,7 @@ class RegionalRelease(RegistryDrainContext):
     _ensure_gpu_namespace = ensure_gpu_namespace
     _ensure_schema = ensure_schema
     _apply_rds_ca_bundle = apply_rds_ca_bundle
+    _apply_release_metadata_rbac = apply_release_metadata_rbac
     _refresh_aurora_credentials = refresh_aurora_credentials
     _apply_aurora_refresh = apply_aurora_refresh
     _prepare_bootstrap_workflows = prepare_bootstrap_workflows
@@ -980,6 +983,9 @@ class RegionalRelease(RegistryDrainContext):
         )
         if force_restart:
             environment["GPU_FAULT_FORCE_ROLE_RESTART"] = "true"
+        # The Pods the apply brings up poll the pin ConfigMap; the grant must
+        # already be there on an upgraded site, not only after a bootstrap.
+        self._apply_release_metadata_rbac()
         render_and_apply_cpu_roles(self, environment)
 
     def _restore_cpu_role_config_maps(
@@ -1122,6 +1128,14 @@ class RegionalRelease(RegistryDrainContext):
         prerequisites = prerequisites.replace(
             "kind: Namespace\nmetadata:\n  name: gpu-fault-system",
             f"kind: Namespace\nmetadata:\n  name: {self.config.namespace}",
+        )
+        # The pin ConfigMap read grant is a prerequisite like the ServiceAccount
+        # it binds (fleet pin hot reload); it rides the same apply so no CPU
+        # command precedes the store ensure that follows.
+        prerequisites = (
+            prerequisites.rstrip("\n")
+            + "\n---\n"
+            + release_metadata_rbac_manifest(self.config.namespace)
         )
         self.runner.run(
             self._cpu("apply", "-f", "-"),

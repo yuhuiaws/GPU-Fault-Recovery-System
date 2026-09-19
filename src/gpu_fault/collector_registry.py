@@ -1,11 +1,14 @@
-"""The one table a collector is added to.
+"""The CLI table a collector is added to.
 
-``COLLECTOR_KINDS`` has one row per ``CollectorKind`` (what the control plane
-tracks: producer name, systemd unit, silence threshold) and
 ``COLLECTOR_REGISTRY`` has one row per ``gpu-fault-collector`` subcommand (what
-the CLI builds: factory, channels, context needs). ``telemetry`` and
-``collector_requirements`` re-export the derived views the rest of the code
-already reads, so a new collector edits these two tables, adds a channel to
+the CLI builds: factory, channels, context needs). What the control plane
+tracks per ``CollectorKind`` -- producer name, systemd unit, silence
+threshold -- is the ``COLLECTOR_KINDS`` table in ``collector_kinds``, a leaf
+module whose names are re-exported here unchanged. The split is deliberate:
+the factory strings below pull every collector implementation into whichever
+wheel imports this module, and ``telemetry`` and ``collector_requirements``
+must not pay that price (the control-plane wheel shipped 26 data-plane
+modules until 2026-09-19). A new collector edits both tables, adds a channel to
 ``channel_registry`` and a systemd unit to ``deploy/``, and nothing else.
 
 ``validate_collector_registry()`` runs at import time like the operation,
@@ -23,10 +26,8 @@ every plugin, never at import time.
 from __future__ import annotations
 
 import argparse
-import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from importlib import import_module, metadata
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -43,6 +44,20 @@ from gpu_fault.channel_registry import (
     NVIDIA_KERNEL_PATH,
     TRAINING_PROGRESS_PATH,
 )
+
+# The kind table and its derived views keep their historical import path here.
+from gpu_fault.collector_kinds import COLLECTOR_KINDS as COLLECTOR_KINDS
+from gpu_fault.collector_kinds import (
+    COLLECTOR_PRODUCER_BY_CHANNEL as COLLECTOR_PRODUCER_BY_CHANNEL,
+)
+from gpu_fault.collector_kinds import COLLECTOR_SYSTEMD_UNITS as COLLECTOR_SYSTEMD_UNITS
+from gpu_fault.collector_kinds import CollectorKind as CollectorKind
+from gpu_fault.collector_kinds import CollectorKindSpec as CollectorKindSpec
+from gpu_fault.collector_kinds import SilentThreshold as SilentThreshold
+from gpu_fault.collector_kinds import (
+    collector_silent_thresholds as collector_silent_thresholds,
+)
+from gpu_fault.collector_kinds import silent_threshold as silent_threshold
 from gpu_fault.plugins import PluginGroup, discover_plugins
 
 if TYPE_CHECKING:
@@ -51,17 +66,6 @@ if TYPE_CHECKING:
 
 OUTBOX_COMMAND = "outbox"
 VALIDATE_PLUGINS_COMMAND = "validate-plugins"
-
-
-class CollectorKind(StrEnum):
-    GPU_INVENTORY = "GPU_INVENTORY"
-    GPU_METRICS = "GPU_METRICS"
-    HOST_TELEMETRY = "HOST_TELEMETRY"
-    NODE_LOGS = "NODE_LOGS"
-    NVIDIA_KERNEL = "NVIDIA_KERNEL"
-    FABRIC_MANAGER_LOG = "FABRIC_MANAGER_LOG"
-    HMA_NODE = "HMA_NODE"
-    HMA_CLOUDWATCH = "HMA_CLOUDWATCH"
 
 
 class RunnableCollector(Protocol):
@@ -77,33 +81,6 @@ ContextFreeCollectorFactory = Callable[
     ["EventSink", argparse.Namespace], RunnableCollector
 ]
 CollectorRuntime = Literal["node", "cluster", "workload"]
-
-
-@dataclass(frozen=True)
-class SilentThreshold:
-    env: str
-    default: float
-    read: Callable[[], float]
-
-
-def silent_threshold(name: str, default: str) -> SilentThreshold:
-    """Declare the silence threshold of a kind as the environment read it is."""
-
-    def read() -> float:
-        return float(os.getenv(name, default))
-
-    return SilentThreshold(env=name, default=float(default), read=read)
-
-
-@dataclass(frozen=True)
-class CollectorKindSpec:
-    kind: CollectorKind
-    producer: str
-    # ``None`` for kinds produced off the node (cluster singletons, Lambda).
-    systemd_unit: str | None
-    # ``None`` for kinds the control plane does not expect on a schedule.
-    silent_threshold: SilentThreshold | None
-    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,71 +122,6 @@ def _load_factory(reference: str) -> Callable[..., object]:
         raise RuntimeError(f"collector factory {reference} is not callable")
     return cast(Callable[..., object], value)
 
-
-COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
-    CollectorKind.GPU_INVENTORY: CollectorKindSpec(
-        kind=CollectorKind.GPU_INVENTORY,
-        producer="DCGM_METRICS_COLLECTOR",
-        systemd_unit="gpu-fault-metrics-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS", "180"
-        ),
-    ),
-    CollectorKind.GPU_METRICS: CollectorKindSpec(
-        kind=CollectorKind.GPU_METRICS,
-        producer="DCGM_METRICS_COLLECTOR",
-        systemd_unit="gpu-fault-metrics-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS", "420"
-        ),
-    ),
-    CollectorKind.HOST_TELEMETRY: CollectorKindSpec(
-        kind=CollectorKind.HOST_TELEMETRY,
-        producer="HOST_TELEMETRY_COLLECTOR",
-        systemd_unit="gpu-fault-host-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_HOST_TELEMETRY_SILENT_AFTER_SECONDS", "420"
-        ),
-    ),
-    CollectorKind.NODE_LOGS: CollectorKindSpec(
-        kind=CollectorKind.NODE_LOGS,
-        producer="NODE_LOG_COLLECTOR",
-        systemd_unit="gpu-fault-log-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_NODE_LOG_SILENT_AFTER_SECONDS", "900"
-        ),
-    ),
-    CollectorKind.NVIDIA_KERNEL: CollectorKindSpec(
-        kind=CollectorKind.NVIDIA_KERNEL,
-        producer="KERNEL_LOG_COLLECTOR",
-        systemd_unit="gpu-fault-kernel-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_KERNEL_SILENT_AFTER_SECONDS", "900"
-        ),
-    ),
-    CollectorKind.FABRIC_MANAGER_LOG: CollectorKindSpec(
-        kind=CollectorKind.FABRIC_MANAGER_LOG,
-        producer="FABRIC_MANAGER_LOG_COLLECTOR",
-        systemd_unit="gpu-fault-fabric-manager-collector",
-        silent_threshold=silent_threshold(
-            "GPU_FAULT_FABRIC_MANAGER_SILENT_AFTER_SECONDS", "900"
-        ),
-    ),
-    CollectorKind.HMA_NODE: CollectorKindSpec(
-        kind=CollectorKind.HMA_NODE,
-        producer="KUBERNETES_HMA_NODE_COLLECTOR",
-        systemd_unit=None,
-        silent_threshold=None,
-        retired=True,
-    ),
-    CollectorKind.HMA_CLOUDWATCH: CollectorKindSpec(
-        kind=CollectorKind.HMA_CLOUDWATCH,
-        producer="CLOUDWATCH_HMA_COLLECTOR",
-        systemd_unit=None,
-        silent_threshold=None,
-        retired=True,
-    ),
-}
 
 COLLECTOR_REGISTRY: dict[str, CollectorDescriptor] = {
     "kernel": CollectorDescriptor(
@@ -283,25 +195,6 @@ COLLECTOR_REGISTRY: dict[str, CollectorDescriptor] = {
         runs_in="workload",
     ),
 }
-
-# Derived views. ``telemetry`` and ``collector_requirements`` re-export them
-# under the names their callers have always imported.
-COLLECTOR_PRODUCER_BY_CHANNEL: dict[CollectorKind, str] = {
-    kind: spec.producer for kind, spec in COLLECTOR_KINDS.items()
-}
-COLLECTOR_SYSTEMD_UNITS: dict[CollectorKind, str] = {
-    kind: spec.systemd_unit
-    for kind, spec in COLLECTOR_KINDS.items()
-    if spec.systemd_unit is not None
-}
-
-
-def collector_silent_thresholds() -> dict[CollectorKind, float]:
-    return {
-        kind: spec.silent_threshold.read()
-        for kind, spec in COLLECTOR_KINDS.items()
-        if spec.silent_threshold is not None
-    }
 
 
 def _known_channel(path: str) -> bool:

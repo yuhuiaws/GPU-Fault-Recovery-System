@@ -1142,3 +1142,47 @@ def test_new_boot_report_carries_the_boot_and_retirement_receipts(
     assert status["boot_id_observed"] == "boot-after"
     assert status["restored_by"] == "reboot-installer"
     assert status["retired"] is True
+
+
+def test_prepare_reclaims_the_claim_of_a_recovery_dead_on_another_boot(
+    host: HostHarness,
+) -> None:
+    """DESTR-014 attempt 8 was fenced by attempt 4's record: armed on the
+    pre-reboot boot, stuck RESTORING after the installer replaced its units,
+    still holding ``active``. A record whose boot is gone and whose resource
+    targets are all absent can never resume, so its claim is released and the
+    record is left as forensics."""
+
+    host.boot = "boot-older"
+    old = probe.Recovery({**host.scope, "owner": "owner-old", "boot_id": "boot-older"})
+    old.prepare()
+    for resource in json.loads(old.state_path.read_text())["resources"]:
+        target = Path(resource["target"])
+        host.links.pop(target, None)
+        target.unlink(missing_ok=True)
+    host.boot = "boot-before"
+
+    report = host.recovery.prepare()
+
+    assert report["reclaimed_stale_active"] == old.key, report
+    assert probe.file_identity(probe.ROOT / "active") == host.read()["claim"], (
+        "the new claim must own active after the dead one is released"
+    )
+    assert old.state_path.exists(), "the dead record stays as forensics"
+
+
+def test_prepare_keeps_the_fence_while_a_stale_recovery_still_owns_units(
+    host: HostHarness,
+) -> None:
+    host.boot = "boot-older"
+    old = probe.Recovery({**host.scope, "owner": "owner-old", "boot_id": "boot-older"})
+    old.prepare()
+    before = json.loads(old.state_path.read_text())["claim"]
+    host.boot = "boot-before"
+
+    with pytest.raises(probe.RecoveryError, match="manual recovery"):
+        host.recovery.prepare()
+
+    assert probe.file_identity(probe.ROOT / "active") == before, (
+        "a stale recovery whose units are still installed keeps its claim"
+    )

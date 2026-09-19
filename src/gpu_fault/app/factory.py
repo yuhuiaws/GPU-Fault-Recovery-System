@@ -162,6 +162,7 @@ from gpu_fault.channel_registry import (
 from gpu_fault.execution import (
     WorkflowExecutionError,
 )
+from gpu_fault.fleet_pins import FleetPinRuntime
 from gpu_fault.lifecycle import (
     required_processor_shutdown_seconds,
     validate_lifespan_shutdown_budget,
@@ -182,9 +183,6 @@ from gpu_fault.processor_diagnostics import (
     unregister_thread_dump_signal,
 )
 from gpu_fault.regional import TOKEN_SLOT_RETIRING
-from gpu_fault.regional_compatibility import (
-    RegionalExecutorCompatibilityPolicy,
-)
 from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 from gpu_fault.store import (
     EfaTrafficAdminConflict,
@@ -215,6 +213,26 @@ def notification_throttle_delay(
     """
 
     return min(max(previous * 2, interval * 2), cap)
+
+
+def _configure_fleet_pin_runtime(ctx: ApplicationContext) -> FleetPinRuntime:
+    """The pin snapshot the routes, the fleet registry and the mint-time gate read.
+
+    A test binds its own runtime (with an injected reader) on the context before
+    ``create_app``; otherwise snapshot 1 is this process's environment, the same
+    ConfigMap the kubelet resolved at Pod start. The runtime exists with or
+    without the agent registry (the executor pins do not depend on it), and its
+    poller is wrapped around the lifespan next to the registry runtime so it
+    lives exactly as long as the app.
+    """
+
+    runtime = ctx.fleet_pin_runtime
+    if runtime is None:
+        runtime = FleetPinRuntime.from_environment(os.environ)
+        ctx.fleet_pin_runtime = runtime
+    if ctx.fleet_registry is not None:
+        runtime.bind_fleet_registry(ctx.fleet_registry)
+    return runtime
 
 
 def _configure_service_runtime(
@@ -400,6 +418,7 @@ def _configure_service_runtime(
     # started LISTEN thread per process, closed when the lifespan exits.
     remote_command_wakeups = RemoteCommandWakeupHub(ctx.store)
     lifespan = remote_command_wakeups.wrap_lifespan(lifespan)
+    lifespan = _configure_fleet_pin_runtime(ctx).wrap_lifespan(lifespan)
     return (
         regional_auth_registry,
         service_role,
@@ -571,9 +590,10 @@ def _install_core_routes(
                     "300",
                 )
             ),
-            executor_compatibility=(
-                RegionalExecutorCompatibilityPolicy.from_mapping(os.environ)
-            ),
+            # Read per request: the pins follow the release ConfigMap without
+            # a restart (``FleetPinRuntime``), so the window a probe or claim
+            # sees is the window the ConfigMap holds now.
+            executor_compatibility=ctx.fleet_pin_runtime.executor_policy(),
             remote_command_wakeups=app.state.remote_command_wakeups,
         )
     )
@@ -588,6 +608,7 @@ def _install_core_routes(
             service_role=service_role,
             environment=os.environ,
             regional_registry_runtime=regional_auth_registry,
+            fleet_pin_runtime=ctx.fleet_pin_runtime,
         )
     )
     app.include_router(admin_router)
@@ -625,6 +646,7 @@ def _install_core_routes(
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)
     app.state.runtime = app_runtime
+    app.state.fleet_pin_runtime = ctx.fleet_pin_runtime
 
     app.dependency_overrides[get_processor_dependencies] = lambda: (
         ProcessorRouterDependencies(

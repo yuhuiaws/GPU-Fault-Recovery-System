@@ -7,12 +7,14 @@ from typing import Annotated
 
 from pydantic import BeforeValidator, field_validator
 
-# The unit and silence tables are rows of the collector registry; they keep
-# their historical import path here.
-from gpu_fault.collector_registry import (
+# The unit and silence tables are rows of the collector kind table; they keep
+# their historical import path here. Read from ``collector_kinds``, not
+# ``collector_registry``: the registry's factory strings would pull every
+# collector implementation into the control-plane wheel.
+from gpu_fault.collector_kinds import (
     COLLECTOR_SYSTEMD_UNITS as COLLECTOR_SYSTEMD_UNITS,
 )
-from gpu_fault.collector_registry import (
+from gpu_fault.collector_kinds import (
     collector_silent_thresholds as collector_silent_thresholds,
 )
 from gpu_fault.env import env_bool

@@ -485,6 +485,38 @@ def apply_rds_ca_bundle(release: Any) -> None:
     )
 
 
+RELEASE_METADATA_RBAC_MANIFEST = (
+    ROOT / "deploy/control-plane/regional/control-plane-release-metadata-rbac.yaml"
+)
+
+
+def release_metadata_rbac_manifest(namespace: str) -> str:
+    """The pin ConfigMap read grant, rendered into the site's namespace."""
+
+    return RELEASE_METADATA_RBAC_MANIFEST.read_text(encoding="utf-8").replace(
+        "namespace: gpu-fault-system", f"namespace: {namespace}"
+    )
+
+
+def apply_release_metadata_rbac(release: Any) -> None:
+    """Grant the control-plane ServiceAccount read access to the pin ConfigMap.
+
+    The control-plane Pods poll ``gpu-fault-release-metadata`` themselves
+    (``gpu_fault.fleet_pins``) instead of being rolled for a pin change, so the
+    grant must exist before any Pod that polls comes up. Bootstrap ships it in
+    the prerequisites stream (namespace, ServiceAccount, grant: one apply, before
+    the store is ensured and before any business CPU command); every CPU apply
+    re-applies it here ahead of the role-split apply, so an upgraded site has it
+    before its first hot-reloading Pods start. ``kubectl apply`` makes the
+    repeat a no-op.
+    """
+
+    release.runner.run(
+        release._cpu("apply", "-f", "-"),
+        input_text=release_metadata_rbac_manifest(release.config.namespace),
+    )
+
+
 def bootstrap_cpu_is_current(release: Any) -> bool:
     try:
         metadata = release._config_map_data("gpu-fault-release-metadata")

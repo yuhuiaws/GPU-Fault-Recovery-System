@@ -186,6 +186,7 @@ def test_retained_v17_bootstrap_runs_normal_ensure_before_candidate_cpu(
     monkeypatch.setattr(rollout, "bootstrap_gpu_clusters", lambda *_args: None)
     for name in (
         "_initialize_registry",
+        "_apply_release_metadata_rbac",
         "_prepare_nlb",
         "_wait_nlb",
         "_validate_release",

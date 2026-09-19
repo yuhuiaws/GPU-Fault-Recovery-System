@@ -503,7 +503,16 @@ def _runtime_list(
         or metadata.get("continue", "") != ""
     ):
         raise RegionalFixtureError("CPU capability population is incomplete")
-    return _items(value.get("items"))
+    items = _items(value.get("items"))
+    # The server's typed list carries bare items; only kubectl stamps
+    # apiVersion/kind on each one. The per-item identity checks below were
+    # written against kubectl output and refused every live ReplicaSet as
+    # "owner is unproven" (DESTR-008 attempt 9), so give each item the identity
+    # the list envelope already proved.
+    for item in items:
+        item.setdefault("apiVersion", api_version)
+        item.setdefault("kind", list_kind.removesuffix("List"))
+    return items
 
 
 def _worker_population(

@@ -452,8 +452,10 @@ if RELEASE_METADATA_JSON="$(
         PIN_METADATA_CHANGED="true"
     fi
 fi
-# ConfigMap consumers need a restart only when the effective pin metadata
-# changed. Re-running an already-finalized release is therefore a no-op.
+# The effective pin metadata changed. The consumer tiers are no longer rolled
+# for it -- they poll the ConfigMap themselves (gpu_fault.fleet_pins) -- so
+# this only names the change in the log; wait_for_pin_convergence below proves
+# every Pod picked it up. Re-running an already-finalized release is a no-op.
 RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"
 if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
     [[ "${REQUIRED_AGENT_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -566,7 +568,10 @@ elif [[ -z "${RELEASE_METADATA_JSON:-}" ]]; then
     echo "gpu-fault-release-metadata is missing; set GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST for a greenfield deploy" >&2
     exit 1
 fi
-PIN_METADATA_SHA256="$(jq -cS '.data' <<<"${RELEASE_METADATA_JSON}" | sha256sum | cut -d' ' -f1)"
+# What every control-plane Pod reports as fleet_pins.content_sha256 on
+# /healthz: the compact, key-sorted .data hashed without jq's trailing
+# newline (-j) -- the same bytes as gpu_fault.fleet_pins.pin_content_sha256.
+PIN_METADATA_SHA256="$(jq -cjS '.data' <<<"${RELEASE_METADATA_JSON}" | sha256sum | cut -d' ' -f1)"
 ROLE_RESTART_TOKEN=""
 if [[ "${FORCE_ROLE_RESTART}" == "true" ]]; then
     ROLE_RESTART_TOKEN="$(date -u +%FT%T.%NZ)"
@@ -601,6 +606,11 @@ render_manifest_for_apply() {
         fi
 }
 
+# The pin digest is recorded on the Deployment, never on the Pod template: on
+# the template it rolled every replica of every tier per release, only so the
+# Pods would re-read a ConfigMap they now poll themselves. The template keeps
+# the digests that do change what runs (wheel, image, role config, failure
+# domains); wait_for_pin_convergence proves the pins reached the Pods.
 apply_manifest() {
     local manifest="$1"
     local role_sha=""
@@ -621,6 +631,7 @@ apply_manifest() {
                 --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
                 .metadata.name as $name |
                 .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
+                .metadata.annotations["gpu-fault.io/pin-config-sha256"] = $pin |
                 .spec.template.metadata.annotations += {
                     "gpu-fault.io/artifact-sha256": $sha,
                     "gpu-fault.io/control-plane-wheel-sha256": $sha,
@@ -628,8 +639,7 @@ apply_manifest() {
                     "gpu-fault.io/release-rollout": $release,
                     "gpu-fault.io/runtime-image": $image,
                     "gpu-fault.io/notification-config-sha256": $notification,
-                    "gpu-fault.io/role-config-sha256": $role_config,
-                    "gpu-fault.io/pin-config-sha256": $pin
+                    "gpu-fault.io/role-config-sha256": $role_config
                 } |
                 if $name == "gpu-fault-control-worker" and $domain != "" then
                     .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain
@@ -889,6 +899,49 @@ with psycopg.connect(dsn, connect_timeout=10) as connection:
     return 1
 }
 
+# The consumer tiers are not rolled for a pin change any more: every Pod polls
+# gpu-fault-release-metadata itself and reports the digest it serves on
+# /healthz. This is the proof that replaced the roll, for the selected roles
+# only, and a Pod that never converges fails the apply exactly like a failed
+# rollout does. Runs whether or not this run changed the pins: a Pod that came
+# up during the apply serves its start-up snapshot until its first read.
+wait_for_pin_convergence() {
+    local timeout="${GPU_FAULT_FLEET_PIN_CONVERGENCE_TIMEOUT_SECONDS:-180}"
+    local deployments=()
+    local wait_args
+    if [[ -n "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" ]]; then
+        # A verbatim rollback force-restarts every tier, so the restored Pods
+        # start from the ConfigMap's env snapshot; the previous release's
+        # wheel may predate fleet_pins on /healthz. Its own contract applies,
+        # as it does for the verifier's snapshot mode.
+        echo "verbatim rollback: restored Pods start from the pin ConfigMap; skipping the /healthz convergence wait" >&2
+        return 0
+    fi
+    if role_selected spool; then
+        deployments+=(gpu-fault-telemetry-spool-worker)
+    fi
+    if role_selected worker; then
+        deployments+=(gpu-fault-control-worker)
+    fi
+    if role_selected ingress; then
+        deployments+=(gpu-fault-api-ha)
+    fi
+    ((${#deployments[@]} > 0)) || return 0
+    wait_args=(
+        --namespace "${NAMESPACE}"
+        --expected-sha256 "${PIN_METADATA_SHA256}"
+        --timeout-seconds "${timeout}"
+        --deployments "$(
+            IFS=,
+            printf '%s' "${deployments[*]}"
+        )"
+    )
+    if [[ -n "${KUBECONFIG_PATH}" ]]; then
+        wait_args+=(--kubeconfig "${KUBECONFIG_PATH}")
+    fi
+    python3 "${SCRIPT_DIR}/wait_control_plane_pins.py" "${wait_args[@]}"
+}
+
 CURRENT_INGRESS_POD="$(
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
         -l app=gpu-fault-api-ha \
@@ -1024,6 +1077,7 @@ else
     apply_consumer_roles
     apply_ingress_role
 fi
+wait_for_pin_convergence
 stamp_admin_config_metadata
 
 # The snapshot variable is inherited from the engine's environment anyway; it

@@ -19,6 +19,7 @@ class EngineRelease(rollout.RegionalRelease):
         self.effects: list[tuple[str, Any]] = []
         self.saves: list[dict[str, Any]] = []
         self.maps: list[dict[str, Any]] = []
+        self.rbac_manifests: list[str] = []
         self.environments: list[dict[str, str]] = []
         self.old_artifact = b"example previous component"
         self.registry_restored = False
@@ -58,6 +59,11 @@ class EngineRelease(rollout.RegionalRelease):
                 )
                 return json.dumps({"binaryData": data})
         if "apply" in arguments and "input_text" in kwargs:
+            if "kind: RoleBinding" in kwargs["input_text"]:
+                # The release-metadata read grant every CPU apply re-applies.
+                self.rbac_manifests.append(kwargs["input_text"])
+                self.effects.append(("release-metadata-rbac", None))
+                return ""
             value = json.loads(kwargs["input_text"])
             if value["kind"] != "ConfigMap":
                 raise AssertionError("unexpected restore object kind")

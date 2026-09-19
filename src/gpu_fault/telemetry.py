@@ -9,12 +9,14 @@ from pydantic import Field, field_validator
 
 from gpu_fault.channel_registry import ATTEMPT_COVERAGE_PATH as _ATTEMPT_COVERAGE_PATH
 
-# ``CollectorKind`` and the producer view are rows of the collector registry;
-# they keep their historical import path here.
-from gpu_fault.collector_registry import (
+# ``CollectorKind`` and the producer view are rows of the collector kind table;
+# they keep their historical import path here. Read from ``collector_kinds``,
+# not ``collector_registry``: the registry's factory strings would pull every
+# collector implementation into the control-plane wheel.
+from gpu_fault.collector_kinds import (
     COLLECTOR_PRODUCER_BY_CHANNEL as COLLECTOR_PRODUCER_BY_CHANNEL,
 )
-from gpu_fault.collector_registry import CollectorKind as CollectorKind
+from gpu_fault.collector_kinds import CollectorKind as CollectorKind
 from gpu_fault.models import StrictModel
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest as TelemetryMetricLatest,

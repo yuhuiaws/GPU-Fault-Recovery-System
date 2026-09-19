@@ -489,6 +489,52 @@ class Recovery:
         if runtime_identity(self.binding, self.dropin) != self.record["baseline"]:
             raise RecoveryError("Node Agent or host incarnation changed")
 
+    def reclaim_stale_active(self) -> str | None:
+        """Release ``active`` when the recovery holding it can never resume.
+
+        A recovery armed on an earlier boot whose units the installer has since
+        replaced (every resource target gone) is dead: nothing on this boot can
+        ACK, disable or restore for it, yet its claim fenced every later arm as
+        "another owner" (DESTR-014 attempt 8 behind the attempt-4 record). The
+        record stays as forensics; only the ``active`` link is released. A claim
+        of this boot, or one whose units are still installed, keeps the fence:
+        that is a live or half-retired recovery and cleanup-only territory.
+        """
+
+        active = ROOT / "active"
+        try:
+            info = active.lstat()
+        except FileNotFoundError:
+            return None
+        for directory in sorted(ROOT.iterdir()):
+            if directory == self.directory or not directory.is_dir():
+                continue
+            try:
+                claim = (directory / "claim").lstat()
+            except FileNotFoundError:
+                continue
+            if (claim.st_dev, claim.st_ino) != (info.st_dev, info.st_ino):
+                continue
+            record = read_record(directory / "state.json")
+            binding = record.get("binding") or {}
+            if (
+                binding.get("boot_id") == boot_id()
+                and record.get("phase") not in TERMINAL
+            ):
+                raise RecoveryError("recovery destination has another owner")
+            for resource in record.get("resources") or []:
+                target = Path(str(resource.get("target")))
+                if target.exists() or target.is_symlink():
+                    raise RecoveryError(
+                        "stale recovery still owns host resources; "
+                        "manual recovery required"
+                    )
+            active.unlink()
+            sync_directory(ROOT)
+            return directory.name
+        # An active link no record claims was not made by this helper: never take it.
+        raise RecoveryError("recovery destination has another owner")
+
     def prepare(self) -> dict[str, Any]:
         with self.locked():
             if self.record:
@@ -516,7 +562,11 @@ class Recovery:
             sync_directory(self.directory)
             identity = file_identity(claim)
             self.record["claim"] = identity
-            self.save()
+            self.save()  # A refused claim still leaves a journal: cleanup only.
+            reclaimed = self.reclaim_stale_active()
+            if reclaimed is not None:
+                self.record["reclaimed_stale_active"] = reclaimed
+                self.save()
             publish(claim, ROOT / "active", identity)
             if boot_id() != self.binding["boot_id"]:
                 raise RecoveryError("node rebooted before recovery arm")
@@ -646,6 +696,7 @@ class Recovery:
             "expired_at": self.record.get("expired_at"),
             "retired": bool(self.record.get("retired")),
             "start_requested": self.record.get("start_requested"),
+            "reclaimed_stale_active": self.record.get("reclaimed_stale_active"),
             "timer": self.timer,
             "service": self.service,
         }
