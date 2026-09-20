@@ -63,6 +63,9 @@
   `scripts/build-regional-case-index.py` 生成。
 - `GPU_FAILURE_AUTOMATION_DESIGN.html`：由 `build-html.sh` 从当前文档集生成，
   作为 Release、Pages 或 CI artifact 发布，不进入源码版本控制。
+- `diagrams/`：正文引用的本地 SVG 矢量图源。Markdown 使用文档相对路径；
+  `build-html.sh` 从仓库根及 `docs/` 查找资源，并嵌入 HTML，离线查看不依赖 S3。
+  带日期的部署图只代表对应核对快照，更新时须同步正文的日期和观察范围。
 
 生成物不得手改。修改事实源后运行对应生成器的 `--check`，并运行
 `scripts/check-doc-references.py` 验证代码和测试引用、

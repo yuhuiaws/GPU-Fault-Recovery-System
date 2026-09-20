@@ -64,6 +64,7 @@ pandoc \
   --to=html5 \
   --standalone \
   --embed-resources \
+  --resource-path=.:docs \
   --toc \
   --toc-depth=3 \
   --number-sections \

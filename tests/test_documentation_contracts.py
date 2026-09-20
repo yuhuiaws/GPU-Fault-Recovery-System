@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tomllib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -678,6 +679,39 @@ def test_large_acceptance_documents_publish_the_anchor_contract() -> None:
         )
         assert "维护契约" in preamble
         assert "锚点" in preamble
+
+
+def test_overview_deployment_snapshot_uses_local_native_svg() -> None:
+    overview = (DOCS / "概要设计.md").read_text(encoding="utf-8")
+    section = overview.split("### 4.1.2 ", 1)[1].split("### 4.2 ", 1)[0]
+    image = re.search(r"!\[图 4-4[^\]]*\]\(([^)]+\.svg)\)", section)
+
+    assert image is not None, "deployment snapshot must embed its local SVG"
+    path = (DOCS / image.group(1)).resolve()
+    assert path.is_relative_to(DOCS), "the diagram must ship with the documentation"
+    root = ET.parse(path).getroot()
+    namespace = "{http://www.w3.org/2000/svg}"
+    assert root.tag == namespace + "svg", "diagram must be native SVG"
+    assert "viewBox" in root.attrib, "diagram needs a scalable viewBox"
+    assert "2026-09-20" in section, "live counts must be tied to a dated snapshot"
+    assert "不是所有站点必须使用的固定配置" in section
+    assert root.find(namespace + "title") is not None
+    forbidden = {namespace + name for name in ("script", "image", "foreignObject")}
+    assert not any(element.tag in forbidden for element in root.iter()), (
+        "the review diagram must remain self-contained vector artwork"
+    )
+    identifiers = {element.get("id") for element in root.iter()}
+    assert {
+        "cpu-vpc",
+        "gpu-vpc",
+        "ingress",
+        "worker",
+        "executor",
+        "agent",
+        "aurora",
+        "amp",
+        "sns",
+    } <= identifiers, "diagram omits a core deployment boundary or component"
 
 
 def test_html_build_uses_the_current_authoritative_document_set() -> None:
