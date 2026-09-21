@@ -7,18 +7,22 @@ import secrets
 import shutil
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.bootstrap_common import CommandRunner
 from gpu_fault.admin.command_log import report_failure
 from gpu_fault.admin.notification_precheck import WAIT_FLAG
 from gpu_fault.admin.operation_lock import (
     SITE_OPERATION_LOCK_FD_ENV,
     site_operation_lock,
 )
+from gpu_fault.admin.postgres_grant import PostgresTestAllocation
 from gpu_fault.admin.python_environment import python_environment
+from gpu_fault.admin.release_postgres import isolated_postgres_allocation
 from gpu_fault_release import REPOSITORY_ROOT_ENV
 
 if __package__:
@@ -660,19 +664,33 @@ def run_source_impact_gate(
         raise StagingDeployError("source impact gate plan is invalid") from exc
     if not isinstance(plan, dict):
         raise StagingDeployError("source impact gate plan must be an object")
-    _run(
-        [
-            sys.executable,
-            str(selector),
-            "--base",
-            base,
-            "--read-plan",
-            str(output),
-            "--execute",
-        ],
-        cwd=repository_root,
-        env=environment,
+    if not isinstance(plan.get("postgres"), bool):
+        raise StagingDeployError("source impact gate plan is incomplete")
+    # The executor refuses a plan that needs PostgreSQL stress unless its caller
+    # grants a database; only this gate can allocate one for the deploy-host-only
+    # and quality-only routes, exactly as the release build does for the
+    # control-plane route.
+    postgres_context = (
+        isolated_postgres_allocation(
+            CommandRunner(), repository_root=repository_root, state_dir=state_dir
+        )
+        if plan["postgres"]
+        else nullcontext(PostgresTestAllocation(""))
     )
+    with postgres_context as postgres:
+        _run(
+            [
+                sys.executable,
+                str(selector),
+                "--base",
+                base,
+                "--read-plan",
+                str(output),
+                "--execute",
+            ],
+            cwd=repository_root,
+            env=postgres.build_environment(environment),
+        )
     return plan
 
 

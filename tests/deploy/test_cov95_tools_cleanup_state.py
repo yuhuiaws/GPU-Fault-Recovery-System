@@ -412,3 +412,39 @@ def test_entrypoints_reject_incomplete_verification_or_nonlist_fleet_snapshot(
             str(fleet),
         )
     assert path.read_bytes() == before
+
+
+def test_a_rematerialized_config_is_accepted_only_with_its_explicit_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_state: dict[str, Any]
+) -> None:
+    import hashlib
+
+    config, _inventory, path = cleanup_inputs(tmp_path)
+    moved = tmp_path / "moved-release.json"
+    moved.write_text(
+        json.dumps({**json.loads(config.read_text()), "release": {"manifest": "/b"}})
+    )
+    digest = hashlib.sha256(moved.read_bytes()).hexdigest()
+    request = dict(scope="all", mode="reset", node_mode="uninstall", cluster_ids=[])
+    previous = cleanup_state["config_sha256"]
+
+    monkeypatch.delenv(STATE.ACCEPT_CONFIG_ENV, raising=False)
+    with pytest.raises(STATE.CleanupStateError, match="differs on config_sha256"):
+        STATE.validate_request(cleanup_state, config_path=moved, **request)
+    monkeypatch.setenv(STATE.ACCEPT_CONFIG_ENV, "0" * 64)
+    with pytest.raises(STATE.CleanupStateError, match="differs on config_sha256"):
+        STATE.validate_request(cleanup_state, config_path=moved, **request)
+    assert cleanup_state["config_sha256"] == previous, "a wrong digest changes nothing"
+
+    monkeypatch.setenv(STATE.ACCEPT_CONFIG_ENV, digest)
+    STATE.validate_request(cleanup_state, config_path=moved, state_path=path, **request)
+    persisted = STATE.read_state(path)
+    assert persisted["config_sha256"] == digest, "the accepted digest is persisted"
+    (entry,) = persisted["config_sha256_history"]
+    assert (entry["previous"], entry["accepted"]) == (previous, digest)
+    STATE.validate_request(cleanup_state, config_path=moved, state_path=path, **request)
+    assert len(STATE.read_state(path)["config_sha256_history"]) == 1, (
+        "an accepted digest is not re-recorded"
+    )
+    with pytest.raises(STATE.CleanupStateError, match="differs on config_sha256"):
+        STATE.validate_request(cleanup_state, config_path=config, **request)

@@ -231,6 +231,20 @@ def test_a_missing_exhausted_id_fails() -> None:
     assert any("exhausted" in item for item in errors), errors
 
 
+def test_the_siblings_initial_branch_counts_as_its_exhausted_branch() -> None:
+    # The runner injects the sibling first, so its finding opens the incident
+    # and its ladder is ``branch:initial`` (live attempt 10, 2026-09-19); the
+    # spec asks for "node-c's branch", not for a branch literally named after
+    # node-c.
+    workflow = happy_workflow()
+    for step in workflow["official_steps"]:
+        if step["branch_id"] == f"branch:{SIBLING}":
+            step["branch_id"] = "branch:initial"
+    workflow["exhausted_branch_ids"] = ["branch:initial"]
+    errors = _errors(workflow, happy_incident())
+    assert not any("exhausted" in item for item in errors), errors
+
+
 def test_an_exhausted_id_for_the_wrong_node_fails() -> None:
     workflow = happy_workflow()
     workflow["exhausted_branch_ids"] = [f"branch:{FAULT}"]

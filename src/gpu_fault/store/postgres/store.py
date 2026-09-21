@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
 )
+from gpu_fault.store.postgres.fresh_control_state import (
+    normalize_fresh_control_state_mode,
+)
 from gpu_fault.store.postgres.collector_telemetry import PostgresCollectorTelemetryMixin
 from gpu_fault.store.postgres.control_records import PostgresControlRecordMixin
 from gpu_fault.store.postgres.core import PostgresCoreMixin
@@ -110,6 +113,7 @@ class PostgresStore(
         pool_timeout_seconds: float = 2,
         initialize_schema: bool = True,
         hot_state_mode: str | None = None,
+        fresh_control_state_mode: str | None = None,
     ) -> None:
         if (
             pool_min_size < 0
@@ -149,6 +153,12 @@ class PostgresStore(
             raise ValueError(
                 "GPU_FAULT_POSTGRES_HOT_STATE_MODE must be legacy, dual, or dedicated"
             )
+        # Honoured only when this bootstrap creates the schema on a database that
+        # had none (the schema release Job on a fresh install); an existing
+        # database keeps its recorded modes whatever the caller asks for.
+        self.fresh_control_state_mode = normalize_fresh_control_state_mode(
+            fresh_control_state_mode
+        )
         self.processor_queue_state_mode = (
             os.getenv(
                 "GPU_FAULT_PROCESSOR_QUEUE_STATE_MODE",

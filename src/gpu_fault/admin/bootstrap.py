@@ -1504,10 +1504,8 @@ def _ensure_aurora(
             site_id=site_id,
             description=f"Aurora cluster {cluster_id}",
         )
-        # Diagnostics (lock-wait and slow-statement logging, pg_stat_statements,
-        # CloudWatch log export) are reconciled on every deploy like capacity
-        # is, so a cluster created before they existed gets them on its next
-        # deploy without an operator step.
+        # Diagnostics (lock-wait/slow-statement logging, pg_stat_statements, CloudWatch
+        # log export) are reconciled on every deploy like capacity, so older clusters catch up.
         parameter_group = ensure_cluster_parameter_group(
             runner,
             aws_region=cpu.region,
@@ -1516,6 +1514,7 @@ def _ensure_aurora(
                 existing_cluster.get("EngineVersion") or AURORA_ENGINE_VERSION
             ),
             safe_name=_safe_name,
+            site_id=site_id,
         )
         reconcile_cluster_diagnostics(
             runner,
@@ -1531,6 +1530,7 @@ def _ensure_aurora(
             cluster_id=cluster_id,
             engine_version=AURORA_ENGINE_VERSION,
             safe_name=_safe_name,
+            site_id=site_id,
         )
         # The argument list is owned by ``aurora_capacity`` -- the one writer of
         # the ACU window, shared with the legacy deploy script's ``create``.
@@ -1556,11 +1556,11 @@ def _ensure_aurora(
         availability_zones=availability_zones,
         safe_name=_safe_name,
         wait=False,
+        site_id=site_id,
     )
     if cluster_exists:
-        # After both instance creates: the shared reconciler proves the window on
-        # both members (waiting for any still creating), so a resumed bootstrap
-        # must not reach it while a reader is still absent.
+        # After both instance creates: the shared reconciler proves the window on both
+        # members (waiting for any still creating); a resumed run must not reach it early.
         reconcile_existing_capacity(
             runner,
             aws_region=cpu.region,

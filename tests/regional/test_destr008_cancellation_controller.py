@@ -70,6 +70,25 @@ def test_arm_close_quiescence_and_control_last_cleanup(
     )
 
 
+def test_claim_converges_while_the_daemon_heartbeat_churns_status(
+    setup: tuple[CpuApi, wire.Plan, resources.CpuRuntime],
+) -> None:
+    api, plan, runtime = setup
+    api.heartbeat_churn = True
+    watchdog = api.watchdog(plan, runtime)
+    control = watchdog.arm()
+    assert control.assert_armed().state == "ARMED", "arming must persist first"
+    claim_id = control.claim()
+    assert claim_id.startswith("claim-"), "the claim must acquire submission authority"
+    submitting = control.read()
+    assert submitting.control.producer.state == "SUBMITTING", (
+        "the parent CAS must land control.json despite concurrent status heartbeats"
+    )
+    assert submitting.control.producer.claim_id == claim_id, (
+        "the persisted claim must be the one the parent minted"
+    )
+
+
 def test_completed_arm_is_idempotent_without_resetting_control(
     setup: tuple[CpuApi, wire.Plan, resources.CpuRuntime],
 ) -> None:
@@ -324,6 +343,60 @@ def test_startup_is_bounded_and_partial_arm_can_be_cleaned_without_quiescence(
     assert api.journal()["closed"] and api.journal()["quiescence"] is None, (
         "resource-only cleanup must not manufacture a Store quiescence receipt"
     )
+
+
+def test_pod_discovery_reads_only_this_jobs_pods_from_the_typed_list(
+    setup: tuple[CpuApi, wire.Plan, resources.CpuRuntime],
+) -> None:
+    # A live namespace held 17 Pods (462 KiB as kubectl JSON), past the bounded
+    # document, and kubectl v1.35 prints a v1/List without a resourceVersion;
+    # discovery must ask the server for this Job's own Pods (attempt 11).
+    api, plan, runtime = setup
+    for index in range(40):
+        api.objects["pod", f"foreign-{index}"] = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": f"foreign-{index}",
+                "namespace": runtime.namespace,
+                "uid": f"foreign-{index}-uid",
+                "resourceVersion": "9",
+                "labels": {"app": "unrelated"},
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "unrelated",
+                        "uid": "unrelated-rs-uid",
+                        "controller": True,
+                        "blockOwnerDeletion": True,
+                    }
+                ],
+                "managedFields": [{"fieldsV1": {"f:" + "x" * 8000: {}}}],
+            },
+            "spec": {"containers": [{"name": "app", "image": "unrelated:1"}]},
+            "status": {"phase": "Running"},
+        }
+    watchdog = api.watchdog(plan, runtime)
+    watchdog.arm()
+    job_uid = api.objects["job", watchdog.name]["metadata"]["uid"]
+    discovery = [
+        args
+        for verb, args, _ in api.calls
+        if verb == "get" and args[1] == "--raw" and "/pods?" in args[2]
+    ]
+    assert discovery, "Pod discovery must read the server's typed Pod list"
+    assert all(
+        args[2].endswith(
+            "/pods?labelSelector=batch.kubernetes.io%2Fcontroller-uid%3D" + job_uid
+        )
+        for args in discovery
+    ), "discovery must be narrowed to the Pods labelled with this Job's uid"
+    assert not [
+        args
+        for verb, args, _ in api.calls
+        if verb == "get" and args[1:4] == ("pod", "-o", "json")
+    ], "a namespace-wide kubectl Pod list is neither bounded nor a typed list"
 
 
 @pytest.mark.parametrize(

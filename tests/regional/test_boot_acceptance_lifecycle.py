@@ -376,6 +376,26 @@ def test_parse_status_report_skips_wrapper_lines() -> None:
         lifecycle.parse_status_report("nothing here\n")
 
 
+def test_parse_status_report_returns_the_final_report_after_a_child_summary() -> None:
+    # Live 2026-09-20 (BOOT-020 a2): `gpu-fault-admin config` applies by running
+    # release-deploy as a child that inherits stdout, so the child's own JSON
+    # summary precedes the APPLIED report. The report is the LAST document.
+    child = json.dumps(
+        {"release_id": "0e813e5eaf80", "status": "verified", "phases": {"roll": 1}},
+        indent=2,
+    )
+    final = {"status": "APPLIED", "audit": "/state/admin-config/history/x"}
+    stdout = "using site /tmp/x\n" + child + "\n" + json.dumps(final, indent=2) + "\n"
+
+    assert lifecycle.parse_status_report(stdout) == final
+
+    nested = {"checks": [{"name": "a", "details": {"b": [{"c": 1}]}}, {"name": "d"}]}
+    wrapped = "wrapper line\n" + json.dumps(nested, indent=2) + "\n"
+    assert lifecycle.parse_status_report(wrapped) == nested
+    with pytest.raises(BootAcceptanceError, match="incomplete JSON report"):
+        lifecycle.parse_status_report(child + '\n{\n  "status": "APPLIED"\n')
+
+
 def test_runtime_identity_passes_only_when_every_replica_matches_the_release() -> None:
     result = lifecycle.runtime_identity_matches_release(
         _report(CPU, EXEC), manifest=MANIFEST, metadata=METADATA, agents=AGENTS

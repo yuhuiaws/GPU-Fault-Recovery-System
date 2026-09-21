@@ -157,6 +157,9 @@ def request_targets(
     }
 
 
+ACCEPT_CONFIG_ENV = "GPU_FAULT_CLEANUP_ACCEPT_CONFIG_SHA256"
+
+
 def validate_request(
     document: dict[str, Any],
     *,
@@ -165,6 +168,7 @@ def validate_request(
     mode: str,
     node_mode: str,
     cluster_ids: list[str],
+    state_path: Path | None = None,
 ) -> None:
     verify_document(document)
     config_text = config_path.read_text(encoding="utf-8")
@@ -177,6 +181,31 @@ def validate_request(
             json.loads(config_text), scope=scope, cluster_ids=cluster_ids
         ),
     }
+    accepted = os.environ.get(ACCEPT_CONFIG_ENV, "").strip()
+    if (
+        document.get("config_sha256") != expected["config_sha256"]
+        and accepted
+        and accepted == expected["config_sha256"]
+    ):
+        # The administrator re-materialized the release config from another
+        # reviewed source tree (``uninstall --accept-repository-root-override``);
+        # only the config's location-bound fields may differ, and scope, modes
+        # and targets are still compared below. Keep the previous digest.
+        history = document.get("config_sha256_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "previous": document.get("config_sha256"),
+                "accepted": accepted,
+                "observed_at": now(),
+                "message": "config digest accepted by the administrator",
+            }
+        )
+        document["config_sha256_history"] = history
+        document["config_sha256"] = accepted
+        if state_path is not None:
+            atomic_write(state_path, document)
     for key, value in expected.items():
         if document.get(key) != value:
             raise CleanupStateError(f"cleanup request differs on {key}")
@@ -477,6 +506,7 @@ def main() -> int:
                 mode=args.mode,
                 node_mode=args.node_mode,
                 cluster_ids=args.cluster_id,
+                state_path=args.path,
             )
             if args.command == "resume":
                 if PHASE_INDEX[document["phase"]] > PHASE_INDEX["CLEANUP_COMPLETED"]:

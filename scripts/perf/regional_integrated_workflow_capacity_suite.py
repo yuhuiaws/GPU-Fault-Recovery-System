@@ -990,6 +990,52 @@ def purge_integrated_rows(run_id: str, *, artifacts: Path) -> None:
     purge_audit_rows(run_id=run_id, artifacts=artifacts)
 
 
+def sweep_late_drill_residue(
+    artifacts: Path, run_id: str, *, attempts: int = 4, pause_seconds: float = 15.0
+) -> dict:
+    """Drain the drill notifications the collector-silence detector emits late.
+
+    The data purge runs before the synthetic clusters are deregistered, so a
+    few ``[DRILL:perf-capacity]`` notifications for the run's nodes can land
+    after it (live 2026-09-20: four for perf-cap-000) and the next round's
+    registration then refuses "synthetic cluster data already exists". Re-probe
+    the run's clusters after a pause and sweep only such residue.
+    """
+
+    if __package__:
+        from .regional_capacity_data import invoke
+        from .regional_capacity_registry import control
+    else:
+        from regional_capacity_data import invoke
+        from regional_capacity_registry import control
+
+    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
+    cluster_ids = list(intent.get("cluster_ids") or [])
+    history: list[dict] = []
+    swept = False
+    for attempt in range(1, attempts + 1):
+        time.sleep(pause_seconds)
+        remaining = invoke(
+            control, run_id=run_id, cluster_ids=cluster_ids, cleanup=False
+        )
+        history.append({"attempt": attempt, "remaining": remaining})
+        if remaining["total"] == 0:
+            return {"swept": swept, "history": history}
+        swept = True
+        history.append(
+            {
+                "attempt": attempt,
+                "swept": invoke(
+                    control, run_id=run_id, cluster_ids=cluster_ids, cleanup=True
+                ),
+            }
+        )
+    remaining = invoke(control, run_id=run_id, cluster_ids=cluster_ids, cleanup=False)
+    if remaining["total"] != 0:
+        raise RuntimeError("late drill residue survived the post-teardown sweep")
+    return {"swept": True, "history": history}
+
+
 def execute_integrated_jobs(
     args: argparse.Namespace,
     *,
@@ -1309,6 +1355,14 @@ def run(args: argparse.Namespace) -> int:
                     workload_residuals = wait_for_integrated_workload_cleanup()
                     (artifacts / "cleanup-workloads.json").write_text(
                         json.dumps(workload_residuals, indent=2, sort_keys=True) + "\n"
+                    )
+                    (artifacts / "cleanup-late-drill-residue.json").write_text(
+                        json.dumps(
+                            sweep_late_drill_residue(artifacts, run_id),
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n"
                     )
                     residuals = workflow_audit(run_id)
                     (artifacts / "cleanup-residuals.json").write_text(

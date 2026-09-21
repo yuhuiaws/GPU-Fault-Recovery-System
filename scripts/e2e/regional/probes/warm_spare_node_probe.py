@@ -32,6 +32,10 @@ SELF_CGROUP = Path("/proc/self/cgroup")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 ACK_SECONDS = 10
 ARM_SECONDS = 30
+# The independent watcher takes the journal lock once a second for its systemd
+# reads; a request landing inside a tick waits this long before it fails closed.
+LOCK_POLL_SECONDS = 0.05
+LOCK_ATTEMPTS = 300
 JOB_SECONDS = 45
 RECOVERY_SECONDS = 180
 MAX_WINDOW = 900
@@ -230,14 +234,26 @@ def file_identity(path: Path) -> dict[str, Any]:
     identity: dict[str, Any] = {"dev": info.st_dev, "ino": info.st_ino}
     if stat.S_ISLNK(info.st_mode):
         return {**identity, "link": os.readlink(path)}
-    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+    # Writable by the caller's own group is still the caller's privilege (this
+    # EKS AMI ships /usr/bin/kubelet as 0775 root:root, live 2026-09-19); any
+    # other write bit lets a different principal change the service.
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_mode & 0o002
+        or (info.st_mode & 0o020 and info.st_gid != os.getegid())
+    ):
         raise ProbeError("service window file is not a protected regular file")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
             raise ProbeError("service window file changed while opening")
-        checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        # The independent units run under the host's /usr/bin/python3 (3.9 on
+        # Amazon Linux 2023); hashlib.file_digest only exists from 3.11.
+        digest_state = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest_state.update(chunk)
+        checksum = digest_state.hexdigest()
         after = os.fstat(stream.fileno())
         if any(
             getattr(after, key) != getattr(opened, key)
@@ -311,11 +327,18 @@ def job_id(unit: dict[str, str]) -> int:
     return int(match[1])
 
 
+IDENTITY_FIELDS = {"Id", "LoadState", "ActiveState", "SubState", "Job"}
+
+
 def unit_state(name: str) -> dict[str, str]:
     fields = UNIT_FIELDS | (SERVICE_FIELDS if name.endswith(".service") else set())
     value = systemctl("show", name, "--property=" + ",".join(sorted(fields)))
-    if not fields <= value.keys() or value["Id"] != name:
+    if not IDENTITY_FIELDS <= value.keys() or value["Id"] != name:
         raise ProbeError("systemd unit identity or properties are incomplete")
+    # systemd 252 (Amazon Linux 2023, live 2026-09-19) prints no line for an
+    # empty list or exec property -- EnvironmentFiles= of a unit without one,
+    # everything of a unit it never loaded -- so an omitted property is empty.
+    value = {**{field: "" for field in fields}, **value}
     job_id(value)
     return value
 
@@ -544,7 +567,14 @@ class ServiceWindow:
                 or info.st_nlink != 1
             ):
                 raise ProbeError("service window lock is not private")
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for attempt in range(LOCK_ATTEMPTS):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt + 1 == LOCK_ATTEMPTS:
+                        raise
+                    time.sleep(LOCK_POLL_SECONDS)
             self.directory.mkdir(mode=0o700, exist_ok=True)
             require_directory(self.directory, private=True)
             if self.state_path.exists() or self.state_path.is_symlink():

@@ -11,6 +11,7 @@ from kubernetes.client.exceptions import ApiException
 
 from gpu_fault.models import (
     FaultIncident,
+    IncidentState,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -212,6 +213,8 @@ def seed(
     event_id: str | None = None,
     predecessor: str | None = None,
     failure_handled: bool = True,
+    policy_source: str = "SITE_SYNTHETIC_REPLACEMENT_TEST",
+    state: IncidentState = IncidentState.DETECTED,
 ) -> tuple[FaultIncident, WorkflowRequest]:
     incident = FaultIncident(
         incident_id=incident_id,
@@ -222,7 +225,8 @@ def seed(
         attempt_id=bound.attempt_id,
         node_ids=[bound.fault_node],
         policy_version="610",
-        policy_source="SITE_SYNTHETIC_REPLACEMENT_TEST",
+        policy_source=policy_source,
+        state=state,
         workflow_request_id=workflow_id,
         created_at=STAMP,
         updated_at=STAMP,

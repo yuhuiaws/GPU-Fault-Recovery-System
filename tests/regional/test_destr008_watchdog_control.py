@@ -169,13 +169,23 @@ def test_cas_retry_exhaustion_and_unknown_readback_never_authorize_post() -> Non
 
 
 def test_direct_control_ack_must_not_replace_watchdog_status() -> None:
+    # The parent's control CAS replaces only control.json, so it can never
+    # overwrite the daemon's status.json. A daemon heartbeat that rewrites
+    # status.json concurrently (here, on every patch) must therefore neither
+    # block the claim -- that pinned-everything CAS was the live control
+    # livelock -- nor lose the daemon's status. The claim converges and the
+    # watchdog receipt is preserved and advances monotonically.
     h = build_control()
     h.tick()
+    before = h.port.read()
+    assert before.status is not None and before.status.state == "ARMED"
     h.api.after_patch = h.tick
-    with pytest.raises(RegionalFixtureError, match="changed watchdog status"):
-        h.submit()
-    assert h.posts == 0
-    assert h.port.read().control.producer.state == "SUBMITTING"
+    claim_id = h.submit()
+    assert claim_id and h.posts == 1
+    after = h.port.read()
+    assert after.control.producer.state == "ACKNOWLEDGED"
+    assert after.status is not None and after.status.state == "ARMED"
+    assert after.status.sequence > before.status.sequence
 
 
 @pytest.mark.parametrize("change", ["version", "control", "plan", "shape"])

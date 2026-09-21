@@ -184,8 +184,9 @@ def test_resume_convergence_failure_discards_stale_observations_without_running_
     backend = FailingConvergence()
     with pytest.raises(RuntimeError, match="could not converge.*noop precondition"):
         rolling.resume_release_rolling(backend, recorder)
-    assert len(backend.calls) == 1
-    assert backend.calls[0][0] == "noop"
+    deploys = [call for call in backend.calls if call[0] != "resume_rollback"]
+    assert len(deploys) == 1, backend.calls
+    assert deploys[0][0] == "noop"
     assert backend.snapshots == []
     saved = json.loads(recorder.path.read_text(encoding="utf-8"))
     assert saved["verdict"] == "FAIL"

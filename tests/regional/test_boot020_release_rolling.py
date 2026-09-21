@@ -45,6 +45,12 @@ class FakeBackend:
             "gpu-fault-control-worker": 1,
             "gpu-fault-telemetry-spool-worker": 1,
         }
+        # What a CPU rollout actually changes; generation alone also moves when
+        # the release stamps an annotation (live 2026-09-20).
+        self.cpu_identities = {
+            name: {"replicas": 3, "template_sha256": f"{name}-template-v1"}
+            for name in self.cpu_generations
+        }
         self.gpu_generations = {
             "cluster-a": {
                 name: 1
@@ -93,9 +99,16 @@ class FakeBackend:
             "release_id": scenario,
             "live": copy.deepcopy(self.live),
             "cpu_generations": dict(self.cpu_generations),
+            "cpu_identities": copy.deepcopy(self.cpu_identities),
             "gpu_generations": copy.deepcopy(self.gpu_generations),
             "next_deploy": self.classify(scenario),
         }
+
+    def node_safety(self, scenario: str) -> dict[str, Any]:
+        return {"safe": True, "clusters": {"cluster-a": []}}
+
+    def resume_rollback(self, scenario: str) -> dict[str, Any]:
+        return {"resumed": False, "phase": "complete"}
 
     def _with_pins(self, result: dict[str, Any], phase: str) -> dict[str, Any]:
         correct = {
@@ -167,6 +180,10 @@ class FakeBackend:
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
             self.cpu_generations["gpu-fault-control-worker"] = 2
+            self.cpu_identities["gpu-fault-control-worker"] = {
+                "replicas": 2,
+                "template_sha256": "gpu-fault-control-worker-template-v2",
+            }
         elif scenario == "executor":
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
             self.gpu_generations["cluster-a"][EXECUTOR] = 2

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
@@ -55,6 +56,71 @@ def test_preflight_reads_real_guards_and_binds_predecessor(
     assert reused["errors"] == [], reused
     assert reused["focused_tests"]["reused"] is True, reused
     assert not any(name == "focused" for name, _ in h.calls), h.calls
+
+
+def _execution_journal(path: Path, *, completed: bool, started: bool) -> None:
+    record = {
+        "schema_version": 1,
+        "binding": {"inputs": {"scenarios": ["no-spare"]}},
+        "attempt": 1,
+        "maintenance_expires_at": 1_800_000_000,
+        "release_id": "release-test",
+        "profile_version": "profile-v1",
+        "fault_uid": "fault-uid",
+        "spare_uid": "spare-uid",
+        "scenarios": {
+            "no-spare": {
+                "state": "STARTED" if started else "CLEANED",
+                "workload_started": True,
+                "fixture_started": True,
+                "post_started": True,
+            }
+        },
+        "prewarm_started": True,
+        "prewarm_cleaned": True,
+        "completed": completed,
+    }
+    path.write_text(json.dumps(record))
+    path.chmod(0o600)
+
+
+def test_shortage_preflight_defers_readiness_only_for_an_unfinished_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Attempts 11 and 15 (2026-09-19) died mid-scenario and left their pinned
+    # workload, a quarantined fault node and an unlabelled spare; the driver's
+    # --plan refused those readiness errors, so the guard never authorized the
+    # cleanup-only continuation that removes them. An UNFINISHED journal defers
+    # them; a finished one (the next attempt runs fresh) keeps every check.
+    h = WarmHarness(shortage, tmp_path, monkeypatch)
+    h.gpu_workloads = [{"node": FAULT, "name": "gpu-fault-single-node-warm-spare"}]
+    h.nodes[SPARE]["labels"].pop(SPARE_LABEL)
+    journal = tmp_path / shortage.EXECUTION_OWNER_JOURNAL
+    _execution_journal(journal, completed=False, started=True)
+    pending = shortage.read_only_preflight(
+        h.settings, tmp_path, reusable_tests=h.test_result
+    )
+    assert pending["errors"] == [] and pending["cleanup_continuation"] is True, pending
+    assert set(pending["deferred_readiness_errors"]) >= {
+        "fault or spare node already has a GPU workload",
+        "spare node is not declared by the spare label",
+    }, "the plan must still record what the continuation is expected to remove"
+    assert pending["occupied_targets"] == h.gpu_workloads, pending
+    _execution_journal(journal, completed=True, started=False)
+    finished = shortage.read_only_preflight(
+        h.settings, tmp_path, reusable_tests=h.test_result
+    )
+    assert finished["cleanup_continuation"] is False, finished
+    assert "fault or spare node already has a GPU workload" in finished["errors"], (
+        "a finished journal owns nothing: the next attempt runs fresh with every check"
+    )
+    journal.write_text("not json")
+    assert (
+        shortage.read_only_preflight(
+            h.settings, tmp_path, reusable_tests=h.test_result
+        )["cleanup_continuation"]
+        is False
+    ), "an unreadable journal never relaxes readiness"
 
 
 @pytest.mark.parametrize("module", [failover, shortage])

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from gpu_fault.admin.aurora_capacity import (
     CAPACITY_SETTLE_STABLE_POLLS,
@@ -412,12 +412,18 @@ def ensure_serverless_instances(
     availability_zones: Sequence[str],
     safe_name: Callable[..., str],
     wait: bool = True,
+    site_id: str | None = None,
 ) -> list[str]:
     """Create the writer and the reader that are missing; returns both ids.
 
     ``wait=False`` defers final readiness to ``aurora_ready``, but never skips
     the available-primary/cluster barrier before a replica create. The whole
     Aurora chain runs alongside tasks that need no database.
+
+    With ``site_id`` every instance carries the site tag: new instances are
+    created with it and existing untagged ones receive it. The uninstall's
+    ownership proof reads that tag on each instance, not only on the cluster
+    (live 2026-09-20: two untagged instances stopped an uninstall at Aurora).
     """
 
     instance_ids = [
@@ -436,6 +442,14 @@ def ensure_serverless_instances(
             not_found=("DBInstanceNotFound",),
         )
         if existing is not None:
+            if site_id is not None:
+                _ensure_instance_site_tag(
+                    runner,
+                    aws_region=aws_region,
+                    document=existing,
+                    instance_id=instance_id,
+                    site_id=site_id,
+                )
             continue
         _await_replica_source(
             runner,
@@ -463,6 +477,11 @@ def ensure_serverless_instances(
                 availability_zone,
                 "--promotion-tier",
                 "0",
+                *(
+                    ["--tags", f"Key={SITE_TAG_KEY},Value={site_id}"]
+                    if site_id is not None
+                    else []
+                ),
             ],
             mutate=True,
             capture=False,
@@ -472,6 +491,37 @@ def ensure_serverless_instances(
             runner, aws_region=aws_region, instance_ids=instance_ids
         )
     return instance_ids
+
+
+def _ensure_instance_site_tag(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    document: Mapping[str, Any],
+    instance_id: str,
+    site_id: str,
+) -> None:
+    instances = document.get("DBInstances")
+    instance = next(
+        (
+            item
+            for item in (instances if isinstance(instances, list) else [])
+            if isinstance(item, dict)
+            and item.get("DBInstanceIdentifier") == instance_id
+        ),
+        None,
+    )
+    arn = str((instance or {}).get("DBInstanceArn") or "")
+    if instance is None or not arn:
+        raise BootstrapError(f"Aurora instance {instance_id} describe lacks its ARN")
+    ensure_rds_site_tag(
+        runner,
+        region=aws_region,
+        resource_arn=arn,
+        tags=instance.get("TagList"),
+        site_id=site_id,
+        description=f"Aurora instance {instance_id}",
+    )
 
 
 def _await_rds_available(
@@ -815,6 +865,7 @@ def ensure_cluster_parameter_group(
     cluster_id: str,
     engine_version: str,
     safe_name: Callable[..., str],
+    site_id: str | None = None,
 ) -> str:
     """Create the cluster parameter group when missing and hold its parameters
     at the diagnostic values; returns the group name.
@@ -826,18 +877,38 @@ def ensure_cluster_parameter_group(
     """
 
     group = cluster_parameter_group_name(cluster_id, safe_name=safe_name)
-    exists = (
-        describe_or_absent(
-            runner,
-            aws_region,
-            "rds",
-            "describe-db-cluster-parameter-groups",
-            "--db-cluster-parameter-group-name",
-            group,
-            not_found=("DBParameterGroupNotFound",),
-        )
-        is not None
+    existing = describe_or_absent(
+        runner,
+        aws_region,
+        "rds",
+        "describe-db-cluster-parameter-groups",
+        "--db-cluster-parameter-group-name",
+        group,
+        not_found=("DBParameterGroupNotFound",),
     )
+    exists = existing is not None
+    if existing is not None and site_id is not None:
+        # The uninstall proves ownership of the group by its site tag; a group
+        # created before the tag existed receives it on the next deploy.
+        groups = existing.get("DBClusterParameterGroups")
+        arn = str(
+            (groups[0] if isinstance(groups, list) and groups else {}).get(
+                "DBClusterParameterGroupArn"
+            )
+            or ""
+        )
+        if not arn:
+            raise BootstrapError(f"parameter group {group} describe lacks its ARN")
+        ensure_rds_site_tag(
+            runner,
+            region=aws_region,
+            resource_arn=arn,
+            tags=runner.aws_json(
+                aws_region, "rds", "list-tags-for-resource", "--resource-name", arn
+            ).get("TagList"),
+            site_id=site_id,
+            description=f"Aurora parameter group {group}",
+        )
     if not exists:
         versions = (
             runner.aws_json(
@@ -872,6 +943,11 @@ def ensure_cluster_parameter_group(
                 family,
                 "--description",
                 f"gpu-fault control plane diagnostics for {cluster_id}",
+                *(
+                    ["--tags", f"Key={SITE_TAG_KEY},Value={site_id}"]
+                    if site_id is not None
+                    else []
+                ),
             ],
             mutate=True,
             capture=False,

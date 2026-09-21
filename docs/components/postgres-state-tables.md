@@ -30,6 +30,13 @@ their dedicated tables in the same destination transaction before success.
 第一阶段新增 v15：`gpu_fault_remote_commands`、数据库迁移模式记录、读视图、
 双写与旧 writer 屏障。默认模式为 `legacy`。普通 deploy 只由独立 schema Job
 创建结构，不启用双写、不回填、不切换数据源，也不清理历史数据。
+例外只有全新数据库：schema Job 以 `--fresh-control-state-mode dedicated` 运行，在没有任何
+schema 的库上建表并记录迁移历史后，直接把两类模式播种为 `dedicated`（revision 1、
+`backfill_complete=true`、`legacy_purged=false`），因为空库没有可迁移的数据；实现位于
+`store/postgres/fresh_control_state.py`，不改任何 DDL，因此不涉及迁移校验和与 schema 版本。
+已存在 `gpu_fault_schema_migrations` 的库无论该参数如何都保持已记录的模式，仍须走下面的
+显式 legacy → dual → dedicated。播种前重新核对两行都是刚建好的默认值且三张相关表为空，否则
+报错停止而不是静默切换。
 
 模式的唯一事实源是 `gpu_fault_control_state_modes`，不是各 Pod 的环境变量。
 新 Store 通过数据库路由写入，通过模式感知视图读取；因此不会出现多个进程使用不同

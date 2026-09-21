@@ -9,6 +9,10 @@ from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
     POSTGRES_SCHEMA_MIGRATIONS,
 )
+from gpu_fault.store.postgres.fresh_control_state import (
+    database_is_fresh,
+    seed_fresh_control_state_modes,
+)
 from gpu_fault.store.postgres.ddl import (
     create_postgres_schema,
 )
@@ -108,7 +112,8 @@ class PostgresSchemaMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     hot_state_backfill_gaps: Callable[..., Any]
-    hot_state_mode: Any
+    hot_state_mode: str
+    fresh_control_state_mode: str
 
     def _initialize_schema_state(self, initialize_schema: bool) -> None:
         if initialize_schema:
@@ -165,6 +170,9 @@ class PostgresSchemaMixin:
                     """,
                     ("gpu_fault_schema_bootstrap",),
                 )
+                # Decided under the bootstrap lock, before any DDL: only a
+                # database with no schema at all may start dedicated.
+                fresh = database_is_fresh(cursor)
                 self._create_schema(cursor)
                 self._record_schema_migrations(cursor)
                 cursor.execute(
@@ -178,6 +186,10 @@ class PostgresSchemaMixin:
                     """,
                     (POSTGRES_SCHEMA_VERSION,),
                 )
+                if fresh:
+                    seed_fresh_control_state_modes(
+                        cursor, self.fresh_control_state_mode
+                    )
 
     def _validate_existing_schema(self) -> None:
         with self._db.cursor() as cursor:

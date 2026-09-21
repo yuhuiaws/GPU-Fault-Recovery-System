@@ -20,6 +20,9 @@ from tools.pytest_result_identity import (
 )
 
 REPORT_ENV = "PYTEST_GPU_FAULT_CASE_REPORT"
+# The git tree the receipt is bound to when pytest runs in a copy of it that
+# carries no .git (BOOT-018 builds and tests in such copies, live 2026-09-20).
+IDENTITY_ROOT_ENV = "PYTEST_GPU_FAULT_IDENTITY_ROOT"
 PARTITION_COUNT_ENV = "PYTEST_GPU_FAULT_PARTITION_COUNT"
 PARTITION_INDEX_ENV = "PYTEST_GPU_FAULT_PARTITION_INDEX"
 REPORT_SCHEMA_VERSION = 1
@@ -191,7 +194,10 @@ def pytest_configure(config: Any) -> None:
     path = _report_path()
     if path is None:
         return
-    SOURCE_ROOT = repository_root(SOURCE_ROOT)
+    identity_root = os.getenv(IDENTITY_ROOT_ENV, "").strip()
+    SOURCE_ROOT = repository_root(
+        Path(identity_root).resolve() if identity_root else SOURCE_ROOT
+    )
     if hasattr(config, "workerinput"):
         return
     STARTED.update(

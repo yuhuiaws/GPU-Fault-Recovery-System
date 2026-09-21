@@ -199,12 +199,25 @@ def workflow_errors(
     if counts != expected_counts:
         errors.append(f"branch_escalation_counts is not {expected_counts}: {counts}")
     exhausted = workflow.get("exhausted_branch_ids") or []
-    if len(exhausted) != 1 or not str(exhausted[0]).startswith(
-        f"branch:{sibling_node}"
-    ):
+    # Step 8 asks for "node-c's branch", however the DAG named it: the sibling
+    # is ``branch:initial`` when its finding opened the incident (the runner
+    # injects it first; attempt 10, 2026-09-19) and ``branch:<node>`` when it
+    # joined later. Resolve every exhausted id through the steps it owns.
+    steps = workflow.get("official_steps") or []
+    branch_nodes: dict[str, set[str]] = {}
+    for step in steps:
+        branch = step.get("branch_id")
+        if branch:
+            branch_nodes.setdefault(str(branch), set()).update(
+                step.get("branch_node_ids") or step.get("node_ids") or []
+            )
+    exhausted_nodes: set[str] = set()
+    for branch in exhausted:
+        exhausted_nodes |= branch_nodes.get(str(branch), set())
+    if len(exhausted) != 1 or exhausted_nodes != {sibling_node}:
         errors.append(
-            "exhausted_branch_ids is not exactly one "
-            f"branch:{sibling_node} entry: {exhausted}"
+            "exhausted_branch_ids is not exactly the sibling's branch: "
+            f"{exhausted} owned by {sorted(exhausted_nodes)}"
         )
     if not unknown and not str(failure_reason or "").startswith(EXHAUSTION_PREFIX):
         errors.append(
@@ -212,7 +225,6 @@ def workflow_errors(
             f"{failure_reason!r}"
         )
 
-    steps = workflow.get("official_steps") or []
     executions = workflow.get("step_executions") or []
     if any(item.get("operation") == "RESTART_WORKLOAD" for item in executions):
         errors.append("RESTART_WORKLOAD has an execution record; the join ran")

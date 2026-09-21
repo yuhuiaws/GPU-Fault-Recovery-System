@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -256,3 +257,95 @@ def test_explicit_isolated_database_reaches_real_pytest_child_without_other_auth
     assert url not in repr(command) and sent["GPU_FAULT_TEST_POSTGRES_URL"] == url, (
         "the opt-in must remain environment-only through the actual child boundary"
     )
+
+
+def test_focused_pytest_identity_can_be_bound_to_the_source_the_copy_came_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Live 2026-09-20 (BOOT-018 a1): the case copies the checkout WITHOUT .git
+    # (build purity) and runs the artifact pytest inside the copy; the receipt
+    # preparation derived the source identity from cwd and git failed with
+    # "not a git repository". The copy is the original working tree, so its
+    # receipts are bound to the original's identity when the caller names it.
+    from scripts.e2e.regional import focused_pytest as focused
+
+    seen: list[Path] = []
+
+    def identity(root: Path) -> str:
+        seen.append(root)
+        if root == tmp_path / "copy":
+            raise RuntimeError("git command failed while identifying pytest results")
+        return "b" * 64
+
+    monkeypatch.setattr(focused.evidence, "source_identity", identity)
+    (tmp_path / "copy").mkdir()
+    (tmp_path / "origin").mkdir()
+    command = tiny_command(tmp_path / "copy", "def test_ok():\n    assert True\n")
+    with pytest.raises(RuntimeError, match="not a git repository|identifying"):
+        with focused.prepare_focused_pytest(
+            command, cwd=tmp_path / "copy", environment={}
+        ):
+            pass
+    with focused.prepare_focused_pytest(
+        command,
+        cwd=tmp_path / "copy",
+        environment={},
+        identity_root=tmp_path / "origin",
+    ) as prepared:
+        assert prepared is not None
+        assert prepared.source_identity == "b" * 64
+        assert prepared.root == (tmp_path / "copy").resolve(), (
+            "receipt paths stay relative to the tree pytest actually ran in"
+        )
+    assert seen[-1] == (tmp_path / "origin").resolve()
+
+
+def test_verify_rechecks_the_bound_identity_root_not_the_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BOOT-018 a3 (2026-09-20): the child receipt was bound to the source tree,
+    # but verify() re-derived the identity from the copy (cwd) and rejected the
+    # evidence with "not a git repository". The recheck must use the same root
+    # the receipt was bound to.
+    from scripts.e2e.regional import focused_pytest as focused
+
+    origin = tmp_path / "origin"
+    copy = tmp_path / "copy"
+    origin.mkdir()
+    copy.mkdir()
+
+    def identity(root: Path) -> str:
+        if root == copy.resolve():
+            raise RuntimeError("git command failed while identifying pytest results")
+        return "c" * 64
+
+    monkeypatch.setattr(focused.evidence, "source_identity", identity)
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_identity": "c" * 64,
+                "session": {
+                    "source_identity": "c" * 64,
+                    "collected_nodeids": ["test_tiny.py::test_ok"],
+                    "discovered_nodeids": ["test_tiny.py::test_ok"],
+                    "collection_skips": [],
+                    "exitstatus": 0,
+                },
+                "records": {
+                    "test_tiny.py::test_ok": {
+                        "status": "PASS",
+                        "phases": dict(focused.PASSED_PHASES),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = focused.FocusedPytest(
+        ["pytest"], {}, copy.resolve(), report, "c" * 64, identity_root=origin.resolve()
+    )
+    completed = subprocess.CompletedProcess(["pytest"], 0, "", "")
+    verified = prepared.verify(completed)
+    assert verified.returncode == 0, verified.stderr

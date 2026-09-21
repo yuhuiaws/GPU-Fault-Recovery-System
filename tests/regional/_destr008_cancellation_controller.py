@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 
 from scripts.e2e.regional import destr008_cancellation as lifecycle
 from scripts.e2e.regional import destr008_controller_lock as locking
+from scripts.e2e.regional import destr008_parallel as parallel
 from scripts.e2e.regional import destr008_watchdog_control as control_api
 from scripts.e2e.regional import destr008_watchdog_resources as resources
 from scripts.e2e.regional import seeded_command_fixture as deletion
@@ -47,6 +49,28 @@ class Clock:
         return datetime.fromtimestamp(self.now(), timezone.utc).isoformat()
 
 
+def raw_list_request(args: tuple[str, ...]) -> tuple[str, dict[str, str]]:
+    """Kind and labelSelector of a ``kubectl get --raw <typed list>`` read.
+
+    The population survey and the Pod discovery read the server's typed list
+    (kubectl v1.35 prints a client-side v1/List with no resourceVersion for
+    ``get -o json``); the fake serves the same objects, filtered by
+    labelSelector exactly like the API server does.
+    """
+
+    resource_path, _, query = args[2].partition("?")
+    assert resource_path.startswith(
+        ("/apis/apps/v1/namespaces/", "/api/v1/namespaces/")
+    ) and resource_path.endswith(("/replicasets", "/pods")), args
+    selector: dict[str, str] = {}
+    for key, value in urllib.parse.parse_qsl(query):
+        assert key == "labelSelector", args
+        label, _, wanted = value.partition("=")
+        selector[label] = wanted
+    kind = "replicaset" if resource_path.endswith("/replicasets") else "pod"
+    return kind, selector
+
+
 @dataclass
 class CpuApi:
     regional: RegionalLiveFixture
@@ -58,6 +82,7 @@ class CpuApi:
     counter: int = 100
     auto_arm: bool = True
     auto_quiet: bool = True
+    heartbeat_churn: bool = False
     keep_pods: bool = False
     omit_pods: bool = False
     gate_lost_ack: bool = False
@@ -91,6 +116,7 @@ class CpuApi:
         )
         monkeypatch.setattr(locking, "host_identity", lambda: HOST)
         monkeypatch.setattr(resources, "CODE_SOURCE", self.source)
+        monkeypatch.setattr(parallel, "workers", 1)  # deterministic fakes
         monkeypatch.setattr(
             control_api, "source_sha256", lambda: wire.source_sha256(self.source)
         )
@@ -160,8 +186,10 @@ class CpuApi:
                     "containerStatuses": [
                         {
                             "name": "control-worker",
-                            "image": image,
-                            "imageID": "docker-pullable://" + image,
+                            # kubelet's shape for a digest-pinned pull: the
+                            # bare image config id, identity in imageID
+                            "image": "sha256:" + "e" * 64,
+                            "imageID": image,
                             "containerID": "containerd://worker-" + str(index),
                             "ready": True,
                             "restartCount": 0,
@@ -285,8 +313,8 @@ class CpuApi:
             "containerStatuses": [
                 {
                     "name": "cancellation-watchdog",
-                    "image": image,
-                    "imageID": "docker-pullable://" + image,
+                    "image": "sha256:" + "e" * 64,
+                    "imageID": image,
                     "containerID": container_id,
                     "ready": True,
                     "started": True,
@@ -439,6 +467,24 @@ class CpuApi:
                     )
                 )
                 control_map["metadata"]["resourceVersion"] = self.next()
+            elif self.heartbeat_churn and previous is not None:
+                # The independent daemon rewrites status.json every POLL_SECONDS,
+                # advancing the receipt sequence and bumping the ConfigMap
+                # resourceVersion. On the live control plane such a heartbeat
+                # lands between the parent's read and its CAS patch (~2.4 s round
+                # trip), so a parent patch that pins the whole resourceVersion or
+                # the status.json key can never converge.
+                data["status.json"] = wire.encode(
+                    wire.receipt(
+                        plan,
+                        control,
+                        previous,
+                        uid=control_map["metadata"]["uid"],
+                        now=int(self.clock.now()),
+                        state=previous.state,
+                    )
+                )
+                control_map["metadata"]["resourceVersion"] = self.next()
 
     def kube(self, plane: str, *args: str, **kwargs: Any) -> str:
         assert plane == "cpu", (
@@ -456,14 +502,9 @@ class CpuApi:
                 return self.raw_override
             kind = args[1]
             raw_list = kind == "--raw"
-            if raw_list and args[2].endswith(("/replicasets", "/pods")):
-                # The population survey reads the server's typed list through
-                # the raw API (kubectl v1.35 prints a client-side v1/List with no
-                # resourceVersion for ``get -o json``); serve the same objects.
-                assert args[2].startswith(
-                    ("/apis/apps/v1/namespaces/", "/api/v1/namespaces/")
-                ), args
-                kind = "replicaset" if args[2].endswith("/replicasets") else "pod"
+            selector: dict[str, str] = {}
+            if raw_list:
+                kind, selector = raw_list_request(args)
                 args = ("get", kind, "-o", "json")
             if kind in {"pod", "replicaset"} and args[2:4] == ("-o", "json"):
                 if kind == "pod" and self.list_override is not None:
@@ -472,6 +513,10 @@ class CpuApi:
                     copy.deepcopy(value)
                     for (resource_kind, _), value in self.objects.items()
                     if resource_kind == kind
+                    and all(
+                        value["metadata"].get("labels", {}).get(label) == wanted
+                        for label, wanted in selector.items()
+                    )
                 ]
                 for value in pods:
                     self.full_reads[kind, value["metadata"]["name"]] = value[

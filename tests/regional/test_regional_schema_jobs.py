@@ -119,3 +119,58 @@ def test_a_failed_schema_job_stops_the_stage_without_sitting_out_the_timeout(
         "a failed index build must stop the stage before the ensure Job"
     )
     assert " wait " not in recorded, "no kubectl wait: it cannot see a failed Job"
+
+
+def test_a_completed_schema_job_is_deleted_after_its_log(tmp_path: Path) -> None:
+    """Live 2026-09-20: the three completed schema Jobs outlived the release and
+    the fail-closed uninstall refused them as unregistered live resources. The
+    release owns its transient Jobs: print the log, then delete the Job."""
+    import os
+    import subprocess
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "calls.log"
+    (fake_bin / "kubectl").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        'case " $* " in\n'
+        '  *" apply -f - "*) cat >/dev/null; echo "job.batch/x created" ;;\n'
+        "  *\" get job/\"*) printf '%s\\n' '"
+        '{"apiVersion":"batch/v1","kind":"Job",'
+        '"metadata":{"name":"gpu-fault-postgres-index-build","uid":"schema-job-uid"},'
+        '"status":{"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}}\' ;;\n'
+        '  *" logs job/"*) echo "schema ok" ;;\n'
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "kubectl").chmod(0o755)
+    completed = subprocess.run(
+        ["bash", str(TOOL)],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": str(tmp_path / "kubeconfig"),
+            "GPU_FAULT_WHEEL_CONFIGMAP": "gpu-fault-wheel-test",
+            "GPU_FAULT_RUNTIME_IMAGE": "registry.example/runtime:test",
+            "GPU_FAULT_JOB_POLL_SECONDS": "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recorded = calls.read_text(encoding="utf-8").splitlines()
+    for name in (
+        "gpu-fault-postgres-index-build",
+        "gpu-fault-postgres-schema-ensure",
+        "gpu-fault-postgres-schema-preflight",
+    ):
+        deletes = [i for i, line in enumerate(recorded) if f"delete job/{name}" in line]
+        logs = [i for i, line in enumerate(recorded) if f"logs job/{name}" in line]
+        assert logs, f"{name}: no log printed"
+        assert len(deletes) == 2 and deletes[-1] > logs[-1], (
+            f"{name}: the completed Job must be deleted after its log: {recorded}"
+        )

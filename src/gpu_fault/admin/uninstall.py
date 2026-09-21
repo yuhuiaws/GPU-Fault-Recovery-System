@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,6 +41,11 @@ from gpu_fault.admin.resource_registry import (
     write_installation_resource_snapshot,
 )
 from gpu_fault.admin.site import RenderedSite, materialized_release_config
+from gpu_fault.admin.uninstall_spares import release_declared_spares
+from gpu_fault.admin.uninstall_override import (
+    cleanup_shell_environment,
+    record_repository_root_override,
+)
 from gpu_fault.admin.uninstall_types import (
     UNINSTALL_PHASES as UNINSTALL_PHASES,
     CpuDisposition as CpuDisposition,
@@ -96,7 +100,7 @@ def _run_cleanup(
     state_file: Path,
 ) -> None:
     with materialized_release_config(request.site) as config:
-        environment = {**os.environ, **request.site.environment}
+        environment = cleanup_shell_environment(request, Path(config))
         try:
             runner.run(
                 [
@@ -932,6 +936,12 @@ def _cleanup_document(
     if _reached(state, "KUBERNETES_VERIFIED") and not cleanup_state.is_file():
         raise BootstrapError("verified Kubernetes cleanup state is missing")
     if not _reached(state, "KUBERNETES_VERIFIED"):
+        release_declared_spares(
+            request,
+            state_dir / "state.json",
+            state,
+            reference=f"uninstall/{request.confirmation}",
+        )
         _run_cleanup(request, runner, cleanup_state)
     with materialized_release_config(request.site) as config:
         runner.run(
@@ -954,7 +964,7 @@ def _cleanup_document(
                 "uninstall",
             ],
             cwd=request.site.repository_root,
-            env={**os.environ, **request.site.environment},
+            env=cleanup_shell_environment(request, Path(config)),
         )
         target_arguments = [
             "python3",
@@ -976,7 +986,7 @@ def _cleanup_document(
         runner.run(
             [*target_arguments, "verify-targets"],
             cwd=request.site.repository_root,
-            env={**os.environ, **request.site.environment},
+            env=cleanup_shell_environment(request, Path(config)),
         )
     cleanup_document = json.loads(cleanup_state.read_text(encoding="utf-8"))
     if (
@@ -1319,7 +1329,9 @@ def _uninstall_locked(
     state_dir = request.site.source.parent / "uninstall"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
+    resumed = state_path.is_file()
     state = _uninstall_state(request, state_path)
+    record_repository_root_override(request, state_path, state, resumed=resumed)
     if _reached(state, "REGISTRY_EXPORTED") and not all(
         (state_dir / name).is_file()
         for name in (

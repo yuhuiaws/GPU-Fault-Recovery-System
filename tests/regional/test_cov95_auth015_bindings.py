@@ -78,7 +78,7 @@ def test_real_wire_probe_binds_release_pod_nodes_and_rejections_but_not_custody(
         (("release_metadata", "deletionTimestamp"), "2026-01-01"),
         (("registration", "cluster_id"), "foreign"),
         (("registration", "enabled"), False),
-        (("registration", "membership_state"), "PENDING"),
+        (("registration", "lifecycle_state"), "PENDING"),
         (("registration", "agent_endpoint_allowed_cidrs"), []),
         (("registration", "agent_endpoint_allowed_cidrs"), "10.0.1.0/24"),
         (("registration", "agent_endpoint_allowed_cidrs"), [None]),

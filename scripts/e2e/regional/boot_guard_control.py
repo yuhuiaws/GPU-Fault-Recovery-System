@@ -78,18 +78,26 @@ def target_identity(environment: dict[str, str]) -> dict[str, Any]:
         "-n",
         environment["NAMESPACE"],
     ]
-    metadata = json.loads(
+    # The release id every case binds its evidence to comes from the regional
+    # release state (``RegionalLiveFixture.release_id``); the release-metadata
+    # ConfigMap carries compatibility digests only and has no ``release-id`` key
+    # on the live control plane (2026-09-20).
+    release_state_document = json.loads(
         run(
             [
                 *prefix,
                 "get",
                 "configmap",
-                "gpu-fault-release-metadata",
+                "gpu-fault-regional-release-state",
                 "-o",
                 "json",
             ]
         ).stdout
     )
+    try:
+        release_state = json.loads(release_state_document["data"]["state.json"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("BOOT guard CPU target identity is incomplete") from exc
     deployment = json.loads(
         run(
             [
@@ -116,7 +124,9 @@ def target_identity(environment: dict[str, str]) -> dict[str, Any]:
         ).stdout
     )
     pods = healthy_api_pods(deployment, inventory)
-    release_id = metadata.get("data", {}).get("release-id")
+    release_id = (
+        release_state.get("release_id") if isinstance(release_state, dict) else None
+    )
     uid = deployment.get("metadata", {}).get("uid")
     generation = deployment.get("metadata", {}).get("generation")
     if (

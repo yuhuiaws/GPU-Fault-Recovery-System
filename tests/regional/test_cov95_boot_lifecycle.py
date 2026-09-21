@@ -189,6 +189,9 @@ def test_umask_build_errors_stop_before_returning_a_manifest(
         )
     assert len(calls) == (1 if stage == "build" else 2)
     assert calls[0][1]["umask"] == 0o77
+    if stage == "artifact":
+        # The copied tree has no .git: receipts bind to the source checkout.
+        assert calls[1][1]["identity_root"] == lifecycle.ROOT
 
 
 def test_checkout_copy_leaves_state_build_outputs_and_git_metadata_behind(

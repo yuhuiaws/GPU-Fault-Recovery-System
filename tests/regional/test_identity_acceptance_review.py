@@ -444,7 +444,9 @@ def test_full_surface_audit_requires_complete_safe_buckets_and_a_security_group(
     monkeypatch.setattr(auth, "outside_probe", lambda *args, **kw: {"valid": True})
     monkeypatch.setattr(auth, "data_plane_execution_token_hits", lambda *args: [])
     monkeypatch.setattr(
-        auth, "authenticated_fleet_isolation", lambda *_args: {"passed": True}
+        auth,
+        "authenticated_fleet_isolation",
+        lambda *_args, **_kwargs: {"passed": True},
     )
     result = auth.run_auth014(
         SimpleNamespace(), SimpleNamespace(), outside_probe_path=None

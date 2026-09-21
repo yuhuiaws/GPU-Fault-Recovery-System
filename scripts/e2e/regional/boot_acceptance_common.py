@@ -44,6 +44,7 @@ def run(
     cwd: Path = ROOT,
     env: dict[str, str] | None = None,
     umask: int | None = None,
+    identity_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if umask is not None:
         command = [
@@ -62,6 +63,7 @@ def run(
             timeout=timeout,
             cwd=cwd,
             env=env,
+            identity_root=identity_root,
         )
     except RegionalCommandTimeout:
         raise

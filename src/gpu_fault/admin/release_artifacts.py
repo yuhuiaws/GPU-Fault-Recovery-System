@@ -188,7 +188,10 @@ def runtime_images_exist(*, region: str, references: Sequence[str]) -> bool:
     )
     if completed.returncode:
         error = (completed.stderr or "").strip()
+        # AWS CLI 2.35 prefixes its error line with ``aws: [ERROR]: `` (live
+        # 2026-09-20); only that prefix is tolerated, nothing else may precede.
         code = re.fullmatch(
+            r"(?:aws: \[ERROR\]: )?"
             r"An error occurred \((\w+)\) when calling the DescribeImages operation:"
             r"[^\r\n]*",
             error,

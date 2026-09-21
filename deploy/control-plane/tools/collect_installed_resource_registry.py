@@ -27,6 +27,10 @@ NAMESPACED_DISCOVERY_KINDS = (
     "serviceaccount,service"
 )
 CLUSTER_DISCOVERY_KINDS = "clusterrole,clusterrolebinding"
+# The node-installer reconciler (a registered Deployment) creates one Job per
+# node, labelled rather than owner-referenced, and lets a TTL retire it.
+INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
+INSTALLER_RECONCILER = "gpu-fault-node-installer-reconciler"
 
 
 def attach_workload_rbac(
@@ -163,6 +167,17 @@ def discover_unregistered(
         if resource_namespace != namespace and not resource_namespace.startswith(
             "gf-regional-"
         ):
+            continue
+        if (
+            kind == "job"
+            and resource_namespace == namespace
+            and (metadata.get("labels") or {}).get(INSTALLER_JOB_LABEL) == "true"
+            and ("namespaced", "deployment", namespace, INSTALLER_RECONCILER)
+            in scoped_registered
+        ):
+            # Installer Jobs belong to the registered reconciler: it stops
+            # creating them when it is scaled away and the namespace deletion
+            # removes the finished ones its TTL has not reached yet.
             continue
         if kind == "job":
             owners = metadata.get("ownerReferences") or []

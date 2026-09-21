@@ -84,7 +84,16 @@ class ReleaseEngine:
                 None,
                 {"metadata": {"name": "unrelated", "generation": 99}},
                 *(
-                    {"metadata": {"name": name, "generation": index + 1}}
+                    {
+                        "metadata": {"name": name, "generation": index + 1},
+                        # The live listing always carries replicas and a Pod
+                        # template; the snapshot reads both for the rollout
+                        # identity next to the generation (2026-09-20).
+                        "spec": {
+                            "replicas": 1,
+                            "template": {"metadata": {"labels": {"app": name}}},
+                        },
+                    }
                     for index, name in enumerate(names)
                 ),
             ]

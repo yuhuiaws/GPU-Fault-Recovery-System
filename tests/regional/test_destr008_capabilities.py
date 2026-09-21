@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from scripts.e2e.regional import destr008_capabilities as checks
+from scripts.e2e.regional import destr008_parallel as parallel
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -163,6 +164,7 @@ def fixture(
         return json.dumps(values[plane][args[1]])
 
     monkeypatch.setattr(regional, "kubectl", kube)
+    monkeypatch.setattr(parallel, "workers", 1)  # deterministic fakes
     return regional, values, calls
 
 

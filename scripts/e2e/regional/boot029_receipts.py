@@ -320,6 +320,41 @@ def verify_journal(
     return proof
 
 
+def foreign_cached_layers(text: str) -> tuple[int, int]:
+    """Count ``CACHED`` steps that a warm cache served, and those built in-run.
+
+    BuildKit prints ``#N CACHED`` both for a layer imported from a pre-existing
+    cache and for a layer another image of the same build run has just
+    produced (the executor image shares the runtime venv steps with the
+    runtime image, live 2026-09-20). Only the former breaks a cold build: a
+    step is in-run reuse when the same instruction already reached ``DONE``
+    earlier in the same logs.
+    """
+
+    instruction = re.compile(r"^#(\d+) (\[.*)$")
+    status = re.compile(r"^#(\d+) (DONE\b.*|CACHED\s*)$")
+    latest: dict[str, str] = {}
+    completed: set[str] = set()
+    foreign = reused = 0
+    for line in text.splitlines():
+        found = instruction.match(line)
+        if found:
+            latest[found.group(1)] = found.group(2).strip()
+            continue
+        found = status.match(line)
+        if not found:
+            continue
+        step = latest.get(found.group(1))
+        if found.group(2).startswith("DONE"):
+            if step:
+                completed.add(step)
+        elif step and step in completed:
+            reused += 1
+        else:
+            foreign += 1
+    return foreign, reused
+
+
 def cold_build_proof(state: Path, logs: list[Path]) -> dict[str, Any]:
     bootstrap = read(state / "bootstrap-state.json")
     manifest_path = Path(
@@ -358,7 +393,7 @@ def cold_build_proof(state: Path, logs: list[Path]) -> dict[str, Any]:
         ):
             raise ValueError(f"cold build lacks a fresh, release-bound {name} image")
     text = "\n".join(item.read_text(encoding="utf-8") for item in logs)
-    cached = len(re.findall(r"(?m)^#\d+ CACHED\s*$", text))
+    cached, reused = foreign_cached_layers(text)
     pulled = bool(re.search(r"(?m)^#\d+ extracting sha256:", text))
     if cached or not pulled:
         raise ValueError(
@@ -367,6 +402,7 @@ def cold_build_proof(state: Path, logs: list[Path]) -> dict[str, Any]:
     return {
         "cold_build": {
             "cached_layers": cached,
+            "reused_within_run": reused,
             "base_image_pulled": pulled,
             "descriptor_sha256": digest(descriptor_path.read_bytes()),
             "images": {

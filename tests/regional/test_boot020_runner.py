@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 from scripts.e2e.regional.run_boot020_release_rolling import (
     EXECUTOR_DEPLOYMENT,
     STAGES,
+    AcceptanceCheckError,
     LiveReleaseRollingBackend,
     configure_gpu_kubeconfig,
     deployment_generations,
@@ -44,6 +46,22 @@ class FakeReleaseRollingBackend:
             "gpu-fault-control-worker": 1,
             "gpu-fault-telemetry-spool-worker": 1,
         }
+        # What a CPU Deployment rollout actually changes; generation alone also
+        # moves when the release stamps an annotation (live 2026-09-20).
+        self.cpu_identities = {
+            name: {"replicas": 3, "template_sha256": f"{name}-template-v1"}
+            for name in self.cpu_generations
+        }
+        self.stamp_ingress_identity = False
+        # A previous attempt's automatic rollback died mid-way (live 2026-09-20
+        # 08:02Z: the HyperPod software update rebooted every CPU node during the
+        # control_plane stage; the engine left phase rollback-failed).
+        self.rollback_pending = False
+        # Blockers the engine's own pre-node-mutation gate would raise on
+        # (live 2026-09-20 08:33Z: the warm spare carried a quarantine taint from
+        # an inconclusive DCGM diagnosis and the executor stage failed after
+        # ~50 minutes of control-plane work).
+        self.unsafe_nodes: list[dict] = []
         # Keyed by the real Deployment names: the executor stage asserts the
         # generation changes are exactly {GPU_EXECUTOR_DEPLOYMENT} per cluster.
         self.gpu_generations = {
@@ -92,6 +110,7 @@ class FakeReleaseRollingBackend:
             "release_id": scenario,
             "live": copy.deepcopy(self.live),
             "cpu_generations": dict(self.cpu_generations),
+            "cpu_identities": copy.deepcopy(self.cpu_identities),
             "gpu_generations": copy.deepcopy(self.gpu_generations),
             "next_deploy": self.classify(scenario),
         }
@@ -112,6 +131,25 @@ class FakeReleaseRollingBackend:
             "previous_required": PREVIOUS_EXECUTOR_PIN,
         }
 
+    def node_safety(self, scenario: str) -> dict:
+        # Kept out of ``calls``: those are the deploys the site saw.
+        self.safety_checks = getattr(self, "safety_checks", []) + [scenario]
+        return {
+            "safe": not self.unsafe_nodes,
+            "clusters": {"cluster-a": list(self.unsafe_nodes)},
+        }
+
+    def resume_rollback(self, scenario: str) -> dict:
+        self.calls.append(("resume_rollback", scenario))
+        if not self.rollback_pending:
+            return {"resumed": False, "phase": "complete"}
+        self.rollback_pending = False
+        return {
+            "resumed": True,
+            "phase_before": "rollback-failed",
+            "phase": "rolled-back",
+        }
+
     def deploy(
         self,
         scenario: str,
@@ -121,6 +159,8 @@ class FakeReleaseRollingBackend:
         resume=False,
         auto_rollback=None,
     ) -> dict:
+        if self.rollback_pending:
+            raise RuntimeError("a rollback is in progress and must finish first")
         self.calls.append((scenario, fault_phase, resume, auto_rollback, diff["kind"]))
         plans = {
             "control_plane": {
@@ -152,6 +192,15 @@ class FakeReleaseRollingBackend:
         }
         if fault_phase:
             if auto_rollback:
+                # A CPU rollback restores EVERY CPU role from the snapshot with a
+                # fresh restart token (live 2026-09-20 07:32Z: api-ha and spool got
+                # new ReplicaSets during a worker-only rollback), so identities
+                # and generations of untouched roles move before the real apply.
+                self.cpu_generations = {
+                    name: value + 2 for name, value in self.cpu_generations.items()
+                }
+                for name, identity in self.cpu_identities.items():
+                    identity["template_sha256"] = f"{name}-template-restored"
                 return {
                     "phase": "rolled-back",
                     "injected_failure": fault_phase,
@@ -168,7 +217,17 @@ class FakeReleaseRollingBackend:
             }
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
-            self.cpu_generations["gpu-fault-control-worker"] = 2
+            # The worker rolls (replicas + template); the admin-config stamp bumps
+            # every CPU Deployment's generation without a rollout.
+            self.cpu_generations = {
+                name: value + 1 for name, value in self.cpu_generations.items()
+            }
+            self.cpu_identities["gpu-fault-control-worker"] = {
+                "replicas": 2,
+                "template_sha256": "gpu-fault-control-worker-template-v2",
+            }
+            if self.stamp_ingress_identity:
+                self.cpu_identities["gpu-fault-api-ha"]["replicas"] = 4
         elif scenario == "executor":
             # The interrupted attempt already staged the CPU side; the resume
             # rolls the executor Deployment and then finalizes the pins, which
@@ -208,6 +267,26 @@ class FakeReleaseRollingBackend:
             "pins": self._pins("finalized"),
             "operation_duration_seconds": 10.0 if resume else 20.0,
         }
+
+
+def test_control_plane_stage_reads_rollouts_from_identity_not_generation(
+    tmp_path: Path,
+) -> None:
+    # Live 2026-09-20 (BOOT-020 a3): the admin-config stamp moved api-ha and spool
+    # generations; only a replicas or template change is a rollout.
+    evidence = tmp_path / "GF-REGIONAL-BOOT-020.json"
+    backend = FakeReleaseRollingBackend()
+    recorder = EvidenceRecorder(evidence, case_id="GF-REGIONAL-BOOT-020", inputs={})
+    result = run_release_rolling(backend, recorder)
+    assert result["verdict"] == "PASS"
+
+    damaged = FakeReleaseRollingBackend()
+    damaged.stamp_ingress_identity = True
+    recorder = EvidenceRecorder(
+        tmp_path / "damaged.json", case_id="GF-REGIONAL-BOOT-020", inputs={}
+    )
+    with pytest.raises(AcceptanceCheckError, match="CPU role rollout differs"):
+        run_release_rolling(damaged, recorder)
 
 
 def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
@@ -413,7 +492,12 @@ class FakeRelease:
 
 
 def _deployment_item(name: str, generation: int) -> dict:
-    return {"metadata": {"name": name, "generation": generation}, "spec": {}}
+    # The live listing always carries replicas and a Pod template; the snapshot
+    # reads both for the rollout identity next to the generation.
+    return {
+        "metadata": {"name": name, "generation": generation},
+        "spec": {"replicas": 1, "template": {"metadata": {"labels": {"app": name}}}},
+    }
 
 
 def test_boot020_generations_come_from_one_list_per_context() -> None:
@@ -505,6 +589,19 @@ def test_boot020_live_snapshot_reads_once_per_context_inside_one_snapshot(
         "cpu_generations": {
             name: index + 1
             for index, name in enumerate(inventory.CPU_RUNTIME_DEPLOYMENTS)
+        },
+        "cpu_identities": {
+            name: {
+                "replicas": 1,
+                "template_sha256": hashlib.sha256(
+                    json.dumps(
+                        {"metadata": {"labels": {"app": name}}},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
+            for name in inventory.CPU_RUNTIME_DEPLOYMENTS
         },
         "gpu_generations": {
             "cluster-a": {
@@ -653,6 +750,82 @@ def test_boot020_resume_target_is_the_first_stage_without_a_passed_marker() -> N
     assert resume_target({"stages": {}}) == (0, "noop")
 
 
+def test_boot020_refuses_to_start_while_a_gpu_node_blocks_data_plane_mutation(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-09-20 08:33Z: the warm spare carried gpu-fault.io/quarantined
+    (inconclusive DCGM diagnosis at 07:35Z); the engine's pre-node-mutation gate
+    refused the executor stage after the drill, noop and control_plane stages had
+    already spent ~50 minutes. The same gate must run before the first stage."""
+    backend = FakeReleaseRollingBackend()
+    backend.unsafe_nodes = [
+        {
+            "node_id": "spare-1",
+            "reason": "blocking-taint",
+            "taint_key": "gpu-fault.io/quarantined",
+        }
+    ]
+    recorder = EvidenceRecorder(
+        tmp_path / "GF-REGIONAL-BOOT-020.json",
+        case_id="GF-REGIONAL-BOOT-020",
+        inputs={},
+    )
+    with pytest.raises(AcceptanceCheckError, match="spare-1.*quarantined"):
+        run_release_rolling(backend, recorder)
+    assert backend.calls == [] and backend.safety_checks == ["noop"], (
+        "the site was touched before the gate"
+    )
+    assert recorder.document["node_safety"]["safe"] is False
+
+    with pytest.raises(AcceptanceCheckError, match="spare-1"):
+        resume_release_rolling(backend, recorder)
+
+    backend.unsafe_nodes = []
+    healthy = EvidenceRecorder(
+        tmp_path / "ok.json", case_id="GF-REGIONAL-BOOT-020", inputs={}
+    )
+    assert run_release_rolling(backend, healthy)["verdict"] == "PASS"
+    assert healthy.document["node_safety"]["safe"] is True
+
+
+def test_boot020_auto_resume_first_resumes_a_failed_rollback(tmp_path: Path) -> None:
+    """Live 2026-09-20 08:02Z: a HyperPod software update rebooted every CPU node
+    inside the control_plane stage; the injected upgrade failed for real and the
+    automatic rollback died on an unavailable webhook, leaving phase
+    rollback-failed. The engine refuses a new transaction over a pending rollback,
+    so the convergence must resume the rollback first, and say so in the evidence."""
+    evidence = tmp_path / "GF-REGIONAL-BOOT-020.json"
+    first = FakeReleaseRollingBackend()
+    recorder = EvidenceRecorder(evidence, case_id="GF-REGIONAL-BOOT-020", inputs={})
+    run_release_rolling(first, recorder)
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    for name in [
+        key
+        for key in document["stages"]
+        if key.startswith("control_plane")
+        or key.startswith("executor")
+        or key.startswith("agent")
+        or key.startswith("full")
+    ]:
+        document["stages"].pop(name)
+    document["status"] = "FAILED"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    second = FakeReleaseRollingBackend()
+    second.rollback_pending = True
+    resumed = EvidenceRecorder(evidence, case_id="GF-REGIONAL-BOOT-020", inputs={})
+    result = resume_release_rolling(second, resumed)
+
+    assert result["status"] == "COMPLETED", result.get("error")
+    convergence = result["convergence"][-1]
+    assert convergence["converged_to"] == "noop"
+    assert convergence["rollback_resume"]["resumed"] is True
+    assert second.calls[:2] == [
+        ("resume_rollback", "noop"),
+        ("noop", None, False, None, "NOOP"),
+    ], "the pending rollback was not resumed before the convergence deploy"
+
+
 def test_boot020_auto_resume_reconverges_and_replays_passed_stages(
     tmp_path: Path,
 ) -> None:
@@ -712,6 +885,9 @@ def test_boot020_auto_resume_reconverges_and_replays_passed_stages(
     # The agent stage ran again from its injected-failure classification, then
     # the full stage ran.
     assert second.calls == [
+        # The convergence first asks the engine to finish any pending rollback
+        # (nothing pending here), then deploys the executor precondition.
+        ("resume_rollback", "executor"),
         ("executor", None, False, None, "NOOP"),
         ("agent", "data-converged", False, True, "DATA_PLANE_COMPATIBLE"),
         ("agent", None, False, None, "DATA_PLANE_COMPATIBLE"),

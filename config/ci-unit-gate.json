@@ -158,7 +158,8 @@
       "tests/store/test_postgres_retention_refresh.py",
       "tests/store/test_postgres_state_table_lock_order.py",
       "tests/store/test_postgres_terminal_quarantine.py",
-      "tests/store/test_store_contracts.py"
+      "tests/store/test_store_contracts.py",
+      "tests/store/test_fresh_control_state_mode.py"
     ],
     "fault_runner_files": [
       "tests/test_case_scheduler.py",

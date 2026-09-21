@@ -22,7 +22,12 @@ def consumer_snapshot(*, activated: bool, stamp: datetime) -> dict:
         "captured_at": (stamp + timedelta(seconds=10)).isoformat(),
         "agents": {
             node: {
-                "incarnation": ("new-" if activated else "old-") + node,
+                # Live identity model (node_agent/heartbeat.py): the incarnation is
+                # sha256(cluster, node, instance, boot_id) -- it survives an agent
+                # restart and changes only on reboot. A token-rotation reinstall
+                # restarts the agent and re-registers it with the wave identity,
+                # which the fleet records as a generation advance.
+                "incarnation": "boot-" + node,
                 "generation": 2 if activated else 1,
                 "lifecycle": "ACTIVE",
                 "last_seen_at": (stamp + timedelta(seconds=1)).isoformat(),
@@ -135,7 +140,7 @@ class RotationWorld:
             {
                 "cluster_id": "cluster-a",
                 "enabled": True,
-                "membership_state": "ACTIVE",
+                "lifecycle_state": "ACTIVE",
                 "token_sha256": hashlib.sha256(
                     (self.new if self.rotated else self.old).encode()
                 ).hexdigest(),

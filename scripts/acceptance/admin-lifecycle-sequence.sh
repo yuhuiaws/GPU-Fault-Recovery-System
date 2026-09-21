@@ -155,8 +155,12 @@ assert_current_journal() {
 # --- cold build ------------------------------------------------------------
 
 prune_image_caches() {
-  local builder images
-  builder="$(docker buildx inspect | awk '/^Name:/ {print $2; exit}')"
+  local builder images inspected
+  # Read the whole report first: an early-exiting awk closes docker's pipe, and
+  # under pipefail that turns a healthy builder into a silent stage failure.
+  inspected="$(docker buildx inspect 2>&1)" ||
+    fail "docker buildx inspect failed: ${inspected##*$'\n'}"
+  builder="$(printf '%s\n' "$inspected" | awk '/^Name:/ {print $2; exit}')"
   [[ -n "$builder" ]] || fail "docker buildx inspect reported no builder name"
   log "pruning BuildKit caches (builder ${builder}) and local runtime images"
   docker buildx prune --builder "$builder" -af 2>&1 | tee -a "$STAGE_LOG"

@@ -634,12 +634,15 @@ def build_release_under_umask(
     write_log(case_dir / f"build-{mask}.log", completed)
     if completed.returncode:
         raise BootAcceptanceError(f"BOOT-018 build failed under umask {mask}")
+    # The copy carries no .git (build purity); its receipts are bound to the
+    # checkout it was copied from.
     artifact_test = runner(
         [sys.executable, "-m", "pytest", "-q", ARTIFACT_TESTS[mask]],
         cwd=checkout,
         env={**environment, "GPU_FAULT_REQUIRE_BUILD_ARTIFACTS": "1"},
         check=False,
         timeout=3600,
+        identity_root=ROOT,
     )
     write_log(case_dir / f"artifact-tests-{mask}.log", artifact_test)
     if artifact_test.returncode:
@@ -651,25 +654,46 @@ def build_release_under_umask(
 
 
 def parse_status_report(stdout: str) -> dict[str, Any]:
-    """The health report ``gpu-fault-admin status --full`` printed.
+    """The JSON report an administrator command printed last.
 
-    The report is an indented JSON document; the rollout wrapper may print
-    plain lines ahead of it, so the parse starts at the first line that is
-    exactly ``{``.
+    ``gpu-fault-admin status --full`` prints one indented JSON document, but a
+    wrapper may print plain lines ahead of it, and ``gpu-fault-admin config``
+    applies by running release-deploy as a child that inherits stdout, so the
+    child's own JSON summary precedes the final report (live 2026-09-20,
+    BOOT-020 a2). The report is therefore the last complete top-level document;
+    an incomplete trailing document is refused rather than read as the earlier one.
     """
 
     text = stdout.strip()
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        lines = text.splitlines()
-        starts = [index for index, line in enumerate(lines) if line.strip() == "{"]
-        if not starts:
-            raise BootAcceptanceError("status printed no JSON report") from None
-        value = json.loads("\n".join(lines[starts[0] :]))
+        value = _final_json_document(text)
     if not isinstance(value, dict):
         raise BootAcceptanceError("status report is not a JSON object")
     return value
+
+
+def _final_json_document(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    documents: list[Any] = []
+    incomplete = False
+    offset = consumed = 0
+    for line in text.splitlines(keepends=True):
+        if offset >= consumed and line.startswith("{"):
+            try:
+                value, consumed = decoder.raw_decode(text, offset)
+            except json.JSONDecodeError:
+                incomplete = True
+            else:
+                documents.append(value)
+                incomplete = False
+        offset += len(line)
+    if incomplete:
+        raise BootAcceptanceError("status printed an incomplete JSON report")
+    if not documents:
+        raise BootAcceptanceError("status printed no JSON report")
+    return documents[-1]
 
 
 def runtime_identity_matches_release(
@@ -877,6 +901,7 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
             },
             check=False,
             timeout=1200,
+            identity_root=ROOT,
         )
         write_log(case_dir / "tamper-negative.log", tamper)
     status = admin_command(

@@ -42,8 +42,11 @@ class UninstallRequest:
     confirmation: str
     final_snapshot_policy: FinalSnapshotPolicy = "retain"
     reset_database: bool = False
+    repository_root_override: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.repository_root_override, bool):
+            raise BootstrapError("repository_root_override must be a boolean")
         if self.cpu_disposition not in {"keep", "delete"}:
             raise BootstrapError("invalid CPU cluster disposition")
         if self.final_snapshot_policy not in {"retain", "skip"}:

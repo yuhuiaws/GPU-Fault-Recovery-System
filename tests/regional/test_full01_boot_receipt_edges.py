@@ -1094,3 +1094,48 @@ def test_receipt_script_entrypoint_enforces_required_arguments(
         runpy.run_path(str(receipts.__file__), run_name="__main__")
     assert raised.value.code == 2
     assert "--record" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("text", "foreign", "reused"),
+    [
+        # The executor image reuses the runtime venv layer built moments earlier.
+        (
+            "#1 extracting sha256:abc\n#10 [3/6] COPY lock /tmp/lock\n#10 DONE 0.1s\n"
+            "#12 [3/6] COPY lock /tmp/lock\n#12 CACHED\n",
+            0,
+            1,
+        ),
+        # A layer nothing in this run built came from a warm cache.
+        ("#1 extracting sha256:abc\n#12 [3/6] COPY lock /tmp/lock\n#12 CACHED\n", 1, 0),
+        # A CACHED status without any instruction is not explained by the run.
+        ("#1 extracting sha256:abc\n#2 CACHED\n", 1, 0),
+        # Same instruction text, but it never reached DONE first.
+        (
+            "#1 extracting sha256:abc\n#10 [3/6] COPY lock /tmp/lock\n#10 CACHED\n"
+            "#12 [3/6] COPY lock /tmp/lock\n#12 CACHED\n",
+            2,
+            0,
+        ),
+    ],
+)
+def test_cached_layers_are_foreign_unless_the_run_built_them_first(
+    text: str, foreign: int, reused: int
+) -> None:
+    assert receipts.foreign_cached_layers(text) == (foreign, reused), (
+        "only warm-cache layers count against a cold build"
+    )
+
+
+def test_cold_build_accepts_in_run_layer_reuse_and_reports_it(
+    cold_build: ColdBuild,
+) -> None:
+    cold_build.log.write_text(
+        "#1 extracting sha256:abc\n#10 [3/6] COPY lock /tmp/lock\n#10 DONE 0.1s\n"
+        "#12 [3/6] COPY lock /tmp/lock\n#12 CACHED\n",
+        encoding="utf-8",
+    )
+    proof = receipts.cold_build_proof(cold_build.state, [cold_build.log])["cold_build"]
+    assert (proof["cached_layers"], proof["reused_within_run"]) == (0, 1), (
+        "in-run reuse is reported, not refused"
+    )

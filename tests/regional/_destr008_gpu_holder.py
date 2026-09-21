@@ -50,6 +50,18 @@ def admitted_pod(manifest: dict[str, Any]) -> dict[str, Any]:
     value["spec"]["containers"][0].update(
         terminationMessagePath="/dev/termination-log", terminationMessagePolicy="File"
     )
+    # EKS runs the ExtendedResourceToleration admission plugin (live 2026-09-20):
+    # every Pod requesting an extended resource gets a NoSchedule toleration for
+    # that resource's taint appended, even when an operator=Exists toleration
+    # already tolerates everything.
+    resources = value["spec"]["containers"][0].get("resources", {})
+    for name in sorted(
+        set(resources.get("requests", {})) | set(resources.get("limits", {}))
+    ):
+        if "/" in name and not name.split("/", 1)[0].endswith("kubernetes.io"):
+            value["spec"].setdefault("tolerations", []).append(
+                {"key": name, "operator": "Exists", "effect": "NoSchedule"}
+            )
     value["status"] = {
         "phase": "Running",
         "conditions": [{"type": "Ready", "status": "True"}],

@@ -920,13 +920,16 @@ def run_auth014(
     target: ClusterTarget,
     *,
     outside_probe_path: Path | None,
+    secondary: ClusterTarget | None = None,
 ) -> dict[str, Any]:
     routes = route_inventory(site, target)
     results = anonymous_routes(site, target, routes)
     nlb = nlb_security_groups(site)
     external = outside_probe(outside_probe_path, nlb_hostname=str(nlb["hostname"]))
     token_hits = data_plane_execution_token_hits(site, target)
-    authenticated_fleet = authenticated_fleet_isolation(site, target)
+    # ``secondary`` is the unregistered peer a one-cluster site names for the
+    # fleet-read scope proof; a multi-cluster site's registered peers suffice.
+    authenticated_fleet = authenticated_fleet_isolation(site, target, peer=secondary)
     expected = {
         "cluster-token": {401},
         "dual-credential": {403},

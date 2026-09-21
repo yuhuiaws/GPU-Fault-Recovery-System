@@ -200,7 +200,33 @@ def enforce_deploy_host_state_dir(
             and getattr(arguments, "prepared_source_release", False)
         )
         and _canonical(repository_root) != load_site(source).repository_root
+        and not _uninstall_resumes_with_override(arguments, state_dir)
     ):
         raise SiteConfigError(
             "deploy-host binding refuses a different site repository root"
         )
+
+
+def _uninstall_resumes_with_override(
+    arguments: argparse.Namespace, state_dir: Path
+) -> bool:
+    """A wedged uninstall may resume with tools from another reviewed tree.
+
+    A bound site runs only the snapshot it deployed; ``deploy`` is the way to
+    change that snapshot, and ``deploy`` refuses while an uninstall is in
+    progress. An uninstall stopped by a defect in its own cleanup tools would
+    otherwise have no exit, so ``uninstall --accept-repository-root-override``
+    is honoured while the journal shows an unfinished uninstall; the uninstall
+    records the override tree in that journal.
+    """
+
+    if str(getattr(arguments, "command", "") or "") != "uninstall" or not getattr(
+        arguments, "accept_repository_root_override", False
+    ):
+        return False
+    record = state_dir / "uninstall" / "state.json"
+    try:
+        phase = json.loads(record.read_text(encoding="utf-8")).get("phase")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(phase, str) and phase not in {"", "COMPLETED"}

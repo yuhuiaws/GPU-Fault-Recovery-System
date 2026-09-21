@@ -651,6 +651,8 @@ class ConfigIO:
         self.generations = dict.fromkeys(CPU_ROLES, 1)
         self.calls: list[str] = []
         self.responses: dict[str, dict[str, Any]] = {}
+        self.prefix: dict[str, str] = {}
+        self.stamp_all_roles = True
         self.exit_codes: dict[str, int] = {}
         self.persist = {"apply": True, "restore": True}
         self.pending_at: set[str] = set()
@@ -704,7 +706,11 @@ class ConfigIO:
             return subprocess.CompletedProcess(arguments, code, "", "owned failure")
         if event in {"apply", "restore"}:
             for role, digest in target.role_sha256().items():
-                if self.runtime.role_sha256()[role] != digest:
+                if self.runtime.role_sha256()[role] != digest or self.stamp_all_roles:
+                    # The product re-stamps gpu-fault.io/admin-config-sha256 on every
+                    # CPU Deployment after each apply, and Kubernetes bumps a
+                    # Deployment's generation on annotation changes (live 2026-09-20:
+                    # api-ha/spool generation +1 per apply, no ReplicaSet, no Pod).
                     self.generations[role] += 1
             self.runtime = target
             if self.persist[event]:
@@ -723,7 +729,10 @@ class ConfigIO:
             "audit": str(self.audit),
         }
         return subprocess.CompletedProcess(
-            arguments, code, json.dumps(self.responses.get(event, default)), ""
+            arguments,
+            code,
+            self.prefix.get(event, "") + json.dumps(self.responses.get(event, default)),
+            "",
         )
 
     def observation(self, site: RenderedSite) -> dict[str, Any]:
@@ -788,6 +797,25 @@ def test_admin_target_validation_binds_all_gpu_members_and_control_plane_fields(
         with pytest.raises(ValueError, match="differs"):
             admin_config.validate_admin_target(config_io.root, path)
     assert config_io.calls == [], "target validation started an administrator command"
+
+
+def test_public_config_drill_reads_the_report_printed_after_the_child_release(
+    config_io: ConfigIO,
+) -> None:
+    # Live 2026-09-20 (BOOT-020 a2): the apply and restore invocations run the
+    # automatic release as a child that inherits stdout, so its JSON summary and
+    # progress lines precede the command's own APPLIED report.
+    summary = json.dumps({"release_id": "0e813e5eaf80", "status": "verified"}, indent=2)
+    config_io.prefix["apply"] = (
+        "release-deploy: rolling control-worker\n" + summary + "\n"
+    )
+    config_io.prefix["restore"] = summary + "\n"
+
+    result = config_io.run()
+
+    assert result["applied_config_sha256"] == config_io.desired.sha256()
+    assert result["restored_config_sha256"] == config_io.before.sha256()
+    assert config_io.calls == ["dry-run", "apply", "noop", "restore"]
 
 
 @pytest.mark.parametrize("damage", ["inventory", "uid"])
@@ -889,7 +917,7 @@ def test_public_config_checks_the_changed_role_set_and_a_strict_repeat_noop(
     config_io: ConfigIO, damage: str
 ) -> None:
     if damage == "cpu":
-        config_io.cpu_damage["apply"] = ("ingress", "generation", 2)
+        config_io.cpu_damage["apply"] = ("ingress", "template_sha256", "foreign")
     elif damage == "gpu":
         config_io.gpu_damage.add("apply")
     elif damage == "noop-status":
@@ -905,6 +933,22 @@ def test_public_config_checks_the_changed_role_set_and_a_strict_repeat_noop(
     assert ("noop" in config_io.calls) == (damage not in {"cpu", "gpu"})
     assert load_desired_admin_config(config_io.root) == config_io.before
     assert config_io.runtime == config_io.before
+
+
+def test_public_config_drill_reads_replicas_template_and_pods_not_generation(
+    config_io: ConfigIO,
+) -> None:
+    # Live 2026-09-20 (BOOT-020 a3): every apply re-stamped api-ha and spool with
+    # the admin-config digest annotation, Kubernetes bumped their generation, and
+    # the drill called that "rolled a role outside its declared scope".
+    config_io.run()  # stamp_all_roles is on: generation moves on every role
+    config_io.calls.clear()
+    config_io.cpu_damage["apply"] = ("spool", "replicas", 2)
+    with pytest.raises(
+        ValueError, match="outside its declared scope.*spool"
+    ) as failure:
+        config_io.run()
+    assert "expected=" in str(failure.value), "the scope error names the plan"
 
 
 @pytest.mark.parametrize("damage", ["outside-state", "empty-audit", "pending"])
@@ -977,7 +1021,9 @@ def test_public_config_roundtrip_keeps_untouched_roles_and_restores_the_original
         "restored_config_sha256": config_io.before.sha256(),
     }
     assert config_io.calls == ["dry-run", "apply", "noop", "restore"]
-    assert config_io.generations == {"worker": 3, "ingress": 1, "spool": 1}
+    # Two applies, two admin-config stamps on every role: generation is not a
+    # rollout signal, so untouched roles bump too and the drill must not count it.
+    assert config_io.generations == {"worker": 3, "ingress": 3, "spool": 3}
     assert load_desired_admin_config(config_io.root) == config_io.before
     assert config_io.runtime == config_io.before
     assert not (config_io.root / "admin-config/pending.json").exists(), (
@@ -1306,3 +1352,58 @@ def test_lifecycle_script_entrypoints_enforce_their_required_target_arguments(
         runpy.run_path(str(module.__file__), run_name="__main__")
     assert raised.value.code == 2
     assert "required" in capsys.readouterr().err
+
+
+def test_public_config_drill_uses_the_state_dirs_own_deploy_host_cli(
+    tmp_path: Path,
+) -> None:
+    # Live 2026-09-20: a managed state dir carries its own deployer venv and the
+    # checkout's module CLI refuses to act on it (rc 2); the drill must call the
+    # binary that owns the dir. Without one, the module form stays (the witness
+    # above pins that path).
+    from scripts.e2e.regional import boot020_admin_config as admin_config
+
+    assert admin_config.admin_config_command(tmp_path, "CHG-1", "--dry-run")[:4] == [
+        sys.executable,
+        "-m",
+        "gpu_fault.admin.cli",
+        "config",
+    ]
+    own = tmp_path / "deployer-venv" / "bin" / "gpu-fault-admin"
+    own.parent.mkdir(parents=True)
+    own.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert admin_config.admin_config_command(tmp_path, "CHG-1", "--dry-run") == [
+        str(own),
+        "config",
+        "--state-dir",
+        str(tmp_path),
+        "--reference",
+        "CHG-1",
+        "--dry-run",
+    ]
+
+
+def test_inadmissible_desired_config_is_refused_before_the_editable_file_changes(
+    config_io: ConfigIO,
+) -> None:
+    # Live 2026-09-20 (BOOT-020 a1): the drill wrote controlWorkerReplicas 7 into
+    # admin-config.yaml, the administrator's dry-run refused it ("connection
+    # ceiling 1276 exceeds the validated fleet budget 1200"), nothing was applied,
+    # and the edit stayed behind -- unparseable by the guard that refused it. The
+    # drill must admit its own desired config before editing anything.
+    editable = config_io.root / "admin-config.yaml"
+    before = editable.read_bytes()
+    from dataclasses import replace
+
+    config_io.desired = replace(
+        config_io.desired,
+        capacity=replace(config_io.desired.capacity, control_worker_replicas=64),
+    )
+    with pytest.raises(ValueError, match="not admissible"):
+        config_io.run()
+    assert editable.read_bytes() == before, (
+        "an inadmissible drill must not edit the site config"
+    )
+    assert config_io.calls == [], (
+        "an inadmissible drill must not reach the administrator"
+    )

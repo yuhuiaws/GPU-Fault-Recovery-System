@@ -208,15 +208,30 @@ def verify_quiesced(
             )
 
 
+# Aggregated APIs that project live measurements as list results: their items
+# carry no uid, cannot be owned and cannot be deleted, so they are not part of
+# a namespace inventory (live 2026-09-20: metrics-server's PodMetrics stopped an
+# uninstall at PREFLIGHT with "cleanup object identity is incomplete").
+PROJECTION_API_GROUPS = frozenset({"metrics.k8s.io", "metrics.eks.amazonaws.com"})
+
+
+def is_projection_resource(name: str) -> bool:
+    group = name.partition(".")[2]
+    return group in PROJECTION_API_GROUPS or group.endswith(".metrics.k8s.io")
+
+
 def namespace_items(client: CleanupClient, namespace: str) -> list[dict[str, Any]]:
-    kinds = sorted(
+    discovered = sorted(
         set(
             client.run(
                 "api-resources", "--verbs=list", "--namespaced=true", "-o", "name"
             ).splitlines()
         )
     )
-    if not kinds or len(kinds) > 512:
+    if not discovered or len(discovered) > 512:
+        raise CleanupStateError("namespace resource discovery is incomplete")
+    kinds = [kind for kind in discovered if not is_projection_resource(kind)]
+    if not kinds:
         raise CleanupStateError("namespace resource discovery is incomplete")
     items: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for start in range(0, len(kinds), 32):
@@ -241,6 +256,60 @@ def implicit_namespace_object(item: dict[str, Any]) -> bool:
         or kind == "serviceaccount"
         and name == "default"
         or kind == "event"
+    )
+
+
+def service_derived_object(
+    item: dict[str, Any], approved: set[tuple[str, str, str, str]]
+) -> bool:
+    """A controller-written mirror of an approved Service in this namespace.
+
+    Kubernetes keeps a ``v1 Endpoints`` object for every selector Service and
+    the AWS Load Balancer Controller keeps one TargetGroupBinding per load
+    balancer Service. Neither carries an ownerReference; both disappear with
+    the Service, so they belong to the Service that is already approved.
+    """
+
+    api, kind, name, _uid = object_identity(item)
+
+    def approved_service(service_name: object) -> bool:
+        return isinstance(service_name, str) and any(
+            identity[:3] == ("v1", "service", service_name) for identity in approved
+        )
+
+    if (api, kind) == ("v1", "endpoints"):
+        return approved_service(name)
+    if kind == "targetgroupbinding" and api.startswith("elbv2.k8s.aws/"):
+        metadata = item.get("metadata") or {}
+        labels = metadata.get("labels") or {}
+        service_reference = (item.get("spec") or {}).get("serviceRef") or {}
+        service_name = service_reference.get("name")
+        return (
+            labels.get("service.k8s.aws/stack-name") == service_name
+            and labels.get("service.k8s.aws/stack-namespace")
+            == metadata.get("namespace")
+            and approved_service(service_name)
+        )
+    return False
+
+
+def installer_job_of_reconciler(
+    item: dict[str, Any], approved: set[tuple[str, str, str, str]]
+) -> bool:
+    """A node-installer Job created by the approved reconciler Deployment.
+
+    The reconciler labels each per-node Job ``gpu-fault.io/node-installer=true``
+    instead of owner-referencing itself and leaves a TTL to retire it; within
+    that hour an uninstall or cluster removal finds the finished Jobs.
+    """
+
+    api, kind, _name, _uid = object_identity(item)
+    if kind != "job" or not api.startswith("batch/"):
+        return False
+    labels = (item.get("metadata") or {}).get("labels") or {}
+    return labels.get("gpu-fault.io/node-installer") == "true" and any(
+        identity[:3] == ("apps/v1", "deployment", "gpu-fault-node-installer-reconciler")
+        for identity in approved
     )
 
 
@@ -298,9 +367,16 @@ def capture_namespace(
                 for identity in approved
             )
         }
-        if children.issubset(approved):
+        derived = {
+            object_identity(item)
+            for item in objects
+            if service_derived_object(item, approved)
+            or installer_job_of_reconciler(item, approved)
+        }
+        if children.issubset(approved) and derived.issubset(approved):
             break
         approved.update(children)
+        approved.update(derived)
     if any(object_identity(item) not in approved for item in objects):
         raise CleanupStateError("solution namespace contains unowned resources")
     document.setdefault("namespace_snapshots", {})[context] = {
@@ -594,7 +670,11 @@ def clear_node_metadata(
         if labels.get("gpu-fault.io/spare") == "true":
             previous = annotations.get("gpu-fault.io/previous-unschedulable")
             if not isinstance(previous, str) or previous not in {"true", "false"}:
-                raise CleanupStateError("spare cleanup lacks a scheduling baseline")
+                raise CleanupStateError(
+                    "declared warm spare has no scheduling baseline on the node; "
+                    "release it with gpu-fault-admin (config spare --release; "
+                    "uninstall does it) before node cleanup"
+                )
             if labels.get("gpu-fault.io/quarantined") not in {None, "false"}:
                 raise CleanupStateError("quarantined spare cannot be released")
             unschedulable = (node.get("spec") or {}).get("unschedulable", False)
@@ -676,16 +756,19 @@ def node_manifest(
                     "affinity": {
                         "nodeAffinity": {
                             "requiredDuringSchedulingIgnoredDuringExecution": {
+                                # Terms are ORed; a ``metadata.name`` field
+                                # selector accepts exactly one value per term.
                                 "nodeSelectorTerms": [
                                     {
                                         "matchFields": [
                                             {
                                                 "key": "metadata.name",
                                                 "operator": "In",
-                                                "values": sorted(nodes),
+                                                "values": [node],
                                             }
                                         ]
                                     }
+                                    for node in sorted(nodes)
                                 ],
                             },
                         }
@@ -987,6 +1070,7 @@ def main() -> int:
                 if document["scope"] == "gpu"
                 else []
             ),
+            state_path=arguments.state_file,
         )
         if arguments.action == "drain-registry":
             completed = completed_phases(document)

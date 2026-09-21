@@ -14,7 +14,13 @@ from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
 from gpu_fault.admin.execution import run_command as bounded_command
 
 FinalSnapshotPolicy = Literal["retain", "skip"]
-_AWS_ERROR = re.compile(r"An error occurred \(([A-Za-z0-9_.-]+)\)(?:\s.*|:.*)?", re.S)
+# AWS CLI 2.35 prefixes every error line with ``aws: [ERROR]: `` (live
+# 2026-09-20: an uninstall treated DBClusterSnapshotNotFoundFault as a hard
+# failure). Only that ERROR prefix is tolerated; other levels stay opaque.
+_AWS_ERROR = re.compile(
+    r"(?:aws: \[ERROR\]: )?An error occurred \(([A-Za-z0-9_.-]+)\)(?:\s.*|:.*)?",
+    re.S,
+)
 
 
 @dataclass(frozen=True)

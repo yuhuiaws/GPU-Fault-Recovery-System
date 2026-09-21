@@ -1294,3 +1294,21 @@ def test_catalog_and_document_agree_on_the_regional_case_set() -> None:
     }
 
     assert documented == catalogued
+
+
+def test_isolated_environment_keeps_the_artifact_verification_opt_in() -> None:
+    # BOOT-018 (2026-09-20): the runner exported GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1
+    # for its artifact pytest, the isolated child environment dropped it, the
+    # tests skipped ("opt-in") and the focused-pytest receipt rejected the skips.
+    # The flag only selects test behaviour; credentials and store URLs stay out.
+    environment = build_isolated_environment(
+        {
+            "PATH": "/unit",
+            "GPU_FAULT_REQUIRE_BUILD_ARTIFACTS": "1",
+            "GPU_FAULT_STORE_URL": "postgres://secret",
+            "AWS_SECRET_ACCESS_KEY": "never",
+        }
+    )
+    assert environment["GPU_FAULT_REQUIRE_BUILD_ARTIFACTS"] == "1"
+    assert environment["GPU_FAULT_STORE_URL"] == ""
+    assert "AWS_SECRET_ACCESS_KEY" not in environment

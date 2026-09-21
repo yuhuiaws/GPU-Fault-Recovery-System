@@ -721,3 +721,49 @@ def test_journal_and_api_methods_require_real_local_ownership(
         with pytest.raises(RegionalFixtureError, match="creation deadline"):
             harness.controller.gpu("create")
     assert not harness.mutations(), "unowned or unbounded operations cannot mutate"
+
+
+def test_extended_resource_toleration_admission_is_not_spec_drift() -> None:
+    # Live EKS (2026-09-20, DESTR-008 a27 active-gpu-pod): the API server's
+    # ExtendedResourceToleration plugin appended
+    # ``{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}`` to the
+    # holder Pod, and the planned/observed digests diverged. The appended
+    # toleration for a resource the Pod itself requests is admission, not a
+    # foreign mutation; any other toleration still is.
+    planned = {
+        "nodeName": "spare-a",
+        "tolerations": [{"operator": "Exists"}],
+        "containers": [
+            {
+                "name": "holder",
+                "image": "image@sha256:" + "a" * 64,
+                "resources": {
+                    "requests": {"nvidia.com/gpu": "1"},
+                    "limits": {"nvidia.com/gpu": "1"},
+                },
+            }
+        ],
+    }
+    observed = copy.deepcopy(planned)
+    observed["tolerations"].append(
+        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+    )
+    assert holder.digest(holder.normal_spec(observed)) == holder.digest(
+        holder.normal_spec(planned)
+    )
+    foreign = copy.deepcopy(planned)
+    foreign["tolerations"].append(
+        {"key": "example.com/other", "operator": "Exists", "effect": "NoSchedule"}
+    )
+    assert holder.digest(holder.normal_spec(foreign)) != holder.digest(
+        holder.normal_spec(planned)
+    ), "a toleration for a resource the Pod never requested is still drift"
+    unrequested = copy.deepcopy(planned)
+    unrequested["containers"][0]["resources"] = {"limits": {"cpu": "1"}}
+    drifted = copy.deepcopy(unrequested)
+    drifted["tolerations"].append(
+        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+    )
+    assert holder.digest(holder.normal_spec(drifted)) != holder.digest(
+        holder.normal_spec(unrequested)
+    ), "the plugin only adds tolerations for requested resources"

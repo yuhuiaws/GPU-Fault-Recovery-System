@@ -11,8 +11,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal
 
+from scripts.e2e.regional.destr008_parallel import gather
 from scripts.e2e.regional.probes.destr008_cancellation_protocol import (
     DRAIN_SECONDS,
     SOURCE_FILES,
@@ -26,6 +27,16 @@ from scripts.e2e.regional.regional_live_fixture import (
     component_python,
 )
 from scripts.e2e.regional.seeded_command_fixture import RUN_LABEL
+from scripts.e2e.regional.destr008_watchdog_fields import (  # noqa: E402
+    _defaults,
+    _image,
+    _image_id,
+    _items,
+    _object,
+    _same,
+    _status_image,
+    _text,
+)
 
 DEPLOYMENT = "gpu-fault-control-worker"
 STORE_SECRET = "gpu-fault-aurora"
@@ -58,55 +69,6 @@ HISTORY_LOADER = (
     "exec(compile(source,'<cpu-history-capability>','exec'),"
     "{'__name__':'__main__','_PROBE_SHA256':actual})\n"
 )
-
-
-def _object(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RegionalFixtureError("CPU watchdog resource object is malformed")
-    return value
-
-
-def _items(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-        raise RegionalFixtureError("CPU watchdog resource list is malformed")
-    return value
-
-
-def _text(value: Any) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(value) and value.strip() == value
-
-
-def _same(actual: Any, expected: Any) -> bool:
-    # JSON equality must not treat False as 0 or True as a replica/exit count.
-    try:
-        return json.dumps(actual, sort_keys=True, allow_nan=False) == json.dumps(
-            expected, sort_keys=True, allow_nan=False
-        )
-    except (ValueError, TypeError):
-        return False
-
-
-def _defaults(value: dict[str, Any], defaults: dict[str, Any]) -> None:
-    for key, default in defaults.items():
-        if key in value and _same(value[key], default):
-            del value[key]
-
-
-def _image(value: Any) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(
-        re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9./:_-]*@sha256:[0-9a-f]{64}", value)
-    )
-
-
-def _image_id(value: Any, image: str) -> bool:
-    digest_value = image.split("@", 1)[1]
-    return isinstance(value, str) and value in {
-        image,
-        digest_value,
-        "docker-pullable://" + image,
-        "containerd://" + digest_value,
-        "cri-o://" + digest_value,
-    }
 
 
 @dataclass(frozen=True)
@@ -172,6 +134,7 @@ def effective_store_configuration(
 ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
     effective: dict[str, str] = {}
     identities: dict[str, dict[str, str]] = {}
+    names: list[str] = []
     for source in _items(container.get("envFrom", [])):
         if (
             not isinstance(source, dict)
@@ -188,10 +151,14 @@ def effective_store_configuration(
             not _text(name)
             or set(reference) - {"name", "optional"}
             or reference.get("optional", False) is not False
-            or name in identities
+            or name in names
         ):
             raise RegionalFixtureError("watchdog configuration source must be required")
-        configmap = read_object(regional, "configmap", name)
+        names.append(name)
+    configmaps = gather(
+        [lambda name=name: read_object(regional, "configmap", name) for name in names]
+    )
+    for name, configmap in zip(names, configmaps, strict=True):
         data = configmap.get("data")
         if not isinstance(data, dict):
             raise RegionalFixtureError("watchdog configuration source is incomplete")
@@ -245,8 +212,12 @@ def effective_store_configuration(
 
 
 def read_runtime(regional: RegionalLiveFixture) -> CpuRuntime:
-    namespace = read_object(regional, "namespace", regional.settings.namespace)
-    deployment = read_object(regional, "deployment", DEPLOYMENT)
+    namespace, deployment = gather(
+        [
+            lambda: read_object(regional, "namespace", regional.settings.namespace),
+            lambda: read_object(regional, "deployment", DEPLOYMENT),
+        ]
+    )
     spec = _object(deployment.get("spec"))
     status = _object(deployment.get("status"))
     generation = deployment["metadata"].get("generation")
@@ -365,8 +336,16 @@ def read_runtime(regional: RegionalLiveFixture) -> CpuRuntime:
         "uid": ca["metadata"]["uid"],
         "resource_version": ca["metadata"]["resourceVersion"],
     }
-    fresh_namespace = read_object(regional, "namespace", regional.settings.namespace)
-    fresh_deployment = read_object(regional, "deployment", DEPLOYMENT)
+    fresh_namespace, fresh_deployment, *current_sources = gather(
+        [
+            lambda: read_object(regional, "namespace", regional.settings.namespace),
+            lambda: read_object(regional, "deployment", DEPLOYMENT),
+            *[
+                lambda name=name: read_object(regional, "configmap", name)
+                for name in sources
+            ],
+        ]
+    )
     if (
         fresh_namespace["metadata"]["uid"] != namespace["metadata"]["uid"]
         or fresh_deployment["metadata"]["uid"] != deployment["metadata"]["uid"]
@@ -375,8 +354,8 @@ def read_runtime(regional: RegionalLiveFixture) -> CpuRuntime:
         or not _same(fresh_deployment.get("status"), status)
     ):
         raise RegionalFixtureError("CPU runtime changed during watchdog discovery")
-    for name, identity in sources.items():
-        current = read_object(regional, "configmap", name)["metadata"]
+    for (name, identity), fresh in zip(sources.items(), current_sources, strict=True):
+        current = fresh["metadata"]
         if (
             current["uid"] != identity["uid"]
             or current["resourceVersion"] != identity["resource_version"]
@@ -613,7 +592,7 @@ def _worker_population(
             or containers[0].get("image") != runtime.image
             or len(states) != 1
             or states[0].get("name") != "control-worker"
-            or states[0].get("image") != runtime.image
+            or not _status_image(states[0].get("image"), runtime.image)
             or not _image_id(states[0].get("imageID"), runtime.image)
             or not _text(states[0].get("containerID"))
             or type(states[0].get("restartCount")) is not int
@@ -652,9 +631,10 @@ def require_cpu_history_capability(
         **history_api_identity(),
         "probe_sha256": hashlib.sha256(source.encode()).hexdigest(),
     }
-    for name in sorted(before):
-        try:
-            raw = regional.kubectl(
+
+    def probe(name: str) -> Any:
+        return json.loads(
+            regional.kubectl(
                 "cpu",
                 "exec",
                 "-i",
@@ -671,15 +651,18 @@ def require_cpu_history_capability(
                 input_text=source,
                 timeout=30,
             )
-            result = json.loads(raw)
-        except Exception:
-            raise RegionalFixtureError(
-                "CPU scoped-history capability probe failed"
-            ) from None
-        if not _same(result, expected):
-            raise RegionalFixtureError(
-                "CPU scoped-history API or implementation source differs"
-            )
+        )
+
+    try:
+        results = gather([lambda name=name: probe(name) for name in sorted(before)])
+    except Exception:
+        raise RegionalFixtureError(
+            "CPU scoped-history capability probe failed"
+        ) from None
+    if any(not _same(result, expected) for result in results):
+        raise RegionalFixtureError(
+            "CPU scoped-history API or implementation source differs"
+        )
     if (
         _worker_population(regional, runtime) != before
         or read_runtime(regional).identity() != runtime.identity()
@@ -836,7 +819,8 @@ def _watchdog_pod_spec(
         "terminationGracePeriodSeconds": 30,
         "dnsPolicy": "ClusterFirst",
         "schedulerName": "default-scheduler",
-        "preemptionPolicy": "Never",
+        # No preemptionPolicy: Priority admission refuses an explicit value
+        # without a PriorityClass; at priority 0 there is nothing to preempt.
         "tolerations": [
             {
                 "key": "node.kubernetes.io/" + key,
@@ -1105,6 +1089,7 @@ def _normal_pod(spec: Any) -> dict[str, Any]:
             "hostPID": False,
             "hostIPC": False,
             "priority": 0,
+            "preemptionPolicy": "PreemptLowerPriority",
             "nodeName": "",
             "initContainers": [],
             "ephemeralContainers": [],
@@ -1328,7 +1313,7 @@ def _process_status(
     container_id = container.get("containerID")
     if (
         container.get("name") != "cancellation-watchdog"
-        or container.get("image") != image
+        or not _status_image(container.get("image"), image)
         or not _image_id(container.get("imageID"), image)
         or not _text(container_id)
         or not _same(container.get("restartCount"), 0)

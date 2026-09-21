@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import sys
 import threading
 import time
 from collections.abc import Callable
@@ -32,6 +31,7 @@ from gpu_fault_release.regional_deployment_inventory import (
     GPU_EXECUTOR_DEPLOYMENT,
 )
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
+from scripts.e2e.regional.admin_cli import admin_command
 from scripts.e2e.regional.identity_acceptance_common import (
     ClusterTarget,
     IdentityAcceptanceError,
@@ -125,14 +125,13 @@ print(json.dumps({
 
 
 def invoke_rotation(site: IdentitySite, target: ClusterTarget, reference: str) -> None:
+    state_dir = site.site.source.parent
     run(
         [
-            sys.executable,
-            "-m",
-            "gpu_fault.admin.cli",
+            *admin_command(state_dir),
             "rotate-token",
             "--state-dir",
-            str(site.site.source.parent),
+            str(state_dir),
             "--gpu-cluster-arn",
             target.eks_cluster_arn,
             "--reference",
@@ -154,6 +153,23 @@ def _stamp(value: Any) -> datetime:
         raise IdentityAcceptanceError(
             "rotation evidence has an invalid timestamp"
         ) from None
+
+
+def registry_entry_committed(entry: dict[str, Any], new_digest: str) -> bool:
+    """The durable registry entry has fully committed the new token.
+
+    Field names follow ``RegionalClusterRegistration`` (``lifecycle_state``,
+    not the fake-only ``membership_state`` that hid a false verdict on the live
+    site, 2026-09-20): the new digest is current, no retiring token remains,
+    and the cluster is enabled and ACTIVE.
+    """
+
+    return (
+        entry.get("token_sha256") == new_digest
+        and not entry.get("retiring_token_sha256")
+        and entry.get("enabled") is True
+        and entry.get("lifecycle_state") == "ACTIVE"
+    )
 
 
 def rotation_journal_errors(
@@ -237,12 +253,18 @@ def consumer_errors(
     try:
         for node, agent in agents.items():
             required = previous[node]["required_collectors"]
+            # Activation proof (live 2026-09-20, AUTH-016 a2): the reinstall wave
+            # restarts the agent and re-registers it with the wave identity, which
+            # the fleet records as a generation advance; the incarnation hashes
+            # cluster/node/instance/boot_id and only changes on reboot, so it must
+            # exist but is not expected to change. A heartbeat after the retiring
+            # token was dropped can only have carried the new credential.
             if (
                 not required
                 or agent["required_collectors"] != required
                 or agent["lifecycle"] != "ACTIVE"
                 or not agent["incarnation"]
-                or agent["incarnation"] == previous[node]["incarnation"]
+                or int(agent["generation"]) <= int(previous[node]["generation"])
                 or _stamp(agent["last_seen_at"]) <= after_withdrawal
                 or _stamp(agent["lease_expires_at"]) <= _stamp(after["captured_at"])
             ):
@@ -533,10 +555,7 @@ def run_rotation_acceptance(
             "all_consumers_use_new_credential": not errors,
             "retired_token_rejected": result["old_token_status"] == 403,
             "target_registry_committed": len(target_entries) == 1
-            and target_entries[0].get("token_sha256") == new_digest
-            and not target_entries[0].get("retiring_token_sha256")
-            and target_entries[0].get("enabled") is True
-            and target_entries[0].get("membership_state") == "ACTIVE",
+            and registry_entry_committed(target_entries[0], new_digest),
             "sibling_registrations_unchanged": siblings
             == {
                 item["cluster_id"]: item

@@ -496,6 +496,8 @@ class _AuroraAccount:
                 "DBInstances": [
                     {
                         "DBInstanceIdentifier": identifier,
+                        "DBInstanceArn": f"arn:aws:rds:us-east-1:123456789012:db:{identifier}",
+                        "TagList": [{"Key": "gpu-fault:site-id", "Value": "site-a"}],
                         "DBClusterIdentifier": "gpu-fault-site-a-aurora",
                         "DBInstanceStatus": "available",
                     }

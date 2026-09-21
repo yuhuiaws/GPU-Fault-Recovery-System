@@ -2149,7 +2149,13 @@ test_cases:
   - 日志出现 regional mode requires GPU_FAULT_REGIONAL_CLUSTERS_JSON
   - /healthz 从未返回 200
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5ad19294668dc362a69b773f6efbb5a6e890cbd52b2e59ddf1f4f2a04979e6a9
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-001
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot001_regional_mode_without_a_registry_refuses_to_start
@@ -2166,7 +2172,13 @@ test_cases:
   - 含非对象元素的数组报 regional cluster registry entries must be objects
   - 显式空数组启动成功且管理员集群清单返回空数组
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 267f67999046c4ce8e907d19b08451e2af57e974de13f4a57b24a0078bda67e9
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-002
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot002_a_malformed_registry_fails_and_an_explicit_empty_one_boots
@@ -2181,7 +2193,13 @@ test_cases:
   - 日志出现 regional mode uses the cluster registry; GPU_FAULT_HYPERPOD_CLUSTER must be unset
   - Pod 不进入 Ready
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 9951ec30b153ec48dcefadbb7f663fae1394db24370b2957752af4d6344c91f1
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-003
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot003_regional_mode_and_the_single_cluster_variable_are_exclusive
@@ -2196,7 +2214,13 @@ test_cases:
   - 日志出现 regional control plane must not enable the in-cluster KubernetesWorkflowAdapter
   - Pod 不进入 Ready
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6644474b805c6c26c797aaa8eed7e6fee0d28709efeaf7f1c8a520f3406e4ed9
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-004
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_context_rejects_local_kubernetes_adapter
@@ -2211,7 +2235,13 @@ test_cases:
   - 日志出现 regional control plane must delegate HyperPod mutations to the target cluster executor
   - CloudTrail 中无来自控制面 role 的 ClusterNodes 类 mutation 调用（枚举动词，不用 contains）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ce7e438ed5bf29c4b698d66db4632f5f6afc7da6af3bedf2195e293bc1b2f384
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-005
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot005_regional_mode_refuses_the_central_hyperpod_adapter
@@ -2243,7 +2273,13 @@ test_cases:
   - 31 字符时报 cluster token must contain at least 32 characters 并启动失败
   - 32 字符时正常 Ready 且 /healthz 返回 200
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d65ee242536b844e7ba6ec94a9f4c2e1c06e77d4c43350e76e74625c6fb92e12
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-007
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot007_a_cluster_token_shorter_than_32_characters_stops_startup
@@ -2259,7 +2295,13 @@ test_cases:
   - 拼错字段名时 StrictModel 拒绝未知字段并启动失败
   - enabled=false 时控制面正常 Ready 但该集群凭证被拒 403
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5056d5a6dcc7d79aafa688059adc08f50e584e67fe60af81d427ff79ee1fcc5d
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-008
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot008_registry_field_integrity_and_disabled_cluster_semantics
@@ -2274,7 +2316,13 @@ test_cases:
   - 日志出现 HyperPod managed recovery observer requires GPU_FAULT_ENABLE_AGENT_REGISTRY=true
   - Pod 不进入 Ready
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 36f11374a4764f45b5d02bc6da3db9106df6dd2b798d6e31afb8e5654788a3ca
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-009
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot009_the_managed_observer_requires_the_agent_registry
@@ -2294,7 +2342,13 @@ test_cases:
   - 每个注册集群的 collector-status 返回 200
   - 三副本落在三个不同 CPU 节点
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6481dc2da59cd4643a0431fd90b0d1f93b609caa34424d2625e5c429bf0af3f7
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-010
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_context_loads_registry_and_remote_adapter
@@ -2337,7 +2391,13 @@ test_cases:
   - executor 清单与线上 Deployment 的专用CA挂载路径一致
   - authenticated readiness携带最近成功claim时间并在过旧时返回503
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 460e487081c2c4c67688c2fe2aa25b79ff5a455be8ebe896899597cc76d890a1
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-012
   related_pytest: tests/regional/test_production_safety_config.py::test_cluster_executor_private_ca_does_not_replace_aws_trust
@@ -2358,7 +2418,13 @@ test_cases:
   - 判据不依赖 GetEmailIdentity/GetAccount，这两个只读 API 在最小权限下必然 AccessDenied
   - 可选的真实投递验收（result 为 SENT 且 provider_message_id 非空）需事先确认并在完成后立刻关闭 ALLOW_EMAIL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 85bad714b1a89c6a78a6f5cc725b0fba0bf9b0eb53266bc77e5afd243949cabf
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-013
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot013_the_ses_client_region_comes_only_from_the_declared_environment
@@ -2378,7 +2444,13 @@ test_cases:
   - 两个开关的绑定关系被写入区域 patch
   - 可选的真实投递验收（60 秒内 SENT，否则手工 dispatch 能投出即 FAIL）需事先确认并在完成后立刻关闭
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 187688480143e1ca0ca9d7737acf820d8f023db35aa01e5b1c09e06327fcfe97
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-014
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot014_the_dangerous_delivery_switch_combination_is_named_not_silent
@@ -2406,7 +2478,13 @@ test_cases:
   - 补充 executor 上报 execution_owners 与控制面在注册 profile 时交叉校验（防线 a，仍未落地）
   - 不得为制造差集而关闭数据面 adapter 开关
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 98321c15446d49cbf52cacb0a4ffd24f87f7a3096ae08b50127a480dbdcf99af
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-015
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot015_a_command_no_adapter_owns_is_skipped_silently_but_counted
@@ -2565,7 +2643,13 @@ test_cases:
   - 阶段 5 与阶段 1 的 site_id、completed_tasks 集合、AWS 资源条数与 status --full PASS 计数一致，重跑 deploy --state-dir 严格 NOOP
   - 驱动的 admin-lifecycle-sequence.json 记录每阶段 PASS/FAIL、日志 sha256 与冷构建计数，ARN、邮箱与路径只以 sha256 出现
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 82d88068e3d63783f408f48ca72b4abbc2bdb5c26322e80d338f7e6488371847
+      components:
+        control_plane: 1d5571b37f011835d92728819c0c8061a3969f8df9f8161567141e8471a6ff8c
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-029
   related_pytest: tests/regional/test_admin_lifecycle_sequence_script.py::test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy
@@ -2580,7 +2664,13 @@ test_cases:
   - HTTP 401
   - detail 为 X-GPU-Fault-Cluster-ID is required
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8aed4ca2db98b4ce51b07d87fa7d37d3ff0fdea6eaaa770fdd04a6f04dcbfa69
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-001
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth001_a_protected_route_without_the_cluster_header_answers_401
@@ -2596,7 +2686,13 @@ test_cases:
   - 非 Bearer 前缀返回 401
   - 空 Bearer 返回 403 且绝不返回 200
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 2a3734f72f9fb266d5977b46d774a180e758a1b394b7bb25e9c3d436ab6b8aaf
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-002
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth002_absent_malformed_and_empty_bearer_stay_distinguishable
@@ -2611,7 +2707,13 @@ test_cases:
   - HTTP 403
   - detail 为 regional cluster is not registered
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: a4fbe1473a22b4f372d2f2ce1544b3b53b2340d3f9418b56615b3228c2b8cbce
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-003
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_authenticates_cluster_and_rejects_spoofing
@@ -2627,7 +2729,13 @@ test_cases:
   - detail 完全相同且不含长度或前缀相关信息
   - 比较使用 secrets.compare_digest
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 91e67748ba704dc1ea872f7035820546f6fa468c1316c4289f8b188124a4c61a
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-004
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth004_a_near_miss_token_is_denied_exactly_like_a_wrong_one
@@ -2642,7 +2750,13 @@ test_cases:
   - HTTP 403 且 detail 为 authenticated cluster does not match all payload cluster_id values
   - B 集群下没有新增任何相关记录
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5bcc22cb9dfe0e4bdce0fe5bbb244c0c68c745eaba6d67454aecdf4b17cb0f6c
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-005
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth005_a_payload_for_another_cluster_is_403_and_writes_nothing
@@ -2658,7 +2772,13 @@ test_cases:
   - 返回 403 而不是签名错误导致的 401 或 409，证明 cluster 校验先于业务处理
   - B 集群下未出现该 agent
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 7b8631cb79241b5ba879e59ad71d2f42807328f09ea7f0915f663067df11b0cd
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-006
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth006_a_nested_heartbeat_cluster_id_is_checked_before_the_signature
@@ -2675,7 +2795,13 @@ test_cases:
   - 改回 true 并滚动后 B 恢复 200
   - 报告记录滚动 ingress 与 control-worker 所需时间作为隔离生效延迟上界
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 998f52d59048ce422355397d6fa51c37223bd0ae7b64b4d6e72a6572e8e98a60
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-007
 - id: GF-REGIONAL-AUTH-008
@@ -2693,7 +2819,13 @@ test_cases:
   - A header 加 B token 返回 403
   - A及交叉token负向检查后B命令仍为PENDING，B正向必须能领取；结束后本次命令安全终态化且没有物理动作
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: bc6d3c33c4e54e8255cfc0dac42dfa85b516c09e58b6c808c5a19bf7caa24dd8
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-008
   related_pytest: tests/regional/test_auth008_owned_backlog.py::test_auth008_uses_owned_b_backlog_and_retires_it_without_actions
@@ -2710,7 +2842,13 @@ test_cases:
   - B 的 evidence 条数未增加
   - 报告列出每个端点的实际状态码，任何 2xx 都是阻断项
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d66e57bc91bf7c5ce1f898f018ec5779ae04e6be918608c428b063ed5e804d36
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-009
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth009_every_cluster_token_write_route_rejects_a_foreign_payload
@@ -2743,7 +2881,13 @@ test_cases:
   - /v1/regional/clusters 在无凭证和集群凭证下都返回 401 或 403
   - 数据面无法读取任何全区域 cluster_id label
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e9de0fec2196fb844cc69957f1f05d0ed07b08ccd1c133f2662ac3b58d6f24c1
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-011
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth011_health_and_metrics_do_not_expose_the_regional_inventory
@@ -2777,7 +2921,13 @@ test_cases:
   - 成功轮换是已提交状态，不由runner私自写回旧Secret；失败保留原journal并遵守生产rollback/fail-forward边界
   - 报告只记录 token 摘要，不记录任何明文
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 11cdfe0e0edb9a9c3e5c6bab9d23fcc22abc7b366ef7651c03220a3ffc80bdb9
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   # Prior binding preserved in docs/evidence/fault/bindings/superseded-acceptance-bindings-20260915.json.
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-016
@@ -2795,7 +2945,13 @@ test_cases:
   - 错误 servername 触发主机名校验失败
   - 证书剩余有效期大于 30 天且已配置到期告警
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5135fa54602abd1ddf588fc89b797e4e2ead4c82db8c109822c03addd2900b81
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-013
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth013_the_executor_trusts_the_private_ca_without_replacing_aws_trust
@@ -2815,7 +2971,13 @@ test_cases:
   - OpenAPI/docs/redoc 的公开只读信息面被记录
   - 管理员 execution token 未出现在任何数据面 Secret 中（原 GF-REGIONAL-AUTH-010 的判定）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 38c5e6032eb505af55403b58970a8e5391f73c2a612ec939759075d7fad68673
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-014
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth014_the_internet_facing_surface_is_exactly_its_declared_buckets
@@ -4176,7 +4338,13 @@ test_cases:
   - 原 producer 撤销、来源完成、command/workflow 全部静默后才关闭防护和恢复夹具；最终场景清理不完整同样禁止整条 PASS
   - 同一 run 只续清理，不重复注入；原失败不能因清理成功而变为 PASS，归属漂移不能触发 Agent 或节点恢复
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 9af18ec35c8b7aadc974d22613a905fd49be6a3e63d499f825f5dcfe0c02e974
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
   related_pytest: tests/regional/test_destr008_main_safety.py::test_main_bounded_case_requires_real_safety_before_fixture_and_post
@@ -4714,7 +4882,13 @@ test_cases:
   - 阳性reboot事件必须匹配目标集群与实际executor role；不完整分页、非法事件身份、不可读或缺少时间证据的已有用例均不能给出通过
   - CloudTrail未成熟窗口只能INCOMPLETE/FAIL并退出1，不能满足正式序列；审计自身输出不补足前序时间覆盖
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 711d345f3fc8ae696932b5593b2caa1521df5afc315669591210579a89087105
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
@@ -4756,7 +4930,7 @@ test_cases:
   - 独立原Agent恢复与只读探针清理不等于物理结果已调和；scenario安全断言可单独记录，但不能替代完整清理后验收
   - 自动恢复早于场景结束则 FAIL；已有 attempt 只续清理，不重新禁用、注入或签发 PASS
   evidence:
-    verdict: NOT_RUN
+    verdict: BLOCKED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-014
   related_pytest: tests/regional/test_acceptance_reboot_hold_alignment.py::test_unknown_reboot_requires_operator_hold_not_replacement
@@ -4930,7 +5104,13 @@ test_cases:
   - 任一不一致都在 rollout 前失败
   - 不使用版本字符串、annotation 或源码行数代替内容摘要
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e4b0fac2a30bdbf37df85113be4338a4cc10e4bd9be4416a689c7256c0b3a320
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-018
   related_pytest: tests/test_artifact_consistency.py::test_built_component_wheels_match_their_source_closures
@@ -4974,7 +5154,13 @@ test_cases:
   - FULL回滚后再次应用同一候选时必须删除并重建旧completed Installer Job，Agent heartbeat须真实收敛，不能只把节点annotation标成Succeeded
   - 完整FULL收敛且下次分类NOOP后输出绑定摘要的boot023-noop.json；后续用例消费该最终基线而不是起始noop.json
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 7da62a60e7db84c367999e01e62de832c49605d9455517bd5608a0bc24a1fe15
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   # Prior binding preserved in docs/evidence/fault/bindings/superseded-acceptance-bindings-20260915.json.
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-020
@@ -4997,9 +5183,9 @@ test_cases:
     verified:
       case_digest: a2806d81cc7a11292eb578983e335599daccfe93054d2b11159177ae74b0378c
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-021
   related_pytest: tests/regional/test_regional_control_plane.py::test_executor_readiness_rejects_an_executor_that_cannot_claim
@@ -5020,9 +5206,9 @@ test_cases:
     verified:
       case_digest: 51540f4330856795858d248360ad1c262369625903b8dd3bff043b69e38da56a
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-022
   execution:
@@ -5064,7 +5250,13 @@ test_cases:
   - "带 database.rollback_compatible: true 的清单被 parse_delivery_identity 以 ReleaseError 拒绝，错误信息同时说明原因（exact schema 匹配）与出路（--accept-schema-change）；不带该声明的同一清单仍被接受"
   - 三个 CPU Deployment 与 executor 的 runtime identity 与 preflight 逐字段相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6c327510b0dc73446869d85032f571cfa7be2f5895bc394c97be73f86d86b5bf
+      components:
+        control_plane: 397355cbbf444dba5b687be821b8603bbd32245a34602b974f8260ef7f15cd7b
+        executor: 86fa93054229aa88525b731fe5b78fd6021353885b90484683e5f003602eda90
+        node_runtime: a7f6b4fb5bc10e18c4a10e55beffb6520a62d9567af02cdd6593c633a458d393
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-023
   related_pytest: tests/regional/test_boot023_release_history.py::test_the_real_parser_refuses_the_flag_and_the_verdict_accepts_its_message
@@ -7057,7 +7249,13 @@ test_cases:
   - 不执行DDL、模式切换、回填、旧行删除或任何AWS及Kubernetes mutation
   - 只读模式审计不能冒充schema发布；另用不可变capture/verify伴随证据核对已批准公共deploy的版本推进、快照、fail-forward及proof Job生命周期
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: c57dc025e434b1f1f1b6f4872bb1dc10ee8e1ba580e875ba9e9c94074fc3f563
+      components:
+        control_plane: 1d5571b37f011835d92728819c0c8061a3969f8df9f8161567141e8471a6ff8c
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-030
   related_pytest: tests/regional/test_state_table_acceptance.py::test_full_audit_reads_every_cpu_replica_with_one_full_verification[remote_command]
@@ -7076,7 +7274,13 @@ test_cases:
   - 保持只读；不测HOT比例，不自动推进迁移，不清理legacy行或索引
   - 迁移维护CLI默认使用当前投影FILE DSN；文件读取失败或显式目标冲突拒绝，不以启动时旧密码继续操作
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f3934000d1e052e663110512093091d6192111e577e3309fc65fd8962ba3cf30
+      components:
+        control_plane: 1d5571b37f011835d92728819c0c8061a3969f8df9f8161567141e8471a6ff8c
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-031
   related_pytest: tests/regional/test_state_table_acceptance.py::test_full_audit_reads_every_cpu_replica_with_one_full_verification[workflow]

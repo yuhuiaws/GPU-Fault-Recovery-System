@@ -605,3 +605,67 @@ def test_workload_rbac_inventory_rejects_a_cross_context_proof_read(
             {"context": "gpu-a"},
             {"resources": []},
         )
+
+
+class InstallerJobKubectl:
+    """A namespace holding the reconciler Deployment and one of its installer Jobs."""
+
+    def __init__(self, *, labelled: bool = True) -> None:
+        self.labelled = labelled
+
+    def run(
+        self, arguments: list[str], *, input_text: str | None = None, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        del input_text, check
+        items: list[dict] = []
+        if "-A" in arguments:
+            job = {
+                "kind": "Job",
+                "apiVersion": "batch/v1",
+                "metadata": {
+                    "namespace": "gpu-fault-system",
+                    "name": "gpu-fault-install-node-a-1234",
+                    "uid": "job-uid",
+                },
+            }
+            if self.labelled:
+                job["metadata"]["labels"] = {"gpu-fault.io/node-installer": "true"}
+            items = [
+                job,
+                {
+                    "kind": "Deployment",
+                    "apiVersion": "apps/v1",
+                    "metadata": {
+                        "namespace": "gpu-fault-system",
+                        "name": "gpu-fault-node-installer-reconciler",
+                        "uid": "reconciler-uid",
+                    },
+                },
+            ]
+        return subprocess.CompletedProcess(
+            arguments, 0, json.dumps({"items": items}), ""
+        )
+
+
+def _discover(kubectl: InstallerJobKubectl, registered: set) -> set[tuple[str, str]]:
+    found = COLLECT_MODULE.discover_unregistered(
+        kubectl,
+        plane="gpu",
+        context="gpu-context",
+        namespace="gpu-fault-system",
+        registered=registered,
+    )
+    return {(item["kind"], item["name"]) for item in found}
+
+
+def test_installer_jobs_of_the_registered_reconciler_are_covered() -> None:
+    reconciler = {("deployment", "gpu-fault-node-installer-reconciler")}
+    assert _discover(InstallerJobKubectl(), reconciler) == set(), (
+        "a labelled installer Job is the registered reconciler's transient child"
+    )
+    assert _discover(InstallerJobKubectl(labelled=False), reconciler) == {
+        ("job", "gpu-fault-install-node-a-1234")
+    }, "a gpu-fault Job without the installer label stays visible"
+    assert ("job", "gpu-fault-install-node-a-1234") in _discover(
+        InstallerJobKubectl(), set()
+    ), "the label proves nothing when the reconciler itself is not registered"

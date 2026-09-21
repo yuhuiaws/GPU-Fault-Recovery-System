@@ -34,6 +34,35 @@ REFERENCE_FIELDS = (
     "source_workflow_id",
 )
 MAX_RECORDS = 100_000
+# A 50-cluster run leaves ~2.5k hot-state rows per synthetic cluster (latest
+# telemetry, collector status and inventory snapshots per node); the walk's
+# bound scales with the run instead of refusing legitimate 50-cluster data.
+RECORDS_PER_CLUSTER = 4000
+# Control-state kinds are deleted one by one through the store's CAS function;
+# every other kind is per-node hot state that lives in gpu_fault_objects and is
+# deleted set-based, or a 50-cluster teardown outlives its exec budget.
+CAS_KINDS = frozenset({"workflow", "remote_command", "incident"})
+BULK_DELETE_BATCH = 5000
+
+
+def record_bound(cluster_ids: list[str]) -> int:
+    return max(MAX_RECORDS, RECORDS_PER_CLUSTER * len(cluster_ids))
+
+
+def bulk_delete_batches(
+    records: dict[tuple[str, str], dict[str, Any]],
+) -> list[tuple[str, list[str]]]:
+    """``(kind, keys)`` batches for the set-based deletes, CAS kinds excluded."""
+
+    by_kind: dict[str, list[str]] = {}
+    for kind, key in sorted(records):
+        if kind not in CAS_KINDS:
+            by_kind.setdefault(kind, []).append(key)
+    return [
+        (kind, keys[start : start + BULK_DELETE_BATCH])
+        for kind, keys in by_kind.items()
+        for start in range(0, len(keys), BULK_DELETE_BATCH)
+    ]
 
 
 def validate_scope(run_id: str, cluster_ids: list[str]) -> None:
@@ -65,7 +94,7 @@ def scope_records(
     )
     records = {(kind, key): payload for kind, key, payload in cursor.fetchall()}
     while records:
-        if len(records) > MAX_RECORDS:
+        if len(records) > record_bound(cluster_ids):
             raise RuntimeError("capacity cleanup record bound exceeded")
         identifiers = record_identifiers(records)
         predicates = sql.SQL(" OR ").join(
@@ -101,7 +130,18 @@ def scope_records(
                     (incident_id,),
                 )
                 owner = cursor.fetchone()
-                if owner is None or owner[0] not in cluster_ids:
+                if owner is not None and owner[0] not in cluster_ids:
+                    raise RuntimeError(
+                        "capacity cleanup incident ownership is unknown or foreign"
+                    )
+                if owner is None and not any(
+                    payload.get(field) in cluster_ids
+                    for field in ("cluster_id", "cluster_name")
+                ):
+                    # Notifications reference derived incident ids (live 2026-09-20:
+                    # `collector-silent-<node>` for perf-cap nodes) that never
+                    # become incident records. The record's own cluster field is
+                    # then the ownership proof; without it the record stays.
                     raise RuntimeError(
                         "capacity cleanup incident ownership is unknown or foreign"
                     )
@@ -110,6 +150,42 @@ def scope_records(
             break
         records.update({key: additions[key] for key in new})
     return records
+
+
+def drill_residue_only(
+    records: dict[tuple[str, str], dict[str, Any]], run_id: str
+) -> bool:
+    """True when every scoped record is a drill notification of ``run_id``.
+
+    The collector-silence detector keeps emitting ``[DRILL:perf-capacity]``
+    notifications for synthetic nodes until their clusters are deregistered;
+    a few land after the run's data purge (live 2026-09-20: four for
+    perf-cap-000). They carry the drill marker and the run id in their derived
+    incident id, which is ownership proof enough to sweep them without a live
+    registration; anything else keeps refusing.
+    """
+
+    if not records:
+        return False
+    drills = {
+        key
+        for (kind, key), payload in records.items()
+        if kind == "notification"
+        and payload.get("drill_id") == "perf-capacity"
+        and run_id in str(payload.get("incident_id") or "")
+    }
+    for (kind, key), payload in records.items():
+        if kind == "notification":
+            if key not in drills:
+                return False
+        elif kind in {"notification_delivery", "notification_result"}:
+            # The delivery queue row and the provider result hang off the
+            # notification by its id; they go with it.
+            if str(payload.get("notification_id") or key) not in drills:
+                return False
+        else:
+            return False
+    return True
 
 
 def record_identifiers(records: dict[tuple[str, str], dict[str, Any]]) -> list[str]:
@@ -168,13 +244,17 @@ def require_registry_scope(cursor: Any, run_id: str, cluster_ids: list[str]) -> 
         raise RuntimeError("capacity cleanup registry revision changed")
     current = {item.cluster_id: item for item in revision.registrations}
     present = [current[key] for key in cluster_ids if key in current]
+    if not present:
+        # Deregistration already happened; the caller may sweep only the late
+        # drill residue it can prove belongs to this run.
+        return False
     if len(present) != len(cluster_ids) or any(
         not item.synthetic or item.synthetic_run_id != run_id for item in present
     ):
         raise RuntimeError(
             "capacity cleanup lacks the complete current run-owned registry"
         )
-    return bool(present)
+    return True
 
 
 def inspect_or_cleanup(
@@ -204,7 +284,11 @@ def inspect_or_cleanup(
                     **counts,
                     "total": len(records) + links + sum(counts.values()),
                 }
-            if not registered and (records or links or sum(counts.values())):
+            if (
+                not registered
+                and (records or links or sum(counts.values()))
+                and (sum(counts.values()) or not drill_residue_only(records, run_id))
+            ):
                 raise RuntimeError(
                     "capacity data has no current run-owned registration"
                 )
@@ -237,6 +321,8 @@ def inspect_or_cleanup(
                 (identifiers, identifiers),
             )
             for (kind, key), payload in records.items():
+                if kind not in CAS_KINDS:
+                    continue
                 cursor.execute(
                     "SELECT gpu_fault_delete_control_state(%s,%s,%s::jsonb)",
                     (kind, key, json.dumps(payload)),
@@ -248,6 +334,14 @@ def inspect_or_cleanup(
                     )
                     if cursor.fetchone() is not None:
                         raise RuntimeError("capacity record changed during cleanup")
+            for kind, keys in bulk_delete_batches(records):
+                # The store's delete function targets gpu_fault_objects for every
+                # kind outside the control-state tables; this is the same delete
+                # without the per-row CAS, which hot-state snapshots do not need.
+                cursor.execute(
+                    "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=ANY(%s)",
+                    (kind, keys),
+                )
             for table, expression in TABLE_SCOPES.items():
                 cursor.execute(
                     sql.SQL("DELETE FROM {} WHERE {}=ANY(%s)").format(
@@ -298,7 +392,7 @@ def invoke(
         "-",
         json.dumps({"run_id": run_id, "cluster_ids": cluster_ids, "cleanup": cleanup}),
         stdin=Path(__file__).read_bytes(),
-        timeout=150,
+        timeout=900 if cleanup else 150,
     )
     result = json.loads(output.splitlines()[-1])
     if not isinstance(result, dict) or type(result.get("total")) is not int:

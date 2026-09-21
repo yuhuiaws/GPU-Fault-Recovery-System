@@ -50,6 +50,11 @@ run_postgres_job() {
     fi
     kubectl --kubeconfig "${KUBECONFIG}" -n "${NAMESPACE}" \
       logs "job/${name}" --all-containers=true || true
+    # The release owns its transient Jobs: a completed Job left behind is an
+    # unregistered live resource the fail-closed uninstall refuses (live
+    # 2026-09-20). Its log was printed above; a failed Job stays for diagnosis.
+    kubectl --kubeconfig "${KUBECONFIG}" -n "${NAMESPACE}" \
+      delete "job/${name}" --ignore-not-found
 }
 
 run_postgres_job gpu-fault-postgres-index-build \

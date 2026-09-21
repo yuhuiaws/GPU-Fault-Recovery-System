@@ -529,14 +529,23 @@ def test_systemctl_output_errors_are_fail_closed_and_withheld(
 
 
 @pytest.mark.parametrize("missing", sorted(probe.UNIT_FIELDS | probe.SERVICE_FIELDS))
-def test_each_systemd_service_property_is_required(
+def test_only_identity_fields_are_required_others_default_empty(
     host: Host, monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
+    # systemd 252 (Amazon Linux 2023, live 2026-09-19) prints no line for an empty
+    # property, so a complete ``systemctl show`` legitimately omits any non-identity
+    # field. ``unit_state`` therefore requires only the always-present identity
+    # fields and reads every omitted property as empty.
     state = dict(host.units["kubelet.service"])
     state.pop(missing)
     monkeypatch.setattr(probe, "systemctl", lambda *_args: state)
-    with pytest.raises(probe.ProbeError, match="properties are incomplete"):
-        probe.service_snapshot("kubelet.service")
+    if missing in probe.IDENTITY_FIELDS:
+        with pytest.raises(probe.ProbeError, match="properties are incomplete"):
+            probe.service_snapshot("kubelet.service")
+    else:
+        snapshot = probe.service_snapshot("kubelet.service")
+        if missing in probe.STATE_FIELDS:
+            assert snapshot[missing] == ""
 
 
 @pytest.mark.parametrize(

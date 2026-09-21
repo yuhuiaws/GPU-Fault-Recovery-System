@@ -46,6 +46,7 @@ def run_fixture_command(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
     isolated_postgres_url: str | None = None,
+    identity_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if not command or any(
         not isinstance(item, str) or "\0" in item for item in command
@@ -59,6 +60,7 @@ def run_fixture_command(
             cwd=cwd,
             environment=env,
             isolated_postgres_url=isolated_postgres_url,
+            identity_root=identity_root,
         ) as focused:
             completed: subprocess.CompletedProcess[str] = run_command(
                 focused.command if focused else command,

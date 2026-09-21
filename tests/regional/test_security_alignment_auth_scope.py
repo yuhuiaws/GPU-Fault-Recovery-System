@@ -114,3 +114,57 @@ def test_authenticated_fleet_runner_reads_local_records_and_denies_real_peer_rec
 def test_fleet_scope_rejects_vacuous_baselines(baseline):
     with pytest.raises(fleet.IdentityAcceptanceError):
         fleet.fleet_scope_requests("a", baseline)
+
+
+def test_single_cluster_site_proves_fleet_isolation_against_an_unregistered_peer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    # Live 2026-09-20 (AUTH-014 a1): the site has ONE registered GPU cluster, so
+    # ``site.targets`` yields a one-entry baseline and the fleet proof raised
+    # "fleet isolation needs populated local and peer baselines". The API denies
+    # a foreign fleet read by comparing the requested cluster id with the
+    # authenticated header before any store lookup (``routes/fleet.py``), so an
+    # UNREGISTERED peer id -- the ISO-003/004 recipe -- is a faithful probe of the
+    # same rule; only the local listing needs real records.
+    context, _ = bound_api(monkeypatch)
+    fleet_agent(context, "a", "node-a")
+    from tests.regional._regional_support import TOKEN_A
+
+    monkeypatch.setenv("GPU_FAULT_CONTROL_PLANE_TOKEN", TOKEN_A)
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_ID", "a")
+    monkeypatch.setenv("GPU_FAULT_CONTROL_PLANE_URL", "https://unit.invalid")
+    monkeypatch.setenv("GPU_FAULT_CONTROL_PLANE_CA_FILE", str(tmp_path / "public-ca"))
+    site = SimpleNamespace(
+        targets={"a": object()},
+        api_pod_json=lambda script, *args: probe(script, *args),
+        any_executor_pod=lambda _target: "executor-a",
+        pod_json=lambda _plane, _target, _pod, script, *args, **kwargs: probe(
+            script, *args
+        ),
+    )
+    with pytest.raises(fleet.IdentityAcceptanceError, match="peer"):
+        fleet.authenticated_fleet_isolation(site, SimpleNamespace(cluster_id="a"))
+    result = fleet.authenticated_fleet_isolation(
+        site,
+        SimpleNamespace(cluster_id="a"),
+        peer=SimpleNamespace(cluster_id="b", registered=False),
+    )
+    assert result["passed"] is True, result
+    assert result["errors"] == []
+    assert result["unregistered_peer"] == "b"
+    rows = result["results"]["results"]
+    assert {name for name in rows if name.startswith("peer-")} == {
+        "peer-0-query",
+        "peer-0-node",
+    }
+    assert all(
+        rows[name]["status"] == 403 for name in rows if name.startswith("peer-")
+    ), "an unregistered peer must be denied on every fleet route"
+    assert rows["local-list"]["agents"] == [{"cluster_id": "a", "node_id": "node-a"}]
+    assert context.store.list_agents("b") == [], "the peer must stay unregistered"
+    with pytest.raises(fleet.IdentityAcceptanceError):
+        fleet.authenticated_fleet_isolation(
+            site,
+            SimpleNamespace(cluster_id="a"),
+            peer=SimpleNamespace(cluster_id="a", registered=False),
+        )

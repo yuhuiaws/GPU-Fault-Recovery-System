@@ -7,10 +7,9 @@ import json
 import os
 import sys
 import time
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from typing import Any, Callable, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -26,6 +25,14 @@ from gpu_fault.admin.config import AdminConfig  # noqa: E402
 from scripts.e2e.regional.boot020_admin_config import (  # noqa: E402
     public_config_roundtrip,
     validate_admin_target,
+)
+from scripts.e2e.regional.boot020_deployment_reads import (  # noqa: E402
+    AcceptanceCheckError,
+    _deployment_listing,
+    deployment_generations,
+    deployment_generations_from,
+    deployment_identities_from,
+    release_read_snapshot,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     EvidenceRecorder,
@@ -79,15 +86,6 @@ class InjectedAcceptanceFailure(RuntimeError):
     pass
 
 
-class AcceptanceCheckError(RuntimeError):
-    """A live observation contradicted the BOOT-020 contract.
-
-    Raised explicitly rather than through ``assert``: ``python -O`` strips
-    ``assert`` statements, and a runner whose checks vanish under an
-    optimisation flag would report a constant PASS.
-    """
-
-
 def _require(condition: bool, message: str, context: Any = None) -> None:
     if not condition:
         detail = f"{message}: {context!r}" if context is not None else message
@@ -110,6 +108,8 @@ COMPATIBLE_EXECUTOR_PINS = "compatible-regional-executor-artifact-sha256s"
 
 class ReleaseRollingBackend(Protocol):
     def classify(self, scenario: str) -> dict[str, Any]: ...
+    def resume_rollback(self, scenario: str) -> dict[str, Any]: ...
+    def node_safety(self, scenario: str) -> dict[str, Any]: ...
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]: ...
 
@@ -176,10 +176,16 @@ def _assert_control_plane_only(
             }[role]
             for role in roles
         }
+        # A CPU role "rolled" when its replicas or Pod template changed. Its
+        # generation alone is no signal: Kubernetes bumps a Deployment's
+        # generation on annotation changes too, and every release re-stamps
+        # gpu-fault.io/admin-config-sha256 on ALL CPU Deployments (live
+        # 2026-09-20: api-ha and spool moved +1 per apply with no ReplicaSet and
+        # no Pod change).
         moved = {
             name
-            for name in set(before["cpu_generations"]) | set(after["cpu_generations"])
-            if before["cpu_generations"].get(name) != after["cpu_generations"].get(name)
+            for name in set(before["cpu_identities"]) | set(after["cpu_identities"])
+            if before["cpu_identities"].get(name) != after["cpu_identities"].get(name)
         }
         _require(
             moved == expected,
@@ -570,7 +576,16 @@ def _stage_control_plane(
     )
     _require(control_apply["phase"] == "complete", "CPU apply phase", control_apply)
     control_after = chain.after(backend, recorder, "control_plane")
-    _assert_control_plane_only(control_before, control_after, control_diff)
+    # Whole-stage invariants against the pre-stage baseline: no GPU cluster or
+    # GPU Deployment changed, and the CPU plane did move.
+    _assert_control_plane_only(control_before, control_after)
+    # The forward apply's role scope is measured from the post-rollback
+    # snapshot: the injected failure's rollback restores EVERY CPU role from
+    # the previous snapshot with a fresh restart token (rollback context targets
+    # spool,worker,ingress; live 2026-09-20 07:32Z api-ha and spool got new
+    # ReplicaSets during this worker-only stage), so measuring from the
+    # pre-stage snapshot counts the rollback's restarts as the release's rollout.
+    _assert_control_plane_only(control_rolled_back, control_after, control_diff)
     _assert_next_noop(backend, recorder, "control_plane")
 
 
@@ -789,6 +804,27 @@ def complete_evidence(recorder: EvidenceRecorder) -> dict[str, Any]:
     return recorder.complete()
 
 
+def assert_gpu_nodes_safe(
+    backend: ReleaseRollingBackend, recorder: EvidenceRecorder
+) -> dict[str, Any]:
+    """The engine's pre-node-mutation gate, run before the first stage.
+
+    The engine only runs it when a data-plane wave is about to mutate nodes,
+    which in this contract is the executor stage: live 2026-09-20 08:33Z the
+    warm spare carried ``gpu-fault.io/quarantined`` (an inconclusive DCGM
+    diagnosis at 07:35Z) and the refusal came after the drill, noop and
+    control_plane stages had already spent ~50 minutes. Recorded as a note,
+    never replayed: a resume must look at the live nodes again.
+    """
+    safety = recorder.note("node_safety", backend.node_safety(STAGES[0]))
+    if safety.get("safe") is not True:
+        raise AcceptanceCheckError(
+            "GPU node state blocks the data-plane stages; release or repair the "
+            f"nodes before running BOOT-020: {json.dumps(safety.get('clusters'), sort_keys=True)}"
+        )
+    return safety
+
+
 def run_release_rolling(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
@@ -816,6 +852,7 @@ def run_release_rolling(
     start = STAGES.index(start_stage)
     chain = _SnapshotChain()
     try:
+        assert_gpu_nodes_safe(backend, recorder)
         if start:
             missing = [
                 stage
@@ -890,6 +927,21 @@ def _converge_to_precondition(
     """
 
     scenario = STAGES[index - 1]
+    # A failed stage may have left the engine's transaction mid-rollback
+    # (live 2026-09-20 08:02Z: a HyperPod software update rebooted every CPU
+    # node during the control_plane stage; the injected upgrade failed for real
+    # and the automatic rollback died on an unavailable webhook, phase
+    # rollback-failed). The engine refuses a new transaction over a pending
+    # rollback, so finish the rollback first; a clean state is a no-op here.
+    rollback_resume = backend.resume_rollback(scenario)
+    if rollback_resume.get("resumed") and rollback_resume.get("phase") not in {
+        "rolled-back",
+        "complete",
+    }:
+        raise RuntimeError(
+            "BOOT-020 could not finish the pending rollback before resuming: "
+            f"{rollback_resume}"
+        )
     diff = backend.classify(scenario)
     applied = backend.deploy(scenario, diff=diff)
     if applied.get("phase") != "complete":
@@ -901,6 +953,7 @@ def _converge_to_precondition(
     history.append(
         {
             "converged_to": scenario,
+            "rollback_resume": rollback_resume,
             "classification": diff,
             "phase": applied.get("phase"),
             "at": utc_now(),
@@ -929,63 +982,15 @@ def resume_release_rolling(
     index, stage = resume_target(recorder.document)
     if stage is None:
         return complete_evidence(recorder)
+    try:
+        assert_gpu_nodes_safe(backend, recorder)
+    except BaseException as exc:
+        recorder.fail(exc)
+        raise
     _discard_incomplete(recorder, index)
     if index:
         _converge_to_precondition(backend, recorder, index)
     return run_release_rolling(backend, recorder, start_stage=stage)
-
-
-def _read_snapshot(release: Any) -> AbstractContextManager[Any]:
-    """The engine's read snapshot when the release offers one, else a no-op.
-
-    Inside it every read-only ``kubectl get`` is served once from one
-    observation, and a nested ``read_snapshot`` -- ``_capture_previous`` opens
-    its own -- joins the outer one instead of discarding its warm cache.
-    """
-
-    factory = getattr(release, "_read_snapshot", None)
-    return (
-        cast(AbstractContextManager[Any], factory())
-        if callable(factory)
-        else nullcontext()
-    )
-
-
-def deployment_generations(
-    release: Any,
-    args: list[str],
-    names: tuple[str, ...],
-) -> dict[str, int]:
-    """``metadata.generation`` of each named Deployment from ONE list read.
-
-    ``args`` is the kube-context prefix (``release._cpu()`` or
-    ``release._gpu(target)``); the argv is built exactly as the engine's
-    ``prime_deployment_snapshot`` builds it, so inside a read snapshot the list
-    ``_capture_previous`` already primed answers this without another kubectl
-    call. Missing, repeated or malformed generations cannot prove stability.
-    """
-
-    listing = release._get_json(
-        args + ["-n", release.config.namespace, "get", "deployment"]
-    )
-    found: dict[str, int] = {}
-    if not isinstance(listing, dict) or not isinstance(listing.get("items"), list):
-        raise AcceptanceCheckError("Deployment inventory is missing")
-    for item in listing["items"]:
-        if not isinstance(item, dict):
-            continue
-        metadata = item.get("metadata", {}) or {}
-        name = metadata.get("name")
-        if name in names:
-            generation = metadata.get("generation")
-            if name in found or type(generation) is not int or generation < 1:
-                raise AcceptanceCheckError(
-                    "Deployment generation is missing or invalid"
-                )
-            found[str(name)] = generation
-    if set(found) != set(names):
-        raise AcceptanceCheckError("Deployment inventory is incomplete")
-    return {name: found[name] for name in names}
 
 
 class LiveReleaseRollingBackend:
@@ -1016,6 +1021,71 @@ class LiveReleaseRollingBackend:
             **diff.as_dict(),
             "execution_plan": self.diff_module.build_execution_plan(diff).as_dict(),
             "cpu_roles": list(self.diff_module.control_plane_role_targets(diff)),
+        }
+
+    def node_safety(self, scenario: str) -> dict[str, Any]:
+        """Every GPU cluster's nodes through the engine's own safety gate.
+
+        ``validate_target_node_state`` is what the data-plane wave runs right
+        before mutating nodes (quarantine/health taints, cordons that are not a
+        parked warm spare, unready or deleting nodes, active installers); it
+        raises ``ReleaseError`` with the blockers, which are recorded here.
+        """
+        from gpu_fault_release import regional_release_node_preflight as preflight
+        from gpu_fault_release.regional_release_config import ReleaseError
+        from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
+
+        release = self._release(scenario)
+        clusters: dict[str, Any] = {}
+        for target in release.config.clusters:
+            names = tuple(
+                sorted(
+                    str((item.get("metadata") or {}).get("name") or "")
+                    for item in gpu_node_items(release, target, fresh=True)
+                )
+            )
+            try:
+                preflight.validate_target_node_state(release, target, names)
+            except ReleaseError as exc:
+                text = str(exc)
+                blockers: Any = text
+                if ": [" in text:
+                    try:
+                        blockers = json.loads(text[text.index(": [") + 2 :])
+                    except ValueError:
+                        blockers = text
+                clusters[target.cluster_id] = blockers
+            else:
+                clusters[target.cluster_id] = []
+        return {
+            "safe": not any(clusters.values()),
+            "clusters": clusters,
+            "checked_at": utc_now(),
+        }
+
+    def resume_rollback(self, scenario: str) -> dict[str, Any]:
+        """Finish a pending rollback the way ``gpu-fault-admin deploy`` does.
+
+        ``_rollback_pending`` is the engine's own rule (every ``rollback-*``
+        phase, ``rollback-failed`` included, and a ``rolled-back`` transaction
+        whose cleanup has not completed); ``release.rollback()`` with no
+        arguments resumes from the persisted state exactly as the CLI's deploy
+        entrypoint does. Nothing pending -> nothing touched.
+        """
+        release = self._release(scenario)
+        state = release._load_state()
+        phase = state.get("phase")
+        if not self.commands._rollback_pending(state):
+            return {"resumed": False, "phase": phase}
+        started = time.monotonic()
+        release.rollback()
+        after = release._load_state()
+        return {
+            "resumed": True,
+            "phase_before": phase,
+            "rollback_failure": state.get("rollback_failure"),
+            "phase": after.get("phase"),
+            "operation_duration_seconds": time.monotonic() - started,
         }
 
     def _next_deploy(self, release: Any, state: dict[str, Any]) -> Any:
@@ -1055,14 +1125,16 @@ class LiveReleaseRollingBackend:
         """
 
         release = self._release(scenario)
-        with _read_snapshot(release):
+        with release_read_snapshot(release):
             state = release._load_state()
             captured = release._capture_previous() if live else None
             next_deploy = self._next_deploy(release, state) if live else None
-            cpu_generations = deployment_generations(
-                release,
-                release._cpu(),
-                self.inventory.CPU_RUNTIME_DEPLOYMENTS,
+            cpu_listing = _deployment_listing(release, release._cpu())
+            cpu_generations = deployment_generations_from(
+                cpu_listing, self.inventory.CPU_RUNTIME_DEPLOYMENTS
+            )
+            cpu_identities = deployment_identities_from(
+                cpu_listing, self.inventory.CPU_RUNTIME_DEPLOYMENTS
             )
             gpu_generations = {
                 target.cluster_id: deployment_generations(
@@ -1080,6 +1152,7 @@ class LiveReleaseRollingBackend:
             "release_id": state.get("release_id"),
             "live": captured,
             "cpu_generations": cpu_generations,
+            "cpu_identities": cpu_identities,
             "gpu_generations": gpu_generations,
             "next_deploy": next_deploy,
         }

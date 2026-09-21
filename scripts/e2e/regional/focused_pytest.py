@@ -78,6 +78,9 @@ class FocusedPytest:
     root: Path
     report_path: Path
     source_identity: str
+    # The git tree the receipt is bound to; ``root`` (where pytest ran) when the
+    # tree itself was the checkout, the source checkout when it was a .git-less copy.
+    identity_root: Path | None = None
 
     def verify(
         self, completed: subprocess.CompletedProcess[str]
@@ -85,7 +88,10 @@ class FocusedPytest:
         if completed.returncode:
             return completed
         try:
-            if evidence.source_identity(self.root) != self.source_identity:
+            bound_root = (
+                self.identity_root if self.identity_root is not None else self.root
+            )
+            if evidence.source_identity(bound_root) != self.source_identity:
                 raise ValueError("source changed while focused pytest was running")
             receipt = evidence.load_pytest_receipt(
                 self.report_path,
@@ -137,7 +143,12 @@ def prepare_focused_pytest(
     cwd: Path | None,
     environment: Mapping[str, str] | None,
     isolated_postgres_url: str | None = None,
+    identity_root: Path | None = None,
 ) -> Iterator[FocusedPytest | None]:
+    """``identity_root`` names the git tree the receipts are bound to when pytest
+    runs in a copy of it that carries no ``.git`` (BOOT-018 builds and tests in
+    such copies, live 2026-09-20); receipt paths stay relative to ``cwd``."""
+
     if not is_local_pytest(command):
         if isolated_postgres_url is not None:
             raise ValueError(
@@ -148,7 +159,9 @@ def prepare_focused_pytest(
     if isolated_postgres_url is not None:
         validate_isolated_postgres_url(isolated_postgres_url)
     root = (cwd or Path.cwd()).resolve()
-    identity = evidence.source_identity(root)
+    identity = evidence.source_identity(
+        identity_root.resolve() if identity_root is not None else root
+    )
     with tempfile.TemporaryDirectory(prefix="gpu-fault-focused-pytest-") as directory:
         report_path = Path(directory) / "report.json"
         child_environment = build_isolated_environment(environment)
@@ -156,10 +169,18 @@ def prepare_focused_pytest(
             child_environment["GPU_FAULT_TEST_POSTGRES_URL"] = isolated_postgres_url
         child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
         child_environment["PYTEST_GPU_FAULT_CASE_REPORT"] = str(report_path)
+        if identity_root is not None:
+            # The child's reporter must bind the receipt to the same tree.
+            child_environment["PYTEST_GPU_FAULT_IDENTITY_ROOT"] = str(
+                identity_root.resolve()
+            )
         yield FocusedPytest(
             [*command, "-p", "tools.pytest_case_reporter", "-o", "addopts="],
             child_environment,
             root,
             report_path,
             identity,
+            identity_root=identity_root.resolve()
+            if identity_root is not None
+            else None,
         )

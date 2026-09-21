@@ -194,6 +194,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_state_tables.py \
 	tests/store/test_state_table_schema_safety.py \
 	tests/store/test_state_table_migration_safety.py \
+	tests/store/test_fresh_control_state_mode.py \
 	tests/store/test_postgres_store.py \
 	tests/store/test_postgres_store_review_indexes.py \
 	tests/store/test_postgres_stuck_workflow_audit.py \

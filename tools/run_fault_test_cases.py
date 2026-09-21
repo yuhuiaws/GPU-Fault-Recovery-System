@@ -205,6 +205,9 @@ ISOLATED_ENVIRONMENT_NAMES = (
     "TZ",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    # Test-behaviour opt-in (tests/test_artifact_consistency.py), not a credential:
+    # BOOT-018 runs the artifact suite in a fresh build copy with it set (2026-09-20).
+    "GPU_FAULT_REQUIRE_BUILD_ARTIFACTS",
 )
 
 

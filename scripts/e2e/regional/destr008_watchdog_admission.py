@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from typing import Any
 
 from scripts.e2e.regional import destr008_watchdog_resources as resources
@@ -180,7 +181,20 @@ class WatchdogAdmission:
         return expected
 
     def pods(self, job: ObserverJob) -> list[dict[str, Any]]:
-        value = _document(self.owner.cpu("get", "pod", "-o", "json", timeout=30))
+        # kubectl v1.35 prints a client-side v1/List with no resourceVersion, and
+        # the namespace-wide read outgrew the bounded document on the live site
+        # (17 Pods = 462 KiB, DESTR-008 attempt 11): read the server's own typed
+        # list, narrowed to the Pods the Job controller labels with this Job.
+        path = resources.raw_list_path("pod", "v1", self.owner.runtime.namespace)
+        selector = "batch.kubernetes.io/controller-uid=" + self.owner._uid(job.resource)
+        value = _document(
+            self.owner.cpu(
+                "get",
+                "--raw",
+                path + "?labelSelector=" + urllib.parse.quote(selector, safe=""),
+                timeout=30,
+            )
+        )
         meta = _object(value.get("metadata"))
         items = value.get("items")
         if (
@@ -195,6 +209,9 @@ class WatchdogAdmission:
         selected = []
         for raw in items:
             item = _object(raw)
+            # The typed list carries bare items; the envelope proved their kind.
+            item.setdefault("apiVersion", "v1")
+            item.setdefault("kind", "Pod")
             metadata = _object(item.get("metadata"))
             owners = metadata.get("ownerReferences", [])
             labels = _object(metadata.get("labels", {}))

@@ -610,3 +610,154 @@ def test_clean_mode_still_captures_the_namespace_incarnation() -> None:
     with pytest.raises(MODULE.CleanupStateError, match="namespace.*replaced"):
         MODULE.verify_quiesced(client, state, CONTEXT)
     assert client.mutations() == [], "clean mode must preserve the namespace UID guard"
+
+
+def _register_service(state: dict[str, Any], name: str) -> None:
+    state["inventory_snapshot"]["gpu"]["resources"].append(
+        {"kind": "service", "name": name, "scope": "namespaced"}
+    )
+
+
+def _target_group_binding(
+    service_name: str, *, stack: str | None = None
+) -> dict[str, Any]:
+    item = resource("TargetGroupBinding", "k8s-gpufault-" + service_name)
+    item["apiVersion"] = "elbv2.k8s.aws/v1beta1"
+    item["metadata"]["labels"] = {
+        "service.k8s.aws/stack-name": stack or service_name,
+        "service.k8s.aws/stack-namespace": NAMESPACE,
+    }
+    item["spec"] = {
+        "serviceRef": {"name": service_name, "port": 443},
+        "targetType": "ip",
+    }
+    return item
+
+
+def test_namespace_capture_accepts_controller_mirrors_of_registered_services() -> None:
+    client, state = Client(), document()
+    _register_service(state, "gpu-fault-api-nlb")
+    binding = _target_group_binding("gpu-fault-api-nlb")
+    client.namespaced = [
+        resource("Service", "gpu-fault-api-nlb"),
+        resource("Endpoints", "gpu-fault-api-nlb"),
+        binding,
+    ]
+
+    MODULE.capture_namespace(client, state, CONTEXT)
+
+    captured = {
+        tuple(identity[:3])
+        for identity in state["namespace_snapshots"][CONTEXT]["objects"]
+    }
+    assert ("v1", "endpoints", "gpu-fault-api-nlb") in captured, (
+        "the endpoints controller mirror of a registered Service is owned"
+    )
+    assert (
+        "elbv2.k8s.aws/v1beta1",
+        "targetgroupbinding",
+        binding["metadata"]["name"],
+    ) in captured, "the LBC binding of a registered NLB Service is owned"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["endpoints-without-service", "binding-foreign-service", "binding-foreign-stack"],
+)
+def test_namespace_capture_refuses_mirrors_of_unregistered_services(
+    variant: str,
+) -> None:
+    client, state = Client(), document()
+    _register_service(state, "gpu-fault-api-nlb")
+    service = resource("Service", "gpu-fault-api-nlb")
+    if variant == "endpoints-without-service":
+        client.namespaced = [service, resource("Endpoints", "customer-svc")]
+    elif variant == "binding-foreign-service":
+        client.namespaced = [service, _target_group_binding("customer-svc")]
+    else:
+        client.namespaced = [
+            service,
+            _target_group_binding("gpu-fault-api-nlb", stack="customer-svc"),
+        ]
+
+    with pytest.raises(MODULE.CleanupStateError, match="unowned resources"):
+        MODULE.capture_namespace(client, state, CONTEXT)
+    assert client.mutations() == [], "refusal happens before any mutation"
+
+
+def test_node_cleanup_affinity_uses_one_field_selector_term_per_node() -> None:
+    """The API server allows exactly one value per ``metadata.name`` field selector."""
+
+    manifest = MODULE.node_manifest(
+        name="gpu-fault-node-cleanup-fixture",
+        namespace=NAMESPACE,
+        run_id="cleanup-fixture",
+        nodes=["node-b", "node-a", "node-c"],
+        image="cleanup:1",
+        mode="uninstall",
+        host_script_b64=base64.b64encode(b"set -eu\n").decode(),
+    )
+
+    terms = manifest["spec"]["template"]["spec"]["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"]
+    assert [term["matchFields"] for term in terms] == [
+        [{"key": "metadata.name", "operator": "In", "values": [node]}]
+        for node in ["node-a", "node-b", "node-c"]
+    ], "each node needs its own term: In accepts a single value for node fields"
+
+
+def _installer_job(name: str, *, labelled: bool = True) -> dict[str, Any]:
+    job = resource("Job", name)
+    job["apiVersion"] = "batch/v1"
+    if labelled:
+        job["metadata"]["labels"] = {"gpu-fault.io/node-installer": "true"}
+    return job
+
+
+def test_namespace_capture_owns_installer_jobs_of_the_registered_reconciler() -> None:
+    client, state = Client(), document()
+    state["inventory_snapshot"]["gpu"]["resources"].append(
+        {
+            "kind": "deployment",
+            "name": "gpu-fault-node-installer-reconciler",
+            "scope": "namespaced",
+        }
+    )
+    client.namespaced = [
+        resource("Deployment", "gpu-fault-node-installer-reconciler"),
+        _installer_job("gpu-fault-install-node-a-1234"),
+    ]
+
+    MODULE.capture_namespace(client, state, CONTEXT)
+
+    captured = {
+        tuple(identity[:3])
+        for identity in state["namespace_snapshots"][CONTEXT]["objects"]
+    }
+    assert ("batch/v1", "job", "gpu-fault-install-node-a-1234") in captured, (
+        "a labelled installer Job belongs to the reconciler"
+    )
+
+
+@pytest.mark.parametrize("variant", ["unlabelled-job", "reconciler-not-registered"])
+def test_namespace_capture_refuses_installer_lookalikes(variant: str) -> None:
+    client, state = Client(), document()
+    if variant == "unlabelled-job":
+        state["inventory_snapshot"]["gpu"]["resources"].append(
+            {
+                "kind": "deployment",
+                "name": "gpu-fault-node-installer-reconciler",
+                "scope": "namespaced",
+            }
+        )
+        client.namespaced = [
+            resource("Deployment", "gpu-fault-node-installer-reconciler"),
+            _installer_job("gpu-fault-install-node-a-1234", labelled=False),
+        ]
+    else:
+        client.namespaced = [_installer_job("gpu-fault-install-node-a-1234")]
+
+    with pytest.raises(MODULE.CleanupStateError, match="unowned resources"):
+        MODULE.capture_namespace(client, state, CONTEXT)
+    assert client.mutations() == [], "refusal happens before any mutation"

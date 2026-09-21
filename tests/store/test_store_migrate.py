@@ -40,10 +40,72 @@ def test_store_migrate_can_initialize_schema(monkeypatch, capsys) -> None:
     store_migrate.main()
 
     assert calls == [
-        ("open", "postgresql://db/gpu_fault", {"hot_state_mode": "legacy"}),
+        (
+            "open",
+            "postgresql://db/gpu_fault",
+            {"hot_state_mode": "legacy", "fresh_control_state_mode": "legacy"},
+        ),
         ("close", None),
     ]
     assert "schema initialization complete" in capsys.readouterr().out
+
+
+def test_store_migrate_can_seed_a_fresh_database_dedicated(monkeypatch, capsys) -> None:
+    """The schema release Job asks for dedicated; the store applies it only when
+    the database is fresh (user decision 2026-09-20)."""
+    calls = []
+
+    class FakeStore:
+        def __init__(self, url, **kwargs) -> None:
+            calls.append(("open", url, kwargs))
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr(store_migrate, "PostgresStore", FakeStore)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gpu-fault-store-migrate",
+            "--ensure-schema",
+            "--fresh-control-state-mode",
+            "dedicated",
+            "--postgres-url",
+            "postgresql://db/gpu_fault",
+        ],
+    )
+
+    store_migrate.main()
+
+    assert calls == [
+        (
+            "open",
+            "postgresql://db/gpu_fault",
+            {"hot_state_mode": "legacy", "fresh_control_state_mode": "dedicated"},
+        ),
+        ("close", None),
+    ]
+    assert "schema initialization complete" in capsys.readouterr().out
+
+
+def test_store_migrate_fresh_control_state_mode_needs_ensure_schema(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gpu-fault-store-migrate",
+            "--hot-state-status",
+            "--fresh-control-state-mode",
+            "dedicated",
+            "--postgres-url",
+            "postgresql://db/gpu_fault",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        store_migrate.main()
 
 
 def test_store_migrate_can_backfill_hot_state(monkeypatch, capsys) -> None:

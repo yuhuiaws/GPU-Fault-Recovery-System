@@ -5,6 +5,7 @@ from typing import Any, cast
 import pytest
 
 from scripts.e2e.regional import warm_spare_fixture as warm
+from scripts.e2e.regional.regional_commands import RegionalCommandFailed
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional.test_warm_spare_fixture_safety import NodeApi, fixture, reservation
 
@@ -104,3 +105,51 @@ def test_cordon_restore_writes_only_when_the_owned_change_still_exists(
     restored = mutation.restore()
     assert restored["unschedulable"] is True, restored
     assert len(api.patches) == (1 if already_restored else 2), api.patches
+
+
+def test_a_patch_that_loses_its_revision_race_is_retried_against_the_fresh_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # DESTR-008 attempt 20 (2026-09-19): the topology restore patch lost its
+    # resourceVersion precondition to a concurrent product update of the spare
+    # and the scenario cleanup failed for good. One re-read and retry, with the
+    # pre-patch checks re-run, is what the transport should do.
+    api = NodeApi()
+    mutation = fixture(api)
+    original = api.kubectl
+    failures = {"left": 1}
+
+    def transport(plane: str, *args: str, **kwargs: Any) -> str:
+        if args[0] == "patch" and failures["left"]:
+            failures["left"] -= 1
+            meta = api.node["metadata"]
+            meta["resourceVersion"] = str(int(meta["resourceVersion"]) + 1)
+            raise RegionalCommandFailed(1, "the object has been modified")
+        return original(plane, *args, **kwargs)
+
+    monkeypatch.setattr(api, "kubectl", transport)
+    mutation.apply(reservation("owned"))
+    assert (
+        len(api.patches) == 1 and api.patches[0]["metadata"]["resourceVersion"] == "2"
+    ), "the retry must carry the node's fresh resourceVersion"
+
+
+def test_a_patch_that_keeps_failing_gives_up_after_the_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = NodeApi()
+    mutation = fixture(api)
+    original = api.kubectl
+    attempts = {"patch": 0}
+
+    def transport(plane: str, *args: str, **kwargs: Any) -> str:
+        if args[0] == "patch":
+            attempts["patch"] += 1
+            raise RegionalCommandFailed(1, "still conflicting")
+        return original(plane, *args, **kwargs)
+
+    monkeypatch.setattr(api, "kubectl", transport)
+    with pytest.raises(RegionalCommandFailed):
+        mutation.apply(reservation("owned"))
+    assert attempts["patch"] == warm.NODE_PATCH_ATTEMPTS, attempts
+    assert api.patches == [], "a failed patch is never recorded as applied"

@@ -156,7 +156,45 @@ def normal_spec(value: Any) -> dict[str, Any]:
     }.items():
         if key in containers[0] and digest(containers[0][key]) == digest(default):
             del containers[0][key]
+    # The API server's ExtendedResourceToleration admission plugin (on by
+    # default on EKS; live 2026-09-20) appends ``{key: <resource>, operator:
+    # Exists, effect: NoSchedule}`` for every extended resource the Pod
+    # requests, even when an operator=Exists toleration already covers it.
+    # That toleration is admission, not a foreign mutation, so it is dropped on
+    # both sides; a toleration for a resource the Pod never requested is drift.
+    tolerations = spec.get("tolerations")
+    if isinstance(tolerations, list):
+        admitted = [
+            {"key": name, "operator": "Exists", "effect": "NoSchedule"}
+            for name in extended_resource_names(containers[0])
+        ]
+        spec["tolerations"] = [item for item in tolerations if item not in admitted]
+        if not spec["tolerations"]:
+            del spec["tolerations"]
     return spec
+
+
+def extended_resource_names(container: dict[str, Any]) -> list[str]:
+    """Extended resource names the container requests or limits.
+
+    Mirrors Kubernetes' ``IsExtendedResourceName``: a qualified name whose
+    domain is not ``kubernetes.io`` (or a subdomain of it).
+    """
+
+    resources = container.get("resources")
+    names: set[str] = set()
+    if isinstance(resources, dict):
+        for section in ("requests", "limits"):
+            values = resources.get(section)
+            if isinstance(values, dict):
+                names.update(str(name) for name in values)
+    return sorted(
+        name
+        for name in names
+        if "/" in name
+        and not name.split("/", 1)[0].endswith("kubernetes.io")
+        and not name.startswith("requests.")
+    )
 
 
 def fingerprint(pod: dict[str, Any]) -> str:

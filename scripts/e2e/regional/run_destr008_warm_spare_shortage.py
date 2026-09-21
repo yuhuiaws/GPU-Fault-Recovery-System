@@ -51,6 +51,7 @@ from scripts.e2e.regional.destr008_journal import (  # noqa: E402
     ExecutionJournal,
     ExecutionRecord,
     ScenarioState,
+    owns_nothing,
     retire_completed_execution,
 )
 from scripts.e2e.regional.destr008_node_restore import (  # noqa: E402
@@ -116,7 +117,46 @@ SERVICE_STOP_DELAY_SECONDS = {
     "kubernetes-not-ready": 15,
     "agent-unavailable": 0,
 }
-SERVICE_RESTORE_SECONDS = 420
+# The failsafe restore bounds the independent cancellation window
+# (``SERVICE_RESTORE_SECONDS - BOUND_MARGIN_SECONDS``) and the service window's
+# host contract caps it at 600 s (``destr008_service_window.stop``). Arming the
+# watchdog on the live site takes ~6 min (control-plane kubectl round trips
+# ~1.2 s each, six worker capability probes), and the window must still leave
+# ``MINIMUM_HEADROOM_SECONDS`` for the action: 420 s left 5 s (attempt 14).
+SERVICE_RESTORE_SECONDS = 600
+# ``ShortageSafety.arm`` fixes the cancellation deadline at ``now + window`` when
+# the watchdog arms, but the replacement claim (``before_post``) only runs after
+# arming, the service stop and the NotReady/fleet wait -- ~7-9 min of setup on
+# the live site. A service window equal to the failsafe (``SERVICE_RESTORE_SECONDS
+# - BOUND_MARGIN_SECONDS`` = 540 s) armed the deadline before that setup finished,
+# so the claim raced its own DEADLINE revocation and exhausted its retries
+# (attempt 25, 2026-09-19). ``bound_at`` is the failsafe restore anchored at the
+# *stop* time (arm + setup + delay), so it opens ~5 min of runway past the naive
+# window; the service window spends part of it as a setup allowance while
+# ``require_bound`` still proves ``deadline + margin <= bound_at`` against the real
+# failsafe after ``apply_late``. ``active-gpu-pod`` needs no allowance: its
+# holder-sleep bound (``HOLD_SECONDS``) is armed only in ``apply_late`` (after the
+# setup), so its window already clears the setup. Keep this <= the smallest
+# ``arm + apply`` setup so ``require_bound`` never fails on a fast arm.
+SERVICE_SETUP_ALLOWANCE_SECONDS = 160
+
+
+def cancellation_window_seconds(scenario: str) -> int:
+    """Seconds from arm to the independent cancellation deadline for a scenario.
+
+    ``active-gpu-pod`` is bounded by the holder Pod's sleep, which is only armed
+    in ``apply_late`` after the watchdog setup, so its window is simply the hold
+    minus the bound margin. The service-stop scenarios arm their deadline before
+    the setup runs, so they add ``SERVICE_SETUP_ALLOWANCE_SECONDS`` to spend the
+    failsafe runway that the stop-time-anchored ``bound_at`` opens up (see the
+    ``SERVICE_SETUP_ALLOWANCE_SECONDS`` note); ``require_bound`` still proves the
+    deadline precedes the real failsafe.
+    """
+    if scenario == "active-gpu-pod":
+        return GpuHolderFixture.HOLD_SECONDS - BOUND_MARGIN_SECONDS
+    return (
+        SERVICE_RESTORE_SECONDS - BOUND_MARGIN_SECONDS + SERVICE_SETUP_ALLOWANCE_SECONDS
+    )
 
 
 @dataclass(frozen=True)
@@ -227,6 +267,25 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
     }
 
 
+EXECUTION_OWNER_JOURNAL = "execution-owner.json"
+
+
+def continuation_pending(case_dir: Path) -> bool:
+    """True while an UNFINISHED execution-owner journal awaits its cleanup.
+
+    A finished journal (``owns_nothing``) is archived by the next attempt and
+    that attempt then runs fresh, so it must keep every readiness check; an
+    unreadable journal refuses in ``execute_case`` anyway.
+    """
+    path = case_dir / EXECUTION_OWNER_JOURNAL
+    if not (path.exists() or path.is_symlink()):
+        return False
+    try:
+        return not owns_nothing(ExecutionJournal.peek(path))
+    except RegionalFixtureError:
+        return False
+
+
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
@@ -302,6 +361,7 @@ def read_only_preflight(
         for item in regional.gpu_workloads()
         if item.get("node") in {settings.fault_node, settings.spare_node}
     ]
+    continuation = continuation_pending(case_dir)
     if active_targets:
         errors.append("fault or spare node already has a GPU workload")
     for node in (settings.fault_node, settings.spare_node):
@@ -364,7 +424,16 @@ def read_only_preflight(
         "activation_inhibition": capabilities,
         "cpu_blast": regional.cpu_blast_snapshot(),
         "selected_scenarios": list(settings.scenarios),
-        "errors": errors,
+        "cleanup_continuation": continuation,
+        "occupied_targets": active_targets,
+        # A failed attempt leaves exactly the state these readiness checks
+        # refuse (its workload, a quarantined fault node, the spare's label);
+        # the next attempt only resumes that attempt's cleanup (``execute_case``
+        # exits before any fresh preflight), so the guard's plan must not be
+        # refused by what the continuation removes (attempts 12 and 16,
+        # 2026-09-19). A fresh attempt sees every error again.
+        "deferred_readiness_errors": errors if continuation else [],
+        "errors": [] if continuation else errors,
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
@@ -937,14 +1006,9 @@ def _run_scenario(
                 release_id=release_id,
                 directory=scenario_dir / "safety",
             )
-            window = (
-                GpuHolderFixture.HOLD_SECONDS
-                if scenario == "active-gpu-pod"
-                else SERVICE_RESTORE_SECONDS
-            ) - BOUND_MARGIN_SECONDS
             safety.arm(
                 observation,
-                window_seconds=window,
+                window_seconds=cancellation_window_seconds(scenario),
                 maintenance_window_end=maintenance_window_end,
             )
             safety.admit_fixture()
@@ -1190,7 +1254,7 @@ def _execute_case(
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     regional = RegionalLiveFixture(settings.regional)
     warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
-    journal_path = case_dir / "execution-owner.json"
+    journal_path = case_dir / EXECUTION_OWNER_JOURNAL
 
     def binding() -> dict[str, Any]:
         return execution_binding(settings, regional, run_dir)

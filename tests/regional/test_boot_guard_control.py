@@ -144,3 +144,67 @@ def test_shell_guard_refuses_failed_or_changed_authorization(
 
     with pytest.raises(RuntimeError, match="preflight|drifted|window"):
         control.main()
+
+
+def _identity_kubectl(release_state: dict[str, Any] | None):
+    """A live-shaped CPU control plane: release-metadata carries compatibility
+    digests only (no ``release-id`` key, live 2026-09-20); the release id lives in
+    ``gpu-fault-regional-release-state`` ``state.json`` like every other case reads it."""
+
+    pods = {
+        "items": [
+            {
+                "metadata": {"name": f"api-{index}", "uid": f"uid-{index}"},
+                "spec": {"nodeName": f"node-{index}", "containers": [{"name": "api"}]},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"name": "api", "ready": True}],
+                },
+            }
+            for index in range(3)
+        ]
+    }
+    deployment = {
+        "metadata": {"uid": "cpu-uid", "generation": 7},
+        "spec": {"replicas": 3},
+    }
+    metadata = {"data": {"required-agent-protocol-version": "4"}}
+    documents = {
+        ("configmap", "gpu-fault-release-metadata"): metadata,
+        ("deployment", "gpu-fault-api-ha"): deployment,
+    }
+    if release_state is not None:
+        documents[("configmap", "gpu-fault-regional-release-state")] = {
+            "data": {"state.json": json.dumps(release_state)}
+        }
+
+    def run(command: list[str], **_kwargs: Any) -> Any:
+        assert command[:2] == ["kubectl", "--kubeconfig"], command
+        kind = command[command.index("get") + 1]
+        if kind == "pod":
+            return type("Completed", (), {"stdout": json.dumps(pods)})()
+        name = command[command.index("get") + 2]
+        if (kind, name) not in documents:
+            raise RuntimeError(f"configmaps {name!r} not found")
+        return type("Completed", (), {"stdout": json.dumps(documents[(kind, name)])})()
+
+    return run
+
+
+def test_target_identity_reads_the_release_id_every_other_case_binds_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = {"CPU_KUBECONFIG": "/dev/null", "NAMESPACE": "synthetic"}
+    monkeypatch.setattr(
+        control,
+        "run",
+        _identity_kubectl({"phase": "complete", "release_id": "0e813e5eaf80"}),
+    )
+    identity = control.target_identity(environment)
+    assert identity["release_id"] == "0e813e5eaf80"
+    assert identity["cpu_deployment_uid"] == "cpu-uid" and identity["generation"] == 7
+    assert len(identity["cpu_pods"]) == 3
+    monkeypatch.setattr(control, "run", _identity_kubectl({"phase": "complete"}))
+    with pytest.raises(RuntimeError, match="identity is incomplete"):
+        control.target_identity(environment)

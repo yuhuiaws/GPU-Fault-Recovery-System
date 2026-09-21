@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from gpu_fault.models import (
     FaultIncident,
+    IncidentState,
     PlanStatus,
     RecoveryPlan,
     WorkflowEvent,
@@ -52,6 +53,7 @@ else:
     )
 
 MAX_RECORD_BYTES = 262144
+SYNTHETIC_POLICY = "SITE_SYNTHETIC_REPLACEMENT_TEST"
 WITHDRAWAL_REASON = "DESTR008 producer revoked; withdraw this acceptance recovery"
 TERMINAL_WORKFLOWS = {
     WorkflowStatus.FAILED,
@@ -129,9 +131,42 @@ def bind_incident(plan: Plan, incident: FaultIncident) -> None:
         or incident.attempt_id != plan.attempt_id
         or set(incident.node_ids) != {plan.fault_node}
         or len(incident.node_ids) != 1
-        or incident.policy_source != "SITE_SYNTHETIC_REPLACEMENT_TEST"
+        or incident.policy_source != SYNTHETIC_POLICY
     ):
         raise ProbeError("INCIDENT_SCOPE")
+
+
+def bind_foreign(
+    plan: Plan, incident: FaultIncident, workflow: WorkflowRequest
+) -> None:
+    """Tolerate a fully settled non-synthetic incident sharing the node.
+
+    During the kubernetes-not-ready window the product legitimately opens
+    RECOVERED SITE_HOST_RESOURCE_HEALTH incidents (idle low_gpu_utilization /
+    low_cpu_utilization) against the synthetic job's node; they inherit our
+    job/attempt/node and carry a SUCCEEDED workflow, so the scoped related
+    listing returns them. They are not ours to withdraw, and they must not
+    fail the drain proof as INCIDENT_SCOPE. Fail closed on anything still live:
+    the node-scoped incomplete-request net
+    (has_incomplete_processor_requests_for_scopes) stays the independent guard
+    for any residual physical work regardless of policy.
+    """
+
+    incident = checked(FaultIncident, incident)
+    workflow = checked(WorkflowRequest, workflow)
+    bind_created_at(plan, incident.created_at)
+    bind_created_at(plan, workflow.created_at)
+    if (
+        incident.cluster_id != plan.cluster_id
+        or incident.job_id != plan.job_id
+        or incident.attempt_id != plan.attempt_id
+        or set(incident.node_ids) != {plan.fault_node}
+        or len(incident.node_ids) != 1
+        or incident.state != IncidentState.RECOVERED
+        or workflow.incident_id != incident.incident_id
+        or not workflow_settled(workflow)
+    ):
+        raise ProbeError("FOREIGN_ACTIVE")
 
 
 def bind_created_at(plan: Plan, created_at: datetime) -> None:
@@ -284,10 +319,17 @@ def command_drained(command: RemoteActionCommand) -> bool:
     )
 
 
-def workflow_drained(workflow: WorkflowRequest) -> bool:
+def workflow_settled(workflow: WorkflowRequest) -> bool:
+    """Terminal, unleased, and free of unresolved steps.
+
+    A settled workflow may or may not have withdrawn its workload. Our own
+    recovery must additionally withdraw (see ``workflow_drained``); a foreign
+    RECOVERED incident's workflow never withdraws the synthetic workload, so it
+    only has to be settled to prove it holds no residual authority.
+    """
+
     return (
         workflow.status in TERMINAL_WORKFLOWS
-        and workflow.workload_withdrawn_at is not None
         and workflow.execution_owner_id is None
         and workflow.execution_lease_expires_at is None
         and not any(
@@ -295,6 +337,10 @@ def workflow_drained(workflow: WorkflowRequest) -> bool:
             for item in workflow.step_executions
         )
     )
+
+
+def workflow_drained(workflow: WorkflowRequest) -> bool:
+    return workflow.workload_withdrawn_at is not None and workflow_settled(workflow)
 
 
 @dataclass(frozen=True)
@@ -428,6 +474,21 @@ def inventory(
     for incident, workflow in related:
         if workflow.request_id in history.records:
             raise ProbeError("DUPLICATE_WORKFLOW")
+        incident = checked(FaultIncident, incident)
+        if (
+            incident.policy_source != SYNTHETIC_POLICY
+            and incident.event_id != plan.event_id
+        ):
+            # A non-synthetic incident that is not our own event (e.g. a
+            # RECOVERED host-health idle low_gpu_utilization / low_cpu_utilization)
+            # inherited our job/attempt/node. Tolerate it only if fully settled
+            # and never add it to the owned history, so it is neither withdrawn
+            # nor reconciled against the synthetic root; a live one fails closed
+            # as FOREIGN_ACTIVE. The synthetic root (event_id == plan.event_id)
+            # still flows through bind_incident, so a corrupted root policy is
+            # rejected as INCIDENT_SCOPE.
+            bind_foreign(plan, incident, workflow)
+            continue
         history.add(incident, workflow)
     listed_ids = set(history.records)
     check()

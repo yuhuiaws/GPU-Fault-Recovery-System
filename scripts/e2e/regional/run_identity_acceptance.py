@@ -204,7 +204,27 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-UNREGISTERED_SECONDARY_CASES = frozenset({"GF-REGIONAL-ISO-003", "GF-REGIONAL-ISO-004"})
+UNREGISTERED_SECONDARY_CASES = frozenset(
+    {"GF-REGIONAL-ISO-003", "GF-REGIONAL-ISO-004", "GF-REGIONAL-AUTH-014"}
+)
+
+
+def registered_site_cluster(
+    site: IdentitySite, cluster_id: str
+) -> ClusterTarget | None:
+    """The site's registered target for ``cluster_id``, or None when it lists none.
+
+    ``IdentitySite`` exposes the registered clusters as ``targets``; a site that
+    does not is asked through ``target`` and its refusal means the same thing.
+    """
+
+    targets = getattr(site, "targets", None)
+    if isinstance(targets, dict):
+        return targets.get(cluster_id)
+    try:
+        return site.target(cluster_id)
+    except IdentityAcceptanceError:
+        return None
 
 
 def validate_case_arguments(
@@ -217,33 +237,41 @@ def validate_case_arguments(
         "GF-REGIONAL-AUTH-008",
         "GF-REGIONAL-ISO-003",
         "GF-REGIONAL-ISO-004",
+        "GF-REGIONAL-AUTH-014",
     }
     # None in site mode (the default); refuses the synthetic mode outside
     # AUTH-007/008, without its allow switch or with an unsafe/colliding id.
     synthetic = synthetic_secondary_from_arguments(arguments, site, primary)
     secondary = None
-    if arguments.case in secondary_cases:
+    # AUTH-014's fleet-read scope proof needs a peer cluster in its baseline.
+    # A multi-cluster site supplies registered peers by itself; a one-cluster
+    # site (live 2026-09-20) must name an unregistered id, the ISO-003/004 way.
+    wants_secondary = arguments.case in secondary_cases and not (
+        arguments.case == "GF-REGIONAL-AUTH-014"
+        and not arguments.secondary_cluster_id
+        and len(getattr(site, "targets", None) or {}) > 1
+    )
+    if wants_secondary:
         if not arguments.secondary_cluster_id:
             raise IdentityAcceptanceError(
                 f"{arguments.case} requires --secondary-cluster-id"
             )
         if synthetic is not None:
             secondary = synthetic
+        elif (
+            arguments.case in UNREGISTERED_SECONDARY_CASES
+            and registered_site_cluster(site, arguments.secondary_cluster_id) is None
+        ):
+            # ISO-003/004 judge a cluster-id binding: the executor's Fleet
+            # proxy and the control plane's payload binding compare ids and
+            # never consult the registry, so a single-cluster site may name
+            # any other id as B (the AUTH matrix does the same); AUTH-014's
+            # fleet-read scope proof denies on the id the same way. AUTH-007/008
+            # disable and claim as B and keep needing a registered cluster --
+            # a site cluster, or the synthetic logical one they register.
+            secondary = unregistered_secondary(primary, arguments.secondary_cluster_id)
         else:
-            try:
-                secondary = site.target(arguments.secondary_cluster_id)
-            except IdentityAcceptanceError:
-                # ISO-003/004 judge a cluster-id binding: the executor's Fleet
-                # proxy and the control plane's payload binding compare ids and
-                # never consult the registry, so a single-cluster site may name
-                # any other id as B (the AUTH matrix does the same). AUTH-007/008
-                # disable and claim as B and keep needing a registered cluster --
-                # a site cluster, or the synthetic logical one they register.
-                if arguments.case not in UNREGISTERED_SECONDARY_CASES:
-                    raise
-                secondary = unregistered_secondary(
-                    primary, arguments.secondary_cluster_id
-                )
+            secondary = site.target(arguments.secondary_cluster_id)
         if secondary.cluster_id == primary.cluster_id:
             raise IdentityAcceptanceError("primary and secondary clusters must differ")
     nodes = tuple(arguments.node)
@@ -444,6 +472,7 @@ def case_handlers(
             site,
             primary,
             outside_probe_path=arguments.outside_probe_evidence,
+            secondary=secondary,
         ),
         "GF-REGIONAL-AUTH-015": lambda: run_auth015(
             site,

@@ -17,7 +17,9 @@ spec:
         - name: migrate
           image: public.ecr.aws/docker/library/python:3.12-slim
           command: ["gpu-fault-store-migrate"]
-          args: ["--ensure-schema"]
+          # A database that has no schema yet starts the control-state tables in
+          # dedicated mode; an existing database keeps its recorded modes.
+          args: ["--ensure-schema", "--fresh-control-state-mode", "dedicated"]
           env:
             - name: PATH
               value: >-

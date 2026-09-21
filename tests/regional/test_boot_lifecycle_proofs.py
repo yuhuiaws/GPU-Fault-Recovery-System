@@ -78,9 +78,10 @@ def test_failed_reexecution_invalidates_canonical_predecessor_evidence(
         "the initial completed evidence should be accepted"
     )
     backend = SimpleNamespace(
+        node_safety=lambda _scenario: {"safe": True, "clusters": {}},
         classify=lambda _scenario: (_ for _ in ()).throw(
             RuntimeError("classification failed")
-        )
+        ),
     )
 
     with pytest.raises(RuntimeError, match="classification failed"):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import inspect
 import json
 import os
@@ -1247,3 +1248,129 @@ def test_configured_custody_cannot_be_skipped_by_source_only_classification(
     result = staging_deploy.deploy(_deploy_arguments(repository, state))
     assert result["deploy_mode"] == "APPLICATION_RELEASE"
     assert DEPLOY_EVENT in events, "configured custody never reached admin bootstrap"
+
+
+def _impact_gate_run(tmp_path: Path, plan: dict[str, object]):
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def run(arguments, *, cwd, env=None, capture=False, **_kwargs):
+        command = [str(item) for item in arguments]
+        calls.append((command, dict(env or {})))
+        if "--write-plan" in command:
+            Path(command[command.index("--write-plan") + 1]).write_text(
+                json.dumps(plan), encoding="utf-8"
+            )
+            return json.dumps(plan)
+        return ""
+
+    return calls, run
+
+
+def test_source_impact_gate_grants_postgres_when_the_plan_requires_stress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from gpu_fault.admin.postgres_grant import PostgresTestAllocation
+
+    monkeypatch.delenv("GPU_FAULT_TEST_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("PYTEST_GPU_FAULT_POSTGRES_ALLOCATION_DIR", raising=False)
+    repository = tmp_path / "repo"
+    (repository / "scripts").mkdir(parents=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    calls, run = _impact_gate_run(tmp_path, {"postgres": True, "full": True})
+    monkeypatch.setattr(staging_deploy, "_run", run)
+    allocations: list[tuple[Path, Path]] = []
+
+    @contextlib.contextmanager
+    def allocation(runner, *, repository_root, state_dir):
+        assert isinstance(runner, staging_deploy.CommandRunner), (
+            "a runner drives docker"
+        )
+        allocations.append((repository_root, state_dir))
+        yield PostgresTestAllocation(
+            "postgresql://gate@127.0.0.1:5432/gate", tmp_path / "grant"
+        )
+
+    monkeypatch.setattr(staging_deploy, "isolated_postgres_allocation", allocation)
+
+    plan = staging_deploy.run_source_impact_gate(
+        repository_root=repository,
+        state_dir=state,
+        source=SimpleNamespace(repository_root=repository, fingerprint="f" * 64),
+        previous={},
+        fallback_base="origin/main",
+    )
+
+    assert plan == {"postgres": True, "full": True}
+    assert allocations == [(repository, state)], "the gate allocated one database"
+    executes = [env for command, env in calls if "--execute" in command]
+    assert len(executes) == 1, calls
+    assert executes[0]["GPU_FAULT_TEST_POSTGRES_URL"] == (
+        "postgresql://gate@127.0.0.1:5432/gate"
+    )
+    assert executes[0]["PYTEST_GPU_FAULT_POSTGRES_ALLOCATION_DIR"] == str(
+        tmp_path / "grant"
+    )
+    writes = [env for command, env in calls if "--write-plan" in command]
+    assert "GPU_FAULT_TEST_POSTGRES_URL" not in writes[0], "planning needs no database"
+
+
+def test_source_impact_gate_skips_the_database_when_stress_is_not_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("GPU_FAULT_TEST_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("PYTEST_GPU_FAULT_POSTGRES_ALLOCATION_DIR", raising=False)
+    repository = tmp_path / "repo"
+    (repository / "scripts").mkdir(parents=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    calls, run = _impact_gate_run(tmp_path, {"postgres": False, "full": False})
+    monkeypatch.setattr(staging_deploy, "_run", run)
+    monkeypatch.setattr(
+        staging_deploy,
+        "isolated_postgres_allocation",
+        lambda *_args, **_kwargs: pytest.fail("a plan without stress allocated a DB"),
+    )
+
+    staging_deploy.run_source_impact_gate(
+        repository_root=repository,
+        state_dir=state,
+        source=SimpleNamespace(repository_root=repository, fingerprint="f" * 64),
+        previous={},
+        fallback_base="origin/main",
+    )
+
+    executes = [env for command, env in calls if "--execute" in command]
+    assert len(executes) == 1, calls
+    assert "PYTEST_GPU_FAULT_POSTGRES_ALLOCATION_DIR" not in executes[0], (
+        "no grant without stress"
+    )
+    assert executes[0].get("GPU_FAULT_TEST_POSTGRES_URL", "") == ""
+
+
+def test_source_impact_gate_refuses_a_plan_without_the_postgres_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    repository = tmp_path / "repo"
+    (repository / "scripts").mkdir(parents=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    calls, run = _impact_gate_run(tmp_path, {"full": True})
+    monkeypatch.setattr(staging_deploy, "_run", run)
+
+    with pytest.raises(staging_deploy.StagingDeployError, match="incomplete"):
+        staging_deploy.run_source_impact_gate(
+            repository_root=repository,
+            state_dir=state,
+            source=SimpleNamespace(repository_root=repository, fingerprint="f" * 64),
+            previous={},
+            fallback_base="origin/main",
+        )
+
+    assert not [command for command, _env in calls if "--execute" in command]

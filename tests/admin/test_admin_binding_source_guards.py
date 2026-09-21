@@ -162,3 +162,43 @@ def test_source_deploy_exemption_does_not_ignore_a_corrupt_recorded_repository(
     binding.enforce_deploy_host_state_dir(arguments)
     with pytest.raises(BootstrapError, match="recorded source repository"):
         cli.run(arguments)
+
+
+@pytest.mark.parametrize(
+    ("journal_phase", "accept", "allowed"),
+    [
+        (None, True, False),
+        ("REGISTRY_EXPORTED", False, False),
+        ("REGISTRY_EXPORTED", True, True),
+        ("COMPLETED", True, False),
+    ],
+)
+def test_uninstall_override_admits_a_foreign_root_only_while_uninstall_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_phase: str | None,
+    accept: bool,
+    allowed: bool,
+) -> None:
+    site = site_file(tmp_path)
+    admin = bind_site(tmp_path)
+    monkeypatch.setattr(
+        binding, "sys", SimpleNamespace(prefix=str(admin.parent.parent))
+    )
+    if journal_phase is not None:
+        journal = tmp_path / "uninstall"
+        journal.mkdir()
+        (journal / "state.json").write_text(
+            json.dumps({"phase": journal_phase}), encoding="utf-8"
+        )
+    arguments = argparse.Namespace(
+        command="uninstall",
+        file=site,
+        repo_root=tmp_path / "foreign",
+        accept_repository_root_override=accept,
+    )
+    if allowed:
+        binding.enforce_deploy_host_state_dir(arguments)
+    else:
+        with pytest.raises(SiteConfigError, match="different site repository root"):
+            binding.enforce_deploy_host_state_dir(arguments)

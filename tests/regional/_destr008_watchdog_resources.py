@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+from scripts.e2e.regional import destr008_parallel as parallel
 from scripts.e2e.regional import destr008_watchdog_resources as resources
 from scripts.e2e.regional.probes import destr008_cancellation_protocol as wire
 from scripts.e2e.regional.regional_live_fixture import (
@@ -110,6 +111,7 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     for file in wire.SOURCE_FILES:
         (source / file).write_bytes(b"# Inert resource fixture.\r\n")
     monkeypatch.setattr(resources, "CODE_SOURCE", source)
+    monkeypatch.setattr(parallel, "workers", 1)  # deterministic fakes
     regional = RegionalLiveFixture(
         RegionalLiveSettings(cpu, gpu, "gpu-a", NAMESPACE, "cluster-a", "us-west-2")
     )
@@ -327,7 +329,9 @@ def pod(
     }
     actual["metadata"]["labels"].update(controller_labels())
     pod_defaults(actual["spec"])
+    # Priority admission stamps both on every admitted Pod (no PriorityClass).
     actual["spec"]["priority"] = 0
+    actual["spec"]["preemptionPolicy"] = "PreemptLowerPriority"
     if phase != "gated":
         actual["spec"].pop("schedulingGates")
         actual["spec"]["nodeName"] = "cpu-node"
@@ -335,8 +339,9 @@ def pod(
         container_id = "containerd://" + "c" * 64
         container: dict[str, Any] = {
             "name": "cancellation-watchdog",
-            "image": IMAGE,
-            "imageID": "docker-pullable://" + IMAGE,
+            # kubelet reports the image config id for a digest-pinned pull
+            "image": "sha256:" + "e" * 64,
+            "imageID": IMAGE,
             "containerID": container_id,
             "restartCount": 0,
             "lastState": {},

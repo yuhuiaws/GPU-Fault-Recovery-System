@@ -204,7 +204,7 @@ def bind_snapshot(
             or version["required_node_action_key_version"] != 2
             or registration["cluster_id"] != target.cluster_id
             or registration["enabled"] is not True
-            or registration["membership_state"] != "ACTIVE"
+            or registration["lifecycle_state"] != "ACTIVE"
             or not isinstance(cidrs, list)
             or not cidrs
             or any(not isinstance(value, str) or not value for value in cidrs)

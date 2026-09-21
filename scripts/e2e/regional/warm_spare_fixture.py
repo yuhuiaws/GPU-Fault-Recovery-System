@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Sequence, cast
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -24,12 +23,12 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
 )
+from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     component_python,
 )
-
 
 SPARE_LABEL = "gpu-fault.io/spare"
 SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
@@ -37,6 +36,7 @@ SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
+NODE_PATCH_ATTEMPTS = 3
 INSTANCE_TYPE_LABELS = (
     "node.kubernetes.io/instance-type",
     "beta.kubernetes.io/instance-type",
@@ -1118,7 +1118,9 @@ class NodeMutationFixture:
             self._written_unschedulable = patch.unschedulable
         self._patch(current, patch)
 
-    def _patch(self, current: dict[str, Any], patch: NodePatch) -> None:
+    def _patch(
+        self, current: dict[str, Any], patch: NodePatch, *, attempt: int = 1
+    ) -> None:
         for key in (
             *OWNERSHIP_ANNOTATIONS,
             SPARE_RESERVATION_ANNOTATION,
@@ -1148,15 +1150,24 @@ class NodeMutationFixture:
         body: dict[str, Any] = {"metadata": metadata}
         if patch.unschedulable is not None:
             body["spec"] = {"unschedulable": patch.unschedulable}
-        self.warm.regional.kubectl(
-            "gpu",
-            "patch",
-            "node",
-            self.node,
-            "--type=merge",
-            "-p",
-            json.dumps(body, sort_keys=True),
-        )
+        try:
+            self.warm.regional.kubectl(
+                "gpu",
+                "patch",
+                "node",
+                self.node,
+                "--type=merge",
+                "-p",
+                json.dumps(body, sort_keys=True),
+            )
+        except RegionalCommandFailed:
+            # The resourceVersion precondition loses to a concurrent product
+            # update of the same node (a reservation cleared as REPLACE_NODE
+            # failed; DESTR-008 attempt 20, 2026-09-19). Re-read and try again,
+            # every pre-patch check above running against the fresh node.
+            if attempt >= NODE_PATCH_ATTEMPTS:
+                raise
+            return self._patch(self._snapshot(), patch, attempt=attempt + 1)
         after = self._snapshot()
         for section, desired in (
             ("labels", patch.labels),

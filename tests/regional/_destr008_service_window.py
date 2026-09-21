@@ -102,6 +102,7 @@ class Host:
             sleep=self.sleep,
             CLOCK_BOOTTIME=time.CLOCK_BOOTTIME,
         )
+        self.clock = clock
         monkeypatch.setattr(probe, "time", clock)
         monkeypatch.setattr(controller, "time", clock)
         monkeypatch.setattr(probe, "subprocess", SimpleNamespace(run=self.run))
@@ -219,6 +220,15 @@ class Host:
             unit = {
                 **self.units.get(name, self.empty(name)),
                 **self.overrides.get(name, {}),
+            }
+            # systemd 252 (Amazon Linux 2023) prints no line for an empty list or
+            # exec property: EnvironmentFiles= of a unit without one, ExecStart=
+            # and EnvironmentFiles= of a unit it never loaded (live 2026-09-19,
+            # DESTR-008 attempts 19 and 23).
+            unit = {
+                k: v
+                for k, v in unit.items()
+                if v != "" or k not in {"ExecStart", "EnvironmentFiles"}
             }
             output = "\n".join(f"{k}={v}" for k, v in unit.items())
             return subprocess.CompletedProcess(

@@ -4,11 +4,13 @@ import hashlib
 import json
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from scripts.e2e.regional import acceptance_supervision
+from scripts.e2e.regional import identity_acceptance_common as common
 from scripts.e2e.regional import live_driver_guard as guard
 from scripts.e2e.regional import run_identity_acceptance as entry
 from scripts.e2e.regional.auth015_protocol import Auth015ProofError
@@ -33,8 +35,21 @@ def caller(tmp_path, monkeypatch):
     gpu_kubeconfig = tmp_path / "gpu.kubeconfig"
     cpu_kubeconfig.write_text("unit CPU connection fixture\n", encoding="utf-8")
     gpu_kubeconfig.write_text("unit GPU connection fixture\n", encoding="utf-8")
-    target = SimpleNamespace(cluster_id="cluster-a", context="context-a")
+    # A real ClusterTarget: an unregistered fleet peer (AUTH-014 on a one-cluster
+    # site, 2026-09-20) is derived from the primary with dataclasses.replace.
+    target = common.ClusterTarget(
+        cluster_id="cluster-a",
+        context="context-a",
+        region="us-west-2",
+        hyperpod_cluster_name="hp-a",
+        eks_cluster_arn="arn:aws:eks:us-west-2:123456789012:cluster/a",
+        executor_role_arn="arn:aws:iam::123456789012:role/executor-a",
+        control_plane_url="https://control.example",
+        ca_file=Path("/unused/ca.crt"),
+    )
     site = SimpleNamespace(
+        # IdentitySite lists its registered clusters here; a one-cluster site.
+        targets={"cluster-a": target},
         cpu_kubeconfig=cpu_kubeconfig,
         gpu_kubeconfig=gpu_kubeconfig,
         target=lambda _: target,
@@ -222,6 +237,9 @@ def test_authorized_attempt_fences_old_pass_before_any_fallible_dispatch(
         caller.argv[caller.argv.index("--case") + 1] = case_id
         flag = caller.argv.index("--auth015-release-proof")
         del caller.argv[flag : flag + 2]
+        # AUTH-014 on a one-cluster site names an unregistered fleet peer
+        # (2026-09-20), exactly as the live driver does.
+        caller.argv.extend(["--secondary-cluster-id", "auth-fleet-peer-b"])
     caller.argv.extend(["--attempt", "2"])
     assert entry.main() == 0
     path = caller.root / "cases" / case_id / f"{case_id}.json"

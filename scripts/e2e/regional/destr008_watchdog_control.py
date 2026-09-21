@@ -288,17 +288,25 @@ class CancellationControl:
             self._parent_change(before, changed)
             if changed == before.control:
                 return before
+            # Pin only what the parent owns and reads: our UID, the immutable
+            # plan, and the exact control.json we are replacing. The daemon
+            # rewrites status.json every POLL_SECONDS and bumps the ConfigMap
+            # resourceVersion, so pinning the whole version or every /data key
+            # (status.json included) could never converge against a live
+            # heartbeat. control.json stays parent-owned except for the daemon's
+            # own ACK, which this test guards against a lost update.
             patch = [
                 {"op": "test", "path": "/metadata/uid", "value": self.uid},
                 {
                     "op": "test",
-                    "path": "/metadata/resourceVersion",
-                    "value": before.version,
+                    "path": "/data/plan.json",
+                    "value": before.data["plan.json"],
                 },
-                *[
-                    {"op": "test", "path": "/data/" + key, "value": value}
-                    for key, value in before.data.items()
-                ],
+                {
+                    "op": "test",
+                    "path": "/data/control.json",
+                    "value": before.data["control.json"],
+                },
                 {
                     "op": "replace",
                     "path": "/data/control.json",
@@ -329,10 +337,6 @@ class CancellationControl:
                     ) from None
             else:
                 after = self.parse(response)
-                if after.data["status.json"] != before.data["status.json"]:
-                    raise RegionalFixtureError(
-                        "parent control patch changed watchdog status"
-                    )
             if (
                 after.version != before.version
                 and after.control == changed

@@ -104,7 +104,7 @@ class LiveSite:
             "registration": {
                 "cluster_id": "cluster-a",
                 "enabled": True,
-                "membership_state": "ACTIVE",
+                "lifecycle_state": "ACTIVE",
                 "agent_endpoint_allowed_cidrs": ["10.0.1.0/24"],
             },
             "agent_snapshot": {

@@ -89,6 +89,8 @@ def test_old_keyword_or_any_production_source_drift_blocks_arming_before_mutatio
         ("pod", "metadata/ownerReferences/0/uid", "replaced-rs"),
         ("pod", "metadata/ownerReferences/0/controller", False),
         ("pod", "spec/containers/0/image", "cpu:old"),
+        ("pod", "status/containerStatuses/0/image", "cpu:old"),
+        ("pod", "status/containerStatuses/0/image", "sha256:" + "9" * 63),
         ("pod", "status/phase", "Pending"),
         ("pod", "status/conditions/0/status", "False"),
         ("pod", "status/containerStatuses/0/ready", False),
@@ -116,6 +118,25 @@ def test_mixed_unready_or_unowned_population_is_not_a_capability_proof(
     assert not [
         call for call in api.calls if call[0] in {"create", "patch", "delete"}
     ], "unknown worker ownership cannot be repaired during capability verification"
+
+
+@pytest.mark.parametrize("status_image", ["sha256:" + "9" * 64, None])
+def test_kubelet_status_image_forms_keep_the_worker_in_the_population(
+    setup: tuple[CpuApi, wire.Plan, resources.CpuRuntime], status_image: str | None
+) -> None:
+    # containerd 2.x reports ``containerStatuses[].image`` as the bare image
+    # config id for a digest-pinned pull (live 2026-09-19); older kubelets echo
+    # the spec reference. Both are the same Ready worker: ``imageID`` proves it.
+    api, _, runtime = setup
+    pod = api.objects["pod", "cpu-worker-1"]
+    if status_image is None:
+        status_image = pod["spec"]["containers"][0]["image"]
+    set_path(pod, "status/containerStatuses/0/image", status_image)
+    resources.require_cpu_history_capability(api.regional, runtime)
+    assert {args[2] for verb, args, _ in api.calls if verb == "exec"} == {
+        "cpu-worker-0",
+        "cpu-worker-1",
+    }, "both kubelet image forms must stay in the inspected population"
 
 
 def test_missing_population_and_duplicate_pod_uids_are_rejected(

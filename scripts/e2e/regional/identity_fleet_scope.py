@@ -159,14 +159,39 @@ def fleet_scope_errors(
     return errors
 
 
+# The node id that shapes the ``/v1/fleet/agents/{cluster}/{node}`` request for an
+# unregistered peer. Never looked up: the API denies the read on the cluster id.
+UNREGISTERED_PEER_NODE = "unregistered-peer-node"
+
+
 def authenticated_fleet_isolation(
-    site: IdentitySite, target: ClusterTarget
+    site: IdentitySite,
+    target: ClusterTarget,
+    *,
+    peer: ClusterTarget | None = None,
 ) -> dict[str, Any]:
     clusters = sorted(site.targets)
     baseline = site.api_pod_json(FLEET_BASELINE_PROBE, *clusters).get("clusters")
     if not isinstance(baseline, dict) or set(baseline) != set(clusters):
         raise IdentityAcceptanceError("fleet isolation baseline is incomplete")
-    requests = fleet_scope_requests(target.cluster_id, baseline)
+    scope = dict(baseline)
+    unregistered_peer: str | None = None
+    if peer is not None and peer.cluster_id not in scope:
+        # A one-cluster site (live 2026-09-20, AUTH-014 a1) has no registered
+        # peer, so the store baseline alone cannot name one. ``routes/fleet.py``
+        # denies a foreign read by comparing the requested cluster id with the
+        # authenticated header before any store lookup, so an UNREGISTERED id
+        # exercises exactly the rule under test -- the ISO-003/004 recipe. Only
+        # the local listing is judged against real records.
+        if peer.cluster_id == target.cluster_id:
+            raise IdentityAcceptanceError("primary and secondary clusters must differ")
+        if getattr(peer, "registered", False):
+            raise IdentityAcceptanceError(
+                "a registered peer must appear in the fleet baseline"
+            )
+        scope[peer.cluster_id] = [UNREGISTERED_PEER_NODE]
+        unregistered_peer = peer.cluster_id
+    requests = fleet_scope_requests(target.cluster_id, scope)
     observed = site.pod_json(
         "gpu",
         target,
@@ -176,9 +201,12 @@ def authenticated_fleet_isolation(
         timeout=300,
     )
     after = site.api_pod_json(FLEET_BASELINE_PROBE, *clusters).get("clusters")
-    errors = fleet_scope_errors(
-        observed, cluster_id=target.cluster_id, baseline=baseline
-    )
+    errors = fleet_scope_errors(observed, cluster_id=target.cluster_id, baseline=scope)
     if after != baseline:
         errors.append("fleet membership changed during the authenticated read window")
-    return {"results": observed, "errors": errors, "passed": not errors}
+    return {
+        "results": observed,
+        "errors": errors,
+        "passed": not errors,
+        "unregistered_peer": unregistered_peer,
+    }

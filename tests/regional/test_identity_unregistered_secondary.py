@@ -171,3 +171,26 @@ def test_spare_health_case_records_secondary_registration() -> None:
     assert any("not registered" in item for item in outcome["limitations"]), (
         "the unregistered B is declared as a limitation"
     )
+
+
+def test_auth014_names_an_unregistered_fleet_peer_on_a_single_cluster_site() -> None:
+    # Live 2026-09-20 (AUTH-014 a1): the fleet-read scope proof needs a peer
+    # cluster in its request baseline, and a one-cluster site has none. The API
+    # denies foreign fleet reads on the cluster id alone, so the ISO-003/004
+    # unregistered id serves here too; a multi-cluster site needs no flag.
+    primary, secondary, _nodes = entry.validate_case_arguments(
+        _arguments("GF-REGIONAL-AUTH-014", "auth-fleet-peer-b"), _Site()
+    )
+    assert secondary is not None and secondary.registered is False
+    assert secondary.cluster_id == "auth-fleet-peer-b"
+    assert secondary.control_plane_url == primary.control_plane_url
+    with pytest.raises(common.IdentityAcceptanceError, match="secondary-cluster-id"):
+        entry.validate_case_arguments(_arguments("GF-REGIONAL-AUTH-014", ""), _Site())
+    site = _Site()
+    site.targets["cluster-b"] = common.ClusterTarget(
+        **{**_primary().__dict__, "cluster_id": "cluster-b", "context": "context-b"}
+    )
+    _primary_target, secondary, _nodes = entry.validate_case_arguments(
+        _arguments("GF-REGIONAL-AUTH-014", ""), site
+    )
+    assert secondary is None, "registered site peers already populate the baseline"

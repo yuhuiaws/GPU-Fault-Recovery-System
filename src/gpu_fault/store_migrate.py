@@ -298,6 +298,13 @@ def _argument_parser() -> argparse.ArgumentParser:
         "(keeps the DSN off the process argv)",
     )
     source.add_argument("--ensure-schema", action="store_true")
+    parser.add_argument(
+        "--fresh-control-state-mode",
+        choices=("legacy", "dedicated"),
+        default="legacy",
+        help="with --ensure-schema only: the control-state mode a database that "
+        "had no schema starts in (an existing database keeps its recorded modes)",
+    )
     source.add_argument("--build-indexes-concurrently", action="store_true")
     source.add_argument("--schema-preflight", action="store_true")
     source.add_argument("--ensure-diagnostics", action="store_true")
@@ -388,8 +395,14 @@ def main() -> None:
     ):
         _run_state_table_command(parser, arguments)
         return
+    if arguments.fresh_control_state_mode != "legacy" and not arguments.ensure_schema:
+        parser.error("--fresh-control-state-mode requires --ensure-schema")
     if arguments.ensure_schema:
-        store = PostgresStore(arguments.postgres_url, hot_state_mode="legacy")
+        store = PostgresStore(
+            arguments.postgres_url,
+            hot_state_mode="legacy",
+            fresh_control_state_mode=arguments.fresh_control_state_mode,
+        )
         store.close()
         print("schema initialization complete")
         return

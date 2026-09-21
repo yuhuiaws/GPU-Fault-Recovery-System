@@ -21,17 +21,21 @@ def test_unknown_or_retired_guard_case_is_not_executable(number) -> None:
 def test_target_binding_reads_complete_replica_population_before_identity(
     failure, tmp_path, monkeypatch
 ) -> None:
-    metadata = {"data": {"release-id": "fixture-release"}}
+    # Live shape (2026-09-20): the release id is bound from the regional release
+    # state ConfigMap's state.json, the same source every case's evidence uses;
+    # the release-metadata ConfigMap carries no release-id key.
+    release_state = {"phase": "complete", "release_id": "fixture-release"}
     deployment = {
         "metadata": {"uid": "fixture-deployment", "generation": 2},
         "spec": {"replicas": 3},
     }
     if failure == "release":
-        metadata["data"]["release-id"] = None
+        release_state["release_id"] = None
     elif failure == "uid":
         deployment["metadata"]["uid"] = ""
     elif failure == "generation":
         deployment["metadata"]["generation"] = True
+    metadata = {"data": {"state.json": json.dumps(release_state)}}
     pods = []
     for index in range(3):
         pod = ready_pod()
@@ -58,7 +62,9 @@ def test_target_binding_reads_complete_replica_population_before_identity(
         assert result["generation"] == 2 and len(result["cpu_pods"]) == 3, (
             "the bound identity needs every Ready API replica"
         )
-    assert len(calls) == 3, "target binding must read metadata, deployment and Pods"
+    assert len(calls) == 3, (
+        "target binding must read release state, deployment and Pods"
+    )
     assert all(
         command[:5]
         == ["kubectl", "--kubeconfig", environment["CPU_KUBECONFIG"], "-n", "fixture"]

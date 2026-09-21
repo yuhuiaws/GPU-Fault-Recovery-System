@@ -48,6 +48,16 @@ class Resource:
         self, unit: str, *, restore_seconds: int, delay_seconds: int
     ) -> dict[str, Any]:
         self.h.warm.call("service.stop", unit)
+        # The live arm->stop setup (watchdog arm plus the worker capability
+        # probes, ~6 min) elapses before the failsafe timer is armed, so the
+        # stop-time-anchored restore clears ``deadline + margin``.
+        # ``cancellation_window_seconds`` spends exactly
+        # ``SERVICE_SETUP_ALLOWANCE_SECONDS`` of that runway, so the fake must
+        # model at least that much elapsed setup or ``require_bound`` rejects a
+        # fake arm that never slept.
+        self.h.causal.cpu.clock.sleep(
+            case.SERVICE_SETUP_ALLOWANCE_SECONDS + case.BOUND_MARGIN_SECONDS
+        )
         self.failsafe_at = self.h.at(restore_seconds + delay_seconds)
         self.h.recovery_at = self.failsafe_at
         if unit == "kubelet.service":

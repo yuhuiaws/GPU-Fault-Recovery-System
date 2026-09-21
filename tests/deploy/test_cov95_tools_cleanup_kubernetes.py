@@ -252,6 +252,43 @@ def test_namespace_inventory_must_be_bounded_and_complete(
         KUBE.namespace_items(client, NAMESPACE)
 
 
+def test_namespace_inventory_skips_metrics_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-09-20: metrics-server lists ``pods.metrics.k8s.io`` as a
+    namespaced resource; its PodMetrics carry no uid and are not objects the
+    cleanup could ever own or delete, so they must not stop the inventory."""
+    client = Client()
+    monkeypatch.setattr(
+        client,
+        "run",
+        lambda *_args, **_kwargs: (
+            "deployments.apps\npods\npods.metrics.k8s.io\n"
+            "externalmetrics.external.metrics.k8s.io\n"
+            "podmetrics.metrics.eks.amazonaws.com\nsecrets\n"
+        ),
+    )
+    requested: list[str] = []
+
+    def items(*arguments: str) -> list[dict[str, Any]]:
+        kinds = arguments[arguments.index("get") + 1].split(",")
+        requested.extend(kinds)
+        if any("metrics" in kind for kind in kinds):
+            return [
+                {
+                    "apiVersion": "metrics.k8s.io/v1beta1",
+                    "kind": "PodMetrics",
+                    "metadata": {"name": "gpu-fault-api-ha-1", "namespace": NAMESPACE},
+                }
+            ]
+        return [resource("Pod", "gpu-fault-api-ha-1")]
+
+    monkeypatch.setattr(client, "items", items)
+    inventory = KUBE.namespace_items(client, NAMESPACE)
+    assert [item["kind"] for item in inventory] == ["Pod"]
+    assert requested == ["deployments.apps", "pods", "secrets"], requested
+
+
 def test_namespace_inventory_cannot_cross_scope() -> None:
     client = Client()
     client.namespaced = [resource("Pod", "other", namespace="customer")]

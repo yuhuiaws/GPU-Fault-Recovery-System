@@ -332,9 +332,12 @@ def test_the_workflow_wait_never_outlives_the_shortage_bound() -> None:
     now = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
     # Unbounded scenarios keep the full wait.
     assert destr008.wait_timeout_seconds(None, now) == destr008.WORKFLOW_WAIT_SECONDS
-    # The kubelet failsafe (15s delay + 420s restore) bounds S3 well under 900s.
+    # The kubelet failsafe (15s delay + the restore) bounds S3 under the default.
     failsafe = now + timedelta(seconds=15 + destr008.SERVICE_RESTORE_SECONDS)
-    assert destr008.wait_timeout_seconds(failsafe, now) == 435 - 60
+    assert destr008.wait_timeout_seconds(failsafe, now) == (
+        15 + destr008.SERVICE_RESTORE_SECONDS - 60
+    )
+    assert 15 + destr008.SERVICE_RESTORE_SECONDS - 60 < destr008.WORKFLOW_WAIT_SECONDS
     # A bound already past waits one second and fails on the timeout, rather
     # than waiting for the REPLACE_NODE that could now succeed.
     assert destr008.wait_timeout_seconds(now - timedelta(seconds=5), now) == 1
@@ -342,6 +345,29 @@ def test_the_workflow_wait_never_outlives_the_shortage_bound() -> None:
     assert (
         destr008.wait_timeout_seconds(now + timedelta(hours=2), now)
         == destr008.WORKFLOW_WAIT_SECONDS
+    )
+
+
+def test_service_cancellation_window_spends_the_failsafe_setup_runway() -> None:
+    # attempt 25 (2026-09-19): the service claim raced its own DEADLINE because
+    # the window equalled the failsafe restore minus the bound margin, yet the
+    # deadline is armed ~7-9 min before the claim (watchdog arm + service stop +
+    # readiness wait). The service window must outlast that pre-claim setup; the
+    # extra is the runway the stop-time-anchored failsafe bound opens up.
+    plain = destr008.SERVICE_RESTORE_SECONDS - destr008.BOUND_MARGIN_SECONDS
+    for scenario in ("kubernetes-not-ready", "agent-unavailable"):
+        window = destr008.cancellation_window_seconds(scenario)
+        assert window > plain, "the deadline must outlast the pre-claim setup"
+        assert window == plain + destr008.SERVICE_SETUP_ALLOWANCE_SECONDS
+    # The allowance stays inside the failsafe runway (require_bound proves the
+    # deadline precedes the real failsafe live), so it never exceeds the restore.
+    assert (
+        0 < destr008.SERVICE_SETUP_ALLOWANCE_SECONDS <= destr008.SERVICE_RESTORE_SECONDS
+    )
+    # active-gpu-pod arms its holder-sleep bound only in apply_late, after the
+    # setup, so it needs no allowance: the window is the hold minus the margin.
+    assert destr008.cancellation_window_seconds("active-gpu-pod") == (
+        destr008.GpuHolderFixture.HOLD_SECONDS - destr008.BOUND_MARGIN_SECONDS
     )
 
 

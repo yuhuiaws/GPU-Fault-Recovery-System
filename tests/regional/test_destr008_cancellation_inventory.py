@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.models import (
+    IncidentState,
     PlanStatus,
     RecoveryPlan,
     WorkflowRequest,
@@ -395,6 +396,74 @@ def test_same_job_attempt_without_source_ancestry_is_not_owned() -> None:
     )
     result = watchdog.tick(bound.deadline_at)
     assert result.state == "FAILED" and result.error_code == "UNRELATED_JOB_RECOVERY"
+    assert store.get_workflow(workflow.request_id).workload_withdrawn_at is None
+    assert store.get_workflow(foreign.request_id).workload_withdrawn_at is None
+
+
+def test_recovered_host_health_incident_on_the_node_does_not_block_quiescence() -> None:
+    bound, _, _, store, watchdog, _, workflow = armed_submission(
+        status=WorkflowStatus.FAILED
+    )
+    # During the kubernetes-not-ready window the product legitimately opens
+    # RECOVERED idle-utilization incidents (low_gpu_utilization / low_cpu_utilization)
+    # against the synthetic job's node. They inherit our job/attempt/node and carry
+    # a SUCCEEDED workflow, so the scoped related listing returns them, but their
+    # policy source is SITE_HOST_RESOURCE_HEALTH, not ours. They are terminal and
+    # not ours to withdraw; the drain proof must tolerate a settled foreign
+    # incident instead of failing INCIDENT_SCOPE. Anything still live on the node
+    # is still caught by has_incomplete_processor_requests_for_scopes.
+    _, foreign = seed(
+        store,
+        bound,
+        status=WorkflowStatus.SUCCEEDED,
+        incident_id="inc-host-low-gpu-utilization",
+        event_id="host-node-low_gpu_utilization",
+        workflow_id="workflow-host-low-gpu-utilization",
+        policy_source="SITE_HOST_RESOURCE_HEALTH",
+        state=IncidentState.RECOVERED,
+    )
+    assert foreign.request_id in {
+        item.request_id
+        for _, item in store.list_job_recovery_workflow_incidents(
+            bound.cluster_id, bound.job_id, bound.attempt_id, include_terminal=True
+        )
+    }, "the foreign host-health workflow must share the scoped related listing"
+    result = watchdog.tick(bound.deadline_at)
+    assert result.error_code != "INCIDENT_SCOPE", result.error_code
+    assert set(result.workflow_ids) == {workflow.request_id}
+    assert store.get_workflow(workflow.request_id).workload_withdrawn_at is not None
+    assert store.get_workflow(foreign.request_id).workload_withdrawn_at is None
+    assert (
+        watchdog.tick(bound.deadline_at + wire.QUIET_SECONDS + 1).state == "QUIESCENT"
+    )
+    assert store.get_workflow(foreign.request_id).workload_withdrawn_at is None
+
+
+@pytest.mark.parametrize("kind", ["not_recovered", "workflow_not_terminal"])
+def test_live_foreign_incident_on_the_node_fails_closed(kind: str) -> None:
+    bound, _, _, store, watchdog, _, workflow = armed_submission(
+        status=WorkflowStatus.FAILED
+    )
+    # A non-synthetic incident that is still live on our node must fail closed:
+    # either its incident has not RECOVERED, or its workflow still holds
+    # authority. Tolerating only fully settled foreign records keeps the drain
+    # proof honest about residual work sharing the node.
+    _, foreign = seed(
+        store,
+        bound,
+        status=WorkflowStatus.SUCCEEDED
+        if kind == "not_recovered"
+        else WorkflowStatus.PENDING,
+        incident_id="inc-host-low-gpu-utilization",
+        event_id="host-node-low_gpu_utilization",
+        workflow_id="workflow-host-low-gpu-utilization",
+        policy_source="SITE_HOST_RESOURCE_HEALTH",
+        state=IncidentState.ESCALATED
+        if kind == "not_recovered"
+        else IncidentState.RECOVERED,
+    )
+    result = watchdog.tick(bound.deadline_at)
+    assert result.state == "FAILED" and result.error_code == "FOREIGN_ACTIVE"
     assert store.get_workflow(workflow.request_id).workload_withdrawn_at is None
     assert store.get_workflow(foreign.request_id).workload_withdrawn_at is None
 

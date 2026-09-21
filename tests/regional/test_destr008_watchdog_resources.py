@@ -875,7 +875,7 @@ VOLUME = ("spec", "volumes")
         (("spec", "dnsPolicy"), "Default"),
         (("spec", "schedulerName"), "foreign"),
         (("spec", "priority"), 1000),
-        (("spec", "preemptionPolicy"), "PreemptLowerPriority"),
+        (("spec", "preemptionPolicy"), "Never"),
         (("spec", "tolerations"), [{"operator": "Exists"}]),
         (("spec", "securityContext", "runAsUser"), 0),
         (("spec", "securityContext", "runAsNonRoot"), False),
@@ -1176,6 +1176,8 @@ def test_missing_gate_and_replaced_controller_are_not_authorized_by_labels(
         (("status", "containerStatuses"), []),
         (("status", "containerStatuses", 0, "name"), "foreign"),
         (("status", "containerStatuses", 0, "image"), "cpu:latest"),
+        (("status", "containerStatuses", 0, "image"), "sha256:" + "9" * 63),
+        (("status", "containerStatuses", 0, "image"), "registry.example/cpu:latest"),
         (("status", "containerStatuses", 0, "imageID"), None),
         (("status", "containerStatuses", 0, "imageID"), "sha256:" + "b" * 64),
         (("status", "containerStatuses", 0, "containerID"), ""),
@@ -1228,6 +1230,19 @@ def test_standard_cri_image_id_forms_keep_the_exact_digest(
     expected = cpu.manifests()[-1]
     actual = pod(expected, "running")
     actual["status"]["containerStatuses"][0]["imageID"] = image_id
+    validate_pod(actual, expected, "running")
+
+
+@pytest.mark.parametrize("status_image", [IMAGE, "sha256:" + "9" * 64])
+def test_kubelet_status_image_forms_keep_the_planned_process(
+    cpu: Harness, status_image: str
+) -> None:
+    # containerd 2.x reports a digest-pinned pull without a local tag as the
+    # bare image config id (live 2026-09-19); the pulled identity stays proven
+    # by ``imageID``, so either form names the planned process.
+    expected = cpu.manifests()[-1]
+    actual = pod(expected, "running")
+    actual["status"]["containerStatuses"][0]["image"] = status_image
     validate_pod(actual, expected, "running")
 
 

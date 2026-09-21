@@ -137,6 +137,24 @@ def test_only_explicit_ecr_absence_is_a_cache_miss(aws, code, cli_message):
 
 
 @pytest.mark.parametrize(
+    "code", ["ImageNotFoundException", "RepositoryNotFoundException"]
+)
+def test_cli_error_prefix_still_means_absence(aws, code):
+    """AWS CLI 2.35 prefixes error lines with ``aws: [ERROR]:`` (live 2026-09-20);
+    an explicit ECR absence keeps meaning absence with the prefix present."""
+    _commands, result = aws
+    result["returncode"] = 254
+    result["stderr"] = (
+        f"aws: [ERROR]: An error occurred ({code}) when calling the DescribeImages "
+        "operation: missing"
+    )
+    assert (
+        release_artifacts.runtime_images_exist(region=REGION, references=REFERENCES)
+        is False
+    ), "a prefixed explicit absence was not recognised"
+
+
+@pytest.mark.parametrize(
     "error",
     [
         "AccessDeniedException",

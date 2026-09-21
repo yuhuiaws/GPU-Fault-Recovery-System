@@ -103,8 +103,14 @@ def test_unsupported_shortage_fixture_lifecycle_records_bounds_without_admitting
             if isinstance(entry, tuple) and entry[0] == "node.ready"
         ]
         assert waits == [False, True], calls
+        # Only the node-side failsafe timer can bring kubelet back, so the
+        # post-restore Ready wait must outlast ``SERVICE_RESTORE_SECONDS`` by a
+        # real margin (600 s + 180 s live since the 2026-09-19 deadline fix).
         assert calls.index(
-            ("node.ready", {"ready": True, "timeout_seconds": 600})
+            (
+                "node.ready",
+                {"ready": True, "timeout_seconds": case.SERVICE_RESTORE_SECONDS + 180},
+            )
         ) < calls.index("service.restore"), calls
     elif scenario == "agent-unavailable":
         waits = [

@@ -8,7 +8,9 @@ import secrets
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -209,6 +211,60 @@ def response_body(raw: bytes) -> Any:
         }
 
 
+RESOLVE_PINS: dict[tuple[str, int], str] = {}
+
+
+def pin_resolution(rules: Sequence[str]) -> dict[tuple[str, int], str]:
+    """Install curl-style ``HOST:PORT:ADDRESS`` pins for the matrix requests.
+
+    The acceptance host may sit outside the control-plane VPC, where the
+    ``.internal`` endpoint name neither resolves nor routes; the driver then
+    forwards the plaintext API Service to a local port and pins the endpoint
+    host to that address so every request still carries the production
+    ``Host`` header. TLS is terminated on the NLB, so a pinned request is
+    plaintext by construction: an ``https`` URL is refused rather than sent
+    with a wrong SNI.
+    """
+
+    pins: dict[tuple[str, int], str] = {}
+    for rule in rules:
+        host, _, remainder = rule.partition(":")
+        port_text, _, address = remainder.partition(":")
+        if not host or not port_text.isdigit() or not address:
+            raise ValueError(f"--resolve expects HOST:PORT:ADDRESS, got {rule!r}")
+        pins[(host.lower(), int(port_text))] = address
+    RESOLVE_PINS.clear()
+    RESOLVE_PINS.update(pins)
+    return dict(pins)
+
+
+def open_request(request: urllib.request.Request, ca_file: Path) -> tuple[int, bytes]:
+    parts = urllib.parse.urlsplit(request.full_url)
+    default_port = 443 if parts.scheme == "https" else 80
+    pinned = RESOLVE_PINS.get(
+        ((parts.hostname or "").lower(), parts.port or default_port)
+    )
+    if pinned is not None:
+        if parts.scheme != "http":
+            raise ValueError(
+                "--resolve pins plaintext forwards only; TLS keeps its real host"
+            )
+        request.full_url = urllib.parse.urlunsplit(
+            parts._replace(netloc=f"{pinned}:{parts.port or default_port}")
+        )
+        request.add_unredirected_header("Host", parts.netloc)
+    context = (
+        ssl.create_default_context(cafile=str(ca_file))
+        if parts.scheme == "https"
+        else None
+    )
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=20) as response:
+            return int(response.status), bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), bytes(exc.read())
+
+
 def post(
     base_url: str,
     ca_file: Path,
@@ -232,19 +288,8 @@ def post(
         headers=headers,
         method="POST",
     )
-    context = ssl.create_default_context(cafile=str(ca_file))
-    try:
-        with urllib.request.urlopen(request, context=context, timeout=20) as response:
-            raw = response.read()
-            return {
-                "status": response.status,
-                "body": response_body(raw),
-            }
-    except urllib.error.HTTPError as exc:
-        return {
-            "status": exc.code,
-            "body": response_body(exc.read()),
-        }
+    status, raw = open_request(request, ca_file)
+    return {"status": status, "body": response_body(raw)}
 
 
 def get(
@@ -265,19 +310,8 @@ def get(
         headers=headers,
         method="GET",
     )
-    context = ssl.create_default_context(cafile=str(ca_file))
-    try:
-        with urllib.request.urlopen(request, context=context, timeout=20) as response:
-            raw = response.read()
-            return {
-                "status": response.status,
-                "body": response_body(raw),
-            }
-    except urllib.error.HTTPError as exc:
-        return {
-            "status": exc.code,
-            "body": response_body(exc.read()),
-        }
+    status, raw = open_request(request, ca_file)
+    return {"status": status, "body": response_body(raw)}
 
 
 def claim_payload(
@@ -848,13 +882,28 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--run-dir", type=Path)
     value.add_argument("--cpu-kubeconfig", type=Path)
     value.add_argument("--namespace", default="gpu-fault-system")
+    value.add_argument(
+        "--resolve",
+        action="append",
+        default=[],
+        metavar="HOST:PORT:ADDRESS",
+        help="pin an http endpoint host to a forwarded local address (see pin_resolution)",
+    )
     return value
 
 
 def main() -> int:
     arguments = parser().parse_args()
     arguments.probe_id = "auth-probe-" + secrets.token_hex(16)
+    pins = pin_resolution(arguments.resolve)
     identity: dict[str, str] = {"cluster_id": arguments.cluster_a}
+    if pins:
+        # The evidence names the forward so an auditor can tell a pinned
+        # plaintext run from one that went through the NLB.
+        identity["transport"] = "pinned-forward " + ",".join(
+            f"{host}:{port}->{address}"
+            for (host, port), address in sorted(pins.items())
+        )
     store_before: dict[str, Any] | None = None
     api_pod = ""
     if arguments.cpu_kubeconfig is not None:

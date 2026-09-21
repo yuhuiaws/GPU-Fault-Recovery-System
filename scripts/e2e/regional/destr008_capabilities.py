@@ -10,6 +10,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from scripts.e2e.regional.destr008_parallel import gather
 from scripts.e2e.regional.guardrail_audit_evidence import complete_pod_population
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureError,
@@ -198,13 +199,14 @@ def read_capabilities(regional: RegionalLiveFixture) -> dict[str, Any]:
     for plane, name, label in TARGETS:
         before, pods, identities, container = snapshot(regional, plane, name, label)
         probes = []
-        for pod in pods:
-            value = json.loads(
+
+        def probe(pod_name: str) -> Any:
+            return json.loads(
                 regional.kubectl(
                     plane,
                     "exec",
                     "-i",
-                    pod["name"],
+                    pod_name,
                     "-c",
                     container,
                     "--",
@@ -219,6 +221,9 @@ def read_capabilities(regional: RegionalLiveFixture) -> dict[str, Any]:
                     timeout=30,
                 )
             )
+
+        values = gather([lambda pod=pod: probe(pod["name"]) for pod in pods])
+        for pod, value in zip(pods, values, strict=True):
             if (
                 not isinstance(value, dict)
                 or value.get("supported") is not True

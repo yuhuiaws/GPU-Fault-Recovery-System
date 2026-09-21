@@ -597,6 +597,16 @@ def parser() -> argparse.ArgumentParser:
             "(skip needs --cpu-cluster delete or --reset-database)"
         ),
     )
+    remove.add_argument(
+        "--accept-repository-root-override",
+        action="store_true",
+        help=(
+            "resume an uninstall that is already in progress with the cleanup "
+            "tools of another reviewed source tree (the repository root given to "
+            "this command) when the deployed snapshot's own tools stopped it; the "
+            "tree and its digest are recorded in the uninstall journal"
+        ),
+    )
     return result
 
 
@@ -673,6 +683,9 @@ def _run_uninstall(arguments: argparse.Namespace) -> int:
             confirmation=arguments.confirm,
             final_snapshot_policy=arguments.aurora_final_snapshot,
             reset_database=bool(arguments.reset_database),
+            repository_root_override=bool(
+                getattr(arguments, "accept_repository_root_override", False)
+            ),
         )
     except BootstrapError as exc:
         raise SiteConfigError(str(exc)) from exc
