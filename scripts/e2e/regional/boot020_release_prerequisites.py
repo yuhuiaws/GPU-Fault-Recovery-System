@@ -13,6 +13,7 @@ builds when the candidates are missing or bound to another release.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -152,8 +153,57 @@ def candidate_paths(out_dir: Path) -> dict[str, Path]:
     return {key: out_dir / name for key, name in CONFIG_FILES.items()}
 
 
-def candidates_bound_to(out_dir: Path, snapshot_repo: Path) -> bool:
-    """Whether the five configs exist and the NOOP one names this snapshot's manifest."""
+def site_inputs(state_dir: Path) -> dict[str, str]:
+    """Digests of the site inputs the candidate derivation reads.
+
+    ``configs`` materialises the site through ``load_site``: ``site.yaml`` and
+    the desired AdminConfig (``admin-config/desired.json`` beside it, or the
+    release defaults before one exists). A candidate set is only as current as
+    those two; the live release id says nothing about them (live 2026-09-30
+    19:01Z: candidates built while the desired config still carried a
+    candidate's 5 workers were reused after the operator re-applied the site's
+    6, and the ``noop`` candidate classified CONTROL_PLANE_ONLY).
+    """
+
+    from gpu_fault.admin.config import load_desired_admin_config
+
+    site_file = state_dir / "site.yaml"
+    if not site_file.is_file():
+        raise RegionalFixtureError(f"administrator state has no site.yaml: {state_dir}")
+    return {
+        "site_yaml_sha256": hashlib.sha256(site_file.read_bytes()).hexdigest(),
+        "admin_config_sha256": load_desired_admin_config(state_dir).sha256(),
+    }
+
+
+def recorded_site_inputs(out_dir: Path) -> dict[str, str] | None:
+    """The ``site_inputs`` the candidates directory's metadata recorded, if any."""
+
+    path = out_dir / CANDIDATES_METADATA_NAME
+    if not path.is_file():
+        return None
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    recorded = summary.get("site_inputs") if isinstance(summary, dict) else None
+    if not isinstance(recorded, dict):
+        return None
+    return {str(key): str(value) for key, value in recorded.items()}
+
+
+def candidates_bound_to(
+    out_dir: Path,
+    snapshot_repo: Path,
+    site: dict[str, str] | None = None,
+) -> bool:
+    """Whether the candidates may stand in for a fresh derivation.
+
+    The five configs must exist and the NOOP one must name this snapshot's
+    manifest. With ``site`` (``site_inputs``) given, the metadata written at
+    build time must also record exactly those digests: a directory without the
+    record (built before it existed) or with other digests is rebuilt.
+    """
 
     paths = candidate_paths(out_dir)
     if not all(path.is_file() for path in paths.values()):
@@ -164,7 +214,9 @@ def candidates_bound_to(out_dir: Path, snapshot_repo: Path) -> bool:
         return False
     manifest = str((noop.get("release") or {}).get("manifest") or "")
     expected = str((snapshot_repo / "dist" / "current-release.json").resolve())
-    return bool(manifest) and str(Path(manifest).resolve()) == expected
+    if not manifest or str(Path(manifest).resolve()) != expected:
+        return False
+    return site is None or recorded_site_inputs(out_dir) == site
 
 
 def ensure_release_candidates(
@@ -188,6 +240,7 @@ def ensure_release_candidates(
     """
 
     derived = inputs(state_dir)
+    site = site_inputs(state_dir)
     record: dict[str, Any] = {
         "candidates_dir": str(out_dir),
         "snapshot_repo": str(derived.snapshot_repo),
@@ -197,7 +250,7 @@ def ensure_release_candidates(
         "runtime_profile": derived.runtime_profile,
         "replicas_delta": replicas_delta,
     }
-    if candidates_bound_to(out_dir, derived.snapshot_repo):
+    if candidates_bound_to(out_dir, derived.snapshot_repo, site):
         return {**record, "action": "reused"}
     work = work_dir or (state_dir / WORK_DIR_NAME)
     build(
@@ -224,40 +277,49 @@ def ensure_release_candidates(
             profile_suffix="-boot020",
         )
     )
+    # The metadata carries the site inputs this build read; written before the
+    # final binding check so that check judges the directory a later run sees.
+    write_candidate_metadata(work, out_dir, site=site)
     failures = check(argparse.Namespace(out_dir=out_dir, gpu_kubeconfig=gpu_kubeconfig))
     if failures:
         raise RegionalFixtureError(
             "freshly built BOOT-020 release candidates do not classify against live"
         )
-    if not candidates_bound_to(out_dir, derived.snapshot_repo):
+    if not candidates_bound_to(out_dir, derived.snapshot_repo, site):
         raise RegionalFixtureError(
             "BOOT-020 release candidates were built but do not name the live snapshot"
         )
-    _copy_candidate_metadata(work, out_dir)
     return {**record, "action": "built", "work_dir": str(work)}
 
 
-def _copy_candidate_metadata(work: Path, out_dir: Path) -> None:
-    """Keep the build summary next to the configs it produced.
+def write_candidate_metadata(
+    work: Path, out_dir: Path, *, site: dict[str, str]
+) -> Path:
+    """Keep the build summary and the site inputs next to the configs.
 
     ``build`` writes ``candidates.json`` (release id, edits digest and component
     summary per candidate) into the work directory, which a later run does not
-    know about and an operator may clean. The copy in the candidates directory
-    is what ``candidate_identity`` reads on every run, built or reused.
+    know about and an operator may clean. The copy in the candidates directory,
+    extended with ``site_inputs`` (``site_inputs``), is what the reuse decision
+    and ``candidate_identity`` read on every run, built or reused.
     """
 
+    summary: dict[str, Any] = {}
     source = work / CANDIDATES_METADATA_NAME
-    if not source.is_file():
-        return
-    try:
-        summary = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(summary, dict):
-        return
+    if source.is_file():
+        try:
+            loaded = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            summary = loaded
     target = out_dir / CANDIDATES_METADATA_NAME
-    target.write_text(json.dumps(summary, indent=1, sort_keys=True), encoding="utf-8")
+    target.write_text(
+        json.dumps({**summary, "site_inputs": site}, indent=1, sort_keys=True),
+        encoding="utf-8",
+    )
     target.chmod(0o600)
+    return target
 
 
 def _config_manifest_release_id(name: str, path: Path) -> str:
@@ -335,6 +397,10 @@ def candidate_identity(
     - ``release_ids``: per config, the release id of the manifest it names;
     - ``candidates``: per candidate B/C/D, release id and edits digest from the
       ``candidates.json`` copied into the candidates directory when present;
+    - ``site_inputs``: the ``site.yaml`` and desired-AdminConfig digests the
+      derivation read (``site_inputs``), so a resume after the operator changed
+      either is refused rather than run against candidates that no longer
+      describe the site;
     - ``runtime_profile``: the noop config's Runtime Profile version.
 
     The config bytes themselves are bound separately (``config_sha256``).
@@ -360,6 +426,7 @@ def candidate_identity(
         identity["candidates"] = _recorded_candidate_metadata(
             Path(str(record["candidates_dir"]))
         )
+    identity["site_inputs"] = site_inputs(state_dir)
     noop = json.loads(configs["noop"].read_text(encoding="utf-8"))
     identity["runtime_profile"] = str(
         (noop.get("runtime_profile") or {}).get("version") or ""
@@ -413,7 +480,9 @@ def resolve_release_configs(
         "candidates_dir": str(out_dir),
         "snapshot_repo": str(snapshot),
         "action": (
-            "reused" if candidates_bound_to(out_dir, snapshot) else "build-at-execute"
+            "reused"
+            if candidates_bound_to(out_dir, snapshot, site_inputs(state_dir))
+            else "build-at-execute"
         ),
     }
     return {

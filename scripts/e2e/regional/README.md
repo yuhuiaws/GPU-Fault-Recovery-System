@@ -160,7 +160,14 @@ never an input (2026-09-30, fifth run: the first execute recorded
 `action=built`, every later `--resume` computed `action=reused` and was
 refused). A refused resume now names the differing input keys with both values
 and repeats the sequence above; a different site, candidates directory or
-kubeconfig is another run and needs a new `--run-dir`.
+kubeconfig is another run and needs a new `--run-dir`. Reuse of an existing
+candidates directory also requires the `site_inputs` its `candidates.json`
+recorded at build time -- the `site.yaml` digest and the desired AdminConfig
+digest (`admin-config/desired.json`) the derivation read -- to equal the
+current ones; otherwise, or without the record, the candidates are rebuilt
+(a `noop` candidate derived under another desired config classifies
+CONTROL_PLANE_ONLY against the site). The same digests are part of the
+evidence identity.
 
 The grouped BOOT-011..018, AUTH/ISO, WORKLOAD/E2E, PREEMPT-012, NOTIFY,
 CAP-001..004 and NET-001 drivers use the same plan/execute guard. They derive

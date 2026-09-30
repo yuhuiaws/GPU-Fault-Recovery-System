@@ -22,6 +22,11 @@ from scripts.e2e.regional import boot020_evidence as evidence
 from scripts.e2e.regional import boot020_release_prerequisites as prerequisites
 from scripts.e2e.regional import run_boot020_release_rolling as boot020
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
+from gpu_fault.admin.config import (
+    AdminConfig,
+    default_admin_config,
+    persist_desired_admin_config,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 RUNTIME = "1.dkr.ecr.us-west-2.amazonaws.com/gpu-fault/runtime-abc@sha256:" + "0" * 64
@@ -184,6 +189,7 @@ def test_the_first_and_the_resumed_attempt_record_the_same_inputs(tmp_path) -> N
         for name in ("B", "C", "D")
     }, "the build summary copied into the candidates dir is part of the identity"
     assert identity["runtime_profile"] == "hyperpod-v1", identity
+    assert set(identity["site_inputs"]) == {"site_yaml_sha256", "admin_config_sha256"}
     assert first["acceptance_contract"] == evidence.ACCEPTANCE_CONTRACT
     assert set(first["config_sha256"]) == set(configs), first["config_sha256"]
     # The volatile facts still reach the reader, as provenance.
@@ -328,3 +334,73 @@ def test_provenance_is_appended_per_attempt_and_never_an_input(tmp_path) -> None
     document = json.loads(path.read_text())
     assert document["inputs"] == inputs, "provenance must not enter the inputs"
     assert document["release_candidates_provenance"] == history
+
+
+def test_candidates_are_rebuilt_when_the_desired_admin_config_changed(tmp_path) -> None:
+    # Live 2026-09-30 19:01Z: candidates built while desired.json carried a
+    # candidate's 5 workers were reused after the operator re-applied the
+    # site's 6, and the noop candidate classified CONTROL_PLANE_ONLY.
+    state = _state_dir(tmp_path)
+    arguments = _arguments(state)
+    builds: list[str] = []
+
+    def build(namespace: argparse.Namespace) -> dict[str, Any]:
+        builds.append("build")
+        return _fake_build(namespace)
+
+    def ensure() -> dict[str, Any]:
+        return prerequisites.ensure_release_candidates(
+            state,
+            state / prerequisites.CANDIDATES_DIR_NAME,
+            gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+            build=build,
+            write=_fake_write,
+            check=lambda namespace: 0,
+            inputs=_inputs,
+        )
+
+    under_a = ensure()
+    assert under_a["action"] == "built" and builds == ["build"], (under_a, builds)
+    # Nothing changed: reused, no build.
+    unchanged = ensure()
+    assert unchanged["action"] == "reused" and builds == ["build"], (unchanged, builds)
+    assert prerequisites.resolve_release_configs(arguments)[1]["action"] == "reused"
+    configs = prerequisites.candidate_paths(state / prerequisites.CANDIDATES_DIR_NAME)
+    identity_a = prerequisites.candidate_identity(state, configs, unchanged)
+
+    # The operator applies another desired AdminConfig (5 -> 6 workers here).
+    desired = default_admin_config().as_dict()
+    capacity = dict(desired["capacity"])  # type: ignore[arg-type]
+    capacity["control_worker_replicas"] = int(capacity["control_worker_replicas"]) - 1
+    changed = AdminConfig.from_mapping({**desired, "capacity": capacity})
+    persist_desired_admin_config(state, config=changed, source="unit-test")
+
+    assert prerequisites.resolve_release_configs(arguments)[1]["action"] == (
+        "build-at-execute"
+    ), "stale candidates must not be reused after the desired config changed"
+    under_b = ensure()
+    assert under_b["action"] == "built" and builds == ["build", "build"], (
+        under_b,
+        builds,
+    )
+    identity_b = prerequisites.candidate_identity(state, configs, under_b)
+    assert (
+        identity_a["site_inputs"]["site_yaml_sha256"]
+        == (identity_b["site_inputs"]["site_yaml_sha256"])
+    )
+    assert (
+        identity_a["site_inputs"]["admin_config_sha256"]
+        != (identity_b["site_inputs"]["admin_config_sha256"])
+    ), "the evidence identity binds the desired config the candidates derive from"
+    # And after the rebuild the new state is reused again.
+    assert ensure()["action"] == "reused" and len(builds) == 2, builds
+
+
+def test_candidates_without_recorded_site_inputs_are_rebuilt(tmp_path) -> None:
+    # A directory built before the metadata existed cannot prove what it was
+    # derived from, so it is rebuilt rather than trusted.
+    state, _configs, built, _reused = _first_and_second_attempt(tmp_path)
+    (Path(built["candidates_dir"]) / prerequisites.CANDIDATES_METADATA_NAME).unlink()
+    assert prerequisites.resolve_release_configs(_arguments(state))[1]["action"] == (
+        "build-at-execute"
+    )

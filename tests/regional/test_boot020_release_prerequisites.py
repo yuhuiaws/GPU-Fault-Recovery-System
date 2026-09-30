@@ -67,12 +67,21 @@ def _inputs(state: Path) -> prerequisites.CandidateInputs:
     )
 
 
-def _write_candidates(out_dir: Path, snapshot_repo: Path) -> None:
+def _write_candidates(
+    out_dir: Path, snapshot_repo: Path, *, state: Path | None = None
+) -> None:
+    """Five configs bound to ``snapshot_repo``; with ``state`` also the metadata
+    recording that state's site inputs, which reuse requires since 2026-09-30."""
+
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = str(snapshot_repo / "dist" / "current-release.json")
     for key, name in prerequisites.CONFIG_FILES.items():
         (out_dir / name).write_text(
             json.dumps({"release": {"manifest": manifest}, "k": key})
+        )
+    if state is not None:
+        prerequisites.write_candidate_metadata(
+            out_dir, out_dir, site=prerequisites.site_inputs(state)
         )
 
 
@@ -126,7 +135,7 @@ def test_ensure_reuses_bound_candidates_without_building(tmp_path):
     state = _state_dir(tmp_path)
     live = prerequisites.live_snapshot_repository(state)
     out = tmp_path / "boot020-releases"
-    _write_candidates(out, live)
+    _write_candidates(out, live, state=state)
     calls: list[str] = []
     record = prerequisites.ensure_release_candidates(
         state,
@@ -263,6 +272,7 @@ def test_plan_mode_records_a_pending_build_instead_of_building(tmp_path):
     _write_candidates(
         state / prerequisites.CANDIDATES_DIR_NAME,
         prerequisites.live_snapshot_repository(state),
+        state=state,
     )
     configs, record = prerequisites.resolve_release_configs(arguments)
     assert record["action"] == "reused", record
