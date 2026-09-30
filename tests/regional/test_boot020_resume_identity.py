@@ -18,15 +18,15 @@ from typing import Any
 
 import pytest
 
-from scripts.e2e.regional import boot020_evidence as evidence
-from scripts.e2e.regional import boot020_release_prerequisites as prerequisites
-from scripts.e2e.regional import run_boot020_release_rolling as boot020
-from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 from gpu_fault.admin.config import (
     AdminConfig,
     default_admin_config,
     persist_desired_admin_config,
 )
+from scripts.e2e.regional import boot020_evidence as evidence
+from scripts.e2e.regional import boot020_release_prerequisites as prerequisites
+from scripts.e2e.regional import run_boot020_release_rolling as boot020
+from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 RUNTIME = "1.dkr.ecr.us-west-2.amazonaws.com/gpu-fault/runtime-abc@sha256:" + "0" * 64

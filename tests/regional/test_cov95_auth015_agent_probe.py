@@ -9,7 +9,6 @@ from tests.regional._cov95_auth015_live import API_TOKEN
 from tests.regional._cov95_auth015_support import KEY_A, agent
 from tests.regional._cov95_identity_support import offline_guard as offline_guard
 
-
 ARGUMENTS = ["cluster-a", "node-a", "node-b", "release-a", "a" * 64, "b" * 64]
 
 

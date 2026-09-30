@@ -29,7 +29,6 @@ from tests._builders import asgi_client, build_context
 from tests.regional._cov95_identity_support import offline_guard as offline_guard
 from tests.regional._regional_support import TOKEN_A, TOKEN_B, registration
 
-
 # The release pins a CPU Pod exports; the AUTH-008 probe binds its receipt to
 # these because CPU Pods carry no GPU_FAULT_RELEASE_ID.
 RELEASE_PINS = {
