@@ -347,6 +347,7 @@ def test_real_capacity_retry_stops_without_executing_unproven_recovery(
         tmp_path,
         lambda: value.probe_control(probe, "/__cap__/release", {"tag": "behavior"}),
         poll_seconds=0.001,
+        executor_pins=value.executor_pins,
     )
     statuses = [503] * 5 if failure == "retry-exhaustion" else [503, 200]
     assert [item["status"] for item in proof["attempts"]] == statuses, (

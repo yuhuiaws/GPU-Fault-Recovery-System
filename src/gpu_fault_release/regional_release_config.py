@@ -21,6 +21,7 @@ DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+# SES v2 configuration set names: letters, digits, hyphens and underscores.
 SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
@@ -101,13 +102,15 @@ def email_subject_prefix(value: object, field: str) -> str:
 
 
 def ses_configuration_set(value: object, field: str) -> str | None:
+    """The optional SES v2 configuration set name; ``None`` when not declared."""
+
     if value is None:
         return None
     normalized = value.strip() if isinstance(value, str) else ""
     if not SES_CONFIGURATION_SET_PATTERN.fullmatch(normalized):
         raise ReleaseError(
-            f"{field} must be an SES configuration set name: "
-            "1-64 letters, digits, hyphens or underscores"
+            f"{field} must be an SES configuration set name: 1-64 letters, "
+            "digits, hyphens or underscores"
         )
     return normalized
 
@@ -348,7 +351,8 @@ class RegionalNotificationConfig:
     the key existed carries an ``email_sender`` and stays on ``ses``, so a
     rollback onto such a record keeps the channel it shipped with; anything
     else is ``sns``. On ``sns`` only ``admin_email`` is required.
-    An absent ``ses_configuration_set`` preserves the legacy notification digest.
+    ``ses_configuration_set`` is ``None`` for a record written before the
+    field existed, so such a record's notification digest does not move.
     """
 
     allow_email: bool = False
@@ -667,7 +671,11 @@ def load_release_artifacts(
                 Path(str(node_component.get("wheel") or manifest["wheel"])),
                 Path(str(manifest["bundle"])),
             ),
-            # In-process callers can run from a different checkout than the site.
+            # Relative to the root that built the manifest -- the site's source
+            # snapshot -- not to this engine's own checkout: join-cluster runs
+            # the engine in-process from the operator's tree, and its verify
+            # step could not find dist/<release-id>/ there (live 2026-09-15:
+            # the join rolled back after a successful release).
             base=containing_repository_root(manifest_path) or ROOT,
         )
         _require_artifact_files((wheel, executor_wheel, node_wheel, bundle))
@@ -1166,7 +1174,17 @@ def resolve_release_image(
     environment_name: str,
     legacy_default: str,
 ) -> str:
-    """Resolve a release image without allowing the environment to change its pin."""
+    """Resolve a release image without letting the environment move its pin.
+
+    Schema v3 manifests lock every image by digest. An environment override
+    with the same digest under another reference is kept; one with another
+    digest is refused here, when the release is built, naming both references.
+    The one mode that reads no image, ``drain-cluster``, never resolves one: it
+    runs through ``rollout.RegistryDrainContext`` (``IMAGE_LOCK_EXEMPT_MODES``),
+    so an uninstall whose checkout names a digest other than the deployed pin
+    still drains. Live 2026-09-15 (main line): such an uninstall died at
+    CLUSTERS_DRAINING on this comparison.
+    """
 
     configured = os.getenv(environment_name, "").strip()
     image = configured or legacy_default
@@ -1185,7 +1203,9 @@ def resolve_release_image(
         elif not configured.endswith("@" + locked.rsplit("@", 1)[-1]):
             raise ReleaseError(
                 f"{environment_name} does not match the schema "
-                f"v{config.release_manifest_schema_version} image lock"
+                f"v{config.release_manifest_schema_version} image lock "
+                f"(configured {configured}, locked {locked}); run the site's "
+                "bound CLI, or deploy this release first"
             )
     if not image or any(character.isspace() or character == "#" for character in image):
         raise ReleaseError(

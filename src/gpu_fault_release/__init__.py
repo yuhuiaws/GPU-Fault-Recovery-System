@@ -39,10 +39,15 @@ def _is_repository(path: Path) -> bool:
 
 
 def containing_repository_root(path: Path) -> Path | None:
-    """Locate the canonical source tree containing a manifest or other path.
+    """The checkout or source snapshot ``path`` lies in, or None.
 
-    Require the rollout entrypoint, as site loading does, not just directory
-    names. This locates inputs; it does not authenticate a release.
+    A release manifest names its wheels and bundle relative to the root that
+    built them (``dist/<release-id>/...`` under the snapshot the site was
+    deployed from). A reader running from another checkout -- the admin CLI
+    joining a cluster in-process from the operator's tree -- must resolve them
+    against the manifest's root, not its own. Require the rollout entrypoint,
+    as site loading does, not just directory names. This locates inputs; it
+    does not authenticate a release.
     """
 
     path = path.resolve()

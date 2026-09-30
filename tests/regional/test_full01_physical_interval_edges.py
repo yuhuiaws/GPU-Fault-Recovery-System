@@ -21,6 +21,7 @@ from tests.regional.test_acceptance_physical_interval_alignment import (
     BASE,
     SECOND,
     interval_fixture,
+    quoted,
     trace_process,
 )
 
@@ -93,6 +94,47 @@ def test_completed_query_must_precede_a_real_reset_interval(defect: str) -> None
         )
     with pytest.raises(BoundaryDenied, match="no completed query calibration"):
         probe.reset_events(raw, executable=executable, gpu_uuid="GPU-a")
+
+
+def test_a_query_killed_on_its_timeout_neither_calibrates_nor_hides_the_reset() -> None:
+    """The live shape: a compute-client query SIGKILLed by the Agent's timeout
+    while the reset exec was entering, leaving strace a ``???(`` entry."""
+    executable = Path("/unit/nvidia-smi")
+
+    def stamp(seconds: int) -> str:
+        return f"{BASE // SECOND + seconds}.000000000"
+
+    def entry(args: tuple[str, ...]) -> str:
+        encoded = ", ".join(quoted(item) for item in args)
+        return f"execve({quoted(str(executable))}, [{encoded}], NULL"
+
+    query = entry(("nvidia-smi", *probe.QUERY_ARGS))
+    reset = entry(("nvidia-smi", "--gpu-reset", "-i", "GPU-a"))
+    raw = trace_process(
+        100, 1, 2, ("nvidia-smi", *probe.QUERY_ARGS), executable=str(executable)
+    )
+    raw += (
+        f"102 {stamp(3)} {query}) = 0\n"
+        f"101 {stamp(4)} {reset} <unfinished ...>\n"
+        f"102 {stamp(4)} ???( <unfinished ...>\n"
+        f"101 {stamp(4)} <... execve resumed>) = 0\n"
+        f"102 {stamp(5)} +++ killed by SIGKILL +++\n"
+        f"101 {stamp(9)} +++ exited with 0 +++\n"
+    ).encode()
+    actions, calibration = probe.reset_events(
+        raw, executable=executable, gpu_uuid="GPU-a"
+    )
+    assert calibration == 1
+    assert [
+        (item["pid"], item["started_ns"], item["ended_ns"], item["returncode"])
+        for item in actions
+    ] == [(101, BASE + 4 * SECOND, BASE + 9 * SECOND, 0)]
+    with pytest.raises(BoundaryDenied, match="terminal record"):
+        probe.reset_events(
+            raw.replace(f"102 {stamp(5)} +++ killed by SIGKILL +++\n".encode(), b""),
+            executable=executable,
+            gpu_uuid="GPU-a",
+        )
 
 
 def test_foreign_executable_is_refused_by_the_real_action_parser() -> None:

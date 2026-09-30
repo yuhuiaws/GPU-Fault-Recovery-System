@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gpu_fault.fleet_pins import CONFIG_MAP_KEY_ENVIRONMENT, DEFAULT_CONFIG_MAP
 from gpu_fault.models import WorkflowOperation
 from scripts.e2e.regional.regional_live_fixture import component_python
 
@@ -77,17 +78,31 @@ TERMINAL = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 CLAIM_ERROR_SAMPLE_LIMIT = 20
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
-AGENT_IDENTITY_ENV_KEYS = (
+# Fleet pins the control plane serves from the ``gpu-fault-release-metadata``
+# ConfigMap (``gpu_fault.fleet_pins.FleetPinRuntime`` polls it and hot-reloads
+# the snapshot). The runner reads them from the same ConfigMap through the
+# product's own key<->environment table.
+RELEASE_PIN_CONFIGMAP = DEFAULT_CONFIG_MAP
+ENVIRONMENT_CONFIG_MAP_KEY = {
+    environment: key for key, environment in CONFIG_MAP_KEY_ENVIRONMENT.items()
+}
+AGENT_IDENTITY_PIN_KEYS = (
     "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION",
     "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION",
-    "GPU_FAULT_REQUIRED_AGENT_VERSION",
     "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
     "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+    "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST",
+)
+# Start-up configuration: literal ``value`` env on the api-ha Deployment, never
+# hot-reloaded, so the running Pod's environment is exactly what the product
+# uses for them.
+AGENT_IDENTITY_STARTUP_KEYS = (
+    "GPU_FAULT_REQUIRED_AGENT_VERSION",
     "GPU_FAULT_REQUIRED_POLICY_VERSION",
     "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION",
-    "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST",
     "GPU_FAULT_ALLOWED_OPERATIONS",
 )
+AGENT_IDENTITY_ENV_KEYS = (*AGENT_IDENTITY_PIN_KEYS, *AGENT_IDENTITY_STARTUP_KEYS)
 EXECUTOR_IDENTITY_ENV_KEYS = (
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION",
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
@@ -273,7 +288,55 @@ def _release_state() -> dict[str, object]:
     return state
 
 
+def _release_pins(keys: tuple[str, ...]) -> dict[str, str]:
+    """Read fleet pins from the ConfigMap the product serves them from.
+
+    Since the fleet-pin hot reload, ``gpu-fault-release-metadata`` is the single
+    system of record: ``FleetPinRuntime`` polls it and the control plane serves
+    whatever it holds. A Pod's environment is only the ``configMapKeyRef``
+    snapshot the kubelet resolved at container start, so a data-plane-only
+    release that re-published the pins without rolling the api-ha Pods leaves
+    that env stale while the product is consistent (live 2026-09-21: Pod env
+    ARTIFACT_SHA256=edb7047b..., ConfigMap, release state and executor
+    Deployment all 8036f771...). Pins must therefore never be read from a Pod.
+    """
+    document = json.loads(
+        control("get", "configmap", RELEASE_PIN_CONFIGMAP, "-o", "json")
+    )
+    data = document.get("data") if isinstance(document, dict) else None
+    if not isinstance(data, dict):
+        data = {}
+    values: dict[str, str] = {}
+    for key in keys:
+        configmap_key = ENVIRONMENT_CONFIG_MAP_KEY.get(key)
+        if configmap_key is None:
+            raise RuntimeError(
+                f"{key} is not a fleet pin published through {RELEASE_PIN_CONFIGMAP}"
+            )
+        values[key] = str(data.get(configmap_key) or "").strip()
+    missing = [key for key in keys if not values[key]]
+    if missing:
+        raise RuntimeError(
+            f"control-plane release pin ConfigMap {RELEASE_PIN_CONFIGMAP} is "
+            "incomplete: " + ", ".join(sorted(missing))
+        )
+    return values
+
+
 def _control_environment(keys: tuple[str, ...]) -> dict[str, str]:
+    """Read start-up configuration from a running api-ha Pod.
+
+    Only for values the Deployment sets as literal env (agent version, policy
+    and profile versions, allowed operations): those are not hot-reloaded, so
+    the Pod is what the product runs with. Fleet pins are refused here; see
+    ``_release_pins`` for why the Pod environment is stale for them.
+    """
+    pins = sorted(key for key in keys if key in ENVIRONMENT_CONFIG_MAP_KEY)
+    if pins:
+        raise RuntimeError(
+            "fleet pins must be read from the release ConfigMap, not a Pod: "
+            + ", ".join(pins)
+        )
     pod = control(
         "get",
         "pod",
@@ -346,7 +409,10 @@ def _verify_environment_pins(
 
 def release_agent_identity() -> dict[str, object]:
     state = _release_state()
-    environment = _control_environment(AGENT_IDENTITY_ENV_KEYS)
+    environment = {
+        **_release_pins(AGENT_IDENTITY_PIN_KEYS),
+        **_control_environment(AGENT_IDENTITY_STARTUP_KEYS),
+    }
     protocol = _state_value(state, "agent_protocol_version")
     artifact = _state_value(state, "node_wheel_sha256")
     compatibility = _component_digest(state, "node_runtime")
@@ -395,7 +461,7 @@ def executor_identity(
     expected_protocol = _state_value(state, "executor_protocol_version")
     expected_artifact = _state_value(state, "executor_wheel_sha256")
     expected_compatibility = _component_digest(state, "executor")
-    environment = _control_environment(EXECUTOR_IDENTITY_ENV_KEYS)
+    environment = _release_pins(EXECUTOR_IDENTITY_ENV_KEYS)
     _verify_environment_pins(
         environment,
         {

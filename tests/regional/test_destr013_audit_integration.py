@@ -181,19 +181,37 @@ class LocalAudit:
                 "annotations": {"eks.amazonaws.com/role-arn": ROLE},
             }
         }
+        # The fleet pins as the product serves them: ``gpu-fault-release-metadata``
+        # in the ``kubectl get configmap -o json`` shape. The api-ha Pods only
+        # hold the kubelet's start-time snapshot of these, so the fixture never
+        # puts the REQUIRED_REGIONAL_EXECUTOR_* values on a cpu Pod.
+        self.pins = {
+            "required-agent-artifact-sha256": "1" * 64,
+            "required-agent-compatibility-digest": "2" * 64,
+            "required-agent-config-digest": "3" * 64,
+            "required-agent-protocol-version": "4",
+            "required-node-action-key-version": "2",
+            "required-regional-executor-protocol-version": "4",
+            "required-regional-executor-artifact-sha256": "d" * 64,
+            "required-regional-executor-compatibility-digest": "b" * 64,
+            "compatible-regional-executor-artifact-sha256s": "",
+            "compatible-regional-executor-compatibility-digests": "",
+            "compatible-regional-executor-protocol-versions": "",
+        }
+        self.state["executor_protocol_version"] = 4
         self.environments = {}
         for plane, container in (("cpu", "api"), ("gpu", "executor")):
             for index in range(3):
                 pod = f"{container}-{index}"
                 self.environments[pod] = {
                     "pod": pod,
-                    "executor_artifact": "d" * 64,
-                    "executor_compatibility": "b" * 64,
                     "module_digest": "a" * 64 if plane == "cpu" else "b" * 64,
                     **(
                         {"synthetic_route": None}
                         if plane == "cpu"
                         else {
+                            "executor_artifact": "d" * 64,
+                            "executor_compatibility": "b" * 64,
                             "allow_replace": "false",
                             "allow_reboot": "true",
                             "allow_automatic": None,
@@ -348,6 +366,18 @@ class LocalAudit:
                 value = {"metadata": {"uid": "gpu-kube-system-uid"}}
             elif operation[:2] == ["get", "serviceaccount"]:
                 value = self.service_account
+            elif operation[:3] == ["get", "configmap", "gpu-fault-release-metadata"]:
+                assert operation[3:] == ["-o", "json"], operation
+                value = {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "gpu-fault-release-metadata",
+                        "namespace": "gpu-fault-system",
+                        "resourceVersion": "48517395",
+                    },
+                    "data": self.pins,
+                }
             elif operation[:2] == ["get", "configmap"]:
                 value = {"data": {"state.json": json.dumps(self.state)}}
             elif operation[:2] == ["exec", "-i"]:
@@ -908,3 +938,114 @@ def test_readonly_environment_probe_reports_only_identity_and_switches(
         assert not calls and "synthetic_route" in value, (
             "the API probe reads no AWS credentials"
         )
+
+
+def test_stale_api_pod_environment_passes_when_configmap_pins_match(
+    local_audit: LocalAudit,
+) -> None:
+    # Live: api-ha Pods started before a data-plane-only release re-published
+    # the executor pins. The kubelet resolved the configMapKeyRef env once at
+    # container start, so the Pod env still carried the previous artifact
+    # digest while the ConfigMap, the release state and the executor
+    # Deployment all agreed. That is a consistent product, not drift.
+    for index in range(3):
+        local_audit.environments[f"api-{index}"].update(
+            executor_artifact="e" * 64, executor_compatibility="f" * 64
+        )
+    code, result = local_audit.run()
+    assert code == 0 and result["verdict"] == "PASS", result
+    pin_reads = [
+        command
+        for command, _ in local_audit.calls
+        if command[0] == "kubectl"
+        and command[command.index("-n") + 2 :]
+        == ["get", "configmap", binding.RELEASE_PIN_CONFIGMAP, "-o", "json"]
+    ]
+    assert len(pin_reads) == 2, "both snapshots read the pins the product serves"
+    assert all(
+        command[command.index("--kubeconfig") + 1] == str(local_audit.cpu_config)
+        for command in pin_reads
+    ), "the release pin ConfigMap lives on the control plane"
+    cpu_probes = [
+        kwargs["input_text"]
+        for command, kwargs in local_audit.calls
+        if command[0] == "kubectl"
+        and "exec" in command
+        and command[command.index("-c") + 1] == "api"
+        and kwargs["input_text"] != binding.REGISTRY_PROBE
+    ]
+    assert len(cpu_probes) == 6, cpu_probes
+    assert not any("REQUIRED_REGIONAL_EXECUTOR" in probe for probe in cpu_probes), (
+        "fleet pins are never read from a Pod's start-time environment snapshot"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "required-regional-executor-artifact-sha256",
+        "required-regional-executor-compatibility-digest",
+        "required-regional-executor-protocol-version",
+    ],
+)
+def test_configmap_executor_pin_drift_fails_naming_the_configmap(
+    local_audit: LocalAudit, key: str
+) -> None:
+    local_audit.pins[key] = "9" if key.endswith("version") else "e" * 64
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert binding.RELEASE_PIN_CONFIGMAP in result["error"], result
+    assert "does not match the deployed release pins" in result["error"], result
+    assert not local_audit.iam_calls(), "drifted pins must not reach IAM simulation"
+
+
+@pytest.mark.parametrize("defect", ["missing", "empty", "blank", "no-data"])
+def test_incomplete_release_pin_configmap_is_refused(
+    local_audit: LocalAudit, defect: str
+) -> None:
+    key = "required-regional-executor-compatibility-digest"
+    if defect == "missing":
+        del local_audit.pins[key]
+    elif defect == "empty":
+        local_audit.pins[key] = ""
+    elif defect == "blank":
+        local_audit.pins[key] = "   "
+    else:
+        local_audit.pins = None
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert binding.RELEASE_PIN_CONFIGMAP in result["error"], result
+    assert "incomplete" in result["error"], result
+    assert not local_audit.iam_calls(), "incomplete pins must not reach IAM simulation"
+
+
+def test_executor_pod_own_identity_is_still_read_from_the_pod(
+    local_audit: LocalAudit,
+) -> None:
+    # GPU_FAULT_EXECUTOR_ARTIFACT_SHA256 is a literal value on the executor
+    # Deployment (the replica's own identity), not a fleet pin, so the running
+    # Pod is exactly what the product runs with.
+    local_audit.environments["executor-1"]["executor_compatibility"] = "f" * 64
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert (
+        "target gpu replica does not match the deployed release pins"
+        in (result["error"])
+    ), result
+
+
+def test_release_pin_table_is_the_product_fleet_pin_table() -> None:
+    from gpu_fault import fleet_pins
+
+    assert binding.RELEASE_PIN_CONFIGMAP == fleet_pins.DEFAULT_CONFIG_MAP
+    assert set(binding.EXECUTOR_PIN_ENVIRONMENT.values()) <= (
+        fleet_pins.PIN_ENVIRONMENT_NAMES
+    )
+    assert binding.EXECUTOR_PIN_CONFIG_MAP_KEYS == {
+        field: next(
+            key
+            for key, environment in fleet_pins.CONFIG_MAP_KEY_ENVIRONMENT.items()
+            if environment == name
+        )
+        for field, name in binding.EXECUTOR_PIN_ENVIRONMENT.items()
+    }

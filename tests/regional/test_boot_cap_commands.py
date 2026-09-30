@@ -121,20 +121,34 @@ def cap005_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[st
         cap005, "_drop_database", lambda _url, name: dropped.append(name)
     )
     monkeypatch.setattr(cap005, "_database_exists", lambda *_a: False)
-    identity = pytest_result_identity.source_identity(cap005.ROOT)
+    checkout = cap005.ROOT
+    identity = pytest_result_identity.source_identity(checkout)
+    # The temporary working directory models the runner's own checkout; the
+    # receipt verifier itself is real.
+    monkeypatch.setattr(cap005, "ROOT", tmp_path)
 
     def mock_source_identity(root: Path) -> str:
         assert root == tmp_path, "CAP005 must bind its supplied mock working directory"
         return identity
 
-    # The temporary working directory models a checkout; the verifier itself is real.
     monkeypatch.setattr(pytest_result_identity, "source_identity", mock_source_identity)
     state: dict[str, Any] = {
         "commands": [],
         "created": created,
         "dropped": dropped,
         "receipt": "complete",
+        "shards": [],
     }
+
+    def shards(workdir: Path, _report_dir: Path, workers: int) -> dict[str, Any]:
+        # The PostgreSQL suite stage: owned PG16 instances through the shard
+        # launcher (exercised in test_cap005_parallel); here only its ordering
+        # relative to the supervised contract child matters.
+        assert workdir == tmp_path, "shards run in the runner's checkout"
+        state["shards"].append(workers)
+        return {"source_identity": identity, "workers": workers, "executed_tests": 2}
+
+    monkeypatch.setattr(cap005, "run_sharded_postgres", shards)
 
     def run(command: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         environment = kwargs["environment"]
@@ -154,7 +168,7 @@ def cap005_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[st
             write_focused_receipt(
                 command,
                 environment=environment,
-                cwd=cap005.ROOT,
+                cwd=checkout,
                 nodeids=[
                     "tests/store/test_store_contracts.py::test_store_classes_cover_application_protocol",
                     "tests/store/test_store_contracts.py::test_processor_queue_contract[postgres]",
@@ -182,8 +196,10 @@ def test_cap005_pytest_children_are_supervised(
         result,
     )
     commands = cap005_transport["commands"]
-    assert len(commands) == 2, "stress and Store contract must both run"
-    assert "PYTEST_XDIST_WORKERS=0" in commands[0]["command"], (
+    assert cap005_transport["shards"] == [1] and len(commands) == 1, (
+        "the owned-shard stage and then the Store contract child must both run"
+    )
+    assert commands[0]["command"][commands[0]["command"].index("-n") + 1] == "0", (
         "this runner must not use shared PG xdist"
     )
     assert result["exit_codes"]["contract"] == 0, (
@@ -204,8 +220,8 @@ def test_cap005_refuses_missing_or_failed_child_receipts(
         "the real receipt verifier must reject missing or failed evidence despite exit zero",
         result,
     )
-    assert len(cap005_transport["commands"]) == 2, (
-        "receipt refusal must not retry either supervised suite"
+    assert len(cap005_transport["commands"]) == 1, (
+        "receipt refusal must not retry the supervised contract child"
     )
     assert cap005_transport["created"] == cap005_transport["dropped"], (
         "receipt failure must preserve cleanup of the generated fake database"
@@ -221,7 +237,7 @@ def test_cap005_contract_child_receives_explicit_report_and_isolated_database(
         "a complete receipt must reach the caller before testing its output handoff",
         result,
     )
-    _, contract = cap005_transport["commands"]
+    (contract,) = cap005_transport["commands"]
     if handoff == "junit":
         assert contract["junit"] is not None, (
             "the direct pytest child needs an explicit JUnit output argument; "
@@ -276,8 +292,8 @@ def test_cap005_clears_inherited_selection_and_authority_for_both_child_types(
     result = cap005.run_suite("postgresql://localhost:55432/postgres", tmp_path)
 
     assert result["status"] == "PASS", result
-    assert len(cap005_transport["commands"]) == 2, (
-        "both supervised child paths must be inspected"
+    assert len(cap005_transport["commands"]) == 1, (
+        "the supervised contract child must be inspected"
     )
     for child in cap005_transport["commands"]:
         environment = child["environment"]
@@ -304,14 +320,7 @@ def test_cap005_clears_inherited_selection_and_authority_for_both_child_types(
             environment.get("PYTEST_GPU_FAULT_CASE_REPORT")
             != inherited["PYTEST_GPU_FAULT_CASE_REPORT"]
         ), "the previous report must not be reused by either child"
-    stress, contract = cap005_transport["commands"]
-    options = shlex.split(stress["environment"]["PYTEST_ADDOPTS"])
-    assert options == [f"--junitxml={stress['junit']}", "--durations=20", "-n", "0"], (
-        "make must receive only CAP005's explicit report and serial options"
-    )
-    assert "PYTEST_GPU_FAULT_CASE_REPORT" not in stress["environment"], (
-        "make must not inherit another pytest session's report identifier"
-    )
+    (contract,) = cap005_transport["commands"]
     assert "PYTEST_ADDOPTS" not in contract["environment"], (
         "the direct child must carry its reporting options in argv"
     )

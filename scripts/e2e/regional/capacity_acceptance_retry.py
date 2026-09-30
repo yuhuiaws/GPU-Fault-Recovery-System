@@ -7,13 +7,20 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault.cluster_executor import ClusterActionExecutor, ClusterExecutorError
-from scripts.e2e.regional.capacity_wire import CapacityWireClient
+from scripts.e2e.regional.capacity_wire import CapacityWireClient, ExecutorPins
 from scripts.e2e.regional.probes.cap004_commands import CLUSTER_ID
 
 
 class RetryingClaimClient(CapacityWireClient):
-    def __init__(self, url: str, token: str, release_hold: Callable[[], None]) -> None:
-        super().__init__(url, token, cluster_id=CLUSTER_ID)
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        release_hold: Callable[[], None],
+        *,
+        executor_pins: ExecutorPins | None = None,
+    ) -> None:
+        super().__init__(url, token, cluster_id=CLUSTER_ID, executor_pins=executor_pins)
         self.release_hold = release_hold
         self.stop: Callable[[str], None] = lambda _reason: None
         self.attempts: list[dict[str, Any]] = []
@@ -51,8 +58,9 @@ def run_claim_retry_proof(
     release_hold: Callable[[], None],
     *,
     poll_seconds: float = 2,
+    executor_pins: ExecutorPins | None = None,
 ) -> dict[str, Any]:
-    client = RetryingClaimClient(url, token, release_hold)
+    client = RetryingClaimClient(url, token, release_hold, executor_pins=executor_pins)
     executor = ClusterActionExecutor(
         client,
         [],

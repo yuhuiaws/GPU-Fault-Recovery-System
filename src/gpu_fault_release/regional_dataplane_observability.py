@@ -101,7 +101,9 @@ from gpu_fault_release.regional_release_rendering import (
     dataplane_adot_skip_reason,
 )
 
-# Installed deploy-host copies use the bound site's source snapshot for assets.
+# The checkout or source snapshot this engine copy runs from -- resolved like
+# every other engine module, so an installed (bound) deploy-host CLI finds the
+# installer and manifest under the site's snapshot, not under site-packages.
 ROOT = repository_root()
 AMP_MONITORING_INSTALLER = ROOT / "deploy/observability/install-amp-monitoring.sh"
 #: The rule-groups namespace the rendered per-cluster rules live in. Separate

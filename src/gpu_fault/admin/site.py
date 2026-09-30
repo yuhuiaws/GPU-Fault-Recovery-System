@@ -28,6 +28,7 @@ AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 OCI_IMAGE_PATTERN = re.compile(r"^[^\s#]+$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+# SES v2 configuration set names: letters, digits, hyphens and underscores.
 SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -772,7 +773,9 @@ class NotificationSiteConfig:
     ``channel: sns``). On ``sns`` only ``adminEmail`` is required, and naming
     one implies ``allowEmail``; a leftover ``emailSender``/``emailRecipients``
     is carried but not required, so flipping a live site edits one key.
-    ``sesConfigurationSet`` is optional and retained, unused, on ``sns``.
+    ``sesConfigurationSet`` names the SES v2 configuration set the ``ses``
+    channel sends through (``GPU_FAULT_SES_CONFIGURATION_SET`` on every role);
+    like a leftover sender it is carried, unused, on ``sns``.
     """
 
     allow_email: bool = False

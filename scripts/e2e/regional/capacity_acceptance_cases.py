@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
-from gpu_fault.cluster_executor import RegionalExecutorClient, ClusterExecutorError
+from gpu_fault.cluster_executor import ClusterExecutorError
 from scripts.e2e.regional.capacity_acceptance_base import (
     CapError,
     CapHarnessBase,
@@ -36,6 +36,13 @@ CAP001_A_QUEUE_CAP = 20
 CAP001_QUEUE_SLACK = 5
 CAP001_BASELINE_REQUESTS = 15
 CAP001_STORM_B_REQUESTS = 60
+# The storm client keeps every connection alive for the whole minute and
+# retires idle ones itself, before the probe's uvicorn does (its keep-alive is
+# 5 s): a request racing the server's close is reset inside the Pod, and one
+# pod-side stream error makes kubectl port-forward drop the whole tunnel.
+CAP001_CLIENT_LIMITS = httpx.Limits(
+    max_connections=100, max_keepalive_connections=100, keepalive_expiry=2.0
+)
 # CAP-002: the probe runs GPU_FAULT_STORE_IO_MAX_IN_FLIGHT=4 and the alert
 # fires above 0.9, so every one of the four slots must be held; three left the
 # ratio at 0.75 and the alert could never fire.
@@ -325,6 +332,33 @@ def cap003_recommendations(
     }
 
 
+def cap002_claim(
+    harness: CapHarnessBase, probe: Any, index: int, phase: str
+) -> dict[str, Any]:
+    """One raw claim from synthetic cluster ``index``, timed, pins included."""
+
+    begin = time.perf_counter()
+    with httpx.Client(base_url=probe.url, timeout=30) as client:
+        response = client.post(
+            "/v1/regional/executors/claim",
+            headers=harness.cluster_headers(
+                f"cap-cluster-{index:03d}", harness.tokens[index]
+            ),
+            json={
+                "executor_id": f"cap002-{phase}-{index:03d}",
+                **harness.claim_identity(),
+                "execution_owners": ["gpu-fault-kubernetes-adapter"],
+                "max_commands": 1,
+                "lease_seconds": 10,
+            },
+        )
+    return {
+        "status": response.status_code,
+        "retry_after": response.headers.get("Retry-After"),
+        "latency_seconds": time.perf_counter() - begin,
+    }
+
+
 class CapacityAcceptanceCases(CapHarnessBase):
     def case_001(self) -> dict[str, Any]:
         probe = self.deploy_probe(
@@ -348,7 +382,9 @@ class CapacityAcceptanceCases(CapHarnessBase):
             args=(self, probe, monitor_stop, maxima, metrics_samples, metric_errors),
             daemon=True,
         )
-        client = httpx.Client(base_url=probe.url, timeout=20)
+        client = httpx.Client(
+            base_url=probe.url, timeout=20, limits=CAP001_CLIENT_LIMITS
+        )
         send = partial(cap001_send, self, client)
 
         drained = False
@@ -401,6 +437,10 @@ class CapacityAcceptanceCases(CapHarnessBase):
             monitor_thread.join()
             client.close()
         write_json(case_dir / "metrics-samples.json", metrics_samples)
+        # The Pod's restart count, container states, events and log tail while
+        # the probe still exists; cleanup below deletes the Deployment.
+        probe_state = self.probe_pod_report(probe)
+        write_json(case_dir / "probe-state.json", probe_state)
 
         by_cluster = {
             cluster: [item for item in responses if item["cluster"] == cluster]
@@ -456,6 +496,8 @@ class CapacityAcceptanceCases(CapHarnessBase):
             "transport_retries": sum(
                 int(item.get("transport_retries", 0)) for item in responses
             ),
+            "probe_restart_count": (probe_state.get("pod") or {}).get("restart_count"),
+            "port_forward_incidents": len(self.transport_incidents),
         }
         failures = cap001_failures(result)
         result["failures"] = failures
@@ -467,27 +509,6 @@ class CapacityAcceptanceCases(CapHarnessBase):
             raise CapError("GF-REGIONAL-CAP-001 failed: " + "; ".join(failures))
         return result
 
-    def _cap002_claim(self, probe: Any, index: int, phase: str) -> dict[str, Any]:
-        begin = time.perf_counter()
-        with httpx.Client(base_url=probe.url, timeout=30) as client:
-            response = client.post(
-                "/v1/regional/executors/claim",
-                headers=self.cluster_headers(
-                    f"cap-cluster-{index:03d}", self.tokens[index]
-                ),
-                json={
-                    "executor_id": f"cap002-{phase}-{index:03d}",
-                    "execution_owners": ["gpu-fault-kubernetes-adapter"],
-                    "max_commands": 1,
-                    "lease_seconds": 10,
-                },
-            )
-        return {
-            "status": response.status_code,
-            "retry_after": response.headers.get("Retry-After"),
-            "latency_seconds": time.perf_counter() - begin,
-        }
-
     def _cap002_behavior(self, probe: Any, case_dir: Any) -> dict[str, Any]:
         behavior_hold = self.probe_control(
             probe,
@@ -497,7 +518,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
         with ThreadPoolExecutor(max_workers=20) as pool:
             initial_results = list(
                 pool.map(
-                    lambda index: self._cap002_claim(probe, index, "behavior"),
+                    lambda index: cap002_claim(self, probe, index, "behavior"),
                     range(20),
                 )
             )
@@ -511,6 +532,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
                 self.tokens[0],
                 case_dir,
                 release_behavior_hold,
+                executor_pins=self.executor_pins,
             )
         finally:
             release_behavior_hold()
@@ -957,9 +979,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
         replicas = 2
         results = []
         # A first long poll starts the production hub's lazy LISTEN connection.
-        warmup = RegionalExecutorClient(
-            probe.url, "cap-cluster-000", self.tokens[0], timeout_seconds=15
-        )
+        warmup = self.executor_client(probe.url, 0)
         if warmup.claim(
             "cap003-warmup",
             max_commands=1,
@@ -986,12 +1006,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
 
             def poll(index: int) -> list[dict[str, Any]]:
                 cluster_index = index // replicas
-                client = RegionalExecutorClient(
-                    probe.url,
-                    f"cap-cluster-{cluster_index:03d}",
-                    self.tokens[cluster_index],
-                    timeout_seconds=15,
-                )
+                client = self.executor_client(probe.url, cluster_index)
                 samples = []
                 for _ in range(3):
                     begin = time.perf_counter()
@@ -1109,6 +1124,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
                             "executor_id": (
                                 f"cap003-{cluster_count}-{cluster_index:03d}"
                             ),
+                            **self.claim_identity(),
                             "execution_owners": ["gpu-fault-kubernetes-adapter"],
                             "max_commands": 1,
                             "lease_seconds": 10,
@@ -1215,6 +1231,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
                         self.tokens[0],
                         self.run_id,
                         case_dir,
+                        executor_pins=self.executor_pins,
                     )
                 )
             except Cap004ThreadsRunning:

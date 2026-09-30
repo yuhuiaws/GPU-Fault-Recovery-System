@@ -124,6 +124,15 @@ def cap001_send(
             transport_retries += 1
             status = f"transport-error:{type(exc).__name__}"
             if attempt < 2:
+                probe = getattr(harness, "active_probe", None)
+                if isinstance(exc, httpx.ConnectError) and probe is not None:
+                    # Nothing is listening on the local port: the kubectl
+                    # forward died. Re-establish it (or fail the case with the
+                    # Pod's diagnostics if the Pod itself restarted) before
+                    # the retry; a live forward makes this a no-op.
+                    harness.ensure_probe_transport(
+                        probe, reason=f"{phase} send: {exc!r}"
+                    )
                 time.sleep(0.05)
     return {
         "phase": phase,

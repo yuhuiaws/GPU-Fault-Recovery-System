@@ -1086,3 +1086,44 @@ def test_certificate_deletion_still_raises_on_any_other_failure(
                 "arn:aws:acm:us-east-1:123456789012:certificate/test",
             )
         )
+
+
+def test_a_fresh_session_over_a_prior_sessions_working_files_is_refused(
+    tmp_path, monkeypatch
+) -> None:
+    """A prior uninstall's working files (``kubernetes-cleanup.json`` still
+    CLEANUP_COMPLETED, a registry snapshot of the retired install) must never be
+    trusted by a later session of a since-redeployed site: doing so skipped the
+    real cleanup and then failed verification against resources the redeploy
+    recreated (live 2026-09-15 ``installed resource still exists:
+    cpu:cpu:deployment/gpu-fault-api-ha``). A completed uninstall is retired
+    whole (``retire_completed_site`` moves the ``uninstall/`` directory into the
+    ``retired-*`` archive on the next deploy), so a fresh session starts in an
+    empty directory; working files without their ``state.json`` journal are an
+    inconsistent transaction and the uninstall refuses before it reads them."""
+
+    harness = Harness(tmp_path, monkeypatch)
+    request = harness.request()
+    uninstall_dir = harness.site.source.parent / "uninstall"
+    uninstall_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cleanup_path = uninstall_dir / "kubernetes-cleanup.json"
+    stale = {"phase": "CLEANUP_COMPLETED", "status": "COMPLETED", "session": "PRIOR"}
+    cleanup_path.write_text(json.dumps(stale), encoding="utf-8")
+    before_path = uninstall_dir / "installation-resources-before.json"
+    before_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        admin_uninstall,
+        "_run_cleanup",
+        lambda *_args, **_kwargs: pytest.fail("cleanup ran over a stale session"),
+    )
+
+    with pytest.raises(BootstrapError, match="lack their original journal"):
+        admin_uninstall.uninstall(request, runner=harness)
+
+    assert not (uninstall_dir / "state.json").exists(), (
+        "the refused session must not open a journal beside the stale files"
+    )
+    assert json.loads(cleanup_path.read_text(encoding="utf-8")) == stale, (
+        "the stale record is evidence for the operator and must stay untouched"
+    )
+    assert harness.exports == 0, "the stale registry snapshot must not be re-read"

@@ -1240,7 +1240,11 @@ def test_cap005_uses_the_postgres_stress_runner_consistently() -> None:
 
     assert case["automation"] == "command"
     assert case["command"] == command
-    assert "make test-postgres-stress" in case["injection"]
+    assert "scripts/run_postgres_shards.py" in case["injection"], (
+        "CAP-005 runs the PostgreSQL suite on owned PG16 shards, never through "
+        "a Make target on the CI server"
+    )
+    assert "make test-postgres-stress" not in case["injection"]
     assert "8×40" in case["injection"]
     assert any("concurrency" in item and "2与4" in item for item in case["expected"]), (
         "CAP-005 must require real PostgreSQL completion concurrency at 2 and 4"
@@ -1253,9 +1257,12 @@ def test_cap005_uses_the_postgres_stress_runner_consistently() -> None:
 
     body = _regional_case_bodies()["GF-REGIONAL-CAP-005"]
     assert command[1] in body
-    assert "make test-postgres-stress" in body
+    assert "scripts/run_postgres_shards.py" in body
+    assert "make test-postgres-stress" not in body, (
+        "the spec must not describe a serial Make path the runner no longer has"
+    )
     assert "sys.executable" in body, (
-        "CAP-005 must document using the active project interpreter for both suites"
+        "CAP-005 must document using the active project interpreter for both stages"
     )
     assert "`2` 与 `4`" in body
 

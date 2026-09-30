@@ -1342,6 +1342,14 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return arguments
 
 
+# Registry-only modes: served by RegistryDrainContext, which never resolves an
+# image, so the schema v3 image lock cannot refuse them (an uninstall run from
+# a checkout ahead of the deployed release drains under a conflicting pin).
+# Every other mode builds RegionalRelease, whose construction enforces the
+# lock (regional_release_config.resolve_release_image) before any render.
+IMAGE_LOCK_EXEMPT_MODES = frozenset({"drain-cluster"})
+
+
 def _run_mode(arguments: argparse.Namespace) -> int:
     validate_cluster_arguments(arguments)
     config = ReleaseConfig.load(arguments.config)
@@ -1351,7 +1359,8 @@ def _run_mode(arguments: argparse.Namespace) -> int:
         config.cpu_kubeconfig, dry_run=arguments.dry_run
     ) as kubeconfigs:
         runner = Runner(dry_run=arguments.dry_run, kubeconfigs=kubeconfigs)
-        if arguments.mode == "drain-cluster":
+        if arguments.mode in IMAGE_LOCK_EXEMPT_MODES:
+            # drain-cluster: one registry publish, no image read, no render.
             drain_registry_clusters(
                 RegistryDrainContext(config, runner), arguments.cluster_ids
             )

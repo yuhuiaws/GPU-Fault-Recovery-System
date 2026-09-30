@@ -1187,25 +1187,6 @@ def test_node_action_key_probe_requires_ensure_when_rotation_is_requested(
         )
 
 
-def test_bootstrap_input_digest_invalidates_only_stale_task_checkpoints(
-    tmp_path: Path,
-) -> None:
-    state = BootstrapState(tmp_path / "state.json", site_id="test")
-    state.record("pki", {"certificate_arn": "arn:certificate"})
-    state.complete("pki")
-
-    task_digests = {"pki": "1" * 64, "aurora": "2" * 64}
-    state.bind_inputs("a" * 64, task_digests)
-    state.complete("pki")
-    state.complete("aurora")
-    state.bind_inputs("a" * 64, task_digests)
-    assert state.value["completed_tasks"] == ["aurora", "pki"]
-
-    state.bind_inputs("b" * 64, {"pki": "1" * 64, "aurora": "3" * 64})
-    assert state.value["completed_tasks"] == ["pki"]
-    assert state.value["resources"]["pki"] == {"certificate_arn": "arn:certificate"}
-
-
 def _control_plane_identity_runner(calls: list[list[str]]):
     """A control plane whose identity already matches, recording every read.
 

@@ -36,6 +36,7 @@ from scripts.e2e.regional.capacity_wire import (
     CapacityWireClient,
     CapacityWireError as Cap004Error,
     CapacityThreadsRunning as Cap004ThreadsRunning,
+    ExecutorPins,
 )
 from scripts.e2e.regional.capacity_queued_lease import run_queued_lease_proof
 from scripts.e2e.regional.probes.cap004_commands import (
@@ -54,13 +55,21 @@ MAX_CONCURRENCY = 5
 class Cap004WireClient(CapacityWireClient):
     """Keep the production wire protocol, scoped to the isolated API."""
 
-    def __init__(self, url: str, token: str) -> None:
-        super().__init__(url, token, cluster_id=CLUSTER_ID)
+    def __init__(
+        self, url: str, token: str, *, executor_pins: ExecutorPins | None = None
+    ) -> None:
+        super().__init__(url, token, cluster_id=CLUSTER_ID, executor_pins=executor_pins)
 
 
-def measure_bulk_api(url: str, token: str, run_id: str) -> dict[str, Any]:
+def measure_bulk_api(
+    url: str,
+    token: str,
+    run_id: str,
+    *,
+    executor_pins: ExecutorPins | None = None,
+) -> dict[str, Any]:
     """Measure 25-command API capacity without executing a queued batch of 25."""
-    client = Cap004WireClient(url, token)
+    client = Cap004WireClient(url, token, executor_pins=executor_pins)
     started = time.monotonic()
     claimed = client.claim(
         f"{run_id}-api-measurement",
@@ -76,7 +85,7 @@ def measure_bulk_api(url: str, token: str, run_id: str) -> dict[str, Any]:
         raise Cap004Error("CAP004 bulk API claim did not return exactly 25 commands")
     for item in claimed:
         require_owned(item, expected[item.command_id])
-    competitor = Cap004WireClient(url, token)
+    competitor = Cap004WireClient(url, token, executor_pins=executor_pins)
     if competitor.claim(
         f"{run_id}-competitor",
         execution_owners=[OWNER],
@@ -117,8 +126,15 @@ def measure_bulk_api(url: str, token: str, run_id: str) -> dict[str, Any]:
 class Cap004Client(Cap004WireClient):
     """Observe actual five-command execution batches and inject bounded failures."""
 
-    def __init__(self, url: str, token: str, run_id: str) -> None:
-        super().__init__(url, token)
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        run_id: str,
+        *,
+        executor_pins: ExecutorPins | None = None,
+    ) -> None:
+        super().__init__(url, token, executor_pins=executor_pins)
         self.expected = {item.command_id: item for item in commands_for_run(run_id)}
         self.failure_command_id = list(self.expected)[-1]
         self.lock = threading.Lock()
@@ -442,12 +458,18 @@ def run_executor_proof(
     minimum_hold_seconds: float = 12,
     action_timeout_seconds: float = 75,
     queue_timeout_seconds: float = 75,
+    executor_pins: ExecutorPins | None = None,
 ) -> dict[str, Any]:
-    bulk_api = measure_bulk_api(url, token, run_id)
+    bulk_api = measure_bulk_api(url, token, run_id, executor_pins=executor_pins)
     queued_lease = run_queued_lease_proof(
-        url, token, run_id, state_dir, timeout_seconds=queue_timeout_seconds
+        url,
+        token,
+        run_id,
+        state_dir,
+        timeout_seconds=queue_timeout_seconds,
+        executor_pins=executor_pins,
     )
-    client = Cap004Client(url, token, run_id)
+    client = Cap004Client(url, token, run_id, executor_pins=executor_pins)
     stop = threading.Event()
     adapter = NonphysicalLedgerAdapter(
         client,
@@ -519,7 +541,7 @@ def run_executor_proof(
             ) from join_error
         ledger = adapter.snapshot()
         adapter.close()
-    final_claim = Cap004WireClient(url, token).claim(
+    final_claim = Cap004WireClient(url, token, executor_pins=executor_pins).claim(
         f"{run_id}-final",
         execution_owners=[OWNER],
         max_commands=COMMAND_COUNT,

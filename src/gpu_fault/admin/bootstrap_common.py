@@ -414,14 +414,35 @@ class BootstrapState:
 
     def bind_inputs(
         self,
-        digest: str,
+        digest: str | None,
         task_digests: Mapping[str, str] | None = None,
         *,
-        partial: bool = False,
+        partial: bool | None = None,
     ) -> None:
+        """Drop the checkpoints whose inputs changed and record the new inputs.
+
+        A completed task stays completed only when its recorded digest equals
+        the digest bound now. Completion by this very process is no exemption:
+        a task that ran before its inputs were bound, or against a provisional
+        digest (the custody fingerprints include the candidate and settle only
+        when the release dependency completes), must run again once the real
+        inputs are known. The pre-build bind therefore precedes the graph and
+        records the same digests the post-build bind re-affirms, so proven
+        early work survives the later bind.
+
+        ``partial`` (implied by ``digest=None``) judges only the tasks
+        ``task_digests`` names and merges their digests over the recorded ones;
+        a full bind replaces the recorded digests, so a task with no declared
+        identity loses its checkpoint. ``digest`` is the whole-input digest;
+        ``None`` leaves the recorded one untouched. Without ``task_digests``
+        (the pre-v3 shape) a changed whole-input digest clears every checkpoint.
+        """
+
+        if partial is None:
+            partial = digest is None
         with self._lock:
             if task_digests is None:
-                if self.value.get("input_sha256") != digest:
+                if digest is not None and self.value.get("input_sha256") != digest:
                     self.value["completed_tasks"] = []
             else:
                 previous = self.value.get("task_input_sha256")
@@ -436,7 +457,8 @@ class BootstrapState:
                 }
                 self.value["completed_tasks"] = sorted(completed)
                 self.value["task_input_sha256"] = dict(sorted(effective.items()))
-            self.value["input_sha256"] = digest
+            if digest is not None:
+                self.value["input_sha256"] = digest
             self._write()
 
     def phase(self, value: str) -> None:

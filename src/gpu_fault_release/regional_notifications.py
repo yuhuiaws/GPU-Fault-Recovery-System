@@ -27,9 +27,13 @@ def notification_digest(config: RegionalNotificationConfig) -> str:
         "email_recipients": list(config.email_recipients),
         "email_subject_prefix": config.email_subject_prefix,
     }
-    # Omit the new field when absent so existing annotations remain valid.
+    # Added after schema_version 4 shipped, so it enters the payload only when
+    # a site declares one: every existing site's digest -- compared against the
+    # live Deployment annotation by the admin check, and deciding whether a
+    # deploy is a NOOP -- stays what it was, and a record or double predating
+    # the field hashes identically.
     configuration_set = getattr(config, "ses_configuration_set", None)
-    if configuration_set is not None:
+    if configuration_set:
         payload["ses_configuration_set"] = configuration_set
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

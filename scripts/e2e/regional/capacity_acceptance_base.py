@@ -13,7 +13,6 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, cast
@@ -31,9 +30,25 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import RenderedSite, load_site  # noqa: E402
-from gpu_fault.postgres_capacity import PostgresPoolCapacity  # noqa: E402
-from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
-    write_json_atomic,
+from gpu_fault.cluster_executor import RegionalExecutorClient  # noqa: E402
+from gpu_fault.regional_compatibility import (  # noqa: E402
+    CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+)
+from scripts.e2e.regional import capacity_probe_transport as probe_transport  # noqa: E402
+from scripts.e2e.regional.capacity_acceptance_common import (  # noqa: E402
+    CapError,
+    Probe,
+    utc_now,
+    write_json,
+)
+from scripts.e2e.regional.capacity_connection_budget import (  # noqa: E402
+    connection_budget,
+)
+from scripts.e2e.regional.capacity_probe_transport import (  # noqa: E402
+    RELEASE_METADATA_CONFIGMAP,
+    executor_pins_from_release_metadata,
+    pod_identity,
+    stop_port_forward,
 )
 from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalCommandTimeout,
@@ -46,6 +61,8 @@ from scripts.e2e.regional.regional_live_fixture import component_python  # noqa:
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
 PROBE_DIR = Path(__file__).with_name("probes")
+# How long a (re)started local kubectl port-forward may take to answer /healthz.
+PORT_FORWARD_READY_SECONDS = 45
 CASE_LIMITATIONS = [
     "The load is generated against disposable control-plane "
     "Deployments and isolated databases in the selected CPU EKS; "
@@ -64,60 +81,11 @@ PRODUCTION_APPS = frozenset(
 )
 
 
-class CapError(RuntimeError):
-    pass
-
-
-def unpooled_connection_budget(deployment: str) -> dict[str, int]:
-    """Upper bound for installed listeners, including lazy claim wakeups."""
-    roles = {
-        "gpu-fault-api-ha": "ingress",
-        "gpu-fault-control-worker": "worker",
-        "gpu-fault-telemetry-spool-worker": "spool-worker",
-    }
-    if deployment not in roles:
-        raise CapError("unrecognized CPU role in connection budget")
-    return PostgresPoolCapacity.listener_connections(
-        roles[deployment],
-        queued_processor=True,
-        spool_enabled=True,
-        workflow_dispatcher_enabled=True,
-        regional=True,
-    )
-
-
-@dataclass
-class Probe:
-    case: str
-    deployment: str
-    service: str
-    database: str
-    pod: str
-    local_port: int
-    url: str
-    port_forward: subprocess.Popen[str] | None
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def percentile(values: Sequence[float], ratio: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * ratio) - 1)]
-
-
-def write_json(path: Path, value: Any) -> None:
-    """Write one evidence document all-or-nothing (0600, fsynced, renamed).
-
-    The case verdict file is what the next case's predecessor gate reads; a
-    half-written one is worse than none. Lists (metric samples, timelines)
-    go through the same writer.
-    """
-
-    write_json_atomic(path, value)
 
 
 def command(
@@ -196,6 +164,12 @@ class CapCoreHarness:
                 "live processor mode is not a supported probe mode: "
                 f"{self.processor_mode!r}"
             )
+        self.executor_pins = executor_pins_from_release_metadata(
+            self.kubectl_json(
+                "get", "configmap", RELEASE_METADATA_CONFIGMAP, "-o", "json"
+            )
+        )
+        self.transport_incidents: list[dict[str, Any]] = []
         self.run_id = datetime.now(timezone.utc).strftime(
             "cap%H%M%S"
         ) + secrets.token_hex(4)
@@ -262,6 +236,35 @@ class CapCoreHarness:
 
     def apply(self, value: Mapping[str, Any]) -> None:
         self.kubectl("apply", "-f", "-", input_text=json.dumps(value))
+
+    def executor_client_pins(self) -> dict[str, str]:
+        """``RegionalExecutorClient`` keyword arguments carrying the fleet pins.
+
+        The same two values the live executor Deployment presents from
+        ``GPU_FAULT_EXECUTOR_ARTIFACT_SHA256`` and
+        ``GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST``.
+        """
+
+        return {name: value for name, value in self.executor_pins.items() if value}
+
+    def claim_identity(self) -> dict[str, Any]:
+        """Body fields a raw claim needs to pass the probe's compatibility gate."""
+
+        return {
+            "executor_protocol_version": CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+            **self.executor_client_pins(),
+        }
+
+    def executor_client(self, url: str, index: int) -> RegionalExecutorClient:
+        """The production client for synthetic cluster ``index``, pins included."""
+
+        return RegionalExecutorClient(
+            url,
+            f"cap-cluster-{index:03d}",
+            self.tokens[index],
+            timeout_seconds=15,
+            **self.executor_client_pins(),
+        )
 
     def create_common_resources(self) -> None:
         registry_digest = [
@@ -567,6 +570,53 @@ class CapProbeHarness(CapCoreHarness):
             }
         )
 
+    def start_port_forward(
+        self, service: str, local_port: int, log_path: Path
+    ) -> subprocess.Popen[str]:
+        """Forward ``service`` to ``local_port``; kubectl's output goes to a file.
+
+        Not to a pipe nobody reads: kubectl prints one line per accepted
+        connection, and a full pipe would stall the forward under the CAP-001
+        storm. The file also keeps the reason kubectl exits ("lost connection
+        to pod", "error forwarding port ...") for the transport diagnostics.
+        """
+
+        with log_path.open("a", encoding="utf-8") as sink:
+            return subprocess.Popen(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    self.cpu_kubeconfig,
+                    "-n",
+                    self.namespace,
+                    "port-forward",
+                    f"service/{service}",
+                    f"{local_port}:18080",
+                ],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+    @staticmethod
+    def wait_healthz(url: str, port_forward: subprocess.Popen[str]) -> None:
+        deadline = time.monotonic() + PORT_FORWARD_READY_SECONDS
+        error: Exception | None = None
+        while time.monotonic() < deadline:
+            if port_forward.poll() is not None:
+                raise CapError("kubectl port-forward exited before readiness")
+            try:
+                response = httpx.get(f"{url}/healthz", timeout=2)
+                if (
+                    response.status_code == 200
+                    and response.json().get("status") == "ok"
+                ):
+                    return
+            except Exception as exc:
+                error = exc
+            time.sleep(0.5)
+        raise CapError(f"probe did not become ready: {type(error).__name__}")
+
     def _wait_for_probe(
         self,
         *,
@@ -597,59 +647,42 @@ class CapProbeHarness(CapCoreHarness):
             if len(inventory["items"]) != 1 or len(ready) != 1:
                 raise CapError("capacity probe replica is not completely Ready")
             pod = str(ready[0]["name"])
+            pod_uid, restart_count = pod_identity(inventory["items"][0])
             local_port = self.reserve_port()
-            port_forward = subprocess.Popen(
-                [
-                    "kubectl",
-                    "--kubeconfig",
-                    self.cpu_kubeconfig,
-                    "-n",
-                    self.namespace,
-                    "port-forward",
-                    f"service/{service}",
-                    f"{local_port}:18080",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            forward_log = self.run_dir / f"{case.lower()}-port-forward.log"
+            port_forward = self.start_port_forward(service, local_port, forward_log)
             url = f"http://127.0.0.1:{local_port}"
-            deadline = time.monotonic() + 45
-            error: Exception | None = None
-            while time.monotonic() < deadline:
-                if port_forward.poll() is not None:
-                    raise CapError("kubectl port-forward exited before readiness")
-                try:
-                    response = httpx.get(f"{url}/healthz", timeout=2)
-                    if (
-                        response.status_code == 200
-                        and response.json().get("status") == "ok"
-                    ):
-                        probe = Probe(
-                            case=case,
-                            deployment=deployment,
-                            service=service,
-                            database=database,
-                            pod=pod,
-                            local_port=local_port,
-                            url=url,
-                            port_forward=port_forward,
-                        )
-                        self.active_probe = probe
-                        return probe
-                except Exception as exc:
-                    error = exc
-                time.sleep(0.5)
-            raise CapError(f"probe did not become ready: {type(error).__name__}")
+            self.wait_healthz(url, port_forward)
+            probe = Probe(
+                case=case,
+                deployment=deployment,
+                service=service,
+                database=database,
+                pod=pod,
+                local_port=local_port,
+                url=url,
+                port_forward=port_forward,
+                pod_uid=pod_uid,
+                restart_count=restart_count,
+                forward_log=forward_log,
+            )
+            self.active_probe = probe
+            return probe
         except BaseException:
-            if port_forward is not None and port_forward.poll() is None:
-                port_forward.terminate()
-                try:
-                    port_forward.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    port_forward.kill()
-                    port_forward.wait(timeout=3)
+            stop_port_forward(port_forward)
             raise
+
+    def probe_pod_report(self, probe: Probe) -> dict[str, Any]:
+        """Pod state, events and log tails, read while the probe still exists."""
+
+        return probe_transport.probe_pod_report(self, probe)
+
+    def ensure_probe_transport(
+        self, probe: Probe, *, reason: str
+    ) -> dict[str, Any] | None:
+        """Restart a dead local forward; a restarted Pod is a distinct failure."""
+
+        return probe_transport.ensure_probe_transport(self, probe, reason=reason)
 
     def deploy_probe(self, case: str, overrides: Mapping[str, str]) -> Probe:
         if self.active_probe is not None:
@@ -710,13 +743,7 @@ class CapProbeHarness(CapCoreHarness):
             raise CapError("CAP002 scrape shutdown is unverified; probe retained")
         if getattr(self, "cap004_executor_stopped", True) is not True:
             raise CapError("CAP004 Executor shutdown is unverified; probe retained")
-        if probe.port_forward is not None and probe.port_forward.poll() is None:
-            probe.port_forward.terminate()
-            try:
-                probe.port_forward.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                probe.port_forward.kill()
-                probe.port_forward.wait(timeout=3)
+        stop_port_forward(probe.port_forward)
         errors = []
         for kind, name in (
             ("deployment", probe.deployment),
@@ -858,10 +885,21 @@ class CapHarnessBase(CapProbeHarness):
         except ValueError as exc:
             raise CapError("capacity metrics are malformed") from exc
 
-    def metrics(self, url: str) -> list[tuple[str, dict[str, str], float]]:
+    def _read_metrics(self, url: str) -> list[tuple[str, dict[str, str], float]]:
         response = httpx.get(f"{url}/metrics", timeout=10)
         response.raise_for_status()
         return self.parse_metrics(response.text)
+
+    def metrics(self, url: str) -> list[tuple[str, dict[str, str], float]]:
+        try:
+            return self._read_metrics(url)
+        except httpx.TransportError as exc:
+            probe = getattr(self, "active_probe", None)
+            if probe is None or probe.url != url or probe.port_forward is None:
+                raise
+            if self.ensure_probe_transport(probe, reason=f"metrics: {exc!r}") is None:
+                raise
+            return self._read_metrics(url)
 
     @staticmethod
     def metric_value(
@@ -1009,136 +1047,9 @@ with psycopg.connect(url) as c:
         )
 
     def connection_budget(self) -> dict[str, Any]:
-        deployments = self.kubectl_json("get", "deployments", "-o", "json")
-        configmaps = self.kubectl_json(
-            "get",
-            "configmap",
-            "gpu-fault-api-ha-config-postgres",
-            "gpu-fault-control-worker-config-postgres",
-            "gpu-fault-telemetry-spool-worker-config-postgres",
-            "-o",
-            "json",
-        )
-        pools = {
-            item["metadata"]["name"]: int(
-                item.get("data", {}).get("GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "0")
-            )
-            for item in configmaps["items"]
-        }
-        rows = []
-        total = 0
-        config_by_deployment = {
-            "gpu-fault-api-ha": "gpu-fault-api-ha-config-postgres",
-            "gpu-fault-control-worker": "gpu-fault-control-worker-config-postgres",
-            "gpu-fault-telemetry-spool-worker": (
-                "gpu-fault-telemetry-spool-worker-config-postgres"
-            ),
-        }
-        if set(pools) != set(config_by_deployment.values()) or any(
-            pool < 1 for pool in pools.values()
-        ):
-            raise CapError("PostgreSQL pool configuration is incomplete")
-        for item in deployments["items"]:
-            name = item["metadata"]["name"]
-            if name not in config_by_deployment:
-                continue
-            replicas = item["spec"].get("replicas")
-            if type(replicas) is not int or replicas < 0:
-                raise CapError("capacity role replica count is missing or invalid")
-            container = item["spec"]["template"]["spec"]["containers"][0]
-            args = " ".join(container["args"])
-            match = re.search(r"--workers\s+(\d+)", args)
-            processes = int(match.group(1)) if match else 1
-            pool = pools[config_by_deployment[name]]
-            overrides = [
-                entry
-                for entry in container.get("env", [])
-                if entry.get("name") == "GPU_FAULT_POSTGRES_POOL_MAX_SIZE"
-            ]
-            if overrides:
-                if (
-                    len(overrides) != 1
-                    or not str(overrides[0].get("value", "")).isdigit()
-                ):
-                    raise CapError("effective PostgreSQL pool size is unknown")
-                pool = int(overrides[0]["value"])
-            if pool < 1 or processes < 1:
-                raise CapError("capacity process or pool size is invalid")
-            listeners = unpooled_connection_budget(name)
-            unpooled = sum(listeners.values())
-            maximum = replicas * processes * (pool + unpooled)
-            rows.append(
-                {
-                    "deployment": name,
-                    "replicas": replicas,
-                    "processes_per_pod": processes,
-                    "pool_max_size": pool,
-                    "unpooled_per_process": unpooled,
-                    "unpooled_by_consumer": listeners,
-                    "pooled_connections": replicas * processes * pool,
-                    "unpooled_connections": replicas * processes * unpooled,
-                    "theoretical_connections": maximum,
-                }
-            )
-            total += maximum
-        if len(rows) != len(config_by_deployment) or {
-            row["deployment"] for row in rows
-        } != set(config_by_deployment):
-            raise CapError("capacity connection budget is missing a CPU role")
-        worker = self.kubectl_json(
-            "get", "pods", "-l", "app=gpu-fault-control-worker", "-o", "json"
-        )
-        # Exclude legacy capacity probes that used the production app label;
-        # only a production worker has the production database credential.
-        pod = next(
-            item["metadata"]["name"]
-            for item in worker["items"]
-            if item.get("status", {}).get("phase") == "Running"
-            and not item.get("metadata", {}).get("deletionTimestamp")
-            and not item.get("metadata", {})
-            .get("labels", {})
-            .get("gpu-fault.io/capacity-probe")
-        )
-        script = r"""
-import os,psycopg
-from pathlib import Path
-path = os.environ.get("GPU_FAULT_STORE_URL_FILE", "").strip()
-url = Path(path).read_text().strip() if path else os.environ["GPU_FAULT_STORE_URL"]
-if not url:
-    raise RuntimeError("database credential reference is empty")
-with psycopg.connect(url, connect_timeout=10) as c:
-  with c.cursor() as cur:
-    cur.execute("select current_setting('max_connections')::int")
-    print(cur.fetchone()[0])
-"""
-        max_connections = int(
-            self.kubectl(
-                "exec",
-                "-i",
-                pod,
-                "--",
-                component_python("cpu"),
-                "-",
-                input_text=script,
-            ).stdout.strip()
-        )
-        if max_connections <= 0:
-            raise CapError("PostgreSQL max_connections is invalid")
-        return {
-            "roles": rows,
-            "theoretical_total": total,
-            "max_connections": max_connections,
-            "budget_ratio": total / max_connections,
-            "budget_scope": (
-                "all installed role listeners, including lazy claim listeners; "
-                "disabled features may use fewer connections"
-            ),
-            "excluded_consumers": [
-                "transient schema/administrator/probe connections",
-                "other applications on the same Aurora server",
-                "temporary surge Pods during a rollout",
-            ],
-        }
+        """The fleet's theoretical PostgreSQL connection budget against max_connections."""
+
+        return connection_budget(self)
 
     def cloudwatch_window(self, start: datetime, end: datetime) -> dict[str, Any]:
         client = boto3.client("cloudwatch", region_name=self.region)
@@ -1294,6 +1205,7 @@ with psycopg.connect(url, connect_timeout=10) as c:
                 "cpu_kubeconfig": self.cpu_kubeconfig,
                 "namespace": self.namespace,
                 "runtime_image": self.runtime_image,
+                "executor_pins": dict(self.executor_pins),
                 "temporary_resource_prefix": self.resource_prefix,
                 "database_isolation": "one disposable database per case",
                 "gpu_mutations": False,

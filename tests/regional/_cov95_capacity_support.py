@@ -72,6 +72,11 @@ class FakeApi:
         self.pods = [pod(name + "-pod", name) for name in APPS]
         self.services = []
         self.processor_mode = "active-active"
+        self.release_metadata = {
+            "required-regional-executor-artifact-sha256": "e" * 64,
+            "required-regional-executor-compatibility-digest": "f" * 64,
+            "compatible-regional-executor-artifact-sha256s": "",
+        }
         self.pool_size = "8"
         self.exec_output = "100\n"
         self.get_override = None
@@ -89,6 +94,8 @@ class FakeApi:
             "gpu-fault-control-worker-config-processor",
         ):
             value = {"data": {"GPU_FAULT_PROCESSOR_MODE": self.processor_mode}}
+        elif args[:3] == ("get", "configmap", "gpu-fault-release-metadata"):
+            value = {"data": self.release_metadata}
         elif args[:3] == ("get", "deployment", "gpu-fault-control-worker"):
             value = self.deployments[1]
         elif args[:2] == ("get", "deployments"):

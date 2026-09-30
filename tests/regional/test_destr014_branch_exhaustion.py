@@ -875,6 +875,217 @@ def test_preflight_requires_the_same_topology_and_a_none_recovery_cluster() -> N
     assert any("identical" in item for item in errors), errors
 
 
+def _pod(
+    namespace: str, name: str, app_label: str, node: str | None, **metadata: Any
+) -> dict[str, Any]:
+    """A Pod as ``kubectl get pod -o json`` lists it, trimmed to what the
+    placement reader touches plus the labels that selected it."""
+
+    key, value = app_label.split("=", 1)
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "uid": f"uid-{name}",
+            "labels": {key: value},
+            **metadata,
+        },
+        "spec": ({"nodeName": node} if node else {}),
+        "status": {"phase": "Running" if node else "Pending"},
+    }
+
+
+class _PlacementRegional:
+    """Serves the two label-selected Pod lists ``cluster_arbiter_placement`` reads."""
+
+    def __init__(self, arbiters: list[dict[str, Any]], dns: list[dict[str, Any]]):
+        self.arbiters = arbiters
+        self.dns = dns
+        self.calls: list[tuple[str, ...]] = []
+
+    def kubectl(self, plane: str, *args: str, **_kwargs: Any) -> str:
+        self.calls.append((plane, *args))
+        assert plane == "gpu", plane
+        assert args[:2] == ("get", "pod"), args
+        items = self.dns if "kube-system" in args else self.arbiters
+        return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
+
+
+def test_preflight_rejects_nodes_hosting_arbiters_or_all_dns_endpoints() -> None:
+    """Spec precondition 2: neither target node may host an executor arbiter
+    replica, and the pair must not hold every kube-dns endpoint. The placement
+    reader is the one DESTR-015 uses; the preflight refuses on what it lists."""
+
+    regional = _PlacementRegional(
+        arbiters=[
+            _pod(
+                "gpu-fault-system",
+                "gpu-fault-cluster-executor-7c9d8b6f5-abcde",
+                "app=gpu-fault-cluster-executor",
+                FAULT,
+            ),
+            _pod(
+                "gpu-fault-system",
+                "gpu-fault-completion-watcher-5f6d7c8b9-fghij",
+                "app=gpu-fault-completion-watcher",
+                "node-d",
+            ),
+            # Terminating and unscheduled replicas have left the node's fate.
+            _pod(
+                "gpu-fault-system",
+                "gpu-fault-node-installer-reconciler-6d5c4b3a2-klmno",
+                "app=gpu-fault-node-installer-reconciler",
+                SIBLING,
+                deletionTimestamp="2000-01-01T00:00:00Z",
+            ),
+            _pod(
+                "gpu-fault-system",
+                "gpu-fault-cluster-executor-7c9d8b6f5-pqrst",
+                "app=gpu-fault-cluster-executor",
+                None,
+            ),
+        ],
+        dns=[
+            _pod("kube-system", "coredns-76f75df574-aaaaa", "k8s-app=kube-dns", FAULT),
+            _pod(
+                "kube-system", "coredns-76f75df574-bbbbb", "k8s-app=kube-dns", SIBLING
+            ),
+        ],
+    )
+    arbiter_pods, dns_nodes = destr014.cluster_arbiter_placement(regional)
+    assert arbiter_pods == {
+        FAULT: ["gpu-fault-system/gpu-fault-cluster-executor-7c9d8b6f5-abcde"],
+        "node-d": ["gpu-fault-system/gpu-fault-completion-watcher-5f6d7c8b9-fghij"],
+    }, arbiter_pods
+    assert dns_nodes == sorted([FAULT, SIBLING]), dns_nodes
+    assert all(call[0] == "gpu" and "-o" in call for call in regional.calls), (
+        regional.calls
+    )
+    assert any("app in (" in " ".join(call) for call in regional.calls), regional.calls
+
+    kwargs = _happy_preflight_kwargs()
+    errors = destr014.preflight_errors(
+        **kwargs, arbiter_pods=arbiter_pods, dns_nodes=dns_nodes
+    )
+    assert any("arbiter Pods" in error and FAULT in error for error in errors), errors
+    assert not any(SIBLING in error and "arbiter" in error for error in errors), (
+        "a terminating replica on the sibling is not a placement"
+    )
+    assert any("every kube-dns endpoint" in error for error in errors), errors
+
+    # An arbiter elsewhere and one kube-dns endpoint off the pair are fine.
+    assert (
+        destr014.preflight_errors(
+            **kwargs,
+            arbiter_pods={"node-d": arbiter_pods["node-d"]},
+            dns_nodes=[FAULT, "node-d"],
+        )
+        == []
+    )
+    # A cluster with no kube-dns endpoint listed is not the DNS rule's case.
+    assert destr014.preflight_errors(**kwargs, arbiter_pods={}, dns_nodes=[]) == []
+
+
+def test_read_only_preflight_records_arbiter_placement_and_passes_it_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live preflight reads the placement once and both records it in
+    ``preflight.json`` and hands it to ``preflight_errors``."""
+
+    from types import SimpleNamespace
+
+    seen: dict[str, Any] = {}
+
+    def fake_placement(regional: Any) -> tuple[dict[str, list[str]], list[str]]:
+        seen["regional"] = regional
+        return {SIBLING: ["gpu-fault-system/gpu-fault-cluster-executor-x"]}, [FAULT]
+
+    def fake_errors(**kwargs: Any) -> list[str]:
+        seen["kwargs"] = kwargs
+        return ["recorded"]
+
+    class _Regional:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def store_snapshot(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"profile": "p", "release_id": "rel"}
+
+        def node_snapshot(self, node: str) -> dict[str, Any]:
+            return {"name": node}
+
+        def business_workloads(self, node: str) -> list[dict[str, Any]]:
+            return []
+
+        def gpu_workloads(self) -> list[dict[str, Any]]:
+            return []
+
+        def cpu_blast_snapshot(self) -> dict[str, Any]:
+            return {}
+
+    class _Warm:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def node_snapshot(self, node: str) -> dict[str, Any]:
+            return {"name": node}
+
+        def store_snapshot(self) -> dict[str, Any]:
+            return {"agents": []}
+
+        def provider_inventory(self) -> list[dict[str, Any]]:
+            return []
+
+        def spare_nodes(self) -> list[str]:
+            return []
+
+        def cluster_recovery(self) -> dict[str, Any]:
+            return {"status": "InService", "node_recovery": "None"}
+
+    site = tmp_path / "site.yaml"
+    site.write_text("{}\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("{}\n", encoding="utf-8")
+    settings = SimpleNamespace(
+        site_file=site,
+        manifest=manifest,
+        regional=SimpleNamespace(cluster_id="cluster-a"),
+        hyperpod_cluster="hp",
+        fault_node=FAULT,
+        sibling_node=SIBLING,
+        predecessor_path=tmp_path / "missing-predecessor",
+        verify_max_attempts=6,
+        managed_recovery_timeout_seconds=600,
+    )
+    monkeypatch.setattr(destr014, "RegionalLiveFixture", _Regional)
+    monkeypatch.setattr(destr014, "WarmSpareLiveFixture", _Warm)
+    monkeypatch.setattr(destr014, "cluster_arbiter_placement", fake_placement)
+    monkeypatch.setattr(destr014, "_control_env", lambda regional: {"max_rungs": 2})
+    monkeypatch.setattr(destr014, "executor_env_snapshot", lambda regional: [])
+    monkeypatch.setattr(
+        destr014, "predecessor_evidence", lambda *args, **kwargs: {"valid": False}
+    )
+    monkeypatch.setattr(destr014, "budget_headroom", lambda *args: {"readable": True})
+    monkeypatch.setattr(destr014, "preflight_errors", fake_errors)
+
+    result = destr014.read_only_preflight(settings, tmp_path)
+
+    assert result["arbiter_pods"] == {
+        SIBLING: ["gpu-fault-system/gpu-fault-cluster-executor-x"]
+    }
+    assert result["dns_nodes"] == [FAULT]
+    assert result["errors"] == ["recorded"]
+    assert seen["kwargs"]["arbiter_pods"] == result["arbiter_pods"]
+    assert seen["kwargs"]["dns_nodes"] == [FAULT]
+    assert isinstance(seen["regional"], _Regional), (
+        "the placement must be read through the same live fixture as the rest"
+    )
+    saved = json.loads((tmp_path / "preflight.json").read_text(encoding="utf-8"))
+    assert saved["arbiter_pods"] == result["arbiter_pods"]
+
+
 def test_plan_identity_digest_is_stable_across_key_order() -> None:
     preflight = {
         "release_id": "rel-1",

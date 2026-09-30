@@ -302,6 +302,11 @@ def _pki_resources(
     state: Mapping[str, Any],
     existing_resources: list[InstallationResource],
 ) -> list[InstallationResource]:
+    """The zone, its control-plane record, the GPU-VPC associations, ACM and PKI.
+
+    The associations follow ``resource_registry_dns.vpc_association_resources``:
+    one rule for bootstrap- and join-created ones (finding A, 2026-09-15).
+    """
     resources: list[InstallationResource] = []
     pki = state.get("pki") or {}
     dns = config.get("dns") or {}

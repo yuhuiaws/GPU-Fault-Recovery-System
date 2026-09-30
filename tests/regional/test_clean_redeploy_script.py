@@ -1215,3 +1215,57 @@ def test_node_cleanup_uncordons_declared_spares_before_stripping_their_label(
     assert customer["spec"]["unschedulable"] is True, (
         "cleanup removed an unrelated node's cordon"
     )
+
+
+def test_scope_gpu_keeps_the_control_plane_up_and_never_touches_the_registry(
+    tmp_path: Path,
+) -> None:
+    """--scope gpu (remove-cluster) drains under the running control plane: the
+    regional registry is not published DRAINING by this script, no CPU
+    Deployment is scaled, and the selected cluster's queues are waited on
+    between the producer stop and the executor stop."""
+
+    config, state, log, env = _skip_mode_fixture(tmp_path, interrupt_worker=False)
+
+    result = run_script(
+        "--config",
+        str(config),
+        "--scope",
+        "gpu",
+        "--cluster-id",
+        "gpu-a",
+        "--mode",
+        "stop",
+        "--node-mode",
+        "skip",
+        "--state-file",
+        str(state),
+        "--execute",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text(encoding="utf-8")
+    assert "registry-drain" not in calls, "--scope gpu must not publish DRAINING"
+    scale_lines = [line for line in calls.splitlines() if " scale " in line]
+    assert not any(
+        name in line
+        for line in scale_lines
+        for name in ("gpu-fault-api-ha", "gpu-fault-control-worker")
+    ), "--scope gpu scales no CPU Deployment"
+    document = json.loads(state.read_text(encoding="utf-8"))
+    phases = list(dict.fromkeys(item["phase"] for item in document["history"]))
+    assert phases == [
+        "PREFLIGHT",
+        "GPU_DATA_PLANE_SOURCES_STOPPED",
+        "QUEUES_DRAINED",
+        "GPU_EXECUTORS_STOPPED",
+        "NODE_RUNTIMES_STOPPED",
+        "CLEANUP_COMPLETED",
+    ], phases
+    producer = calls.index(
+        "scale deployment/gpu-fault-node-installer-reconciler --replicas=0"
+    )
+    drain_probe = calls.rindex(" counts gpu gpu-a")
+    executor = calls.index("scale deployment/gpu-fault-cluster-executor --replicas=0")
+    assert producer < drain_probe < executor, calls

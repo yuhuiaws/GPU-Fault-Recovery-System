@@ -564,24 +564,42 @@ class HostProbeFixture:
                 f"host probe returned an empty or non-object result (exit {completed.returncode})"
             )
         if completed.returncode or "error" in payload:
+            # Every shown token is whitelisted by shape: a 16-hex digest of the
+            # message, an ``identifier:line`` site, an identifier class name.
+            # The message itself (``error``) never leaves the node.
+            code = payload.get("error_code")
+            if not (isinstance(code, str) and re.fullmatch(r"[a-f0-9]{16}", code)):
+                code = None
+            site = payload.get("error_site")
+            if not (
+                isinstance(site, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*:[1-9][0-9]*", site)
+            ):
+                site = None
+            kind = payload.get("error_kind")
             diagnostic = ""
-            if payload.get("error_kind") == "collector_env_guard":
-                code = payload.get("error_code")
-                site = payload.get("error_site")
-                if isinstance(code, str) and re.fullmatch(r"[a-f0-9]{16}", code):
+            if kind == "collector_env_guard":
+                if code:
                     diagnostic += f"; collector-env guard {code}"
-                if isinstance(site, str) and re.fullmatch(
-                    r"[A-Za-z_][A-Za-z0-9_]*:[1-9][0-9]*", site
-                ):
+                if site:
                     diagnostic += f" at {site}"
-            # A probe's own failure line is ``{"error": <ExceptionType>}``. The
-            # type name alone is safe to show and is the one clue left once the
-            # output is withheld; anything wordier (a message, a path) is not.
-            error = payload.get("error")
+            # A probe's generic failure line carries ``error_kind: probe`` with
+            # the exception class, digest and site (collector_node_probe.main);
+            # older probes print ``{"error": <ExceptionType>}`` and the bare
+            # type name is the one clue left. Anything wordier (a message, a
+            # path) stays withheld.
+            error = (
+                payload.get("error_class") if kind == "probe" else payload.get("error")
+            )
             if isinstance(error, str) and re.fullmatch(
                 r"[A-Za-z_][A-Za-z0-9_]*", error
             ):
                 diagnostic += f"; error {error}"
+                if kind == "probe":
+                    if code:
+                        diagnostic += f" {code}"
+                    if site:
+                        diagnostic += f" at {site}"
             raise HostProbeError(
                 f"host probe failed (exit {completed.returncode}{diagnostic}); output withheld"
             )

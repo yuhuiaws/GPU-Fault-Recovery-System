@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
@@ -703,6 +704,41 @@ def test_metrics_reading_extracts_cluster_depth_and_rejections() -> None:
 # --------------------------------------------------------------------------- #
 def test_e2e002_follows_the_same_identity_isolation_case() -> None:
     assert e2e002.PREDECESSOR_CASE_ID == "GF-REGIONAL-ISO-001"
+
+
+def test_e2e002_notification_judgment_re_reads_a_delivery_still_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def entry(category: str, result: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "notification": {
+                "notification_id": category.lower(),
+                "category": category,
+                "incident_id": "inc-a",
+                "cluster_name": "hp-a",
+            },
+            "result": result,
+        }
+
+    sent = [
+        entry("FAULT_DETECTED", {"status": "SENT", "provider_message_id": "m1"}),
+        entry("ACTION_COMPLETED", {"status": "SENT", "provider_message_id": "m2"}),
+    ]
+    state = {
+        "incident": {"incident_id": "inc-a", "cluster_id": "a"},
+        "notifications": [sent[0], entry("ACTION_COMPLETED", None)],
+    }
+    registrations = [{"cluster_id": "a", "hyperpod_cluster_name": "hp-a"}]
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    errors = e2e002.notification_errors(
+        [state], ["a"], registrations, snapshots=[lambda: {"notifications": sent}]
+    )
+
+    assert errors == [] and sleeps == [5]
+    assert state["notifications"] == sent, "the judged reading is the refreshed one"
+    assert e2e002.notification_errors([state], ["a"], registrations) == []
 
 
 def test_e2e002_notification_and_command_scope_judgments() -> None:

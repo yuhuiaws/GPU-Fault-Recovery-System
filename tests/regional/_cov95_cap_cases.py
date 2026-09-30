@@ -74,6 +74,13 @@ class Client:
 
     def post(self, path: str, **kwargs: Any) -> httpx.Response:
         self.harness.requests.append((path, kwargs))
+        if path == "/v1/regional/executors/claim":
+            body = kwargs["json"]
+            assert (
+                body["executor_protocol_version"] > 1
+                and body["executor_artifact_sha256"] == "e" * 64
+                and body["executor_compatibility_digest"] == "f" * 64
+            ), "a raw claim must present the release's executor pins"
         if self.harness.failure == "request":
             raise httpx.ReadTimeout("synthetic claim read failure")
         if self.harness.case == "CAP002":
@@ -94,6 +101,12 @@ class CapacityModel(CapacityAcceptanceCases):
         self.run_dir = root
         self.run_id = "caplocaltest"
         self.tokens = [f"synthetic-{index:03d}" for index in range(20)]
+        self.executor_pins = {
+            "executor_artifact_sha256": "e" * 64,
+            "executor_compatibility_digest": "f" * 64,
+        }
+        self.transport_incidents: list[dict[str, Any]] = []
+        self.probe_reports: list[str] = []
         self.b_latency_factor = 2.0
         self.clock = clock
         self.failure = failure
@@ -134,6 +147,10 @@ class CapacityModel(CapacityAcceptanceCases):
         )
         assert ssl_context is None, "the loopback HTTP fixture does not use TLS"
         payload = json.loads(request.data or b"{}")
+        assert (
+            payload["executor_artifact_sha256"] == "e" * 64
+            and payload["executor_compatibility_digest"] == "f" * 64
+        ), "the production client must be constructed with the release's pins"
         headers = {key.lower(): value for key, value in request.header_items()}
         cluster_id = headers["x-gpu-fault-cluster-id"]
         index = int(cluster_id.removeprefix("cap-cluster-"))
@@ -201,6 +218,13 @@ class CapacityModel(CapacityAcceptanceCases):
         if self.failure == "cleanup":
             raise OSError("synthetic probe cleanup failure")
         return {"database_dropped": True, "residual_probe_pods": []}
+
+    def probe_pod_report(self, probe: Any) -> dict[str, Any]:
+        assert ("cleanup", probe.pod) not in self.events, (
+            "the Pod report must be taken before the probe is deleted"
+        )
+        self.probe_reports.append(probe.pod)
+        return {"pod": {"uid": "cap-probe-uid", "restart_count": 0}, "events": []}
 
     def probe_control(
         self, _probe: Any, path: str, payload: dict[str, Any]

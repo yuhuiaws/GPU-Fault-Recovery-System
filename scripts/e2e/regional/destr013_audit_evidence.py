@@ -1,4 +1,18 @@
-"""Read-only deployment binding for the DESTR013 final invariant audit."""
+"""Read-only deployment binding for the DESTR013 final invariant audit.
+
+Two kinds of release identity are compared and they come from different
+places. The *required executor pins* (protocol version, artifact sha256,
+compatibility digest) are fleet pins: the control plane serves whatever the
+``gpu-fault-release-metadata`` ConfigMap holds (``gpu_fault.fleet_pins``
+hot-reloads it), and a Pod's environment is only the ``configMapKeyRef``
+snapshot the kubelet resolved at container start. A data-plane-only release
+that re-publishes the pins without rolling api-ha therefore leaves every api
+Pod's env stale while the product is consistent, so those pins are read from
+the ConfigMap and never from a Pod. What a replica *itself* runs -- its image,
+the installed ``gpu_fault`` module digest and, on the executor, the literal
+``GPU_FAULT_EXECUTOR_*`` identity values -- is fixed at container start, so
+the running Pod is the only truthful source for it.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +25,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.fleet_pins import CONFIG_MAP_KEY_ENVIRONMENT, DEFAULT_CONFIG_MAP
 from scripts.e2e.regional.guardrail_audit_evidence import (
     REGISTRY_PROBE,
     complete_pod_population,
@@ -29,6 +44,25 @@ ENVIRONMENT_FIELDS = {
     "allow_reboot": "GPU_FAULT_ALLOW_HYPERPOD_REBOOT",
     "allow_automatic": "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY",
     "legacy_mutation": "GPU_FAULT_ALLOW_HYPERPOD_MUTATION",
+}
+# The required executor pins the control plane serves. They are compared from
+# the ConfigMap the product reads them from, through the product's own
+# key<->environment table, never from a Pod's start-time environment.
+RELEASE_PIN_CONFIGMAP = DEFAULT_CONFIG_MAP
+EXECUTOR_PIN_ENVIRONMENT = {
+    "executor_protocol_version": (
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION"
+    ),
+    "executor_artifact": "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
+    "executor_compatibility": (
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST"
+    ),
+}
+EXECUTOR_PIN_CONFIG_MAP_KEYS = {
+    field: key
+    for field, name in EXECUTOR_PIN_ENVIRONMENT.items()
+    for key, environment in CONFIG_MAP_KEY_ENVIRONMENT.items()
+    if environment == name
 }
 
 
@@ -300,12 +334,16 @@ def pod_json(
 
 
 def environment_probe(plane: str) -> str:
+    """Read-only in-Pod probe of what the replica itself runs with.
+
+    Only start-time literals are read here: the installed module digest, the
+    synthetic-route switch on the API, and on the executor its own identity
+    (``GPU_FAULT_EXECUTOR_*`` are literal ``value`` env on the Deployment) plus
+    the mutation switches and IRSA identity. The required executor pins are
+    fleet pins and are read by ``release_pins`` from the ConfigMap instead.
+    """
     fields = (
-        {
-            "synthetic_route": SYNTHETIC_ROUTE_ENV,
-            "executor_artifact": "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
-            "executor_compatibility": "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST",
-        }
+        {"synthetic_route": SYNTHETIC_ROUTE_ENV}
         if plane == "cpu"
         else {
             **ENVIRONMENT_FIELDS,
@@ -334,6 +372,37 @@ def environment_probe(plane: str) -> str:
             "value.update(caller_arn=caller.get('Arn'), caller_account=caller.get('Account'))\n"
         )
     return script + "print(json.dumps(value))\n"
+
+
+def release_pins(kubeconfig: Path, context: str, namespace: str) -> dict[str, str]:
+    """Read the required executor pins from ``gpu-fault-release-metadata``.
+
+    Fail-closed: a ConfigMap without ``.data``, a missing key or a blank value
+    is a refusal, never treated as "unpinned".
+    """
+    document = json_object(
+        kubectl(
+            kubeconfig,
+            context,
+            namespace,
+            "get",
+            "configmap",
+            RELEASE_PIN_CONFIGMAP,
+            "-o",
+            "json",
+        ),
+        "release pin ConfigMap",
+    )
+    data = document.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    pins: dict[str, str] = {}
+    for field, key in EXECUTOR_PIN_CONFIG_MAP_KEYS.items():
+        value = data.get(key)
+        pins[field] = value.strip() if isinstance(value, str) else ""
+    if len(pins) != len(EXECUTOR_PIN_ENVIRONMENT) or not all(pins.values()):
+        raise AuditError(f"release pin ConfigMap {RELEASE_PIN_CONFIGMAP} is incomplete")
+    return pins
 
 
 def executor_identity(
@@ -388,6 +457,63 @@ def executor_identity(
             raise AuditError(f"executor environment has an invalid {key} switch")
         switches[key] = raw
     return {"uid": account["uid"], "role_arn": role_arn}, switches
+
+
+def deployed_release(
+    kubeconfig: Path, context: str, namespace: str, cluster_id: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The complete, committed release state and the pins the product serves.
+
+    The required executor pins are compared from ``gpu-fault-release-metadata``
+    against the release state here, once per snapshot; a replica probe never
+    re-reads them from a Pod's start-time environment.
+    """
+    document = json_object(
+        kubectl(
+            kubeconfig,
+            context,
+            namespace,
+            "get",
+            "configmap",
+            "gpu-fault-regional-release-state",
+            "-o",
+            "json",
+        ),
+        "release state ConfigMap",
+    )
+    state = json_object(document["data"]["state.json"], "release state")
+    if (
+        not isinstance(state.get("release_id"), str)
+        or not state["release_id"].strip()
+        or state.get("phase") != "complete"
+        or state.get("transaction_committed") is not True
+        or not isinstance(state.get("cluster_ids"), list)
+        or cluster_id not in state.get("cluster_ids", [])
+    ):
+        raise AuditError("target release is not complete, committed and cluster-bound")
+    digests = state["component_digests"]
+    for pin in (
+        state["wheel_sha256"],
+        state["executor_wheel_sha256"],
+        digests["control_plane"],
+        digests["executor"],
+    ):
+        if not isinstance(pin, str) or re.fullmatch(r"[0-9a-f]{64}", pin) is None:
+            raise AuditError("target release component pins are missing or malformed")
+    protocol = state["executor_protocol_version"]
+    if type(protocol) is not int or protocol < 1:
+        raise AuditError("target release component pins are missing or malformed")
+    pins = release_pins(kubeconfig, context, namespace)
+    if pins != {
+        "executor_protocol_version": str(protocol),
+        "executor_artifact": state["executor_wheel_sha256"],
+        "executor_compatibility": digests["executor"],
+    }:
+        raise AuditError(
+            f"release pin ConfigMap {RELEASE_PIN_CONFIGMAP} does not match "
+            "the deployed release pins"
+        )
+    return state, pins
 
 
 def target_evidence(
@@ -445,42 +571,10 @@ def target_evidence(
             region,
             registration["eks_cluster_arn"],
         )
-        document = json_object(
-            kubectl(
-                cpu_kubeconfig,
-                cpu_context,
-                namespace,
-                "get",
-                "configmap",
-                "gpu-fault-regional-release-state",
-                "-o",
-                "json",
-            ),
-            "release state ConfigMap",
+        state, pins = deployed_release(
+            cpu_kubeconfig, cpu_context, namespace, registration["cluster_id"]
         )
-        state = json_object(document["data"]["state.json"], "release state")
-        if (
-            not isinstance(state.get("release_id"), str)
-            or not state["release_id"].strip()
-            or state.get("phase") != "complete"
-            or state.get("transaction_committed") is not True
-            or not isinstance(state.get("cluster_ids"), list)
-            or registration["cluster_id"] not in state.get("cluster_ids", [])
-        ):
-            raise AuditError(
-                "target release is not complete, committed and cluster-bound"
-            )
         digests = state["component_digests"]
-        for pin in (
-            state["wheel_sha256"],
-            state["executor_wheel_sha256"],
-            digests["control_plane"],
-            digests["executor"],
-        ):
-            if not isinstance(pin, str) or re.fullmatch(r"[0-9a-f]{64}", pin) is None:
-                raise AuditError(
-                    "target release component pins are missing or malformed"
-                )
         executor = pod_population(
             gpu_kubeconfig, gpu_context, namespace, EXECUTOR_APP, "executor"
         )
@@ -506,6 +600,9 @@ def target_evidence(
                     raise AuditError(
                         f"target {plane} replica environment evidence is incomplete"
                     )
+                # What the replica itself runs: image, installed module digest
+                # and (executor only) its literal own-identity env. The required
+                # executor pins were compared from the ConfigMap above.
                 if (
                     not isinstance(image, str)
                     or not image
@@ -513,9 +610,15 @@ def target_evidence(
                     or observed.get("pod") != pod["name"]
                     or observed.get("module_digest")
                     != digests["control_plane" if plane == "cpu" else "executor"]
-                    or observed.get("executor_artifact")
-                    != state["executor_wheel_sha256"]
-                    or observed.get("executor_compatibility") != digests["executor"]
+                    or (
+                        plane == "gpu"
+                        and (
+                            observed.get("executor_artifact")
+                            != state["executor_wheel_sha256"]
+                            or observed.get("executor_compatibility")
+                            != digests["executor"]
+                        )
+                    )
                 ):
                     raise AuditError(
                         f"target {plane} replica does not match the deployed release pins"
@@ -564,8 +667,10 @@ def target_evidence(
             | {
                 "component_digests": {
                     key: digests[key] for key in ("control_plane", "executor")
-                }
+                },
+                "executor_protocol_version": state["executor_protocol_version"],
             },
+            "fleet_pins": {"configmap": RELEASE_PIN_CONFIGMAP, **pins},
             "gpu_eks_binding": binding,
             "cpu_kubeconfig_sha256": cpu_digest,
             "api_population": api,

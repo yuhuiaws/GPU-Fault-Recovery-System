@@ -148,7 +148,19 @@ class PrimaryRecovery:
                 observed_after=injected_at,
             )
         )
-        errors.extend(workload.notification_errors(state))
+        errors.extend(
+            workload.wait_for_notification_results(
+                state,
+                snapshot=lambda: self.regional.store_snapshot(
+                    node=node,
+                    marker=marker,
+                    observed_after=injected_at,
+                    job_id=self.job_id,
+                    attempt_id=self.attempt_id,
+                    queue_attempts=1,
+                ),
+            )
+        )
         if (state.get("event") or {}).get("evidence_ref") != payload["evidence_ref"]:
             errors.append("A event does not bind the submitted software replay")
         if errors:

@@ -117,6 +117,11 @@ def harness(
     value.run_id = RUN_ID
     value.tokens = [TOKEN]
     value.active_probe = None
+    value.executor_pins = {
+        "executor_artifact_sha256": None,
+        "executor_compatibility_digest": None,
+    }
+    value.transport_incidents = []
     monkeypatch.setattr(
         value,
         "deploy_probe",
@@ -195,10 +200,14 @@ def test_real_executor_api_and_ledger_complete_cap004(
         events.append(mode)
         return commands.command_snapshot(local_api.store, RUN_ID, mode)
 
-    def run(*args: Any) -> dict[str, Any]:
+    def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
         events.append("executor")
+        assert kwargs == {"executor_pins": value.executor_pins}, (
+            "the case must hand the release's executor pins to the proof"
+        )
         return proof.run_executor_proof(
             *args,
+            **kwargs,
             timeout_seconds=30,
             poll_seconds=0.02,
             minimum_hold_seconds=0.01,
@@ -590,7 +599,7 @@ def test_case_failure_never_keeps_pass_or_deletes_under_live_threads(
             raise OSError("seed acknowledgement lost")
         return {"commands": []}
 
-    def run(*_args: Any) -> dict[str, Any]:
+    def run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         events.append("executor")
         if mode == "live_threads":
             raise proof.Cap004ThreadsRunning("still running")

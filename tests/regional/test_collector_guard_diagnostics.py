@@ -103,3 +103,48 @@ def test_host_failure_names_the_sanitized_error_type_only(
     if not exposed:
         assert error not in message, message
     assert "recovery_required" not in message, message
+
+
+@pytest.mark.parametrize(
+    "problem", [None, "class", "code", "site"], ids=["valid", "class", "code", "site"]
+)
+def test_host_failure_surfaces_sanitized_probe_class_code_and_site(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, problem: str | None
+) -> None:
+    """A probe's generic failure line carries ``error_kind: probe`` plus the
+    exception class, a digest of its message and the probe's own source site.
+    The fixture shows exactly those three (each whitelisted); the message itself
+    (``error``) never leaves the node, so a wordy ``error`` no longer collapses
+    the record to a bare "exit 1" (COLLECT-005, 2026-09-21)."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    payload = {
+        "error": "ProbeError: FM journal window is not in journal order /private",
+        "error_kind": "probe",
+        "error_class": "ProbeError",
+        "error_code": "a" * 16,
+        "error_site": "fm_delivery_evidence:1509",
+    }
+    if problem is not None:
+        payload[f"error_{problem}"] = "private-diagnostic detail"
+    api.probe_stdout = json.dumps(payload)
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("fm-delivery-evidence")
+    message = str(caught.value)
+    assert message.endswith("; output withheld"), message
+    assert "private" not in message and "journal order" not in message, message
+    if problem is None:
+        expected = f"; error ProbeError {'a' * 16} at fm_delivery_evidence:1509)"
+        assert expected in message, message
+    elif problem == "class":
+        assert "; error" not in message, message
+    else:
+        assert "; error ProbeError" in message, message
+        assert ("a" * 16 in message) is (problem != "code"), message
+        assert ("fm_delivery_evidence:1509" in message) is (problem != "site"), message
+    assert not isinstance(caught.value, host.HostProbeMissingResponseError), message
+    assert not any(fixture.cleanup().values()), "cleanup must still remove the probe"

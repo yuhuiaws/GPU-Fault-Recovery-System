@@ -437,8 +437,18 @@ def test_capacity_cleanup_refuses_missing_or_foreign_registry_before_deleting_ol
     targets = (
         ["perf-cap-000", "perf-cap-001"] if registry == "partial" else ["perf-cap-000"]
     )
+    # A registry that no longer names any of the run's clusters is the
+    # post-deregistration state (2026-09-20: late drill notifications land after
+    # the purge); the scope check then yields nothing instead of raising, and the
+    # cleanup itself refuses because the old rows are real records, not drill
+    # residue. A foreign or partial registry is still refused at the scope check.
+    expected = (
+        "capacity data has no current run-owned registration"
+        if registry == "absent"
+        else "complete current run-owned registry"
+    )
     with psycopg.connect(url) as connection:
-        with pytest.raises(RuntimeError, match="complete current run-owned registry"):
+        with pytest.raises(RuntimeError, match=expected):
             capacity_data.inspect_or_cleanup(
                 connection, run_id="run-a", cluster_ids=targets, cleanup=True
             )

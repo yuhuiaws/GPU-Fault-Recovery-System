@@ -15,8 +15,15 @@ from uuid import uuid4
 
 PHASES = (
     "PREFLIGHT",
+    # Every selected GPU cluster is published DRAINING in the regional registry
+    # (one revision names them all): the API then refuses new collector events
+    # and executor claims while in-flight leases may still renew and complete.
+    # Nothing is stopped yet.
     "CLUSTERS_DRAINING",
     "GPU_DATA_PLANE_SOURCES_STOPPED",
+    # Waited with CPU ingress and the consumers still running, until workflow,
+    # remote-command, processor and spool rows are all gone; leftovers fail the
+    # run closed (no bulk orphan SQL), and ingress stops only after the drain.
     "QUEUES_DRAINED",
     "CONTROL_CONSUMERS_STOPPED",
     "INGRESS_STOPPED",

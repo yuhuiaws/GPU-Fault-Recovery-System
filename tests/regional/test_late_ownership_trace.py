@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import multiprocessing
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +20,9 @@ CALIBRATION = (
     "--query-gpu=uuid",
     "--format=csv,noheader,nounits",
 )
+# A harmless executable that runs long enough for its parent to SIGKILL it.
+KILLED_EXECUTABLE = Path("/usr/bin/sleep").resolve()
+AGENT_PID = 419965
 
 
 def hex_string(value: str) -> str:
@@ -40,6 +44,45 @@ def closed_trace(arguments: tuple[str, ...] = CALIBRATION, *, code: int = 0) -> 
     return (
         exec_line(arguments=arguments) + f"101  123.000002 +++ exited with {code} +++\n"
     ).encode()
+
+
+def record(pid: int, stamp: str, body: str) -> str:
+    return f"{pid}  {stamp} {body}\n"
+
+
+def open_exec(arguments: tuple[str, ...] = CALIBRATION) -> str:
+    """An execve entry as strace prints it before the return value."""
+    encoded = ", ".join(hex_string(item) for item in arguments)
+    return f"execve({hex_string(str(SAFE_EXECUTABLE))}, [{encoded}], 0xff /* 65 vars */"
+
+
+def killed_child_trace(*, terminal: bool = True, deliveries: bool = False) -> bytes:
+    """The ``strace -f`` shape a SIGKILLed child leaves, as recorded live.
+
+    pid 79916 completed its exec, sibling 79917 entered execve, and the kill of
+    79916 raced its next syscall stop: strace printed an entry whose registers
+    it could no longer read (``???(``), closed by the sibling's output.
+    ``+++ killed by`` is the only terminal record such a process ever gets.
+    """
+    lines = [
+        record(79916, "100.691365", open_exec() + ") = 0"),
+        record(79917, "100.694766", open_exec() + " <unfinished ...>"),
+        record(79916, "100.694853", "???( <unfinished ...>"),
+        record(79917, "100.694950", "<... execve resumed>) = 0"),
+    ]
+    if deliveries:
+        lines.append(
+            record(
+                AGENT_PID,
+                "100.695000",
+                "--- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_KILLED, si_pid=79916, "
+                "si_uid=0, si_status=SIGKILL, si_utime=0, si_stime=0} ---",
+            )
+        )
+    if terminal:
+        lines.append(record(79916, "100.695100", "+++ killed by SIGKILL +++"))
+    lines.append(record(79917, "100.696000", "+++ exited with 0 +++"))
+    return "".join(lines).encode()
 
 
 def test_trace_parser_recovers_actual_exec_identity_and_exit():
@@ -114,6 +157,61 @@ def test_unfinished_exec_is_joined_only_to_its_own_resumption():
     assert event.ended_ns == 123_000_003_000
 
 
+def test_killed_child_that_vanished_mid_syscall_is_closed_by_its_kill_record():
+    events = trace.parse_exec_trace(killed_child_trace())
+    assert [(event.pid, event.returncode) for event in events] == [
+        (79916, -1),
+        (79917, 0),
+    ]
+    killed, sibling = events
+    assert (killed.started_ns, killed.ended_ns) == (100_691_365_000, 100_695_100_000)
+    assert (sibling.started_ns, sibling.ended_ns) == (100_694_766_000, 100_696_000_000)
+    # A query killed on its timeout is neither a calibration nor an action.
+    assert (
+        trace.physical_actions(
+            events, nvidia_smi=SAFE_EXECUTABLE, calibration_argv=CALIBRATION
+        )
+        == ()
+    )
+
+
+def test_vanished_process_without_a_terminal_record_is_a_named_refusal():
+    with pytest.raises(BoundaryDenied, match="terminal record") as raised:
+        trace.parse_exec_trace(killed_child_trace(terminal=False))
+    assert "ambiguous" not in str(raised.value)
+
+
+def test_signal_deliveries_are_skipped_but_never_stand_in_for_a_terminal_record():
+    events = trace.parse_exec_trace(killed_child_trace(deliveries=True))
+    assert [event.pid for event in events] == [79916, 79917]
+    with pytest.raises(BoundaryDenied, match="terminal record"):
+        trace.parse_exec_trace(killed_child_trace(terminal=False, deliveries=True))
+    stopped = record(101, "123.000001", "--- stopped by SIGSTOP ---")
+    assert trace.parse_exec_trace(stopped.encode()) == ()
+
+
+def test_failed_calibration_query_is_not_counted_and_does_not_hide_the_proof():
+    killed = (
+        closed_trace()
+        .replace(b"101 ", b"102 ")
+        .replace(b"+++ exited with 0 +++", b"+++ killed by SIGKILL +++")
+    )
+    events = trace.parse_exec_trace(killed + closed_trace())
+    assert [event.returncode for event in events] == [-1, 0]
+    assert (
+        trace.physical_actions(
+            events, nvidia_smi=SAFE_EXECUTABLE, calibration_argv=CALIBRATION
+        )
+        == ()
+    )
+    with pytest.raises(BoundaryDenied, match="requires a physical calibration"):
+        trace.physical_actions(
+            trace.parse_exec_trace(killed),
+            nvidia_smi=SAFE_EXECUTABLE,
+            calibration_argv=CALIBRATION,
+        )
+
+
 @pytest.mark.parametrize(
     "data,error",
     [
@@ -133,6 +231,28 @@ def test_unfinished_exec_is_joined_only_to_its_own_resumption():
         (
             b"101  123.000001 execve( <unfinished ...>\n101  123.000002 +++ exited with 0 +++\n",
             "unfinished exec",
+        ),
+        (
+            b"101  123.000001 execve( <unfinished ...>\n101  123.000002 ???( <unfinished ...>\n",
+            "unfinished exec",
+        ),
+        (
+            (
+                "101  123.000001 " + open_exec() + " <unfinished ...>\n"
+                "102  123.000002 +++ exited with 0 +++\n"
+                "101  123.000003 <... execve resumed> <unfinished ...>) = ?\n"
+            ).encode(),
+            "unfinished exec",
+        ),
+        (
+            ("101  123.000001 " + open_exec() + " <unfinished ...>) = ?\n").encode(),
+            "unfinished exec",
+        ),
+        (b"101  123.000001 ???( <unfinished ...>\n", "terminal record"),
+        (b"101  123.000001 ???( <detached ...>\n", "detached"),
+        (
+            ("101  123.000001 ???( <unfinished ...>\n" + exec_line()).encode(),
+            "identity changed",
         ),
         (exec_line().encode(), "drained"),
         ((exec_line() + exec_line()).encode(), "exec chain"),
@@ -223,6 +343,16 @@ def trace_target(connection):
         command = connection.recv()
         if command == "exit":
             return
+        if command == "spawn-and-kill":
+            child = subprocess.Popen(
+                [str(KILLED_EXECUTABLE), "30"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.2)
+            child.kill()
+            connection.send(child.wait())
+            continue
         args = (
             CALIBRATION
             if command == "calibrate"
@@ -297,6 +427,41 @@ def test_real_owned_child_exec_witness_cannot_be_replaced_with_model_counters(
         assert list(directory.iterdir()) == [], "raw trace must remain anonymous"
     finally:
         witness.close()
+    assert worker.is_alive(), "witness cleanup must not signal the observed process"
+
+
+def test_real_killed_child_keeps_its_terminal_record_in_the_trace(
+    tmp_path, owned_tracee
+):
+    """The Agent SIGKILLs a query on its timeout; the kernel exec witness must
+    still close that process, or a legitimate timeout voids the whole proof."""
+    worker, peer = owned_tracee
+    directory = tmp_path / "witness"
+    directory.mkdir(mode=0o700)
+    witness = trace.AttachedExecWitness(
+        directory,
+        process_identity(worker.pid),
+        deadline=time.monotonic() + 20,
+        executable=KILLED_EXECUTABLE,
+    )
+    try:
+        witness.start()
+        peer.send("spawn-and-kill")
+        assert peer.poll(10), "owned child was not killed"
+        assert peer.recv() == -signal.SIGKILL
+        raw = witness.snapshot()
+        for _ in range(100):
+            if b"+++ killed by SIGKILL +++" in raw:
+                break
+            time.sleep(0.05)
+            raw = witness.snapshot()
+        events = trace.parse_exec_trace(raw)
+    finally:
+        witness.close()
+    assert [(event.executable, event.returncode) for event in events] == [
+        (str(KILLED_EXECUTABLE), -1)
+    ]
+    assert events[0].ended_ns - events[0].started_ns >= 100_000_000
     assert worker.is_alive(), "witness cleanup must not signal the observed process"
 
 

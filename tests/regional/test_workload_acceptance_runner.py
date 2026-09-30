@@ -543,6 +543,83 @@ def test_e2e001_checks_attempt_id_scope_and_nodes_after_cleanup(
     ), "node restoration must be checked after every resource cleanup"
 
 
+# --- 4j: E2E-001 judges the ACTION_COMPLETED delivery after a re-read --------
+
+
+def test_e2e001_waits_for_the_completion_delivery_and_records_the_refreshed_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workflow terminalizes ~100 ms before the outbox dispatcher writes
+    the ACTION_COMPLETED result; the terminal snapshot alone must not fail."""
+
+    site, targets, _events = lifecycle_harness(monkeypatch, tmp_path)
+    regional = site.regional(targets[0])
+    wait_for_workflow = regional.wait_for_workflow
+    settle_kwargs: dict[str, Any] = {}
+    reads: list[dict[str, Any]] = []
+    sleeps: list[float] = []
+
+    def settled(**kwargs: Any) -> dict[str, Any]:
+        settle_kwargs.update(kwargs)
+        state = wait_for_workflow(**kwargs)
+        state["notifications"][1]["result"] = None
+        return state
+
+    def store_snapshot(**kwargs: Any) -> dict[str, Any]:
+        reads.append(kwargs)
+        pending = {"status": "LEASED", "provider_message_id": None}
+        sent = {"status": "SENT", "provider_message_id": "message-a-completed"}
+        completed = dict(regional.state["notifications"][1])
+        completed["result"] = pending if len(reads) == 1 else sent
+        return {
+            **regional.state,
+            "notifications": [regional.state["notifications"][0], completed],
+        }
+
+    monkeypatch.setattr(regional, "wait_for_workflow", settled)
+    monkeypatch.setattr(regional, "store_snapshot", store_snapshot, raising=False)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    result = workload.run_e2e001(
+        site=site,
+        target=targets[0],
+        case_dir=tmp_path,
+        job_id="job-test",
+        attempt_id="attempt-test",
+        host_probe_image="image@sha256:" + "a" * 64,
+        attempt=1,
+        maintenance_window_end=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert result["verdict"] == "PASS", result["errors"]
+    assert sleeps == [workload.NOTIFICATION_DELIVERY_POLL_SECONDS] * 2
+    assert (
+        reads
+        == [
+            {
+                **{
+                    key: settle_kwargs[key]
+                    for key in (
+                        "node",
+                        "marker",
+                        "observed_after",
+                        "job_id",
+                        "attempt_id",
+                    )
+                },
+                "queue_attempts": 1,
+            }
+        ]
+        * 2
+    ), "the re-read must bind the same identity the terminal snapshot used"
+    completed = result["state"]["notifications"][1]
+    assert completed["notification"]["category"] == "ACTION_COMPLETED"
+    assert completed["result"] == {
+        "status": "SENT",
+        "provider_message_id": "message-a-completed",
+    }, "the record must show the reading that was judged"
+
+
 # --- 4i: admin status once per group ----------------------------------------
 
 

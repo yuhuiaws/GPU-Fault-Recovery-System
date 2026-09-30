@@ -671,6 +671,7 @@ render_manifest() {
         -e "s#gpu-fault.io/artifact-sha256: .*#gpu-fault.io/artifact-sha256: ${WHEEL_SHA256}#g" \
         -e "s/GPU_FAULT_ALLOW_EMAIL: 'true'/GPU_FAULT_ALLOW_EMAIL: '${ALLOW_EMAIL}'/g" \
         -e "s/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: '${ACKNOWLEDGE_NO_ALERT_CHANNEL}'/g" \
+        -e "s/GPU_FAULT_SES_CONFIGURATION_SET: ''/GPU_FAULT_SES_CONFIGURATION_SET: '${SES_CONFIGURATION_SET}'/g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${GENERATED}/${manifest}.yaml"
 }

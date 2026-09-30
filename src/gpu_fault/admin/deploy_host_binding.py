@@ -1,4 +1,24 @@
-"""Check deploy-host and managed-site identities before opening command logs."""
+"""Which ``gpu-fault-admin`` may act on a managed state directory.
+
+The first ``deploy`` installs the site's own deploy-host CLI under
+``<state-dir>/deployer-venv`` and binds it there with
+``gpu-fault-managed-state-dir.json``. Two rules follow, both checked before a
+command opens its log:
+
+* a bound CLI acts only on its own state directory: ``--state-dir`` (or the
+  canonical ``site.yaml``) must name it, and every managed-site command needs
+  one;
+* an unbound CLI -- the developer checkout's ``.venv``, which runs whatever the
+  working tree holds -- does not mutate a site that already has a bound CLI.
+  A source ``deploy`` is exempt (it prepares the release and re-execs into the
+  bound CLI itself) and so are the read-only verbs; ``deploy --rollback`` and
+  ``--prepared-source-release`` are not. Live 2026-09-15: a join-cluster run
+  from the checkout verified its candidate against the checkout's own
+  ``dist/`` and rolled a healthy data plane back; nothing had said "wrong CLI".
+  The refusal names the CLI to run. There is no ambient environment override:
+  a wedged uninstall may resume with ``--accept-repository-root-override``
+  while its journal is unfinished, and nothing else authorises the checkout.
+"""
 
 from __future__ import annotations
 

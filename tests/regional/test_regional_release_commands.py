@@ -315,10 +315,15 @@ def test_rollback_preserves_the_alerting_configuration(
         "be told which channel the snapshot shipped with"
     )
     assert enabled["GPU_FAULT_SNS_TOPIC_ARN"] == SNS_TOPIC_ARN
-    assert enabled["GPU_FAULT_SES_CONFIGURATION_SET"] == ""
+    assert enabled["GPU_FAULT_SES_CONFIGURATION_SET"] == "", (
+        "an unset site re-renders the empty ConfigMap value, never a value "
+        "inherited from the operator's shell"
+    )
+
     declared = rollback_environment(
         monkeypatch, metadata={}, allow_email=True, ses_configuration_set="alerts-set"
     )
+
     assert declared["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
 
 

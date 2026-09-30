@@ -429,6 +429,15 @@ def test_release_config_loads_health_targets(tmp_path: Path) -> None:
 def test_manifest_artifacts_resolve_against_the_manifests_own_repository_root(
     tmp_path: Path,
 ) -> None:
+    """Relative wheel/bundle paths belong to the root that built the manifest.
+
+    A site's manifest lives in the source snapshot it was deployed from, and
+    join-cluster runs the engine in-process from the operator's checkout. The
+    loader used to resolve ``dist/<release-id>/...`` against that checkout, so
+    the join's verify step could not find artifacts that sat next to the
+    manifest and the join rolled back after a successful release.
+    """
+
     snapshot = tmp_path / "snapshot"
     entrypoint = snapshot / "deploy/control-plane/regional/rollout-regional-release.sh"
     entrypoint.parent.mkdir(parents=True)
@@ -455,6 +464,8 @@ def test_manifest_artifacts_resolve_against_the_manifests_own_repository_root(
     )
     value = json.loads(config_file(tmp_path).read_text(encoding="utf-8"))
     value["release"] = {"manifest": str(manifest), "agent_config_digest": "a" * 64}
+    # The CLI materializes the site's release config in a temporary directory,
+    # nowhere near the snapshot or the checkout.
     elsewhere = tmp_path / "materialized"
     elsewhere.mkdir()
     path = elsewhere / "regional-release.json"

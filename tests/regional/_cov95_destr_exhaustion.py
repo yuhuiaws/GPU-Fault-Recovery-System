@@ -12,6 +12,7 @@ import pytest
 from scripts.e2e.regional import control_plane_env_window, executor_env_window
 from scripts.e2e.regional import destr014_recovery as recovery
 from scripts.e2e.regional import run_destr014_branch_exhaustion as case
+from scripts.e2e.regional import run_destr015_parallel_branch_join as destr015
 from scripts.e2e.regional.destr014_verdicts import quarantine_taint_value
 from scripts.e2e.regional.host_probe_fixture import HostProbeSettings
 from scripts.e2e.regional.probes import destr014_recovery_probe as host_probe
@@ -36,6 +37,76 @@ from tests.regional.test_destr014_recovery_probe import HostHarness
 RECOVERY_IDENTITY_REFUSAL = (
     "sibling Node Agent recovery identity is incomplete or mismatched"
 )
+ARBITER_NAMESPACE = "gpu-fault-system"
+
+
+def cluster_pod(
+    namespace: str,
+    name: str,
+    labels: dict[str, str],
+    node: str | None,
+    *,
+    terminating: bool = False,
+) -> dict[str, Any]:
+    """A Pod as ``kubectl get pod -o json`` lists it: the fields the DESTR-014
+    placement preflight reads (``spec.nodeName``, ``deletionTimestamp``) plus
+    the identity that selected it. ``node=None`` is a Pending replica."""
+
+    metadata: dict[str, Any] = {
+        "namespace": namespace,
+        "name": name,
+        "uid": f"uid-{name}",
+        "labels": dict(labels),
+    }
+    if terminating:
+        metadata["deletionTimestamp"] = "2026-09-21T00:00:00Z"
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": metadata,
+        "spec": {"nodeName": node} if node else {},
+        "status": {"phase": "Running" if node else "Pending"},
+    }
+
+
+def arbiter_pod(
+    app: str, suffix: str, node: str | None, *, terminating: bool = False
+) -> dict[str, Any]:
+    return cluster_pod(
+        ARBITER_NAMESPACE,
+        f"{app}-{suffix}",
+        {"app": app},
+        node,
+        terminating=terminating,
+    )
+
+
+def dns_pod(suffix: str, node: str | None) -> dict[str, Any]:
+    return cluster_pod(
+        "kube-system", f"coredns-76f75df574-{suffix}", {"k8s-app": "kube-dns"}, node
+    )
+
+
+def healthy_placement() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """A cluster whose arbiter replicas live off the two target nodes and whose
+    kube-dns endpoints are not confined to the pair -- the shape a passing live
+    preflight sees. A terminating replica on the sibling and a Pending one are
+    listed too: neither is a placement."""
+
+    arbiters = [
+        arbiter_pod("gpu-fault-cluster-executor", "7c9d8b6f5-abcde", "node-d"),
+        arbiter_pod("gpu-fault-completion-watcher", "5f6d7c8b9-fghij", "node-d"),
+        arbiter_pod("gpu-fault-node-installer-reconciler", "6d5c4b3a2-klmno", "node-e"),
+        arbiter_pod(
+            "gpu-fault-cluster-executor",
+            "7c9d8b6f5-pqrst",
+            data.SIBLING,
+            terminating=True,
+        ),
+        arbiter_pod("gpu-fault-cluster-executor", "7c9d8b6f5-uvwxy", None),
+    ]
+    dns = [dns_pod("aaaaa", "node-d"), dns_pod("bbbbb", data.FAULT)]
+    return arbiters, dns
 
 
 class ExhaustionHarness(BranchHarness):
@@ -121,6 +192,7 @@ class ExhaustionHarness(BranchHarness):
                 "session_issuer_role_name": "executor",
             }
         ] * 2
+        self.arbiters, self.dns = healthy_placement()
         self.regional = ExhaustionRegional(self)
         self.workload = ExhaustionWorkload(self)
         self.warm = ExhaustionWarm(self)
@@ -228,7 +300,27 @@ class ExhaustionRegional(BranchRegional):
                     }
                 }
             )
+        if args[:2] == ("get", "pod"):
+            return self.pod_list(plane, args)
         raise AssertionError(f"unexpected fake exhaustion request: {args}")
+
+    def pod_list(self, plane: str, args: tuple[str, ...]) -> str:
+        """The two label-selected lists ``cluster_arbiter_placement`` reads."""
+
+        assert plane == "gpu", f"placement is read on the GPU cluster, not {plane}"
+        assert args[-2:] == ("-o", "json"), f"placement must be read as JSON: {args}"
+        selector = args[args.index("-l") + 1]
+        if selector == "k8s-app=kube-dns":
+            assert ("-n", "kube-system") == args[2:4], f"kube-dns is namespaced: {args}"
+            items = self.h.dns
+        else:
+            assert selector == f"app in ({','.join(destr015.ARBITER_APPS)})", (
+                f"unexpected fake exhaustion Pod selector: {selector}"
+            )
+            items = self.h.arbiters
+        return json.dumps(
+            {"apiVersion": "v1", "kind": "List", "items": deepcopy(items)}
+        )
 
     def pod_python(self, *args: Any) -> dict[str, Any]:
         self.h.call("budget.read")

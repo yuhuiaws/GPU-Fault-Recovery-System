@@ -28,6 +28,7 @@ if __package__:
         executor_identity,
         executor_job,
     )
+    from .regional_capacity_data import invoke
     from .regional_capacity_resources import RunResources, run_manifest
     from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
@@ -76,6 +77,7 @@ else:
         executor_identity,
         executor_job,
     )
+    from regional_capacity_data import invoke
     from regional_capacity_resources import RunResources, run_manifest
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
@@ -1001,13 +1003,6 @@ def sweep_late_drill_residue(
     registration then refuses "synthetic cluster data already exists". Re-probe
     the run's clusters after a pause and sweep only such residue.
     """
-
-    if __package__:
-        from .regional_capacity_data import invoke
-        from .regional_capacity_registry import control
-    else:
-        from regional_capacity_data import invoke
-        from regional_capacity_registry import control
 
     intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
     cluster_ids = list(intent.get("cluster_ids") or [])

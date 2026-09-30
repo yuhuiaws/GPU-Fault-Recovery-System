@@ -3,6 +3,14 @@
 Only sanitized exec identities leave this module. Trace gaps, unknown syscall
 syntax, unfinished execs, missing exits and uncalibrated captures are refusals,
 not evidence of zero actions. The observer must attach before STOP is allowed.
+
+The trace is ``strace -f`` output shared by every traced process, so one line
+can be split into ``<unfinished ...>`` and ``<... execve resumed>`` halves that
+are rejoined per pid. A process the Agent SIGKILLs (a query on its timeout)
+can leave a ``???( <unfinished ...>`` entry -- strace could no longer read its
+registers -- and its only terminal record is ``+++ killed by``. The tracer must
+therefore keep terminal signals visible (only SIGCHLD deliveries are muted),
+and a process that vanished without a terminal record is a refusal.
 """
 
 from __future__ import annotations
@@ -45,6 +53,15 @@ _EXIT = re.compile(r"^\+\+\+ exited with (\d+) \+\+\+$")
 _SIGNALLED = re.compile(
     r"^\+\+\+ killed by (SIG[A-Z0-9]+)(?: \(core dumped\))? \+\+\+$"
 )
+# A signal delivery or group-stop; informative, never an exec or an exit.
+_SIGNAL_DELIVERY = re.compile(r"^--- (?:stopped by )?SIG[A-Z0-9_]+(?: \{.*\})? ---$")
+# strace received a syscall stop but the process was already gone (SIGKILL
+# raced it): the entry has no name and can never resume.
+_LOST_REGISTERS = "???( <unfinished ...>"
+_UNFINISHED = " <unfinished ...>"
+_DETACHED = " <detached ...>"
+# The process died inside the syscall; strace closes the line with ``= ?``.
+_DIED_IN_SYSCALL = " <unfinished ...>) = ?"
 TRACER_CHILD = Path(__file__).with_name("probes") / "late_ownership_tracer_child.py"
 
 
@@ -66,7 +83,13 @@ def _decode_literal(text: str) -> str:
 
 
 def parse_exec_trace(data: bytes) -> tuple[ExecEvent, ...]:
-    """Parse the deliberately fixed ``strace -f -ttt -xx`` exec-only format."""
+    """Parse the deliberately fixed ``strace -f -ttt -xx`` exec-only format.
+
+    Split lines are rejoined per pid in order. A pid that vanished mid-syscall
+    (``???( <unfinished ...>``) is carried until its own ``+++ killed by`` or
+    ``+++ exited`` record; that record ends its exec interval, and a trace that
+    never delivers it is refused rather than read as a completed process.
+    """
     if len(data) > TRACE_LIMIT or (data and not data.endswith(b"\n")):
         raise BoundaryDenied("exec trace is oversized or incomplete")
     try:
@@ -75,6 +98,7 @@ def parse_exec_trace(data: bytes) -> tuple[ExecEvent, ...]:
         raise BoundaryDenied("exec trace is not in the pinned format") from None
     unfinished: dict[int, tuple[int, str]] = {}
     running: dict[int, tuple[int, str, tuple[str, ...]]] = {}
+    lost: set[int] = set()
     events: list[ExecEvent] = []
     last_ns: dict[int, int] = {}
     for line in lines:
@@ -87,10 +111,23 @@ def parse_exec_trace(data: bytes) -> tuple[ExecEvent, ...]:
             raise BoundaryDenied("exec trace process clock or identity changed")
         last_ns[pid] = stamp
         body = match[4]
-        if body.endswith(" <unfinished ...>"):
+        if body.endswith(_DETACHED):
+            raise BoundaryDenied("exec trace was detached before it drained")
+        if _SIGNAL_DELIVERY.fullmatch(body):
+            continue
+        exit_match = _EXIT.fullmatch(body)
+        signal_match = _SIGNALLED.fullmatch(body)
+        if pid in lost and exit_match is None and signal_match is None:
+            raise BoundaryDenied("exec trace process clock or identity changed")
+        if body == _LOST_REGISTERS:
+            if pid in unfinished:
+                raise BoundaryDenied("trace process exited during an unfinished exec")
+            lost.add(pid)
+            continue
+        if body.endswith(_UNFINISHED):
             if pid in unfinished or not body.startswith("execve("):
                 raise BoundaryDenied("exec trace has an ambiguous unfinished syscall")
-            unfinished[pid] = (stamp, body.removesuffix(" <unfinished ...>"))
+            unfinished[pid] = (stamp, body.removesuffix(_UNFINISHED))
             continue
         if body.startswith("<... execve resumed>"):
             if pid not in unfinished:
@@ -99,6 +136,8 @@ def parse_exec_trace(data: bytes) -> tuple[ExecEvent, ...]:
             body = prefix + body.removeprefix("<... execve resumed>")
         else:
             started = stamp
+        if body.endswith(_DIED_IN_SYSCALL):
+            raise BoundaryDenied("trace process exited during an unfinished exec")
         call = _EXEC.fullmatch(body)
         if call is not None:
             if pid in running:
@@ -113,17 +152,18 @@ def parse_exec_trace(data: bytes) -> tuple[ExecEvent, ...]:
             else:
                 running[pid] = (started, executable, args)
             continue
-        exit_match = _EXIT.fullmatch(body)
-        signal_match = _SIGNALLED.fullmatch(body)
         if exit_match is None and signal_match is None:
             raise BoundaryDenied("exec trace syscall or output is unsupported")
         if pid in unfinished:
             raise BoundaryDenied("trace process exited during an unfinished exec")
+        lost.discard(pid)
         if pid not in running:
             continue
         code = int(exit_match[1]) if exit_match is not None else -1
         began, executable, args = running.pop(pid)
         events.append(ExecEvent(pid, began, stamp, executable, args, code))
+    if lost:
+        raise BoundaryDenied("exec trace lost a process before its terminal record")
     if unfinished or running:
         raise BoundaryDenied("exec trace has not drained every observed exec")
     return tuple(events)
@@ -155,9 +195,9 @@ def physical_actions(
                 "unapproved executable entered the observed action interval"
             )
         if event.argv == calibration_argv:
-            if event.returncode != 0:
-                raise BoundaryDenied("exec witness calibration did not complete")
-            calibrations += 1
+            # A query that failed or was killed on its timeout is still a
+            # read-only query, not an action; it just does not calibrate.
+            calibrations += event.returncode == 0
             continue
         args = event.argv[1:]
         if args in {
@@ -282,8 +322,11 @@ class AttachedExecWitness:
                     "65536",
                     "-e",
                     "trace=execve,execveat",
+                    # ``+++ killed by`` is only written for signals in this
+                    # set, and the Agent SIGKILLs queries on their timeouts;
+                    # mute only the SIGCHLD deliveries that carry no evidence.
                     "-e",
-                    "signal=none",
+                    "signal=!SIGCHLD",
                     *(
                         ["-P", str(self.executable)]
                         if self.executable is not None

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.e2e.regional import run_destr014_branch_exhaustion as case
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureAbort,
     RegionalFixtureError,
@@ -12,6 +13,8 @@ from scripts.e2e.regional.regional_live_fixture import (
 from tests.regional._cov95_destr_exhaustion import (
     RECOVERY_IDENTITY_REFUSAL,
     ExhaustionHarness,
+    arbiter_pod,
+    dns_pod,
 )
 
 
@@ -30,6 +33,58 @@ def test_real_exhaustion_preflight_still_refuses_without_reboot_surviving_safegu
     assert not any(
         name in {"control.open", "executor.open", "probe.create"} for name, _ in h.calls
     ), h.calls
+
+
+def test_real_exhaustion_preflight_refuses_arbiters_or_all_dns_on_the_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec precondition 2 on the real preflight path: a running arbiter replica
+    on the fault node and kube-dns confined to the pair refuse the case before
+    any env window opens or a probe lands. A terminating replica on the sibling
+    has already left the node's fate and is not a placement."""
+
+    h = ExhaustionHarness(tmp_path, monkeypatch)
+    assert h.plan(tmp_path)["errors"] == [], (
+        "arbiters off the pair and one kube-dns endpoint elsewhere must pass"
+    )
+    fault, sibling = h.settings.fault_node, h.settings.sibling_node
+    executor = arbiter_pod("gpu-fault-cluster-executor", "7c9d8b6f5-zzzzz", fault)
+    h.arbiters.append(executor)
+    h.dns = [dns_pod("ccccc", fault), dns_pod("ddddd", sibling)]
+    preflight = h.plan(tmp_path)
+    errors = preflight["errors"]
+    assert any("arbiter Pods" in error and fault in error for error in errors), errors
+    assert not any("arbiter" in error and sibling in error for error in errors), (
+        "the terminating replica on the sibling must not count as a placement"
+    )
+    assert any("every kube-dns endpoint" in error for error in errors), errors
+    assert preflight["arbiter_pods"] == {
+        fault: [f"gpu-fault-system/{executor['metadata']['name']}"],
+        "node-d": [
+            "gpu-fault-system/gpu-fault-cluster-executor-7c9d8b6f5-abcde",
+            "gpu-fault-system/gpu-fault-completion-watcher-5f6d7c8b9-fghij",
+        ],
+        "node-e": [
+            "gpu-fault-system/gpu-fault-node-installer-reconciler-6d5c4b3a2-klmno"
+        ],
+    }, preflight["arbiter_pods"]
+    assert preflight["dns_nodes"] == sorted([fault, sibling]), preflight["dns_nodes"]
+    saved = json.loads(
+        (tmp_path / "cases" / case.CASE_ID / "preflight.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["arbiter_pods"] == preflight["arbiter_pods"], saved
+    with pytest.raises(RegionalFixtureError, match="arbiter Pods"):
+        h.execute(tmp_path)
+    assert not any(
+        name in {"control.open", "executor.open", "probe.create"} for name, _ in h.calls
+    ), h.calls
+    # Moving the replica off the pair and one kube-dns endpoint elsewhere is the
+    # only way back to a clean plan; the rule cannot be relaxed by the harness.
+    executor["spec"]["nodeName"] = "node-d"
+    h.dns.append(dns_pod("eeeee", "node-d"))
+    assert h.plan(tmp_path)["errors"] == [], h.plan(tmp_path)["arbiter_pods"]
 
 
 def test_exhaustion_orchestration_under_synthetic_admission_restores_known_owners(

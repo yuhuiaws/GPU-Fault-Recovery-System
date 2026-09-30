@@ -23,6 +23,7 @@ from gpu_fault.admin.cluster_removal import (
     _write_site_without_cluster,
     remove_cluster,
 )
+from gpu_fault.admin.cluster_removal_resources import association_to_detach
 from gpu_fault.admin.resource_registry import write_installation_resource_snapshot
 from gpu_fault.admin.resource_registry_dns import vpc_association_resource
 from gpu_fault.admin.site import load_site
@@ -863,3 +864,171 @@ def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
     )
     archived = list((tmp_path / "remove-cluster" / "gpu-a" / "history").glob("*.json"))
     assert len(archived) == 1, "the morning's record must be kept as history"
+
+
+def _association_row(key: str, vpc_id: str) -> InstallationResource:
+    """A registry row as bootstrap or join writes it; its key may be a legacy
+    per-cluster key, the immutable identity lives in the attributes."""
+
+    return vpc_association_resource(
+        site_id="test-site",
+        hosted_zone_id="Z123",
+        vpc_id=vpc_id,
+        vpc_region="us-east-1",
+        region="us-east-1",
+        account_id="123456789012",
+        ownership=InstallationResourceOwnership.CREATED,
+        resource_key=key,
+    )
+
+
+def _snapshot_with_association(
+    row: InstallationResource,
+) -> InstallationResourceSnapshot:
+    base = _snapshot()
+    value = base.model_copy(
+        update={
+            "resources": [
+                item
+                for item in base.resources
+                if item.resource_type != "route53_vpc_association"
+            ]
+            + [row]
+        }
+    )
+    return value.model_copy(update={"source_sha256": value.digest()})
+
+
+def _site_with_zone(tmp_path):
+    """The site fixture has no private zone; detach authorization needs one."""
+
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["dns"] = {"hostedZoneId": "Z123", "hostname": "api.test.internal"}
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    path.chmod(0o600)
+    return load_site(path)
+
+
+def _detach_statuses(
+    monkeypatch,
+    site,
+    snapshot: InstallationResourceSnapshot,
+    *,
+    target_vpc_id: str,
+    remaining_vpcs: set[str],
+    cpu_vpc_id: str,
+) -> tuple[dict[str, InstallationResourceStatus], dict]:
+    """Authorize the detach the way remove-cluster does, then retire the rows.
+
+    ``association_to_detach`` decides whether the target's VPC association is
+    exclusive (no remaining cluster uses the VPC and it is not the CPU VPC);
+    only then does the network step detach it and hand ``detached_vpc_id`` to
+    the resource removal, which selects the row by VPC identity."""
+
+    class Cleaner:
+        def __init__(self, _site):
+            pass
+
+        def validate_supported(self, _resources):
+            pass
+
+        def delete(self, _resource):
+            pass
+
+    monkeypatch.setattr(admin_cluster_removal, "ResourceCleaner", Cleaner)
+    association = association_to_detach(
+        site,
+        snapshot,
+        target_network={"vpc_id": target_vpc_id},
+        remaining_networks=[{"vpc_id": vpc_id} for vpc_id in sorted(remaining_vpcs)],
+        cpu_vpc_id=cpu_vpc_id,
+    )
+    updated, evidence = _remove_target_aws_resources(
+        RemoveClusterRequest(
+            site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+        ),
+        snapshot,
+        detached_vpc_id=(
+            association.attributes["vpc_id"] if association is not None else None
+        ),
+    )
+    return {item.resource_key: item.status for item in updated.resources}, evidence
+
+
+def test_a_vpc_association_another_cluster_still_uses_is_not_detached(
+    tmp_path, monkeypatch
+) -> None:
+    """The registry holds one association row per VPC. Removing a cluster while
+    a remaining cluster still uses the VPC must leave the row ACTIVE -- the
+    direct disassociation already skips a shared VPC -- or the registry says an
+    association is gone that Route53 still holds and the other cluster still
+    resolves through."""
+
+    site = _site_with_zone(tmp_path)
+    snapshot = _snapshot_with_association(
+        _association_row("aws/route53/vpc-association/gpu-a", "vpc-gpu-a")
+    )
+
+    statuses, evidence = _detach_statuses(
+        monkeypatch,
+        site,
+        snapshot,
+        target_vpc_id="vpc-gpu-a",
+        remaining_vpcs={"vpc-gpu-a"},
+        cpu_vpc_id="vpc-cpu",
+    )
+
+    assert (
+        statuses["aws/route53/vpc-association/gpu-a"]
+        is InstallationResourceStatus.ACTIVE
+    )
+    assert "aws/route53/vpc-association/gpu-a" not in evidence["detached"]
+    assert (
+        statuses["aws/iam/executor/gpu-a/oidc-provider"]
+        is InstallationResourceStatus.DETACHED
+    ), "the guard must only spare the shared association"
+
+
+def test_the_last_cluster_of_a_shared_vpc_detaches_the_row_keyed_by_the_first(
+    tmp_path, monkeypatch
+) -> None:
+    """``gpu-z`` left earlier and its VPC stayed associated for ``gpu-a``, so the
+    row still carries ``gpu-z``'s legacy key. Removing ``gpu-a``, the last user,
+    selects the row by its VPC identity -- the condition under which the direct
+    path disassociates -- so no ACTIVE row outlives the association. The CPU VPC
+    is never selected: the zone keeps it."""
+
+    site = _site_with_zone(tmp_path)
+    snapshot = _snapshot_with_association(
+        _association_row("aws/route53/vpc-association/gpu-z", "vpc-gpu-a")
+    )
+
+    statuses, evidence = _detach_statuses(
+        monkeypatch,
+        site,
+        snapshot,
+        target_vpc_id="vpc-gpu-a",
+        remaining_vpcs=set(),
+        cpu_vpc_id="vpc-cpu",
+    )
+
+    assert (
+        statuses["aws/route53/vpc-association/gpu-z"]
+        is InstallationResourceStatus.DETACHED
+    )
+    assert "aws/route53/vpc-association/gpu-z" in evidence["detached"]
+
+    statuses, _evidence = _detach_statuses(
+        monkeypatch,
+        site,
+        snapshot,
+        target_vpc_id="vpc-gpu-a",
+        remaining_vpcs=set(),
+        cpu_vpc_id="vpc-gpu-a",
+    )
+
+    assert (
+        statuses["aws/route53/vpc-association/gpu-z"]
+        is InstallationResourceStatus.ACTIVE
+    ), "a GPU cluster inside the CPU VPC must not detach the zone's own VPC"

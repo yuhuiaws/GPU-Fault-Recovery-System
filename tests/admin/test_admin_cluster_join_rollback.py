@@ -166,6 +166,7 @@ class Attempt:
         self.extra_steps: list[str] = []
         self.extra_evidence: dict[str, Any] = {}
         self.released = False
+        self.real_rollouts = False
 
     def _write_candidate(self) -> Path:
         target = _target()
@@ -266,13 +267,14 @@ class Attempt:
             )
 
         monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
-        monkeypatch.setattr(
-            admin_cluster_join,
-            "_run_rollout",
-            lambda _site, mode, *, cluster_id=None: self.rollouts.append(
-                (mode, cluster_id)
-            ),
-        )
+        if not self.real_rollouts:
+            monkeypatch.setattr(
+                admin_cluster_join,
+                "_run_rollout",
+                lambda _site, mode, *, cluster_id=None: self.rollouts.append(
+                    (mode, cluster_id)
+                ),
+            )
         monkeypatch.setattr(
             admin_cluster_join,
             "_clear_installer_annotations",
@@ -362,6 +364,43 @@ def test_a_failure_before_activation_undoes_everything_the_attempt_created(
         "the fleet master secret was left on disk"
     )
     assert len(load_site(attempt.path).release_config["clusters"]) == 1
+
+
+def test_a_verify_whose_release_cannot_be_loaded_is_one_reported_join_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate whose release cannot even be loaded is a join failure the CLI
+    reports, not a traceback after the rollback (live 2026-09-15: the manifest's
+    wheels resolved against the wrong root). The join verify runs the release
+    rollout driver as a subprocess, so whatever the driver cannot load surfaces
+    as its non-zero exit, is reported as one BootstrapError, and still rolls
+    the attempt back through the same driver."""
+
+    attempt = Attempt(tmp_path)
+    attempt.prepare_error = None
+    attempt.real_rollouts = True
+    # The data plane is joined and its collectors reported ready; the verify is
+    # the next step the resumed attempt has to run.
+    attempt.extra_steps = ["COLLECTORS_READY"]
+    attempt.extra_evidence = {"COLLECTORS_READY": {"nodes": 1, "ready": True}}
+    attempt.commands = Commands(
+        failures=[
+            (
+                "rollout-regional-release.sh verify",
+                1,
+                "release component wheels and bundle must exist",
+            )
+        ]
+    )
+
+    attempt.run(monkeypatch, error="regional verify failed")
+
+    verifies = attempt.commands.matching("rollout-regional-release.sh verify")
+    assert len(verifies) == 1, "the verify must run the rollout driver exactly once"
+    assert attempt.commands.matching("rollout-regional-release.sh fail-cluster"), (
+        "the failed verify did not roll the candidate cluster back"
+    )
+    assert attempt.membership == [True]
 
 
 def test_a_rollback_repoints_the_current_context_it_left_dangling(

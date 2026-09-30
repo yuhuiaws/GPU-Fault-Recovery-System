@@ -338,6 +338,10 @@ def caller(
             lambda **_kwargs: lambda: None,
         )
         monkeypatch.setattr(module, "control_pods", lambda: [])
+        # The post-teardown late-residue sweep probes the CPU Pod through the data
+        # helper and paces its attempts; the unit harness answers "clean" at once.
+        monkeypatch.setattr(module, "invoke", lambda *_args, **_kwargs: {"total": 0})
+        monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(module, "wait_for_executor_pods", lambda *_args: None)
         monkeypatch.setattr(
             module, "wait_for_load_pods", lambda *_args, **_kwargs: None

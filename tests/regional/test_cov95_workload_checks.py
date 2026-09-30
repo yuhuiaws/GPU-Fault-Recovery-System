@@ -282,3 +282,93 @@ def test_notification_completion_needs_unique_sent_incident_bound_records(
     assert checks.notification_errors(state), (
         "invalid delivery evidence must not prove recovery notification completion"
     )
+
+
+def pending_completion_state(result: dict[str, Any] | None) -> dict[str, Any]:
+    """A terminal-edge snapshot: ACTION_COMPLETED exists, its result does not."""
+
+    state = recovery_state("a", "node-a", "unit")
+    state["notifications"][1]["result"] = result
+    return state
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        {"status": "PENDING", "provider_message_id": None},
+        {"status": "LEASED", "provider_message_id": None},
+        {"status": "RETRY", "provider_message_id": None},
+    ],
+)
+def test_notification_wait_re_reads_the_store_while_delivery_is_in_flight(
+    result: dict[str, Any] | None,
+) -> None:
+    state = pending_completion_state(result)
+    settled = recovery_state("a", "node-a", "unit")
+    sleeps: list[float] = []
+    reads: list[str] = []
+
+    def snapshot() -> dict[str, Any]:
+        reads.append("store")
+        return settled
+
+    errors = checks.wait_for_notification_results(
+        state, snapshot=snapshot, sleep=sleeps.append, monotonic=lambda: 0.0
+    )
+    assert errors == []
+    assert sleeps == [checks.NOTIFICATION_DELIVERY_POLL_SECONDS] and reads == ["store"]
+    assert state["notifications"] == settled["notifications"], (
+        "the judged reading must be the refreshed one"
+    )
+
+
+@pytest.mark.parametrize("defect", ["DEAD", "FAILED", "sent-without-id", "missing"])
+def test_notification_wait_stops_at_once_on_a_defect_no_later_read_cures(
+    defect: str,
+) -> None:
+    state = pending_completion_state(None)
+    if defect == "missing":
+        state["notifications"].pop()
+    elif defect == "sent-without-id":
+        state["notifications"][1]["result"] = {"status": "SENT"}
+    else:
+        state["notifications"][1]["result"] = {
+            "status": defect,
+            "provider_message_id": None,
+        }
+    before = copy.deepcopy(state["notifications"])
+
+    def refuse(*args: Any) -> Any:
+        raise AssertionError(f"no store read or sleep is allowed: {args}")
+
+    errors = checks.wait_for_notification_results(
+        state, snapshot=refuse, sleep=refuse, monotonic=lambda: 0.0
+    )
+    assert any("ACTION_COMPLETED" in error for error in errors), errors
+    assert state["notifications"] == before
+
+
+def test_notification_wait_returns_the_pending_errors_at_the_deadline() -> None:
+    state = pending_completion_state(None)
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    errors = checks.wait_for_notification_results(
+        state,
+        snapshot=lambda: pending_completion_state(None),
+        timeout_seconds=12,
+        poll_seconds=5,
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
+    )
+    assert errors == [
+        "ACTION_COMPLETED notification is not SENT",
+        "ACTION_COMPLETED notification has no provider message ID",
+    ]
+    assert sleeps == [5, 5, 5], "the loop stops at the first poll past the deadline"
+    assert checks.NOTIFICATION_DELIVERY_WAIT_SECONDS == 120

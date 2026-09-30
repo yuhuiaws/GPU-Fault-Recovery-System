@@ -113,7 +113,9 @@ def test_real_cap005_database_is_private_and_removed_without_running_suites(
     import psycopg
 
     observed: list[str] = []
-    source_identity = pytest_result_identity.source_identity(cap005.ROOT)
+    checkout = cap005.ROOT
+    source_identity = pytest_result_identity.source_identity(checkout)
+    monkeypatch.setattr(cap005, "ROOT", tmp_path)
 
     def fixture_source_identity(root: Path) -> str:
         assert root == tmp_path, "the mocked checkout must retain its working directory"
@@ -122,6 +124,16 @@ def test_real_cap005_database_is_private_and_removed_without_running_suites(
     monkeypatch.setattr(
         pytest_result_identity, "source_identity", fixture_source_identity
     )
+
+    def shards(workdir: Path, report_dir: Path, workers: int) -> dict[str, Any]:
+        # The owned-instance shard stage never sees this run's database: its
+        # workers allocate their own PostgreSQL 16 servers.
+        assert workdir == tmp_path and workers == 1, "shards run in this checkout"
+        if child_fails:
+            raise OSError("mocked shard stage failed after database creation")
+        return {"source_identity": source_identity, "workers": 1, "executed_tests": 1}
+
+    monkeypatch.setattr(cap005, "run_sharded_postgres", shards)
 
     def child(command: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         environment = kwargs["environment"]
@@ -135,8 +147,6 @@ def test_real_cap005_database_is_private_and_removed_without_running_suites(
                 "the allocation's admin database must not run the suite"
             )
             observed.append(name)
-        if child_fails:
-            raise OSError("mocked test child failed after database creation")
         options = argparse.ArgumentParser(add_help=False)
         options.add_argument("--junitxml", "--junit-xml")
         arguments, _ = options.parse_known_args(
@@ -149,7 +159,7 @@ def test_real_cap005_database_is_private_and_removed_without_running_suites(
             write_focused_receipt(
                 command,
                 environment=environment,
-                cwd=cap005.ROOT,
+                cwd=checkout,
                 nodeids=[
                     "tests/store/test_store_contracts.py::test_processor_queue_contract[postgres]"
                 ],
@@ -165,16 +175,15 @@ def test_real_cap005_database_is_private_and_removed_without_running_suites(
     result = cap005.run_suite(URL, tmp_path)
 
     assert result["status"] == ("FAIL" if child_fails else "PASS"), (
-        "the real database lifecycle must retain the mocked child outcome"
+        "the real database lifecycle must retain the mocked child outcome: "
+        f"{result['errors']}"
     )
     assert result["database_dropped"] is True, (
-        "failed children still require verified cleanup"
+        "a failed shard stage still requires verified cleanup"
     )
-    assert observed and set(observed) == {result["database"]}, (
-        "both children must share only this run's DB"
-    )
-    assert len(observed) == (1 if child_fails else 2), (
-        "only an earlier child failure may prevent the second suite from starting"
+    assert observed == ([] if child_fails else [result["database"]]), (
+        "only the contract child uses this run's database, and only after the "
+        "shard stage completed"
     )
     with psycopg.connect(URL) as connection:
         assert (
@@ -195,6 +204,14 @@ def test_real_cap005_creation_refusal_preserves_the_existing_database(
     identifier = uuid4()
     database = f"gpu_fault_cap005_{identifier.hex[:12]}"
     monkeypatch.setattr(cap005, "uuid4", lambda: identifier)
+    monkeypatch.setattr(cap005, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        cap005,
+        "run_sharded_postgres",
+        lambda *_args: pytest.fail(
+            "a refused database allocation must not start shards"
+        ),
+    )
     monkeypatch.setattr(
         regional_commands,
         "run_command",

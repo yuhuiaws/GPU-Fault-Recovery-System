@@ -34,9 +34,17 @@ def test_constructor_binds_the_site_and_generates_isolated_registry(capacity) ->
         "probes use the current worker's pinned image"
     )
     assert harness.run_dir.stat().st_mode & 0o777 == 0o700, "run files are private"
-    assert len(api.calls) == 2, (
-        "construction only reads processor config and worker deployment"
+    assert len(api.calls) == 3, (
+        "construction only reads processor config, release pins and worker deployment"
     )
+    assert harness.executor_pins == {
+        "executor_artifact_sha256": "e" * 64,
+        "executor_compatibility_digest": "f" * 64,
+    }, "probe executors present the pins the release ConfigMap requires"
+    assert harness.claim_identity() == {
+        "executor_protocol_version": base.CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+        **harness.executor_pins,
+    }, "raw claims carry the current protocol version and both pins"
 
 
 @pytest.mark.parametrize("mode", ["", "disabled", "active-passive"])

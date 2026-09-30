@@ -12,11 +12,9 @@ import pytest
 
 from gpu_fault.cluster_executor import ClusterExecutorError
 from scripts.e2e.regional import capacity_acceptance_cases as cases
-from scripts.e2e.regional.capacity_acceptance_base import (
-    CapError,
-    unpooled_connection_budget,
-)
+from scripts.e2e.regional.capacity_acceptance_base import CapError
 from scripts.e2e.regional.capacity_acceptance_retry import run_claim_retry_proof
+from scripts.e2e.regional.capacity_connection_budget import unpooled_connection_budget
 
 
 @pytest.mark.parametrize(
@@ -89,8 +87,14 @@ def test_production_long_poll_is_separate_from_the_short_poll_latency_gate(
     )
     listener_reads = []
 
+    pins = {"executor_artifact_sha256": "e" * 64}
+
     class Client:
         def __init__(self, url, cluster, token, **kwargs):
+            assert (
+                kwargs.get("executor_artifact_sha256")
+                == pins["executor_artifact_sha256"]
+            ), "long-poll executors must present the release's executor pins"
             self.cluster = cluster
 
         def claim(self, owner, **kwargs):
@@ -102,7 +106,6 @@ def test_production_long_poll_is_separate_from_the_short_poll_latency_gate(
                     return [object()]
             return []
 
-    monkeypatch.setattr(cases, "RegionalExecutorClient", Client)
     monkeypatch.setattr(cases, "write_json", lambda *args: None)
 
     # The private probe answers the same runtime wait budget on every read; a
@@ -136,6 +139,9 @@ def test_production_long_poll_is_separate_from_the_short_poll_latency_gate(
         probe_control=listener,
         pod_cpu_usage_usec=lambda _pod: 0,
         isolated_db_connections=lambda _pod: 2,
+        executor_client=lambda url, index: Client(
+            url, f"cap-cluster-{index:03d}", "fixture", **pins
+        ),
     )
     # The method is exercised on its public harness contract, not an alternate load loop.
     method = cases.CapacityAcceptanceCases.cap003_long_poll_samples

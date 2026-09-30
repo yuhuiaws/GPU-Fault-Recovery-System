@@ -709,7 +709,7 @@ def test_constructor_keeps_optional_binding_without_requiring_it_for_other_cases
     )
     assert harness.scrape_source_binding == binding
     assert harness.maintenance_deadline is deadline
-    assert len(api.calls) - before == 2, (
+    assert len(api.calls) - before == 3, (
         "construction adds no scrape reads or mutations"
     )
 

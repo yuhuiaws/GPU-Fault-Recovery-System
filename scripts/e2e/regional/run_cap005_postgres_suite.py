@@ -278,9 +278,18 @@ def parallel_postgres_child(workers: int) -> None:
     )
 
 
-def run_parallel_postgres(
+def run_sharded_postgres(
     workdir: Path, report_dir: Path, workers: int
 ) -> dict[str, Any]:
+    """The PostgreSQL suite on ``workers`` owned PG16 instances (1..8).
+
+    Every worker count, including one, goes through
+    ``scripts/run_postgres_shards.py``: the suite's PostgreSQL modules expect
+    the grant that launcher provides (an admin URL on a PG16 instance the
+    test process owns, the allocation files, a private HOME and PGPASSFILE)
+    and create their own databases from it. A single generated database on the
+    CI server, which the contract stage still uses, cannot serve them.
+    """
     from gpu_fault.admin.release_postgres import require_postgres_cleanup
     from scripts.ci_coverage_config import pytest_targets
     from scripts.postgres_shard_receipts import (
@@ -294,8 +303,8 @@ def run_parallel_postgres(
     from tools.pytest_result_identity import source_identity
     from tools.run_fault_test_cases import build_isolated_environment
 
-    if workdir != ROOT or type(workers) is not int or not 2 <= workers <= 8:
-        raise SuiteError("parallel CAP-005 requires this checkout and 2..8 workers")
+    if workdir != ROOT or type(workers) is not int or not 1 <= workers <= 8:
+        raise SuiteError("sharded CAP-005 requires this checkout and 1..8 workers")
     tests = validate_targets(workdir, pytest_targets(workdir, "postgres"))
     identity = source_identity(workdir)
     home = report_dir / "postgres-shards-home"
@@ -330,7 +339,12 @@ def run_parallel_postgres(
         timeout=21600,
     )
     if completed.returncode:
-        raise SuiteError("parallel PostgreSQL child did not complete successfully")
+        # The launcher's own progress lines name the first failing shard and
+        # nodeid; everything else the child printed stays private.
+        for line in (completed.stderr or "").splitlines()[-40:]:
+            if line.startswith("postgres-shards:"):
+                print(line, file=sys.stderr)
+        raise SuiteError("sharded PostgreSQL child did not complete successfully")
     reference = json.loads(completed.stdout, object_pairs_hook=unique_fields)
     if (
         not isinstance(reference, dict)
@@ -409,16 +423,15 @@ def run_suite(
     if type(postgres_workers) is not int or not 1 <= postgres_workers <= 8:
         raise SuiteError("CAP-005 PostgreSQL workers must be within 1..8")
     workdir = workdir.resolve()
-    if postgres_workers > 1 and workdir != ROOT:
-        raise SuiteError("parallel CAP-005 must use the runner's own checkout")
     validate_database_url(base_url)
+    if workdir != ROOT:
+        raise SuiteError("CAP-005 must use the runner's own checkout")
     validate_server(base_url)
     production_database = _database_name(base_url)
     database = f"gpu_fault_cap005_{uuid4().hex[:12]}"
     test_url = database_url(base_url, database)
     report_dir = workdir / "artifacts" / "cap005" / database
     report_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-    postgres_xml = report_dir / "postgres.xml"
     contract_xml = report_dir / "contract.xml"
     started = time.monotonic()
     created = False
@@ -445,23 +458,12 @@ def run_suite(
         creation_outcome = "ACKNOWLEDGED"
         exit_codes: dict[str, int] = {}
         suites: dict[str, dict[str, int] | None] = {}
-        if postgres_workers == 1:
-            exit_codes["postgres"] = _run_pytest(
-                [
-                    "make",
-                    "test-postgres-stress",
-                    f"PYTHON={sys.executable}",
-                    "PYTEST_XDIST_WORKERS=0",
-                ],
-                cwd=workdir,
-                env=environment,
-                junit=postgres_xml,
-            )
-        else:
-            summary["postgres_shards"] = run_parallel_postgres(
-                workdir, report_dir, postgres_workers
-            )
-            exit_codes["postgres"] = 0
+        # Stage 1: the PostgreSQL suite on owned PG16 instances; its proof is
+        # the launcher's receipts, never a JUnit rendering of them.
+        summary["postgres_shards"] = run_sharded_postgres(
+            workdir, report_dir, postgres_workers
+        )
+        # Stage 2: the complete Store contract on this run's generated database.
         exit_codes["contract"] = _run_pytest(
             [
                 sys.executable,
@@ -475,8 +477,6 @@ def run_suite(
             junit=contract_xml,
             isolated_postgres_url=test_url,
         )
-        if postgres_workers == 1:
-            suites["postgres"] = _junit_stats(postgres_xml)
         suites["contract"] = _junit_stats(contract_xml)
         summary["suites"] = suites
         summary["exit_codes"] = exit_codes

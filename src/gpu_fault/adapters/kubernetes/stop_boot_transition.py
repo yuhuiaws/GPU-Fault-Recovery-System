@@ -1,4 +1,36 @@
-"""Prove a STOP participant's boot change from this workflow's reboot receipts."""
+"""Prove a STOP participant's boot change from this workflow's reboot receipts.
+
+A STOP receipt binds every participant node by UID and boot id. When a later
+node action re-verifies the receipt and a participant's boot id has changed,
+the change is ownership drift unless this workflow's own reboot records
+account for it. Two shapes are accepted:
+
+1. **Confirmed chain** (``_confirmed_transition``): the node's ``RESTART_NODE``
+   executions SUCCEEDED, externally confirmed by HyperPod ``Running`` plus a
+   new Node Agent incarnation, each carrying the ``stop_reboot_authorization_v1``
+   record the pre-submit check signed for this receipt, and the recorded
+   old/new boot ids chain from the receipt's boot id to the current one.
+
+2. **In-flight sibling reboot** (``_in_flight_transition``): the node is not a
+   target of the action being checked, and its latest ``RESTART_NODE``
+   execution is still WAITING with a real provider submission (``action`` is
+   the HyperPod reboot, ``requires_external_confirmation`` is set, the
+   submission key is this workflow's, ``submitted_nodes`` names one logical id
+   per target and the record is not a cached duplicate) whose
+   ``stop_reboot_authorization_v1`` was signed for this receipt's digest and
+   binds this node's UID and the boot id the chain expects. The product
+   itself rebooted that node from the boot the receipt recorded and has not
+   yet confirmed it, so the node coming back under any other boot id is that
+   reboot, not a foreign actor. GF-REGIONAL-DESTR-014: two nodes share one
+   receipt; the sibling's reboot is in flight (its agent stays down, so it can
+   never be confirmed) when the fault node escalates to its own reboot, and the
+   fault node's pre-submit check must not read the sibling's new boot as drift.
+
+A boot change on a node with no such record, a record bound to another
+receipt digest, a terminal (FAILED or unconfirmed SUCCEEDED) reboot, a node
+that is itself the action's target, or a changed node UID remains
+``STOP_OWNERSHIP_DRIFT``. Nothing here mutates the receipt.
+"""
 
 from __future__ import annotations
 
@@ -40,34 +72,45 @@ def _observations(values: object, targets: set[str]) -> dict[str, dict[str, Any]
     return result
 
 
-def _confirmed_transition(
+def _submitted_nodes(submitted: object, count: int) -> bool:
+    """Whether ``submitted_nodes`` names one provider logical id per target."""
+
+    return (
+        isinstance(submitted, list)
+        and len(submitted) == count
+        and count > 0
+        and all(isinstance(value, str) and value for value in submitted)
+    )
+
+
+def _bound_authorization(
     context: WorkflowStepContext,
     execution: WorkflowStepExecution,
     node_id: str,
     node_uid: str,
     receipt_digest: str,
     after: datetime,
-) -> _RebootTransition | None:
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The pre-submit authorization and agent baseline a reboot record binds.
+
+    Shared by the confirmed-chain and the in-flight acceptance: the record must
+    be this workflow's own reboot of a step naming ``node_id``, signed for this
+    receipt digest, this node UID, and the isolation the incident holds. Returns
+    ``(authorized node, agent baseline)`` for ``node_id`` or ``None``.
+    """
+
     workflow = context.workflow
     index = execution.step_index
     step = workflow.official_steps[index]
     details = execution.details
     targets = set(step.node_ids)
     if (
-        execution.status is not WorkflowStepStatus.SUCCEEDED
-        or not execution.adapter_operation_id
-        or execution.error is not None
-        or index not in workflow.completed_step_indexes
+        len(targets) != len(step.node_ids)
         or index in workflow.inherited_step_indexes
         or index in workflow.superseded_step_indexes
-        or len(targets) != len(step.node_ids)
         or details.get("preemption_reuse")
         or details.get("inherited_from_workflow_id")
-        or unknown_outcome_failure(details)
         or details.get("action") != HyperPodAction.REBOOT.value
-        or details.get("externally_confirmed") is not True
-        or details.get("confirmation_source")
-        != "hyperpod-running-and-new-agent-incarnation"
         or details.get("submission_idempotency_key")
         != hyperpod_submission_idempotency_key(
             workflow.request_id, index, WorkflowOperation.RESTART_NODE
@@ -129,27 +172,108 @@ def _confirmed_transition(
         return None
     baseline = baselines.get(node_id)
     isolated = isolation.get(node_id)
-    agents = _observations(details.get("agent_observations"), targets)
-    providers = _observations(details.get("provider_observations"), targets)
     if (
         not isinstance(baseline, dict)
         or not isinstance(isolated, dict)
-        or node_id not in agents
-        or node_id not in providers
         or isolated.get("kubernetes_node") != node_id
         or isolated.get("unschedulable") is not True
         or isolated.get("incident") != context.incident.incident_id
         or isolated.get("fencing_token") != str(workflow.fencing_token)
     ):
         return None
+    return authorized_node, baseline
+
+
+def _in_flight_transition(
+    context: WorkflowStepContext,
+    execution: WorkflowStepExecution,
+    node_id: str,
+    node_uid: str,
+    receipt_digest: str,
+    after: datetime,
+) -> str | None:
+    """The boot id a still-unconfirmed, product-submitted reboot left from.
+
+    Accepts only a WAITING ``RESTART_NODE`` record that carries a real provider
+    submission for this receipt (shape 2 of the module docstring); returns the
+    boot id its authorization bound, or ``None``. The record's unknown-outcome
+    flags are expected here: the CPU marks every unconfirmed remote node action
+    ``outcome_unknown`` until it is confirmed or an operator resolves it.
+    """
+
+    workflow = context.workflow
+    index = execution.step_index
+    details = execution.details
+    if (
+        execution.status is not WorkflowStepStatus.WAITING
+        or not execution.adapter_operation_id
+        or index in workflow.completed_step_indexes
+        or details.get("requires_external_confirmation") is not True
+        or details.get("provider_submission_duplicate") is True
+        or details.get("node_action_not_started") is True
+        or details.get("externally_confirmed") is True
+    ):
+        return None
+    bound = _bound_authorization(
+        context, execution, node_id, node_uid, receipt_digest, after
+    )
+    if bound is None:
+        return None
+    authorized_node, baseline = bound
+    old_boot = authorized_node.get("boot_id")
+    if (
+        not isinstance(old_boot, str)
+        or not old_boot
+        or baseline.get("boot_id") != old_boot
+        or not _submitted_nodes(
+            details.get("submitted_nodes"),
+            len(workflow.official_steps[index].node_ids),
+        )
+    ):
+        return None
+    return old_boot
+
+
+def _confirmed_transition(
+    context: WorkflowStepContext,
+    execution: WorkflowStepExecution,
+    node_id: str,
+    node_uid: str,
+    receipt_digest: str,
+    after: datetime,
+) -> _RebootTransition | None:
+    workflow = context.workflow
+    index = execution.step_index
+    details = execution.details
+    targets = set(workflow.official_steps[index].node_ids)
+    if (
+        execution.status is not WorkflowStepStatus.SUCCEEDED
+        or not execution.adapter_operation_id
+        or execution.error is not None
+        or index not in workflow.completed_step_indexes
+        or unknown_outcome_failure(details)
+        or details.get("externally_confirmed") is not True
+        or details.get("confirmation_source")
+        != "hyperpod-running-and-new-agent-incarnation"
+    ):
+        return None
+    bound = _bound_authorization(
+        context, execution, node_id, node_uid, receipt_digest, after
+    )
+    if bound is None:
+        return None
+    authorized_node, baseline = bound
+    agents = _observations(details.get("agent_observations"), targets)
+    providers = _observations(details.get("provider_observations"), targets)
+    if node_id not in agents or node_id not in providers:
+        return None
     submitted = details.get("submitted_nodes")
+    if not isinstance(submitted, list) or not _submitted_nodes(submitted, len(targets)):
+        return None
     logical_ids = [provider.get("node_logical_id") for provider in providers.values()]
     if (
-        not isinstance(submitted, list)
-        or not all(isinstance(value, str) and value for value in submitted)
-        or not all(isinstance(value, str) and value for value in logical_ids)
+        not all(isinstance(value, str) and value for value in logical_ids)
         or len(set(logical_ids)) != len(targets)
-        or len(submitted) != len(targets)
         or set(submitted) != set(logical_ids)
         or any(
             provider.get("status") != "Running"
@@ -192,8 +316,10 @@ def authorized_boot_transition(
 ) -> bool:
     """Accept only a complete, ordered chain of locally authorized reboots.
 
-    The result must carry the UID/boot and immutable STOP digest checked before
-    submission. The caller still checks live Node UID and all workload/Pod ownership.
+    Every link must carry the UID/boot and immutable STOP digest checked before
+    submission; the last link may still be in flight when ``node_id`` is not a
+    target of ``context.step`` (module docstring, shape 2). The caller still
+    checks live Node UID and all workload/Pod ownership.
     """
 
     workflow = context.workflow
@@ -225,7 +351,8 @@ def authorized_boot_transition(
         for execution in latest.values()
     ):
         return False
-    for execution in sorted(latest.values(), key=lambda item: item.updated_at):
+    ordered = sorted(latest.values(), key=lambda item: item.updated_at)
+    for position, execution in enumerate(ordered):
         if (
             execution.started_at.tzinfo is None
             or execution.updated_at.tzinfo is None
@@ -235,10 +362,21 @@ def authorized_boot_transition(
         transition = _confirmed_transition(
             context, execution, node_id, node_uid, receipt_digest, after
         )
-        if (
-            transition is None
-            or transition.old_boot != boot
-            or (incarnation is not None and transition.old_incarnation != incarnation)
+        if transition is None:
+            # Shape 2: the chain may end in a reboot the product submitted and
+            # has not confirmed, for a node this action does not itself touch.
+            # The node left ``boot`` under our submission; whatever boot it
+            # shows now is that reboot's, so the chain closes on it.
+            in_flight = (
+                None
+                if node_id in context.step.node_ids or position != len(ordered) - 1
+                else _in_flight_transition(
+                    context, execution, node_id, node_uid, receipt_digest, after
+                )
+            )
+            return in_flight is not None and in_flight == boot != current_boot_id
+        if transition.old_boot != boot or (
+            incarnation is not None and transition.old_incarnation != incarnation
         ):
             return False
         boot = transition.new_boot

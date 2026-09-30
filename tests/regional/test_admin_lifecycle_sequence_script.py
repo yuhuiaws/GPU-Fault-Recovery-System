@@ -4,17 +4,30 @@ The driver runs the five admin lifecycle stages in order against fake
 ``gpu-fault-admin``, ``docker`` and ``aws`` binaries that log every invocation
 to one shared file, so the order across tools (cache prune before each cold
 deploy, no prune between the middle stages) is observable.
+
+Stage 5 follows README.md's procedure from a pristine copy of ``--repo`` in a
+clean environment, so ``--repo`` is a self-contained git checkout built from
+this working tree whose ``Makefile`` is replaced by a fixture: its
+``deploy-host-setup-online`` target creates the ``.venv`` the README activates,
+and the ``gpu-fault-admin`` inside that venv is the same fake, reached only the
+way the README reaches it.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
+import shlex
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
+
+from scripts.e2e.regional import boot029_readme
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "acceptance" / "admin-lifecycle-sequence.sh"
@@ -156,6 +169,95 @@ else:
 """
 
 
+# The README's ``make deploy-host-setup-online`` in the fixture checkout: it
+# runs in the pristine copy under the clean environment, so every value it
+# needs is baked in, and it refuses the two things the stage asserts against.
+FIXTURE_MAKEFILE = """.PHONY: deploy-host-setup-online
+deploy-host-setup-online:
+\tbash fixture-setup.sh
+"""
+
+FIXTURE_SETUP = """#!/usr/bin/env bash
+set -euo pipefail
+printf 'make deploy-host-setup-online\\n' >> {tool_log}
+[[ -z "$(git status --porcelain)" ]] || {{ echo 'fixture: source copy is dirty' >&2; exit 43; }}
+[[ ! -e .venv ]] || {{ echo 'fixture: .venv pre-exists' >&2; exit 44; }}
+[[ "$PWD" != {checkout} ]] || {{ echo 'fixture: ran inside the checkout' >&2; exit 48; }}
+mkdir -p .venv/bin
+printf 'export VIRTUAL_ENV=%q\\nexport PATH="$VIRTUAL_ENV/bin:$PATH"\\n' "$PWD/.venv" > .venv/bin/activate
+cat > .venv/bin/gpu-fault-admin <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'readme-admin-env %s\\n' "$(compgen -e | sort | tr '\\n' ' ')" >> {tool_log}
+printf 'readme-admin-path %s\\n' "$PATH" >> {tool_log}
+printf 'readme-admin-cwd %s\\n' "$PWD" >> {tool_log}
+source {env_file}
+exec {fake_admin} "$@"
+WRAPPER
+chmod 755 .venv/bin/gpu-fault-admin
+"""
+
+_TEMPLATE: Path | None = None
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _checkout_template() -> Path:
+    """This working tree (tracked and untracked files) as one committed repo."""
+
+    global _TEMPLATE
+    if _TEMPLATE is not None:
+        return _TEMPLATE
+    base = Path(tempfile.mkdtemp(prefix="boot029-checkout-template-"))
+    atexit.register(shutil.rmtree, base, True)
+    template = base / "repo"
+    template.mkdir()
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout
+    for raw in listing.split(b"\0"):
+        source = ROOT / os.fsdecode(raw)
+        if not raw or source.is_symlink() or not source.is_file():
+            continue
+        target = template / os.fsdecode(raw)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    _git(template, "init", "-q")
+    _git(template, "config", "user.name", "Fixture")
+    _git(template, "config", "user.email", "fixture@example.invalid")
+    _git(template, "add", "-A", "-f", ".")
+    _git(template, "commit", "-q", "-m", "checkout template")
+    _TEMPLATE = template
+    return template
+
+
+def _install_checkout(tmp_path: Path, fake_bin: Path) -> Path:
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", "-q", str(_checkout_template()), str(checkout))
+    _git(checkout, "config", "user.name", "Fixture")
+    _git(checkout, "config", "user.email", "fixture@example.invalid")
+    (checkout / "Makefile").write_text(FIXTURE_MAKEFILE, encoding="utf-8")
+    (checkout / "fixture-setup.sh").write_text(
+        FIXTURE_SETUP.format(
+            tool_log=shlex.quote(str(tmp_path / "tools.log")),
+            checkout=shlex.quote(str(checkout)),
+            env_file=shlex.quote(str(tmp_path / "fake-env.sh")),
+            fake_admin=shlex.quote(str(fake_bin / "gpu-fault-admin")),
+        ),
+        encoding="utf-8",
+    )
+    _git(checkout, "add", "-A", "-f", ".")
+    _git(checkout, "commit", "-q", "-m", "fixture makefile")
+    return checkout
+
+
 def _install_fakes(tmp_path: Path) -> dict[str, str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -167,18 +269,32 @@ def _install_fakes(tmp_path: Path) -> dict[str, str]:
         path = fake_bin / name
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
+    _install_checkout(tmp_path, fake_bin)
     return {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAKE_TOOL_LOG": str(tmp_path / "tools.log"),
         "FAKE_CPU_ARN": CPU_ARN,
         "FAKE_GPU_ARN": GPU_ARN,
+        # The driver's environment must not reach the README deploy.
+        "GPU_FAULT_SENTINEL": "driver",
+        "AWS_REGION": "us-west-2",
     }
 
 
 def _run(
     tmp_path: Path, env: dict[str, str], *extra: str
 ) -> subprocess.CompletedProcess[str]:
+    # The README deploy runs in a clean environment; the fake it reaches
+    # through the venv reads this run's FAKE_* knobs from a file instead.
+    (tmp_path / "fake-env.sh").write_text(
+        "".join(
+            f"export {name}={shlex.quote(value)}\n"
+            for name, value in sorted(env.items())
+            if name.startswith("FAKE_")
+        ),
+        encoding="utf-8",
+    )
     return subprocess.run(
         [
             str(SCRIPT),
@@ -191,7 +307,7 @@ def _run(
             "--admin-email",
             ADMIN_EMAIL,
             "--repo",
-            str(ROOT),
+            str(tmp_path / "checkout"),
             "--confirm-isolated-build-host",
             *extra,
         ],
@@ -706,12 +822,25 @@ def test_failed_initial_deploy_resumes_only_its_bound_checkpoint(
         "resuming must not bypass the uncached-build requirement"
     )
     new_tools = _tool_log(env)[len(tools) :]
-    assert new_tools[0].startswith("gpu-fault-admin deploy "), (
-        "a resumed deployment must not prune its already-started build or ECR tags"
+    redeploy = next(
+        index
+        for index, line in enumerate(new_tools)
+        if line.startswith("gpu-fault-admin deploy ")
     )
-    assert f"--state-dir {state} " in new_tools[0], (
+    assert not any(
+        line.startswith(("docker ", "aws ")) for line in new_tools[:redeploy]
+    ), "a resumed deployment must not prune its already-started build or ECR tags"
+    assert f"--state-dir {state} " in new_tools[redeploy], (
         "the resume must use the same state directory"
     )
+    if stage == 5:
+        assert new_tools[0] == "make deploy-host-setup-online", (
+            "a resumed README deploy repeats the README procedure from its start"
+        )
+        readme = current["readme"]
+        assert readme["attempt"] == 2 and readme["venv_preexisted"] is False, (
+            "each attempt builds the venv in a fresh pristine copy"
+        )
     for number in range(1, stage):
         assert after["stages"][str(number)] == record["stages"][str(number)], (
             "already passed stages cannot be rewritten by a later resume"
@@ -872,3 +1001,232 @@ def test_failed_bound_command_stops_the_sequence_and_preserves_resume_guards(
         "uninstall",
     ], lines
     assert _admin_verbs(lines) == ["deploy", "deploy"]
+
+
+def test_stage_five_refuses_an_installed_site_even_with_a_bootstrap_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A second state directory holding both bootstrap-state.json and site.yaml
+    is an installed site, not the unfinished first deploy the driver may resume
+    (that resume is bound to the receipt of this run's own failed attempt); the
+    stage-5 deploy must not run against it and the site stays untouched."""
+
+    env = _install_fakes(tmp_path)
+    installed = tmp_path / "state-second"
+    installed.mkdir()
+    checkpoint = installed / "bootstrap-state.json"
+    checkpoint.write_text(
+        json.dumps({"schema_version": 3, "phase": "site-ready"}), encoding="utf-8"
+    )
+    site = installed / "site.yaml"
+    site.write_text("spec: {}\n", encoding="utf-8")
+    before = (checkpoint.read_bytes(), site.read_bytes())
+
+    result = _run(tmp_path, env)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "already holds bootstrap-state.json" in result.stderr, result.stderr
+    assert not any(
+        line.startswith("gpu-fault-admin deploy ")
+        and f"--state-dir {installed} " in line
+        for line in _tool_log(env)
+    ), "the installed target must not receive another deploy"
+    assert _admin_verbs(_tool_log(env)) == [
+        "deploy",
+        "remove-cluster",
+        "join-cluster",
+        "uninstall",
+    ], "stages 1-4 ran against the first state directory only"
+    stages = _record(tmp_path)["stages"]
+    assert {number: stage["status"] for number, stage in stages.items()} == {
+        "1": "PASS",
+        "2": "PASS",
+        "3": "PASS",
+        "4": "PASS",
+    }, "the refusal happens before a stage-5 attempt is opened"
+    assert (checkpoint.read_bytes(), site.read_bytes()) == before, (
+        "the installed site must be preserved for reconciliation"
+    )
+
+
+def _readme_lines(lines: list[str], prefix: str) -> list[str]:
+    return [line[len(prefix) :] for line in lines if line.startswith(prefix)]
+
+
+def test_stage_five_deploys_by_the_readme_procedure_from_a_pristine_copy(
+    tmp_path: Path,
+) -> None:
+    env = _install_fakes(tmp_path)
+    checkout = tmp_path / "checkout"
+    readme_text = (checkout / "README.md").read_text(encoding="utf-8")
+
+    result = _run(tmp_path, env, "--email-wait-minutes", "3")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = _tool_log(env)
+    deploys = [index for index, line in enumerate(lines) if "admin deploy " in line]
+    prunes = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("docker buildx prune")
+    ]
+    makes = [
+        index
+        for index, line in enumerate(lines)
+        if line == "make deploy-host-setup-online"
+    ]
+    assert len(makes) == 1 and prunes[1] < makes[0] < deploys[1], (
+        "stage 5 runs the README's make target after its cache prune and before"
+        " the README deploy; stage 1 does not touch make"
+    )
+    assert "--wait-for-email-confirmation 3" in lines[deploys[0]], (
+        "--email-wait-minutes still reaches the stage-1 deploy"
+    )
+    assert "--wait-for-email-confirmation" not in lines[deploys[1]], (
+        "the README command has no wait and the stage adds none"
+    )
+    assert lines[deploys[1]].split()[2:] == [
+        "--cpu-cluster-arn",
+        CPU_ARN,
+        "--gpu-cluster-arn",
+        GPU_ARN,
+        "--state-dir",
+        str(tmp_path / "state-second"),
+        "--admin-email",
+        ADMIN_EMAIL,
+    ], "the README deploy carries exactly the four rendered arguments"
+    (names,) = _readme_lines(lines, "readme-admin-env ")
+    (path,) = _readme_lines(lines, "readme-admin-path ")
+    (cwd,) = _readme_lines(lines, "readme-admin-cwd ")
+    incidental = {"PATH", "VIRTUAL_ENV", "PWD", "OLDPWD", "SHLVL", "_"}
+    for name in set(names.split()) - incidental:
+        assert name in boot029_readme.KEPT_NAMES or name.startswith(
+            boot029_readme.KEPT_PREFIXES
+        ), f"{name} leaked from the driver into the README deploy"
+    assert "GPU_FAULT_SENTINEL" not in names and "AWS_REGION" not in names
+    assert "PYTHONPATH" not in names and "BUILDKIT_PROGRESS" not in names
+    operator = boot029_readme.operator_path(env["PATH"])
+    assert path == f"{cwd}/.venv/bin:{operator}", (
+        "only the README's activation extends the operator's filtered PATH"
+    )
+    assert str(tmp_path / "bin") not in operator.split(os.pathsep), (
+        "the directory offering the driver's gpu-fault-admin is dropped"
+    )
+    copy = Path(cwd)
+    assert copy.is_relative_to(
+        tmp_path / "state/acceptance/stage-5-readme/attempt-1"
+    ), "the pristine copy lives in this attempt's stage area"
+    assert copy != checkout, "the README procedure never runs inside --repo"
+    assert (copy / "README.md").read_text(encoding="utf-8") == readme_text
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"], cwd=copy, capture_output=True, text=True
+        ).stdout
+        == ""
+    ), "the venv the README creates is ignored; the copy stays clean"
+    assert not (checkout / ".venv").exists(), "--repo receives no venv"
+
+    stage = _record(tmp_path)["stages"]["5"]
+    assert stage["status"] == "PASS" and stage["cold_build"]["cached_layers"] == 0
+    receipt = stage["readme"]
+    assert receipt["readme_sha256"] == _sha256(readme_text)
+    assert receipt["executed_lines"][:2] == [
+        "make deploy-host-setup-online",
+        ". .venv/bin/activate",
+    ]
+    assert receipt["executed_lines"][2].startswith("gpu-fault-admin deploy"), receipt[
+        "executed_lines"
+    ]
+    assert f"sha256:{_sha256(CPU_ARN)}" in receipt["executed_lines"][2]
+    assert (
+        f"sha256:{_sha256(str(tmp_path / 'state-second'))}"
+        in (receipt["executed_lines"][2])
+    )
+    assert receipt["skipped_verification_lines"] == [
+        "make PYTHON=.venv/bin/python check"
+    ]
+    assert receipt["venv_preexisted"] is False and receipt["attempt"] == 1
+    assert receipt["source_snapshot"] is False
+    assert (
+        receipt["source_commit"]
+        == receipt["source_base_commit"]
+        == _git(checkout, "rev-parse", "HEAD")
+    )
+    assert receipt["path_sha256"] == _sha256(operator)
+    assert receipt["path_entries_dropped"] >= 1, "the fake admin directory was dropped"
+    assert "path" not in receipt, "PATH entries never appear in clear"
+
+
+def test_stage_five_carries_uncommitted_checkout_changes_into_the_copy(
+    tmp_path: Path,
+) -> None:
+    env = _install_fakes(tmp_path)
+    checkout = tmp_path / "checkout"
+    head = _git(checkout, "rev-parse", "HEAD")
+    readme_path = checkout / "README.md"
+    readme_path.write_text(
+        readme_path.read_text(encoding="utf-8").replace(
+            ". .venv/bin/activate\n",
+            ". .venv/bin/activate\necho readme-fixture-marker\n",
+        ),
+        encoding="utf-8",
+    )
+    (checkout / "untracked-marker.txt").write_text("carried\n", encoding="utf-8")
+
+    result = _run(tmp_path, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stage = _record(tmp_path)["stages"]["5"]
+    log = (tmp_path / "state/acceptance" / stage["log_name"]).read_text()
+    assert "readme-fixture-marker" in log, (
+        "the uncommitted README line is executed verbatim from the pristine copy"
+    )
+    receipt = stage["readme"]
+    assert receipt["executed_lines"][:3] == [
+        "make deploy-host-setup-online",
+        ". .venv/bin/activate",
+        "echo readme-fixture-marker",
+    ]
+    assert receipt["source_snapshot"] is True
+    assert receipt["source_base_commit"] == head != receipt["source_commit"], (
+        "a dirty checkout is deployed as its own snapshot commit"
+    )
+    (cwd,) = _readme_lines(_tool_log(env), "readme-admin-cwd ")
+    assert (Path(cwd) / "untracked-marker.txt").read_text() == "carried\n"
+    assert "untracked-marker.txt" in _git(checkout, "status", "--porcelain"), (
+        "the checkout itself stays dirty and untouched"
+    )
+
+
+def test_stage_five_fails_when_the_readme_no_longer_states_the_procedure(
+    tmp_path: Path,
+) -> None:
+    env = _install_fakes(tmp_path)
+    readme_path = tmp_path / "checkout/README.md"
+    readme_path.write_text(
+        readme_path.read_text(encoding="utf-8").replace(
+            boot029_readme.DEPLOY_HEADING + "\n", "## 部署\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path, env)
+
+    assert result.returncode != 0, result.stdout
+    assert "FAILED at stage 5 (cold-redeploy-readme)" in result.stderr, result.stderr
+    assert "README lacks the heading" in result.stderr, result.stderr
+    lines = _tool_log(env)
+    assert _admin_verbs(lines) == [
+        "deploy",
+        "remove-cluster",
+        "join-cluster",
+        "uninstall",
+    ]
+    assert "make deploy-host-setup-online" not in lines, (
+        "a README that lost its procedure runs nothing"
+    )
+    stage = _record(tmp_path)["stages"]["5"]
+    assert stage["status"] == "FAIL" and "readme" not in stage
+    assert not (tmp_path / "state-second/bootstrap-state.json").exists(), (
+        "no deploy reaches the second state directory"
+    )

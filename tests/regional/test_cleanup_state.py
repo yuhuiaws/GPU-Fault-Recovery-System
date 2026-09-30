@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -414,3 +416,135 @@ def test_scope_all_cannot_complete_without_the_registry_drain_phase(
         MODULE.transition(
             document, phase="CLEANUP_COMPLETED", status="COMPLETED", message="missing"
         )
+
+
+def test_phase_order_drains_the_registry_before_ingress_stops() -> None:
+    """Live uninstall (2026-09-15): the drain waited under a stopped ingress, so
+    leases that could no longer renew expired, the still-running worker failed
+    their workflows and minted drain successors, and the queue never reached
+    zero. The clusters are published DRAINING first, the drain waits with
+    ingress and the consumers up, the consumers stop, and only then does
+    ingress stop; leftovers fail the run closed instead of being bulk-failed."""
+
+    assert MODULE.PHASES == (
+        "PREFLIGHT",
+        "CLUSTERS_DRAINING",
+        "GPU_DATA_PLANE_SOURCES_STOPPED",
+        "QUEUES_DRAINED",
+        "CONTROL_CONSUMERS_STOPPED",
+        "INGRESS_STOPPED",
+        "GPU_EXECUTORS_STOPPED",
+        "NODE_RUNTIMES_STOPPED",
+        "CPU_AUXILIARIES_STOPPED",
+        "APPLICATION_OBJECTS_DELETED",
+        "NAMESPACES_DELETED",
+        "CLEANUP_COMPLETED",
+        "READY_TO_DELETE_AURORA",
+        "AURORA_DELETED",
+    )
+    assert "UNCLAIMABLE_WORK_ABANDONED" not in MODULE.PHASES, (
+        "the cleanup never bulk-fails leftover work; undrained rows fail closed"
+    )
+
+
+def test_transition_refuses_the_earlier_ingress_first_order(tmp_path: Path) -> None:
+    config, inventory = inputs(tmp_path)
+    path = tmp_path / "cleanup.json"
+    document = MODULE.initialize(
+        path,
+        config_path=config,
+        inventory_path=inventory,
+        scope="all",
+        mode="reset",
+        node_mode="uninstall",
+    )
+    for phase in (
+        "CLUSTERS_DRAINING",
+        "GPU_DATA_PLANE_SOURCES_STOPPED",
+        "QUEUES_DRAINED",
+        "CONTROL_CONSUMERS_STOPPED",
+        "INGRESS_STOPPED",
+    ):
+        MODULE.transition(document, phase=phase, status="COMPLETED", message=phase)
+
+    with pytest.raises(MODULE.CleanupStateError, match="backwards"):
+        MODULE.transition(
+            document, phase="QUEUES_DRAINED", status="IN_PROGRESS", message="old order"
+        )
+    with pytest.raises(MODULE.CleanupStateError, match="backwards"):
+        MODULE.transition(
+            document,
+            phase="CONTROL_CONSUMERS_STOPPED",
+            status="IN_PROGRESS",
+            message="old order",
+        )
+    assert document["phase"] == "INGRESS_STOPPED", (
+        "a refused transition changes nothing"
+    )
+
+
+def test_a_record_of_the_earlier_order_is_neither_continued_nor_a_fleet_source(
+    tmp_path: Path,
+) -> None:
+    """A record written under the ingress-first order (schema 1) must never be
+    continued -- one history would mix two phase orders -- and it is not a
+    fleet-snapshot authority for a new journal either: the new run starts a
+    fresh schema-2 record and exports the fleet from the live control plane."""
+
+    config, inventory = inputs(tmp_path)
+    earlier = tmp_path / "cleanup.failed-20260915T094455.json"
+    document = MODULE.initialize(
+        earlier,
+        config_path=config,
+        inventory_path=inventory,
+        scope="all",
+        mode="reset",
+        node_mode="uninstall",
+    )
+    assert document["schema_version"] == 2
+    document["schema_version"] = 1
+    document.pop("phase_order")
+    document["phase"] = "INGRESS_STOPPED"
+    document["status"] = "FAILED"
+    MODULE.attach_fleet_snapshot(document, [{"cluster_id": "gpu-a", "node_id": "n"}])
+    MODULE.atomic_write(earlier, document)
+    before = earlier.read_bytes()
+
+    with pytest.raises(MODULE.CleanupStateError, match="reconciliation"):
+        MODULE.read_state(earlier)
+    with pytest.raises(MODULE.CleanupStateError, match="reconciliation"):
+        MODULE.transition(
+            document, phase="QUEUES_DRAINED", status="IN_PROGRESS", message="continue"
+        )
+
+    fresh = tmp_path / "cleanup.json"
+    MODULE.initialize(
+        fresh,
+        config_path=config,
+        inventory_path=inventory,
+        scope="all",
+        mode="reset",
+        node_mode="uninstall",
+    )
+    fresh_before = fresh.read_bytes()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy" / "control-plane" / "tools" / "cleanup_state.py"),
+            "reuse-fleet",
+            "--path",
+            str(fresh),
+            "--from",
+            str(earlier),
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0, completed.stdout
+    assert "resume the original bound journal" in completed.stderr, completed.stderr
+    assert fresh.read_bytes() == fresh_before, (
+        "refused fleet import changed the journal"
+    )
+    assert earlier.read_bytes() == before, "the earlier record was rewritten"
+    assert MODULE.read_state(fresh)["fleet_snapshot"] is None

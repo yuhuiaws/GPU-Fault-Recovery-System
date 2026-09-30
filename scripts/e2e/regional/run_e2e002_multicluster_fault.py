@@ -333,8 +333,14 @@ def notification_errors(
     registrations: list[dict[str, Any]],
     *,
     denied_cluster_id: str | None = None,
+    snapshots: list[Callable[[], dict[str, Any]]] | None = None,
 ) -> list[str]:
-    """The two emails belong to their own cluster's incident, and only to it."""
+    """The two emails belong to their own cluster's incident, and only to it.
+
+    ``snapshots`` re-reads one cluster's store while its ACTION_COMPLETED
+    delivery is still in flight (the result row lands after the workflow is
+    terminal); without it every state is judged as read.
+    """
 
     errors = []
     names_by_cluster = {
@@ -345,9 +351,15 @@ def notification_errors(
         for item in registrations
     }
     seen: dict[str, str] = {}
-    for state, cluster_id in zip(states, cluster_ids, strict=True):
-        if cluster_id != denied_cluster_id:
+    for index, (state, cluster_id) in enumerate(zip(states, cluster_ids, strict=True)):
+        if cluster_id != denied_cluster_id and snapshots is None:
             errors.extend(workload_acceptance.notification_errors(state))
+        elif cluster_id != denied_cluster_id:
+            errors.extend(
+                workload_acceptance.wait_for_notification_results(
+                    state, snapshot=snapshots[index]
+                )
+            )
         incident = state.get("incident") or {}
         if incident.get("cluster_id") != cluster_id:
             errors.append(f"{cluster_id}: incident is not scoped to the cluster")
@@ -648,12 +660,26 @@ def verify_cluster_recoveries(
             states, cluster_ids, preflight.get("executor_identities") or {}
         )
     )
+
+    def store_reader(index: int) -> Callable[[], dict[str, Any]]:
+        # The same identity ``settle`` handed ``wait_for_workflow``; resolved
+        # only when a delivery result is still in flight.
+        return lambda: fixtures[index].store_snapshot(
+            node=str(sources[index]["pods"][0]["node"]),
+            marker=str(payloads[index]["record_id"]),
+            observed_after=injection_starts[index],
+            job_id=settings.job_id,
+            attempt_id=settings.attempt_id,
+            queue_attempts=1,
+        )
+
     result["errors"].extend(
         notification_errors(
             states,
             cluster_ids,
             preflight["registrations"],
             denied_cluster_id=cluster_ids[0] if expect_a_budget_denial else None,
+            snapshots=[store_reader(index) for index in range(len(fixtures))],
         )
     )
     if expect_a_budget_denial:

@@ -1,4 +1,15 @@
-"""Private-zone association inventory with stable physical resource identities."""
+"""Private-zone association inventory with stable physical resource identities.
+
+Finding A (staging-1, 2026-09-15): the association bootstrap created for a GPU
+VPC never reached the installation registry -- the checkpoint reader skipped
+every association of a zone the site created -- while the same association
+created by ``join-cluster`` was registered under its own key. Both writers now
+record the checkpoint entry through ``vpc_association_entry`` and both registry
+paths build the row through ``vpc_association_resource``, keyed by the physical
+identity ``aws/route53/vpc-association/<region>/<vpc>`` rather than by list
+position or cluster membership; ``reconcile_vpc_association_resource`` reuses
+the key of a row an earlier release registered for the same association.
+"""
 
 from __future__ import annotations
 

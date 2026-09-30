@@ -154,10 +154,7 @@ class PowerRecoveryIdentityError(ProbeError):
 
 
 def run(
-    command: list[str],
-    *,
-    check: bool = True,
-    timeout: float = 180,
+    command: list[str], *, check: bool = True, timeout: float = 180
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         command,
@@ -212,8 +209,7 @@ def parse_env() -> dict[str, str]:
         raise ProbeError("collector env file does not exist")
     values = {}
     for line in COLLECTOR_ENV.read_text(
-        encoding="utf-8",
-        errors="replace",
+        encoding="utf-8", errors="replace"
     ).splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -556,8 +552,7 @@ def checked_power_state(
             or any(
                 not isinstance(uuid, str)
                 or re.fullmatch(
-                    r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
-                    uuid,
+                    r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", uuid
                 )
                 is None
                 for uuid in uuids
@@ -1197,9 +1192,7 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
         requested_monotonic = time.monotonic()
         run(["systemctl", "start", f"{unit}-load.service"], timeout=10)
         load_start = power_wait_load_start(
-            record,
-            requested_at=requested_at,
-            requested_monotonic=requested_monotonic,
+            record, requested_at=requested_at, requested_monotonic=requested_monotonic
         )
         emit(
             {
@@ -1441,19 +1434,38 @@ def checked_fm_receipt(value: Any) -> dict[str, Any]:
     return value
 
 
+def active_unit_identity(unit: str, what: str) -> tuple[dict[str, Any], str]:
+    """The unit's snapshot and MainPID, refused unless it is a running process."""
+
+    before = service_snapshot().get(unit) or {}
+    pid = str(before.get("MainPID") or "")
+    if (
+        before.get("ActiveState") != "active"
+        or not pid.isdecimal()
+        or int(pid) <= 1
+        or not before.get("InvocationID")
+    ):
+        raise ProbeError(f"{what} process identity is unknown")
+    return before, pid
+
+
 def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
-    """Read an inclusive, bounded receipt window without exposing general logs."""
+    """Read an inclusive, bounded receipt window without exposing general logs.
+
+    The window is the running boot's only: ``__MONOTONIC_TIMESTAMP`` restarts
+    at every boot, so an un-anchored tail spanning a reboot fails the
+    journal-order check for hours (live COLLECT-005, 2026-09-21). journald is
+    asked for the boot and every row's ``_BOOT_ID`` is checked regardless.
+    """
 
     cursor = arguments.cursor
     if cursor and not SAFE_JOURNAL_CURSOR.fullmatch(cursor):
         raise ProbeError("FM journal cursor is invalid")
-    before = service_snapshot().get(FM_UNIT) or {}
-    if (
-        before.get("ActiveState") != "active"
-        or not HEX32.fullmatch(str(before.get("InvocationID") or ""))
-        or not str(before.get("MainPID") or "").isdecimal()
-        or int(before["MainPID"]) <= 1
-    ):
+    boot_id = BOOT_ID_FILE.read_text().strip().replace("-", "")
+    if not HEX32.fullmatch(boot_id):
+        raise ProbeError("host boot id is unknown")
+    before, _ = active_unit_identity(FM_UNIT, "FM producer")
+    if not HEX32.fullmatch(str(before["InvocationID"])):
         raise ProbeError("FM producer process identity is unknown")
     # No ``--grep``: systemd 252 hands ``--grep`` matches back newest-first once
     # ``--lines`` is given and walks *backwards* from ``--cursor`` (live
@@ -1466,15 +1478,17 @@ def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
         "--no-pager",
         "--quiet",
         "--all",
-        "--output-fields=MESSAGE,__CURSOR,_SYSTEMD_INVOCATION_ID,_PID,__MONOTONIC_TIMESTAMP",
+        "--output-fields=MESSAGE,__CURSOR,_SYSTEMD_INVOCATION_ID,_PID,"
+        "__MONOTONIC_TIMESTAMP,_BOOT_ID",
         (
             f"--lines=+{FM_JOURNAL_LIMIT + 1}"
             if cursor
             else f"--lines={FM_JOURNAL_TAIL_LINES}"
         ),
     ]
-    if cursor:
-        command.append(f"--cursor={cursor}")
+    # An anchor cursor already lies inside this boot (the producer identity is
+    # re-checked below); only the un-anchored tail needs journald's boot scope.
+    command.append(f"--cursor={cursor}" if cursor else f"--boot={boot_id}")
     completed = run(command, check=False, timeout=60)
     if completed.returncode or len(completed.stdout.encode()) > 4 * 1024 * 1024:
         raise ProbeError("FM journal receipt read failed or exceeded its bound")
@@ -1486,6 +1500,8 @@ def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
             if not line.strip():
                 continue
             entry = json.loads(line)
+            if entry["_BOOT_ID"] != boot_id:
+                raise ProbeError("FM journal window crosses a boot boundary")
             unit_lines += 1
             message = entry["MESSAGE"]
             if not isinstance(message, str) or FM_RECEIPT_PREFIX not in message:
@@ -1509,11 +1525,7 @@ def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
                 raise ProbeError("FM journal window is not in journal order")
             previous_clock = clock
             records.append(
-                {
-                    "cursor": record_cursor,
-                    "monotonic_us": clock,
-                    "receipt": body,
-                }
+                {"cursor": record_cursor, "monotonic_us": clock, "receipt": body}
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise ProbeError("FM journal receipt JSON is malformed") from exc
@@ -1564,15 +1576,7 @@ def gpu_identity(_arguments: argparse.Namespace) -> None:
 
 def firmware_premise(_arguments: argparse.Namespace) -> None:
     unit = "gpu-fault-node-agent.service"
-    before = service_snapshot().get(unit) or {}
-    pid = str(before.get("MainPID") or "")
-    if (
-        before.get("ActiveState") != "active"
-        or not pid.isdecimal()
-        or int(pid) <= 1
-        or not before.get("InvocationID")
-    ):
-        raise ProbeError("Node Agent process identity is unknown")
+    before, pid = active_unit_identity(unit, "Node Agent")
     process = PROC_ROOT / pid
     start = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
     environment = {}
@@ -1610,15 +1614,7 @@ def firmware_premise(_arguments: argparse.Namespace) -> None:
 def inventory_configuration() -> dict[str, Any]:
     """Read only inventory settings from the running host collector and its file."""
 
-    before = service_snapshot().get(HOST_COLLECTOR_UNIT) or {}
-    pid = str(before.get("MainPID") or "")
-    if (
-        before.get("ActiveState") != "active"
-        or not pid.isdecimal()
-        or int(pid) <= 1
-        or not before.get("InvocationID")
-    ):
-        raise ProbeError("host collector process identity is unknown")
+    before, pid = active_unit_identity(HOST_COLLECTOR_UNIT, "host collector")
     keys = {
         "GPU_FAULT_EXPECTED_GPU_COUNT",
         "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT",
@@ -1881,11 +1877,7 @@ def publish_gpu_inventory(arguments: argparse.Namespace) -> None:
     from urllib.parse import urlsplit
 
     from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
-    from gpu_fault.collectors.sinks import (
-        DeliveryStatus,
-        HttpEventSink,
-        deliver_event,
-    )
+    from gpu_fault.collectors.sinks import DeliveryStatus, HttpEventSink, deliver_event
 
     if (
         arguments.confirm != "PUBLISH_GPU_INVENTORY"
@@ -2042,10 +2034,7 @@ SAFE_POD_UID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def workload_processes(
-    pod_uid: str,
-    *,
-    proc: Path = Path("/proc"),
-    excluded_pids: Iterable[int] = (),
+    pod_uid: str, *, proc: Path = Path("/proc"), excluded_pids: Iterable[int] = ()
 ) -> list[dict[str, Any]]:
     """Every process whose cgroup names ``pod_uid``, both kubelet spellings.
 
@@ -2138,14 +2127,7 @@ def write_xid(arguments: argparse.Namespace) -> None:
         written = os.write(descriptor, message)
     finally:
         os.close(descriptor)
-    emit(
-        {
-            "xid": xid,
-            "marker": marker,
-            "pci_bdf": bdf,
-            "bytes_written": written,
-        }
-    )
+    emit({"xid": xid, "marker": marker, "pci_bdf": bdf, "bytes_written": written})
 
 
 def append_sxid(arguments: argparse.Namespace) -> None:
@@ -2271,10 +2253,7 @@ COLLECTOR_ENV_INTENT_FIELDS = (
     "host_unit_path",
     "host_unit_sha256",
 )
-COLLECTOR_ENV_V3_INTENT_FIELDS = (
-    *COLLECTOR_ENV_INTENT_FIELDS,
-    "runtime_filesystem",
-)
+COLLECTOR_ENV_V3_INTENT_FIELDS = (*COLLECTOR_ENV_INTENT_FIELDS, "runtime_filesystem")
 
 
 class CollectorEnvGuardError(ProbeError):
@@ -2820,11 +2799,7 @@ def collector_guard_failure_path(run_id: str, command: str, error_code: str) -> 
 
 
 def collector_guard_failure_valid(
-    receipt: dict[str, Any],
-    record: dict[str, Any],
-    *,
-    command: str,
-    error_code: str,
+    receipt: dict[str, Any], record: dict[str, Any], *, command: str, error_code: str
 ) -> bool:
     try:
         timestamp = receipt["recorded_at"]
@@ -3549,10 +3524,7 @@ def collector_automatic_restart(record: dict[str, Any]) -> None:
         and state.get("ControlPID") == "0"
         and state.get("Job") in {"", "0", "[not set]"}
     ):
-        run(
-            ["systemctl", "--no-block", "restart", HOST_COLLECTOR_UNIT],
-            timeout=10,
-        )
+        run(["systemctl", "--no-block", "restart", HOST_COLLECTOR_UNIT], timeout=10)
         return
     if (
         state.get("ActiveState") == "inactive"
@@ -3961,6 +3933,18 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main() -> int:
     arguments = parser().parse_args()
     try:
@@ -3983,12 +3967,7 @@ def main() -> int:
             retryable = isinstance(exc, CollectorEnvBusyError) or not isinstance(
                 exc, CollectorEnvGuardError
             )
-            error_site = None
-            frame = exc.__traceback__
-            while frame is not None:
-                if frame.tb_frame.f_code.co_filename == __file__:
-                    error_site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
-                frame = frame.tb_next
+            error_site = exception_site(exc)
             error_code = hashlib.sha256(str(exc).encode()).hexdigest()[:16]
             failure_receipt = collector_guard_failure(
                 arguments, error_code=error_code, error_site=error_site
@@ -4010,7 +3989,17 @@ def main() -> int:
                 }
             )
             return 1 if retryable else 78
-        emit({"error": f"{type(exc).__name__}: {exc}"})
+        # The host fixture withholds this output; the class, a digest of the
+        # message and the site are the message-free trail it may show.
+        emit(
+            {
+                "error": f"{type(exc).__name__}: {exc}",
+                "error_kind": "probe",
+                "error_class": type(exc).__name__,
+                "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+                "error_site": exception_site(exc),
+            }
+        )
         return 1
     return 0
 

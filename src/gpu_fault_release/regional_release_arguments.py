@@ -74,6 +74,8 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     value.add_argument("--config", required=True, type=Path)
+    # Repeatable: drain-cluster publishes every named cluster in one revision;
+    # the other cluster modes take exactly one (see validate_cluster_arguments).
     value.add_argument(
         "--cluster-id", action="append", dest="cluster_ids", metavar="CLUSTER_ID"
     )

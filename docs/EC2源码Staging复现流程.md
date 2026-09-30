@@ -12,8 +12,7 @@ gpu-fault-admin deploy \
 ```
 
 多个GPU集群重复传`--gpu-cluster-arn`。首集群形成基线后，其余集群通过独立batch join
-接入；滚动并行度使用站点`upgradeMaxParallelClusters`，默认逐集群。
-操作者不提供release-ref、artifact、site、
+接入（按站点`upgradeMaxParallelClusters`滚动，默认逐集群）。操作者不提供release-ref、artifact、site、
 release-build、release-deploy、bundle或venv路径。
 
 ## 1. 前提
@@ -24,8 +23,9 @@ release-build、release-deploy、bundle或venv路径。
 - EC2执行身份具有staging bootstrap所需的AWS、EKS和Kubernetes权限。
 - EC2已安装Python 3.12、Git、Make、Docker/Buildx、AWS CLI、Cosign、kubectl、Helm、
   curl、jq、OpenSSL和sha256sum。
-- 按下一节建立源码开发venv；统一部署命令会安装并绑定本站点的受信deploy-host。
-  生产部署机的签名离线bundle要求仍见[CI 发布流程](CI发布流程.md)。
+- 不需要预先安装签名deploy-host bundle：按§2的`make deploy-host-setup-online`建立源码开发venv，
+  统一部署命令会在`STATE_DIR/deployer-venv`内自行构建、验签并绑定本站点的受信deploy-host（见§8）；
+  签名离线bundle只用于生产部署机，见[CI 发布流程](CI发布流程.md)。
 - CPU/GPU集群ARN属于同一账号和Region。
 
 state目录必须位于Git仓库外。本流程不执行GPU reset、节点reboot、warm-spare切换或
@@ -100,12 +100,12 @@ state中不存在站点
   -> release构建、签名/验签与独立基础资源任务并行
   -> 收敛Aurora、NLB、DNS/PKI、监控和IAM
   -> 内部生成site
-  -> 写入首个基线GPU集群registry -> CPU/endpoint -> 首个GPU bootstrap
+  -> 写入首个基线GPU集群的registry -> CPU/endpoint -> 首个GPU bootstrap
   -> verify -> stability -> 其余GPU集群独立batch join
 
 state中已有站点
   -> 首次多GPU接入未完成时，验证原目标未变且当前成员是其单调子集
-  -> 原目标全部纳管或有完整已完成移除证明后，允许纳管集合及其超集
+  -> 原目标全部纳管或有完整已完成移除证明后，要求CPU不变且请求的GPU集合是纳管集合或其超集，多出的集群在发布后自动join
   -> 扫描并固定当前源码身份
   -> 应用身份未变:
        -> deploy-host变化: 更新deploy-host并执行影响门禁和只读preflight
@@ -116,7 +116,7 @@ state中已有站点
   -> upgrade -> verify -> stability
 ```
 
-`deploy`可接受纳管集合的超集，发布后通过独立受检join事务接入新增集群。
+`deploy`可接受纳管集合的超集，发布后通过独立受检join事务接入新增集群（`join-cluster`是其别名）。
 未完成的多目标首次部署仍绑定原目标及顺序；不能以部分site解除承诺。
 少给受管集群或更换CPU仍拒绝，移除必须使用受检`remove-cluster`流程。
 
@@ -218,7 +218,8 @@ AWS查询或Kubernetes访问之前直接拒绝。需要管理另一站点时必�
 流程安装的deploy-host，不能复用其他state目录的CLI。
 
 deploy-host bundle中的第三方依赖按lock和平台安装到
-`STATE_DIR/.deployer-venv.dependencies/<dependency identity>`。项目wheel更新但依赖identity不变时只重建轻量
+`STATE_DIR/.deployer-venv.dependencies/<dependency identity>`（与deployer-venv相邻的共享
+依赖层）。项目wheel更新但依赖identity不变时只重建轻量
 overlay venv，不再重复安装全部第三方wheel；依赖层校验失败时不会激活新venv。
 
 ## 9. 修改代码后的循环

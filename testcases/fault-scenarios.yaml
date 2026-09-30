@@ -3016,9 +3016,9 @@ test_cases:
     verified:
       case_digest: 594a2f191fa245c3f470f8b967bfc401028f980cc69e5cb74c4ae62198057493
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-002
   related_pytest: tests/regional/test_regional_acceptance_fixtures.py::test_local_executor_guard_fixture_covers_iso002_and_cmd011
@@ -3039,9 +3039,9 @@ test_cases:
     verified:
       case_digest: 8d0448fdc2cdddbe887f8406f179f48bb160e3ec4c22fb9b8fd6775b41b8d008
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-003
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_iso003_the_fleet_proxy_refuses_cross_cluster_reads_and_transitions
@@ -3061,9 +3061,9 @@ test_cases:
     verified:
       case_digest: d7b284cbdca969d250cdadc68ae3ec99277792a7a639de13ff113ab471f0ed5c
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-004
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_spare_health_uses_fleet_registry
@@ -3084,9 +3084,9 @@ test_cases:
     verified:
       case_digest: e16ef14763a1822cdfefe7e3cbf2d2e17205a468d55e8872feb58b644d0f74c1
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-005
 - id: GF-REGIONAL-ISO-006
@@ -3130,9 +3130,9 @@ test_cases:
     verified:
       case_digest: ca2792c570a4bd5a6b8b8e527e8d51f5c9400679ad43d993a8f8594009e9912a
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-001
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd001_max_commands_is_enforced_at_both_ends_of_its_range
@@ -3153,9 +3153,9 @@ test_cases:
     verified:
       case_digest: 5bcd06ae32d4dff3abaae5f734d4f05ff4a51ce87006d811c5bd8a39142eac4b
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-002
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd002_lease_seconds_bounds_and_the_deadline_it_returns
@@ -3176,9 +3176,9 @@ test_cases:
     verified:
       case_digest: 8ad9bdcdace22429053f141817f670591c8beb9fc9eff108dd6d166374e993f5
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-003
   related_pytest: tests/regional/test_regional_control_plane.py::test_remote_claim_filters_execution_owners_and_legacy_api
@@ -3199,9 +3199,9 @@ test_cases:
     verified:
       case_digest: d01e26bbfc96ae440518cf24a48830f9251827822d0f3275776249ae7ee26662
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-004
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd004_a_claim_only_takes_commands_for_the_owners_it_asked_for
@@ -3220,9 +3220,9 @@ test_cases:
     verified:
       case_digest: 585bbc05b4ddce220217bcf6d090014d2e0ffd4ddc73fcb383fbe7ee6505dcdd
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-005
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd005_the_claim_order_is_fifo_and_ties_break_deterministically
@@ -3244,9 +3244,9 @@ test_cases:
     verified:
       case_digest: 934ea97fa0a4858e68f128fe2fc5a180cda0fd24acba5409a9b3357134ba5c41
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-006
   related_pytest: tests/regional/test_regional_control_plane.py::test_remote_command_lease_and_result_advance_adapter
@@ -3266,9 +3266,9 @@ test_cases:
     verified:
       case_digest: 3daf41e2314a5fecd9725163540bd2345020ebb584cc8bf34d9abddf6fc4781b
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-007
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd007_a_terminal_result_is_idempotent_and_cannot_be_rewritten
@@ -3291,9 +3291,9 @@ test_cases:
     verified:
       case_digest: 6cd1593e938fb3d1e8ca66f9d57b46c059ba04733e3baf6da442516d3df18f37
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-008
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd008_an_illegal_result_is_rejected_and_changes_nothing
@@ -3314,9 +3314,9 @@ test_cases:
     verified:
       case_digest: 91c6c42371938652f57aeba5d621ac526ffd6136da23c35e5059d83814e11eee
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-009
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd009_an_unknown_and_a_foreign_command_are_the_same_404
@@ -3357,9 +3357,9 @@ test_cases:
     verified:
       case_digest: f1ba1d2f1d1a970ab367c78e71e7a5943b5c0cc02d446aa6ae03e4d0e8f54304
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-011
   command:
@@ -3383,9 +3383,9 @@ test_cases:
     verified:
       case_digest: 951917eb6f98c65fed76d9227031963da4ccf1ad504154b39e6c7c3a9e0e7cea
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-012
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd012_the_command_identity_is_reused_on_retry_and_new_on_a_fence
@@ -3406,9 +3406,9 @@ test_cases:
     verified:
       case_digest: 2ae8aed3e4591cc12750b7e608c181ea4892e652765c7738a70be38b8440ba4a
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-013
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd013_waiting_can_be_reclaimed_and_carries_the_previous_details
@@ -3428,9 +3428,9 @@ test_cases:
     verified:
       case_digest: 2b668c153c78c309dde2b40dcf1f8309b1f161b754f6c18a06a62c51425a237d
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-014
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd014_the_delegating_step_states_the_control_plane_did_not_mutate
@@ -3480,9 +3480,9 @@ test_cases:
     verified:
       case_digest: ec1596a84d086cf33624872bfac382b6ede4661ff0b4f76ab9e90446110328da
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-016
   related_pytest: tests/regional/test_regional_control_plane.py::test_remote_hyperpod_submission_endpoints_enforce_cluster_binding
@@ -3515,9 +3515,9 @@ test_cases:
     verified:
       case_digest: c169574d8fc0febf85a676251067417835059f2f1b9eba31143c0ca8a21e7e57
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-017
   related_pytest: tests/regional/test_cmd017_barrier_hold.py::test_the_held_command_contract_passes_on_the_fail_closed_record
@@ -3547,9 +3547,9 @@ test_cases:
     verified:
       case_digest: 485c1b205d255f088a2b566585859586fcc76ab6378a6c4ba2c6715d884fe12e
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-018
   related_pytest: tests/regional/test_cmd018_open_sibling_hold.py::test_the_dispatch_contract_passes_on_a_held_rewrite
@@ -3573,9 +3573,9 @@ test_cases:
     verified:
       case_digest: abe8f1e0362979c58f340356224a208cc9928b95fe6a4291e2d9de19a8333cc0
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-001
 - id: GF-REGIONAL-HA-002
@@ -3597,9 +3597,9 @@ test_cases:
     verified:
       case_digest: d71787c549098695acb1df9a755e54f9583a174fe66f2d3fcc2355c9a1da1592
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-002
 - id: GF-REGIONAL-HA-003
@@ -3671,9 +3671,9 @@ test_cases:
     verified:
       case_digest: e674fd26e96b03b41d5186d54142a815e8611ad3296d9585ce86f142db99e999
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-005
 - id: GF-REGIONAL-HA-006
@@ -3718,9 +3718,9 @@ test_cases:
     verified:
       case_digest: 67cc655e3f4700c02cf268f8ac2dfacdf30f2efddccffb67706344bf56ec33e1
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-001
 - id: GF-REGIONAL-NET-002
@@ -3741,9 +3741,9 @@ test_cases:
     verified:
       case_digest: e1433a3f48ab07fe243962aa0470b4b2cca4d3b7459498a390a01bcd40ef75cf
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-002
 - id: GF-REGIONAL-NET-003
@@ -3763,9 +3763,9 @@ test_cases:
     verified:
       case_digest: 012ee691ec20d813337ead584927acc95b66478b455bcdb8b59f651feac42d21
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-003
 - id: GF-REGIONAL-NET-004
@@ -3786,9 +3786,9 @@ test_cases:
     verified:
       case_digest: ca8b68d6287c4935dd4cb1ec80c73da1c2ac90e07c934b12505cebb3c327631a
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-004
   command:
@@ -3812,9 +3812,9 @@ test_cases:
     verified:
       case_digest: 7e5ae86271d34d98000fbb0456baafdc235fc63e7a63fa4b8ad40a8c8a42946f
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-005
   execution:
@@ -3855,9 +3855,9 @@ test_cases:
     verified:
       case_digest: 50b99a9870342328b4f69ba5d53a5222abfdbf8d3eb96cb7ccf4ffe6e8aca2ee
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-006
   related_pytest: tests/regional/test_net006_lease_loss.py::test_the_counter_contract_passes_on_one_withheld_result_and_one_reclaim
@@ -3888,9 +3888,9 @@ test_cases:
     verified:
       case_digest: ba353869dfb9dc235d71ac6a9b5d77fc3ab893e87be6566f0f3cc26ee0d172a0
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-007
   related_pytest: tests/execution/test_retryable_adapter_errors.py::test_transient_adapter_error_becomes_a_waiting_step_not_a_failure
@@ -3920,9 +3920,9 @@ test_cases:
     verified:
       case_digest: 04296f03bc797366dfb8cb118b1b537cae39925835967bda4481aabc57a43138
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-008
   related_pytest: tests/regional/test_net008_outbox_dead_letter.py::test_the_transient_outbox_contract_passes_on_replayable_403_records
@@ -4062,9 +4062,9 @@ test_cases:
     verified:
       case_digest: 50747c01b148565f1ae53474a7ceee456161f79d70fe70931b795e9c2245a834
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-002
   related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_blast002_the_control_plane_declares_no_gpu_write_permission
@@ -4086,9 +4086,9 @@ test_cases:
     verified:
       case_digest: 6118fb6478ecded192e1b8219e77cef5c696a353562b099e146c05d409ec2298
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-003
   related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_blast003_the_executor_rbac_and_iam_stay_minimal
@@ -4243,9 +4243,9 @@ test_cases:
     verified:
       case_digest: ea946894758c7fcb26df2352441f821a44b109e6876d8b81e208a8c0620f4792
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-005
   command:
@@ -4274,9 +4274,9 @@ test_cases:
     verified:
       case_digest: 907e18777d24010fcef8842ca6f7cd71d08282560da05a72b7a2910f449a9298
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-006
   command:
@@ -4304,9 +4304,9 @@ test_cases:
     verified:
       case_digest: f83e988057df1c3bedf23d0b8fb7d230edcf39320ea5c89b5019103548735e76
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-007
   command:
@@ -4397,9 +4397,9 @@ test_cases:
     verified:
       case_digest: cc2d97bc8c9d5c631079543f9538da024a9102c9bc23aecdf384c470eec8d5b6
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-010
 
@@ -4953,9 +4953,9 @@ test_cases:
     verified:
       case_digest: 6b0293fd73df64e2e7349a24e54c8bebc876d99005998bee1d952ac0b7d9a3f9
       components:
-        control_plane: 14e1f1ea8ab545a11d9f66a464d735f1c4344fd23d6d2edbd913e1aef092fc95
-        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-001
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_executor_workload_restart_notification
@@ -4992,9 +4992,9 @@ test_cases:
     verified:
       case_digest: 7671e28a4c1beb399a6965b3803bc665b96a8478d332eadaf6c4f837bf7d7ee0
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-003
   related_pytest: tests/notifications/test_notifications.py::test_first_dispatch_suppresses_the_pre_enable_backlog
@@ -5013,9 +5013,9 @@ test_cases:
     verified:
       case_digest: f2006247a9cd5d541d7d7bc3407f11b6e301b47e13cebf72896fe414d06167bf
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-004
   related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_notify004_no_data_plane_identity_can_send_mail
@@ -5034,9 +5034,9 @@ test_cases:
     verified:
       case_digest: 02ab42261cd5ab3cea37959b6c6993e6f8c356f2778aa3dfb4e1aff415e1dc66
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-005
 - id: GF-REGIONAL-E2E-001
@@ -5307,9 +5307,9 @@ test_cases:
     verified:
       case_digest: 6321814f7f116ca29b8c4c2f6c114fd855f26a63ff90cfd61a53162761c4158a
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-007
   command:
@@ -5337,9 +5337,9 @@ test_cases:
     verified:
       case_digest: 89f8e83e16e2c26a56f11132094d9004eab3625fe2d156f5d67a3ce850319672
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-008
   command:
@@ -5367,9 +5367,9 @@ test_cases:
     verified:
       case_digest: 2cd0ec80660ec374b6b355d22debd8c592da5107bb82e4b99d57251a230ad331
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-009
   related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_updates_the_secret_and_leaves_every_deployment_alone
@@ -5425,7 +5425,13 @@ test_cases:
   - shutdown 后不残留 dispatcher 线程
   - 多副本 throttling 不形成同步重试风暴
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e1ab6e67425ba963ec832022112db1bce08c9fc5dcf27ed15735e39b6d47b4e8
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-006
   command:
@@ -5459,9 +5465,9 @@ test_cases:
     verified:
       case_digest: a580c265315d8b3a7dc14f536d7c9f84d482ec0a935dc882edf90a5ac9da56aa
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-007
   related_pytest: tests/regional/test_notify007_delivery_states.py::test_the_retry_phase_contract_passes_when_retry_is_not_failed
@@ -5474,8 +5480,9 @@ test_cases:
     生产使用 Aurora PostgreSQL，但默认 pytest 在没有 GPU_FAULT_TEST_POSTGRES_URL 时会跳过全部 PostgreSQL store/claim 测试。
   injection: >-
     CI 设置独立回环PostgreSQL 16管理连接GPU_FAULT_STORE_URL并执行python3 scripts/e2e/regional/run_cap005_postgres_suite.py；
-    runner拒绝Aurora及其端口转发，创建隔离database，设置GPU_FAULT_TEST_POSTGRES_URL，
-    通过make test-postgres-stress执行8×40锁竞争压力档和store contract，外层不使用xdist。
+    runner拒绝Aurora及其端口转发，通过scripts/run_postgres_shards.py在1..8个自建的独立PostgreSQL 16实例上
+    以8×40锁竞争压力档执行PostgreSQL suite（每个进程串行，不使用xdist），再创建隔离database、
+    设置GPU_FAULT_TEST_POSTGRES_URL执行完整store contract。
   expected:
   - PostgreSQL 专属用例零 skip、零失败
   - 测试数据库与生产数据库隔离
@@ -5483,13 +5490,7 @@ test_cases:
   - completion cluster concurrency在真实PostgreSQL事务上覆盖2与4两档，counter一致、fencing不回退且deadlock为0
   - 测试结束无数据库对象残留
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 9a34f664651c7381c27202c52c5ec3375fc32e9b167feea4970834c56027a816
-      components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+    verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cap-005
   execution:
@@ -5522,9 +5523,9 @@ test_cases:
     verified:
       case_digest: 83220e580ada78b6eb86bc7d9d293918143f598eb3b44f4fbd2ba6a375defcb2
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-001配置关闭
   command:
@@ -5552,9 +5553,9 @@ test_cases:
     verified:
       case_digest: 5c1736061c061150b920a2be0058b7e8a52651ad1898a07b6d22a8a5512e2423
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-002同attempt-clean-boundary
   command:
@@ -5582,9 +5583,9 @@ test_cases:
     verified:
       case_digest: 3cca322c990d6dd24c83ace1dbc87b6afb4880f8e1ac0f9580297a547def8c5f
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-003无job同节点
   command:
@@ -5611,9 +5612,9 @@ test_cases:
     verified:
       case_digest: def40223b35af2d8f2cf8ac1cbaec8c103a18f6471035d4d2e3a8094cbe2eb4d
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-004rank门禁
   command:
@@ -5639,9 +5640,9 @@ test_cases:
     verified:
       case_digest: 1f0cb947d734cc2f45e4a558e981e64fbd4eb5e1d14467ab279ad72cf3773011
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-005remote-pending取消
   command:
@@ -5669,9 +5670,9 @@ test_cases:
     verified:
       case_digest: fe4e121dad6895f8541f4eb67852663cf34a4436693e5b4a8f59b69a9c3ccc9f
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-006已提交resetreboot
   command:
@@ -5698,9 +5699,9 @@ test_cases:
     verified:
       case_digest: c9a0942984869fe061c9e420da03e748545cd2cbfce8190f1024ea4cac82af70
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-007已提交rebootreplace
   command:
@@ -5729,9 +5730,9 @@ test_cases:
     verified:
       case_digest: e9c235cd76b70221c07436b180141cfbd17467bd202cdada2ed4465dd7b1cb6a
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-008quiesce后跳过低级reset
   command:
@@ -5759,9 +5760,9 @@ test_cases:
     verified:
       case_digest: 4bff9fd2cab55f9641f3d90aa1fc577df46ad86d20e7be09ace131cf36a85ba5
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-009waiting分类
   command:
@@ -5783,7 +5784,13 @@ test_cases:
   - incident.fencing_token 等于 successor.fencing_token
   - 三种前驱终态都不覆盖 successor 指针
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8d009ba27ceb520948bee3d1a9947da99199452ee8779d0c9636bf43a8afb6a3
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-010incident指针
   pytest_nodeid: tests/execution/test_misc.py::test_predecessor_terminal_save_preserves_successor_incident_pointer
@@ -5806,9 +5813,9 @@ test_cases:
     verified:
       case_digest: 1429f3803b4a09809bd8aee9861a8acd8d62f4b38d985d5be1fa9c6ddf43e9ca
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-011多副本租约与aurora-failover
   pytest_nodeid: tests/execution/test_executor.py::test_preemption_survives_store_failover_and_lease_takeover
@@ -5832,9 +5839,9 @@ test_cases:
     verified:
       case_digest: 169fba084a2e127231f5aa45c79b36492b4e645d9945e04cfdd2fa656496b981
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-012真机验收
 - id: GF-REGIONAL-PREEMPT-013
@@ -5874,7 +5881,13 @@ test_cases:
   - 重复运行 dispatcher 不改变链，也不产生第二次物理动作
   - 两种注入时序的结果一致
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 50e4c3ebdb49d26c411be4e9223613a77c60e1eeab028dd20fe9566a93893b3e
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-014五级连环抢占
   pytest_nodeid: tests/execution/test_executor.py::test_five_level_preemption_is_arrival_order_independent
@@ -5894,7 +5907,13 @@ test_cases:
   - incident 仍指向高级 workflow
   - 重复 event ID 幂等
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6c6f25a8d1f09819fe141af94b69336fd6e8e7d1a67e73962de025a85d480442
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-015高级workflow运行后到达低级事件
   pytest_nodeid: tests/orchestration/test_cross_fault_arbitration.py::test_later_weaker_event_does_not_reverse_existing_preemption
@@ -5913,7 +5932,13 @@ test_cases:
   - 同 job 时共享 STOP_WORKLOADS 与 RESTART_WORKLOAD 只执行一次
   - 走 containment barrier 到多节点分支到 join 到单次 restart 的 DAG
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: de82d9f8ec8f9b040e34c3f14457df94ef212be65f8a40ad23a7e69ec1263178
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-016不同节点与warm-spare并发
   pytest_nodeid: tests/orchestration/test_cross_fault_arbitration.py::test_disjoint_node_scope_uses_independent_workflows_or_shared_dag
@@ -5933,7 +5958,13 @@ test_cases:
   - join 同时依赖两个 branch 末端
   - 每个node branch各有一条RESTORE_SCHEDULING，RESTART_WORKLOAD共享且只执行一次
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f4eef0169d9de0ae8a6497292537355bab94c2a00f09e84cd0331d2419ed73c8
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-017同job双节点并行branch
   execution:
@@ -5964,7 +5995,13 @@ test_cases:
   - 唯一 RESTART_WORKLOAD 的 dependency 集合包含全部 branch 末端
   - 重复事件不追加重复 branch
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 780307ada3eeb08fecc21a628337559548f0aa397a66f9724920eb9a357db19a
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-0183节点与5节点动态追加
   pytest_nodeid: tests/orchestration/test_merge.py::test_parallel_job_dag_accepts_three_and_five_node_branches
@@ -5982,7 +6019,13 @@ test_cases:
   - 已知耗尽保持FAILED且不共享restart，健康兄弟仍可完成合法恢复
   - 物理结果未知保持BLOCKED/NEEDS_OPERATOR，不升级未知节点的新硬件动作或恢复调度，也不共享restart
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 65e65528a07c2fb21c2fb4f0c6fa46807db9f0dc86f4bcae525c86361d2fd4a5
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-019branch失败与join门禁
   pytest_nodeid: tests/regional/test_acceptance_recovery_outcomes.py::test_preempt019_branch_outcome_does_not_conflate_repair_failure_and_operator_hold
@@ -5999,7 +6042,13 @@ test_cases:
   - 新事件创建独立 workflow
   - 按共享 job 状态保守串行，已重启的 job 不被旧 DAG 改写
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 9bae6a52343b20a9e918c0868dca0fa44112784fc121a735f853b4d64544ba5c
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-020finalization开始后的迟到节点
   pytest_nodeid: tests/orchestration/test_cross_fault_arbitration.py::test_late_node_after_restart_finalization_uses_new_workflow
@@ -6019,7 +6068,13 @@ test_cases:
   - RESET step 已有 WAITING 或 LEASED execution 后不改写已提交 command
   - 新增 GPU 进入同一 attempt DAG 的后续恢复阶段，join 仍只有一个
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 08565043352062f1a49ea9956042f3e3997387673e0941fa05987a8e130296e8
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-021同节点同级不同gpu
   execution:
@@ -6051,7 +6106,13 @@ test_cases:
   - node-A 尚未执行的旧 reset step 标记 superseded
   - STOP_WORKLOADS 与 RESTART_WORKLOAD 各一个
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: b46ec6a63fd0ae0fc822e79ed6e4a53036baa9506229a7e883e9c82f1c9540d1
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-022同节点branch-local-rank
   pytest_nodeid: tests/orchestration/test_cross_fault_arbitration.py::test_dag_compares_recovery_rank_within_the_target_node_branch
@@ -6092,7 +6153,13 @@ test_cases:
   - 普通 diagnostic bundle 与 VALIDATE_HOST/FABRIC 不延迟共享 STOP
   - STOP 完成后到达的事件标记运行中 process evidence 不可用但仍可用原始 evidence 并追加 branch
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d4b861fe88f76cfb5b08fd10ada2ab8ad5fd6b741e8b1c8ab4fdc4dc3a24e2fc
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-024持续采集与按需诊断边界
   execution:
@@ -6126,7 +6193,13 @@ test_cases:
   - restart budget delta 为 0
   - 不再匹配 marker，也不触发递归 STOP 或 RESTART
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5a247476564d99a0b4cef5703caf9604157b54a45dda2a5ba4b42191f2466c83
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-025completionwatcher因果ack
   execution:
@@ -6159,7 +6232,13 @@ test_cases:
   - workflow 完成QUARANTINE分支后SUCCEEDED，incident保持QUARANTINED
   - restart 已提交后到达的 quarantine 属于下一恢复代际，不伪造取消
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 26569161a7b4382e06a327883b50acb921c94201fe51fdf5d37e29e612b848d8
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-026quarantine终止共享restart
   execution:
@@ -6192,7 +6271,13 @@ test_cases:
   - replacement 与 reset/reboot 保留各自 node branch
   - 不因 group 创建顺序生成 predecessor 链
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 00b0478a1aa4ae3ee0953590ec05337f8a308b5cd8fede706f21d31548e59261
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-027跨group到达顺序对称
   pytest_nodeid: tests/orchestration/test_xid.py::test_xid_and_replacement_arrival_order_joins_same_attempt_dag
@@ -6212,7 +6297,13 @@ test_cases:
   - 只有同一物理节点 resource claim 冲突时才用 node predecessor 作最后防线
   - 同时产生 exclusive node ownership invariant violation 告警
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6a294624eebab0e68fc265ac019a08570a2b4e0fc3eb4648145524c1a2138ce0
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-028不同attempt独立与节点独占不变量
   execution:
@@ -6254,7 +6345,13 @@ test_cases:
   - dedup key 含 incident 与 replacement operation ID，重试不重复发信
   - 区域 executor 的 store=None 路径用 regional notification sink 回写控制面 outbox
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: aa71e76a8ae5db24a7b8a0dd80a78d46e7c08e8b93a4aa25b62ba203e8113aac
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-029warm-spare替换成功通知
   execution:
@@ -6289,7 +6386,13 @@ test_cases:
   - snapshot FAILED 时记录错误并回退到正常 collector 等待，不永久卡死
   - 正常路径不再等待最长约 5 分钟的 health-summary 周期
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f7dc50fe8c0e07dd1a9d2872394f49c533c3cb80c91ef5e5cd506b570de000ec
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-030reboot后主动health-snapshot
   command:
@@ -6317,7 +6420,13 @@ test_cases:
   - 已有终态 QUARANTINED 时后来的自动 reset 或 reboot 不得 takeover 并移除 taint
   - 区域 ownership 报告包含 incident_state 与 quarantine_hold
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 1981204e51e4051e51dd3f4c38182cfc0b338e70d5e71dd13a9d3a12aaea9a8a
+      components:
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-031critical-host-quarantine合并
   execution:
@@ -6358,9 +6467,9 @@ test_cases:
     verified:
       case_digest: 8d00db1e6deff541efebd5c65f50cd9b9f0a33fdf8776490cdf9b021de5e343f
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-032工作流生命周期硬截止
   execution:
@@ -6398,9 +6507,9 @@ test_cases:
     verified:
       case_digest: 8858c2a051b4a11c2cee52fe7f3fc2129944f67083eb6d7fe7dc3a50ed9c07f3
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-033作业被外部停止后工作流收口
   execution:
@@ -6460,9 +6569,9 @@ test_cases:
     verified:
       case_digest: f170797fbc4d9565847a74ab6d2d10c4e74293898e975516d858a304a4244e55
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-035新作业被观察到落在修复中节点的安置保留
   execution:
@@ -6511,9 +6620,9 @@ test_cases:
     verified:
       case_digest: 6e171e0887f2d0e75b76219bf4a8a2f95c63ed1970f5e48c8d851924cb3a1714
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-036卡死工作流由dispatcher自动关闭
   execution:
@@ -6552,9 +6661,9 @@ test_cases:
     verified:
       case_digest: 71d5f661cb5d662877fb34062e5602ad803eb98202e3d13881df970163f815d5
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-037调度循环判活
   related_pytest: tests/regional/test_preempt037_dispatcher_liveness.py::test_the_stall_timeline_contract_passes_when_the_expression_holds_for_the_rule_for
@@ -6580,9 +6689,9 @@ test_cases:
     verified:
       case_digest: 79d12477dd4931ca2d1842ac3b661c05918d0e06a91046f2f03dccbb489ebd79
       components:
-        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
-        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
-        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-038证据钉在-incident-生命周期
   related_pytest: tests/regional/test_preempt038_evidence_pins.py::test_the_audit_contract_passes_when_only_the_pinned_row_survives
@@ -6633,9 +6742,9 @@ test_cases:
     verified:
       case_digest: 73692882591e3925e0f6c3008a2c5a56481702bd2605a0ef157c5a019d3ea244
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: 16396fa83fc9ed2fab4f3d8248bbe70d13145580a7f6f2b052bba4be5785fb05
+        executor: af4e1ade389bc4763aaaf505be7a4e08baaabba5abdf532be296804b0de30cfa
+        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-workload-002
 - id: GF-REGIONAL-COLLECT-001

@@ -6,9 +6,15 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("psycopg")
-
 from scripts.perf import regional_capacity_data as data
+
+
+@pytest.fixture(autouse=True)
+def _psycopg_available() -> None:
+    # The walk builds its queries with psycopg.sql at call time; skip per test, never
+    # at module level (tests/test_optional_postgres_collection.py contract).
+    pytest.importorskip("psycopg")
+
 
 CLUSTERS = ["perf-cap-000"]
 

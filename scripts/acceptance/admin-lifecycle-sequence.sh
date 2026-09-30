@@ -8,7 +8,17 @@
 #   3  join-cluster --gpu-cluster-arn re-attach
 #   4  uninstall --cpu-cluster keep --reset-database
 #      (--aurora-final-snapshot retain|skip, default retain)
-#   5  cold first deploy again, into a second empty state directory
+#   5  cold first deploy again, into a second empty state directory, strictly
+#      by README.md's three documented steps: `make deploy-host-setup-online`,
+#      `. .venv/bin/activate` and the four-argument `gpu-fault-admin deploy`.
+#      The lines are read from the README (its `make ... check` verification
+#      line is skipped: the deploy runs the release gates itself), rendered
+#      with this run's ARNs, second state directory and email, and executed
+#      from a pristine copy of --repo in a clean environment
+#      (scripts/e2e/regional/boot029_readme.py). --email-wait-minutes applies
+#      to stage 1 only: the README command has no wait, so an unconfirmed
+#      SNS subscription ends the first stage-5 attempt with the deploy's own
+#      refusal, and --stage 5 resumes after the mail was confirmed.
 #
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
@@ -22,7 +32,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: admin-lifecycle-sequence.sh --state-dir DIR --cpu-cluster-arn ARN
          --gpu-cluster-arn ARN --admin-email EMAIL --repo CHECKOUT
-         [--stage N] [--second-state-dir DIR] [--email-wait-minutes M]
+         [--stage N] [--second-state-dir DIR] [--email-wait-minutes M  (stage 1 only)]
          [--previous-site-id ID] [--aurora-final-snapshot retain|skip]
          --confirm-isolated-build-host
 USAGE
@@ -62,9 +72,10 @@ SECOND_STATE_DIR="$(realpath -m "${SECOND_STATE_DIR:-${STATE_DIR}-second}")"
 ACCEPT_DIR="${STATE_DIR}/acceptance"
 RECORD="${ACCEPT_DIR}/admin-lifecycle-sequence.json"
 CASE_ID="GF-REGIONAL-BOOT-029"
-STAGE_NAMES=("" cold-first-deploy remove-cluster join-cluster uninstall-reset cold-redeploy)
+STAGE_NAMES=("" cold-first-deploy remove-cluster join-cluster uninstall-reset cold-redeploy-readme)
 STAGE_LOG=""
 CURRENT_STAGE=1
+CURRENT_ATTEMPT=1
 # The deploy reads its source tree from the working directory.
 cd "$REPO"
 export PYTHONPATH="$REPO/src:$REPO"
@@ -184,22 +195,35 @@ assert_cold_build() {  # the stage log must show a full, uncached image build
 
 # --- stages ----------------------------------------------------------------
 
-deploy_fresh() {  # STATE_DIR SITE_ID_FOR_ECR_CHECK
+run_path_deploy() {  # STATE_DIR: the driver's own four-argument deploy (stage 1)
+  local wait=()
+  [[ "$EMAIL_WAIT" -gt 0 ]] && wait=(--wait-for-email-confirmation "$EMAIL_WAIT")
+  run_admin deploy --cpu-cluster-arn "$CPU_ARN" --gpu-cluster-arn "$GPU_ARN" \
+    --state-dir "$1" --admin-email "$ADMIN_EMAIL" "${wait[@]}"
+}
+
+run_readme_deploy() {  # STATE_DIR: README.md's procedure, verbatim, clean environment
+  log "README procedure from $REPO/README.md (waiting for the process to exit)"
+  python3 -m scripts.e2e.regional.boot029_readme --readme "$REPO/README.md" \
+    --repo "$REPO" --work-dir "$ACCEPT_DIR/stage-5-readme" --attempt "$CURRENT_ATTEMPT" \
+    --cpu-arn "$CPU_ARN" --gpu-arn "$GPU_ARN" --state-dir "$1" \
+    --admin-email "$ADMIN_EMAIL" --receipt "${STAGE_LOG}.extra.json" 2>&1 |
+    tee -a "$STAGE_LOG" || return "$?"
+}
+
+deploy_fresh() {  # STATE_DIR SITE_ID_FOR_ECR_CHECK DEPLOY_FUNCTION
   require_fresh_state_dir "$1"
   # Do not destroy caches of an already-started build when resuming its deploy.
   if [[ ! -f "$1/bootstrap-state.json" ]]; then
     prune_image_caches
     clear_site_ecr_tags "$2"
   fi
-  local wait=()
-  [[ "$EMAIL_WAIT" -gt 0 ]] && wait=(--wait-for-email-confirmation "$EMAIL_WAIT")
-  run_admin deploy --cpu-cluster-arn "$CPU_ARN" --gpu-cluster-arn "$GPU_ARN" \
-    --state-dir "$1" --admin-email "$ADMIN_EMAIL" "${wait[@]}"
+  "$3" "$1"
   assert_cold_build "$1"
   assert_current_journal "$1"
 }
 
-stage_1() { deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID"; }
+stage_1() { deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy; }
 
 stage_2() {
   run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$GPU_ARN" \
@@ -221,7 +245,7 @@ stage_4() {
 stage_5() {
   local site_id=""
   [[ -f "$STATE_DIR/bootstrap-state.json" ]] && site_id="$(json_field "$STATE_DIR/bootstrap-state.json" site_id)"
-  deploy_fresh "$SECOND_STATE_DIR" "$site_id"
+  deploy_fresh "$SECOND_STATE_DIR" "$site_id" run_readme_deploy
 }
 
 run_stage() {  # N
@@ -230,6 +254,7 @@ run_stage() {  # N
   state="$STATE_DIR"
   [[ "$number" == 5 ]] && state="$SECOND_STATE_DIR"
   attempt="$(python3 -m scripts.e2e.regional.boot029_receipts start --record "$RECORD" --state "$state" --stage "$number")"
+  CURRENT_ATTEMPT="$attempt"
   STAGE_LOG="${ACCEPT_DIR}/stage-${number}-${name}-attempt-${attempt}.log"
   [[ ! -e "$STAGE_LOG" ]] || fail "attempt log already exists"
   : >"$STAGE_LOG"

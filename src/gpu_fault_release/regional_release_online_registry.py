@@ -110,10 +110,12 @@ def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> Non
     Every currently active CPU process must ACK the exact revision, including
     arrivals after the immutable publish-time membership snapshot. A required
     member with a stale row stops blocking a live fleet once its persisted
-    heartbeat no longer authorizes traffic; a missing row remains unresolved.
-    A known fleet needs a live ACK, not universal heartbeat expiry. Only an
-    empty required set with no member rows converges without any ACK. GPU
-    executors and agents are not CPU registry members.
+    heartbeat no longer authorizes traffic (live 2026-09-15: a control-worker
+    terminating under the remove-cluster roll was captured at publish and held
+    the join's generation for its whole window); a missing row remains
+    unresolved. A known fleet needs a live ACK, not universal heartbeat expiry.
+    Only an empty required set with no member rows converges without any ACK.
+    GPU executors and agents are not CPU registry members.
 
     The probe's exit line names only the generation. Read status once more
     for the unresolved members and their reported readiness/errors. This is
@@ -407,7 +409,14 @@ def purge_failed_join(release: Any, target: Any) -> None:
 
 
 def drain_registry_clusters(release: Any, cluster_ids: Sequence[str]) -> None:
-    """Drain every selected cluster in one CAS-protected, fleet-ACKed revision."""
+    """Drain every selected cluster in one CAS-protected, fleet-ACKed revision.
+
+    ``current_registrations`` publishes every cluster it does not override as
+    ACTIVE, so draining several clusters one revision at a time would flip each
+    earlier one back to ACTIVE and only the last would stay DRAINING; an
+    uninstall drains all of a site's GPU clusters through this one publish.
+    Fail-closed like remove-cluster: refused while any remote command is open.
+    """
 
     if isinstance(cluster_ids, (str, bytes)) or any(
         not isinstance(item, str) or not item.strip() for item in cluster_ids

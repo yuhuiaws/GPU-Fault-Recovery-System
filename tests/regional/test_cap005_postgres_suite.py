@@ -27,8 +27,21 @@ def test_isolation_needs_the_test_url_to_name_the_generated_database() -> None:
     assert isolated["production_database"] == "postgres"
 
 
-def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None):
+def _script(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    drop_error: Exception | None = None,
+    shard_error: Exception | None = None,
+):
     calls: list[str] = []
+    monkeypatch.setattr(cap005, "ROOT", tmp_path.resolve())
+
+    def shards(_workdir: Path, _report_dir: Path, workers: int) -> dict[str, Any]:
+        calls.append(f"shards {workers}")
+        if shard_error is not None:
+            raise shard_error
+        return {"source_identity": "a" * 64, "workers": workers, "executed_tests": 3}
 
     def create(_base_url: str, database: str) -> None:
         calls.append(f"create {database}")
@@ -60,6 +73,10 @@ def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None)
         return 1
 
     monkeypatch.setattr(cap005, "_create_database", create)
+    monkeypatch.setattr(cap005, "run_sharded_postgres", shards)
+    monkeypatch.setattr(
+        "tools.pytest_result_identity.source_identity", lambda _root: "a" * 64
+    )
     monkeypatch.setattr(cap005, "validate_server", lambda _url: None)
     monkeypatch.setattr(cap005, "_drop_database", drop)
     monkeypatch.setattr(cap005, "_database_exists", lambda _u, _d: False)
@@ -67,7 +84,7 @@ def _script(monkeypatch, tmp_path: Path, *, drop_error: Exception | None = None)
     return calls
 
 
-def test_a_red_suite_still_reports_its_junit_counts(
+def test_a_red_contract_suite_still_reports_its_junit_counts(
     tmp_path: Path, monkeypatch
 ) -> None:
     calls = _script(monkeypatch, tmp_path)
@@ -75,16 +92,37 @@ def test_a_red_suite_still_reports_its_junit_counts(
     summary = cap005.run_suite(BASE_URL, tmp_path)
 
     assert summary["status"] == "FAIL"
-    assert summary["suites"]["postgres"] == {
+    assert summary["suites"]["contract"] == {
         "tests": 3,
         "failures": 1,
         "errors": 0,
         "skipped": 0,
     }
-    assert summary["exit_codes"] == {"postgres": 1, "contract": 1}
-    assert "postgres pytest exited 1" in summary["errors"]
+    assert summary["exit_codes"] == {"contract": 1}
+    assert "contract pytest exited 1" in summary["errors"]
+    assert summary["postgres_shards"]["executed_tests"] == 3, (
+        "the shard proof stays in the report next to the red contract"
+    )
     assert summary["database_dropped"] is True
     assert [item for item in calls if item.startswith("drop")], "database not dropped"
+
+
+def test_a_failed_shard_stage_is_named_and_the_contract_is_not_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = _script(
+        monkeypatch, tmp_path, shard_error=cap005.SuiteError("shard receipts invalid")
+    )
+
+    summary = cap005.run_suite(BASE_URL, tmp_path)
+
+    assert summary["status"] == "FAIL" and summary["errors"] == ["suite: SuiteError"]
+    assert "postgres_shards" not in summary and "suites" not in summary, (
+        "an incomplete shard stage leaves no proof and no contract report"
+    )
+    assert [item.split()[0] for item in calls] == ["create", "shards", "drop"], (
+        "cleanup follows the failed shard stage"
+    )
 
 
 def test_a_drop_failure_is_merged_into_the_report(tmp_path: Path, monkeypatch) -> None:

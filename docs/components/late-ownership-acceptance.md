@@ -169,8 +169,11 @@ queries are distinct from reset attempts.
 
 Raw exec data stays in an anonymous, size-bounded regular file. Only sanitized
 receipts leave the observer. Complete exec/exit pairs, failed execs and killed
-action processes are accounted for. Missing calibration, process replacement,
-truncation, unknown invocation forms, unfinished records or lost tracing cause
+action processes are accounted for: the tracer keeps every terminal signal
+visible (only SIGCHLD deliveries are muted), so a process the Agent kills on a
+timeout is closed by its `+++ killed by` record. Missing calibration, process
+replacement, truncation, unknown invocation forms, unfinished records, a
+process that vanished without its terminal record, or lost tracing cause
 failure, never a zero-action receipt. The tracer's parent-death guard and
 cleanup target only its owned pidfd, never the observed Agent.
 

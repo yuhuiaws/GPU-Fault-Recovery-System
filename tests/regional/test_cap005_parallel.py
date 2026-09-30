@@ -4,7 +4,6 @@ import argparse
 import io
 import json
 import os
-import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -47,7 +46,7 @@ class Harness:
         self.database_residual = False
         self.change_after_contract = False
         self.change_during_cleanup = False
-        self.malformed_serial_report = False
+        self.malformed_contract_report = False
         self.identity = IDENTITY
 
     def allocation(self, index: int) -> dict[str, Any]:
@@ -114,33 +113,37 @@ class Harness:
                 with redirect_stdout(output), redirect_stderr(io.StringIO()):
                     cap005.parallel_postgres_child(int(command[-1]))
             self.after_reference()
-            return subprocess.CompletedProcess(
-                command, self.child_exit, output.getvalue(), ""
+            stderr = (
+                "postgres-shards: first failure shard=0 nodeid=tests/x.py::t "
+                "phase=call outcome=failed\nprivate child detail\n"
+                if self.child_exit
+                else ""
             )
-        arguments = (
-            shlex.split(environment["PYTEST_ADDOPTS"])
-            if command[0] == "make"
-            else command
+            return subprocess.CompletedProcess(
+                command, self.child_exit, output.getvalue(), stderr
+            )
+        assert command[0] != "make", (
+            "CAP-005 no longer runs the PostgreSQL suite through a Make target: "
+            "the suite needs the shard launcher's owned-instance grant"
         )
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--junitxml", type=Path)
-        parsed, _rest = parser.parse_known_args(arguments)
+        parsed, _rest = parser.parse_known_args(command)
         assert parsed.junitxml is not None, (
-            "serial children must retain real JUnit routing"
+            "the contract child must retain real JUnit routing"
         )
         parsed.junitxml.write_text(
             "<testsuite"
-            if command[0] == "make" and self.malformed_serial_report
+            if self.malformed_contract_report
             else f'<testsuite tests="3" failures="{self.contract_exit}" errors="0" skipped="0"/>',
             encoding="utf-8",
         )
-        if command[0] != "make":
-            assert (
-                options["isolated_postgres_url"]
-                == environment["GPU_FAULT_TEST_POSTGRES_URL"]
-            ), "the separate full contract must explicitly use its CAP-005 database"
-            if self.change_after_contract:
-                self.identity = "b" * 64
+        assert (
+            options["isolated_postgres_url"]
+            == environment["GPU_FAULT_TEST_POSTGRES_URL"]
+        ), "the separate full contract must explicitly use its CAP-005 database"
+        if self.change_after_contract:
+            self.identity = "b" * 64
         return subprocess.CompletedProcess(command, self.contract_exit, "", "")
 
     def connect(self, url: str, **_options: Any) -> Any:
@@ -201,7 +204,7 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Harness
     yield value
 
 
-@pytest.mark.parametrize("workers", [2, 8])
+@pytest.mark.parametrize("workers", [1, 2, 8])
 def test_parallel_routes_to_owned_shards_and_separate_contract(
     harness: Harness, workers: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -406,6 +409,23 @@ def test_parallel_proof_failures_never_become_native_success(
     )
 
 
+def test_failed_child_surfaces_only_the_launcher_diagnostics(
+    harness: Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness.child_exit = 1
+    result = cap005.run_suite(LOCAL_URL, harness.root, postgres_workers=2)
+    captured = capsys.readouterr().err
+    assert result["status"] == "FAIL" and result["errors"] == ["suite: SuiteError"], (
+        "a failed shard child fails the case"
+    )
+    assert "postgres-shards: first failure shard=0" in captured, (
+        "the launcher's first-failure line must reach the case log"
+    )
+    assert "private child detail" not in captured, (
+        "only the launcher's own progress lines are public"
+    )
+
+
 @pytest.mark.parametrize(
     "defect",
     ["contract", "database-cleanup", "source-after-contract", "source-during-cleanup"],
@@ -430,35 +450,35 @@ def test_parallel_pass_does_not_override_contract_cleanup_or_source_failure(
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_default_and_explicit_one_preserve_serial_native_case(
+def test_default_and_explicit_one_run_a_single_owned_shard(
     harness: Harness, explicit: bool
 ) -> None:
+    # The PostgreSQL modules create their own databases from the shard
+    # launcher's owned-instance grant; a single generated database on the CI
+    # server (the old `make test-postgres-stress` path) cannot serve them.
     options = {"postgres_workers": 1} if explicit else {}
     result = cap005.run_suite(LOCAL_URL, harness.root, **options)
     assert result["status"] == "PASS", result
-    assert harness.workers == [] and "postgres_shards" not in result, (
-        "one worker must not allocate shards"
+    assert harness.workers == [1] and result["postgres_shards"]["workers"] == 1, (
+        "one worker is one owned shard, not a Make target on the CI server"
     )
-    assert harness.commands[0] == [
-        "make",
-        "test-postgres-stress",
-        f"PYTHON={sys.executable}",
-        "PYTEST_XDIST_WORKERS=0",
-    ], "the established serial Make invocation must remain unchanged"
-    assert set(result["suites"]) == {"postgres", "contract"}, (
-        "serial mode still requires both JUnit reports"
+    assert harness.commands[0][:3] == [sys.executable, "-B", "-c"], (
+        "the shard stage still runs in a clean child process"
+    )
+    assert set(result["suites"]) == {"contract"}, (
+        "only the separate contract stage yields a JUnit report"
     )
     assert harness.database_events == ["create", "drop", "verify_absence"], (
-        "serial ownership cleanup regressed"
+        "contract database ownership cleanup regressed"
     )
 
 
-def test_serial_junit_validation_still_follows_both_suites(harness: Harness) -> None:
-    harness.malformed_serial_report = True
+def test_contract_junit_validation_still_follows_the_shards(harness: Harness) -> None:
+    harness.malformed_contract_report = True
     result = cap005.run_suite(LOCAL_URL, harness.root)
-    assert result["status"] == "FAIL", "malformed JUnit cannot pass the serial case"
+    assert result["status"] == "FAIL", "malformed JUnit cannot pass the case"
     assert len(harness.commands) == 2, (
-        "serial mode must preserve both invocations before reading their reports"
+        "both stages must run before their proofs are read"
     )
     assert result["database_dropped"], "report parsing failures must retain cleanup"
 

@@ -1817,6 +1817,11 @@ def bootstrap_from_arns(
     remember_hyperpod_hints(state, cpu, gpu_clusters)
     # Legacy config migration must finish before either bind hashes desired.json.
     aurora_capacity = bootstrap_aurora_capacity(request.state_dir)
+    # Bound before the release build starts and before any graph reads
+    # ``completed_tasks``: a checkpoint whose inputs changed re-runs in this
+    # deploy rather than the next. The release-independent digests are final
+    # here; the candidate-dependent ones are provisional until the build
+    # rebinds with the signed release (``release_repositories``).
     bind_bootstrap_inputs(
         state,
         request=request,

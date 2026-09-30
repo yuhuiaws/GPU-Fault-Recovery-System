@@ -1436,6 +1436,8 @@ def main() -> int:
     arguments = parser().parse_args()
     command = str(getattr(arguments, "command", "admin"))
     try:
+        # Before the log opens under --state-dir: a refused call must not leave
+        # a log file in another site's directory.
         enforce_deploy_host_state_dir(arguments, readonly_commands=READONLY_COMMANDS)
     except SiteConfigError as exc:
         return report_failure("gpu-fault-admin", exc)

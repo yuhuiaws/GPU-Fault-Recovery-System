@@ -1,4 +1,22 @@
-"""Registry-only drain cannot weaken image-consuming entrypoints."""
+"""The schema v3 image lock is enforced where an image is read, never on a drain.
+
+Live 2026-09-15 (main line): ``gpu-fault-admin uninstall`` run from a checkout
+ahead of the deployed release died at CLUSTERS_DRAINING with
+"GPU_FAULT_RUNTIME_IMAGE does not match the schema v3 image lock": the site's
+deployed pin (``spec.images.runtime``) and the checkout's
+``dist/current-release.json`` named different digests, and ``RegionalRelease``
+compared them while it was built, for every mode -- ``drain-cluster`` included,
+which publishes one registry revision and reads no image. The bound CLI never
+sees the conflict (its snapshot's lock is the deployed image); only the
+override path did, which defeated the override's purpose.
+
+The split here: ``drain-cluster`` runs on ``RegistryDrainContext`` (registry
+access only, no image resolved, nothing rendered), so no lock can refuse it;
+every image-consuming mode builds ``RegionalRelease``, whose construction
+refuses a conflicting pin before any render, naming both references. The
+``main()`` tests drive the parser, the config load and the mode dispatch: the
+path the uninstall script takes.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +53,8 @@ VARIABLES = {
     "executor": "GPU_FAULT_EXECUTOR_IMAGE",
 }
 OTHER = "registry.example/other@sha256:" + "1" * 64
+SAME_DIGEST_OTHER_REGISTRY = "mirror.example/runtime@sha256:" + "a" * 64
+REFUSAL = "GPU_FAULT_RUNTIME_IMAGE does not match the schema v3 image lock"
 CLUSTER_MODES = (
     "join-cluster",
     "activate-cluster",
@@ -63,6 +83,47 @@ def locked_config(
     )
 
 
+class _NoKubeconfigCache:
+    """Stands in for the exec-plugin token cache; the tests never run kubectl."""
+
+    def __init__(self, *_args: object, **_keywords: object) -> None:
+        pass
+
+    def __enter__(self) -> _NoKubeconfigCache:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    @staticmethod
+    def rewrite_config(config: ReleaseConfig) -> ReleaseConfig:
+        return config
+
+    @staticmethod
+    def refresh_if_needed() -> None:
+        return None
+
+
+def _schema_v3_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **environment: str
+) -> ReleaseConfig:
+    """A schema v3 site with no delivery identity, loaded by ``main()``."""
+
+    config = replace(locked_config(tmp_path, monkeypatch), release_delivery_identity={})
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+    monkeypatch.setattr(rollout.ReleaseConfig, "load", staticmethod(lambda _p: config))
+    monkeypatch.setattr(rollout, "ReleaseKubeconfigCache", _NoKubeconfigCache)
+    return config
+
+
+def _run(monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
+    monkeypatch.setattr(
+        rollout.sys, "argv", ["rollout", *argv, "--config", "release.json"]
+    )
+    return rollout.main()
+
+
 @pytest.mark.parametrize("schema", [3, 4])
 @pytest.mark.parametrize(
     "image", ["runtime", "node_installer", "dcgm_exporter", "adot"]
@@ -72,7 +133,6 @@ def test_programmatic_construction_refuses_conflicts_before_any_render(
 ) -> None:
     config = locked_config(tmp_path, monkeypatch, schema=schema)
     monkeypatch.setenv(VARIABLES[image], OTHER)
-    monkeypatch.setenv("GPU_FAULT_ADMIN_ALLOW_UNBOUND", "1")
     monkeypatch.setattr(
         rollout,
         "rendered_release_manifest_sha256",
@@ -81,6 +141,33 @@ def test_programmatic_construction_refuses_conflicts_before_any_render(
 
     with pytest.raises(ReleaseError, match=f"{VARIABLES[image]}.*v{schema} image lock"):
         rollout.RegionalRelease(config, rollout.Runner(dry_run=True))
+
+
+def test_construction_refuses_a_conflicting_pin_naming_both_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _schema_v3_site(tmp_path, monkeypatch, GPU_FAULT_RUNTIME_IMAGE=OTHER)
+
+    with pytest.raises(ReleaseError) as refused:
+        rollout.RegionalRelease(config, rollout.Runner(dry_run=True))
+
+    assert (
+        f"{REFUSAL} (configured {OTHER}, locked {LOCKED['runtime']}); run the "
+        "site's bound CLI, or deploy this release first"
+    ) in str(refused.value), "the refusal names both references and the remedy"
+
+
+def test_the_same_digest_or_no_pin_is_not_a_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _schema_v3_site(
+        tmp_path, monkeypatch, GPU_FAULT_RUNTIME_IMAGE=SAME_DIGEST_OTHER_REGISTRY
+    )
+
+    release = rollout.RegionalRelease(config, rollout.Runner(dry_run=True))
+
+    assert release.runtime_image == SAME_DIGEST_OTHER_REGISTRY
+    assert release.adot_image == LOCKED["adot"]
 
 
 def test_split_executor_conflicts_do_not_fall_back_to_the_cpu_image(
@@ -118,6 +205,36 @@ def test_cli_image_consumers_refuse_conflicts_before_the_handler(
 
     assert rollout.main() == 2
     assert f"schema v{schema} image lock" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("argv", "handler"),
+    [
+        (("plan",), "plan"),
+        (("upgrade",), "upgrade"),
+        (("remove-cluster", "--cluster-id", "gpu-a"), "remove_cluster"),
+    ],
+)
+def test_a_mode_that_reads_an_image_refuses_before_it_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    handler: str,
+) -> None:
+    _schema_v3_site(tmp_path, monkeypatch, GPU_FAULT_RUNTIME_IMAGE=OTHER)
+    monkeypatch.setattr(
+        rollout.RegionalRelease,
+        handler,
+        lambda *_args, **_keywords: pytest.fail(
+            f"{argv[0]} ran under a conflicting image pin"
+        ),
+    )
+
+    assert _run(monkeypatch, *argv) == 2
+
+    err = capsys.readouterr().err
+    assert f"{REFUSAL} (configured {OTHER}, locked {LOCKED['runtime']})" in err
 
 
 @pytest.mark.parametrize("schema", [3, 4])
@@ -193,6 +310,23 @@ def test_later_environment_changes_cannot_replace_selected_split_images(
     )
 
 
+def test_drain_cluster_publishes_under_a_conflicting_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _schema_v3_site(tmp_path, monkeypatch, GPU_FAULT_RUNTIME_IMAGE=OTHER)
+    drained: list[list[str]] = []
+    monkeypatch.setattr(
+        rollout,
+        "drain_registry_clusters",
+        lambda release, cluster_ids: drained.append(list(cluster_ids)),
+    )
+
+    assert _run(monkeypatch, "drain-cluster", "--cluster-id", "gpu-a") == 0
+
+    assert drained == [["gpu-a"]]
+    assert REFUSAL not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("schema", [3, 4])
 def test_cli_batch_drain_uses_only_registry_access_despite_image_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema: int
@@ -239,6 +373,12 @@ def test_cli_batch_drain_uses_only_registry_access_despite_image_conflicts(
 
     assert rollout.main() == 0
     assert seen == [["gpu-a", "gpu-b"]]
+
+
+def test_only_the_registry_only_mode_is_exempt() -> None:
+    # A new mode bypasses RegionalRelease -- and with it the lock -- only when
+    # it is added here on purpose.
+    assert rollout.IMAGE_LOCK_EXEMPT_MODES == frozenset({"drain-cluster"})
 
 
 def test_registry_only_drain_still_refuses_unknown_targets(

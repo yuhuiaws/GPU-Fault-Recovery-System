@@ -108,6 +108,11 @@ def test_cap002_resolve_budget_covers_the_five_minute_for_clause() -> None:
 
 def _bare_cases(tmp_path: Path) -> cases.CapacityAcceptanceCases:
     harness = cases.CapacityAcceptanceCases.__new__(cases.CapacityAcceptanceCases)
+    harness.executor_pins = {
+        "executor_artifact_sha256": None,
+        "executor_compatibility_digest": None,
+    }
+    harness.transport_incidents = []
     harness.run_dir = tmp_path
     harness.tokens = ["t"] * 20
     harness.run_id = "cap-unit"
@@ -334,6 +339,11 @@ class _ScriptedHarness(base.CapHarnessBase):
         self.resource_prefix = "gpu-fault-test"
         self.case_results = []
         self.active_probe = None
+        self.executor_pins = {
+            "executor_artifact_sha256": None,
+            "executor_compatibility_digest": None,
+        }
+        self.transport_incidents = []
         self.b_latency_factor = 2.0
         self._baselines = iter(baselines)
         self._case_error = case_error

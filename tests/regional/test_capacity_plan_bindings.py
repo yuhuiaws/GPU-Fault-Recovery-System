@@ -411,13 +411,24 @@ def test_capacity_harness_consumes_the_authorized_site_without_reloading(
             "json",
         ):
             return {"data": {"GPU_FAULT_PROCESSOR_MODE": "direct"}}
+        if arguments == (
+            "get",
+            "configmap",
+            "gpu-fault-release-metadata",
+            "-o",
+            "json",
+        ):
+            return {"data": {}}
         assert arguments == (
             "get",
             "deployment",
             "gpu-fault-control-worker",
             "-o",
             "json",
-        ), "the constructor may only read the processor mode and worker Deployment"
+        ), (
+            "the constructor may only read the processor mode, the release pins "
+            "and the worker Deployment"
+        )
         return {
             "spec": {"template": {"spec": {"containers": [{"image": "unit-image"}]}}}
         }

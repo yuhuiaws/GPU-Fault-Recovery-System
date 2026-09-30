@@ -332,3 +332,88 @@ def test_refusal_opens_no_log_and_never_dispatches(
     assert not (target / ".administrator-operation.lock").exists(), (
         "binding refusal must precede creation of the target operation lock"
     )
+
+
+# The scenarios main pinned when it introduced the unbound-checkout refusal
+# (2026-09-15), on this module's stricter binding reader: the binding file must
+# be private and the bound CLI executable (``bind_site``), and there is no
+# ambient environment override (``test_ambient_unbound_override_cannot_authorize_mutations``).
+
+
+def test_an_unbound_cli_refuses_to_mutate_a_site_that_has_its_own_cli(
+    tmp_path: Path,
+) -> None:
+    """The checkout's gpu-fault-admin runs whatever the working tree holds; once a
+    site has a bound deploy-host CLI, mutating verbs from the checkout are refused
+    and the refusal names the CLI to run (live 2026-09-15: a join from the
+    checkout verified against the checkout's own dist/ and rolled back)."""
+
+    site = tmp_path / "site"
+    admin = bind_site(site)
+
+    with pytest.raises(SiteConfigError, match=f"run {admin} join-cluster"):
+        enforce(argparse.Namespace(command="join-cluster", state_dir=site, file=None))
+    with pytest.raises(SiteConfigError, match=f"run {admin} uninstall"):
+        enforce(argparse.Namespace(command="uninstall", state_dir=site, file=None))
+
+
+def test_an_unbound_cli_still_deploys_reads_and_serves_unbound_sites(
+    tmp_path: Path,
+) -> None:
+    site = tmp_path / "site"
+    bind_site(site)
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+
+    # a source deploy prepares the release and re-execs into the bound CLI itself.
+    enforce(argparse.Namespace(command="deploy", state_dir=site, file=None))
+    # read-only verbs stay available from the checkout.
+    enforce(argparse.Namespace(command="status", state_dir=site, file=None))
+    # a directory without a bound CLI (before its first deploy) is not guarded.
+    enforce(argparse.Namespace(command="join-cluster", state_dir=fresh, file=None))
+    # no --state-dir at all: nothing to guard.
+    enforce(argparse.Namespace(command="status", state_dir=None, file=None))
+
+
+def test_a_bound_cli_keeps_refusing_other_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = tmp_path / "canonical"
+    monkeypatch.setattr(
+        binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
+    )
+
+    with pytest.raises(SiteConfigError, match="installed deploy-host is bound"):
+        enforce(
+            argparse.Namespace(
+                command="status", state_dir=tmp_path / "other", file=None
+            )
+        )
+    with pytest.raises(SiteConfigError, match="requires that managed state"):
+        enforce(argparse.Namespace(command="status", state_dir=None, file=None))
+    enforce(argparse.Namespace(command="status", state_dir=canonical, file=None))
+
+
+def test_a_refused_call_opens_no_log_under_the_other_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The binding is checked before command_log opens under --state-dir, so a
+    refused call leaves nothing behind in the directory it was refused for."""
+
+    canonical = tmp_path / "canonical"
+    other = tmp_path / "other"
+    other.mkdir()
+    arguments = argparse.Namespace(command="status", state_dir=other, file=None)
+    monkeypatch.setattr(
+        cli, "parser", lambda: SimpleNamespace(parse_args=lambda: arguments)
+    )
+    monkeypatch.setattr(
+        binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
+    )
+    monkeypatch.setattr(
+        cli, "run", lambda _arguments: pytest.fail("dispatch ran despite the binding")
+    )
+
+    assert cli.main() == 2
+    assert "installed deploy-host is bound" in capsys.readouterr().err
+    assert not (other / "logs").exists(), sorted(other.iterdir())

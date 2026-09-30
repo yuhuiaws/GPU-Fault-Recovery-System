@@ -15,6 +15,7 @@ from gpu_fault.regional_registry_runtime import (
 )
 from gpu_fault_release import regional_release_online_registry as REGISTRY
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.rollout import parse_arguments
 from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -263,7 +264,7 @@ def test_batch_drain_validates_every_target_once_before_one_publish(
 
     REGISTRY.drain_registry_clusters(release, ["gpu-b", "gpu-a", "gpu-b"])
 
-    assert targeted == ["gpu-b", "gpu-a"]
+    assert targeted == ["gpu-b", "gpu-a"], "every named cluster is validated once"
     assert published == [
         {
             "reason": "remove gpu-b, gpu-a draining",
@@ -310,3 +311,23 @@ def test_batch_drain_refuses_an_unknown_target_before_publishing(
     )
     with pytest.raises(ReleaseError, match="unknown cluster"):
         REGISTRY.drain_registry_clusters(release, ["gpu-a", "gpu-unknown"])
+
+
+def test_drain_cluster_takes_several_cluster_ids_and_the_other_modes_one() -> None:
+    drain = parse_arguments(
+        [
+            "drain-cluster",
+            "--config",
+            "r.json",
+            "--cluster-id",
+            "a",
+            "--cluster-id",
+            "b",
+        ]
+    )
+    assert drain.cluster_ids == ["a", "b"]
+    single = parse_arguments(
+        ["remove-cluster", "--config", "r.json", "--cluster-id", "a"]
+    )
+    assert single.cluster_ids == ["a"]
+    assert parse_arguments(["verify", "--config", "r.json"]).cluster_ids is None

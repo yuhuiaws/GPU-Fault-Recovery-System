@@ -388,6 +388,12 @@ def render_cpu_manifest_text(release: RegionalRelease, filename: str, text: str)
             "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: "
             f"'{str(config.notifications.acknowledge_external_alert_channel).lower()}'"
         ),
+        # The site's SES configuration set, or the template's '' when unset;
+        # the name charset ([A-Za-z0-9_-]) keeps the quoted scalar intact.
+        "GPU_FAULT_SES_CONFIGURATION_SET: ''": (
+            "GPU_FAULT_SES_CONFIGURATION_SET: "
+            f"'{config.notifications.ses_configuration_set or ''}'"
+        ),
     }
     for source, destination in replacements.items():
         text = text.replace(source, destination)
@@ -614,6 +620,8 @@ def build_cpu_apply_environment(
         "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": str(
             config.notifications.acknowledge_external_alert_channel
         ).lower(),
+        # Always set, '' when the site declares none: the apply script's sed
+        # reads it, and the operator's shell must not supply it instead.
         "GPU_FAULT_SES_CONFIGURATION_SET": (
             config.notifications.ses_configuration_set or ""
         ),

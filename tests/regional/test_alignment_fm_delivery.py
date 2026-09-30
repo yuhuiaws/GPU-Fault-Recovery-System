@@ -254,21 +254,178 @@ def test_original_anchor_and_restarted_window_cannot_use_an_unstarted_process() 
     )
 
 
+# The running boot as the kernel spells it (with dashes) and as journald spells
+# the ``_BOOT_ID`` field (32 hex digits).
+HOST_BOOT_ID = "5c2c6a4e-9d2f-4b7e-8f1a-3e6d0c9b7a51"
+HOST_BOOT_HEX = HOST_BOOT_ID.replace("-", "")
+PREVIOUS_BOOT_HEX = "7" * 32
+
+
+@pytest.fixture(autouse=True)
+def host_boot_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    boot_file = tmp_path / "boot_id"
+    boot_file.write_text(HOST_BOOT_ID + "\n")
+    monkeypatch.setattr(probe, "BOOT_ID_FILE", boot_file)
+    return HOST_BOOT_ID
+
+
+def journal_entry(row: dict[str, Any], *, boot: str = HOST_BOOT_HEX) -> dict[str, Any]:
+    return {
+        "MESSAGE": "INFO:collector:"
+        + probe.FM_RECEIPT_PREFIX
+        + json.dumps(row["receipt"]),
+        "__CURSOR": row["cursor"],
+        "_SYSTEMD_INVOCATION_ID": row["receipt"]["systemd_invocation_id"],
+        "_PID": str(row["receipt"]["pid"]),
+        "__MONOTONIC_TIMESTAMP": str(row["monotonic_us"]),
+        "_BOOT_ID": boot,
+    }
+
+
 def journal_lines(projection: dict[str, Any]) -> str:
-    return "\n".join(
-        json.dumps(
-            {
-                "MESSAGE": "INFO:collector:"
-                + probe.FM_RECEIPT_PREFIX
-                + json.dumps(row["receipt"]),
-                "__CURSOR": row["cursor"],
-                "_SYSTEMD_INVOCATION_ID": row["receipt"]["systemd_invocation_id"],
-                "_PID": str(row["receipt"]["pid"]),
-                "__MONOTONIC_TIMESTAMP": str(row["monotonic_us"]),
-            }
-        )
-        for row in projection["records"]
+    return "\n".join(json.dumps(journal_entry(row)) for row in projection["records"])
+
+
+def two_boot_tail(projection: dict[str, Any]) -> list[str]:
+    """The unit's journal tail as a recently rebooted node hands it back.
+
+    ``__MONOTONIC_TIMESTAMP`` restarts at every boot, so the previous boot's
+    receipts sit *ahead* of the running boot's in journal order while carrying
+    the larger clocks (live COLLECT-005, 2026-09-21: an idle FM collector emits
+    ~18 unit lines an hour, so a 64-line tail spans the reboot for ~3.5 h).
+    """
+    previous = window(restarted=True)
+    rows = []
+    for index, row in enumerate(previous["records"], start=1):
+        entry = journal_entry(row, boot=PREVIOUS_BOOT_HEX)
+        entry["__CURSOR"] = f"s=previous;i={index}"
+        entry["__MONOTONIC_TIMESTAMP"] = str(50_000_000 + index * 1000)
+        rows.append(json.dumps(entry))
+    return rows + journal_lines(projection).splitlines()
+
+
+def boot_scoped_journalctl(
+    projection: dict[str, Any], commands: list[list[str]], *, honour_boot: bool = True
+) -> Any:
+    def journalctl(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        lines = two_boot_tail(projection)
+        if honour_boot and f"--boot={HOST_BOOT_HEX}" in command:
+            lines = [
+                line for line in lines if json.loads(line)["_BOOT_ID"] == HOST_BOOT_HEX
+            ]
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr="")
+
+    return journalctl
+
+
+def test_journal_tail_after_a_reboot_is_scoped_to_the_running_boot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The un-anchored tail (COLLECT-005's first read) must ask journald for the
+    running boot only; the previous boot's lines carry a larger monotonic clock
+    and used to trip the journal-order check for hours after every reboot."""
+    projection = window()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        probe, "service_snapshot", lambda: {probe.FM_UNIT: projection["service"]}
     )
+    monkeypatch.setattr(probe, "run", boot_scoped_journalctl(projection, commands))
+    arguments = probe.parser().parse_args(["fm-delivery-evidence"])
+    arguments.handler(arguments)
+    text = capsys.readouterr().out
+    result = json.loads(text)
+    assert result["records"] == projection["records"]
+    assert result["anchor_cursor"] is None
+    assert f"--boot={HOST_BOOT_HEX}" in commands[0]
+    assert f"--lines={probe.FM_JOURNAL_TAIL_LINES}" in commands[0]
+    assert not any(item.startswith("--cursor=") for item in commands[0]), commands[0]
+    fields = [item for item in commands[0] if item.startswith("--output-fields=")]
+    assert len(fields) == 1 and "_BOOT_ID" in fields[0].split("=", 1)[1].split(",")
+    assert PREVIOUS_BOOT_HEX not in text and "s=previous" not in text
+
+
+@pytest.mark.parametrize("anchored", [False, True], ids=["tail", "cursor"])
+def test_journal_probe_refuses_rows_from_another_boot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], anchored: bool
+) -> None:
+    """Whatever journalctl returns, a row from another boot is refused by its
+    ``_BOOT_ID``; the anchored read keeps its argv (no ``--boot``) and gains the
+    same guard."""
+    projection = window()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        probe, "service_snapshot", lambda: {probe.FM_UNIT: projection["service"]}
+    )
+    monkeypatch.setattr(
+        probe, "run", boot_scoped_journalctl(projection, commands, honour_boot=False)
+    )
+    cursor = "s=previous;i=1" if anchored else ""
+    with pytest.raises(probe.ProbeError, match="boot"):
+        probe.fm_delivery_evidence(SimpleNamespace(cursor=cursor))
+    assert capsys.readouterr().out == ""
+    assert (f"--boot={HOST_BOOT_HEX}" in commands[0]) is not anchored, commands[0]
+    assert (f"--cursor={cursor}" in commands[0]) is anchored, commands[0]
+    fields = [item for item in commands[0] if item.startswith("--output-fields=")]
+    assert len(fields) == 1 and "_BOOT_ID" in fields[0].split("=", 1)[1].split(",")
+
+
+def test_journal_probe_refuses_an_unknown_host_boot_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    projection = window()
+    monkeypatch.setattr(
+        probe, "service_snapshot", lambda: {probe.FM_UNIT: projection["service"]}
+    )
+    monkeypatch.setattr(
+        probe,
+        "run",
+        lambda *a, **k: pytest.fail("journalctl must not run without a boot id"),
+    )
+    boot_file = tmp_path / "boot_id"
+    boot_file.write_text("not-a-boot-id\n")
+    monkeypatch.setattr(probe, "BOOT_ID_FILE", boot_file)
+    with pytest.raises(probe.ProbeError, match="boot id"):
+        probe.fm_delivery_evidence(SimpleNamespace(cursor=""))
+
+
+def test_probe_main_sanitizes_a_generic_failure_into_class_code_and_site(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host fixture withholds the probe's output; the failure must still
+    leave a diagnosable, message-free trail (class, digest, own source site)."""
+    import hashlib
+    import sys
+
+    projection = window()
+    monkeypatch.setattr(sys, "argv", ["probe.py", "fm-delivery-evidence"])
+    monkeypatch.setattr(
+        probe, "service_snapshot", lambda: {probe.FM_UNIT: projection["service"]}
+    )
+    monkeypatch.setattr(
+        probe,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(reversed(journal_lines(projection).splitlines())),
+            stderr="",
+        ),
+    )
+    assert probe.main() == 1
+    value = json.loads(capsys.readouterr().out)
+    message = "FM journal window is not in journal order"
+    assert value["error"] == f"ProbeError: {message}"
+    assert value["error_kind"] == "probe"
+    assert value["error_class"] == "ProbeError"
+    assert value["error_code"] == hashlib.sha256(message.encode()).hexdigest()[:16]
+    assert value["error_site"].startswith("fm_delivery_evidence:"), value["error_site"]
+    assert set(value) == {
+        "error",
+        "error_kind",
+        "error_class",
+        "error_code",
+        "error_site",
+    }
 
 
 def test_journal_probe_reads_inclusive_bounded_cursor_and_projects_only_receipts(
@@ -322,6 +479,7 @@ def test_journal_probe_does_not_rely_on_grep_ordering_and_skips_plain_log_lines(
             ],
             "_PID": str(projection["records"][0]["receipt"]["pid"]),
             "__MONOTONIC_TIMESTAMP": str(projection["records"][0]["monotonic_us"] + 1),
+            "_BOOT_ID": HOST_BOOT_HEX,
         }
     )
 

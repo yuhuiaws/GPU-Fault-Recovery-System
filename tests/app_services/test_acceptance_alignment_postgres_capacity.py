@@ -14,7 +14,7 @@ from gpu_fault.admin.config_patch import apply_patch, preset_admin_config
 from gpu_fault.app.admission_runtime import AdmissionRuntimeFactory
 from gpu_fault.app.admission_runtime import PostgresPoolCapacity as RuntimeCapacity
 from gpu_fault.postgres_capacity import PostgresPoolCapacity
-from scripts.e2e.regional.capacity_acceptance_base import unpooled_connection_budget
+from scripts.e2e.regional.capacity_connection_budget import unpooled_connection_budget
 
 
 @pytest.mark.parametrize("role", ["all", "worker", "ingress", "spool-worker"])

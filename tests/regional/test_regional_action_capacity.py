@@ -194,19 +194,88 @@ def test_action_capacity_seed_rejects_unknown_release_identity_fields() -> None:
         )
 
 
+EXECUTOR_STATE = {
+    "executor_protocol_version": 2,
+    "executor_wheel_sha256": "a" * 64,
+    "component_digests": {"executor": "b" * 64},
+}
+EXECUTOR_PINS = {
+    "required-regional-executor-protocol-version": "2",
+    "required-regional-executor-artifact-sha256": "a" * 64,
+    "required-regional-executor-compatibility-digest": "b" * 64,
+}
+AGENT_STATE = {
+    "agent_protocol_version": 3,
+    "node_wheel_sha256": "a" * 64,
+    "bundle_sha256": "c" * 64,
+    "runtime_profile_version": "hyperpod-v1",
+    "agent_config_digest": "d" * 64,
+    "component_digests": {"node_runtime": "b" * 64},
+}
+AGENT_PINS = {
+    "required-agent-protocol-version": "3",
+    "required-node-action-key-version": "2",
+    "required-agent-artifact-sha256": "a" * 64,
+    "required-agent-compatibility-digest": "b" * 64,
+    "required-agent-config-digest": "d" * 64,
+}
+AGENT_STARTUP_ENVIRONMENT = {
+    "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.10.0",
+    "GPU_FAULT_REQUIRED_POLICY_VERSION": "catalog-v1",
+    "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "hyperpod-v1",
+    "GPU_FAULT_ALLOWED_OPERATIONS": "VERIFY_NO_GPU_CLIENTS,RESET_GPU",
+}
+
+
+def fake_control(
+    monkeypatch,
+    *,
+    state: dict[str, object],
+    pins: dict[str, str],
+    pod_environment: dict[str, str] | None = None,
+) -> list[tuple[str, ...]]:
+    """Fake ``kubectl`` for the control namespace.
+
+    Serves the release state, the ``gpu-fault-release-metadata`` ConfigMap in
+    the ``-o json`` shape and, only when ``pod_environment`` is given, the
+    ``exec ... python3 -c`` read of a running api-ha Pod. A pin check that
+    reaches the Pod environment without permission fails the test: the Pod env
+    is the snapshot from container start, not the pins the product serves.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def control(*args: str, **_kwargs) -> str:
+        calls.append(args)
+        if args[:3] == ("get", "configmap", "gpu-fault-regional-release-state"):
+            return json.dumps(state)
+        if args[:3] == ("get", "configmap", "gpu-fault-release-metadata"):
+            assert args[3:] == ("-o", "json")
+            return json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "gpu-fault-release-metadata",
+                        "namespace": "gpu-fault-system",
+                        "resourceVersion": "48517395",
+                    },
+                    "data": pins,
+                }
+            )
+        if args[:2] == ("get", "pod"):
+            return "gpu-fault-api-ha-6f4d9-abcde\n"
+        if args[0] == "exec":
+            if pod_environment is None:
+                pytest.fail("release pin check read a Pod environment snapshot")
+            return json.dumps(pod_environment, sort_keys=True) + "\n"
+        pytest.fail(f"unexpected control call: {args}")
+
+    monkeypatch.setattr(suite, "control", control)
+    return calls
+
+
 def test_isolated_executor_identity_does_not_read_live_deployment(monkeypatch) -> None:
-    state = {
-        "executor_protocol_version": 2,
-        "executor_wheel_sha256": "a" * 64,
-        "component_digests": {"executor": "b" * 64},
-    }
-    environment = {
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": "2",
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": "b" * 64,
-    }
-    monkeypatch.setattr(suite, "_release_state", lambda: state)
-    monkeypatch.setattr(suite, "_control_environment", lambda _keys: environment)
+    fake_control(monkeypatch, state=EXECUTOR_STATE, pins=EXECUTOR_PINS)
     monkeypatch.setattr(
         suite,
         "dataplane_identity",
@@ -222,17 +291,83 @@ def test_isolated_executor_identity_does_not_read_live_deployment(monkeypatch) -
     }
 
 
+def test_executor_identity_reads_pins_from_the_release_configmap(monkeypatch) -> None:
+    calls = fake_control(monkeypatch, state=EXECUTOR_STATE, pins=EXECUTOR_PINS)
+
+    suite.executor_identity(require_dataplane_deployment=False)
+
+    assert ("get", "configmap", "gpu-fault-release-metadata", "-o", "json") in calls
+    assert not [call for call in calls if call[0] == "exec"]
+
+
+def test_executor_identity_fails_closed_when_configmap_pin_differs(monkeypatch) -> None:
+    # Live 2026-09-21: the api-ha Pod env still carried the pre-deploy
+    # artifact digest while the ConfigMap, the release state and the executor
+    # Deployment all agreed. Only a ConfigMap that disagrees with the release
+    # state is drift.
+    pins = dict(EXECUTOR_PINS)
+    pins["required-regional-executor-artifact-sha256"] = "e" * 64
+    fake_control(monkeypatch, state=EXECUTOR_STATE, pins=pins)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "control-plane release pins differ from release state: "
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256$"
+        ),
+    ):
+        suite.executor_identity(require_dataplane_deployment=False)
+
+
+@pytest.mark.parametrize("empty", [None, "", "  "])
+def test_executor_identity_refuses_an_incomplete_configmap(monkeypatch, empty) -> None:
+    pins = dict(EXECUTOR_PINS)
+    if empty is None:
+        del pins["required-regional-executor-compatibility-digest"]
+    else:
+        pins["required-regional-executor-compatibility-digest"] = empty
+    fake_control(monkeypatch, state=EXECUTOR_STATE, pins=pins)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "incomplete: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST$"
+        ),
+    ):
+        suite.executor_identity(require_dataplane_deployment=False)
+
+
+def test_executor_identity_refuses_a_configmap_without_data(monkeypatch) -> None:
+    def control(*args: str, **_kwargs) -> str:
+        if args[:3] == ("get", "configmap", "gpu-fault-regional-release-state"):
+            return json.dumps(EXECUTOR_STATE)
+        return json.dumps({"kind": "ConfigMap", "metadata": {}})
+
+    monkeypatch.setattr(suite, "control", control)
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        suite.executor_identity(require_dataplane_deployment=False)
+
+
+def test_pin_key_mapping_is_the_product_fleet_pin_table() -> None:
+    from gpu_fault import fleet_pins
+
+    assert suite.RELEASE_PIN_CONFIGMAP == fleet_pins.DEFAULT_CONFIG_MAP
+    assert suite.ENVIRONMENT_CONFIG_MAP_KEY == {
+        environment: key
+        for key, environment in fleet_pins.CONFIG_MAP_KEY_ENVIRONMENT.items()
+    }
+    assert set(suite.EXECUTOR_IDENTITY_ENV_KEYS) <= fleet_pins.PIN_ENVIRONMENT_NAMES
+    assert set(suite.AGENT_IDENTITY_PIN_KEYS) <= fleet_pins.PIN_ENVIRONMENT_NAMES
+    assert not set(suite.AGENT_IDENTITY_STARTUP_KEYS) & fleet_pins.PIN_ENVIRONMENT_NAMES
+    assert suite.AGENT_IDENTITY_ENV_KEYS == (
+        *suite.AGENT_IDENTITY_PIN_KEYS,
+        *suite.AGENT_IDENTITY_STARTUP_KEYS,
+    )
+
+
 def test_live_executor_identity_reads_production_deployment(monkeypatch) -> None:
-    state = {
-        "executor_protocol_version": 2,
-        "executor_wheel_sha256": "a" * 64,
-        "component_digests": {"executor": "b" * 64},
-    }
-    environment = {
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": "2",
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
-        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": "b" * 64,
-    }
+    fake_control(monkeypatch, state=EXECUTOR_STATE, pins=EXECUTOR_PINS)
     calls = []
     deployment = {
         "spec": {
@@ -256,8 +391,6 @@ def test_live_executor_identity_reads_production_deployment(monkeypatch) -> None
             }
         }
     }
-    monkeypatch.setattr(suite, "_release_state", lambda: state)
-    monkeypatch.setattr(suite, "_control_environment", lambda _keys: environment)
     monkeypatch.setattr(
         suite,
         "dataplane_identity",
@@ -272,30 +405,57 @@ def test_live_executor_identity_reads_production_deployment(monkeypatch) -> None
     assert calls == [("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")]
 
 
-def test_release_agent_identity_fails_closed_on_control_pin_drift(monkeypatch) -> None:
-    state = {
-        "agent_protocol_version": 3,
-        "node_wheel_sha256": "a" * 64,
-        "bundle_sha256": "c" * 64,
-        "runtime_profile_version": "hyperpod-v1",
-        "agent_config_digest": "d" * 64,
-        "component_digests": {"node_runtime": "b" * 64},
-    }
-    environment = {
-        "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": "3",
-        "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION": "2",
-        "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.10.0",
-        "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "e" * 64,
-        "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": "b" * 64,
-        "GPU_FAULT_REQUIRED_POLICY_VERSION": "catalog-v1",
-        "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "hyperpod-v1",
-        "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": "d" * 64,
-        "GPU_FAULT_ALLOWED_OPERATIONS": "VERIFY_NO_GPU_CLIENTS,RESET_GPU",
-    }
-    monkeypatch.setattr(suite, "_release_state", lambda: state)
-    monkeypatch.setattr(suite, "_control_environment", lambda _keys: environment)
+def test_release_agent_identity_takes_pins_from_configmap_and_startup_from_pod(
+    monkeypatch,
+) -> None:
+    calls = fake_control(
+        monkeypatch,
+        state=AGENT_STATE,
+        pins=AGENT_PINS,
+        pod_environment=AGENT_STARTUP_ENVIRONMENT,
+    )
 
-    with pytest.raises(RuntimeError, match="differ from release state"):
+    expected = release_agent_identity()
+    expected["allowed_operations"] = sorted(expected["allowed_operations"])
+    assert suite.release_agent_identity() == expected
+    scripts = [call[-1] for call in calls if call[0] == "exec"]
+    assert len(scripts) == 1
+    for key in suite.AGENT_IDENTITY_STARTUP_KEYS:
+        assert key in scripts[0]
+    for key in suite.AGENT_IDENTITY_PIN_KEYS:
+        assert key not in scripts[0]
+
+
+def test_release_agent_identity_fails_closed_on_control_pin_drift(monkeypatch) -> None:
+    pins = dict(AGENT_PINS)
+    pins["required-agent-artifact-sha256"] = "e" * 64
+    fake_control(
+        monkeypatch,
+        state=AGENT_STATE,
+        pins=pins,
+        pod_environment=AGENT_STARTUP_ENVIRONMENT,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=("differ from release state: GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256$"),
+    ):
+        suite.release_agent_identity()
+
+
+def test_release_agent_identity_refuses_an_incomplete_pod_environment(
+    monkeypatch,
+) -> None:
+    environment = dict(AGENT_STARTUP_ENVIRONMENT)
+    environment["GPU_FAULT_REQUIRED_POLICY_VERSION"] = ""
+    fake_control(
+        monkeypatch, state=AGENT_STATE, pins=AGENT_PINS, pod_environment=environment
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="environment is incomplete: GPU_FAULT_REQUIRED_POLICY_VERSION$",
+    ):
         suite.release_agent_identity()
 
 

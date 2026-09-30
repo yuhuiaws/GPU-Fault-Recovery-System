@@ -108,6 +108,11 @@ def harness(tmp_path: Path) -> cases.CapacityAcceptanceCases:
     value.run_dir = tmp_path
     value.tokens = ["synthetic"] * 20
     value.run_id = "cap-unit"
+    value.executor_pins = {
+        "executor_artifact_sha256": None,
+        "executor_compatibility_digest": None,
+    }
+    value.transport_incidents = []
     value.scrape_source_binding = {"source_sha256": "a" * 64}
     value.maintenance_deadline = datetime.now(timezone.utc) + timedelta(hours=1)
     value.cap002_scrape_stopped = True

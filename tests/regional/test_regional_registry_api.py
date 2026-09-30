@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import create_app
-from gpu_fault.regional import RegionalClusterLifecycle
+from gpu_fault.app.routes.regional_registry import _status
+from gpu_fault.regional import (
+    RegionalClusterLifecycle,
+    RegionalRegistryMember,
+    RegionalRegistryRevision,
+)
 from tests._builders import asgi_client, build_context
 from tests.regional._regional_support import TOKEN_A, registration
 
@@ -19,6 +25,83 @@ def context_and_app():
 
 def operator_headers() -> dict[str, str]:
     return {"X-GPU-Fault-Execution-Token": EXECUTION_TOKEN}
+
+
+def _member(
+    member_id: str,
+    revision: RegionalRegistryRevision,
+    *,
+    generation: int,
+    last_seen: datetime,
+) -> RegionalRegistryMember:
+    at_revision = generation == revision.generation
+    return RegionalRegistryMember(
+        member_id=member_id,
+        service_role="control-worker",
+        release_id="release-a",
+        generation=generation,
+        content_sha256=revision.content_sha256 if at_revision else "b" * 64,
+        ready=True,
+        started_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
+        last_seen_at=last_seen,
+    )
+
+
+def test_status_reports_a_departed_required_member_as_neither_acked_nor_missing() -> (
+    None
+):
+    """A stale straggler in required is dropped from missing and never blocks.
+
+    _status feeds describe_unconverged_publish and rotate_token, which raise on
+    a non-empty missing set, so a member that has left the fleet must not appear
+    there or a converged publish would still read as unfinished. A member still
+    heartbeating but merely behind stays in missing and holds convergence.
+    """
+
+    now = datetime(2026, 9, 15, 0, 2, tzinfo=timezone.utc)
+    revision = RegionalRegistryRevision.build(
+        generation=5,
+        registrations=[registration("cluster-a", TOKEN_A)],
+        previous_generation=4,
+        required_member_ids=["live/process", "drained/process"],
+        reason="join cluster-a",
+        created_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
+    )
+    live = _member("live/process", revision, generation=5, last_seen=now)
+    # Last heartbeat 100s back, past the 90s window: gone, never acked gen 5.
+    drained = _member(
+        "drained/process",
+        revision,
+        generation=4,
+        last_seen=now - timedelta(seconds=100),
+    )
+    status = _status(revision, [live, drained], observed_at=now, stale_seconds=90)
+    assert status.converged is True
+    assert status.acked_member_ids == ["live/process"]
+    assert status.missing_member_ids == []
+
+    revision_two = RegionalRegistryRevision.build(
+        generation=5,
+        registrations=[registration("cluster-a", TOKEN_A)],
+        previous_generation=4,
+        required_member_ids=["behind/process", "drained/process", "live/process"],
+        reason="join cluster-a",
+        created_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
+    )
+    live_two = _member("live/process", revision_two, generation=5, last_seen=now)
+    behind = _member("behind/process", revision_two, generation=4, last_seen=now)
+    drained_two = _member(
+        "drained/process",
+        revision_two,
+        generation=4,
+        last_seen=now - timedelta(seconds=100),
+    )
+    status_two = _status(
+        revision_two, [live_two, behind, drained_two], observed_at=now, stale_seconds=90
+    )
+    assert status_two.converged is False
+    assert status_two.acked_member_ids == ["live/process"]
+    assert status_two.missing_member_ids == ["behind/process"]
 
 
 def test_registry_api_publishes_with_cas_and_reports_convergence() -> None:

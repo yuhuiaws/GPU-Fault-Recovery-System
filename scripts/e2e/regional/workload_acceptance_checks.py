@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +17,21 @@ SUSPICIOUS_LOG_PATTERN = re.compile(
 
 
 MAX_RECORDED_SUSPICIOUS_LINES = 20
+
+# The two records a recovery owes; ``notification_errors`` judges exactly these.
+JUDGED_NOTIFICATION_CATEGORIES = ("FAULT_DETECTED", "ACTION_COMPLETED")
+# ``NotificationDeliveryStatus`` members the outbox dispatcher can still turn
+# into SENT; DEAD is final, and so is a SENT row without its provider ID.
+PENDING_DELIVERY_STATUSES = frozenset({"PENDING", "LEASED", "RETRY"})
+# The ACTION_COMPLETED record is created before the workflow is terminalized
+# and its delivery result is written afterwards (~100 ms later on the live
+# store), so a snapshot taken at the terminal edge reads the record without a
+# result. The dispatcher polls every 2 s and the SNS publish follows; the
+# budget exists for the store read cadence (~6 s per probe) and still fits one
+# 15 s backoff retry. A mail that really was not sent is a FAIL, reached at
+# the deadline -- the same budget ``reset_notification_evidence`` grants.
+NOTIFICATION_DELIVERY_WAIT_SECONDS = 120
+NOTIFICATION_DELIVERY_POLL_SECONDS = 5
 
 
 LOSS_LINE_PATTERN = re.compile(r"\brank=(\d+)\b.*?\bstep=(\d+)\b.*?\bloss=(\S+)")
@@ -541,7 +557,7 @@ def notification_errors(state: dict[str, Any]) -> list[str]:
         )
     ):
         errors.append("notifications do not uniquely bind the recovery incident")
-    for category in ("FAULT_DETECTED", "ACTION_COMPLETED"):
+    for category in JUDGED_NOTIFICATION_CATEGORIES:
         values = categories.get(category) or []
         if len(values) != 1:
             errors.append(f"{category} notification count is not one")
@@ -550,6 +566,71 @@ def notification_errors(state: dict[str, Any]) -> list[str]:
             errors.append(f"{category} notification is not SENT")
         if not values[0].get("provider_message_id"):
             errors.append(f"{category} notification has no provider message ID")
+    return errors
+
+
+def pending_delivery_errors(state: dict[str, Any]) -> set[str]:
+    """The ``notification_errors`` a delivery still in flight accounts for.
+
+    Only a judged category with exactly one record whose ``result`` is absent
+    or carries a non-terminal ``NotificationDeliveryStatus`` can change on a
+    later read. A missing or duplicated record, a DEAD result and a SENT
+    result without its provider ID are defects no later read cures, so their
+    errors are not returned here.
+    """
+
+    results: dict[str, list[dict[str, Any] | None]] = {}
+    for item in state.get("notifications") or []:
+        category = str((item.get("notification") or {}).get("category"))
+        results.setdefault(category, []).append(item.get("result"))
+    explained: set[str] = set()
+    for category in JUDGED_NOTIFICATION_CATEGORIES:
+        values = results.get(category) or []
+        if len(values) != 1:
+            continue
+        result = values[0]
+        if result is None or result.get("status") in PENDING_DELIVERY_STATUSES:
+            explained.add(f"{category} notification is not SENT")
+            explained.add(f"{category} notification has no provider message ID")
+    return explained
+
+
+def wait_for_notification_results(
+    state: dict[str, Any],
+    *,
+    snapshot: Callable[[], dict[str, Any]],
+    timeout_seconds: float = NOTIFICATION_DELIVERY_WAIT_SECONDS,
+    poll_seconds: float = NOTIFICATION_DELIVERY_POLL_SECONDS,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> list[str]:
+    """``notification_errors`` once every delivery is settled, or at the deadline.
+
+    The terminal workflow snapshot is judged first, so a run whose results are
+    already there costs no extra store read. While the only errors are the ones
+    ``pending_delivery_errors`` explains, every later read is a fresh
+    ``snapshot()`` whose ``notifications`` replace ``state["notifications"]``
+    in place, so the caller's record shows the reading that was judged. The
+    loop stops at once on a defect no later read cures and at the deadline,
+    returning the errors of the last reading either way.
+
+    ``sleep`` and ``monotonic`` default to the ``time`` module's functions at
+    call time, so a test can substitute them without threading them through
+    every runner.
+    """
+
+    sleep = time.sleep if sleep is None else sleep
+    monotonic = time.monotonic if monotonic is None else monotonic
+    errors = notification_errors(state)
+    deadline = monotonic() + timeout_seconds
+    while (
+        errors
+        and set(errors) <= pending_delivery_errors(state)
+        and monotonic() < deadline
+    ):
+        sleep(poll_seconds)
+        state["notifications"] = list(snapshot().get("notifications") or [])
+        errors = notification_errors(state)
     return errors
 
 

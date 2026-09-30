@@ -72,7 +72,11 @@ def test_cli_help_contract_under_fake_profile_and_transport_boundaries(
 
 @pytest.mark.parametrize(
     "runner_name",
-    ["run_ha005_rollout_continuity.py", "run_ha009_aurora_credential_rotation.py"],
+    [
+        "run_ha005_rollout_continuity.py",
+        "run_ha006_executor_takeover.py",
+        "run_ha009_aurora_credential_rotation.py",
+    ],
 )
 def test_legacy_ha_runners_accept_the_regional_flags_the_site_profile_fills(
     runner_name: str,

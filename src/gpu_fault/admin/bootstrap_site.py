@@ -203,7 +203,23 @@ def bind_initial_deploy_target(
     cpu: ClusterIdentity,
     gpu_clusters: Sequence[ClusterIdentity],
 ) -> list[ClusterIdentity]:
-    """Settle a fulfilled target while retaining in-flight and removal bindings."""
+    """Bind the deploy to its clusters; return the GPU clusters it manages.
+
+    A first deploy records the clusters it targets before any site document
+    exists, and a resume of that deploy must aim at the same ones: the
+    resources it created are bound to them. Once the site document holds the
+    whole target -- or a completed, identity-bound ``remove-cluster`` journal
+    proves what it detached (``_initial_target_is_managed``) -- the document,
+    not the checkpoint, says which clusters the site manages, and the
+    checkpoint settles. It used to stay PENDING until an upgrade happened to
+    request exactly the birth set, so a CPU-only upgrade right after
+    remove-cluster (live 2026-09-15: "initial deploy target differs from the
+    persisted checkpoint" on ``clusters: []``) and a ``deploy
+    --gpu-cluster-arn NEW`` right after the first deploy were both refused
+    against a target the site had already met. A name-only
+    ``removed_clusters`` row never releases the commitment: it cannot prove
+    which provider cluster was detached.
+    """
     requested = _target_identity(cpu, gpu_clusters)
     requested_keys = [_cluster_key(cluster) for cluster in gpu_clusters]
     if len(requested_keys) != len(set(requested_keys)):

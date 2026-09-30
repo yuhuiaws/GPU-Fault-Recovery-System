@@ -22,6 +22,7 @@ from scripts.e2e.regional.capacity_wire import (
     CapacityWireError as Cap004Error,
     CapacityThreadsRunning as Cap004ThreadsRunning,
     CapacityWireClient,
+    ExecutorPins,
 )
 from scripts.e2e.regional.probes.cap004_commands import (
     CLUSTER_ID,
@@ -39,11 +40,12 @@ class QueueClient(CapacityWireClient):
         self,
         url: str,
         token: str,
+        executor_pins: ExecutorPins | None = None,
         *,
         executor_id: str,
         selected: list[RemoteActionCommand],
     ) -> None:
-        super().__init__(url, token, cluster_id=CLUSTER_ID)
+        super().__init__(url, token, cluster_id=CLUSTER_ID, executor_pins=executor_pins)
         self.executor_id = executor_id
         self.expected = {item.command_id: item for item in selected}
         self.claimed: list[RemoteActionCommand] = []
@@ -157,6 +159,19 @@ class QueueClient(CapacityWireClient):
             return dict(handbacks), unconfirmed
 
 
+# Claim the whole owned inventory at once, as the reserve step and the
+# competitor both do.
+FULL_CLAIM = {
+    "execution_owners": [OWNER],
+    "max_commands": COMMAND_COUNT,
+    "lease_seconds": 60,
+}
+
+
+def _wire(url: str, token: str, pins: ExecutorPins | None) -> CapacityWireClient:
+    return CapacityWireClient(url, token, cluster_id=CLUSTER_ID, executor_pins=pins)
+
+
 def run_queued_lease_proof(
     url: str,
     token: str,
@@ -164,15 +179,11 @@ def run_queued_lease_proof(
     state_dir: Path,
     *,
     timeout_seconds: float = 75,
+    executor_pins: ExecutorPins | None = None,
 ) -> dict[str, Any]:
-    wire = CapacityWireClient(url, token, cluster_id=CLUSTER_ID)
+    wire = _wire(url, token, executor_pins)
     expected = {item.command_id: item for item in commands_for_run(run_id)}
-    held = wire.claim(
-        f"{run_id}-queue-reserve",
-        execution_owners=[OWNER],
-        max_commands=COMMAND_COUNT,
-        lease_seconds=60,
-    )
+    held = wire.claim(f"{run_id}-queue-reserve", **FULL_CLAIM)
     if len(held) != COMMAND_COUNT or {item.command_id for item in held} != set(
         expected
     ):
@@ -204,7 +215,9 @@ def run_queued_lease_proof(
     errors: list[str] = []
     stale_renewal_status = None
     owner = f"{run_id}-queued-executor"
-    client = QueueClient(url, token, executor_id=owner, selected=selected)
+    client = QueueClient(
+        url, token, executor_pins, executor_id=owner, selected=selected
+    )
     claimed = client.claimed
 
     class WaitingAdapter:
@@ -237,12 +250,7 @@ def run_queued_lease_proof(
             delay = (expiry - datetime.now(timezone.utc)).total_seconds() + 0.05
             if stop.wait(max(0, delay)):
                 return
-            commands = wire.claim(
-                f"{run_id}-queue-competitor",
-                execution_owners=[OWNER],
-                max_commands=COMMAND_COUNT,
-                lease_seconds=60,
-            )
+            commands = wire.claim(f"{run_id}-queue-competitor", **FULL_CLAIM)
             competitor_claims.extend(commands)
             if (
                 len(commands) != 1

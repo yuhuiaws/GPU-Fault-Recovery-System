@@ -75,60 +75,26 @@ from scripts.e2e.regional.readme_workload_fixture import (  # noqa: E402
 )
 from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     LOSS_LINE_PATTERN as LOSS_LINE_PATTERN,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     MAX_RECORDED_SUSPICIOUS_LINES as MAX_RECORDED_SUSPICIOUS_LINES,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    NOTIFICATION_DELIVERY_POLL_SECONDS as NOTIFICATION_DELIVERY_POLL_SECONDS,
     SUCCESS_LINE_PATTERN as SUCCESS_LINE_PATTERN,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     SUSPICIOUS_LOG_PATTERN as SUSPICIOUS_LOG_PATTERN,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     collective_errors as collective_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     command_ids_in_logs as command_ids_in_logs,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     control_plane_blast_errors as control_plane_blast_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     gpu_nodes_clean as gpu_nodes_clean,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     identity_baseline_errors as identity_baseline_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     loss_errors as loss_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     metadata_errors as metadata_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     notification_errors as notification_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     observation_pod_names as observation_pod_names,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     observation_pod_uids as observation_pod_uids,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     observation_rank_errors as observation_rank_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     recovery_identity_errors as recovery_identity_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     source_observation_errors as source_observation_errors,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     suspicious_log_lines as suspicious_log_lines,
-)
-from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     virtual_isolation_errors as virtual_isolation_errors,
+    wait_for_notification_results as wait_for_notification_results,
 )
 from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
     E2E_PREFLIGHT_PROBE as E2E_PREFLIGHT_PROBE,
@@ -1596,7 +1562,19 @@ def e2e001_recovery_outcome(
             observed_after=injected_at,
         )
     )
-    errors.extend(notification_errors(state))
+    errors.extend(
+        wait_for_notification_results(
+            state,
+            snapshot=lambda: regional.store_snapshot(
+                node=node,
+                marker=marker,
+                observed_after=injected_at,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                queue_attempts=1,
+            ),
+        )
+    )
     event = state.get("event") or {}
     incident = state.get("incident") or {}
     if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
