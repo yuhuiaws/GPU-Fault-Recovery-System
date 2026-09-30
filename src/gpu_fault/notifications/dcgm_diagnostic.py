@@ -32,16 +32,16 @@ class DcgmDiagnosticEmailBuilder:
             findings = result.get("diagnostic_findings", [])
             if not isinstance(findings, list) or not findings:
                 result_lines.append(
-                    f"- Node：{node_id}；Result：{outcome}；Checks：NONE"
+                    f"- Node: {node_id}; Result: {outcome}; Checks: NONE"
                 )
             else:
                 for finding in findings:
                     if not isinstance(finding, dict):
                         continue
                     result_lines.append(
-                        "- Node：{node}；Test：{test}；Status："
-                        "{status}；Entity：{entities}；Error code："
-                        "{codes}；Message：{messages}".format(
+                        "- Node: {node}; Test: {test}; Status: "
+                        "{status}; Entity: {entities}; Error code: "
+                        "{codes}; Message: {messages}".format(
                             node=node_id,
                             test=finding.get("test_name", "UNKNOWN"),
                             status=finding.get("status", "UNKNOWN"),
@@ -63,9 +63,9 @@ class DcgmDiagnosticEmailBuilder:
                 if not isinstance(action, dict):
                     continue
                 guidance_lines.append(
-                    "- Node：{node}；Priority：{priority}；"
-                    "Action code：{code}；Trigger：{triggers}；"
-                    "Instruction：{instruction}".format(
+                    "- Node: {node}; Priority: {priority}; "
+                    "Action code: {code}; Trigger: {triggers}; "
+                    "Instruction: {instruction}".format(
                         node=node_id,
                         priority=action.get("priority", "UNKNOWN"),
                         code=action.get("action_code", "UNKNOWN"),
@@ -99,7 +99,7 @@ class DcgmDiagnosticEmailBuilder:
             control_plane_action=control_plane_action,
             recommended_actions=(
                 "\n".join(guidance_lines)
-                or "- 无额外人工处置；继续执行冷却观察和 GPU validation。"
+                or "- No extra manual handling; continue the cool-down observation and GPU validation."
             ),
             evidence_refs=(
                 "\n".join(f"- {evidence_ref}" for evidence_ref in evidence_refs)
@@ -114,7 +114,7 @@ class DcgmDiagnosticEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                "[GPU故障][DCGM诊断结果 "
+                "[GPU FAULT][DCGM diagnostic "
                 f"{aggregate_outcome}] {cluster_id}: "
                 f"{', '.join(sorted(node_results))}"
             ),

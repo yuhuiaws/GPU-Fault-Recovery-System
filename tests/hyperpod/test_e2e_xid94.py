@@ -133,8 +133,8 @@ def test_active_xid94_to_managed_job_recovery_and_admin_email() -> None:
                 for item in notifier.notifications
                 if item.notification_id == decision["investigatory_notification_id"]
             )
-            assert "NVIDIA Immediate Action：RESTART_APP" in (investigatory.body_text)
-            assert "NVIDIA Investigatory Action：IGNORE (sympathetic)" in (
+            assert "NVIDIA immediate action: RESTART_APP" in (investigatory.body_text)
+            assert "NVIDIA investigatory action: IGNORE (sympathetic)" in (
                 investigatory.body_text
             )
 

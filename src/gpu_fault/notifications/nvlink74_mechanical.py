@@ -43,7 +43,7 @@ class Nvlink74MechanicalEmailBuilder:
                 cluster_name=cluster_id,
                 incident_id=incident_id,
                 subject=(
-                    f"[GPU故障][XID {xid}机械检查] {cluster_id} "
+                    f"[GPU FAULT][XID {xid} mechanical check] {cluster_id} "
                     f"{', '.join(node_ids) or 'UNKNOWN'}"
                 ),
                 body_text=body,
@@ -76,7 +76,7 @@ class Nvlink74MechanicalEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[GPU故障][XID 74机械检查] {cluster_id} "
+                f"[GPU FAULT][XID 74 mechanical check] {cluster_id} "
                 f"{', '.join(node_ids) or 'UNKNOWN'}"
             ),
             body_text=body,

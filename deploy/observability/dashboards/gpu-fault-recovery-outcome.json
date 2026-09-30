@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-recovery-outcome; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-recovery-outcome; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -95,7 +95,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultRecoveryBlockedBacklog (warning, for 30m, > 3): docs/管理员日常运维.md#gpufaultrecoveryblockedbacklog",
+      "description": "Alert GpuFaultRecoveryBlockedBacklog (warning, for 30m, > 3): docs/en/administrator-operations.md#gpufaultrecoveryblockedbacklog",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -166,7 +166,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultWorkflowPendingAge (warning, for 10m, > 1800): docs/管理员日常运维.md#gpufaultworkflowpendingage",
+      "description": "Alert GpuFaultWorkflowPendingAge (warning, for 10m, > 1800): docs/en/administrator-operations.md#gpufaultworkflowpendingage",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -237,7 +237,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Above zero means an execution deadline was not enforced.\n\nAlert GpuFaultWorkflowDeadlineNotEnforced (critical, for 10m, > 300): docs/管理员日常运维.md#gpufaultworkflowdeadlinenotenforced",
+      "description": "Above zero means an execution deadline was not enforced.\n\nAlert GpuFaultWorkflowDeadlineNotEnforced (critical, for 10m, > 300): docs/en/administrator-operations.md#gpufaultworkflowdeadlinenotenforced",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -321,7 +321,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Positive means the oldest WAITING step of that operation has outlived the limit configured for it.\n\nAlert GpuFaultWorkflowStepStalled (warning, for 3m, > 0): docs/管理员日常运维.md#gpufaultworkflowstepstalled",
+      "description": "Positive means the oldest WAITING step of that operation has outlived the limit configured for it.\n\nAlert GpuFaultWorkflowStepStalled (warning, for 3m, > 0): docs/en/administrator-operations.md#gpufaultworkflowstepstalled",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -405,7 +405,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultWorkflowLifetimeExceeded (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultworkflowlifetimeexceeded",
+      "description": "Alert GpuFaultWorkflowLifetimeExceeded (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultworkflowlifetimeexceeded",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -476,7 +476,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultJobWorkflowNodeBusyTimeout (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultjobworkflownodebusytimeout",
+      "description": "Alert GpuFaultJobWorkflowNodeBusyTimeout (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultjobworkflownodebusytimeout",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -547,7 +547,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorRetryHorizonFailures (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorretryhorizonfailures",
+      "description": "Alert GpuFaultProcessorRetryHorizonFailures (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultprocessorretryhorizonfailures",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -618,7 +618,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultBranchEscalationBudgetRefused (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultbranchescalationbudgetrefused",
+      "description": "Alert GpuFaultBranchEscalationBudgetRefused (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultbranchescalationbudgetrefused",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -702,7 +702,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Creation to first successful containment in the event-time window. Empty, incomplete or stale windows have no mean.\n\nAlert GpuFaultClosedLoopSlow (warning, for 15m, > 900): docs/管理员日常运维.md#gpufaultclosedloopslow",
+      "description": "Creation to first successful containment in the event-time window. Empty, incomplete or stale windows have no mean.\n\nAlert GpuFaultClosedLoopSlow (warning, for 15m, > 900): docs/en/administrator-operations.md#gpufaultclosedloopslow",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -745,7 +745,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultClosedLoopSlow",
-          "url": "docs/管理员日常运维.md#gpufaultclosedloopslow"
+          "url": "docs/en/administrator-operations.md#gpufaultclosedloopslow"
         }
       ],
       "options": {
@@ -780,7 +780,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Workers lacking a complete, fresh containment window. A missing latency mean does not establish healthy recovery.\n\nAlert GpuFaultClosedLoopWindowIncomplete (warning, for 5m): docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete",
+      "description": "Workers lacking a complete, fresh containment window. A missing latency mean does not establish healthy recovery.\n\nAlert GpuFaultClosedLoopWindowIncomplete (warning, for 5m): docs/en/administrator-operations.md#gpufaultclosedloopwindowincomplete",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -819,7 +819,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultClosedLoopWindowIncomplete",
-          "url": "docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete"
+          "url": "docs/en/administrator-operations.md#gpufaultclosedloopwindowincomplete"
         }
       ],
       "options": {
@@ -854,7 +854,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 after a recorded terminal delivery failure in the last 15 minutes. Deleting older failures or retaining DEAD rows does not create an event.\n\nAlert GpuFaultNotificationDeliveryFailing (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing",
+      "description": "1 after a recorded terminal delivery failure in the last 15 minutes. Deleting older failures or retaining DEAD rows does not create an event.\n\nAlert GpuFaultNotificationDeliveryFailing (critical, for 5m, > 0): docs/en/administrator-operations.md#gpufaultnotificationdeliveryfailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -897,7 +897,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultNotificationDeliveryFailing",
-          "url": "docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing"
+          "url": "docs/en/administrator-operations.md#gpufaultnotificationdeliveryfailing"
         }
       ],
       "options": {
@@ -1079,7 +1079,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultRemediationBudgetStarved (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultremediationbudgetstarved",
+      "description": "Alert GpuFaultRemediationBudgetStarved (warning, for 30m, > 0): docs/en/administrator-operations.md#gpufaultremediationbudgetstarved",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1150,7 +1150,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Saturated when a cluster has waiters while its active claims sit at the configured limit.\n\nAlert GpuFaultRemediationBudgetClusterSaturated (warning, for 30m): docs/管理员日常运维.md#gpufaultremediationbudgetclustersaturated",
+      "description": "Saturated when a cluster has waiters while its active claims sit at the configured limit.\n\nAlert GpuFaultRemediationBudgetClusterSaturated (warning, for 30m): docs/en/administrator-operations.md#gpufaultremediationbudgetclustersaturated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1319,7 +1319,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultCompletionEventsWithoutDecision (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultcompletioneventswithoutdecision",
+      "description": "Alert GpuFaultCompletionEventsWithoutDecision (warning, for 30m, > 0): docs/en/administrator-operations.md#gpufaultcompletioneventswithoutdecision",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1390,7 +1390,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "ESCALATED is the operator queue the alert watches.\n\nAlert GpuFaultIncidentsAwaitingOperator (warning, for 24h, > 0): docs/管理员日常运维.md#gpufaultincidentsawaitingoperator",
+      "description": "ESCALATED is the operator queue the alert watches.\n\nAlert GpuFaultIncidentsAwaitingOperator (warning, for 24h, > 0): docs/en/administrator-operations.md#gpufaultincidentsawaitingoperator",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1474,7 +1474,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since a dispatch cycle last hit an internal error; small is bad.\n\nAlert GpuFaultWorkflowDispatchInternalErrors (warning, for 0m, < 900): docs/管理员日常运维.md#gpufaultworkflowdispatchinternalerrors",
+      "description": "Seconds since a dispatch cycle last hit an internal error; small is bad.\n\nAlert GpuFaultWorkflowDispatchInternalErrors (warning, for 0m, < 900): docs/en/administrator-operations.md#gpufaultworkflowdispatchinternalerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1545,7 +1545,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since the dispatcher last gave up handling a step failure; small is bad.\n\nAlert GpuFaultWorkflowFailureHandlingAbandoned (critical, for 0m, < 1800): docs/管理员日常运维.md#gpufaultworkflowfailurehandlingabandoned",
+      "description": "Seconds since the dispatcher last gave up handling a step failure; small is bad.\n\nAlert GpuFaultWorkflowFailureHandlingAbandoned (critical, for 0m, < 1800): docs/en/administrator-operations.md#gpufaultworkflowfailurehandlingabandoned",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1616,7 +1616,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Age of the oldest PENDING/RETRY/LEASED delivery, counted from creation or the last operator re-queue.\n\nAlert GpuFaultNotificationUndeliveredTooLong (critical, for 10m, > 1800): docs/管理员日常运维.md#gpufaultnotificationundeliveredtoolong",
+      "description": "Age of the oldest PENDING/RETRY/LEASED delivery, counted from creation or the last operator re-queue.\n\nAlert GpuFaultNotificationUndeliveredTooLong (critical, for 10m, > 1800): docs/en/administrator-operations.md#gpufaultnotificationundeliveredtoolong",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1687,7 +1687,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Undelivered rows next to the seconds since the outbox dispatcher last ran; rows with no cycle is a stuck outbox.\n\nAlert GpuFaultNotificationOutboxNotDraining (warning, for 5m, > 300): docs/管理员日常运维.md#gpufaultnotificationoutboxnotdraining",
+      "description": "Undelivered rows next to the seconds since the outbox dispatcher last ran; rows with no cycle is a stuck outbox.\n\nAlert GpuFaultNotificationOutboxNotDraining (warning, for 5m, > 300): docs/en/administrator-operations.md#gpufaultnotificationoutboxnotdraining",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1769,7 +1769,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since an advisory expired unsent; small is bad.\n\nAlert GpuFaultNotificationExpiredUnsent (warning, for 0m, < 1800): docs/管理员日常运维.md#gpufaultnotificationexpiredunsent",
+      "description": "Seconds since an advisory expired unsent; small is bad.\n\nAlert GpuFaultNotificationExpiredUnsent (warning, for 0m, < 1800): docs/en/administrator-operations.md#gpufaultnotificationexpiredunsent",
       "fieldConfig": {
         "defaults": {
           "color": {

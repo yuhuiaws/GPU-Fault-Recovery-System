@@ -249,6 +249,29 @@ class DagBrancher:
 
     _SHARED_OPERATIONS = SHARED_DAG_OPERATIONS
 
+    def adopt_linear_plan(self, existing: WorkflowRequest) -> WorkflowRequest:
+        """Grow a flat record into a one-branch DAG without changing its steps.
+
+        The steps keep their indexes, completions and executions; each gets
+        the dependency the flat order implied and a branch id (``shared`` for
+        the job-level stop, ``branch:initial`` otherwise). The record is then
+        a DAG the branch escalator can rewrite in place -- the same growth
+        ``append_parallel_job_branch`` performs when a second node's branch
+        lands on a flat record.
+        """
+
+        if existing.dag_enabled:
+            return existing
+        steps, _, _ = self._normalize_existing(existing)
+        return existing.model_copy(
+            update={
+                "official_steps": steps,
+                "dag_enabled": True,
+                "dag_revision": existing.dag_revision + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+
     def _normalize_existing(
         self, existing: WorkflowRequest
     ) -> tuple[list[WorkflowStepSpec], int | None, bool]:

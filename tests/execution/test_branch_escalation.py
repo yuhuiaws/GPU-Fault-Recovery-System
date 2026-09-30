@@ -518,3 +518,120 @@ def test_a_sibling_finishing_normally_does_not_restart_a_job_whose_other_branch_
     ]
     assert len(node_c_replace) == 1, saved.step_executions
     assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+
+
+# ------------------------------------------------- single-node linear plans
+
+
+def _single_node_plan(store, *, nodes=("node-a",)):
+    """A plain (non-DAG) node record: STOP -> RESET_GPU -> VALIDATE_GPU ->
+    RESTORE_SCHEDULING -> RESTART_WORKLOAD, every step on the same node(s)."""
+
+    incident, workflow = workflow_state(
+        store,
+        [
+            STOP,
+            RESET,
+            WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.RESTORE_SCHEDULING,
+            RESTART_JOB,
+        ],
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[
+            copy_model(step, node_ids=list(nodes)) for step in workflow.official_steps
+        ],
+    )
+    store.save_workflow(workflow)
+    return incident, workflow
+
+
+def _operations(adapter) -> list[str]:
+    return [call.rsplit("/", 1)[1] for call in adapter.calls]
+
+
+def test_a_single_node_plan_escalates_its_failed_reset_in_the_same_record():
+    """The ladder is not a multi-node privilege: a plain node record whose
+    RESET_GPU fails grows into a one-branch DAG and reboots in place, instead
+    of ending FAILED and handing the reboot to a workflow-reboot-after record
+    (live 2026-09-23: the same fault class showed two record shapes)."""
+
+    store = build_store()
+    incident, workflow = _single_node_plan(store)
+    outcomes = {
+        RESET: WorkflowStepOutcome.failed("reset refused"),
+        **_ok(STOP, REBOOT, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(store, workflow, outcomes, escalator=_escalator())
+
+    assert result.status is WorkflowStatus.SUCCEEDED
+    assert saved.dag_enabled is True, "the record grew into a DAG at the escalation"
+    assert saved.branch_escalation_counts == {"node-a": 1}
+    assert saved.exhausted_branch_ids == []
+    assert {1, 2, 3} <= set(saved.superseded_step_indexes), (
+        "the failed reset and the validation tail behind it are retired"
+    )
+    operations = _operations(adapter)
+    assert operations.count("RESTART_NODE") == 1
+    assert operations.count("RESTART_WORKLOAD") == 1
+    assert operations.index("RESTART_NODE") < operations.index("RESTART_WORKLOAD"), (
+        "the job restarts only after the node's reboot"
+    )
+    assert (
+        operations.index("RESTART_NODE")
+        < operations.index("VALIDATE_HOST")
+        < (operations.index("RESTART_WORKLOAD"))
+    ), "the rung's validation tail runs between the reboot and the restart"
+    rungs = [event for event in saved.events if event.code == "BRANCH_ESCALATED"]
+    assert len(rungs) == 1
+    assert rungs[0].details["from_operation"] == "RESET_GPU"
+    assert rungs[0].details["to_operation"] == "RESTART_NODE"
+    assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED
+
+
+def test_a_multi_node_linear_plan_still_fails_as_a_whole():
+    """Only a record that belongs to one node is adopted; a flat record whose
+    steps name several nodes keeps the whole-workflow failure path."""
+
+    store = build_store()
+    _, workflow = _single_node_plan(store, nodes=("node-a", "node-b"))
+    outcomes = {
+        RESET: WorkflowStepOutcome.failed("reset refused"),
+        **_ok(STOP, REBOOT, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(store, workflow, outcomes, escalator=_escalator())
+
+    assert result.status is WorkflowStatus.FAILED
+    assert saved.dag_enabled is False
+    assert "RESTART_NODE" not in _operations(adapter)
+    assert saved.branch_escalation_counts == {}
+
+
+def test_a_single_node_plan_with_an_unknown_outcome_is_not_adopted():
+    """The same stop as the DAG ladder: an interrupted reset is an operator's
+    call, so the record holds for confirmation as before and no rung is
+    appended."""
+
+    store = build_store()
+    _, workflow = _single_node_plan(store)
+    outcomes = {
+        RESET: WorkflowStepOutcome.failed(
+            "node agent node-a: interrupted",
+            details={
+                "node_action_interrupted": True,
+                "manual_confirmation_required": True,
+                "operation": RESET.value,
+            },
+        ),
+        **_ok(STOP, REBOOT, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(store, workflow, outcomes, escalator=_escalator())
+
+    assert result.status is WorkflowStatus.BLOCKED
+    assert saved.dag_enabled is False
+    assert "RESTART_NODE" not in _operations(adapter)
+    assert saved.exhausted_branch_ids == []

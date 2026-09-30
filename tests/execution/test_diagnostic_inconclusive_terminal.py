@@ -122,7 +122,7 @@ def test_the_inconclusive_notification_is_idempotent_per_workflow():
 
     assert first.deduplication_key == second.deduplication_key
     assert first.deduplication_key.endswith("/diagnostic-inconclusive/workflow-a")
-    assert "诊断未定论" in first.subject
+    assert "diagnostic inconclusive" in first.subject
     assert "node-a" in first.body_text
     assert "CPU saturation threshold exceeded" in first.body_text
     assert first.support_case_draft == ""

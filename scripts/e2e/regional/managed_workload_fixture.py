@@ -57,6 +57,16 @@ RESOURCE_APIS = {
     "job": ("apis/batch/v1", "jobs"),
     "pytorchjob": ("apis/kubeflow.org/v1", "pytorchjobs"),
     "jobset": ("apis/jobset.x-k8s.io/v1alpha2", "jobsets"),
+    "service": ("api/v1", "services"),
+}
+# The headless Services a training controller creates for its replicas carry
+# the controller's name in this label. Orphaning the controller (see
+# ``ManagedWorkloadFixture.delete``) strips their ownerReferences, so they must
+# be deleted explicitly or they outlive the drill (26 of them blocked the
+# 2026-09-24 uninstall as unregistered live resources).
+CONTROLLER_SERVICE_LABEL = {
+    "pytorchjob": "training.kubeflow.org/job-name",
+    "jobset": "jobset.sigs.k8s.io/jobset-name",
 }
 
 
@@ -618,6 +628,9 @@ class ManagedWorkloadFixture:
                 self.cleanup_snapshots.setdefault(
                     (kind, name), capture_cleanup_custody(document)
                 )
+        # The controllers' replica Services, read while they still name their
+        # owner: the Orphan delete below detaches them from the controller.
+        services = self._controller_services(documents)
         # Orphan controllers first so they cannot replace Pods during cleanup.
         # Their Pods are then deleted explicitly with zero grace.
         priority = {"jobset": 0, "pytorchjob": 0, "job": 1, "pod": 2}
@@ -639,8 +652,53 @@ class ManagedWorkloadFixture:
             raise RegionalFixtureError(
                 "managed workload resources remain after cleanup"
             )
+        for service in services:
+            self._delete_controller_service(service)
         if self.ownership is not None:
             self.ownership.complete()
+
+    def _controller_services(
+        self, controllers: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Replica Services of our controllers: label-selected, owner-checked."""
+
+        services: list[dict[str, Any]] = []
+        for controller in controllers:
+            kind, name, uid = resource_identity(self.regional, controller)
+            label = CONTROLLER_SERVICE_LABEL.get(kind)
+            if label is None:
+                continue
+            value = json.loads(
+                self.regional.kubectl(
+                    "gpu", "get", "service", "-l", f"{label}={name}", "-o", "json"
+                )
+            )
+            items = value.get("items") if isinstance(value, dict) else None
+            if not isinstance(items, list):
+                raise RegionalFixtureError("controller Service inventory is incomplete")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise RegionalFixtureError(
+                        "controller Service inventory is invalid"
+                    )
+                owners = item["metadata"].get("ownerReferences") or []
+                # Owned by this controller, or already orphaned by an earlier
+                # interrupted cleanup of the same controller; never a Service
+                # some other object owns.
+                if owners and not any(owner.get("uid") == uid for owner in owners):
+                    continue
+                resource_identity(self.regional, item)
+                services.append(item)
+        return services
+
+    def _delete_controller_service(self, document: dict[str, Any]) -> None:
+        kind, name, uid = resource_identity(self.regional, document)
+        current = read_resource(self.regional, kind, name)
+        if current is None:
+            return
+        if resource_identity(self.regional, current)[2] != uid:
+            raise RegionalFixtureError("controller Service UID changed before deletion")
+        delete_resource(self.regional, current)
 
     def _delete_owned_resource(self, document: dict[str, Any]) -> None:
         kind, name, uid = resource_identity(self.regional, document)

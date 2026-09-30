@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
@@ -23,7 +24,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from gpu_fault.telemetry_models import TelemetryMetricLatest
-
 
 KUBERNETES_OWNER = "gpu-fault-kubernetes-adapter"
 NODE_OWNER = "gpu-fault-node-agent"
@@ -48,6 +48,18 @@ INTEGRATED_HEALTHY_HOST_METRICS = (
     ("rdma_link_down", 0.0),
     ("rdma_errors_delta", 0.0),
 )
+# The GPU metric package a returned synthetic node reports: fresh temperature
+# (the validation adapter's presence proof) and clean NVLink counters (the
+# fabric validation's metric groups).
+HEALTHY_GPU_METRICS = (
+    ("gpu_temperature_c", 30.0),
+    ("nvlink_crc_aggregate_error_total", 0.0),
+    ("nvlink_recovery_aggregate_error_total", 0.0),
+    ("nvlink_replay_aggregate_error_total", 0.0),
+)
+HEARTBEAT_TELEMETRY_ENV = "ACTION_HEARTBEAT_TELEMETRY"
+NODE_RETURN_TELEMETRY = "node-return"
+CORRELATED_NODE_OFFSET = re.compile(r"^corr-node-.*-c(\d{3})-[a-z]+$")
 
 
 def synthetic_agent(
@@ -185,6 +197,156 @@ def integrated_node_id(run_id: str, cluster_index: int, workflow_index: int) -> 
     return f"integrated-node-{run_id}-c{cluster_index:03d}-w{workflow_index:02d}"
 
 
+def refresh_run_agent_heartbeats(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    now: datetime,
+    lease_seconds: int,
+    publish_telemetry: bool = False,
+) -> int:
+    """Refresh every ACTIVE synthetic Agent of this run in the perf clusters.
+
+    The action and correlated suites seed their own node ids
+    (``actionperf-<run>-...``, ``corr-node-<run>-...``); the fleet compatibility
+    preflight holds destructive steps once an Agent heartbeat is older than the
+    fleet policy allows (live 2026-09-22: seven clusters' workflows waited past
+    the limit behind the others and every executor there timed out on zero
+    commands). Agents are matched by the run id inside their node id.
+
+    ``publish_telemetry`` also reports the node's healthy telemetry package
+    (GPU metrics, host metrics, collector success): the escalated
+    ``RESTART_NODE`` rung is followed by post-action validation that waits for
+    telemetry newer than the reboot, and a synthetic node publishes nothing
+    on its own (live 2026-09-23: every §8.3 node sat in ``VALIDATE_GPU`` until
+    the step cap and walked on to ``REPLACE_NODE``). The action suite keeps
+    the default: its seeded workflows carry no validation step.
+    """
+
+    refreshed = 0
+    for cluster_index in range(clusters):
+        cluster_id = f"perf-cap-{cluster_index:03d}"
+        for record in context.store.list_agents(cluster_id):
+            if run_id not in record.node_id:
+                continue
+            if record.lifecycle_state is not AgentLifecycleState.ACTIVE:
+                continue
+            context.store.save_agent(
+                record.model_copy(
+                    update={
+                        "last_seen_at": now,
+                        "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                    }
+                )
+            )
+            if publish_telemetry:
+                publish_healthy_node_telemetry(
+                    context,
+                    record=record,
+                    cluster_id=cluster_id,
+                    now=now,
+                    gpu_uuid=synthetic_node_gpu_uuid(record.node_id),
+                    gpu_index="0",
+                    batch_id=(
+                        f"node-return-{run_id}-{record.node_id}-"
+                        f"{int(now.timestamp() * 1_000_000)}"
+                    ),
+                )
+            refreshed += 1
+    if not refreshed:
+        raise RuntimeError(f"no synthetic Agent of run {run_id} to refresh")
+    return refreshed
+
+
+def synthetic_node_gpu_uuid(node_id: str) -> str:
+    """The GPU a synthetic node reports for itself.
+
+    The correlated scenario's attempt identity names ``GPU-corr-<offset>`` for
+    ``corr-node-<run>-c<offset>-<lane>``; post-action validation requires the
+    step's own GPU to report, so the node must publish under that UUID.
+    """
+
+    match = CORRELATED_NODE_OFFSET.match(node_id)
+    if match:
+        return f"GPU-corr-{match.group(1)}"
+    return f"GPU-{node_id}"
+
+
+def publish_healthy_node_telemetry(
+    context: ApplicationContext,
+    *,
+    record: AgentRecord,
+    cluster_id: str,
+    now: datetime,
+    gpu_uuid: str,
+    gpu_index: str,
+    batch_id: str,
+) -> None:
+    """Report one synthetic node as healthy and fully collected at ``now``.
+
+    Every sample carries the refresh time, so it postdates any completed
+    reset/reboot barrier and the post-action validation sees fresh data.
+    """
+
+    node_id = record.node_id
+    gpu_samples = [
+        GpuMetricSample(
+            metric_name=name,
+            canonical_name=name,
+            value=value,
+            gpu_index=gpu_index,
+            gpu_uuid=gpu_uuid,
+        )
+        for name, value in HEALTHY_GPU_METRICS
+    ]
+    context.gpu_metrics.ingest(
+        GpuMetricBatch(
+            batch_id=batch_id,
+            cluster_id=cluster_id,
+            node_id=node_id,
+            observed_at=now,
+            collected_at=now,
+            source=GpuMetricSource.DCGM_EXPORTER,
+            samples=gpu_samples,
+            runtime_profile_version=record.runtime_profile_version,
+        )
+    )
+    host_samples = [
+        TelemetryMetricLatest(
+            cluster_id=cluster_id,
+            node_id=node_id,
+            observed_at=now,
+            name=name,
+            value=value,
+        )
+        for name, value in INTEGRATED_HEALTHY_HOST_METRICS
+    ]
+    context.store.observe_telemetry_metrics(host_samples)
+    sample_counts = {
+        CollectorKind.GPU_METRICS: len(gpu_samples),
+        CollectorKind.HOST_TELEMETRY: len(host_samples),
+    }
+    context.store.save_collector_statuses_batch(
+        [
+            CollectorStatus(
+                cluster_id=cluster_id,
+                node_id=node_id,
+                collector=collector,
+                observed_at=now,
+                ingested_at=now,
+                last_success_at=now,
+                batch_id=batch_id,
+                sample_count=sample_counts.get(collector, 1),
+            )
+            for collector in sorted(
+                required_collectors_for_agent(record),
+                key=lambda item: item.value,
+            )
+        ]
+    )
+
+
 def refresh_integrated_agent_heartbeats(
     context: ApplicationContext,
     *,
@@ -218,75 +380,17 @@ def refresh_integrated_agent_heartbeats(
                     }
                 )
             )
-            gpu_uuid = f"GPU-integrated-{cluster_index:03d}-{workflow_index:02d}"
-            gpu_samples = [
-                GpuMetricSample(
-                    metric_name=name,
-                    canonical_name=name,
-                    value=value,
-                    gpu_index=str(workflow_index),
-                    gpu_uuid=gpu_uuid,
-                )
-                for name, value in (
-                    ("gpu_temperature_c", 30.0),
-                    ("nvlink_crc_aggregate_error_total", 0.0),
-                    ("nvlink_recovery_aggregate_error_total", 0.0),
-                    ("nvlink_replay_aggregate_error_total", 0.0),
-                )
-            ]
-            batch_id = (
-                f"integrated-validation-{run_id}-{cluster_index:03d}-"
-                f"{workflow_index:02d}-{int(now.timestamp() * 1_000_000)}"
-            )
-            context.gpu_metrics.ingest(
-                GpuMetricBatch(
-                    batch_id=batch_id,
-                    cluster_id=cluster_id,
-                    node_id=node_id,
-                    observed_at=now,
-                    collected_at=now,
-                    source=GpuMetricSource.DCGM_EXPORTER,
-                    samples=gpu_samples,
-                    runtime_profile_version=record.runtime_profile_version,
-                )
-            )
-            host_samples = [
-                TelemetryMetricLatest(
-                    cluster_id=cluster_id,
-                    node_id=node_id,
-                    observed_at=now,
-                    name=name,
-                    value=value,
-                )
-                for name, value in INTEGRATED_HEALTHY_HOST_METRICS
-            ]
-            context.store.observe_telemetry_metrics(host_samples)
-            required_collectors = required_collectors_for_agent(record)
-            context.store.save_collector_statuses_batch(
-                [
-                    CollectorStatus(
-                        cluster_id=cluster_id,
-                        node_id=node_id,
-                        collector=collector,
-                        observed_at=now,
-                        ingested_at=now,
-                        last_success_at=now,
-                        batch_id=batch_id,
-                        sample_count=(
-                            len(gpu_samples)
-                            if collector is CollectorKind.GPU_METRICS
-                            else (
-                                len(host_samples)
-                                if collector is CollectorKind.HOST_TELEMETRY
-                                else 1
-                            )
-                        ),
-                    )
-                    for collector in sorted(
-                        required_collectors,
-                        key=lambda item: item.value,
-                    )
-                ]
+            publish_healthy_node_telemetry(
+                context,
+                record=record,
+                cluster_id=cluster_id,
+                now=now,
+                gpu_uuid=f"GPU-integrated-{cluster_index:03d}-{workflow_index:02d}",
+                gpu_index=str(workflow_index),
+                batch_id=(
+                    f"integrated-validation-{run_id}-{cluster_index:03d}-"
+                    f"{workflow_index:02d}-{int(now.timestamp() * 1_000_000)}"
+                ),
             )
             refreshed += 1
     return refreshed
@@ -382,6 +486,31 @@ def main() -> None:
     agents_created = 0
     now = datetime.now(timezone.utc)
     try:
+        if seed_mode == "run-heartbeats":
+            lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
+            telemetry = os.getenv(HEARTBEAT_TELEMETRY_ENV, "")
+            if telemetry not in {"", NODE_RETURN_TELEMETRY}:
+                raise RuntimeError(f"unsupported heartbeat telemetry: {telemetry}")
+            refreshed = refresh_run_agent_heartbeats(
+                context,
+                run_id=run_id,
+                clusters=clusters,
+                now=now,
+                lease_seconds=lease_seconds,
+                publish_telemetry=telemetry == NODE_RETURN_TELEMETRY,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "clusters": clusters,
+                        "agents_refreshed": refreshed,
+                        "telemetry": telemetry or None,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
         if seed_mode == "integrated-heartbeats":
             workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "4"))
             lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))

@@ -88,6 +88,31 @@ class AmpDefinition:
     label: str
 
 
+AMP_READ_ATTEMPTS = 3
+AMP_READ_RETRY_SECONDS = 5.0
+_RETRY_SLEEP = time.sleep
+_TRANSIENT_AWS_MARKERS = (
+    "NoCredentials",
+    "Unable to locate credentials",
+    "ExpiredToken",
+    "Throttling",
+    "RequestLimitExceeded",
+    "TooManyRequests",
+    "ServiceUnavailable",
+    "InternalServerException",
+    "Could not connect",
+    "Connection was closed",
+    "timed out",
+    "Read timeout",
+)
+
+
+def transient_aws_failure(stderr: str) -> bool:
+    """Whether an ``aws`` CLI failure is a credential, throttle or transport blip."""
+
+    return any(marker in stderr for marker in _TRANSIENT_AWS_MARKERS)
+
+
 def describe_amp_definition(
     release: Any, definition: AmpDefinition
 ) -> dict[str, Any] | None:
@@ -99,12 +124,22 @@ def describe_amp_definition(
     one that does.
     """
 
-    code, stdout, stderr = release.runner.probe_output(
-        [*definition.describe, "--output", "json"]
-    )
-    if code:
+    for attempt in range(1, AMP_READ_ATTEMPTS + 1):
+        code, stdout, stderr = release.runner.probe_output(
+            [*definition.describe, "--output", "json"]
+        )
+        if not code:
+            break
         if "ResourceNotFoundException" in stderr:
             return None
+        if attempt < AMP_READ_ATTEMPTS and transient_aws_failure(stderr):
+            # Live 2026-09-23: one `aws amp describe-alert-manager-definition`
+            # in release-diff answered "NoCredentials: Unable to locate
+            # credentials" (the instance-role fetch failed once under ~370
+            # parallel commands) and the verified release was rolled back. A
+            # read that is only a read gets a bounded second chance.
+            _RETRY_SLEEP(AMP_READ_RETRY_SECONDS * attempt)
+            continue
         raise ReleaseError(
             f"cannot read the {definition.label}: {stderr.strip() or code}"
         )

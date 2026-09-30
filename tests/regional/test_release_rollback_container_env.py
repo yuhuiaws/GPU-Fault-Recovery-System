@@ -234,6 +234,7 @@ def test_capture_previous_records_the_container_env_beside_the_config_maps() -> 
         _config_map_binary_key=lambda _args, name: f"{name}-key",
         _config_map_sha=lambda *_args: "4" * 64,
         _remote_command_stats=lambda: {"executor_internal_error_total": 0},
+        _cpu_runtime_profile_drift=lambda: "profile-v0",
     )
     plan = STATE.ReleaseExecutionPlan(
         nodes=(STATE.ReleaseComponent.CPU_FINALIZE, STATE.ReleaseComponent.VERIFY)
@@ -242,6 +243,10 @@ def test_capture_previous_records_the_container_env_beside_the_config_maps() -> 
     previous = STATE.capture_previous(release, plan)
 
     assert previous["cpu_role_container_env"] == _expected_snapshot()
+    assert previous["runtime_profile_version"] == "profile-v1", "the ConfigMap"
+    assert previous["effective_runtime_profile_version"] == "profile-v0", (
+        "what the Running replicas loaded is recorded beside the ConfigMap value"
+    )
     assert set(previous["cpu_role_config_maps"]) == {
         f"{deployment}-config-{domain}"
         for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS

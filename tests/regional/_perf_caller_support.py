@@ -112,9 +112,20 @@ class CapacityWire:
         monkeypatch.setattr(capacity, "DATAPLANE_CONTEXT", "fake-context")
         monkeypatch.setattr(registry, "validate_notification_safety", lambda: None)
         monkeypatch.setattr(
+            registry,
+            "sync_dataplane_connection_secret",
+            lambda: self.events.append("connection-mirror") or {"changed": False},
+        )
+        monkeypatch.setattr(
             registry, "load_registry", lambda: copy.deepcopy(self.entries)
         )
         monkeypatch.setattr(registry, "write_registry", self.publish)
+        # Secret/head/replica alignment and the Secret byte baseline are the
+        # registry module's own contract (test_perf_registry_alignment).
+        monkeypatch.setattr(
+            registry, "verify_registry_alignment", lambda **_kwargs: {"aligned": True}
+        )
+        monkeypatch.setattr(registry, "capture_secret_baseline", lambda *_args: None)
         monkeypatch.setattr(data, "invoke", self.data)
         for module in (capacity, action):
             monkeypatch.setattr(module, "release_identity", lambda: dict(self.identity))
@@ -158,6 +169,18 @@ class CapacityWire:
         )
 
     def control(self, *args: str, **_kwargs: Any) -> str:
+        if args[:1] == ("exec",):
+            # The live remediation budget read: answer with the raw capacity
+            # tier so the fake runs keep their full executor concurrency.
+            return json.dumps(
+                {
+                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "128",
+                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "4",
+                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "4",
+                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
+                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
+                }
+            )
         assert args[:2] == ("get", "pod"), "unexpected control-plane API boundary"
         return "api"
 
@@ -168,7 +191,13 @@ class CapacityWire:
             raise TimeoutError("registration ACK lost")
 
     def data(
-        self, _control: Any, *, run_id: str, cluster_ids: list[str], cleanup: bool
+        self,
+        _control: Any,
+        *,
+        run_id: str,
+        cluster_ids: list[str],
+        cleanup: bool,
+        force_nonterminal: bool = False,
     ) -> dict[str, Any]:
         assert run_id == "run-a", "data scope must retain the caller run identity"
         assert cluster_ids == ["perf-cap-000"], (

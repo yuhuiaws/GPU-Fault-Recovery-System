@@ -62,9 +62,9 @@ def test_support_escalation_creates_fixed_ticket_notification() -> None:
     assert outcome.details["hardware_disposition"] == ("OFFLINE_QUARANTINED")
     notification = store.list_notifications()[0]
     assert outcome.details["ticket_id"] in notification.body_text
-    assert "实际失败的自动恢复步骤" in notification.body_text
+    assert "Automatic recovery steps that failed" in notification.body_text
     assert "NONE_RECORDED" in notification.body_text
-    assert "内部厂商支持升级记录" in notification.body_text
+    assert "internal vendor-support escalation record" in notification.body_text
     assert sent == [notification.notification_id]
 
 
@@ -181,7 +181,7 @@ def test_full_fabric_reset_sends_one_idempotent_email() -> None:
     assert second.status is WorkflowStepStatus.SUCCEEDED
     assert len(store.list_notifications()) == 1
     assert len(notifier.deliveries) == 1
-    assert "SXID：10003" in notifier.deliveries[0].body_text
+    assert "SXID: 10003" in notifier.deliveries[0].body_text
 
 
 def test_restore_retries_fabric_reset_email_after_network_recovers() -> None:

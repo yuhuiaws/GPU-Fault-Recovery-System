@@ -39,7 +39,7 @@ def tiny_suite(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
         path = Path(directory) / "test_selection.py"
         path.write_text(
             "import pytest\n\n"
-            "@pytest.mark.parametrize('value', [0, 1, 2, 3], ids=['v0', 'v1', 'v2', 'v3'])\n"
+            "@pytest.mark.parametrize('value', [0, 1, 2, 3], ids=['shape-0', 'shape-1', 'shape-2', 'shape-3'])\n"
             "def test_matrix(value):\n"
             "    assert 0 <= value < 4\n\n"
             "def test_control():\n"
@@ -50,8 +50,11 @@ def tiny_suite(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 
 def matrix_nodeids(path: Path) -> list[str]:
+    # Hyphenated ids: the child suite lives under a random `evidence-child-<8 chars>` directory whose
+    # name is drawn from [a-z0-9_]; a plain id like `v0` can occur in that name and then `-k v0`
+    # matches every variant through the directory keyword (deploy gate 2026-09-24, dir ...zuhk4tv0).
     selector = path.relative_to(ROOT).as_posix() + "::test_matrix"
-    return [f"{selector}[v{index}]" for index in range(4)]
+    return [f"{selector}[shape-{index}]" for index in range(4)]
 
 
 def run_child(
@@ -118,7 +121,7 @@ def test_filtered_parameterized_receipt_cannot_pass_generic_case(
     variants = matrix_nodeids(tiny_suite)
     selector = variants[0].partition("[")[0]
     options = (
-        ("-k", "v0")
+        ("-k", "shape-0")
         if selection == "keyword"
         else tuple(
             option for nodeid in variants[1:] for option in ("--deselect", nodeid)

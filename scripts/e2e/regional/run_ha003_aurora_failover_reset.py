@@ -23,6 +23,9 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
 from scripts.e2e.regional.aurora_binding import regional_binding  # noqa: E402
+from scripts.e2e.regional.drill_incident_cleanup import (  # noqa: E402
+    close_drill_incident,
+)
 from scripts.e2e.regional.ha_cleanup import (  # noqa: E402
     ProcessSupervisionLost,
     record_supervision_loss,
@@ -777,6 +780,28 @@ def cleanup_case(
                     result["errors"].append("node restore workflow failed")
         except Exception as exc:
             result["errors"].append(f"node restore: {type(exc).__name__}: {exc}")
+        # The drill's own incident: closed through the product path when it is
+        # operator-closable, otherwise named as a residual (a leftover
+        # ACTION_PENDING XID incident without a workflow cannot be closed by
+        # anyone but the workflow that ends it).
+        try:
+            report = close_drill_incident(
+                WarmSpareLiveFixture(regional, ""),
+                regional,
+                incident_id,
+                reason="HA-003 drill cleanup",
+                reference=run_id,
+                nodes=(settings.node,),
+            )
+            result["incident_close"] = report
+            if report.get("residual"):
+                result["residual_incident"] = {
+                    "incident_id": incident_id,
+                    "state": report.get("state_before"),
+                    "reason": report["residual"],
+                }
+        except Exception as exc:
+            result["errors"].append(f"incident close: {type(exc).__name__}: {exc}")
     return result
 
 

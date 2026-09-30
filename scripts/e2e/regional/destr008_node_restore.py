@@ -8,6 +8,10 @@ from scripts.e2e.regional.destr008_cleanup_identity import (
     require_cleanup_family,
     require_cleanup_node,
 )
+from scripts.e2e.regional.drill_incident_cleanup import (
+    close_drill_incidents,
+    residual_incidents,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.warm_spare_fixture import (
     QUARANTINE_TAINT,
@@ -141,3 +145,34 @@ def audit_scenario_nodes(
     except Exception as exc:
         result["postflight_error"] = f"{type(exc).__name__}: {exc}"
         result["verdict"] = "FAIL"
+
+
+def close_scenario_incidents(
+    warm: WarmSpareLiveFixture,
+    settings: Settings,
+    result: dict[str, Any],
+    *,
+    incident_id: str,
+    successor_incident: str | None,
+    reference: str,
+) -> None:
+    """Close the shortage incident and the support incident the escalation
+    opened over the fault node once their isolation is gone -- the same
+    judgement ``workflow-reconcile --close-quarantined`` makes -- and record
+    the ones the product keeps open as residuals."""
+
+    try:
+        reports = close_drill_incidents(
+            warm,
+            warm.regional,
+            [incident_id, successor_incident],
+            reason="DESTR-008 scenario cleanup",
+            reference=reference,
+            nodes=(settings.fault_node, settings.spare_node),
+        )
+        result["incident_close"] = reports
+        residual = residual_incidents(reports)
+        if residual:
+            result["residual_incidents"] = residual
+    except Exception as exc:  # noqa: BLE001 - recorded; the verdict already stands
+        result["incident_close_error"] = f"{type(exc).__name__}: {exc}"

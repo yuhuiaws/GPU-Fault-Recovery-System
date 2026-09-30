@@ -20,6 +20,7 @@ from gpu_fault.execution.config import (
     MAX_DAG_STEPS as MAX_DAG_STEPS,
     ProductionExecutorConfig,
 )
+from gpu_fault.execution.flat_step_failure import fail_flat_step
 from gpu_fault.execution.fleet_preflight import (
     held_workflow_result,
 )
@@ -412,33 +413,17 @@ class ProductionWorkflowExecutor:
                         waiting_step_index=index,
                     )
                 if outcome.status is WorkflowStepStatus.FAILED:
-                    if (
-                        step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
-                        and self._has_unrestored_quiesce(workflow, steps)
-                    ):
-                        workflow = workflow.model_copy(
-                            update={
-                                "pending_failure_step_index": index,
-                                "pending_failure_error": (
-                                    outcome.error or "workflow step failed"
-                                ),
-                                "updated_at": datetime.now(timezone.utc),
-                            }
-                        )
-                        self._save_leased(workflow, execution_epoch)
-                        return self._resume_failure_compensation(
-                            workflow,
-                            incident,
-                            request,
-                            execution_epoch,
-                            is_safety=is_safety,
-                        )
-                    return self._terminalize(
+                    return fail_flat_step(
+                        self,
                         workflow,
                         incident,
-                        WorkflowStatus.FAILED,
-                        execution_epoch,
-                        reason=outcome.error,
+                        request,
+                        index=index,
+                        step=step,
+                        steps=steps,
+                        outcome=outcome,
+                        is_safety=is_safety,
+                        execution_epoch=execution_epoch,
                     )
 
                 rebindings = (outcome.details or {}).get("node_rebindings", {})
@@ -845,7 +830,7 @@ class ProductionWorkflowExecutor:
         index: int,
         outcome: WorkflowStepOutcome,
     ) -> BranchEscalation | None:
-        if self.branch_escalator is None or not workflow.dag_enabled:
+        if self.branch_escalator is None:
             return None
         if workflow.pending_failure_step_index is not None:
             # A job-level failure is already parked on this record (D-3): the

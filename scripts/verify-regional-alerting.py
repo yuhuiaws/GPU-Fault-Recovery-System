@@ -26,7 +26,7 @@ EXPECTED_GROUPS = {
     "gpu-fault-remote-command",
     "gpu-fault-telemetry-pipeline",
 }
-RUNBOOK_DOCUMENT = "docs/管理员日常运维.md"
+RUNBOOK_DOCUMENT = "docs/en/administrator-operations.md"
 # The triage cards live under one section and are titled with the bare alert
 # name, so the anchor is derivable from the alert. Any other `###` heading in
 # the document is a normal numbered subsection and is not an alert card.

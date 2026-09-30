@@ -46,6 +46,38 @@ def test_recorded_repository_is_reused_outside_checkout(tmp_path: Path) -> None:
     assert resolved == source
 
 
+def test_current_checkout_wins_over_a_recorded_one_and_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A first deploy resumed from a corrected checkout, or an upgrade run from a
+    fresh clone, must build the checkout the operator is standing in, not the
+    directory an earlier attempt recorded."""
+
+    earlier = repository(tmp_path / "attempt-1")
+    current = repository(tmp_path / "attempt-2")
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / admin_source_deploy.SOURCE_DEPLOY_STATE).write_text(
+        json.dumps({"schema_version": 1, "source_repository_root": str(earlier)}),
+        encoding="utf-8",
+    )
+
+    resolved = admin_source_deploy.resolve_source_repository(
+        state, current_directory=current
+    )
+
+    assert resolved == current, "the operator's checkout is the source"
+    notice = capsys.readouterr().err
+    assert str(current) in notice and str(earlier) in notice, (
+        "the switch away from the recorded source is announced"
+    )
+    assert (
+        admin_source_deploy.resolve_source_repository(state, current_directory=earlier)
+        == earlier
+        and capsys.readouterr().err == ""
+    ), "no notice when the current directory is the recorded one"
+
+
 def test_invalid_recorded_repository_fails_closed(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()

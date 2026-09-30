@@ -36,12 +36,14 @@ def test_rolling_entrypoint_runs_the_real_stage_contract_from_fresh_evidence(
     document = json.loads(entry.path.read_text(encoding="utf-8"))
     assert document["status"] == "COMPLETED"
     assert document["verdict"] == "PASS"
-    assert document["release_id"] == "full"
+    assert document["release_id"] == "restore", (
+        "the restored site is the final identity"
+    )
     assert document["cluster_ids"] == ["cluster-a"]
     assert document["cluster_id"] == "cluster-a"
     assert set(document["stages"]) >= {f"{stage}_passed" for stage in rolling.STAGES}
     assert constructed == [entry.configs]
-    assert len(backend.calls) == 10
+    assert len(backend.calls) == 11, "ten chain deploys plus the restore release"
     assert len(entry.calls) == 1
     assert document["inputs"]["config_sha256"] == {
         name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -149,7 +151,7 @@ def test_completed_evidence_needs_actual_final_identity_and_supports_multicluste
         tmp_path / "case.json", case_id=rolling.CASE_ID, inputs={}
     )
     recorder.stage(
-        "full_after",
+        "restore_after",
         lambda: {"release_id": "unit-full", "live": {"clusters": clusters}},
     )
     if isinstance(clusters, dict) and clusters:

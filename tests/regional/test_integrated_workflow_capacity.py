@@ -732,8 +732,23 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
     assert "control-plane container restarts are nonzero" in errors
 
 
-@pytest.mark.parametrize("status_code", ("429", "503"))
-def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> None:
+@pytest.mark.parametrize(
+    ("kind", "status_code", "rejected"),
+    (
+        ("GPU_METRICS", "429", True),
+        ("GPU_METRICS", "500", True),
+        ("GPU_METRICS", "503", False),
+        ("NVIDIA_KERNEL", "503", True),
+        ("GPU_METRICS_EVIDENCE", "503", True),
+    ),
+)
+def test_integrated_verdict_rejects_ingress_http_errors(
+    kind: str, status_code: str, rejected: bool
+) -> None:
+    """§6.1: P0 and evidence must be accepted and normal telemetry may carry the
+    reserved HTTP 503 (recorded, capped by RESERVED_503_MAX_SHARE); every other
+    non-2xx status fails the round (ruling 2026-09-23)."""
+
     expected = 128
     summary = {
         "clusters": 32,
@@ -748,10 +763,8 @@ def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> Non
             "paths": {
                 "NVIDIA_KERNEL": {"count": 500, "status_counts": {"202": 500}},
                 "FABRIC_MANAGER_LOG": {"count": 500, "status_counts": {"202": 500}},
-                "GPU_METRICS": {
-                    "count": 8192,
-                    "status_counts": {"202": 8191, status_code: 1},
-                },
+                "GPU_METRICS": {"count": 8192, "status_counts": {"202": 8192}},
+                "GPU_METRICS_EVIDENCE": {"count": 500, "status_counts": {"202": 500}},
             },
         },
         "control_plane_pod_lifecycle": {
@@ -797,10 +810,32 @@ def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> Non
         },
     }
 
+    path = summary["ingress"]["paths"][kind]
+    path["status_counts"] = {"202": path["count"] - 1, status_code: 1}
+
     status, errors = suite.verdict(summary, expected_workflows=expected)
 
-    assert status == "FAIL"
-    assert f"GPU_METRICS returned HTTP {status_code}" in errors
+    if rejected:
+        assert status == "FAIL", "a non-reserved HTTP error fails the round"
+        assert f"{kind} returned HTTP {status_code}" in errors
+        assert summary["ingress"]["reserved_rejections"] == {}, "nothing was shed"
+    else:
+        assert f"{kind} returned HTTP {status_code}" not in errors, (
+            "one reserved 503 on normal telemetry is evidence, not an error"
+        )
+        assert summary["ingress"]["reserved_rejections"] == {kind: 1}, (
+            "the shed count is recorded per kind"
+        )
+        assert 0 < summary["ingress"]["reserved_rejection_share"] < 0.001, (
+            "the share of normal telemetry shed is recorded"
+        )
+    # Past the cap the reserved rejection is a regression, not evidence.
+    path["status_counts"] = {"202": path["count"] - 300, "503": 300}
+    capped_status, capped_errors = suite.verdict(summary, expected_workflows=expected)
+    if kind in suite.NORMAL_TELEMETRY_KINDS:
+        assert capped_status == "FAIL" and any(
+            "reserved 503 share" in error for error in capped_errors
+        ), "300/8192 = 3.7% of normal telemetry shed exceeds the 2% guard"
 
 
 def test_control_pod_runtime_snapshot_is_redacted_and_detects_restart(

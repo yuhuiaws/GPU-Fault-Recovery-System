@@ -431,6 +431,9 @@ def test_config_only_rollout_is_role_scoped_and_spool_disable_drains() -> None:
     assert "stamp_admin_config_metadata" in script
     assert "gpu-fault.io/admin-config-sha256" in script
     assert "gpu-fault.io/role-config-sha256" in script
+    # A profile-only release must roll the CPU Pods: the required Runtime
+    # Profile version is start-up env, not a polled pin (live 2026-09-26).
+    assert '"gpu-fault.io/runtime-profile-version": $profile' in script
     assert "role_selected worker" in script
     disable = script.index('if [[ "${CURRENT_SPOOL_ADMISSION}" == "true"')
     ingress = script.index("apply_ingress_role", disable)

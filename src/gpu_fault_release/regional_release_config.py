@@ -472,6 +472,10 @@ class ReleaseArtifacts:
     delivery_component_digests: dict[str, str]
     locked_images: dict[str, str]
     node_template_sha256: str
+    # Where dist/<release>/release.json was read from; the rollback alignment
+    # tries it first, so a previous release delivered from outside
+    # source-snapshots (BOOT-020 candidates) can still be located.
+    manifest_path: Path | None = None
 
 
 def _resolved_artifact_paths(
@@ -647,6 +651,7 @@ def load_release_artifacts(
 ) -> ReleaseArtifacts:
     release_manifest = release.get("manifest")
     manifest: dict[str, Any] | None = None
+    manifest_path: Path | None = None
     manifest_schema_version = 1
     delivery_identity: dict[str, Any] = {}
     delivery_sha256 = ""
@@ -785,6 +790,7 @@ def load_release_artifacts(
         delivery_component_digests=delivery_component_digests,
         locked_images=locked_images,
         node_template_sha256=node_template_sha256,
+        manifest_path=manifest_path,
     )
 
 
@@ -902,6 +908,7 @@ class ReleaseConfig:
     retention: RegionalRetentionConfig = RegionalRetentionConfig()
     installation_id: str | None = None
     retained_database_handoff: Path | None = None
+    release_manifest_path: str = ""
 
     def for_rollback(
         self,
@@ -1104,6 +1111,7 @@ class ReleaseConfig:
             delivery_component_digests=(artifacts.delivery_component_digests),
             locked_images=artifacts.locked_images,
             node_template_sha256=artifacts.node_template_sha256,
+            release_manifest_path=str(artifacts.manifest_path or ""),
             upgrade_max_unavailable=upgrade_max_unavailable,
             rollback_max_unavailable=rollback_max_unavailable,
             upgrade_max_parallel_clusters=upgrade_max_parallel_clusters,

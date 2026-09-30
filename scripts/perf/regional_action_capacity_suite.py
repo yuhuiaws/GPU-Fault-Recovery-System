@@ -13,17 +13,21 @@ from gpu_fault.models import WorkflowOperation
 from scripts.e2e.regional.regional_live_fixture import component_python
 
 if TYPE_CHECKING or __package__:
-    from .regional_capacity_resources import RunResources, run_manifest
-    from .regional_capacity_results import collect_pod_json_logs
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
         validate_registry_target,
     )
+    from .regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
+    from .regional_capacity_results import collect_pod_json_logs
     from .regional_capacity_suite import (
-        DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
         CONTROL_NAMESPACE,
+        DEFAULT_ARTIFACT_ROOT,
         NAMESPACE,
         REGISTRY_SECRET,
         TOKEN_SECRET,
@@ -42,17 +46,21 @@ if TYPE_CHECKING or __package__:
         write_status,
     )
 else:
-    from regional_capacity_resources import RunResources, run_manifest
-    from regional_capacity_results import collect_pod_json_logs
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
         validate_registry_target,
     )
+    from regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
+    from regional_capacity_results import collect_pod_json_logs
     from regional_capacity_suite import (
-        DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
         CONTROL_NAMESPACE,
+        DEFAULT_ARTIFACT_ROOT,
         NAMESPACE,
         REGISTRY_SECRET,
         TOKEN_SECRET,
@@ -72,6 +80,7 @@ else:
     )
 
 
+LOAD_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
 SCRIPT_CONFIGMAP = "gpu-fault-action-capacity-script"
 JOB_NAME = "gpu-fault-action-capacity-executors"
 TERMINAL = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
@@ -115,6 +124,105 @@ def log(message: str) -> None:
     print(f"[{stamp}] {message}", flush=True)
 
 
+REMEDIATION_BUDGET_ENV = (
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN",
+)
+
+
+def live_remediation_budget() -> dict[str, int | None]:
+    """The five remediation budget limits of the live control workers.
+
+    Read from one Running control-worker Pod's environment; ``None`` for a
+    limit that is unset. The same request model runs under the production
+    budget tier and the raw capacity tier (性能压测验收方案 §8.2), so the run
+    records which tier it measured instead of assuming one.
+    """
+
+    pods = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-control-worker",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[*].metadata.name}",
+    ).split()
+    if not pods:
+        raise RuntimeError("no Running control-worker Pods for the budget read")
+    raw = control(
+        "exec",
+        pods[0],
+        "--",
+        "python3",
+        "-c",
+        (
+            "import json,os; print(json.dumps({"
+            + ",".join(
+                f"{name!r}:os.environ.get({name!r})" for name in REMEDIATION_BUDGET_ENV
+            )
+            + "},sort_keys=True))"
+        ),
+    )
+    values = json.loads(raw.splitlines()[-1])
+    return {
+        name: (int(values[name]) if values.get(name) not in (None, "") else None)
+        for name in REMEDIATION_BUDGET_ENV
+    }
+
+
+def budget_tier(
+    budget: dict[str, int | None],
+    *,
+    clusters: int,
+    workflows_per_cluster: int,
+    executor_workers: int,
+) -> dict:
+    """Classify the live budget against the fixed request model (§8.2).
+
+    Raw capacity tier: region >= clusters x workflows, cluster and resource
+    class >= workflows per cluster -- every workflow may run at once, so each
+    executor must reach one in-flight command per workflow. Production budget tier:
+    a lower limit throttles the workflows on purpose, so an executor only has
+    to make progress (floor 1); the budget waits are the measurement. Live
+    2026-09-22: under 20/5/2 every executor completed its 40 commands but
+    exited on the raw-tier floor of 8, failing a run that had behaved.
+    """
+
+    region = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION")
+    per_cluster = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER")
+    per_class = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS")
+    limits = [
+        (region, clusters * workflows_per_cluster),
+        (per_cluster, workflows_per_cluster),
+        (per_class, workflows_per_cluster),
+    ]
+    if all(limit is None for limit, _ in limits):
+        tier = "unbounded"
+    elif all(limit is None or limit >= needed for limit, needed in limits):
+        tier = "raw-capacity"
+    else:
+        tier = "production-budget"
+    return {
+        "tier": tier,
+        "limits": dict(budget),
+        "required_for_raw_capacity": {
+            "region": clusters * workflows_per_cluster,
+            "per_cluster": workflows_per_cluster,
+            "per_resource_class": workflows_per_cluster,
+        },
+        # The executor's concurrency floor is progress-only in every tier: the
+        # per-node and per-failure-domain limits serialize a cluster's workflows
+        # on purpose, so peak concurrency is evidence (max_concurrent_commands
+        # per executor), not a pass criterion. Live 2026-09-22: floors of 8 and
+        # then 4 each failed a run whose 128 workflows had all SUCCEEDED.
+        "min_concurrent_commands": 1,
+    }
+
+
 def executor_job(
     *,
     clusters: int,
@@ -127,6 +235,8 @@ def executor_job(
     executor_artifact_sha256: str,
     executor_compatibility_digest: str,
     connection_secret: str = CONNECTION_SECRET,
+    min_concurrent_commands: int | None = None,
+    max_seconds: int = 900,
 ) -> dict:
     return {
         "apiVersion": "batch/v1",
@@ -140,11 +250,14 @@ def executor_job(
             "parallelism": clusters,
             "completionMode": "Indexed",
             "backoffLimit": 0,
-            "activeDeadlineSeconds": 1200,
+            # The executors' own wall (ACTION_MAX_SECONDS) plus teardown slack;
+            # both follow --timeout-seconds (live 2026-09-22: a throttled
+            # production-budget run needed ~16 min and hit the fixed 900/1200).
+            "activeDeadlineSeconds": max_seconds + 300,
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
-                    "serviceAccountName": ("gpu-fault-completion-watcher"),
+                    "serviceAccountName": LOAD_SERVICE_ACCOUNT,
                     "containers": [
                         {
                             "name": "executor",
@@ -190,6 +303,18 @@ def executor_job(
                                 {
                                     "name": "ACTION_EXECUTOR_WORKERS",
                                     "value": str(workers),
+                                },
+                                {
+                                    "name": "ACTION_MAX_SECONDS",
+                                    "value": str(max_seconds),
+                                },
+                                {
+                                    "name": "ACTION_MIN_CONCURRENT_COMMANDS",
+                                    "value": str(
+                                        workers
+                                        if min_concurrent_commands is None
+                                        else min_concurrent_commands
+                                    ),
                                 },
                                 {
                                     "name": "ACTION_DELAY_SCALE",
@@ -509,6 +634,90 @@ def executor_identity(
     }
 
 
+def refresh_run_agents(
+    *,
+    run_id: str,
+    clusters: int,
+    lease_seconds: int,
+    control_fn=None,
+    telemetry: bool = False,
+) -> dict:
+    """Refresh the run's synthetic Agent heartbeats (seed script, run-heartbeats mode).
+
+    ``control_fn`` lets a caller in another module route the kubectl calls
+    through its own (test-patchable) ``control`` binding. ``telemetry`` makes
+    the refresh also publish each node's healthy telemetry package, so a
+    post-action validation after an escalated reboot sees the node return.
+    """
+
+    kube = control if control_fn is None else control_fn
+    pod = kube(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    output = kube(
+        "exec",
+        "-i",
+        pod,
+        "--",
+        "env",
+        f"ACTION_RUN_ID={run_id}",
+        f"ACTION_CLUSTERS={clusters}",
+        f"ACTION_AGENT_LEASE_SECONDS={lease_seconds}",
+        "ACTION_SEED_MODE=run-heartbeats",
+        *(["ACTION_HEARTBEAT_TELEMETRY=node-return"] if telemetry else []),
+        "python3",
+        "-",
+        stdin=(PERF_DIR / "seed_regional_action_workflows.py").read_bytes(),
+        timeout=180,
+    )
+    return json.loads(output.splitlines()[-1])
+
+
+def run_agent_heartbeat_refresher(
+    *,
+    run_id: str,
+    clusters: int,
+    lease_seconds: int,
+    interval_seconds: int = 30,
+    refresh_agents=None,
+    clock=time.monotonic,
+    control_fn=None,
+    telemetry: bool = False,
+):
+    """A throttled callable: refreshes the run's Agent heartbeats at most once
+    per ``interval_seconds``. The fleet compatibility preflight holds destructive
+    steps behind a stale heartbeat, so a long run must keep them fresh (live
+    2026-09-22: clusters 025-031 starved after their heartbeats aged past the
+    limit while the first 25 clusters ran)."""
+
+    next_refresh = 0.0
+    refresh_agents = refresh_run_agents if refresh_agents is None else refresh_agents
+
+    def refresh() -> None:
+        nonlocal next_refresh
+        now = clock()
+        if now < next_refresh:
+            return
+        kwargs = {
+            "run_id": run_id,
+            "clusters": clusters,
+            "lease_seconds": lease_seconds,
+        }
+        if control_fn is not None:
+            kwargs["control_fn"] = control_fn
+        if telemetry:
+            kwargs["telemetry"] = True
+        refresh_agents(**kwargs)
+        next_refresh = now + interval_seconds
+
+    return refresh
+
+
 def seed(
     *,
     run_id: str,
@@ -771,7 +980,10 @@ def execute_capacity_run(
     started: float,
     registry_scope: str,
     resources: RunResources,
+    min_concurrent_commands: int | None = None,
 ) -> int:
+    if min_concurrent_commands is None:
+        min_concurrent_commands = args.executor_workers
     upsert_configmap(
         SCRIPT_CONFIGMAP,
         resources=resources,
@@ -788,14 +1000,26 @@ def execute_capacity_run(
         clusters=args.clusters,
         expected_commands=expected_commands_per_cluster,
         workers=args.executor_workers,
+        min_concurrent_commands=min_concurrent_commands,
+        max_seconds=int(args.timeout_seconds),
         delay_scale=args.delay_scale,
         lease_seconds=args.lease_seconds,
         inject_renew_failure_once=args.inject_renew_failure_once,
         **identity,
     )
+    # The executor Pods run as the load ServiceAccount; a run creates it when
+    # the perf namespace has none (live 2026-09-22: the previous run tore its
+    # own account down and this Job could not create Pods).
+    ensure_load_service_account(
+        resources, name=LOAD_SERVICE_ACCOUNT, namespace=NAMESPACE
+    )
     manifest = run_manifest(manifest, run_id)
     (artifacts / "job.json").write_text(json.dumps(manifest, indent=2) + "\n")
     resources.create(manifest)
+    refresh_heartbeats = run_agent_heartbeat_refresher(
+        run_id=run_id, clusters=args.clusters, lease_seconds=args.lease_seconds
+    )
+    # Agents are seeded after the executors are Running; refresh only from then.
     deadline = time.time() + 300
     while time.time() < deadline:
         running = dataplane(
@@ -843,6 +1067,7 @@ def execute_capacity_run(
     history = []
     end = time.time() + args.timeout_seconds
     while time.time() < end:
+        refresh_heartbeats()
         snapshot = database_snapshot(run_id)
         snapshot["elapsed_seconds"] = time.time() - seeded_at
         history.append(snapshot)
@@ -975,10 +1200,21 @@ def main(argv: list[str] | None = None) -> int:
     expected_workflows = args.clusters * args.workflows_per_cluster
     expected_commands_per_cluster = args.workflows_per_cluster * 10
     log(f"artifacts: {artifacts}")
+    tier = budget_tier(
+        live_remediation_budget(),
+        clusters=args.clusters,
+        workflows_per_cluster=args.workflows_per_cluster,
+        executor_workers=args.executor_workers,
+    )
+    log(
+        f"remediation budget tier {tier['tier']}: executor concurrency floor "
+        f"{tier['min_concurrent_commands']} of {args.executor_workers}"
+    )
     (artifacts / "run.json").write_text(
         json.dumps(
             {
                 "run_id": run_id,
+                "remediation_budget": tier,
                 "clusters": args.clusters,
                 "workflows_per_cluster": (args.workflows_per_cluster),
                 "nodes_per_workflow": args.nodes_per_workflow,
@@ -1031,6 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
             started=started,
             registry_scope=registry_scope,
             resources=resources,
+            min_concurrent_commands=tier["min_concurrent_commands"],
         )
     except BaseException as exc:
         failure = exc

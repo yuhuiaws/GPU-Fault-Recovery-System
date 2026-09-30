@@ -561,7 +561,7 @@ def test_exhausted_budget_mails_the_operator_from_the_preflight() -> None:
     )
     assert notification.incident_id == "incident-a"
     assert "training-a" in notification.subject
-    assert "1 次上限" in notification.subject
+    assert "limit of 1 reached" in notification.subject
     assert "attempt-a" in notification.body_text
     assert sent == [notification.notification_id]
     assert execution.details["notification_id"] == notification.notification_id

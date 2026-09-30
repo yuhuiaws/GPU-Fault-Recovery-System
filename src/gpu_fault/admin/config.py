@@ -35,6 +35,7 @@ from gpu_fault.admin.capacity_evidence import (
     aurora_min_acu_floor,
     fault_reserved_cluster_depth,
     fault_reserved_queue_depth,
+    ingress_normal_concurrency,
     legacy_largest_cluster_node_count,
     validate_capacity_evidence,
 )
@@ -122,11 +123,23 @@ class RemediationCapacity(_Section):
 class TelemetrySpoolCapacity(_Section):
     enabled: bool = False
     replicas: int = 0
+    # Per-cluster spool depth (GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH): how
+    # many normal-telemetry items one cluster may hold in the spool before its
+    # requests get the reserved HTTP 429. 性能压测验收方案 §13.4 measured a
+    # 1000-node single cluster at 1024 (429s) and 4096 (none).
+    max_cluster_depth: int = 1024
+    # Added 2026-09-23: omitted from records and YAML while at its default so
+    # every live desired.json keeps its digest (see config_parser.lifted_default).
+    OMIT_WHEN_DEFAULT = frozenset({"max_cluster_depth"})
 
     def validate(self) -> None:
         if not 0 <= self.replicas <= 32:
             raise AdminConfigError(
                 "spec.capacity.telemetrySpool.replicas must be within 0..32"
+            )
+        if not 64 <= self.max_cluster_depth <= 65536:
+            raise AdminConfigError(
+                "spec.capacity.telemetrySpool.maxClusterDepth must be within 64..65536"
             )
         if self.enabled and self.replicas < 1:
             raise AdminConfigError(
@@ -379,6 +392,16 @@ class AdminConfig(_Section):
         """GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH as the renderers ship it."""
 
         return fault_reserved_queue_depth(self.processor.max_queue_depth)
+
+    def ingress_normal_concurrency(self) -> int:
+        """GPU_FAULT_INGRESS_NORMAL_CONCURRENCY as the renderers ship it.
+
+        Derived from the managed fleet size (capacity_evidence section 8.4):
+        the routine burst front of a 50-cluster fleet overran the fixed 1000
+        normal-tier slots per ingress process by 0.58-3.85 % reserved 503.
+        """
+
+        return ingress_normal_concurrency(self.capacity.managed_node_count)
 
     def fault_reserved_cluster_depth(self) -> int:
         """GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH as the renderers ship it.

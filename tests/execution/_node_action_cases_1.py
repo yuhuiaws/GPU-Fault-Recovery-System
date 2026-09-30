@@ -570,15 +570,15 @@ def test_hyperpod_replace_records_activated_spare_nodes():
     assert len(notifications) == 1
     notification = notifications[0]
     assert notification.notification_id == (execution.details["notification_id"])
-    assert "warm-spare替换成功" in notification.subject
+    assert "warm-spare replacement succeeded" in notification.subject
     assert "node-a -> spare-a" in notification.body_text
     assert incident.incident_id in notification.body_text
     assert workflow.request_id in notification.body_text
     assert execution.adapter_operation_id in notification.body_text
     assert "healthy-running-warm-spare" in notification.body_text
-    assert "Provider replacement API submitted：false" in (notification.body_text)
+    assert "Provider replacement API submitted: false" in (notification.body_text)
     assert "GPU/Fabric validation" in notification.body_text
-    assert "Workflow 最终状态为准" in notification.body_text
+    assert "the workflow's final state" in notification.body_text
     assert lifecycle.calls == 0
     assert lifecycle.preflight_kwargs == {
         "isolation_verified_nodes": ["node-a"],

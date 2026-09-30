@@ -41,6 +41,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
+    gpu_nodes_clean,
+)
 
 CASE_ID = "GF-REGIONAL-PREEMPT-012"
 CONFIRMATION = "PREEMPT012_REAL_QUIESCE_BOUNDARIES"
@@ -701,16 +704,9 @@ def evaluate_checks(
         "gpu_count_unchanged": type(baseline["gpu_count"]) is int
         and baseline["gpu_count"] > 0
         and final_host["gpu_count"] == baseline["gpu_count"],
-        "all_gpu_nodes_ready_and_schedulable": bool(final_nodes)
-        and all(
-            item["ready"] == "True"
-            and not item["unschedulable"]
-            and not any(
-                str(taint.get("key", "")).startswith("gpu-fault.io/")
-                for taint in item["taints"]
-            )
-            for item in final_nodes
-        ),
+        # A declared warm spare (label gpu-fault.io/spare=true) stays cordoned
+        # by design; the shared helper excepts it (live third round, 2026-09-26).
+        "all_gpu_nodes_ready_and_schedulable": gpu_nodes_clean(final_nodes),
         "audit_objects_removed": not control["residual_objects"],
         "no_provider_mutation": not provider,
         "control_plane_eks_identical": cpu_blast_unchanged,

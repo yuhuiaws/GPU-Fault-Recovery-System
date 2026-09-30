@@ -197,7 +197,12 @@ phases:
       - case: GF-REGIONAL-DESTR-023
         predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-024
+      - case: GF-REGIONAL-DESTR-025
+        predecessor: GF-REGIONAL-DESTR-002
     notes:
+      - DESTR-025 以 DESTR-002 PASS 为证据前置，在单节点 RESET_GPU 工作流上用设备持有者制造已知的 reset 失败，
+        证明线性单节点记录在同一记录内升级为一次真实 RESTART_NODE 并 SUCCEEDED，不产生 workflow-reboot-after 后继；
+        不禁用 Agent、不开托管恢复窗口、不声明 spare。
       - 普通 DESTR-015 PASS 且清理完成后，物理所有权补充验收单独审批并按
         unchanged-owner、ownership-drift、late-sibling 顺序执行；使用独立且不嵌套的
         run-dir，不覆盖普通 case 证据。统一归于 DESTR-015，PREEMPT-033 仅引用同一

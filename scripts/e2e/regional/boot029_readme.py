@@ -226,7 +226,32 @@ def supplies_admin(entry: str) -> bool:
     return admin.is_file() and os.access(admin, os.X_OK)
 
 
-def operator_path(parent_path: str) -> str:
+def shadow_tool_directory(entry: str, shadow_root: Path, position: int) -> str:
+    """A private stand-in for a tool directory that also offers gpu-fault-admin.
+
+    Operators commonly keep kubectl, helm and an earlier deploy-host shim side
+    by side in one directory (``/usr/local/bin``). Dropping the directory would
+    take the README's prerequisite tools with it; keeping it would let the old
+    shim pre-empt the README's venv. The stand-in links every other executable
+    of the directory and omits ``gpu-fault-admin``.
+    """
+
+    source = Path(entry)
+    shadow = shadow_root / f"{position:02d}-{source.name or 'root'}"
+    shadow.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for tool in sorted(source.iterdir()):
+        if tool.name == "gpu-fault-admin" or not tool.is_file():
+            continue
+        if not os.access(tool, os.X_OK):
+            continue
+        link = shadow / tool.name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(tool)
+    return str(shadow)
+
+
+def operator_path(parent_path: str, shadow_root: Path | None = None) -> str:
     """The operator's PATH minus every entry that could pre-empt the README.
 
     The README's prerequisite is that the deploy host *has* the tools (aws,
@@ -236,19 +261,32 @@ def operator_path(parent_path: str) -> str:
     Python virtual environment: the README's ``. .venv/bin/activate`` has to be
     the only thing that puts a ``gpu-fault-admin`` (and its ``python``) on PATH,
     otherwise the stage would deploy with the driver's CLI and prove nothing.
+
+    A plain tool directory that happens to hold a ``gpu-fault-admin`` too is
+    replaced by a stand-in under ``shadow_root`` (see
+    :func:`shadow_tool_directory`) so its other tools stay reachable; without a
+    ``shadow_root`` it is dropped. Virtual environments are always dropped.
     """
 
     kept: list[str] = []
+    seen: set[str] = set()
     for entry in parent_path.split(os.pathsep):
-        if not entry or entry in kept or is_venv_entry(entry) or supplies_admin(entry):
+        if not entry or entry in seen or is_venv_entry(entry):
             continue
+        seen.add(entry)
+        if supplies_admin(entry):
+            if shadow_root is None:
+                continue
+            entry = shadow_tool_directory(entry, shadow_root, len(kept))
         kept.append(entry)
     if not kept:
         raise ReadmeProcedureError("operator PATH has no entry left for the README")
     return os.pathsep.join(kept)
 
 
-def clean_environment(parent: Mapping[str, str]) -> dict[str, str]:
+def clean_environment(
+    parent: Mapping[str, str], shadow_root: Path | None = None
+) -> dict[str, str]:
     """The allowlist the README procedure runs under: no driver state, operator PATH."""
 
     kept = {
@@ -256,7 +294,7 @@ def clean_environment(parent: Mapping[str, str]) -> dict[str, str]:
         for name, value in parent.items()
         if name in KEPT_NAMES or name.startswith(KEPT_PREFIXES)
     }
-    kept["PATH"] = operator_path(parent.get("PATH", ""))
+    kept["PATH"] = operator_path(parent.get("PATH", ""), shadow_root)
     return kept
 
 
@@ -313,7 +351,13 @@ def readme_receipt(
     environment: Mapping[str, str],
     parent_path: str,
     attempt: int,
+    shadow_root: Path | None = None,
 ) -> dict[str, Any]:
+    shadowed = (
+        sorted(child.name for child in shadow_root.iterdir() if child.is_dir())
+        if shadow_root is not None and shadow_root.is_dir()
+        else []
+    )
     return {
         "readme": {
             "readme_sha256": procedure.readme_sha256,
@@ -336,6 +380,7 @@ def readme_receipt(
                 {entry for entry in parent_path.split(os.pathsep) if entry}
             )
             - len(environment["PATH"].split(os.pathsep)),
+            "path_entries_shadowed": len(shadowed),
             "attempt": attempt,
         }
     }
@@ -373,7 +418,8 @@ def run(
     script_path = attempt_dir / SCRIPT_NAME
     script_path.write_text(script, encoding="utf-8")
     script_path.chmod(0o700)
-    environment = clean_environment(parent_environment)
+    shadow_root = attempt_dir / "operator-path"
+    environment = clean_environment(parent_environment, shadow_root)
     entry = readme_receipt(
         procedure,
         redacted_command=redacted_deploy_command(procedure.deploy_block, **values),
@@ -383,6 +429,7 @@ def run(
         environment=environment,
         parent_path=parent_environment.get("PATH", ""),
         attempt=attempt,
+        shadow_root=shadow_root,
     )
     with receipt.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry, sort_keys=True) + "\n")

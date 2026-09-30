@@ -62,6 +62,7 @@ from scripts.e2e.regional.destr014_preflight import (  # noqa: E402
 )
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost  # noqa: E402
 from scripts.e2e.regional import destr014_recovery as recovery  # noqa: E402
+from scripts.e2e.regional import destr014_release as release  # noqa: E402
 from scripts.e2e.regional.destr014_cleanup import (  # noqa: E402
     _cleanup as _cleanup,
     _ledger as _ledger,
@@ -91,11 +92,13 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    install_abort_signals,
     predecessor_evidence,
     required,
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.site_profile import install_site_profile  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     QUARANTINE_TAINT as QUARANTINE_TAINT,
     WarmSpareLiveFixture,
@@ -213,6 +216,20 @@ class Settings:
 
 
 def configure(arguments: argparse.Namespace) -> Settings:
+    return _settings(arguments, strict=True)
+
+
+def release_settings(arguments: argparse.Namespace) -> Settings:
+    """Settings for ``--release``: the device identities the injection needs
+    (PCI BDFs, device file) are not required to release a hold."""
+
+    return _settings(arguments, strict=False)
+
+
+def _settings(arguments: argparse.Namespace, *, strict: bool) -> Settings:
+    def device(value: str, label: str) -> str:
+        return required(value, label) if strict else value.strip()
+
     default_job, default_attempt = derived_identity(
         arguments.run_dir, arguments.attempt
     )
@@ -257,13 +274,13 @@ def configure(arguments: argparse.Namespace) -> Settings:
             arguments.fault_node or os.getenv("GPU_FAULT_FAULT_NODE", ""),
             "fault node",
         ),
-        fault_pci_bdf=required(arguments.fault_pci_bdf, "fault PCI BDF"),
-        fault_device=required(arguments.fault_device, "fault GPU device"),
+        fault_pci_bdf=device(arguments.fault_pci_bdf, "fault PCI BDF"),
+        fault_device=device(arguments.fault_device, "fault GPU device"),
         sibling_node=required(
             arguments.sibling_node or os.getenv("GPU_FAULT_SIBLING_NODE", ""),
             "sibling node",
         ),
-        sibling_pci_bdf=required(arguments.sibling_pci_bdf, "sibling PCI BDF"),
+        sibling_pci_bdf=device(arguments.sibling_pci_bdf, "sibling PCI BDF"),
         job_id=job_id,
         attempt_id=arguments.attempt_id.strip() or default_attempt,
         verify_max_attempts=int(arguments.verify_max_attempts),
@@ -434,6 +451,18 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--verify-max-attempts", type=int, default=6)
     value.add_argument("--managed-recovery-timeout-seconds", type=int, default=600)
     value.add_argument("--variant", choices=VARIANTS, default="unknown-reboot")
+    value.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "release a held attempt (plan-free): confirm-node-action for the "
+            "rebooted node, --disposition restore, validated restore of every "
+            "isolated node, workflow-reconcile, delete the drill job, disarm "
+            "the holder, close both "
+            f"env windows, close the drill incidents; requires --confirm "
+            f"{release.RELEASE_CONFIRMATION}"
+        ),
+    )
     return value
 
 
@@ -1116,6 +1145,9 @@ def execute_case(
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        # A run that died before the verdict block still reports a uniform
+        # shape: readers (and the cov95 harness) index "errors" unconditionally.
+        result.setdefault("errors", [])
         if journal is not None and journal.data["phase"] == "CLOSED":
             cleanup: dict[str, Any] = {"errors": [], "already_closed": True}
         elif not cleanup_permitted:
@@ -1222,7 +1254,56 @@ CASE = CaseRunner(
 )
 
 
+def build_release_context(
+    settings: Settings, run_dir: Path, attempt: int
+) -> release.ReleaseContext:
+    """The live fixtures a release needs, bound to the attempt's own records."""
+
+    case_dir = run_dir / "cases" / CASE_ID
+    inputs = release.load_release_inputs(case_dir)
+    regional = RegionalLiveFixture(settings.regional)
+    pinned = case_dir / "pinned-workload.yaml"
+    # By identity, not by the run's ownership nonce: see release.PinnedWorkload.
+    workload = (
+        release.PinnedWorkload(regional, pinned, settings.job_id)
+        if pinned.is_file()
+        else None
+    )
+    return release.ReleaseContext(
+        settings=settings,
+        inputs=inputs,
+        regional=regional,
+        warm=WarmSpareLiveFixture(regional, settings.hyperpod_cluster),
+        state_dir=settings.site_file.parent,
+        fault_probe=_host_probe(settings, settings.fault_node, inputs.run_id, case_dir),
+        workload=workload,
+        admin=release.run_admin,
+    )
+
+
+def run_release(arguments: argparse.Namespace) -> int:
+    """``--release``: the documented operator handling of a held attempt."""
+
+    if arguments.plan or arguments.execute:
+        raise RegionalFixtureError("--release is its own mode; drop --plan/--execute")
+    if arguments.confirm != release.RELEASE_CONFIRMATION:
+        raise RegionalFixtureError(
+            f"--release requires --confirm {release.RELEASE_CONFIRMATION}"
+        )
+    settings = release_settings(arguments)
+    context = build_release_context(settings, arguments.run_dir, arguments.attempt)
+    report = release.release_hold(context)
+    print(json.dumps(report, sort_keys=True, default=str))
+    return 0 if report["released"] else 1
+
+
 def main() -> int:
+    if "--release" in sys.argv[1:]:
+        install_site_profile()
+        arguments = parser().parse_args()
+        os.umask(0o077)
+        install_abort_signals()
+        return run_release(arguments)
     return run_standard_case(CASE)
 
 

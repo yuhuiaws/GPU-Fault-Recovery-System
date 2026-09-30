@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-collector-health; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-collector-health; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Nodes whose channel has not delivered a batch within its silence threshold; the policy is blind to them.\n\nAlert GpuFaultCollectorSilent (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultcollectorsilent",
+      "description": "Nodes whose channel has not delivered a batch within its silence threshold; the policy is blind to them.\n\nAlert GpuFaultCollectorSilent (critical, for 5m, > 0): docs/en/administrator-operations.md#gpufaultcollectorsilent",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -99,7 +99,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Nodes still delivering on time but reporting a collection error every cycle.\n\nAlert GpuFaultCollectorCollectionErrors (warning, for 15m, > 0): docs/管理员日常运维.md#gpufaultcollectorcollectionerrors",
+      "description": "Nodes still delivering on time but reporting a collection error every cycle.\n\nAlert GpuFaultCollectorCollectionErrors (warning, for 15m, > 0): docs/en/administrator-operations.md#gpufaultcollectorcollectionerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -250,7 +250,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Age of the collector-status snapshot the two gauges above are computed from; stale means they are stale too.\n\nAlert GpuFaultCollectorMetricsSnapshotStale (critical, for 5m, > 120): docs/管理员日常运维.md#gpufaultcollectormetricssnapshotstale",
+      "description": "Age of the collector-status snapshot the two gauges above are computed from; stale means they are stale too.\n\nAlert GpuFaultCollectorMetricsSnapshotStale (critical, for 5m, > 120): docs/en/administrator-operations.md#gpufaultcollectormetricssnapshotstale",
       "fieldConfig": {
         "defaults": {
           "color": {

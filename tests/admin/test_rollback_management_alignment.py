@@ -166,6 +166,95 @@ def test_rolled_back_status_uses_temporary_management_baseline(tmp_path: Path) -
     assert not temporary.exists(), "temporary rollback status site was not removed"
 
 
+def _write_manifest_copy(source: Path, target: Path, **changes) -> Path:
+    document = json.loads(source.read_text(encoding="utf-8"))
+    document.update(changes)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(document), encoding="utf-8")
+    return target
+
+
+def test_previous_manifest_recorded_outside_source_snapshots_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-09-26 03:47Z: the previous release was a BOOT-020 candidate built
+    under <state-dir>/boot020-work-*/wt-D/dist, which the source-snapshots scan
+    never sees, so the rollback's alignment raised "cannot locate" although the
+    rollback itself had completed. The snapshot now records where the manifest
+    was delivered from; that path is tried first."""
+
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    candidate = _write_manifest_copy(
+        manifest,
+        tmp_path
+        / "boot020-work-20260926"
+        / "wt-D"
+        / "dist"
+        / "cand-d"
+        / "release.json",
+        release_id="cand-d",
+        delivery={**json.loads(manifest.read_text())["delivery"], "sha256": "e" * 64},
+    )
+    manifest.unlink()  # nothing under source-snapshots matches any more
+    previous = {
+        **live_state["previous"],
+        "release_id": "cand-d",
+        "release_delivery_sha256": "e" * 64,
+        "release_manifest_path": str(candidate),
+    }
+
+    assert find_previous_release_manifest(tmp_path, previous) == candidate
+
+
+def test_previous_manifest_recorded_path_with_foreign_identity_is_ignored(
+    tmp_path: Path,
+) -> None:
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    foreign = _write_manifest_copy(
+        manifest,
+        tmp_path / "elsewhere" / "dist" / "other" / "release.json",
+        release_id="other",
+        delivery={**json.loads(manifest.read_text())["delivery"], "sha256": "f" * 64},
+    )
+    previous = {**live_state["previous"], "release_manifest_path": str(foreign)}
+
+    selected = find_previous_release_manifest(tmp_path, previous)
+
+    assert selected == manifest, (
+        "a recorded path that is not the previous release falls back to the scan"
+    )
+
+
+def test_previous_manifest_missing_recorded_path_falls_back_to_the_scan(
+    tmp_path: Path,
+) -> None:
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    previous = {
+        **live_state["previous"],
+        "release_manifest_path": str(tmp_path / "gone" / "release.json"),
+    }
+
+    assert find_previous_release_manifest(tmp_path, previous) == manifest
+
+
+def test_previous_manifest_error_names_the_recorded_path_and_the_scan(
+    tmp_path: Path,
+) -> None:
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    manifest.unlink()
+    previous = {
+        **live_state["previous"],
+        "release_manifest_path": str(tmp_path / "gone" / "release.json"),
+    }
+
+    with pytest.raises(SiteConfigError, match="cannot locate") as failure:
+        find_previous_release_manifest(tmp_path, previous)
+    message = str(failure.value)
+    assert "source-snapshots" in message and str(tmp_path / "gone") in message, (
+        "the refusal names both the recorded manifest and the scanned glob"
+    )
+
+
 def test_previous_manifest_identity_ignores_build_timestamp(tmp_path: Path) -> None:
     site, manifest, live_state, _admin_config = _fixture(tmp_path)
     first = json.loads(manifest.read_text(encoding="utf-8"))

@@ -224,7 +224,7 @@ OVERVIEW = Dashboard(
                     kind="stat",
                     description=(
                         "Every AMP alert currently firing; the name is the "
-                        "runbook card in docs/管理员日常运维.md §8."
+                        "runbook card in docs/en/administrator-operations.md §8."
                     ),
                 ),
             ),

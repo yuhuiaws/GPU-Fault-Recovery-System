@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-remote-command; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-remote-command; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "A PENDING command no cluster executor has claimed; the recovery it carries is silently not happening.\n\nAlert GpuFaultRemoteCommandUnclaimed (critical, for 2m, > 600): docs/管理员日常运维.md#gpufaultremotecommandunclaimed",
+      "description": "A PENDING command no cluster executor has claimed; the recovery it carries is silently not happening.\n\nAlert GpuFaultRemoteCommandUnclaimed (critical, for 2m, > 600): docs/en/administrator-operations.md#gpufaultremotecommandunclaimed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -99,7 +99,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Low is bad: the alert fires while the newest executor-side defect is younger than its window.\n\nAlert GpuFaultRemoteCommandExecutorInternalError (critical, < 900): docs/管理员日常运维.md#gpufaultremotecommandexecutorinternalerror",
+      "description": "Low is bad: the alert fires while the newest executor-side defect is younger than its window.\n\nAlert GpuFaultRemoteCommandExecutorInternalError (critical, < 900): docs/en/administrator-operations.md#gpufaultremotecommandexecutorinternalerror",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -317,7 +317,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultRemoteCommandUnclaimedExpired (critical, for 2m, > 0): docs/管理员日常运维.md#gpufaultremotecommandunclaimedexpired",
+      "description": "Alert GpuFaultRemoteCommandUnclaimedExpired (critical, for 2m, > 0): docs/en/administrator-operations.md#gpufaultremotecommandunclaimedexpired",
       "fieldConfig": {
         "defaults": {
           "color": {

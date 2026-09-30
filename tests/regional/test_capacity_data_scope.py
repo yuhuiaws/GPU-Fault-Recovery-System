@@ -175,3 +175,28 @@ def test_record_bound_scales_with_the_run_and_bulk_batches_skip_cas_kinds() -> N
         len(keys) for kind, keys in batches if kind == "telemetry_metric_latest"
     ] == [5000, 1], "hot-state keys are deleted in bounded batches"
     assert ("collector_status", ["s-1"]) in batches, "every other kind is bulk-deleted"
+
+
+def test_open_synthetic_records_are_listed_for_the_forced_teardown() -> None:
+    """Live 2026-09-22: an aborted action run left LEASED and PENDING commands
+    whose executors were gone; the teardown must be able to remove them while a
+    probe still reports them as open."""
+
+    records = {
+        ("remote_command", "c-1"): {"status": "LEASED", "cluster_id": "perf-cap-000"},
+        ("remote_command", "c-2"): {"status": "PENDING", "cluster_id": "perf-cap-000"},
+        ("remote_command", "c-3"): {
+            "status": "SUCCEEDED",
+            "cluster_id": "perf-cap-000",
+        },
+        ("workflow", "w-1"): {"status": "RUNNING", "cluster_id": "perf-cap-000"},
+        ("workflow", "w-2"): {"status": "BLOCKED", "cluster_id": "perf-cap-000"},
+        ("incident", "i-1"): {"status": "OPEN", "cluster_id": "perf-cap-000"},
+    }
+
+    assert data.nonterminal_records(records) == [
+        ("remote_command", "c-1"),
+        ("remote_command", "c-2"),
+        ("workflow", "w-1"),
+    ], "only open workflows and commands count; incidents and terminal rows do not"
+    assert data.nonterminal_records({}) == [], "nothing open, nothing to force"

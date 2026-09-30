@@ -183,7 +183,9 @@ def test_a_batched_reset_is_mailed_once_keyed_by_its_own_step() -> None:
     assert [item.status for item in results] == [NotificationStatus.SENT], results
     [notification] = store.list_notifications()
     assert notification.category == "ACTION_COMPLETED"
-    assert "GPU 已自动重置" in notification.subject, notification.subject
+    assert "[NOTICE][GPU reset automatically]" in notification.subject, (
+        notification.subject
+    )
     assert notification.deduplication_key == (
         f"{command.cluster_id}/{command.incident_id}/gpu-reset/"
         "workflow-reset/4/RESET_GPU"

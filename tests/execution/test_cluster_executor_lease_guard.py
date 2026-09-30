@@ -221,7 +221,11 @@ def test_cancellation_in_preexecution_renewal_is_seen_without_starting_an_adapte
     executor.run_once()
 
     assert executor.cancellations_observed_total == 1
-    assert adapter.contexts == [] and client.completed == []
+    assert adapter.contexts == [], "the adapter never starts after a cancellation"
+    # Live 2026-09-28: the cancellation seen at admission is answered as a
+    # no-start so the row does not stay LEASED with a cancellation nobody settles.
+    assert [identity for identity, _ in client.completed] == ["command-a"]
+    assert client.reported("command-a").details["node_action_not_started"] is True
     assert executor.results_withheld_total == 1
 
 

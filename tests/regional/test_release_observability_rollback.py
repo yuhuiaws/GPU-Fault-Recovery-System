@@ -654,10 +654,17 @@ def test_an_absent_rule_namespace_is_created_rather_than_put(
     assert "put-rule-groups-namespace" not in _aws_verbs(calls), calls
 
 
-def test_an_unreadable_definition_refuses_the_restore_before_any_put() -> None:
-    release, calls, _slept = _amp_release(
-        rules=[(255, "", "Unable to locate credentials")], alertmanager=[]
+def test_an_unreadable_definition_refuses_the_restore_before_any_put(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault_release import regional_observability_rollback as observability
+
+    release, calls, slept = _amp_release(
+        rules=[(255, "", "Unable to locate credentials")]
+        * observability.AMP_READ_ATTEMPTS,
+        alertmanager=[],
     )
+    monkeypatch.setattr(observability, "_RETRY_SLEEP", slept.append)
 
     with pytest.raises(MODULE.ReleaseError, match="cannot read the AMP rule namespace"):
         ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)

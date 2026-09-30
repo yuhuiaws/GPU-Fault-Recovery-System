@@ -441,6 +441,53 @@ def test_other_gpu_nodes_must_not_move() -> None:
 # --------------------------------------------------------------------------- #
 # Probe
 # --------------------------------------------------------------------------- #
+def test_executor_evidence_waits_out_the_claim_long_poll_for_a_fresh_breadcrumb() -> (
+    None
+):
+    """First-pass campaign 2026-09-25: a fixed 5 s sleep after the reclaim raced the
+    30 s claim long-poll, so both executors still showed a pre-reclaim breadcrumb."""
+
+    reclaimed = datetime(2026, 9, 25, 18, 33, 47, tzinfo=timezone.utc)
+    stale = _probe(
+        claim_state=_breadcrumb(counter=0, claimed_at=reclaimed - timedelta(seconds=3))
+    )
+    fresh = _probe(
+        claim_state=_breadcrumb(counter=1, claimed_at=reclaimed + timedelta(seconds=20))
+    )
+    rounds = iter([[stale], [stale], [fresh]])
+    slept: list[float] = []
+    ticks = iter([0.0, 5.0, 10.0, 15.0])
+
+    result = destr022.wait_for_fresh_breadcrumbs(
+        lambda: next(rounds),
+        reclaimed,
+        timeout_seconds=100,
+        sleep=slept.append,
+        clock=lambda: next(ticks),
+    )
+
+    assert result == [fresh], "the probe that carries a post-reclaim claim is returned"
+    assert slept == [5, 5], "two waits of one short poll interval each"
+
+
+def test_executor_evidence_returns_the_stale_probe_at_the_deadline() -> None:
+    reclaimed = datetime(2026, 9, 25, 18, 33, 47, tzinfo=timezone.utc)
+    stale = _probe(
+        claim_state=_breadcrumb(counter=0, claimed_at=reclaimed - timedelta(seconds=3))
+    )
+    ticks = iter([0.0, 200.0])
+
+    result = destr022.wait_for_fresh_breadcrumbs(
+        lambda: [stale],
+        reclaimed,
+        timeout_seconds=100,
+        sleep=lambda _s: None,
+        clock=lambda: next(ticks),
+    )
+
+    assert result == [stale], "the verdict, not the wait, reports the stale breadcrumb"
+
+
 def test_the_executor_probe_reports_the_breadcrumb_and_sweep_env(
     tmp_path: Path,
 ) -> None:

@@ -7,7 +7,6 @@ from threading import RLock
 from typing import Callable
 
 from gpu_fault.host_health import NodeHealthFinding
-from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -20,11 +19,13 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.reboot_window import RebootOwner, absorb_finding
+from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
+from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
     TERMINAL_QUARANTINE_NODES,
     inherit_terminal_quarantine,
 )
-from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +95,9 @@ class NodeHealthCallbacks:
     # same-signal incident instead of minting its own (record-only
     # accounting, ``gpu_fault_workflow_merge_record_only_total``).
     record_host_resource_absorb: Callable[[], None]
+    # The incident/workflow currently rebooting a node (``reboot_window``);
+    # a finding on that node is its evidence, not a new plan.
+    owning_reboot_workflow: Callable[[str, str], RebootOwner] | None = None
 
 
 @dataclass
@@ -814,6 +818,12 @@ class NodeHealthIngestionService:
                 finding.event_id,
                 existing.workflow_request_id,
             )
+        if self.callbacks.owning_reboot_workflow is not None:
+            owner = self.callbacks.owning_reboot_workflow(
+                finding.cluster_id, finding.node_id
+            )
+            if owner is not None:
+                return absorb_finding(self.store, finding, owner, persist=persist)
         absorbed = self._absorb_into_unsettled_host_resource_incident(
             finding, persist=persist
         )

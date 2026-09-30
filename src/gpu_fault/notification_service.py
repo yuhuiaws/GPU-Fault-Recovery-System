@@ -63,7 +63,9 @@ DEFAULT_NOTIFICATION_TTL_SECONDS = 6 * 3600
 # What the DCGM mail says when the step failed before the control plane
 # decided anything: the escalation is still choosing between a cooldown and a
 # drain, and telling the administrator either one would be a guess.
-PENDING_CONTROL_PLANE_ACTION = "待控制面升级判定（诊断步骤未完成）"
+PENDING_CONTROL_PLANE_ACTION = (
+    "pending control-plane escalation decision (diagnostic steps incomplete)"
+)
 CATEGORY_TTL_SECONDS = {
     # A trend sample is restated by the next cooldown bucket, so an
     # undelivered one is worth less than the mail it would cost.

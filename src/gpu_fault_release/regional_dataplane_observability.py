@@ -114,7 +114,7 @@ DATAPLANE_EXPECTED_RULE_NAMESPACE = "gpu-fault-dataplane-expected"
 DATAPLANE_EXPECTED_RULE_GROUP = "gpu-fault-dataplane-expected"
 DATAPLANE_COLLECTOR_ALERT = "GpuFaultDataplaneCollectorMissing"
 DATAPLANE_COLLECTOR_RUNBOOK_URL = (
-    "docs/管理员日常运维.md#gpufaultdataplanecollectormissing"
+    "docs/en/administrator-operations.md#gpufaultdataplanecollectormissing"
 )
 #: What the data-plane collector stamps on every series
 #: (``deploy/dataplane/adot-dataplane.yaml``, relabel ``control_plane_cluster``);

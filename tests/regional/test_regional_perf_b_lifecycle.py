@@ -97,6 +97,7 @@ class FakeDataplane:
             "roles": "role",
             "rolebindings": "rolebinding",
             "secrets": "secret",
+            "serviceaccounts": "serviceaccount",
         }[plural]
         key = f"{kind}/{name}"
         metadata = self.objects[key]["metadata"]
@@ -155,6 +156,10 @@ class CallerHarness:
         )
 
     def read_connection(self, namespace: str, *args: str, **_kwargs: Any) -> str:
+        if args == ("get", "namespace", registry.NAMESPACE, "-o", "json"):
+            # The perf namespace exists in this harness; the runner creates it
+            # only when this read comes back empty.
+            return json.dumps({"kind": "Namespace", "metadata": {"name": namespace}})
         assert args == ("get", "secret", registry.CONNECTION_SECRET, "-o", "json"), (
             "the connection fake permits only the selected Secret read"
         )
@@ -227,6 +232,10 @@ class CallerHarness:
         )
         if args[0] == "get":
             return "api-a"
+        if args[0] == "exec" and "ACTION_SEED_MODE=run-heartbeats" in args:
+            # The run's synthetic Agent heartbeat refresh (seed script mode).
+            self.events.append("heartbeat")
+            return json.dumps({"run_id": "run-a", "agents_refreshed": 1})
         self.events.append("purge")
         self.requests.append(json.loads(args[-1]))
         if self.data_error is not None:
@@ -272,6 +281,11 @@ def caller(
     monkeypatch.setattr(base, "validate_registry_target", lambda **_kwargs: "live")
     monkeypatch.setattr(
         base, "deregister", lambda **_kwargs: harness.events.append("revoke")
+    )
+    # The teardown's alignment gate now runs after the token Secret deletion,
+    # outside deregister(); it is the registry module's own contract.
+    monkeypatch.setattr(
+        registry, "verify_registry_alignment", lambda **_kwargs: {"aligned": True}
     )
     monkeypatch.setattr(module, "dataplane", harness.api)
     monkeypatch.setattr(module, "control", harness.control)
@@ -405,6 +419,7 @@ def test_callers_create_labelled_receipts_and_pass_them_to_teardown(
             "run_id": "run-a",
             "cluster_ids": [f"perf-cap-{index:03d}" for index in range(32)],
             "cleanup": True,
+            "force_nonterminal": True,
         }
     ]
     deleted = [
@@ -442,9 +457,9 @@ def test_callers_create_labelled_receipts_and_pass_them_to_teardown(
             ],
         }, "the run must retain the checked AMP preflight receipt"
         assert f"patch:configmap/{base.START_GATE_CONFIGMAP}" in caller.events
-        assert len(caller.api.created) == 8
+        assert len(caller.api.created) == 9  # + the run-owned load ServiceAccount
     else:
-        assert len(caller.api.created) == 2
+        assert len(caller.api.created) == 3  # + the run-owned load ServiceAccount
 
 
 @pytest.mark.parametrize("caller", [integrated], indirect=True, ids=["integrated"])
@@ -637,6 +652,11 @@ def test_retained_purge_stops_resources_before_exact_data_cleanup(
         "purge"
     )
     assert caller.requests == [
-        {"run_id": "run-a", "cluster_ids": ["perf-cap-000"], "cleanup": True}
+        {
+            "run_id": "run-a",
+            "cluster_ids": ["perf-cap-000"],
+            "cleanup": True,
+            "force_nonterminal": True,
+        }
     ]
     assert "revoke" not in caller.events

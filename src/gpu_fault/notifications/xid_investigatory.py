@@ -59,7 +59,9 @@ class XidInvestigatoryEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[GPU故障][XID {xid} 调查动作] {cluster_id} {node_id}"),
+            subject=(
+                f"[GPU FAULT][XID {xid} investigatory action] {cluster_id} {node_id}"
+            ),
             body_text=body,
             support_case_draft="",
             evidence_refs=evidence_refs,

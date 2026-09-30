@@ -1105,13 +1105,19 @@ def test_stage_five_deploys_by_the_readme_procedure_from_a_pristine_copy(
         ), f"{name} leaked from the driver into the README deploy"
     assert "GPU_FAULT_SENTINEL" not in names and "AWS_REGION" not in names
     assert "PYTHONPATH" not in names and "BUILDKIT_PROGRESS" not in names
-    operator = boot029_readme.operator_path(env["PATH"])
+    attempt_dir = tmp_path / "state/acceptance/stage-5-readme/attempt-1"
+    operator = boot029_readme.operator_path(env["PATH"], attempt_dir / "operator-path")
     assert path == f"{cwd}/.venv/bin:{operator}", (
         "only the README's activation extends the operator's filtered PATH"
     )
     assert str(tmp_path / "bin") not in operator.split(os.pathsep), (
-        "the directory offering the driver's gpu-fault-admin is dropped"
+        "the directory offering the driver's gpu-fault-admin is replaced by its"
+        " stand-in, so the driver's CLI is not on the README's PATH"
     )
+    for entry in operator.split(os.pathsep):
+        assert not (Path(entry) / "gpu-fault-admin").exists(), (
+            f"{entry} still offers a gpu-fault-admin to the README procedure"
+        )
     copy = Path(cwd)
     assert copy.is_relative_to(
         tmp_path / "state/acceptance/stage-5-readme/attempt-1"
@@ -1153,7 +1159,10 @@ def test_stage_five_deploys_by_the_readme_procedure_from_a_pristine_copy(
         == _git(checkout, "rev-parse", "HEAD")
     )
     assert receipt["path_sha256"] == _sha256(operator)
-    assert receipt["path_entries_dropped"] >= 1, "the fake admin directory was dropped"
+    assert receipt["path_entries_shadowed"] >= 1, (
+        "the fake admin directory was replaced by a stand-in"
+    )
+    assert receipt["path_entries_dropped"] >= 0, "the dropped count is recorded"
     assert "path" not in receipt, "PATH entries never appear in clear"
 
 

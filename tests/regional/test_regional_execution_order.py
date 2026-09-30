@@ -85,7 +85,7 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 197, (
+    assert len(indexed) == len(document_cases) == 198, (
         "main lifecycle and distinct WIP cases must all remain indexed"
     )
 

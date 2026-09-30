@@ -379,8 +379,11 @@ class _AuroraAccount:
     """RDS, EC2 and the CPU cluster as an already-bootstrapped site sees them:
     every resource exists, tagged for the site, so the ensure should only read."""
 
-    def __init__(self, *, subnet_group_subnets: Sequence[str]) -> None:
+    def __init__(
+        self, *, subnet_group_subnets: Sequence[str], node_zone: str | None = None
+    ) -> None:
         self.subnet_group_subnets = list(subnet_group_subnets)
+        self.node_zone = node_zone
         self.calls: list[list[str]] = []
         self.mutations: list[str] = []
 
@@ -395,11 +398,18 @@ class _AuroraAccount:
                 {
                     "items": [
                         {
+                            "metadata": {
+                                "labels": (
+                                    {"topology.kubernetes.io/zone": self.node_zone}
+                                    if self.node_zone
+                                    else {}
+                                )
+                            },
                             "status": {
                                 "addresses": [
                                     {"type": "InternalIP", "address": "10.0.1.5"}
                                 ]
-                            }
+                            },
                         }
                     ]
                 }
@@ -562,6 +572,33 @@ def test_the_subnet_group_is_not_modified_when_it_already_holds_the_subnets(
     )
 
 
+def test_the_writer_zone_follows_the_cpu_nodes(monkeypatch, tmp_path: Path) -> None:
+    """The first zone -- the initial writer's -- is the CPU nodes' zone, not the
+    first private subnet's (live 2026-09-27: a writer in the other zone tripled
+    the reserved 503s of the 50-cluster load)."""
+
+    account = _AuroraAccount(
+        subnet_group_subnets=["subnet-private-a", "subnet-private-b"],
+        node_zone="us-east-1b",
+    )
+    placed: list[list[str]] = []
+
+    def instances(_runner, *, availability_zones, wait, **_kwargs):
+        placed.append(list(availability_zones))
+        return ["w", "r"]
+
+    monkeypatch.setattr(admin_bootstrap, "ensure_serverless_instances", instances)
+    result = _aurora(account, monkeypatch, tmp_path, stub_instances=False)
+
+    assert placed == [["us-east-1b", "us-east-1a"]], placed
+    assert result["availability_zones"] == ["us-east-1b", "us-east-1a"]
+    assert result["control_plane_zones"] == ["us-east-1b"]
+    nodes_reads = [
+        argv for argv in account.calls if argv[0] == "kubectl" and "nodes" in argv
+    ]
+    assert len(nodes_reads) == 1, "the CPU nodes must be listed once, not per consumer"
+
+
 def test_the_subnet_group_is_modified_when_its_subnets_drifted(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -656,6 +693,11 @@ def test_aurora_ready_hands_the_control_plane_its_secret_once_both_instances_are
     assert result == {
         "master_secret_arn": "arn:aws:secretsmanager:x",
         "master_secret_kms_key_arn": "k",
+        # The fake's nodes carry no zone label: nothing to align, nothing moved.
+        "writer_zone_affinity": {
+            "action": "none",
+            "reason": "control-plane zones unknown",
+        },
     }
     assert account.mutations == ["kubectl"], (
         "aurora_ready mutated something other than the control-plane Secret"

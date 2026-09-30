@@ -23,6 +23,9 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
 )
+from scripts.e2e.regional.drill_incident_cleanup import (  # noqa: E402
+    close_drill_incident,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -47,6 +50,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     runtime_identity_errors,
     settings_from_arguments,
+)
+from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
+    WarmSpareLiveFixture,
 )
 
 DEFAULT_A_MANIFEST = (
@@ -804,6 +810,8 @@ def run_group_d(
     quiescence_marker: str | None = None
     quiescence_after: datetime | None = None
     workflow_request_ids: list[str] = []
+    blocked_incident_id = ""
+    first_marker = ""
     try:
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError(
@@ -861,6 +869,9 @@ def run_group_d(
             attempt_id=case_settings.attempt_id,
         )
         write_json_atomic(case_dir / "group-d-blocked-workflow.json", blocked)
+        blocked_incident_id = str(
+            (blocked.get("incident") or {}).get("incident_id") or ""
+        )
         blocked_request_id = (blocked.get("workflow") or {}).get("request_id")
         if blocked_request_id:
             workflow_request_ids.append(str(blocked_request_id))
@@ -958,12 +969,7 @@ def run_group_d(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        try:
-            workload.annotate_auto_resume(None)
-        except Exception as exc:
-            result["annotation_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        delete_after_quiescence(
+        finish_group_d(
             regional,
             workload,
             result,
@@ -973,8 +979,82 @@ def run_group_d(
             marker=quiescence_marker,
             observed_after=quiescence_after,
             workflow_request_ids=workflow_request_ids,
+            incident_id=blocked_incident_id,
+            reference=first_marker,
         )
     return result
+
+
+def finish_group_d(
+    regional: RegionalLiveFixture,
+    workload: ManagedWorkloadFixture,
+    result: dict[str, Any],
+    *,
+    case_settings: Any,
+    case_dir: Path,
+    node: str | None,
+    marker: str | None,
+    observed_after: datetime | None,
+    workflow_request_ids: list[str],
+    incident_id: str,
+    reference: str,
+) -> None:
+    """Group D's teardown: drop the violating annotation, delete the workload
+    through the quiescence gate, then close the blocked injection's incident."""
+
+    try:
+        workload.annotate_auto_resume(None)
+    except Exception as exc:
+        result["annotation_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+    delete_after_quiescence(
+        regional,
+        workload,
+        result,
+        case_settings=case_settings,
+        case_dir=case_dir,
+        node=node,
+        marker=marker,
+        observed_after=observed_after,
+        workflow_request_ids=workflow_request_ids,
+    )
+    if incident_id and node:
+        close_group_d_incident(
+            regional, result, incident_id=incident_id, node=node, reference=reference
+        )
+
+
+def close_group_d_incident(
+    regional: RegionalLiveFixture,
+    result: dict[str, Any],
+    *,
+    incident_id: str,
+    node: str,
+    reference: str,
+) -> None:
+    """Close the ESCALATED incident the blocked injection opened; a refusal
+    (the BLOCKED record not yet reconciled) is recorded as the residual the
+    driver has to settle with ``workflow-reconcile --incident-id``."""
+
+    try:
+        report = close_drill_incident(
+            WarmSpareLiveFixture(regional, ""),
+            regional,
+            incident_id,
+            reason="DESTR-012 group D drill cleanup",
+            reference=reference,
+            nodes=(node,),
+        )
+        result["incident_close"] = report
+        if report.get("residual"):
+            result["residual_incident"] = {
+                "incident_id": incident_id,
+                "state": report.get("state_before"),
+                "reason": report["residual"],
+            }
+    except Exception as exc:  # noqa: BLE001 - recorded, the verdict already stands
+        result["incident_close_error"] = f"{type(exc).__name__}: {exc}"
+        result["residual_incident"] = {"incident_id": incident_id, "reason": str(exc)}
 
 
 def groups_not_run(groups: dict[str, dict[str, Any]]) -> list[str]:

@@ -67,7 +67,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 CASE_ID = verdicts.CASE_ID
 CONFIRMATION = verdicts.CONFIRMATION
 RULES = ROOT / "deploy" / "observability" / "amp-rules.yaml"
-RUNBOOK = ROOT / "docs" / "管理员日常运维.md"
+RUNBOOK = ROOT / "docs" / "en" / "administrator-operations.md"
 ROLLOUT_TIMEOUT_SECONDS = 600
 
 WORKFLOW_STATUSES_PROBE = r"""

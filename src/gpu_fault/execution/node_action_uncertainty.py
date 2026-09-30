@@ -177,9 +177,23 @@ def _remote_step_execution(
             else recorded_status
         )
     elif index != command.step_index and isinstance(entries, dict):
-        if command.status is not RemoteCommandStatus.LEASED:
+        if command.status in {
+            RemoteCommandStatus.SUCCEEDED,
+            RemoteCommandStatus.FAILED,
+        }:
+            # The carrier ended before it reached this batched step: the agent
+            # records a result per step it ran, so no entry means the step
+            # never started. Saying so replaces the LEASED-time snapshot that
+            # marked it unknown (live 2026-09-28: a cancelled carrier left its
+            # RESTORE_GPU_SERVICES step "unknown" for ever).
+            details = {
+                "node_action_not_started": True,
+                "batched_step_not_reached": True,
+            }
+        elif command.status is not RemoteCommandStatus.LEASED:
             return None
-        details = {}
+        else:
+            details = {}
     if (
         command.status is RemoteCommandStatus.FAILED
         and command.status_source
@@ -187,7 +201,12 @@ def _remote_step_execution(
         and not completed_entry
     ):
         after = command.result_details.get("post_cancellation_status")
-        if isinstance(after, str) and after in {"SUCCEEDED", "FAILED"}:
+        if details.get("batched_step_not_reached") is True:
+            # The carrier is over and never ran this step: nothing is in
+            # flight, so the row must not stay WAITING (live 2026-09-28: a
+            # WAITING RESET row on a FAILED record refused the incident close).
+            status = RemoteCommandStatus.FAILED
+        elif isinstance(after, str) and after in {"SUCCEEDED", "FAILED"}:
             status = RemoteCommandStatus(after)
         elif (
             command.last_lease_owner is None
@@ -298,12 +317,21 @@ def refresh_remote_action_state(
             details["unresolved_remote_command_ids"] = sorted(
                 {str(item.details["remote_command_id"]) for item in unresolved}
             )
-        executions[positions[-1]] = previous.model_copy(
-            update={
-                "adapter_operation_id": snapshot.adapter_operation_id,
-                "details": details,
-            }
-        )
+        update: dict[str, Any] = {
+            "adapter_operation_id": snapshot.adapter_operation_id,
+            "details": details,
+        }
+        if (
+            previous.status is WorkflowStepStatus.WAITING
+            and snapshot.status is WorkflowStepStatus.FAILED
+            and not unresolved
+        ):
+            # The receipt ended what the WAITING row was waiting for -- a
+            # confirmed failure or a step the ended carrier never reached. Left
+            # WAITING, the row reads as an in-flight action on a record that
+            # has none (live 2026-09-28: it refused the incident close).
+            update.update(status=snapshot.status, error=snapshot.error)
+        executions[positions[-1]] = previous.model_copy(update=update)
     if executions == workflow.step_executions:
         return workflow
     return workflow.model_copy(update={"step_executions": executions})

@@ -323,6 +323,15 @@ class CallerEnvironment:
             registry, "load_registry", lambda: copy.deepcopy(self.registrations)
         )
         monkeypatch.setattr(registry, "write_registry", self.write_registry)
+        monkeypatch.setattr(
+            registry, "sync_dataplane_connection_secret", lambda: {"changed": False}
+        )
+        # Secret/head/replica alignment and the Secret byte baseline are the
+        # registry module's own contract (test_perf_registry_alignment).
+        monkeypatch.setattr(
+            registry, "verify_registry_alignment", lambda **_kwargs: {"aligned": True}
+        )
+        monkeypatch.setattr(registry, "capture_secret_baseline", lambda *_args: None)
         monkeypatch.setattr(registry, "perf_cluster_entries", self.entries)
         monkeypatch.setattr(base, "database_residuals", lambda: {"total": self.rows})
         monkeypatch.setattr(

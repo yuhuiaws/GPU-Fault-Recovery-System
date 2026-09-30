@@ -579,9 +579,9 @@ def test_sustained_host_resource_risk_sends_fixed_email(monkeypatch) -> None:
     asyncio.run(scenario())
     assert len(notifier.notifications) == 1
     body = notifier.notifications[0].body_text
-    assert "Signal：LOW_MEMORY_AVAILABLE" in body
-    assert "Metric：memory_available_percent" in body
-    assert "持续时间阈值：15.0 秒" in body
+    assert "Signal: LOW_MEMORY_AVAILABLE" in body
+    assert "Metric: memory_available_percent" in body
+    assert "Minimum duration threshold: 15.0 s" in body
     assert "host-resource-event-zh-v1" in body
 
 
@@ -804,8 +804,8 @@ def test_rdma_link_error_sends_one_fixed_email() -> None:
     asyncio.run(scenario())
     assert len(notifier.notifications) == 1
     notification = notifier.notifications[0]
-    assert "事件类型：RDMA_LINK_OR_ERROR" in notification.body_text
-    assert "Metric：rdma_link_down" in notification.body_text
+    assert "Event type: RDMA_LINK_OR_ERROR" in notification.body_text
+    assert "Metric: rdma_link_down" in notification.body_text
     assert "FREEZE_EVIDENCE -> VALIDATE_FABRIC" in (notification.body_text)
     assert "efa-rdma-event-zh-v1" in notification.body_text
 
@@ -951,11 +951,11 @@ def test_inventory_card_loss_reboots_then_escalates_to_replacement(
     asyncio.run(scenario())
     assert len(notifier.notifications) == 1
     email = notifier.notifications[0]
-    assert f"硬件类型：{resource}" in email.body_text
-    assert f"期望数量：{expected}" in email.body_text
-    assert f"当前 ACTIVE 数量：{observed}" in email.body_text
-    assert "EC2/HyperPod 实例类型：ml.p5en.48xlarge" in email.body_text
-    assert "策略动作：REBOOT_NODE" in email.body_text
+    assert f"Hardware type: {resource}" in email.body_text
+    assert f"Expected count: {expected}" in email.body_text
+    assert f"Current ACTIVE count: {observed}" in email.body_text
+    assert "EC2/HyperPod instance type: ml.p5en.48xlarge" in email.body_text
+    assert "Policy action: REBOOT_NODE" in email.body_text
     assert "hardware-inventory-mismatch-zh-v1" in email.body_text
 
 

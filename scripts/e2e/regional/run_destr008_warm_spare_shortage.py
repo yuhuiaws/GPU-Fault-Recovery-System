@@ -56,6 +56,7 @@ from scripts.e2e.regional.destr008_journal import (  # noqa: E402
 )
 from scripts.e2e.regional.destr008_node_restore import (  # noqa: E402
     audit_scenario_nodes as audit_scenario_nodes,
+    close_scenario_incidents,
     restore_fault_node as restore_fault_node,
 )
 from scripts.e2e.regional.destr008_safety import ShortageSafety  # noqa: E402
@@ -869,6 +870,15 @@ def cleanup_scenario(
     if fault_cleanup["errors"]:
         result["verdict"] = "FAIL"
     audit_scenario_nodes(warm, settings, result)
+    if cleanup_safe and incident_id:
+        close_scenario_incidents(
+            warm,
+            settings,
+            result,
+            incident_id=incident_id,
+            successor_incident=fault_cleanup.get("successor_incident"),
+            reference=event_id or incident_id,
+        )
     result["cleanup_complete"] = bool(
         cleanup_safe
         and not scenario_cleanup["errors"]

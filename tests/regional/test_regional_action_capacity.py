@@ -571,3 +571,202 @@ def test_action_capacity_summary_keeps_renewal_and_concurrency_evidence() -> Non
     assert summary["injected_renewal_failures"] == 1
     assert summary["long_commands"] == 5
     assert summary["max_concurrent_commands"] == 5
+
+
+def test_run_heartbeat_refresh_touches_only_this_runs_active_agents() -> None:
+    """Live 2026-09-22: workflows of clusters 025-031 were held by the fleet
+    compatibility preflight once their seeded Agent heartbeats aged past the
+    policy while the first clusters ran. The refresh matches Agents by the run
+    id in their node id and leaves other runs' and non-ACTIVE Agents alone."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.fleet import AgentLifecycleState
+    from scripts.perf import seed_regional_action_workflows as seed
+
+    class Agent:
+        def __init__(self, node_id: str, state: AgentLifecycleState) -> None:
+            self.node_id = node_id
+            self.lifecycle_state = state
+            self.last_seen_at = datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc)
+            self.lease_expires_at = self.last_seen_at
+
+        def model_copy(self, *, update: dict) -> "Agent":
+            copy = Agent(self.node_id, self.lifecycle_state)
+            copy.__dict__.update(update)
+            return copy
+
+    class Store:
+        def __init__(self) -> None:
+            self.agents = {
+                "perf-cap-000": [
+                    Agent(
+                        "actionperf-run-a-c000-w000-node-00", AgentLifecycleState.ACTIVE
+                    ),
+                    Agent(
+                        "actionperf-run-b-c000-w000-node-00", AgentLifecycleState.ACTIVE
+                    ),
+                    Agent("corr-node-run-a-c000-lane", AgentLifecycleState.REVOKED),
+                ],
+                "perf-cap-001": [
+                    Agent(
+                        "actionperf-run-a-c001-w003-node-03", AgentLifecycleState.ACTIVE
+                    )
+                ],
+            }
+            self.saved: list[Agent] = []
+
+        def list_agents(self, cluster_id: str) -> list[Agent]:
+            return list(self.agents.get(cluster_id, []))
+
+        def save_agent(self, agent: Agent) -> None:
+            self.saved.append(agent)
+
+    class Context:
+        store = Store()
+
+    now = datetime(2026, 9, 22, 14, 0, tzinfo=timezone.utc)
+    refreshed = seed.refresh_run_agent_heartbeats(
+        Context(), run_id="run-a", clusters=2, now=now, lease_seconds=600
+    )
+
+    assert refreshed == 2, "the two ACTIVE Agents of run-a are refreshed"
+    assert sorted(a.node_id for a in Context.store.saved) == [
+        "actionperf-run-a-c000-w000-node-00",
+        "actionperf-run-a-c001-w003-node-03",
+    ], "run-b and the revoked Agent are untouched"
+    assert all(a.last_seen_at == now for a in Context.store.saved), (
+        "the heartbeat is moved to now"
+    )
+    assert all(
+        a.lease_expires_at == now + timedelta(seconds=600) for a in Context.store.saved
+    ), "the lease follows the heartbeat"
+    with pytest.raises(RuntimeError, match="no synthetic Agent of run"):
+        seed.refresh_run_agent_heartbeats(
+            Context(), run_id="run-zzz", clusters=2, now=now, lease_seconds=600
+        )
+
+
+def test_run_agent_heartbeat_refresh_publishes_the_node_return_telemetry() -> None:
+    context = ApplicationContext(store=build_store())
+    node_id = "corr-node-run-a-c007-preempt"
+    agent = MODULE.release_bound_synthetic_agent(
+        release_agent_identity(),
+        cluster_id="perf-cap-000",
+        node_id=node_id,
+        run_id="run-a",
+        now=NOW,
+    )
+    context.store.save_agent(agent)
+    refreshed_at = NOW + timedelta(minutes=5)
+
+    count = MODULE.refresh_run_agent_heartbeats(
+        context,
+        run_id="run-a",
+        clusters=1,
+        now=refreshed_at,
+        lease_seconds=600,
+        publish_telemetry=True,
+    )
+
+    assert count == 1
+    latest = context.gpu_metrics.latest("perf-cap-000", node_id)
+    assert {item.sample.gpu_uuid for item in latest} == {"GPU-corr-007"}, (
+        "the node must report under the GPU its attempt identity names"
+    )
+    assert {item.sample.canonical_name for item in latest} == {
+        "gpu_temperature_c",
+        "nvlink_crc_aggregate_error_total",
+        "nvlink_recovery_aggregate_error_total",
+        "nvlink_replay_aggregate_error_total",
+    }
+    assert all(item.observed_at == refreshed_at for item in latest), (
+        "GPU samples must carry the refresh time to cross the reboot barrier"
+    )
+    host = context.store.list_telemetry_metrics_latest("perf-cap-000", node_id)
+    assert {item.name for item in host} == {
+        "load1_per_cpu",
+        "memory_used_percent",
+        "filesystem_used_percent",
+        "network_link_up",
+        "rdma_link_down",
+        "rdma_errors_delta",
+    }
+    statuses = context.store.list_collector_statuses("perf-cap-000", node_id)
+    assert {"GPU_METRICS", "HOST_TELEMETRY"} <= {
+        item.collector.value for item in statuses
+    }
+    assert all(item.last_success_at == refreshed_at for item in statuses), (
+        "collector success must be as fresh as the refresh"
+    )
+    # The default refresh (the action suite) leaves telemetry alone.
+    plain = ApplicationContext(store=build_store())
+    plain.store.save_agent(agent)
+    MODULE.refresh_run_agent_heartbeats(
+        plain, run_id="run-a", clusters=1, now=refreshed_at, lease_seconds=600
+    )
+    assert plain.gpu_metrics.latest("perf-cap-000", node_id) == []
+    assert MODULE.synthetic_node_gpu_uuid("actionperf-run-a-c000-w000-node-00") == (
+        "GPU-actionperf-run-a-c000-w000-node-00"
+    )
+
+
+def test_run_agent_refresh_forwards_the_telemetry_switch() -> None:
+    calls: list[tuple] = []
+
+    def fake_control(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "get":
+            return "api-a\n"
+        return json.dumps({"agents_refreshed": 2, "telemetry": "node-return"}) + "\n"
+
+    result = suite.refresh_run_agents(
+        run_id="run-a",
+        clusters=2,
+        lease_seconds=900,
+        control_fn=fake_control,
+        telemetry=True,
+    )
+
+    assert result["telemetry"] == "node-return"
+    assert "ACTION_HEARTBEAT_TELEMETRY=node-return" in calls[-1]
+    suite.refresh_run_agents(
+        run_id="run-a", clusters=2, lease_seconds=900, control_fn=fake_control
+    )
+    assert "ACTION_HEARTBEAT_TELEMETRY=node-return" not in calls[-1], (
+        "the action suite's refresh must not publish telemetry"
+    )
+    forwarded: list[dict] = []
+    refresh = suite.run_agent_heartbeat_refresher(
+        run_id="run-a",
+        clusters=2,
+        lease_seconds=900,
+        refresh_agents=lambda **kw: forwarded.append(kw),
+        clock=lambda: 0.0,
+        telemetry=True,
+    )
+    refresh()
+    assert forwarded == [
+        {"run_id": "run-a", "clusters": 2, "lease_seconds": 900, "telemetry": True}
+    ]
+
+
+def test_run_heartbeat_refresher_is_throttled_to_its_interval() -> None:
+    calls: list[dict] = []
+    ticks = iter([0.0, 5.0, 31.0, 40.0, 62.0])
+    refresh = suite.run_agent_heartbeat_refresher(
+        run_id="run-a",
+        clusters=3,
+        lease_seconds=900,
+        interval_seconds=30,
+        refresh_agents=lambda **kw: calls.append(kw),
+        clock=lambda: next(ticks),
+    )
+
+    for _ in range(5):
+        refresh()
+
+    assert len(calls) == 3, "one refresh per 30 s window: t=0, t=31, t=62"
+    assert calls[0] == {"run_id": "run-a", "clusters": 3, "lease_seconds": 900}, (
+        "the refresh carries the run scope and lease"
+    )

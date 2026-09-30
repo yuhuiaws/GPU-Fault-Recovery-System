@@ -40,7 +40,7 @@ TERMINAL_FAILURE_METRIC = (
 )
 FAILING_ALERT = "GpuFaultNotificationDeliveryFailing"
 UNDELIVERED_ALERT = "GpuFaultNotificationUndeliveredTooLong"
-RUNBOOK_DOCUMENT = "docs/\u7ba1\u7406\u5458\u65e5\u5e38\u8fd0\u7ef4.md"
+RUNBOOK_DOCUMENT = "docs/en/administrator-operations.md"
 REQUIRED_FAMILIES = (
     DEAD_LETTERED_METRIC,
     DISPATCH_CYCLE_METRIC,

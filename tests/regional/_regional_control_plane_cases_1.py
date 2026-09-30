@@ -718,7 +718,7 @@ def test_regional_api_sends_gpu_reset_completion_once() -> None:
     asyncio.run(scenario())
     assert wake_calls == [True, True]
     assert len(notifier.notifications) == 1
-    assert "系统动作：RESET_GPU" in notifier.notifications[0].body_text
+    assert "System action: RESET_GPU" in notifier.notifications[0].body_text
 
 
 def test_regional_api_sends_executor_workload_restart_notification() -> None:
@@ -792,7 +792,7 @@ def test_regional_api_sends_executor_workload_restart_notification() -> None:
 
     asyncio.run(scenario())
     assert len(notifier.notifications) == 1
-    assert "系统动作：RESTART_WORKLOAD" in (notifier.notifications[0].body_text)
+    assert "System action: RESTART_WORKLOAD" in (notifier.notifications[0].body_text)
 
 
 def test_regional_context_loads_registry_and_remote_adapter(

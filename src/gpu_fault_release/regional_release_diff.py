@@ -80,6 +80,10 @@ CPU_ROLE_MANIFEST_FIELDS = {
     "cpu_worker_manifests": "worker",
     "cpu_spool_manifests": "spool",
 }
+#: A Running CPU replica loaded a Runtime Profile version other than the
+#: desired one although the ConfigMap already agrees (start-up env snapshot).
+#: Control-plane-only: the roles roll with a forced restart, nothing else moves.
+CPU_POD_PROFILE_DRIFT = "cpu_pod_runtime_profile"
 
 
 def control_plane_role_targets(diff: ReleaseDiff) -> tuple[str, ...]:
@@ -232,7 +236,9 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             *ADMIN_CONFIG_CHANGE_FIELDS,
         }
     )
-    cpu_stage = pin_changed or profile or bool(changed & {"clusters"})
+    cpu_stage = (
+        pin_changed or profile or bool(changed & {"clusters", CPU_POD_PROFILE_DRIFT})
+    )
     cpu_finalize = cpu_changed or cpu_stage
     scoped = changed - {"release_delivery", "rendered_manifests"}
     role_scoped_cpu_only = bool(scoped) and scoped.issubset(
@@ -311,6 +317,7 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
             "observability_drift",
             "adot_image",
             *ADMIN_CONFIG_CHANGE_FIELDS,
+            CPU_POD_PROFILE_DRIFT,
         }
     ):
         kind = ReleaseChangeKind.CONTROL_PLANE_ONLY
@@ -330,6 +337,31 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
     else:
         kind = ReleaseChangeKind.FULL
     return ReleaseDiff(kind=kind, changed=normalized)
+
+
+def cpu_pod_profile_drift(release: RegionalRelease) -> bool:
+    """Whether a Running api-ha replica loaded another Runtime Profile version.
+
+    Live 2026-09-26: the ConfigMap said hyperpod-v1, every Pod still ran with
+    hyperpod-v1-boot020 (BOOT-020 restores the ConfigMap without a roll), the
+    release classified "unchanged", skipped the CPU roll and failed its own
+    control_api verification. A release without the probe (tests, legacy
+    callers) or with no Running replica reports no drift.
+    """
+
+    # Same gate as the other classification-time probes (observability, Aurora
+    # refresh): a dry run or a config without a delivered control plane never
+    # reads the cluster -- unit fixtures and legacy callers stay offline.
+    runner = getattr(release, "runner", None)
+    if getattr(
+        runner, "dry_run", False
+    ) or not release.config.delivery_component_digests.get("cpu"):
+        return False
+    probe = getattr(release, "_cpu_runtime_profile_drift", None)
+    if not callable(probe):
+        return False
+    effective = probe()
+    return effective is not None and effective != release.config.runtime_profile_version
 
 
 def classify_release(release: RegionalRelease, state: dict[str, Any]) -> ReleaseDiff:
@@ -458,6 +490,8 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         changed.add("observability_drift")
     if state and release._aurora_refresh_drift():
         changed.add("aurora_refresh_drift")
+    if state and cpu_pod_profile_drift(release):
+        changed.add(CPU_POD_PROFILE_DRIFT)
     if AURORA_PREREQUISITE_REPAIR_KEY in state and not (
         state.get("transaction_committed") is False
         and isinstance(state.get("previous"), dict)

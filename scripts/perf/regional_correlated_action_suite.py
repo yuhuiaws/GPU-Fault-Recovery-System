@@ -10,22 +10,27 @@ if __package__:
     from .regional_action_capacity_suite import (
         executor_identity,
         release_agent_identity,
-    )
-    from .regional_capacity_resources import RunResources, run_manifest
-    from .regional_capacity_results import (
-        artifact_dir,
-        move_to_aborted,
-        write_status,
+        run_agent_heartbeat_refresher,
     )
     from .regional_capacity_registry import (
-        STORE_DSN_SNIPPET,
         CONNECTION_SECRET,
         NAMESPACE,
+        STORE_DSN_SNIPPET,
         TOKEN_SECRET,
         control,
         dataplane,
         register,
         validate_registry_target,
+    )
+    from .regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
+    from .regional_capacity_results import (
+        artifact_dir,
+        move_to_aborted,
+        write_status,
     )
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
@@ -38,19 +43,24 @@ else:
     from regional_action_capacity_suite import (
         executor_identity,
         release_agent_identity,
+        run_agent_heartbeat_refresher,
     )
-    from regional_capacity_resources import RunResources, run_manifest
-    from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
-        STORE_DSN_SNIPPET,
         CONNECTION_SECRET,
         NAMESPACE,
+        STORE_DSN_SNIPPET,
         TOKEN_SECRET,
         control,
         dataplane,
         register,
         validate_registry_target,
     )
+    from regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
+    from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         purge_audit_rows,
@@ -60,6 +70,7 @@ else:
     )
 
 
+LOAD_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
 SCRIPT_CONFIGMAP = "gpu-fault-correlated-action-script"
 JOB_NAME = "gpu-fault-correlated-action"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -93,7 +104,7 @@ def scenario_job(
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
-                    "serviceAccountName": "gpu-fault-completion-watcher",
+                    "serviceAccountName": LOAD_SERVICE_ACCOUNT,
                     "tolerations": [
                         {
                             "key": "node.kubernetes.io/unschedulable",
@@ -379,16 +390,18 @@ def step_operation(item,index):
 def in_record_preemption(item):
     # Clean boundary: the stronger fabric reset preempted the weak GPU reset
     # inside one record -- the weak plan's pending steps (its RESET_GPU among
-    # them) are superseded, the fabric reset lives in a successor branch, and
-    # the record carries a PREEMPTION event.
+    # them) are superseded, the fabric reset lives in the node's successor
+    # branch, and the record carries a PREEMPTION event. The fabric reset's
+    # own branch is retired (superseded) once it fails and escalates, so its
+    # index is not required to stay live.
     superseded=set(item.get('superseded_step_indexes') or [])
     return bool(
         superseded
         and any(step_operation(item,i)=='RESET_GPU' for i in superseded)
         and any(
             step.get('operation')=='RESET_ALL_GPUS_NVSWITCHES'
-            and index not in superseded
-            for index,step in enumerate(item.get('official_steps',[]))
+            and ':successor:' in str(step.get('branch_id') or '')
+            for step in item.get('official_steps',[])
         )
         and any(
             event.get('kind')=='PREEMPTION' for event in item.get('events',[])
@@ -410,15 +423,44 @@ strong_cross=[
 ]
 weak=[*weak_cross,*in_record]
 strong=[*strong_cross,*in_record]
-reset_gpu=[
-    item for item in workflows
-    if item.get('status')=='FAILED'
-    and any(
-        execution.get('operation')=='RESET_GPU'
+def failed_execution(item,operation):
+    return any(
+        execution.get('operation')==operation
         and execution.get('status')=='FAILED'
         for execution in item.get('step_executions',[])
     )
+def escalation_rungs(item,to_operation=None):
+    # The failed node branch walks the hardware ladder inside its own record:
+    # each BRANCH_ESCALATED event is one rung (from_operation -> to_operation).
+    return [
+        event for event in item.get('events',[])
+        if event.get('code')=='BRANCH_ESCALATED'
+        and (
+            to_operation is None
+            or (event.get('details') or {}).get('to_operation')==to_operation
+        )
+    ]
+def reboot_after_id(request_id):
+    return f"workflow-reboot-after-{request_id}"
+# Two reboot shapes follow a failed reset. A failure on one node's DAG branch
+# (the preempt chain's fabric reset) escalates in place: a BRANCH_ESCALATED
+# rung to RESTART_NODE inside the same record. A failure on a job-level or
+# non-DAG step (the reset lane's RESET_GPU) fails the record and the
+# whole-workflow escalation creates workflow-reboot-after-<id>. Every failed
+# reset must be bound to exactly one reboot of either shape.
+def in_record_reboot(item):
+    return bool(escalation_rungs(item,'RESTART_NODE'))
+def bound_reboot(item):
+    if in_record_reboot(item):
+        return item
+    return by_id.get(reboot_after_id(item['request_id']))
+# Reset lane: the precise RESET_GPU failed.
+reset_gpu=[item for item in workflows if failed_execution(item,'RESET_GPU')]
+failed_fabric=[
+    item for item in workflows
+    if failed_execution(item,'RESET_ALL_GPUS_NVSWITCHES')
 ]
+sources={item['request_id']:item for item in [*failed_fabric,*reset_gpu]}
 reboot=[
     item for item in workflows
     if 'RESTART_NODE' in operations(item)
@@ -459,56 +501,89 @@ weak_ok=sum(
     for item in weak_cross
 )+len(in_record)
 strong_ok=sum(
-    item.get('status')=='FAILED'
-    and any(
-        execution.get('operation')=='RESET_ALL_GPUS_NVSWITCHES'
-        and execution.get('status')=='FAILED'
-        for execution in item.get('step_executions',[])
-    )
+    failed_execution(item,'RESET_ALL_GPUS_NVSWITCHES')
+    and bound_reboot(item) is not None
     for item in strong
 )
 """
 
 
 def _database_audit_script_metrics() -> str:
-    """Reboot pairing, terminal drain, idempotency and fencing counters."""
+    """Reboot binding, terminal drain, idempotency and fencing counters."""
     return f"""
-failed_sources={{
-    item['request_id']:item
-    for item in [*strong,*reset_gpu]
-}}
-deterministic_reboot_sources={{
-    f"workflow-reboot-after-{{request_id}}":request_id
-    for request_id in failed_sources
-}}
-reboot_by_predecessor={{}}
-unexpected_reboot_predecessors=0
-for item in reboot:
-    predecessor=(
-        item.get('predecessor_workflow_id')
-        or deterministic_reboot_sources.get(item['request_id'])
+VALIDATION_TAIL={{'VALIDATE_GPU','VALIDATE_HOST','VALIDATE_FABRIC','RESTORE_SCHEDULING'}}
+def restart_execution(item):
+    return next(
+        (
+            execution for execution in item.get('step_executions',[])
+            if execution.get('operation')=='RESTART_NODE'
+            and execution.get('status')=='SUCCEEDED'
+        ),
+        None,
     )
-    if predecessor not in failed_sources:
-        unexpected_reboot_predecessors+=1
-        continue
-    reboot_by_predecessor.setdefault(predecessor,[]).append(item)
-reboot_successor_pairs=sum(
-    len(items)==1
-    and items[0].get('status')=='SUCCEEDED'
-    and 'RESTART_NODE' in operations(items[0])
-    for items in reboot_by_predecessor.values()
+def validated_after_reboot(item):
+    # The node came back: every validation and the release behind the
+    # RESTART_NODE succeeded and the record ended SUCCEEDED.
+    restart=restart_execution(item)
+    if restart is None or item.get('status')!='SUCCEEDED':
+        return False
+    tail={{
+        execution.get('operation')
+        for execution in item.get('step_executions',[])
+        if int(execution.get('step_index',-1))>int(restart.get('step_index',-1))
+        and execution.get('status')=='SUCCEEDED'
+    }}
+    return VALIDATION_TAIL<=tail
+reboot_records={{
+    request_id:bound_reboot(item)
+    for request_id,item in sources.items()
+    if bound_reboot(item) is not None
+}}
+in_record_reboots=sum(in_record_reboot(item) for item in sources.values())
+successor_reboots=sum(
+    not in_record_reboot(item)
+    and reboot_after_id(request_id) in by_id
+    for request_id,item in sources.items()
 )
-duplicate_reboot_successors=sum(
-    max(0,len(items)-1)
-    for items in reboot_by_predecessor.values()
-)
+bound_ids={{item['request_id'] for item in reboot_records.values()}}
+orphan_reboots=sum(item['request_id'] not in bound_ids for item in reboot)
 reboot_ok=sum(
-    item.get('status')=='SUCCEEDED'
-    and any(
-        step.get('operation')=='RESTART_NODE'
-        for step in item.get('official_steps',[])
-    )
-    for item in reboot
+    item.get('status')=='SUCCEEDED' and restart_execution(item) is not None
+    for item in reboot_records.values()
+)
+validated_reboots=sum(
+    validated_after_reboot(item) for item in reboot_records.values()
+)
+replace_rungs=sum(len(escalation_rungs(item,'REPLACE_NODE')) for item in workflows)
+exhausted_branches=sum(
+    len(item.get('exhausted_branch_ids') or []) for item in workflows
+)
+# A rung the cluster remediation budget cannot take retires the branch
+# instead (fail closed); the record then fails and the whole-workflow path
+# reboots the node through workflow-reboot-after-<id>. Any other exhaustion
+# (no rung left, outcome unknown) is a node that did not come back.
+BUDGET_REFUSAL='remediation budget cannot take the next rung'
+exhausted_events=[
+    event for item in workflows for event in item.get('events',[])
+    if event.get('code')=='BRANCH_EXHAUSTED'
+]
+budget_refused_rungs=sum(
+    BUDGET_REFUSAL in str(event.get('reason') or '') for event in exhausted_events
+)
+exhausted_other=len(exhausted_events)-budget_refused_rungs
+unrecovered_exhausted=sum(
+    bool(item.get('exhausted_branch_ids'))
+    and not validated_after_reboot(bound_reboot(item) or {{}})
+    for item in workflows
+)
+duplicate_reboot_rungs=sum(
+    max(0,len(escalation_rungs(item,'RESTART_NODE'))-1) for item in workflows
+)
+unexpected_rung_sources=sum(
+    (event.get('details') or {{}}).get('from_operation')
+    not in ('RESET_GPU','RESET_ALL_GPUS_NVSWITCHES')
+    for item in workflows
+    for event in escalation_rungs(item,'RESTART_NODE')
 )
 terminal_workflows=sum(
     item.get('status') in {sorted(TERMINAL_WORKFLOWS)!r}
@@ -579,10 +654,18 @@ out={{
     'strong_preempt_failed_fabric_reset_count':strong_ok,
     'reset_gpu_failed_count':len(reset_gpu),
     'reboot_succeeded_count':reboot_ok,
-    'reboot_successor_pair_count':reboot_successor_pairs,
-    'unique_reboot_predecessor_count':len(reboot_by_predecessor),
-    'duplicate_reboot_successors':duplicate_reboot_successors,
-    'unexpected_reboot_predecessors':unexpected_reboot_predecessors,
+    'reboot_bound_source_count':len(reboot_records),
+    'in_record_reboot_count':in_record_reboots,
+    'successor_reboot_count':successor_reboots,
+    'orphan_reboot_count':orphan_reboots,
+    'validated_reboot_count':validated_reboots,
+    'replace_rung_count':replace_rungs,
+    'exhausted_branch_count':exhausted_branches,
+    'budget_refused_rung_count':budget_refused_rungs,
+    'exhausted_other_reason_count':exhausted_other,
+    'unrecovered_exhausted_count':unrecovered_exhausted,
+    'duplicate_reboot_rungs':duplicate_reboot_rungs,
+    'unexpected_reboot_rung_sources':unexpected_rung_sources,
     'terminal_workflow_count':terminal_workflows,
     'terminal_command_count':terminal_commands,
     'duplicate_idempotency_keys':duplicates,
@@ -614,7 +697,7 @@ print(json.dumps(out,sort_keys=True))
 """
 
 
-def _database_audit_script_suffix() -> str:
+def database_audit_script_suffix() -> str:
     return _database_audit_script_shapes() + _database_audit_script_metrics()
 
 
@@ -627,7 +710,7 @@ def database_audit(run_id: str) -> dict:
         "-o",
         "jsonpath={.items[0].metadata.name}",
     ).strip()
-    script = _database_audit_script_prefix(run_id) + _database_audit_script_suffix()
+    script = _database_audit_script_prefix(run_id) + database_audit_script_suffix()
     output = control(
         "exec",
         "-i",
@@ -711,16 +794,23 @@ def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
         if int(item.get("ownership_errors", 0)):
             errors.append("scenario ownership errors are nonzero")
     # A clean-boundary preemption stays inside the weak record (one record per
-    # cluster: preempted record, its reboot, the reset-lane record, its
-    # reboot); a preemption on an in-flight physical step adds a separate
-    # successor record. The two shapes must account for every cluster.
+    # cluster for the preempted chain and one for the reset lane); a
+    # preemption on an in-flight physical step adds a separate successor
+    # record. The two shapes must account for every cluster. Each failed
+    # reset is bound to one reboot: an in-record RESTART_NODE rung (a node
+    # branch of a DAG record) or a workflow-reboot-after-<id> successor (a
+    # plain record, or a DAG record whose rung the remediation budget refused
+    # -- live 2026-09-23, 1 of 32 clusters); successors add to the workflow
+    # count. An exhausted branch is acceptable only as that budget refusal
+    # with the node's reboot validated behind it.
     in_record = int(audit.get("in_record_preemption_count", 0))
     cross_record = int(audit.get("cross_record_preemption_count", 0))
     if in_record + cross_record != clusters:
         errors.append(f"preemption shape counts do not add up to {clusters}")
+    successor_reboots = int(audit.get("successor_reboot_count", 0))
     expected_counts = {
         "incident_count": clusters * 2,
-        "workflow_count": clusters * 4 + cross_record,
+        "workflow_count": clusters * 2 + cross_record + successor_reboots,
         "weak_workflow_count": clusters,
         "strong_workflow_count": clusters,
         "reset_gpu_workflow_count": clusters,
@@ -729,9 +819,9 @@ def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
         "strong_preempt_failed_fabric_reset_count": clusters,
         "reset_gpu_failed_count": clusters,
         "reboot_workflow_count": clusters * 2,
+        "reboot_bound_source_count": clusters * 2,
         "reboot_succeeded_count": clusters * 2,
-        "reboot_successor_pair_count": clusters * 2,
-        "unique_reboot_predecessor_count": clusters * 2,
+        "validated_reboot_count": clusters * 2,
     }
     for key, expected in expected_counts.items():
         if int(audit.get(key, 0)) != expected:
@@ -745,8 +835,12 @@ def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
     for key in (
         "duplicate_idempotency_keys",
         "duplicate_workflow_steps",
-        "duplicate_reboot_successors",
-        "unexpected_reboot_predecessors",
+        "duplicate_reboot_rungs",
+        "unexpected_reboot_rung_sources",
+        "orphan_reboot_count",
+        "replace_rung_count",
+        "exhausted_other_reason_count",
+        "unrecovered_exhausted_count",
         "fencing_mismatches",
         "permanent_budget_waiters",
     ):
@@ -849,19 +943,44 @@ def main() -> int:
             runtime_profile_version=str(seeded["runtime_profile_version"]),
             **identity,
         )
+        # The scenario Pods run as the load ServiceAccount; a run creates it when
+        # the perf namespace has none (live 2026-09-22: the previous run tore its
+        # own account down and the Job could not create Pods).
+        ensure_load_service_account(
+            resources, name=LOAD_SERVICE_ACCOUNT, namespace=NAMESPACE
+        )
         manifest = run_manifest(manifest, run_id)
         (artifacts / "job.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
         resources.create(manifest)
-        wait = dataplane(
-            "wait",
-            "--for=condition=complete",
-            f"job/{JOB_NAME}",
-            f"--timeout={timeout_seconds}s",
-            check=False,
-            timeout=timeout_seconds + 60,
+        # Poll instead of one blocking `kubectl wait`: the scenario runs up to
+        # scenario_max_seconds and the fleet compatibility preflight holds
+        # destructive steps behind a stale Agent heartbeat, so the run's
+        # synthetic Agents are refreshed while it waits (live 2026-09-22).
+        # telemetry=True: the validation tail behind the escalated RESTART_NODE
+        # rung waits for telemetry newer than the reboot (live 2026-09-23).
+        refresh_heartbeats = run_agent_heartbeat_refresher(
+            run_id=run_id,
+            clusters=args.clusters,
+            lease_seconds=1800,
+            control_fn=control,
+            telemetry=True,
         )
+        wait_deadline = time.time() + timeout_seconds
+        wait = ""
+        while time.time() < wait_deadline:
+            refresh_heartbeats()
+            job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
+            done = {
+                str(item.get("type"))
+                for item in job.get("status", {}).get("conditions", [])
+                if str(item.get("status")) == "True"
+            }
+            if done & {"Complete", "Failed"}:
+                wait = "job.batch/%s condition met" % JOB_NAME
+                break
+            time.sleep(10)
         job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
         conditions = {
             str(item.get("type")): str(item.get("status"))

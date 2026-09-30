@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-policy-coverage; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-policy-coverage; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "GPU products the catalog could not map to a family; the policy is silent for every node reporting them.\n\nAlert GpuFaultUnknownProductFamily (critical, > 0): docs/管理员日常运维.md#gpufaultunknownproductfamily",
+      "description": "GPU products the catalog could not map to a family; the policy is silent for every node reporting them.\n\nAlert GpuFaultUnknownProductFamily (critical, > 0): docs/en/administrator-operations.md#gpufaultunknownproductfamily",
       "fieldConfig": {
         "defaults": {
           "color": {

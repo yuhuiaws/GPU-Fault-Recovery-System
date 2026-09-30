@@ -200,7 +200,7 @@ def test_annotation_that_does_not_match_the_alert_name_is_a_defect() -> None:
     """A runbook_url pointing at some other card reads as valid to an operator."""
     defects = defects_for(
         "GpuFaultCollectorSilent",
-        {"runbook_url": "docs/管理员日常运维.md#gpufaultstoreiorejected"},
+        {"runbook_url": "docs/en/administrator-operations.md#gpufaultstoreiorejected"},
     )
 
     assert len(defects) == 1, defects
@@ -215,7 +215,9 @@ def test_a_runbook_card_without_an_alert_is_a_defect() -> None:
             {
                 "alert": "GpuFaultCollectorSilent",
                 "annotations": {
-                    "runbook_url": ("docs/管理员日常运维.md#gpufaultcollectorsilent")
+                    "runbook_url": (
+                        "docs/en/administrator-operations.md#gpufaultcollectorsilent"
+                    )
                 },
             }
         ],

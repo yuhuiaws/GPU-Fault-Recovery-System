@@ -22,24 +22,23 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
 from scripts.e2e.regional import run_destr001_gpu_reset as reset_case  # noqa: E402
-from scripts.e2e.regional.ha_kubernetes import delete_pod, scale_patch  # noqa: E402
-from scripts.e2e.regional.ha_plan_preflight import require_window  # noqa: E402
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
+    write_json_atomic,
+)
+from scripts.e2e.regional.drill_incident_cleanup import (  # noqa: E402
+    close_drill_incident,
+)
 from scripts.e2e.regional.ha_cleanup import (  # noqa: E402
     ProcessSupervisionLost,
     record_supervision_loss,
     run_cleanup,
 )
-from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
-    processor_queue_backlog,
-    write_json_atomic,
-)
+from scripts.e2e.regional.ha_kubernetes import delete_pod, scale_patch  # noqa: E402
+from scripts.e2e.regional.ha_plan_preflight import require_window  # noqa: E402
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
-)
-from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
-from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
-    reset_notification_evidence,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
@@ -57,6 +56,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     required,
     run_case_main,
     settings_from_arguments,
+)
+from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
+from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
+    reset_notification_evidence,
 )
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     WarmSpareLiveFixture,
@@ -964,6 +967,28 @@ def cleanup_case(
                     result["errors"].append("node restore workflow failed")
         except Exception as exc:
             result["errors"].append(f"node restore: {type(exc).__name__}: {exc}")
+        # The drill's own incident: closed through the product path when it is
+        # operator-closable, otherwise named as a residual (a leftover
+        # ACTION_PENDING XID incident without a workflow cannot be closed by
+        # anyone but the workflow that ends it).
+        try:
+            report = close_drill_incident(
+                WarmSpareLiveFixture(regional, ""),
+                regional,
+                incident_id,
+                reason="HA-004 drill cleanup",
+                reference=run_id,
+                nodes=(settings.node,),
+            )
+            result["incident_close"] = report
+            if report.get("residual"):
+                result["residual_incident"] = {
+                    "incident_id": incident_id,
+                    "state": report.get("state_before"),
+                    "reason": report["residual"],
+                }
+        except Exception as exc:
+            result["errors"].append(f"incident close: {type(exc).__name__}: {exc}")
     return result
 
 

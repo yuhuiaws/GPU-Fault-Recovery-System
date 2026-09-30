@@ -793,6 +793,71 @@ def test_completed_uninstall_revalidates_the_original_available_final_snapshot(
     assert aws.mutations == [], "completed replay must remain read-only"
 
 
+def test_preserved_association_of_a_deleted_zone_is_detached_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-09-24: a resumed cold deploy recorded its GPU VPC association as
+    EXTERNAL/PRESERVE (association receipt lost), and the uninstall refused with
+    "retained resource depends on a deletion target: aws/route53/zone". The zone
+    is always solution owned; an association cannot outlive it, so the row is
+    detached before the zone instead."""
+
+    harness = Harness(tmp_path, monkeypatch)
+    resources = list(harness.snapshot.resources)
+    for key, kind, name, ownership, policy, dependencies, attributes in (
+        (
+            "aws/route53/zone",
+            "route53_zone",
+            "Z123",
+            Ownership.CREATED,
+            Policy.DELETE,
+            [],
+            {"zone_name": "test-site.gpu-fault.internal"},
+        ),
+        (
+            "aws/route53/vpc-association/us-east-1/vpc-gpu",
+            "route53_vpc_association",
+            "Z123:us-east-1:vpc-gpu",
+            Ownership.EXTERNAL,
+            Policy.PRESERVE,
+            ["aws/route53/zone"],
+            {"hosted_zone_id": "Z123", "vpc_id": "vpc-gpu", "vpc_region": "us-east-1"},
+        ),
+    ):
+        resources.append(
+            InstallationResource(
+                site_id="test-site",
+                resource_key=key,
+                resource_type=kind,
+                resource_id=name,
+                region="us-east-1",
+                account_id="123456789012",
+                ownership=ownership,
+                delete_policy=policy,
+                dependencies=dependencies,
+                attributes=attributes,
+            )
+        )
+    snapshot = InstallationResourceSnapshot(site_id="test-site", resources=resources)
+    harness.snapshot = snapshot.model_copy(update={"source_sha256": snapshot.digest()})
+    harness.existing = {item.resource_key for item in resources}
+
+    result = uninstall(harness.request(), runner=harness)
+
+    assert result["delete_policy_residuals"] == 0, result
+    association = "delete:aws/route53/vpc-association/us-east-1/vpc-gpu"
+    assert association in harness.events and "delete:aws/route53/zone" in harness.events
+    assert harness.events.index(association) < harness.events.index(
+        "delete:aws/route53/zone"
+    ), "the association is detached before its zone is deleted"
+    final = load_installation_resource_snapshot(
+        harness.site.source.parent / "uninstall" / "installation-resources-final.json"
+    )
+    statuses = {item.resource_key: item.status.value for item in final.resources}
+    assert statuses["aws/route53/vpc-association/us-east-1/vpc-gpu"] == "DETACHED"
+    assert statuses["aws/route53/zone"] == "DELETED"
+
+
 @pytest.mark.parametrize("retry", [False, True])
 def test_dns_cleanup_survives_controller_owned_nlb_deletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry: bool

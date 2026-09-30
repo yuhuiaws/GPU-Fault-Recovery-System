@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.e2e.regional.acceptance_runner_common import write_json_atomic  # noqa: E402
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    write_json_atomic,
+)
 from scripts.perf.regional_capacity_registry import RUN_LABEL  # noqa: E402
 
 
@@ -174,3 +176,30 @@ class RunResources:
                 expected_uid=self.records[key]["uid"],
                 require_uid=True,
             )
+
+
+def ensure_load_service_account(
+    resources: RunResources, *, name: str, namespace: str
+) -> bool:
+    """The load Pods' ServiceAccount; created by the run when the perf namespace
+    has none, left alone when it already exists.
+
+    The Jobs name the account and the start-gate RoleBinding grants it the gate
+    read. The perf namespace normally outlives the site with the account in it;
+    live 2026-09-22 the namespace had been recreated empty and every Job failed
+    to create its Pods ("error looking up service account") until the runner
+    timed out. A run-created account carries the run label and is torn down
+    with the run's other resources.
+    """
+
+    if resources.read("serviceaccount", name) is not None:
+        return False
+    resources.create(
+        {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": name, "namespace": namespace},
+            "automountServiceAccountToken": True,
+        }
+    )
+    return True

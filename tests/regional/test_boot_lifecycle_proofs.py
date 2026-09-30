@@ -101,7 +101,7 @@ def test_completed_rolling_evidence_supplies_the_next_case_identity(
 ) -> None:
     path = tmp_path / "GF-REGIONAL-BOOT-020.json"
     recorder = EvidenceRecorder(path, case_id=rolling.CASE_ID, inputs={})
-    recorder.document["stages"]["full_after"] = {
+    recorder.document["stages"]["restore_after"] = {
         "release_id": "release-full",
         "live": {"clusters": {"cluster-a": {}}},
     }

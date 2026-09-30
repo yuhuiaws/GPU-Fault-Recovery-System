@@ -58,7 +58,7 @@ def test_notify008_native_execution_requires_an_explicit_url_and_private_grant(
         capture_output=True,
         text=True,
         check=False,
-        timeout=30,
+        timeout=180,  # a nested pytest under a loaded release gate (12 workers) exceeded 30 s
     )
     output = result.stdout + result.stderr
     if explicit:

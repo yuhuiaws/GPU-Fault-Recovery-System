@@ -484,3 +484,38 @@ def test_preflight_repair_survives_owned_bootstrap_checkpoints(
         "bootstrap reused preflight's old database proof instead of rereading"
     )
     assert instance.runner.jobs == {}, "bootstrap handoff left an owned proof Job"
+
+
+def test_same_candidate_reproof_keeps_the_pinned_state_digest_recognisable(
+    monkeypatch,
+) -> None:
+    """A retried candidate re-proves over its own READY journal (2026-09-28 #2).
+
+    The first attempt left the journal READY and failed a later preflight gate.
+    The retry pinned the deployment diff over the state *with* that journal,
+    then the preflight re-proof rewrote the journal; the deploy phase must
+    still recognise the digest it pinned, or the release refuses itself.
+    """
+
+    instance = repair_release(monkeypatch)
+    prepare(instance)
+    assert instance.state[REPAIR.REPAIR_KEY]["status"] == "READY", (
+        "first attempt did not leave a READY journal"
+    )
+    pinned = canonical_sha256(instance.state)
+    assert not REPAIR.matches_pre_repair_state(instance, instance.state, "0" * 64), (
+        "an unrelated digest matched the journal"
+    )
+    prepare(instance)
+    assert canonical_sha256(instance.state) != pinned, (
+        "the re-proof left the state unchanged; the scenario is not reproduced"
+    )
+    assert REPAIR.matches_pre_repair_state(instance, instance.state, pinned), (
+        "the deploy phase rejected the digest it pinned over the candidate's own journal"
+    )
+    assert instance.state[REPAIR.REPAIR_KEY]["resumed_state_sha256"] == pinned, (
+        "the journal did not record the digest the retry was pinned over"
+    )
+    assert not REPAIR.matches_pre_repair_state(instance, instance.state, "0" * 64), (
+        "an unrelated digest matched the rewritten journal"
+    )

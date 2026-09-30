@@ -108,6 +108,15 @@ TRANSPORT_RETRYABLE_SOURCE = "executor-retryable-transport"
 # the queue instead of parking for a window, and ``result_details`` is echoed
 # unchanged (see ``CommandLifecycle._release_on_shutdown``).
 SHUTDOWN_RELEASE_STATUS_SOURCE = "executor-released-on-shutdown"
+# The ``status_source`` of the WAITING an executor posts for a command whose
+# cancellation it observed at lease admission, before any adapter ran: the lease
+# is confirmed its own and nothing started, so the row must not stay LEASED (the
+# store turns the post into FAILED/completed-after-cancellation and the engine
+# reads ``node_action_not_started`` as a resolved no-start). Live 2026-09-28: a
+# lifetime deadline that landed exactly at re-claim left a compound reset
+# carrier LEASED for ever and parked the workflow NEEDS_OPERATOR with no
+# support hand-off.
+CANCELLED_BEFORE_START_STATUS_SOURCE = "executor-cancelled-before-start"
 
 # The keys a retryable WAITING report adds on top of the adapter's own record.
 # They describe one failed attempt by one executor, not the operation, so the
@@ -383,6 +392,56 @@ class CommandLifecycle:
         )
         return True
 
+    def _report_cancelled_before_start(
+        self, command: RemoteActionCommand, reason: str
+    ) -> bool:
+        """Answer a cancellation observed at admission: not started, nothing ran.
+
+        The store records the post as FAILED with
+        ``status_source=completed-after-cancellation`` and
+        ``post_cancellation_status=WAITING``; ``node_action_not_started`` on the
+        echoed details is what lets ``node_action_uncertainty`` treat the step
+        as a known no-start rather than an unknown outcome, so the compensation
+        restore and the operator hand-off proceed. Not retried: a lapsed lease
+        is the pre-existing behaviour and is logged as such.
+        """
+
+        if not command.lease_token:
+            return False
+        result = RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=RemoteCommandStatus.WAITING,
+            status_source=CANCELLED_BEFORE_START_STATUS_SOURCE,
+            details={
+                **command.result_details,
+                "node_action_not_started": True,
+                "cancelled_before_start": True,
+                "cancellation_reason": reason,
+            },
+        )
+        try:
+            self.executor.client.complete(command, result)
+        except Exception as exc:
+            LOGGER.warning(
+                "cancelled regional command could not report its no-start; its "
+                "lease lapses on the control plane's schedule: command=%s "
+                "cluster=%s %s: %s",
+                command.command_id,
+                command.cluster_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        self.executor.metrics.result_posted(result.status)
+        LOGGER.warning(
+            "regional command cancelled before it started: command=%s cluster=%s "
+            "reason=%s",
+            command.command_id,
+            command.cluster_id,
+            reason,
+        )
+        return True
+
     def _confirmed_deadline(
         self,
         response: RemoteActionCommand,
@@ -458,7 +517,12 @@ class CommandLifecycle:
                 command.cluster_id,
                 watch.hold_reason() or "executor shutdown",
             )
-            if (
+            if watch.cancellation_reason is not None and not watch.lost():
+                # Refused because the control plane cancelled the command and
+                # the lease is confirmed ours: nothing ran, so say so instead
+                # of leaving the row LEASED with a cancellation nobody answers.
+                self._report_cancelled_before_start(command, watch.cancellation_reason)
+            elif (
                 self.executor.stop_requested
                 and not watch.lost()
                 and watch.cancellation_reason is None

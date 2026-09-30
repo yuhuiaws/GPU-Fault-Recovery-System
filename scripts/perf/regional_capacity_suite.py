@@ -49,7 +49,11 @@ if TYPE_CHECKING or __package__:
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
     from .regional_capacity_job import build_job as _build_job
-    from .regional_capacity_resources import RunResources, run_manifest
+    from .regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
 else:
     import regional_capacity_data as capacity_data
     import regional_capacity_database as capacity_database
@@ -59,7 +63,11 @@ else:
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
     from regional_capacity_job import build_job as _build_job
-    from regional_capacity_resources import RunResources, run_manifest
+    from regional_capacity_resources import (
+        RunResources,
+        ensure_load_service_account,
+        run_manifest,
+    )
 
 AWS_REGION = capacity_registry.AWS_REGION
 CONNECTION_SECRET = capacity_registry.CONNECTION_SECRET
@@ -107,6 +115,7 @@ TEMPLATE_CONFIGMAP = "gpu-fault-perf-suite-templates"
 START_GATE_CONFIGMAP = "gpu-fault-perf-start-gate"
 START_GATE_ROLE = "gpu-fault-perf-start-gate-reader"
 START_GATE_ROLE_BINDING = "gpu-fault-perf-start-gate-reader"
+LOAD_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
 CASES = {
     "burst": {
         "script": "benchmark_synchronized_burst.py",
@@ -155,6 +164,9 @@ def upsert_configmap(
 
 
 def prepare_start_gate(*, resources: RunResources) -> None:
+    ensure_load_service_account(
+        resources, name=LOAD_SERVICE_ACCOUNT, namespace=NAMESPACE
+    )
     upsert_configmap(
         START_GATE_CONFIGMAP,
         resources=resources,
@@ -187,7 +199,7 @@ def prepare_start_gate(*, resources: RunResources) -> None:
             "subjects": [
                 {
                     "kind": "ServiceAccount",
-                    "name": "gpu-fault-completion-watcher",
+                    "name": LOAD_SERVICE_ACCOUNT,
                     "namespace": NAMESPACE,
                 }
             ],
@@ -1002,6 +1014,7 @@ def purge_audit_rows(
         run_id=run_id,
         cluster_ids=intent["cluster_ids"],
         cleanup=True,
+        force_nonterminal=True,  # executor Jobs are gone; open commands never finish
     )
     if type(result.get("total")) is not int or result["total"] != 0:
         raise RuntimeError("capacity exact run-owned cleanup left data")
@@ -1058,11 +1071,8 @@ def _teardown_once(
     if purge:
         purge_audit_rows(run_id=run_id, artifacts=artifacts)
     if deregister_clusters:
-        deregister(
-            scope=scope,
-            artifacts=artifacts,
-            run_id=run_id,
-        )
+        # Registry, token Secret, then the gate (a failed gate must not strand the Secret).
+        deregister(scope=scope, artifacts=artifacts, run_id=run_id, verify=False)
         delete_owned_resource(
             "secret",
             TOKEN_SECRET,
@@ -1071,6 +1081,9 @@ def _teardown_once(
             namespace=NAMESPACE,
             expected_uid=token_uid,
             require_uid=True,
+        )
+        capacity_registry.verify_registry_alignment(
+            artifacts=artifacts, phase="postflight"
         )
 
 

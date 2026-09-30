@@ -42,7 +42,7 @@ class Nvlink74SupportEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[GPU故障][XID 74 NVLink] {cluster_id} "
+                f"[GPU FAULT][XID 74 NVLink] {cluster_id} "
                 f"{', '.join(node_ids) or 'UNKNOWN'}"
             ),
             body_text=body,

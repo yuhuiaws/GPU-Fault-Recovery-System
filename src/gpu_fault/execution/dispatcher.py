@@ -11,6 +11,7 @@ from typing import Callable, Literal, TypeVar
 from pydantic import ValidationError
 
 from gpu_fault.compile_blocked import close_compile_blocked_workflows
+from gpu_fault.execution.receipt_settled_resume import resume_receipt_settled_workflows
 from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
@@ -1265,16 +1266,14 @@ class WorkflowDispatcher:
         )
 
     def sweep_stuck_records(self, now: datetime) -> set[str]:
-        """Close the records nothing else will -- by Store predicate, never age.
-
-        Abandoned and retired generations, compile-time BLOCKED no-ops and remote
-        commands a terminal workflow left open; not counted into the dispatch
-        report. Returns the still-settling retired generations the scan withholds.
-        """
+        """Close the records nothing else will -- by Store predicate, never age:
+        abandoned/retired generations, compile-time BLOCKED no-ops, receipt-settled
+        parked records, orphaned commands. Returns the retired generations withheld."""
 
         self._supersede_abandoned_generations(now)
         retired = self._revoke_retired_generations(now)
         close_compile_blocked_workflows(self.store, now=now)
+        resume_receipt_settled_workflows(self.store, now=now)
         cancel_orphaned_commands(self.store, now=now)
         return retired
 

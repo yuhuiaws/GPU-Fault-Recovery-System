@@ -188,8 +188,8 @@ def test_gpu_count_change_waits_for_explicit_admin_approval() -> None:
     assert len(store.list_notifications()) == 1
     assert sent == [waiting.details["notification_id"]]
     body = store.list_notifications()[0].body_text
-    assert "一、发生了什么" in body
-    assert "二、建议管理员做什么" in body
+    assert "1. What happened" in body
+    assert "2. What the administrator should do" in body
     assert "global batch size" in body
     assert "learning rate" in body
     assert (
@@ -781,7 +781,7 @@ def test_pytorch_restart_creates_new_attempt_metadata() -> None:
     assert len(notifications) == 1
     assert sent == [notifications[0].notification_id]
     assert completed.details["notification_id"] == (notifications[0].notification_id)
-    assert "系统动作：RESTART_WORKLOAD" in notifications[0].body_text
+    assert "System action: RESTART_WORKLOAD" in notifications[0].body_text
     assert attempt_id in notifications[0].body_text
 
 
@@ -843,7 +843,7 @@ def test_zero_gpu_workload_can_restart_when_counts_match() -> None:
     assert store.get_restart_budget("cluster-a", "train-1").restart_count == 1
     notifications = store.list_notifications()
     assert len(notifications) == 1
-    assert "原 GPU 数量：0" in notifications[0].body_text
+    assert "Previous GPU count: 0" in notifications[0].body_text
 
 
 def test_restart_reservation_is_idempotent_and_persistent(tmp_path) -> None:

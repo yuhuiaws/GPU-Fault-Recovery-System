@@ -242,6 +242,7 @@ def admin_config_renderer_environment(
         "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": str(capacity.managed_node_count),
         "GPU_FAULT_TELEMETRY_SPOOL": str(spool.enabled).lower(),
         "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS": str(spool.replicas),
+        "GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH": str(spool.max_cluster_depth),
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": str(remediation.max_active_region),
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": str(
             remediation.max_active_per_cluster

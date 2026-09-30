@@ -45,6 +45,10 @@ from scripts.e2e.regional import destr018_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.drill_incident_cleanup import (  # noqa: E402
+    isolation_evidence,
+    node_isolated,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -1114,7 +1118,7 @@ def _refuse_residual_map(residuals: dict[str, bool]) -> dict[str, bool]:
     return residuals
 
 
-def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
+def restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
     """Release the isolation through a validated restore, never by hand.
 
     The taint is owned by whichever incident quarantined the node -- the
@@ -1133,7 +1137,30 @@ def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
     )
     if not isolated:
         return {"isolated": False}
-    candidates = [item for item in (run.support_incident_id, run.incident_id) if item]
+    # The support incident id is learned in the verdict phase; when that phase
+    # stops at an earlier failed assertion (live 2026-09-27) it is still empty,
+    # so read the owner off the node itself and by the escalation's naming.
+    annotated = str(
+        (snapshot.get("ownership_annotations") or {}).get("gpu-fault.io/incident-id")
+        or ""
+    )
+    conventional = (
+        f"inc-support-after-{run.workflow_request_id}"
+        if run.workflow_request_id
+        else ""
+    )
+    candidates = list(
+        dict.fromkeys(
+            item
+            for item in (
+                run.support_incident_id,
+                annotated,
+                conventional,
+                run.incident_id,
+            )
+            if item
+        )
+    )
     if not candidates:
         raise RegionalFixtureError("the node is isolated but no incident is known")
     warm = WarmSpareLiveFixture(run.regional, "")
@@ -1185,12 +1212,43 @@ def close_reset_incident(run: _LiveRun) -> dict[str, Any]:
     if before.get("state") == "RECOVERED":
         return {"closed": False, "state": "RECOVERED"}
     warm.wait_incident_idle(run.incident_id)
-    created = warm.create_restore_workflow(
-        incident_id=run.incident_id,
-        node=run.settings.node,
-        profile_version=run.profile_version,
-        reason=f"{CASE_ID} close the lifetime-escalated reset incident",
-    )
+    try:
+        created = warm.create_restore_workflow(
+            incident_id=run.incident_id,
+            node=run.settings.node,
+            profile_version=run.profile_version,
+            reason=f"{CASE_ID} close the lifetime-escalated reset incident",
+        )
+    except RegionalFixtureError as exc:
+        # The validated restore refuses the reset incident when its compound
+        # command left a physical outcome unresolved ("operator hold retained",
+        # live 2026-09-27). Once the support incident's restore has lifted the
+        # isolation, the product's operator exit is the isolation-evidence
+        # close -- the same service call `workflow-reconcile --close-quarantined`
+        # makes -- so take it here instead of leaving the record QUARANTINED.
+        snapshot = run.regional.node_snapshot(run.settings.node)
+        evidence = isolation_evidence(run.settings.node, snapshot)
+        if node_isolated(evidence):
+            raise
+        closed = warm.close_incident_with_evidence(
+            run.incident_id,
+            reason=f"{CASE_ID} validated cleanup: the restore through the reset "
+            "incident was refused and nothing isolates the node any more",
+            operator="acceptance-fixture",
+            reference=None,
+            evidence=[evidence],
+        )
+        if closed.get("refusal"):
+            raise RegionalFixtureError(
+                f"evidence close of {run.incident_id} was refused: {closed['refusal']}"
+            ) from exc
+        return {
+            "closed": True,
+            "method": "isolation-evidence",
+            "restore_refusal": str(exc),
+            "previous_state": before.get("state"),
+            "state": closed.get("state"),
+        }
     restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
     if restored.get("status") != "SUCCEEDED":
         raise RegionalFixtureError(
@@ -1241,7 +1299,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
                 timeout=120,
             ),
         )
-    guard("restore_isolated_node", lambda: _restore_isolated_node(run))
+    guard("restore_isolated_node", lambda: restore_isolated_node(run))
     guard("close_reset_incident", lambda: close_reset_incident(run))
     # Only now may the Deployment roll again.
     if run.window_opened:

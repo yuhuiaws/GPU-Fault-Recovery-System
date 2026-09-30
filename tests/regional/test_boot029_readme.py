@@ -309,6 +309,57 @@ def test_operator_path_keeps_tool_directories_and_drops_venvs_and_admins(
         readme.operator_path(f"{venv}{os.pathsep}{admin_dir}")
 
 
+def test_operator_path_shadows_a_tool_directory_that_also_offers_an_admin(
+    tmp_path: Path,
+) -> None:
+    """/usr/local/bin holding kubectl, helm AND an old deploy-host shim must not
+    cost the README its prerequisite tools: the shim alone is left out."""
+
+    tools = tmp_path / "usr/local/bin"
+    venv = tmp_path / "checkout/.venv/bin"
+    tools.mkdir(parents=True)
+    venv.mkdir(parents=True)
+    for name in ("gpu-fault-admin", "kubectl", "helm"):
+        tool = tools / name
+        tool.write_text("#!/bin/sh\n", encoding="utf-8")
+        tool.chmod(0o755)
+    (tools / "README.txt").write_text("not a tool\n", encoding="utf-8")
+    (tools / "notes.sh").write_text("#!/bin/sh\n", encoding="utf-8")  # not executable
+    (venv / "gpu-fault-admin").write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv / "gpu-fault-admin").chmod(0o755)
+    shadow_root = tmp_path / "attempt-1/operator-path"
+    parent = os.pathsep.join([str(venv), "/usr/bin", str(tools), str(tools)])
+
+    kept = readme.operator_path(parent, shadow_root).split(os.pathsep)
+
+    assert kept[0] == "/usr/bin", "plain tool directories keep their place"
+    assert len(kept) == 2, "the venv is dropped, the tool directory is stood in once"
+    shadow = Path(kept[1])
+    assert shadow.parent == shadow_root and shadow.name == "01-bin", (
+        "the stand-in lives under the attempt's shadow root at the entry's position"
+    )
+    assert sorted(child.name for child in shadow.iterdir()) == ["helm", "kubectl"], (
+        "every executable except gpu-fault-admin is linked; plain files and"
+        " non-executables are not"
+    )
+    assert (shadow / "kubectl").resolve() == (tools / "kubectl").resolve(), (
+        "links point at the operator's own tools"
+    )
+    assert not (shadow / "gpu-fault-admin").exists(), (
+        "the stand-in never offers a gpu-fault-admin"
+    )
+    assert readme.operator_path(parent, shadow_root).split(os.pathsep) == kept, (
+        "re-running the same PATH re-uses the stand-in"
+    )
+    environment = readme.clean_environment({"PATH": parent, "HOME": "/h"}, shadow_root)
+    assert environment["PATH"].split(os.pathsep) == kept, (
+        "clean_environment applies the same stand-in rule"
+    )
+    assert readme.operator_path(parent).split(os.pathsep) == ["/usr/bin"], (
+        "without a shadow root the directory is still dropped"
+    )
+
+
 def test_pristine_copy_carries_the_dirty_checkout_but_not_its_venv(
     tmp_path: Path,
 ) -> None:
@@ -512,7 +563,9 @@ def test_run_executes_the_readme_procedure_in_a_clean_environment(
     copy = Path(dump["cwd"])
     assert copy.is_relative_to(tmp_path / "work/attempt-1") and copy != repository
     environment = dump["env"]
-    operator = readme.operator_path(parent["PATH"])
+    operator = readme.operator_path(
+        parent["PATH"], tmp_path / "work/attempt-1/operator-path"
+    )
     assert environment["PATH"] == f"{copy}/.venv/bin:{operator}", (
         "only the README's activation extends the operator's filtered PATH"
     )

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence, cast
 
 from gpu_fault.admin.aurora_capacity import (
     CAPACITY_SETTLE_STABLE_POLLS,
@@ -475,8 +475,11 @@ def ensure_serverless_instances(
                 "db.serverless",
                 "--availability-zone",
                 availability_zone,
+                # The writer is tier 0; the reader tier 1, so an RDS-initiated
+                # failover prefers the instance that was placed as the writer
+                # (the control-plane zone, see ``writer_first_zones``).
                 "--promotion-tier",
-                "0",
+                "0" if instance_id == instance_ids[0] else "1",
                 *(
                     ["--tags", f"Key={SITE_TAG_KEY},Value={site_id}"]
                     if site_id is not None
@@ -491,6 +494,282 @@ def ensure_serverless_instances(
             runner, aws_region=aws_region, instance_ids=instance_ids
         )
     return instance_ids
+
+
+NODE_ZONE_LABELS = (
+    "topology.kubernetes.io/zone",
+    "failure-domain.beta.kubernetes.io/zone",
+)
+WRITER_ZONE_FAILOVER_TIMEOUT_SECONDS = 600.0
+
+
+def control_plane_node_zones(node_document: Mapping[str, Any]) -> list[str]:
+    """One zone per CPU node from a ``kubectl get nodes -o json`` document."""
+
+    zones: list[str] = []
+    for item in node_document.get("items") or ():
+        labels = (item.get("metadata") or {}).get("labels") or {}
+        for key in NODE_ZONE_LABELS:
+            zone = labels.get(key)
+            if isinstance(zone, str) and zone:
+                zones.append(zone)
+                break
+    return zones
+
+
+def cpu_nodes_document(
+    runner: CommandRunner, *, kubeconfig: Path, hyperpod_name: str
+) -> dict[str, Any]:
+    """The CPU HyperPod nodes as kubectl lists them (addresses and zone labels)."""
+
+    return dict(
+        json.loads(
+            runner.run(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(kubeconfig),
+                    "get",
+                    "nodes",
+                    "-l",
+                    f"sagemaker.amazonaws.com/cluster-name={hyperpod_name}",
+                    "-o",
+                    "json",
+                ]
+            )
+        )
+    )
+
+
+def cpu_node_security_groups(
+    runner: CommandRunner, *, aws_region: str, document: Mapping[str, Any]
+) -> list[str]:
+    """Security Groups of the CPU nodes' ENIs (the Aurora ingress sources)."""
+
+    ips = sorted(
+        {
+            address["address"]
+            for item in document.get("items", [])
+            for address in item.get("status", {}).get("addresses", [])
+            if address.get("type") == "InternalIP"
+        }
+    )
+    if not ips:
+        raise BootstrapError("CPU HyperPod has no node InternalIP")
+    interfaces = cast(
+        list[dict[str, Any]],
+        runner.aws_json(
+            aws_region,
+            "ec2",
+            "describe-network-interfaces",
+            "--filters",
+            "Name=addresses.private-ip-address,Values=" + ",".join(ips),
+        ).get("NetworkInterfaces", []),
+    )
+    groups = sorted(
+        {
+            group["GroupId"]
+            for interface in interfaces
+            for group in interface.get("Groups", [])
+        }
+    )
+    if not groups:
+        raise BootstrapError("cannot discover CPU node Security Groups")
+    return groups
+
+
+def reconcile_writer_zone(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_ids: Sequence[str],
+    control_plane_zones: Sequence[str],
+    kubeconfig: Path,
+    hyperpod_name: str,
+) -> dict[str, Any]:
+    """``ensure_writer_zone_affinity`` for ``aurora_ready``: a checkpoint written
+    before the zones were recorded reads them from the CPU nodes now."""
+
+    zones = [str(item) for item in control_plane_zones]
+    if not zones:
+        zones = control_plane_node_zones(
+            cpu_nodes_document(
+                runner, kubeconfig=kubeconfig, hyperpod_name=hyperpod_name
+            )
+        )
+    return ensure_writer_zone_affinity(
+        runner,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
+        control_plane_zones=zones,
+    )
+
+
+def writer_first_zones(
+    availability_zones: Sequence[str], control_plane_zones: Sequence[str]
+) -> list[str]:
+    """Order the Aurora zones so the writer lands where the control plane runs.
+
+    The initial writer is the first instance created, so the zone at index 0
+    decides where every database round-trip of the API Pods terminates. A
+    writer in another zone than the CPU nodes costs a cross-zone hop per query;
+    the 2026-09-27 fresh bootstrap put the writer in us-west-2b under a
+    control plane entirely in us-west-2a and the §8.4 50-cluster load then
+    returned 3x the reserved 503s (2.1-2.6 % against 0.7 %) until the writer
+    was failed over. The most common CPU node zone that also has a private
+    subnet goes first; without a match the order is left alone.
+    """
+
+    ordered = list(availability_zones)
+    counts: dict[str, int] = {}
+    for zone in control_plane_zones:
+        counts[zone] = counts.get(zone, 0) + 1
+    for zone, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        if zone in ordered:
+            ordered.remove(zone)
+            return [zone, *ordered]
+    return ordered
+
+
+def ensure_writer_zone_affinity(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_ids: Sequence[str],
+    control_plane_zones: Sequence[str],
+    timeout_seconds: float = WRITER_ZONE_FAILOVER_TIMEOUT_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Fail the cluster over when its writer runs outside the control-plane zone.
+
+    Creation order places the writer (``writer_first_zones``), but an RDS
+    failover, a resumed bootstrap or a site created before this rule can leave
+    the writer elsewhere. When another available member sits in a control-plane
+    zone, ``failover-db-cluster`` targets it and the call waits for the cluster
+    to report that member as the writer. With no such member nothing is done
+    and the report says why.
+    """
+
+    wanted = set(control_plane_zones)
+    if not wanted or not instance_ids:
+        return {"action": "none", "reason": "control-plane zones unknown"}
+    statuses = _instance_placements(
+        runner, aws_region=aws_region, cluster_id=cluster_id
+    )
+    writer_id = _cluster_writer(runner, aws_region=aws_region, cluster_id=cluster_id)
+    writer_zone = (statuses.get(writer_id) or {}).get("availability_zone")
+    report = {
+        "writer": writer_id,
+        "writer_zone": writer_zone,
+        "control_plane_zones": sorted(wanted),
+    }
+    if writer_zone in wanted:
+        return {"action": "none", **report}
+    candidates = [
+        instance_id
+        for instance_id in instance_ids
+        if instance_id != writer_id
+        and (statuses.get(instance_id) or {}).get("availability_zone") in wanted
+        and (statuses.get(instance_id) or {}).get("status") == "available"
+    ]
+    if not candidates:
+        return {
+            "action": "none",
+            "reason": "no available member in a control-plane zone",
+            **report,
+        }
+    target = candidates[0]
+    runner.run(
+        [
+            "aws",
+            "rds",
+            "failover-db-cluster",
+            "--region",
+            aws_region,
+            "--db-cluster-identifier",
+            cluster_id,
+            "--target-db-instance-identifier",
+            target,
+        ],
+        mutate=True,
+        capture=False,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        cluster = _cluster_document(
+            runner, aws_region=aws_region, cluster_id=cluster_id
+        )
+        writers = [
+            member.get("DBInstanceIdentifier")
+            for member in cluster.get("DBClusterMembers") or []
+            if member.get("IsClusterWriter")
+        ]
+        if cluster.get("Status") == "available" and writers == [target]:
+            return {"action": "failover", "target": target, **report}
+        if time.monotonic() >= deadline:
+            raise BootstrapError(
+                f"Aurora writer failover to {target} did not settle within "
+                f"{timeout_seconds:.0f}s (status={cluster.get('Status')}, writers={writers})"
+            )
+        sleep(15.0)
+
+
+def _instance_placements(
+    runner: CommandRunner, *, aws_region: str, cluster_id: str
+) -> dict[str, dict[str, str]]:
+    """``DBInstanceIdentifier -> {status, availability_zone}`` from one filtered describe."""
+
+    listed = (
+        runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-instances",
+            "--filters",
+            f"Name=db-cluster-id,Values={cluster_id}",
+        ).get("DBInstances")
+        or []
+    )
+    return {
+        str(instance.get("DBInstanceIdentifier") or ""): {
+            "status": str(instance.get("DBInstanceStatus") or ""),
+            "availability_zone": str(instance.get("AvailabilityZone") or ""),
+        }
+        for instance in listed
+    }
+
+
+def _cluster_document(
+    runner: CommandRunner, *, aws_region: str, cluster_id: str
+) -> dict[str, Any]:
+    clusters = runner.aws_json(
+        aws_region,
+        "rds",
+        "describe-db-clusters",
+        "--db-cluster-identifier",
+        cluster_id,
+    ).get("DBClusters")
+    if (
+        not isinstance(clusters, list)
+        or len(clusters) != 1
+        or clusters[0].get("DBClusterIdentifier") != cluster_id
+    ):
+        raise BootstrapError(f"cannot describe Aurora cluster {cluster_id}")
+    return dict(clusters[0])
+
+
+def _cluster_writer(runner: CommandRunner, *, aws_region: str, cluster_id: str) -> str:
+    cluster = _cluster_document(runner, aws_region=aws_region, cluster_id=cluster_id)
+    writers = [
+        str(member.get("DBInstanceIdentifier") or "")
+        for member in cluster.get("DBClusterMembers") or []
+        if member.get("IsClusterWriter")
+    ]
+    if len(writers) != 1 or not writers[0]:
+        raise BootstrapError(f"Aurora cluster {cluster_id} has no single writer")
+    return writers[0]
 
 
 def _ensure_instance_site_tag(

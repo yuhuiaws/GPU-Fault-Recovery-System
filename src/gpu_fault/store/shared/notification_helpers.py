@@ -70,8 +70,8 @@ def with_incident_drill_label(
             "drill_id": drill_id,
             "subject": f"[DRILL:{drill_id}] {notification.subject}",
             "body_text": (
-                "【演练通知 / DRILL - 非真实故障】\n"
-                f"Drill ID：{drill_id}\n\n" + notification.body_text
+                "[DRILL NOTIFICATION - NOT A REAL FAULT]\n"
+                f"Drill ID: {drill_id}\n\n" + notification.body_text
             ),
         }
     )

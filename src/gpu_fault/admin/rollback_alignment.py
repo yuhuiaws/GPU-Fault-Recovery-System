@@ -148,11 +148,11 @@ def find_previous_release_manifest(
     physical_matches: list[tuple[Path, str, str]] = []
     release_id_matches: list[tuple[Path, str, str]] = []
     delivery_matches: list[tuple[Path, str, str]] = []
-    snapshots = state_dir.expanduser().resolve() / "source-snapshots"
-    for path in snapshots.glob("*/repository-*/dist/*/release.json"):
+
+    def consider(path: Path) -> None:
         identity = _release_manifest_identity(path, previous)
         if identity is None:
-            continue
+            return
         (
             candidate_id,
             digest,
@@ -166,10 +166,27 @@ def find_previous_release_manifest(
             release_id_matches.append((path, candidate_id, digest))
         if delivery_match:
             delivery_matches.append((path, candidate_id, digest))
+
+    # The snapshot records where the previous release's manifest was read from.
+    # A release delivered from outside source-snapshots (BOOT-020's chained
+    # candidates live in <state-dir>/boot020-work-*/wt-*/dist) is only findable
+    # there; the path is still held to the same identity evidence as the scan.
+    recorded = str(previous.get("release_manifest_path") or "")
+    recorded_path = Path(recorded).expanduser() if recorded else None
+    if recorded_path is not None and recorded_path.is_file():
+        consider(recorded_path.resolve())
+    snapshots = state_dir.expanduser().resolve() / "source-snapshots"
+    if not (physical_matches or release_id_matches or delivery_matches):
+        for path in snapshots.glob("*/repository-*/dist/*/release.json"):
+            consider(path)
     matches = physical_matches or release_id_matches or delivery_matches
     if not matches:
+        searched = f"{snapshots}/*/repository-*/dist/*/release.json"
+        if recorded:
+            searched = f"recorded manifest {recorded} and {searched}"
         raise SiteConfigError(
-            "cannot locate the immutable previous release after rollback"
+            "cannot locate the immutable previous release after rollback "
+            f"(searched {searched})"
         )
     identities = {(candidate_id, digest) for _path, candidate_id, digest in matches}
     if len(identities) != 1:

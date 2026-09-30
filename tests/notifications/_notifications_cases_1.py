@@ -88,8 +88,8 @@ def test_store_labels_drill_notification_from_incident() -> None:
     assert saved.subject.startswith("[DRILL:maintenance-42]"), (
         'expected saved.subject.startswith("[DRILL:maintenance-42]") to be truthy'
     )
-    assert "演练通知 / DRILL - 非真实故障" in saved.body_text
-    assert "Drill ID：maintenance-42" in saved.body_text
+    assert "DRILL NOTIFICATION - NOT A REAL FAULT" in saved.body_text
+    assert "Drill ID: maintenance-42" in saved.body_text
 
 
 def test_store_labels_performance_notification_without_incident() -> None:
@@ -110,7 +110,7 @@ def test_store_labels_performance_notification_without_incident() -> None:
     assert saved.subject.startswith("[DRILL:perf-capacity]"), (
         "performance notification subject was not labeled as a drill"
     )
-    assert "演练通知 / DRILL - 非真实故障" in saved.body_text
+    assert "DRILL NOTIFICATION - NOT A REAL FAULT" in saved.body_text
 
 
 def test_remote_fabric_manager_completion_creates_one_drill_notification() -> None:
@@ -203,14 +203,14 @@ def test_warm_spare_replacement_email_lists_rebinding() -> None:
         provider_mutation_submitted=False,
     )
 
-    assert "warm-spare替换成功" in notification.subject
+    assert "warm-spare replacement succeeded" in notification.subject
     assert "node-old -> node-spare" in notification.body_text
-    assert "Provider replacement API submitted：false" in (notification.body_text)
+    assert "Provider replacement API submitted: false" in (notification.body_text)
     assert "incident-a" in notification.body_text
     assert "workflow-a" in notification.body_text
     assert "healthy-running-warm-spare" in notification.body_text
     assert "GPU/Fabric validation" in notification.body_text
-    assert "Workflow 最终状态为准" in notification.body_text
+    assert "the workflow's final state" in notification.body_text
     assert notification.deduplication_key.endswith(
         "/warm-spare-replacement/workflow-a/4/REPLACE_NODE"
     ), (
@@ -234,9 +234,9 @@ def test_xid74_support_email_uses_fixed_decoded_template() -> None:
 
     assert NVLINK74_SUPPORT_TEMPLATE_VERSION in notification.body_text
     assert "register4.bit18" in notification.body_text
-    assert "reset、节点 reboot" not in notification.body_text
-    assert "未执行 XID 74 单 GPU reset" in notification.body_text
-    assert "unschedulable 和 quarantine" not in notification.body_text
+    assert "No single-GPU reset was performed for XID 74" in notification.body_text
+    assert "Automatic recovery steps that failed" not in notification.body_text
+    assert "stay unschedulable and quarantined" not in notification.body_text
 
 
 def test_xid74_mechanical_email_uses_fixed_acknowledgement() -> None:
@@ -255,7 +255,7 @@ def test_xid74_mechanical_email_uses_fixed_acknowledgement() -> None:
     assert "xid74-mechanical-zh-v1" in notification.body_text
     assert "register1.bit8=1" in notification.body_text
     assert "incident-xid74:2" in notification.body_text
-    assert "不会自动确认" in notification.body_text
+    assert "never confirms the physical check on its own" in notification.body_text
 
 
 def test_xid_investigatory_email_uses_fixed_field_template() -> None:
@@ -281,9 +281,11 @@ def test_xid_investigatory_email_uses_fixed_field_template() -> None:
     )
 
     assert XID_INVESTIGATORY_TEMPLATE_VERSION in notification.body_text
-    assert "NVIDIA Immediate Action：RESTART_APP" in notification.body_text
-    assert "NVIDIA Investigatory Action：CHECK_APP/CUDA" in (notification.body_text)
-    assert "不会自动执行 Investigatory Action" in notification.body_text
+    assert "NVIDIA immediate action: RESTART_APP" in notification.body_text
+    assert "NVIDIA investigatory action: CHECK_APP/CUDA" in (notification.body_text)
+    assert (
+        "does not execute investigatory actions automatically" in notification.body_text
+    )
     assert "{investigatory_action}" in XID_INVESTIGATORY_EMAIL_TEMPLATE
     assert "prompt" not in XID_INVESTIGATORY_EMAIL_TEMPLATE.lower()
 
@@ -408,12 +410,12 @@ def test_gpu_count_change_email_is_actionable() -> None:
         approval_annotation="24:16",
     )
 
-    assert "一、发生了什么" in notification.body_text
-    assert "二、建议管理员做什么" in notification.body_text
+    assert "1. What happened" in notification.body_text
+    assert "2. What the administrator should do" in notification.body_text
     assert RESTART_GUARD_TEMPLATE_VERSION in notification.body_text
-    assert "当前没有创建新的训练 workload" in notification.body_text
-    assert "方案 A：恢复原资源" in notification.body_text
-    assert "方案 B：接受 16 张 GPU" in notification.body_text
+    assert "No new training workload was created" in notification.body_text
+    assert "Option A: restore the original resources" in notification.body_text
+    assert "Option B: accept 16 GPUs" in notification.body_text
     assert "world size" in notification.body_text
     assert (
         'kubectl --context "${GPU_FAULT_KUBE_CONTEXT:'
@@ -458,14 +460,14 @@ def test_workload_restart_email_is_a_field_only_template() -> None:
         restart_budget=2,
     )
 
-    assert "系统动作：RESTART_WORKLOAD" in notification.body_text
-    assert "原 attempt：training-a-a001" in notification.body_text
-    assert "新 attempt：training-a-a001-r-abcd1234" in notification.body_text
-    assert "原 GPU 数量：24" in notification.body_text
-    assert "重启 GPU 数量：24" in notification.body_text
-    assert "本任务已使用自动重启次数：1" in notification.body_text
+    assert "System action: RESTART_WORKLOAD" in notification.body_text
+    assert "Previous attempt: training-a-a001" in notification.body_text
+    assert "New attempt: training-a-a001-r-abcd1234" in notification.body_text
+    assert "Previous GPU count: 24" in notification.body_text
+    assert "Restart GPU count: 24" in notification.body_text
+    assert "Automatic restarts used by this job: 1" in notification.body_text
     assert RESTART_WORKLOAD_TEMPLATE_VERSION in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert "prompt" not in RESTART_WORKLOAD_EMAIL_TEMPLATE.lower()
 
 
@@ -488,10 +490,10 @@ def test_gpu_reset_email_is_a_field_only_template() -> None:
         workload_ids=["training/pytorchjob/training-a"],
     )
 
-    assert "系统动作：RESET_GPU" in notification.body_text
-    assert "目标节点：worker-1" in notification.body_text
-    assert "目标 GPU UUID：GPU-a" in notification.body_text
-    assert "Status：SUCCEEDED" in notification.body_text
+    assert "System action: RESET_GPU" in notification.body_text
+    assert "Target nodes: worker-1" in notification.body_text
+    assert "Target GPU UUIDs: GPU-a" in notification.body_text
+    assert "Status: SUCCEEDED" in notification.body_text
     assert GPU_RESET_TEMPLATE_VERSION in notification.body_text
     assert "prompt" not in GPU_RESET_EMAIL_TEMPLATE.lower()
 
@@ -532,18 +534,18 @@ def test_node_restart_email_is_a_field_only_template() -> None:
         confirmation_source=("hyperpod-running-and-new-agent-incarnation"),
     )
 
-    assert "系统动作：RESTART_NODE" in notification.body_text
-    assert "故障标识：XID 79" in notification.body_text
-    assert "Policy source：NVIDIA_CATALOG" in notification.body_text
-    assert "策略动作：RESTART_BM" in notification.body_text
-    assert "Effective action：REBOOT_NODE" in notification.body_text
+    assert "System action: RESTART_NODE" in notification.body_text
+    assert "Fault identifier: XID 79" in notification.body_text
+    assert "Policy source: NVIDIA_CATALOG" in notification.body_text
+    assert "Policy action: RESTART_BM" in notification.body_text
+    assert "Effective action: REBOOT_NODE" in notification.body_text
     assert "Immediate Action for XID 79" in notification.body_text
-    assert "重启前 boot ID：boot-a" in notification.body_text
-    assert "重启后 boot ID：boot-b" in notification.body_text
-    assert "InstanceId：i-123" in notification.body_text
-    assert "HyperPod status：Running" in notification.body_text
+    assert "boot ID before restart: boot-a" in notification.body_text
+    assert "boot ID after restart: boot-b" in notification.body_text
+    assert "InstanceId: i-123" in notification.body_text
+    assert "HyperPod status: Running" in notification.body_text
     assert RESTART_NODE_TEMPLATE_VERSION in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert "prompt" not in RESTART_NODE_EMAIL_TEMPLATE.lower()
 
 
@@ -569,15 +571,15 @@ def test_fabric_manager_restart_email_is_a_field_only_template() -> None:
         workload_ids=["training/pytorchjob/training-a"],
     )
 
-    assert "系统动作：RESTART_FABRIC_MANAGER" in notification.body_text
-    assert "故障类型：XID" in notification.body_text
-    assert "策略动作：RESTART_FM" in notification.body_text
-    assert "重启前 MainPID：101" in notification.body_text
-    assert "重启后 MainPID：202" in notification.body_text
-    assert "服务状态：active" in notification.body_text
+    assert "System action: RESTART_FABRIC_MANAGER" in notification.body_text
+    assert "Fault type: XID" in notification.body_text
+    assert "Policy action: RESTART_FM" in notification.body_text
+    assert "MainPID before restart: 101" in notification.body_text
+    assert "MainPID after restart: 202" in notification.body_text
+    assert "service state: active" in notification.body_text
     assert RESTART_FABRIC_MANAGER_TEMPLATE_VERSION in notification.body_text
     assert notification.category == "ACTION_COMPLETED"
-    assert "建议" not in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert "prompt" not in RESTART_FABRIC_MANAGER_EMAIL_TEMPLATE.lower()
 
 
@@ -605,12 +607,12 @@ def test_fabric_reset_email_is_a_field_only_template() -> None:
         sxid=10003,
     )
 
-    assert "系统动作：RESET_ALL_GPUS_NVSWITCHES" in (notification.body_text)
-    assert "SXID：10003" in notification.body_text
+    assert "System action: RESET_ALL_GPUS_NVSWITCHES" in (notification.body_text)
+    assert "SXID: 10003" in notification.body_text
     assert "GPU-a, GPU-b" in notification.body_text
-    assert "Reset 后 inventory：True" in notification.body_text
+    assert "inventory after reset: True" in notification.body_text
     assert FABRIC_RESET_TEMPLATE_VERSION in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert "prompt" not in FABRIC_RESET_EMAIL_TEMPLATE.lower()
 
 
@@ -635,10 +637,10 @@ def test_node_restart_template_supports_non_xid_incidents() -> None:
         confirmation_source="explicit-operation-id",
     )
 
-    assert "故障类型：HYPERPOD_HMA" in notification.body_text
-    assert "故障标识：hma-node-health-worker-1" in notification.body_text
-    assert "Policy source：HYPERPOD_HMA" in notification.body_text
-    assert "XID：UNKNOWN" not in notification.body_text
+    assert "Fault type: HYPERPOD_HMA" in notification.body_text
+    assert "Fault identifier: hma-node-health-worker-1" in notification.body_text
+    assert "Policy source: HYPERPOD_HMA" in notification.body_text
+    assert "XID: UNKNOWN" not in notification.body_text
 
 
 def test_node_restart_template_maps_two_nodes_independently() -> None:
@@ -690,12 +692,12 @@ def test_node_restart_template_maps_two_nodes_independently() -> None:
     )
 
     body = notification.body_text
-    assert "worker-1; InstanceId：i-111" in body
-    assert "重启前 boot ID：boot-1-old" in body
-    assert "重启后 boot ID：boot-1-new" in body
-    assert "worker-2; InstanceId：i-222" in body
-    assert "重启前 boot ID：boot-2-old" in body
-    assert "重启后 boot ID：boot-2-new" in body
+    assert "worker-1; InstanceId: i-111" in body
+    assert "boot ID before restart: boot-1-old" in body
+    assert "boot ID after restart: boot-1-new" in body
+    assert "worker-2; InstanceId: i-222" in body
+    assert "boot ID before restart: boot-2-old" in body
+    assert "boot ID after restart: boot-2-new" in body
 
 
 def test_not_applicable_email_is_a_field_only_template() -> None:
@@ -724,11 +726,11 @@ def test_not_applicable_email_is_a_field_only_template() -> None:
     )
 
     assert NOT_APPLICABLE_TEMPLATE_VERSION in notification.body_text
-    assert "XID：1" in notification.body_text
-    assert "GPU 产品：H200" in notification.body_text
-    assert "Disposition：NOT_APPLICABLE" in notification.body_text
-    assert "Safety action：QUARANTINE" in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "XID: 1" in notification.body_text
+    assert "GPU product: H200" in notification.body_text
+    assert "Disposition: NOT_APPLICABLE" in notification.body_text
+    assert "Safety action: QUARANTINE" in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert "prompt" not in NOT_APPLICABLE_EMAIL_TEMPLATE.lower()
 
 
@@ -776,10 +778,10 @@ def test_not_applicable_xid_creates_and_sends_one_email() -> None:
     assert notification.incident_id.startswith("inc-"), (
         'expected notification.incident_id.startswith("inc-") to be truthy'
     )
-    assert "Workload 状态：ACTIVE" in notification.body_text
-    assert "官方恢复动作：未执行" in notification.body_text
-    assert "NVIDIA Investigatory Action：NONE" in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "Workload state: ACTIVE" in notification.body_text
+    assert "Official recovery action: not executed" in notification.body_text
+    assert "NVIDIA investigatory action: NONE" in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
     assert len(context.store.list_notifications()) == 1
 
 
@@ -821,9 +823,9 @@ def test_applicable_xid_sends_one_investigatory_email_per_event() -> None:
 
     assert len(notifier.notifications) == 1
     notification = notifier.notifications[0]
-    assert "XID：11" in notification.body_text
-    assert "NVIDIA Immediate Action：RESTART_APP" in notification.body_text
-    assert "NVIDIA Investigatory Action：CHECK_APP/CUDA" in (notification.body_text)
+    assert "XID: 11" in notification.body_text
+    assert "NVIDIA immediate action: RESTART_APP" in notification.body_text
+    assert "NVIDIA investigatory action: CHECK_APP/CUDA" in (notification.body_text)
 
 
 @pytest.mark.parametrize(
@@ -878,12 +880,12 @@ def test_every_sxid_sends_one_fixed_event_email(
 
     assert len(notifier.notifications) == 1
     notification = notifier.notifications[0]
-    assert f"SXID：{sxid}" in notification.body_text
+    assert f"SXID: {sxid}" in notification.body_text
     assert (
-        f"NVIDIA Investigatory Action：{investigatory_action}" in notification.body_text
+        f"NVIDIA investigatory action: {investigatory_action}" in notification.body_text
     )
     assert SXID_EVENT_TEMPLATE_VERSION in notification.body_text
-    assert "建议" not in notification.body_text
+    assert "What the administrator should do" not in notification.body_text
 
 
 def test_disabled_preview_does_not_consume_delivery_key() -> None:

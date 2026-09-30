@@ -70,6 +70,26 @@ def _captured_aurora(release: Any, recorded: Any) -> dict[str, float]:
     return {"min_acu": current.aurora.min_acu, "max_acu": current.aurora.max_acu}
 
 
+def _captured_spool(
+    defaults: Any,
+    *,
+    enabled: bool,
+    replicas: Any,
+    ingress_telemetry: Mapping[str, Any],
+) -> dict[str, object]:
+    """The live telemetry spool section: switch, worker replicas and the
+    per-cluster depth read back from the ingress telemetry ConfigMap."""
+
+    depth = ingress_telemetry.get("GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH")
+    return {
+        "enabled": enabled,
+        "replicas": int(defaults.replicas if replicas is None else replicas),
+        "max_cluster_depth": (
+            int(defaults.max_cluster_depth) if depth is None else int(str(depth))
+        ),
+    }
+
+
 def captured_admin_config(
     release: Any,
     snapshots: dict[str, dict[str, str]],
@@ -144,14 +164,12 @@ def captured_admin_config(
                         if worker_replicas is None
                         else worker_replicas
                     ),
-                    "telemetry_spool": {
-                        "enabled": spool_enabled == "true",
-                        "replicas": int(
-                            capacity_defaults.telemetry_spool.replicas
-                            if spool_replicas is None
-                            else spool_replicas
-                        ),
-                    },
+                    "telemetry_spool": _captured_spool(
+                        capacity_defaults.telemetry_spool,
+                        enabled=spool_enabled == "true",
+                        replicas=spool_replicas,
+                        ingress_telemetry=ingress_telemetry,
+                    ),
                     "remediation": {
                         "max_active_region": int(
                             worker_core.get(

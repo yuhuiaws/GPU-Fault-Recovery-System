@@ -22,6 +22,8 @@ from gpu_fault_release import regional_release_diff  # noqa: E402
 from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
 from gpu_fault.admin.atomic_json import write_json_atomic  # noqa: E402
 from gpu_fault.admin.config import AdminConfig  # noqa: E402
+from scripts.e2e.regional import boot020_restore_stage as restore_stage  # noqa: E402
+from scripts.e2e.regional import boot020_release_prerequisites as prerequisites  # noqa: E402
 from scripts.e2e.regional.boot020_admin_config import (  # noqa: E402
     public_config_roundtrip,
     validate_admin_target,
@@ -112,6 +114,7 @@ class ReleaseRollingBackend(Protocol):
     def node_safety(self, scenario: str) -> dict[str, Any]: ...
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]: ...
+    def cpu_env_alignment(self, scenario: str) -> dict[str, Any]: ...
 
     def deploy(
         self,
@@ -121,6 +124,7 @@ class ReleaseRollingBackend(Protocol):
         fault_phase: str | None = None,
         resume: bool = False,
         auto_rollback: bool | None = None,
+        commit: bool = False,
     ) -> dict[str, Any]: ...
 
 
@@ -399,7 +403,13 @@ def _assert_executor_pins(result: dict[str, Any], *, phase: str) -> None:
         raise ValueError(f"unknown pin phase: {phase}")
 
 
-STAGES = ("noop", "control_plane", "executor", "agent", "full")
+# ``restore`` gives the site back to its own release after candidate D
+# (scripts/e2e/regional/boot020_restore_stage.py): BOOT-023 and every later
+# case find a committed site release, no hand-run deploy owed.
+STAGES = ("noop", "control_plane", "executor", "agent", "full", "restore")
+# Stage -> release config it deploys/classifies; the restore stage applies the
+# site's own (noop) config again.
+SCENARIO_CONFIG = {"restore": restore_stage.RESTORE_SCENARIO}
 # The stage key whose presence in the evidence proves a stage ran to its end.
 STAGE_TERMINAL_KEY = {
     "noop": "noop_after",
@@ -407,6 +417,7 @@ STAGE_TERMINAL_KEY = {
     "executor": "executor_after",
     "agent": "agent_after",
     "full": "full_after",
+    "restore": "restore_after",
 }
 
 
@@ -777,11 +788,14 @@ STAGE_RUNNERS: dict[
     "executor": _stage_executor,
     "agent": _stage_agent,
     "full": _stage_full,
+    "restore": lambda backend, recorder, chain: restore_stage.stage_restore(
+        backend, recorder, chain, require=_require
+    ),
 }
 
 
 def complete_evidence(recorder: EvidenceRecorder) -> dict[str, Any]:
-    final = recorder.document["stages"].get("full_after", {})
+    final = recorder.document["stages"].get("restore_after", {})
     release_id = final.get("release_id")
     clusters = final.get("live", {}).get("clusters")
     if (
@@ -831,7 +845,7 @@ def run_release_rolling(
     *,
     start_stage: str = "noop",
 ) -> dict[str, Any]:
-    """Run the six-stage contract, optionally resuming at a later stage.
+    """Run the seven-stage contract, optionally resuming at a later stage.
 
     Every observation goes through the recorder, so a rerun over the same
     evidence file replays recorded stages instead of touching the site again.
@@ -1008,7 +1022,9 @@ class LiveReleaseRollingBackend:
         *,
         auto_rollback: bool | None = None,
     ) -> Any:
-        config = self.config_module.ReleaseConfig.load(self.configs[scenario])
+        config = self.config_module.ReleaseConfig.load(
+            self.configs[SCENARIO_CONFIG.get(scenario, scenario)]
+        )
         if auto_rollback is not None:
             config = replace(config, auto_rollback=auto_rollback)
         return self.rollout.RegionalRelease(config, self.rollout.Runner())
@@ -1157,6 +1173,11 @@ class LiveReleaseRollingBackend:
             "next_deploy": next_deploy,
         }
 
+    def cpu_env_alignment(self, scenario: str) -> dict[str, Any]:
+        return restore_stage.live_cpu_env_alignment(
+            self._release(scenario), self.inventory.CPU_RUNTIME_DEPLOYMENTS
+        )
+
     def _pin_window(self, release: Any, state: dict[str, Any]) -> dict[str, Any]:
         """The executor pin window as the metadata ConfigMap holds it now.
 
@@ -1195,6 +1216,7 @@ class LiveReleaseRollingBackend:
         fault_phase: str | None = None,
         resume: bool = False,
         auto_rollback: bool | None = None,
+        commit: bool = False,
     ) -> dict[str, Any]:
         release = self._release(scenario, auto_rollback=auto_rollback)
         active_diff = self._diff(diff)
@@ -1231,9 +1253,22 @@ class LiveReleaseRollingBackend:
                 "operation_duration_seconds": time.monotonic() - started,
             }
         state = release._load_state()
+        if (
+            commit
+            and state.get("phase") == "complete"
+            and state.get("transaction_committed") is not True
+        ):
+            # The engine's upgrade ends `complete` but uncommitted; the admin
+            # `deploy` driver commits after its own validation. The restore
+            # stage asks for that commit here (live 2026-09-26 13:20Z: the
+            # restore applied cleanly and was then refused as uncommitted).
+            release.state = dict(state)
+            release.commit_release()
+            state = release._load_state()
         return {
             "phase": state.get("phase"),
             "release_id": state.get("release_id"),
+            "transaction_committed": state.get("transaction_committed") is True,
             "injected_failure": None,
             "release_diff": diff,
             "rollback_plan": state.get("rollback_plan"),
@@ -1246,11 +1281,25 @@ class LiveReleaseRollingBackend:
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     add_live_arguments(value, confirmation=CONFIRMATION)
-    value.add_argument("--noop-config", required=True, type=Path)
-    value.add_argument("--control-plane-config", required=True, type=Path)
-    value.add_argument("--data-plane-config", required=True, type=Path)
-    value.add_argument("--agent-config", required=True, type=Path)
-    value.add_argument("--full-config", required=True, type=Path)
+    # The five chained configs. Omit any of them and the runner derives the
+    # candidates from --admin-state-dir (boot020_release_prerequisites):
+    # reused when already bound to the live snapshot, built otherwise.
+    value.add_argument("--noop-config", type=Path)
+    value.add_argument("--control-plane-config", type=Path)
+    value.add_argument("--data-plane-config", type=Path)
+    value.add_argument("--agent-config", type=Path)
+    value.add_argument("--full-config", type=Path)
+    value.add_argument(
+        "--release-candidates-dir",
+        type=Path,
+        help="where derived candidates live (default <admin-state-dir>/boot020-releases)",
+    )
+    value.add_argument(
+        "--replicas-delta",
+        type=int,
+        default=-1,
+        help="control_worker_replicas change of the CONTROL_PLANE_ONLY candidate",
+    )
     value.add_argument("--gpu-kubeconfig", type=Path)
     value.add_argument("--predecessor-evidence", default="")
     value.add_argument("--admin-state-dir", required=True, type=Path)
@@ -1285,21 +1334,17 @@ def main() -> int:
             "--resume chooses the stage from the evidence; do not also pass "
             "--start-stage"
         )
-    configs = {
-        "noop": arguments.noop_config.resolve(),
-        "control_plane": arguments.control_plane_config.resolve(),
-        "executor": arguments.data_plane_config.resolve(),
-        "agent": arguments.agent_config.resolve(),
-        "full": arguments.full_config.resolve(),
-    }
+    configs, candidates = prerequisites.resolve_release_configs(arguments)
     if len(set(configs.values())) != 5:
         raise SystemExit(
             "the five release scenarios require five distinct config files"
         )
-    for path in configs.values():
-        if not path.is_file():
-            raise SystemExit(f"release config does not exist: {path}")
-    validate_admin_target(arguments.admin_state_dir.resolve(), configs["noop"])
+    pending = candidates.get("action") == "build-at-execute"
+    if not pending:
+        for path in configs.values():
+            if not path.is_file():
+                raise SystemExit(f"release config does not exist: {path}")
+        validate_admin_target(arguments.admin_state_dir.resolve(), configs["noop"])
     previous_id, previous_path = predecessor_path(
         arguments.run_dir, CASE_ID, arguments.predecessor_evidence
     )
@@ -1308,10 +1353,14 @@ def main() -> int:
         if previous_id is not None and previous_path is not None
         else {"valid": True, "verdict": "NOT_REQUIRED"}
     )
-    config_digests = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in configs.items()
-    }
+    config_digests = (
+        {}
+        if pending
+        else {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in configs.items()
+        }
+    )
     environment = {
         "GPU_FAULT_BOOT020_CONFIGS": json.dumps(
             {name: str(path) for name, path in configs.items()}, sort_keys=True
@@ -1330,6 +1379,7 @@ def main() -> int:
         ),
         "configs": {name: str(path) for name, path in configs.items()},
         "config_sha256": config_digests,
+        "release_candidates": candidates,
         "predecessor": predecessor,
         "start_stage": "auto (--resume)" if arguments.resume else arguments.start_stage,
         "resume": arguments.resume,
@@ -1343,6 +1393,8 @@ def main() -> int:
             "assert Agent-only rollback T_safe and T_full",
             "assert FULL rollback T_safe and T_full",
             "apply FULL successfully and verify the next classification is NOOP",
+            "restore the site's own config as a committed release, verify NOOP "
+            "again and that no CPU Pod keeps candidate D's start-up environment",
         ],
     }
     if not arguments.execute:
@@ -1367,6 +1419,16 @@ def main() -> int:
     )
     if predecessor.get("valid") is not True:
         raise AcceptanceCheckError("formal predecessor evidence is not PASS")
+    if pending:
+        # Only an authorized execute run signs and pushes candidate images.
+        candidates = prerequisites.ensure_for_execute(arguments, candidates)
+        validate_admin_target(arguments.admin_state_dir.resolve(), configs["noop"])
+        config_digests = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in configs.items()
+        }
+        plan["release_candidates"] = candidates
+        plan["config_sha256"] = config_digests
     gpu_kubeconfig = configure_gpu_kubeconfig(arguments.gpu_kubeconfig)
     case_path = case_evidence_path(arguments.run_dir, CASE_ID)
     case_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1376,6 +1438,7 @@ def main() -> int:
         "admin_reference": arguments.admin_reference,
         "configs": {name: str(path) for name, path in configs.items()},
         "config_sha256": config_digests,
+        "release_candidates": candidates,
         "gpu_kubeconfig": str(gpu_kubeconfig),
     }
     recorder = EvidenceRecorder(
@@ -1384,15 +1447,17 @@ def main() -> int:
         inputs=inputs,
     )
     backend = LiveReleaseRollingBackend(configs)
+    # The restore stage leaves the site on its own release, so the hand-off for
+    # BOOT-023 is the site config itself (the noop candidate), not candidate D.
     handoff = case_path.parent / "boot023-noop.json"
-    write_json_atomic(handoff, json.loads(configs["full"].read_text(encoding="utf-8")))
+    write_json_atomic(handoff, json.loads(configs["noop"].read_text(encoding="utf-8")))
     recorder.note(
         "final_noop_handoff",
         {
             "config": str(handoff),
             "config_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
             "usable_only_after_full_pass": True,
-            "classification_stage": "full_next_classification",
+            "classification_stage": "restore_next_classification",
         },
     )
     recorder.stage(

@@ -130,6 +130,7 @@ gpu-fault-admin deploy \
 
 多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、
 签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
+首次部署先为`--admin-email`发一封SNS确认邮件；未确认时命令在第一分钟退出（nothing was deployed），点击链接后用同一参数重跑即可，或加`--wait-for-email-confirmation <分钟>`原地等待。
 首次部署后的日常变更使用`<state-dir>/deployer-venv/bin/gpu-fault-admin`。
 未绑定站点的开发checkout不能替代该CLI执行已有站点的变更；普通源码deploy和真正
 只读的查询按各自入口校验，rollback不享有普通源码deploy的豁免。见

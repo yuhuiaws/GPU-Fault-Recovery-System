@@ -69,7 +69,7 @@ class NotApplicableEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[GPU故障][NOT_APPLICABLE] {cluster_id} {node_id} XID {xid}"),
+            subject=(f"[GPU FAULT][NOT_APPLICABLE] {cluster_id} {node_id} XID {xid}"),
             body_text=body,
             support_case_draft=(
                 f"Cluster: {cluster_id}\n"

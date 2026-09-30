@@ -72,19 +72,20 @@ class RestartGuardEmailBuilder:
             "\n".join(f"   {command}" for command in approval_commands)
             if approval_commands
             else (
-                "   无法生成审批命令：源或目标 GPU 数量未知，或 workload "
-                "标识不完整。请修正资源元数据后人工重新提交任务。"
+                "   No approval command can be generated: the source or target GPU "
+                "count is unknown or the workload identity is incomplete. Fix the "
+                "resource metadata and resubmit the job manually."
             )
         )
         body = GPU_COUNT_CHANGE_EMAIL_TEMPLATE.format(
             job_id=job_id,
             attempt_id=attempt_id,
             cluster_id=cluster_id,
-            workloads=", ".join(workload_ids) or "未知",
+            workloads=", ".join(workload_ids) or "UNKNOWN",
             source_gpu_count=source,
             target_gpu_count=target,
             approval_commands=approval,
-            approval_annotation=approval_annotation or "不可用",
+            approval_annotation=approval_annotation or "UNAVAILABLE",
             incident_id=incident_id,
             template_version=RESTART_GUARD_TEMPLATE_VERSION,
         )
@@ -95,12 +96,14 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[需处理][GPU训练重启已暂停] {job_id}: {source} GPU -> {target} GPU"
+                f"[ACTION REQUIRED][GPU training restart paused] {job_id}: "
+                f"{source} GPU -> {target} GPU"
             ),
             body_text=body,
             support_case_draft=(
-                "需要管理员决定恢复原 GPU 资源，或调整并行策略和训练参数后"
-                "批准新的 GPU 数量。"
+                "An administrator must either restore the original GPU resources or "
+                "adjust the parallel strategy and training parameters and then "
+                "approve the new GPU count."
             ),
         )
 
@@ -130,13 +133,14 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[需处理][GPU训练停止自动重启] {job_id}: "
-                f"已达到 {restart_budget} 次上限"
+                f"[ACTION REQUIRED][GPU training automatic restarts stopped] {job_id}: "
+                f"limit of {restart_budget} reached"
             ),
             body_text=body,
             support_case_draft=(
-                "自动重启次数已耗尽，需要管理员调查重复故障并决定是否以"
-                "新的 job ID 重新提交。"
+                "Automatic restarts are exhausted; an administrator must investigate "
+                "the repeated failures and decide whether to resubmit under a new "
+                "job ID."
             ),
         )
 
@@ -164,7 +168,7 @@ class RestartGuardEmailBuilder:
             job_id=job_id,
             source_attempt_id=source_attempt_id,
             restart_attempt_id=restart_attempt_id,
-            workloads=", ".join(workload_ids) or "未知",
+            workloads=", ".join(workload_ids) or "UNKNOWN",
             source_gpu_count=source_gpu_count,
             target_gpu_count=target_gpu_count,
             restart_count=restart_count,
@@ -178,7 +182,7 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[通知][GPU训练任务已自动重启] {job_id}: "
+                f"[NOTICE][GPU training workload restarted automatically] {job_id}: "
                 f"{source_attempt_id} -> {restart_attempt_id}"
             ),
             body_text=body,
@@ -216,11 +220,11 @@ class RestartGuardEmailBuilder:
             provider = providers.get(node_id, {})
             baseline = agent_baselines.get(node_id, {})
             lines.append(
-                "- Node：{node}; InstanceId：{instance}; "
-                "NodeLogicalId：{logical}; 重启前 boot ID：{old_boot}; "
-                "重启后 boot ID：{new_boot}; "
-                "Agent incarnation：{incarnation}; "
-                "HyperPod status：{status}".format(
+                "- Node: {node}; InstanceId: {instance}; "
+                "NodeLogicalId: {logical}; boot ID before restart: {old_boot}; "
+                "boot ID after restart: {new_boot}; "
+                "Agent incarnation: {incarnation}; "
+                "HyperPod status: {status}".format(
                     node=node_id,
                     instance=provider.get("instance_id", "UNKNOWN"),
                     logical=provider.get("node_logical_id", "UNKNOWN"),
@@ -254,7 +258,10 @@ class RestartGuardEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[通知][GPU节点已自动重启] {cluster_id}: {', '.join(node_ids)}"),
+            subject=(
+                f"[NOTICE][GPU node restarted automatically] {cluster_id}: "
+                f"{', '.join(node_ids)}"
+            ),
             body_text=body,
             support_case_draft="",
             category="ACTION_COMPLETED",
@@ -280,8 +287,8 @@ class RestartGuardEmailBuilder:
         for node_id in sorted(node_results):
             result = node_results[node_id]
             result_lines.append(
-                "- Node：{node}; 重启前 MainPID：{previous}; "
-                "重启后 MainPID：{current}; 服务状态：{status}".format(
+                "- Node: {node}; MainPID before restart: {previous}; "
+                "MainPID after restart: {current}; service state: {status}".format(
                     node=node_id,
                     previous=result.get("previous_main_pid", "UNKNOWN"),
                     current=result.get("current_main_pid", "UNKNOWN"),
@@ -297,7 +304,7 @@ class RestartGuardEmailBuilder:
             policy_source=policy_source,
             official_action=official_action or "UNKNOWN",
             reasons=("\n".join(f"  - {item}" for item in reasons) or "  - UNKNOWN"),
-            workloads=", ".join(workload_ids) or "无",
+            workloads=", ".join(workload_ids) or "NONE",
             operation_id=operation_id,
             node_results="\n".join(result_lines) or "- UNKNOWN",
             template_version=(RESTART_FABRIC_MANAGER_TEMPLATE_VERSION),
@@ -309,7 +316,7 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                "[通知][GPU Fabric Manager 已自动重启] "
+                "[NOTICE][GPU Fabric Manager restarted automatically] "
                 f"{cluster_id}: {', '.join(sorted(node_results))}"
             ),
             body_text=body,
@@ -366,8 +373,8 @@ class RestartGuardEmailBuilder:
             result = node_results[node_id]
             gpu_uuids = result.get("reset_gpu_uuids", [])
             result_lines.append(
-                "- Node：{node}; Scope：{scope}; GPU UUID：{gpus}; "
-                "无客户端校验：{clients}; Reset 后 inventory：{after}".format(
+                "- Node: {node}; Scope: {scope}; GPU UUID: {gpus}; "
+                "no-client check: {clients}; inventory after reset: {after}".format(
                     node=node_id,
                     scope=result.get("reset_scope", "UNKNOWN"),
                     gpus=", ".join(gpu_uuids) or "UNKNOWN",
@@ -386,7 +393,7 @@ class RestartGuardEmailBuilder:
             official_action=official_action or "UNKNOWN",
             fabric_partition=fabric_partition_text,
             reasons=("\n".join(f"  - {item}" for item in reasons) or "  - UNKNOWN"),
-            workloads=", ".join(workload_ids) or "无",
+            workloads=", ".join(workload_ids) or "NONE",
             operation_id=operation_id,
             node_results="\n".join(result_lines) or "- UNKNOWN",
             template_version=FABRIC_RESET_TEMPLATE_VERSION,
@@ -398,7 +405,7 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                "[通知][GPU/NVSwitch 已自动重置] "
+                "[NOTICE][GPU/NVSwitch reset automatically] "
                 f"{cluster_id}: {', '.join(sorted(node_results))}"
             ),
             body_text=body,
@@ -437,11 +444,11 @@ class RestartGuardEmailBuilder:
                     result.get("reset_status", "SUCCEEDED"),
                 )
                 result_lines.append(
-                    f"- Node：{node_id}; Status：{status}; "
-                    f"GPU UUID：{', '.join(map(str, reset_gpus)) or 'UNKNOWN'}"
+                    f"- Node: {node_id}; Status: {status}; "
+                    f"GPU UUID: {', '.join(map(str, reset_gpus)) or 'UNKNOWN'}"
                 )
             else:
-                result_lines.append(f"- Node：{node_id}; Result：{result}")
+                result_lines.append(f"- Node: {node_id}; Result: {result}")
         body = GPU_RESET_EMAIL_TEMPLATE.format(
             cluster_id=cluster_id,
             incident_id=incident_id,
@@ -451,7 +458,7 @@ class RestartGuardEmailBuilder:
             policy_source=policy_source,
             official_action=official_action or "UNKNOWN",
             reasons=("\n".join(f"  - {item}" for item in reasons) or "  - UNKNOWN"),
-            workloads=", ".join(workload_ids) or "无",
+            workloads=", ".join(workload_ids) or "NONE",
             operation_id=operation_id,
             node_ids=", ".join(node_ids) or "UNKNOWN",
             gpu_uuids=", ".join(gpu_uuids) or "UNKNOWN",
@@ -463,7 +470,7 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[通知][GPU 已自动重置] {cluster_id}: "
+                f"[NOTICE][GPU reset automatically] {cluster_id}: "
                 f"{', '.join(gpu_uuids) or 'UNKNOWN'}"
             ),
             body_text=body,

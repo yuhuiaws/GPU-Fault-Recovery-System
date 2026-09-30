@@ -237,6 +237,11 @@ def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> 
         registry_module, "cleanup_registry_residuals", lambda **_kwargs: 0
     )
     monkeypatch.setattr(registry_module, "load_registry", lambda: list(baseline))
+    # The alignment gate and the Secret baseline are proven by their own tests.
+    monkeypatch.setattr(
+        registry_module, "verify_registry_alignment", lambda **_kwargs: {}
+    )
+    monkeypatch.setattr(registry_module, "capture_secret_baseline", lambda *_args: None)
     monkeypatch.setattr(regional_capacity_data, "invoke", lambda *a, **k: {"total": 0})
 
     def write_registry(values, **kwargs):
@@ -247,6 +252,11 @@ def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> 
         published.append((list(values), kwargs["reason"]))
 
     monkeypatch.setattr(registry_module, "write_registry", write_registry)
+    monkeypatch.setattr(
+        registry_module,
+        "sync_dataplane_connection_secret",
+        lambda: {"changed": False},  # the mirror is exercised by its own tests
+    )
     monkeypatch.setattr(
         registry_module,
         "publish_registry_revision",
@@ -526,6 +536,9 @@ def test_registry_cleanup_preserves_other_runs(monkeypatch) -> None:
         entries[:] = values
 
     monkeypatch.setattr(registry_module, "write_registry", write)
+    monkeypatch.setattr(
+        registry_module, "sync_dataplane_connection_secret", lambda: {"changed": False}
+    )
     assert (
         registry_module.cleanup_registry_residuals(
             scope="isolated",
@@ -620,9 +633,12 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
             raise TimeoutError("Job delete acknowledgement lost")
         return "deleted"
 
-    def residuals(control, *, run_id, cluster_ids, cleanup):
+    def residuals(control, *, run_id, cluster_ids, cleanup, force_nonterminal=False):
         assert run_id == "run-a"
         assert cluster_ids == ["perf-cap-000"] and cleanup is True
+        assert force_nonterminal is True, (
+            "the teardown may remove the run's open synthetic commands"
+        )
         assert f"job/{job}" not in resources
         events.append("residuals")
         return {"total": remaining}
@@ -630,6 +646,11 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
     monkeypatch.setattr(suite, "dataplane", dataplane)
     monkeypatch.setattr(regional_capacity_data, "invoke", residuals)
     monkeypatch.setattr(suite, "deregister", lambda **k: events.append("deregister"))
+    monkeypatch.setattr(
+        suite.capacity_registry,
+        "verify_registry_alignment",
+        lambda **k: events.append(f"alignment:{k['phase']}"),
+    )
     kwargs = {
         "purge": True,
         "deregister_clusters": True,
@@ -644,6 +665,8 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
             "residuals",
             "deregister",
             f"secret/{suite.TOKEN_SECRET}",
+            # the gate runs last: a failing gate never strands the token Secret
+            "alignment:postflight",
         ]
         assert resources == {}
     else:
@@ -712,6 +735,8 @@ def test_registration_rejects_old_cluster_data_before_any_mutation(
     )
     monkeypatch.setattr(registry_module, "cleanup_registry_residuals", lambda **k: 0)
     monkeypatch.setattr(registry_module, "load_registry", lambda: [])
+    monkeypatch.setattr(registry_module, "verify_registry_alignment", lambda **k: {})
+    monkeypatch.setattr(registry_module, "capture_secret_baseline", lambda *a: None)
     monkeypatch.setattr(regional_capacity_data, "invoke", lambda *a, **k: {"total": 1})
     monkeypatch.setattr(
         registry_module,
@@ -1276,6 +1301,8 @@ def test_connection_secret_is_mirrored_from_the_identity_namespace(monkeypatch) 
     )
 
     def dataplane(*args, stdin=None, **_kwargs):
+        if args[:2] == ("get", "namespace"):
+            return json.dumps({"kind": "Namespace"})
         if args[:2] == ("get", "secret"):
             return json.dumps(stale)
         if args[:1] == ("apply",):
@@ -1294,6 +1321,41 @@ def test_connection_secret_is_mirrored_from_the_identity_namespace(monkeypatch) 
     )
     assert "uid" not in applied[0]["metadata"], "source metadata is not copied"
     assert report["keys"] == ["ca.crt", "cluster-token", "control-plane-url"]
+    assert report["namespace_created"] is False, "an existing namespace is untouched"
+
+
+def test_connection_secret_mirror_creates_an_absent_perf_namespace(monkeypatch) -> None:
+    """Live 2026-09-22: the perf namespace had been swept with acceptance residue;
+    `kubectl apply` of the mirrored Secret failed with NotFound and round 1 of the
+    matrix aborted at preflight. The namespace is created before the Secret."""
+
+    live = {"data": {"ca.crt": "bmV3"}, "type": "Opaque"}
+    applied: list[dict] = []
+    monkeypatch.setattr(
+        registry_module, "dataplane_identity", lambda *a, **k: json.dumps(live)
+    )
+
+    def dataplane(*args, stdin=None, **_kwargs):
+        if args[:2] in {("get", "namespace"), ("get", "secret")}:
+            return ""
+        if args[:1] == ("apply",):
+            applied.append(json.loads(stdin))
+            return ""
+        raise AssertionError(f"unexpected kubectl: {args}")
+
+    monkeypatch.setattr(registry_module, "dataplane", dataplane)
+
+    report = registry_module.sync_dataplane_connection_secret()
+
+    assert [item["kind"] for item in applied] == ["Namespace", "Secret"], (
+        "the namespace is created first, then the Secret is mirrored into it"
+    )
+    assert applied[0]["metadata"]["name"] == registry_module.NAMESPACE, (
+        "the perf namespace is the one created"
+    )
+    assert report["namespace_created"] is True and report["changed"] is True, (
+        "the report tells both facts"
+    )
 
 
 def test_connection_secret_mirror_fails_closed_without_a_joined_data_plane(
@@ -1312,6 +1374,8 @@ def test_connection_secret_mirror_is_a_no_op_when_already_current(monkeypatch) -
     )
 
     def dataplane(*args, **_kwargs):
+        if args[:2] == ("get", "namespace"):
+            return json.dumps({"kind": "Namespace"})
         if args[:2] == ("get", "secret"):
             return json.dumps(live)
         raise AssertionError(f"an unchanged mirror must not be re-applied: {args}")
@@ -1386,3 +1450,44 @@ def test_capacity_run_requires_the_alertmanager_drill_sink(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="must not mail drill alerts"):
         registry_module.validate_alertmanager_drill_route()
+
+
+class _FakeRunResources:
+    def __init__(self, existing: set[tuple[str, str]]) -> None:
+        self.existing = existing
+        self.created: list[dict] = []
+
+    def read(self, kind: str, name: str) -> dict | None:
+        return {"kind": kind} if (kind, name) in self.existing else None
+
+    def create(self, manifest: dict) -> dict:
+        self.created.append(manifest)
+        return manifest
+
+
+def test_load_service_account_is_created_only_when_the_perf_namespace_lacks_it() -> (
+    None
+):
+    """Live 2026-09-22: a recreated perf namespace had no load ServiceAccount, the
+    Jobs could not create Pods and the round timed out. A run creates the account
+    (owned, torn down with the run) when absent and never touches an existing one."""
+
+    import scripts.perf.regional_capacity_suite as suite
+    from scripts.perf.regional_capacity_resources import ensure_load_service_account
+
+    ensure = lambda resources: ensure_load_service_account(  # noqa: E731
+        resources, name=suite.LOAD_SERVICE_ACCOUNT, namespace=suite.NAMESPACE
+    )
+    absent = _FakeRunResources(set())
+    assert ensure(absent) is True, "an absent account is created"
+    assert [m["kind"] for m in absent.created] == ["ServiceAccount"], (
+        "exactly one ServiceAccount manifest is created"
+    )
+    assert absent.created[0]["metadata"] == {
+        "name": suite.LOAD_SERVICE_ACCOUNT,
+        "namespace": suite.NAMESPACE,
+    }, "the account the Jobs and the start-gate RoleBinding name"
+
+    present = _FakeRunResources({("serviceaccount", suite.LOAD_SERVICE_ACCOUNT)})
+    assert ensure(present) is False, "an existing account is left alone"
+    assert present.created == [], "nothing is created over an existing account"

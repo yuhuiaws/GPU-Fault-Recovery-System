@@ -44,6 +44,7 @@ def run_guard(
     ready: str | None = "False",
     changed_uid: bool = False,
     endpoint: bool = False,
+    container_state: dict | None = None,
 ) -> subprocess.CompletedProcess[str]:
     pod = {
         "metadata": {"name": "probe", "uid": "original"},
@@ -51,7 +52,16 @@ def run_guard(
         "status": {
             "phase": "Running",
             "conditions": [] if ready is None else [{"type": "Ready", "status": ready}],
-            "containerStatuses": [{"name": "api", "ready": False, "restartCount": 0}],
+            "containerStatuses": [
+                {
+                    "name": "api",
+                    "ready": False,
+                    "restartCount": 0,
+                    "state": container_state
+                    if container_state is not None
+                    else {"running": {"startedAt": "2000-01-01T00:00:00Z"}},
+                }
+            ],
         },
     }
     inventory = json.dumps({"items": [pod] if script == "assert.sh" else []})
@@ -113,6 +123,21 @@ def test_assertion_requires_an_explicit_false_ready_condition(
 
     assert result.returncode != 0, "Ready or missing readiness must not pass"
     assert "PASS" not in result.stdout, "absence of Ready=True alone proves nothing"
+
+
+def test_assertion_keeps_polling_while_the_container_is_creating() -> None:
+    # The batch reads the probe's logs while kubelet is still pulling the
+    # image: ``kubectl logs`` fails on a ContainerCreating Pod, and errexit
+    # turned that into a bare exit before the first refusal line existed.
+    result = run_guard(
+        "assert.sh",
+        failure="logs",
+        container_state={"waiting": {"reason": "ContainerCreating"}},
+    )
+
+    assert result.returncode == 1, "a Pod that never starts is a timeout, not a crash"
+    assert "超时" in result.stdout, "the wait must end on the deadline message"
+    assert "PASS" not in result.stdout, "an unstarted container proves no refusal"
 
 
 def test_assertion_rejects_a_replaced_pod() -> None:

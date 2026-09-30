@@ -383,6 +383,7 @@ class ResetHarness:
         self.watchdog = Watchdog()
         self.restore_status = "SUCCEEDED"
         self.restore_failure: BaseException | None = None
+        self.incident_state = "RECOVERED"
         self.deadline = DEADLINE
         self.directory = path / "cases" / module.CASE_ID
         self.directory.mkdir(parents=True)
@@ -488,6 +489,20 @@ class ResetHarness:
     def wait_workflow_id(self, workflow_id: str) -> dict[str, str]:
         assert workflow_id == "restore-unit"
         return {"status": self.restore_status}
+
+    # The drill's own incident, as the cleanup reads and closes it: RECOVERED
+    # by default (the reset workflow ended it), so nothing is closed.
+    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
+        assert incident_id == "incident-unit"
+        return {
+            "incident_id": incident_id,
+            "state": self.incident_state,
+            "node_ids": ["node-a"],
+        }
+
+    def close_incident_with_evidence(self, incident_id: str, **kwargs: Any) -> dict:
+        self.events.append(f"incident-close:{incident_id}")
+        return {"closed": True, "refusal": None, "state": "RECOVERED"}
 
     def execute(self) -> tuple[int, dict[str, Any]]:
         code = self.module.execute_case(self.settings, self.path, 1, self.deadline)

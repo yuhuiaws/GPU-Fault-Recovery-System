@@ -30,7 +30,9 @@ RDS_CA_BUNDLE_URL="${GPU_FAULT_RDS_CA_BUNDLE_URL:-https://truststore.pki.rds.ama
 # Pinned SHA-256 of the AWS RDS global-bundle.pem. Provenance:
 #   curl -fsS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem | sha256sum
 # Fetched 2026-09-07; 108 certificates.
-RDS_CA_BUNDLE_SHA256="e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+# 2026-09-30: AWS rotated the global bundle (108 -> 111 CAs; the three
+# "Amazon RDS me-west-1 Root CA" G1 roots were added, nothing removed).
+RDS_CA_BUNDLE_SHA256="fe45bbebf92ad3e27a583bbb2ddd1553c521ed4d49af5514dc0a40372ea5395c"
 
 for command in kubectl sha256sum; do
     command -v "${command}" >/dev/null 2>&1 || {

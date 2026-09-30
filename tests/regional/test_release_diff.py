@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_release_config as CONFIG
 from gpu_fault_release import regional_release_diff as DIFF
@@ -17,11 +19,22 @@ from scripts.component_wheels import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+_NO_PROBE = object()
+
+
 def _release(
-    *, drift: bool = False, probes: list[str] | None = None
+    *,
+    drift: bool = False,
+    probes: list[str] | None = None,
+    pod_profile: str | None | object = _NO_PROBE,
 ) -> SimpleNamespace:
     admin_config = default_admin_config()
+    extra: dict = {}
+    if pod_profile is not _NO_PROBE:
+        # The live probe: what a Running api-ha replica loaded at start-up.
+        extra["_cpu_runtime_profile_drift"] = lambda: pod_profile
     return SimpleNamespace(
+        **extra,
         _observability_drift=lambda: (
             probes.append("read-only-probe") if probes is not None else None,
             drift,
@@ -506,4 +519,42 @@ def test_admin_source_change_only_changes_deploy_host_digest() -> None:
             "deploy_host", source_overrides=override
         )
         != deploy_before
+    )
+
+
+def test_a_replica_on_another_profile_version_is_a_cpu_only_change() -> None:
+    """Live 2026-09-26: ConfigMap hyperpod-v1, Pods hyperpod-v1-boot020 (BOOT-020
+    restored the ConfigMap without a roll). The classifier used to see nothing,
+    skip the CPU roll and fail its own control_api verification."""
+
+    release = _release(pod_profile="hyperpod-v1-boot020")
+    state = _state()
+    assert state["runtime_profile_version"] == release.config.runtime_profile_version, (
+        "the ConfigMap already agrees; only the replicas drift"
+    )
+
+    diff = DIFF.classify_release(release, state)
+
+    assert DIFF.CPU_POD_PROFILE_DRIFT in diff.changed, diff
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY, diff
+    plan = DIFF.build_execution_plan(diff)
+    assert plan.has(
+        DIFF.ReleaseComponent.CPU_STAGE, DIFF.ReleaseComponent.CPU_FINALIZE
+    ), plan
+    assert not plan.has(
+        DIFF.ReleaseComponent.RUNTIME_PROFILE,
+        DIFF.ReleaseComponent.AGENT,
+        DIFF.ReleaseComponent.EXECUTOR,
+    ), "an env-only drift rolls the CPU roles, not the data plane"
+
+
+@pytest.mark.parametrize("pod_profile", ["hyperpod-v1", None, _NO_PROBE])
+def test_an_agreeing_or_unknown_replica_profile_is_not_a_change(pod_profile) -> None:
+    release = _release(pod_profile=pod_profile)
+
+    diff = DIFF.classify_release(release, _state())
+
+    assert DIFF.CPU_POD_PROFILE_DRIFT not in diff.changed, diff
+    assert diff.kind is DIFF.ReleaseChangeKind.NOOP, (
+        "matching, unknown (no Running replica) or unprobed never invents a roll"
     )

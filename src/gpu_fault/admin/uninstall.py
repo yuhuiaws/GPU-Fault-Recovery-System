@@ -71,6 +71,7 @@ LEGACY_EXTERNAL_RESOURCE_TYPES = frozenset(
         "eks_addon",
     }
 )
+ZONE_RESOURCE_KEY = "aws/route53/zone"
 DETACH_RESOURCE_TYPES = frozenset(
     {
         "ec2_route_table_association",
@@ -352,6 +353,20 @@ def _effective_policy(
         if resource.resource_type in DETACH_RESOURCE_TYPES:
             return InstallationResourceDeletePolicy.DETACH
         return InstallationResourceDeletePolicy.DELETE
+    if (
+        resource.resource_type == "route53_vpc_association"
+        and resource.delete_policy is InstallationResourceDeletePolicy.PRESERVE
+        and ZONE_RESOURCE_KEY in resource.dependencies
+    ):
+        # A resumed deploy that lost its association receipt records the GPU
+        # VPC association of its own zone as EXTERNAL/PRESERVE (the bootstrap
+        # never invents creation proof). The zone itself is always solution
+        # owned and a deletion target, and no VPC association outlives its
+        # zone, so retaining the row is impossible: detach it before the zone
+        # goes instead of refusing the uninstall (live 2026-09-24). The native
+        # CPU association is never registered, so this cannot remove the last
+        # VPC of a private zone.
+        return InstallationResourceDeletePolicy.DETACH
     return resource.delete_policy
 
 

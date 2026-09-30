@@ -104,10 +104,13 @@ class BranchEscalator:
         an operator, exactly as off the DAG.
         """
 
-        if not workflow.dag_enabled or not 0 <= failed_index < len(
-            workflow.official_steps
-        ):
+        if not 0 <= failed_index < len(workflow.official_steps):
             return None
+        if not workflow.dag_enabled:
+            adopted = self._adopt_single_node_plan(workflow, failed_index, details)
+            if adopted is None:
+                return None
+            workflow = adopted
         step = workflow.official_steps[failed_index]
         if step.branch_id in JOB_LEVEL_BRANCH_IDS or len(step.node_ids) != 1:
             return None
@@ -234,6 +237,39 @@ class BranchEscalator:
             next_operation=rung,
             reason=reason,
         )
+
+    def _adopt_single_node_plan(
+        self,
+        workflow: WorkflowRequest,
+        failed_index: int,
+        details: Mapping[str, Any] | None,
+    ) -> WorkflowRequest | None:
+        """A flat record that belongs to one node walks the same ladder.
+
+        A single-node XID plan is compiled flat (no branches, no join); its
+        failed reset used to end the record FAILED and hand the reboot to a
+        ``workflow-reboot-after-<id>`` successor, while the same failure on a
+        node branch of a job DAG escalated in place -- two record shapes for
+        one fault class (live 2026-09-23). The flat record is grown into a
+        one-branch DAG here, only when a rung exists for it: a step that names
+        several nodes, a record whose steps span nodes, an unknown outcome or
+        an operation with no next rung keep the whole-workflow path unchanged.
+        """
+
+        step = workflow.official_steps[failed_index]
+        if len(step.node_ids) != 1:
+            return None
+        node_id = step.node_ids[0]
+        if any(set(item.node_ids) - {node_id} for item in workflow.official_steps):
+            return None
+        if unknown_outcome_failure(details):
+            return None
+        recovery_context = self._recovery_context(
+            workflow, set(range(len(workflow.official_steps)))
+        )
+        if next_rung(step.operation, recovery_context) is None:
+            return None
+        return self.brancher.adopt_linear_plan(workflow)
 
     def exhaust_branch(
         self,

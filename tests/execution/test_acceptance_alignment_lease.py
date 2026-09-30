@@ -156,7 +156,14 @@ def test_invalid_renewal_identity_or_window_never_admits(
     client.response_update = update
     value = executor(tmp_path, client, adapter)
     assert value.run_once() == 1
-    assert adapter.calls == [] and client.completed == []
+    assert adapter.calls == [], "an invalid or cancelled renewal never admits"
+    if "cancellation_requested_at" in update:
+        # A cancellation carried by an otherwise authoritative renewal is the
+        # one refusal that is answered: nothing ran, and the row must not stay
+        # LEASED with a cancellation nobody settles (live 2026-09-28).
+        assert client.completed == ["command"], "the no-start is reported"
+    else:
+        assert client.completed == [], "an unproven lease reports nothing"
 
 
 def test_queue_wait_cannot_rebase_the_original_deadline(tmp_path) -> None:
@@ -229,7 +236,16 @@ def test_already_cancelled_claim_is_not_renewed_or_executed(tmp_path) -> None:
     )
     result = value.lifecycle.run(command)
     assert result.status is RemoteCommandStatus.WAITING
-    assert client.renewals == adapter.calls == client.completed == []
+    assert client.renewals == adapter.calls == [], "nothing is renewed or executed"
+    # Live 2026-09-28: the cancelled claim is answered as a no-start, so the row
+    # does not stay LEASED with a cancellation nobody settles.
+    assert client.completed == ["command"], "the no-start is reported"
+    # The server row here was never cancelled (only the claimed copy carried the
+    # flag), so the post lands as a plain WAITING hand-back: harmless re-queue.
+    settled = client.store.get_remote_command("command")
+    assert settled.status is RemoteCommandStatus.WAITING
+    assert settled.status_source == "executor-cancelled-before-start"
+    assert settled.result_details["node_action_not_started"] is True
 
 
 def test_unhandled_dispatch_failure_does_not_fabricate_an_action_result(

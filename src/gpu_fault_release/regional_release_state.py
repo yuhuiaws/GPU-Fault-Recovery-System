@@ -527,6 +527,52 @@ def config_map_binary_key(
     return keys[0] if len(keys) == 1 else None
 
 
+CPU_PROFILE_ENV = "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
+
+
+def effective_cpu_runtime_profile_version(release: Any) -> str | None:
+    """The Runtime Profile version a Running api-ha Pod actually loaded.
+
+    ``-config-core`` is a start-up snapshot for the process: a ConfigMap
+    edited without a roll (BOOT-020 restores it that way) leaves every replica
+    on the old value while the ConfigMap already reads the new one. The
+    classifier compares this against the desired version; ``None`` (no Running
+    replica) is "unknown", never a change.
+    """
+
+    pods = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+        )
+    )
+    for item in pods.get("items") or []:
+        if (item.get("status") or {}).get("phase") != "Running":
+            continue
+        name = str((item.get("metadata") or {}).get("name") or "")
+        if not name:
+            continue
+        value = release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "exec",
+                name,
+                "--",
+                "sh",
+                "-c",
+                f'printf %s "${CPU_PROFILE_ENV}"',
+            ),
+            capture=True,
+        )
+        return str(value or "").strip() or None
+    return None
+
+
 def cpu_role_deployments(release: Any) -> dict[str, dict[str, Any]]:
     """Read every CPU role Deployment once, keyed by name.
 
@@ -796,6 +842,7 @@ _ROLLED_BACK_TRUTH_KEYS = (
     "release_id",
     "component_digests",
     "release_delivery_sha256",
+    "release_manifest_path",
     "rendered_manifest_sha256",
     "node_template_sha256",
     "release_manifest_schema_version",
@@ -965,7 +1012,14 @@ def _capture_previous(
         "agent_identities": agent_identities,
         "runtime_profile_version": release._config_map_data(
             "gpu-fault-api-ha-config-core"
-        ).get("GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"),
+        ).get(CPU_PROFILE_ENV),
+        # What the Running replicas loaded; None when the plan skips the CPU.
+        "effective_runtime_profile_version": (
+            release._cpu_runtime_profile_drift()
+            if capture_cpu
+            and callable(getattr(release, "_cpu_runtime_profile_drift", None))
+            else None
+        ),
         "cpu_wheel": cpu_wheel,
         "cpu_wheel_sha256": cpu_wheel_sha256,
         "cpu_role_config_maps": role_config_maps,
@@ -975,6 +1029,7 @@ def _capture_previous(
             remote.get("executor_internal_error_total", 0) or 0
         ),
         "release_delivery_sha256": live_state.get("release_delivery_sha256"),
+        "release_manifest_path": live_state.get("release_manifest_path"),
         "aurora_refresh_manifest_sha256": live_state.get(
             "aurora_refresh_manifest_sha256"
         ),
@@ -1332,6 +1387,9 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
                 "rollback_parallel_min_nodes": 6,
             },
             "release_delivery_sha256": (release.config.release_delivery_sha256),
+            "release_manifest_path": (
+                getattr(release.config, "release_manifest_path", "") or None
+            ),
             **{
                 f"{name}_manifest_sha256": release.config.delivery_component_digests.get(
                     name

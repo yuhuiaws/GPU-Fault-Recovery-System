@@ -15,6 +15,7 @@ from gpu_fault.admin.config import (
     AdminConfigError,
     AuroraCapacityConfig,
     CapacityConfig,
+    CapacityEvidenceError,
     ProcessorConfig,
     RemediationCapacity,
     admin_config_desired_path,
@@ -27,6 +28,7 @@ from gpu_fault.admin.config import (
     complete_admin_config_apply,
     default_admin_config,
     default_admin_config_reference,
+    ingress_normal_concurrency,
     load_desired_admin_config,
     load_pending_admin_config_apply,
     matching_pending_admin_config_apply,
@@ -223,6 +225,25 @@ def test_capacity_presets_model_their_topology_and_its_aurora_floor() -> None:
     assert fifty.aurora == AuroraCapacityConfig(min_acu=128.0, max_acu=128.0)
     for name in ("32-disabled", "32-enabled", "50-disabled", "50-enabled"):
         preset_admin_config(name).validate()
+
+
+def test_ingress_normal_concurrency_follows_the_managed_fleet() -> None:
+    # Perf plan section 8.4: the 50-cluster preset (12800 nodes) overran the fixed
+    # 1000 normal-tier slots per ingress process (0.58-3.85 % reserved 503 over
+    # six live runs); the 32-cluster preset (8192 nodes) produced none at 1000.
+    assert ingress_normal_concurrency(512) == 1000
+    assert ingress_normal_concurrency(5000) == 1000
+    assert ingress_normal_concurrency(5001) == 1001
+    assert ingress_normal_concurrency(8192) == 1639
+    assert ingress_normal_concurrency(12800) == 2560
+    assert ingress_normal_concurrency(65536) == 3584, (
+        "the ceiling must leave the 256 fault slots under uvicorn's 4096 limit"
+    )
+    with pytest.raises(CapacityEvidenceError):
+        ingress_normal_concurrency(0)
+    assert default_admin_config().ingress_normal_concurrency() == 1000
+    assert preset_admin_config("32-disabled").ingress_normal_concurrency() == 1639
+    assert preset_admin_config("50-enabled").ingress_normal_concurrency() == 2560
 
 
 def test_aurora_min_acu_floor_rounds_up_to_half_acu() -> None:
@@ -1104,3 +1125,46 @@ def test_yaml_boolean_field_is_one_rule_raising_the_callers_error(
         boolean_field("yes", "spec.flag", default=True, error=error)
     with pytest.raises(error, match="spec.flag must be a boolean"):
         boolean_field(1, "spec.flag", default=True, error=error)
+
+
+def test_telemetry_spool_max_cluster_depth_is_configurable_and_bounded(
+    tmp_path,
+) -> None:
+    """性能压测验收方案 §13.4: the single-cluster 1000-node model hits the per-cluster
+    spool depth at 1024 and not at 4096; the depth is an AdminConfig knob rendered
+    into GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH, bounded 64..65536."""
+
+    from gpu_fault.admin.config import AdminConfigError, TelemetrySpoolCapacity
+
+    assert TelemetrySpoolCapacity().max_cluster_depth == 1024, "the default is 1024"
+    config = apply_patch(
+        default_admin_config(),
+        {
+            "capacity": {
+                "preset": "50-enabled",
+                "telemetrySpool": {
+                    "enabled": True,
+                    "replicas": 3,
+                    "maxClusterDepth": 4096,
+                },
+            }
+        },
+    )
+    assert config.capacity.telemetry_spool.max_cluster_depth == 4096, (
+        "the YAML spelling maxClusterDepth lays over the preset's section"
+    )
+    assert (
+        config.as_dict()["capacity"]["telemetry_spool"]["max_cluster_depth"] == 4096
+    ), "a non-default depth is recorded"
+    assert (
+        "max_cluster_depth"
+        not in default_admin_config().as_dict()["capacity"]["telemetry_spool"]
+    ), "the default depth stays out of the record so live digests do not move"
+    assert AdminConfig.from_mapping(config.as_dict()) == config, (
+        "the record round-trips"
+    )
+    for bad in (0, 63, 65537):
+        with pytest.raises(AdminConfigError, match="maxClusterDepth must be within"):
+            TelemetrySpoolCapacity(
+                enabled=False, replicas=0, max_cluster_depth=bad
+            ).validate()

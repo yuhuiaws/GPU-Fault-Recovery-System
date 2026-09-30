@@ -71,7 +71,9 @@ class HardwareInventoryEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[GPU故障][{resource_type}掉卡] {cluster_id} {node_id}"),
+            subject=(
+                f"[GPU FAULT][{resource_type} inventory mismatch] {cluster_id} {node_id}"
+            ),
             body_text=body,
             support_case_draft="",
             evidence_refs=evidence_refs,

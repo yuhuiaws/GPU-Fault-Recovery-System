@@ -10,7 +10,6 @@ from pathlib import Path
 from urllib import error, request
 from urllib.parse import urlencode
 
-
 OWNERS = [
     "gpu-fault-kubernetes-adapter",
     "gpu-fault-node-agent",
@@ -410,7 +409,7 @@ def _start_reset_attempt(
     state.idle_started = None
 
 
-def _handle_scenario_command(
+def handle_scenario_command(
     client: Client,
     command: dict,
     state: ScenarioState,
@@ -488,18 +487,29 @@ def _handle_scenario_command(
         state.strong_sent = True
     if operation != "RESTART_NODE":
         return
-    predecessor = workflow.get("predecessor_workflow_id")
+    # Two reboot shapes follow a failed reset. A failure on one node's DAG
+    # branch (the fabric reset) escalates in place: the reboot is the
+    # RESTART_NODE rung of the same record. A failure on a plain record (the
+    # reset lane's RESET_GPU) creates workflow-reboot-after-<id>. Either way
+    # the reboot record's incident is watched until it ends SUCCEEDED (the
+    # node's telemetry returns through the run's Agent refresh, so the
+    # validation tail behind the reboot can pass).
     incident_id = str((command.get("incident") or {}).get("incident_id") or "")
-    if predecessor == state.strong_workflow_id or workflow_id == (
-        f"workflow-reboot-after-{state.strong_workflow_id}"
-    ):
+    predecessor = workflow.get("predecessor_workflow_id")
+    if _reboot_of(workflow_id, predecessor, state.strong_workflow_id):
         state.primary_reboot_workflow_id = workflow_id
         state.primary_reboot_incident_id = incident_id
-    if predecessor == state.reset_workflow_id or workflow_id == (
-        f"workflow-reboot-after-{state.reset_workflow_id}"
-    ):
+    if _reboot_of(workflow_id, predecessor, state.reset_workflow_id):
         state.reset_reboot_workflow_id = workflow_id
         state.reset_reboot_incident_id = incident_id
+
+
+def _reboot_of(workflow_id: str, predecessor: object, source_id: str) -> bool:
+    return bool(source_id) and (
+        workflow_id == source_id
+        or workflow_id == f"workflow-reboot-after-{source_id}"
+        or predecessor == source_id
+    )
 
 
 def _scenario_output(
@@ -621,7 +631,7 @@ def run_scenario(
             time.sleep(0.1)
             continue
         state.idle_started = None
-        _handle_scenario_command(
+        handle_scenario_command(
             client,
             commands[0],
             state,

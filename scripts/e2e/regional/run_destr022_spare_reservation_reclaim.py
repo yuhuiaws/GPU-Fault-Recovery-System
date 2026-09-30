@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -70,6 +70,8 @@ EXECUTOR_PROBE_SCRIPT = (
     Path(__file__).with_name("probes") / "destr022_executor_probe.py"
 )
 POLL_SECONDS = 10
+# One claim long-poll (30 s) + the API budget (15 s) + one poll interval, twice.
+BREADCRUMB_WAIT_SECONDS = 100
 
 INCIDENT_LOOKUP = r"""
 import json
@@ -438,13 +440,52 @@ def _wait_reclaim(run: _LiveRun) -> list[str]:
     return verdicts.timeline_errors(timeline, incident_id=run.incident_id)
 
 
+def wait_for_fresh_breadcrumbs(
+    probe: Callable[[], list[dict[str, Any]]],
+    reclaimed_at: datetime | None,
+    *,
+    timeout_seconds: float,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> list[dict[str, Any]]:
+    """Probe the executors until each Ready one has claimed after ``reclaimed_at``.
+
+    Returns the last probe either way; a still-stale breadcrumb is the
+    verdict's finding, not this helper's. ``time`` is read at call time so a
+    harness that fakes the module clock drives the wait.
+    """
+
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + timeout_seconds
+    while True:
+        probes = probe()
+        if reclaimed_at is None or all(
+            (claimed := verdicts.breadcrumb_claimed_at(item.get("claim_state")))
+            is not None
+            and claimed > reclaimed_at
+            for item in probes
+        ):
+            return probes
+        if clock() >= deadline:
+            return probes
+        sleep(min(POLL_SECONDS, 5))
+
+
 def _executor_evidence(run: _LiveRun) -> list[str]:
     if run.injected_at is None:
         raise RegionalFixtureError("executor evidence follows the injection")
-    # The breadcrumb is rewritten on the next successful claim round-trip
-    # (every poll interval, ~2 s, even on an empty queue); give it one.
-    time.sleep(5)
-    after = executor_probes(run.regional)
+    # The breadcrumb is rewritten on the next successful claim round-trip. Since
+    # the claim long-poll (2026-09-09) an empty queue holds a claim for up to
+    # 30 s plus the API budget, so a fixed 5 s sleep raced it (first-pass
+    # campaign 2026-09-25: "no fresh post-reclaim breadcrumb" on both
+    # executors). Wait, bounded, until every Ready executor has claimed after
+    # the reclaim; the verdict still judges freshness itself.
+    after = wait_for_fresh_breadcrumbs(
+        lambda: executor_probes(run.regional),
+        run.reclaimed_at,
+        timeout_seconds=BREADCRUMB_WAIT_SECONDS,
+    )
     write_json_atomic(run.case_dir / "executor-after.json", {"pods": after})
     lines: list[str] = []
     logs: list[dict[str, Any]] = []

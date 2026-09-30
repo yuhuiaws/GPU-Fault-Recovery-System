@@ -26,6 +26,8 @@ from scripts.e2e.regional.run_boot020_release_rolling import (
 PREVIOUS_EXECUTOR_PIN = "a" * 64
 CANDIDATE_EXECUTOR_PIN = "b" * 64
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 class FakeReleaseRollingBackend:
     def __init__(self) -> None:
@@ -76,11 +78,23 @@ class FakeReleaseRollingBackend:
             }
         }
         self.calls = []
+        self.commits: list[str] = []
         # Every live snapshot costs 20-30 s of kubectl reads, so the runner is
         # held to the number it takes, not only to the deploys it issues.
         self.snapshots: list[str] = []
+        # The restore stage (see FakeBackend in test_boot020_release_rolling).
+        self.initial_live = copy.deepcopy(self.live)
+        self.restored = False
+        self.cpu_env_drift = False
+        self.uncommitted_restore = False
+
+    def cpu_env_alignment(self, scenario: str) -> dict:
+        return {"aligned": not self.cpu_env_drift, "deployments": {}}
 
     def classify(self, scenario: str) -> dict:
+        scenario = "noop" if scenario == "restore" else scenario
+        if scenario == "noop" and "full" in self.completed and not self.restored:
+            return {"kind": "FULL", "changed": ["runtime_profile"]}
         kind = (
             "NOOP"
             if scenario in self.completed
@@ -158,7 +172,10 @@ class FakeReleaseRollingBackend:
         fault_phase=None,
         resume=False,
         auto_rollback=None,
+        commit=False,
     ) -> dict:
+        if commit:
+            self.commits.append(scenario)
         if self.rollback_pending:
             raise RuntimeError("a rollback is in progress and must finish first")
         self.calls.append((scenario, fault_phase, resume, auto_rollback, diff["kind"]))
@@ -260,9 +277,22 @@ class FakeReleaseRollingBackend:
             self.gpu_generations = {
                 "cluster-a": {EXECUTOR_DEPLOYMENT: 3, "gpu-fault-completion-watcher": 3}
             }
+        elif scenario == "noop" and "full" in self.completed:
+            # The restore: the site is back on its own release, every CPU role
+            # rolled once more (a profile change restarts the CPU Pods).
+            self.restored = True
+            self.live = copy.deepcopy(self.initial_live)
+            self.cpu_generations = dict.fromkeys(self.cpu_generations, 4)
         self.completed.add(scenario)
         return {
             "phase": "complete",
+            # The engine leaves a release uncommitted; only a requested commit
+            # (the restore stage asks for it) makes it a committed transaction.
+            "transaction_committed": not (
+                scenario == "noop"
+                and self.restored
+                and (self.uncommitted_restore or not commit)
+            ),
             "injected_failure": None,
             "pins": self._pins("finalized"),
             "operation_duration_seconds": 10.0 if resume else 20.0,
@@ -310,6 +340,9 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         ("agent", None, False, None, "DATA_PLANE_COMPATIBLE"),
         ("full", "data-converged", False, True, "FULL"),
         ("full", None, False, None, "FULL"),
+        # The restore stage gives the site back its own config as a committed
+        # release (the noop candidate classifies FULL against candidate D).
+        ("noop", None, False, None, "FULL"),
     ]
     assert (
         result["stages"]["full_rollback_snapshot"]["live"]
@@ -371,6 +404,8 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         "agent",
         "full",
         "full",
+        # ``restore_before`` reuses ``full_after``; one fresh ``restore_after``.
+        "restore",
     ], backend.snapshots
     stages = result["stages"]
     assert "reused_from" not in stages["noop_before"]
@@ -389,7 +424,8 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         # ``next_deploy`` computes for a committed ``complete`` release.
         assert before["next_deploy"] == stages[f"{stage}_classification"], stage
         assert "reused_from" not in stages[f"{stage}_after"]
-        assert "reused_from" not in stages[f"{stage}_rollback_snapshot"]
+        if stage != "restore":  # the restore is a plain release: no rollback drill
+            assert "reused_from" not in stages[f"{stage}_rollback_snapshot"]
 
 
 def test_boot020_replayed_after_snapshot_is_never_reused(tmp_path: Path) -> None:
@@ -879,9 +915,10 @@ def test_boot020_auto_resume_reconverges_and_replays_passed_stages(
         ("executor", None, False, None, "NOOP")
     ]
     # The passed stages were replayed, never re-run against the site.
-    assert not any(call[0] in {"noop", "control_plane"} for call in second.calls), (
-        "a passed stage was re-run against the site instead of replayed"
-    )
+    assert not any(
+        call[0] == "control_plane" or (call[0] == "noop" and call[-1] == "NOOP")
+        for call in second.calls
+    ), "a passed stage was re-run against the site instead of replayed"
     # The agent stage ran again from its injected-failure classification, then
     # the full stage ran.
     assert second.calls == [
@@ -893,11 +930,13 @@ def test_boot020_auto_resume_reconverges_and_replays_passed_stages(
         ("agent", None, False, None, "DATA_PLANE_COMPATIBLE"),
         ("full", "data-converged", False, True, "FULL"),
         ("full", None, False, None, "FULL"),
+        ("noop", None, False, None, "FULL"),
     ], second.calls
     # The resumed stage's ``before`` is observed afresh -- the convergence
     # deploy sits between it and any earlier snapshot -- and only the in-process
-    # ``agent_after`` is reused for ``full_before``.
-    assert second.snapshots == ["agent", "agent", "agent", "full", "full"], (
+    # ``agent_after`` is reused for ``full_before`` (and ``full_after`` for
+    # ``restore_before``).
+    assert second.snapshots == ["agent", "agent", "agent", "full", "full", "restore"], (
         second.snapshots
     )
     assert "reused_from" not in result["stages"]["agent_before"]
@@ -939,3 +978,74 @@ def test_boot020_start_stage_cannot_skip_an_unpassed_terminal_assertion(
         run_release_rolling(backend, recorder, start_stage="control_plane")
 
     assert backend.calls == [], "a snapshot without its PASS marker authorizes nothing"
+
+
+def test_boot020_restore_stage_returns_the_site_to_its_own_committed_release(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-09-26: BOOT-020 left the site on candidate D (uncommitted, Pods on
+    the candidate's start-up env) and the operator's restore deploy failed. The
+    runner now restores the site itself and proves the end state."""
+
+    backend = FakeReleaseRollingBackend()
+    recorder = EvidenceRecorder(
+        tmp_path / "GF-REGIONAL-BOOT-020.json",
+        case_id="GF-REGIONAL-BOOT-020",
+        inputs={},
+    )
+    result = run_release_rolling(backend, recorder)
+
+    stages = result["stages"]
+    assert stages["restore_classification"]["kind"] == "FULL", (
+        "the site config is a real change against candidate D"
+    )
+    assert stages["restore_apply"]["phase"] == "complete", stages["restore_apply"]
+    assert stages["restore_apply"]["transaction_committed"] is True, (
+        "the restore is a committed release, not a candidate left open"
+    )
+    assert backend.commits == ["noop"], (
+        "only the restore asks the engine to commit; candidates stay open"
+    )
+    assert stages["restore_next_classification"]["kind"] == "NOOP", stages[
+        "restore_next_classification"
+    ]
+    assert stages["restore_cpu_env_alignment"]["aligned"] is True, stages[
+        "restore_cpu_env_alignment"
+    ]
+    assert stages["restore_after"]["live"] == backend.initial_live, (
+        "the live state is back where the chain started"
+    )
+    assert result["release_id"] == "restore", "the final identity is the restored site"
+    assert "restore_passed" in stages, "the restore stage carries its pass marker"
+
+
+@pytest.mark.parametrize("defect", ["cpu_env_drift", "uncommitted_restore"])
+def test_boot020_restore_stage_refuses_a_site_that_is_not_fully_restored(
+    tmp_path: Path, defect: str
+) -> None:
+    backend = FakeReleaseRollingBackend()
+    setattr(backend, defect, True)
+    recorder = EvidenceRecorder(
+        tmp_path / "GF-REGIONAL-BOOT-020.json",
+        case_id="GF-REGIONAL-BOOT-020",
+        inputs={},
+    )
+    expected = (
+        "start-up environment" if defect == "cpu_env_drift" else "committed transaction"
+    )
+    with pytest.raises(AcceptanceCheckError, match=expected):
+        run_release_rolling(backend, recorder)
+    saved = json.loads(recorder.path.read_text(encoding="utf-8"))
+    assert saved["verdict"] == "FAIL", saved
+    assert "restore_passed" not in saved["stages"], "no pass marker on a refusal"
+    assert "full_passed" in saved["stages"], "the earlier stages keep their pass"
+
+
+def test_boot020_spec_no_longer_owes_a_restore_deploy_after_the_case() -> None:
+    doc = (ROOT / "docs" / "区域模式端到端验收测试用例.md").read_text(encoding="utf-8")
+    start = doc.index("### GF-REGIONAL-BOOT-020")
+    section = doc[start : doc.index("### GF-REGIONAL-BOOT-021", start)]
+    assert "restore_next_classification" in section, "the spec names the NOOP re-check"
+    assert "restore_cpu_env_alignment" in section, "the spec names the Pod env check"
+    assert "恢复部署" not in section, "the runner restores the site; no deploy is owed"
+    assert "自己恢复" in section, "the spec says the runner restores the site itself"

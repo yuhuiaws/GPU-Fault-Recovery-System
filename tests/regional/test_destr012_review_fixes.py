@@ -450,6 +450,10 @@ def _group_fakes(
 
 def _blocked_state() -> dict[str, Any]:
     return {
+        "incident": {
+            "incident_id": "inc-kernel-log-destr012-d-block",
+            "state": "ESCALATED",
+        },
         "workflow": {
             "status": "FAILED",
             "request_id": "wf-blocked",
@@ -469,7 +473,7 @@ def _blocked_state() -> dict[str, Any]:
                     },
                 }
             ],
-        }
+        },
     }
 
 
@@ -552,12 +556,46 @@ def test_group_d_deletes_its_workload_only_through_the_quiescence_gate(
         executor_logs="2026-09-07 INFO executor idle\n",
     )
 
+    closes: list[dict[str, Any]] = []
+
+    def close_drill_incident(
+        _warm: Any, _regional: Any, incident_id: str, **kwargs: Any
+    ):
+        log.entries.append(f"incident-close:{incident_id}")
+        closes.append({"incident_id": incident_id, **kwargs})
+        return {
+            "incident_id": incident_id,
+            "state_before": "ESCALATED",
+            "closed": False,
+            "residual": "still has an open workflow wf-blocked",
+        }
+
+    monkeypatch.setattr(destr012, "close_drill_incident", close_drill_incident)
+
     result = destr012.run_group_d(
         _settings(tmp_path), cast(Any, regional), tmp_path / "case", _window_end()
     )
 
     assert result["verdict"] == "PASS", result
-    assert log.entries[-1] == "delete_after_quiescence", log.entries
+    # The blocked injection's own ESCALATED incident is closed after the
+    # quiescence-gated delete; a refusal is a named residual, not a FAIL.
+    assert log.entries[-2:] == [
+        "delete_after_quiescence",
+        "incident-close:inc-kernel-log-destr012-d-block",
+    ], log.entries
+    assert closes == [
+        {
+            "incident_id": "inc-kernel-log-destr012-d-block",
+            "reason": "DESTR-012 group D drill cleanup",
+            "reference": result["blocked_marker"],
+            "nodes": ("node-a",),
+        }
+    ], closes
+    assert result["residual_incident"] == {
+        "incident_id": "inc-kernel-log-destr012-d-block",
+        "state": "ESCALATED",
+        "reason": "still has an open workflow wf-blocked",
+    }
     assert "workload:training-d:delete" not in log.entries, log.entries
     assert [item["workload"] for item in quiescence] == [workload]
     # The gate follows the most recent injection: the remediated retry.

@@ -7,8 +7,8 @@ import socket
 import ssl
 import statistics
 import time
-from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -18,8 +18,7 @@ from threading import Lock
 from typing import Any, Callable, Iterator, cast
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import quote
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 if __package__:
     from .benchmark_mixed_control_plane import PATHS, stamp

@@ -68,22 +68,42 @@ def resolve_source_repository(
     *,
     current_directory: Path,
 ) -> Path:
+    """The checkout a deploy builds from.
+
+    The operator's current directory wins whenever it is a repository: that is
+    how an upgrade from a fresh clone, or a first deploy resumed after a fix,
+    picks up the operator's changes. A recorded source (``source-deploy.json``)
+    or the generated site's root only stands in when the command runs from
+    elsewhere (a bound CLI invoked from any directory). A recorded source that
+    cannot be read fails closed before any fallback. Live 2026-09-22: a first
+    deploy resumed from a corrected checkout silently rebuilt the earlier
+    attempt's recorded copy and failed its release gate a second time.
+    """
+
     resolved_state = state_dir.expanduser().resolve()
     recorded = _repository_from_source_state(resolved_state)
-    if recorded is not None:
-        return recorded
     try:
-        return _require_repository(
+        current = _require_repository(
             current_directory,
             description="current directory",
         )
     except BootstrapError:
-        existing = _repository_from_site(resolved_state)
-        if existing is not None:
-            return existing
-        raise BootstrapError(
-            "first deploy must run from the cloned GPU Fault repository"
-        ) from None
+        current = None
+    if current is not None:
+        if recorded is not None and recorded != current:
+            print(
+                f"gpu-fault-admin: deploying the source in the current directory "
+                f"{current}; the earlier deploy of this site ran from {recorded}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return current
+    if recorded is not None:
+        return recorded
+    existing = _repository_from_site(resolved_state)
+    if existing is not None:
+        return existing
+    raise BootstrapError("first deploy must run from the cloned GPU Fault repository")
 
 
 def run_source_deploy(

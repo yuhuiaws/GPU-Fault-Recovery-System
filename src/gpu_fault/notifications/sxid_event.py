@@ -75,7 +75,7 @@ class SxidEventEmailBuilder:
             deduplication_key=(f"{event_id}/sxid-event/{SXID_EVENT_TEMPLATE_VERSION}"),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[GPU故障][SXID {sxid}] {cluster_id} {node_id}"),
+            subject=(f"[GPU FAULT][SXID {sxid}] {cluster_id} {node_id}"),
             body_text=body,
             support_case_draft="",
             evidence_refs=([evidence_ref] if evidence_ref else []),

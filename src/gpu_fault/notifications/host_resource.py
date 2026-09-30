@@ -67,7 +67,9 @@ class HostResourceEventEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=(f"[GPU故障][节点资源隐患] {cluster_id} {node_id} {metric_name}"),
+            subject=(
+                f"[GPU FAULT][host resource risk] {cluster_id} {node_id} {metric_name}"
+            ),
             body_text=body,
             support_case_draft="",
             evidence_refs=evidence_refs,

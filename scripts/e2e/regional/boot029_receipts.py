@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -133,7 +134,27 @@ def initialize(path: Path, *, inputs: dict[str, str], stage: int) -> dict[str, A
             ),
             6,
         )
-        if first != stage:
+        if first == 6 and stage == 5:
+            # Every stage has passed. Stage 5 (the README redeploy of the
+            # second site) may run again on the same record once that site
+            # has been uninstalled: the passed receipt is kept under
+            # ``reruns`` and the rerun's attempts are marked, so one attempt
+            # that passes end to end is visible as such (2026-09-22:
+            # the first pass needed a resumed first deploy after fixes).
+            previous = record["stages"]["5"]
+            record.setdefault("reruns", []).append(
+                {"stage": 5, "previous": copy.deepcopy(previous)}
+            )
+            attempts = int(previous.get("attempts", 0))
+            record["stages"]["5"] = {
+                "status": "RERUN",
+                # Attempts keep counting so every attempt log name stays unique;
+                # ``rerun_from_attempt`` marks where this rerun's attempts begin.
+                "attempts": attempts,
+                "rerun_from_attempt": attempts + 1,
+                "attempt_logs": list(previous.get("attempt_logs", [])),
+            }
+        elif first != stage:
             raise ValueError("BOOT-029 must resume its first unpassed stage")
         if record["stages"].get(str(stage), {}).get("status") == "RUNNING":
             raise ValueError(

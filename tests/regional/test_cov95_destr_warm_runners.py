@@ -471,11 +471,20 @@ def test_safe_shortage_scenario_keeps_refusal_and_restores_after_terminal(
         "shortage.restore",
         "spares.release",
         "restore.create",
+        "incident.close",
     ]
     assert [names.index(name) for name in order] == sorted(
         names.index(name) for name in order
     ), names
     assert h.nodes == {node: node_snapshot(node) for node in (FAULT, SPARE)}, h.nodes
+    # The shortage incident is closed once its node is released, with the
+    # evidence read from the restored node; nothing is left for the operator.
+    closed = [payload for name, payload in h.calls if name == "incident.close"]
+    assert [item["incident_id"] for item in closed] == [INCIDENT], closed
+    assert closed[0]["evidence"][0]["node_id"] == FAULT, closed
+    assert closed[0]["evidence"][0]["unschedulable"] is False, closed
+    assert report["incident_close"][INCIDENT]["closed"] is True, report
+    assert "residual_incidents" not in report, report
 
 
 @pytest.mark.parametrize(

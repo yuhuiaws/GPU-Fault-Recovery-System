@@ -383,6 +383,37 @@ def test_registry_stage_forces_cpu_secret_reload() -> None:
     )
 
 
+def test_a_replica_profile_drift_forces_the_cpu_roll() -> None:
+    """An identical template would not restart a replica that started on a
+    stale -config-core env (live 2026-09-26); the drift key forces the roll."""
+
+    release = upgrade_release(staged=False)
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+        changed=frozenset({ORCHESTRATION_MODULE.CPU_POD_PROFILE_DRIFT}),
+    )
+
+    ORCHESTRATION_MODULE.run_upgrade_phases(
+        release,
+        diff=diff,
+        plan=ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+            nodes=(
+                ORCHESTRATION_MODULE.ReleaseComponent.CPU_STAGE,
+                ORCHESTRATION_MODULE.ReleaseComponent.VERIFY,
+            )
+        ),
+        previous={},
+        completed_phases=set(),
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+
+    assert [item["force_restart"] for item in release.applies] == [True], (
+        release.applies
+    )
+    assert release.commits == [], "no staged registry: nothing to commit"
+
+
 def test_unchanged_registry_does_not_force_a_cpu_restart() -> None:
     release = upgrade_release(staged=False)
 

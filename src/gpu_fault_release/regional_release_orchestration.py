@@ -54,6 +54,7 @@ from gpu_fault_release.regional_release_config import (
     canonical_sha256,
 )
 from gpu_fault_release.regional_release_diff import (
+    CPU_POD_PROFILE_DRIFT,
     GPU_CLUSTER_COMPONENTS,
     ReleaseChangeKind,
     ReleaseComponent,
@@ -741,7 +742,9 @@ def _apply_upgrade_cpu(
             expected_agents,
             required_identity=release._candidate_agent_pin_identity(),
         )
-    release._apply_cpu(finalize=finalize, force_restart=force_restart, diff=diff)
+    # Stale start-up env on a replica: an identical template would not roll it.
+    restart = force_restart or diff.has(CPU_POD_PROFILE_DRIFT)
+    release._apply_cpu(finalize=finalize, force_restart=restart, diff=diff)
     if ingress:
         release._wait_candidate_cpu_agent_heartbeats(expected_agents)
 
@@ -792,8 +795,7 @@ def run_upgrade_phases(
                 registry_staged=registry_staged,
                 **merged,
             )
-            # Narrate carried phases only after the write made them durable.
-            # Their elapsed time belongs to the checkpoint that persisted them.
+            # Narrate carried phases only once durable; their time is the checkpoint's.
             for phase in carried:
                 narrate_phase(self, phase)
 
@@ -978,13 +980,11 @@ def run_upgrade_phases(
                 )
                 phase_complete("profile-ready")
             if not phase_done("endpoint-ready"):
-                # Target health is meaningful only after the staged ingress
-                # restart and its heartbeat barrier have completed.
+                # Target health counts only after the staged ingress restart + barrier.
                 start_component(ReleaseComponent.ENDPOINT)
                 submit_phase(PHASE_ENDPOINT, self._apply_nlb)
             if not phase_done("observability-ready"):
-                # Monitoring configuration can overlap GPU rollout. Join it
-                # before CPU finalization and the strict verification gates.
+                # Monitoring overlaps the GPU rollout; join it before CPU finalize/verify.
                 start_component(ReleaseComponent.OBSERVABILITY)
                 submit_phase(
                     PHASE_OBSERVABILITY, self._apply_control_plane_observability

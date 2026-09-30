@@ -23,8 +23,9 @@ def test_action_main_uses_real_registration_and_receipted_resources(
     receipt = json.loads((tmp_path / "capacity-resources.json").read_text())
     assert set(receipt["resources"]) == {
         f"configmap/{action.SCRIPT_CONFIGMAP}",
+        f"serviceaccount/{action.LOAD_SERVICE_ACCOUNT}",
         f"job/{action.JOB_NAME}",
-    }, "both action resources must reach the shared run journal"
+    }, "every action resource, the load account included, reaches the run journal"
     assert all(value["uid"] for value in receipt["resources"].values()), (
         "action creations must preserve UIDs"
     )
@@ -265,4 +266,86 @@ def test_action_database_transport_uses_cpu_component_python(
     )
     assert "python3" not in calls[-1], (
         "system Python cannot stand in for the CPU runtime"
+    )
+
+
+def test_budget_tier_relaxes_the_executor_floor_under_the_production_budget() -> None:
+    """§8.2 runs the same model under the production budget and the raw
+    capacity tier; the run records the tier and only the raw tier demands full
+    executor concurrency (live 2026-09-22: 20/5/2 failed the floor of 8)."""
+
+    raw = {
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": 128,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": 4,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": 4,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": 1,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": 1,
+    }
+    production = {**raw, "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": 20}
+    production["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] = 5
+    production["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] = 2
+    unbounded = {name: None for name in raw}
+    model = {"clusters": 32, "workflows_per_cluster": 4, "executor_workers": 8}
+
+    assert action.budget_tier(raw, **model)["tier"] == "raw-capacity", (
+        "128/4/4 admits every one of 32 x 4 workflows at once"
+    )
+    assert action.budget_tier(raw, **model)["min_concurrent_commands"] == 1, (
+        "peak concurrency is recorded evidence, not a pass criterion, in any tier"
+    )
+    tier = action.budget_tier(production, **model)
+    assert tier["tier"] == "production-budget", "20/5/2 throttles the model"
+    assert tier["min_concurrent_commands"] == 1, (
+        "a throttled executor only has to make progress"
+    )
+    assert tier["required_for_raw_capacity"] == {
+        "region": 128,
+        "per_cluster": 4,
+        "per_resource_class": 4,
+    }, "the record names what the raw tier would need"
+    assert action.budget_tier(unbounded, **model)["tier"] == "unbounded", (
+        "no limits configured is its own tier"
+    )
+    job = action.executor_job(
+        clusters=1,
+        expected_commands=40,
+        workers=8,
+        min_concurrent_commands=1,
+        delay_scale=1.0,
+        lease_seconds=60,
+        inject_renew_failure_once=False,
+        executor_protocol_version=1,
+        executor_artifact_sha256="a" * 64,
+        executor_compatibility_digest="b" * 64,
+    )
+    env = {
+        item["name"]: item["value"]
+        for item in job["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "value" in item
+    }
+    assert env["ACTION_MIN_CONCURRENT_COMMANDS"] == "1", (
+        "the floor reaches the executor through its environment"
+    )
+    long_job = action.executor_job(
+        clusters=1,
+        expected_commands=40,
+        workers=8,
+        max_seconds=2400,
+        delay_scale=1.0,
+        lease_seconds=60,
+        inject_renew_failure_once=False,
+        executor_protocol_version=1,
+        executor_artifact_sha256="a" * 64,
+        executor_compatibility_digest="b" * 64,
+    )
+    long_env = {
+        item["name"]: item["value"]
+        for item in long_job["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "value" in item
+    }
+    assert long_env["ACTION_MAX_SECONDS"] == "2400", (
+        "the executors' wall follows the runner's --timeout-seconds"
+    )
+    assert long_job["spec"]["activeDeadlineSeconds"] == 2700, (
+        "the Job deadline leaves teardown slack past the executors' wall"
     )

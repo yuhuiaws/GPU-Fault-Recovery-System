@@ -28,6 +28,8 @@ Two contracts here are subtle enough to name:
 
 from __future__ import annotations
 
+import re
+
 import math
 from datetime import datetime, timezone
 from typing import Any
@@ -872,16 +874,19 @@ def ledger_command_matches(row: dict[str, Any], command: dict[str, Any]) -> bool
         }:
             return True
         key = entry.get("idempotency_key")
-        if (
-            key
-            and type(generation) is int
-            and generation > 0
-            and any(
-                row_id == f"{key}/{node}/agent-{generation}"
-                for node in step.get("node_ids") or []
-            )
-        ):
-            return True
+        if key and type(generation) is int and generation > 0:
+            for node in step.get("node_ids") or []:
+                # A batched VERIFY_NO_GPU_CLIENTS is re-sent per attempt under
+                # ``<key>/<node>/attempt-N`` (step_execution._dispatch), so its
+                # ledger rows carry that segment before ``/agent-G`` (live
+                # DESTR-018, 2026-09-27).
+                if re.fullmatch(
+                    re.escape(f"{key}/{node}")
+                    + r"(?:/attempt-[1-9][0-9]*)?"
+                    + re.escape(f"/agent-{generation}"),
+                    row_id,
+                ):
+                    return True
     return False
 
 

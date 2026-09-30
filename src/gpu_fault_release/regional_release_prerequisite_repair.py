@@ -123,6 +123,11 @@ def matches_pre_repair_state(
     record = _validate_record(release, state)
     if record["baseline_sha256"] == expected:
         return True
+    # The same candidate's earlier attempt left its journal (READY, then the
+    # release failed a later preflight gate): this attempt's diff was pinned
+    # over that journal, and the re-proof below rewrote it (2026-09-28 #2).
+    if record.get("resumed_state_sha256") == expected:
+        return True
     # The deploy diff was pinned while a predecessor journal was still live;
     # the successor this candidate wrote in preflight recorded that digest.
     supersedes = record.get("supersedes")
@@ -418,9 +423,14 @@ def prepare_prerequisite_repair(
     elif orphan is not None:
         record = _advance_upgrade_repair(release, orphan, identity=identity)
     elif has_prerequisite_repair(release.state):
+        # This candidate's own journal from an earlier attempt. The deploy
+        # driver pinned the state digest with that journal in it; the re-proof
+        # rewrites the journal, so keep the pinned digest recognisable.
+        resumed_state_sha256 = canonical_sha256(release.state)
         record = _validate_record(release, release.state)
         if record["binding"]["database"] != identity:
             raise ReleaseError("Aurora prerequisite database identity drifted")
+        record["resumed_state_sha256"] = resumed_state_sha256
     else:
         snapshot: object = capture_aurora_refresh_snapshot(release, bootstrap=bootstrap)
         if previous_override is not None:

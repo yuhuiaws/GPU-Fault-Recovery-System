@@ -477,6 +477,12 @@ def renderer_admin_config() -> AdminConfig:
                         str(spool.replicas),
                     )
                 ),
+                "max_cluster_depth": int(
+                    os.getenv(
+                        "GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH",
+                        str(spool.max_cluster_depth),
+                    )
+                ),
             },
             "remediation": {
                 "max_active_region": int(
@@ -894,7 +900,7 @@ def main() -> None:
     set_env(
         ingress,
         "GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH",
-        "1024",
+        str(admin_config.capacity.telemetry_spool.max_cluster_depth),
     )
     set_env(
         ingress,
@@ -926,10 +932,10 @@ def main() -> None:
         "GPU_FAULT_INGRESS_FAULT_CONCURRENCY",
         "256",
     )
-    set_env(
+    set_env(  # fleet-derived, capacity_evidence section 8.4
         ingress,
         "GPU_FAULT_INGRESS_NORMAL_CONCURRENCY",
-        "1000",
+        str(admin_config.ingress_normal_concurrency()),
     )
     set_env(
         ingress,

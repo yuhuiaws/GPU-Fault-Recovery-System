@@ -52,7 +52,7 @@ class WarmSpareReplacementEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[通知][GPU warm-spare替换成功] {cluster_id}: "
+                f"[NOTICE][GPU warm-spare replacement succeeded] {cluster_id}: "
                 f"{', '.join(fault_node_ids)} -> "
                 f"{', '.join(spare_node_ids)}"
             ),

@@ -43,12 +43,18 @@ PENDING_REBOOT = {
 }
 
 
-def remote_flow(operation: OP = OP.RESET_GPU, *, batched: bool = False) -> FlowHarness:
-    operations = (
-        [OP.QUIESCE_GPU_SERVICES, operation, OP.RESTORE_GPU_SERVICES]
-        if operation is OP.RESET_GPU
-        else [OP.QUARANTINE, operation, OP.VALIDATE_GPU, OP.RESTORE_SCHEDULING]
-    )
+def remote_flow(
+    operation: OP = OP.RESET_GPU,
+    *,
+    batched: bool = False,
+    operations: list[OP] | None = None,
+) -> FlowHarness:
+    if operations is None:
+        operations = (
+            [OP.QUIESCE_GPU_SERVICES, operation, OP.RESTORE_GPU_SERVICES]
+            if operation is OP.RESET_GPU
+            else [OP.QUARANTINE, operation, OP.VALIDATE_GPU, OP.RESTORE_SCHEDULING]
+        )
     flow = FlowHarness(operations)
     flow.store.save_regional_cluster(
         RegionalClusterRegistration(

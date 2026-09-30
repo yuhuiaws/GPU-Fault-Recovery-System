@@ -1,6 +1,6 @@
 # Every rule in this file must carry an `annotations.summary`, an
 # `annotations.description` and an `annotations.runbook_url` pointing at
-# `docs/管理员日常运维.md#<alert name lowercased>`. The value is a
+# `docs/en/administrator-operations.md#<alert name lowercased>`. The value is a
 # repository-relative path rather than an absolute URL on purpose: this file is
 # published with the repository and has no single canonical hosting origin, so
 # an absolute URL would pin one fork's web address into the alert payload. An
@@ -19,7 +19,7 @@ groups:
           severity: critical
         annotations:
           summary: A required GPU fault collector is missing or stale
-          runbook_url: docs/管理员日常运维.md#gpufaultcollectorsilent
+          runbook_url: docs/en/administrator-operations.md#gpufaultcollectorsilent
           description: >-
             Check the node systemd service, TLS trust, regional token,
             collector outbox and the last successful batch timestamp.
@@ -37,7 +37,7 @@ groups:
           severity: warning
         annotations:
           summary: A GPU fault collector is reporting collection errors
-          runbook_url: docs/管理员日常运维.md#gpufaultcollectorcollectionerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultcollectorcollectionerrors
           description: >-
             The collector is delivering batches whose newest state is a
             failure. Read the per-node errors from the collector status
@@ -49,7 +49,7 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault collector metrics snapshots are stale
-          runbook_url: docs/管理员日常运维.md#gpufaultcollectormetricssnapshotstale
+          runbook_url: docs/en/administrator-operations.md#gpufaultcollectormetricssnapshotstale
           description: >-
             Ensure the metrics scraper targets ingress replicas and check
             ingress connectivity to the shared control-plane store.
@@ -77,7 +77,7 @@ groups:
           severity: critical
         annotations:
           summary: ADOT is dropping metric points on the way to AMP
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryremotewritefailing
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryremotewritefailing
           description: >-
             Points that keep failing past the exporter's 120s retry window are
             dropped and never resent. What AMP holds is therefore incomplete, so
@@ -95,7 +95,7 @@ groups:
           severity: warning
         annotations:
           summary: The ADOT export queue is close to dropping metric points
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryremotewritequeuesaturated
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryremotewritequeuesaturated
           description: >-
             The retry queue is over 80% full, so AMP is being written slower than
             the control plane is scraped and the next backlog is dropped rather
@@ -110,7 +110,7 @@ groups:
           severity: critical
         annotations:
           summary: The ADOT collector's own telemetry is missing from AMP
-          runbook_url: docs/管理员日常运维.md#gpufaultadotselfmetricsmissing
+          runbook_url: docs/en/administrator-operations.md#gpufaultadotselfmetricsmissing
           description: >-
             Either the collector is not running or remote_write is failing
             completely, and in the second case GpuFaultTelemetryRemoteWriteFailing
@@ -152,7 +152,7 @@ groups:
           severity: warning
         annotations:
           summary: The data-plane metrics collector is not scraping a GPU cluster
-          runbook_url: docs/管理员日常运维.md#gpufaultdataplanecollectormissing
+          runbook_url: docs/en/administrator-operations.md#gpufaultdataplanecollectormissing
           description: >-
             The per-GPU-cluster ADOT collector (job gpu-fault-dataplane) in
             {{ $labels.gpu_cluster }} is alive but every target it scrapes is
@@ -207,7 +207,7 @@ groups:
           severity: warning
         annotations:
           summary: Completion Watcher attempt state is not being persisted
-          runbook_url: docs/管理员日常运维.md#gpufaultcompletionactivestateunavailable
+          runbook_url: docs/en/administrator-operations.md#gpufaultcompletionactivestateunavailable
           description: >-
             The routine attempt-state ConfigMap
             (gpu-fault-completion-watcher-outbox-active), or the Role that names
@@ -248,7 +248,7 @@ groups:
           severity: warning
         annotations:
           summary: Completion Watcher write-ahead appends are failing
-          runbook_url: docs/管理员日常运维.md#gpufaultcompletionoutboxappendfailures
+          runbook_url: docs/en/administrator-operations.md#gpufaultcompletionoutboxappendfailures
           description: >-
             {{ $value | printf "%.0f" }} critical completion event(s) on {{ $labels.gpu_cluster }}
             in the last 10 minutes got no write-ahead ConfigMap copy, so a
@@ -272,7 +272,7 @@ groups:
           severity: warning
         annotations:
           summary: The ADOT collector is close to its memory limit
-          runbook_url: docs/管理员日常运维.md#gpufaultadotmemoryhigh
+          runbook_url: docs/en/administrator-operations.md#gpufaultadotmemoryhigh
           description: >-
             The collector's resident memory has stayed above 200MiB for ten
             minutes against a 256Mi container limit (GOMEMLIMIT 220MiB). The
@@ -290,7 +290,7 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault control-plane metrics are missing
-          runbook_url: docs/管理员日常运维.md#gpufaultcontrolplanemetricsmissing
+          runbook_url: docs/en/administrator-operations.md#gpufaultcontrolplanemetricsmissing
           description: >-
             The whole regional control plane is invisible to monitoring, so
             every other rule in this file is simultaneously inert. Check the
@@ -310,7 +310,7 @@ groups:
           severity: critical
         annotations:
           summary: A control-plane replica's /metrics scrape is failing
-          runbook_url: docs/管理员日常运维.md#gpufaultcontrolplanereplicascrapefailing
+          runbook_url: docs/en/administrator-operations.md#gpufaultcontrolplanereplicascrapefailing
           description: >-
             Pod {{ $labels.pod }} ({{ $labels.service_role }}) has not answered
             a scrape for five minutes: the request timed out or returned a
@@ -334,7 +334,7 @@ groups:
           severity: warning
         annotations:
           summary: A /metrics contributor keeps failing on one replica
-          runbook_url: docs/管理员日常运维.md#gpufaultmetricscontributorfailing
+          runbook_url: docs/en/administrator-operations.md#gpufaultmetricscontributorfailing
           description: >-
             Contributor {{ $labels.contributor }} on Pod {{ $labels.pod }} has
             raised on most scrapes for ten minutes, so its families are missing
@@ -359,7 +359,7 @@ groups:
           severity: warning
         annotations:
           summary: A control-plane Pod has incomplete process metric coverage
-          runbook_url: docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete
+          runbook_url: docs/en/administrator-operations.md#gpufaultmetricsaggregationincomplete
           description: >-
             Pod {{ $labels.pod }} ({{ $labels.service_role }}) lacks fresh,
             complete metric publications from its live processes. Publications
@@ -374,7 +374,7 @@ groups:
           severity: warning
         annotations:
           summary: Regional GPU fault processor queue exceeds 70 percent
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorqueuedepthhigh
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh
           description: >-
             Nothing is rejected yet, but queueing delay is already growing.
             Check control-worker replicas and lane occupancy, Aurora latency,
@@ -388,7 +388,7 @@ groups:
           severity: critical
         annotations:
           summary: Regional GPU fault processor queue exceeds 90 percent
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorqueuedepthcritical
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical
           description: >-
             One step away from admission rejection, at which point fault events
             depend on client redelivery. Check the same signals as
@@ -404,7 +404,7 @@ groups:
           severity: warning
         annotations:
           summary: Oldest GPU fault processor request is delayed
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessoroldestrequestdelayed
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessoroldestrequestdelayed
           description: >-
             Queue depth may be entirely normal: this catches tail starvation,
             usually one slow request holding a lane. Locate the phase with
@@ -419,7 +419,7 @@ groups:
           severity: warning
         annotations:
           summary: A GPU cluster processor backlog exceeds 70 percent
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorclusterbackloghigh
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh
           description: >-
             Cluster {{ $labels.cluster_id }} is using over 70 percent of its own
             quota, so the backlog is concentrated in one cluster rather than
@@ -441,7 +441,7 @@ groups:
           severity: warning
         annotations:
           summary: Workflow metric scan is truncated
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowmetricscantruncated
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowmetricscantruncated
           description: >-
             More workflows are open or were updated within
             gpu_fault_workflow_scan_window_seconds than
@@ -468,7 +468,7 @@ groups:
           severity: warning
         annotations:
           summary: Attempt observation metric scan is truncated
-          runbook_url: docs/管理员日常运维.md#gpufaultattemptobservationmetricscantruncated
+          runbook_url: docs/en/administrator-operations.md#gpufaultattemptobservationmetricscantruncated
           description: >-
             gpu_fault_ambiguous_attempt_ownership_current and
             gpu_fault_stale_attempt_observations are computed from the newest
@@ -486,7 +486,7 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault processor rejected requests due to capacity
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessoradmissionrejected
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessoradmissionrejected
           description: >-
             Rejected fault events depend on client redelivery, so this is a real
             detection loss window, not just a capacity signal. Check the
@@ -502,7 +502,7 @@ groups:
           severity: warning
         annotations:
           summary: GPU fault control-plane Store I/O exceeds 90 percent
-          runbook_url: docs/管理员日常运维.md#gpufaultstoreiosaturated
+          runbook_url: docs/en/administrator-operations.md#gpufaultstoreiosaturated
           description: >-
             The Store I/O lane is nearly full, so the processor may start
             refusing Store operations at any moment. Check Aurora CPU and
@@ -526,7 +526,7 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault control-plane rejected Store I/O work for capacity
-          runbook_url: docs/管理员日常运维.md#gpufaultstoreiorejected
+          runbook_url: docs/en/administrator-operations.md#gpufaultstoreiorejected
           description: >-
             The Store I/O lane is full and requests waited past the admission
             timeout ({{ $value | printf "%.2f" }} rejections/s, reason=capacity),
@@ -545,7 +545,7 @@ groups:
           severity: warning
         annotations:
           summary: GPU fault control-plane keeps answering 503 because the writer is unreachable
-          runbook_url: docs/管理员日常运维.md#gpufaultstoreiobackendunavailable
+          runbook_url: docs/en/administrator-operations.md#gpufaultstoreiobackendunavailable
           description: >-
             {{ $value | printf "%.0f" }} Store calls in 10 minutes were answered
             503 + Retry-After because the PostgreSQL writer was briefly
@@ -565,7 +565,7 @@ groups:
           severity: warning
         annotations:
           summary: GPU fault processor p95 request duration exceeds 5 seconds
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorp95slow
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorp95slow
           description: >-
             The earliest leading indicator among the capacity alerts. Check
             event loop lag, Aurora connection pool wait, and whether a release
@@ -595,7 +595,7 @@ groups:
           severity: warning
         annotations:
           summary: Expired processor leases were returned to PENDING
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorexpiredleasesreclaimed
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorexpiredleasesreclaimed
           description: >-
             {{ $value | printf "%.0f" }} queued request(s) sat LEASED past their lease and were
             reclaimed by the periodic job, so a processor worker died or
@@ -643,7 +643,7 @@ groups:
           severity: warning
         annotations:
           summary: Processor queue shard counters disagree with the queue table
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdrift
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorcounterdrift
           description: >-
             For five minutes the shard counters have not matched a real count
             of PENDING/LEASED rows, so per-cluster queue depth and quota
@@ -680,7 +680,7 @@ groups:
           severity: warning
         annotations:
           summary: The latest processor counter drift scan is unavailable
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorcounterdriftscanunavailable
           description: >-
             No complete, current successful counter scan is available. The
             measurement expires after three configured scan intervals, with a
@@ -695,7 +695,7 @@ groups:
           severity: warning
         annotations:
           summary: Telemetry spool consumer fell back to polling
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoollistenerdown
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspoollistenerdown
           description: >-
             The spool consumer's LISTEN/NOTIFY connection dropped and it is
             polling instead. Behaviour is still correct, latency is worse. Check
@@ -710,7 +710,7 @@ groups:
           severity: critical
         annotations:
           summary: Telemetry spool dropped routine samples
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooldataloss
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspooldataloss
           description: >-
             Dropping applies to routine telemetry only, never to fault events,
             but host and network trends now have a hole in them. Check whether
@@ -724,7 +724,7 @@ groups:
           severity: critical
         annotations:
           summary: Telemetry spool rejected routine samples
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooladmissionrejected
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspooladmissionrejected
           description: >-
             Rejection at the spool ingress is one link earlier than
             GpuFaultTelemetrySpoolDataLoss. Check the ingress batch parameters,
@@ -736,7 +736,7 @@ groups:
           severity: critical
         annotations:
           summary: Telemetry spool replay failed
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoolreplayerror
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspoolreplayerror
           description: >-
             Samples that were already durably spooled did not make it into the
             processing path. Read the exception type in the spool worker log,
@@ -751,7 +751,7 @@ groups:
           severity: warning
         annotations:
           summary: Telemetry spool has not drained within 60 seconds
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooldraindelayed
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspooldraindelayed
           description: >-
             The leading indicator for both spool rejection and spool data loss.
             Check spool worker replicas and lane occupancy, and Aurora write
@@ -775,7 +775,7 @@ groups:
           severity: critical
         annotations:
           summary: No workflow dispatcher has completed a cycle for five minutes
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowdispatcherstalled
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowdispatcherstalled
           description: >-
             gpu_fault_workflow_pending_age_seconds_max and every dispatch counter
             are stale from this moment: the thread that writes them is not
@@ -793,7 +793,7 @@ groups:
           severity: critical
         annotations:
           summary: No periodic service runner has ticked for five minutes
-          runbook_url: docs/管理员日常运维.md#gpufaultperiodicrunnerstalled
+          runbook_url: docs/en/administrator-operations.md#gpufaultperiodicrunnerstalled
           description: >-
             Training health, spare health, identity refresh, cleanup, archive,
             collector-silence detection, lease reclaim and counter drift all
@@ -814,7 +814,7 @@ groups:
           severity: critical
         annotations:
           summary: A control-worker replica has marked its processor unhealthy
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorunhealthy
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorunhealthy
           description: >-
             Pod {{ $labels.pod }} refuses to claim processor requests and sits
             out every periodic job. The reason is in its /healthz body and the
@@ -838,7 +838,7 @@ groups:
           severity: critical
         annotations:
           summary: A control-worker's processor consumer loop is dead or wedged
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorconsumerstalled
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorconsumerstalled
           description: >-
             Pod {{ $labels.pod }} reports its processor consumer loop as not
             running, or has not started a claim cycle for over 30 seconds, for
@@ -856,7 +856,7 @@ groups:
           severity: critical
         annotations:
           summary: No replica is consuming the processor queue
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessornoactiveconsumer
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessornoactiveconsumer
           description: >-
             Fault events are being accepted and queued and nothing is claiming
             them, so detection has stopped while every ingress health check
@@ -872,7 +872,7 @@ groups:
           severity: critical
         annotations:
           summary: A telemetry spool worker has no running consumer loop
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoolconsumerstopped
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspoolconsumerstopped
           description: >-
             Pod {{ $labels.pod }} is up but its spool consumer loop has exited,
             so routine telemetry spooled to it is not being replayed and
@@ -896,7 +896,7 @@ groups:
           severity: critical
         annotations:
           summary: A telemetry spool consumer loop is running but no longer claiming
-          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoolconsumerstalled
+          runbook_url: docs/en/administrator-operations.md#gpufaulttelemetryspoolconsumerstalled
           description: >-
             Pod {{ $labels.pod }} reports a live consumer loop that has issued
             no claim round in ten minutes, when an idle loop claims every few
@@ -922,7 +922,7 @@ groups:
           severity: warning
         annotations:
           summary: Processor lease renewals were refused or failed
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorleaserenewalfailing
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorleaserenewalfailing
           description: >-
             {{ $value | printf "%.0f" }} lease renewal(s) in 15 minutes were fenced (another
             owner holds the lane, so a request may have run on two workers) or
@@ -945,7 +945,7 @@ groups:
           severity: warning
         annotations:
           summary: Fault-layer collector events were rejected after the ingress 202
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorfaulteventsrejected
           description: >-
             {{ $value | printf "%.0f" }} fault-layer event(s) in 15 minutes were accepted at the
             ingress and then completed with a 4xx on replay, so the fault they
@@ -973,7 +973,7 @@ groups:
           severity: warning
         annotations:
           summary: A periodic service job raised or could not take its task lease
-          runbook_url: docs/管理员日常运维.md#gpufaultperiodicserviceerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultperiodicserviceerrors
           description: >-
             {{ if $labels.periodic_job }}The periodic job {{ $labels.periodic_job }} raised an
             exception{{ else }}A periodic tick could not take a task lease from
@@ -1011,7 +1011,7 @@ groups:
           severity: critical
         annotations:
           summary: A GPU cluster remote command was never claimed by an executor
-          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandunclaimed
+          runbook_url: docs/en/administrator-operations.md#gpufaultremotecommandunclaimed
           description: >-
             Check that the runtime profile owner for the stuck step is
             advertised by an adapter the target cluster executor actually
@@ -1037,7 +1037,7 @@ groups:
           severity: critical
         annotations:
           summary: A remote command was dead-lettered because no executor ever claimed it
-          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandunclaimedexpired
+          runbook_url: docs/en/administrator-operations.md#gpufaultremotecommandunclaimedexpired
           description: >-
             {{ $value | printf "%.0f" }} remote command(s) passed
             GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS still PENDING and
@@ -1056,7 +1056,7 @@ groups:
           severity: critical
         annotations:
           summary: A cluster executor failed a command through an internal defect
-          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandexecutorinternalerror
+          runbook_url: docs/en/administrator-operations.md#gpufaultremotecommandexecutorinternalerror
           description: >-
             The failure is an executor bug, not a refused recovery action.
             Read the executor Pod log stack trace before retrying. The alert
@@ -1072,7 +1072,7 @@ groups:
           severity: critical
         annotations:
           summary: A GPU product is not mapped to an NVIDIA Catalog family
-          runbook_url: docs/管理员日常运维.md#gpufaultunknownproductfamily
+          runbook_url: docs/en/administrator-operations.md#gpufaultunknownproductfamily
           description: >-
             Add the product prefix to spec.catalog.productFamilies in the
             pinned XID catalog before enabling automated XID recovery.
@@ -1091,7 +1091,7 @@ groups:
           severity: critical
         annotations:
           summary: Multiple fresh active attempts claim the same GPU node
-          runbook_url: docs/管理员日常运维.md#gpufaultexclusivenodeownershipinvariantviolation
+          runbook_url: docs/en/administrator-operations.md#gpufaultexclusivenodeownershipinvariantviolation
           description: >-
             Recovery is currently fail-closed for cluster
             {{ $labels.cluster_id }} GPU node {{ $labels.gpu_node }} because
@@ -1106,7 +1106,7 @@ groups:
           severity: warning
         annotations:
           summary: Stale active attempt observations remain
-          runbook_url: docs/管理员日常运维.md#gpufaultstaleattemptobservation
+          runbook_url: docs/en/administrator-operations.md#gpufaultstaleattemptobservation
           description: >-
             Cluster {{ $labels.cluster_id }} GPU node
             {{ $labels.gpu_node }} retains {{ $value | printf "%.0f" }} active-phase
@@ -1144,7 +1144,7 @@ groups:
           severity: warning
         annotations:
           summary: Workflows exist that nothing will dispatch, fence or sweep
-          runbook_url: docs/管理员日常运维.md#gpufaultorphanworkflows
+          runbook_url: docs/en/administrator-operations.md#gpufaultorphanworkflows
           description: >-
             {{ $value | printf "%.0f" }} PENDING or SAFETY_PENDING workflow(s) past the
             aggregation window have an incident that is gone or points
@@ -1161,7 +1161,7 @@ groups:
           severity: warning
         annotations:
           summary: Incidents point at workflow rows that do not exist
-          runbook_url: docs/管理员日常运维.md#gpufaultincidentdanglingworkflowpointers
+          runbook_url: docs/en/administrator-operations.md#gpufaultincidentdanglingworkflowpointers
           description: >-
             {{ $value | printf "%.0f" }} incident(s) carry a workflow_request_id no workflow row
             answers to. A later event on the same node follows that pointer,
@@ -1182,7 +1182,7 @@ groups:
           severity: warning
         annotations:
           summary: ACTIVE node agents have stopped heartbeating
-          runbook_url: docs/管理员日常运维.md#gpufaultstaleagents
+          runbook_url: docs/en/administrator-operations.md#gpufaultstaleagents
           description: >-
             {{ $value | printf "%.0f" }} ACTIVE agent(s) have no live heartbeat lease. Every
             node action on those nodes fails readiness and the collector
@@ -1203,7 +1203,7 @@ groups:
           severity: warning
         annotations:
           summary: A control-plane pin names a build no live agent runs
-          runbook_url: docs/管理员日常运维.md#gpufaultfleetpinaheadoffleet
+          runbook_url: docs/en/administrator-operations.md#gpufaultfleetpinaheadoffleet
           description: >-
             Cluster {{ $labels.cluster_id }}: {{ $value | printf "%.0f" }} node(s) fail
             readiness because a pinned value (agent version, artifact sha256,
@@ -1221,7 +1221,7 @@ groups:
           severity: warning
         annotations:
           summary: A fleet rollout has fenced destructive remediation for hours
-          runbook_url: docs/管理员日常运维.md#gpufaultfleetrolloutfencestuck
+          runbook_url: docs/en/administrator-operations.md#gpufaultfleetrolloutfencestuck
           description: >-
             Cluster {{ $labels.cluster_id }} has a non-terminal fleet deployment
             {{ $value | humanizeDuration }} old, so every destructive
@@ -1245,7 +1245,7 @@ groups:
           severity: warning
         annotations:
           summary: The regional registry Secret drifts from the durable registry head
-          runbook_url: docs/管理员日常运维.md#gpufaultregionalregistrysecretdrift
+          runbook_url: docs/en/administrator-operations.md#gpufaultregionalregistrysecretdrift
           description: >-
             Role {{ $labels.service_role }} started from a registry Secret whose
             digest differs from the durable registry head for 15 minutes. The
@@ -1277,7 +1277,7 @@ groups:
           severity: warning
         annotations:
           summary: A remote command was failed by the stale-fence sweep
-          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept
+          runbook_url: docs/en/administrator-operations.md#gpufaultremotecommandstalefenceswept
           description: >-
             {{ $value | printf "%.0f" }} LEASED remote command(s) whose workflow moved to
             another fencing token had their lease lapse without the data plane
@@ -1296,7 +1296,7 @@ groups:
           severity: warning
         annotations:
           summary: Notification outbox deliveries are raising
-          runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultnotificationdeliveryerrors
           description: >-
             {{ $value | printf "%.0f" }} outbox deliveries in fifteen minutes raised inside the
             provider call or the bookkeeping after it (F-3); each row was
@@ -1313,7 +1313,7 @@ groups:
           severity: warning
         annotations:
           summary: The control-record archiver is failing on candidates
-          runbook_url: docs/管理员日常运维.md#gpufaultcontrolrecordarchiveerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultcontrolrecordarchiveerrors
           description: >-
             {{ $value | printf "%.0f" }} archive candidate(s) in the last hour failed with an
             exception other than a safety refusal (F-8); the run continued and
@@ -1357,7 +1357,7 @@ groups:
           severity: warning
         annotations:
           summary: Fail-closed recovery workflows are accumulating
-          runbook_url: docs/管理员日常运维.md#gpufaultrecoveryblockedbacklog
+          runbook_url: docs/en/administrator-operations.md#gpufaultrecoveryblockedbacklog
           description: >-
             {{ $value | printf "%.0f" }} recovery workflows are BLOCKED with no verified restore
             successor, so each one still holds a GPU node out of the training
@@ -1380,7 +1380,7 @@ groups:
           severity: warning
         annotations:
           summary: Callers are queueing for a PostgreSQL pool connection
-          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespoolcheckoutqueueing
+          runbook_url: docs/en/administrator-operations.md#gpufaultpostgrespoolcheckoutqueueing
           description: >-
             Pod {{ $labels.pod }} ({{ $labels.service_role }}) has had callers
             blocked on pool checkout on every sample for two minutes: every
@@ -1399,7 +1399,7 @@ groups:
           severity: critical
         annotations:
           summary: A PostgreSQL pool cannot open new connections
-          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespoolconnectionerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultpostgrespoolconnectionerrors
           description: >-
             Pod {{ $labels.pod }} ({{ $labels.service_role }}) has failed to open
             pooled connections for five minutes. After a master password
@@ -1423,7 +1423,7 @@ groups:
           severity: warning
         annotations:
           summary: The Aurora credential refresher has not succeeded for three hours
-          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstale
+          runbook_url: docs/en/administrator-operations.md#gpufaultauroracredentialrefreshstale
           description: >-
             The hourly gpu-fault-aurora-credential-refresh CronJob last
             verified and published the master password more than three hours
@@ -1444,7 +1444,7 @@ groups:
           severity: critical
         annotations:
           summary: The Aurora credential refresher's last run failed
-          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshfailing
+          runbook_url: docs/en/administrator-operations.md#gpufaultauroracredentialrefreshfailing
           description: >-
             The most recent gpu-fault-aurora-credential-refresh run finished
             with a non-ok status and no later run has succeeded in fifteen
@@ -1462,7 +1462,7 @@ groups:
           severity: warning
         annotations:
           summary: Configured Aurora credential refresh evidence is unknown
-          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown
+          runbook_url: docs/en/administrator-operations.md#gpufaultauroracredentialrefreshstatusunknown
           description: >-
             A configured DSN-file consumer cannot validate its refresh status:
             the file is missing, unreadable, malformed or future-dated.
@@ -1479,7 +1479,7 @@ groups:
           severity: warning
         annotations:
           summary: A node branch went to an operator because the cluster budget was full
-          runbook_url: docs/管理员日常运维.md#gpufaultbranchescalationbudgetrefused
+          runbook_url: docs/en/administrator-operations.md#gpufaultbranchescalationbudgetrefused
           description: >-
             {{ $value | printf "%.0f" }} node branch(es) could not take their next rung
             (reboot or replacement) because the cluster remediation budget was
@@ -1493,7 +1493,7 @@ groups:
           severity: warning
         annotations:
           summary: A recovery workflow ran out of its hard lifetime
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowlifetimeexceeded
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowlifetimeexceeded
           description: >-
             {{ $value | printf "%.0f" }} workflow(s) failed in the last 30 minutes because their
             lifetime deadline passed. Each is now ESCALATED to an operator and
@@ -1508,7 +1508,7 @@ groups:
           severity: warning
         annotations:
           summary: A training job was stopped because its nodes stayed under repair
-          runbook_url: docs/管理员日常运维.md#gpufaultjobworkflownodebusytimeout
+          runbook_url: docs/en/administrator-operations.md#gpufaultjobworkflownodebusytimeout
           description: >-
             {{ $value | printf "%.0f" }} job workflow(s) waited out the node-busy window and were
             failed by suspending the job. The job owner sees a controller-initiated
@@ -1528,7 +1528,7 @@ groups:
           severity: warning
         annotations:
           summary: Workflow dispatch attempts are raising internal errors
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowdispatchinternalerrors
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowdispatchinternalerrors
           description: >-
             A dispatch attempt raised an error the dispatcher does not
             recognise {{ $value | humanizeDuration }} ago;
@@ -1550,7 +1550,7 @@ groups:
           severity: critical
         annotations:
           summary: A failed workflow's failure handling was abandoned
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowfailurehandlingabandoned
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowfailurehandlingabandoned
           description: >-
             A failed workflow's failure handler gave up after repeated
             exceptions {{ $value | humanizeDuration }} ago
@@ -1568,7 +1568,7 @@ groups:
           severity: warning
         annotations:
           summary: Processor requests kept failing past the retry horizon
-          runbook_url: docs/管理员日常运维.md#gpufaultprocessorretryhorizonfailures
+          runbook_url: docs/en/administrator-operations.md#gpufaultprocessorretryhorizonfailures
           description: >-
             {{ $value | printf "%.0f" }} queued request(s) were completed as failed (503) because
             their releases kept failing for longer than the retry horizon. The
@@ -1601,7 +1601,7 @@ groups:
           severity: warning
         annotations:
           summary: Recent GPU fault containment took over 15 minutes on average
-          runbook_url: docs/管理员日常运维.md#gpufaultclosedloopslow
+          runbook_url: docs/en/administrator-operations.md#gpufaultclosedloopslow
           description: >-
             The mean workflow-creation-to-first-containment duration for
             successes in the six-hour event-time window exceeds 15 minutes.
@@ -1643,7 +1643,7 @@ groups:
           severity: warning
         annotations:
           summary: Recent GPU fault containment latency is unknown
-          runbook_url: docs/管理员日常运维.md#gpufaultclosedloopwindowincomplete
+          runbook_url: docs/en/administrator-operations.md#gpufaultclosedloopwindowincomplete
           description: >-
             At least one control-worker lacks a complete, fresh six-hour
             containment window. Check workflow scan truncation and its recency
@@ -1683,7 +1683,7 @@ groups:
           severity: critical
         annotations:
           summary: Business notifications were given up on undelivered
-          runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing
+          runbook_url: docs/en/administrator-operations.md#gpufaultnotificationdeliveryfailing
           description: >-
             A notification reached a recorded terminal FAILED result
             {{ $value | humanizeDuration }} ago: the outbox exhausted its delivery attempts
@@ -1709,7 +1709,7 @@ groups:
           severity: critical
         annotations:
           summary: A business notification has waited over 30 minutes to be delivered
-          runbook_url: docs/管理员日常运维.md#gpufaultnotificationundeliveredtoolong
+          runbook_url: docs/en/administrator-operations.md#gpufaultnotificationundeliveredtoolong
           description: >-
             The oldest undelivered notification has waited
             {{ $value | humanizeDuration }} and its shelf life will expire it
@@ -1739,7 +1739,7 @@ groups:
           severity: warning
         annotations:
           summary: Notifications are queued but no dispatcher is draining the outbox
-          runbook_url: docs/管理员日常运维.md#gpufaultnotificationoutboxnotdraining
+          runbook_url: docs/en/administrator-operations.md#gpufaultnotificationoutboxnotdraining
           description: >-
             {{ $value | printf "%.0f" }} notification(s) are PENDING or RETRY and no replica has
             started a dispatch cycle for five minutes. Either
@@ -1766,7 +1766,7 @@ groups:
           severity: warning
         annotations:
           summary: Notifications were retired unsent past their shelf life
-          runbook_url: docs/管理员日常运维.md#gpufaultnotificationexpiredunsent
+          runbook_url: docs/en/administrator-operations.md#gpufaultnotificationexpiredunsent
           description: >-
             A notification was claimed only after its
             GPU_FAULT_NOTIFICATION_TTL_SECONDS shelf life and retired with a
@@ -1809,7 +1809,7 @@ groups:
           severity: warning
         annotations:
           summary: A recovery workflow step has been waiting far too long
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowstepstalled
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowstepstalled
           description: >-
             A {{ $labels.operation }} step has been WAITING
             {{ $value | humanizeDuration }} longer than that operation is
@@ -1836,7 +1836,7 @@ groups:
           severity: critical
         annotations:
           summary: A recovery workflow outlived its execution deadline
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowdeadlinenotenforced
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowdeadlinenotenforced
           description: >-
             A non-terminal workflow is {{ $value | humanizeDuration }} past its
             execution_deadline, so the bound that is supposed to terminalize it
@@ -1857,7 +1857,7 @@ groups:
           severity: warning
         annotations:
           summary: Recovery workflows have waited 30 minutes for remediation capacity
-          runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetstarved
+          runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetstarved
           description: >-
             {{ $value | printf "%.0f" }} workflows are held by a remediation budget. Compare
             gpu_fault_remediation_budget_active_claims against the configured
@@ -1888,7 +1888,7 @@ groups:
           severity: warning
         annotations:
           summary: One GPU cluster's remediation budget has been saturated for 30 minutes
-          runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetclustersaturated
+          runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetclustersaturated
           description: >-
             Cluster {{ $labels.cluster_id }} has {{ $value | printf "%.0f" }} recovery workflows
             waiting on its remediation budget while its active claims sit at
@@ -1922,7 +1922,7 @@ groups:
           severity: warning
         annotations:
           summary: Completion events were recorded but never decided
-          runbook_url: docs/管理员日常运维.md#gpufaultcompletioneventswithoutdecision
+          runbook_url: docs/en/administrator-operations.md#gpufaultcompletioneventswithoutdecision
           description: >-
             {{ $value | printf "%.0f" }} completion event(s) have had no decision for 30
             minutes. The attempt outcome was stored but its decision was never
@@ -1945,7 +1945,7 @@ groups:
           severity: warning
         annotations:
           summary: Escalated incidents have waited a day for an operator
-          runbook_url: docs/管理员日常运维.md#gpufaultincidentsawaitingoperator
+          runbook_url: docs/en/administrator-operations.md#gpufaultincidentsawaitingoperator
           description: >-
             {{ $value | printf "%.0f" }} incident(s) have been ESCALATED for at least 24 hours.
             Each one is a decision the control plane deliberately handed to a
@@ -1968,7 +1968,7 @@ groups:
           severity: warning
         annotations:
           summary: A recovery workflow has waited over 30 minutes to be dispatched
-          runbook_url: docs/管理员日常运维.md#gpufaultworkflowpendingage
+          runbook_url: docs/en/administrator-operations.md#gpufaultworkflowpendingage
           description: >-
             The oldest PENDING workflow is {{ $value | humanizeDuration }} old
             and no dispatcher has claimed it. Read its predecessor_workflow_id

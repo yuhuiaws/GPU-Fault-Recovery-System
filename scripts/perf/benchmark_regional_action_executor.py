@@ -11,7 +11,6 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from urllib import error, request
 
-
 OWNERS = [
     "gpu-fault-kubernetes-adapter",
     "gpu-fault-node-agent",

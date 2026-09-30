@@ -480,6 +480,47 @@ def test_role_split_derives_the_fault_reserve_from_the_declared_node_count() -> 
         assert values["GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT"] == "4000"
         assert values["GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH"] == "1000"
         assert values["GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH"] == "8192"
+    api = _effective_env(items, items["gpu-fault-api-ha"])
+    assert api["GPU_FAULT_INGRESS_NORMAL_CONCURRENCY"] == "1000", (
+        "4000 managed nodes stay at the measured 1000 normal-tier slots"
+    )
+
+
+def test_role_split_derives_the_ingress_normal_tier_from_the_managed_fleet() -> None:
+    # Perf plan section 8.4: the 50-cluster preset (12800 nodes) overran the
+    # fixed 1000 normal-tier slots per ingress process (0.58-3.85 % reserved
+    # 503 across six live runs), so the renderer sizes them from the fleet.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT": "256",
+            "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": "12800",
+            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": "4096",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    api = _effective_env(items, items["gpu-fault-api-ha"])
+    assert api["GPU_FAULT_INGRESS_NORMAL_CONCURRENCY"] == "2560", api.get(
+        "GPU_FAULT_INGRESS_NORMAL_CONCURRENCY"
+    )
+    assert api["GPU_FAULT_INGRESS_FAULT_CONCURRENCY"] == "256", (
+        "the fault tier is not touched by the fleet-derived normal tier"
+    )
+    assert api["GPU_FAULT_INGRESS_NORMAL_WAIT_SECONDS"] == "2", (
+        "the routine tier keeps its fast-fail wait"
+    )
 
 
 POOL_ENV = (

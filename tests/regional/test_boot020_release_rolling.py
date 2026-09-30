@@ -73,8 +73,22 @@ class FakeBackend:
         # Per-scenario rollback plan replacing the correct one.
         self.plan_overrides: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[Any, ...]] = []
+        self.commits: list[str] = []
+        # The restore stage: after candidate D the site config is a FULL change
+        # again until it is applied; ``cpu_env_drift`` fakes Pods that kept
+        # candidate D's start-up environment after the restore.
+        self.initial_live = copy.deepcopy(self.live)
+        self.restored = False
+        self.cpu_env_drift = False
+
+    def cpu_env_alignment(self, scenario: str) -> dict[str, Any]:
+        self.calls.append(("cpu_env_alignment", scenario))
+        return {"aligned": not self.cpu_env_drift, "deployments": {}}
 
     def classify(self, scenario: str) -> dict[str, Any]:
+        scenario = "noop" if scenario == "restore" else scenario
+        if scenario == "noop" and "full" in self.completed and not self.restored:
+            return {"kind": "FULL", "changed": ["runtime_profile"]}
         kind = (
             "NOOP" if scenario in self.completed else boot020.EXPECTED_KINDS[scenario]
         )
@@ -129,8 +143,11 @@ class FakeBackend:
         fault_phase: str | None = None,
         resume: bool = False,
         auto_rollback: bool | None = None,
+        commit: bool = False,
     ) -> dict[str, Any]:
         self.calls.append((scenario, fault_phase, resume, auto_rollback, diff["kind"]))
+        if commit:
+            self.commits.append(scenario)
         plans = {
             "control_plane": {
                 "clusters": {},
@@ -206,10 +223,17 @@ class FakeBackend:
         elif scenario == "full":
             self.live["cpu_wheel"] = "cpu-v3"
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v3"
+        elif scenario == "noop" and "full" in self.completed:
+            # The restore: the site is back on its own release.
+            self.restored = True
+            self.live = copy.deepcopy(self.initial_live)
         self.completed.add(scenario)
         return self._with_pins(
             {
                 "phase": "complete",
+                "transaction_committed": commit
+                or scenario != "noop"
+                or not self.restored,
                 "injected_failure": None,
                 "operation_duration_seconds": 10.0,
             },

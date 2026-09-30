@@ -332,11 +332,11 @@ def test_efa_traffic_anomaly_sends_fixed_email(monkeypatch) -> None:
     asyncio.run(scenario())
     assert len(notifier.notifications) == 1
     body = notifier.notifications[0].body_text
-    assert "事件类型：EFA_TRAFFIC_ANOMALY" in body
-    assert "流量状态：SPIKE" in body
-    assert "流量 baseline：1000.0" in body
-    assert "Job ID：job-a" in body
-    assert "Attempt ID：attempt-a" in body
+    assert "Event type: EFA_TRAFFIC_ANOMALY" in body
+    assert "Traffic state: SPIKE" in body
+    assert "Traffic baseline: 1000.0" in body
+    assert "Job ID: job-a" in body
+    assert "Attempt ID: attempt-a" in body
 
 
 def test_admin_can_acknowledge_transient_efa_spike(monkeypatch) -> None:

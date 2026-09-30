@@ -418,7 +418,23 @@ class CollectorAcceptanceFixture:
         restore = WarmSpareLiveFixture(self.regional, "")
         results = []
         seen = set()
-        for incident in reversed(list(state.get("incidents") or [])):
+        # The isolation may be owned by an incident this state never saw -- a
+        # support escalation of an earlier case's still-open incident that
+        # absorbed this case's XID (live 2026-09-28: the restore offered under
+        # the seeded incident failed "isolation ownership does not match").
+        # The node's own annotation names the owner; offer it first.
+        read_node = getattr(self.regional, "node_snapshot", None)
+        annotated = str(
+            ((read_node(self.node) if callable(read_node) else {}) or {})
+            .get("ownership_annotations", {})
+            .get("gpu-fault.io/incident-id")
+            or ""
+        )
+        candidates = [
+            *([{"incident_id": annotated}] if annotated else []),
+            *reversed(list(state.get("incidents") or [])),
+        ]
+        for incident in candidates:
             incident_id = str(incident.get("incident_id") or "")
             if not incident_id:
                 raise RegionalFixtureError(

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from gpu_fault.notifications.common import AdvisoryNotification
 
-CONTEXT_HEADER = "通知上下文"
+CONTEXT_HEADER = "Notification context"
 
 
 def subject_with_context(

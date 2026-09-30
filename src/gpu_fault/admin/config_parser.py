@@ -96,6 +96,8 @@ def snake_section(
     result: dict[str, object] = {}
     for field in fields(cast(Any, section)):
         value = getattr(section, field.name)
+        if lifted_default(section, field.name, value):
+            continue
         result[field.name] = (
             snake_section(value, constants=constants) if is_dataclass(value) else value
         )
@@ -103,11 +105,29 @@ def snake_section(
     return result
 
 
+def lifted_default(section: object, name: str, value: object) -> bool:
+    """Whether a field added after sites went live is left out of the record.
+
+    A section lists such fields in ``OMIT_WHEN_DEFAULT``; while the value is the
+    field's default the persisted and YAML forms omit it, so every existing
+    ``desired.json`` keeps its digest and older records read back unchanged
+    (``read_section`` fills the default). A non-default value is recorded.
+    """
+
+    omit: frozenset[str] = getattr(type(section), "OMIT_WHEN_DEFAULT", frozenset())
+    if name not in omit:
+        return False
+    default = next(f.default for f in fields(cast(Any, section)) if f.name == name)
+    return value == default
+
+
 def camel_section(section: object) -> dict[str, object]:
     """The editable YAML form of a section: its fields in camelCase, no constants."""
 
     result: dict[str, object] = {}
     for field in fields(cast(Any, section)):
+        if lifted_default(section, field.name, getattr(section, field.name)):
+            continue
         value = getattr(section, field.name)
         result[camel_case(field.name)] = (
             camel_section(value) if is_dataclass(value) else value

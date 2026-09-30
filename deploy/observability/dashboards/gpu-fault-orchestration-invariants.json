@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-orchestration-invariants; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-orchestration-invariants; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "More than one fresh attempt owning a node.\n\nAlert GpuFaultExclusiveNodeOwnershipInvariantViolation (critical, > 1): docs/管理员日常运维.md#gpufaultexclusivenodeownershipinvariantviolation",
+      "description": "More than one fresh attempt owning a node.\n\nAlert GpuFaultExclusiveNodeOwnershipInvariantViolation (critical, > 1): docs/en/administrator-operations.md#gpufaultexclusivenodeownershipinvariantviolation",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -99,7 +99,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultStaleAttemptObservation (warning, for 2m, > 0): docs/管理员日常运维.md#gpufaultstaleattemptobservation",
+      "description": "Alert GpuFaultStaleAttemptObservation (warning, for 2m, > 0): docs/en/administrator-operations.md#gpufaultstaleattemptobservation",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -183,7 +183,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "How long destructive remediation has been fenced for the cluster by a non-terminal fleet deployment.\n\nAlert GpuFaultFleetRolloutFenceStuck (warning, for 10m, > 7200): docs/管理员日常运维.md#gpufaultfleetrolloutfencestuck",
+      "description": "How long destructive remediation has been fenced for the cluster by a non-terminal fleet deployment.\n\nAlert GpuFaultFleetRolloutFenceStuck (warning, for 10m, > 7200): docs/en/administrator-operations.md#gpufaultfleetrolloutfencestuck",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -334,7 +334,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Incidents whose workflow_request_id names a workflow that no longer exists.\n\nAlert GpuFaultIncidentDanglingWorkflowPointers (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultincidentdanglingworkflowpointers",
+      "description": "Incidents whose workflow_request_id names a workflow that no longer exists.\n\nAlert GpuFaultIncidentDanglingWorkflowPointers (warning, for 30m, > 0): docs/en/administrator-operations.md#gpufaultincidentdanglingworkflowpointers",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -405,7 +405,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Node agents past their heartbeat deadline.\n\nAlert GpuFaultStaleAgents (warning, for 15m, > 0): docs/管理员日常运维.md#gpufaultstaleagents",
+      "description": "Node agents past their heartbeat deadline.\n\nAlert GpuFaultStaleAgents (warning, for 15m, > 0): docs/en/administrator-operations.md#gpufaultstaleagents",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -476,7 +476,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "PIN_AHEAD_OF_FLEET is a node pinned to a release the fleet has not reached.\n\nAlert GpuFaultFleetPinAheadOfFleet (warning, for 10m, > 0): docs/管理员日常运维.md#gpufaultfleetpinaheadoffleet",
+      "description": "PIN_AHEAD_OF_FLEET is a node pinned to a release the fleet has not reached.\n\nAlert GpuFaultFleetPinAheadOfFleet (warning, for 10m, > 0): docs/en/administrator-operations.md#gpufaultfleetpinaheadoffleet",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -547,7 +547,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 when the registry Secret's configured digest differs from the durable head the replicas serve.\n\nAlert GpuFaultRegionalRegistrySecretDrift (warning, for 15m): docs/管理员日常运维.md#gpufaultregionalregistrysecretdrift",
+      "description": "1 when the registry Secret's configured digest differs from the durable head the replicas serve.\n\nAlert GpuFaultRegionalRegistrySecretDrift (warning, for 15m): docs/en/administrator-operations.md#gpufaultregionalregistrysecretdrift",
       "fieldConfig": {
         "defaults": {
           "color": {

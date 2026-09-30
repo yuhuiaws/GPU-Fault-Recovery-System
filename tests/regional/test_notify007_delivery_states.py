@@ -193,7 +193,7 @@ def test_the_exported_families_and_production_untouched_contracts() -> None:
 
 def test_the_shipped_alert_rule_reads_terminal_failed_and_has_its_runbook() -> None:
     rules = (ROOT / "deploy/observability/amp-rules.yaml").read_text(encoding="utf-8")
-    runbook = (ROOT / "docs/管理员日常运维.md").read_text(encoding="utf-8")
+    runbook = (ROOT / "docs/en/administrator-operations.md").read_text(encoding="utf-8")
     assert verdicts.alert_rule_errors(rules, runbook) == []
     assert "no runbook anchor" in _text(verdicts.alert_rule_errors(rules, "nothing"))
 
@@ -214,7 +214,7 @@ def alert_document() -> dict[str, Any]:
                         "for": "5m",
                         "labels": {"severity": "critical"},
                         "annotations": {
-                            "runbook_url": "docs/管理员日常运维.md"
+                            "runbook_url": "docs/en/administrator-operations.md"
                             "#gpufaultnotificationdeliveryfailing"
                         },
                     },
@@ -227,7 +227,7 @@ def alert_document() -> dict[str, Any]:
                         "for": "10m",
                         "labels": {"severity": "critical"},
                         "annotations": {
-                            "runbook_url": "docs/管理员日常运维.md"
+                            "runbook_url": "docs/en/administrator-operations.md"
                             "#gpufaultnotificationundeliveredtoolong"
                         },
                     },

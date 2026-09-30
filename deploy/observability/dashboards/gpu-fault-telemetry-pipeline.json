@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-telemetry-pipeline; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-telemetry-pipeline; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetryRemoteWriteFailing (critical, for 10m, > 0): docs/管理员日常运维.md#gpufaulttelemetryremotewritefailing",
+      "description": "Alert GpuFaultTelemetryRemoteWriteFailing (critical, for 10m, > 0): docs/en/administrator-operations.md#gpufaulttelemetryremotewritefailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -110,7 +110,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetryRemoteWriteQueueSaturated (warning, for 10m, > 0.8): docs/管理员日常运维.md#gpufaulttelemetryremotewritequeuesaturated",
+      "description": "Alert GpuFaultTelemetryRemoteWriteQueueSaturated (warning, for 10m, > 0.8): docs/en/administrator-operations.md#gpufaulttelemetryremotewritequeuesaturated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -181,7 +181,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Collector resident memory against its 256Mi limit (GOMEMLIMIT 220MiB); an OOMKill loop still lands a batch per restart, so absence alerts stay quiet (H2-4).\n\nAlert GpuFaultAdotMemoryHigh (warning, for 10m, > 2.09715e+08): docs/管理员日常运维.md#gpufaultadotmemoryhigh",
+      "description": "Collector resident memory against its 256Mi limit (GOMEMLIMIT 220MiB); an OOMKill loop still lands a batch per restart, so absence alerts stay quiet (H2-4).\n\nAlert GpuFaultAdotMemoryHigh (warning, for 10m, > 2.09715e+08): docs/en/administrator-operations.md#gpufaultadotmemoryhigh",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -265,7 +265,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "0 or absent: the collector's own pipeline counters are not reaching AMP, so the two panels above are blind.\n\nAlert GpuFaultAdotSelfMetricsMissing (critical, for 10m): docs/管理员日常运维.md#gpufaultadotselfmetricsmissing",
+      "description": "0 or absent: the collector's own pipeline counters are not reaching AMP, so the two panels above are blind.\n\nAlert GpuFaultAdotSelfMetricsMissing (critical, for 10m): docs/en/administrator-operations.md#gpufaultadotselfmetricsmissing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -326,7 +326,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 per GPU cluster whose ADOT collector (adot-dataplane.yaml) scrapes at least one data-plane target. 0 or a missing cluster: the Completion Watcher row below is blind for it. A cluster whose release skipped the collector (no adot_irsa_role_arn) never appears here.\n\nAlert GpuFaultDataplaneCollectorMissing (warning, for 15m): docs/管理员日常运维.md#gpufaultdataplanecollectormissing",
+      "description": "1 per GPU cluster whose ADOT collector (adot-dataplane.yaml) scrapes at least one data-plane target. 0 or a missing cluster: the Completion Watcher row below is blind for it. A cluster whose release skipped the collector (no adot_irsa_role_arn) never appears here.\n\nAlert GpuFaultDataplaneCollectorMissing (warning, for 15m): docs/en/administrator-operations.md#gpufaultdataplanecollectormissing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -400,7 +400,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 while the routine attempt-state ConfigMap or the Role that names it is refusing. Delivery keeps working, so this is the only place the outage is visible.\n\nAlert GpuFaultCompletionActiveStateUnavailable (warning, for 15m): docs/管理员日常运维.md#gpufaultcompletionactivestateunavailable",
+      "description": "1 while the routine attempt-state ConfigMap or the Role that names it is refusing. Delivery keeps working, so this is the only place the outage is visible.\n\nAlert GpuFaultCompletionActiveStateUnavailable (warning, for 15m): docs/en/administrator-operations.md#gpufaultcompletionactivestateunavailable",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -461,7 +461,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Each step is a critical completion event that was delivered without a write-ahead copy, so only a watcher restart turns it into a lost or replayed event.\n\nAlert GpuFaultCompletionOutboxAppendFailures (warning, for 15m, > 0): docs/管理员日常运维.md#gpufaultcompletionoutboxappendfailures",
+      "description": "Each step is a critical completion event that was delivered without a write-ahead copy, so only a watcher restart turns it into a lost or replayed event.\n\nAlert GpuFaultCompletionOutboxAppendFailures (warning, for 15m, > 0): docs/en/administrator-operations.md#gpufaultcompletionoutboxappendfailures",
       "fieldConfig": {
         "defaults": {
           "color": {

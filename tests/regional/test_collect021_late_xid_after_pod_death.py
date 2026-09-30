@@ -356,7 +356,9 @@ def test_passive_side_passes_on_the_documented_readings() -> None:
             lambda d: d["containers"][0].update(terminated=True, exit_code=0),
             "exit",
         ),
-        ("death", lambda d: d.__setitem__("workload_phase", "RUNNING"), "phase"),
+        # RUNNING with the killed container terminated is the failure-detected
+        # reading and counts as Pod death; SUCCEEDED never does.
+        ("death", lambda d: d.__setitem__("workload_phase", "SUCCEEDED"), "phase"),
         ("restarted", lambda r: r["pods"].pop(), "three"),
         ("restarted", lambda r: r["pods"][0].__setitem__("uid", "s1"), "source"),
         (
@@ -561,3 +563,33 @@ def test_wait_for_decision_times_out_without_a_decision(tmp_path: Path) -> None:
             timeout_seconds=0,
             poll_seconds=0,
         )
+
+
+def test_failure_detected_reading_with_the_killed_container_terminated_is_pod_death() -> (
+    None
+):
+    """Phase RUNNING with the killed container terminated non-zero is the
+    product's failure-detected observation; waiting for phase FAILED instead
+    hands the late-XID window to the passive restart (live 2026-09-28)."""
+
+    death = _death()
+    death["workload_phase"] = "RUNNING"
+    errors = collect021.death_observation_errors(
+        death, node=None, job_id=None, attempt_id=ATTEMPT_ID, pod_uid=POD_UID
+    )
+    assert not any("phase is not FAILED" in item for item in errors), errors
+
+
+def test_running_phase_without_the_terminated_killed_container_is_not_pod_death() -> (
+    None
+):
+    death = _death()
+    death["workload_phase"] = "RUNNING"
+    for item in death["containers"]:
+        if item.get("pod_uid") == POD_UID:
+            item["terminated"] = False
+    errors = collect021.death_observation_errors(
+        death, node=None, job_id=None, attempt_id=ATTEMPT_ID, pod_uid=POD_UID
+    )
+    assert any("phase is not FAILED" in item for item in errors), errors
+    assert any("not terminated" in item for item in errors), errors

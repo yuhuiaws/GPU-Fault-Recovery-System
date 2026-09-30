@@ -611,6 +611,12 @@ render_manifest_for_apply() {
 # Pods would re-read a ConfigMap they now poll themselves. The template keeps
 # the digests that do change what runs (wheel, image, role config, failure
 # domains); wait_for_pin_convergence proves the pins reached the Pods.
+# The required Runtime Profile version is NOT a polled pin: it reaches the
+# process only as GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION from the
+# -config-core ConfigMap at start-up, so it is stamped on the template too --
+# a profile-only release (2026-09-26: hyperpod-v1-boot020 -> hyperpod-v1 with
+# an unchanged wheel) otherwise leaves every replica on the old profile and
+# fails its own control_api verification.
 apply_manifest() {
     local manifest="$1"
     local role_sha=""
@@ -628,6 +634,7 @@ apply_manifest() {
                 --arg image "${RUNTIME_IMAGE}" --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
                 --arg role_config "${role_sha}" --arg admin_config "${ADMIN_CONFIG_SHA256}" \
                 --arg pin "${PIN_METADATA_SHA256}" --arg domain "${FAILURE_DOMAIN_MAP_SHA256}" \
+                --arg profile "${RUNTIME_PROFILE_VERSION}" \
                 --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
                 .metadata.name as $name |
                 .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
@@ -639,7 +646,8 @@ apply_manifest() {
                     "gpu-fault.io/release-rollout": $release,
                     "gpu-fault.io/runtime-image": $image,
                     "gpu-fault.io/notification-config-sha256": $notification,
-                    "gpu-fault.io/role-config-sha256": $role_config
+                    "gpu-fault.io/role-config-sha256": $role_config,
+                    "gpu-fault.io/runtime-profile-version": $profile
                 } |
                 if $name == "gpu-fault-control-worker" and $domain != "" then
                     .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain

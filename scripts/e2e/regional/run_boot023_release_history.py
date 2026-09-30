@@ -51,12 +51,11 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    component_python,
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    component_python,
     predecessor_evidence,
-    required,
     run_case_main,
     runtime_identity_errors,
     settings_from_arguments,
@@ -93,6 +92,17 @@ class Settings:
         }
 
 
+def default_noop_config(run_dir: Path) -> str:
+    """BOOT-020's hand-off in this run: the config that classifies NOOP after FULL.
+
+    The case document names ``cases/GF-REGIONAL-BOOT-020/boot023-noop.json`` as
+    BOOT-023's input; until 2026-09-30 the runner still demanded it as an
+    argument or environment variable, so a campaign had to wire it by hand.
+    """
+
+    return str(run_dir / "cases" / PREDECESSOR_CASE_ID / "boot023-noop.json")
+
+
 def configure(arguments: argparse.Namespace) -> Settings:
     predecessor = (
         Path(arguments.predecessor_evidence).expanduser().resolve()
@@ -106,10 +116,9 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
     noop_config = (
         Path(
-            required(
-                arguments.noop_config or os.getenv("GPU_FAULT_NOOP_RELEASE_CONFIG", ""),
-                "NOOP release config",
-            )
+            arguments.noop_config
+            or os.getenv("GPU_FAULT_NOOP_RELEASE_CONFIG", "")
+            or default_noop_config(arguments.run_dir)
         )
         .expanduser()
         .resolve()

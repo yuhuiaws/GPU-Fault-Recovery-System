@@ -4,6 +4,18 @@
 同一事实冲突时，优先采用更靠前的类别；`docs/history/` 中的内容只用于追溯，
 不得作为当前部署或实现依据。
 
+## English editions
+
+本目录每篇文档都有英文版，位于 [`docs/en/`](en/README.md)（英文索引逐篇列出
+对应关系与一句话说明）。中文文件仍是事实源，直到两者同步维护。告警的
+`runbook_url` 与 Grafana 面板链接指向英文版 `docs/en/administrator-operations.md`，
+锚点与中文版的告警名标题一致。
+
+English editions of every document in this directory live under
+[`docs/en/`](en/README.md); the Chinese files remain the source of record until
+both are maintained together. Alert `runbook_url` annotations and Grafana panel
+links point at `docs/en/administrator-operations.md`.
+
 ## 管理员入口
 
 | 任务 | 首选文档 |

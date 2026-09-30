@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 import re
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
-
 
 MAX_POD_LOG_WORKERS = 16
 

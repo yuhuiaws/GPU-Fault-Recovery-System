@@ -34,6 +34,7 @@ def test_capacity_main_registers_creates_and_cleans_one_receipted_run(
         f"configmap/{capacity.SCRIPT_CONFIGMAP}",
         f"configmap/{capacity.TEMPLATE_CONFIGMAP}",
         f"configmap/{capacity.START_GATE_CONFIGMAP}",
+        f"serviceaccount/{capacity.LOAD_SERVICE_ACCOUNT}",
         f"role/{capacity.START_GATE_ROLE}",
         f"rolebinding/{capacity.START_GATE_ROLE_BINDING}",
         f"job/{capacity.CASES['burst']['job']}",

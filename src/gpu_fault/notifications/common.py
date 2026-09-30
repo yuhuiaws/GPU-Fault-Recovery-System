@@ -22,6 +22,10 @@ from gpu_fault.models import (
 )
 from gpu_fault.models import StrictModel as StrictModel
 
+# Template texts are English. The version tags keep their historical "zh"
+# lineage on purpose: several deduplication keys embed them, and a retag
+# would re-notify every open incident once. Bump a tag only when a
+# template's meaning changes, never for wording.
 RESTART_GUARD_TEMPLATE_VERSION = "restart-guard-zh-v2"
 RESTART_WORKLOAD_TEMPLATE_VERSION = "restart-workload-zh-v1"
 RESTART_NODE_TEMPLATE_VERSION = "restart-node-zh-v1"
@@ -43,638 +47,654 @@ HOST_RESOURCE_EVENT_TEMPLATE_VERSION = "host-resource-event-zh-v1"
 DIAGNOSTIC_INCONCLUSIVE_TEMPLATE_VERSION = "diagnostic-inconclusive-zh-v1"
 
 DIAGNOSTIC_INCONCLUSIVE_EMAIL_TEMPLATE = """\
-GPU 节点诊断未定论通知
+GPU node diagnostic inconclusive
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{nodes}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- Policy source：{policy_source}
-- Official action：{official_action}
+1. Event
+- Cluster: {cluster_id}
+- Nodes: {nodes}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Policy source: {policy_source}
+- Official action: {official_action}
 
-二、诊断结果
-- Workflow steps：{operations}
-- 失败 step：{failed_operation}
-- 失败原因：{error}
-- 结论：诊断未定论（diagnostic inconclusive）。该 workflow 只包含取证/诊断/验证类
-  步骤，没有改动或隔离节点。
+2. Diagnostic result
+- Workflow steps: {operations}
+- Failed step: {failed_operation}
+- Failure reason: {error}
+- Conclusion: diagnostic inconclusive. The workflow contained only
+  evidence/diagnostic/validation steps; no node was changed or isolated.
 
-三、系统处理
-- Incident 已收尾为 RECOVERED，reason 记为 diagnostic inconclusive。
-- 该 incident 的 marker 已退役，节点不再被视为「修复中」；后续训练失败按正常
-  路径（快速分诊或重启）处理。
-- 未创建任何恢复动作或 AWS Support case。若节点持续报警，请人工复核。
+3. System handling
+- The incident is closed as RECOVERED with reason "diagnostic inconclusive".
+- The incident's marker is retired; the node is no longer treated as "under
+  repair". Later training failures follow the normal path (fast triage or
+  restart).
+- No recovery action and no AWS Support case was created. Review manually if
+  the node keeps alerting.
 
-四、触发原因
+4. Trigger reasons
 {reasons}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 HARDWARE_INVENTORY_EMAIL_TEMPLATE = """\
-GPU 节点硬件 Inventory 不匹配通知
+GPU node hardware inventory mismatch
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- 事件时间：{observed_at}
-- EC2/HyperPod 实例类型：{node_instance_type}
-- 硬件类型：{resource_type}
-- 严重级别：{severity}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Observed at: {observed_at}
+- EC2/HyperPod instance type: {node_instance_type}
+- Hardware type: {resource_type}
+- Severity: {severity}
 
-二、Inventory 检查
-- Metric：{metric_name}
-- 期望数量：{expected_count}
-- 当前 ACTIVE 数量：{observed_count}
-- 当前发现数量：{discovered_count}
-- 缺失数量：{missing_count}
-- 超出数量：{excess_count}
-- 连续异常采样：{consecutive_samples}
-- 触发所需采样：{required_samples}
+2. Inventory check
+- Metric: {metric_name}
+- Expected count: {expected_count}
+- Current ACTIVE count: {observed_count}
+- Currently discovered count: {discovered_count}
+- Missing: {missing_count}
+- Excess: {excess_count}
+- Consecutive abnormal samples: {consecutive_samples}
+- Samples required to trigger: {required_samples}
 
-三、关联训练任务
-- Workload 状态：{workload_state}
-- 受影响 workload：{workloads}
+3. Related training workloads
+- Workload state: {workload_state}
+- Affected workloads: {workloads}
 
-四、系统处理
-- 策略动作：{recommended_action}
-- Workflow steps：{workflow_steps}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
+4. System handling
+- Policy action: {recommended_action}
+- Workflow steps: {workflow_steps}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
 
-五、证据信息
+5. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 EFA_RDMA_EVENT_EMAIL_TEMPLATE = """\
-GPU EFA/RDMA 监控事件通知
+GPU EFA/RDMA monitoring event
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- 事件时间：{observed_at}
-- 事件类型：{event_type}
-- 严重级别：{severity}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Observed at: {observed_at}
+- Event type: {event_type}
+- Severity: {severity}
 
-二、监控信号
-- Metric：{metric_name}
-- Device/Port：{device}
-- 当前值：{value}
-- 流量状态：{traffic_signal}
-- 流量 baseline：{baseline}
-- 触发原因：{reason}
+2. Monitoring signal
+- Metric: {metric_name}
+- Device/Port: {device}
+- Current value: {value}
+- Traffic state: {traffic_signal}
+- Traffic baseline: {baseline}
+- Trigger reason: {reason}
 
-三、关联训练任务
-- Workload 状态：{workload_state}
-- Job ID：{job_id}
-- Attempt ID：{attempt_id}
-- 受影响 workload：{workloads}
+3. Related training workloads
+- Workload state: {workload_state}
+- Job ID: {job_id}
+- Attempt ID: {attempt_id}
+- Affected workloads: {workloads}
 
-四、系统处理
-- 策略动作：{recommended_action}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
-- Workflow steps：{workflow_steps}
+4. System handling
+- Policy action: {recommended_action}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
+- Workflow steps: {workflow_steps}
 
-五、证据信息
+5. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 HOST_RESOURCE_EVENT_EMAIL_TEMPLATE = """\
-GPU 节点资源隐患通知
+GPU node host resource risk
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- 事件时间：{observed_at}
-- 严重级别：{severity}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Observed at: {observed_at}
+- Severity: {severity}
 
-二、监控信号
-- Signal：{signal}
-- Metric：{metric_name}
-- Device/Mount：{device}
-- 当前值：{value}
-- 比较方式：{comparison}
-- 配置阈值：{threshold_percent}%
-- 持续时间阈值：{minimum_active_seconds} 秒
-- 触发原因：{reason}
-- 同批次关联指标：{related_metrics}
+2. Monitoring signal
+- Signal: {signal}
+- Metric: {metric_name}
+- Device/Mount: {device}
+- Current value: {value}
+- Comparison: {comparison}
+- Configured threshold: {threshold_percent}%
+- Minimum duration threshold: {minimum_active_seconds} s
+- Trigger reason: {reason}
+- Related metrics in the same batch: {related_metrics}
 
-三、关联训练任务
-- Workload 状态：{workload_state}
-- 受影响 workload：{workloads}
+3. Related training workloads
+- Workload state: {workload_state}
+- Affected workloads: {workloads}
 
-四、系统处理
-- 策略动作：{recommended_action}
-- Workflow steps：{workflow_steps}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
+4. System handling
+- Policy action: {recommended_action}
+- Workflow steps: {workflow_steps}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
 
-五、证据信息
+5. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 DCGM_DIAGNOSTIC_EMAIL_TEMPLATE = """\
-GPU DCGM 快速诊断结果通知
+GPU DCGM quick diagnostic result
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- 受影响 workload：{workloads}
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Affected workloads: {workloads}
 
-二、诊断结果
+2. Diagnostic result
 {node_results}
 
-三、系统处理
-- 控制面动作：{control_plane_action}
-- PASS/WARN：进入温度冷却观察和 GPU validation。
-- FAIL/INCONCLUSIVE：停止受影响任务、禁止调度并隔离节点，不自动重启训练。
-- 仅配置类失败（dcgmErrorSeverity_t=CONFIG，如 persistence mode 未开）：
-  按 WARN 处理，不隔离节点、不停止任务；请按下方指导修主机配置后复跑诊断。
+3. System handling
+- Control-plane action: {control_plane_action}
+- PASS/WARN: proceed to the thermal cool-down observation and GPU validation.
+- FAIL/INCONCLUSIVE: stop the affected workloads, cordon and isolate the node;
+  training is not restarted automatically.
+- Configuration-only failures (dcgmErrorSeverity_t=CONFIG, e.g. persistence
+  mode off) are treated as WARN: the node is not isolated and workloads are not
+  stopped; fix the host configuration per the guidance below and rerun the
+  diagnostic.
 
-四、下一步处理指导
+4. Next steps
 {recommended_actions}
 
-五、证据信息
+5. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 NVLINK74_SUPPORT_EMAIL_TEMPLATE = """\
-GPU XID 74 NVLink 事件支持通知
+GPU XID 74 NVLink event: vendor support
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 节点：{node_ids}
-- 受影响 workload：{workloads}
-- Event ID：{event_id}
-- Policy source：{policy_source}
-- Official action：{official_action}
-- 解码与处置原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Nodes: {node_ids}
+- Affected workloads: {workloads}
+- Event ID: {event_id}
+- Policy source: {policy_source}
+- Official action: {official_action}
+- Decode and disposition reasons:
 {reasons}
 
-二、系统处理
-- 未执行 XID 74 单 GPU reset。
-- 节点调度和训练任务状态以 Workflow 实际步骤记录为准。
-- 已生成内部厂商支持升级记录：{ticket_id}
+2. System handling
+- No single-GPU reset was performed for XID 74.
+- Node scheduling and training state follow the workflow's recorded steps.
+- An internal vendor-support escalation record was created: {ticket_id}
 
-三、工单信息
-- Internal Ticket ID：{ticket_id}
-- Workflow operation：ESCALATE_SUPPORT
+3. Ticket
+- Internal Ticket ID: {ticket_id}
+- Workflow operation: ESCALATE_SUPPORT
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 NVLINK74_MECHANICAL_EMAIL_TEMPLATE = """\
-GPU XID 74 NVLink 机械检查待办
+GPU XID 74 NVLink mechanical check required
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 节点：{node_ids}
-- NVLink：{link_id}
-- PCI BDF：{pci_bdf}
-- 寄存器计数：{occurrence_counts}
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Nodes: {node_ids}
+- NVLink: {link_id}
+- PCI BDF: {pci_bdf}
+- Register counts: {occurrence_counts}
 
-二、当前状态
-- Workflow operation：CHECK_MECHANICALS
-- 训练和调度状态以 Workflow 实际步骤记录为准。
-- 系统不会自动确认物理检查已经完成。
+2. Current state
+- Workflow operation: CHECK_MECHANICALS
+- Training and scheduling state follow the workflow's recorded steps.
+- The system never confirms the physical check on its own.
 
-三、确认字段
-- Annotation：{annotation}
-- Required value：{annotation_value}
+3. Confirmation field
+- Annotation: {annotation}
+- Required value: {annotation_value}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 GPU_MECHANICAL_EMAIL_TEMPLATE = """\
-GPU 机械检查待办
+GPU mechanical check required
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 节点：{node_ids}
-- XID：{xid}
-- PCI BDF：{pci_bdf}
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Nodes: {node_ids}
+- XID: {xid}
+- PCI BDF: {pci_bdf}
 
-二、当前状态
-- Workflow operation：CHECK_MECHANICALS
-- 训练和调度状态以 Workflow 实际步骤记录为准。
-- 系统不会自动确认物理检查已经完成。
+2. Current state
+- Workflow operation: CHECK_MECHANICALS
+- Training and scheduling state follow the workflow's recorded steps.
+- The system never confirms the physical check on its own.
 
-三、确认字段
-- Annotation：{annotation}
-- Required value：{annotation_value}
+3. Confirmation field
+- Annotation: {annotation}
+- Required value: {annotation_value}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 HARDWARE_ESCALATION_EMAIL_TEMPLATE = """\
-GPU 节点自动恢复失败及硬件下线通知
+GPU node automatic recovery failed: hardware taken out of service
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 故障节点：{node_ids}
-- 受影响 workload：{workloads}
-- 事件类型：{event_type}
-- 原始事件：{event_id}
-- 失败原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Faulty nodes: {node_ids}
+- Affected workloads: {workloads}
+- Event type: {event_type}
+- Original event: {event_id}
+- Failure reasons:
 {reasons}
 
-二、系统处理
-- 实际失败的自动恢复步骤：{failed_operations}
-- 故障节点保持 unschedulable 和 quarantine，不会恢复调度。
-- 系统已创建内部厂商支持升级记录：{ticket_id}
+2. System handling
+- Automatic recovery steps that failed: {failed_operations}
+- The faulty nodes stay unschedulable and quarantined; scheduling is not
+  restored.
+- An internal vendor-support escalation record was created: {ticket_id}
 
-三、工单信息
-- Internal Ticket ID：{ticket_id}
-- Policy source：{policy_source}
-- Official action：{official_action}
-- Workflow operation：ESCALATE_SUPPORT
+3. Ticket
+- Internal Ticket ID: {ticket_id}
+- Policy source: {policy_source}
+- Official action: {official_action}
+- Workflow operation: ESCALATE_SUPPORT
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 NOT_APPLICABLE_EMAIL_TEMPLATE = """\
-GPU XID 策略不适用通知
+GPU XID policy not applicable
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- XID：{xid}
-- GPU 产品：{product}
-- Driver branch：{driver_branch}
-- CUDA 版本：{cuda_version}
-- 事件时间：{observed_at}
-- Event ID：{event_id}
-- Workload 状态：{workload_state}
-- 受影响 workload：{workloads}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- XID: {xid}
+- GPU product: {product}
+- Driver branch: {driver_branch}
+- CUDA version: {cuda_version}
+- Observed at: {observed_at}
+- Event ID: {event_id}
+- Workload state: {workload_state}
+- Affected workloads: {workloads}
 
-二、策略判定
-- Disposition：NOT_APPLICABLE
-- NVIDIA Catalog 动作：{official_action}
-- NVIDIA Investigatory Action：{investigatory_action}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
-- 判定原因：
+2. Policy decision
+- Disposition: NOT_APPLICABLE
+- NVIDIA catalog action: {official_action}
+- NVIDIA investigatory action: {investigatory_action}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
+- Decision reasons:
 {reasons}
 
-三、系统处理
-- 官方恢复动作：未执行
-- Safety action：{safety_action}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Workflow 状态：{workflow_status}
-- Safety steps：{safety_steps}
-- Official steps：{official_steps}
+3. System handling
+- Official recovery action: not executed
+- Safety action: {safety_action}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Workflow status: {workflow_status}
+- Safety steps: {safety_steps}
+- Official steps: {official_steps}
 
-四、证据信息
+4. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 XID_INVESTIGATORY_EMAIL_TEMPLATE = """\
-GPU XID 调查动作通知
+GPU XID investigatory action
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- XID：{xid}
-- GPU 产品：{product}
-- 事件时间：{observed_at}
-- Event ID：{event_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Workload 状态：{workload_state}
-- 受影响 workload：{workloads}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- XID: {xid}
+- GPU product: {product}
+- Observed at: {observed_at}
+- Event ID: {event_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Workload state: {workload_state}
+- Affected workloads: {workloads}
 
-二、策略判定
-- Disposition：{disposition}
-- NVIDIA Immediate Action：{official_action}
-- 系统 Effective Action：{effective_action}
-- NVIDIA Investigatory Action：{investigatory_action}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
-- 判定原因：
+2. Policy decision
+- Disposition: {disposition}
+- NVIDIA immediate action: {official_action}
+- Effective action: {effective_action}
+- NVIDIA investigatory action: {investigatory_action}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
+- Decision reasons:
 {reasons}
 
-三、调查动作状态
-- 本方案不会自动执行 Investigatory Action。
-- 是否执行该调查动作由管理员决定。
-- Immediate Action 和训练任务状态以 Workflow 实际记录为准。
+3. Investigatory action status
+- The system does not execute investigatory actions automatically.
+- Whether to run this investigatory action is the administrator's decision.
+- Immediate action and training state follow the workflow's recorded steps.
 
-四、证据信息
+4. Evidence
 {evidence_refs}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 SXID_EVENT_EMAIL_TEMPLATE = """\
-GPU NVSwitch SXID 事件通知
+GPU NVSwitch SXID event
 
-一、事件信息
-- 集群：{cluster_id}
-- 节点：{node_id}
-- SXID：{sxid}
-- GPU 产品：{product}
-- 事件时间：{observed_at}
-- Event ID：{event_id}
-- Collector source：{event_source}
-- Evidence：{evidence_ref}
-- Workload 状态：{workload_state}
-- 受影响 workload：{workloads}
+1. Event
+- Cluster: {cluster_id}
+- Node: {node_id}
+- SXID: {sxid}
+- GPU product: {product}
+- Observed at: {observed_at}
+- Event ID: {event_id}
+- Collector source: {event_source}
+- Evidence: {evidence_ref}
+- Workload state: {workload_state}
+- Affected workloads: {workloads}
 
-二、NVSwitch 信息
-- Classification：{classification}
-- Classification source：{classification_source}
-- Link scope：{link_scope}
-- Link scope source：{link_scope_source}
-- Switch：{switch_id}
-- Port：{port}
-- PCI BDF：{pci_bdf}
-- Fabric partition：{fabric_partition}
+2. NVSwitch details
+- Classification: {classification}
+- Classification source: {classification_source}
+- Link scope: {link_scope}
+- Link scope source: {link_scope_source}
+- Switch: {switch_id}
+- Port: {port}
+- PCI BDF: {pci_bdf}
+- Fabric partition: {fabric_partition}
 
-三、策略判定
-- Disposition：{disposition}
-- NVIDIA Official Action：{official_action}
-- 系统 Effective Action：{effective_action}
-- Safety Action：{safety_action}
-- NVIDIA Investigatory Action：{investigatory_action}
-- Policy source：{policy_source}
-- Policy version：{policy_version}
-- 判定原因：
+3. Policy decision
+- Disposition: {disposition}
+- NVIDIA official action: {official_action}
+- Effective action: {effective_action}
+- Safety action: {safety_action}
+- NVIDIA investigatory action: {investigatory_action}
+- Policy source: {policy_source}
+- Policy version: {policy_version}
+- Decision reasons:
 {reasons}
 
-四、系统记录
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 后续恢复动作及其结果使用独立固定模板通知。
+4. System records
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Follow-up recovery actions and their results are reported with their own
+  fixed templates.
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 GPU_COUNT_CHANGE_EMAIL_TEMPLATE = """\
-GPU 训练任务重启已暂停，需要管理员处理
+GPU training restart paused: administrator decision required
 
-一、发生了什么
-- 训练任务：{job_id}
-- 失败运行：{attempt_id}
-- 集群：{cluster_id}
-- 受影响 workload：{workloads}
-- 失败运行使用的 GPU 数量：{source_gpu_count}
-- 当前模板准备使用的 GPU 数量：{target_gpu_count}
-- 系统检测到重启前后 GPU 数量不一致或无法确认，因此已阻止自动重启。
-- 当前没有创建新的训练 workload，也没有消耗 restart budget。
+1. What happened
+- Training job: {job_id}
+- Failed attempt: {attempt_id}
+- Cluster: {cluster_id}
+- Affected workloads: {workloads}
+- GPUs used by the failed attempt: {source_gpu_count}
+- GPUs the current template would use: {target_gpu_count}
+- The GPU count differs between the failed attempt and the restart, or could
+  not be confirmed, so the automatic restart was blocked.
+- No new training workload was created and no restart budget was consumed.
 
-二、建议管理员做什么
-方案 A：恢复原资源。将 workload 模板恢复为 {source_gpu_count} 张 GPU；系统再次检查到数量一致后才会继续重启。
-方案 B：接受 {target_gpu_count} 张 GPU。先修改并核对以下配置：
-1. world size 及数据并行、张量并行、流水线并行策略；
-2. per-device batch size、gradient accumulation 和 global batch size；
-3. learning rate 及其调度策略；
-4. checkpoint 与新并行拓扑的兼容性；
-5. 训练模板中的 expected critical ranks 和资源请求。
-完成上述修改并审核无误后，执行以下精确审批命令。不要在修改训练参数前批准：
+2. What the administrator should do
+Option A: restore the original resources. Set the workload template back to
+{source_gpu_count} GPUs; the restart continues once the counts match again.
+Option B: accept {target_gpu_count} GPUs. First change and review:
+1. world size and the data/tensor/pipeline parallel strategy;
+2. per-device batch size, gradient accumulation and global batch size;
+3. learning rate and its schedule;
+4. checkpoint compatibility with the new parallel topology;
+5. expected critical ranks and resource requests in the training template.
+After these changes are made and reviewed, run exactly the approval command
+below. Do not approve before the training parameters are adjusted:
 {approval_commands}
 
-审批后，控制面会重新读取 workload 模板；只有实际 GPU 变化仍为 {approval_annotation} 时才会继续。
+After approval the control plane re-reads the workload template and continues
+only while the actual GPU change is still {approval_annotation}.
 
-三、追踪信息
-- Incident：{incident_id}
-- 审批 annotation：gpu-fault.io/approve-gpu-count-change={approval_annotation}
-- 邮件模板：{template_version}
+3. Tracking
+- Incident: {incident_id}
+- Approval annotation: gpu-fault.io/approve-gpu-count-change={approval_annotation}
+- Template: {template_version}
 """
 
 RESTART_BUDGET_EMAIL_TEMPLATE = """\
-GPU 训练任务自动重启次数已耗尽，需要管理员处理
+GPU training automatic restarts exhausted: administrator decision required
 
-一、发生了什么
-- 训练任务：{job_id}
-- 最近失败运行：{attempt_id}
-- 集群：{cluster_id}
-- 已完成或预留的自动重启次数：{restart_count}
-- 配置的最大自动重启次数：{restart_budget}
-- 系统已停止继续自动重启，防止任务反复失败并占用 GPU 资源。
+1. What happened
+- Training job: {job_id}
+- Latest failed attempt: {attempt_id}
+- Cluster: {cluster_id}
+- Automatic restarts used or reserved: {restart_count}
+- Configured maximum automatic restarts: {restart_budget}
+- Automatic restarts have stopped to keep a repeatedly failing job from
+  holding GPU resources.
 
-二、建议管理员做什么
-1. 检查最近几次失败的 GPU、节点、训练日志和 checkpoint；
-2. 判断故障是否已修复，以及当前资源和训练参数是否仍然适用；
-3. 不要直接提高 restart budget 掩盖重复故障；
-4. 确认可以继续后，使用新的 job ID 人工提交新训练任务。
+2. What the administrator should do
+1. Review the GPUs, nodes, training logs and checkpoints of the recent failures;
+2. Decide whether the fault is fixed and whether the current resources and
+   training parameters still apply;
+3. Do not raise the restart budget to hide a repeating fault;
+4. Once it is safe to continue, submit a new training job manually under a new
+   job ID.
 
-三、追踪信息
-- Incident：{incident_id}
-- 邮件模板：{template_version}
+3. Tracking
+- Incident: {incident_id}
+- Template: {template_version}
 """
 
 RESTART_WORKLOAD_EMAIL_TEMPLATE = """\
-GPU 训练任务自动重启通知
+GPU training workload restarted automatically
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- 训练任务：{job_id}
-- 受影响 workload：{workloads}
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Training job: {job_id}
+- Affected workloads: {workloads}
 
-二、重启信息
-- 系统动作：RESTART_WORKLOAD
-- 原 attempt：{source_attempt_id}
-- 新 attempt：{restart_attempt_id}
-- 原 GPU 数量：{source_gpu_count}
-- 重启 GPU 数量：{target_gpu_count}
-- 本任务已使用自动重启次数：{restart_count}
-- 本任务最大自动重启次数：{restart_budget}
-- Kubernetes 重启操作：已成功提交
+2. Restart
+- System action: RESTART_WORKLOAD
+- Previous attempt: {source_attempt_id}
+- New attempt: {restart_attempt_id}
+- Previous GPU count: {source_gpu_count}
+- Restart GPU count: {target_gpu_count}
+- Automatic restarts used by this job: {restart_count}
+- Maximum automatic restarts for this job: {restart_budget}
+- Kubernetes restart operation: submitted successfully
 
-三、追踪信息
-- Workflow：{workflow_id}
-- Operation：{operation_id}
-- 邮件模板：{template_version}
+3. Tracking
+- Workflow: {workflow_id}
+- Operation: {operation_id}
+- Template: {template_version}
 """
 
 RESTART_NODE_EMAIL_TEMPLATE = """\
-GPU 节点自动重启通知
+GPU node restarted automatically
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 触发事件：{event_id}
-- 故障类型：{event_type}
-- 故障标识：{fault_identifier}
-- Collector source：{event_source}
-- Policy source：{policy_source}
-- 策略动作：{official_action}
-- Effective action：{effective_action}
-- 重启原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Triggering event: {event_id}
+- Fault type: {event_type}
+- Fault identifier: {fault_identifier}
+- Collector source: {event_source}
+- Policy source: {policy_source}
+- Policy action: {official_action}
+- Effective action: {effective_action}
+- Restart reasons:
 {reasons}
-- 受影响节点：{node_ids}
+- Affected nodes: {node_ids}
 
-二、重启信息
-- 系统动作：RESTART_NODE
-- HyperPod 动作：BatchRebootClusterNodes
-- HyperPod operation：{operation_id}
-- 重启节点明细：
+2. Restart
+- System action: RESTART_NODE
+- HyperPod action: BatchRebootClusterNodes
+- HyperPod operation: {operation_id}
+- Restarted nodes:
 {node_observations}
-- 重启确认方式：{confirmation_source}
-- 重启状态：已确认完成
+- Restart confirmed by: {confirmation_source}
+- Restart status: confirmed complete
 
-三、后续状态
-- GPU 验证：由 workflow 后续 VALIDATE_GPU step 执行
-- Fabric 验证：由 workflow 后续 VALIDATE_FABRIC step 执行
-- 调度恢复：验证成功后由 RESTORE_SCHEDULING step 执行
+3. Follow-up
+- GPU validation: the workflow's VALIDATE_GPU step
+- Fabric validation: the workflow's VALIDATE_FABRIC step
+- Scheduling: restored by the RESTORE_SCHEDULING step after validation passes
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 WARM_SPARE_REPLACEMENT_EMAIL_TEMPLATE = """\
-GPU 节点 warm-spare 替换成功通知
+GPU node replaced by warm spare
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- Event ID：{event_id}
-- Policy source：{policy_source}
-- Official action：{official_action}
-- Effective action：{effective_action}
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Event ID: {event_id}
+- Policy source: {policy_source}
+- Official action: {official_action}
+- Effective action: {effective_action}
 
-二、替换结果
-- 故障节点：{fault_nodes}
-- 激活 warm spare：{spare_nodes}
-- 节点重绑定：
+2. Replacement result
+- Faulty nodes: {fault_nodes}
+- Activated warm spares: {spare_nodes}
+- Node rebindings:
 {node_rebindings}
-- 确认来源：{confirmation_source}
-- Provider replacement API submitted：{provider_mutation_submitted}
-- Operation ID：{operation_id}
+- Confirmation source: {confirmation_source}
+- Provider replacement API submitted: {provider_mutation_submitted}
+- Operation ID: {operation_id}
 
-三、系统状态
-- REPLACE_NODE branch 已成功完成。
-- 原故障节点保持隔离，后续训练使用重绑定后的 warm spare。
-- GPU/Fabric validation、恢复调度和训练 restart 仍以 Workflow 最终状态为准。
+3. System state
+- The REPLACE_NODE branch completed successfully.
+- The faulty nodes stay isolated; training continues on the rebound warm
+  spares.
+- GPU/Fabric validation, scheduling restore and the training restart follow
+  the workflow's final state.
 
-四、处置原因
+4. Disposition reasons
 {reasons}
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 RESTART_FABRIC_MANAGER_EMAIL_TEMPLATE = """\
-GPU Fabric Manager 自动重启通知
+GPU Fabric Manager restarted automatically
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 触发事件：{event_id}
-- 故障类型：{event_type}
-- Policy source：{policy_source}
-- 策略动作：{official_action}
-- 触发原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Triggering event: {event_id}
+- Fault type: {event_type}
+- Policy source: {policy_source}
+- Policy action: {official_action}
+- Trigger reasons:
 {reasons}
-- 受影响 workload：{workloads}
+- Affected workloads: {workloads}
 
-二、重启信息
-- 系统动作：RESTART_FABRIC_MANAGER
-- Operation：{operation_id}
-- 服务：nvidia-fabricmanager
-- 节点重启明细：
+2. Restart
+- System action: RESTART_FABRIC_MANAGER
+- Operation: {operation_id}
+- Service: nvidia-fabricmanager
+- Per-node results:
 {node_results}
-- 重启状态：已确认完成
+- Restart status: confirmed complete
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 GPU_RESET_EMAIL_TEMPLATE = """\
-GPU 自动重置完成通知
+GPU reset completed automatically
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 触发事件：{event_id}
-- 故障类型：{event_type}
-- Policy source：{policy_source}
-- 策略动作：{official_action}
-- 触发原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Triggering event: {event_id}
+- Fault type: {event_type}
+- Policy source: {policy_source}
+- Policy action: {official_action}
+- Trigger reasons:
 {reasons}
-- 受影响 workload：{workloads}
+- Affected workloads: {workloads}
 
-二、执行信息
-- 系统动作：RESET_GPU
-- Operation：{operation_id}
-- 目标节点：{node_ids}
-- 目标 GPU UUID：{gpu_uuids}
-- 执行结果：
+2. Execution
+- System action: RESET_GPU
+- Operation: {operation_id}
+- Target nodes: {node_ids}
+- Target GPU UUIDs: {gpu_uuids}
+- Results:
 {node_results}
-- Reset 状态：已执行成功
+- Reset status: executed successfully
 
-三、后续状态
-- GPU 服务恢复：由 workflow 后续 RESTORE_GPU_SERVICES step 执行
-- GPU 验证：由 workflow 后续 VALIDATE_GPU step 执行
-- 调度恢复：验证成功后由 RESTORE_SCHEDULING step 执行
-- 训练恢复：全部验证成功后由 RESTART_WORKLOAD step 执行
+3. Follow-up
+- GPU services: restored by the workflow's RESTORE_GPU_SERVICES step
+- GPU validation: the workflow's VALIDATE_GPU step
+- Scheduling: restored by the RESTORE_SCHEDULING step after validation passes
+- Training: restarted by the RESTART_WORKLOAD step after all validation passes
 
-邮件模板：{template_version}
+Template: {template_version}
 """
 
 FABRIC_RESET_EMAIL_TEMPLATE = """\
-GPU/NVSwitch 自动重置通知
+GPU/NVSwitch reset completed automatically
 
-一、事件信息
-- 集群：{cluster_id}
-- Incident：{incident_id}
-- Workflow：{workflow_id}
-- 触发事件：{event_id}
-- 故障类型：{event_type}
-- SXID：{sxid}
-- Policy source：{policy_source}
-- 策略动作：{official_action}
-- Fabric partition：{fabric_partition}
-- 触发原因：
+1. Event
+- Cluster: {cluster_id}
+- Incident: {incident_id}
+- Workflow: {workflow_id}
+- Triggering event: {event_id}
+- Fault type: {event_type}
+- SXID: {sxid}
+- Policy source: {policy_source}
+- Policy action: {official_action}
+- Fabric partition: {fabric_partition}
+- Trigger reasons:
 {reasons}
-- 受影响 workload：{workloads}
+- Affected workloads: {workloads}
 
-二、执行信息
-- 系统动作：RESET_ALL_GPUS_NVSWITCHES
-- Operation：{operation_id}
-- 执行节点明细：
+2. Execution
+- System action: RESET_ALL_GPUS_NVSWITCHES
+- Operation: {operation_id}
+- Per-node results:
 {node_results}
-- Reset 状态：已执行并通过本机 GPU inventory 复核
+- Reset status: executed and re-checked against the node's GPU inventory
 
-三、后续状态
-- GPU 服务恢复：由 workflow 后续 RESTORE_GPU_SERVICES step 执行
-- GPU 验证：由 workflow 后续 VALIDATE_GPU step 执行
-- Fabric 验证：由 workflow 后续 VALIDATE_FABRIC step 执行
-- 训练恢复：全部验证成功后由 RESTART_WORKLOAD step 执行
+3. Follow-up
+- GPU services: restored by the workflow's RESTORE_GPU_SERVICES step
+- GPU validation: the workflow's VALIDATE_GPU step
+- Fabric validation: the workflow's VALIDATE_FABRIC step
+- Training: restarted by the RESTART_WORKLOAD step after all validation passes
 
-邮件模板：{template_version}
+Template: {template_version}
 """

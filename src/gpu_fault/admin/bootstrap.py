@@ -29,12 +29,17 @@ from gpu_fault.admin.bootstrap_aurora import (
     assert_aurora_ready,
     await_aurora_ready,
     bootstrap_aurora_capacity,
+    control_plane_node_zones,
+    cpu_node_security_groups,
+    cpu_nodes_document,
     ensure_cluster_parameter_group,
     ensure_rds_site_tag,
     ensure_serverless_instances,
     ensure_subnet_group,
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
+    reconcile_writer_zone,
+    writer_first_zones,
 )
 from gpu_fault.admin.bootstrap_checkpoint import (
     HYPERPOD_HINTS as HYPERPOD_HINTS,
@@ -1360,59 +1365,6 @@ def _ensure_pki(
     }
 
 
-def _cpu_node_security_groups(
-    runner: CommandRunner,
-    *,
-    cpu: ClusterIdentity,
-    cpu_kubeconfig: Path,
-) -> list[str]:
-    document = json.loads(
-        runner.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(cpu_kubeconfig),
-                "get",
-                "nodes",
-                "-l",
-                f"sagemaker.amazonaws.com/cluster-name={cpu.hyperpod_name}",
-                "-o",
-                "json",
-            ]
-        )
-    )
-    ips = sorted(
-        {
-            address["address"]
-            for item in document.get("items", [])
-            for address in item.get("status", {}).get("addresses", [])
-            if address.get("type") == "InternalIP"
-        }
-    )
-    if not ips:
-        raise BootstrapError("CPU HyperPod has no node InternalIP")
-    interfaces = cast(
-        list[dict[str, Any]],
-        runner.aws_json(
-            cpu.region,
-            "ec2",
-            "describe-network-interfaces",
-            "--filters",
-            "Name=addresses.private-ip-address,Values=" + ",".join(ips),
-        ).get("NetworkInterfaces", []),
-    )
-    groups = sorted(
-        {
-            group["GroupId"]
-            for interface in interfaces
-            for group in interface.get("Groups", [])
-        }
-    )
-    if not groups:
-        raise BootstrapError("cannot discover CPU node Security Groups")
-    return groups
-
-
 def _ensure_aurora(
     runner: CommandRunner,
     *,
@@ -1433,7 +1385,14 @@ def _ensure_aurora(
     cluster_id = _safe_name(f"gpu-fault-{site_id}-aurora", maximum=63)
     subnets = _private_subnets(runner, cpu)
     subnet_ids = [item["SubnetId"] for item in subnets]
-    availability_zones = [item["AvailabilityZone"] for item in subnets]
+    # The writer (first instance) goes to the CPU nodes' zone: writer_first_zones.
+    cpu_nodes = cpu_nodes_document(
+        runner, kubeconfig=cpu_kubeconfig, hyperpod_name=cpu.hyperpod_name
+    )
+    control_plane_zones = control_plane_node_zones(cpu_nodes)
+    availability_zones = writer_first_zones(
+        [item["AvailabilityZone"] for item in subnets], control_plane_zones
+    )
     subnet_group = cluster_id
     ensure_subnet_group(
         runner,
@@ -1449,10 +1408,8 @@ def _ensure_aurora(
         description="GPU fault regional Aurora PostgreSQL",
         site_id=site_id,
     )
-    for source_group in _cpu_node_security_groups(
-        runner,
-        cpu=cpu,
-        cpu_kubeconfig=cpu_kubeconfig,
+    for source_group in cpu_node_security_groups(
+        runner, aws_region=cpu.region, document=cpu_nodes
     ):
         result = subprocess.run(
             [
@@ -1574,6 +1531,7 @@ def _ensure_aurora(
         "cluster_ownership": "CREATED",
         "instance_ids": [*instance_ids],
         "availability_zones": [*availability_zones],  # positional, like the ids
+        "control_plane_zones": sorted(set(control_plane_zones)),
         "subnet_group": subnet_group,
         "subnet_group_ownership": "CREATED",
         "security_group": security_group["group_id"],
@@ -1624,6 +1582,16 @@ def _aurora_ready(
         cluster_id=cluster_id,
         instance_ids=instance_ids,
     )
+    # Both members are available: keep the writer in the control-plane zone.
+    affinity = reconcile_writer_zone(
+        runner,
+        aws_region=cpu.region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
+        control_plane_zones=aurora.get("control_plane_zones") or (),
+        kubeconfig=cpu_kubeconfig,
+        hyperpod_name=cpu.hyperpod_name,
+    )
     manifest = _secret_manifest(
         name=AURORA_SECRET_NAME,
         namespace=namespace,
@@ -1641,6 +1609,7 @@ def _aurora_ready(
     return {
         "master_secret_arn": ready.secret_arn,
         "master_secret_kms_key_arn": ready.kms_key_arn,
+        "writer_zone_affinity": affinity,
     }
 
 

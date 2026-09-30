@@ -534,6 +534,24 @@ requirements:
       - nodeid: tests/completion/test_cov95_withdrawal_postgres.py::test_postgres_failed_withdrawal_remains_retryable
         expected: 2
     critical: true
+  - id: GF-REQ-RECOVERY-IN-RECORD-LADDER
+    family: recovery
+    title: In-record hardware ladder for single-node records
+    source: [src/gpu_fault/execution/branch_escalation.py, src/gpu_fault/execution/flat_step_failure.py, src/gpu_fault/orchestration/dag_branching.py]
+    covers: [recovery:in-record-escalation]
+    conditions: [failure, restart, safety]
+    assertions:
+      - A flat single-node record whose reset fails with a known outcome grows into a one-branch DAG and reboots in the same record.
+      - Several nodes, an unknown outcome or a missing rung keep the whole-workflow failure path unchanged.
+      - The reboot rung is real, the validation tail runs behind it and no reboot-after successor is created.
+    cases: [GF-REGIONAL-DESTR-025]
+    runners: [scripts/e2e/regional/run_destr025_single_node_reset_escalation.py]
+    checks:
+      - nodeid: tests/execution/test_branch_escalation.py::test_a_single_node_plan_escalates_its_failed_reset_in_the_same_record
+      - nodeid: tests/execution/test_branch_escalation.py::test_a_multi_node_linear_plan_still_fails_as_a_whole
+      - nodeid: tests/execution/test_branch_escalation.py::test_a_single_node_plan_with_an_unknown_outcome_is_not_adopted
+      - nodeid: tests/regional/test_destr025_verdicts.py::test_in_record_reboot_without_successor_is_the_pass_shape
+    critical: true
   - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD
     family: recovery
     title: Reboot-surviving safeguard and explicit unknown-outcome protection

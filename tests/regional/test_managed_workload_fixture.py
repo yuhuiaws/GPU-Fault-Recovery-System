@@ -116,7 +116,12 @@ class Kubernetes:
         elif args[0] == "delete":
             assert args[1] == "--raw", "name/label deletion bypasses UID fencing"
             plural, name = args[2].split("/")[-2:]
-            kind = {"pods": "pod", "jobs": "job", "pytorchjobs": "pytorchjob"}[plural]
+            kind = {
+                "pods": "pod",
+                "jobs": "job",
+                "pytorchjobs": "pytorchjob",
+                "services": "service",
+            }[plural]
             options = json.loads(kwargs["input_text"])
             self.deletes.append((kind, name, options))
             current = self.objects[(kind, name)]
@@ -135,7 +140,9 @@ class Kubernetes:
 
 
 def harness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest: str = "manifests/training/xid11-single-node-job.yaml",
 ) -> tuple[ManagedWorkloadFixture, Kubernetes, str]:
     site = tmp_path / "site.yaml"
     site.write_text("schemaVersion: 1\n", encoding="utf-8")
@@ -145,7 +152,7 @@ def harness(
     fixture = ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
-            manifest=(REGIONAL / "manifests/training/xid11-single-node-job.yaml"),
+            manifest=(REGIONAL / manifest),
             site_file=site,
             job_id="test-job",
             attempt_id="test-attempt",
@@ -250,6 +257,67 @@ def test_fixture_cleanup_handles_lost_mutation_receipts(
     fixture.delete()
     assert api.objects == {}
     assert len(api.deletes) == 1
+
+
+def test_cleanup_deletes_the_controllers_replica_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-09-24: 26 headless replica Services of deleted drill PyTorchJobs
+    outlived their runs (the Orphan delete of the controller strips their
+    ownerReferences) and blocked the uninstall as unregistered live resources."""
+
+    fixture, api, rendered = harness(
+        tmp_path, monkeypatch, "manifests/training/xid11-three-node-pytorchjob.yaml"
+    )
+    fixture.submit_rendered(rendered)
+    job = next(obj for (kind, _n), obj in api.objects.items() if kind == "pytorchjob")
+    for replica in ("master-0", "worker-0"):
+        api.add(
+            {
+                "kind": "Service",
+                "metadata": {
+                    "name": f"{job['metadata']['name']}-{replica}",
+                    "labels": {
+                        "training.kubeflow.org/job-name": job["metadata"]["name"]
+                    },
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "kubeflow.org/v1",
+                            "kind": "PyTorchJob",
+                            "name": job["metadata"]["name"],
+                            "uid": job["metadata"]["uid"],
+                        }
+                    ],
+                },
+            }
+        )
+    api.add(
+        {
+            "kind": "Service",
+            "metadata": {
+                "name": "someone-elses-master-0",
+                "labels": {"training.kubeflow.org/job-name": job["metadata"]["name"]},
+                "ownerReferences": [
+                    {
+                        "apiVersion": "kubeflow.org/v1",
+                        "kind": "PyTorchJob",
+                        "name": "other",
+                        "uid": "uid-other",
+                    }
+                ],
+            },
+        }
+    )
+
+    fixture.delete()
+
+    assert set(api.objects) == {("service", "someone-elses-master-0")}, (
+        "our controller's Services go; a Service another owner holds stays"
+    )
+    kinds = [kind for kind, _name, _options in api.deletes]
+    assert kinds.index("pytorchjob") < kinds.index("service"), (
+        "the controller is orphaned first, its Services are removed last"
+    )
 
 
 @pytest.mark.parametrize("defect", ["uid", "owner", "read", "delete-race"])

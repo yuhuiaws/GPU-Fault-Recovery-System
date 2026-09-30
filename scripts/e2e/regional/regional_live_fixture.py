@@ -645,6 +645,64 @@ print(
 """
 
 
+SPARE_POOL_ANNOTATION_PREFIX = "gpu-fault.io/spare-"
+
+
+def project_node_snapshot(value: dict[str, Any]) -> dict[str, Any]:
+    """The runner's view of one Node document.
+
+    ``ownership_annotations`` are the marks an incident leaves while it holds
+    the node (incident-id, fencing-token, previous-unschedulable, ...); the
+    installer's identity annotations and the warm-spare pool's bookkeeping
+    (``gpu-fault.io/spare-*``: a released spare keeps ``spare-pool-state:
+    AVAILABLE``) are not ownership and are reported apart, so a validated
+    restore is not judged "still isolated" by a node nothing holds (live
+    COLLECT-016, 2026-09-24).
+    """
+
+    annotations = value["metadata"].get("annotations", {})
+    return {
+        "name": value["metadata"]["name"],
+        "uid": value["metadata"]["uid"],
+        "boot_id": value.get("status", {}).get("nodeInfo", {}).get("bootID"),
+        "ready": next(
+            (
+                condition["status"]
+                for condition in value["status"].get("conditions", [])
+                if condition["type"] == "Ready"
+            ),
+            None,
+        ),
+        # When kubelet last flipped Ready: a node that just booted flips it
+        # again ~30 s later when HyperPod restarts kubelet with its final
+        # config, and an exec into a probe Pod across that restart fails.
+        "ready_since": next(
+            (
+                condition.get("lastTransitionTime")
+                for condition in value["status"].get("conditions", [])
+                if condition["type"] == "Ready"
+            ),
+            None,
+        ),
+        "installer_boot_id": annotations.get("gpu-fault.io/installer-boot-id"),
+        "unschedulable": value["spec"].get("unschedulable", False),
+        "taints": value["spec"].get("taints", []),
+        "gpu_allocatable": value["status"].get("allocatable", {}).get("nvidia.com/gpu"),
+        "ownership_annotations": {
+            key: item
+            for key, item in annotations.items()
+            if key.startswith("gpu-fault.io/")
+            and not key.startswith("gpu-fault.io/installer-")
+            and not key.startswith(SPARE_POOL_ANNOTATION_PREFIX)
+        },
+        "spare_pool_annotations": {
+            key: item
+            for key, item in annotations.items()
+            if key.startswith(SPARE_POOL_ANNOTATION_PREFIX)
+        },
+    }
+
+
 class RegionalLiveFixture:
     def __init__(self, settings: RegionalLiveSettings) -> None:
         self.settings = settings
@@ -1068,31 +1126,7 @@ class RegionalLiveFixture:
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         value = json.loads(self.kubectl("gpu", "get", "node", node, "-o", "json"))
-        annotations = value["metadata"].get("annotations", {})
-        return {
-            "name": value["metadata"]["name"],
-            "uid": value["metadata"]["uid"],
-            "boot_id": value.get("status", {}).get("nodeInfo", {}).get("bootID"),
-            "ready": next(
-                (
-                    condition["status"]
-                    for condition in value["status"].get("conditions", [])
-                    if condition["type"] == "Ready"
-                ),
-                None,
-            ),
-            "unschedulable": value["spec"].get("unschedulable", False),
-            "taints": value["spec"].get("taints", []),
-            "gpu_allocatable": value["status"]
-            .get("allocatable", {})
-            .get("nvidia.com/gpu"),
-            "ownership_annotations": {
-                key: item
-                for key, item in annotations.items()
-                if key.startswith("gpu-fault.io/")
-                and not key.startswith("gpu-fault.io/installer-")
-            },
-        }
+        return project_node_snapshot(value)
 
     def node_workload_view(self, node: str) -> dict[str, Any]:
         """The control plane's own resolution of what runs on ``node`` now.

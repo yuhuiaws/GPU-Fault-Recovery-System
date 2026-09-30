@@ -252,6 +252,7 @@ class WarmHarness:
         self.returned_nodes: dict[str, dict[str, Any]] = {}
         self.target_nodes = [SPARE]
         self.lookup_incident = INCIDENT
+        self.incident_state = "QUARANTINED"
         self.restore_status = "SUCCEEDED"
         self.prewarm_residuals = {"pods": False}
         self.regional = FakeRegional(self)
@@ -353,6 +354,17 @@ class FakeRegional:
         self.h.call("regional.store", kwargs)
         return deepcopy(self.h.fault_state)
 
+    def node_snapshot(self, node: str) -> dict[str, Any]:
+        # ``RegionalLiveFixture`` shape: ownership annotations, not the warm
+        # fixture's full annotation map.
+        value = deepcopy(self.h.returned_nodes.get(node, self.h.nodes[node]))
+        value["ownership_annotations"] = {
+            key: item
+            for key, item in value.pop("annotations", {}).items()
+            if key.startswith("gpu-fault.io/") and "spare" not in key
+        }
+        return value
+
     def gpu_workloads(self) -> list[dict[str, Any]]:
         return deepcopy(self.h.gpu_workloads)
 
@@ -439,10 +451,15 @@ class FakeWarm:
         return {
             "incident_id": incident_id,
             "cluster_id": "cluster-a",
+            "state": self.h.incident_state,
             "job_id": self.h.posted.get("job_id", "owned-job"),
             "attempt_id": self.h.posted.get("attempt_id", "owned-attempt"),
             "node_ids": [FAULT],
         }
+
+    def close_incident_with_evidence(self, incident_id: str, **kwargs: Any) -> dict:
+        self.h.call("incident.close", {"incident_id": incident_id, **kwargs})
+        return {"closed": True, "refusal": None, "state": "RECOVERED"}
 
     def release_spares(self, nodes: list[str], incident_id: str) -> dict[str, Any]:
         self.h.call("spares.release", {"nodes": nodes, "incident_id": incident_id})

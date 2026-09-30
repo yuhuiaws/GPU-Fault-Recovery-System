@@ -15,7 +15,6 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from uuid import uuid4
 
-
 RATES = {
     "GPU_INVENTORY": 136,
     "GPU_METRICS": 27,

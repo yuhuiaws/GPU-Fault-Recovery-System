@@ -541,6 +541,79 @@ class InventoryRecovery(InventoryWorkflow):
         return receipt
 
 
+def wait_node_settled_after_reboot(
+    regional: RegionalLiveFixture,
+    *,
+    node: str,
+    boot_id: str,
+    min_ready_seconds: float = 45.0,
+    timeout_seconds: float = 600.0,
+    poll_seconds: float = 5.0,
+    clock: Any = time,
+) -> dict[str, Any]:
+    """Wait until the freshly booted node stops changing under the probe.
+
+    Right after a reboot kubelet starts, reports Ready, and ~30 s later HyperPod
+    restarts it with its final configuration (live 2026-09-28: Ready 13:09:29,
+    kubelet "Starting" again 13:10:01). A probe Pod re-created in between is
+    Ready for a moment and then unreachable: ``kubectl exec`` fails with exit 1
+    and the case reads "inventory reboot failed". The node is settled once it
+    has been Ready for ``min_ready_seconds`` on the new boot and the node
+    installer has reconciled that boot (``gpu-fault.io/installer-boot-id``).
+    A snapshot without those fields (older projections) is accepted as is.
+    """
+
+    deadline = clock.monotonic() + timeout_seconds
+    polls = 0
+    while True:
+        current = regional.node_snapshot(node)
+        polls += 1
+        if current.get("boot_id") != boot_id:
+            raise RegionalFixtureError("node boot changed again after the reboot")
+        ready_since = current.get("ready_since")
+        installer_boot = current.get("installer_boot_id")
+        ready_age: float | None = None
+        if isinstance(ready_since, str) and ready_since:
+            ready_age = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(ready_since.replace("Z", "+00:00"))
+            ).total_seconds()
+        settled = (
+            current.get("ready") == "True"
+            and (ready_age is None or ready_age >= min_ready_seconds)
+            and (installer_boot is None or installer_boot == boot_id)
+        )
+        if settled:
+            return {
+                "boot_id": boot_id,
+                "polls": polls,
+                "ready_age_seconds": ready_age,
+                "installer_reconciled": installer_boot == boot_id,
+            }
+        remaining = deadline - clock.monotonic()
+        if remaining <= 0:
+            raise RegionalFixtureError(
+                "rebooted node did not settle before deadline: "
+                f"ready={current.get('ready')} ready_age={ready_age} "
+                f"installer_boot_id={installer_boot}"
+            )
+        clock.sleep(min(poll_seconds, max(0.0, remaining)))
+
+
+def recreate_settled_probe(
+    recovery: Any, collector: Any, node_after: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Re-create the probe Pod only once the rebooted node stopped changing."""
+
+    settled = wait_node_settled_after_reboot(
+        recovery.regional,
+        node=recovery.settings.node,
+        boot_id=str(node_after["boot_id"]),
+    )
+    collector.recreate()
+    return settled
+
+
 def valid_sha256(value: object) -> TypeGuard[str]:
     return (
         isinstance(value, str)
@@ -801,7 +874,7 @@ def run_collect004(
             raise RegionalFixtureError(
                 "reboot node identity or changed boot is unproven"
             )
-        collector.recreate()
+        result["node_settled"] = recreate_settled_probe(recovery, collector, node_after)
         workflow = recovery.wait(terminal=True, timeout_seconds=1200)
         state = recovery.read()
         result["workflow_state"] = state

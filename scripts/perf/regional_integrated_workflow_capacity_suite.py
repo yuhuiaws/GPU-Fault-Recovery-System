@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import json
 import signal
 import sys
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,21 +29,23 @@ if __package__:
         executor_job,
     )
     from .regional_capacity_data import invoke
-    from .regional_capacity_resources import RunResources, run_manifest
-    from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
-        validate_alertmanager_drill_route,
-        sync_dataplane_connection_secret,
-        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         NAMESPACE,
+        STORE_DSN_SNIPPET,
         control,
         dataplane,
         register,
-        run as shell_run,
+        sync_dataplane_connection_secret,
+        validate_alertmanager_drill_route,
         validate_registry_target,
     )
+    from .regional_capacity_registry import (
+        run as shell_run,
+    )
+    from .regional_capacity_resources import RunResources, run_manifest
+    from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         aggregate,
@@ -78,21 +80,23 @@ else:
         executor_job,
     )
     from regional_capacity_data import invoke
-    from regional_capacity_resources import RunResources, run_manifest
-    from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
-        validate_alertmanager_drill_route,
-        sync_dataplane_connection_secret,
-        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         NAMESPACE,
+        STORE_DSN_SNIPPET,
         control,
         dataplane,
         register,
-        run as shell_run,
+        sync_dataplane_connection_secret,
+        validate_alertmanager_drill_route,
         validate_registry_target,
     )
+    from regional_capacity_registry import (
+        run as shell_run,
+    )
+    from regional_capacity_resources import RunResources, run_manifest
+    from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         aggregate,
@@ -132,6 +136,12 @@ FORMAL_WORKFLOWS_PER_CLUSTER = 4
 FORMAL_COMMANDS_PER_CLUSTER = 30
 FORMAL_AURORA_MIN_ACU = 124.0
 FORMAL_AURORA_MAX_ACU = 128.0
+# Normal (non-fault) telemetry kinds: the ingress sheds them with the reserved
+# HTTP 503 once their quota is spent (§6.1); P0 fault kinds and evidence never.
+NORMAL_TELEMETRY_KINDS = frozenset({"GPU_INVENTORY", "GPU_METRICS", "HOST_TELEMETRY"})
+# The reserved-503 share of normal telemetry a round may carry (§6.1 allows the
+# rejection; §8.4 caps it as a version-regression guard).
+RESERVED_503_MAX_SHARE = 0.02
 FORMAL_MODELS = {
     32: {
         "xid": 500,
@@ -909,11 +919,23 @@ def verdict(
         path = paths.get(kind) or {}
         if int(path.get("count", 0)) != expected:
             errors.append(f"{kind} count changed from {expected}")
+    reserved_rejections: dict[str, int] = {}
     for kind, path in sorted(paths.items()):
         status_counts = path.get("status_counts") or {}
         for status, count in sorted(status_counts.items()):
-            if int(count) and not 200 <= int(status) < 300:
-                errors.append(f"{kind} returned HTTP {status}")
+            if not int(count) or 200 <= int(status) < 300:
+                continue
+            if kind in NORMAL_TELEMETRY_KINDS and int(status) == 503:
+                # 性能压测验收方案 §6.1: normal telemetry past its quota gets the
+                # reserved HTTP 503 while P0 stays 100% accepted. Recorded per
+                # kind; the round fails only past RESERVED_503_MAX_SHARE (the
+                # version-regression guard; live 2026-09-22: 1.2% cold Pods,
+                # 0.6% warm at 50 clusters without spool).
+                reserved_rejections[kind] = reserved_rejections.get(kind, 0) + int(
+                    count
+                )
+                continue
+            errors.append(f"{kind} returned HTTP {status}")
         if path.get("errors"):
             errors.append(f"{kind} produced client errors")
         if path.get("transport_retries"):
@@ -932,6 +954,19 @@ def verdict(
             errors.append("control-plane Pod set changed during the run")
         if lifecycle.get("not_ready_after"):
             errors.append("a control-plane Pod is not Ready after the run")
+    ingress["reserved_rejections"] = reserved_rejections
+    normal_total = sum(
+        int((paths.get(kind) or {}).get("count", 0)) for kind in NORMAL_TELEMETRY_KINDS
+    )
+    reserved_total = sum(reserved_rejections.values())
+    ingress["reserved_rejection_share"] = (
+        reserved_total / normal_total if normal_total else 0.0
+    )
+    if normal_total and reserved_total / normal_total > RESERVED_503_MAX_SHARE:
+        errors.append(
+            "normal telemetry reserved 503 share "
+            f"{reserved_total}/{normal_total} exceeds {RESERVED_503_MAX_SHARE:.0%}"
+        )
     if audit["incident_count"] != expected_workflows:
         errors.append("action-bearing incident count mismatch")
     if audit["context_incident_count"] != expected_workflows:

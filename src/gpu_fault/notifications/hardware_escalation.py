@@ -62,7 +62,8 @@ class HardwareEscalationEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[GPU故障][硬件下线] {cluster_id} {', '.join(node_ids) or 'UNKNOWN'}"
+                f"[GPU FAULT][hardware out of service] {cluster_id} "
+                f"{', '.join(node_ids) or 'UNKNOWN'}"
             ),
             body_text=body,
             support_case_draft=case_draft,

@@ -443,14 +443,30 @@ def death_observation_errors(
         errors.append("death observation belongs to another job")
     if observation.get("attempt_id") != attempt_id:
         errors.append("death observation belongs to another attempt")
-    if observation.get("workload_phase") != "FAILED":
-        errors.append("death observation phase is not FAILED")
     containers = [
         item
         for item in observation.get("containers") or []
         if item.get("pod_uid") == pod_uid
         and (node is None or item.get("node_id") == node)
     ]
+    killed_terminated = bool(containers) and all(
+        item.get("terminated") is True
+        and type(item.get("exit_code")) is int
+        and item["exit_code"] != 0
+        for item in containers
+    )
+    # The product's failure-detected reading is posted the moment the killed
+    # container's exit is seen; the PyTorchJob flips to Failed a moment later
+    # and no re-post follows for that flip alone, so the next observation with
+    # phase FAILED may be the terminal one -- which is also when the passive
+    # restart re-owns the node (live 2026-09-28: 57 s vs the usual 22 s, and
+    # the late-XID window was gone). Pod death is the terminated killed
+    # container, in a RUNNING/PENDING phase as much as in FAILED.
+    phase = observation.get("workload_phase")
+    if phase != "FAILED" and not (
+        phase in {"RUNNING", "PENDING"} and killed_terminated
+    ):
+        errors.append("death observation phase is not FAILED")
     if not containers:
         errors.append("death observation does not contain the killed Pod on its node")
     elif any(item.get("terminated") is not True for item in containers):

@@ -29,6 +29,16 @@ while (( elapsed < deadline )); do
   if (( count == 1 )); then
     pod="$(jq -er '.items[0].metadata.name | select(type == "string" and length > 0)' <<<"${inventory}")"
     uid="$(jq -er '.items[0].metadata.uid | select(type == "string" and length > 0)' <<<"${inventory}")"
+    # 容器仍在 ContainerCreating（拉镜像/挂卷）时 `kubectl logs` 必然失败，
+    # errexit 会把这次读取变成裸退出（假 FAIL）。只在容器已启动
+    # （running/terminated，或有过重启）后才读日志，否则继续轮询。
+    started="$(jq -er '[.items[0].status.containerStatuses[]? | select(.state.running != null or .state.terminated != null or (.restartCount // 0) > 0)] | length' <<<"${inventory}")"
+    if (( started == 0 )); then
+      echo "pod=${pod}; container has not started yet; waiting"
+      sleep 10
+      elapsed=$(( elapsed + 10 ))
+      continue
+    fi
     logs="$(kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
       logs "${pod}" --tail=400)"
     restarts="$(jq -er '[.items[0].status.containerStatuses[]?.restartCount] | if length > 0 then add else 0 end' <<<"${inventory}")"

@@ -83,6 +83,11 @@ from gpu_fault.orchestration.provider_correlation import (
     covered_correlated_workflow,
     execution_decision,
 )
+from gpu_fault.orchestration.reboot_window import (
+    RebootOwner,
+    cover_fault,
+    owning_reboot,
+)
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
@@ -455,6 +460,7 @@ class IncidentOrchestrator:
             prepare_preempting_successor=(self._prepare_preempting_successor),
             sample_hung_triage_nodes=(self._sample_hung_triage_nodes),
             record_host_resource_absorb=self._record_host_resource_absorb,
+            owning_reboot_workflow=self._owning_reboot_workflow,
         )
         plan_builder = NodeHealthPlanBuilder(
             self.store,
@@ -469,10 +475,11 @@ class IncidentOrchestrator:
         )
 
     def _record_host_resource_absorb(self) -> None:
-        # The merge service owns the record-only accounting the metrics
-        # endpoint exports by reason; the health family reports its absorb
-        # there so one counter family covers every "recorded, not planned".
+        # The merge service owns the record-only counter family by reason.
         self._workflow_merger.unsettled_host_resource_record_only_total += 1
+
+    def _owning_reboot_workflow(self, cluster_id: str, node_id: str) -> RebootOwner:
+        return owning_reboot(self.store, cluster_id, node_id)
 
     @cached_property
     def _workflow_merger(self) -> WorkflowMergeService:
@@ -586,15 +593,11 @@ class IncidentOrchestrator:
             observed_after,
             source_boot_id=marker.source_boot_id,
         ):
-            # Node names can repeat across regional clusters, so marker
-            # correlation must stop at the incident's cluster boundary
-            # before comparing shared node and GPU identities. The marker
-            # carries its tenant since H-14 (the policy stamps
-            # ``cluster_id=event.cluster_id``), so the boundary is read off
-            # the marker; reading the incident for every candidate only to
-            # compare its cluster made this loop N+1 store round trips per
-            # event (性能 3). Legacy rows without a cluster_id still take
-            # the incident read: a missing tenant must not be guessed.
+            # Node names repeat across regional clusters, so marker correlation
+            # stops at the incident's cluster boundary. The marker carries its
+            # tenant since H-14, so the boundary is read off the marker (an
+            # incident read per candidate was N+1 round trips, 性能 3); legacy
+            # rows without a cluster_id still take the incident read.
             if candidate.cluster_id:
                 if candidate.cluster_id != cluster_id:
                     continue
@@ -730,9 +733,13 @@ class IncidentOrchestrator:
             )
             if companion is not None:
                 return companion
+            covered = cover_fault(
+                self.store, event, decision, self._independent_incident
+            )
+            if covered is not None:
+                return covered
 
-            # Marker association is evidence. Store groups choose the incumbent
-            # and arbitrate this event's full candidate atomically.
+            # Marker association is evidence; store groups arbitrate atomically.
             decision = execution_decision(event, decision, existing)
 
             stale = self._fence_stale_generation_without_baseline(event, decision)
@@ -749,9 +756,7 @@ class IncidentOrchestrator:
                     grouped = self._ingest_grouped_fault(event, decision)
                 if grouped is not None:
                     return grouped
-            # Last resort before an independent incident: keep
-            # same-node actions from overlapping each other's blast
-            # radius when no workload scoped them together.
+            # Last resort before an independent incident: same-node serialization.
             grouped = self._ingest_node_scoped_fault(event, decision)
             if grouped is not None:
                 return grouped
@@ -783,15 +788,10 @@ class IncidentOrchestrator:
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
-            # One transaction for incident + workflow + event link. The blind
-            # ``save_workflow`` then ``save_incident`` pair was two autocommit
-            # statements on Postgres: two replicas ingesting the same event made
-            # two incidents, and a crash in between left an orphan workflow
-            # (store review 2026-09-07, item B). The pair is built above, not in
-            # the builder: ``_build_workflow`` reads the profile from the store,
-            # and the builder runs under the advisory lock, where it must be pure
-            # (item D). ``incident.event_id`` is this event's id, so the store's
-            # link of both is one link.
+            # One transaction for incident + workflow + event link (store review
+            # 2026-09-07, items B/D): two autocommit saves let two replicas mint
+            # two incidents and a crash strand an orphan workflow; the pair is
+            # built above because the builder must stay pure under the lock.
             created_incident, created_workflow, _created = (
                 self.store.create_incident_workflow_if_absent(
                     event.event_id, lambda: (incident, workflow)

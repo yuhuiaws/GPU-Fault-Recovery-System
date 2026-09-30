@@ -16,6 +16,16 @@ Every constant here is a measurement from ``docs/性能压测验收方案.md``:
   cluster's lanes, so the fault-reserved per-cluster depth must hold the
   largest cluster, not a fixed eighth of the queue depth.
 
+* section 8.4 -- the 50-cluster preset (12,800 managed nodes) against the
+  fixed ingress normal-tier semaphore of 1000 per process (2 s wait) produced
+  a reserved HTTP 503 share of 0.58-3.85 % on normal telemetry across six
+  live runs (2026-09-22, -27, -29), while the 32-cluster preset (8,192
+  nodes) produced 0. The routine burst front grows with the managed fleet,
+  so the normal-tier concurrency is derived from it: one slot per five
+  managed nodes, never below the 1000 the 32-cluster preset held with, and
+  never above 3584 so that with the 256 fault slots it stays under uvicorn's
+  ``--limit-concurrency 4096``.
+
 The functions are pure so that the admin config, the two manifest renderers
 and the runtime guard all compute the same number from the same inputs.
 """
@@ -29,6 +39,9 @@ DEFAULT_MANAGED_NODE_COUNT = 512
 MAX_CLUSTER_QUEUE_DEPTH_PER_NODE = 4
 NODES_PER_AURORA_ACU = 100
 FAULT_RESERVE_DIVISOR = 8
+INGRESS_NORMAL_CONCURRENCY_FLOOR = 1000
+INGRESS_NORMAL_CONCURRENCY_CEILING = 3584
+MANAGED_NODES_PER_INGRESS_NORMAL_SLOT = 5
 
 
 class CapacityEvidenceError(ValueError):
@@ -81,6 +94,25 @@ def fault_reserved_cluster_depth(
     return max(
         max_cluster_queue_depth // FAULT_RESERVE_DIVISOR,
         largest_cluster_node_count,
+    )
+
+
+def ingress_normal_concurrency(managed_node_count: int) -> int:
+    """GPU_FAULT_INGRESS_NORMAL_CONCURRENCY for a fleet of ``managed_node_count``.
+
+    One normal-tier ingress slot per five managed nodes, clamped to
+    [1000, 3584]: the 32-cluster preset (8,192 nodes) keeps its measured 1000,
+    the 50-cluster preset (12,800 nodes) gets 2560 (section 8.4: 1000 gave
+    0.58-3.85 % reserved 503 there), and the ceiling leaves room for the 256
+    fault slots under uvicorn's 4096 in-flight limit.
+    """
+
+    if managed_node_count < 1:
+        raise CapacityEvidenceError("managed node count must be at least 1")
+    slots = math.ceil(managed_node_count / MANAGED_NODES_PER_INGRESS_NORMAL_SLOT)
+    return max(
+        INGRESS_NORMAL_CONCURRENCY_FLOOR,
+        min(INGRESS_NORMAL_CONCURRENCY_CEILING, slots),
     )
 
 

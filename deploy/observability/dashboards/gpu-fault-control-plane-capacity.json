@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Alert group gpu-fault-control-plane-capacity; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/管理员日常运维.md §8).",
+  "description": "Alert group gpu-fault-control-plane-capacity; every panel carries the thresholds and runbook anchors of the alerts it plots (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "One series per scraped Pod across api-ha, control-worker and telemetry-spool-worker.\n\nAlert GpuFaultControlPlaneMetricsMissing (critical, for 5m): docs/管理员日常运维.md#gpufaultcontrolplanemetricsmissing\n\nAlert GpuFaultControlPlaneReplicaScrapeFailing (critical, for 5m): docs/管理员日常运维.md#gpufaultcontrolplanereplicascrapefailing",
+      "description": "One series per scraped Pod across api-ha, control-worker and telemetry-spool-worker.\n\nAlert GpuFaultControlPlaneMetricsMissing (critical, for 5m): docs/en/administrator-operations.md#gpufaultcontrolplanemetricsmissing\n\nAlert GpuFaultControlPlaneReplicaScrapeFailing (critical, for 5m): docs/en/administrator-operations.md#gpufaultcontrolplanereplicascrapefailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -95,7 +95,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Scrapes on which one /metrics contributor raised and its families were skipped while the rest still rendered (G-8).\n\nAlert GpuFaultMetricsContributorFailing (warning, for 10m, > 3): docs/管理员日常运维.md#gpufaultmetricscontributorfailing",
+      "description": "Scrapes on which one /metrics contributor raised and its families were skipped while the rest still rendered (G-8).\n\nAlert GpuFaultMetricsContributorFailing (warning, for 10m, > 3): docs/en/administrator-operations.md#gpufaultmetricscontributorfailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -166,7 +166,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Whether each control-worker's queue consumer loop is alive and how long since it last started a claim cycle; a dead or wedged loop kept the health gauge at 1 before B-6.\n\nAlert GpuFaultProcessorConsumerStalled (critical, for 2m, > 30): docs/管理员日常运维.md#gpufaultprocessorconsumerstalled",
+      "description": "Whether each control-worker's queue consumer loop is alive and how long since it last started a claim cycle; a dead or wedged loop kept the health gauge at 1 before B-6.\n\nAlert GpuFaultProcessorConsumerStalled (critical, for 2m, > 30): docs/en/administrator-operations.md#gpufaultprocessorconsumerstalled",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -417,7 +417,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Callers blocked on pool checkout right now; sustained above 0 the pool is saturated or losing slots (G-7).\n\nAlert GpuFaultPostgresPoolCheckoutQueueing (warning, for 2m, > 0): docs/管理员日常运维.md#gpufaultpostgrespoolcheckoutqueueing",
+      "description": "Callers blocked on pool checkout right now; sustained above 0 the pool is saturated or losing slots (G-7).\n\nAlert GpuFaultPostgresPoolCheckoutQueueing (warning, for 2m, > 0): docs/en/administrator-operations.md#gpufaultpostgrespoolcheckoutqueueing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -488,7 +488,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Failed attempts to open a pooled connection: a rotated password the Secret has not caught up with, or a failover (G-7 / CP-3).\n\nAlert GpuFaultPostgresPoolConnectionErrors (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultpostgrespoolconnectionerrors",
+      "description": "Failed attempts to open a pooled connection: a rotated password the Secret has not caught up with, or a failover (G-7 / CP-3).\n\nAlert GpuFaultPostgresPoolConnectionErrors (critical, for 5m, > 0): docs/en/administrator-operations.md#gpufaultpostgrespoolconnectionerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -559,7 +559,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since the hourly refresher CronJob last published the Aurora master password, and whether its latest run succeeded, from the status file in the mounted Secret (H1-2).\n\nAlert GpuFaultAuroraCredentialRefreshStale (warning, for 15m, > 10800): docs/管理员日常运维.md#gpufaultauroracredentialrefreshstale\n\nAlert GpuFaultAuroraCredentialRefreshFailing (critical, for 15m): docs/管理员日常运维.md#gpufaultauroracredentialrefreshfailing",
+      "description": "Seconds since the hourly refresher CronJob last published the Aurora master password, and whether its latest run succeeded, from the status file in the mounted Secret (H1-2).\n\nAlert GpuFaultAuroraCredentialRefreshStale (warning, for 15m, > 10800): docs/en/administrator-operations.md#gpufaultauroracredentialrefreshstale\n\nAlert GpuFaultAuroraCredentialRefreshFailing (critical, for 15m): docs/en/administrator-operations.md#gpufaultauroracredentialrefreshfailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -641,7 +641,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "A configured status projection is missing, unreadable, malformed or future-dated. This is unknown evidence, not a successful refresh.\n\nAlert GpuFaultAuroraCredentialRefreshStatusUnknown (warning, for 15m): docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown",
+      "description": "A configured status projection is missing, unreadable, malformed or future-dated. This is unknown evidence, not a successful refresh.\n\nAlert GpuFaultAuroraCredentialRefreshStatusUnknown (warning, for 15m): docs/en/administrator-operations.md#gpufaultauroracredentialrefreshstatusunknown",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -680,7 +680,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultAuroraCredentialRefreshStatusUnknown",
-          "url": "docs/管理员日常运维.md#gpufaultauroracredentialrefreshstatusunknown"
+          "url": "docs/en/administrator-operations.md#gpufaultauroracredentialrefreshstatusunknown"
         }
       ],
       "options": {
@@ -728,7 +728,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "LEASED remote commands whose workflow moved to another fencing token and whose lease lapsed unreported, failed by the periodic sweep with status_source=stale-fence (D-9).\n\nAlert GpuFaultRemoteCommandStaleFenceSwept (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept",
+      "description": "LEASED remote commands whose workflow moved to another fencing token and whose lease lapsed unreported, failed by the periodic sweep with status_source=stale-fence (D-9).\n\nAlert GpuFaultRemoteCommandStaleFenceSwept (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultremotecommandstalefenceswept",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -799,7 +799,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Outbox deliveries whose provider call or bookkeeping raised; the row was released for retry and the batch continued (F-3).\n\nAlert GpuFaultNotificationDeliveryErrors (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryerrors",
+      "description": "Outbox deliveries whose provider call or bookkeeping raised; the row was released for retry and the batch continued (F-3).\n\nAlert GpuFaultNotificationDeliveryErrors (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultnotificationdeliveryerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -870,7 +870,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Archive candidates that failed with an exception other than a safety refusal, by exception type (F-8).\n\nAlert GpuFaultControlRecordArchiveErrors (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultcontrolrecordarchiveerrors",
+      "description": "Archive candidates that failed with an exception other than a safety refusal, by exception type (F-8).\n\nAlert GpuFaultControlRecordArchiveErrors (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultcontrolrecordarchiveerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -954,7 +954,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Incomplete processor requests across the region.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 7000): docs/管理员日常运维.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 9000): docs/管理员日常运维.md#gpufaultprocessorqueuedepthcritical",
+      "description": "Incomplete processor requests across the region.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 7000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 9000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1029,7 +1029,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorOldestRequestDelayed (warning, for 5m, > 30): docs/管理员日常运维.md#gpufaultprocessoroldestrequestdelayed",
+      "description": "Alert GpuFaultProcessorOldestRequestDelayed (warning, for 5m, > 30): docs/en/administrator-operations.md#gpufaultprocessoroldestrequestdelayed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1100,7 +1100,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 700): docs/管理员日常运维.md#gpufaultprocessorclusterbackloghigh",
+      "description": "Alert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 700): docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1251,7 +1251,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 means the workflow detail gauges cover only the newest slice of the table.\n\nAlert GpuFaultWorkflowMetricScanTruncated (warning, for 30m): docs/管理员日常运维.md#gpufaultworkflowmetricscantruncated",
+      "description": "1 means the workflow detail gauges cover only the newest slice of the table.\n\nAlert GpuFaultWorkflowMetricScanTruncated (warning, for 30m): docs/en/administrator-operations.md#gpufaultworkflowmetricscantruncated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1318,7 +1318,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultAttemptObservationMetricScanTruncated (warning, for 30m): docs/管理员日常运维.md#gpufaultattemptobservationmetricscantruncated",
+      "description": "Alert GpuFaultAttemptObservationMetricScanTruncated (warning, for 30m): docs/en/administrator-operations.md#gpufaultattemptobservationmetricscantruncated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1398,7 +1398,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Requests rejected before enqueue, per second.\n\nAlert GpuFaultProcessorAdmissionRejected (critical, for 1m, > 0): docs/管理员日常运维.md#gpufaultprocessoradmissionrejected",
+      "description": "Requests rejected before enqueue, per second.\n\nAlert GpuFaultProcessorAdmissionRejected (critical, for 1m, > 0): docs/en/administrator-operations.md#gpufaultprocessoradmissionrejected",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1469,7 +1469,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
+      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/en/administrator-operations.md#gpufaultstoreiosaturated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1540,7 +1540,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultStoreIoRejected (critical, for 1m, > 0): docs/管理员日常运维.md#gpufaultstoreiorejected\n\nAlert GpuFaultStoreIoBackendUnavailable (warning, for 5m, > 5): docs/管理员日常运维.md#gpufaultstoreiobackendunavailable",
+      "description": "Alert GpuFaultStoreIoRejected (critical, for 1m, > 0): docs/en/administrator-operations.md#gpufaultstoreiorejected\n\nAlert GpuFaultStoreIoBackendUnavailable (warning, for 5m, > 5): docs/en/administrator-operations.md#gpufaultstoreiobackendunavailable",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1628,7 +1628,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorP95Slow (warning, for 10m, > 5): docs/管理员日常运维.md#gpufaultprocessorp95slow",
+      "description": "Alert GpuFaultProcessorP95Slow (warning, for 10m, > 5): docs/en/administrator-operations.md#gpufaultprocessorp95slow",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1699,7 +1699,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorExpiredLeasesReclaimed (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorexpiredleasesreclaimed",
+      "description": "Alert GpuFaultProcessorExpiredLeasesReclaimed (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultprocessorexpiredleasesreclaimed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1770,7 +1770,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Five-minute minimum from the newest complete, fresh scan. An old task owner cannot preserve repaired drift; unavailable scans are shown separately.\n\nAlert GpuFaultProcessorCounterDrift (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorcounterdrift",
+      "description": "Five-minute minimum from the newest complete, fresh scan. An old task owner cannot preserve repaired drift; unavailable scans are shown separately.\n\nAlert GpuFaultProcessorCounterDrift (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultprocessorcounterdrift",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1813,7 +1813,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultProcessorCounterDrift",
-          "url": "docs/管理员日常运维.md#gpufaultprocessorcounterdrift"
+          "url": "docs/en/administrator-operations.md#gpufaultprocessorcounterdrift"
         }
       ],
       "options": {
@@ -1859,7 +1859,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 when no current complete counter scan is available; 0 when one is known.\n\nAlert GpuFaultProcessorCounterDriftScanUnavailable (warning, for 5m): docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable",
+      "description": "1 when no current complete counter scan is available; 0 when one is known.\n\nAlert GpuFaultProcessorCounterDriftScanUnavailable (warning, for 5m): docs/en/administrator-operations.md#gpufaultprocessorcounterdriftscanunavailable",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1898,7 +1898,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultProcessorCounterDriftScanUnavailable",
-          "url": "docs/管理员日常运维.md#gpufaultprocessorcounterdriftscanunavailable"
+          "url": "docs/en/administrator-operations.md#gpufaultprocessorcounterdriftscanunavailable"
         }
       ],
       "options": {
@@ -1946,7 +1946,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetrySpoolListenerDown (warning, for 2m): docs/管理员日常运维.md#gpufaulttelemetryspoollistenerdown",
+      "description": "Alert GpuFaultTelemetrySpoolListenerDown (warning, for 2m): docs/en/administrator-operations.md#gpufaulttelemetryspoollistenerdown",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2007,7 +2007,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetrySpoolDataLoss (critical, > 0): docs/管理员日常运维.md#gpufaulttelemetryspooldataloss",
+      "description": "Alert GpuFaultTelemetrySpoolDataLoss (critical, > 0): docs/en/administrator-operations.md#gpufaulttelemetryspooldataloss",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2078,7 +2078,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetrySpoolAdmissionRejected (critical, > 0): docs/管理员日常运维.md#gpufaulttelemetryspooladmissionrejected",
+      "description": "Alert GpuFaultTelemetrySpoolAdmissionRejected (critical, > 0): docs/en/administrator-operations.md#gpufaulttelemetryspooladmissionrejected",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2149,7 +2149,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetrySpoolReplayError (critical, > 0): docs/管理员日常运维.md#gpufaulttelemetryspoolreplayerror",
+      "description": "Alert GpuFaultTelemetrySpoolReplayError (critical, > 0): docs/en/administrator-operations.md#gpufaulttelemetryspoolreplayerror",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2220,7 +2220,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultTelemetrySpoolDrainDelayed (warning, for 5m, > 60): docs/管理员日常运维.md#gpufaulttelemetryspooldraindelayed",
+      "description": "Alert GpuFaultTelemetrySpoolDrainDelayed (warning, for 5m, > 60): docs/en/administrator-operations.md#gpufaulttelemetryspooldraindelayed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2304,7 +2304,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since any dispatcher replica stamped a cycle; a lease held elsewhere still stamps.\n\nAlert GpuFaultWorkflowDispatcherStalled (critical, for 5m, > 300): docs/管理员日常运维.md#gpufaultworkflowdispatcherstalled",
+      "description": "Seconds since any dispatcher replica stamped a cycle; a lease held elsewhere still stamps.\n\nAlert GpuFaultWorkflowDispatcherStalled (critical, for 5m, > 300): docs/en/administrator-operations.md#gpufaultworkflowdispatcherstalled",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2375,7 +2375,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultPeriodicRunnerStalled (critical, for 5m, > 300): docs/管理员日常运维.md#gpufaultperiodicrunnerstalled",
+      "description": "Alert GpuFaultPeriodicRunnerStalled (critical, for 5m, > 300): docs/en/administrator-operations.md#gpufaultperiodicrunnerstalled",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2446,7 +2446,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "0 is a control-worker whose processor reports unhealthy.\n\nAlert GpuFaultProcessorUnhealthy (critical, for 5m): docs/管理员日常运维.md#gpufaultprocessorunhealthy",
+      "description": "0 is a control-worker whose processor reports unhealthy.\n\nAlert GpuFaultProcessorUnhealthy (critical, for 5m): docs/en/administrator-operations.md#gpufaultprocessorunhealthy",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2513,7 +2513,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "0 means no replica is consuming the processor queue.\n\nAlert GpuFaultProcessorNoActiveConsumer (critical, for 5m): docs/管理员日常运维.md#gpufaultprocessornoactiveconsumer",
+      "description": "0 means no replica is consuming the processor queue.\n\nAlert GpuFaultProcessorNoActiveConsumer (critical, for 5m): docs/en/administrator-operations.md#gpufaultprocessornoactiveconsumer",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2580,7 +2580,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "A consumer that reports running but claims nothing for 10m is stalled, not idle: an idle spool still claims.\n\nAlert GpuFaultTelemetrySpoolConsumerStopped (critical, for 5m): docs/管理员日常运维.md#gpufaulttelemetryspoolconsumerstopped\n\nAlert GpuFaultTelemetrySpoolConsumerStalled (critical, for 5m): docs/管理员日常运维.md#gpufaulttelemetryspoolconsumerstalled",
+      "description": "A consumer that reports running but claims nothing for 10m is stalled, not idle: an idle spool still claims.\n\nAlert GpuFaultTelemetrySpoolConsumerStopped (critical, for 5m): docs/en/administrator-operations.md#gpufaulttelemetryspoolconsumerstopped\n\nAlert GpuFaultTelemetrySpoolConsumerStalled (critical, for 5m): docs/en/administrator-operations.md#gpufaulttelemetryspoolconsumerstalled",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2671,7 +2671,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorLeaseRenewalFailing (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorleaserenewalfailing",
+      "description": "Alert GpuFaultProcessorLeaseRenewalFailing (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultprocessorleaserenewalfailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2753,7 +2753,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Fault events refused by worker processes. Increase is computed per reset domain before regional aggregation.\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected",
+      "description": "Fault events refused by worker processes. Increase is computed per reset domain before regional aggregation.\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/en/administrator-operations.md#gpufaultprocessorfaulteventsrejected",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2824,7 +2824,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Seconds since the periodic runner last saw a lease or job error; small is bad.\n\nAlert GpuFaultPeriodicServiceErrors (warning, for 0m, < 900): docs/管理员日常运维.md#gpufaultperiodicserviceerrors",
+      "description": "Seconds since the periodic runner last saw a lease or job error; small is bad.\n\nAlert GpuFaultPeriodicServiceErrors (warning, for 0m, < 900): docs/en/administrator-operations.md#gpufaultperiodicserviceerrors",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2906,7 +2906,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "1 for stale, missing or invalid process publications, or a missing merger verdict on a reachable Pod. Unknown process coverage is not zero activity.\n\nAlert GpuFaultMetricsAggregationIncomplete (warning, for 5m): docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete",
+      "description": "1 for stale, missing or invalid process publications, or a missing merger verdict on a reachable Pod. Unknown process coverage is not zero activity.\n\nAlert GpuFaultMetricsAggregationIncomplete (warning, for 5m): docs/en/administrator-operations.md#gpufaultmetricsaggregationincomplete",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2945,7 +2945,7 @@
         {
           "targetBlank": true,
           "title": "GpuFaultMetricsAggregationIncomplete",
-          "url": "docs/管理员日常运维.md#gpufaultmetricsaggregationincomplete"
+          "url": "docs/en/administrator-operations.md#gpufaultmetricsaggregationincomplete"
         }
       ],
       "options": {

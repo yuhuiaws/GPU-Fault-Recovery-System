@@ -50,7 +50,7 @@ class DiagnosticInconclusiveEmailBuilder:
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,
-            subject=f"[通知][GPU 诊断未定论] {cluster_id}: {nodes}",
+            subject=f"[NOTICE][GPU diagnostic inconclusive] {cluster_id}: {nodes}",
             body_text=body,
             support_case_draft="",
             evidence_refs=[],

@@ -901,14 +901,23 @@ def test_a_transient_describe_failure_is_not_read_as_absent(
     """A boolean probe turned a throttle or a credentials error into "the
     namespace is absent", and the restore then tried to CREATE over an existing
     namespace (or skipped a delete). Only ResourceNotFoundException is absence."""
-    release, calls, _slept = _rules_release([(255, "", "Unable to locate credentials")])
+    from gpu_fault_release import regional_observability_rollback as observability
+
+    attempts = observability.AMP_READ_ATTEMPTS
+    release, calls, slept = _rules_release(
+        [(255, "", "Unable to locate credentials")] * attempts
+    )
+    monkeypatch.setattr(observability, "_RETRY_SLEEP", slept.append)
 
     with pytest.raises(ReleaseError, match="expected-collector rule namespace"):
         DATAPLANE.restore_dataplane_expected_rules(
             release, {"present": False, "data_base64": None}
         )
 
-    assert [c[2] for c in calls] == ["describe-rule-groups-namespace"], calls
+    # A credentials blip is retried (2026-09-23) but a persistent one still refuses
+    # and is never read as absence.
+    assert [c[2] for c in calls] == ["describe-rule-groups-namespace"] * attempts, calls
+    assert len(slept) == attempts - 1, "one backoff between attempts"
 
 
 def test_a_namespace_still_deleting_is_waited_for_before_the_put(

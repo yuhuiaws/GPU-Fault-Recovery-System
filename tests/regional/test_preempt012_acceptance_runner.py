@@ -191,6 +191,69 @@ def test_overlap_check_needs_the_whole_audit_inside_the_quiesce_window() -> None
     )
 
 
+def test_node_check_excepts_a_cordoned_declared_spare_but_not_other_cordons() -> None:
+    now = datetime(2026, 9, 26, 20, 0, tzinfo=timezone.utc)
+    control = {
+        "executed_at": now.isoformat(),
+        "completed_at": (now + timedelta(seconds=20)).isoformat(),
+        "clean": {
+            "status": "SUPERSEDED",
+            "new_adapter_calls": [],
+            "predecessor_id": "pred",
+            "preempted_by": "succ",
+            "successor_id": "succ",
+            "successor_adapter_calls": ["RESTART_NODE"],
+            "successor_inherited_step_indexes": [0, 1],
+            "successor_completed_operations": ["MARK_UNSCHEDULABLE", "STOP_WORKLOADS"],
+            "successor_inherited_from": ["pred"],
+        },
+        "dirty": {
+            "status": "SUPERSEDED",
+            "handoff_after_claim": "pred",
+            "predecessor_id": "pred",
+        },
+        "physical_operations_called": [],
+        "remote_commands_for_audit_workflows": 0,
+        "residual_objects": [],
+    }
+
+    def node(
+        name: str, *, unschedulable: bool, labels: dict[str, str]
+    ) -> dict[str, Any]:
+        return {
+            "name": name,
+            "ready": "True",
+            "unschedulable": unschedulable,
+            "taints": [],
+            "labels": labels,
+        }
+
+    def check(final_nodes: list[dict[str, Any]]) -> bool:
+        return runner.evaluate_checks(
+            control=control,
+            cycle={
+                "quiesced_at": (now - timedelta(seconds=1)).isoformat(),
+                "restored_at": (now + timedelta(seconds=30)).isoformat(),
+            },
+            baseline=host_snapshot(),
+            final_host=host_snapshot(),
+            final_nodes=final_nodes,
+            provider=[],
+            cpu_blast_unchanged=True,
+        )["all_gpu_nodes_ready_and_schedulable"]
+
+    fault = node("node-a", unschedulable=False, labels={})
+    # Live third round 2026-09-26: the declared warm spare 0cf5 stays cordoned
+    # (spare-pool-state AVAILABLE) by design and failed the old all-nodes check.
+    spare = node(
+        "node-spare", unschedulable=True, labels={"gpu-fault.io/spare": "true"}
+    )
+    assert check([fault, spare]), "a cordoned declared spare is not a residue"
+    stray = node("node-b", unschedulable=True, labels={})
+    assert not check([fault, stray]), "any other cordon still fails the check"
+    assert not check([]), "no GPU nodes at all must not pass"
+
+
 def test_wait_for_cycle_returns_at_the_requested_status_or_a_terminal_one() -> None:
     class Host:
         def __init__(self, statuses: list[str]) -> None:

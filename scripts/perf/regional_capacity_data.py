@@ -257,9 +257,41 @@ def require_registry_scope(cursor: Any, run_id: str, cluster_ids: list[str]) -> 
     return True
 
 
+TERMINAL_STATUSES = {
+    "remote_command": frozenset({"SUCCEEDED", "FAILED", "CANCELLED"}),
+    "workflow": frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}),
+}
+
+
+def nonterminal_records(records: dict[tuple[str, str], dict]) -> list[tuple[str, str]]:
+    """Run-owned workflows and commands that are still open."""
+
+    return sorted(
+        (kind, key)
+        for (kind, key), payload in records.items()
+        if kind in TERMINAL_STATUSES
+        and payload.get("status") not in TERMINAL_STATUSES[kind]
+    )
+
+
 def inspect_or_cleanup(
-    connection: Any, *, run_id: str, cluster_ids: list[str], cleanup: bool
+    connection: Any,
+    *,
+    run_id: str,
+    cluster_ids: list[str],
+    cleanup: bool,
+    force_nonterminal: bool = False,
 ) -> dict[str, Any]:
+    """Probe (``cleanup=False``) or delete the run's synthetic data.
+
+    Open workflows or commands refuse the cleanup unless ``force_nonterminal``:
+    a teardown runs after the run's executor Jobs are gone, so a synthetic
+    command that is still LEASED or PENDING can never finish and would refuse
+    every later run (live 2026-09-22: an aborted action run left 13 LEASED and
+    8 PENDING RESTART_NODE commands; the next registration was refused with
+    "synthetic registry entries already exist").
+    """
+
     from psycopg import sql
 
     validate_scope(run_id, cluster_ids)
@@ -303,25 +335,26 @@ def inspect_or_cleanup(
             )
             if int(cursor.fetchone()[0]):
                 raise RuntimeError("capacity processor queue has not drained")
-            for (kind, _), payload in records.items():
-                terminal = (
-                    {"SUCCEEDED", "FAILED", "CANCELLED"}
-                    if kind == "remote_command"
-                    else {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
-                )
-                if (
-                    kind in {"workflow", "remote_command"}
-                    and payload.get("status") not in terminal
-                ):
-                    raise RuntimeError(
-                        "capacity workflow or command is still nonterminal"
-                    )
+            stuck = nonterminal_records(records)
+            if stuck and not force_nonterminal:
+                raise RuntimeError("capacity workflow or command is still nonterminal")
             cursor.execute(
                 "DELETE FROM gpu_fault_links WHERE key=ANY(%s) OR value=ANY(%s)",
                 (identifiers, identifiers),
             )
+            forced = set(stuck) if force_nonterminal else set()
             for (kind, key), payload in records.items():
                 if kind not in CAS_KINDS:
+                    continue
+                if (kind, key) in forced:
+                    # An open synthetic record is still being touched by the
+                    # processor (lease expiry, dispatch); the CAS on the probe's
+                    # snapshot would miss. Delete it unconditionally: the store
+                    # function locks the row and the run owns the cluster.
+                    cursor.execute(
+                        "SELECT gpu_fault_delete_control_state(%s,%s)", (kind, key)
+                    )
+                    cursor.fetchone()
                     continue
                 cursor.execute(
                     "SELECT gpu_fault_delete_control_state(%s,%s,%s::jsonb)",
@@ -360,11 +393,17 @@ def inspect_or_cleanup(
         "total": 0,
         "deleted_records": len(records),
         "deleted_links": links,
+        "forced_nonterminal": len(stuck),
     }
 
 
 def invoke(
-    control: Callable[..., str], *, run_id: str, cluster_ids: list[str], cleanup: bool
+    control: Callable[..., str],
+    *,
+    run_id: str,
+    cluster_ids: list[str],
+    cleanup: bool,
+    force_nonterminal: bool = False,
 ) -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     if str(root) not in sys.path:
@@ -390,7 +429,14 @@ def invoke(
         "--",
         component_python("cpu"),
         "-",
-        json.dumps({"run_id": run_id, "cluster_ids": cluster_ids, "cleanup": cleanup}),
+        json.dumps(
+            {
+                "run_id": run_id,
+                "cluster_ids": cluster_ids,
+                "cleanup": cleanup,
+                "force_nonterminal": bool(cleanup and force_nonterminal),
+            }
+        ),
         stdin=Path(__file__).read_bytes(),
         timeout=900 if cleanup else 150,
     )
@@ -406,6 +452,8 @@ def run_request(arguments: dict[str, Any]) -> dict[str, Any]:
     validate_scope(arguments["run_id"], arguments["cluster_ids"])
     if type(arguments.get("cleanup")) is not bool:
         raise RuntimeError("capacity cleanup mode must be explicit")
+    if type(arguments.get("force_nonterminal", False)) is not bool:
+        raise RuntimeError("capacity forced cleanup flag must be a boolean")
     path = os.getenv("GPU_FAULT_STORE_URL_FILE")
     credentials = StoreCredentials(os.getenv("GPU_FAULT_STORE_URL", ""), path=path)
     url = credentials.conninfo()

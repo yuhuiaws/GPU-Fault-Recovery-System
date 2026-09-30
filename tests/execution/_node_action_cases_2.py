@@ -188,7 +188,7 @@ def test_hyperpod_reboot_auto_confirms_new_ready_agent_incarnation(
     assert len(notifications) == 1
     assert sent == [notifications[0].notification_id]
     assert execution.details["notification_id"] == (notifications[0].notification_id)
-    assert "系统动作：RESTART_NODE" in notifications[0].body_text
+    assert "System action: RESTART_NODE" in notifications[0].body_text
 
 
 def test_hyperpod_replace_auto_confirms_and_rebinds_ready_new_instance() -> None:
@@ -885,7 +885,7 @@ def test_node_action_adapter_interprets_dcgm_diagnostic_outcome(
 
     assert outcome.status is expected_status
     notification = store.list_notifications()[0]
-    assert "DCGM 快速诊断结果通知" in notification.body_text
+    assert "GPU DCGM quick diagnostic result" in notification.body_text
     assert "PCIE_AER_INSPECTION" in notification.body_text
     assert "file:///diagnostics/dcgm.json" in (notification.evidence_refs)
     assert outcome.details["notification_id"] == (notification.notification_id)

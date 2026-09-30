@@ -225,3 +225,56 @@ def test_cold_build_requires_each_current_image_descriptor(tmp_path, missing):
         assert set(
             receipts.cold_build_proof(tmp_path, [log])["cold_build"]["images"]
         ) == set(mapping)
+
+
+def test_completed_record_admits_a_stage_five_rerun_and_keeps_the_passed_receipt(
+    tmp_path,
+):
+    """2026-09-22: the first stage-5 pass needed a resumed first deploy after
+    runner fixes; the user asked for one unbroken attempt. A fully passed record
+    may run stage 5 again (the second site was uninstalled in between); earlier
+    stages stay closed and the passed receipt survives under ``reruns``."""
+
+    path = tmp_path / "receipt.json"
+    inputs = {"cpu": "cpu", "gpu": "gpu"}
+    receipts.initialize(path, inputs=inputs, stage=1)
+    for stage in range(1, 6):
+        if stage > 1:
+            receipts.initialize(path, inputs=inputs, stage=stage)
+        receipts.start_stage(path, state=tmp_path / "state", stage=stage)
+        log = tmp_path / f"stage-{stage}.log"
+        log.write_text(f"stage {stage} done")
+        receipts.finish(
+            path, stage=stage, status="PASS", seconds=1, log=log, name=f"s{stage}"
+        )
+    with pytest.raises(ValueError, match="first unpassed"):
+        receipts.initialize(path, inputs=inputs, stage=3)
+
+    record = receipts.initialize(path, inputs=inputs, stage=5)
+
+    assert record["stages"]["5"]["status"] == "RERUN", "stage 5 is open again"
+    assert record["reruns"][0]["previous"]["status"] == "PASS", (
+        "the passed receipt is kept, not overwritten"
+    )
+    assert record["stages"]["5"]["attempt_logs"] == [
+        {"name": "stage-5.log", "sha256": record["reruns"][0]["previous"]["log_sha256"]}
+    ], "earlier attempt logs stay listed on the stage"
+    assert record["stages"]["5"]["rerun_from_attempt"] == 2, (
+        "the rerun's attempts are marked where they begin"
+    )
+    receipt = receipts.start_stage(path, state=tmp_path / "state", stage=5)
+    assert receipt["attempts"] == 2 and receipt["status"] == "RUNNING", (
+        "attempts keep counting so attempt log names stay unique"
+    )
+    log = tmp_path / "stage-5-rerun.log"
+    log.write_text("one attempt")
+    receipts.finish(path, stage=5, status="PASS", seconds=2, log=log, name="s5")
+    final = receipts.read(path)
+    assert final["stages"]["5"]["status"] == "PASS", "the rerun passed"
+    assert (
+        final["stages"]["5"]["attempts"] == final["stages"]["5"]["rerun_from_attempt"]
+    ), "one attempt, one pass: the rerun began and ended on the same attempt"
+    assert [item["name"] for item in final["stages"]["5"]["attempt_logs"]] == [
+        "stage-5.log",
+        "stage-5-rerun.log",
+    ], "the log chain covers both runs"

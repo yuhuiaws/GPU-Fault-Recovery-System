@@ -381,6 +381,7 @@ def test_previous_release_snapshot_reads_live_images() -> None:
     release = SimpleNamespace(
         state={
             "release_delivery_sha256": "1" * 64,
+            "release_manifest_path": "/state/boot020-work/wt-D/dist/cand-d/release.json",
             "rendered_manifest_sha256": "2" * 64,
             "node_template_sha256": "3" * 64,
         },
@@ -431,6 +432,11 @@ def test_previous_release_snapshot_reads_live_images() -> None:
     assert previous["observability"]["rule_namespace"] == "rules"
     assert previous["runtime_image"] != release.runtime_image
     assert previous["release_delivery_sha256"] == "1" * 64
+    assert previous["release_manifest_path"] == (
+        "/state/boot020-work/wt-D/dist/cand-d/release.json"
+    ), (
+        "the rollback alignment must find a manifest delivered from outside source-snapshots"
+    )
     assert previous["executor_internal_error_total"] == 2
     assert previous["executor_internal_error_last_seen_timestamp_seconds"] == 123.0
     assert previous["clusters"][target.cluster_id]["dcgm_image"] == previous_dcgm

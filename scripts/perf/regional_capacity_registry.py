@@ -4,15 +4,31 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .regional_registry_alignment import (
+        SECRET_RESTORE_FILE,
+        baseline_serialization,
+        preflight_checked_at,
+        record_secret_baseline,
+        verify_alignment,
+    )
+else:
+    from regional_registry_alignment import (
+        SECRET_RESTORE_FILE,
+        baseline_serialization,
+        preflight_checked_at,
+        record_secret_baseline,
+        verify_alignment,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_CONTROL_NAMESPACE = "gpu-fault-system"
@@ -199,6 +215,30 @@ def dataplane_identity(
     return result.stdout.decode()
 
 
+def ensure_perf_namespace() -> bool:
+    """Create the perf namespace when it is absent; return whether it was created.
+
+    The namespace is the load generators' home and normally outlives the site,
+    but an operator sweeping acceptance residue (live 2026-09-22) or a fresh
+    data plane starts without it, and ``kubectl apply`` of the connection
+    Secret then fails with NotFound. An existing namespace is left untouched.
+    """
+
+    if dataplane("get", "namespace", NAMESPACE, "-o", "json", check=False).strip():
+        return False
+    document = {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": NAMESPACE,
+            "labels": {"gpu-fault.io/perf-namespace": "capacity-load"},
+        },
+    }
+    dataplane("apply", "-f", "-", stdin=json.dumps(document).encode())
+    print(f"perf namespace {NAMESPACE} created", file=sys.stderr, flush=True)
+    return True
+
+
 def sync_dataplane_connection_secret() -> dict:
     """Copy the live connection Secret into the perf namespace; report the change.
 
@@ -223,6 +263,7 @@ def sync_dataplane_connection_secret() -> dict:
     data = dict(source.get("data") or {})
     if not data:
         raise RuntimeError(f"connection Secret {CONNECTION_SECRET} carries no data")
+    namespace_created = ensure_perf_namespace()
     digest = hashlib.sha256(
         json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -258,6 +299,7 @@ def sync_dataplane_connection_secret() -> dict:
         "data_sha256": digest,
         "previous_sha256": previous_digest,
         "changed": previous_digest != digest,
+        "namespace_created": namespace_created,
     }
 
 
@@ -302,13 +344,14 @@ def _registry_entry_index(
     return result
 
 
-def _read_registry_secret() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def registry_secret_document() -> tuple[dict[str, Any], bytes, list[dict[str, Any]]]:
+    """``(metadata, raw clusters.json bytes, parsed entries)`` of the Secret."""
+
     try:
         value = json.loads(control("get", "secret", REGISTRY_SECRET, "-o", "json"))
         metadata = value["metadata"]
-        values = json.loads(
-            base64.b64decode(value["data"]["clusters.json"], validate=True)
-        )
+        raw = base64.b64decode(value["data"]["clusters.json"], validate=True)
+        values = json.loads(raw)
     except Exception:
         raise RuntimeError("registry Secret could not be read safely") from None
     if (
@@ -318,54 +361,29 @@ def _read_registry_secret() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         or not isinstance(values, list)
     ):
         raise RuntimeError("registry Secret identity or contents are unknown")
+    return metadata, raw, values
+
+
+def _read_registry_secret() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    metadata, _raw, values = registry_secret_document()
     return metadata, values
 
 
-def write_registry(
-    entries: list[dict],
-    *,
-    run_id: str,
-    expected_entries: list[dict],
-    reason: str,
-) -> dict:
-    from gpu_fault.regional import (
-        RegionalClusterRegistration,
-        regional_registry_content_sha256,
-    )
-    from gpu_fault.regional_registry import (
-        configured_regional_registrations,
-        regional_registry_config_sha256,
-    )
+def capture_secret_baseline(artifacts: Path, entries: list[dict[str, Any]]) -> None:
+    """Record the Secret as it is before the run's first write."""
+
+    _metadata, raw, observed = registry_secret_document()
+    if observed != entries:
+        raise RuntimeError("registry Secret changed while recording its baseline")
+    record_secret_baseline(artifacts, raw, entries)
+
+
+def durable_registry_revision() -> dict[str, Any]:
+    """The durable head revision (``generation``, ``registrations``,
+    ``content_sha256``) read inside a Running api-ha Pod."""
+
     from scripts.e2e.regional.regional_live_fixture import component_python
 
-    if (
-        not isinstance(run_id, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
-    ):
-        raise RuntimeError("registry write requires an explicit run identity")
-
-    def owned(value: dict) -> bool:
-        return (
-            value.get("synthetic") is True and value.get("synthetic_run_id") == run_id
-        )
-
-    before = _registry_entry_index(expected_entries)
-    desired = _registry_entry_index(entries)
-    for key in before.keys() | desired.keys():
-        if before.get(key) != desired.get(key):
-            if any(
-                not owned(value)
-                for value in (before.get(key), desired.get(key))
-                if value is not None
-            ):
-                raise RuntimeError(
-                    "registry write would change another run or a production registration"
-                )
-    registrations = configured_regional_registrations(entries)
-
-    metadata, observed = _read_registry_secret()
-    if observed != expected_entries:
-        raise RuntimeError("registry Secret changed since the run inspected it")
     pod = control(
         "get",
         "pod",
@@ -392,6 +410,68 @@ def write_registry(
     generation = revision.get("generation")
     if type(generation) is not int or generation < 1:
         raise RuntimeError("durable registry generation is unknown")
+    return revision
+
+
+def write_registry(
+    entries: list[dict],
+    *,
+    run_id: str,
+    expected_entries: list[dict],
+    reason: str,
+    serialization: str | None = None,
+) -> dict:
+    """Write ``entries`` to the Secret and publish the matching durable revision.
+
+    ``serialization`` is the exact ``clusters.json`` text to store (teardown
+    passes the pre-run bytes rebuilt from the recorded shape); it must parse
+    to ``entries``. Without it the compact form is written.
+    """
+
+    from gpu_fault.regional import (
+        RegionalClusterRegistration,
+        regional_registry_content_sha256,
+    )
+    from gpu_fault.regional_registry import (
+        configured_regional_registrations,
+        regional_registry_config_sha256,
+    )
+
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
+    ):
+        raise RuntimeError("registry write requires an explicit run identity")
+    exact_bytes = serialization is not None
+    if serialization is None:
+        serialization = json.dumps(entries, separators=(",", ":"))
+    elif json.loads(serialization) != entries:
+        raise RuntimeError("registry serialization does not describe the entries")
+
+    def owned(value: dict) -> bool:
+        return (
+            value.get("synthetic") is True and value.get("synthetic_run_id") == run_id
+        )
+
+    before = _registry_entry_index(expected_entries)
+    desired = _registry_entry_index(entries)
+    for key in before.keys() | desired.keys():
+        if before.get(key) != desired.get(key):
+            if any(
+                not owned(value)
+                for value in (before.get(key), desired.get(key))
+                if value is not None
+            ):
+                raise RuntimeError(
+                    "registry write would change another run or a production registration"
+                )
+    registrations = configured_regional_registrations(entries)
+
+    metadata, raw_before, observed = registry_secret_document()
+    if observed != expected_entries:
+        raise RuntimeError("registry Secret changed since the run inspected it")
+    revision = durable_registry_revision()
+    generation = revision["generation"]
     current = [
         RegionalClusterRegistration.model_validate(item)
         for item in revision["registrations"]
@@ -428,10 +508,8 @@ def write_registry(
             raise RuntimeError(
                 "registry write would recreate an unrelated durable registration"
             )
-    payload = base64.b64encode(
-        json.dumps(entries, separators=(",", ":")).encode()
-    ).decode()
-    if observed != entries:
+    payload = base64.b64encode(serialization.encode()).decode()
+    if observed != entries or (exact_bytes and serialization.encode() != raw_before):
         patch = [
             {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
             {
@@ -924,14 +1002,35 @@ def cleanup_registry_residuals(
         if entry.get("synthetic") is True and entry.get("synthetic_run_id") == run_id
     ]
     baseline = [entry for entry in initial if entry not in owned]
+    # Restore the pre-run bytes when the surviving entries are exactly what
+    # register() saw: the api-ha replicas compare the Secret they started on
+    # with the durable head, and a re-serialised Secret is a needless change.
+    serialization = (
+        baseline_serialization(artifacts, baseline) if artifacts is not None else None
+    )
     write_registry(
         baseline,
         run_id=run_id,
         expected_entries=initial,
         reason=f"capacity cleanup {run_id}",
+        serialization=serialization,
     )
     if load_registry() != baseline:
         raise RuntimeError("registry changed while verifying scoped cleanup")
+    if artifacts is not None:
+        # write_registry stored exactly ``serialization`` (or the compact form).
+        written = serialization or json.dumps(baseline, separators=(",", ":"))
+        (artifacts / SECRET_RESTORE_FILE).write_text(
+            json.dumps(
+                {
+                    "byte_identical": serialization is not None,
+                    "sha256_after": hashlib.sha256(written.encode()).hexdigest(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     _write_registry_audit(
         artifacts,
         phase=phase,
@@ -1054,8 +1153,9 @@ def upsert_secret(name: str, files: dict[str, bytes], *, run_id: str) -> dict:
     existing = read()
     if existing is not None:
         return verify(existing)
-    try:
-        raw = dataplane(
+
+    def create() -> str:
+        return dataplane(
             "create",
             "-f",
             "-",
@@ -1063,10 +1163,19 @@ def upsert_secret(name: str, files: dict[str, bytes], *, run_id: str) -> dict:
             "jsonpath={.metadata}",
             stdin=json.dumps(manifest).encode(),
         )
+
+    try:
+        raw = create()
     except Exception:
         # A lost create ACK is resolved by the run label, contents and fresh UID.
-        # Never replay the create or overwrite a same-name foreign Secret.
-        return verify(read())
+        # Never replay the create or overwrite a same-name foreign Secret. The one
+        # create that is retried is the first Secret of a run whose perf namespace
+        # does not exist yet (live 2026-09-23: the namespace had been swept with
+        # acceptance residue); the namespace is created and the create repeated.
+        if read() is None and ensure_perf_namespace():
+            raw = create()
+        else:
+            return verify(read())
     try:
         created = json.loads(raw)
         uid = created["uid"]
@@ -1104,6 +1213,9 @@ def register(
         )
     validate_notification_safety()
     validate_alertmanager_drill_route()
+    # A Secret that already disagrees with the durable head (or a replica that
+    # says so) is refused here, so the drift is never attributed to this run.
+    verify_registry_alignment(artifacts=artifacts, phase="preflight")
     cleanup_registry_residuals(
         scope=scope,
         artifacts=artifacts,
@@ -1116,6 +1228,7 @@ def register(
     (artifacts / "registry-baseline.json").write_text(
         json.dumps(redacted_registry_entries(baseline), indent=1) + "\n"
     )
+    capture_secret_baseline(artifacts, existing)
     perf = perf_cluster_entries(
         count,
         run_id=run_id,
@@ -1167,6 +1280,14 @@ def register(
         {"clusters.json": json.dumps(tokens, indent=1).encode()},
         run_id=run_id,
     )
+    # Every load and executor Pod mounts the mirrored connection Secret from the
+    # perf namespace; mirror it for every suite here (live 2026-09-23: only the
+    # integrated suite did, and a recreated namespace left the capacity suite's
+    # load Pod in ContainerCreating on "secret not found" until its wait cap).
+    connection = sync_dataplane_connection_secret()
+    (artifacts / "connection-secret-preflight.json").write_text(
+        json.dumps(connection, sort_keys=True) + "\n", encoding="utf-8"
+    )
     token_path = artifacts / "registry-token-proof.json"
     token_path.write_text(
         json.dumps(token_proof, sort_keys=True) + "\n", encoding="utf-8"
@@ -1186,11 +1307,38 @@ def deregister(
     scope: str,
     artifacts: Path | None = None,
     run_id: str | None = None,
+    verify: bool = True,
 ) -> int:
-    return cleanup_registry_residuals(
+    removed = cleanup_registry_residuals(
         scope=scope,
         artifacts=artifacts,
         phase="postflight",
         force=True,
         run_id=run_id,
+    )
+    # The run's cleanup is not done until the control plane agrees with the
+    # Secret it left behind; a drifted replica fails the teardown here rather
+    # than the next HA-010 preflight. Callers with more run-owned resources to
+    # remove (the data-plane token Secret) pass verify=False and run the gate
+    # last, so a failed gate never strands them.
+    if verify:
+        verify_registry_alignment(artifacts=artifacts, phase="postflight")
+    return removed
+
+
+def verify_registry_alignment(*, artifacts: Path | None, phase: str) -> dict[str, Any]:
+    """Prove the Secret, the durable head and every api-ha replica agree
+    (see ``regional_registry_alignment.verify_alignment``). The postflight may
+    roll replicas that started inside the run's window (their start-up Secret
+    digest is the run's transient one, not a drift the run left behind)."""
+
+    return verify_alignment(
+        control,
+        secret_document=registry_secret_document,
+        durable_revision=durable_registry_revision,
+        artifacts=artifacts,
+        phase=phase,
+        restart_window_start=(
+            preflight_checked_at(artifacts) if phase == "postflight" else None
+        ),
     )

@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Closed-loop essentials across every alert group (see docs/管理员日常运维.md §8).",
+  "description": "Closed-loop essentials across every alert group (see docs/en/administrator-operations.md §8).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Every AMP alert currently firing; the name is the runbook card in docs/管理员日常运维.md §8.",
+      "description": "Every AMP alert currently firing; the name is the runbook card in docs/en/administrator-operations.md §8.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -102,7 +102,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "ESCALATED is the operator queue.\n\nAlert GpuFaultIncidentsAwaitingOperator (warning, for 24h, > 0): docs/管理员日常运维.md#gpufaultincidentsawaitingoperator",
+      "description": "ESCALATED is the operator queue.\n\nAlert GpuFaultIncidentsAwaitingOperator (warning, for 24h, > 0): docs/en/administrator-operations.md#gpufaultincidentsawaitingoperator",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -240,7 +240,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "PENDING or SAFETY_PENDING workflows whose incident no longer points at them.\n\nAlert GpuFaultOrphanWorkflows (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultorphanworkflows",
+      "description": "PENDING or SAFETY_PENDING workflows whose incident no longer points at them.\n\nAlert GpuFaultOrphanWorkflows (warning, for 30m, > 0): docs/en/administrator-operations.md#gpufaultorphanworkflows",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -391,7 +391,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Incomplete processor requests across the region.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 7000): docs/管理员日常运维.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 9000): docs/管理员日常运维.md#gpufaultprocessorqueuedepthcritical",
+      "description": "Incomplete processor requests across the region.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 7000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 9000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -466,7 +466,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorOldestRequestDelayed (warning, for 5m, > 30): docs/管理员日常运维.md#gpufaultprocessoroldestrequestdelayed",
+      "description": "Alert GpuFaultProcessorOldestRequestDelayed (warning, for 5m, > 30): docs/en/administrator-operations.md#gpufaultprocessoroldestrequestdelayed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -537,7 +537,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 700): docs/管理员日常运维.md#gpufaultprocessorclusterbackloghigh",
+      "description": "Alert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 700): docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -846,7 +846,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
+      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/en/administrator-operations.md#gpufaultstoreiosaturated",
       "fieldConfig": {
         "defaults": {
           "color": {
