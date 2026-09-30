@@ -30,6 +30,8 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
 )
+from gpu_fault.fleet_compatibility import NODE_ACTION_KEY_VERSION_DERIVED
+from gpu_fault.node_action_keys import resolve_node_action_secret
 from gpu_fault.regional import (
     RegionalExecutorReadinessReport,
     RegionalExecutorReadinessRequest,
@@ -45,6 +47,8 @@ from gpu_fault.regional import (
     RemoteHyperPodSubmissionRequest,
     RemoteHyperPodSubmissionReservation,
     RemoteIncidentOwnershipReport,
+    RemoteNodeActionKeyRequest,
+    RemoteNodeActionKeys,
     RemoteSpareHealthReport,
     RemoteSpareHealthRequest,
 )
@@ -611,6 +615,142 @@ async def get_remote_fleet_rollout_fence(
         cluster_id=cluster_id,
         fencing_deployment_ids=list(fencing),
     )
+
+
+def _node_known_to_cluster(
+    store: Any,
+    cluster_id: str,
+    node_id: str,
+    *,
+    hyperpod_identities: list[Any],
+) -> bool:
+    """Whether data-plane evidence already places ``node_id`` in ``cluster_id``.
+
+    Any one of: an Agent record (a node that heartbeated before, e.g. a
+    re-imaged node), a GPU inventory snapshot or GPU metric (the DCGM path
+    reports a fresh node long before its Agent exists), or a HyperPod node
+    identity whose current Kubernetes name or alias is this node. Retired
+    aliases do not count: a replaced node's old name must not be re-keyed.
+    """
+
+    try:
+        store.get_agent(cluster_id, node_id)
+        return True
+    except (NotFoundError, KeyError):
+        pass
+    if store.get_gpu_inventory_snapshot(cluster_id, node_id) is not None:
+        return True
+    if store.list_gpu_metrics_latest(cluster_id, node_id):
+        return True
+    return any(
+        identity.kubernetes_node_name == node_id or node_id in identity.aliases
+        for identity in hyperpod_identities
+    )
+
+
+@router.post("/node-action-keys", response_model=RemoteNodeActionKeys)
+@authorization_bucket("cluster-token")
+async def regional_node_action_keys(
+    request: RemoteNodeActionKeyRequest,
+    cluster_id: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> RemoteNodeActionKeys:
+    """Node-scoped Node Action keys for nodes this cluster already has.
+
+    ``gpu-fault-admin deploy``/``join-cluster`` write one version-2 key per
+    node into the GPU Secret ``gpu-fault-node-action-keys`` for the nodes
+    present at that time. A node HyperPod replaces later has none, so every
+    installer Job for it fails on the missing Secret key (live 2026-09-30) and
+    the node never gets an Agent. The cluster executor asks here for the
+    missing names and patches only those keys in.
+
+    The fleet master never leaves the control plane: only the derived,
+    node-scoped value is returned, only for the authenticated cluster (the
+    payload ``cluster_id`` is bound by the middleware and re-checked here), and
+    only for node ids the control plane already knows from this cluster's own
+    data-plane evidence -- an executor cannot mint a key for a name nothing in
+    its cluster has ever reported. Key values are never logged.
+    """
+
+    cluster_id = _require_cluster(cluster_id)
+    if cluster_id != request.cluster_id:
+        raise HTTPException(
+            status_code=403,
+            detail="authenticated cluster does not match request",
+        )
+    registry = dependencies.context.fleet_registry
+    if registry is None:
+        raise HTTPException(
+            status_code=503,
+            detail="agent registry is disabled",
+        )
+    fleet_secret = str(getattr(registry, "secret", "") or "")
+    if len(fleet_secret) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="node action fleet secret is unavailable",
+        )
+    auth_registry = dependencies.auth_registry
+    registration = auth_registry.get(cluster_id) if auth_registry is not None else None
+    hyperpod_cluster_name = getattr(registration, "hyperpod_cluster_name", None)
+
+    def issue() -> RemoteNodeActionKeys:
+        store = dependencies.context.store
+        identities = (
+            list(store.list_hyperpod_node_identities(hyperpod_cluster_name))
+            if hyperpod_cluster_name
+            else []
+        )
+        unknown = [
+            node_id
+            for node_id in request.node_ids
+            if not _node_known_to_cluster(
+                store, cluster_id, node_id, hyperpod_identities=identities
+            )
+        ]
+        if unknown:
+            LOGGER.warning(
+                "refused node action keys for cluster %s: %d of %d node ids are "
+                "not known to this cluster",
+                cluster_id,
+                len(unknown),
+                len(request.node_ids),
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "one or more node_ids are not known to the control plane "
+                    "for the authenticated cluster"
+                ),
+            )
+        keys: dict[str, str] = {}
+        for node_id in request.node_ids:
+            try:
+                keys[node_id] = resolve_node_action_secret(
+                    fleet_secret,
+                    registry.node_secrets,
+                    cluster_id,
+                    node_id,
+                    NODE_ACTION_KEY_VERSION_DERIVED,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="node action key derivation is unavailable",
+                ) from exc
+        # The audit line: which cluster asked for which nodes. Never the values.
+        LOGGER.info(
+            "issued node action keys: cluster=%s nodes=%s",
+            cluster_id,
+            ",".join(request.node_ids),
+        )
+        return RemoteNodeActionKeys(cluster_id=cluster_id, keys=keys)
+
+    issued: RemoteNodeActionKeys = await _store_call(dependencies, issue)
+    return issued
 
 
 @router.post(

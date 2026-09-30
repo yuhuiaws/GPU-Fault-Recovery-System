@@ -246,7 +246,9 @@ def test_blast003_the_executor_rbac_and_iam_stay_minimal() -> None:
     write -- pods delete/patch, jobs/pytorchjobs/jobsets create/patch -- lives
     in a Role the rollout renders per ``allowed_namespaces`` entry, so the API
     server enforces the boundary GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES declares.
-    No access to secrets, configmaps or RBAC objects anywhere, which is what
+    No access to configmaps or RBAC objects anywhere, and exactly one Secret:
+    the node-key Secret in its own namespace, by name, get+patch, so the
+    node-key sync can add a replacement node's key (2026-09-30). That is what
     stops a compromised executor from reading another cluster's credentials or
     widening its own binding.
     """
@@ -257,6 +259,12 @@ def test_blast003_the_executor_rbac_and_iam_stay_minimal() -> None:
         for item in documents(EXECUTOR_MANIFEST)
         if item["kind"] == "ClusterRoleBinding"
     )
+    manifest_roles = [
+        item for item in documents(EXECUTOR_MANIFEST) if item["kind"] == "Role"
+    ]
+    manifest_role_bindings = [
+        item for item in documents(EXECUTOR_MANIFEST) if item["kind"] == "RoleBinding"
+    ]
     verbs = verb_matrix(role)
     node_rule = next(rule for rule in role["rules"] if rule["resources"] == ["nodes"])
 
@@ -291,6 +299,32 @@ def test_blast003_the_executor_rbac_and_iam_stay_minimal() -> None:
             "namespace": "gpu-fault-system",
         }
     ]
+
+    # The node-key sync's grant: one Secret by name in the executor's own
+    # namespace, read (key names) and patch (add a missing key). No list/watch
+    # -- resourceNames cannot scope them -- and no create/update/delete, so the
+    # deploy host stays the only writer of the Secret's identity and rotations.
+    (node_key_role,) = manifest_roles
+    assert node_key_role["metadata"] == {
+        "name": "gpu-fault-cluster-executor-node-keys",
+        "namespace": "gpu-fault-system",
+    }
+    assert node_key_role["rules"] == [
+        {
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "resourceNames": ["gpu-fault-node-action-keys"],
+            "verbs": ["get", "patch"],
+        }
+    ]
+    (node_key_binding,) = manifest_role_bindings
+    assert node_key_binding["metadata"]["namespace"] == "gpu-fault-system"
+    assert node_key_binding["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": "gpu-fault-cluster-executor-node-keys",
+    }
+    assert node_key_binding["subjects"] == binding["subjects"]
 
     # The write verbs did move rather than vanish: one Role per allowed
     # namespace, bound to the same ServiceAccount, and still no pod create.

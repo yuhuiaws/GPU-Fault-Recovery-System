@@ -1092,7 +1092,7 @@ middleware on top of them. Grouped by function:
   queue status, enqueue receipts, internal telemetry batch submission, and operations injection.
 - `/v1/regional/*`: cluster registration query, remote command claim/renew/progress/result, HyperPod submission idempotency,
   incident ownership and fleet rollout fence query, spare health, Agent drain/revoke, evidence and
-  notification write-back, **16 endpoints** in total (another 4 are under `/v1/regional/registry/*`). The routes are also mounted in the local
+  notification write-back, node-key top-up for replacement nodes, **17 endpoints** in total (another 4 are under `/v1/regional/registry/*`). The routes are also mounted in the local
   `all` mode, but only regional is the supported production semantics and the complete authentication path; see them one by one in
   Detailed Design §4.4.
 

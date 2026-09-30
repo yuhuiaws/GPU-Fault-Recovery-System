@@ -705,6 +705,48 @@ class RemoteFleetRolloutFence(StrictModel):
     fencing_deployment_ids: list[str] = Field(default_factory=list)
 
 
+#: One HyperPod replacement adds a handful of nodes; a whole-cluster re-key is
+#: the deploy host's job (``provision-node-action-keys.sh``), not this route's.
+NODE_ACTION_KEY_REQUEST_MAX_NODES = 64
+
+
+class RemoteNodeActionKeyRequest(StrictModel):
+    """Which nodes of one cluster the data plane wants node-scoped keys for.
+
+    ``cluster_id`` is a payload cluster identity, so the cluster-token
+    middleware binds it to the authenticated cluster before the route runs,
+    and the route checks it again. Node ids are validated like every other
+    node id the control plane accepts, and the list is bounded.
+    """
+
+    cluster_id: str = Field(min_length=1)
+    node_ids: list[str] = Field(
+        min_length=1, max_length=NODE_ACTION_KEY_REQUEST_MAX_NODES
+    )
+
+    @field_validator("node_ids")
+    @classmethod
+    def _validate_node_ids(cls, value: list[str]) -> list[str]:
+        from gpu_fault.fleet import validate_node_identifier
+
+        for node_id in value:
+            validate_node_identifier(node_id)
+        if len(set(value)) != len(value):
+            raise ValueError("node_ids must not repeat")
+        return value
+
+
+class RemoteNodeActionKeys(StrictModel):
+    """Node-scoped Node Action keys, one per requested node id.
+
+    The values are secrets: the executor writes them into the GPU node-key
+    Secret and nothing else; no log, metric or evidence record carries them.
+    """
+
+    cluster_id: str
+    keys: dict[str, str]
+
+
 class RemoteAdvisoryNotificationRequest(StrictModel):
     """Lets the data-plane executor page an operator.
 

@@ -1224,6 +1224,41 @@ capture_preflight() {
             --cluster-id "${CLUSTER_IDS[index]}" \
             --timeout-seconds "${TIMEOUT_SECONDS}" capture
     done
+    log_node_capture_exceptions
+}
+
+log_node_capture_exceptions() {
+    # Nodes the capture proved safe to leave out of the fleet targets: agents
+    # whose spot instance HyperPod no longer lists, and replacement nodes that
+    # carry only unfinished installer annotations. Both are journaled in the
+    # state file; this only surfaces them in the run output.
+    local line
+    local lines
+    lines="$(
+        python3 - "${STATE_FILE}" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+for entry in document.get("departed_fleet_nodes") or []:
+    print(
+        f"{entry.get('cluster_id')}: departed fleet node {entry.get('node_id')} "
+        f"(instance {entry.get('node_instance_id')} left HyperPod); "
+        "not a node cleanup target"
+    )
+for context, nodes in sorted((document.get("orphaned_installer_nodes") or {}).items()):
+    for name in sorted(nodes):
+        print(
+            f"{context}: node {name} carries only unfinished installer "
+            "annotations and no fleet agent; annotations are removed at reset"
+        )
+PY
+    )"
+    while IFS= read -r line; do
+        if [[ -n "${line}" ]]; then
+            log "${line}"
+        fi
+    done <<<"${lines}"
 }
 
 stop_all_gpu_producers() {

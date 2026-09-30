@@ -3752,7 +3752,7 @@ they cannot be placed in a single bucket.
 
 ### 4.4 Regional executor Interface
 
-**16 endpoints** in total, all in `src/gpu_fault/app/routes/regional.py`. The router is also mounted in non-
+**17 endpoints** in total, all in `src/gpu_fault/app/routes/regional.py`. The router is also mounted in non-
 regional local/test modes, but only regional mode is the supported
 production semantics, fully protected by the cluster-token/execution-token middleware:
 
@@ -3766,6 +3766,7 @@ production semantics, fully protected by the cluster-token/execution-token middl
 | POST | `/v1/regional/executors/readiness` | cluster-token | `regional_executor_readiness` |
 | GET | `/v1/regional/executors/incident-ownership` | cluster-token | `get_remote_incident_ownership` |
 | GET | `/v1/regional/executors/fleet-rollout-fence` | cluster-token | `get_remote_fleet_rollout_fence` |
+| POST | `/v1/regional/node-action-keys` | cluster-token | `regional_node_action_keys` |
 | POST | `/v1/regional/executors/hyperpod-submissions/reserve` | cluster-token | `reserve_remote_hyperpod_submission` |
 | GET | `/v1/regional/executors/hyperpod-submissions` | cluster-token | `get_remote_hyperpod_submission` |
 | POST | `/v1/regional/executors/hyperpod-submissions/outcome` | cluster-token | `record_remote_hyperpod_submission` |
@@ -3785,6 +3786,13 @@ node-action, read the set of deployments of this cluster currently in fleet roll
 evaluated before dispatch and cannot recall a command already written to the Store, while the executor itself has no Store to query; the cluster is taken from the authentication header and cannot be
 read across clusters. `regional_capture_evidence` and `regional_save_advisory_notification` let
 the cluster-side executor write evidence and notifications back to the control plane: the cluster side has no database (see §2.17).
+`node-action-keys` feeds the executor's node-key sync (`cluster_executor/node_key_sync.py`): body
+`{cluster_id, node_ids}` (at most 64, validated like every node id), `cluster_id` enters the cluster
+binding check, and the control plane derives the version-2 key from the fleet master only for nodes
+this cluster's own data-plane evidence has already reported (an Agent record, a GPU inventory
+snapshot or metric, a HyperPod node identity's current name or alias; a rotated value in the CPU
+mirror wins). Any unknown node fails the whole request with 404; an unavailable fleet master is
+503. The fleet master never leaves the control plane and key values are never logged.
 
 ### 4.5 Authorization Model: Explicit Buckets + Default Deny
 

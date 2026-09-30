@@ -40,6 +40,12 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     EvidenceRecorder,
     utc_now,
 )
+from scripts.e2e.regional.boot020_evidence import (  # noqa: E402
+    authorize_release_rolling,
+    evidence_inputs,
+    open_evidence,
+    record_candidate_provenance,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
@@ -1353,6 +1359,7 @@ def main() -> int:
         if previous_id is not None and previous_path is not None
         else {"valid": True, "verdict": "NOT_REQUIRED"}
     )
+    state_dir = arguments.admin_state_dir.resolve()
     config_digests = (
         {}
         if pending
@@ -1360,6 +1367,14 @@ def main() -> int:
             name: hashlib.sha256(path.read_bytes()).hexdigest()
             for name, path in configs.items()
         }
+    )
+    # The plan shows the candidates' identity when they already exist; a
+    # pending build has none yet, and both sides of authorize_execution agree
+    # because the build happens only after it.
+    identity = (
+        None
+        if pending
+        else prerequisites.candidate_identity(state_dir, configs, candidates)
     )
     environment = {
         "GPU_FAULT_BOOT020_CONFIGS": json.dumps(
@@ -1380,10 +1395,11 @@ def main() -> int:
         "configs": {name: str(path) for name, path in configs.items()},
         "config_sha256": config_digests,
         "release_candidates": candidates,
+        "release_candidates_identity": identity,
         "predecessor": predecessor,
         "start_stage": "auto (--resume)" if arguments.resume else arguments.start_stage,
         "resume": arguments.resume,
-        "admin_state_dir": str(arguments.admin_state_dir.resolve()),
+        "admin_state_dir": str(state_dir),
         "admin_reference": arguments.admin_reference,
         "stages": [
             "apply, repeat and restore AdminConfig through the public locked CLI",
@@ -1410,42 +1426,36 @@ def main() -> int:
         )
         print(json.dumps(document, indent=2, sort_keys=True))
         return 0 if predecessor.get("valid") is True else 1
-    authorize_execution(
+    authorize_release_rolling(
         arguments,
         case_id=CASE_ID,
         confirmation=CONFIRMATION,
         environment=environment,
         details=plan,
+        authorize=authorize_execution,
     )
     if predecessor.get("valid") is not True:
         raise AcceptanceCheckError("formal predecessor evidence is not PASS")
     if pending:
         # Only an authorized execute run signs and pushes candidate images.
         candidates = prerequisites.ensure_for_execute(arguments, candidates)
-        validate_admin_target(arguments.admin_state_dir.resolve(), configs["noop"])
-        config_digests = {
-            name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in configs.items()
-        }
-        plan["release_candidates"] = candidates
-        plan["config_sha256"] = config_digests
+        validate_admin_target(state_dir, configs["noop"])
     gpu_kubeconfig = configure_gpu_kubeconfig(arguments.gpu_kubeconfig)
     case_path = case_evidence_path(arguments.run_dir, CASE_ID)
     case_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    inputs = {
-        "acceptance_contract": 4,
-        "admin_state_dir": str(arguments.admin_state_dir.resolve()),
-        "admin_reference": arguments.admin_reference,
-        "configs": {name: str(path) for name, path in configs.items()},
-        "config_sha256": config_digests,
-        "release_candidates": candidates,
-        "gpu_kubeconfig": str(gpu_kubeconfig),
-    }
-    recorder = EvidenceRecorder(
+    # The same function on every attempt, built or reused: the identity of the
+    # run, so a later --resume finds inputs equal to the first attempt's.
+    recorder = open_evidence(
         case_path,
         case_id=CASE_ID,
-        inputs=inputs,
+        inputs=evidence_inputs(
+            arguments,
+            configs=configs,
+            candidates=candidates,
+            gpu_kubeconfig=gpu_kubeconfig,
+        ),
     )
+    record_candidate_provenance(recorder, arguments, candidates)
     backend = LiveReleaseRollingBackend(configs)
     # The restore stage leaves the site on its own release, so the hand-off for
     # BOOT-023 is the site config itself (the noop candidate), not candidate D.

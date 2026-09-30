@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 from datetime import datetime, timezone
+from typing import Any
 
 from gpu_fault.adapters import (
     HyperPodLifecycleStepAdapter,
@@ -35,6 +36,7 @@ from gpu_fault.cluster_executor.executor import (
 )
 from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
 from gpu_fault.cluster_executor.metrics import loop_breadcrumb_is_fresh
+from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -259,6 +261,9 @@ def executor_from_environment() -> ClusterActionExecutor:
         executor_id=executor_id,
         allowed_namespaces=namespaces,
         spare_reservation_sweep=sweep,
+        node_key_sync=_node_key_sync_from_environment(
+            regional_client, kubernetes_adapter.core
+        ),
         # Only set when this executor actually owns HyperPod mutations.
         # Left None otherwise so an unexpectedly routed RESTART_NODE or
         # REPLACE_NODE fails the adapter's confirmation gate instead of
@@ -273,6 +278,60 @@ def executor_from_environment() -> ClusterActionExecutor:
     )
     setattr(executor, "stop_ownership_validator", validator)
     return executor
+
+
+POD_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+
+def _pod_namespace() -> str:
+    """This Pod's namespace from its projected ServiceAccount token, or ''."""
+
+    try:
+        with open(POD_NAMESPACE_FILE, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _node_key_sync_from_environment(
+    regional_client: RegionalExecutorClient, core: Any
+) -> NodeActionKeySync | None:
+    """The node-key sync, or None with one WARNING naming why it is off.
+
+    ``GPU_FAULT_NODE_KEY_SYNC_SECONDS`` paces it (default 60); 0 or less turns
+    it off. Off means a node HyperPod replaces after the last deploy gets no
+    Node Action key -- and therefore no Agent -- until the next
+    ``gpu-fault-admin deploy``, which is the pre-sync behaviour, so it is said
+    out loud rather than left to be discovered at the next spot reclaim.
+    """
+
+    interval = float(os.getenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", "60"))
+    if interval <= 0:
+        LOGGER.warning(
+            "node action key sync is disabled (GPU_FAULT_NODE_KEY_SYNC_SECONDS=%s); "
+            "replacement nodes get no Node Action key until the next deploy",
+            interval,
+        )
+        return None
+    hyperpod_cluster = (os.getenv("GPU_FAULT_HYPERPOD_CLUSTER") or "").strip()
+    if not hyperpod_cluster:
+        LOGGER.warning(
+            "node action key sync is disabled: GPU_FAULT_HYPERPOD_CLUSTER is unset, "
+            "so this executor cannot select its cluster's nodes"
+        )
+        return None
+    namespace = (
+        os.getenv("GPU_FAULT_NAMESPACE", "").strip()
+        or _pod_namespace()
+        or "gpu-fault-system"
+    )
+    return NodeActionKeySync(
+        regional_client,
+        core,
+        hyperpod_cluster=hyperpod_cluster,
+        namespace=namespace,
+        interval_seconds=interval,
+    )
 
 
 def _claim_loop_settings_from_environment() -> dict[str, float | int]:

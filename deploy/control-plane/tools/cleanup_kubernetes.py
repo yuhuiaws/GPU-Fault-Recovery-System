@@ -16,10 +16,12 @@ from cleanup_state import (
     PHASE_INDEX,
     CleanupStateError,
     atomic_write,
+    attach_provider_nodes,
     completed_phases,
     read_state,
     required_phases,
     validate_request,
+    verify_provider_nodes,
 )
 
 from gpu_fault.admin.cluster_removal_rbac import (
@@ -598,6 +600,176 @@ def delete_workload_rbac(
     return removed
 
 
+# HyperPod names every EKS node ``hyperpod-<instance-id>``; the fleet agent
+# record carries the same instance id (``gpu_fault.hyperpod`` aliases).
+HYPERPOD_NODE_PREFIX = "hyperpod-"
+# Node annotations the node-installer-reconciler writes while (or after) it
+# tries to install a node; ``gpu-fault.io/node-key-*`` ownership annotations
+# are deliberately not in this family.
+INSTALLER_ANNOTATION_PREFIX = "gpu-fault.io/installer-"
+INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
+# Installer states that prove the node never received a runtime from us. A
+# spot replacement without a node key sits in one of these with no fleet agent
+# (live 2026-09-30: ``Failed``, attempts 2); ``Succeeded`` means a runtime was
+# installed and stays a blocker without a fleet agent.
+ORPHANED_INSTALLER_STATES = frozenset(
+    {"Failed", "Installing", "Retrying", "WaitingForKey"}
+)
+
+
+def hyperpod_target(
+    config: dict[str, Any] | None, context: str, cluster_id: str
+) -> tuple[str, str]:
+    """The HyperPod cluster name and Region bound to this cleanup cluster."""
+
+    if config is None:
+        raise CleanupStateError("cluster is not HyperPod-managed")
+    members = [
+        item
+        for item in config.get("clusters") or []
+        if isinstance(item, dict) and item.get("cluster_id") == cluster_id
+    ]
+    if len(members) != 1 or members[0].get("context") != context.removeprefix("gpu:"):
+        raise CleanupStateError("cleanup cluster is outside the bound config scope")
+    name = members[0].get("hyperpod_cluster_name")
+    region = members[0].get("region") or config.get("aws_region")
+    if not isinstance(name, str) or not name:
+        raise CleanupStateError("cluster is not HyperPod-managed")
+    if not isinstance(region, str) or not region:
+        raise CleanupStateError("HyperPod cluster has no bound Region")
+    return name, region
+
+
+def hyperpod_instances(
+    config: dict[str, Any] | None,
+    document: dict[str, Any],
+    context: str,
+    cluster_id: str,
+) -> set[str]:
+    """Instance ids HyperPod currently lists for the cluster, captured once."""
+
+    cached = (document.get("provider_nodes") or {}).get(cluster_id)
+    if cached is not None:
+        return set(verify_provider_nodes(cached))
+    name, region = hyperpod_target(config, context, cluster_id)
+    try:
+        result = run_command(
+            [
+                "aws",
+                "sagemaker",
+                "list-cluster-nodes",
+                "--cluster-name",
+                name,
+                "--region",
+                region,
+                "--output",
+                "json",
+            ],
+            timeout_seconds=remaining_timeout(45),
+        )
+    except OSError as exc:
+        raise CleanupStateError(
+            f"HyperPod node listing failed ({type(exc).__name__})"
+        ) from exc
+    if result.returncode:
+        raise CleanupStateError(
+            f"HyperPod node listing failed (exit {result.returncode})"
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CleanupStateError("HyperPod node listing is not JSON") from exc
+    summaries = value.get("ClusterNodeSummaries") if isinstance(value, dict) else None
+    if not isinstance(summaries, list) or value.get("NextToken"):
+        raise CleanupStateError("HyperPod node listing is invalid or truncated")
+    instance_ids = [
+        item.get("InstanceId") if isinstance(item, dict) else None for item in summaries
+    ]
+    if not all(isinstance(item, str) and item for item in instance_ids):
+        raise CleanupStateError("HyperPod node listing lacks instance identities")
+    record = attach_provider_nodes(
+        document,
+        cluster_id,
+        hyperpod_cluster_name=name,
+        region=region,
+        instance_ids=cast(list[str], instance_ids),
+    )
+    return set(verify_provider_nodes(record))
+
+
+def departed_fleet_node(
+    config: dict[str, Any] | None,
+    document: dict[str, Any],
+    context: str,
+    agent: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove an ACTIVE agent's node left the cluster with its spot instance.
+
+    The node is already absent from Kubernetes. It is DEPARTED only when its
+    name identifies a HyperPod instance that the provider no longer lists;
+    every other outcome (not HyperPod-managed, listing failed, instance still
+    listed, unrecognized name) keeps the original refusal, with the reason.
+    """
+
+    name = str(agent["node_id"])
+    cluster_id = str(agent["cluster_id"])
+
+    def refuse(reason: str) -> CleanupStateError:
+        return CleanupStateError(f"an active fleet node is missing: {name}; {reason}")
+
+    instance_id = name.removeprefix(HYPERPOD_NODE_PREFIX)
+    if not name.startswith(HYPERPOD_NODE_PREFIX) or not instance_id:
+        raise refuse("node name does not identify a HyperPod instance")
+    recorded_instance = agent.get("node_instance_id")
+    if recorded_instance not in (None, "", instance_id):
+        raise refuse("agent instance identity differs from the node name")
+    try:
+        members = hyperpod_instances(config, document, context, cluster_id)
+    except CleanupStateError as exc:
+        raise refuse(str(exc)) from exc
+    if instance_id in members:
+        raise refuse(f"HyperPod still lists instance {instance_id}")
+    return {
+        "cluster_id": cluster_id,
+        "node_id": name,
+        "node_instance_id": instance_id,
+    }
+
+
+def orphaned_installer_node(
+    node: dict[str, Any], agents: object, cluster_id: str
+) -> bool:
+    """A node carrying only unfinished installer annotations and no agent.
+
+    Anything else of ours on the node (labels, quarantine taint, ownership or
+    other annotations, ``installer-state=Succeeded``) or any fleet agent record
+    for the node keeps it a blocker.
+    """
+
+    metadata = node["metadata"]
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    taints = (node.get("spec") or {}).get("taints") or []
+    if any(key.startswith("gpu-fault.io/") for key in labels) or any(
+        str(taint.get("key", "")).startswith("gpu-fault.io/") for taint in taints
+    ):
+        return False
+    owned = [key for key in annotations if key.startswith("gpu-fault.io/")]
+    if not owned or any(
+        not key.startswith(INSTALLER_ANNOTATION_PREFIX) for key in owned
+    ):
+        return False
+    if annotations.get(INSTALLER_STATE_ANNOTATION) not in ORPHANED_INSTALLER_STATES:
+        return False
+    if not isinstance(agents, list):
+        return False
+    name = metadata["name"]
+    return not any(
+        agent.get("cluster_id") == cluster_id and agent.get("node_id") == name
+        for agent in agents
+    )
+
+
 def node_targets(
     client: CleanupClient,
     document: dict[str, Any],
@@ -605,25 +777,29 @@ def node_targets(
     cluster_id: str,
     *,
     nodes: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     if nodes is None:
         nodes = client.items("get", "nodes")
     by_name = {object_identity(node)[2]: node for node in nodes}
     if len(by_name) != len(nodes):
         raise CleanupStateError("duplicate Kubernetes node identity")
+    agents = document.get("fleet_snapshot")
     recorded = document.get("node_targets", {}).get(context)
     if recorded is None:
-        agents = document.get("fleet_snapshot")
         if not isinstance(agents, list):
             raise CleanupStateError("node cleanup requires captured fleet inventory")
         recorded = {}
+        departed: list[dict[str, Any]] = []
         for agent in agents:
             if agent.get("cluster_id") != cluster_id:
                 continue
             name = agent["node_id"]
             if name not in by_name:
                 if agent.get("lifecycle_state") == "ACTIVE":
-                    raise CleanupStateError("an active fleet node is missing")
+                    departed.append(
+                        departed_fleet_node(config, document, context, agent)
+                    )
                 continue
             if not (agent.get("installed_unit_inventory") or {}).get("units"):
                 raise CleanupStateError("node cleanup lacks installed unit inventory")
@@ -631,35 +807,77 @@ def node_targets(
         if not recorded:
             raise CleanupStateError("node cleanup has no proven fleet targets")
         document.setdefault("node_targets", {})[context] = recorded
+        journal = document.setdefault("departed_fleet_nodes", [])
+        journal.extend(entry for entry in departed if entry not in journal)
     for name, uid in recorded.items():
         if name not in by_name or object_identity(by_name[name])[3] != uid:
             raise CleanupStateError("node cleanup target disappeared or changed UID")
+    orphaned: dict[str, str] = {}
     for name, node in by_name.items():
         metadata = node["metadata"]
         keys = set(metadata.get("labels") or {}) | set(
             metadata.get("annotations") or {}
         )
-        if name not in recorded and any(
-            key.startswith("gpu-fault.io/") for key in keys
-        ):
-            raise CleanupStateError(
-                "unregistered node runtime remains outside cleanup targets"
-            )
+        if name in recorded or not any(key.startswith("gpu-fault.io/") for key in keys):
+            continue
+        if orphaned_installer_node(node, agents, cluster_id):
+            orphaned[name] = object_identity(node)[3]
+            continue
+        raise CleanupStateError(
+            "unregistered node runtime remains outside cleanup targets"
+        )
+    document.setdefault("orphaned_installer_nodes", {})[context] = orphaned
     return dict(recorded)
 
 
+def installer_annotation_patch(node: dict[str, Any], uid: str) -> list[dict[str, Any]]:
+    """Remove every installer annotation from an orphaned node, UID/RV bound."""
+
+    metadata = node["metadata"]
+    operations: list[dict[str, Any]] = [
+        {"op": "test", "path": "/metadata/uid", "value": uid},
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": metadata["resourceVersion"],
+        },
+    ]
+    for key in sorted(metadata.get("annotations") or {}):
+        if key.startswith(INSTALLER_ANNOTATION_PREFIX):
+            escaped = key.replace("~", "~0").replace("/", "~1")
+            operations.append(
+                {"op": "remove", "path": f"/metadata/annotations/{escaped}"}
+            )
+    return operations
+
+
 def clear_node_metadata(
-    client: CleanupClient, document: dict[str, Any], context: str, cluster_id: str
+    client: CleanupClient,
+    document: dict[str, Any],
+    context: str,
+    cluster_id: str,
+    *,
+    config: dict[str, Any] | None = None,
 ) -> None:
     verify_cluster(client, document, context)
     verify_namespace(client, document, context, allow_absent=True)
     nodes = client.items("get", "nodes")
-    targets = node_targets(client, document, context, cluster_id, nodes=nodes)
+    targets = node_targets(
+        client, document, context, cluster_id, nodes=nodes, config=config
+    )
+    orphaned = dict(document.get("orphaned_installer_nodes", {}).get(context, {}))
     inventory = document["inventory_snapshot"]["gpu"]
     patches: list[tuple[str, list[dict[str, Any]], bool]] = []
     for node in nodes:
         metadata = node["metadata"]
         name = metadata["name"]
+        if name in orphaned:
+            if metadata.get("uid") != orphaned[name]:
+                raise CleanupStateError("orphaned installer node changed UID")
+            patches.append(
+                (name, installer_annotation_patch(node, orphaned[name]), False)
+            )
+            continue
         if name not in targets:
             continue
         if metadata.get("uid") != targets[name]:
@@ -711,9 +929,17 @@ def clear_node_metadata(
     for name, operations, restored in patches:
         client.run("patch", "node", name, "--type=json", "-p", json.dumps(operations))
         current = client.get("node", name)
-        if current is None or object_identity(current)[3] != targets[name]:
+        expected_uid = orphaned[name] if name in orphaned else targets[name]
+        if current is None or object_identity(current)[3] != expected_uid:
             raise CleanupStateError("node changed during metadata cleanup")
         metadata = current["metadata"]
+        if name in orphaned:
+            if any(
+                key.startswith("gpu-fault.io/")
+                for key in metadata.get("annotations") or {}
+            ):
+                raise CleanupStateError("node metadata cleanup did not converge")
+            continue
         if any(
             key in (metadata.get(field) or {})
             for field, keys in (
@@ -935,7 +1161,7 @@ def run_node_cleanup(
         raise CleanupStateError("node cleanup lacks a cluster identity checkpoint")
     verify_cluster(client, document, context)
     verify_namespace(client, document, context)
-    nodes = node_targets(client, document, context, cluster_id)
+    nodes = node_targets(client, document, context, cluster_id, config=config)
     namespace = document["targets"]["namespace"]
     suffix = hashlib.sha256(f"{document['run_id']}:{context}".encode()).hexdigest()[:16]
     name = f"gpu-fault-node-cleanup-{suffix}"
@@ -1115,7 +1341,13 @@ def main() -> int:
             )
             capture_namespace(client, document, arguments.context)
             if arguments.context != "cpu" and document["node_mode"] != "skip":
-                node_targets(client, document, arguments.context, arguments.cluster_id)
+                node_targets(
+                    client,
+                    document,
+                    arguments.context,
+                    arguments.cluster_id,
+                    config=config,
+                )
             atomic_write(arguments.state_file, document)
         elif arguments.action == "delete-namespace":
             delete_namespace(client, document, arguments.context)
@@ -1123,7 +1355,11 @@ def main() -> int:
             cleanup_pending(config, document, arguments.state_file)
         elif arguments.action == "clear-node-metadata":
             clear_node_metadata(
-                client, document, arguments.context, arguments.cluster_id
+                client,
+                document,
+                arguments.context,
+                arguments.cluster_id,
+                config=config,
             )
         elif arguments.action == "delete-workload-rbac":
             delete_workload_rbac(

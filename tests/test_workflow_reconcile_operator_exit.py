@@ -359,8 +359,10 @@ def test_never_changed_still_waits_for_an_incident_that_is_driving_a_workflow() 
     ]
 
 
-def test_a_record_without_a_source_plan_stays_ineligible_by_design() -> None:
-    """The ops manual (§10) rule: not a defect, and this pin keeps it that way."""
+def test_a_never_changed_record_without_a_source_plan_is_eligible() -> None:
+    """The ops manual (§10.2) rule since 2026-09-30: a never-changed record
+    whose plan was replaced in place (``source_plan_id`` empty) is closable;
+    there is no plan to write and nothing on the node to restore."""
 
     store = InMemoryStore()
     incident_id, blocked_id, _successor_id = _restored_state(store)
@@ -375,5 +377,6 @@ def test_a_record_without_a_source_plan_stays_ineligible_by_design() -> None:
 
     item = build_workflow_reconcile_plan(store, [blocked_id], now=NOW)["items"][0]
 
-    assert item["eligible"] is False
-    assert item["reasons"] == ["workflow has no source recovery plan"]
+    assert item["eligible"] is True, item["reasons"]
+    assert item["terminalization"] == "never-changed"
+    assert item["source_plan_id"] is None

@@ -9,6 +9,14 @@ isolation annotation. This module reads that evidence through the site's own
 GPU kubeconfig and hands the verdict to ``gpu_fault.workflow_reconcile`` in the
 CPU ingress Pod.
 
+A node that is gone carries none of that. When a ``never-changed`` record's
+node is missing from Kubernetes and the GPU cluster is HyperPod-managed, the
+node name (``hyperpod-<instance-id>``) is looked up in the HyperPod node list:
+an instance HyperPod no longer lists has nothing left to restore and the item
+records that as its evidence (``absent_from_provider``); an instance still
+listed, a cluster that is not HyperPod-managed or a failed lookup keep failing
+closed, naming why. ``verified-restore`` items keep the Kubernetes rule.
+
 The other three shapes the command used to take modes for are closed by the
 dispatcher's periodic sweep now (``WorkflowDispatcher.sweep_stuck_records``):
 retired generations, compile-time BLOCKED no-ops (``gpu_fault.compile_blocked``)
@@ -56,7 +64,31 @@ QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 # in the release preflight), so the admin side promotes the item and applies it
 # through ``apply-verified-restore`` with primitives every image has.
 VERIFIED_RESTORE_NON_PLAN = "verified-restore-non-plan"
+# The sibling bridge for a ``never-changed`` record without a source plan: its
+# plan was replaced in place by a merge (``PLAN_REWRITE`` leaves
+# ``source_plan_id`` empty) or it was never plan-driven, it completed no
+# node-mutating operation and its incident is settled. The checkout's resolver
+# accepts it; the deployed image's may still refuse it for the plan it never
+# had, so the admin side promotes it and applies it through
+# ``apply-never-changed`` with primitives every image has.
+NEVER_CHANGED = "never-changed"
+NEVER_CHANGED_NON_PLAN = "never-changed-non-plan"
 NON_PLAN_REASON = "workflow has no source recovery plan"
+# Which bridge mode applies a promoted item; anything else goes through the
+# deployed ``apply_workflow_reconcile_plan``.
+BRIDGE_MODES = {
+    VERIFIED_RESTORE_NON_PLAN: "apply-verified-restore",
+    NEVER_CHANGED_NON_PLAN: "apply-never-changed",
+}
+# Items whose missing node may be explained by the provider instead of failing
+# on "node is missing": there is no restore successor to name, and a node
+# HyperPod no longer lists carries no cordon, taint or annotation to restore.
+DEPARTED_NODE_TERMINALIZATIONS = frozenset({NEVER_CHANGED, NEVER_CHANGED_NON_PLAN})
+HYPERPOD_PROVIDER = "hyperpod"
+# HyperPod names an EKS node after its EC2 instance.
+HYPERPOD_NODE_NAME = re.compile(r"^hyperpod-(i-[0-9a-f]{8,17})$")
+# Pages of ``list-cluster-nodes`` read before the lookup is declared broken.
+HYPERPOD_INVENTORY_PAGE_LIMIT = 100
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
     "gpu-fault.io/fencing-token",
@@ -235,6 +267,131 @@ elif payload["mode"] == "apply-verified-restore":
         "archive_eligible_incident_ids": sorted(incidents),
         "records_deleted": 0,
     }
+elif payload["mode"] == "apply-never-changed":
+    # A record that completed no node-mutating operation and names no source
+    # plan (replaced in place by a merge, or never plan-driven). The deployed
+    # ``apply_workflow_reconcile_plan`` may still refuse it for the plan it
+    # never had, so the write is made here the way the checkout's
+    # ``_close_never_changed`` makes it: the resolver's own eligibility minus
+    # that one reason, ``amend_workflow`` with the audit event in the same
+    # write, no plan and no incident write.
+    from datetime import datetime, timezone
+
+    from gpu_fault.models import (
+        WorkflowEventKind,
+        WorkflowStatus,
+        build_operator_event,
+    )
+    from gpu_fault.workflow_resolution import (
+        restore_reconciliation_reasons,
+        verified_restore_successor,
+        workflow_never_changed_a_node,
+    )
+
+    try:
+        from gpu_fault.execution.restart_budget_preflight import (
+            release_unattempted_restart_reservations,
+        )
+    except ImportError:  # an image that predates the reservation release
+        release_unattempted_restart_reservations = None
+
+    NON_PLAN_REASON = "workflow has no source recovery plan"
+    now = datetime.now(timezone.utc)
+    applied = []
+    failures = {}
+    warnings = []
+    incidents = set()
+    for item in payload["items"]:
+        request_id = item["request_id"]
+        try:
+            workflow = store.get_workflow(request_id)
+            incident = store.get_incident(workflow.incident_id)
+            if workflow.fencing_token != item["fencing_token"]:
+                raise ValueError(
+                    f"workflow fencing token changed: expected {item['fencing_token']}, "
+                    f"found {workflow.fencing_token}"
+                )
+            if workflow.execution_epoch != item["execution_epoch"]:
+                raise ValueError(
+                    "workflow execution epoch changed: expected "
+                    f"{item['execution_epoch']}, found {workflow.execution_epoch}"
+                )
+            if workflow.source_plan_id:
+                raise ValueError(
+                    "workflow has a source recovery plan; the restore reconcile owns it"
+                )
+            if verified_restore_successor(store, workflow) is not None:
+                raise ValueError(
+                    "workflow has a verified restore successor; "
+                    "the restore reconcile owns it"
+                )
+            if not workflow_never_changed_a_node(workflow):
+                raise ValueError("workflow completed a node-mutating operation")
+            reasons = [
+                reason
+                for reason in restore_reconciliation_reasons(
+                    workflow,
+                    incident,
+                    None,
+                    None,
+                    store.list_remote_commands(workflow_request_ids=[request_id]),
+                    evaluated_at=now,
+                )
+                if reason != NON_PLAN_REASON
+            ]
+            if reasons:
+                raise ValueError("; ".join(reasons))
+            audit = (
+                f"operator reconciliation {payload['reference']}: closed "
+                f"{request_id}, which completed no node-mutating operation, "
+                f"with its incident {incident.state.value}"
+            )
+            superseded = workflow.model_copy(update={"status": WorkflowStatus.SUPERSEDED})
+            amended = store.amend_workflow(
+                request_id,
+                {
+                    "status": WorkflowStatus.SUPERSEDED,
+                    "preempted_by_workflow_id": None,
+                    "preemption_reason": audit,
+                    "superseded_at": now,
+                },
+                event=build_operator_event(
+                    superseded,
+                    WorkflowEventKind.OPERATOR_RECONCILED,
+                    actor=payload.get("actor"),
+                    reference=payload["reference"],
+                    previous_status=workflow.status,
+                    at=now,
+                    details={
+                        "terminalization": "never-changed-non-plan",
+                        "expected_fencing_token": item["fencing_token"],
+                        "expected_execution_epoch": item["execution_epoch"],
+                        "admin_plan_sha256": payload.get("admin_plan_sha256"),
+                    },
+                ),
+            )
+            applied.append(request_id)
+            incidents.add(incident.incident_id)
+            if release_unattempted_restart_reservations is not None:
+                try:
+                    release_unattempted_restart_reservations(store, amended)
+                except Exception as exc:  # the row is terminal; a warning
+                    warnings.append(
+                        f"{request_id}: closed, but releasing its restart "
+                        f"reservations failed ({type(exc).__name__}: {exc})"
+                    )
+        except Exception as exc:  # per-item isolation, reported like the apply
+            failures[request_id] = f"{type(exc).__name__}: {exc}"
+    result = {
+        "mode": "workflow-reconcile-apply",
+        "applied_workflow_ids": applied,
+        "failed_workflow_ids": sorted(failures),
+        "failures": dict(sorted(failures.items())),
+        "restart_reservation_warnings": sorted(warnings),
+        "resolved_plan_ids": [],
+        "archive_eligible_incident_ids": sorted(incidents),
+        "records_deleted": 0,
+    }
 else:
     raise ValueError("unsupported workflow reconcile mode")
 print(json.dumps(result, sort_keys=True))
@@ -294,26 +451,52 @@ def promote_non_plan_successor(item: dict[str, Any]) -> None:
         item["terminalization"] = VERIFIED_RESTORE_NON_PLAN
 
 
+def promote_non_plan_never_changed(item: dict[str, Any]) -> None:
+    """Mark a ``NEVER_CHANGED_NON_PLAN`` item eligible, in place.
+
+    Only the exact shape: the deployed planner refused the record for
+    ``NON_PLAN_REASON`` alone -- so it already judged the record never changed
+    a node and its incident settled -- names no successor and the record
+    carries no source plan. Anything else stays as the planner judged it.
+    """
+
+    if (
+        not item.get("eligible")
+        and [str(reason) for reason in item.get("reasons") or []] == [NON_PLAN_REASON]
+        and item.get("terminalization") == NEVER_CHANGED
+        and not item.get("successor_workflow_id")
+        and not item.get("source_plan_id")
+    ):
+        item["eligible"] = True
+        item["reasons"] = []
+        item["terminalization"] = NEVER_CHANGED_NON_PLAN
+
+
 def _bridge_payload(
     *,
+    mode: str,
     items: list[dict[str, Any]],
     admin_plan_sha256: str,
     reference: str,
     actor: str,
 ) -> dict[str, Any]:
-    """The ``apply-verified-restore`` request: the keys the approval bound."""
+    """A bridge request (``BRIDGE_MODES``): the keys the approval bound.
 
+    The verified-restore bridge names the successor it supersedes the record
+    with; the never-changed bridge has none to name.
+    """
+
+    bound: list[dict[str, Any]] = []
+    for item in items:
+        entry: dict[str, Any] = {"request_id": str(item["request_id"])}
+        if mode == BRIDGE_MODES[VERIFIED_RESTORE_NON_PLAN]:
+            entry["successor_workflow_id"] = str(item["successor_workflow_id"])
+        entry["fencing_token"] = int(item["fencing_token"])
+        entry["execution_epoch"] = int(item["execution_epoch"])
+        bound.append(entry)
     return {
-        "mode": "apply-verified-restore",
-        "items": [
-            {
-                "request_id": str(item["request_id"]),
-                "successor_workflow_id": str(item["successor_workflow_id"]),
-                "fencing_token": int(item["fencing_token"]),
-                "execution_epoch": int(item["execution_epoch"]),
-            }
-            for item in items
-        ],
+        "mode": mode,
+        "items": bound,
         "reference": reference,
         "actor": actor,
         "admin_plan_sha256": admin_plan_sha256,
@@ -710,11 +893,151 @@ def node_isolation_evidence(
     return evidence
 
 
+def hyperpod_instance_ids(site: RenderedSite, cluster_id: str) -> frozenset[str]:
+    """The EC2 instance ids HyperPod currently lists for ``cluster_id``.
+
+    Read with ``aws sagemaker list-cluster-nodes`` in the cluster's region,
+    every page. A cluster the site does not describe as HyperPod-managed, a
+    failed call and an unreadable answer all raise ``BootstrapError``: the
+    caller turns that into a blocker, never into "absent".
+    """
+
+    target = cluster_target(site, cluster_id)
+    name = str(target.get("hyperpod_cluster_name") or "").strip()
+    if not name:
+        raise BootstrapError(
+            f"GPU cluster {cluster_id} is not HyperPod-managed in the site"
+        )
+    region = str(
+        target.get("region") or site.release_config.get("aws_region") or ""
+    ).strip()
+    if not region:
+        raise BootstrapError(f"GPU cluster {cluster_id} has no AWS region in the site")
+    instance_ids: set[str] = set()
+    token: str | None = None
+    for _page in range(HYPERPOD_INVENTORY_PAGE_LIMIT):
+        command = [
+            "aws",
+            "sagemaker",
+            "list-cluster-nodes",
+            "--cluster-name",
+            name,
+            "--region",
+            region,
+            "--output",
+            "json",
+        ]
+        if token:
+            command.extend(["--next-token", token])
+        completed = run_command(command, timeout_seconds=120)
+        if completed.returncode:
+            raise BootstrapError(
+                f"cannot list HyperPod nodes of {cluster_id}: "
+                f"{diagnostic_text(completed.stderr, sensitive=True)}"
+            )
+        try:
+            value = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise BootstrapError(
+                f"HyperPod node inventory of {cluster_id} is invalid JSON"
+            ) from exc
+        summaries = (
+            value.get("ClusterNodeSummaries") if isinstance(value, dict) else None
+        )
+        if not isinstance(summaries, list):
+            raise BootstrapError(f"HyperPod node inventory of {cluster_id} is invalid")
+        for row in summaries:
+            if isinstance(row, dict):
+                instance_id = row.get("InstanceId")
+                if isinstance(instance_id, str) and instance_id.strip():
+                    instance_ids.add(instance_id.strip())
+        next_token = value.get("NextToken")
+        if not next_token:
+            return frozenset(instance_ids)
+        if not isinstance(next_token, str) or next_token == token:
+            raise BootstrapError(
+                f"HyperPod node inventory of {cluster_id} repeats its page token"
+            )
+        token = next_token
+    raise BootstrapError(
+        f"HyperPod node inventory of {cluster_id} exceeds "
+        f"{HYPERPOD_INVENTORY_PAGE_LIMIT} pages"
+    )
+
+
+def _departed_node_evidence(
+    site: RenderedSite,
+    cluster_id: str,
+    node_id: str,
+    provider_inventories: dict[str, frozenset[str] | str],
+) -> dict[str, Any]:
+    """Evidence for a ``never-changed`` item's node that Kubernetes no longer has.
+
+    Restored only when the node name maps to an instance HyperPod no longer
+    lists: nothing exists to carry a cordon, a taint or an isolation
+    annotation. Every other answer keeps the Kubernetes blocker and adds why
+    the provider could not clear it. ``provider_inventories`` caches one
+    provider read (or its failure) per cluster for the plan being built.
+    """
+
+    missing = _node_scheduling_evidence(node_id, None)
+    match = HYPERPOD_NODE_NAME.fullmatch(node_id)
+    if match is None:
+        return {
+            **missing,
+            "blockers": [
+                *missing["blockers"],
+                "provider membership unknown: node name carries no HyperPod "
+                "instance id",
+            ],
+        }
+    instance_id = match.group(1)
+    inventory = provider_inventories.get(cluster_id)
+    if inventory is None:
+        try:
+            inventory = hyperpod_instance_ids(site, cluster_id)
+        except BootstrapError as exc:
+            inventory = str(exc)
+        provider_inventories[cluster_id] = inventory
+    if isinstance(inventory, str):
+        return {
+            **missing,
+            "instance_id": instance_id,
+            "blockers": [
+                *missing["blockers"],
+                f"provider membership unknown: {inventory}",
+            ],
+        }
+    if instance_id in inventory:
+        return {
+            "node_id": node_id,
+            "exists": False,
+            "provider": HYPERPOD_PROVIDER,
+            "instance_id": instance_id,
+            "absent_from_provider": False,
+            "restored": False,
+            "blockers": [
+                "node is missing from Kubernetes but HyperPod still lists "
+                f"instance {instance_id}"
+            ],
+        }
+    return {
+        "node_id": node_id,
+        "exists": False,
+        "provider": HYPERPOD_PROVIDER,
+        "instance_id": instance_id,
+        "absent_from_provider": True,
+        "restored": True,
+        "blockers": [],
+    }
+
+
 def _scheduling_evidence(
     site: RenderedSite,
     items: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     inventories: dict[str, dict[str, dict[str, Any]]] = {}
+    provider_inventories: dict[str, frozenset[str] | str] = {}
     result: dict[str, dict[str, Any]] = {}
     for item in items:
         request_id = str(item.get("request_id") or "")
@@ -732,8 +1055,13 @@ def _scheduling_evidence(
         if inventory is None:
             inventory = cluster_nodes(site, cluster_id)
             inventories[cluster_id] = inventory
+        # Only a never-changed item may have its missing node explained by the
+        # provider; a verified-restore item is judged on Kubernetes alone.
+        departed_allowed = item.get("terminalization") in DEPARTED_NODE_TERMINALIZATIONS
         nodes = [
-            _node_scheduling_evidence(node_id, inventory.get(node_id))
+            _departed_node_evidence(site, cluster_id, node_id, provider_inventories)
+            if departed_allowed and inventory.get(node_id) is None
+            else _node_scheduling_evidence(node_id, inventory.get(node_id))
             for node_id in node_ids
         ]
         blockers = [
@@ -809,6 +1137,7 @@ def _finalize_plan(
     items = [dict(item) for item in raw_items]
     for item in items:
         promote_non_plan_successor(item)
+        promote_non_plan_never_changed(item)
     scheduling = _scheduling_evidence(site, items)
     for item in items:
         evidence = scheduling[str(item.get("request_id") or "")]
@@ -910,19 +1239,17 @@ def _apply(
     actor: str,
 ) -> dict[str, Any]:
     """Apply the eligible items: the deployed apply for the records it
-    accepts, the bridge for ``VERIFIED_RESTORE_NON_PLAN`` items.
+    accepts, a bridge (``BRIDGE_MODES``) for each promoted shape.
 
     The deployed apply rebuilds its plan over exactly the ids it is handed and
     compares the digest, so when bridged items are set apart the remaining ids
     are re-planned on their own and checked for drift against ``current``
-    before that digest is sent. Both applies are per-record isolated in the
+    before that digest is sent. Every apply is per-record isolated in the
     Pod; the results merge into one.
     """
 
     bridged = [
-        item
-        for item in current["items"]
-        if item.get("terminalization") == VERIFIED_RESTORE_NON_PLAN
+        item for item in current["items"] if item.get("terminalization") in BRIDGE_MODES
     ]
     bridged_ids = {str(item["request_id"]) for item in bridged}
     runtime_ids = [item for item in eligible_ids if item not in bridged_ids]
@@ -955,18 +1282,23 @@ def _apply(
                 ),
             )
         )
-    if bridged:
-        results.append(
-            _run_reconcile(
-                site,
-                _bridge_payload(
-                    items=bridged,
-                    admin_plan_sha256=current["plan_sha256"],
-                    reference=reference,
-                    actor=actor,
-                ),
+    for terminalization, mode in BRIDGE_MODES.items():
+        group = [
+            item for item in bridged if item.get("terminalization") == terminalization
+        ]
+        if group:
+            results.append(
+                _run_reconcile(
+                    site,
+                    _bridge_payload(
+                        mode=mode,
+                        items=group,
+                        admin_plan_sha256=current["plan_sha256"],
+                        reference=reference,
+                        actor=actor,
+                    ),
+                )
             )
-        )
     return _merge_apply_results(results)
 
 

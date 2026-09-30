@@ -31,6 +31,7 @@ LAYERS = (
     "executor",
     "bootstrap",
     "metrics",
+    "node_key_sync",
 )
 # The names the module published before the split, as importers spell them.
 PUBLIC_NAMES = (

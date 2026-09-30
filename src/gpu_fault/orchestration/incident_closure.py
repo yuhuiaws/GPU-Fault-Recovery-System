@@ -259,6 +259,18 @@ def restores_node(workflow: WorkflowRequest) -> bool:
     return True
 
 
+def _operator_reconciled(workflow: WorkflowRequest) -> bool:
+    """A row ``workflow-reconcile`` ended: SUPERSEDED, with the event it writes.
+
+    The event is the last one the row receives -- a terminal row gets no more
+    -- so the bounded history keeps it.
+    """
+
+    return workflow.status is WorkflowStatus.SUPERSEDED and any(
+        event.kind is WorkflowEventKind.OPERATOR_RECONCILED for event in workflow.events
+    )
+
+
 class IncidentClosureService:
     def __init__(self, store: ControlPlaneStore) -> None:
         self.store = store
@@ -608,6 +620,14 @@ class IncidentClosureService:
         (``workflow_is_open``), except a BLOCKED(NEEDS_OPERATOR) row that never
         ran a step: it holds nothing on the node (C-03) and the next fault
         replaces it in place.
+
+        A node action whose outcome is unknown keeps its row open whatever the
+        status, until an operator confirms it -- except on a row an operator
+        already ended through ``workflow-reconcile`` (SUPERSEDED with an
+        ``OPERATOR_RECONCILED`` event). That close rested on node evidence the
+        control plane cannot read (the node restored, or gone from the
+        provider), and ``confirm-node-action`` needs a Ready node, so keeping
+        the row open would leave the incident with no exit (2026-09-30).
         """
 
         candidates: list[WorkflowRequest] = []
@@ -628,7 +648,10 @@ class IncidentClosureService:
                 continue
             seen.add(workflow.request_id)
             if (
-                has_unresolved_node_action(workflow)
+                (
+                    has_unresolved_node_action(workflow)
+                    and not _operator_reconciled(workflow)
+                )
                 or workflow.execution_owner_id is not None
                 or (
                     workflow.execution_lease_expires_at is not None

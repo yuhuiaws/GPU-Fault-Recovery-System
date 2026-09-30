@@ -767,3 +767,349 @@ def test_command_passthrough_is_scoped_and_preserves_failure(
         "namespace",
         NAMESPACE,
     ]
+
+
+# --- spot replacement during uninstall (live 2026-09-30) -----------------------
+
+DEPARTED_INSTANCE = "i-00000000000000001"
+DEPARTED_NODE = f"hyperpod-{DEPARTED_INSTANCE}"
+REPLACEMENT_INSTANCE = "i-00000000000000002"
+HYPERPOD_CONFIG: dict[str, Any] = {
+    "cpu_kubeconfig": "/dev/null",
+    "aws_region": "us-east-1",
+    "clusters": [
+        {
+            "cluster_id": "gpu-a",
+            "context": "gpu-a",
+            "hyperpod_cluster_name": "hp-gpu-a",
+            "region": "us-east-1",
+        }
+    ],
+}
+INSTALLER_FAILED = {
+    "gpu-fault.io/installer-state": "Failed",
+    "gpu-fault.io/installer-attempts": "2",
+    "gpu-fault.io/installer-reason": "NodeKeyUnavailable",
+    "gpu-fault.io/installer-node-uid": "uid-customer-node",
+    "customer.example/owner": "kept",
+}
+
+
+def departed_state(
+    *, node_id: str = DEPARTED_NODE, instance_id: str | None = DEPARTED_INSTANCE
+) -> dict[str, Any]:
+    state = document()
+    state["fleet_snapshot"].append(
+        {
+            "cluster_id": "gpu-a",
+            "node_id": node_id,
+            "node_instance_id": instance_id,
+            "lifecycle_state": "ACTIVE",
+            "installed_unit_inventory": {"units": ["gpu-fault-node-agent.service"]},
+        }
+    )
+    return state
+
+
+def hyperpod_listing(*instance_ids: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "ClusterNodeSummaries": [
+            {
+                "InstanceId": instance_id,
+                "InstanceGroupName": "gpu",
+                "InstanceStatus": {"Status": "Running"},
+            }
+            for instance_id in instance_ids
+        ],
+        **extra,
+    }
+
+
+def test_departed_hyperpod_node_is_journaled_and_left_out_of_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, state = Client(), departed_state()
+    calls = install_transport(monkeypatch, hyperpod_listing(REPLACEMENT_INSTANCE))
+    assert KUBE.node_targets(
+        client, state, CONTEXT, "gpu-a", config=HYPERPOD_CONFIG
+    ) == {"managed-node": "uid-managed-node"}
+    assert state["departed_fleet_nodes"] == [
+        {
+            "cluster_id": "gpu-a",
+            "node_id": DEPARTED_NODE,
+            "node_instance_id": DEPARTED_INSTANCE,
+        }
+    ]
+    record = state["provider_nodes"]["gpu-a"]
+    assert record["instance_ids"] == [REPLACEMENT_INSTANCE]
+    assert record["sha256"] == STATE.provider_nodes_digest([REPLACEMENT_INSTANCE])
+    assert (record["hyperpod_cluster_name"], record["region"]) == (
+        "hp-gpu-a",
+        "us-east-1",
+    )
+    assert calls[0][0] == [
+        "aws",
+        "sagemaker",
+        "list-cluster-nodes",
+        "--cluster-name",
+        "hp-gpu-a",
+        "--region",
+        "us-east-1",
+        "--output",
+        "json",
+    ]
+    # A re-capture reads the journaled listing instead of asking again, and
+    # the departed journal is not duplicated.
+    del state["node_targets"]
+    KUBE.node_targets(client, state, CONTEXT, "gpu-a", config=HYPERPOD_CONFIG)
+    assert len(calls) == 1
+    assert len(state["departed_fleet_nodes"]) == 1
+    assert client.mutations() == []
+
+
+def test_missing_active_node_still_listed_by_hyperpod_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, state = Client(), departed_state()
+    install_transport(
+        monkeypatch, hyperpod_listing(DEPARTED_INSTANCE, REPLACEMENT_INSTANCE)
+    )
+    with pytest.raises(
+        KUBE.CleanupStateError,
+        match=f"an active fleet node is missing: {DEPARTED_NODE}; HyperPod still lists",
+    ):
+        KUBE.node_targets(client, state, CONTEXT, "gpu-a", config=HYPERPOD_CONFIG)
+    assert "node_targets" not in state
+    assert "departed_fleet_nodes" not in state
+
+
+@pytest.mark.parametrize(
+    "variant,reason",
+    [
+        ("no-config", "not HyperPod-managed"),
+        ("no-hyperpod-name", "not HyperPod-managed"),
+        ("no-region", "no bound Region"),
+        ("other-context", "outside the bound config scope"),
+        ("aws-exit", r"listing failed \(exit 1\)"),
+        ("aws-missing", r"listing failed \(FileNotFoundError\)"),
+        ("truncated", "invalid or truncated"),
+        ("not-json", "not JSON"),
+        ("no-instance-id", "lacks instance identities"),
+        ("empty-listing", "empty or ambiguous"),
+        ("foreign-name", "does not identify a HyperPod instance"),
+        ("instance-mismatch", "differs from the node name"),
+    ],
+)
+def test_missing_active_node_without_provider_proof_keeps_refusing(
+    monkeypatch: pytest.MonkeyPatch, variant: str, reason: str
+) -> None:
+    client, state = Client(), departed_state()
+    config: dict[str, Any] | None = copy.deepcopy(HYPERPOD_CONFIG)
+    assert config is not None
+    listing: Any = hyperpod_listing(REPLACEMENT_INSTANCE)
+    code = 0
+    if variant == "no-config":
+        config = None
+    elif variant == "no-hyperpod-name":
+        del config["clusters"][0]["hyperpod_cluster_name"]
+    elif variant == "no-region":
+        del config["clusters"][0]["region"]
+        del config["aws_region"]
+    elif variant == "other-context":
+        config["clusters"][0]["context"] = "gpu-b"
+    elif variant == "aws-exit":
+        code = 1
+    elif variant == "truncated":
+        listing = hyperpod_listing(REPLACEMENT_INSTANCE, NextToken="more")
+    elif variant == "not-json":
+        listing = "not json"
+    elif variant == "no-instance-id":
+        listing = {"ClusterNodeSummaries": [{"InstanceGroupName": "gpu"}]}
+    elif variant == "empty-listing":
+        listing = hyperpod_listing()
+    elif variant == "foreign-name":
+        state = departed_state(node_id="gpu-node-1", instance_id=None)
+    elif variant == "instance-mismatch":
+        state = departed_state(instance_id="i-0000000000000000")
+    calls = install_transport(monkeypatch, listing, code)
+    if variant == "aws-missing":
+
+        def missing(arguments: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+            calls.append((arguments, {}))
+            raise FileNotFoundError("aws")
+
+        monkeypatch.setattr(KUBE, "run_command", missing)
+    with pytest.raises(
+        KUBE.CleanupStateError, match="an active fleet node is missing: .*" + reason
+    ):
+        KUBE.node_targets(client, state, CONTEXT, "gpu-a", config=config)
+    if variant in {
+        "no-config",
+        "no-hyperpod-name",
+        "no-region",
+        "other-context",
+        "foreign-name",
+        "instance-mismatch",
+    }:
+        assert calls == [], "no provider call without a bound HyperPod identity"
+    assert "node_targets" not in state
+    assert "departed_fleet_nodes" not in state
+    assert "provider_nodes" not in state
+    assert client.mutations() == []
+
+
+@pytest.mark.parametrize("installer_state", sorted(KUBE.ORPHANED_INSTALLER_STATES))
+def test_keyless_replacement_node_passes_and_loses_only_installer_annotations(
+    installer_state: str,
+) -> None:
+    client, state = Client(), document()
+    replacement = client.nodes[1]
+    replacement["metadata"]["annotations"] = {
+        **INSTALLER_FAILED,
+        "gpu-fault.io/installer-state": installer_state,
+    }
+    assert KUBE.node_targets(client, state, CONTEXT, "gpu-a") == {
+        "managed-node": "uid-managed-node"
+    }
+    assert state["orphaned_installer_nodes"] == {
+        CONTEXT: {"customer-node": "uid-customer-node"}
+    }
+    assert client.mutations() == []
+
+    KUBE.clear_node_metadata(client, state, CONTEXT, "gpu-a")
+    (patch,) = client.mutations()
+    assert patch[:3] == ("patch", "node", "customer-node")
+    operations = json.loads(patch[patch.index("-p") + 1])
+    assert operations[:2] == [
+        {"op": "test", "path": "/metadata/uid", "value": "uid-customer-node"},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": "1"},
+    ]
+    assert {operation["op"] for operation in operations[2:]} == {"remove"}
+    assert sorted(operation["path"] for operation in operations[2:]) == sorted(
+        "/metadata/annotations/" + key.replace("/", "~1")
+        for key in INSTALLER_FAILED
+        if key.startswith("gpu-fault.io/installer-")
+    )
+    assert replacement["metadata"]["annotations"] == {"customer.example/owner": "kept"}
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "succeeded",
+        "no-installer-state",
+        "quarantine-label",
+        "quarantine-taint",
+        "spare-label",
+        "ownership-annotation",
+        "other-annotation",
+        "retired-agent",
+        "no-fleet-snapshot",
+    ],
+)
+def test_installer_annotations_with_any_other_evidence_keep_failing_closed(
+    variant: str,
+) -> None:
+    client, state = Client(), document()
+    replacement = client.nodes[1]
+    metadata = replacement["metadata"]
+    metadata["annotations"] = dict(INSTALLER_FAILED)
+    if variant == "succeeded":
+        metadata["annotations"]["gpu-fault.io/installer-state"] = "Succeeded"
+    elif variant == "no-installer-state":
+        del metadata["annotations"]["gpu-fault.io/installer-state"]
+    elif variant == "quarantine-label":
+        metadata["labels"] = {"gpu-fault.io/quarantined": "true"}
+    elif variant == "quarantine-taint":
+        replacement["spec"] = {
+            "taints": [{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}]
+        }
+    elif variant == "spare-label":
+        metadata["labels"] = {"gpu-fault.io/spare": "true"}
+    elif variant == "ownership-annotation":
+        metadata["annotations"]["gpu-fault.io/node-key-activation"] = "gen-1"
+    elif variant == "other-annotation":
+        metadata["annotations"]["gpu-fault.io/installed"] = "true"
+    elif variant == "retired-agent":
+        # Targets already recorded without the node, yet the fleet knows an
+        # agent for it: an agent record of any state is not "no agent".
+        state["node_targets"] = {CONTEXT: {"managed-node": "uid-managed-node"}}
+        state["fleet_snapshot"].append(
+            {
+                "cluster_id": "gpu-a",
+                "node_id": "customer-node",
+                "lifecycle_state": "RETIRED",
+                "installed_unit_inventory": None,
+            }
+        )
+    else:
+        # Targets already recorded, fleet evidence gone: no agent proof.
+        state["node_targets"] = {CONTEXT: {"managed-node": "uid-managed-node"}}
+        state["fleet_snapshot"] = None
+    with pytest.raises(KUBE.CleanupStateError, match="unregistered node runtime"):
+        KUBE.node_targets(client, state, CONTEXT, "gpu-a")
+    assert "orphaned_installer_nodes" not in state
+    assert client.mutations() == []
+
+
+def test_capture_entrypoint_journals_departed_and_orphaned_nodes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(HYPERPOD_CONFIG))
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(
+        json.dumps({"cpu": {"resources": []}, **document()["inventory_snapshot"]})
+    )
+    path = tmp_path / "state.json"
+    state = STATE.initialize(
+        path,
+        config_path=config,
+        inventory_path=inventory,
+        scope="gpu",
+        mode="reset",
+        node_mode="uninstall",
+        cluster_ids=["gpu-a"],
+    )
+    fixture = departed_state()
+    state.update(
+        {
+            key: fixture[key]
+            for key in ("cluster_uids", "namespace_snapshots", "fleet_snapshot")
+        }
+    )
+    STATE.atomic_write(path, state)
+    client = Client()
+    client.nodes[1]["metadata"]["annotations"] = dict(INSTALLER_FAILED)
+    monkeypatch.setattr(KUBE, "CleanupClient", lambda _config, _context: client)
+    calls = install_transport(monkeypatch, hyperpod_listing(REPLACEMENT_INSTANCE))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cleanup_kubernetes",
+            "--config",
+            str(config),
+            "--state-file",
+            str(path),
+            "--context",
+            CONTEXT,
+            "--cluster-id",
+            "gpu-a",
+            "capture",
+        ],
+    )
+    assert KUBE.main() == 0
+    persisted = STATE.read_state(path)
+    assert persisted["node_targets"] == {CONTEXT: {"managed-node": "uid-managed-node"}}
+    assert [entry["node_id"] for entry in persisted["departed_fleet_nodes"]] == [
+        DEPARTED_NODE
+    ]
+    assert persisted["provider_nodes"]["gpu-a"]["instance_ids"] == [
+        REPLACEMENT_INSTANCE
+    ]
+    assert persisted["orphaned_installer_nodes"] == {
+        CONTEXT: {"customer-node": "uid-customer-node"}
+    }
+    assert len(calls) == 1
+    assert client.mutations() == []

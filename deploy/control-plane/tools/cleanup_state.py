@@ -318,6 +318,15 @@ def initialize(
     return document
 
 
+# What ``record --previous`` captures per kind (``prepare-clean-redeploy.sh``
+# ``capture_cpu_state``/``capture_gpu_state``), for the mismatch message.
+CAPTURED_RESOURCE_FIELDS = {
+    "deployment": "replicas",
+    "cronjob": "suspend",
+    "daemonset": "presence",
+}
+
+
 def record_resource(
     document: dict[str, Any],
     *,
@@ -344,7 +353,15 @@ def record_resource(
         if existing != identity:
             continue
         if resource["previous"] != previous:
-            raise CleanupStateError("original resource state changed during capture")
+            # Name the resource and both values: the operator has to restore
+            # the captured state (live 2026-09-30: a reconciler scaled to 0 by
+            # hand between two PREFLIGHT attempts left only this message).
+            field = CAPTURED_RESOURCE_FIELDS.get(kind, "state")
+            raise CleanupStateError(
+                "original resource state changed during capture: "
+                f"{kind} {name} {field} {resource['previous']} -> {previous}; "
+                f"restore {field} {resource['previous']} before resuming"
+            )
         return
     resources.append(
         {
@@ -368,6 +385,52 @@ def attach_fleet_snapshot(
     ).encode()
     document["fleet_snapshot"] = snapshot
     document["fleet_snapshot_sha256"] = hashlib.sha256(encoded).hexdigest()
+
+
+def provider_nodes_digest(instance_ids: list[str]) -> str:
+    encoded = json.dumps(instance_ids, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def attach_provider_nodes(
+    document: dict[str, Any],
+    cluster_id: str,
+    *,
+    hyperpod_cluster_name: str,
+    region: str,
+    instance_ids: list[str],
+) -> dict[str, Any]:
+    """Journal one cluster's HyperPod node membership, captured once per run.
+
+    Like the fleet snapshot this is a bound, digested capture: ``node_targets``
+    reads it back through :func:`verify_provider_nodes` instead of listing the
+    provider again, so a departed-node decision cannot silently change
+    between PREFLIGHT and the node phases.
+    """
+
+    if not instance_ids or len(set(instance_ids)) != len(instance_ids):
+        raise CleanupStateError("HyperPod node listing is empty or ambiguous")
+    ordered = sorted(instance_ids)
+    record = {
+        "hyperpod_cluster_name": hyperpod_cluster_name,
+        "region": region,
+        "instance_ids": ordered,
+        "captured_at": now(),
+        "sha256": provider_nodes_digest(ordered),
+    }
+    document.setdefault("provider_nodes", {})[cluster_id] = record
+    return record
+
+
+def verify_provider_nodes(record: object) -> list[str]:
+    if (
+        not isinstance(record, dict)
+        or not isinstance(record.get("instance_ids"), list)
+        or not all(isinstance(item, str) and item for item in record["instance_ids"])
+        or record.get("sha256") != provider_nodes_digest(record["instance_ids"])
+    ):
+        raise CleanupStateError("captured HyperPod node listing is invalid")
+    return cast(list[str], record["instance_ids"])
 
 
 def transition(

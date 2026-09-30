@@ -24,6 +24,14 @@ from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CANDIDATES_DIR_NAME = "boot020-releases"
 WORK_DIR_NAME = "boot020-work"
+# The build summary ``boot020_release_candidates.py build`` keeps in the work
+# directory, copied beside the five configs so a later run that reuses them can
+# read the per-candidate release ids and edits digests without the work dir.
+CANDIDATES_METADATA_NAME = "candidates.json"
+# Keys of the ``ensure_release_candidates`` record that describe *this* run's
+# work rather than the candidates themselves; never part of the evidence
+# identity (see ``candidate_identity``).
+VOLATILE_RECORD_KEYS = frozenset({"action", "work_dir", "replicas_delta"})
 CONFIG_FILES = {
     "noop": "noop.json",
     "control_plane": "control-plane.json",
@@ -225,7 +233,149 @@ def ensure_release_candidates(
         raise RegionalFixtureError(
             "BOOT-020 release candidates were built but do not name the live snapshot"
         )
+    _copy_candidate_metadata(work, out_dir)
     return {**record, "action": "built", "work_dir": str(work)}
+
+
+def _copy_candidate_metadata(work: Path, out_dir: Path) -> None:
+    """Keep the build summary next to the configs it produced.
+
+    ``build`` writes ``candidates.json`` (release id, edits digest and component
+    summary per candidate) into the work directory, which a later run does not
+    know about and an operator may clean. The copy in the candidates directory
+    is what ``candidate_identity`` reads on every run, built or reused.
+    """
+
+    source = work / CANDIDATES_METADATA_NAME
+    if not source.is_file():
+        return
+    try:
+        summary = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(summary, dict):
+        return
+    target = out_dir / CANDIDATES_METADATA_NAME
+    target.write_text(json.dumps(summary, indent=1, sort_keys=True), encoding="utf-8")
+    target.chmod(0o600)
+
+
+def _config_manifest_release_id(name: str, path: Path) -> str:
+    """The release id of the manifest a chained config points at (fail closed)."""
+
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegionalFixtureError(
+            f"BOOT-020 {name} config is unreadable: {path} ({exc})"
+        ) from exc
+    manifest_path = str((config.get("release") or {}).get("manifest") or "")
+    if not manifest_path:
+        raise RegionalFixtureError(f"BOOT-020 {name} config names no manifest: {path}")
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegionalFixtureError(
+            f"BOOT-020 {name} config points at an unreadable manifest: "
+            f"{manifest_path} ({exc}); rebuild the candidates or restore the "
+            "work directory before planning again"
+        ) from exc
+    release_id = str(manifest.get("release_id") or "")
+    if not release_id:
+        raise RegionalFixtureError(
+            f"BOOT-020 {name} manifest names no release_id: {manifest_path}"
+        )
+    return release_id
+
+
+def _recorded_candidate_metadata(candidates_dir: Path) -> dict[str, dict[str, str]]:
+    """``{B: {release_id, edits_sha256}, ...}`` from the candidates directory."""
+
+    path = candidates_dir / CANDIDATES_METADATA_NAME
+    if not path.is_file():
+        return {}
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    recorded = summary.get("candidates") if isinstance(summary, dict) else None
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        str(name): {
+            "release_id": str(value.get("release_id") or ""),
+            "edits_sha256": str(value.get("edits_sha256") or ""),
+        }
+        for name, value in sorted(recorded.items())
+        if isinstance(value, dict)
+    }
+
+
+def candidate_identity(
+    state_dir: Path, configs: dict[str, Path], record: dict[str, Any]
+) -> dict[str, Any]:
+    """What identifies the candidates a run consumes, built or reused alike.
+
+    The evidence document's ``inputs`` must be equal on every attempt of one
+    run, or ``EvidenceRecorder`` refuses to resume. The ``ensure`` record is
+    not that: it says ``built`` with a ``work_dir`` on the first attempt and
+    ``reused`` on the next (live 2026-09-30, fifth regional run: every
+    ``--resume`` died on exactly this). This identity is computed from the
+    administrator state and the candidate files themselves, never from what
+    this attempt had to do for them:
+
+    - ``source``: ``explicit`` when the five paths were given, else ``derived``.
+      Explicit configs are the operator's and opaque to the runner beyond
+      existing and passing the admin-target check (the entrypoint contract);
+      their identity is ``config_sha256`` alone and nothing below is read;
+    - ``candidates_dir`` and ``snapshot_repo`` (derived candidates);
+    - ``live_release_id`` (``source-deploy-success.json``, written only by
+      ``gpu-fault-admin deploy``, so a BOOT-020 release does not move it) and
+      ``snapshot_release_id`` (the snapshot's ``dist/current-release.json``);
+    - ``release_ids``: per config, the release id of the manifest it names;
+    - ``candidates``: per candidate B/C/D, release id and edits digest from the
+      ``candidates.json`` copied into the candidates directory when present;
+    - ``runtime_profile``: the noop config's Runtime Profile version.
+
+    The config bytes themselves are bound separately (``config_sha256``).
+    """
+
+    if record.get("action") == "explicit":
+        return {"source": "explicit"}
+    identity: dict[str, Any] = {
+        "source": "derived",
+        "live_release_id": live_release_id(state_dir),
+    }
+    if record.get("candidates_dir"):
+        identity["candidates_dir"] = str(record["candidates_dir"])
+    snapshot = record.get("snapshot_repo")
+    if snapshot:
+        identity["snapshot_repo"] = str(snapshot)
+        identity["snapshot_release_id"] = snapshot_release_id(Path(str(snapshot)))
+    identity["release_ids"] = {
+        name: _config_manifest_release_id(name, path)
+        for name, path in sorted(configs.items())
+    }
+    if record.get("candidates_dir"):
+        identity["candidates"] = _recorded_candidate_metadata(
+            Path(str(record["candidates_dir"]))
+        )
+    noop = json.loads(configs["noop"].read_text(encoding="utf-8"))
+    identity["runtime_profile"] = str(
+        (noop.get("runtime_profile") or {}).get("version") or ""
+    )
+    return identity
+
+
+def candidate_provenance(record: dict[str, Any]) -> dict[str, Any]:
+    """The per-attempt facts the identity deliberately leaves out.
+
+    ``action`` (``built`` / ``reused`` / ``explicit``), the work directory and
+    the replicas delta this attempt would have built with; recorded as an
+    evidence note so the reader still learns what each attempt did.
+    """
+
+    return {key: record[key] for key in sorted(VOLATILE_RECORD_KEYS) if key in record}
 
 
 def resolve_release_configs(

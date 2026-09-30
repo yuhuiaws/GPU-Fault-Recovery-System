@@ -251,27 +251,34 @@ def _close_never_changed(
     applied_at: datetime,
     actor: str | None = None,
     approval: Mapping[str, object] | None = None,
-) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan | None]:
     """Terminalize a BLOCKED record that never changed a node (F-B4 (4)).
 
     There is no restore successor to name, and ``reconcile_restored_workflow``
     requires one, so this path re-derives every condition itself and writes the
     workflow through ``amend_workflow`` -- the out-of-lease write that bumps
-    ``merge_revision`` -- and the plan through ``save_plan``. The incident is
-    deliberately not written: without a transaction that would be a blind
-    overwrite of a row new events may be merging into, and the audit is carried
-    by ``preemption_reason`` and the plan's ``reconciliation_reference``. A
-    BLOCKED row itself is quiescent (merges refuse it since F-B4 (2), the
-    dispatcher never claims it), which is what makes this two-step write
-    acceptable until the Store grows a transactional form.
+    ``merge_revision`` -- and the plan, when the record names one, through
+    ``save_plan``. The incident is deliberately not written: without a
+    transaction that would be a blind overwrite of a row new events may be
+    merging into, and the audit is carried by ``preemption_reason`` and the
+    plan's ``reconciliation_reference``. A BLOCKED row itself is quiescent
+    (merges refuse it since F-B4 (2), the dispatcher never claims it), which is
+    what makes this two-step write acceptable until the Store grows a
+    transactional form.
+
+    A record without a ``source_plan_id`` -- its plan was replaced in place by
+    a merge (``PLAN_REWRITE``), or it was never plan-driven -- has no plan to
+    write and none is required: the resolver judges it on having never changed
+    a node, the returned plan is ``None``, and the ``OPERATOR_RECONCILED`` event
+    plus ``preemption_reason`` are its whole audit.
     """
 
     request_id = str(item["request_id"])
     workflow = store.get_workflow(request_id)
     incident = store.get_incident(workflow.incident_id)
-    if not workflow.source_plan_id:
-        raise ValueError("workflow has no source recovery plan")
-    source_plan = store.get_plan(workflow.source_plan_id)
+    source_plan: RecoveryPlan | None = None
+    if workflow.source_plan_id:
+        source_plan = store.get_plan(workflow.source_plan_id)
     updated_workflow, updated_incident, updated_plan = reconciled_restore_records(
         workflow,
         incident,
@@ -287,7 +294,7 @@ def _close_never_changed(
         reference=reference,
         reconciled_at=applied_at,
     )
-    if updated_plan is None:
+    if source_plan is not None and updated_plan is None:
         # Unreachable with a plan handed in; the resolver returns the plan it
         # was given. Kept so the type says what this path writes.
         raise ValueError("workflow has no source recovery plan")
@@ -316,7 +323,8 @@ def _close_never_changed(
             },
         ),
     )
-    store.save_plan(updated_plan)
+    if updated_plan is not None:
+        store.save_plan(updated_plan)
     return amended, updated_incident, updated_plan
 
 

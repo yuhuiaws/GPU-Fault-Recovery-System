@@ -415,6 +415,36 @@ class RegionalExecutorClient:
         )
         return RemoteActionCommand.model_validate(response)
 
+    def node_action_keys(self, node_ids: list[str]) -> dict[str, str]:
+        """Node-scoped Node Action keys for ``node_ids`` of this cluster.
+
+        Backs the executor's node-key sync: the control plane derives the
+        version-2 key for each name it already knows from this cluster's own
+        evidence, and refuses the whole request (404) when any name is unknown.
+        The values are secrets -- the caller writes them into the node-key
+        Secret and never logs them. The answer must be for this cluster and
+        must name exactly the nodes asked for; anything else is refused here so
+        a confused control plane cannot key a node it was not asked about.
+        """
+
+        requested = [str(node_id) for node_id in node_ids]
+        response = self._post(
+            "/v1/regional/node-action-keys",
+            {"cluster_id": self.cluster_id, "node_ids": requested},
+        )
+        keys = response.get("keys") if isinstance(response, dict) else None
+        if response.get("cluster_id") != self.cluster_id or not isinstance(keys, dict):
+            raise ClusterExecutorError(
+                "node action key response is not for this cluster"
+            )
+        if set(keys) != set(requested):
+            raise ClusterExecutorError(
+                "node action key response names a different node set than requested"
+            )
+        if any(not isinstance(value, str) for value in keys.values()):
+            raise ClusterExecutorError("node action key response is malformed")
+        return {str(node_id): value for node_id, value in keys.items()}
+
 
 class RegionalFleetRegistry:
     """Fleet registry proxy backed by the regional control-plane API."""

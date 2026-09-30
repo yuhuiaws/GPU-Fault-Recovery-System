@@ -40,6 +40,7 @@ from gpu_fault.regional import (
     RemoteCommandResult,
     RemoteCommandStatus,
 )
+from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
 from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
@@ -176,6 +177,7 @@ class ClusterActionExecutor:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         spare_reservation_sweep: SpareReservationSweep | None = None,
+        node_key_sync: NodeActionKeySync | None = None,
     ) -> None:
         _validate_settings(
             poll_seconds=poll_seconds,
@@ -199,6 +201,7 @@ class ClusterActionExecutor:
         # retry happened.
         self.sleep = sleep
         self.spare_reservation_sweep = spare_reservation_sweep
+        self.node_key_sync = node_key_sync
         self.client = client
         self.adapters = adapters
         self.executor_id = executor_id
@@ -657,6 +660,27 @@ class ClusterActionExecutor:
         finally:
             self.metrics.spare_reservations_reclaimed(sweep.reclaimed_total - before)
 
+    def sync_node_action_keys(self) -> None:
+        """Key the nodes the Secret lacks when due; never raises into the loop.
+
+        A failed sync is one warning and the next cycle's retry: the claim loop
+        must keep turning while the control plane refuses or is unreachable.
+        The log carries node names and counts only, never key material.
+        """
+
+        sync = self.node_key_sync
+        if sync is None or not sync.due():
+            return
+        try:
+            sync.run()
+        except Exception as exc:  # noqa: BLE001 - housekeeping must not stop claims
+            LOGGER.warning(
+                "node action key sync failed (consecutive failures %d): %s: %s",
+                sync.failures_total,
+                type(exc).__name__,
+                exc,
+            )
+
     def run(self) -> None:
         consecutive_failures = 0
         self.advertise_execution_owners()
@@ -665,6 +689,7 @@ class ClusterActionExecutor:
                 count = self.run_once()
                 consecutive_failures = 0
                 self.sweep_spare_reservations()
+                self.sync_node_action_keys()
             except Exception as exc:
                 consecutive_failures += 1
                 delay = min(

@@ -271,6 +271,8 @@ categories:
         description: "命令回 WAITING 时的空转间隔，也是控制面不可达时退避的起点；长轮询开启后空回答不再按它睡眠。"
       - name: GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS
         description: "claim 长轮询：控制面对空结果最多挂起的秒数（0–30，服务端上限 25）；0 关闭并退回纯轮询。"
+      - name: GPU_FAULT_NODE_KEY_SYNC_SECONDS
+        description: "Executor 节点 key 补齐周期（默认 60）：比对本 HyperPod 集群标签下的节点与 GPU Secret `gpu-fault-node-action-keys` 的键名，只为缺失节点向控制面取 v2 key 并追加；0 关闭后替换节点要等下次 deploy 才有 Agent。"
 
   - title: Collector、DCGM 与 inventory
     description: >-

@@ -9,8 +9,9 @@ was restored, the incident is RECOVERED, and the ``OPERATOR_RECONCILED`` event
 on the workflow already carries the audit -- yet the record stayed ineligible
 ("workflow has no source recovery plan") and kept both nodes out of fault
 handling (GF-REGIONAL-DESTR-014, unknown-reboot). The gate now applies only
-where it means something: to a plan-driven record (whose plan is written) and
-to the never-changed path (which has no successor to prove anything).
+where it means something: to a plan-driven record (whose plan is written).
+A record without a plan is judged by its successor or, on the never-changed
+path, by having completed no node-mutating operation.
 """
 
 from __future__ import annotations
@@ -183,19 +184,24 @@ def test_applying_the_plan_supersedes_the_record_and_names_no_plan(
     ), "the superseded record no longer holds either node"
 
 
-def test_a_non_plan_record_without_a_successor_keeps_the_source_plan_gate() -> None:
-    """The never-changed path is unchanged: nothing proves a restore there."""
+def test_a_non_plan_record_without_a_successor_is_closable_as_never_changed() -> None:
+    """The never-changed path no longer needs a plan either.
+
+    Only a containment completed and the incident is settled: there is nothing
+    on the node to restore, and no plan to carry the audit was never a reason
+    to keep the record open (2026-09-30: a plan replaced in place under a merge
+    left ``source_plan_id`` empty on a record no admin path could then close).
+    The admin side still demands node evidence before applying it.
+    """
 
     store = InMemoryStore()
     _incident_id, blocked_id, _successor_id = _non_plan_state(store, successor=False)
 
     item = build_workflow_reconcile_plan(store, [blocked_id], now=NOW)["items"][0]
 
-    assert item["eligible"] is False
-    assert item["reasons"] == ["workflow has no source recovery plan"], (
-        "the never-changed path (only a containment completed, incident "
-        "settled) keeps the gate exactly as the ops manual pins it"
-    )
+    assert item["eligible"] is True, item["reasons"]
+    assert item["terminalization"] == "never-changed"
+    assert item["source_plan_id"] is None
 
 
 def test_a_plan_driven_record_still_needs_its_plan_beside_the_successor() -> None:

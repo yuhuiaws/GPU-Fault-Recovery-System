@@ -18,6 +18,9 @@ import surface and splits the code along the seams it already had:
   ``main``, the console-script targets.
 * ``metrics`` -- the ``gpu_fault_cluster_executor_`` Prometheus family the
   executor's counters are mirrored into, and the ``/healthz`` predicate.
+* ``node_key_sync`` -- ``NodeActionKeySync``: the periodic reconciliation that
+  keys nodes HyperPod replaced after the last deploy (adds missing entries to
+  the GPU node-key Secret, never overwrites or deletes).
 
 ``SpareReservationSweep`` lives in ``gpu_fault.spare_reservation_sweep`` and is
 re-exported here, where it always was.
@@ -67,6 +70,10 @@ from gpu_fault.cluster_executor.metrics import (
     cluster_executor_metrics,
     loop_breadcrumb_is_fresh,
 )
+from gpu_fault.cluster_executor.node_key_sync import (
+    NODE_KEY_SYNC_INTERVAL_SECONDS,
+    NodeActionKeySync,
+)
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -89,6 +96,7 @@ __all__ = [
     "EXECUTION_TIMEOUT_STATUS_SOURCE",
     "EXECUTION_TIMEOUT_UNKNOWN_STATUS_SOURCE",
     "LIVENESS_STALE_AFTER_SECONDS",
+    "NODE_KEY_SYNC_INTERVAL_SECONDS",
     "RETRYABLE_MARKER_KEYS",
     "SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS",
     "SPARE_RESERVATION_TTL_SECONDS",
@@ -102,6 +110,7 @@ __all__ = [
     "CommandLeaseWatch",
     "CommandLifecycle",
     "CommandOutcome",
+    "NodeActionKeySync",
     "RegionalExecutorClient",
     "RegionalFleetRegistry",
     "RegionalHyperPodSubmissionStore",

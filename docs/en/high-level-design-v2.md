@@ -728,7 +728,7 @@ All three API classes the proposal cares about exist, and the production deploym
 | Query restart budget | `GET /v1/restart-budgets/{cluster_id}/{job_id}` |
 | Query/sync/advance AWS installation resource state | `GET /v1/installation-resources`, `POST /sync`, `PUT /{site_id}/{resource_key:path}` |
 | Approve a GPU count change | Node annotation (exact value), not an API |
-| Regional operations (claim/renew/receipt/progress, spare health, evidence and notification write-back, cluster registry) | `/v1/regional/*`, 20 endpoints in total (`executors` 15, `registry` 4, `clusters` 1) |
+| Regional operations (claim/renew/receipt/progress, spare health, evidence and notification write-back, cluster registry) | `/v1/regional/*`, 21 endpoints in total (`executors` 15, `registry` 4, `clusters` 1, `node-action-keys` 1) |
 
 **Gap: there is still no first-class entry point for "isolate an arbitrary node" or "terminate a RUNNING workflow"**. Manual isolation currently relies on
 creating/advancing a workflow or cordon+taint directly in the cluster (the latter bypasses the state store and is not recommended);

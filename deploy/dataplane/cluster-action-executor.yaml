@@ -64,6 +64,42 @@ subjects:
     name: gpu-fault-cluster-executor
     namespace: gpu-fault-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-fault-cluster-executor-node-keys
+  namespace: gpu-fault-system
+# The one namespaced grant the executor holds: the GPU node-key Secret, by
+# name. `deploy`/`join-cluster` key the nodes present at that time; a node
+# HyperPod replaces later has no entry, so every installer Job for it failed
+# on the missing Secret key until the next deploy (live 2026-09-30). The
+# executor's node-key sync (cluster_executor/node_key_sync.py) asks the control
+# plane for the missing names and merge-patches only those keys in, fenced by
+# the Secret's resourceVersion. `get` reads key names (never values -- the
+# executor already mounts this Secret for its own signing); `patch` adds keys.
+# No `list`/`watch` (resourceNames cannot scope them), no `create`/`delete`/
+# `update` (the deploy host owns the Secret's identity and rotations), and no
+# grant on any other Secret in the namespace.
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["gpu-fault-node-action-keys"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gpu-fault-cluster-executor-node-keys
+  namespace: gpu-fault-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gpu-fault-cluster-executor-node-keys
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-cluster-executor
+    namespace: gpu-fault-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -204,6 +240,18 @@ spec:
               value: "true"
             - name: GPU_FAULT_NODE_ACTION_KEYS_DIR
               value: /etc/gpu-fault/node-action-keys
+            # Node-key sync: every this many seconds compare the nodes labelled
+            # with GPU_FAULT_HYPERPOD_CLUSTER against the keys in
+            # gpu-fault-node-action-keys (the Secret named in the Role above,
+            # in this Pod's own namespace) and fetch the missing ones from
+            # POST /v1/regional/node-action-keys. 0 disables it, and then a
+            # replacement node gets no Agent until the next deploy.
+            - name: GPU_FAULT_NODE_KEY_SYNC_SECONDS
+              value: "60"
+            - name: GPU_FAULT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             # Only needed when GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER is
             # true. Marked optional so the default deployment does not
             # require a key the deployment manual never creates.

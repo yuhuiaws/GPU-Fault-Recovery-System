@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from gpu_fault.admin.execution import (
     deployment_deadline,
     run_command,
 )
+from gpu_fault.admin.python_environment import python_environment
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
@@ -322,6 +324,16 @@ class Runner:
                 args, environment = self._kubeconfigs.command_inputs(
                     args, environment, timeout_seconds=deadline.remaining()
                 )
+            # Deploy tools shell out to bare ``python3`` and import gpu_fault.
+            # The admin CLI pins the venv via ``effective_environment``; a
+            # driver constructing ``Runner`` directly inherited the shell's
+            # python3 (2026-09-30: system interpreter, upgrade and automatic
+            # rollback both died with ModuleNotFoundError). Pin it here for
+            # every child; ``api_environment`` still shims ahead of it.
+            environment = python_environment(
+                os.environ if environment is None else environment,
+                executable=sys.executable,
+            )
             return run_command(
                 args,
                 input_text=input_text,

@@ -448,3 +448,60 @@ def test_a_rematerialized_config_is_accepted_only_with_its_explicit_digest(
     )
     with pytest.raises(STATE.CleanupStateError, match="differs on config_sha256"):
         STATE.validate_request(cleanup_state, config_path=config, **request)
+
+
+def test_changed_capture_names_the_resource_and_both_values(
+    cleanup_state: dict[str, Any],
+) -> None:
+    reconciler = {
+        "resource_scope": "gpu:gpu-a",
+        "context": "gpu-a",
+        "kind": "deployment",
+        "name": "gpu-fault-system/gpu-fault-node-installer-reconciler",
+        "previous": "1",
+    }
+    STATE.record_resource(cleanup_state, **reconciler)
+    with pytest.raises(
+        STATE.CleanupStateError,
+        match=(
+            "original resource state changed during capture: deployment "
+            "gpu-fault-system/gpu-fault-node-installer-reconciler replicas 1 -> 0; "
+            "restore replicas 1 before resuming"
+        ),
+    ):
+        STATE.record_resource(cleanup_state, **{**reconciler, "previous": "0"})
+    cronjob = {**reconciler, "kind": "cronjob", "previous": "false"}
+    STATE.record_resource(cleanup_state, **cronjob)
+    with pytest.raises(STATE.CleanupStateError, match="suspend false -> true"):
+        STATE.record_resource(cleanup_state, **{**cronjob, "previous": "true"})
+
+
+def test_provider_node_listing_is_digested_and_verified(
+    cleanup_state: dict[str, Any],
+) -> None:
+    record = STATE.attach_provider_nodes(
+        cleanup_state,
+        "gpu-a",
+        hyperpod_cluster_name="hp-gpu-a",
+        region="us-east-1",
+        instance_ids=["i-b", "i-a"],
+    )
+    assert cleanup_state["provider_nodes"]["gpu-a"] is record
+    assert record["instance_ids"] == ["i-a", "i-b"]
+    assert record["sha256"] == STATE.provider_nodes_digest(["i-a", "i-b"])
+    assert STATE.verify_provider_nodes(record) == ["i-a", "i-b"]
+    tampered = {**record, "instance_ids": ["i-a"]}
+    with pytest.raises(STATE.CleanupStateError, match="listing is invalid"):
+        STATE.verify_provider_nodes(tampered)
+    with pytest.raises(STATE.CleanupStateError, match="listing is invalid"):
+        STATE.verify_provider_nodes(None)
+    for instance_ids in ([], ["i-a", "i-a"]):
+        with pytest.raises(STATE.CleanupStateError, match="empty or ambiguous"):
+            STATE.attach_provider_nodes(
+                cleanup_state,
+                "gpu-b",
+                hyperpod_cluster_name="hp-gpu-b",
+                region="us-east-1",
+                instance_ids=instance_ids,
+            )
+    assert "gpu-b" not in cleanup_state["provider_nodes"]

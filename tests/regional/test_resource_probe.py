@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -35,7 +38,12 @@ def test_real_runner_accepts_both_advisory_wait_forms(arguments, monkeypatch):
     assert actual_arguments == arguments
     assert set(options) == {"capture", "input_text", "environment", "timeout_seconds"}
     assert options["capture"] is True
-    assert options["input_text"] is None and options["environment"] is None
+    assert options["input_text"] is None
+    # The engine pins its own interpreter directory for every child (deploy
+    # tools call bare ``python3``); an advisory wait is no exception.
+    assert options["environment"]["PATH"].split(os.pathsep)[0] == str(
+        Path(sys.executable).absolute().parent
+    )
     assert 0 < options["timeout_seconds"] <= 3, (
         "environment preparation must consume the same advisory wait deadline"
     )

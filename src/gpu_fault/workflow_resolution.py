@@ -294,10 +294,11 @@ def restore_reconciliation_reasons(
     # The second eligible path (F-B4 (4)): a record that never changed a node
     # needs no restore successor, because there is nothing to restore. It still
     # needs its incident settled -- recovered elsewhere, or escalated to the
-    # operator now closing it -- and every gate below this block still applies,
-    # including the source-plan gate: on this path a workflow that was never
-    # plan-driven has no plan to carry the reconciliation audit and no
-    # successor to prove anything, and stays ineligible by design.
+    # operator now closing it -- and every gate below this block still applies.
+    # The source-plan gate applies to it only when the record names a plan: a
+    # never-changed record without one (a plan rewritten in place under a
+    # merge, a job DAG's node branch) has left nothing on the node, and the
+    # ``OPERATOR_RECONCILED`` event plus ``preemption_reason`` carry its audit.
     never_changed = successor is None and workflow_never_changed_a_node(workflow)
     if incident is not None and never_changed:
         if incident.state not in SETTLED_INCIDENT_STATES:
@@ -327,10 +328,15 @@ def restore_reconciliation_reasons(
     # proves the node was put back, and the OPERATOR_RECONCILED event on the
     # workflow plus the incident's reasons carry the audit. Requiring a plan
     # there kept both of DESTR-014's nodes out of fault handling with no lever
-    # left. The gate therefore applies to plan-driven records (the plan must
-    # exist and link back) and, above, to the never-changed path.
+    # left. The same held for a never-changed record whose plan was replaced
+    # in place by a merge (2026-09-30, ``source_plan_id`` empty after
+    # PLAN_REWRITE): its node had since been replaced by HyperPod, no admin
+    # path could close it, and ``uninstall`` failed closed on it. The gate
+    # therefore applies to plan-driven records (the plan must exist and link
+    # back); a record without a plan is judged by its successor or by having
+    # never changed a node, and only a record that is neither still needs one.
     if not workflow.source_plan_id:
-        if successor is None:
+        if successor is None and not never_changed:
             reasons.append("workflow has no source recovery plan")
     elif source_plan is None:
         reasons.append("source recovery plan is missing")
@@ -367,9 +373,11 @@ def reconciled_restore_records(
     what the Store contract still hands in today and is honoured when given.
 
     ``source_plan`` is ``None`` only for a record that was never plan-driven
-    and is reconciled by its verified restore successor
-    (``restore_reconciliation_reasons``); the returned plan is then ``None``
-    and the audit is carried by the workflow's event and the incident.
+    (or whose plan was replaced in place, leaving ``source_plan_id`` empty)
+    and is reconciled by its verified restore successor or by having never
+    changed a node (``restore_reconciliation_reasons``); the returned plan is
+    then ``None`` and the audit is carried by the workflow's event, its
+    ``preemption_reason`` and, on the successor path, the incident.
 
     ``blocked_reasons`` is deliberately not appended to (P1-61D): it records why
     the workflow blocked, the audit lives in ``preemption_reason`` and on the

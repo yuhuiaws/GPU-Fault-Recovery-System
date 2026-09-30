@@ -114,6 +114,13 @@ them would turn every `--plan` into an execute against a real node.
 - `run_iso006_cluster_offline.py`
 - `run_e2e002_multicluster_fault.py`
 
+Drivers that build `gpu_fault_release.rollout.Runner` in-process (BOOT-020 and the
+release-history/lifecycle runners) do not need `.venv/bin` on PATH: the engine pins
+its own interpreter directory onto every deploy tool it runs, so the tools' bare
+`python3` calls import the same `gpu_fault` the driver runs under (2026-09-30: the
+system interpreter failed a BOOT-020 upgrade and its automatic rollback with
+`ModuleNotFoundError`). Launch the drivers with the venv interpreter as before.
+
 The BOOT-019/020 runners are plan-only by default. Their live paths require
 both `--execute` and the case-specific confirmation string, keep resumable
 evidence under a caller-supplied `--run-dir`, and remain `manual` in the case
@@ -121,6 +128,39 @@ catalog because they attach/remove clusters or roll real releases.
 BOOT-020 consumes distinct CPU-only, Executor-only, Agent-only and FULL
 configs, and records component rollback scope plus `T_safe`, `T_full` and
 interrupted-resume RTO evidence.
+
+Continuing an interrupted BOOT-020 run is a two-command sequence. The plan and
+the execute of one attempt must be the same command line, `--resume` and
+`--attempt` included: `arguments_sha256` binds every non-approval argument, so
+the first attempt's plan cannot admit a `--resume` execute, and a plan written
+at another `--attempt` fails at `attempt`.
+
+```bash
+run_boot020_release_rolling.py <site/candidate arguments> \
+  --run-dir "${RUN_DIR}" --attempt <n> --resume --plan
+run_boot020_release_rolling.py <the same arguments> \
+  --run-dir "${RUN_DIR}" --attempt <n> --resume \
+  --execute --confirm RUN_BOOT020_RELEASE_ROLLING \
+  --maintenance-window-end "${MAINTENANCE_WINDOW_END}"
+```
+
+The evidence `inputs` are the run's identity and are equal on every attempt
+whether the candidates were built or reused: `admin_state_dir`,
+`admin_reference`, the five config paths with their `config_sha256`, the GPU
+kubeconfig path, and `release_candidates` as
+`boot020_release_prerequisites.candidate_identity` computes it (source
+explicit/derived, `candidates_dir`, snapshot repository, live and snapshot
+release ids, the release id each config's manifest names, the B/C/D release
+ids and edits digests from the `candidates.json` copied into the candidates
+directory, the noop Runtime Profile version; explicit `--*-config` files are
+identified by `config_sha256` alone, `source: explicit`). What one attempt did for the
+candidates -- `built`, `reused` or `explicit`, its work directory, the replicas
+delta -- is the `release_candidates_provenance` note, appended per attempt,
+never an input (2026-09-30, fifth run: the first execute recorded
+`action=built`, every later `--resume` computed `action=reused` and was
+refused). A refused resume now names the differing input keys with both values
+and repeats the sequence above; a different site, candidates directory or
+kubeconfig is another run and needs a new `--run-dir`.
 
 The grouped BOOT-011..018, AUTH/ISO, WORKLOAD/E2E, PREEMPT-012, NOTIFY,
 CAP-001..004 and NET-001 drivers use the same plan/execute guard. They derive

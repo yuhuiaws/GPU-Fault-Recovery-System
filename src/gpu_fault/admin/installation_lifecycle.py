@@ -144,6 +144,17 @@ def bind_retained_database(
         raise BootstrapError("retained Aurora incarnation changed during uninstall")
 
 
+# Aurora reports these while the cluster stays online, writable and unchanged
+# in identity: ``backing-up`` during the first automated backup right after
+# creation and during every daily backup window, ``maintenance`` during the
+# maintenance window. Treating them as "binding differs" made the 2026-09-30
+# first deploy fail its preflight fifteen minutes after creating the cluster;
+# rerunning the same command once the backup ended passed. Anything else
+# (``creating``, ``modifying``, ``failing-over``, ``deleting``, ``stopped`` ...)
+# still fails closed.
+AURORA_ONLINE_STATUSES = frozenset({"available", "backing-up", "maintenance"})
+
+
 def aurora_binding(
     cluster: object,
     *,
@@ -159,11 +170,17 @@ def aurora_binding(
     secret = cluster.get("MasterUserSecret")
     secret_arn = secret.get("SecretArn") if isinstance(secret, dict) else None
     required = ("DbClusterResourceId", "Endpoint", "DatabaseName", "MasterUsername")
+    status = cluster.get("Status")
+    if status not in AURORA_ONLINE_STATUSES:
+        # Distinct from a binding mismatch: the identity may be exactly right
+        # while the cluster is still creating, failing over or being deleted.
+        raise BootstrapError(
+            f"retained Aurora cluster is not online: status={status!r}"
+        )
     if (
         cluster.get("DBClusterIdentifier") != cluster_id
         or cluster.get("DBClusterArn") != expected_arn
         or cluster.get("Engine") != "aurora-postgresql"
-        or cluster.get("Status") != "available"
         or any(
             not isinstance(cluster.get(key), str) or not cluster[key]
             for key in required

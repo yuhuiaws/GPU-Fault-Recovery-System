@@ -426,6 +426,14 @@
       },
       {
         "kind": "role",
+        "name": "gpu-fault-cluster-executor-node-keys",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "role",
         "name": "gpu-fault-node-installer-reconciler",
         "scope": "namespaced",
         "phase": "support",
@@ -435,6 +443,14 @@
       {
         "kind": "rolebinding",
         "name": "gpu-fault-adot-dataplane-discovery",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "rolebinding",
+        "name": "gpu-fault-cluster-executor-node-keys",
         "scope": "namespaced",
         "phase": "support",
         "order": 100,

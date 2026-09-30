@@ -33,6 +33,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
+    build_operator_event,
 )
 from gpu_fault.orchestration.families.conflicts import NodeConflictService
 from gpu_fault.orchestration.incident_closure import (
@@ -850,3 +851,70 @@ def test_physical_uncertainty_refuses_operator_and_restore_closure(
     assert store.list_markers_for_incident(incident.incident_id)[0].active, (
         "unresolved physical work must retain the incident's active marker"
     )
+
+
+def test_a_record_workflow_reconcile_ended_no_longer_holds_the_incident_open(
+    store,
+) -> None:
+    """The unresolved node action of a row ``workflow-reconcile`` superseded.
+
+    On 2026-09-30 a device-plugin restart was reaped with its outcome unknown,
+    HyperPod then replaced the node, and the record was closed as
+    never-changed on provider evidence -- yet ``--close-incident`` still named
+    it as open for the unresolved action, which ``confirm-node-action`` could
+    no longer answer without a Ready node. An operator-reconciled SUPERSEDED
+    row is the operator's answer; a row the executor superseded is not.
+    """
+
+    incident, workflow = _escalated_reset(store, workflow_status=WorkflowStatus.BLOCKED)
+    unresolved = copy_model(
+        workflow,
+        blocked_kind=BlockedKind.NEEDS_OPERATOR,
+        step_executions=[
+            workflow_step_execution(
+                3, RESET, WorkflowStepStatus.FAILED, details={"outcome_unknown": True}
+            )
+        ],
+    )
+    store.save_workflow(unresolved)
+    service = IncidentClosureService(store)
+    assert service.preview(incident.incident_id)["closable"] is False
+
+    store.save_workflow(copy_model(unresolved, status=WorkflowStatus.SUPERSEDED))
+    preview = service.preview(incident.incident_id)
+    assert preview["closable"] is False, "an executor preemption answers nothing"
+    assert preview["open_workflow_id"] == workflow.request_id
+
+    audit = (
+        f"operator reconciliation CHG-9: closed {workflow.request_id}, which "
+        "completed no node-mutating operation, with its incident ESCALATED"
+    )
+    store.save_workflow(unresolved)
+    store.amend_workflow(
+        workflow.request_id,
+        {
+            "status": WorkflowStatus.SUPERSEDED,
+            "preemption_reason": audit,
+            "superseded_at": datetime.now(timezone.utc),
+        },
+        event=build_operator_event(
+            copy_model(unresolved, status=WorkflowStatus.SUPERSEDED),
+            WorkflowEventKind.OPERATOR_RECONCILED,
+            actor=OPERATOR,
+            reference="CHG-9",
+            previous_status=WorkflowStatus.BLOCKED,
+            details={"terminalization": "never-changed"},
+        ),
+    )
+
+    preview = service.preview(incident.incident_id)
+    assert preview["closable"] is True, preview
+    assert preview["open_workflow_id"] is None
+    closed, changed = service.close_incident(
+        incident.incident_id,
+        reason="node replaced by HyperPod spot recovery",
+        operator=OPERATOR,
+        reference="CHG-9",
+    )
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    assert store.get_workflow(workflow.request_id).status is WorkflowStatus.SUPERSEDED
