@@ -12,6 +12,15 @@ from urllib.parse import quote
 from gpu_fault.fleet import AgentRecord, validate_node_identifier
 
 MAX_RESPONSE_BYTES = 512 * 1024
+# This probe is exec'd into the CPU API Pod, which exports the required agent
+# pins (from gpu-fault-release-metadata) but not GPU_FAULT_RELEASE_ID: the CPU
+# role environment never renders it and gpu_fault.app.factory defaults it to
+# "local". The release binding is therefore the pins the caller derived from the
+# verified release; the release ID is carried through as evidence only.
+RELEASE_PIN_ENVIRONMENT = (
+    "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+    "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+)
 VERSION_FIELDS = (
     "module_digest",
     "deployment_mode",
@@ -34,15 +43,17 @@ def http_exchange(**arguments: Any) -> tuple[int, bytes]:
 
 
 def read_snapshot(
-    cluster_id: str, nodes: tuple[str, str], *, expected_release_id: str
+    cluster_id: str,
+    nodes: tuple[str, str],
+    *,
+    expected_release_id: str,
+    expected_pins: tuple[str, str],
 ) -> dict[str, Any]:
-    if (
-        not cluster_id
-        or not expected_release_id
-        or os.environ.get("GPU_FAULT_RELEASE_ID") != expected_release_id
-        or len(set(nodes)) != 2
-    ):
+    if not cluster_id or not expected_release_id or len(set(nodes)) != 2:
         raise ValueError("AUTH015 snapshot identity is invalid")
+    for name, expected in zip(RELEASE_PIN_ENVIRONMENT, expected_pins, strict=True):
+        if not expected or os.environ.get(name, "").strip() != expected:
+            raise ValueError(f"AUTH015 release pin {name} does not bind this Pod")
     for node in nodes:
         validate_node_identifier(node)
     token = os.environ["GPU_FAULT_EXECUTION_TOKEN"]
@@ -83,10 +94,15 @@ def read_snapshot(
 def main(arguments: Sequence[str] | None = None) -> int:
     values = list(sys.argv[1:] if arguments is None else arguments)
     try:
-        if len(values) != 4:
-            raise ValueError("AUTH015 snapshot needs a cluster, two nodes and release")
+        if len(values) != 6:
+            raise ValueError(
+                "AUTH015 snapshot needs a cluster, two nodes, release and two pins"
+            )
         result = read_snapshot(
-            values[0], (values[1], values[2]), expected_release_id=values[3]
+            values[0],
+            (values[1], values[2]),
+            expected_release_id=values[3],
+            expected_pins=(values[4], values[5]),
         )
     except Exception:
         # Neither API bodies nor credential-bearing transport errors may escape.

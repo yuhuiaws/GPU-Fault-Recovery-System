@@ -346,6 +346,10 @@ if hyperpod_cluster and commands:
         except NotFoundError:
             pass
 print(json.dumps({
+    # CPU Pods do not export GPU_FAULT_RELEASE_ID, so this is None in a real
+    # deployment; RegionalLiveFixture.store_snapshot fills the key from the
+    # gpu-fault-regional-release-state ConfigMap. Kept so an environment that
+    # does set it (local runs) is still reported as-is.
     "release_id": os.getenv("GPU_FAULT_RELEASE_ID"),
     "event": (
         {

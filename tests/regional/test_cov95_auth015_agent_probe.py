@@ -10,9 +10,15 @@ from tests.regional._cov95_auth015_support import KEY_A, agent
 from tests.regional._cov95_identity_support import offline_guard as offline_guard
 
 
+ARGUMENTS = ["cluster-a", "node-a", "node-b", "release-a", "a" * 64, "b" * 64]
+
+
 @pytest.fixture
 def transport(monkeypatch):
-    monkeypatch.setenv("GPU_FAULT_RELEASE_ID", "release-a")
+    # A CPU API Pod exports the required agent pins, never GPU_FAULT_RELEASE_ID.
+    monkeypatch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
+    monkeypatch.setenv("GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256", "a" * 64)
+    monkeypatch.setenv("GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST", "b" * 64)
     monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", API_TOKEN)
     calls = []
 
@@ -37,7 +43,7 @@ def transport(monkeypatch):
 def test_readonly_probe_serializes_actual_agent_models_without_credentials(
     transport, capsys
 ):
-    assert probe.main(["cluster-a", "node-a", "node-b", "release-a"]) == 0
+    assert probe.main(ARGUMENTS) == 0
     output = capsys.readouterr().out
     value = json.loads(output)
     assert set(value["agents"]) == {"node-a", "node-b"}
@@ -51,11 +57,14 @@ def test_readonly_probe_serializes_actual_agent_models_without_credentials(
     [
         [],
         ["cluster-a", "node-a", "node-b"],
-        ["", "node-a", "node-b", "release-a"],
-        ["cluster-a", "node-a", "node-b", ""],
-        ["cluster-a", "node-a", "node-a", "release-a"],
-        ["cluster-a", "bad/node", "node-b", "release-a"],
-        ["cluster-a", "node-a", "node-b", "other-release"],
+        ["cluster-a", "node-a", "node-b", "release-a"],
+        ["", *ARGUMENTS[1:]],
+        [*ARGUMENTS[:3], "", *ARGUMENTS[4:]],
+        ["cluster-a", "node-a", "node-a", *ARGUMENTS[3:]],
+        ["cluster-a", "bad/node", "node-b", *ARGUMENTS[3:]],
+        [*ARGUMENTS[:4], "f" * 64, "b" * 64],
+        [*ARGUMENTS[:5], "f" * 64],
+        [*ARGUMENTS[:4], "", ""],
     ],
 )
 def test_bad_snapshot_identity_cannot_reach_the_api(transport, arguments, capsys):
@@ -63,6 +72,25 @@ def test_bad_snapshot_identity_cannot_reach_the_api(transport, arguments, capsys
     assert json.loads(capsys.readouterr().out) == {
         "error": "AUTH015 read-only agent snapshot failed"
     }
+    assert transport == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+        "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+    ],
+)
+def test_pod_without_the_release_pin_refuses_by_name(transport, monkeypatch, name):
+    monkeypatch.delenv(name)
+    with pytest.raises(ValueError, match=name):
+        probe.read_snapshot(
+            "cluster-a",
+            ("node-a", "node-b"),
+            expected_release_id="release-a",
+            expected_pins=("a" * 64, "b" * 64),
+        )
     assert transport == []
 
 
@@ -74,7 +102,7 @@ def test_missing_cpu_authentication_is_not_an_anonymous_fallback(
         monkeypatch.delenv("GPU_FAULT_EXECUTION_TOKEN")
     else:
         monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", token)
-    assert probe.main(["cluster-a", "node-a", "node-b", "release-a"]) == 1
+    assert probe.main(ARGUMENTS) == 1
     assert transport == []
 
 
@@ -96,7 +124,7 @@ def test_invalid_cpu_responses_never_echo_the_body_or_exception(
         return status, payload
 
     monkeypatch.setattr(probe, "http_exchange", query)
-    assert probe.main(["cluster-a", "node-a", "node-b", "release-a"]) == 1
+    assert probe.main(ARGUMENTS) == 1
     output = capsys.readouterr().out
     assert API_TOKEN not in output
     assert json.loads(output) == {"error": "AUTH015 read-only agent snapshot failed"}

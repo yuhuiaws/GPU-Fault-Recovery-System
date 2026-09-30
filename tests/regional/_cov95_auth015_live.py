@@ -219,8 +219,17 @@ class LiveSite:
             patch.setattr(sys, "argv", [str(AGENT_PROBE), *arguments[8:]])
             patch.setattr(subprocess, "run", self.http_worker)
             patch.setenv("GPU_FAULT_EXECUTION_TOKEN", API_TOKEN)
+            # A CPU API Pod exports the required agent pins, never
+            # GPU_FAULT_RELEASE_ID; the probe binds the release through them.
+            patch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
+            version = self.raw["agent_snapshot"]["version"]
             patch.setenv(
-                "GPU_FAULT_RELEASE_ID", self.raw["agent_snapshot"]["release_id"]
+                "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+                version["required_agent_artifact_sha256"],
+            )
+            patch.setenv(
+                "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+                version["required_agent_compatibility_digest"],
             )
             if self.restrict_cpu_imports:
                 original_import = builtins.__import__

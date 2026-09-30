@@ -32,6 +32,10 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     run_fixture_command,
 )
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.release_pins import (  # noqa: E402
+    RELEASE_METADATA_CONFIGMAP,
+    release_pins_from_metadata,
+)
 from scripts.e2e.regional.regional_store_probe import STORE_PROBE as STORE_PROBE  # noqa: E402
 from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
     SYSTEM_NAMESPACES as SYSTEM_NAMESPACES,
@@ -939,6 +943,22 @@ class RegionalLiveFixture:
         )
         state = json.loads(value["data"]["state.json"])
         return str(state.get("release_id") or "")
+
+    def release_pins(self) -> dict[str, str]:
+        """The required release pins, keyed by the env name a CPU Pod exports.
+
+        Read from ``gpu-fault-release-metadata`` exactly as the CPU Deployments
+        do; a Pod-side probe compares them with its own environment to refuse
+        work once the release rolled past the receipt it was handed.
+        """
+
+        return release_pins_from_metadata(
+            json.loads(
+                self.kubectl(
+                    "cpu", "get", "configmap", RELEASE_METADATA_CONFIGMAP, "-o", "json"
+                )
+            )
+        )
 
     def runtime_identity(self) -> dict[str, Any]:
         release_document = json.loads(

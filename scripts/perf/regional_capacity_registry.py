@@ -195,6 +195,29 @@ def dataplane(
     return result.stdout.decode()
 
 
+def release_state_release_id() -> str:
+    """The release ID from ``gpu-fault-regional-release-state``, or "".
+
+    The CPU role environment never renders ``GPU_FAULT_RELEASE_ID`` into the
+    api-ha Deployment, so the release's own state record is the only source
+    once no artifact volume names it.
+    """
+
+    state_document = control(
+        "get",
+        "configmap",
+        "gpu-fault-regional-release-state",
+        "-o",
+        "jsonpath={.data.state\\.json}",
+        check=False,
+    ).strip()
+    try:
+        state = json.loads(state_document) if state_document else {}
+    except ValueError:
+        return ""
+    return str(state.get("release_id") or "") if isinstance(state, dict) else ""
+
+
 def dataplane_identity(
     *args: str,
     check: bool = True,

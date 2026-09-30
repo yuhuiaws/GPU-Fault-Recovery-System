@@ -92,6 +92,10 @@ def capture_snapshot(
         target.cluster_id,
         *nodes,
         release.release_id,
+        # The Pod binds itself to the verified release through these pins; it
+        # has no GPU_FAULT_RELEASE_ID to compare (see auth015_agent_probe).
+        release.node_wheel_sha256,
+        release.node_digest,
         input_text=agent_probe_script(),
         timeout=30,
     )

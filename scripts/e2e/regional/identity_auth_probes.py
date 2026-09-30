@@ -80,12 +80,31 @@ from gpu_fault.models import (
 from gpu_fault.regional import RemoteActionCommand, RemoteCommandResult, RemoteCommandStatus
 from gpu_fault.store import NotFoundError
 
+# CPU Pods do not export GPU_FAULT_RELEASE_ID (gpu_fault.app.factory defaults it
+# to "local"); the receipt's release_id is evidence only. The release binding is
+# the required pins the Pod took from gpu-fault-release-metadata at start-up: a
+# receipt written against another release must not seed or clean up here.
+RELEASE_PINS = (
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
+    "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+    "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+)
 action, receipt = json.loads(sys.argv[1])
 nonce = receipt["nonce"]
 if not re.fullmatch(r"[0-9a-f]{32}", nonce):
     raise RuntimeError("invalid AUTH008 ownership nonce")
-if os.environ["GPU_FAULT_RELEASE_ID"] != receipt["release_id"]:
-    raise RuntimeError("AUTH008 release changed")
+pins = receipt.get("required_pins")
+if (
+    not isinstance(pins, dict) or set(pins) != set(RELEASE_PINS)
+    or not all(isinstance(value, str) and value for value in pins.values())
+):
+    raise RuntimeError("AUTH008 receipt release pins are incomplete")
+for name in RELEASE_PINS:
+    deployed = os.environ.get(name, "").strip()
+    if not deployed:
+        raise RuntimeError("AUTH008 release pin " + name + " is not exported by this Pod")
+    if deployed != pins[name]:
+        raise RuntimeError("AUTH008 release pin " + name + " differs from the receipt; release changed")
 cluster_a, cluster_b = receipt["cluster_a"], receipt["cluster_b"]
 if not cluster_a or not cluster_b or cluster_a == cluster_b:
     raise RuntimeError("AUTH008 needs distinct clusters")

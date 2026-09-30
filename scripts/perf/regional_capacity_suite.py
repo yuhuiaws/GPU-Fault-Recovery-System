@@ -727,15 +727,9 @@ def release_id() -> str:
     ).strip()
     if config_map:
         return config_map.rsplit("-", 1)[-1]
-    return control(
-        "get",
-        "deploy",
-        "gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.spec.template.spec.containers[0].env"
-        "[?(@.name=='GPU_FAULT_RELEASE_ID')].value}",
-        check=False,
-    ).strip()
+    # Not the Deployment env: api-ha never carries GPU_FAULT_RELEASE_ID, so a
+    # jsonpath over its container env read "" silently.
+    return capacity_registry.release_state_release_id()
 
 
 def release_identity() -> dict[str, str]:

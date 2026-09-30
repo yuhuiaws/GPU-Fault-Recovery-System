@@ -200,7 +200,19 @@ def test_auth008_real_claim_protocol_owns_only_its_b_candidate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
 ) -> None:
     context, bridge = bound_api(monkeypatch)
-    monkeypatch.setenv("GPU_FAULT_RELEASE_ID", "unit-release")
+    # The CPU Pod exports the release pins, not GPU_FAULT_RELEASE_ID.
+    monkeypatch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
+    pins = {
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
+        "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "c" * 64,
+        "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": "d" * 64,
+    }
+    for name, value in pins.items():
+        monkeypatch.setenv(name, value)
+    # The bound API derives its executor policy from this environment too.
+    monkeypatch.setenv(
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST", "b" * 64
+    )
     events = []
 
     class Regional:
@@ -214,6 +226,9 @@ def test_auth008_real_claim_protocol_owns_only_its_b_candidate(
                 else "unit-release",
                 "cluster_id": self.cluster,
             }
+
+        def release_pins(self) -> dict[str, str]:
+            return dict(pins)
 
         def executor_python(
             self, script: str, *args: str, **kwargs: Any

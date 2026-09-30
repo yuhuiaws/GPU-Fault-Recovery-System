@@ -41,6 +41,23 @@ API_POD = "gpu-fault-api-ha-0"
 IMAGE = "registry.example/executor@sha256:" + "e" * 64
 ARTIFACT = "a" * 64
 COMPATIBILITY = "b" * 64
+# What the CPU Pods export and gpu-fault-release-metadata declares; the AUTH-008
+# CPU probe binds its receipt to these, never to GPU_FAULT_RELEASE_ID.
+RELEASE_PINS = {
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": ARTIFACT,
+    "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "c" * 64,
+    "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": "d" * 64,
+}
+# The in-process API derives its executor policy from the same environment.
+POD_ENVIRONMENT = {
+    **RELEASE_PINS,
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": COMPATIBILITY,
+}
+RELEASE_METADATA_DATA = {
+    "required-regional-executor-artifact-sha256": ARTIFACT,
+    "required-agent-artifact-sha256": "c" * 64,
+    "required-agent-compatibility-digest": "d" * 64,
+}
 CONTROL_PLANE_URL = "https://control.unit.invalid"
 CA_PEM = "-----BEGIN CERTIFICATE-----\nunit\n-----END CERTIFICATE-----\n"
 NOT_REGISTERED = json.dumps({"detail": "regional cluster is not registered"})
@@ -324,6 +341,8 @@ class FakeSite:
                 )
             return json.dumps(self._pod_document(namespace or "", app))
         if kind == "configmap" and plane == "cpu":
+            if arguments[1] == "gpu-fault-release-metadata":
+                return json.dumps({"data": dict(RELEASE_METADATA_DATA)})
             return json.dumps(
                 {"data": {"state.json": json.dumps({"release_id": RELEASE_ID})}}
             )

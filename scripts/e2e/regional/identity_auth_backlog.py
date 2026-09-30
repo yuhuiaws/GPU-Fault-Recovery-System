@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from gpu_fault.admin.diagnostics import diagnostic_text
 from scripts.e2e.regional import audit_auth_boundary
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.identity_acceptance_common import (
@@ -48,6 +49,17 @@ def auth008_claim(
     )
 
 
+def sanitized_error(exc: BaseException) -> str:
+    """The exception text with credential-shaped tokens removed and bounded.
+
+    ``RegionalFixtureError`` already carries redacted command output; this only
+    guarantees that whatever text reaches ``auth008-details.json`` has bearer
+    tokens, ``token=`` assignments, key material and control characters gone.
+    """
+
+    return diagnostic_text(str(exc), limit=1024)
+
+
 def run_auth008(
     site: IdentitySite,
     primary: ClusterTarget,
@@ -65,6 +77,10 @@ def run_auth008(
         or peer.get("release_id") != deployment["release_id"]
     ):
         raise IdentityAcceptanceError("AUTH-008 A/B release identity is incomplete")
+    # The CPU probe binds to these pins, not to release_id: the CPU Pods export
+    # the pins (from gpu-fault-release-metadata) but not GPU_FAULT_RELEASE_ID.
+    # Both fixtures read the same CPU namespace, so one read is the release.
+    pins = regional_a.release_pins()
     identities = [
         regional.executor_python(AUTH008_EXECUTOR_IDENTITY_PROBE, attempts=1)
         for regional in (regional_a, regional_b)
@@ -92,6 +108,7 @@ def run_auth008(
         "cluster_a": primary.cluster_id,
         "cluster_b": secondary.cluster_id,
         "release_id": deployment["release_id"],
+        "required_pins": pins,
         "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
         "claimants": [normal_id, spoofed_id, positive_id],
     }
@@ -202,9 +219,11 @@ def run_auth008(
         result["checks"]["release_unchanged"] = (
             regional_a.evidence_identity() == deployment
             and regional_b.evidence_identity() == peer
+            and regional_a.release_pins() == pins
         )
     except Exception as exc:
         result["error_type"] = type(exc).__name__
+        result["error"] = sanitized_error(exc)
         result["checks"]["probe_completed"] = False
     finally:
         try:
@@ -213,7 +232,9 @@ def run_auth008(
                 result["cleanup"].get("retired") is True
             )
         except Exception as exc:
-            result["cleanup_errors"].append(type(exc).__name__)
+            result["cleanup_errors"].append(
+                f"{type(exc).__name__}: {sanitized_error(exc)}"
+            )
             result["checks"]["owned_records_retired"] = False
         result["verdict"] = verdict(result["checks"])
         result["limitations"] = [

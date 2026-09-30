@@ -19,6 +19,7 @@ from gpu_fault.regional import (
     regional_registry_content_sha256,
 )
 from scripts.perf import regional_capacity_registry as registry
+from scripts.perf import regional_capacity_suite as suite
 from scripts.perf import regional_registry_alignment as alignment
 
 NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
@@ -473,3 +474,52 @@ def test_register_and_deregister_run_the_alignment_gate(
     with pytest.raises(RuntimeError, match="postflight"):
         registry.deregister(scope="isolated", artifacts=tmp_path, run_id="run-a")
     assert phases[-1] == "postflight", "teardown fails the run's cleanup on drift"
+
+
+@pytest.mark.parametrize(
+    ("state_document", "expected"),
+    [
+        (json.dumps({"release_id": "release-a", "phase": "complete"}), "release-a"),
+        ("", ""),
+        ("not-json", ""),
+        (json.dumps({"phase": "complete"}), ""),
+        (json.dumps(["release-a"]), ""),
+    ],
+)
+def test_release_state_release_id_reads_the_release_state_configmap(
+    monkeypatch: pytest.MonkeyPatch, state_document: str, expected: str
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def control(*args: str, **_kwargs: Any) -> str:
+        calls.append(args)
+        return state_document + "\n"
+
+    monkeypatch.setattr(registry, "control", control)
+
+    assert registry.release_state_release_id() == expected
+    assert len(calls) == 1, calls
+    assert calls[0][:3] == ("get", "configmap", "gpu-fault-regional-release-state")
+    assert "GPU_FAULT_RELEASE_ID" not in " ".join(calls[0]), (
+        "the CPU Deployments never carry GPU_FAULT_RELEASE_ID; do not read it"
+    )
+
+
+@pytest.mark.parametrize("artifact_volume", [True, False])
+def test_capacity_release_id_prefers_the_artifact_volume_then_the_release_state(
+    monkeypatch: pytest.MonkeyPatch, artifact_volume: bool
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def control(*args: str, **_kwargs: Any) -> str:
+        calls.append(args)
+        if args[1] == "deploy":
+            return "gpu-fault-control-plane-wheel-0100\n" if artifact_volume else "\n"
+        return json.dumps({"release_id": "release-a"}) + "\n"
+
+    # The suite binds the registry's ``control`` at import; patch both names.
+    monkeypatch.setattr(suite, "control", control)
+    monkeypatch.setattr(registry, "control", control)
+
+    assert suite.release_id() == ("0100" if artifact_volume else "release-a")
+    assert len(calls) == (1 if artifact_volume else 2), calls

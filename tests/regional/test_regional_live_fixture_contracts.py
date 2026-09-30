@@ -253,6 +253,73 @@ def test_evidence_identity_names_the_release_and_the_cluster(
     }
 
 
+def test_release_pins_map_the_release_metadata_to_the_pod_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = _regional(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def kubectl(plane: str, *arguments: str, **_kwargs: Any) -> str:
+        calls.append((plane, *arguments))
+        return json.dumps(
+            {
+                "data": {
+                    "required-regional-executor-artifact-sha256": "a" * 64,
+                    "required-agent-artifact-sha256": " " + "c" * 64 + "\n",
+                    "required-agent-compatibility-digest": "d" * 64,
+                    "required-agent-protocol-version": "3",
+                }
+            }
+        )
+
+    monkeypatch.setattr(regional, "kubectl", kubectl)
+
+    assert regional.release_pins() == {
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
+        "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "c" * 64,
+        "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": "d" * 64,
+    }
+    assert calls == [
+        ("cpu", "get", "configmap", "gpu-fault-release-metadata", "-o", "json")
+    ], "the pins come from the CPU release-metadata ConfigMap, not from a Pod"
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (None, "has no data"),
+        ({"required-agent-artifact-sha256": "c" * 64}, "missing or malformed"),
+        (
+            {
+                "required-regional-executor-artifact-sha256": "A" * 64,
+                "required-agent-artifact-sha256": "c" * 64,
+                "required-agent-compatibility-digest": "d" * 64,
+            },
+            "required-regional-executor-artifact-sha256 is missing or malformed",
+        ),
+        (
+            {
+                "required-regional-executor-artifact-sha256": "a" * 64,
+                "required-agent-artifact-sha256": "",
+                "required-agent-compatibility-digest": "d" * 64,
+            },
+            "required-agent-artifact-sha256 is missing or malformed",
+        ),
+    ],
+)
+def test_release_pins_fail_closed_on_an_incomplete_configmap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: Any, message: str
+) -> None:
+    regional = _regional(tmp_path)
+    document = {"metadata": {"name": "gpu-fault-release-metadata"}}
+    if data is not None:
+        document["data"] = data
+    monkeypatch.setattr(regional, "kubectl", lambda *_a, **_k: json.dumps(document))
+
+    with pytest.raises(RegionalFixtureError, match=message):
+        regional.release_pins()
+
+
 # -- items 3 and 8: the store probe redacts lease tokens and filters commands --
 
 
