@@ -1,5 +1,7 @@
 # Contributing
 
+English edition: [CONTRIBUTING.en.md](CONTRIBUTING.en.md).
+
 修改前按变化类型选择文档：
 
 | 变化 | 必读文档 |

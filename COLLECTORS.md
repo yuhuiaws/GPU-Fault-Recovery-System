@@ -1,5 +1,7 @@
 # GPU Fault Collectors
 
+English edition: [COLLECTORS.en.md](COLLECTORS.en.md).
+
 ## 数据路径
 
 `gpu-fault-collector` 是只读采集进程，不执行节点或任务恢复：

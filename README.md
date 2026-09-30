@@ -1,5 +1,7 @@
 # GPU多节点分布式训练故障自动化处理
 
+English edition: [README.en.md](README.en.md).
+
 本仓库实现面向大规模 GPU 训练集群的故障采集、策略判定、隔离、恢复编排、训练任务恢复和验收工具。
 
 ## 当前支持范围
@@ -90,8 +92,7 @@ make PYTHON=.venv/bin/python check
 无需另跑命令或添加`make -j`；promtool下载与工具包安装重叠。任一路失败均等待已启动任务结束后返回失败。
 工具通过版本及缓存archive摘要校验后复用，缺失或不符才修复；在线Python初始化仍会重建环境并可能联网。
 生产部署机必须使用CI生成并验签的离线bundle，见[CI 发布流程](docs/CI发布流程.md)。
-初始化后，Make默认自动使用`.venv/bin/python`；无本地venv的源码包回退到`python3`，
-CI和高级调用仍可用`PYTHON=...`显式覆盖。
+初始化后，Make默认自动使用`.venv/bin/python`；无本地venv的源码包回退到`python3`，CI和高级调用仍可用`PYTHON=...`显式覆盖。
 
 需要手工逐项执行时，建议按以下顺序：
 
@@ -128,8 +129,7 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、
-签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
+多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
 首次部署先为`--admin-email`发一封SNS确认邮件；未确认时命令在第一分钟退出（nothing was deployed），点击链接后用同一参数重跑即可，或加`--wait-for-email-confirmation <分钟>`原地等待。
 首次部署后的日常变更使用`<state-dir>/deployer-venv/bin/gpu-fault-admin`。
 未绑定站点的开发checkout不能替代该CLI执行已有站点的变更；普通源码deploy和真正

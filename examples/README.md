@@ -1,5 +1,7 @@
 # Examples
 
+English edition: [README.en.md](README.en.md).
+
 本目录只保存客户训练任务输入样例，不是生产部署入口。生产组件从
 `deploy/` 部署；当前唯一生产形态见
 [`docs/部署和运维手册.md`](../docs/部署和运维手册.md)。
