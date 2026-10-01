@@ -8,7 +8,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -140,6 +140,48 @@ def sign_permit(
     return permit.model_copy(update={"signature": permit_signature(permit, secret)})
 
 
+#: Holder attribution carried by an ``OWNERSHIP_FINAL_CLIENTS_CHANGED``
+#: refusal: at most this many holders, each identity field cut to this many
+#: printable characters. A ``comm`` is 15 bytes by kernel contract and a GPU
+#: UUID or ``/dev/nvidia*`` path is shorter than the cap, so the cap only bites
+#: on an injected finder. Nothing beyond these four fields is ever copied: a
+#: command line or environment could carry a token into the journal.
+FINAL_CLIENT_ATTRIBUTION_LIMIT: Final = 8
+FINAL_CLIENT_FIELD_LIMIT: Final = 64
+_HOLDER_FIELDS: Final = ("gpu_uuid", "pid", "device", "process_name")
+
+
+def _printable(value: Any) -> str:
+    text = "".join(char if char.isprintable() else "?" for char in str(value))
+    return text[:FINAL_CLIENT_FIELD_LIMIT]
+
+
+def device_holder_attribution(
+    holders: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, str]], int]:
+    """Bounded, sanitized identity of persistent device holders.
+
+    Returns the attributed entries and how many holders were left out, so a
+    truncated list is visible as such instead of reading as the whole set.
+    """
+
+    attributed = [
+        {field: _printable(item.get(field, "")) for field in _HOLDER_FIELDS}
+        for item in holders[:FINAL_CLIENT_ATTRIBUTION_LIMIT]
+    ]
+    return attributed, len(holders) - len(attributed)
+
+
+def device_holder_summary(attributed: Sequence[Mapping[str, str]], omitted: int) -> str:
+    """``<gpu>:<pid>:<comm>`` per holder, the shape the sampled preflight uses."""
+
+    text = ", ".join(
+        f"{item['gpu_uuid']}:{item['pid']}:{item['process_name']}"
+        for item in attributed
+    )
+    return f"{text} (+{omitted} more)" if omitted else text
+
+
 class OwnershipRefused(ValueError):
     """A safety refusal, never a failed GPU or an authorization to escalate."""
 
@@ -149,8 +191,19 @@ class OwnershipRefused(ValueError):
         *,
         boundary: str = "AGENT_PRE_SPAWN",
         cause: str | None = None,
+        device_clients: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
-        super().__init__(reason)
+        attributed, omitted = device_holder_attribution(device_clients or ())
+        # The refusal code stays the message prefix for every existing matcher;
+        # the holders follow it so the one line an operator reads first (the
+        # step's ``node_failures``, the journal) already names who held the
+        # device. Without it a lingering workload and a platform daemon (DCGM,
+        # the exporter, a health monitor) were the same opaque refusal (live
+        # 2026-10-01, a freshly provisioned node).
+        message = reason
+        if attributed:
+            message = f"{reason}: {device_holder_summary(attributed, omitted)}"
+        super().__init__(message)
         self.action_details: dict[str, Any] = {
             "reason": reason,
             "safety_rejection": True,
@@ -164,6 +217,11 @@ class OwnershipRefused(ValueError):
             # safety code: enough to tell a bug from a moved fence, never the
             # message (which may carry host process names or paths).
             self.action_details["refusal_cause"] = cause
+        if attributed:
+            self.action_details["persistent_device_clients"] = attributed
+            self.action_details["persistent_device_client_count"] = (
+                len(attributed) + omitted
+            )
 
 
 @dataclass
@@ -475,10 +533,33 @@ def execute_with_final_ownership(
                 if command.operation is not WorkflowOperation.RESTART_FABRIC_MANAGER:
                     with agent._device_path_cache_window():
                         agent._require_resolvable_targets(command.gpu_uuids)
-                        if persistent_final_device_clients(
+                        holders = persistent_final_device_clients(
                             agent, set(command.gpu_uuids)
-                        ):
-                            raise OwnershipRefused("OWNERSHIP_FINAL_CLIENTS_CHANGED")
+                        )
+                        if holders:
+                            refusal = OwnershipRefused(
+                                "OWNERSHIP_FINAL_CLIENTS_CHANGED",
+                                device_clients=holders,
+                            )
+                            # The executor's failure line only carries the
+                            # error class; this is the journal's one record of
+                            # who held the device when the reset was refused.
+                            LOGGER.warning(
+                                "final ownership recheck refused command_id=%s "
+                                "operation=%s node_id=%s "
+                                "persistent_device_clients=%s",
+                                command.command_id,
+                                command.operation.value,
+                                command.node_id,
+                                " ".join(
+                                    f"{item['gpu_uuid']}:{item['pid']}:"
+                                    f"{item['device']}:{item['process_name']}"
+                                    for item in refusal.action_details[
+                                        "persistent_device_clients"
+                                    ]
+                                ),
+                            )
+                            raise refusal
             _validate_local_authority(agent, envelope)
         except OwnershipRefused:
             # A fence that moved names itself (fence, clients); it is not a

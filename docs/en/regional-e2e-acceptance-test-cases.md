@@ -13696,6 +13696,11 @@ GPU hardware damage be inflicted or a forbidden persistent holder be deployed to
    - **It is forbidden to run the negative test live with a holder that keeps `/dev/nvidia*` open long-term.**
      That injection may cause the driver to keep removing the device after the holder exits, exceeding the reversible acceptance boundary;
      the TOCTOU negative may only be covered in Node Agent unit tests/the simulated runner.
+   - If a live `RESET_GPU` is refused with `OWNERSHIP_FINAL_CLIENTS_CHANGED` (for example a platform daemon still holding the device
+     on a freshly provisioned node), the step details and the remote command's `node_results` must carry
+     `persistent_device_clients` (`gpu_uuid`/`pid`/`device`/`process_name`, at most 8 entries) and
+     `persistent_device_client_count`, and the error text must name `<gpu>:<pid>:<comm>` after the code; the evidence records the
+     holder identity from there, must not infer a training process from the code alone, and must not log into the node for extra sampling.
    - `RUN_DCGM_DIAGNOSTIC` and quiesce/reset both depend on the GPU runtime.
      The registry already makes them share the `GPU_RUNTIME_MUTATION` claim; a concurrent host finding
      may only queue as a successor; merging the dcgmi branch into a reset DAG that is stopping DCGM is forbidden.

@@ -2720,6 +2720,9 @@ the single-node incident's `source_boot_id`; refused when none exists -- the rec
 the remote command carries the Agent's own terminal answer (`node_results`, SUCCEEDED/FAILED; the Agent refusing before the action also counts as terminal),
 **or** a later validated restore of the same incident has completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node, and the incident is
 RECOVERED and points at it. A BLOCKED record's deadline being long past is no grounds for refusal -- that is exactly why it was stopped.
+When the terminal answer of a `RESET_GPU` is `OWNERSHIP_FINAL_CLIENTS_CHANGED`, its details carry `persistent_device_clients`
+(`gpu_uuid`/`pid`/`device`/`process_name`, at most 8 entries): read there whether the holder is a lingering workload or a platform daemon
+(DCGM host engine, exporter, health monitoring agent) before deciding to clear the holder or quiesce again; no node login is needed to reproduce it.
 
 **Effect**: changes only that step record: the uncertainty flags `outcome_unknown`/`manual_confirmation_required` etc. are set to false,
 `operator_confirmed` records verbatim the operator ARN, `--reference`, time, boot id before and after, Agent generation, node and Agent evidence,

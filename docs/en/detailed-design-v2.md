@@ -853,7 +853,13 @@ any AWS management permission from this, nor touches the AWS API.
    causing every node action to fail permanently.
 5. **Post-dequeue final ownership permit**: bound to the original command, nonce, Agent generation, and fencing;
    the safety conditions, cancellation state, and original deadline are reconfirmed before and after the local client check, and the deadline cannot be extended by receiving a permit again.
-   A refusal must be handed to the operator and cannot be escalated to reboot/replace as a reset failure. The Executor signs a denial only for observed
+   A refusal must be handed to the operator and cannot be escalated to reboot/replace as a reset failure. When the final device-holder recheck
+   (`persistent_final_device_clients`) refuses, the `OWNERSHIP_FINAL_CLIENTS_CHANGED` error text appends a `<gpu>:<pid>:<comm>` summary after the
+   code and the details carry `persistent_device_clients` (per entry `gpu_uuid`/`pid`/`device`/`process_name`; at most 8 entries, each field at most
+   64 printable characters, the remainder marked `(+N more)`) plus `persistent_device_client_count`; only those four identity fields are copied,
+   never a command line, environment or cgroup. The node result details travel unchanged into the remote command's `node_results` and the
+   workflow step details (`manual_confirmation_required` triggers the full details merge), so an operator can tell a lingering workload from a
+   platform daemon (DCGM host engine, exporter, health monitoring agent) without a node login. The Executor signs a denial only for observed
    violations; when a recheck cannot be completed it signs no permit and hands off with `OWNERSHIP_RECHECK_DEFERRED` to the next lease
    owner for recheck (see §3.7 Node Agent ②).
    The sequential Kubernetes reads and the final system call are not an atomic transaction; any change after the last read remains an
@@ -881,6 +887,9 @@ any AWS management permission from this, nor touches the AWS API.
 **⑩ Logs/metrics/alerts**: logs go to journald, with fields including `command_id`, `operation`,
 `node_id`, `fencing_token`, `agent_generation`, `gpu_count`, `attempt`, `duration_ms`;
 the rejection line is `node action rejected <fields> reason=<msg>` (the HTTP code is mapped afterwards in `app.py` and is not logged).
+A final ownership recheck refused by a device holder adds one WARNING line: `final ownership recheck refused command_id=...
+operation=... node_id=... persistent_device_clients=<gpu>:<pid>:<device>:<comm> ...` (same caps and fields as layer 5 of ⑧;
+the `node action failed ... error_class=ResetProgressError` line itself carries only the error class).
 The Agent **exposes no Prometheus endpoint**; its health can only be observed from the control-plane side (heartbeat age,
 `config_digest` match, node action success rate). Therefore the alert chain for "the Agent is down" is
 the control plane's stale-agent decision, not the Agent alerting on its own.
