@@ -734,6 +734,48 @@ def test_the_script_retires_through_drain_and_revoke_with_the_evidence(
         assert untouched.generation == 4
 
 
+def test_the_script_accepts_the_inventory_spelling_of_the_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plan carries ``last_seen_at`` as the inventory serialized it (JSON
+    ``Z`` suffix) while the record yields ``+00:00``; the compare-and-set must
+    compare the instant, not the spelling (live defect: every apply failed)."""
+
+    now = datetime.now(timezone.utc)
+    store, registry = _fleet(now)
+    record = store.get_agent("gpu-a", NODE)
+    spelled = record.last_seen_at.isoformat().replace("+00:00", "Z")
+    assert spelled.endswith("Z"), "the test must exercise the JSON spelling"
+
+    result = _exec_script(
+        monkeypatch,
+        capsys,
+        store,
+        registry,
+        {
+            "mode": "retire-departed-agents",
+            "items": [
+                {
+                    "cluster_id": "gpu-a",
+                    "node_id": NODE,
+                    "generation": record.generation,
+                    "lifecycle_state": record.lifecycle_state.value,
+                    "last_seen_at": spelled,
+                    "departed_node_evidence": _evidence(NODE),
+                }
+            ],
+            "reference": REFERENCE,
+            "actor": TEST_OPERATOR_ARN,
+            "admin_plan_sha256": "d" * 64,
+            "transition_id": f"workflow-reconcile/{REFERENCE}/0123456789abcdef",
+        },
+    )
+
+    assert result["failed_agents"] == [], result.get("failures")
+    assert [item["agent"] for item in result["retired_agents"]] == [f"gpu-a/{NODE}"]
+    assert store.get_agent("gpu-a", NODE).lifecycle_state is AgentLifecycleState.REVOKED
+
+
 def test_the_script_refuses_without_a_registry_and_an_unknown_mode(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -137,10 +137,16 @@ elif payload["mode"] == "retire-departed-agents":
                     "agent lifecycle state changed: expected "
                     f"{item['lifecycle_state']}, found {current.lifecycle_state.value}"
                 )
-            if current.last_seen_at.isoformat() != item["last_seen_at"]:
+            # The inventory serialized the heartbeat as JSON (``Z`` suffix); the
+            # record yields ``+00:00``. Compare instants, not spellings (live
+            # 2026-10-01: every apply failed on the suffix alone).
+            expected_seen = datetime.fromisoformat(
+                str(item["last_seen_at"]).replace("Z", "+00:00")
+            )
+            if expected_seen.tzinfo is None or current.last_seen_at != expected_seen:
                 raise ValueError(
                     "agent heartbeat changed: expected "
-                    f"{item['last_seen_at']}, found {current.last_seen_at.isoformat()}"
+                    f"{expected_seen.isoformat()}, found {current.last_seen_at.isoformat()}"
                 )
             if current.last_seen_at > now - GUARD_AGE:
                 raise ValueError(GUARD_REASON)
