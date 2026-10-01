@@ -80,6 +80,7 @@
         "description": "The remaining modules of src/gpu_fault_release: admin checks, DNS, GPU bootstrap, endpoint and observability rollback, schema change, notifications, kubeconfig token cache. Listed by name so a new module lands outside every floor visibly rather than inheriting this one. Floors from the 2026-09-07 measurement (group 73.3%, lowest file regional_monitoring_safety.py 57.1%).",
         "globs": [
           "src/gpu_fault_release/regional_admin_checks.py",
+          "src/gpu_fault_release/regional_admin_checks_coverage.py",
           "src/gpu_fault_release/regional_admin_commands.py",
           "src/gpu_fault_release/regional_adot_self_metrics.py",
           "src/gpu_fault_release/regional_aurora_credentials.py",
@@ -93,10 +94,10 @@
           "src/gpu_fault_release/regional_monitoring_safety.py",
           "src/gpu_fault_release/regional_node_batch.py",
           "src/gpu_fault_release/regional_notifications.py",
-          "src/gpu_fault_release/regional_observability_rollback.py",
           "src/gpu_fault_release/regional_observability_drift.py",
-          "src/gpu_fault_release/regional_runtime_profile.py",
+          "src/gpu_fault_release/regional_observability_rollback.py",
           "src/gpu_fault_release/regional_resource_probe.py",
+          "src/gpu_fault_release/regional_runtime_profile.py",
           "src/gpu_fault_release/regional_schema_change.py",
           "src/gpu_fault_release/regional_secret_checks.py",
           "src/gpu_fault_release/regional_validation_evidence.py"
