@@ -98,7 +98,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
-from scripts.e2e.regional.site_profile import install_site_profile  # noqa: E402
+from scripts.e2e.regional.site_profile import (  # noqa: E402
+    install_site_profile,
+    supplied_flags,
+)
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     QUARANTINE_TAINT as QUARANTINE_TAINT,
     WarmSpareLiveFixture,
@@ -219,27 +222,50 @@ def configure(arguments: argparse.Namespace) -> Settings:
     return _settings(arguments, strict=True)
 
 
-def release_settings(arguments: argparse.Namespace) -> Settings:
+def release_settings(
+    arguments: argparse.Namespace, identity: release.AttemptIdentity
+) -> Settings:
     """Settings for ``--release``: the device identities the injection needs
-    (PCI BDFs, device file) are not required to release a hold."""
+    (PCI BDFs, device file) are not required to release a hold, and the node
+    pair plus job/attempt id are the attempt's plan's, already checked against
+    whatever the operator typed (`release.bind_attempt_identity`)."""
 
-    return _settings(arguments, strict=False)
+    return _settings(arguments, strict=False, identity=identity)
 
 
-def _settings(arguments: argparse.Namespace, *, strict: bool) -> Settings:
+def _settings(
+    arguments: argparse.Namespace,
+    *,
+    strict: bool,
+    identity: release.AttemptIdentity | None = None,
+) -> Settings:
     def device(value: str, label: str) -> str:
         return required(value, label) if strict else value.strip()
 
     default_job, default_attempt = derived_identity(
         arguments.run_dir, arguments.attempt
     )
+    if identity is None:
+        fault_node = required(
+            arguments.fault_node or os.getenv("GPU_FAULT_FAULT_NODE", ""),
+            "fault node",
+        )
+        sibling_node = required(
+            arguments.sibling_node or os.getenv("GPU_FAULT_SIBLING_NODE", ""),
+            "sibling node",
+        )
+        job_id = arguments.job_id.strip() or default_job
+        attempt_id = arguments.attempt_id.strip() or default_attempt
+    else:
+        # The plan's words, not the profile's or the environment's defaults.
+        fault_node, sibling_node = identity.fault_node, identity.sibling_node
+        job_id, attempt_id = identity.job_id, identity.attempt_id
     problems = managed_recovery_errors(int(arguments.managed_recovery_timeout_seconds))
     if problems:
         raise RegionalFixtureError(
             "managed recovery timeout is not a value the control plane accepts: "
             + "; ".join(problems)
         )
-    job_id = arguments.job_id.strip() or default_job
     predecessor = (
         Path(arguments.predecessor_evidence).expanduser().resolve()
         if arguments.predecessor_evidence
@@ -270,19 +296,13 @@ def _settings(arguments: argparse.Namespace, *, strict: bool) -> Settings:
             arguments.host_probe_image or os.getenv("GPU_FAULT_HOST_PROBE_IMAGE", ""),
             "host probe image",
         ),
-        fault_node=required(
-            arguments.fault_node or os.getenv("GPU_FAULT_FAULT_NODE", ""),
-            "fault node",
-        ),
+        fault_node=fault_node,
         fault_pci_bdf=device(arguments.fault_pci_bdf, "fault PCI BDF"),
         fault_device=device(arguments.fault_device, "fault GPU device"),
-        sibling_node=required(
-            arguments.sibling_node or os.getenv("GPU_FAULT_SIBLING_NODE", ""),
-            "sibling node",
-        ),
+        sibling_node=sibling_node,
         sibling_pci_bdf=device(arguments.sibling_pci_bdf, "sibling PCI BDF"),
         job_id=job_id,
-        attempt_id=arguments.attempt_id.strip() or default_attempt,
+        attempt_id=attempt_id,
         verify_max_attempts=int(arguments.verify_max_attempts),
         managed_recovery_timeout_seconds=int(
             arguments.managed_recovery_timeout_seconds
@@ -455,7 +475,9 @@ def parser() -> argparse.ArgumentParser:
         "--release",
         action="store_true",
         help=(
-            "release a held attempt (plan-free): confirm-node-action for the "
+            "release a held attempt (no new plan; the node pair and job identity "
+            "are bound from the attempt's recorded plan, typed --fault-node/"
+            "--sibling-node only have to agree): confirm-node-action for the "
             "rebooted node, --disposition restore, validated restore of every "
             "isolated node, workflow-reconcile, delete the drill job, disarm "
             "the holder, close both "
@@ -1255,12 +1277,11 @@ CASE = CaseRunner(
 
 
 def build_release_context(
-    settings: Settings, run_dir: Path, attempt: int
+    settings: Settings, inputs: release.ReleaseInputs
 ) -> release.ReleaseContext:
     """The live fixtures a release needs, bound to the attempt's own records."""
 
-    case_dir = run_dir / "cases" / CASE_ID
-    inputs = release.load_release_inputs(case_dir)
+    case_dir = inputs.case_dir
     regional = RegionalLiveFixture(settings.regional)
     pinned = case_dir / "pinned-workload.yaml"
     # By identity, not by the run's ownership nonce: see release.PinnedWorkload.
@@ -1281,8 +1302,13 @@ def build_release_context(
     )
 
 
-def run_release(arguments: argparse.Namespace) -> int:
-    """``--release``: the documented operator handling of a held attempt."""
+def run_release(arguments: argparse.Namespace, argv: list[str] | None = None) -> int:
+    """``--release``: the documented operator handling of a held attempt.
+
+    ``argv`` is the command line as typed (``sys.argv[1:]`` by default), before
+    the site profile filled its unsupplied flags: the node pair and job identity
+    come from the attempt's plan, and only flags present there are compared.
+    """
 
     if arguments.plan or arguments.execute:
         raise RegionalFixtureError("--release is its own mode; drop --plan/--execute")
@@ -1290,20 +1316,27 @@ def run_release(arguments: argparse.Namespace) -> int:
         raise RegionalFixtureError(
             f"--release requires --confirm {release.RELEASE_CONFIRMATION}"
         )
-    settings = release_settings(arguments)
-    context = build_release_context(settings, arguments.run_dir, arguments.attempt)
+    inputs = release.load_release_inputs(arguments.run_dir / "cases" / CASE_ID)
+    identity = release.bind_attempt_identity(
+        inputs.identity,
+        arguments,
+        supplied_flags(sys.argv[1:] if argv is None else argv),
+    )
+    settings = release_settings(arguments, identity)
+    context = build_release_context(settings, inputs)
     report = release.release_hold(context)
     print(json.dumps(report, sort_keys=True, default=str))
     return 0 if report["released"] else 1
 
 
 def main() -> int:
-    if "--release" in sys.argv[1:]:
+    argv = sys.argv[1:]
+    if "--release" in argv:
         install_site_profile()
-        arguments = parser().parse_args()
+        arguments = parser().parse_args(argv)
         os.umask(0o077)
         install_abort_signals()
-        return run_release(arguments)
+        return run_release(arguments, argv)
     return run_standard_case(CASE)
 
 

@@ -9818,7 +9818,19 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   If automatic recovery fires before the scenario completes, this case FAILs; if the host comes back
   only after the recovery deadline, manual handling is required.
   Manual handling is performed by the `--release` mode of the same runner (it generates no plan and
-  only reads this attempt's own plan/journal/result records):
+  only reads this attempt's own plan/journal/result records). The fault node, the sibling node and
+  the job/attempt id are bound from this attempt's `plan.json`
+  (`details.fault_node`/`sibling_node`/`job_id`/`attempt_id`, see
+  `destr014_release.AttemptIdentity`), never from the site profile's `fault-node`/`sibling-node`
+  keys or the `GPU_FAULT_FAULT_NODE`/`GPU_FAULT_SIBLING_NODE` environment -- those are only
+  defaults for the unsupplied flags of a *new* attempt; when the attempt was executed with explicit
+  `--fault-node A --sibling-node B` and the profile names another pair, a release that took the
+  profile's nodes would compare the plan's UID against a different, healthy node and refuse.
+  A `--fault-node`/`--sibling-node`/`--job-id`/`--attempt-id` **typed on the command line** is only
+  a typo guard (`destr014_release.bind_attempt_identity`): if it agrees with the plan the release
+  proceeds, if it differs the release is refused naming both the typed value and the plan's value;
+  values that were not typed, or that the profile filled in, are not compared. The documented
+  invocation therefore needs only `--run-dir/--attempt/--site-profile`:
 
   ```bash
   python3 scripts/e2e/regional/run_destr014_branch_exhaustion.py \
@@ -9827,7 +9839,8 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   ```
 
   It performs the following in order and is re-runnable: first verify identity (the live release id
-  and the Node UIDs of both nodes must match the plan; boot ids may differ; any mismatch is refused);
+  and the Node UIDs of the two nodes the plan recorded must match the plan; boot ids may differ; any
+  mismatch is refused);
   for each node whose boot id has changed, run
   `gpu-fault-admin submit-remediation --disposition confirm-node-action --node <node>`
   (confirming the reboot outcome from the boot-id change and the Agent-return evidence; a node with

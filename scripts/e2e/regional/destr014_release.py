@@ -37,18 +37,30 @@ order and idempotently, through the repository's admin CLI and fixtures:
 
 Identity is checked first: the live release id and both Node UIDs must be the
 ones the plan recorded (boot ids are expected to differ -- that is the point).
+Which two nodes those are is the plan's business as well: the release binds the
+fault node, the sibling node and the job/attempt id from the attempt's recorded
+``plan.json`` (`AttemptIdentity`), never from a site profile's ``fault-node`` /
+``sibling-node`` keys or the ``GPU_FAULT_*_NODE`` environment. Those are
+unsupplied-flag defaults for a *new* attempt; an attempt executed with explicit
+``--fault-node A --sibling-node B`` would otherwise be released against the
+profile's pair and refused on a healthy node's UID (live, DESTR-014). A
+``--fault-node``/``--sibling-node``/``--job-id``/``--attempt-id`` the operator
+actually types is only a typo guard: it must agree with the plan or the release
+refuses naming both values (`bind_attempt_identity`).
 Nothing here reads a plan mode or injects anything; the case's own journal,
 plan and result under ``<run-dir>/cases/GF-REGIONAL-DESTR-014`` are the input.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 
 import yaml
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,12 +118,89 @@ with command_log(getattr(arguments, "state_dir", None), command=command, kind=ki
 """
 
 
+@dataclass(frozen=True)
+class AttemptIdentity:
+    """The node pair and workload identity the attempt's plan recorded."""
+
+    fault_node: str
+    sibling_node: str
+    job_id: str
+    attempt_id: str
+
+
+# ``--release`` binds these from the plan; a typed flag is only a typo guard.
+PLAN_BOUND_FLAGS = (
+    ("fault_node", "--fault-node"),
+    ("sibling_node", "--sibling-node"),
+    ("job_id", "--job-id"),
+    ("attempt_id", "--attempt-id"),
+)
+
+
+def attempt_identity(plan_details: dict[str, Any]) -> AttemptIdentity:
+    """The plan's own node pair and job identity; refused when it names none."""
+
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    for dest, _flag in PLAN_BOUND_FLAGS:
+        value = str(plan_details.get(dest) or "").strip()
+        if not value:
+            missing.append(dest)
+        values[dest] = value
+    if missing:
+        raise RegionalFixtureError(
+            "DESTR-014 plan records no " + ", ".join(missing) + "; the release "
+            "binds its node pair and workload identity from the attempt's plan"
+        )
+    if values["fault_node"] == values["sibling_node"]:
+        raise RegionalFixtureError(
+            f"DESTR-014 plan names one node twice: {values['fault_node']}"
+        )
+    return AttemptIdentity(**values)
+
+
+def bind_attempt_identity(
+    identity: AttemptIdentity,
+    arguments: argparse.Namespace,
+    typed_flags: Collection[str],
+) -> AttemptIdentity:
+    """The plan's identity, once every flag the operator typed agrees with it.
+
+    ``typed_flags`` are the ``--flag`` names present on the command line itself
+    (`site_profile.supplied_flags`). A site profile fills *unsupplied* flags and
+    the environment is read only for empty ones, so neither reaches this
+    comparison: both are defaults for a new attempt, not statements about the
+    one being released. A typed value that disagrees with the plan is refused
+    with both values named; a typed value that agrees, or none, binds the plan.
+    """
+
+    conflicts: list[str] = []
+    for dest, flag in PLAN_BOUND_FLAGS:
+        if flag not in typed_flags:
+            continue
+        typed = str(getattr(arguments, dest, "") or "").strip()
+        recorded = getattr(identity, dest)
+        if typed and typed != recorded:
+            conflicts.append(
+                f"{flag} {typed} does not match the attempt's plan ({recorded})"
+            )
+    if conflicts:
+        raise RegionalFixtureError(
+            "DESTR-014 release refused: "
+            + "; ".join(conflicts)
+            + "; the release binds the node pair and job identity from the "
+            "plan, so drop the flag or release the attempt whose plan names it"
+        )
+    return identity
+
+
 @dataclass
 class ReleaseInputs:
     """What the case directory says about the attempt being released."""
 
     case_dir: Path
     plan_identity: dict[str, Any]
+    identity: AttemptIdentity
     journal: dict[str, Any]
     result: dict[str, Any]
     run_id: str
@@ -175,6 +264,7 @@ def load_release_inputs(case_dir: Path) -> ReleaseInputs:
     return ReleaseInputs(
         case_dir=case_dir,
         plan_identity=dict(plan["details"]["preflight_identity"]),
+        identity=attempt_identity(plan["details"]),
         journal=journal,
         result=result,
         run_id=run_id,

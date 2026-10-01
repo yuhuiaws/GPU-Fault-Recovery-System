@@ -121,6 +121,19 @@ def load_site_profile(path: Path) -> dict[str, Any]:
     return document
 
 
+def supplied_flags(argv: list[str]) -> set[str]:
+    """The ``--flag`` names an operator actually typed on this command line.
+
+    ``--flag=value`` counts as ``--flag``. This is the one rule for "typed, not
+    defaulted": `profile_argv` uses it to decide which profile entries a typed
+    flag suppresses, and a runner that binds its identity from a recorded plan
+    (DESTR-014 ``--release``) uses it to tell the operator's own flags from the
+    values the profile or the environment filled in for unsupplied ones.
+    """
+
+    return {item.split("=", 1)[0] for item in argv if item.startswith("--")}
+
+
 def profile_argv(
     profile: dict[str, Any],
     argv: list[str],
@@ -144,7 +157,7 @@ def profile_argv(
 
     arguments = profile.get("arguments", {})
     refuse_reserved_arguments(arguments)
-    supplied = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
+    supplied = supplied_flags(argv)
     extra: list[str] = []
     for dest, value in sorted(arguments.items()):
         flag = "--" + str(dest).replace("_", "-")

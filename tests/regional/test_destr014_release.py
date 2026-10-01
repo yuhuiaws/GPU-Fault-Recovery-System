@@ -17,6 +17,8 @@ from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
 FAULT = "hyperpod-i-fault"
 SIBLING = "hyperpod-i-sibling"
+JOB_ID = "destr014-plan-job"
+ATTEMPT_ID = "destr014-plan-job-a001"
 INCIDENT = "inc-two-node-replace"
 FOLLOW_UP = "inc-support-after-workflow"
 IDENTITY = {
@@ -32,7 +34,17 @@ IDENTITY = {
 def write_case(case_dir: Path, *, holder_armed: bool = True) -> None:
     case_dir.mkdir(parents=True, exist_ok=True)
     (case_dir / "plan.json").write_text(
-        json.dumps({"details": {"preflight_identity": IDENTITY}})
+        json.dumps(
+            {
+                "details": {
+                    "preflight_identity": IDENTITY,
+                    "fault_node": FAULT,
+                    "sibling_node": SIBLING,
+                    "job_id": JOB_ID,
+                    "attempt_id": ATTEMPT_ID,
+                }
+            }
+        )
     )
     (case_dir / release.JOURNAL_FILE).write_text(
         json.dumps(
@@ -489,9 +501,10 @@ def test_pinned_workload_reports_an_absent_job_as_nothing_to_do(tmp_path: Path) 
     assert record["deleted"] is False and record["absent"] is True, record
 
 
-def runner_arguments(tmp_path: Path, *extra: str) -> list[str]:
+def runner_arguments(tmp_path: Path, *extra: str, nodes: bool = True) -> list[str]:
     kube = tmp_path / "kube"
     kube.write_text("apiVersion: v1\n")
+    node_flags = ["--fault-node", FAULT, "--sibling-node", SIBLING] if nodes else []
     return [
         "--run-dir",
         str(tmp_path / "run"),
@@ -513,10 +526,7 @@ def runner_arguments(tmp_path: Path, *extra: str) -> list[str]:
         "hp",
         "--host-probe-image",
         "img",
-        "--fault-node",
-        FAULT,
-        "--sibling-node",
-        SIBLING,
+        *node_flags,
         *extra,
     ]
 
@@ -539,22 +549,204 @@ def test_release_mode_needs_its_own_confirmation_and_no_plan_or_execute(
         destr014.run_release(arguments)
 
 
+def plan_identity() -> release.AttemptIdentity:
+    return release.AttemptIdentity(
+        fault_node=FAULT, sibling_node=SIBLING, job_id=JOB_ID, attempt_id=ATTEMPT_ID
+    )
+
+
 def test_release_settings_do_not_need_the_device_identities(tmp_path: Path) -> None:
     settings(tmp_path)
     arguments = destr014.parser().parse_args(runner_arguments(tmp_path, "--release"))
 
-    value = destr014.release_settings(arguments)
+    value = destr014.release_settings(arguments, plan_identity())
 
     assert value.fault_pci_bdf == "" and value.fault_device == ""
     assert value.fault_node == FAULT and value.sibling_node == SIBLING
+    assert (value.job_id, value.attempt_id) == (JOB_ID, ATTEMPT_ID), (
+        "the plan's job identity, not the one derived from --run-dir/--attempt"
+    )
     with pytest.raises(RegionalFixtureError, match="PCI BDF"):
         destr014.configure(arguments)
+
+
+# --- release binds the node pair from the plan ------------------------------------
+
+
+def released_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> Any:
+    """Run ``--release`` up to the live fixtures; return the Settings it bound."""
+
+    write_case(tmp_path / "run" / "cases" / release.CASE_ID)
+    settings(tmp_path)
+    bound: list[Any] = []
+
+    def build(settings_value: Any, inputs: release.ReleaseInputs) -> Any:
+        bound.append((settings_value, inputs))
+        return "context"
+
+    monkeypatch.setattr(destr014, "build_release_context", build)
+    monkeypatch.setattr(
+        destr014.release, "release_hold", lambda _ctx: {"released": True}
+    )
+    arguments = destr014.parser().parse_args(argv)
+    assert destr014.run_release(arguments, argv) == 0, "release ran to the end"
+    assert len(bound) == 1, bound
+    return bound[0][0]
+
+
+def test_release_uses_the_plan_nodes_when_no_node_flag_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The environment fallback a new attempt would use is not the plan's word.
+    monkeypatch.setenv("GPU_FAULT_FAULT_NODE", "hyperpod-i-env-fault")
+    monkeypatch.setenv("GPU_FAULT_SIBLING_NODE", "hyperpod-i-env-sibling")
+    argv = runner_arguments(
+        tmp_path, "--release", "--confirm", release.RELEASE_CONFIRMATION, nodes=False
+    )
+
+    value = released_settings(tmp_path, monkeypatch, argv)
+
+    assert (value.fault_node, value.sibling_node) == (FAULT, SIBLING), (
+        "release binds the node pair from plan.json, not from the environment"
+    )
+    assert (value.job_id, value.attempt_id) == (JOB_ID, ATTEMPT_ID), value
+
+
+def test_release_accepts_typed_node_flags_that_agree_with_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv = runner_arguments(
+        tmp_path,
+        "--release",
+        "--confirm",
+        release.RELEASE_CONFIRMATION,
+        "--job-id",
+        JOB_ID,
+        f"--attempt-id={ATTEMPT_ID}",
+    )
+
+    value = released_settings(tmp_path, monkeypatch, argv)
+
+    assert (value.fault_node, value.sibling_node) == (FAULT, SIBLING), value
+    assert (value.job_id, value.attempt_id) == (JOB_ID, ATTEMPT_ID), value
+
+
+def test_release_refuses_typed_node_flags_that_differ_from_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_case(tmp_path / "run" / "cases" / release.CASE_ID)
+    settings(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        destr014, "build_release_context", lambda *_a: calls.append("build")
+    )
+    argv = runner_arguments(
+        tmp_path,
+        "--release",
+        "--confirm",
+        release.RELEASE_CONFIRMATION,
+        "--sibling-node",
+        "hyperpod-i-typo",
+        nodes=False,
+    )
+    arguments = destr014.parser().parse_args(argv)
+
+    with pytest.raises(RegionalFixtureError) as refused:
+        destr014.run_release(arguments, argv)
+
+    message = str(refused.value)
+    assert "--sibling-node hyperpod-i-typo" in message, message
+    assert f"plan ({SIBLING})" in message, "the refusal names the plan's node too"
+    assert "--fault-node" not in message, "an untyped flag is not a conflict"
+    assert calls == [], "refused before any live fixture is built"
+
+
+def test_release_ignores_a_site_profile_node_pair_that_differs_from_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live defect: the attempt ran with explicit ``--fault-node A --sibling-node
+    B``; the release was invoked with only ``--site-profile`` whose keys named
+    a different pair, and compared the plan's sibling UID with the profile
+    node's UID. Profile values are unsupplied-flag defaults; the plan wins."""
+
+    profile = tmp_path / "site-profile.yaml"
+    profile.write_text(
+        "arguments:\n"
+        "  fault-node: hyperpod-i-profile-fault\n"
+        "  sibling-node: hyperpod-i-profile-sibling\n"
+        "  host-probe-image: img\n",
+        encoding="utf-8",
+    )
+    profile.chmod(0o600)
+    monkeypatch.setenv("GPU_FAULT_ACCEPTANCE_SITE_PROFILE", str(profile))
+    argv = runner_arguments(
+        tmp_path, "--release", "--confirm", release.RELEASE_CONFIRMATION, nodes=False
+    )
+    namespace = destr014.parser().parse_args(argv)
+    assert namespace.fault_node == "hyperpod-i-profile-fault", (
+        "the profile did fill the unsupplied flag; the binding must look past it"
+    )
+
+    value = released_settings(tmp_path, monkeypatch, argv)
+
+    assert (value.fault_node, value.sibling_node) == (FAULT, SIBLING), (
+        "the release compares the plan's UIDs against the plan's own nodes"
+    )
+
+
+def test_attempt_identity_refuses_a_plan_without_a_node_pair() -> None:
+    with pytest.raises(RegionalFixtureError, match="records no fault_node, job_id"):
+        release.attempt_identity(
+            {"sibling_node": SIBLING, "attempt_id": ATTEMPT_ID, "fault_node": ""}
+        )
+    with pytest.raises(RegionalFixtureError, match="one node twice"):
+        release.attempt_identity(
+            {
+                "fault_node": FAULT,
+                "sibling_node": FAULT,
+                "job_id": JOB_ID,
+                "attempt_id": ATTEMPT_ID,
+            }
+        )
+
+
+def test_bind_attempt_identity_compares_only_typed_flags() -> None:
+    identity = plan_identity()
+    namespace = SimpleNamespace(
+        fault_node="hyperpod-i-profile-fault",
+        sibling_node=SIBLING,
+        job_id="",
+        attempt_id="other",
+    )
+
+    # Nothing typed: the profile-filled fault node is never compared.
+    assert release.bind_attempt_identity(identity, namespace, set()) == identity
+    # Typed but empty (``--job-id ""``) binds the plan rather than conflicting.
+    assert (
+        release.bind_attempt_identity(
+            identity, namespace, {"--job-id", "--sibling-node"}
+        )
+        == identity
+    )
+    with pytest.raises(RegionalFixtureError) as refused:
+        release.bind_attempt_identity(
+            identity, namespace, {"--fault-node", "--attempt-id"}
+        )
+    assert "--fault-node hyperpod-i-profile-fault" in str(refused.value), refused.value
+    assert f"plan ({FAULT})" in str(refused.value), refused.value
+    assert (
+        f"--attempt-id other does not match the attempt's plan ({ATTEMPT_ID})"
+        in str(refused.value)
+    ), refused.value
 
 
 def test_main_routes_release_through_its_own_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings(tmp_path)
+    write_case(tmp_path / "run" / "cases" / release.CASE_ID)
     calls: list[str] = []
     monkeypatch.setattr(
         destr014.sys,
@@ -576,8 +768,8 @@ def test_main_routes_release_through_its_own_entry(
         destr014, "run_standard_case", lambda _case: calls.append("standard") or 9
     )
 
-    def build(settings_value: Any, run_dir: Path, attempt: int) -> Any:
-        calls.append(f"build:{run_dir.name}:{attempt}")
+    def build(settings_value: Any, inputs: release.ReleaseInputs) -> Any:
+        calls.append(f"build:{inputs.case_dir.parent.parent.name}:{inputs.run_id}")
         return "context"
 
     monkeypatch.setattr(destr014, "build_release_context", build)
@@ -588,4 +780,9 @@ def test_main_routes_release_through_its_own_entry(
     )
 
     assert destr014.main() == 0
-    assert calls == ["profile", "signals", "build:run:3", "release:context"], calls
+    assert calls == [
+        "profile",
+        "signals",
+        "build:run:destr014-run-a3",
+        "release:context",
+    ], calls
