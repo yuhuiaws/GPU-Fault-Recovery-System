@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 
@@ -161,10 +161,45 @@ def wait_deployment_rollout(
     capacity_grace_seconds: float = 60,
     poll_seconds: float = 2,
 ) -> dict[str, Any]:
+    """Wait for one GPU-cluster Deployment of ``target`` to roll out completely."""
+
+    return wait_deployment_rollout_with(
+        release,
+        kubectl=lambda *arguments: list(release._gpu(target, *arguments)),
+        scope=target.cluster_id,
+        deployment_name=deployment_name,
+        timeout_seconds=timeout_seconds,
+        no_progress_timeout_seconds=no_progress_timeout_seconds,
+        capacity_grace_seconds=capacity_grace_seconds,
+        poll_seconds=poll_seconds,
+    )
+
+
+def wait_deployment_rollout_with(
+    release: Any,
+    *,
+    kubectl: Callable[..., list[str]],
+    scope: str,
+    deployment_name: str,
+    timeout_seconds: float = 300,
+    no_progress_timeout_seconds: float = 90,
+    capacity_grace_seconds: float = 60,
+    poll_seconds: float = 2,
+) -> dict[str, Any]:
+    """The rollout barrier over whichever cluster ``kubectl`` addresses.
+
+    ``kubectl`` builds the command prefix (``release._gpu(target, ...)`` for a
+    GPU cluster, ``release._cpu(...)`` for the control plane) and ``scope``
+    names that cluster in failures. Completion means every replica is updated,
+    Ready and available with none unavailable -- stricter than
+    ``rollout status``, which stops at "available" -- and a Pod that cannot
+    start, a Deployment that stops progressing or a rollout that stalls fails
+    the wait instead of running out the clock.
+    """
+
     if release.runner.dry_run:
         release.runner.run(
-            release._gpu(
-                target,
+            kubectl(
                 "-n",
                 release.config.namespace,
                 "rollout",
@@ -182,8 +217,7 @@ def wait_deployment_rollout(
     kubectl_saw_completion = False
     while time.monotonic() < deadline:
         deployment = release._get_json(
-            release._gpu(
-                target,
+            kubectl(
                 "-n",
                 release.config.namespace,
                 "get",
@@ -194,7 +228,7 @@ def wait_deployment_rollout(
         failure = _deployment_failure(deployment)
         if failure is not None:
             raise ReleaseError(
-                f"{target.cluster_id} Deployment {deployment_name} failed: {failure}"
+                f"{scope} Deployment {deployment_name} failed: {failure}"
             )
         progress = _rollout_progress(deployment)
         observed_at = time.monotonic()
@@ -213,8 +247,7 @@ def wait_deployment_rollout(
                 "object": deployment,
             }
         pods = release._get_json(
-            release._gpu(
-                target,
+            kubectl(
                 "-n",
                 release.config.namespace,
                 "get",
@@ -231,11 +264,11 @@ def wait_deployment_rollout(
         )
         if failure is not None:
             raise ReleaseError(
-                f"{target.cluster_id} Deployment {deployment_name} failed: {failure}"
+                f"{scope} Deployment {deployment_name} failed: {failure}"
             )
         if no_progress >= no_progress_timeout_seconds:
             raise ReleaseError(
-                f"{target.cluster_id} Deployment {deployment_name} made no "
+                f"{scope} Deployment {deployment_name} made no "
                 f"progress for {int(no_progress)} seconds; progress={progress}"
             )
         # The interval between inspections is spent inside `rollout status`
@@ -253,8 +286,7 @@ def wait_deployment_rollout(
             continue
         kubectl_saw_completion = bounded_kubectl_wait(
             release,
-            release._gpu(
-                target,
+            kubectl(
                 "-n",
                 release.config.namespace,
                 "rollout",
@@ -264,6 +296,5 @@ def wait_deployment_rollout(
             seconds=interval,
         )
     raise ReleaseError(
-        f"{target.cluster_id} Deployment {deployment_name} exceeded "
-        f"{int(timeout_seconds)} seconds"
+        f"{scope} Deployment {deployment_name} exceeded {int(timeout_seconds)} seconds"
     )

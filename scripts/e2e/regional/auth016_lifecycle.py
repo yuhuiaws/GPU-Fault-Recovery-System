@@ -18,6 +18,7 @@ from gpu_fault.admin.rotate_token import (
     DEFAULT_QUIET_SECONDS,
     ROTATION_STEPS,
     STEP_ACCEPTED,
+    STEP_CONTROL_PLANE_ROLLED,
     STEP_DATA_PLANE_ROLLED,
     STEP_NODES_ROLLED,
     STEP_OVERLAP_PUBLISHED,
@@ -27,6 +28,7 @@ from gpu_fault.admin.rotate_token import (
 )
 from gpu_fault.admin.site import effective_environment
 from gpu_fault_release.regional_deployment_inventory import (
+    CPU_RUNTIME_DEPLOYMENTS,
     DEPLOYMENTS,
     GPU_EXECUTOR_DEPLOYMENT,
 )
@@ -200,6 +202,11 @@ def rotation_journal_errors(
         (steps[STEP_DATA_PLANE_ROLLED].get("evidence") or {}).get("deployments", [])
     ) != set(DEPLOYMENTS):
         errors.append("rotation did not roll all data-plane credential consumers")
+    control_plane = steps[STEP_CONTROL_PLANE_ROLLED].get("evidence") or {}
+    if control_plane.get("registry_secret_rewritten") is not True or set(
+        control_plane.get("deployments", [])
+    ) != set(CPU_RUNTIME_DEPLOYMENTS):
+        errors.append("rotation did not roll all control-plane registry consumers")
     node_evidence = steps[STEP_NODES_ROLLED].get("evidence") or {}
     if (
         not node_names

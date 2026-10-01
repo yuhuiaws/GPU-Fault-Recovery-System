@@ -70,6 +70,33 @@ def test_rollout_wait_fails_immediately_on_crash_loop() -> None:
         )
 
 
+def test_rollout_wait_with_addresses_the_cluster_its_kubectl_prefix_names() -> None:
+    """The barrier runs over any kubectl prefix; the GPU entry is one binding."""
+
+    commands: list[list[str]] = []
+    release = _release([_deployment(), _pod_failure("CrashLoopBackOff")])
+
+    def kubectl(*arguments: str) -> list[str]:
+        commands.append(list(arguments))
+        return ["kubectl", "--kubeconfig", "cpu.kubeconfig", *arguments]
+
+    with pytest.raises(
+        WAIT.ReleaseError,
+        match="control plane Deployment gpu-fault-api-ha failed: .*CrashLoopBackOff",
+    ):
+        WAIT.wait_deployment_rollout_with(
+            release,
+            kubectl=kubectl,
+            scope="control plane",
+            deployment_name="gpu-fault-api-ha",
+            poll_seconds=0,
+        )
+    assert commands == [
+        ["-n", "gpu-fault-system", "get", "deployment", "gpu-fault-api-ha"],
+        ["-n", "gpu-fault-system", "get", "pods", "-l", "app=executor"],
+    ]
+
+
 def test_rollout_wait_allows_transient_capacity_pending_with_progress() -> None:
     release = _release(
         [

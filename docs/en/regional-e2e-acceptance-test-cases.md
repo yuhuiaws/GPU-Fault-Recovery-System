@@ -4876,7 +4876,9 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   2. Start real-consumer claim sampling every 2 seconds and call the public `rotate-token`. The three phases
      baseline, overlap and new-consumers must be observed; the probe switching tokens by itself is no substitute for the product taking effect.
   3. Check the complete order in the native journal: the overlap window, the update of every data-plane Deployment, the full node
-     wave, the revocation of the old slot and the quiescence acceptance all completed; rolling only the Executor is not enough.
+     wave, the roll of every CPU control-plane Deployment (api-ha, control-worker, telemetry-spool-worker) after the registry
+     Secret rewrite, the revocation of the old slot and the quiescence acceptance all completed; rolling only the Executor is not
+     enough, nor may running control-plane Pods keep the old Secret snapshot (`secret_drift`).
   4. After revocation, every new consumer Pod uses the new credential and no old Pod may remain; Agents, required Collectors
      and the Watcher must have fresh post-revocation reports, and an independent request with the old token returns exactly 403.
   5. Check that the new token file matches the committed registry digest, the retiring slot has been removed, temporary credentials have been cleaned up,

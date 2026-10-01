@@ -222,6 +222,10 @@ class RotationWorld:
         self.state["steps"][lifecycle.STEP_DATA_PLANE_ROLLED]["evidence"] = {
             "deployments": list(lifecycle.DEPLOYMENTS)
         }
+        self.state["steps"][lifecycle.STEP_CONTROL_PLANE_ROLLED]["evidence"] = {
+            "registry_secret_rewritten": True,
+            "deployments": list(lifecycle.CPU_RUNTIME_DEPLOYMENTS),
+        }
         self.state["steps"][lifecycle.STEP_NODES_ROLLED]["evidence"] = {
             "reinstalled_nodes": ["node-a", "node-b"]
         }

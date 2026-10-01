@@ -24,7 +24,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
 | Permanently decommission and delete the CPU cluster | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster delete --confirm DELETE_CPU_CONTROL_PLANE` (`--aurora-final-snapshot retain|skip` decides the final snapshot) | REG-13, §3 |
 | Troubleshoot PENDING/LEASED commands, Pods not Ready, certificate/Agent version drift | `gpu-fault-admin status --full` (the former `doctor` idea has been folded into status), then follow the symptom table | §7, REG-14.2/14.3 |
-| Rotate the cluster token | `gpu-fault-admin rotate-token --state-dir ... --gpu-cluster-arn <ARN>` (one command completes the registry overlap window, GPU Secret, data-plane rollout and node Agent switch) | §6.1, REG-9 |
+| Rotate the cluster token | `gpu-fault-admin rotate-token --state-dir ... --gpu-cluster-arn <ARN>` (one command completes the registry overlap window, GPU Secret, data-plane rollout, node Agent switch, registry Secret rewrite and CPU control-plane roll) | §6.1, REG-9 |
 | Explicitly register Node key custody | `gpu-fault-admin node-key-custody configure --state-dir ... --file ... --trust-sha256 ...`; after registration the original `deploy` / `join-cluster` still perform the authorised preparation and resume; Secrets are not rotated directly | [§6.2](#62-node-key-custody) |
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, REG 8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
@@ -1150,7 +1150,7 @@ cluster, and **administrators need to run no command**:
 | Object | Current behaviour | Administrator requirement |
 |---|---|---|
 | Aurora master password | Rotated by Secrets Manager, synchronised to Kubernetes by the CronJob, running Pods re-read through the mounted file (no rollout) | Watch the age of `last-refresh-status.json` and `GpuFaultAuroraCredentialRefreshStale/Failing`; after a rotation check the three roles' mounted file digests updated and no authentication failure logs |
-| cluster token | One current token per cluster; during rotation one additional retiring token with a bounded expiry may be accepted | Use `gpu-fault-admin rotate-token` to complete the registry overlap window, GPU Secret, data plane and node Agent switch in one go (§6.1, REG-9) |
+| cluster token | One current token per cluster; during rotation one additional retiring token with a bounded expiry may be accepted | Use `gpu-fault-admin rotate-token` to complete the registry overlap window, GPU Secret, data plane and node Agent switch, plus the registry Secret rewrite and CPU control-plane roll at finalisation, in one go (§6.1, REG-9) |
 | Node Action key | Node-level key version 2; existing legitimate randomly rotated values are kept | custody must be explicitly registered in advance and independently authorised; the deployment and witness after a single-node rotation cannot be replaced by a Secret snapshot or reinstall (§6.2) |
 | Node Agent TLS | A certificate is generated per node at installation and pinned by the signed heartbeat | A certificate change raises the Agent generation; rotate via a formal node rollout, never fall back to HTTP |
 | NLB server certificate | The certificate self-issued by bootstrap and **imported** into ACM (issued by a private root CA: server certificate valid 825 days, root CA 3650 days, nodes hold the CA public key). ACM does not auto-renew imported certificates; `status` alerts ahead of time on this 825-day server certificate per `certificateMinValidityDays` (default 30) | Before expiry re-issue and import the certificate, update the data-plane trust chain and switch via a formal node rollout; there is no `renew-certificate` verb and none is planned; `curl -k` is forbidden |
@@ -1191,7 +1191,9 @@ gpu-fault-admin rotate-token \
    release transaction; fault handling need not be stopped.
 2. **Scope of impact**: only the target GPU cluster's registry entry, connection Secret, the three Deployments Executor /
    Completion Watcher / Resource Collector, and all node Agents (reinstalled wave by wave via the same fleet wave as a
-   release).
+   release); on the CPU side the finalisation rewrites the `gpu-fault-regional-clusters` Secret and rolls the three
+   Deployments that read it -- api-ha, control-worker, telemetry-spool-worker -- one at a time (each restart waits for
+   its rollout to complete before the next).
 3. **Read-only checks**: `gpu-fault-admin status` healthy; a first rotation has no conflicting `IN_PROGRESS` transaction,
    and interrupted recovery of the same rotation must reuse `<state-dir>/rotate-token/<cluster-id>/state.json`,
    which must not be deleted first.
@@ -1199,12 +1201,17 @@ gpu-fault-admin rotate-token \
    revision carrying `retiring_token_sha256` -> update the GPU connection Secret -> roll the data plane -> reinstall nodes by wave -> wait for the control-plane
    logs to pass the current retention check with no
    `regional cluster <id> authenticated with the retiring token` within the `--quiet-seconds` (default 180) window -> atomically write
-   `secure/<cluster-id>.token` (the old file kept as `.retired-<time>`) -> publish the revision dropping the retiring
-   digest. `--window-minutes` (default 120, set in minutes or hours, not days), `--keep-window`,
+   `secure/<cluster-id>.token` (the old file kept as `.retired-<time>`) -> write the new token into the
+   `gpu-fault-regional-clusters` Secret and roll the three CPU Deployments (the retiring digest is still in the durable
+   head, so both tokens are accepted meanwhile) -> publish the revision dropping the retiring
+   digest. CPU Pods read that Secret only at start; without the roll every replica keeps reporting
+   `regional_registry.secret_drift=true`. `--window-minutes` (default 120, set in minutes or hours, not days), `--keep-window`,
    `--rollback` and the state machine and resume rules are in REG-9.
 5. **Success criteria**: output `status=COMPLETED`; in `GET /v1/regional/clusters` that cluster has
    `retiring_token_sha256_present=false` (the two digests themselves are always redacted); the token file digest equals the output's
-   `new_token_sha256`; `warnings` is empty.
+   `new_token_sha256`; `warnings` is empty; every api-ha replica reports `regional_registry.secret_drift=false` on
+   `/healthz?verbose=1` (under `--keep-window` the retiring digest stays in the head, so the drift persists until the
+   next registry publish after the window closes).
 6. **Rollback**: before the `TOKEN_FILE_WRITTEN` start intent is recorded, the same command with `--rollback` can be used
    (Secret -> data plane -> nodes that started or completed the switch -> registry containing only the old digest).
    Once that write intent is on disk, even if the file replacement ACK is lost you can only continue the original rotation without `--rollback` and cannot

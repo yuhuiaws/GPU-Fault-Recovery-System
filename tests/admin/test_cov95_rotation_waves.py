@@ -12,6 +12,8 @@ from gpu_fault.admin import release_engine
 from gpu_fault.admin import rotate_token as rotation
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import load_site
+from gpu_fault_release import repository_root
+from gpu_fault_release.regional_release_config import ReleaseError
 from tests.admin.test_admin_rotate_token import Harness
 from tests.admin.test_admin_site import site_file
 from tests.admin.test_cov95_rotate_token import pause
@@ -115,6 +117,98 @@ def test_rotation_restarts_every_secret_consumer_before_waiting(context, monkeyp
     )
     assert all(count == len(waits) for _name, count, _timeout in waits), (
         "rotation waited before all connection-secret consumers restarted"
+    )
+
+
+def test_control_plane_secret_consumers_are_the_manifests_that_mount_it():
+    """The rolled set is exactly the CPU Deployments that read the registry Secret."""
+
+    import yaml
+
+    generated = repository_root() / "deploy/control-plane/regional/generated"
+    consumers = set()
+    for manifest in sorted(generated.glob("*.yaml")):
+        for document in yaml.safe_load_all(manifest.read_text(encoding="utf-8")):
+            if not isinstance(document, dict) or document.get("kind") != "Deployment":
+                continue
+            if "gpu-fault-regional-clusters" in json.dumps(document):
+                consumers.add(document["metadata"]["name"])
+    assert consumers == set(rotation.CONTROL_PLANE_SECRET_CONSUMERS), (
+        "rotate-token must roll every CPU Deployment that loads the registry Secret"
+    )
+    assert consumers == {
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+    }
+
+
+def test_rotation_restarts_each_control_plane_consumer_then_waits_for_it(
+    context, monkeypatch
+):
+    waits = []
+
+    def wait(release, *, kubectl, scope, deployment_name, timeout_seconds):
+        waits.append(
+            (
+                deployment_name,
+                len(context.transport.calls),
+                timeout_seconds,
+                scope,
+                kubectl("-n", "gpu-fault-system")[:3],
+            )
+        )
+        return {
+            "deployment": deployment_name,
+            "duration_seconds": 1.5,
+            "progress": [2, 1, 1, 1],
+            "object": {"kind": "Deployment"},
+        }
+
+    monkeypatch.setattr(rotation, "wait_deployment_rollout_with", wait)
+    result = rotation.restart_control_plane(context.release)
+
+    names = list(rotation.CONTROL_PLANE_SECRET_CONSUMERS)
+    restarts = [call for call in context.transport.calls if "restart" in call]
+    assert [call[-1] for call in restarts] == [f"deployment/{name}" for name in names]
+    cpu_prefix = context.release._cpu()
+    assert all(call[: len(cpu_prefix)] == cpu_prefix for call in restarts), (
+        "control-plane restarts go through the CPU kubeconfig, not a GPU context"
+    )
+    assert all("--context" not in call for call in restarts), (
+        "a GPU context must never be used for the control plane"
+    )
+    assert [name for name, *_rest in waits] == names
+    assert [count for _name, count, *_rest in waits] == list(
+        range(1, len(names) + 1)
+    ), "each Deployment is restarted and waited for before the next one restarts"
+    assert all(
+        timeout == rotation.DEPLOYMENT_ROLLOUT_TIMEOUT_SECONDS
+        and scope == "control plane"
+        and prefix == cpu_prefix
+        for _name, _count, timeout, scope, prefix in waits
+    ), (
+        "every wait uses the rotation timeout, the control-plane scope and the CPU kubectl"
+    )
+    assert result["deployments"] == names
+    assert result["rollouts"][names[0]] == {
+        "duration_seconds": 1.5,
+        "progress": [2, 1, 1, 1],
+    }, "the journal keeps the rollout outcome, not the Deployment object"
+
+
+def test_control_plane_rollout_failure_stops_before_the_next_restart(
+    context, monkeypatch
+):
+    def wait(release, *, kubectl, scope, deployment_name, timeout_seconds):
+        raise ReleaseError(f"{scope} Deployment {deployment_name} exceeded 600 seconds")
+
+    monkeypatch.setattr(rotation, "wait_deployment_rollout_with", wait)
+    with pytest.raises(ReleaseError, match="control plane Deployment .* exceeded"):
+        rotation.restart_control_plane(context.release)
+    restarts = [call for call in context.transport.calls if "restart" in call]
+    assert len(restarts) == 1, (
+        "a rollout that did not complete leaves the remaining Deployments alone"
     )
 
 

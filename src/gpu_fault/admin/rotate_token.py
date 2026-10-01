@@ -18,7 +18,7 @@ State machine (``<state-dir>/rotate-token/<cluster-id>/state.json``)::
 
     PREPARED -> REGISTRY_OVERLAP_PUBLISHED -> CONNECTION_SECRET_UPDATED
       -> DATA_PLANE_ROLLED -> NODES_ROLLED -> DATA_PLANE_ACCEPTED
-      -> TOKEN_FILE_WRITTEN -> RETIRING_TOKEN_DROPPED
+      -> TOKEN_FILE_WRITTEN -> CONTROL_PLANE_ROLLED -> RETIRING_TOKEN_DROPPED
 
 Re-running with the same arguments resumes at the first unfinished step. The
 new token lives only in a 0600 file under the state directory until the data
@@ -27,6 +27,28 @@ on a command line. The site's token file is rewritten only after that proof,
 atomically, with the old value kept as ``<file>.retired-<timestamp>``.
 ``--rollback`` walks the data plane back onto the old token and republishes
 the old-only registry while the window still accepts both.
+
+``CONTROL_PLANE_ROLLED`` is the control plane restart the manual procedure had
+and the verb at first dropped. The CPU Deployments (api-ha, control-worker,
+telemetry-spool-worker) read the registry Secret into their environment once,
+at Pod start, so rewriting ``gpu-fault-regional-clusters`` reaches no running
+Pod; until they restart every replica compares its start-up snapshot with the
+durable head and reports ``regional_registry.secret_drift`` (observed
+2026-09-30: drift held after a completed rotation until an operator ran
+``kubectl rollout restart`` by hand, and the acceptance registry-alignment
+preflight refused to run). The step sits between the token file write and the
+final publish on purpose: the Secret is rewritten first so the restarted Pods
+load the accepted token, and the retiring digest is still in the durable head
+while they roll, so both tokens stay accepted throughout and a stalled rollout
+leaves a working fleet that a rerun resumes at the same step. The drift digest
+covers the retiring digest too, so the Pods read aligned only once the final
+publish drops it (``--keep-window`` therefore leaves ``secret_drift`` raised
+until the window closes and the registry is next published). Rollback never
+needs the step: it is refused once ``TOKEN_FILE_WRITTEN`` has started and the
+Secret is untouched before that, so the running Pods' snapshot is exactly the
+old-only registry the rollback republishes. A journal written by a build that
+predates the step resumes through it, so a rotation left mid-finish gets the
+restart on its next run.
 
 Node delivery reuses the release's fleet-wave machinery -- the Agent lease and
 open-command safety barrier, the Reconciler wave ConfigMap handoff and the
@@ -117,7 +139,10 @@ from gpu_fault_release.regional_release_online_registry import (
     publish_registry_revision,
 )
 from gpu_fault_release.regional_release_registry import registry, write_registry
-from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
+from gpu_fault_release.regional_release_rollout_wait import (
+    wait_deployment_rollout,
+    wait_deployment_rollout_with,
+)
 from gpu_fault_release.regional_release_state import remote_command_stats
 
 STATE_SCHEMA_VERSION = 1
@@ -148,6 +173,7 @@ STEP_DATA_PLANE_ROLLED = "DATA_PLANE_ROLLED"
 STEP_NODES_ROLLED = "NODES_ROLLED"
 STEP_ACCEPTED = "DATA_PLANE_ACCEPTED"
 STEP_TOKEN_FILE_WRITTEN = "TOKEN_FILE_WRITTEN"
+STEP_CONTROL_PLANE_ROLLED = "CONTROL_PLANE_ROLLED"
 STEP_RETIRING_DROPPED = "RETIRING_TOKEN_DROPPED"
 ROTATION_STEPS = (
     STEP_PREPARED,
@@ -157,8 +183,13 @@ ROTATION_STEPS = (
     STEP_NODES_ROLLED,
     STEP_ACCEPTED,
     STEP_TOKEN_FILE_WRITTEN,
+    STEP_CONTROL_PLANE_ROLLED,
     STEP_RETIRING_DROPPED,
 )
+# The CPU Deployments whose Pods load ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` from
+# the registry Secret at start (api-ha, control-worker, telemetry-spool-worker):
+# the ones a Secret rewrite reaches only through a restart.
+CONTROL_PLANE_SECRET_CONSUMERS = inventory.CPU_RUNTIME_DEPLOYMENTS
 ROLLBACK_SECRET_RESTORED = "ROLLBACK_SECRET_RESTORED"
 ROLLBACK_DATA_PLANE_ROLLED = "ROLLBACK_DATA_PLANE_ROLLED"
 ROLLBACK_NODES_ROLLED = "ROLLBACK_NODES_ROLLED"
@@ -552,6 +583,39 @@ def restart_data_plane(release: Any, target: ClusterTarget) -> dict[str, Any]:
             timeout_seconds=DEPLOYMENT_ROLLOUT_TIMEOUT_SECONDS,
         )
     return {"deployments": list(inventory.DEPLOYMENTS)}
+
+
+def restart_control_plane(release: Any) -> dict[str, Any]:
+    """Restart every CPU Deployment that loads the registry Secret and wait.
+
+    One Deployment at a time -- restart, then the full rollout barrier -- so at
+    most one control-plane role is rolling while the data plane keeps
+    authenticating against the others; api-ha's own rolling update keeps the
+    ingress serving. A rollout that does not complete raises, and the
+    Deployments after it are left alone for the rerun.
+    """
+
+    namespace = release.config.namespace
+    rollouts: dict[str, Any] = {}
+    for name in CONTROL_PLANE_SECRET_CONSUMERS:
+        release.runner.run(
+            release._cpu("-n", namespace, "rollout", "restart", f"deployment/{name}")
+        )
+        result = wait_deployment_rollout_with(
+            release,
+            kubectl=release._cpu,
+            scope="control plane",
+            deployment_name=name,
+            timeout_seconds=DEPLOYMENT_ROLLOUT_TIMEOUT_SECONDS,
+        )
+        # The Deployment object itself is left out of the journal: the
+        # evidence wants the outcome, not a copy of the manifest.
+        rollouts[name] = {
+            key: result[key]
+            for key in ("duration_seconds", "progress", "dry_run")
+            if key in result
+        }
+    return {"deployments": list(CONTROL_PLANE_SECRET_CONSUMERS), "rollouts": rollouts}
 
 
 def token_rollout_waves(
@@ -1081,10 +1145,22 @@ def _finish(context: RotationContext, new_token: str) -> None:
         complete_step(
             context, STEP_TOKEN_FILE_WRITTEN, {"retired_token_file": str(retired)}
         )
-    if not step_done(context.state, STEP_RETIRING_DROPPED):
+    if not step_done(context.state, STEP_CONTROL_PLANE_ROLLED):
+        # Secret first, then the restart that makes the Pods load it; both
+        # tokens are still in the durable head while the control plane rolls.
         rewrite_registry_secret_token(
             context.release, context.cluster_id, _read_token(context.token_file)
         )
+        start_step(context, STEP_CONTROL_PLANE_ROLLED)
+        complete_step(
+            context,
+            STEP_CONTROL_PLANE_ROLLED,
+            {
+                "registry_secret_rewritten": True,
+                **restart_control_plane(context.release),
+            },
+        )
+    if not step_done(context.state, STEP_RETIRING_DROPPED):
         evidence: dict[str, Any] = {"retiring_token_dropped": False}
         if context.request.keep_window:
             context.state.setdefault("warnings", []).append(
@@ -1310,7 +1386,8 @@ def add_rotate_token_command(
         help=(
             "rotate one GPU cluster's token end to end: registry overlap window, "
             "GPU Secret, data-plane Deployments, node Agents in fleet waves, then "
-            "the site's token file; rerun to resume"
+            "the site's token file, the registry Secret and a control-plane "
+            "restart; rerun to resume"
         ),
     )
     add_managed_site_arguments(command)

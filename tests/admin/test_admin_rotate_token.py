@@ -94,6 +94,7 @@ def _release(token_file: str = "/secure/gpu-a.token") -> SimpleNamespace:
         _target=lambda cluster_id: target,
         _remote_commands_are_idle=lambda: True,
         _gpu=lambda target, *args: ["kubectl", "--context", target.context, *args],
+        _cpu=lambda *args: ["kubectl", "--kubeconfig", "cpu.kubeconfig", *args],
     )
 
 
@@ -114,6 +115,7 @@ class Harness:
         self.secret = _secret_entries()
         self.publishes: list[dict] = []
         self.acceptance_error: BootstrapError | None = None
+        self.control_plane_error: Exception | None = None
         self.publish_errors: list[Exception] = []
         self.clock = NOW
 
@@ -154,6 +156,19 @@ class Harness:
             self.calls.append(("restart_data_plane", target.cluster_id))
             return {"deployments": ["executor"]}
 
+        def restart_control_plane(release):
+            # Recorded with what the control plane would load (the Secret's
+            # token for gpu-a) and how many revisions are published so far.
+            self.calls.append(
+                ("restart_control_plane", self.secret[0]["token"], len(self.publishes))
+            )
+            if self.control_plane_error is not None:
+                raise self.control_plane_error
+            return {
+                "deployments": ["api-ha"],
+                "rollouts": {"api-ha": {"duration_seconds": 1.0, "progress": [1]}},
+            }
+
         def roll(release, target, *, rotation_id, progress, record, only_nodes=None):
             progress["completed_nodes"] = sorted(only_nodes or {"node-1", "node-2"})
             record()
@@ -186,6 +201,7 @@ class Harness:
         monkeypatch.setattr(module, "write_registry", write_registry)
         monkeypatch.setattr(module, "ensure_connection_secret", ensure_secret)
         monkeypatch.setattr(module, "restart_data_plane", restart)
+        monkeypatch.setattr(module, "restart_control_plane", restart_control_plane)
         monkeypatch.setattr(module, "roll_node_tokens", roll)
         monkeypatch.setattr(module, "wait_for_new_token_acceptance", accept)
 
@@ -231,6 +247,7 @@ def test_rotation_runs_every_step_and_writes_the_token_file_only_after_acceptanc
         "roll_node_tokens",
         "acceptance",
         "write_registry",
+        "restart_control_plane",
         "publish",
     ]
     overlap = harness.publishes[0]["registrations"]
@@ -257,6 +274,20 @@ def test_rotation_runs_every_step_and_writes_the_token_file_only_after_acceptanc
     # The bootstrap Secret carries the accepted token and the final revision
     # drops the retiring digest.
     assert harness.secret[0]["token"] == new_token
+    # The control plane is rolled after the Secret rewrite (so the Pods load
+    # the accepted token) and before the final publish (so the retiring digest
+    # is still accepted while they roll).
+    _kind, loaded_token, published = next(
+        call for call in harness.calls if call[0] == "restart_control_plane"
+    )
+    assert loaded_token == new_token and published == 1, (
+        "the control plane must roll between the Secret rewrite and the final publish"
+    )
+    control_plane = state["steps"][module.STEP_CONTROL_PLANE_ROLLED]["evidence"]
+    assert control_plane["registry_secret_rewritten"] is True
+    assert control_plane["deployments"] == ["api-ha"]
+    assert control_plane["rollouts"]["api-ha"]["progress"] == [1]
+    assert new_token not in json.dumps(state), "the journal never carries a token"
     final = next(
         item
         for item in harness.publishes[1]["registrations"]
@@ -293,9 +324,12 @@ def test_token_file_stays_old_until_acceptance_and_a_rerun_resumes(
     summary = harness.rotate()
 
     resumed = [call[0] for call in harness.calls[before:]]
-    assert resumed == ["acceptance", "write_registry", "publish"], (
-        "the resume repeats nothing the state file already recorded"
-    )
+    assert resumed == [
+        "acceptance",
+        "write_registry",
+        "restart_control_plane",
+        "publish",
+    ], "the resume repeats nothing the state file already recorded"
     assert harness.token_file.read_text(encoding="utf-8") == pending_token
     assert summary["status"] == module.STATUS_COMPLETED
     assert summary["rotation_id"] == state["rotation_id"]
@@ -322,7 +356,84 @@ def test_resume_after_final_publish_failure_uses_the_committed_token(
 
     assert result["status"] == module.STATUS_COMPLETED
     assert result["new_token_sha256"] == committed_digest
-    assert [item[0] for item in harness.calls[before:]] == ["write_registry", "publish"]
+    assert [item[0] for item in harness.calls[before:]] == ["publish"], (
+        "the completed Secret rewrite and control-plane roll are not repeated"
+    )
+    assert module.STEP_CONTROL_PLANE_ROLLED in harness.state["steps"]
+
+
+def test_control_plane_rollout_failure_fails_closed_and_the_rerun_resumes_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    harness.control_plane_error = ReleaseError(
+        "control plane Deployment gpu-fault-api-ha exceeded 600 seconds"
+    )
+
+    with pytest.raises(ReleaseError, match="gpu-fault-api-ha exceeded"):
+        harness.rotate()
+
+    state = harness.state
+    assert state["status"] == module.STATUS_IN_PROGRESS
+    assert module.STEP_TOKEN_FILE_WRITTEN in state["steps"]
+    assert module.STEP_CONTROL_PLANE_ROLLED in state["started_steps"]
+    assert module.STEP_CONTROL_PLANE_ROLLED not in state["steps"]
+    assert module.STEP_RETIRING_DROPPED not in state["steps"]
+    assert len(harness.publishes) == 1, (
+        "the retiring digest is not dropped while the control plane has not rolled"
+    )
+    new_token = harness.token_file.read_text(encoding="utf-8")
+    assert harness.secret[0]["token"] == new_token, (
+        "the Secret rewrite precedes the restart that loads it"
+    )
+    with pytest.raises(BootstrapError, match="rollback is forbidden"):
+        harness.rotate(rollback=True)
+
+    harness.control_plane_error = None
+    before = len(harness.calls)
+    summary = harness.rotate()
+
+    assert [call[0] for call in harness.calls[before:]] == [
+        "write_registry",
+        "restart_control_plane",
+        "publish",
+    ], "the rerun resumes at the roll, re-asserting the Secret it must load"
+    assert summary["status"] == module.STATUS_COMPLETED
+    assert summary["steps"][module.STEP_CONTROL_PLANE_ROLLED] is not None
+    assert harness.token_file.read_text(encoding="utf-8") == new_token
+
+
+def test_a_journal_from_before_the_control_plane_step_resumes_through_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A site left mid-finish by a build without the step gets the restart."""
+
+    harness = Harness(tmp_path, monkeypatch)
+    publish = module.publish_current_revision
+
+    def fail_final(*args, **kwargs):
+        raise ReleaseError("final registry publish interrupted")
+
+    monkeypatch.setattr(module, "publish_current_revision", fail_final)
+    with pytest.raises(ReleaseError, match="final registry publish"):
+        harness.rotate()
+    monkeypatch.setattr(module, "publish_current_revision", publish)
+    path = module.rotation_state_path(harness.site, "gpu-a")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    del state["steps"][module.STEP_CONTROL_PLANE_ROLLED]
+    del state["started_steps"][module.STEP_CONTROL_PLANE_ROLLED]
+    path.write_text(json.dumps(state), encoding="utf-8")
+    before = len(harness.calls)
+
+    summary = harness.rotate()
+
+    assert [call[0] for call in harness.calls[before:]] == [
+        "write_registry",
+        "restart_control_plane",
+        "publish",
+    ]
+    assert summary["status"] == module.STATUS_COMPLETED
+    assert set(harness.state["steps"]) == set(module.ROTATION_STEPS)
 
 
 def test_token_replace_ack_loss_resumes_forward_and_refuses_rollback(
@@ -653,6 +764,15 @@ def test_rollback_walks_the_data_plane_back_before_restoring_the_registry(
     assert harness.token_file.read_text(encoding="utf-8") == OLD_TOKEN
     assert not Path(harness.state["pending_token_file"]).exists(), (
         "the pending token is shredded on rollback"
+    )
+    # The registry Secret was never rewritten before the rollback boundary, so
+    # the running control-plane Pods already hold the old-only registry the
+    # rollback republishes: no restart, and the journal says so.
+    assert harness.secret[0]["token"] == OLD_TOKEN
+    assert "restart_control_plane" not in [call[0] for call in harness.calls]
+    assert module.STEP_CONTROL_PLANE_ROLLED not in harness.state.get("steps", {})
+    assert module.STEP_CONTROL_PLANE_ROLLED not in harness.state.get(
+        "started_steps", {}
     )
 
 

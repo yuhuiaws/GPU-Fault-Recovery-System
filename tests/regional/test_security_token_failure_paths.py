@@ -10,7 +10,17 @@ from tests.regional._security_token_rotation_support import RotationWorld
 
 
 @pytest.mark.parametrize(
-    "defect", ["deployments", "nodes", "retirement", "quiet", "loss", "timestamp"]
+    "defect",
+    [
+        "deployments",
+        "control-plane",
+        "control-plane-secret",
+        "nodes",
+        "retirement",
+        "quiet",
+        "loss",
+        "timestamp",
+    ],
 )
 def test_production_journal_requires_each_claimed_postcondition(
     monkeypatch, tmp_path, defect
@@ -23,6 +33,14 @@ def test_production_journal_requires_each_claimed_postcondition(
         steps[lifecycle.STEP_DATA_PLANE_ROLLED]["evidence"]["deployments"] = [
             "gpu-fault-cluster-executor"
         ]
+    elif defect == "control-plane":
+        steps[lifecycle.STEP_CONTROL_PLANE_ROLLED]["evidence"]["deployments"] = [
+            "gpu-fault-api-ha"
+        ]
+    elif defect == "control-plane-secret":
+        steps[lifecycle.STEP_CONTROL_PLANE_ROLLED]["evidence"][
+            "registry_secret_rewritten"
+        ] = False
     elif defect == "nodes":
         steps[lifecycle.STEP_NODES_ROLLED]["evidence"]["reinstalled_nodes"] = ["node-a"]
     elif defect == "retirement":

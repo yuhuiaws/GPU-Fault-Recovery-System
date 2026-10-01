@@ -5353,8 +5353,11 @@ gpu-fault-admin rotate-token \
    unfinished release transaction (any intermediate phase of `deploy`/`resume`/`rollback`, or a `complete` not yet
    committed). If either fails, the command refuses outright and modifies nothing. It is not necessary to wait until there are no non-terminal
    workflows: old and new tokens are both valid during the overlap window (design in Administrator Operations §6.1).
-2. **Scope of impact**: only the GPU cluster pointed to by `--gpu-cluster-arn`. The CPU side only publishes two extra registry
-   revisions (overlap first, then finalisation); that cluster's Executor, Completion Watcher and Resource Collector
+2. **Scope of impact**: only the GPU cluster pointed to by `--gpu-cluster-arn`. The CPU side publishes two extra registry
+   revisions (overlap first, then finalisation) and, before the finalisation, writes the new token into the
+   `gpu-fault-regional-clusters` Secret and rolls the three Deployments that read it -- api-ha, control-worker,
+   telemetry-spool-worker -- one at a time (each restart waits for its rollout to complete before the next); that
+   cluster's Executor, Completion Watcher and Resource Collector
    Deployments each roll once; every node reinstalls the Agent once via the same fleet wave as a release (Agent lease / open command
    safety gate -> Reconciler wave ConfigMap handover -> `installer-state=Retrying` triggering the installer reinstall ->
    installer state and heartbeat convergence), and the node's Agent is briefly unavailable during the reinstall. Other GPU
@@ -5373,30 +5376,43 @@ gpu-fault-admin rotate-token \
    it is not printed, does not enter the command line, and does not enter `state.json` (which records only the sha256). State machine:
    `PREPARED → REGISTRY_OVERLAP_PUBLISHED → CONNECTION_SECRET_UPDATED →
    DATA_PLANE_ROLLED → NODES_ROLLED → DATA_PLANE_ACCEPTED → TOKEN_FILE_WRITTEN →
-   RETIRING_TOKEN_DROPPED`. After any step fails, rerun with exactly the same parameters to resume from the first unfinished step;
+   CONTROL_PLANE_ROLLED → RETIRING_TOKEN_DROPPED`. `CONTROL_PLANE_ROLLED` first writes the new token into the
+   `gpu-fault-regional-clusters` Secret, then `rollout restart`s the three CPU Deployments one by one and waits for each
+   rollout to complete; it precedes the final revision because the retiring digest is still in the durable head at that
+   point, so both tokens are accepted and a stalled rollout only makes the command fail closed and resume at that step on
+   the rerun. CPU Pods read that Secret only at start; without this step every replica keeps reporting
+   `regional_registry.secret_drift=true` and the acceptance registry-alignment preflight refuses to run. After any step
+   fails, rerun with exactly the same parameters to resume from the first unfinished step; an unfinished `state.json`
+   left by an older build also passes through this step on resume;
    on resume, if the remaining window is under 10 minutes it first republishes the overlap revision to extend the window and then continues, rather than relying on expiry to finalise.
-5. **Success criteria**: `status` in the output JSON is `COMPLETED`, all eight `steps` have timestamps,
+5. **Success criteria**: `status` in the output JSON is `COMPLETED`, all nine `steps` have timestamps,
    `old_token_sha256` and `new_token_sha256` differ; the sha256 of the `token_file` content equals
    `new_token_sha256`, and `<file>.retired-<time>` appears next to it; in `GET /v1/regional/clusters`
-   that cluster has `retiring_token_sha256_present=false` (without `--keep-window`); `warnings`
+   that cluster has `retiring_token_sha256_present=false` (without `--keep-window`); every api-ha replica reports
+   `regional_registry.secret_drift=false` on `/healthz?verbose=1` (under `--keep-window` the retiring digest stays in
+   the head, so the drift persists until the next registry publish after the window closes); `warnings`
    is empty -- if `remote command terminal counters grew` appears, a remote command was terminated during the rollout;
    investigate per REG-14. Looking only at Pod Ready does not count as success: before `TOKEN_FILE_WRITTEN` the deployment
    host still holds the old token, and the next release would republish the old token.
 6. **Rollback**: any failure before `DATA_PLANE_ACCEPTED` can be
    `gpu-fault-admin rotate-token ... --rollback`: it writes the old token back into the GPU Secret, rolls the data-plane
    Deployments, reinstalls only the nodes that already received the new token, and finally publishes a registry
-   revision containing only the old digest; both tokens are accepted throughout, with no interruption window. If publishing the overlap revision itself fails, the command
+   revision containing only the old digest; both tokens are accepted throughout, with no interruption window. A
+   rollback does not roll the CPU control plane: the `gpu-fault-regional-clusters` Secret is never rewritten before
+   `TOKEN_FILE_WRITTEN`, so the running CPU Pods already hold exactly the old registry the rollback republishes. If publishing the overlap revision itself fails, the command
    automatically republishes the old digest with no human intervention. After `TOKEN_FILE_WRITTEN` the old token has been retired and
    `--rollback` refuses -- rolling back at that point is equivalent to doing another rotation.
 7. **Evidence**: `<state-dir>/rotate-token/<cluster-id>/state.json` (archived to
    `history/<rotation_id>.json` when the next rotation starts) records the operator ARN, `--reference`, the two digests, the completion time and registry generation of every step,
-   the reinstalled nodes and the remote command baseline; the command's output JSON is the
+   the reinstalled nodes, the rolled CPU Deployments with their rollout results (`deployments`/`rollouts` under
+   `CONTROL_PLANE_ROLLED`) and the remote command baseline; the command's output JSON is the
    change-ticket attachment. None of these contains the token in plaintext.
 
 Correspondence to the manual procedure: the registry overlap revision (former step 3), the GPU Secret (step 4), the data-plane restart
 (step 5), the node credentials (step 6, no longer using the REG-10 DaemonSet), the retirement log confirmation (step 7),
 and the finalisation publish and file replacement (step 8) are all done by the command; the
-`gpu-fault-regional-clusters` Secret used by bootstrap is updated with the new token at finalisation. REG-10 is now used only for endpoint and CA
+`gpu-fault-regional-clusters` Secret used by bootstrap is updated with the new token at finalisation and the three CPU
+Deployments that read it are rolled right after (the manual procedure's control plane restart, `CONTROL_PLANE_ROLLED`). REG-10 is now used only for endpoint and CA
 migration, no longer for token rotation.
 
 #### REG-10. Bulk Migration of Node Endpoints and Credentials
