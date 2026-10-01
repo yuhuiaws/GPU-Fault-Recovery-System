@@ -77,6 +77,7 @@ RECORD_FIELDS = (
 # registry primitives it uses (``drain_agent``/``revoke_agent``) predate every
 # release this can be asked to repair.
 AGENT_SCRIPT = """
+import re
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -157,21 +158,27 @@ elif payload["mode"] == "retire-departed-agents":
                 or evidence.get("absent_from_provider") is not True
             ):
                 raise ValueError("departed-node evidence does not prove the node gone")
+            # The fleet record's node_instance_id is whatever the node reported
+            # at registration -- on HyperPod/EKS the Kubernetes Node UID, not the
+            # EC2 instance id the evidence carries (live 2026-10-01). Only an
+            # EC2-shaped value can be compared; a UID is recorded in the audit.
+            recorded_instance = str(current.node_instance_id or "")
             if (
-                current.node_instance_id
+                re.fullmatch(r"i-[0-9a-f]{8,17}", recorded_instance)
                 and evidence.get("instance_id")
-                and current.node_instance_id != evidence["instance_id"]
+                and recorded_instance != evidence["instance_id"]
             ):
                 raise ValueError(
                     "agent instance changed: the record names "
-                    f"{current.node_instance_id}, the evidence {evidence['instance_id']}"
+                    f"{recorded_instance}, the evidence {evidence['instance_id']}"
                 )
             hyperpod = (evidence.get("sources") or {}).get("hyperpod") or {}
             read_at = evidence.get("read_at") or {}
             audit = (
                 f"operator reconciliation {payload['reference']}: retired Agent "
                 f"{item['node_id']} after its node left Kubernetes and HyperPod "
-                f"(instance {evidence.get('instance_id')}, HyperPod cluster "
+                f"(instance {evidence.get('instance_id')}, record node_instance_id "
+                f"{recorded_instance or 'unset'}, HyperPod cluster "
                 f"{hyperpod.get('cluster_name')} in {hyperpod.get('region')}; "
                 f"kubernetes read {read_at.get('kubernetes')}, hyperpod read "
                 f"{read_at.get('hyperpod')}; actor {payload.get('actor')}; "

@@ -776,6 +776,57 @@ def test_the_script_accepts_the_inventory_spelling_of_the_heartbeat(
     assert store.get_agent("gpu-a", NODE).lifecycle_state is AgentLifecycleState.REVOKED
 
 
+def test_a_record_whose_instance_field_is_a_node_uid_is_still_retired(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On HyperPod/EKS the registration stores the Kubernetes Node UID in
+    ``node_instance_id``; it is not comparable with the EC2 instance id of the
+    evidence and must not be mistaken for a changed instance (live defect)."""
+
+    now = datetime.now(timezone.utc)
+    store, registry = _fleet(now)
+    record = store.get_agent("gpu-a", NODE)
+    uid_record = record.model_copy(
+        update={"node_instance_id": "59fe166a-3d25-4514-ad57-0126c53078c0"}
+    )
+    store.save_agent(uid_record)
+    record = store.get_agent("gpu-a", NODE)
+    assert record.node_instance_id.startswith("59fe"), (
+        "fixture must carry a UID-shaped value"
+    )
+
+    result = _exec_script(
+        monkeypatch,
+        capsys,
+        store,
+        registry,
+        {
+            "mode": "retire-departed-agents",
+            "items": [
+                {
+                    "cluster_id": "gpu-a",
+                    "node_id": NODE,
+                    "generation": record.generation,
+                    "lifecycle_state": record.lifecycle_state.value,
+                    "last_seen_at": record.last_seen_at.isoformat(),
+                    "departed_node_evidence": _evidence(NODE),
+                }
+            ],
+            "reference": REFERENCE,
+            "actor": TEST_OPERATOR_ARN,
+            "admin_plan_sha256": "d" * 64,
+            "transition_id": f"workflow-reconcile/{REFERENCE}/0123456789abcdef",
+        },
+    )
+
+    assert result["failed_agents"] == [], result.get("failures")
+    retired = store.get_agent("gpu-a", NODE)
+    assert retired.lifecycle_state is AgentLifecycleState.REVOKED
+    assert "record node_instance_id 59fe166a" in (retired.transition_reason or ""), (
+        "the audit line must record the UID the comparison skipped"
+    )
+
+
 def test_the_script_refuses_without_a_registry_and_an_unknown_mode(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
