@@ -29,7 +29,16 @@ def _run_child(
         "PYTHONDONTWRITEBYTECODE": "1",
         reporter.REPORT_ENV: str(report),
     }
-    environment.pop(reporter.IDENTITY_ROOT_ENV, None)
+    # A coverage shard exports its partition and CI context to every child; a
+    # runtime shard inherited here would deselect the single test (exit 5).
+    for name in (
+        reporter.IDENTITY_ROOT_ENV,
+        reporter.PARTITION_COUNT_ENV,
+        reporter.PARTITION_INDEX_ENV,
+        reporter.CI_CONTEXT_ENV,
+        "PYTEST_ADDOPTS",
+    ):
+        environment.pop(name, None)
     if identity_root is not None:
         environment[reporter.IDENTITY_ROOT_ENV] = str(identity_root)
     return subprocess.run(

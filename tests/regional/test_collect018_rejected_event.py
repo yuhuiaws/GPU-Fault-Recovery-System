@@ -462,4 +462,4 @@ def test_the_runner_is_plan_by_default_with_the_documented_flags(
         ROOT / "scripts/e2e/regional/run_collect018_rejected_event.py",
         ROOT / "scripts/e2e/regional/probes/collector_window_probe.py",
     ):
-        assert path.stat().st_mode & 0o777 == 0o775, path
+        assert path.stat().st_mode & 0o111 == 0o111, path

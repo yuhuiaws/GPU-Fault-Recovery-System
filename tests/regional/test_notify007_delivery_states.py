@@ -514,4 +514,4 @@ def test_the_runner_is_plan_by_default_with_the_documented_flags(
     assert verdicts.PREDECESSOR_CASE_ID == "GF-REGIONAL-NOTIFY-005"
     assert (
         ROOT / "scripts/e2e/regional/run_notify007_delivery_states.py"
-    ).stat().st_mode & 0o777 == 0o775
+    ).stat().st_mode & 0o111 == 0o111

@@ -218,19 +218,19 @@ jobs:
         env:
           POSTGRES_USER: gpu_fault
           POSTGRES_PASSWORD: gpu_fault
-          POSTGRES_DB: gpu_fault_test
+          POSTGRES_DB: postgres
         ports:
           - 127.0.0.1:5432:5432
         options: >-
           --label "gpu-fault.test-owner=gpu-fault-ci-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}-postgres"
-          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
+          --health-cmd "pg_isready -U gpu_fault -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
       CI_TEST_RUNNER_LABEL: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
       GPU_FAULT_TEST_POSTGRES_URL: >-
-        postgresql://gpu_fault@127.0.0.1:5432/gpu_fault_test
+        postgresql://gpu_fault@127.0.0.1:5432/postgres
       PYTEST_DURATIONS: "50"
       PYTEST_XDIST_DIST: worksteal
       PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
@@ -514,6 +514,9 @@ jobs:
       - run: >-
           python -m pip install
           '.[dev,collectors,postgres,performance]'
+      # test-shuffled runs promtool-preflight first; the pinned tool comes from
+      # the same supply-chain venv the static job installs.
+      - run: make ci-supply-chain-tools PYTHON=python
       - run: make test-shuffled PYTHON=python
 
   artifact:

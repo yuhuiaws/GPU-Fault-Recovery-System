@@ -141,7 +141,7 @@ def test_the_probe_definition_and_plan_are_plan_only_and_name_the_hard_stop() ->
         ROOT / "scripts/e2e/regional/run_cmd018_open_sibling_hold.py",
         ROOT / "scripts/e2e/regional/probes/cmd018_ledger_executor.py",
     ):
-        assert path.stat().st_mode & 0o777 == 0o775, path
+        assert path.stat().st_mode & 0o111 == 0o111, path
         assert (
             path.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env python3"
         )

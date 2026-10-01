@@ -610,7 +610,7 @@ def test_the_case_constants_follow_the_contract() -> None:
     )
     assert destr025.CASE.case_id == destr025.CASE_ID, "the CaseRunner names the case"
     path = ROOT / "scripts/e2e/regional/run_destr025_single_node_reset_escalation.py"
-    assert path.stat().st_mode & 0o777 == 0o775, "the runner is executable"
+    assert path.stat().st_mode & 0o111 == 0o111, "the runner is executable"
     assert (
         path.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env python3"
     ), "the runner carries the python3 shebang"

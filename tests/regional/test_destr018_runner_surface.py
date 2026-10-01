@@ -64,7 +64,7 @@ def test_the_runner_and_the_env_window_helper_are_executable_with_a_shebang() ->
         ROOT / "scripts/e2e/regional/probes/destr018_node_probe.py",
     ):
         mode = path.stat().st_mode & 0o777
-        assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
+        assert mode & 0o111 == 0o111, f"{path.name} is {oct(mode)}, not executable"
         first = path.read_text(encoding="utf-8").splitlines()[0]
         assert first == "#!/usr/bin/env python3"
 

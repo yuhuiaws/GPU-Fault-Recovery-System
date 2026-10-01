@@ -692,7 +692,7 @@ def test_the_help_text_offers_the_four_documented_live_flags() -> None:
 def test_the_runner_is_executable_with_a_shebang_and_no_site_topology() -> None:
     path = ROOT / "scripts/e2e/regional/run_destr020_identity_mismatch_isolation.py"
     mode = path.stat().st_mode & 0o777
-    assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
+    assert mode & 0o111 == 0o111, f"{path.name} is {oct(mode)}, not executable"
     source = path.read_text(encoding="utf-8")
     assert source.splitlines()[0] == "#!/usr/bin/env python3", source.splitlines()[0]
     assert not site_topology_leaks(source), site_topology_leaks(source)

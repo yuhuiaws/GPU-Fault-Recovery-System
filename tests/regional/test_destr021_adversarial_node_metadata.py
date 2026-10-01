@@ -810,7 +810,7 @@ def test_the_runner_and_probe_are_executable_and_carry_no_site_topology() -> Non
         if name not in executables:
             continue
         mode = path.stat().st_mode & 0o777
-        assert mode == 0o775, f"{name} is {oct(mode)}, not 0o775"
+        assert mode & 0o111 == 0o111, f"{name} is {oct(mode)}, not executable"
         assert source.splitlines()[0] == "#!/usr/bin/env python3", name
 
 

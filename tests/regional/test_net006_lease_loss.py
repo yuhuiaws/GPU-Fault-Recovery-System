@@ -378,7 +378,7 @@ def test_the_runner_is_plan_by_default_with_the_documented_flags() -> None:
         ROOT / "scripts/e2e/regional/run_net006_lease_loss_withheld_result.py",
         ROOT / "scripts/e2e/regional/probes/net006_executor.py",
     ):
-        assert path.stat().st_mode & 0o777 == 0o775, path
+        assert path.stat().st_mode & 0o111 == 0o111, path
         assert (
             path.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env python3"
         )

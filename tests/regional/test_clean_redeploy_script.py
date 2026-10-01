@@ -1065,7 +1065,10 @@ def test_drain_leftovers_keep_ingress_consumers_executors_and_nodes_running(
     api["drain_counts"] = counts
     harness.api.write_text(json.dumps(api))
 
-    result = harness.run(timeout_seconds=1)
+    # --timeout-seconds is also the budget of every PREFLIGHT kubectl/tool
+    # invocation (each a fresh python3 process); one second is exceeded on a
+    # loaded CI runner and fails PREFLIGHT before the queue drain is reached.
+    result = harness.run(timeout_seconds=10)
 
     assert result.returncode != 0, "leftover records were treated as completion"
     state = json.loads(harness.state.read_text())
