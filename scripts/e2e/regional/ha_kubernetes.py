@@ -80,6 +80,55 @@ def node_cordon_patch(
     return patch
 
 
+CORDON_ATTEMPTS = 3
+
+
+def cordon_node_with_retry(
+    *,
+    read_node: Callable[[], Mapping[str, Any]],
+    apply_patch: Callable[[list[dict[str, Any]]], None],
+    uid: str,
+    owner: str,
+    retryable: Callable[[BaseException], bool],
+    attempts: int = CORDON_ATTEMPTS,
+    log: Callable[[str], None] | None = None,
+) -> tuple[Mapping[str, Any], int]:
+    """Cordon through ``node_cordon_patch`` with a bounded optimistic-lock retry.
+
+    The patch tests the Node's ``resourceVersion``, so a kubelet status update
+    (an image pull landing on the node, a condition heartbeat) between the read
+    and the patch makes the API server reject the request (live 2026-10-01,
+    HA-002). Only that race is retried: the Node is re-read, the cordon
+    invariants are re-checked by ``node_cordon_patch`` (a UID change, an existing
+    owner or an already-cordoned node still fail closed), and the patch is
+    rebuilt from the fresh ``resourceVersion``. A rejection while the
+    ``resourceVersion`` did not move is not the race and is re-raised at once.
+    Returns the snapshot the successful patch was built from and the attempt
+    number (1-based) for the evidence.
+    """
+    if attempts < 1:
+        raise RegionalFixtureError("cordon retry budget must allow one attempt")
+    for attempt in range(1, attempts + 1):
+        snapshot = read_node()
+        patch = node_cordon_patch(snapshot, uid=uid, owner=owner)
+        try:
+            apply_patch(patch)
+        except Exception as exc:
+            if attempt >= attempts or not retryable(exc):
+                raise
+            current = read_node()
+            if current.get("resource_version") == snapshot.get("resource_version"):
+                raise
+            if log is not None:
+                log(
+                    "cordon patch lost the resourceVersion race "
+                    f"(attempt {attempt}/{attempts}); re-reading the node"
+                )
+            continue
+        return snapshot, attempt
+    raise RegionalFixtureError("cordon retry loop exhausted without a verdict")
+
+
 def node_restore_patch(
     baseline: Mapping[str, Any], *, owner: str
 ) -> list[dict[str, Any]]:

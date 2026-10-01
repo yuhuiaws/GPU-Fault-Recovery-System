@@ -19,7 +19,7 @@ if __package__:
     from .ha_evidence import chain_preflight, require_chain, result_identity
     from .ha_kubernetes import (
         NODE_OWNER,
-        node_cordon_patch,
+        cordon_node_with_retry,
         node_restore_patch,
         require_uid,
     )
@@ -32,6 +32,7 @@ if __package__:
         authorize_execution as guard_authorize_execution,
         build_plan as guard_build_plan,
     )
+    from .regional_commands import RegionalCommandFailed
     from .regional_live_fixture import (
         install_abort_signals,
         run_case_main,
@@ -41,7 +42,7 @@ else:
     from ha_evidence import chain_preflight, require_chain, result_identity
     from ha_kubernetes import (
         NODE_OWNER,
-        node_cordon_patch,
+        cordon_node_with_retry,
         node_restore_patch,
         require_uid,
     )
@@ -54,6 +55,7 @@ else:
         authorize_execution as guard_authorize_execution,
         build_plan as guard_build_plan,
     )
+    from regional_commands import RegionalCommandFailed
     from regional_live_fixture import (
         install_abort_signals,
         run_case_main,
@@ -669,15 +671,16 @@ def _run_disruptions(
     state.update({"watchdog": watchdog, "watchdog_handle": handle})
     COMMON.log(f"cordoning CPU node {context['node_name']}")
     state["cordoned"] = True
-    patch_node(
-        context["node_name"],
-        node_cordon_patch(
-            current_node(context["node_name"]),
-            uid=context["baseline_node"]["uid"],
-            owner=context["node_owner"],
-        ),
+    _cordon_snapshot, cordon_attempts = cordon_node_with_retry(
+        read_node=lambda: current_node(context["node_name"]),
+        apply_patch=lambda patch: patch_node(context["node_name"], patch),
+        uid=context["baseline_node"]["uid"],
+        owner=context["node_owner"],
+        retryable=lambda exc: isinstance(exc, RegionalCommandFailed),
+        log=COMMON.log,
     )
     cordoned_state = current_node(context["node_name"])
+    cordoned_state["cordon_attempts"] = cordon_attempts
     if (
         not cordoned_state["unschedulable"]
         or cordoned_state["uid"] != context["baseline_node"]["uid"]

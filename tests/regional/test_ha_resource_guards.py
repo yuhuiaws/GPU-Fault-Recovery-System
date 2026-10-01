@@ -12,6 +12,7 @@ from scripts.e2e.regional import run_ha002_pdb_topology as ha002
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
 from scripts.e2e.regional.ha_kubernetes import (
     NODE_OWNER,
+    cordon_node_with_retry,
     delete_pod,
     node_cordon_patch,
     node_restore_patch,
@@ -322,3 +323,124 @@ def test_ha004_never_restores_a_recreated_deployment(monkeypatch, tmp_path) -> N
     assert all(args[0] == "get" for _, args, _ in api.calls[before:]), api.calls[
         before:
     ]
+
+
+def _cordon_snapshot(resource_version: str) -> dict[str, object]:
+    return {
+        "uid": "node-uid",
+        "unschedulable": False,
+        "ha_owner": None,
+        "resource_version": resource_version,
+        "annotations_present": True,
+    }
+
+
+class _PatchRejected(RuntimeError):
+    pass
+
+
+def test_cordon_retry_rebuilds_the_patch_after_a_resource_version_race() -> None:
+    reads = iter(["100", "101", "101"])
+    applied: list[list[dict[str, object]]] = []
+    logs: list[str] = []
+
+    def apply(patch: list[dict[str, object]]) -> None:
+        applied.append(patch)
+        if len(applied) == 1:
+            raise _PatchRejected("the server rejected our request")
+
+    snapshot, attempts = cordon_node_with_retry(
+        read_node=lambda: _cordon_snapshot(next(reads)),
+        apply_patch=apply,
+        uid="node-uid",
+        owner="owned",
+        retryable=lambda exc: isinstance(exc, _PatchRejected),
+        log=logs.append,
+    )
+
+    assert attempts == 2, "the second attempt must be the one that succeeded"
+    assert snapshot["resource_version"] == "101", (
+        "the successful patch must be built from the re-read node"
+    )
+    assert [
+        op["value"]
+        for p in applied
+        for op in p
+        if op["path"] == "/metadata/resourceVersion"
+    ] == ["100", "101"], "each attempt must test the resourceVersion it was built from"
+    assert logs and "resourceVersion race" in logs[0], "the retry must be logged"
+
+
+def test_cordon_retry_re_raises_when_the_resource_version_did_not_move() -> None:
+    def apply(_patch: list[dict[str, object]]) -> None:
+        raise _PatchRejected("forbidden")
+
+    with pytest.raises(_PatchRejected, match="forbidden"):
+        cordon_node_with_retry(
+            read_node=lambda: _cordon_snapshot("100"),
+            apply_patch=apply,
+            uid="node-uid",
+            owner="owned",
+            retryable=lambda exc: isinstance(exc, _PatchRejected),
+        )
+
+
+def test_cordon_retry_fails_closed_when_invariants_break_on_re_read() -> None:
+    reads = iter(
+        [
+            _cordon_snapshot("100"),
+            _cordon_snapshot("101"),
+            {**_cordon_snapshot("101"), "ha_owner": "someone"},
+        ]
+    )
+
+    def apply(_patch: list[dict[str, object]]) -> None:
+        raise _PatchRejected("rejected")
+
+    with pytest.raises(RegionalFixtureError, match="changed before cordon"):
+        cordon_node_with_retry(
+            read_node=lambda: next(reads),
+            apply_patch=apply,
+            uid="node-uid",
+            owner="owned",
+            retryable=lambda exc: isinstance(exc, _PatchRejected),
+        )
+
+
+def test_cordon_retry_budget_is_bounded_and_non_retryable_errors_pass_through() -> None:
+    versions = iter(str(n) for n in range(100, 120))
+
+    def always_rejected(_patch: list[dict[str, object]]) -> None:
+        raise _PatchRejected("rejected")
+
+    with pytest.raises(_PatchRejected):
+        cordon_node_with_retry(
+            read_node=lambda: _cordon_snapshot(next(versions)),
+            apply_patch=always_rejected,
+            uid="node-uid",
+            owner="owned",
+            retryable=lambda exc: isinstance(exc, _PatchRejected),
+            attempts=3,
+        )
+    assert next(versions) == "105", "three attempts read the node at most five times"
+
+    def other_error(_patch: list[dict[str, object]]) -> None:
+        raise ValueError("not a kubectl failure")
+
+    with pytest.raises(ValueError, match="not a kubectl"):
+        cordon_node_with_retry(
+            read_node=lambda: _cordon_snapshot("1"),
+            apply_patch=other_error,
+            uid="node-uid",
+            owner="owned",
+            retryable=lambda exc: isinstance(exc, _PatchRejected),
+        )
+    with pytest.raises(RegionalFixtureError, match="retry budget"):
+        cordon_node_with_retry(
+            read_node=lambda: _cordon_snapshot("1"),
+            apply_patch=other_error,
+            uid="node-uid",
+            owner="owned",
+            retryable=lambda exc: True,
+            attempts=0,
+        )

@@ -6128,6 +6128,15 @@ These checks add no CLI parameters and do not automatically modify IAM, Secrets,
      kubectl --kubeconfig "${CPU_KUBECONFIG}" cordon "${NODE}"
      ```
 
+     The runner cordons through a JSON patch guarded by UID and `resourceVersion`
+     preconditions and writes the owner annotation in the same request. When a kubelet
+     status update (an image pull, a condition heartbeat) lands between the read and the
+     patch, the API server rejects the request (observed live); only that race is
+     retried: the runner re-reads the node, re-checks the invariants (UID, not cordoned,
+     no owner) and rebuilds the patch from the fresh `resourceVersion`, at most 3 times,
+     recording the attempt count in `cordoned-node.json.cordon_attempts`. A rejection
+     while the `resourceVersion` did not move is not the race and fails at once.
+
   3. Evict the Pods on the target node per role with `kubectl drain --pod-selector app=<role>`;
      handle only one role at a time to avoid evicting shared business workloads as a side effect.
   4. Before the first replacement Pod has recovered, try to evict a second Pod of the same role; it must be
