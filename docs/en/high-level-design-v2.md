@@ -302,6 +302,15 @@ Nodes whose Agent heartbeat has expired do not participate in this silence scan 
 and Fleet readiness and stale-agent metrics should be consulted separately. Loss of contact of components such as the Executor and Watcher has its own
 criteria; this task must not be described as unified loss-of-contact detection covering all data-plane components. Implementation boundaries are in Detailed Design v2 §2.3.1.
 
+`GET /v1/collector-readiness/{cluster_id}` applies the same lifecycle rule: only `ACTIVE` Agents enter `nodes` and decide
+`ready`; `DRAINING`/`REVOKED` records (for example a departed node retired by `workflow-reconcile --retire-departed-agents`)
+are listed under `retired_nodes` with `lifecycle_state`, `last_seen_at` and each channel's last successful report, and do not
+affect `ready`. Their `collector_status` rows stay in the Store as evidence -- the Store has no deletion path; readers skip them
+by Agent lifecycle. When only non-`ACTIVE` records remain after a retirement, `nodes` is empty and `ready` is `false` (fail
+closed). An `ACTIVE` Agent whose lease has expired still enters `nodes`: its success record is necessarily past the threshold,
+which is exactly the Agent coverage drift shape that must fail the release verification (Administrator Operations §10.2,
+fourth shape).
+
 ---
 
 ## 3. Overall Architecture (Closed-Loop Perspective)

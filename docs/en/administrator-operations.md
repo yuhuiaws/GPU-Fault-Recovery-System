@@ -1484,6 +1484,12 @@ a reading of 0 means that release declared none. Every metric family on the dash
   while raw evidence is written only when a batch carries a finding, a collection error or a reason other than `health-summary` -- a healthy
   node having 0 `GPU_METRICS` evidence records is by design, not a dead collector; "what the collector saw" is what
   evidence is for.
+- **Scope**: `gpu_fault_collector_silent_nodes`, `gpu_fault_collector_last_success_age_seconds_max` and the outbox
+  notifications count only `ACTIVE` Agents whose lease is valid; records retired by
+  `workflow-reconcile --retire-departed-agents` (`REVOKED`) or in `DRAINING` are no longer counted, and
+  `/v1/collector-readiness/{cluster_id}` lists them under `retired_nodes` without counting them toward `ready` (§10.2,
+  fourth shape). Retirement does not delete the node's `collector_status` rows -- they are evidence; readers simply stop
+  counting them.
 - **Boundary**: do not verify connectivity with `curl -k`, and do not raise the silence threshold to clear the alert. Repair entry points REG-6,
   REG-14.5.
 
@@ -2948,8 +2954,12 @@ Kubernetes Node the refusal ends with a hint naming this switch. The same `workf
   There is no raw UPDATE. Plan and result are archived under `--state-dir` at
   `workflow-reconcile/departed-agents/<plan_sha256>/`.
 - **The verification afterwards**: `control_api` no longer counts `REVOKED` records as coverage and no longer checks
-  their Runtime Profile; should a node re-register under the same name, the registry's normal heartbeat path makes it
-  `ACTIVE` again.
+  their Runtime Profile; `/v1/collector-readiness/{cluster_id}` computes `ready` from `ACTIVE` records only and lists the
+  retired node, with the last success time it stopped at, under `retired_nodes`; the collector silence metrics and
+  notifications (§8 `GpuFaultCollectorSilent`) skip non-`ACTIVE` records the same way, so after the retirement this node
+  no longer produces `collector readiness failed` or `GpuFaultCollectorSilent`. The node's `collector_status` rows are not
+  deleted -- the Store has no deletion path and they are evidence -- readers simply stop counting them. Should a node
+  re-register under the same name, the registry's normal heartbeat path makes it `ACTIVE` again.
 
 **The complete sequence after a spot node is reclaimed** (three residues, one verb, one `--reference`):
 

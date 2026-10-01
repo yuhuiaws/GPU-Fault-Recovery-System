@@ -7673,6 +7673,8 @@ The returned matrix contains each node's Agent state, the five systemd collectio
 inventory/metrics, host, kernel, Fabric Manager and node-log channels.
 Each item's `unit_state` and `unit_enabled` always return strings; a NodeLogCollector disabled by default policy or whose enabled state cannot be confirmed
 does not enter the required set.
+Only `ACTIVE` Agents enter `nodes` and decide `ready`; `DRAINING`/`REVOKED` records are listed under `retired_nodes`
+(with `lifecycle_state` and each channel's last successful report) and do not affect `ready`.
 The CLI accepts the report only when the returned `cluster_id` matches the request, `ready` is a real boolean, and the node results are complete and consistent with
 the summary; the string `"false"`, empty nodes claiming ready, or a response from another cluster are all treated as
 read errors. Exit code `0` means healthy, `1` means not ready in a valid report, `2` means a credential, transport or

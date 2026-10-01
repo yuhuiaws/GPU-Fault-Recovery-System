@@ -17,6 +17,7 @@ from gpu_fault.collector_requirements import (
     collector_silent_thresholds,
     required_collectors_for_agent,
 )
+from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.gpu_metrics import (
     GpuHealthFinding,
     GpuMetricLatest,
@@ -70,6 +71,19 @@ async def collector_readiness(
     cluster_id: str,
     dependencies: TelemetryRouterDependencies = Depends(get_telemetry_dependencies),
 ) -> dict[str, Any]:
+    """Whether every Agent that can still report has fresh collector receipts.
+
+    Only ``ACTIVE`` Agents count toward ``ready`` -- the same lifecycle gate
+    fleet readiness (``FleetRegistry._policy_reasons``) and the silence metrics
+    and notifications (``agent_is_current``) apply. A ``DRAINING`` or
+    ``REVOKED`` record belongs to a node that is leaving or has left: its
+    ``collector_status`` rows stay in the store (there is no deletion path and
+    they are evidence), but nothing will ever refresh them, so counting them
+    here kept a cluster "not ready" forever after a departed node's Agent was
+    retired. Those nodes are reported under ``retired_nodes`` so operators
+    still see them; they do not affect ``ready``.
+    """
+
     def read() -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         store = dependencies.context.store
@@ -79,58 +93,90 @@ async def collector_readiness(
         }
         thresholds = _collector_readiness_thresholds()
         nodes = []
+        retired_nodes = []
         for agent in store.list_agents(cluster_id):
-            collectors = {}
-            for kind in required_collectors_for_agent(agent):
-                unit = COLLECTOR_SYSTEMD_UNITS[kind]
-                status = statuses.get((agent.node_id, kind))
-                last = status.last_success_at if status else None
-                age = (now - last).total_seconds() if last is not None else None
-                service_state = agent.collector_services.get(unit)
-                unit_state = (
-                    service_state.active.value
-                    if service_state is not None
-                    else "unknown"
-                )
-                unit_enabled = (
-                    service_state.enabled.value
-                    if service_state is not None
-                    else "unknown"
-                )
-                unit_running = unit_state in {"active", "unknown"}
-                # A kind that has never reported is silent only once its
-                # threshold has elapsed since the Agent first appeared; before
-                # that its first report is simply not due yet (a fresh install's
-                # health summaries post every 5 min, the verify runs after 1).
-                agent_age = (now - agent.first_seen_at).total_seconds()
-                pending_first_report = (
-                    last is None and unit_running and agent_age <= thresholds[kind]
-                )
-                # Warmup is diagnostic, not a successful collection receipt.
-                ready = age is not None and age <= thresholds[kind] and unit_running
-                collectors[kind.value] = {
-                    "unit": unit,
-                    "unit_state": unit_state,
-                    "unit_enabled": unit_enabled,
-                    "last_success_at": (last.isoformat() if last else None),
-                    "age_seconds": age,
-                    "pending_first_report": pending_first_report,
-                    "ready": ready,
-                }
-            nodes.append(
-                {
-                    "node_id": agent.node_id,
-                    "collectors": collectors,
-                    "ready": all(item["ready"] for item in collectors.values()),
-                }
-            )
+            if agent.lifecycle_state is not AgentLifecycleState.ACTIVE:
+                retired_nodes.append(_retired_node_readiness(agent, statuses, now))
+                continue
+            nodes.append(_node_readiness(agent, statuses, thresholds, now))
         return {
             "cluster_id": cluster_id,
             "ready": bool(nodes) and all(node["ready"] for node in nodes),
             "nodes": nodes,
+            "retired_nodes": retired_nodes,
         }
 
     return await _store_call(dependencies, read)
+
+
+def _node_readiness(
+    agent: Any,
+    statuses: dict[tuple[str, CollectorKind], CollectorStatus],
+    thresholds: dict[CollectorKind, float],
+    now: datetime,
+) -> dict[str, Any]:
+    collectors = {}
+    for kind in required_collectors_for_agent(agent):
+        unit = COLLECTOR_SYSTEMD_UNITS[kind]
+        status = statuses.get((agent.node_id, kind))
+        last = status.last_success_at if status else None
+        age = (now - last).total_seconds() if last is not None else None
+        service_state = agent.collector_services.get(unit)
+        unit_state = (
+            service_state.active.value if service_state is not None else "unknown"
+        )
+        unit_enabled = (
+            service_state.enabled.value if service_state is not None else "unknown"
+        )
+        unit_running = unit_state in {"active", "unknown"}
+        # A kind that has never reported is silent only once its threshold has
+        # elapsed since the Agent first appeared; before that its first report
+        # is simply not due yet (a fresh install's health summaries post every
+        # 5 min, the verify runs after 1).
+        agent_age = (now - agent.first_seen_at).total_seconds()
+        pending_first_report = (
+            last is None and unit_running and agent_age <= thresholds[kind]
+        )
+        # Warmup is diagnostic, not a successful collection receipt.
+        ready = age is not None and age <= thresholds[kind] and unit_running
+        collectors[kind.value] = {
+            "unit": unit,
+            "unit_state": unit_state,
+            "unit_enabled": unit_enabled,
+            "last_success_at": (last.isoformat() if last else None),
+            "age_seconds": age,
+            "pending_first_report": pending_first_report,
+            "ready": ready,
+        }
+    return {
+        "node_id": agent.node_id,
+        "collectors": collectors,
+        "ready": all(item["ready"] for item in collectors.values()),
+    }
+
+
+def _retired_node_readiness(
+    agent: Any,
+    statuses: dict[tuple[str, CollectorKind], CollectorStatus],
+    now: datetime,
+) -> dict[str, Any]:
+    """The stale receipts of a non-``ACTIVE`` Agent, for display only."""
+
+    collectors = {}
+    for kind in required_collectors_for_agent(agent):
+        status = statuses.get((agent.node_id, kind))
+        last = status.last_success_at if status else None
+        collectors[kind.value] = {
+            "unit": COLLECTOR_SYSTEMD_UNITS[kind],
+            "last_success_at": (last.isoformat() if last else None),
+            "age_seconds": ((now - last).total_seconds() if last is not None else None),
+        }
+    return {
+        "node_id": agent.node_id,
+        "lifecycle_state": agent.lifecycle_state.value,
+        "last_seen_at": agent.last_seen_at.isoformat(),
+        "collectors": collectors,
+    }
 
 
 def _collector_readiness_thresholds() -> dict[CollectorKind, float]:
