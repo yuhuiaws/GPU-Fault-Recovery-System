@@ -31,6 +31,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | Converge historical workflows that recovered but stay BLOCKED, and never-dispatched PENDING workflows whose node left with a spot replacement | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
 | Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
 | Handle one AMP alert | Enter the triage card by alert name | §8 |
@@ -2911,6 +2912,63 @@ gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-inciden
   --reason "node reclaimed by HyperPod; workflow never dispatched" --reference CHG-12345
 ```
 
+**The fourth shape: the node is gone, its Agent record is still `ACTIVE` (`--retire-departed-agents`).** The same spot
+reclaim leaves a third residue: the node's fleet Agent record. The Agent process died with the instance and no path ever
+revokes it -- the Agent's own lifecycle ends with its last heartbeat, and the HyperPod lifecycle adapter revokes only the
+nodes *it* replaces -- so the record stays `ACTIVE` with a long-expired lease. The release verification's `control_api`
+check then reads one Agent more than there are Ready nodes, reports
+`<cluster> Agent coverage drift: expected=[...], agents=[...]` and rolls every deploy back; when every extra Agent has no
+Kubernetes Node the refusal ends with a hint naming this switch. The same `workflow-reconcile` with
+`--retire-departed-agents` retires such records:
+
+- **Discovery rule** (command-line side; a read-only `list-agents` in the Pod lists every Agent record of the site's
+  clusters): the record is `ACTIVE` or `DRAINING` (`REVOKED` is no longer a candidate and is only counted under
+  `discovery.revoked`); `last_seen_at` is **at least 10 minutes** before the Pod's clock (`DEPARTED_AGENT_GUARD_AGE` -- an
+  Agent that spoke within ten minutes is restarting, not gone); and the node is absent from the cluster's Kubernetes Node
+  list **and** the instance behind `hyperpod-<instance-id>` absent from the `aws sagemaker list-cluster-nodes` inventory.
+  A node still in Kubernetes (NotReady or cordoned included) is `node is still in Kubernetes; an Agent is retired only for
+  a node that left Kubernetes and HyperPod` and the provider is not consulted; an instance HyperPod still lists, a cluster
+  the site does not describe as HyperPod-managed, a failed AWS call, or a record of a cluster not in the site keep failing
+  closed with the reason. `--node <id>` narrows the plan to the named nodes; a named node without a record (or already
+  `REVOKED`) is reported as `no Agent record in the fleet`, and a named record that is not eligible refuses the whole
+  apply before any write.
+- **Plan output**: each item carries the record's keys (`generation`, `lifecycle_state`, `last_seen_at`,
+  `node_instance_id`, `agent_incarnation_id`, `transition_id`), `node_evidence.sources` (`kubernetes.present`,
+  `hyperpod.cluster_name`/`region`/`listed`) and `evidence_read_at`. The keys and verdicts are in `plan_sha256`, the read
+  times are not -- if the re-plan before apply finds the instance listed again, the node back in Kubernetes, or the
+  record heartbeating again (`generation`/`last_seen_at` moved), the command refuses by field
+  (`gpu-a/hyperpod-...: eligible True -> False`, `...: generation 4 -> 5`) and writes nothing.
+- **Write**: through the registry's own lifecycle path in the Pod -- `FleetRegistry.drain_agent` then `revoke_agent`
+  with one `AgentTransitionRequest`: `transition_id` is `workflow-reconcile/<reference>/<first 16 of plan_sha256>`, and
+  `reason` is the audit line `operator reconciliation <reference>: retired Agent <node> after its node left Kubernetes
+  and HyperPod (instance ..., HyperPod cluster ... in ...; kubernetes read ..., hyperpod read ...; actor <ARN>; admin
+  plan <sha256>)`, which the record keeps for good in `transition_id`/`transition_reason`. Before the write the Pod
+  compare-and-sets `generation`, `lifecycle_state` and `last_seen_at` and re-checks the 10-minute guard and the evidence
+  on its own clock; a `DRAINING` record (a drain whose revoke never followed) is revoked under its original transition.
+  There is no raw UPDATE. Plan and result are archived under `--state-dir` at
+  `workflow-reconcile/departed-agents/<plan_sha256>/`.
+- **The verification afterwards**: `control_api` no longer counts `REVOKED` records as coverage and no longer checks
+  their Runtime Profile; should a node re-register under the same name, the registry's normal heartbeat path makes it
+  `ACTIVE` again.
+
+**The complete sequence after a spot node is reclaimed** (three residues, one verb, one `--reference`):
+
+```bash
+# 1. Look at every residue: the BLOCKED backlog, the never-dispatched PENDING records (with per-node evidence),
+#    and the departed Agents still ACTIVE
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --dry-run
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents --dry-run
+# 2. Close the node's workflow records, then the ESCALATED incident handed to the operator
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --incident-id <incident-id> --reference CHG-12345
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-incident <incident-id> \
+  --reason "node reclaimed by HyperPod; workflow never dispatched" --reference CHG-12345
+# 3. Retire the node's Agent record (named; without --node every departed node is retired)
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents \
+  --node hyperpod-<instance-id> --reference CHG-12345
+# 4. Deploy again; the control_api check now counts only Agents that were not retired
+make release-deploy SITE=/secure/path/site.yaml
+```
+
 When a manual migration or purge is required, first record the replicas, stop ingress, drain the consumers, then stop all writers.
 Recovery is in the reverse order: consumers first, ingress last. The state file must not be deleted before all original replicas are
 Ready.
@@ -3037,7 +3095,9 @@ uninstall            uninstall; --cpu-cluster keep|delete, only --reset-database
 workflow-reconcile   converges historical workflows that recovered but stay BLOCKED, and never-dispatched
                      PENDING workflows whose node left Kubernetes and HyperPod (--dry-run / execute);
                      --close-incident <id> / --close-escalated close ESCALATED incidents,
-                     --close-quarantined closes QUARANTINED incidents whose isolation is no longer on the node (§9.1)
+                     --close-quarantined closes QUARANTINED incidents whose isolation is no longer on the node (§9.1);
+                     --retire-departed-agents [--node ID] retires the fleet Agent record, still ACTIVE, of a
+                     node that left Kubernetes and HyperPod (§10.2)
 rotate-token         one command completes the cluster token overlap-window rotation
 node-key-custody     configure explicitly registers forward-looking custody; authorised delivery is still performed by deploy/join (§6.2)
 submit-remediation   explicit remediation after CHECK_MECHANICALS

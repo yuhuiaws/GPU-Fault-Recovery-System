@@ -2344,6 +2344,25 @@ incident's `node_ids`, `amend_workflow` to `SUPERSEDED` with the per-node `depar
 an incident still `DETECTED`/`ACTION_PENDING`/`SAFETY_PENDING` to `ESCALATED` for `--close-incident`. When the deployed
 planner predates the shape the script carries the same rule (tests pin the two copies).
 
+The fourth shape, **node gone, Agent record still `ACTIVE`** (`--retire-departed-agents`,
+`admin/workflow_reconcile_departed_agents.py`): the Agent process dies with the spot instance and no path revokes its fleet
+record (the Agent's lifecycle ends with its last heartbeat; the HyperPod adapter revokes only the nodes it replaces), so the
+record stays `ACTIVE` with an expired lease and the release verification's `control_api` reads one Agent more than there are
+Ready nodes and rolls back. The command-line side takes every record through a read-only `list-agents` in the Pod; a candidate
+is `ACTIVE`/`DRAINING`, has `last_seen_at` at least 10 minutes before the Pod's clock (`DEPARTED_AGENT_GUARD_AGE`) and its node
+absent from Kubernetes and from the `list-cluster-nodes` inventory at once (the `never-dispatched` evidence and `sources` shape
+are reused; a node still present, an instance still listed, a non-HyperPod cluster, a failed lookup or a cluster not in the site
+all fail closed); the item carries the record's keys (`generation`/`lifecycle_state`/`last_seen_at`, ...) and the verdicts in
+the digest, the read times outside it, and the re-plan before apply is compared field by field. The write goes through
+`FleetRegistry.drain_agent` then `revoke_agent` in the Pod with an `AgentTransitionRequest` whose `transition_id` is
+`workflow-reconcile/<reference>/<first 16 of the digest>` and whose `reason` is the audit line with the evidence sources, read
+times, operator and plan digest; before writing the Pod compare-and-sets `generation`/`lifecycle_state`/`last_seen_at` and
+re-checks the guard and the evidence on its own clock; a `DRAINING` record is revoked under its original transition; the archive
+is `workflow-reconcile/departed-agents/<sha>/`. On the verification side `regional_admin_checks_coverage.check_agent_coverage`
+leaves `REVOKED` records out of the coverage comparison (and of the Runtime Profile check); coverage drift stays a hard failure,
+but when every extra Agent is absent from the Kubernetes Node list (`kubernetes_node_ids`, NotReady included) the refusal
+names the switch; the Agent of a NotReady node gets no retire hint.
+
 The same entry point has three more mutually exclusive incident-level switches (`admin/incident_close.py`, all accepting
 `--reason`/`--reference`/`--dry-run`): `--close-incident INCIDENT_ID ...` closes the named
 `ESCALATED` incident; `--close-escalated [--max-items N]` discovers and closes all `ESCALATED` incidents

@@ -558,3 +558,88 @@ def test_ambiguous_https_security_group_rules_fail_closed(
     permission: dict[str, Any], violation: bool
 ) -> None:
     assert (checks.nlb_https_rule_violation(permission) is not None) is violation
+
+
+# ------------------------------------------------- Agent coverage and retired Agents
+
+
+def _extra_agent(release: CheckedRelease, node_id: str, **overrides: Any) -> None:
+    agent = {
+        "node_id": node_id,
+        "lifecycle_state": "ACTIVE",
+        "runtime_profile_version": release.config.runtime_profile_version,
+    }
+    agent.update(overrides)
+    release.api["clusters"]["gpu-a"]["agents"].append(agent)
+
+
+def test_a_retired_agent_is_not_counted_as_coverage(release: CheckedRelease) -> None:
+    """The REVOKED record of a departed node, with the Runtime Profile it died
+    on, is left out of the comparison and of the checks that follow."""
+
+    _extra_agent(
+        release,
+        "hyperpod-i-00000000000000001",
+        lifecycle_state="REVOKED",
+        runtime_profile_version="hyperpod-v0",
+    )
+
+    report = checks.build_quick_health_report(release)
+
+    result = finding(report, "control_api")
+    assert result["status"] == "PASS", result["summary"]
+    assert result["details"]["clusters"]["gpu-a"]["kubernetes_node_ids"] == ["node-a"]
+
+
+def test_coverage_drift_from_an_agent_without_a_node_names_the_remedy(
+    release: CheckedRelease,
+) -> None:
+    """The departed node's Agent is still ACTIVE: a hard failure that tells
+    the operator which command retires it."""
+
+    _extra_agent(release, "hyperpod-i-00000000000000001")
+
+    result = finding(checks.build_quick_health_report(release), "control_api")
+
+    assert result["status"] == "FAIL"
+    assert "gpu-a Agent coverage drift: expected=['node-a']" in result["summary"]
+    assert (
+        "Agents without a Kubernetes Node: ['hyperpod-i-00000000000000001']"
+        in (result["summary"])
+    )
+    assert (
+        "workflow-reconcile --state-dir <state-dir> --retire-departed-agents"
+        in (result["summary"])
+    )
+
+
+def test_coverage_drift_from_a_not_ready_node_carries_no_retire_hint(
+    release: CheckedRelease,
+) -> None:
+    """A NotReady node is still a node: its Agent is not departed and the
+    refusal must not suggest retiring it."""
+
+    release.documents[("gpu-a", "nodes", "")]["items"].append(
+        {
+            "metadata": {"name": "node-b"},
+            "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+        }
+    )
+    _extra_agent(release, "node-b")
+
+    result = finding(checks.build_quick_health_report(release), "control_api")
+
+    assert result["status"] == "FAIL"
+    assert "Agent coverage drift" in result["summary"]
+    assert "--retire-departed-agents" not in result["summary"]
+
+
+def test_a_cluster_whose_only_agents_are_retired_has_no_coverage(
+    release: CheckedRelease,
+) -> None:
+    release.api["clusters"]["gpu-a"]["agents"][0]["lifecycle_state"] = "REVOKED"
+
+    result = finding(checks.build_quick_health_report(release), "control_api")
+
+    assert result["status"] == "FAIL"
+    assert "no registered Node Agents" in result["summary"]

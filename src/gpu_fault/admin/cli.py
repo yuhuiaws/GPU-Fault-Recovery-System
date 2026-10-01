@@ -146,7 +146,7 @@ from gpu_fault.admin.submit_remediation import (
     run_submit_remediation_command,
 )
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
-from gpu_fault.admin import warm_spare
+from gpu_fault.admin import warm_spare, workflow_reconcile_departed_agents
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
@@ -313,12 +313,15 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
             "       gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
             "(--close-incident INCIDENT_ID ... | --close-escalated [--max-items N] "
             "| --close-quarantined [--max-items N]) "
-            "[--reason TEXT] [--reference REFERENCE] [--dry-run]"
+            "[--reason TEXT] [--reference REFERENCE] [--dry-run]\n"
+            "       gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
+            "--retire-departed-agents [--node ID ...] [--reference REFERENCE] [--dry-run]"
         ),
         help=(
             "close BLOCKED workflow records a later workflow already restored, "
             "and PENDING records never dispatched whose node left Kubernetes and "
             "HyperPod (plans and applies in one run; --dry-run only prints the plan); "
+            "with --retire-departed-agents revoke the fleet Agent record of such a node; "
             "with --close-incident / --close-escalated close ESCALATED incidents, "
             "with --close-quarantined close QUARANTINED incidents whose node "
             "isolation is gone (a hand-released taint's leftover annotations are stripped)"
@@ -359,6 +362,7 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         help="print the plan with its node evidence and write nothing",
     )
     _add_incident_close_arguments(reconcile)
+    workflow_reconcile_departed_agents.add_arguments(reconcile)
 
 
 def _add_incident_close_arguments(reconcile: argparse.ArgumentParser) -> None:
@@ -752,7 +756,29 @@ def _run_incident_close(arguments: argparse.Namespace) -> int:
     return incident_close_exit_code(result)
 
 
+def _run_retire_departed_agents(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="workflow-reconcile")
+    assert site_file is not None
+    if arguments.state_dir is None:
+        raise SiteConfigError(
+            "workflow-reconcile --retire-departed-agents requires --state-dir"
+        )
+    state_dir = arguments.state_dir.expanduser().resolve()
+    try:
+        with administrator_operation_lock(state_dir):
+            site = load_site(site_file, repository_root=arguments.repo_root)
+            result = workflow_reconcile_departed_agents.retire_departed_agents_command(
+                arguments, site=site, state_dir=state_dir
+            )
+    except BootstrapError as exc:
+        raise SiteConfigError(str(exc)) from exc
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if result.get("failed_agents") else 0
+
+
 def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "retire_departed_agents", False):
+        return _run_retire_departed_agents(arguments)
     if (
         getattr(arguments, "close_incident", None)
         or getattr(arguments, "close_escalated", False)

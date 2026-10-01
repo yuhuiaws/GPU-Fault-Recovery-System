@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
+from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release import repository_root
@@ -1233,6 +1234,7 @@ def run_read_only_verifiers(
 
 def _control_api_report(release: Any) -> dict[str, Any]:
     expected_nodes = {}
+    kubernetes_nodes = {}
     for target in release.config.clusters:
         nodes = release._get_json(
             release._gpu(
@@ -1242,6 +1244,9 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 "-l",
                 f"sagemaker.amazonaws.com/cluster-name={target.hyperpod_cluster_name}",
             )
+        )
+        kubernetes_nodes[target.cluster_id] = sorted(
+            item["metadata"]["name"] for item in nodes.get("items", [])
         )
         expected_nodes[target.cluster_id] = sorted(
             item["metadata"]["name"] for item in _ready_nodes(nodes)
@@ -1269,6 +1274,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     )
     if not isinstance(result, dict):
         raise ReleaseError("control API report returned non-object evidence")
+    agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes)
     return result
 
 
@@ -1348,18 +1354,8 @@ def _check_control_api(release: Any) -> CheckValue:
             f"registered={sorted(registered)}"
         )
     for cluster_id, cluster in report.get("clusters", {}).items():
-        agents = cluster.get("agents") or []
-        if not agents:
-            raise ReleaseError(f"{cluster_id} has no registered Node Agents")
-        expected_nodes = set(cluster.get("expected_node_ids") or [])
-        agent_nodes = {item.get("node_id") for item in agents}
-        if agent_nodes != expected_nodes:
-            raise ReleaseError(
-                f"{cluster_id} Agent coverage drift: "
-                f"expected={sorted(expected_nodes)}, agents={sorted(agent_nodes)}"
-            )
-        if any(item.get("lifecycle_state") != "ACTIVE" for item in agents):
-            raise ReleaseError(f"{cluster_id} has a non-ACTIVE Node Agent")
+        # Retired (REVOKED) records are not coverage; see the sibling module.
+        agents = agent_coverage.check_agent_coverage(cluster_id, cluster)
         if any(
             item.get("runtime_profile_version")
             != release.config.runtime_profile_version
