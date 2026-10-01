@@ -8,6 +8,7 @@ import pytest
 
 from gpu_fault.admin.postgres_grant import ALLOCATION_ENV, POSTGRES_URL_ENV
 from gpu_fault.app import ApplicationContext
+from gpu_fault.collectors import sinks as collector_sinks
 from gpu_fault.models import (
     AllocationEntry,
     Environment,
@@ -22,10 +23,17 @@ from tests._cluster_binary_guard import install as install_binary_guard
 SHUFFLE_SEED_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SEED"
 
 
+OUTBOX_RETRY_MARKER = "collector_outbox_retry"
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         f"{MARKER}(*names): permit this test to execute the named cluster binaries.",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{OUTBOX_RETRY_MARKER}: keep the production outbox replay retry schedule.",
     )
     _isolate_postgres_per_worker()
 
@@ -136,6 +144,24 @@ def deploy_consent_is_never_ambient(monkeypatch) -> None:
         "COSIGN_PASSWORD",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def outbox_replay_retry_is_opt_in(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sink left with an undeliverable backlog must not outlive its test.
+
+    ``HttpEventSink`` retries a stalled outbox on a daemon worker (10 s
+    doubling to 60 s). In a test that is a thread that wakes after the
+    monkeypatched ``urlopen`` is gone and posts to the real network. The
+    schedule is therefore off unless a test asks for it with the
+    ``collector_outbox_retry`` marker or passes its own retry arguments.
+    """
+
+    if request.node.get_closest_marker(OUTBOX_RETRY_MARKER) is not None:
+        return
+    monkeypatch.setattr(collector_sinks, "OUTBOX_REPLAY_RETRY_MAX_SECONDS", 0.0)
 
 
 @pytest.fixture(autouse=True)

@@ -336,3 +336,82 @@ def test_business_workloads_share_the_fleet_wide_definition(
     ]
     assert runner.active_business_workloads() == expected
     assert regional.business_workloads("node-a") == expected
+
+
+# --------------------------------------------------------------------------- #
+# Replay attribution (2026-10-01: "did not converge" named no channel)
+# --------------------------------------------------------------------------- #
+def test_every_timeline_entry_records_the_replayable_backlog_per_channel(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path)
+    snapshot = _snapshot()
+    snapshot["outboxes"]["fabric-manager"]["replayable_count"] = 2
+    snapshot["outboxes"]["host"]["replayable_count"] = 1
+
+    runner.record_timeline("recovery", snapshot, _store(evidence=3))
+
+    written = json.loads(
+        (runner.case_dir / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert [entry["phase"] for entry in written] == ["recovery"]
+    assert written[0]["replayable_counts"] == {
+        "kernel": 0,
+        "dcgm": 0,
+        "host": 1,
+        "fabric-manager": 2,
+    }
+    assert runner.timeline[0]["replayable_counts"] == written[0]["replayable_counts"]
+
+
+def test_an_unconverged_replay_names_the_stalled_channels_and_their_counts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _runner(tmp_path)
+    snapshot = _snapshot()
+    snapshot["outboxes"]["fabric-manager"]["replayable_count"] = 2
+    snapshot["outboxes"]["host"]["replayable_count"] = 1
+    now = [0.0]
+
+    def monotonic() -> float:
+        return now[0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(
+        net001,
+        "time",
+        type(
+            "Clock",
+            (),
+            {"monotonic": staticmethod(monotonic), "sleep": staticmethod(sleep)},
+        ),
+    )
+    monkeypatch.setattr(runner, "snapshot", lambda tag=None: snapshot)
+    monkeypatch.setattr(runner, "validate_services", lambda _snapshot: None)
+    monkeypatch.setattr(runner, "store_probe", lambda: _store(evidence=3))
+    monkeypatch.setattr(net001, "write_json", lambda _p, _v: None)
+
+    with pytest.raises(net001.CaseError) as failure:
+        runner.wait_for_replay()
+
+    message = str(failure.value)
+    assert message.startswith("collector replay did not converge within 300 s"), message
+    assert "fabric-manager=2" in message and "host=1" in message, message
+    assert "kernel" not in message and "dcgm" not in message, (
+        "drained channels must not be blamed"
+    )
+    assert "evidence records 3/3" in message
+    assert now[0] >= net001.REPLAY_WAIT_SECONDS, "the 300 s budget was not spent"
+    assert all(entry["phase"] == "recovery" for entry in runner.timeline), (
+        runner.timeline
+    )
+    assert runner.timeline[-1]["replayable_counts"]["fabric-manager"] == 2
+
+
+def test_an_unconverged_replay_with_missing_evidence_reports_the_shortfall() -> None:
+    message = net001.unconverged_replay_message(_snapshot(), _store(evidence=1))
+
+    assert "replayable backlog by channel none" in message
+    assert "evidence records 1/3" in message

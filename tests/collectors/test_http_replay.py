@@ -156,6 +156,12 @@ def test_live_post_is_not_blocked_by_background_replay(monkeypatch, tmp_path) ->
 def test_background_replay_stops_on_zero_progress_and_can_be_reawakened(
     monkeypatch, tmp_path
 ) -> None:
+    """With the time-based retry off, only a delivered live post wakes replay.
+
+    ``outbox_replay_retry_max_seconds=0`` is the pre-2026-10 behaviour; the
+    default schedule is covered by ``test_outbox_replay_backoff``.
+    """
+
     calls = []
     recovered = [False]
 
@@ -174,6 +180,7 @@ def test_background_replay_stops_on_zero_progress_and_can_be_reawakened(
         outbox_path=str(outbox),
         outbox_replay_batch_size=1,
         outbox_replay_background_interval_seconds=0,
+        outbox_replay_retry_max_seconds=0,
     )
 
     sink.post("/events", {"sequence": "live-1"})
@@ -301,6 +308,16 @@ def test_outbox_background_replay_inputs_are_bounded() -> None:
         HttpEventSink("https://control", outbox_replay_batch_size=0)
     with pytest.raises(ValueError, match="interval"):
         HttpEventSink("https://control", outbox_replay_background_interval_seconds=-0.1)
+    with pytest.raises(ValueError, match="retry start"):
+        HttpEventSink("https://control", outbox_replay_retry_initial_seconds=0)
+    with pytest.raises(ValueError, match="retry cap"):
+        HttpEventSink("https://control", outbox_replay_retry_max_seconds=-1)
+    with pytest.raises(ValueError, match="below its start"):
+        HttpEventSink(
+            "https://control",
+            outbox_replay_retry_initial_seconds=30,
+            outbox_replay_retry_max_seconds=10,
+        )
 
 
 def test_buffering_an_event_appends_one_line_instead_of_rewriting_the_outbox(

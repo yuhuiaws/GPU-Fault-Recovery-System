@@ -120,10 +120,15 @@ staging environment as of 2026-08-27:
 - `HttpEventSink` now has a per-collector bounded disk outbox. Network errors,
   429 and exhausted 5xx retries are replayable; permanent 4xx records remain
   non-replayable. The residual limitation is bounded capacity, unwritable or
-  damaged local storage, and needing one successful live post to wake replay.
-  After that wake-up a single background worker continues bounded batches
-  without waiting for another collection cycle; it stops on a zero-progress
-  round and a later successful live post wakes it again. Completion Watcher
+  damaged local storage, and a Collector process restarted mid-outage waiting
+  for that channel's next live post (delivered or failed) to re-arm replay.
+  Once armed -- by a delivered post or by a failed post the outbox took -- a
+  single background worker continues bounded batches without waiting for
+  another collection cycle; a zero-progress round waits out a bounded backoff
+  (10 s doubling to a 60 s cap, jittered) rather than stopping, so the backlog
+  drains within about one interval of connectivity returning (GF-REGIONAL-NET-001
+  on 2026-10-01 showed the fabric-manager channel lagging by its full 300 s
+  cadence before this). A later successful live post wakes it early. Completion Watcher
   critical failure/terminal events now use a ConfigMap-backed write-ahead
   outbox and replay independently after restart; its residual bound is the
   configured ConfigMap record/byte limit.

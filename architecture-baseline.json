@@ -2,7 +2,7 @@
   "classes": {
     "scripts/e2e/regional/audit_regional_command_protocol_live.py:LiveProtocolAudit": 1237,
     "scripts/e2e/regional/capacity_acceptance_cases.py:CapacityAcceptanceCases": 937,
-    "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 847,
+    "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 842,
     "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 838,
     "src/gpu_fault/execution/dispatcher.py:WorkflowDispatcher": 1605,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 2350,

@@ -75,6 +75,13 @@ def audit_outbox() -> dict[str, Any]:
                 pass
             available[0] = True
             sink.post("/events", {"sequence": 2})
+            # The failed post armed the backoff worker; the delivered post
+            # wakes it instead of running an inline batch, so the replay
+            # completes just behind the live call rather than inside it.
+            expect(
+                sink.wait_for_outbox_replay(2),
+                "the woken replay worker did not drain within two seconds",
+            )
             replay_order = [item["sequence"] for item in calls]
             expect(
                 replay_order == [1, 2, 1],
@@ -141,11 +148,14 @@ def audit_outbox() -> dict[str, Any]:
 
             collector_sinks.urlopen = unavailable
             bounded_path = f"{directory}/bounded.ndjson"
+            # Capacity and write-failure audits only: the control plane stays
+            # down, so a timed retry would outlive the temporary directory.
             bounded = HttpEventSink(
                 "https://control",
                 max_attempts=1,
                 outbox_path=bounded_path,
                 outbox_max_records=3,
+                outbox_replay_retry_max_seconds=0,
             )
             for sequence in range(10, 15):
                 try:
@@ -173,6 +183,7 @@ def audit_outbox() -> dict[str, Any]:
                 "https://control",
                 max_attempts=1,
                 outbox_path=f"{blocked_parent}/events.ndjson",
+                outbox_replay_retry_max_seconds=0,
             )
             try:
                 unwritable.post("/events", {"sequence": 20})

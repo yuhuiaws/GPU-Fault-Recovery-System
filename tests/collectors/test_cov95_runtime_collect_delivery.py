@@ -214,8 +214,10 @@ def test_replay_failure_cannot_revoke_delivered_event(monkeypatch, tmp_path, cap
     assert sink.post("/events", {"event_id": "fresh"}) == {"accepted": True}
     assert waits == [False], "inline replay is active before a worker exists"
     assert sink.wait_for_outbox_replay(), "failed worker must clear replay ownership"
+    # Inline batch read, its reconciling re-read, then the worker's one round;
+    # the read that failed is not retried on the backoff schedule.
+    assert len(reads) == 3, reads
     assert sink.outbox_stats()["replayable"] == 1
-    assert clock.sleeps == [0.25]
     assert "background read unavailable" in caplog.text
 
 

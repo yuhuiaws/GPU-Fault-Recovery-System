@@ -847,9 +847,12 @@ Only when that header is absent does it use the exponential backoff range. The U
 `gpu-fault-collector/0.10.0`.
 
 Each collector subcommand uses its own bounded NDJSON outbox. Records whose 429/5xx or network retries are exhausted are marked
-replayable; after the latest live event succeeds, a batch of at most 10 records and at most 5 seconds is first resubmitted synchronously. If that batch had
-successful records and a backlog remains, the same sink starts exactly one background worker that keeps resubmitting within the same bounds, without waiting for the
-next collection cycle; it stops on a round with zero successes and waits for a later successful live delivery to wake it again. Live events do not wait for the
+replayable; after the latest live event succeeds, a batch of at most 10 records and at most 5 seconds is first resubmitted synchronously. If a backlog
+remains, the same sink starts exactly one background worker that keeps resubmitting within the same bounds, without waiting for the next collection
+cycle; a round with zero successes waits out a bounded backoff (10 s doubling to a 60 s cap, jittered) and tries again instead of stopping for a later
+successful live delivery -- a failed live delivery that reached the outbox arms the same worker, so after connectivity returns the backlog drains within
+about one interval regardless of the channel's collection cadence; while a worker is waiting out its backoff, a successful live delivery only wakes it
+early instead of running a synchronous batch. Live events do not wait for the
 background worker; permanent rejections such as 400/403/413 are marked as non-replayable dead-letters for audit. By default each file
 holds at most 1000 records, at the path `/var/lib/gpu-fault/outbox/<collector>.ndjson`.
 

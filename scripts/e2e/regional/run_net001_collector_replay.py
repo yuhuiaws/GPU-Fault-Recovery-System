@@ -59,6 +59,9 @@ MAINTENANCE_WINDOW_MINIMUM_SECONDS = 25 * 60
 # firewall rules still in place; the host rollback timer was the only exit.
 EXEC_TIMEOUT_SECONDS = 120
 DELETE_TIMEOUT_SECONDS = 300
+#: The spec's convergence budget (NET-001 判定: every channel's replayable
+#: backlog from this outage reaches zero within 300 s of recovery).
+REPLAY_WAIT_SECONDS = 300
 WAIT_TIMEOUT_SECONDS = 240
 SERVICES = (
     "gpu-fault-kernel-collector.service",
@@ -152,6 +155,54 @@ def command(
         )
     except RegionalFixtureError as exc:
         raise CaseError(str(exc)) from None
+
+
+def replayable_counts(snapshot: dict[str, Any]) -> dict[str, int]:
+    """Per-channel replayable backlog, so a stalled channel is named in evidence."""
+
+    return {
+        name: int(value.get("replayable_count", 0))
+        for name, value in snapshot.get("outboxes", {}).items()
+    }
+
+
+def timeline_entry(
+    phase: str, snapshot: dict[str, Any], store: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "captured_at": utc_now(),
+        "phase": phase,
+        "matching_outbox_ids": Runner.matching_ids(snapshot),
+        "kernel_outbox_line_count": snapshot["outboxes"]["kernel"]["line_count"],
+        "replayable_counts": replayable_counts(snapshot),
+        "evidence_count": len(store["evidence"]),
+        "incident_count": len(store["incidents"]),
+        "notification_count": len(store["notifications"]),
+        "rules": snapshot.get("rules", []),
+    }
+
+
+def unconverged_replay_message(snapshot: dict[str, Any], store: dict[str, Any]) -> str:
+    """Name the channel(s) still holding replayable records and their counts.
+
+    On 2026-10-01 the case failed with a bare "did not converge" while the
+    kernel and DCGM outboxes had drained within seconds and only the
+    fabric-manager channel was still buffering; the next failure must be
+    attributable from the result document alone.
+    """
+
+    stalled = {
+        name: count for name, count in replayable_counts(snapshot).items() if count
+    }
+    channels = (
+        ", ".join(f"{name}={count}" for name, count in sorted(stalled.items()))
+        or "none"
+    )
+    return (
+        f"collector replay did not converge within {REPLAY_WAIT_SECONDS} s: "
+        f"replayable backlog by channel {channels}; "
+        f"evidence records {len(store.get('evidence', []))}/3"
+    )
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -521,20 +572,12 @@ finally:
         snapshot: dict[str, Any],
         store: dict[str, Any],
     ) -> None:
-        entry = {
-            "captured_at": utc_now(),
-            "phase": phase,
-            "matching_outbox_ids": self.matching_ids(snapshot),
-            "kernel_outbox_line_count": snapshot["outboxes"]["kernel"]["line_count"],
-            "evidence_count": len(store["evidence"]),
-            "incident_count": len(store["incidents"]),
-            "notification_count": len(store["notifications"]),
-            "rules": snapshot.get("rules", []),
-        }
+        entry = timeline_entry(phase, snapshot, store)
         self.timeline.append(entry)
         write_json(self.case_dir / "timeline.json", self.timeline)
         print(
             f"{phase}: outbox={entry['matching_outbox_ids']} "
+            f"replayable={entry['replayable_counts']} "
             f"evidence={entry['evidence_count']}",
             flush=True,
         )
@@ -709,7 +752,7 @@ finally:
         )
 
     def wait_for_replay(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + REPLAY_WAIT_SECONDS
         last_snapshot: dict[str, Any] = {}
         last_store: dict[str, Any] = {}
         while time.monotonic() < deadline:
@@ -720,7 +763,7 @@ finally:
             if self.replay_converged(last_snapshot, last_store):
                 return last_snapshot, last_store
             time.sleep(15)
-        raise CaseError("collector replay did not converge")
+        raise CaseError(unconverged_replay_message(last_snapshot, last_store))
 
     def reconnect_once(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Block and unblock once more; the replay must not duplicate anything.
@@ -1004,7 +1047,10 @@ finally:
             "limitations": [
                 "Collector disk outboxes are bounded to 1000 records per channel.",
                 "An unwritable or corrupt outbox can still lose telemetry.",
-                "Kernel outbox replay waits for a subsequent live collector post.",
+                "Outbox replay is woken by the next delivered live collector post "
+                "or by the sink's bounded backoff retry (10 s doubling to a 60 s "
+                "cap, jittered); a silent channel drains within about one "
+                "interval of connectivity returning.",
                 "Completion Watcher has no persistent disk outbox.",
             ],
         }

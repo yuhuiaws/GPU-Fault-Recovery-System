@@ -7557,9 +7557,12 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
   - none of the three decisions generates a node-changing workflow.
 - **Known limitations (must be written into the report)**: the production node Collector configures
   `HttpEventSink` with a bounded per-channel disk outbox, by default at most 1000 records. Capacity overflow,
-  an unwritable or corrupted file system can still lose data; the first successful live post is responsible for waking the catch-up,
-  the background worker keeps draining across batches while it makes progress, and after a round with zero successes it still waits for the next successful live post
-  to wake it again. The Completion Watcher currently has no disk outbox configured; although it reconciles repeatedly inside the running process,
+  an unwritable or corrupted file system can still lose data; the catch-up is woken by the first successful live post **or** by the bounded
+  backoff retry a failed post arms (10 s doubling to a 60 s cap, jittered); the background worker keeps draining across batches while it makes
+  progress, and after a round with zero successes it waits out the next backoff interval instead of the channel's next live post, so the backlog
+  drains within about one interval of connectivity returning (before 2026-10-01 the fabric-manager channel lagged by its full 300 s cadence here).
+  A Collector process restarted during the outage still waits for that channel's next live post (delivered or failed) to re-arm the retry.
+  The Completion Watcher currently has no disk outbox configured; although it reconciles repeatedly inside the running process,
   there is still a one-off risk of losing a terminal event when the Pod restarts exactly inside the interruption window.
 
 
@@ -7741,7 +7744,8 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
     and only then the historical catch-up; the latest XID must not be queued behind the backlog;
   - when the backlog exceeds one batch, a single successful live post is enough to wake the single background worker to drain across batches,
     without relying on a second live event; new live events must not wait for the backlog during the background catch-up;
-  - the background round stops when it has zero successes and must not spin while the network is down; a later successful live post can wake it again and drain;
+  - a background round with zero successes must not spin while the network is down: it retries on a bounded backoff (10 s doubling to a 60 s cap, jittered),
+    at most one bounded batch per interval; a later successful live post wakes it early and drains;
   - a small-capacity outbox keeps only the latest N records, and the output explicitly lists the retained sequences;
   - when the outbox path is not writable, `CollectorError.buffered=false`; it must not pretend to have persisted;
   - HTTP 400 is recorded as `replayable=false` and is not automatically resent;
@@ -14435,13 +14439,15 @@ and the collector restarted**.
 The following are the real boundaries of the current implementation. Reports **must not**
 record them as "passed"; each must be recorded truthfully, item by item:
 
-1. **The Collector outbox is bounded and relies on a subsequent successful post to trigger
-   replay**. `HttpEventSink` persists failed payloads when `outbox_path` is configured;
+1. **The Collector outbox is bounded; replay is triggered by a subsequent successful post
+   or by the bounded backoff retry**. `HttpEventSink` persists failed payloads when `outbox_path` is configured;
    the kernel, DCGM, host and other collectors on production nodes all use a per-channel
    NDJSON outbox with a default cap of 1000 entries. `GF-REGIONAL-NET-001` has proven
    that all kernel/DCGM/host records from a 10-minute outage are submitted late. But
-   capacity overflow and an unwritable/corrupted disk can still lose data, and without a
-   successful live post there is no proactive replay. The Completion Watcher uses the
+   capacity overflow and an unwritable/corrupted disk can still lose data; without a
+   successful live post the backoff retry a failed post arms (10 s doubling to a 60 s cap)
+   replays proactively, while a Collector process restarted mid-outage waits for that
+   channel's next live post to re-arm it. The Completion Watcher uses the
    `gpu-fault-completion-watcher-outbox` ConfigMap as a write-ahead record (steady-state
    attempt status lives separately in `-outbox-active` and does not consume the WAL
    budget); after a Pod rebuild it replays proactively, and duplicate events are absorbed

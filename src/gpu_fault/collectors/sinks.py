@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError
 from urllib.request import (
@@ -405,6 +405,78 @@ class _OutboxReplayResult:
     replayable_remaining: int = 0
 
 
+#: Wait schedule for a replay worker whose last batch delivered nothing while
+#: replayable records remain. The k-th consecutive empty batch waits between
+#: half of and all of ``min(initial * 2**k, maximum)`` seconds, so after an
+#: outage the backlog drains within roughly one capped interval of
+#: connectivity returning -- whatever the collector's own live cadence. The
+#: fabric-manager collector posts a receipt every 300 s and the host collector
+#: a summary every 300 s: on 2026-10-01 both kept a drained-connectivity backlog
+#: buffered for up to a full cadence after a 10-minute outage was lifted, and
+#: GF-REGIONAL-NET-001 (300 s to converge) failed by construction. ``0`` for
+#: the maximum disables the time-based retry: the worker then stops on a
+#: zero-progress batch and only the next delivered live post wakes it.
+OUTBOX_REPLAY_RETRY_INITIAL_SECONDS = 10.0
+OUTBOX_REPLAY_RETRY_MAX_SECONDS = 60.0
+
+#: Doublings after which the schedule is pinned at its cap, so a backlog that
+#: stays undeliverable for days cannot overflow the exponent.
+_OUTBOX_REPLAY_RETRY_MAX_DOUBLINGS = 16
+
+
+def _outbox_replay_retry_schedule(
+    initial_seconds: float | None, max_seconds: float | None
+) -> tuple[float, float]:
+    """Resolve and validate the sink's zero-progress retry schedule.
+
+    ``None`` takes the module defaults (``OUTBOX_REPLAY_RETRY_*``); a maximum
+    of ``0`` disables the time-based retry altogether.
+    """
+
+    initial = (
+        initial_seconds
+        if initial_seconds is not None
+        else OUTBOX_REPLAY_RETRY_INITIAL_SECONDS
+    )
+    maximum = (
+        max_seconds if max_seconds is not None else OUTBOX_REPLAY_RETRY_MAX_SECONDS
+    )
+    if initial <= 0:
+        raise ValueError("collector outbox replay retry start must be positive")
+    if maximum < 0:
+        raise ValueError("collector outbox replay retry cap cannot be negative")
+    if maximum and maximum < initial:
+        raise ValueError("collector outbox replay retry cap cannot be below its start")
+    return initial, maximum
+
+
+class _OutboxReplayBackoff:
+    """Per-worker state for the zero-progress wait schedule above."""
+
+    def __init__(
+        self,
+        initial_seconds: float,
+        max_seconds: float,
+        jitter: Callable[[float, float], float],
+    ) -> None:
+        self.initial_seconds = initial_seconds
+        self.max_seconds = max_seconds
+        self.jitter = jitter
+        self.empty_batches = 0
+
+    def reset(self) -> None:
+        self.empty_batches = 0
+
+    def next_delay(self) -> float:
+        doublings = min(self.empty_batches, _OUTBOX_REPLAY_RETRY_MAX_DOUBLINGS)
+        base = min(self.initial_seconds * 2**doublings, self.max_seconds)
+        self.empty_batches += 1
+        # Clamp the jitter's answer too: a caller-supplied ``jitter`` is a
+        # test seam, and a worker that honoured a negative or oversize value
+        # would either spin against a down control plane or sleep past the cap.
+        return min(max(self.jitter(base / 2, base), 0.0), self.max_seconds)
+
+
 #: Identity of one buffered record: path, when it was buffered and its payload.
 #: Used to reconcile a replay's outcome with a file another writer may have
 #: appended to while the replay's requests were in flight, because a record's
@@ -474,6 +546,8 @@ class HttpEventSink:
         outbox_replay_batch_size: int = 10,
         outbox_replay_budget_seconds: float | None = None,
         outbox_replay_background_interval_seconds: float = 0.25,
+        outbox_replay_retry_initial_seconds: float | None = None,
+        outbox_replay_retry_max_seconds: float | None = None,
         processor_receipt_timeout_seconds: float = 120,
         processor_receipt_poll_seconds: float = 0.25,
         gzip_min_bytes: int | None = None,
@@ -513,6 +587,12 @@ class HttpEventSink:
         self.outbox_replay_background_interval_seconds = (
             outbox_replay_background_interval_seconds
         )
+        (
+            self.outbox_replay_retry_initial_seconds,
+            self.outbox_replay_retry_max_seconds,
+        ) = _outbox_replay_retry_schedule(
+            outbox_replay_retry_initial_seconds, outbox_replay_retry_max_seconds
+        )
         if (
             processor_receipt_timeout_seconds <= 0
             or processor_receipt_poll_seconds <= 0
@@ -541,7 +621,15 @@ class HttpEventSink:
         self._outbox_line_count: int | None = None
         self._outbox_replay_state_lock = Lock()
         self._outbox_replay_active = False
+        # A live post was delivered while the worker ran: run another batch
+        # right away, the link is evidently up.
         self._outbox_replay_requested = False
+        # A live post failed and buffered a record while the worker ran: the
+        # worker must not stop on a snapshot that predates that append.
+        self._outbox_replay_pending = False
+        # Set by a delivered live post so a worker waiting out its backoff
+        # replays now instead of at the end of the interval.
+        self._outbox_replay_wake = Event()
         self._outbox_replay_thread: Thread | None = None
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -554,12 +642,20 @@ class HttpEventSink:
         ``processor_receipt_timeout_seconds`` poll, so a node that had
         just come back from a network partition could delay its own
         fault report by minutes while the kernel collector's /dev/kmsg
-        reader fell behind. Replay only runs after a successful
+        reader fell behind. An inline replay only runs after a successful
         delivery: if the fresh post failed, the link is still down and
-        replaying would only waste the caller's time.
+        replaying would only waste the caller's time. A failed post that
+        the outbox took instead arms the background worker's bounded
+        backoff, so the backlog drains once connectivity returns without
+        waiting for this channel's next live post.
         """
 
-        result = self._post_with_retry(path, payload, buffer_failure=True)
+        try:
+            result = self._post_with_retry(path, payload, buffer_failure=True)
+        except CollectorError as exc:
+            if exc.buffered and exc.replayable:
+                self._schedule_outbox_replay_retry()
+            raise
         self._kick_outbox_replay()
         return result
 
@@ -611,7 +707,10 @@ class HttpEventSink:
 
         Collectors do not call this on their hot path. It exists for
         acceptance probes and orderly embedders that need to prove the
-        durable queue has converged before they exit.
+        durable queue has converged before they exit. ``True`` means no
+        worker owns the outbox; ``False`` means one is still draining --
+        or, while the control plane stays unreachable, still waiting out
+        its backoff with replayable records left.
         """
 
         if timeout_seconds < 0:
@@ -633,9 +732,11 @@ class HttpEventSink:
         with self._outbox_replay_state_lock:
             if self._outbox_replay_active:
                 self._outbox_replay_requested = True
+                self._outbox_replay_wake.set()
                 return
             self._outbox_replay_active = True
             self._outbox_replay_requested = False
+            self._outbox_replay_pending = False
         try:
             outcome = self._replay_outbox()
         except Exception as exc:
@@ -651,15 +752,51 @@ class HttpEventSink:
                 self._outbox_replay_active = False
                 self._outbox_replay_thread = None
             return
-        if not self._continue_outbox_replay(outcome):
+        backoff = self._new_outbox_replay_backoff()
+        delay = self._continue_outbox_replay(outcome, backoff)
+        if delay is None:
             return
+        self._start_outbox_replay_thread(delay, backoff)
+
+    def _schedule_outbox_replay_retry(self) -> None:
+        """Arm the backoff worker for a record a failed live post just buffered.
+
+        No inline batch: the link just proved itself down. If a worker already
+        owns the outbox it keeps its own schedule and is told not to stop on a
+        snapshot older than this append; otherwise one starts and sleeps the
+        first backoff interval before its first attempt.
+        """
+
+        if self.outbox_path is None or not self.outbox_replay_retry_max_seconds:
+            return
+        with self._outbox_replay_state_lock:
+            if self._outbox_replay_active:
+                self._outbox_replay_pending = True
+                return
+            self._outbox_replay_active = True
+            self._outbox_replay_requested = False
+            self._outbox_replay_pending = False
+        backoff = self._new_outbox_replay_backoff()
+        self._start_outbox_replay_thread(backoff.next_delay(), backoff)
+
+    def _new_outbox_replay_backoff(self) -> _OutboxReplayBackoff:
+        return _OutboxReplayBackoff(
+            self.outbox_replay_retry_initial_seconds,
+            self.outbox_replay_retry_max_seconds,
+            self.jitter,
+        )
+
+    def _start_outbox_replay_thread(
+        self, delay: float, backoff: _OutboxReplayBackoff
+    ) -> None:
         thread = Thread(
-            target=self._background_outbox_replay,
+            target=lambda: self._background_outbox_replay(delay, backoff),
             name="gpu-fault-collector-outbox-replay",
             daemon=True,
         )
         with self._outbox_replay_state_lock:
             self._outbox_replay_thread = thread
+            self._outbox_replay_wake.clear()
         try:
             thread.start()
         except Exception as exc:
@@ -679,24 +816,54 @@ class HttpEventSink:
                 exc,
             )
 
-    def _continue_outbox_replay(self, outcome: _OutboxReplayResult) -> bool:
+    def _continue_outbox_replay(
+        self, outcome: _OutboxReplayResult, backoff: _OutboxReplayBackoff
+    ) -> float | None:
+        """How long the worker waits before its next batch; ``None`` to stop.
+
+        Progress -- a delivered record, or a live post delivered meanwhile --
+        resets the backoff and the next batch follows at the background
+        interval. No progress with replayable records left (or a record a
+        failed live post buffered while this batch was in flight) waits out
+        the next backoff interval, so a down control plane sees at most one
+        bounded batch per interval and a returning one is noticed within
+        roughly one. An empty outbox, or a disabled retry, releases the
+        worker; the next delivered live post kicks a fresh one.
+        """
+
         with self._outbox_replay_state_lock:
             requested = self._outbox_replay_requested
             self._outbox_replay_requested = False
-            if outcome.replayable_remaining and (outcome.delivered or requested):
-                return True
+            pending = self._outbox_replay_pending
+            self._outbox_replay_pending = False
+            remaining = outcome.replayable_remaining or pending
+            if remaining and (outcome.delivered or requested):
+                backoff.reset()
+                return self.outbox_replay_background_interval_seconds
+            if remaining and self.outbox_replay_retry_max_seconds:
+                delay = backoff.next_delay()
+                LOGGER.debug(
+                    "collector outbox replay made no progress; %d replayable "
+                    "record(s) wait %.1fs for the next attempt",
+                    outcome.replayable_remaining,
+                    delay,
+                )
+                return delay
             self._outbox_replay_active = False
             self._outbox_replay_thread = None
-            return False
+            return None
 
-    def _background_outbox_replay(self) -> None:
+    def _background_outbox_replay(
+        self, delay: float, backoff: _OutboxReplayBackoff
+    ) -> None:
         try:
             while True:
-                if self.outbox_replay_background_interval_seconds:
-                    time.sleep(self.outbox_replay_background_interval_seconds)
+                self._pause_outbox_replay(delay)
                 outcome = self._replay_outbox()
-                if not self._continue_outbox_replay(outcome):
+                next_delay = self._continue_outbox_replay(outcome, backoff)
+                if next_delay is None:
                     return
+                delay = next_delay
         except Exception as exc:
             _report_replay_failure(
                 "collector background outbox replay", self.outbox_path, exc
@@ -704,6 +871,18 @@ class HttpEventSink:
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
                 self._outbox_replay_thread = None
+
+    def _pause_outbox_replay(self, delay: float) -> None:
+        """Wait ``delay`` seconds unless a delivered live post wakes the worker.
+
+        An ``Event`` rather than ``time.sleep`` so a successful post cuts a
+        60 s backoff short, and so the daemon thread never holds up a shutdown
+        for longer than the batch it is in.
+        """
+
+        if delay > 0:
+            self._outbox_replay_wake.wait(delay)
+        self._outbox_replay_wake.clear()
 
     def _post_with_retry(
         self,
@@ -913,7 +1092,8 @@ class HttpEventSink:
         receipt-bearing paths, a receipt poll) against a control plane that may
         already be gone, so a shutdown budget of a second buys a handful of
         records instead of the whole queue. Each record costs one appended
-        line, and the next successful post replays them in file order.
+        line; the next successful post -- or the backoff worker a failed
+        post arms -- replays them in file order.
 
         Returns ``False`` -- never raises -- when there is no outbox
         configured or the write failed, so a drain loop can count what it
