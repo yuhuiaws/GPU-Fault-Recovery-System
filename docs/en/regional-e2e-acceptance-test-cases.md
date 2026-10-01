@@ -5420,7 +5420,7 @@ and pass it in). Cases must be selected explicitly with `--case`; duplicate sele
 Each case is judged and cleaned up independently; any failed assertion or cleanup stops the run and subsequent cases are recorded as not run;
 with `--run-dir` (optionally `--release-id`), CMD-001..010/012..016
 each write one `cases/<id>/<id>.json`;
-`--write-evidence <summary.json>` writes the printed run summary into the same kind of evidence file on the operator side,
+`--write-evidence <summary.json>` writes the printed run summary (the captured Pod stdout, progress lines included) into the same kind of evidence file on the operator side,
 without touching any cluster. `--emit-probe` only emits the complete source bundle including the companion helper,
 for execution by the CPU component interpreter; do not copy only the main script and leave out the helper.
 

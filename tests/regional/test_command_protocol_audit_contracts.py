@@ -18,6 +18,7 @@ import pytest
 
 from scripts.e2e.regional import audit_executor_local_guards as local_guards
 from scripts.e2e.regional import audit_regional_command_protocol_live as audit_module
+from scripts.e2e.regional import command_audit_summary
 from scripts.e2e.regional.audit_regional_command_protocol_live import (
     AUDITED_CASE_IDS,
     LiveProtocolAudit,
@@ -332,6 +333,33 @@ def test_write_evidence_from_summary_writes_one_file_per_recorded_case(
     assert second["verdict"] == "FAIL" and second["error"] == "order"
     with pytest.raises(ProtocolAuditError, match="no per-case results"):
         write_evidence_from_summary({"results": {}}, tmp_path)
+
+
+def test_printed_summary_skips_the_audit_progress_lines() -> None:
+    summary = {
+        "verdict": "PASS",
+        "results": {"GF-REGIONAL-CMD-001": {"verdict": "PASS"}},
+    }
+    captured = "\n".join(
+        [
+            "ARMED",
+            "PASS GF-REGIONAL-CMD-001",
+            "FAIL GF-REGIONAL-CMD-005: order",
+            json.dumps(summary, indent=2),
+            "",
+        ]
+    )
+
+    assert command_audit_summary.printed_summary(captured) == summary, (
+        "progress lines before the JSON summary must be skipped"
+    )
+    assert command_audit_summary.printed_summary(json.dumps(summary)) == summary, (
+        "a bare JSON summary must still parse"
+    )
+    with pytest.raises(SystemExit, match="printed run summary JSON"):
+        command_audit_summary.printed_summary("Traceback (most recent call last):\n{}")
+    with pytest.raises(SystemExit, match="printed run summary JSON"):
+        command_audit_summary.printed_summary("PASS GF-REGIONAL-CMD-001\n[]")
 
 
 def test_local_guard_fixture_writes_evidence_for_iso002_and_cmd011(

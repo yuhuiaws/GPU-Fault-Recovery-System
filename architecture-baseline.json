@@ -26,7 +26,7 @@
   "files": {
     "deploy/hyperpod/deploy.sh": 3323,
     "deploy/node/install-gpu-fault-collector.sh": 1827,
-    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2199,
+    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2192,
     "scripts/e2e/regional/probes/collector_node_probe.py": 4008,
     "scripts/e2e/regional/run_collector_acceptance.py": 1860,
     "scripts/e2e/regional/run_collector_destructive.py": 1594,

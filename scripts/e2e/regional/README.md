@@ -261,8 +261,8 @@ journals retain their original guarded recovery path.
   passes `--isolated-cluster` or `--executor-ready-replicas 0` (read from the
   executor Deployment outside the Pod); `--run-dir`/`--release-id` write
   `cases/<id>/<id>.json` per CMD case, and `--write-evidence SUMMARY_JSON`
-  writes that evidence operator-side from a printed run summary without
-  touching any cluster.
+  writes that evidence operator-side from a printed run summary (the captured
+  Pod stdout, progress lines included) without touching any cluster.
 - `audit_executor_local_guards.py --run-dir/--release-id` writes ISO-002 and
   CMD-011 evidence.
 - `audit_auth_boundary.py matrix ... --run-dir --cpu-kubeconfig --namespace`:

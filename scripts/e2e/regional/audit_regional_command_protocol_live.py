@@ -2163,16 +2163,9 @@ def main() -> int:
         print(probe_source(), end="")
         return 0
     if arguments.write_evidence is not None:
-        if arguments.credentials_stdin or arguments.synthetic_run_id:
-            raise SystemExit("credential input is only valid for a live audit")
-        if arguments.run_dir is None:
-            raise SystemExit("--write-evidence needs --run-dir")
-        summary = json.loads(arguments.write_evidence.read_text(encoding="utf-8"))
-        written = write_evidence_from_summary(
-            summary, arguments.run_dir, release_id=arguments.release_id
-        )
-        print(json.dumps({"written": [str(path) for path in written]}, indent=2))
-        return 0 if summary.get("verdict") == "PASS" else 1
+        from scripts.e2e.regional.command_audit_summary import write_evidence_main
+
+        return write_evidence_main(arguments, write_evidence_from_summary)
     for name in (
         "cluster_id",
         "other_cluster_id",
