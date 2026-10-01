@@ -317,17 +317,37 @@ def test_unknown_notification_channel_cannot_be_inferred_as_a_known_mode() -> No
         "namespace-jobset",
         "pod-sa",
         "iam",
+        "named-secret-drift",
+        "unnamed-secret",
     ],
 )
 def test_executor_audit_judges_every_workload_permission_column(
     defect: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     runner = make_runner(monkeypatch, tmp_path, "GF-REGIONAL-BLAST-003")
-    role = next(
+    manifest = [
         item
         for item in yaml.safe_load_all(cases.EXECUTOR_MANIFEST.read_text())
-        if isinstance(item, dict) and item["kind"] == "ClusterRole"
-    )
+        if isinstance(item, dict)
+    ]
+    role = next(item for item in manifest if item["kind"] == "ClusterRole")
+    # The live inventory as deploy renders it: the manifest's namespaced
+    # node-key Role + RoleBinding in the site's system namespace.
+    inventory = []
+    for item in manifest:
+        if item["kind"] not in {"Role", "RoleBinding"}:
+            continue
+        item = json.loads(json.dumps(item))
+        item["metadata"]["namespace"] = runner.namespace
+        for subject in item.get("subjects", []):
+            subject["namespace"] = runner.namespace
+        if item["kind"] == "Role":
+            rule = item["rules"][0]
+            if defect == "named-secret-drift":
+                rule["resourceNames"] = ["gpu-fault-cluster-token"]
+            elif defect == "unnamed-secret":
+                rule.pop("resourceNames")
+        inventory.append(item)
     expected = cases.expected_executor_role()
     keys = {
         "nodes": "core:nodes",
@@ -364,7 +384,7 @@ def test_executor_audit_judges_every_workload_permission_column(
 
     def gpu_json(target: base.ClusterTarget, *args: str) -> dict[str, Any]:
         if cases.RBAC_INVENTORY in args:
-            return {"items": []}
+            return {"items": inventory}
         if "clusterrole" in args:
             return role
         if "pod" in args:
@@ -421,6 +441,28 @@ def test_executor_audit_judges_every_workload_permission_column(
         checks = result["checks"]["clusters"][0]
         assert checks["sensitive_resources_all_denied"] is True
         assert checks["workloads_exact_permissions"] is False
+    role_evidence = json.loads(
+        (runner.run_dir / "BLAST-003-role-cluster-0.json").read_text()
+    )
+    assert role_evidence["expected_named_namespace_grants"] == {
+        runner.namespace: {"core:secrets@gpu-fault-node-action-keys": ["get", "patch"]}
+    }
+    grants = role_evidence["unexpected_bound_grants"]
+    if defect in {"named-secret-drift", "unnamed-secret"}:
+        assert [(item["verb"], item["resource_names"]) for item in grants] == [
+            (
+                verb,
+                ["gpu-fault-cluster-token"] if defect == "named-secret-drift" else [],
+            )
+            for verb in ("get", "patch")
+        ]
+        assert all(
+            item["binding"] == "RoleBinding/gpu-fault-cluster-executor-node-keys"
+            and item["namespace"] == runner.namespace
+            for item in grants
+        ), grants
+    else:
+        assert grants == [], "the manifest's named node-key grant is not a finding"
 
 
 @pytest.mark.parametrize(

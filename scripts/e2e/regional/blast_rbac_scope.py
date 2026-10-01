@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from scripts.e2e.regional.blast_acceptance_base import CheckError
 
@@ -171,15 +171,32 @@ def bound_rules(document: dict[str, Any], service_account: str) -> list[BoundRul
     return result
 
 
+def named_grant_key(key: str, name: str) -> str:
+    """Key of one named-resource expectation: ``core:secrets@secret-name``."""
+
+    return f"{key}@{name}"
+
+
 def unexpected_grants(
     grants: list[BoundRule],
     *,
     expected_cluster: dict[str, list[str]],
     expected_namespaces: dict[str, dict[str, list[str]]],
+    expected_named_namespaces: Mapping[str, Mapping[str, list[str]]] | None = None,
     cpu: bool = False,
 ) -> list[dict[str, Any]]:
-    """Reject extra actionable or sensitive grants, including named resources."""
+    """Reject extra actionable or sensitive grants, including named resources.
 
+    ``expected_named_namespaces[namespace][named_grant_key(key, name)]`` lists
+    the verbs a *named* rule may hold in one namespace. Such an expectation
+    satisfies a rule only when the rule carries ``resourceNames`` and every
+    name it lists is expected for the verb; a rule without ``resourceNames``
+    is judged solely against the unnamed expectations, so a manifest's
+    named Secret grant can never excuse namespace-wide Secret access. The
+    ``cpu`` policy ignores both expectation maps.
+    """
+
+    named_expectations = expected_named_namespaces or {}
     errors = []
     for grant in grants:
         rule = grant.rule
@@ -215,6 +232,12 @@ def unexpected_grants(
                             expected_namespaces.get(grant.namespace, {}).get(key, [])
                         )
                     denied = verb not in allowed
+                    if denied and names and grant.namespace is not None:
+                        named = named_expectations.get(grant.namespace, {})
+                        denied = any(
+                            verb not in named.get(named_grant_key(key, name), [])
+                            for name in names
+                        )
                     if cpu:
                         denied = verb in WRITE_VERBS or (
                             resource in {"pods/exec", "pods/attach", "nodes/proxy"}

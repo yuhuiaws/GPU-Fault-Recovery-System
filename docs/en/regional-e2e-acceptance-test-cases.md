@@ -8382,7 +8382,17 @@ The lock name may in future be subdivided by explicit endpoint scope; for now th
      RoleBindings; an SSAR without a resource name cannot stand in for them.
   3. Inspect the executor's IAM role: confirm there is **no** `ses:*`.
 - Verdict:
-  - every verb on `secrets` / `configmaps` / `clusterroles` is `no`;
+  - in the SSARs without a resource name, every verb on `secrets` / `configmaps` /
+    `clusterroles` is `no`. The one named exception comes from the executor manifest
+    `deploy/dataplane/cluster-action-executor.yaml` itself: the system-namespace Role
+    `gpu-fault-cluster-executor-node-keys` grants `get,patch` on the Secret
+    `gpu-fault-node-action-keys` (scoped by `resourceNames`) so that nodes HyperPod replaces
+    after deploy receive their node key; there is no `list`/`watch`/`create`/`delete`/`update`.
+    The runner derives the expectation from the named Roles that manifest binds to the executor
+    ServiceAccount (evidence `BLAST-003-role-<cluster>.json`, field
+    `expected_named_namespace_grants`); a manifest Role with a rule lacking `resourceNames` or
+    with any verb beyond `get`/`patch` is an error, and any other named or unnamed Secret grant
+    (another Secret name, another namespace, a ClusterRoleBinding) still fails;
   - `nodes` has only `get,list,watch,patch` (**no** `delete`);
   - `pods` has only `get,list,watch` in the ClusterRole (since security review 459bcc1 the
     `delete`/`patch` needed to stop workloads is granted only through a Role in each allowed

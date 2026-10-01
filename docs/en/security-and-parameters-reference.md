@@ -581,6 +581,18 @@ Agent; it does not itself hand out the master, nor restart or reinstall nodes.
 That evidence covers only the trusted provisioning path and does not endorse unobserved historical activity; see
 [Node Key Custody Evidence](../components/node-key-custody-evidence.md) for details.
 
+Replacement nodes obtain their key through `POST /v1/regional/node-action-keys` (cluster-token
+bucket; the payload's `cluster_id` is subject to cluster binding, at most 64 node ids). Threat
+boundary: an executor holding one cluster's cluster token can only obtain v2 keys for **nodes the
+control plane has already seen in that cluster's own data-plane evidence**, and keys are derived
+scoped by cluster_id, so it cannot fetch keys for another cluster or for invented node names; the
+fleet master never leaves the CPU, values never enter logs or audit, only the cluster and node names
+enter the audit row. On the data-plane side the executor's Kubernetes permission is the namespaced
+Role `gpu-fault-cluster-executor-node-keys`: `secrets` `get`/`patch` with `resourceNames`
+containing only `gpu-fault-node-action-keys`; no list/watch/create/delete, the sync only appends
+missing keys and uses a `resourceVersion` precondition so it cannot overwrite a concurrent write.
+Clusters not in the ACTIVE lifecycle state are refused on this path.
+
 ### 5.1 Mail Notification Boundaries
 
 - `adminEmail` is the site operations contact; `emailSender` is the verified SES identity;

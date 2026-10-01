@@ -29,6 +29,7 @@ from scripts.e2e.regional.blast_acceptance_cases_1 import BlastCasesOne
 from scripts.e2e.regional.blast_rbac_scope import (
     RBAC_INVENTORY,
     bound_rules,
+    named_grant_key,
     unexpected_grants,
 )
 from scripts.e2e.regional.credential_value_scan import (
@@ -40,6 +41,20 @@ from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
 
 EXECUTOR_MANIFEST = ROOT / "deploy" / "dataplane" / "cluster-action-executor.yaml"
 EXECUTOR_CLUSTER_ROLE = "gpu-fault-cluster-executor"
+# The only verbs a manifest Role may hold on a named resource. `list`/`watch`
+# cannot be name-scoped by RBAC and `create`/`update`/`delete` would let the
+# executor own a Secret's identity, so the audit refuses such a manifest
+# rather than learning to expect it.
+NAMED_ROLE_VERBS = frozenset({"get", "patch"})
+RBAC_KINDS = frozenset({"Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"})
+
+
+def executor_manifest_documents(manifest: Path) -> list[dict[str, Any]]:
+    return [
+        document
+        for document in yaml.safe_load_all(manifest.read_text(encoding="utf-8"))
+        if isinstance(document, dict)
+    ]
 
 
 def expected_executor_role(
@@ -52,15 +67,76 @@ def expected_executor_role(
     case judged the deployment against a role nobody ships.
     """
 
-    documents = yaml.safe_load_all(manifest.read_text(encoding="utf-8"))
-    for document in documents:
+    for document in executor_manifest_documents(manifest):
         if (
-            isinstance(document, dict)
-            and document.get("kind") == "ClusterRole"
+            document.get("kind") == "ClusterRole"
             and (document.get("metadata") or {}).get("name") == EXECUTOR_CLUSTER_ROLE
         ):
             return BlastCasesTwo.normalized_role_rules(document)
     raise CheckError(f"{manifest} declares no ClusterRole {EXECUTOR_CLUSTER_ROLE}")
+
+
+def expected_executor_named_roles(
+    *,
+    system_namespace: str,
+    manifest: Path = EXECUTOR_MANIFEST,
+) -> dict[str, dict[str, list[str]]]:
+    """Named-resource grants the shipped manifest binds to the executor SA.
+
+    Every manifest Role whose RoleBinding reaches the executor ServiceAccount
+    becomes an expectation keyed ``namespace -> "group:resource@name" ->
+    verbs``, with the manifest's namespace mapped onto the live system
+    namespace. Only ``resourceNames``-scoped ``get``/``patch`` rules qualify:
+    an un-named rule or any other verb in such a Role fails the audit instead
+    of widening what BLAST-003 tolerates (the node-key Secret grant added for
+    HyperPod replacement nodes is the one such Role today).
+    """
+
+    documents = executor_manifest_documents(manifest)
+    accounts = [
+        (document.get("metadata") or {}).get("namespace")
+        for document in documents
+        if document.get("kind") == "ServiceAccount"
+        and (document.get("metadata") or {}).get("name") == EXECUTOR_CLUSTER_ROLE
+    ]
+    if len(accounts) != 1 or not isinstance(accounts[0], str) or not accounts[0]:
+        raise CheckError(f"{manifest} declares no executor ServiceAccount namespace")
+    manifest_namespace = accounts[0]
+    grants = bound_rules(
+        {"items": [item for item in documents if item.get("kind") in RBAC_KINDS]},
+        f"system:serviceaccount:{manifest_namespace}:{EXECUTOR_CLUSTER_ROLE}",
+    )
+    result: dict[str, set[str]] = {}
+    for grant in grants:
+        if grant.namespace is None:
+            continue
+        if grant.namespace != manifest_namespace:
+            raise CheckError("executor manifest binds a Role outside its namespace")
+        rule = grant.rule
+        names = rule.get("resourceNames") or []
+        resources = rule.get("resources") or []
+        verbs = {str(item) for item in rule.get("verbs") or []}
+        if (
+            not names
+            or not resources
+            or rule.get("nonResourceURLs")
+            or not verbs
+            or not verbs <= NAMED_ROLE_VERBS
+        ):
+            raise CheckError(
+                f"executor manifest Role bound by {grant.binding} grants un-named "
+                "or non get/patch access"
+            )
+        for api_group in rule.get("apiGroups") or [""]:
+            for resource in resources:
+                for name in names:
+                    key = named_grant_key(f"{api_group or 'core'}:{resource}", name)
+                    result.setdefault(key, set()).update(verbs)
+    if not result:
+        return {}
+    return {
+        system_namespace: {key: sorted(value) for key, value in sorted(result.items())}
+    }
 
 
 class BlastCasesTwo(BlastCasesOne):
@@ -264,6 +340,7 @@ class BlastCasesTwo(BlastCasesOne):
         target_results = []
         passed = True
         expected_role = expected_executor_role()
+        expected_named = expected_executor_named_roles(system_namespace=self.namespace)
         expected_node_verbs = set(expected_role.get("core:nodes", []))
         expected_pod_verbs = set(expected_role.get("core:pods", []))
         # The spec's two named facts about the manifest, checked against the
@@ -382,12 +459,14 @@ class BlastCasesTwo(BlastCasesOne):
                 ),
                 expected_cluster=expected_role,
                 expected_namespaces=self.expected_namespace_roles(target),
+                expected_named_namespaces=expected_named,
             )
             write_json(
                 self.run_dir / f"BLAST-003-role-{target.cluster_id}.json",
                 {
                     "actual": normalized_role,
                     "expected": expected_role,
+                    "expected_named_namespace_grants": expected_named,
                     "expected_source": str(EXECUTOR_MANIFEST.relative_to(ROOT)),
                     "matches": role_matches_manifest,
                     "unexpected_bound_grants": binding_errors,
