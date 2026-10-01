@@ -160,9 +160,48 @@ def manifest_repository_root(manifest: Path) -> Path:
         return resolved.parents[1]
     if len(resolved.parents) > 2 and resolved.parents[1].name == "dist":
         return resolved.parents[2]
+    # A management copy lives outside any dist/; its absolute wheel path still
+    # tells which repository built the release.
+    try:
+        value = json.loads(resolved.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        value = None
+    wheel = Path(str(value.get("wheel") or "")) if isinstance(value, dict) else None
+    if wheel is not None and wheel.is_absolute() and wheel.is_file():
+        root = containing_repository_root(wheel)
+        if root is not None:
+            return root
+        if len(wheel.parents) > 2 and wheel.parents[1].name == "dist":
+            return wheel.parents[2]
     raise SiteConfigError(
         f"previous release manifest is not under a dist/ directory: {resolved}"
     )
+
+
+def _unwrap_management_manifest(path: Path) -> Path:
+    """The immutable source behind a rollback-management copy, or ``path``.
+
+    After one rollback the site points at
+    ``rollback-management/<id>/release.status.json``; the next release records
+    that path as the previous release's manifest, so a later rollback is
+    handed the management copy as its source. The copy is a status baseline
+    with absolute artifact paths, not the manifest that built them; follow
+    its ``management_baseline.source_manifest`` when that file still exists.
+    """
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return path
+    if not isinstance(value, dict):
+        return path
+    baseline = value.get("management_baseline")
+    if not isinstance(baseline, dict):
+        return path
+    source = str(baseline.get("source_manifest") or "")
+    if not source:
+        return path
+    candidate = Path(source).expanduser()
+    return candidate.resolve() if candidate.is_file() else path
 
 
 def find_previous_release_manifest(
@@ -177,6 +216,7 @@ def find_previous_release_manifest(
     delivery_matches: list[tuple[Path, str, str]] = []
 
     def consider(path: Path) -> None:
+        path = _unwrap_management_manifest(path)
         identity = _release_manifest_identity(path, previous)
         if identity is None:
             return

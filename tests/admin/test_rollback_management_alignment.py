@@ -640,3 +640,41 @@ def test_manifest_repository_root_prefers_the_rollout_entrypoint(
     )
     with pytest.raises(SiteConfigError, match="not under a dist"):
         manifest_repository_root(tmp_path / "elsewhere" / "release.json")
+
+
+def test_a_recorded_management_manifest_resolves_to_its_immutable_source(
+    tmp_path: Path,
+) -> None:
+    """After one rollback the state records the management copy as the previous
+    manifest; the next rollback must follow it back to the source that built
+    the artifacts instead of refusing it as "not under dist/" (live defect)."""
+    from gpu_fault.admin.rollback_alignment import (
+        find_previous_release_manifest,
+        manifest_repository_root,
+    )
+
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    destination = (
+        tmp_path / "rollback-management" / "old-release" / "release.status.json"
+    )
+    rollback_management_document(site, live_state, management_manifest=destination)
+    assert destination.is_file(), "the first rollback must write the management copy"
+
+    live_state["previous"]["release_manifest_path"] = str(destination)
+    resolved = find_previous_release_manifest(tmp_path, live_state["previous"])
+
+    assert resolved == manifest.resolve(), (
+        "the management copy must unwrap to the immutable source manifest"
+    )
+    assert manifest_repository_root(destination) == manifest.parents[2].resolve(), (
+        "a management copy's absolute wheel path names the repository that built it"
+    )
+    document, _restored, repository_root = rollback_management_document(
+        site, live_state, management_manifest=destination
+    )
+    assert repository_root == manifest.parents[2].resolve(), (
+        "the second rollback must anchor at the same repository"
+    )
+    assert document["spec"]["release"]["manifest"] == str(destination), (
+        "the site must point at the rewritten management copy"
+    )

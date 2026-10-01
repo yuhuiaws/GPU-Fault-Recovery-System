@@ -677,6 +677,10 @@ there is no entrypoint — two levels up for `dist/<release-id>/release.json`, o
 `deploy` all refuse with "release component wheels and bundle must exist". Every wheel and the bundle the
 management manifest would name is checked for existence before anything is written; a missing file
 refuses the rewrite of `site.yaml` (fail closed) instead of leaving a site that cannot load its release.
+After one rollback the site points at that management copy and the next release records it as the
+previous release's manifest path; a later rollback follows `management_baseline.source_manifest` back to
+the immutable manifest that built the artifacts (falling back to the copy's absolute wheel path to infer
+the repository root only when the source is gone) and never treats the copy itself as the source.
 
 When rolling back to a single-wheel release of **release manifest schema v1** (not PostgreSQL
 schema v1), the old Agent compatibility digest is equivalent to the old artifact SHA; the old process's environment
