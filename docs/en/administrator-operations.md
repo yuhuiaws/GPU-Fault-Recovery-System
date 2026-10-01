@@ -30,7 +30,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
-| Converge historical workflows that recovered but stay BLOCKED | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| Converge historical workflows that recovered but stay BLOCKED, and never-dispatched PENDING workflows whose node left with a spot replacement | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
 | Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
 | Handle one AMP alert | Enter the triage card by alert name | §8 |
@@ -2854,6 +2854,63 @@ reason, `amend_workflow` with an audit event, compare-and-set `save_incident`)
 -- so this lever is usable on the very release whose preflight such records block; after the release the dispatcher's sweep also automatically closes out
 the same shape (except node actions with a still-unknown outcome; confirm first per §9.4). Do not change Store rows to make the count fall.
 
+**The third shape: a never-dispatched `PENDING` record whose node is gone (`never-dispatched`).** HyperPod reclaimed a
+spot node while the control plane was still ingesting its last telemetry; the workflows of that node's incidents lost their
+Agent the moment they were created -- the fleet preflight will never dispatch them -- so the records sit at `PENDING`: zero
+step executions, zero remote commands, no events. The dispatcher's sweep leaves `PENDING` alone, `workflow_safety` counts
+them as active destructive workflows and refuses every release (the refusal ends with a hint naming this command), and
+`uninstall` counts them as active. The same `workflow-reconcile` now discovers and closes them beside the `BLOCKED` backlog:
+
+- **Discovery rule** (Pod side, `gpu_fault.workflow_resolution.never_dispatched_reconciliation_reasons`, all required):
+  `status=PENDING`; no step execution, no completed or superseded step, no completed operation; no execution owner, no
+  unexpired lease, no remediation budget claim; the workflow has **no** remote command at all (a settled one does not
+  count either -- it means an Agent did act); `created_at` is **at least 10 minutes** ago (`NEVER_DISPATCHED_GUARD_AGE`,
+  so a record about to be dispatched is never raced); the incident still names it (a record the incident moved past is a
+  retired generation and the dispatcher sweep's). The `PENDING` scan is likewise oldest `updated_at` first, at most
+  10,000; `--incident-id`/`--max-items` apply too (`--max-items` caps the `BLOCKED` batch and the `PENDING` batch
+  separately) and the result counts it under `never_dispatched_discovery`; a `PENDING` record named with `--workflow-id`
+  is judged by the same rule.
+- **Node evidence** (command-line side): the node must be absent from the cluster's Kubernetes Node list **and** the
+  instance behind `hyperpod-<instance-id>` absent from the `aws sagemaker list-cluster-nodes` inventory. A node still in
+  Kubernetes (NotReady or cordoned included) is the blocker `node is still in Kubernetes; a never-dispatched record is
+  closed only for a node that left Kubernetes and HyperPod` and the provider is not consulted; an instance HyperPod still
+  lists, a cluster the site does not describe as HyperPod-managed, or a failed AWS call keep failing closed with the
+  reason. The Pod gives such an item exactly one reason, `node departure is unproven: the administrator reads Kubernetes
+  and HyperPod`; the command-line side marks it `eligible` only when that is the **only** reason and every node has
+  `absent_from_kubernetes=true` and `absent_from_provider=true`. A record carrying any other reason (the 10 minutes not
+  yet passed, say) is never let through on the node's departure.
+- **Plan output**: each item's `scheduling_evidence.nodes[*].sources` names the sources consulted and what each said
+  (`kubernetes.present`, `hyperpod.cluster_name`/`region`/`listed`), and `evidence_read_at` carries the two read
+  timestamps. The verdicts are in `plan_sha256`, the timestamps are not -- if the re-plan before apply finds the
+  instance listed by HyperPod again or the node back in Kubernetes, the command refuses by field
+  (`workflow-...: eligible True -> False`, `scheduling_evidence ...`) and writes nothing; a moved timestamp alone is not
+  drift.
+- **Write**: through the in-Pod `apply-never-dispatched` bridge, which uses only existing store primitives (so it works
+  on the very release these records block, without upgrading the image first; when the deployed planner does not know
+  the shape, the command-line side ships the same rule with its script): fencing token, execution epoch, `created_at`
+  and every condition above are re-checked, and the node set the evidence covers must equal the incident's `node_ids`;
+  `amend_workflow` sets the record `SUPERSEDED` (`preempted_by_workflow_id` empty, `preemption_reason` the audit text
+  `... closed <id>, never dispatched, after its node left Kubernetes and HyperPod (<nodes>)`), and the
+  `OPERATOR_RECONCILED` event in the same write records `terminalization=never-dispatched`, the operator ARN,
+  `admin_plan_sha256` and the per-node `departed_node_evidence` (sources, verdicts, read times); a compare-and-set
+  `save_incident` then appends the same audit line to the incident's `reasons` and moves an incident still
+  `DETECTED`/`ACTION_PENDING`/`SAFETY_PENDING` to `ESCALATED` -- nobody will act for it any more; it is the
+  operator's now. Close it afterwards with `--close-incident <id>`: a record the reconcile set `SUPERSEDED` no longer
+  counts as an open workflow (`incident_closure._operator_reconciled`). `records_deleted` is always 0.
+
+```bash
+# Look first: the BLOCKED backlog and the PENDING records of departed nodes, with per-node evidence and read times
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --dry-run
+# One incident / one named record
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --incident-id <incident-id> --dry-run
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --workflow-id <workflow-id> --dry-run
+# After confirming, execute once (plan, re-check and write in the same invocation)
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --workflow-id <workflow-id> --reference CHG-12345
+# Then close the ESCALATED incident
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-incident <incident-id> \
+  --reason "node reclaimed by HyperPod; workflow never dispatched" --reference CHG-12345
+```
+
 When a manual migration or purge is required, first record the replicas, stop ingress, drain the consumers, then stop all writers.
 Recovery is in the reverse order: consumers first, ingress last. The state file must not be deleted before all original replicas are
 Ready.
@@ -2977,7 +3034,8 @@ config               administrator capacity configuration (plan and execution in
 join-cluster         joins only the given GPU clusters without triggering a site release (to upgrade at the same time use the deploy superset path)
 remove-cluster       removes one GPU cluster by --gpu-cluster-arn
 uninstall            uninstall; --cpu-cluster keep|delete, only --reset-database wipes the database
-workflow-reconcile   converges historical workflows that recovered but stay BLOCKED (--dry-run / execute);
+workflow-reconcile   converges historical workflows that recovered but stay BLOCKED, and never-dispatched
+                     PENDING workflows whose node left Kubernetes and HyperPod (--dry-run / execute);
                      --close-incident <id> / --close-escalated close ESCALATED incidents,
                      --close-quarantined closes QUARANTINED incidents whose isolation is no longer on the node (§9.1)
 rotate-token         one command completes the cluster token overlap-window rotation

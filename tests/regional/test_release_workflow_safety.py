@@ -321,3 +321,23 @@ def test_scaled_down_control_plane_does_not_prove_no_durable_workflows() -> None
     assert all("exec" not in command for command in target.runner.runs), (
         "scaled-down Pods cannot prove durable workflows absent"
     )
+
+
+def test_a_blocker_names_the_departed_node_remedy() -> None:
+    """The refusal tells the operator the audited exit for a record whose node
+    HyperPod replaced: ``workflow-reconcile``, plan first, never a row edit."""
+
+    with pytest.raises(SAFETY.ReleaseError) as refused:
+        SAFETY.workflow_safety_snapshot(
+            release(
+                '{"blocker_count":2,"blockers":["workflow-a","workflow-b"],'
+                '"resolved_blocked_count":0,"resolved_blocked":[]}'
+            )
+        )
+
+    message = str(refused.value)
+    assert message.startswith("active destructive workflows block release: {"), message
+    assert "gpu-fault-admin workflow-reconcile --state-dir <state-dir> --dry-run" in (
+        message
+    )
+    assert "left Kubernetes and HyperPod" in message

@@ -316,8 +316,9 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
             "[--reason TEXT] [--reference REFERENCE] [--dry-run]"
         ),
         help=(
-            "close BLOCKED workflow records a later workflow already restored "
-            "(plans and applies in one run; --dry-run only prints the plan); "
+            "close BLOCKED workflow records a later workflow already restored, "
+            "and PENDING records never dispatched whose node left Kubernetes and "
+            "HyperPod (plans and applies in one run; --dry-run only prints the plan); "
             "with --close-incident / --close-escalated close ESCALATED incidents, "
             "with --close-quarantined close QUARANTINED incidents whose node "
             "isolation is gone (a hand-released taint's leftover annotations are stripped)"

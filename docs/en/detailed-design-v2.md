@@ -2324,6 +2324,26 @@ pointing to the successor, and adds recovery associations to the incident and so
 successes, failures and reasons separately. Discovery mode batches by incident / `blocked_kind`, with a batch size and a scan cap; exceeding the cap
 is reported rather than refused; records remain in the live store and can only afterwards be archived by the archive-first process above.
 
+The third shape, **never dispatched, node gone** (`never-dispatched`): HyperPod reclaimed a spot node while its last telemetry
+was being ingested, the workflows created for its incidents had no Agent to be dispatched to and stay `PENDING` for good (zero
+step executions, zero remote commands, no events); the dispatcher sweep leaves `PENDING` alone and the release preflight
+`workflow_safety` counts them as live blockers. The Pod side judges them in
+`workflow_resolution.never_dispatched_reconciliation_reasons` -- `PENDING`, no step execution / completed or superseded step /
+completed operation, no owner or unexpired lease, no budget claim, **no** remote command at all, `created_at` at least
+`NEVER_DISPATCHED_GUARD_AGE` (10 minutes) ago, the incident still naming it -- and always adds the reason
+`node departure is unproven ...`: the Pod cannot read the node, so the deployed apply refuses it for ever. The admin side
+(`admin/workflow_reconcile_never_dispatched.py`) discovers it beside the `BLOCKED` backlog (`never_dispatched_plan_items`;
+`--incident-id`/`--max-items`/`--workflow-id` apply alike), takes the node being absent from the Kubernetes Node list **and**
+its instance absent from `aws sagemaker list-cluster-nodes` as the only admitting evidence (a node still in Kubernetes is a
+blocker and the provider is not asked; still listed, not HyperPod-managed or a failed lookup all fail closed), records each
+source's verdict on the item (`sources`, in the digest) and read time (`evidence_read_at`, outside it), and re-plans field
+by field before the apply; the write goes through the `apply-never-dispatched` bridge -- existing store primitives only,
+re-checking fencing token, execution epoch, `created_at`, every condition and that the evidence's node set equals the
+incident's `node_ids`, `amend_workflow` to `SUPERSEDED` with the per-node `departed_node_evidence` on the
+`OPERATOR_RECONCILED` event of the same write, and a compare-and-set `save_incident` appending the same audit line and moving
+an incident still `DETECTED`/`ACTION_PENDING`/`SAFETY_PENDING` to `ESCALATED` for `--close-incident`. When the deployed
+planner predates the shape the script carries the same rule (tests pin the two copies).
+
 The same entry point has three more mutually exclusive incident-level switches (`admin/incident_close.py`, all accepting
 `--reason`/`--reference`/`--dry-run`): `--close-incident INCIDENT_ID ...` closes the named
 `ESCALATED` incident; `--close-escalated [--max-items N]` discovers and closes all `ESCALATED` incidents

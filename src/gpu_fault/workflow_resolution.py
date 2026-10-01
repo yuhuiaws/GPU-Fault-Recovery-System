@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from gpu_fault.models import (
@@ -38,11 +38,14 @@ if TYPE_CHECKING:
 # CLI ships its source into a Pod running the previously deployed image, which
 # constrains what it may import; see that module's docstring.
 __all__ = [
+    "DEPARTED_NODE_PROOF_REASON",
+    "NEVER_DISPATCHED_GUARD_AGE",
     "OPEN_REMOTE_STATUSES",
     "RETIRED_GENERATION_STATUSES",
     "SETTLED_INCIDENT_STATES",
     "abandoned_generation_successor",
     "completed_containment_operations",
+    "never_dispatched_reconciliation_reasons",
     "reconciled_restore_records",
     "restore_reconciliation_reasons",
     "retired_generation_audit",
@@ -52,6 +55,7 @@ __all__ = [
     "retirement_fences_out_dispatch",
     "verified_restore_successor",
     "workflow_never_changed_a_node",
+    "workflow_never_dispatched",
 ]
 
 # Incident states in which nobody is waiting on the incident's workflow to act:
@@ -59,6 +63,18 @@ __all__ = [
 # incident in ESCALATED (``coordinator._incident_state_for_workflow``), which is
 # the state the operator running ``workflow-reconcile`` is answering.
 SETTLED_INCIDENT_STATES = frozenset({IncidentState.RECOVERED, IncidentState.ESCALATED})
+
+# A PENDING record younger than this is not judged never-dispatched: the
+# dispatcher may be about to hand it its first step (an aggregation deadline, a
+# fence, the fleet preflight) and the proof below cannot see that tick coming.
+NEVER_DISPATCHED_GUARD_AGE = timedelta(minutes=10)
+# The reason every never-dispatched record carries on the Pod side. The Pod
+# cannot read the GPU cluster or the provider, so the record is closable only
+# once the administrator has proven the node departed from both; the admin
+# layer replaces this one reason with that evidence (``workflow-reconcile``).
+DEPARTED_NODE_PROOF_REASON = (
+    "node departure is unproven: the administrator reads Kubernetes and HyperPod"
+)
 
 
 def verified_restore_successor(
@@ -248,6 +264,89 @@ def workflow_never_changed_a_node(workflow: WorkflowRequest) -> bool:
     """
 
     return not (set(workflow.completed_operations) & NODE_MUTATING_OPERATIONS)
+
+
+def workflow_never_dispatched(workflow: WorkflowRequest) -> bool:
+    """A PENDING record no adapter was ever handed a step of.
+
+    No step execution, no completed or superseded step, no completed operation
+    and no execution owner: the record has changed nothing anywhere, so when
+    its node is gone there is nothing it could still be about to do and
+    nothing left to undo. Remote commands are a Store read, so they are judged
+    by ``never_dispatched_reconciliation_reasons`` rather than here.
+    """
+
+    return (
+        workflow.status is WorkflowStatus.PENDING
+        and not workflow.step_executions
+        and not workflow.completed_step_indexes
+        and not workflow.superseded_step_indexes
+        and not workflow.completed_operations
+        and workflow.execution_owner_id is None
+    )
+
+
+def never_dispatched_reconciliation_reasons(
+    workflow: WorkflowRequest,
+    incident: FaultIncident | None,
+    remote_commands: list[RemoteActionCommand],
+    *,
+    evaluated_at: datetime,
+    guard_age: timedelta = NEVER_DISPATCHED_GUARD_AGE,
+) -> list[str]:
+    """Why a PENDING record is *not* a never-dispatched record of a departed node.
+
+    On 2026-10-01 HyperPod reclaimed a spot node while its last telemetry was
+    being ingested; two workflows were created for its incidents and stayed
+    PENDING for good -- the node's Agent was gone, so the fleet preflight never
+    dispatched them -- and the release preflight refused every deploy on them.
+    Nothing in the runtime closes such a record (``abandoned_generation_successor``
+    needs the incident to have moved on; the sweep leaves PENDING alone), so the
+    administrator does, on evidence the Pod cannot read.
+
+    Every condition is required: the record is PENDING and never dispatched
+    (``workflow_never_dispatched``), holds no unexpired lease and no budget
+    claim, has no remote command at all (open or settled -- a settled one means
+    an Agent did act on it), is older than ``guard_age``, and its incident
+    exists and still names it (a record the incident moved past belongs to the
+    dispatcher's retired-generation sweep). The departed-node proof itself is
+    the administrator's and is always listed here as missing.
+    """
+
+    reasons: list[str] = []
+    if workflow.status is not WorkflowStatus.PENDING:
+        reasons.append(f"workflow status is {workflow.status.value}, not PENDING")
+    if workflow.step_executions:
+        reasons.append("workflow has step executions")
+    if (
+        workflow.completed_step_indexes
+        or workflow.superseded_step_indexes
+        or workflow.completed_operations
+    ):
+        reasons.append("workflow completed or superseded a step")
+    if workflow.execution_owner_id is not None:
+        reasons.append("workflow still has an execution owner")
+    if (
+        workflow.execution_lease_expires_at is not None
+        and workflow.execution_lease_expires_at > evaluated_at
+    ):
+        reasons.append("workflow execution lease has not expired")
+    if workflow.remediation_budget_claims:
+        reasons.append("workflow holds remediation budget claims")
+    if any(item.workflow_request_id == workflow.request_id for item in remote_commands):
+        reasons.append("workflow has remote commands")
+    if workflow.created_at > evaluated_at - guard_age:
+        minutes = int(guard_age.total_seconds() // 60)
+        reasons.append(f"workflow is younger than the {minutes}-minute dispatch guard")
+    if incident is None:
+        reasons.append("incident is missing")
+    elif incident.workflow_request_id != workflow.request_id:
+        reasons.append(
+            "incident names another workflow; the dispatcher sweep owns a "
+            "retired generation"
+        )
+    reasons.append(DEPARTED_NODE_PROOF_REASON)
+    return reasons
 
 
 def completed_containment_operations(workflow: WorkflowRequest) -> list[str]:

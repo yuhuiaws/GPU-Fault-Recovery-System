@@ -29,17 +29,27 @@ from gpu_fault.retired_generation import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.workflow_resolution import (
+    NEVER_DISPATCHED_GUARD_AGE,
     completed_containment_operations,
+    never_dispatched_reconciliation_reasons,
     reconciled_restore_records,
     restore_reconciliation_reasons,
     verified_restore_successor,
     workflow_never_changed_a_node,
+    workflow_never_dispatched,
 )
 
-# How an eligible item will be terminalized. Both end SUPERSEDED; the first
+# How an eligible item will be terminalized. All end SUPERSEDED; the first
 # names the successor that restored the node, the second has none to name.
 VERIFIED_RESTORE = "verified-restore"
 NEVER_CHANGED = "never-changed"
+# The third shape is planned here but never eligible here: a PENDING record no
+# adapter was ever handed a step of, whose node left Kubernetes and HyperPod.
+# The Pod cannot read either, so every item carries
+# ``DEPARTED_NODE_PROOF_REASON`` and the deployed apply refuses it; the admin
+# layer of ``workflow-reconcile`` adds the evidence and applies through its
+# own bridge (``gpu_fault.admin.workflow_reconcile_never_dispatched``).
+NEVER_DISPATCHED = "never-dispatched"
 
 
 def _canonical_sha256(value: object) -> str:
@@ -95,6 +105,104 @@ def _discover_blocked(
         candidates=len(candidates),
         scan_truncated=truncated,
     )
+
+
+def never_dispatched_plan_items(
+    store: ControlPlaneStore,
+    workflow_ids: Iterable[str] | None = None,
+    *,
+    incident_ids: Iterable[str] | None = None,
+    max_items: int | None = None,
+    scan_limit: int = DISCOVERY_SCAN_LIMIT,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Plan items for PENDING records that were never dispatched.
+
+    Explicit ``workflow_ids`` are judged as given (a record that is not PENDING,
+    or not in the Store, is an ineligible item naming why); discovery scans the
+    PENDING backlog once, oldest first, keeps the records
+    ``workflow_never_dispatched`` admits that are older than the guard age and
+    whose incident is wanted, and returns the oldest ``max_items`` with a
+    discovery report. Every item is ineligible on the Pod side
+    (``DEPARTED_NODE_PROOF_REASON``); the digest fields are the ones the
+    admin's approval binds, ``workflow_created_at`` among them because the
+    guard is judged on it and it never moves.
+    """
+
+    evaluated_at = now or datetime.now(timezone.utc)
+    report: dict[str, Any] | None = None
+    requested = [str(item) for item in workflow_ids or () if str(item).strip()]
+    if requested:
+        request_ids = requested_workflow_ids(requested)
+    else:
+        workflows, truncated = discover_open_workflows(
+            store, {WorkflowStatus.PENDING}, scan_limit=scan_limit
+        )
+        wanted = {str(item).strip() for item in incident_ids or () if item}
+        oldest_allowed = evaluated_at - NEVER_DISPATCHED_GUARD_AGE
+        candidates = [
+            item.request_id
+            for item in workflows
+            if workflow_never_dispatched(item)
+            and item.created_at <= oldest_allowed
+            and (not wanted or item.incident_id in wanted)
+        ]
+        selected = candidates if max_items is None else candidates[:max_items]
+        request_ids = sorted(selected)
+        report = discovery_report(
+            scanned=len(workflows),
+            selected=len(selected),
+            candidates=len(candidates),
+            scan_truncated=truncated,
+        )
+    commands = (
+        store.list_remote_commands(workflow_request_ids=request_ids)
+        if request_ids
+        else []
+    )
+    items: list[dict[str, Any]] = []
+    for request_id in request_ids:
+        try:
+            workflow: WorkflowRequest = store.get_workflow(request_id)
+        except (KeyError, NotFoundError):
+            items.append(
+                {
+                    "request_id": request_id,
+                    "eligible": False,
+                    "reasons": ["workflow does not exist"],
+                }
+            )
+            continue
+        incident: FaultIncident | None
+        try:
+            incident = store.get_incident(workflow.incident_id)
+        except (KeyError, NotFoundError):
+            incident = None
+        items.append(
+            {
+                "request_id": request_id,
+                "incident_id": workflow.incident_id,
+                "cluster_id": incident.cluster_id if incident is not None else None,
+                "node_ids": sorted(incident.node_ids) if incident is not None else [],
+                "incident_state": (
+                    incident.state.value if incident is not None else None
+                ),
+                "fencing_token": workflow.fencing_token,
+                "execution_epoch": workflow.execution_epoch,
+                "workflow_created_at": workflow.created_at.isoformat(),
+                "workflow_updated_at": workflow.updated_at.isoformat(),
+                "step_execution_count": len(workflow.step_executions),
+                "remote_command_count": sum(
+                    1 for item in commands if item.workflow_request_id == request_id
+                ),
+                "terminalization": NEVER_DISPATCHED,
+                "eligible": False,
+                "reasons": never_dispatched_reconciliation_reasons(
+                    workflow, incident, commands, evaluated_at=evaluated_at
+                ),
+            }
+        )
+    return items, report
 
 
 def _plan_item(

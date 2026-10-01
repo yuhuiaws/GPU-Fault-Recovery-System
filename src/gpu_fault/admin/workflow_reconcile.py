@@ -17,6 +17,13 @@ records that as its evidence (``absent_from_provider``); an instance still
 listed, a cluster that is not HyperPod-managed or a failed lookup keep failing
 closed, naming why. ``verified-restore`` items keep the Kubernetes rule.
 
+A PENDING record no adapter was ever handed a step of, whose node left both
+Kubernetes and HyperPod the same way, is the third shape (``never-dispatched``,
+``workflow_reconcile_never_dispatched``): discovered beside the BLOCKED backlog
+once it is older than the dispatch guard, planned by the Pod with the departed-
+node proof as its one missing reason, made eligible here only when every node
+is absent from both sources, and applied through its own bridge.
+
 The other three shapes the command used to take modes for are closed by the
 dispatcher's periodic sweep now (``WorkflowDispatcher.sweep_stuck_records``):
 retired generations, compile-time BLOCKED no-ops (``gpu_fault.compile_blocked``)
@@ -40,11 +47,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from gpu_fault import retired_generation
-from gpu_fault.admin import operator_identity
+from gpu_fault.admin import operator_identity, workflow_reconcile_never_dispatched
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.diagnostics import diagnostic_text
@@ -74,11 +82,15 @@ VERIFIED_RESTORE_NON_PLAN = "verified-restore-non-plan"
 NEVER_CHANGED = "never-changed"
 NEVER_CHANGED_NON_PLAN = "never-changed-non-plan"
 NON_PLAN_REASON = "workflow has no source recovery plan"
+# The PENDING record never dispatched whose node left Kubernetes and HyperPod;
+# the Pod plans it, this layer proves the departure and bridges the apply.
+NEVER_DISPATCHED = workflow_reconcile_never_dispatched.NEVER_DISPATCHED
 # Which bridge mode applies a promoted item; anything else goes through the
 # deployed ``apply_workflow_reconcile_plan``.
 BRIDGE_MODES = {
     VERIFIED_RESTORE_NON_PLAN: "apply-verified-restore",
     NEVER_CHANGED_NON_PLAN: "apply-never-changed",
+    NEVER_DISPATCHED: workflow_reconcile_never_dispatched.BRIDGE_MODE,
 }
 # Items whose missing node may be explained by the provider instead of failing
 # on "node is missing": there is no restore successor to name, and a node
@@ -94,7 +106,10 @@ ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/fencing-token",
     "gpu-fault.io/previous-unschedulable",
 )
-RECONCILE_SCRIPT = """
+# The mode chain; a mode it does not know leaves ``result`` unset for the tail
+# (``workflow_reconcile_never_dispatched.SCRIPT_TAIL``), which also extends the
+# plan with the never-dispatched shape and prints the result.
+_RECONCILE_SCRIPT_CORE = """
 import inspect
 import json
 import sys
@@ -393,9 +408,11 @@ elif payload["mode"] == "apply-never-changed":
         "records_deleted": 0,
     }
 else:
-    raise ValueError("unsupported workflow reconcile mode")
-print(json.dumps(result, sort_keys=True))
+    result = None
 """
+RECONCILE_SCRIPT = (
+    _RECONCILE_SCRIPT_CORE + workflow_reconcile_never_dispatched.SCRIPT_TAIL
+)
 
 
 def _canonical_sha256(value: object) -> str:
@@ -483,11 +500,15 @@ def _bridge_payload(
     """A bridge request (``BRIDGE_MODES``): the keys the approval bound.
 
     The verified-restore bridge names the successor it supersedes the record
-    with; the never-changed bridge has none to name.
+    with; the never-changed bridge has none to name; the never-dispatched
+    bridge carries the departed-node evidence the close rests on.
     """
 
     bound: list[dict[str, Any]] = []
     for item in items:
+        if mode == BRIDGE_MODES[NEVER_DISPATCHED]:
+            bound.append(workflow_reconcile_never_dispatched.bridge_entry(item))
+            continue
         entry: dict[str, Any] = {"request_id": str(item["request_id"])}
         if mode == BRIDGE_MODES[VERIFIED_RESTORE_NON_PLAN]:
             entry["successor_workflow_id"] = str(item["successor_workflow_id"])
@@ -970,6 +991,7 @@ def _departed_node_evidence(
     cluster_id: str,
     node_id: str,
     provider_inventories: dict[str, frozenset[str] | str],
+    read_at: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Evidence for a ``never-changed`` item's node that Kubernetes no longer has.
 
@@ -977,7 +999,8 @@ def _departed_node_evidence(
     lists: nothing exists to carry a cordon, a taint or an isolation
     annotation. Every other answer keeps the Kubernetes blocker and adds why
     the provider could not clear it. ``provider_inventories`` caches one
-    provider read (or its failure) per cluster for the plan being built.
+    provider read (or its failure) per cluster for the plan being built;
+    ``read_at`` records when that read happened (``hyperpod``).
     """
 
     missing = _node_scheduling_evidence(node_id, None)
@@ -994,6 +1017,8 @@ def _departed_node_evidence(
     instance_id = match.group(1)
     inventory = provider_inventories.get(cluster_id)
     if inventory is None:
+        if read_at is not None:
+            read_at["hyperpod"] = datetime.now(timezone.utc).isoformat()
         try:
             inventory = hyperpod_instance_ids(site, cluster_id)
         except BootstrapError as exc:
@@ -1038,6 +1063,9 @@ def _scheduling_evidence(
 ) -> dict[str, dict[str, Any]]:
     inventories: dict[str, dict[str, dict[str, Any]]] = {}
     provider_inventories: dict[str, frozenset[str] | str] = {}
+    # When each cluster's sources were read, reported beside the evidence of a
+    # never-dispatched item and left out of its digest.
+    read_at: dict[str, dict[str, str]] = {}
     result: dict[str, dict[str, Any]] = {}
     for item in items:
         request_id = str(item.get("request_id") or "")
@@ -1053,17 +1081,42 @@ def _scheduling_evidence(
             continue
         inventory = inventories.get(cluster_id)
         if inventory is None:
+            read_at[cluster_id] = {"kubernetes": datetime.now(timezone.utc).isoformat()}
             inventory = cluster_nodes(site, cluster_id)
             inventories[cluster_id] = inventory
-        # Only a never-changed item may have its missing node explained by the
-        # provider; a verified-restore item is judged on Kubernetes alone.
-        departed_allowed = item.get("terminalization") in DEPARTED_NODE_TERMINALIZATIONS
-        nodes = [
-            _departed_node_evidence(site, cluster_id, node_id, provider_inventories)
-            if departed_allowed and inventory.get(node_id) is None
-            else _node_scheduling_evidence(node_id, inventory.get(node_id))
-            for node_id in node_ids
-        ]
+        terminalization = item.get("terminalization")
+        if terminalization == NEVER_DISPATCHED:
+            # Closed only for a node that is gone from both sources; a node
+            # Kubernetes still has is a blocker whatever its scheduling state.
+            nodes = [
+                workflow_reconcile_never_dispatched.node_evidence(
+                    node_id,
+                    departed=(
+                        None
+                        if inventory.get(node_id) is not None
+                        else _departed_node_evidence(
+                            site,
+                            cluster_id,
+                            node_id,
+                            provider_inventories,
+                            read_at[cluster_id],
+                        )
+                    ),
+                    target=cluster_target(site, cluster_id),
+                    aws_region=site.release_config.get("aws_region"),
+                )
+                for node_id in node_ids
+            ]
+        else:
+            # Only a never-changed item may have its missing node explained by
+            # the provider; a verified-restore item is judged on Kubernetes alone.
+            departed_allowed = terminalization in DEPARTED_NODE_TERMINALIZATIONS
+            nodes = [
+                _departed_node_evidence(site, cluster_id, node_id, provider_inventories)
+                if departed_allowed and inventory.get(node_id) is None
+                else _node_scheduling_evidence(node_id, inventory.get(node_id))
+                for node_id in node_ids
+            ]
         blockers = [
             f"{node['node_id']}: {reason}"
             for node in nodes
@@ -1075,6 +1128,8 @@ def _scheduling_evidence(
             "restored": not blockers,
             "blockers": blockers,
         }
+        if terminalization == NEVER_DISPATCHED:
+            result[request_id]["read_at"] = dict(read_at[cluster_id])
     return result
 
 
@@ -1087,7 +1142,15 @@ def plan_digest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     digest did (P0-72A). See ``retired_generation.DIGEST_EXCLUDED_ITEM_FIELDS``.
     """
 
-    return retired_generation.plan_digest_items(items)
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key
+            not in workflow_reconcile_never_dispatched.DIGEST_EXCLUDED_ITEM_FIELDS
+        }
+        for item in retired_generation.plan_digest_items(items)
+    ]
 
 
 def _plan_drift(
@@ -1141,7 +1204,11 @@ def _finalize_plan(
     scheduling = _scheduling_evidence(site, items)
     for item in items:
         evidence = scheduling[str(item.get("request_id") or "")]
+        read_at = evidence.pop("read_at", None)
         item["scheduling_evidence"] = evidence
+        if read_at is not None:
+            item["evidence_read_at"] = read_at
+        workflow_reconcile_never_dispatched.promote_never_dispatched(item)
         if not evidence["restored"]:
             item["eligible"] = False
             item["reasons"] = [
@@ -1155,6 +1222,7 @@ def _finalize_plan(
         "site_identity": _site_identity(site),
         "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
         "discovery": runtime_plan.get("discovery"),
+        "never_dispatched_discovery": runtime_plan.get("never_dispatched_discovery"),
         "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
@@ -1212,7 +1280,7 @@ def _validate_request(
 
     if workflow_ids and (incident_ids or max_items is not None):
         raise BootstrapError(
-            "--incident-id and --max-items select BLOCKED records for discovery; "
+            "--incident-id and --max-items select records for discovery; "
             "do not combine them with --workflow-id"
         )
     if max_items is not None and max_items < 1:
