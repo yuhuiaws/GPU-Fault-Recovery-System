@@ -18,6 +18,7 @@ from gpu_fault.admin.config import (
     persist_desired_admin_config,
 )
 from gpu_fault.admin.site import SiteConfigError
+from gpu_fault_release import containing_repository_root
 
 # The recorded previous release_id becomes a directory name below the state
 # directory. It arrives from live release state the CLI did not author, so it is
@@ -138,6 +139,32 @@ def _release_manifest_identity(
     )
 
 
+def manifest_repository_root(manifest: Path) -> Path:
+    """The root a release manifest's relative artifact paths are anchored to.
+
+    Manifests name wheels and the bundle relative to the checkout or source
+    snapshot that built them. The real root is the directory that carries the
+    rollout entrypoint; a bare fixture without one is anchored by its ``dist``
+    layout instead -- ``dist/<release-id>/release.json`` two levels up,
+    ``dist/current-release.json`` one level up. The previous code took
+    ``parents[2]`` unconditionally and, handed ``dist/current-release.json``,
+    anchored every path one directory too high (the snapshot hash directory),
+    so after a rollback the management manifest pointed at files that do not
+    exist and every admin verb refused to load the release (live defect).
+    """
+    resolved = manifest.resolve()
+    root = containing_repository_root(resolved)
+    if root is not None:
+        return root
+    if resolved.parent.name == "dist":
+        return resolved.parents[1]
+    if len(resolved.parents) > 2 and resolved.parents[1].name == "dist":
+        return resolved.parents[2]
+    raise SiteConfigError(
+        f"previous release manifest is not under a dist/ directory: {resolved}"
+    )
+
+
 def find_previous_release_manifest(
     state_dir: Path,
     previous: dict[str, Any],
@@ -241,7 +268,9 @@ def rollback_management_document(
     if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
         raise SiteConfigError("rollback management site is invalid")
     source_manifest = find_previous_release_manifest(site_file.parent, previous)
-    repository_root = management_repository_root or source_manifest.parents[2]
+    repository_root = management_repository_root or manifest_repository_root(
+        source_manifest
+    )
     manifest = (
         _materialize_management_manifest(source_manifest, management_manifest)
         if management_manifest is not None
@@ -359,7 +388,7 @@ def _materialize_management_manifest(
 ) -> Path:
     raw = source.read_bytes()
     value = json.loads(raw)
-    source_root = source.parents[2]
+    source_root = manifest_repository_root(source)
 
     def absolute(raw_path: object) -> str:
         path = Path(str(raw_path))
@@ -374,6 +403,28 @@ def _materialize_management_manifest(
         for component in components.values():
             if isinstance(component, dict) and component.get("wheel"):
                 component["wheel"] = absolute(component["wheel"])
+    missing = [
+        path
+        for path in (
+            value["wheel"],
+            value["bundle"],
+            *(
+                component["wheel"]
+                for component in (components or {}).values()
+                if isinstance(components, dict)
+                and isinstance(component, dict)
+                and component.get("wheel")
+            ),
+        )
+        if not Path(str(path)).is_file()
+    ]
+    if missing:
+        # Repointing the site at a manifest whose artifacts cannot be found
+        # would wedge every later admin verb; refuse before writing anything.
+        raise SiteConfigError(
+            "rollback management manifest names missing artifacts: "
+            + ", ".join(sorted(str(path) for path in missing))
+        )
     value["management_baseline"] = {
         "source_manifest": str(source),
         "source_manifest_sha256": hashlib.sha256(raw).hexdigest(),

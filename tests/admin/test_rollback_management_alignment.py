@@ -549,3 +549,94 @@ def test_a_malformed_previous_release_id_is_rejected(
 
     with pytest.raises(SiteConfigError, match="release_id is malformed"):
         reconcile_rollback_management(site, live_state, source="rollback:test")
+
+
+def test_rollback_management_anchors_a_current_release_manifest_at_the_repository_root(
+    tmp_path: Path,
+) -> None:
+    """``dist/current-release.json`` sits one level higher than ``dist/<id>/release.json``.
+
+    Live defect: the alignment anchored its absolute artifact paths at
+    ``parents[2]`` of whatever manifest it was handed; for the snapshot's
+    ``dist/current-release.json`` that is the snapshot hash directory, so the
+    management manifest named files that do not exist and the rolled-back site
+    could not load its release any more.
+    """
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    repository = manifest.parents[2]
+    current = repository / "dist" / "current-release.json"
+    current.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+    manifest.unlink()
+    live_state["previous"]["release_manifest_path"] = str(current)
+    destination = (
+        tmp_path / "rollback-management" / "old-release" / "release.status.json"
+    )
+
+    document, _restored, repository_root = rollback_management_document(
+        site, live_state, management_manifest=destination
+    )
+
+    assert repository_root == repository, (
+        "the management root must be the repository that built the manifest"
+    )
+    written = json.loads(destination.read_text(encoding="utf-8"))
+    for path in (
+        written["wheel"],
+        written["bundle"],
+        *(component["wheel"] for component in written["components"].values()),
+    ):
+        assert Path(path).is_file(), (
+            f"management manifest must name an existing artifact: {path}"
+        )
+        assert Path(path).is_relative_to(repository / "dist"), (
+            "artifact paths must stay under the repository's dist directory"
+        )
+    assert document["spec"]["release"]["manifest"] == str(destination), (
+        "the site must point at the written management manifest"
+    )
+
+
+def test_rollback_management_refuses_a_manifest_whose_artifacts_are_missing(
+    tmp_path: Path,
+) -> None:
+    site, manifest, live_state, _admin_config = _fixture(tmp_path)
+    (manifest.parent / "bundle.tar.gz").unlink()
+    destination = (
+        tmp_path / "rollback-management" / "old-release" / "release.status.json"
+    )
+
+    with pytest.raises(SiteConfigError, match="missing artifacts"):
+        rollback_management_document(site, live_state, management_manifest=destination)
+    assert not destination.exists(), "nothing may be written when artifacts are missing"
+
+
+def test_manifest_repository_root_prefers_the_rollout_entrypoint(
+    tmp_path: Path,
+) -> None:
+    from gpu_fault.admin.rollback_alignment import manifest_repository_root
+
+    repository = tmp_path / "snapshot" / "repository-x"
+    (repository / "deploy" / "control-plane" / "regional").mkdir(parents=True)
+    (
+        repository
+        / "deploy"
+        / "control-plane"
+        / "regional"
+        / "rollout-regional-release.sh"
+    ).write_text("#!/bin/sh\n")
+    (repository / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (repository / "dist" / "rel").mkdir(parents=True)
+    current = repository / "dist" / "current-release.json"
+    current.write_text("{}")
+    nested = repository / "dist" / "rel" / "release.json"
+    nested.write_text("{}")
+
+    assert (
+        manifest_repository_root(current) == repository.resolve()
+        or manifest_repository_root(current) == repository
+    ), "dist/current-release.json anchors one level up"
+    assert manifest_repository_root(nested) in (repository, repository.resolve()), (
+        "dist/<id>/release.json anchors two levels up"
+    )
+    with pytest.raises(SiteConfigError, match="not under a dist"):
+        manifest_repository_root(tmp_path / "elsewhere" / "release.json")

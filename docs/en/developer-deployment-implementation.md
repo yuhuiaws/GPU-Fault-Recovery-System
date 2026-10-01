@@ -666,6 +666,18 @@ the Agent additionally has a config digest. Together they use the two-phase requ
 5. on failure, restore the previous pin, the corresponding component wheel, bundle, Profile and node artifacts.
 
 The strict required pin must not be switched before installing nodes, nor may the compatible window be cleared while the Fleet has not converged.
+After a rollback, `rollback_alignment` copies the previous release's manifest to
+`<state-dir>/rollback-management/<release-id>/release.status.json` (wheel/bundle paths made absolute)
+and points `site.yaml` at it. The paths must be anchored at **the repository root that built the
+manifest**: resolved like the release engine does (the directory carrying
+`deploy/control-plane/regional/rollout-regional-release.sh`), falling back to the `dist/` layout when
+there is no entrypoint — two levels up for `dist/<release-id>/release.json`, one level up for
+`dist/current-release.json`. Taking `parents[2]` unconditionally anchors the snapshot's
+`dist/current-release.json` at the snapshot hash directory, after which `sync-state`, `status` and
+`deploy` all refuse with "release component wheels and bundle must exist". Every wheel and the bundle the
+management manifest would name is checked for existence before anything is written; a missing file
+refuses the rewrite of `site.yaml` (fail closed) instead of leaving a site that cannot load its release.
+
 When rolling back to a single-wheel release of **release manifest schema v1** (not PostgreSQL
 schema v1), the old Agent compatibility digest is equivalent to the old artifact SHA; the old process's environment
 variable allowlist does not recognize component pins, so

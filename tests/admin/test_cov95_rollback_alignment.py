@@ -22,12 +22,33 @@ def write_snapshot(root, document, name="one"):
     )
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(document))
+    # The alignment refuses to publish a management manifest whose artifacts
+    # are missing, so the fixture materializes every relative artifact it names.
+    repository = path.parents[2]
+    if not isinstance(document, dict):
+        return path
+    for value in (
+        document.get("wheel"),
+        document.get("bundle"),
+        *(
+            component.get("wheel")
+            for component in (document.get("components") or {}).values()
+            if isinstance(component, dict)
+        ),
+    ):
+        if isinstance(value, str) and value and not value.startswith("/"):
+            target = repository / value
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"artifact")
     return path
 
 
 @pytest.fixture
 def baseline(tmp_path):
     site = site_file(tmp_path)
+    external_executor = tmp_path / "external" / "executor.whl"
+    external_executor.parent.mkdir(parents=True, exist_ok=True)
+    external_executor.write_bytes(b"artifact")
     manifest = {
         "release_id": "release-old",
         "wheel": "dist/old.whl",
@@ -38,7 +59,7 @@ def baseline(tmp_path):
         },
         "components": {
             "control_plane": {"wheel": "dist/control.whl"},
-            "executor": {"wheel": "/example/executor.whl"},
+            "executor": {"wheel": str(external_executor)},
             "legacy": {},
         },
     }
@@ -154,7 +175,9 @@ def test_status_manifest_normalizes_only_artifact_paths_and_keeps_source_binding
     assert root == current_root
     assert document["spec"]["release"]["manifest"] == str(destination)
     assert materialized["wheel"] == str(path.parents[2] / manifest["wheel"])
-    assert materialized["components"]["executor"]["wheel"] == "/example/executor.whl"
+    assert materialized["components"]["executor"]["wheel"] == str(
+        site.parent / "external" / "executor.whl"
+    ), "absolute component paths are kept as written"
     assert materialized["management_baseline"]["source_manifest"] == str(path)
     assert config == AdminConfig()
 
