@@ -148,6 +148,7 @@ from gpu_fault.admin.submit_remediation import (
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.admin import warm_spare, workflow_reconcile_departed_agents
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
+from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
     QUICK_VALIDATION_EVIDENCE_FILE,  # noqa: F401  # re-exported; tests pin it
@@ -1449,6 +1450,7 @@ def _run_reporting_failures(arguments: argparse.Namespace) -> int:
         ApiBudgetError,
         OSError,
         ProfileApprovalError,
+        ReleaseError,
         SiteConfigError,
         ValueError,
         subprocess.CalledProcessError,
@@ -1456,6 +1458,8 @@ def _run_reporting_failures(arguments: argparse.Namespace) -> int:
         # A child that is one of our own drivers (``make``, a nested CLI, a
         # Python script) has already printed its cause; this only adds a line
         # for foreign commands and hands the child's exit status through.
+        # ``ReleaseError``: rotate-token drives the release engine in-process;
+        # uncaught, it escaped ``main()`` after the command log's tee closed.
         return report_failure("gpu-fault-admin", exc)
 
 

@@ -5381,7 +5381,19 @@ gpu-fault-admin rotate-token \
    rollout to complete; it precedes the final revision because the retiring digest is still in the durable head at that
    point, so both tokens are accepted and a stalled rollout only makes the command fail closed and resume at that step on
    the rerun. CPU Pods read that Secret only at start; without this step every replica keeps reporting
-   `regional_registry.secret_drift=true` and the acceptance registry-alignment preflight refuses to run. After any step
+   `regional_registry.secret_drift=true` and the acceptance registry-alignment preflight refuses to run. The final
+   publish of `RETIRING_TOKEN_DROPPED` goes through the control plane that was just rolled, so before publishing the
+   command waits, bounded (up to 120 s, polling every 2 s), until every Pod of the three CPU Deployments' *current*
+   ReplicaSets (the `pod-template-hash` of the Deployment's current revision) is Ready with none Terminating, and
+   execs into each one to read its own `/healthz?verbose=1`, requiring `regional_registry.ready=true` on one
+   `generation`; running out of time fails closed and nothing is published. The publish execs only into a Ready,
+   not-Terminating Pod of api-ha's current ReplicaSet (never a Pod name memoised before the roll, and no fallback to
+   "any Running Pod"). A failed publish is retried, bounded (at most 3 attempts, 5 s apart, re-selecting the Pod each
+   time), only for the transient classes: exec target gone, container reaped mid-exec (exit 137/143), control plane
+   unavailable (`ServiceUnavailable`/`Unable to connect`/`RequestTimeout`/throttling); registry refusals -- a
+   generation conflict, an identity refusal, a convergence window run out -- fail at once and are never retried.
+   Every attempt (Pod, outcome, failure class) is written to `final_publish_attempts` in `state.json` and, on
+   success, to the step's evidence as `publish_attempts` beside `control_plane_ready`. After any step
    fails, rerun with exactly the same parameters to resume from the first unfinished step; an unfinished `state.json`
    left by an older build also passes through this step on resume;
    on resume, if the remaining window is under 10 minutes it first republishes the overlap revision to extend the window and then continues, rather than relying on expiry to finalise.
@@ -5405,7 +5417,8 @@ gpu-fault-admin rotate-token \
 7. **Evidence**: `<state-dir>/rotate-token/<cluster-id>/state.json` (archived to
    `history/<rotation_id>.json` when the next rotation starts) records the operator ARN, `--reference`, the two digests, the completion time and registry generation of every step,
    the reinstalled nodes, the rolled CPU Deployments with their rollout results (`deployments`/`rollouts` under
-   `CONTROL_PLANE_ROLLED`) and the remote command baseline; the command's output JSON is the
+   `CONTROL_PLANE_ROLLED`), the control-plane readiness evidence and the publish attempts before the final revision
+   (`control_plane_ready`/`publish_attempts` under `RETIRING_TOKEN_DROPPED`) and the remote command baseline; the command's output JSON is the
    change-ticket attachment. None of these contains the token in plaintext.
 
 Correspondence to the manual procedure: the registry overlap revision (former step 3), the GPU Secret (step 4), the data-plane restart

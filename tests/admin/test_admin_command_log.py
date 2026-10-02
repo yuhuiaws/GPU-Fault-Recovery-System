@@ -253,6 +253,48 @@ def test_a_failure_propagates_the_first_cause_through_the_admin_cli(
     assert "command failed" not in capsys.readouterr().err
 
 
+def test_a_release_error_is_reported_inside_the_command_log(tmp_path: Path) -> None:
+    """The verbs that drive the release engine in-process raise ``ReleaseError``.
+
+    Live, a rotate-token publish failure left ``main()`` as an uncaught
+    traceback *after* the tee had closed: the log ended with the API accounting
+    footer and never said why the command failed. Driven in a child process so
+    the real descriptors are in play, as they are for an operator.
+    """
+
+    script = (
+        "import argparse, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "from gpu_fault.admin import cli\n"
+        "from gpu_fault_release.regional_release_config import ReleaseError\n"
+        "class Parser:\n"
+        "    @staticmethod\n"
+        "    def parse_args():\n"
+        "        return argparse.Namespace(command='rotate-token', state_dir=Path(%r))\n"
+        "def run(_arguments):\n"
+        "    raise ReleaseError('final registry publish interrupted')\n"
+        "cli.parser = Parser\n"
+        "cli.enforce_deploy_host_state_dir = lambda _a, **_k: None\n"
+        "cli.run = run\n"
+        "raise SystemExit(cli.main())\n" % (str(Path("src").resolve()), str(tmp_path))
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    assert "Traceback" not in completed.stderr
+    logs = list((tmp_path / "logs" / "mutating").glob("rotate-token-*.log"))
+    assert len(logs) == 1, logs
+    recorded = logs[0].read_text(encoding="utf-8")
+    assert "gpu-fault-admin: final registry publish interrupted" in recorded, (
+        "the failure line must land in the log, not only on the console"
+    )
+    assert "gpu-fault-admin: final registry publish interrupted" in completed.stderr
+    assert f"full output in {logs[0]}" in completed.stderr
+
+
 def test_a_command_without_managed_state_logs_nowhere(tmp_path: Path) -> None:
     """Some commands take no ``--state-dir``, and there is no private home then."""
 

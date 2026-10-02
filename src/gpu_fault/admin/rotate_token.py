@@ -48,7 +48,10 @@ needs the step: it is refused once ``TOKEN_FILE_WRITTEN`` has started and the
 Secret is untouched before that, so the running Pods' snapshot is exactly the
 old-only registry the rollback republishes. A journal written by a build that
 predates the step resumes through it, so a rotation left mid-finish gets the
-restart on its next run.
+restart on its next run. ``RETIRING_TOKEN_DROPPED`` publishes through the
+control plane it has just rolled, so it waits for the current ReplicaSets to
+serve the registry, execs only into one of their Pods and retries transient
+failures a bounded number of times (``regional_release_control_plane_ready``).
 
 Node delivery reuses the release's fleet-wave machinery -- the Agent lease and
 open-command safety barrier, the Reconciler wave ConfigMap handoff and the
@@ -118,6 +121,9 @@ from gpu_fault_release.regional_release_agent_convergence import wait_agents
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
+)
+from gpu_fault_release.regional_release_control_plane_ready import (
+    publish_after_control_plane_roll,
 )
 from gpu_fault_release.regional_release_fleet_rollout import (
     INSTALLER_WAVE_CONFIG_MAP_ENV,
@@ -1168,17 +1174,34 @@ def _finish(context: RotationContext, new_token: str) -> None:
                 f"{context.state['expires_at']} (--keep-window)"
             )
         else:
-            result = publish_current_revision(
+            # The control plane was just rolled: wait for its current
+            # ReplicaSets to serve the registry, exec only into one of their
+            # Pods, and retry the transient classes a bounded number of times.
+            outcome = publish_after_control_plane_roll(
                 context.release,
-                reason=f"rotate-token {context.cluster_id} {context.rotation_id} final",
+                publish=lambda: publish_current_revision(
+                    context.release,
+                    reason=f"rotate-token {context.cluster_id} {context.rotation_id} final",
+                ),
+                record=lambda attempts: _record_final_publish(context, attempts),
             )
+            result = outcome["result"]
             evidence = {
                 "retiring_token_dropped": True,
                 "generation": result.get("generation"),
                 "content_sha256": result.get("content_sha256"),
+                "control_plane_ready": outcome["control_plane_ready"],
+                "publish_attempts": outcome["publish_attempts"],
             }
         complete_step(context, STEP_RETIRING_DROPPED, evidence)
     _complete_rotation(context, STATUS_COMPLETED)
+
+
+def _record_final_publish(
+    context: RotationContext, attempts: list[dict[str, Any]]
+) -> None:
+    context.state["final_publish_attempts"] = list(attempts)
+    context.save()
 
 
 def _complete_rotation(context: RotationContext, status: str) -> None:

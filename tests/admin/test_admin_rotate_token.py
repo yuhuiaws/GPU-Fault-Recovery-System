@@ -15,6 +15,7 @@ from gpu_fault.admin import cli
 from gpu_fault.admin import rotate_token as module
 from gpu_fault.admin import rotate_token_acceptance as acceptance_module
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault_release import regional_release_control_plane_ready as control_plane
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from tests.admin.test_admin_rotate_token_acceptance import LogHost
 
@@ -77,6 +78,22 @@ def _target(token_file: str = "/secure/gpu-a.token") -> ClusterTarget:
 def _release(token_file: str = "/secure/gpu-a.token") -> SimpleNamespace:
     runner = SimpleNamespace(calls=[], dry_run=False)
     runner.run = lambda args, **kwargs: runner.calls.append(list(args)) or ""
+    # The publish retry asks whether its exec target still exists; every Pod
+    # this release is asked about is present unless a test says otherwise.
+    runner.probe_output = lambda args, timeout_seconds=None: (
+        0,
+        json.dumps(
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": args[args.index("pod") + 1],
+                    "namespace": "gpu-fault-system",
+                    "uid": "pod-uid",
+                },
+            }
+        ),
+        "",
+    )
     target = _target(token_file)
     return SimpleNamespace(
         runner=runner,
@@ -117,6 +134,7 @@ class Harness:
         self.acceptance_error: BootstrapError | None = None
         self.control_plane_error: Exception | None = None
         self.publish_errors: list[Exception] = []
+        self.readiness_waits: list[tuple] = []
         self.clock = NOW
 
         def registrations(release, overrides):
@@ -181,6 +199,24 @@ class Harness:
                 raise self.acceptance_error
             return {"quiet_seconds": quiet_seconds, "waited_seconds": 1.0}
 
+        def wait_ready(release, deployments=None, **options):
+            # Recorded with how many revisions are published so far and the
+            # steps run before it, so a test can place it between the roll and
+            # the final publish.
+            self.readiness_waits.append(
+                (len(self.publishes), [call[0] for call in self.calls])
+            )
+            return {
+                "waited_seconds": 0.5,
+                "registry_generation": len(self.publishes),
+                "deployments": {},
+            }
+
+        monkeypatch.setattr(control_plane, "wait_control_plane_ready", wait_ready)
+        monkeypatch.setattr(
+            control_plane, "select_current_ingress_pod", lambda release: "api-ha-new-1"
+        )
+        monkeypatch.setattr(control_plane, "PUBLISH_RETRY_DELAY_SECONDS", 0.0)
         monkeypatch.setattr(module, "build_release", lambda site: self.release)
         monkeypatch.setattr(module, "reload_site_for_mutation", lambda site: site)
         monkeypatch.setattr(
@@ -401,6 +437,106 @@ def test_control_plane_rollout_failure_fails_closed_and_the_rerun_resumes_there(
     assert summary["status"] == module.STATUS_COMPLETED
     assert summary["steps"][module.STEP_CONTROL_PLANE_ROLLED] is not None
     assert harness.token_file.read_text(encoding="utf-8") == new_token
+
+
+def test_final_publish_waits_for_the_rolled_control_plane_and_retries_transients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live, the publish raced the roll it had just caused and failed in seconds.
+
+    The readiness wait sits between ``restart_control_plane`` and the final
+    publish; a transient failure (the exec target reaped under it) is retried
+    once the current ReplicaSet is re-selected, and every attempt is journaled.
+    """
+
+    harness = Harness(tmp_path, monkeypatch)
+    killed = ReleaseError("command failed (137): kubectl")
+    setattr(killed, control_plane.FAILURE_EXIT_CODE_ATTRIBUTE, 137)
+    harness_publish = module.publish_registry_revision
+    publishes_seen: list[str] = []
+
+    def publish(release, *, path, payload, use_current_generation, timeout_seconds):
+        # The overlap publish succeeds; the first final publish is killed under
+        # the exec (exit 137), the second lands.
+        publishes_seen.append(payload["reason"])
+        if payload["reason"].endswith(" final") and len(publishes_seen) == 2:
+            raise killed
+        return harness_publish(
+            release,
+            path=path,
+            payload=payload,
+            use_current_generation=use_current_generation,
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(module, "publish_registry_revision", publish)
+
+    summary = harness.rotate()
+
+    assert summary["status"] == module.STATUS_COMPLETED
+    assert len(harness.readiness_waits) == 1
+    published_before_wait, steps_before_wait = harness.readiness_waits[0]
+    assert published_before_wait == 1 and steps_before_wait[-1] == (
+        "restart_control_plane"
+    ), "the readiness wait runs after the roll and before the final publish"
+    assert publishes_seen[1:] == [
+        f"rotate-token gpu-a {summary['rotation_id']} final",
+        f"rotate-token gpu-a {summary['rotation_id']} final",
+    ], "the killed publish is retried with the same idempotent revision"
+    evidence = harness.state["steps"][module.STEP_RETIRING_DROPPED]["evidence"]
+    assert evidence["retiring_token_dropped"] is True
+    assert evidence["control_plane_ready"]["waited_seconds"] == 0.5
+    assert [item["outcome"] for item in evidence["publish_attempts"]] == [
+        "failed",
+        "published",
+    ]
+    assert evidence["publish_attempts"][0]["failure_class"] == "exec-killed"
+    assert all(
+        item["pod"] == "api-ha-new-1" for item in evidence["publish_attempts"]
+    ), "every attempt execs into a Pod of the current ReplicaSet"
+    assert harness.state["final_publish_attempts"] == evidence["publish_attempts"]
+
+
+def test_a_refused_final_publish_is_not_retried_and_the_rerun_resumes_at_the_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    publish = module.publish_current_revision
+    attempts = []
+
+    def refuse(*args, **kwargs):
+        attempts.append("publish")
+        raise ReleaseError("regional registry generation conflict")
+
+    monkeypatch.setattr(module, "publish_current_revision", refuse)
+    with pytest.raises(ReleaseError, match="generation conflict") as info:
+        harness.rotate()
+
+    assert attempts == ["publish"], "a registry refusal is never repeated"
+    assert info.value.__notes__ == [
+        "registry publish failed on attempt 1/3 (refused); exec target api-ha-new-1"
+    ]
+    state = harness.state
+    assert state["status"] == module.STATUS_IN_PROGRESS
+    assert module.STEP_CONTROL_PLANE_ROLLED in state["steps"]
+    assert module.STEP_RETIRING_DROPPED not in state["steps"]
+    assert [item["failure_class"] for item in state["final_publish_attempts"]] == [
+        "refused"
+    ], "the journal keeps the failed attempt for the operator"
+
+    monkeypatch.setattr(module, "publish_current_revision", publish)
+    before = len(harness.calls)
+    summary = harness.rotate()
+
+    assert [call[0] for call in harness.calls[before:]] == ["publish"], (
+        "the rerun resumes at RETIRING_TOKEN_DROPPED without rolling again"
+    )
+    assert len(harness.readiness_waits) == 2, (
+        "the resumed drop waits for the control plane again before publishing"
+    )
+    assert summary["status"] == module.STATUS_COMPLETED
+    evidence = harness.state["steps"][module.STEP_RETIRING_DROPPED]["evidence"]
+    assert [item["outcome"] for item in evidence["publish_attempts"]] == ["published"]
 
 
 def test_a_journal_from_before_the_control_plane_step_resumes_through_it(
