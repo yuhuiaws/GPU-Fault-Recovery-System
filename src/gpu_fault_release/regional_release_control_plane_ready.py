@@ -128,10 +128,14 @@ class CurrentReplicaSet:
 
     @property
     def complete(self) -> bool:
-        return (
-            self.replicas > 0
-            and len(self.serving_pods) == self.replicas
-            and not any(pod.terminating for pod in self.pods)
+        # A Deployment scaled to zero (the spool worker with spool disabled)
+        # has nothing to wait for once no Pod of its current revision is left;
+        # requiring at least one Pod made the rotation's final publish time out
+        # on every spool-disabled site (live 2026-10-02).
+        if self.replicas == 0:
+            return not self.pods
+        return len(self.serving_pods) == self.replicas and not any(
+            pod.terminating for pod in self.pods
         )
 
     def evidence(self) -> dict[str, Any]:

@@ -5419,7 +5419,7 @@ gpu-fault-admin rotate-token \
    the reinstalled nodes, the rolled CPU Deployments with their rollout results (`deployments`/`rollouts` under
    `CONTROL_PLANE_ROLLED`), the control-plane readiness evidence and the publish attempts before the final revision
    (`control_plane_ready`/`publish_attempts` under `RETIRING_TOKEN_DROPPED`) and the remote command baseline; the command's output JSON is the
-   change-ticket attachment. None of these contains the token in plaintext.
+   change-ticket attachment. None of these contains the token in plaintext. A Deployment scaled to zero (the spool worker with spool disabled) counts as ready as soon as no Pod of its current revision remains; it is not required to have a Pod.
 
 Correspondence to the manual procedure: the registry overlap revision (former step 3), the GPU Secret (step 4), the data-plane restart
 (step 5), the node credentials (step 6, no longer using the REG-10 DaemonSet), the retirement log confirmation (step 7),

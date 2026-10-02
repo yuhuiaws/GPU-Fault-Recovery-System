@@ -416,6 +416,48 @@ def test_wait_judges_a_deployment_without_a_healthz_probe_on_ready_alone() -> No
     assert evidence["registry_generation"] is None
 
 
+def test_wait_treats_a_deployment_scaled_to_zero_as_ready_once_its_pods_are_gone() -> (
+    None
+):
+    """Spool disabled: the spool worker is a Deployment with ``replicas: 0``.
+    Live 2026-10-02 the readiness wait demanded at least one Pod of it and the
+    rotation's final publish timed out after the roll on every such site."""
+    cluster = ControlPlane().with_rolled(
+        "gpu-fault-telemetry-spool-worker", healthz=False, replicas=0
+    )
+
+    evidence = READY.wait_control_plane_ready(
+        _release(cluster),
+        ("gpu-fault-telemetry-spool-worker",),
+        timeout_seconds=5,
+        sleep=lambda _seconds: None,
+    )
+
+    assert (
+        evidence["deployments"]["gpu-fault-telemetry-spool-worker"]["replicas"] == 0
+    ), "the evidence must record the zero-replica Deployment"
+    assert (
+        evidence["deployments"]["gpu-fault-telemetry-spool-worker"]["ready_pods"] == []
+    ), "nothing serves a scaled-to-zero Deployment"
+
+
+def test_wait_keeps_waiting_while_a_scaled_to_zero_deployment_still_has_a_pod() -> None:
+    cluster = ControlPlane().with_rolled(
+        "gpu-fault-telemetry-spool-worker", healthz=False, replicas=0
+    )
+    cluster.pods.append(
+        _pod("gpu-fault-telemetry-spool-worker", "spool-old-1", terminating=True)
+    )
+
+    with pytest.raises(ReleaseError, match="did not become ready"):
+        READY.wait_control_plane_ready(
+            _release(cluster),
+            ("gpu-fault-telemetry-spool-worker",),
+            timeout_seconds=1,
+            sleep=lambda _seconds: None,
+        )
+
+
 def test_wait_in_dry_run_reads_nothing() -> None:
     cluster = ControlPlane()
 
