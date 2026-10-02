@@ -21,18 +21,13 @@ from urllib.parse import urlsplit
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release import regional_release_token_rotation_safety as rotation_safety
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_adot_self_metrics import adot_self_metrics_report
 from gpu_fault_release.regional_aurora_credentials import (
     REFRESH_STATUS_KEY as AURORA_REFRESH_STATUS_KEY,
-)
-from gpu_fault_release.regional_aurora_credentials import (
     REFRESH_STATUS_MAX_AGE_SECONDS as AURORA_REFRESH_STATUS_MAX_AGE_SECONDS,
-)
-from gpu_fault_release.regional_aurora_credentials import (
     aurora_refresh_status as _aurora_refresh_status,
-)
-from gpu_fault_release.regional_aurora_credentials import (
     refresh_status_supersedes_failure,
 )
 from gpu_fault_release.regional_notifications import check_notification_channel
@@ -1099,6 +1094,11 @@ def build_preflight_report(
                 "no active destructive workflow blocks release",
                 workflow_safety_snapshot(release),
             ),
+        ),
+        # The mirror of rotate-token's "a release transaction is open" guard.
+        (
+            "token_rotation",
+            lambda: CheckValue(*rotation_safety.token_rotation_check(release)),
         ),
     ]
     with _read_snapshot(release):

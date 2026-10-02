@@ -29,29 +29,24 @@ atomically, with the old value kept as ``<file>.retired-<timestamp>``.
 the old-only registry while the window still accepts both.
 
 ``CONTROL_PLANE_ROLLED`` is the control plane restart the manual procedure had
-and the verb at first dropped. The CPU Deployments (api-ha, control-worker,
+and the verb at first dropped: the CPU Deployments (api-ha, control-worker,
 telemetry-spool-worker) read the registry Secret into their environment once,
 at Pod start, so rewriting ``gpu-fault-regional-clusters`` reaches no running
-Pod; until they restart every replica compares its start-up snapshot with the
-durable head and reports ``regional_registry.secret_drift`` (observed
-2026-09-30: drift held after a completed rotation until an operator ran
-``kubectl rollout restart`` by hand, and the acceptance registry-alignment
-preflight refused to run). The step sits between the token file write and the
-final publish on purpose: the Secret is rewritten first so the restarted Pods
-load the accepted token, and the retiring digest is still in the durable head
-while they roll, so both tokens stay accepted throughout and a stalled rollout
-leaves a working fleet that a rerun resumes at the same step. The drift digest
-covers the retiring digest too, so the Pods read aligned only once the final
-publish drops it (``--keep-window`` therefore leaves ``secret_drift`` raised
-until the window closes and the registry is next published). Rollback never
-needs the step: it is refused once ``TOKEN_FILE_WRITTEN`` has started and the
-Secret is untouched before that, so the running Pods' snapshot is exactly the
-old-only registry the rollback republishes. A journal written by a build that
-predates the step resumes through it, so a rotation left mid-finish gets the
-restart on its next run. ``RETIRING_TOKEN_DROPPED`` publishes through the
-control plane it has just rolled, so it waits for the current ReplicaSets to
-serve the registry, execs only into one of their Pods and retries transient
-failures a bounded number of times (``regional_release_control_plane_ready``).
+Pod and every replica reports ``regional_registry.secret_drift`` until it
+restarts (observed 2026-09-30). The step sits between the token file write and
+the final publish on purpose: the Secret is rewritten first so the restarted
+Pods load the accepted token, and the retiring digest is still in the durable
+head while they roll, so both tokens stay accepted and a stalled rollout leaves
+a working fleet that a rerun resumes at the same step. Rollback never needs
+the step (it is refused once ``TOKEN_FILE_WRITTEN`` has started, and the
+Secret is untouched before that). ``RETIRING_TOKEN_DROPPED`` publishes through
+the control plane it has just rolled (``regional_release_control_plane_ready``)
+and is idempotent: a head that already holds only the new digest -- a deploy
+republished the registry mid-finish -- is recorded, not republished.
+
+The journal binds the site through ``rotate_token_binding``: the raw
+``site_sha256`` for audit plus a projection of the facts the rotation reads,
+so a release-only rewrite of ``site.yaml`` does not strand a resume.
 
 Node delivery reuses the release's fleet-wave machinery -- the Agent lease and
 open-command safety barrier, the Reconciler wave ConfigMap handoff and the
@@ -80,7 +75,6 @@ from gpu_fault.admin.bootstrap import discover_cluster
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
-    safe_name,
     write_secret,
 )
 from gpu_fault.admin.cluster_removal import resolve_cluster_id
@@ -97,6 +91,39 @@ from gpu_fault.admin.rotate_token_acceptance import (
     RETIRING_TOKEN_LOG_FRAGMENT as RETIRING_TOKEN_LOG_FRAGMENT,
     collect_retiring_token_authentications,
     wait_for_quiet_token_authentications,
+)
+from gpu_fault.admin.rotate_token_binding import (
+    legacy_rebind_pending,
+    rebind_legacy_journal,
+    registry_head_evidence,
+    rotation_site_binding,
+    site_binding_sha256,
+)
+from gpu_fault.admin.rotate_token_journal import (
+    ROLLBACK_DATA_PLANE_ROLLED,
+    ROLLBACK_NODES_ROLLED,
+    ROLLBACK_REGISTRY_RESTORED,
+    ROLLBACK_SECRET_RESTORED,
+    ROLLBACK_STEPS,
+    ROTATION_STEPS as ROTATION_STEPS,
+    STATE_ROOT as STATE_ROOT,
+    STATE_SCHEMA_VERSION,
+    STATUS_COMPLETED,
+    STATUS_IN_PROGRESS,
+    STATUS_ROLLED_BACK,
+    STEP_ACCEPTED,
+    STEP_CONTROL_PLANE_ROLLED,
+    STEP_DATA_PLANE_ROLLED,
+    STEP_NODES_ROLLED,
+    STEP_OVERLAP_PUBLISHED,
+    STEP_PREPARED,
+    STEP_RETIRING_DROPPED,
+    STEP_SECRET_UPDATED,
+    STEP_TOKEN_FILE_WRITTEN,
+    load_rotation_state,
+    rotation_journal_path,
+    step_done,
+    step_started,
 )
 from gpu_fault.admin.rotate_token_policy import (
     MAX_WINDOW_MINUTES,
@@ -151,8 +178,6 @@ from gpu_fault_release.regional_release_rollout_wait import (
 )
 from gpu_fault_release.regional_release_state import remote_command_stats
 
-STATE_SCHEMA_VERSION = 1
-STATE_ROOT = "rotate-token"
 PENDING_TOKEN_FILE = "pending.token"
 DEFAULT_WINDOW_MINUTES = 120
 DEFAULT_QUIET_SECONDS = 180
@@ -167,45 +192,10 @@ MIN_TOKEN_LENGTH = 32
 # Remote command terminal states whose growth during the rotation means a
 # command was cut off by a restart rather than finished by its executor.
 REMOTE_COMMAND_LOSS_STATUSES = ("FAILED", "EXPIRED")
-
-STATUS_IN_PROGRESS = "IN_PROGRESS"
-STATUS_COMPLETED = "COMPLETED"
-STATUS_ROLLED_BACK = "ROLLED_BACK"
-
-STEP_PREPARED = "PREPARED"
-STEP_OVERLAP_PUBLISHED = "REGISTRY_OVERLAP_PUBLISHED"
-STEP_SECRET_UPDATED = "CONNECTION_SECRET_UPDATED"
-STEP_DATA_PLANE_ROLLED = "DATA_PLANE_ROLLED"
-STEP_NODES_ROLLED = "NODES_ROLLED"
-STEP_ACCEPTED = "DATA_PLANE_ACCEPTED"
-STEP_TOKEN_FILE_WRITTEN = "TOKEN_FILE_WRITTEN"
-STEP_CONTROL_PLANE_ROLLED = "CONTROL_PLANE_ROLLED"
-STEP_RETIRING_DROPPED = "RETIRING_TOKEN_DROPPED"
-ROTATION_STEPS = (
-    STEP_PREPARED,
-    STEP_OVERLAP_PUBLISHED,
-    STEP_SECRET_UPDATED,
-    STEP_DATA_PLANE_ROLLED,
-    STEP_NODES_ROLLED,
-    STEP_ACCEPTED,
-    STEP_TOKEN_FILE_WRITTEN,
-    STEP_CONTROL_PLANE_ROLLED,
-    STEP_RETIRING_DROPPED,
-)
 # The CPU Deployments whose Pods load ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` from
 # the registry Secret at start (api-ha, control-worker, telemetry-spool-worker):
 # the ones a Secret rewrite reaches only through a restart.
 CONTROL_PLANE_SECRET_CONSUMERS = inventory.CPU_RUNTIME_DEPLOYMENTS
-ROLLBACK_SECRET_RESTORED = "ROLLBACK_SECRET_RESTORED"
-ROLLBACK_DATA_PLANE_ROLLED = "ROLLBACK_DATA_PLANE_ROLLED"
-ROLLBACK_NODES_ROLLED = "ROLLBACK_NODES_ROLLED"
-ROLLBACK_REGISTRY_RESTORED = "ROLLBACK_REGISTRY_RESTORED"
-ROLLBACK_STEPS = (
-    ROLLBACK_SECRET_RESTORED,
-    ROLLBACK_DATA_PLANE_ROLLED,
-    ROLLBACK_NODES_ROLLED,
-    ROLLBACK_REGISTRY_RESTORED,
-)
 
 
 def _utc_now() -> datetime:
@@ -258,24 +248,7 @@ class RotationContext:
 
 
 def rotation_state_path(site: RenderedSite, cluster_id: str) -> Path:
-    return site.source.parent / STATE_ROOT / safe_name(cluster_id) / "state.json"
-
-
-def load_rotation_state(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise BootstrapError(f"rotate-token state is not an object: {path}")
-    return cast(dict[str, Any], value)
-
-
-def step_done(state: Mapping[str, Any], step: str) -> bool:
-    return step in (state.get("steps") or {})
-
-
-def step_started(state: Mapping[str, Any], step: str) -> bool:
-    return step_done(state, step) or step in (state.get("started_steps") or {})
+    return rotation_journal_path(site.source.parent, cluster_id)
 
 
 def start_step(context: RotationContext, step: str) -> None:
@@ -320,7 +293,7 @@ def _start_or_resume_state(
     request: RotateTokenRequest,
     token_file: Path,
     now: Callable[[], datetime],
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], bool]:
     policy = rotation_policy(request)
     path = rotation_state_path(request.site, request.cluster_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -341,17 +314,16 @@ def _start_or_resume_state(
         cleanup_pending = existing.get("pending_token_cleanup_completed") is False
         if existing.get("status") == STATUS_IN_PROGRESS or cleanup_pending:
             require_rotation_policy(existing, policy)
-            if existing.get("site_sha256") != request.site.source_sha256:
-                raise BootstrapError(
-                    "rotate-token site changed since the rotation started"
-                )
+            rebind = legacy_rebind_pending(
+                existing, request.site, request.cluster_id, rollback=request.rollback
+            )
             if cleanup_pending and request.rollback != (
                 existing.get("status") == STATUS_ROLLED_BACK
             ):
                 raise BootstrapError(
                     "rotate-token cleanup must resume in the committed direction"
                 )
-            return path, existing
+            return path, existing, rebind
         if request.rollback:
             raise BootstrapError(
                 f"no rotation is in progress for {request.cluster_id}; "
@@ -361,10 +333,13 @@ def _start_or_resume_state(
     elif request.rollback:
         raise BootstrapError(f"no rotation is in progress for {request.cluster_id}")
     stamp = now()
+    binding = rotation_site_binding(request.site, request.cluster_id)
     state: dict[str, Any] = {
         "schema_version": STATE_SCHEMA_VERSION,
         "site_id": request.site.release_config["site_name"],
         "site_sha256": request.site.source_sha256,
+        "site_binding": binding,
+        "site_binding_sha256": site_binding_sha256(binding),
         "cluster_id": request.cluster_id,
         "rotation_id": f"{stamp:%Y%m%dT%H%M%SZ}-{secrets.token_hex(4)}",
         "status": STATUS_IN_PROGRESS,
@@ -378,7 +353,7 @@ def _start_or_resume_state(
         "warnings": [],
     }
     write_json_atomic(path, state)
-    return path, state
+    return path, state, False
 
 
 # --------------------------------------------------------------------------
@@ -1179,15 +1154,13 @@ def _finish(context: RotationContext, new_token: str) -> None:
             # Pods, and retry the transient classes a bounded number of times.
             outcome = publish_after_control_plane_roll(
                 context.release,
-                publish=lambda: publish_current_revision(
-                    context.release,
-                    reason=f"rotate-token {context.cluster_id} {context.rotation_id} final",
-                ),
+                publish=lambda: _drop_retiring_digest(context),
                 record=lambda attempts: _record_final_publish(context, attempts),
             )
             result = outcome["result"]
             evidence = {
                 "retiring_token_dropped": True,
+                "already_dropped": bool(result.get("already_dropped", False)),
                 "generation": result.get("generation"),
                 "content_sha256": result.get("content_sha256"),
                 "control_plane_ready": outcome["control_plane_ready"],
@@ -1195,6 +1168,24 @@ def _finish(context: RotationContext, new_token: str) -> None:
             }
         complete_step(context, STEP_RETIRING_DROPPED, evidence)
     _complete_rotation(context, STATUS_COMPLETED)
+
+
+def _drop_retiring_digest(context: RotationContext) -> dict[str, Any]:
+    """The final publish, unless the head already holds only the new token."""
+
+    head = registry_head_evidence(
+        context.release, context.cluster_id, str(context.state["new_token_sha256"])
+    )
+    if head["converged"]:
+        return {
+            "generation": head["generation"],
+            "content_sha256": head["content_sha256"],
+            "already_dropped": True,
+        }
+    return publish_current_revision(
+        context.release,
+        reason=f"rotate-token {context.cluster_id} {context.rotation_id} final",
+    )
 
 
 def _record_final_publish(
@@ -1370,7 +1361,7 @@ def rotate_cluster_token(
         token_file = Path(str(record.get("token_file") or ""))
         if not token_file.is_file():
             raise BootstrapError(f"cluster token file is missing: {token_file}")
-        state_path, state = _start_or_resume_state(request, token_file, now)
+        state_path, state, rebind = _start_or_resume_state(request, token_file, now)
         with site_process_environment(site):
             release = build_release(site)
             context = RotationContext(
@@ -1382,6 +1373,16 @@ def rotate_cluster_token(
                 token_file=token_file,
                 now=now,
             )
+            if rebind:
+                rebind_legacy_journal(
+                    state,
+                    site=site,
+                    cluster_id=request.cluster_id,
+                    token_file_sha256=cluster_token_sha256(_read_token(token_file)),
+                    release=release,
+                    now=now(),
+                )
+                context.save()
             if request.rollback:
                 _rollback(context)
             else:

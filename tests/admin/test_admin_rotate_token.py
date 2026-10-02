@@ -14,6 +14,7 @@ import pytest
 from gpu_fault.admin import cli
 from gpu_fault.admin import rotate_token as module
 from gpu_fault.admin import rotate_token_acceptance as acceptance_module
+from gpu_fault.admin import rotate_token_binding as binding
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault_release import regional_release_control_plane_ready as control_plane
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
@@ -135,6 +136,9 @@ class Harness:
         self.control_plane_error: Exception | None = None
         self.publish_errors: list[Exception] = []
         self.readiness_waits: list[tuple] = []
+        # The durable registry head a test wants the Secret to reconstruct;
+        # ``None`` derives it from the last published revision (or the Secret).
+        self.durable: list[dict] | None = None
         self.clock = NOW
 
         def registrations(release, overrides):
@@ -212,6 +216,31 @@ class Harness:
                 "deployments": {},
             }
 
+        def durable_registrations(release):
+            entries = self.durable
+            if entries is None:
+                entries = (
+                    self.publishes[-1]["registrations"]
+                    if self.publishes
+                    else registrations(release, {})
+                )
+            if any(item.get("retiring_token_sha256") for item in entries):
+                # The Secret carries one token per cluster, so a head with a
+                # retiring digest cannot be reconstructed from it.
+                raise ReleaseError("regional registry credential identity differs")
+            status = SimpleNamespace(
+                generation=len(self.publishes), content_sha256="f" * 64
+            )
+            return status, [
+                SimpleNamespace(
+                    cluster_id=item["cluster_id"],
+                    token_sha256=item["token_sha256"],
+                    retiring_token_sha256=item.get("retiring_token_sha256"),
+                )
+                for item in entries
+            ]
+
+        monkeypatch.setattr(binding, "durable_registrations", durable_registrations)
         monkeypatch.setattr(control_plane, "wait_control_plane_ready", wait_ready)
         monkeypatch.setattr(
             control_plane, "select_current_ingress_pod", lambda release: "api-ha-new-1"
@@ -668,8 +697,9 @@ def test_resume_refuses_changed_site_identity_before_another_mutation(
         harness.rotate()
     before = len(harness.calls)
     harness.site.source_sha256 = "9" * 64
+    harness.site.release_config["clusters"][0]["context"] = "gpu-a-other-context"
 
-    with pytest.raises(BootstrapError, match="site"):
+    with pytest.raises(BootstrapError, match="site changed.*clusters"):
         harness.rotate()
     assert len(harness.calls) == before
 

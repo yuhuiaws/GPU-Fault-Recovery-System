@@ -1351,7 +1351,11 @@ def materialized_release_config(site: RenderedSite) -> Iterator[Path]:
         path = root / "regional-release.json"
         path.write_text(
             json.dumps(
-                {**site.release_config, **lifecycle},
+                {
+                    **site.release_config,
+                    **lifecycle,
+                    "admin_state_dir": str(site.source.parent),
+                },
                 indent=2,
                 sort_keys=True,
             ),

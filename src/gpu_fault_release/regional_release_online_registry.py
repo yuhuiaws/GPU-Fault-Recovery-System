@@ -244,10 +244,18 @@ def publish_current_registry(
     )
 
 
-def _lifecycle_registry_request(
-    release: Any, overrides: dict[str, str], reason: str
-) -> RegionalRegistryPublishRequest:
-    """Bind a lifecycle-only update to the complete durable registry snapshot."""
+def durable_registrations(
+    release: Any,
+) -> tuple[RegionalRegistryStatus, list[RegionalClusterRegistration]]:
+    """The durable registry head, its redacted digests restored from the Secret.
+
+    The API redacts ``token_sha256``/``retiring_token_sha256``; they are taken
+    from the CPU Secret and the revision's content digest proves the bytes
+    agree. Raises when the Secret cannot reconstruct the head -- membership,
+    lifecycle, digest presence or length, content or config digest differ --
+    which is also what a rotation's overlap window (a retiring digest the
+    Secret knows nothing about) looks like.
+    """
 
     try:
         status = RegionalRegistryStatus.model_validate(
@@ -260,8 +268,6 @@ def _lifecycle_registry_request(
         by_id = {item.cluster_id: item for item in configured}
         if len(by_id) != len(configured) or set(by_id) != set(status.cluster_states):
             raise ReleaseError("regional registry membership differs from its Secret")
-        if not set(overrides).issubset(by_id):
-            raise ReleaseError("regional registry lifecycle target is missing")
         durable: list[RegionalClusterRegistration] = []
         for source in _request(
             release, "GET", "/v1/regional/clusters", response_list=True
@@ -292,6 +298,20 @@ def _lifecycle_registry_request(
             != regional_registry_config_sha256(configured)
         ):
             raise ReleaseError("regional registry snapshot identity differs")
+        return status, durable
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseError("regional registry lifecycle evidence is invalid") from None
+
+
+def _lifecycle_registry_request(
+    release: Any, overrides: dict[str, str], reason: str
+) -> RegionalRegistryPublishRequest:
+    """Bind a lifecycle-only update to the complete durable registry snapshot."""
+
+    status, durable = durable_registrations(release)
+    if not set(overrides).issubset({item.cluster_id for item in durable}):
+        raise ReleaseError("regional registry lifecycle target is missing")
+    try:
         observed = datetime.now(timezone.utc)
         for registration in durable:
             if registration.cluster_id not in overrides:

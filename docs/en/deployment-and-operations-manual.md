@@ -5353,6 +5353,12 @@ gpu-fault-admin rotate-token \
    unfinished release transaction (any intermediate phase of `deploy`/`resume`/`rollback`, or a `complete` not yet
    committed). If either fails, the command refuses outright and modifies nothing. It is not necessary to wait until there are no non-terminal
    workflows: old and new tokens are both valid during the overlap window (design in Administrator Operations §6.1).
+   The reverse rule holds too: while any cluster's `state.json` is `IN_PROGRESS`, or terminal with
+   `pending_token_cleanup_completed` false, the release preflight check `token_rotation` of `deploy` and
+   `join-cluster` refuses the release, naming the cluster, the status, the last completed step and the finishing
+   command (`gpu-fault-admin rotate-token --state-dir … --gpu-cluster-arn …`, plus `--rollback` before
+   `TOKEN_FILE_WRITTEN`). A release re-renders and republishes the registry from the token files; run mid-rotation it
+   would wipe the digest still to be retired and rewrite `site.yaml`.
 2. **Scope of impact**: only the GPU cluster pointed to by `--gpu-cluster-arn`. The CPU side publishes two extra registry
    revisions (overlap first, then finalisation) and, before the finalisation, writes the new token into the
    `gpu-fault-regional-clusters` Secret and rolls the three Deployments that read it -- api-ha, control-worker,
@@ -5366,7 +5372,16 @@ gpu-fault-admin rotate-token \
    `<state-dir>/rotate-token/<cluster-id>/state.json` absent, or its `status` is
    `COMPLETED`/`ROLLED_BACK` (`IN_PROGRESS` means the last run did not finish; rerunning the same command resumes);
    the Reconciler's wave ConfigMap `allowed-nodes` is `*` (otherwise a release is rolling nodes and
-   the command refuses).
+   the command refuses). How a resume checks the site: the journal records `site_sha256` (the raw digest of
+   `site.yaml`, for audit) and `site_binding_sha256` (a canonical projection of the site facts the rotation reads:
+   site name, every cluster entry's cluster_id/context/EKS ARN/HyperPod name/token file, the CPU kubeconfig,
+   namespace, GPU kubeconfig and the registry Secret identity; stored as `site_binding`, never holding a token). An
+   equal raw digest resumes as before; otherwise the projections are compared, so a `site.yaml` a release rewrote
+   only in `spec.repositoryRoot`/`spec.release.manifest`/`spec.runtimeProfile.source` no longer blocks the resume,
+   while a changed rotation-relevant fact refuses and names the differing field. A legacy journal without
+   `site_binding_sha256` whose `site.yaml` changed is rebound only when it is past `TOKEN_FILE_WRITTEN`, the token
+   file's digest equals `new_token_sha256`, and the durable head holds only that digest for the cluster (it records
+   `site_rebound` and the new binding, then continues); otherwise it still refuses.
 4. **Run the command**: as above. Optional parameters: `--window-minutes` (how long the old token keeps being accepted, default
    120, allowed from 10 minutes to 7 days, set in minutes or hours, not days), `--quiet-seconds` (how long the control-plane logs
    must be continuously free of `authenticated with the retiring token` before the data plane counts as switched, default 180),
@@ -5397,6 +5412,10 @@ gpu-fault-admin rotate-token \
    fails, rerun with exactly the same parameters to resume from the first unfinished step; an unfinished `state.json`
    left by an older build also passes through this step on resume;
    on resume, if the remaining window is under 10 minutes it first republishes the overlap revision to extend the window and then continues, rather than relying on expiry to finalise.
+   `RETIRING_TOKEN_DROPPED` is idempotent: before publishing it reads the durable head through the same registry
+   read path, and when the cluster already carries no retiring digest and its token digest equals
+   `new_token_sha256` (for example a deploy already republished the registry with the new token) it only records
+   the step as completed (evidence `already_dropped=true` with the generation seen) and publishes no new revision.
 5. **Success criteria**: `status` in the output JSON is `COMPLETED`, all nine `steps` have timestamps,
    `old_token_sha256` and `new_token_sha256` differ; the sha256 of the `token_file` content equals
    `new_token_sha256`, and `<file>.retired-<time>` appears next to it; in `GET /v1/regional/clusters`
@@ -5413,7 +5432,8 @@ gpu-fault-admin rotate-token \
    rollback does not roll the CPU control plane: the `gpu-fault-regional-clusters` Secret is never rewritten before
    `TOKEN_FILE_WRITTEN`, so the running CPU Pods already hold exactly the old registry the rollback republishes. If publishing the overlap revision itself fails, the command
    automatically republishes the old digest with no human intervention. After `TOKEN_FILE_WRITTEN` the old token has been retired and
-   `--rollback` refuses -- rolling back at that point is equivalent to doing another rotation.
+   `--rollback` refuses -- rolling back at that point is equivalent to doing another rotation. `--rollback` never
+   rebinds a legacy journal: one without `site_binding_sha256` is refused outright once `site.yaml` changed.
 7. **Evidence**: `<state-dir>/rotate-token/<cluster-id>/state.json` (archived to
    `history/<rotation_id>.json` when the next rotation starts) records the operator ARN, `--reference`, the two digests, the completion time and registry generation of every step,
    the reinstalled nodes, the rolled CPU Deployments with their rollout results (`deployments`/`rollouts` under

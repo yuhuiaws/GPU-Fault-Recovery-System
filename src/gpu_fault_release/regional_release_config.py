@@ -41,6 +41,15 @@ class PartialClusterRolloutError(ReleaseError):
     pass
 
 
+def _optional_absolute_path(value: dict[str, Any], field: str) -> Path | None:
+    raw = value.get(field)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise ReleaseError(f"{field} must be an absolute path")
+    return Path(raw)
+
+
 def canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -909,6 +918,10 @@ class ReleaseConfig:
     installation_id: str | None = None
     retained_database_handoff: Path | None = None
     release_manifest_path: str = ""
+    # The managed state directory (the one holding ``site.yaml``) the
+    # administrator CLI materialized this config from; the preflight reads the
+    # ``rotate-token`` journals through it. Absent for a hand-written config.
+    admin_state_dir: Path | None = None
 
     def for_rollback(
         self,
@@ -1134,6 +1147,7 @@ class ReleaseConfig:
             ),
             installation_id=installation_id,
             retained_database_handoff=Path(handoff) if handoff is not None else None,
+            admin_state_dir=_optional_absolute_path(value, "admin_state_dir"),
             retention=RegionalRetentionConfig.from_mapping(
                 dict(value.get("retention") or {})
             ),

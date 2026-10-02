@@ -369,11 +369,10 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         monkeypatch.setattr(
             module, name, lambda *args, name=name: module.CheckValue(name)
         )
-
     report = module.build_preflight_report(Release())
 
     assert report["healthy"] is True
-    assert report["summary"]["PASS"] == len(names)
+    assert (report["summary"]["PASS"], report["summary"]["WARN"]) == (len(names), 1)
     assert {item["name"] for item in report["checks"]} == {
         "tools",
         "local_inputs",
@@ -389,6 +388,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "email_notifications",
         "monitoring",
         "workflow_safety",
+        "token_rotation",
     }
 
 

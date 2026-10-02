@@ -1189,7 +1189,12 @@ gpu-fault-admin rotate-token \
 ```
 
 1. **Applicability**: the target cluster has no `PENDING`/`LEASED`/`WAITING` remote commands and no unfinished
-   release transaction; fault handling need not be stopped.
+   release transaction; fault handling need not be stopped. The rule is symmetric: while any cluster's rotation
+   journal is unfinished (`status=IN_PROGRESS`, or terminal with its pending-token cleanup incomplete) the release
+   preflight check `token_rotation` of `deploy` and `join-cluster` fails closed, naming the cluster, the status and
+   the finishing command (the same `rotate-token` command, plus `--rollback` where still allowed). A release
+   re-renders and republishes the registry from the token files, which would wipe the digest a mid-flight rotation
+   still has to retire, so publishing first and finishing later is not permitted.
 2. **Scope of impact**: only the target GPU cluster's registry entry, connection Secret, the three Deployments Executor /
    Completion Watcher / Resource Collector, and all node Agents (reinstalled wave by wave via the same fleet wave as a
    release); on the CPU side the finalisation rewrites the `gpu-fault-regional-clusters` Secret and rolls the three
@@ -1197,7 +1202,19 @@ gpu-fault-admin rotate-token \
    its rollout to complete before the next).
 3. **Read-only checks**: `gpu-fault-admin status` healthy; a first rotation has no conflicting `IN_PROGRESS` transaction,
    and interrupted recovery of the same rotation must reuse `<state-dir>/rotate-token/<cluster-id>/state.json`,
-   which must not be deleted first.
+   which must not be deleted first. The journal records two site bindings: `site_sha256` (the raw digest of
+   `site.yaml`, kept for audit) and `site_binding_sha256` (a canonical JSON projection of the site facts the rotation
+   actually reads: site name, every cluster entry's cluster_id/context/EKS ARN/HyperPod name/token file, the CPU
+   kubeconfig, namespace, GPU kubeconfig and the registry Secret identity; the projection itself is stored as
+   `site_binding` and holds paths and identifiers only, never a token). On resume an equal raw digest proceeds as
+   before; otherwise the projections are compared -- a `site.yaml` a release rewrote in release-only fields such as
+   `spec.repositoryRoot`, `spec.release.manifest` or `spec.runtimeProfile.source` no longer blocks the resume, while a
+   changed rotation-relevant fact still fails closed and names the differing field. A legacy journal without
+   `site_binding_sha256` whose `site.yaml` changed is rebound only when it is already past `TOKEN_FILE_WRITTEN`, the
+   token file's digest equals `new_token_sha256`, and the durable registry head holds only that digest for the
+   cluster (no retiring digest; reconstructed from the registry Secret and proved by the revision content digest):
+   the journal then records `site_rebound` (`at`, `from_site_sha256`, `to_site_sha256`, `evidence`) plus the new
+   `site_binding`/`site_binding_sha256` and finishes; every other legacy mismatch still fails closed.
 4. **Command**: as above. The command executes in order: publish the overlap
    revision carrying `retiring_token_sha256` -> update the GPU connection Secret -> roll the data plane -> reinstall nodes by wave -> wait for the control-plane
    logs to pass the current retention check with no
@@ -1217,6 +1234,8 @@ gpu-fault-admin rotate-token \
    (Secret -> data plane -> nodes that started or completed the switch -> registry containing only the old digest).
    Once that write intent is on disk, even if the file replacement ACK is lost you can only continue the original rotation without `--rollback` and cannot
    revert; to change the credential again after completion, start a new rotation. Once a rollback has started, keep finishing it with `--rollback`.
+   `--rollback` never rebinds a legacy journal: one without `site_binding_sha256` is refused outright after
+   `site.yaml` changed; a bound journal follows the projection rule of item 3.
 7. **Evidence**: `<state-dir>/rotate-token/<cluster-id>/state.json` and the command output JSON, containing digests only.
 
 The rotation does not modify the execution token, nor does it distribute any cluster token to other GPU clusters. Real-machine acceptance is
