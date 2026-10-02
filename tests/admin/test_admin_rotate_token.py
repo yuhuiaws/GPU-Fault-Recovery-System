@@ -216,7 +216,7 @@ class Harness:
                 "deployments": {},
             }
 
-        def durable_registrations(release):
+        def durable_registrations(release, *, retiring_digests=None):
             entries = self.durable
             if entries is None:
                 entries = (
@@ -224,10 +224,17 @@ class Harness:
                     if self.publishes
                     else registrations(release, {})
                 )
-            if any(item.get("retiring_token_sha256") for item in entries):
-                # The Secret carries one token per cluster, so a head with a
-                # retiring digest cannot be reconstructed from it.
-                raise ReleaseError("regional registry credential identity differs")
+            for item in entries:
+                retiring = item.get("retiring_token_sha256")
+                if not retiring:
+                    continue
+                supplied = (retiring_digests or {}).get(item["cluster_id"])
+                if supplied is None:
+                    # The Secret carries one token per cluster, so a head with
+                    # a retiring digest cannot be reconstructed from it alone.
+                    raise ReleaseError("regional registry credential identity differs")
+                if supplied != retiring:
+                    raise ReleaseError("regional registry snapshot identity differs")
             status = SimpleNamespace(
                 generation=len(self.publishes), content_sha256="f" * 64
             )

@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -246,6 +246,8 @@ def publish_current_registry(
 
 def durable_registrations(
     release: Any,
+    *,
+    retiring_digests: Mapping[str, str] | None = None,
 ) -> tuple[RegionalRegistryStatus, list[RegionalClusterRegistration]]:
     """The durable registry head, its redacted digests restored from the Secret.
 
@@ -254,7 +256,10 @@ def durable_registrations(
     agree. Raises when the Secret cannot reconstruct the head -- membership,
     lifecycle, digest presence or length, content or config digest differ --
     which is also what a rotation's overlap window (a retiring digest the
-    Secret knows nothing about) looks like.
+    Secret knows nothing about) looks like. ``retiring_digests`` lets a caller
+    that does know the retiring digest of a cluster (``rotate-token``'s
+    journal) supply it for exactly that case; the content digest still has to
+    prove it, so a wrong candidate fails the same way as any other drift.
     """
 
     try:
@@ -274,12 +279,19 @@ def durable_registrations(
         ):
             item = dict(source)
             candidate = by_id[item["cluster_id"]]
-            # The API redacts digests. Restore them only from the CPU Secret;
-            # the full revision digest below proves the actual bytes agree.
+            # The API redacts digests. Restore them only from the CPU Secret
+            # (or the caller's retiring candidate); the full revision digest
+            # below proves the actual bytes agree.
             for field in ("token_sha256", "retiring_token_sha256"):
                 digest = getattr(candidate, field)
                 present = item.pop(f"{field}_present")
                 length = item.pop(f"{field}_length")
+                supplied = (retiring_digests or {}).get(str(item["cluster_id"]))
+                if field == "retiring_token_sha256" and digest is None and supplied:
+                    if present is True:
+                        digest = supplied
+                        candidate = candidate.model_copy(update={field: supplied})
+                        by_id[candidate.cluster_id] = candidate
                 if (
                     type(present) is not bool
                     or type(length) is not int
@@ -295,7 +307,7 @@ def durable_registrations(
             != status.cluster_states
             or regional_registry_content_sha256(durable) != status.content_sha256
             or regional_registry_config_sha256(durable)
-            != regional_registry_config_sha256(configured)
+            != regional_registry_config_sha256(list(by_id.values()))
         ):
             raise ReleaseError("regional registry snapshot identity differs")
         return status, durable

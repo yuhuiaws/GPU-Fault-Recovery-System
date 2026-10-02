@@ -14,8 +14,10 @@ fails closed and names the fact that moved.
 A journal from before the projection has nothing to compare. It is rebound
 only when live state proves the rotation already converged onto the recorded
 new token (the journal is past ``TOKEN_FILE_WRITTEN``, the token file's digest
-is ``new_token_sha256``, and the durable registry head holds only that digest
-for the cluster) -- never for a rollback, and never earlier in the machine.
+is ``new_token_sha256``, and the durable registry head holds that digest for
+the cluster with the retiring digest either gone or still equal to the
+journal's ``old_token_sha256``) -- never for a rollback, and never earlier in
+the machine.
 """
 
 from __future__ import annotations
@@ -130,18 +132,27 @@ def legacy_rebind_pending(
 
 
 def registry_head_evidence(
-    release: Any, cluster_id: str, digest: str
+    release: Any,
+    cluster_id: str,
+    digest: str,
+    *,
+    retiring_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Whether the durable registry head holds only ``digest`` for ``cluster_id``.
+    """Whether the durable registry head holds ``digest`` for ``cluster_id``.
 
     Reads through the registry client the rotation already publishes with and
     restores the redacted digests from the CPU Secret; the revision's content
-    digest proves the two agree. A head that still carries a retiring digest
-    cannot be reconstructed from the Secret and reports as not converged.
+    digest proves the two agree. Without ``retiring_digest`` the head must
+    carry no retiring digest at all (a head that still does cannot be
+    reconstructed from the Secret and reports as not converged). With it --
+    the journal's ``old_token_sha256`` -- a retiring digest equal to it is
+    accepted too: the shape a rotation stopped between the control-plane roll
+    and the final drop leaves behind.
     """
 
+    candidates = {cluster_id: retiring_digest} if retiring_digest else None
     try:
-        status, durable = durable_registrations(release)
+        status, durable = durable_registrations(release, retiring_digests=candidates)
     except ReleaseError as exc:
         return {
             "converged": False,
@@ -156,11 +167,6 @@ def registry_head_evidence(
             "converged": False,
             "reason": f"{cluster_id} is not in the durable registry head",
         }
-    if entry.retiring_token_sha256 is not None:
-        return {
-            "converged": False,
-            "reason": "the durable registry head still carries a retiring digest",
-        }
     if entry.token_sha256 != digest:
         return {
             "converged": False,
@@ -168,11 +174,18 @@ def registry_head_evidence(
                 "the durable registry head token digest is not the recorded new digest"
             ),
         }
+    retiring = entry.retiring_token_sha256
+    if retiring is not None and retiring != retiring_digest:
+        return {
+            "converged": False,
+            "reason": "the durable registry head still carries a retiring digest",
+        }
     return {
         "converged": True,
         "generation": status.generation,
         "content_sha256": status.content_sha256,
         "token_sha256": digest,
+        "retiring_token_present": retiring is not None,
     }
 
 
@@ -203,14 +216,25 @@ def rebind_legacy_journal(
             "is not the recorded new_token_sha256"
         )
     evidence.append("token file sha256 equals new_token_sha256")
-    head = registry_head_evidence(release, cluster_id, digest)
+    head = registry_head_evidence(
+        release,
+        cluster_id,
+        digest,
+        retiring_digest=str(state.get("old_token_sha256") or "") or None,
+    )
     if not head["converged"]:
         raise BootstrapError(
             f"{SITE_CHANGED}; the journal cannot be rebound: {head['reason']}"
         )
     evidence.append(
-        f"durable registry head generation {head['generation']} holds only "
+        f"durable registry head generation {head['generation']} holds "
         f"new_token_sha256 for {cluster_id} (content_sha256 {head['content_sha256']})"
+    )
+    evidence.append(
+        "retiring digest still present (equals old_token_sha256); the final step "
+        "drops it"
+        if head["retiring_token_present"]
+        else "retiring digest already absent from the durable head"
     )
     binding = rotation_site_binding(site, cluster_id)
     state["site_rebound"] = {

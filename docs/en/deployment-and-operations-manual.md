@@ -5380,8 +5380,9 @@ gpu-fault-admin rotate-token \
    only in `spec.repositoryRoot`/`spec.release.manifest`/`spec.runtimeProfile.source` no longer blocks the resume,
    while a changed rotation-relevant fact refuses and names the differing field. A legacy journal without
    `site_binding_sha256` whose `site.yaml` changed is rebound only when it is past `TOKEN_FILE_WRITTEN`, the token
-   file's digest equals `new_token_sha256`, and the durable head holds only that digest for the cluster (it records
-   `site_rebound` and the new binding, then continues); otherwise it still refuses.
+   file's digest equals `new_token_sha256`, and the durable head holds that digest for the cluster with the retiring
+   digest absent or equal to the journal's `old_token_sha256` (it records `site_rebound` and the new binding, then
+   continues; a retiring digest still present is dropped by the final step as usual); otherwise it still refuses.
 4. **Run the command**: as above. Optional parameters: `--window-minutes` (how long the old token keeps being accepted, default
    120, allowed from 10 minutes to 7 days, set in minutes or hours, not days), `--quiet-seconds` (how long the control-plane logs
    must be continuously free of `authenticated with the retiring token` before the data plane counts as switched, default 180),

@@ -213,13 +213,55 @@ def test_a_legacy_journal_rebinds_when_live_state_holds_only_the_new_token(
     assert harness.token_file.read_text(encoding="utf-8") not in serialized
 
 
-def test_a_legacy_journal_fails_closed_while_the_head_carries_the_retiring_digest(
+def test_a_legacy_journal_rebinds_on_the_overlap_head_and_then_drops_the_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live shape: the head is still the rotation's own overlap revision
+    (token new, retiring old), the Secret holds the new token only."""
+
+    harness = Harness(tmp_path, monkeypatch)
+    state = _stop_at_final_publish(harness, monkeypatch)
+    _strip_binding(harness)
+    _release_only_rewrite(harness)
+    head = harness.publishes[-1]["registrations"]
+    target = [item for item in head if item["cluster_id"] == "gpu-a"][0]
+    assert target["retiring_token_sha256"] == state["old_token_sha256"]
+    before = len(harness.calls)
+
+    summary = harness.rotate()
+
+    assert summary["status"] == module.STATUS_COMPLETED
+    assert [call[0] for call in harness.calls[before:]] == ["publish"], (
+        "the retiring digest is still in the head: the final step drops it"
+    )
+    final = harness.state
+    evidence = final["site_rebound"]["evidence"]
+    assert any("retiring digest still present" in item for item in evidence), evidence
+    assert final["site_rebound"]["from_site_sha256"] == "c" * 64
+    assert final["site_binding_sha256"] == binding.site_binding_sha256(
+        binding.rotation_site_binding(harness.site, "gpu-a")
+    )
+    dropped = final["steps"][module.STEP_RETIRING_DROPPED]["evidence"]
+    assert dropped["already_dropped"] is False
+    published = [
+        item
+        for item in harness.publishes[-1]["registrations"]
+        if item["cluster_id"] == "gpu-a"
+    ][0]
+    assert published["token_sha256"] == state["new_token_sha256"]
+    assert "retiring_token_sha256" not in published
+    assert OLD_TOKEN not in json.dumps(final)
+
+
+def test_a_legacy_journal_fails_closed_when_the_retiring_digest_is_not_the_old_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = Harness(tmp_path, monkeypatch)
     state = _stop_at_final_publish(harness, monkeypatch)
     _strip_binding(harness)
     _release_only_rewrite(harness)
+    harness.durable = _new_only_head(harness)
+    harness.durable[0]["retiring_token_sha256"] = "7" * 64
     before = len(harness.calls)
 
     with pytest.raises(BootstrapError, match="site changed since the rotation"):
@@ -231,6 +273,25 @@ def test_a_legacy_journal_fails_closed_while_the_head_carries_the_retiring_diges
     assert "site_binding_sha256" not in after
     assert after["status"] == module.STATUS_IN_PROGRESS
     assert after["steps"].keys() == state["steps"].keys()
+
+
+def test_a_legacy_journal_fails_closed_when_the_head_token_is_not_the_new_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+    state = _stop_at_final_publish(harness, monkeypatch)
+    _strip_binding(harness)
+    _release_only_rewrite(harness)
+    harness.durable = _new_only_head(harness)
+    harness.durable[0]["token_sha256"] = state["old_token_sha256"]
+    harness.durable[0]["retiring_token_sha256"] = None
+    before = len(harness.calls)
+
+    with pytest.raises(BootstrapError, match="not the recorded new digest"):
+        harness.rotate()
+
+    assert len(harness.calls) == before
+    assert "site_rebound" not in harness.state
 
 
 def test_a_legacy_journal_fails_closed_when_the_token_file_is_not_the_new_token(
@@ -349,6 +410,7 @@ def test_registry_head_evidence_reports_why_the_head_is_not_converged(
         "generation": 0,
         "content_sha256": "f" * 64,
         "token_sha256": digest,
+        "retiring_token_present": False,
     }
     other = binding.registry_head_evidence(harness.release, "gpu-a", "2" * 64)
     assert other["converged"] is False
@@ -358,5 +420,111 @@ def test_registry_head_evidence_reports_why_the_head_is_not_converged(
     assert "gpu-z" in missing["reason"]
     harness.durable[0]["retiring_token_sha256"] = "3" * 64
     overlap = binding.registry_head_evidence(harness.release, "gpu-a", digest)
-    assert overlap["converged"] is False
+    assert overlap["converged"] is False, "no candidate: the strict drop check"
     assert "Secret" in overlap["reason"]
+    accepted = binding.registry_head_evidence(
+        harness.release, "gpu-a", digest, retiring_digest="3" * 64
+    )
+    assert accepted["converged"] is True
+    assert accepted["retiring_token_present"] is True
+    wrong = binding.registry_head_evidence(
+        harness.release, "gpu-a", digest, retiring_digest="4" * 64
+    )
+    assert wrong["converged"] is False
+    assert "Secret" in wrong["reason"]
+
+
+def _durable_api(monkeypatch: pytest.MonkeyPatch, head: list[dict]) -> None:
+    """Stand in for the registry API and the Secret behind ``durable_registrations``:
+    the head carries full digests, the API redacts them, the Secret knows one token."""
+
+    from gpu_fault.regional import (
+        RegionalClusterRegistration,
+        regional_registry_content_sha256,
+    )
+    from gpu_fault_release import regional_release_online_registry as registry
+
+    models = [RegionalClusterRegistration.model_validate(item) for item in head]
+    status = {
+        "generation": 7,
+        "content_sha256": regional_registry_content_sha256(models),
+        "cluster_states": {item.cluster_id: item.lifecycle_state for item in models},
+        "required_member_ids": [],
+        "acked_member_ids": [],
+        "missing_member_ids": [],
+        "active_member_ids": [],
+        "members": [],
+        "converged": True,
+    }
+    redacted = []
+    for item in models:
+        value = item.model_dump(mode="json")
+        for field in ("token_sha256", "retiring_token_sha256"):
+            digest = value.pop(field) or ""
+            value[f"{field}_present"] = bool(digest)
+            value[f"{field}_length"] = len(digest)
+        redacted.append(value)
+
+    def request(release, method, path, payload=None, *, response_list=False):
+        assert method == "GET", method
+        return redacted if path == "/v1/regional/clusters" else status
+
+    secret = [
+        {
+            **item.model_dump(
+                mode="json",
+                exclude={
+                    "lifecycle_state",
+                    "created_at",
+                    "updated_at",
+                    "token_sha256",
+                    "retiring_token_sha256",
+                    "token_rotation_expires_at",
+                },
+            ),
+            "token_sha256": item.token_sha256,
+        }
+        for item in models
+    ]
+    monkeypatch.setattr(registry, "_request", request)
+    monkeypatch.setattr(registry, "current_registrations", lambda release, o: secret)
+
+
+def test_durable_registrations_restores_a_retiring_digest_only_from_a_proven_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault_release import regional_release_online_registry as registry
+
+    new_digest, old_digest = "1" * 64, "2" * 64
+    _durable_api(
+        monkeypatch,
+        [
+            {
+                "cluster_id": "gpu-a",
+                "region": "us-west-2",
+                "hyperpod_cluster_name": "hp-a",
+                "eks_cluster_arn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a",
+                "token_sha256": new_digest,
+                "retiring_token_sha256": old_digest,
+                "created_at": "2999-01-01T00:00:00+00:00",
+                "updated_at": "2999-01-01T00:00:00+00:00",
+                "token_rotation_expires_at": "2999-01-02T00:00:00+00:00",
+                "allowed_namespaces": ["team-a"],
+                "agent_endpoint_allowed_cidrs": ["10.0.0.0/8"],
+            }
+        ],
+    )
+
+    with pytest.raises(ReleaseError, match="credential identity differs"):
+        registry.durable_registrations(object())
+    with pytest.raises(ReleaseError, match="snapshot identity differs"):
+        registry.durable_registrations(object(), retiring_digests={"gpu-a": "9" * 64})
+
+    status, durable = registry.durable_registrations(
+        object(), retiring_digests={"gpu-a": old_digest}
+    )
+
+    assert status.generation == 7
+    assert [item.cluster_id for item in durable] == ["gpu-a"]
+    assert durable[0].token_sha256 == new_digest
+    assert durable[0].retiring_token_sha256 == old_digest

@@ -1211,8 +1211,9 @@ gpu-fault-admin rotate-token \
    `spec.repositoryRoot`, `spec.release.manifest` or `spec.runtimeProfile.source` no longer blocks the resume, while a
    changed rotation-relevant fact still fails closed and names the differing field. A legacy journal without
    `site_binding_sha256` whose `site.yaml` changed is rebound only when it is already past `TOKEN_FILE_WRITTEN`, the
-   token file's digest equals `new_token_sha256`, and the durable registry head holds only that digest for the
-   cluster (no retiring digest; reconstructed from the registry Secret and proved by the revision content digest):
+   token file's digest equals `new_token_sha256`, and the durable registry head holds that digest for the cluster
+   with the retiring digest either absent or equal to the journal's `old_token_sha256` (reconstructed from the
+   registry Secret plus the journal's digests and proved by the revision content digest):
    the journal then records `site_rebound` (`at`, `from_site_sha256`, `to_site_sha256`, `evidence`) plus the new
    `site_binding`/`site_binding_sha256` and finishes; every other legacy mismatch still fails closed.
 4. **Command**: as above. The command executes in order: publish the overlap
