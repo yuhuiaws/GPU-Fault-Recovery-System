@@ -201,10 +201,7 @@ def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None
 
     with materialized_release_config(rendered) as path:
         assert path.stat().st_mode & 0o777 == 0o600
-        assert json.loads(path.read_text()) == {
-            **rendered.release_config,
-            "admin_state_dir": str(rendered.source.parent),
-        }
+        assert json.loads(path.read_text()) == rendered.release_config
     assert not path.exists(), "materialized release config must be removed on exit"
 
 
@@ -379,7 +376,7 @@ def test_generated_release_json_loads_through_the_existing_state_machine(
     assert config.clusters[0].cluster_id == "gpu-a"
     assert config.admin_config.capacity.control_worker_replicas == 6
     assert config.admin_state_dir == rendered.source.parent, (
-        "the engine's preflight finds the rotate-token journals through it"
+        "the engine's preflight finds the rotate-token journals through the sidecar"
     )
 
 
@@ -548,10 +545,7 @@ def test_status_reports_when_previous_rollback_baseline_is_unlocatable(
     def driver(arguments, **_kwargs):
         seen.append(list(arguments))
         config = Path(arguments[arguments.index("--config") + 1])
-        assert json.loads(config.read_text()) == {
-            **load_site(site).release_config,
-            "admin_state_dir": str(site.parent),
-        }
+        assert json.loads(config.read_text()) == load_site(site).release_config
         return subprocess.CompletedProcess(arguments, 0, json.dumps(report), "")
 
     monkeypatch.setattr(admin_cli, "run_driver", driver)

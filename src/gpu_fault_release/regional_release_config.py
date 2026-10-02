@@ -11,6 +11,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.admin.site import ADMIN_STATE_DIR_SIDECAR
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 from gpu_fault_release import containing_repository_root, repository_root
 
@@ -41,13 +42,21 @@ class PartialClusterRolloutError(ReleaseError):
     pass
 
 
-def _optional_absolute_path(value: dict[str, Any], field: str) -> Path | None:
-    raw = value.get(field)
-    if raw is None:
+def admin_state_dir_sidecar(config_path: Path) -> Path | None:
+    """The managed state directory bound to ``config_path``, if the CLI wrote one."""
+
+    sidecar = config_path.with_name(ADMIN_STATE_DIR_SIDECAR)
+    if not sidecar.is_file():
         return None
-    if not isinstance(raw, str) or not Path(raw).is_absolute():
-        raise ReleaseError(f"{field} must be an absolute path")
-    return Path(raw)
+    value = Path(sidecar.read_text(encoding="utf-8").strip())
+    # Absolute, nothing more: an in-process engine is also built from a
+    # rendered site whose source file is not on disk, and a journal lookup
+    # under a directory that does not exist simply finds no journal.
+    if not value.is_absolute():
+        raise ReleaseError(
+            f"{ADMIN_STATE_DIR_SIDECAR} must name an absolute managed state directory"
+        )
+    return value
 
 
 def canonical_sha256(value: object) -> str:
@@ -919,8 +928,9 @@ class ReleaseConfig:
     retained_database_handoff: Path | None = None
     release_manifest_path: str = ""
     # The managed state directory (the one holding ``site.yaml``) the
-    # administrator CLI materialized this config from; the preflight reads the
-    # ``rotate-token`` journals through it. Absent for a hand-written config.
+    # administrator CLI materialized this config from, read from the sidecar
+    # beside the config; the preflight reads the ``rotate-token`` journals
+    # through it. Absent for a hand-written config.
     admin_state_dir: Path | None = None
 
     def for_rollback(
@@ -1147,7 +1157,7 @@ class ReleaseConfig:
             ),
             installation_id=installation_id,
             retained_database_handoff=Path(handoff) if handoff is not None else None,
-            admin_state_dir=_optional_absolute_path(value, "admin_state_dir"),
+            admin_state_dir=admin_state_dir_sidecar(path),
             retention=RegionalRetentionConfig.from_mapping(
                 dict(value.get("retention") or {})
             ),

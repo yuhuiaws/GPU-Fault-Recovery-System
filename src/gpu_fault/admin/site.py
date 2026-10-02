@@ -1333,6 +1333,14 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
     )
 
 
+# Written beside the materialized release config the CLI hands the engine: the
+# absolute managed state directory (the one holding ``site.yaml``), which
+# ``ReleaseConfig.load`` reads back. Out of band on purpose -- the config bytes
+# feed identity and evidence digests that must equal the ones computed from the
+# site's own release config.
+ADMIN_STATE_DIR_SIDECAR = "regional-release.admin-state-dir"
+
+
 @contextmanager
 def materialized_release_config(site: RenderedSite) -> Iterator[Path]:
     from gpu_fault.installation_lifecycle import (
@@ -1351,17 +1359,19 @@ def materialized_release_config(site: RenderedSite) -> Iterator[Path]:
         path = root / "regional-release.json"
         path.write_text(
             json.dumps(
-                {
-                    **site.release_config,
-                    **lifecycle,
-                    "admin_state_dir": str(site.source.parent),
-                },
+                {**site.release_config, **lifecycle},
                 indent=2,
                 sort_keys=True,
             ),
             encoding="utf-8",
         )
         path.chmod(0o600)
+        # The managed state directory travels beside the config, never in it:
+        # every identity and evidence digest the lifecycle commands derive
+        # from the materialized bytes must stay equal to the site's own.
+        sidecar = path.with_name(ADMIN_STATE_DIR_SIDECAR)
+        sidecar.write_text(str(site.source.parent), encoding="utf-8")
+        sidecar.chmod(0o600)
         yield path
 
 

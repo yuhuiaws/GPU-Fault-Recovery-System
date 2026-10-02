@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.admin import rotate_token_journal as journal
+from gpu_fault.admin.site import ADMIN_STATE_DIR_SIDECAR
 from gpu_fault_release import regional_admin_checks as CHECKS
 from gpu_fault_release import regional_release_token_rotation_safety as SAFETY
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -197,6 +198,31 @@ def test_an_unreadable_or_unknown_journal_fails_closed(
 
     with pytest.raises(Exception, match="rotate-token|SOMETHING_NEW|Expecting"):
         SAFETY.token_rotation_snapshot(_release(tmp_path))
+
+
+def test_the_state_dir_reaches_the_engine_through_a_sidecar_not_the_config(
+    tmp_path: Path,
+) -> None:
+    """The materialized config bytes feed identity digests, so the managed state
+    directory travels in a 0600 sidecar beside them and nowhere else."""
+
+    from gpu_fault_release import regional_release_config as config_module
+
+    config = tmp_path / "work" / "regional-release.json"
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    assert config_module.admin_state_dir_sidecar(config) is None
+
+    sidecar = config.with_name(ADMIN_STATE_DIR_SIDECAR)
+    state_dir = tmp_path / "state"
+    sidecar.write_text(f"{state_dir}\n", encoding="utf-8")
+    assert config_module.admin_state_dir_sidecar(config) == state_dir, (
+        "an in-process engine may be built before the directory exists"
+    )
+
+    sidecar.write_text("relative/state", encoding="utf-8")
+    with pytest.raises(ReleaseError, match="absolute"):
+        config_module.admin_state_dir_sidecar(config)
 
 
 def test_the_preflight_check_passes_warns_and_fails_through_the_report(
