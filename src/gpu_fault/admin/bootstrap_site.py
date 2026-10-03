@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.bootstrap_common import (
+    require_single_provider,
     Arn,
     BootstrapError,
     BootstrapRequest,
@@ -701,6 +702,7 @@ def discover_bootstrap_scope(
                 1,
             )
         ]
+    require_single_provider([cluster.provider for cluster in gpu_clusters])
     return existing, cpu, gpu_clusters
 
 

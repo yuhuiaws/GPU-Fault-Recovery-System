@@ -36,7 +36,6 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.hyperpod import (
     HyperPodAdapterError,
-    HyperPodLifecycleAdapter,
     HyperPodWorkflowDispatcher,
 )
 from gpu_fault.hyperpod_spares import (
@@ -55,6 +54,7 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.node_provider import NodeLifecycleProvider
 from gpu_fault.notifications import (
     RestartGuardEmailBuilder,
     WarmSpareReplacementEmailBuilder,
@@ -77,13 +77,21 @@ class HyperPodLifecycleStepAdapter(
     HyperPodConfirmationMixin,
     HyperPodNotificationMixin,
 ):
+    """Executes provider-owned node lifecycle steps and confirms them.
+
+    Written against ``NodeLifecycleProvider``: the HyperPod adapter (owner
+    ``gpu-fault-hyperpod-adapter``) and the plain-EKS provider (owner
+    ``gpu-fault-eks-adapter``) share every guard here; only the provider call
+    behind ``dispatcher.submit`` and the wording of its failures differ.
+    """
+
     activation_inhibition_version = ACTIVATION_INHIBITION_VERSION
 
     OPERATIONS = operations_for_adapter(OperationAdapter.HYPERPOD)
 
     def __init__(
         self,
-        adapter: HyperPodLifecycleAdapter,
+        adapter: NodeLifecycleProvider,
         *,
         owner: str = "gpu-fault-hyperpod-adapter",
         registry: FleetRegistry | None = None,
@@ -109,6 +117,17 @@ class HyperPodLifecycleStepAdapter(
         self.restart_email_builder = RestartGuardEmailBuilder()
         self.warm_spare_email_builder = WarmSpareReplacementEmailBuilder()
         self.dispatcher = HyperPodWorkflowDispatcher(adapter, execution_owner=owner)
+
+    @property
+    def provider_label(self) -> str:
+        """``HyperPod`` or ``EKS`` for failure wording.
+
+        Read lazily: a provider is only consulted once a step has passed the
+        ownership guards, and the boundary tests prove that by handing in a
+        provider whose every attribute access fails.
+        """
+
+        return str(getattr(self.dispatcher.adapter, "provider_label", "HyperPod"))
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS
@@ -254,8 +273,8 @@ class HyperPodLifecycleStepAdapter(
         """
         if self.kubernetes_adapter is None:
             return WorkflowStepOutcome.failed(
-                "HyperPod mutation requires the Kubernetes adapter to observe "
-                "node isolation",
+                f"{self.provider_label} mutation requires the Kubernetes adapter "
+                "to observe node isolation",
                 details={"safety_rejection": True},
             )
         core = self.kubernetes_adapter.core
@@ -628,7 +647,7 @@ class HyperPodLifecycleStepAdapter(
             return resumed
         if not context.request.confirm_cluster_name:
             return WorkflowStepOutcome.failed(
-                "confirm_cluster_name is required for HyperPod mutation"
+                f"confirm_cluster_name is required for {self.provider_label} mutation"
             )
         require_mutation_ownership(context)
         # What the scheduler shows now, not what the workflow remembers: an
@@ -675,7 +694,8 @@ class HyperPodLifecycleStepAdapter(
             preflight_error = exc
         if preflight_configuration_error is not None:
             return WorkflowStepOutcome.failed(
-                "HyperPod preflight cannot run: " + preflight_configuration_error,
+                f"{self.provider_label} preflight cannot run: "
+                + preflight_configuration_error,
                 details={
                     "configuration_error": True,
                     "exception_type": type(preflight_error).__name__,
@@ -690,7 +710,7 @@ class HyperPodLifecycleStepAdapter(
             )
         if preflight_error is not None:
             return WorkflowStepOutcome.failed(
-                "HyperPod preflight failed: " + str(preflight_error)
+                f"{self.provider_label} preflight failed: " + str(preflight_error)
             )
         if (
             warm_spare_only
@@ -703,7 +723,8 @@ class HyperPodLifecycleStepAdapter(
             )
         if preflight is not None and not preflight.safe_to_submit:
             return WorkflowStepOutcome.failed(
-                "HyperPod preflight failed: " + "; ".join(preflight.gate_failures)
+                f"{self.provider_label} preflight failed: "
+                + "; ".join(preflight.gate_failures)
             )
         if warm_spare_only and self.spare_coordinator is None:
             return WorkflowStepOutcome.failed(
@@ -744,7 +765,8 @@ class HyperPodLifecycleStepAdapter(
             revoked_agents = self._revoke_agents(context)
         except (KeyError, ValueError) as exc:
             return WorkflowStepOutcome.failed(
-                f"failed to revoke node agent before HyperPod mutation: {exc}"
+                "failed to revoke node agent before "
+                f"{self.provider_label} mutation: {exc}"
             )
         # The dispatcher owns the provider submission key; it is distinct
         # from the remote command idempotency key carried by this context.
@@ -758,7 +780,7 @@ class HyperPodLifecycleStepAdapter(
         )
         if result.failures:
             return WorkflowStepOutcome.failed(
-                "HyperPod rejected nodes: "
+                f"{self.provider_label} rejected nodes: "
                 + ", ".join(
                     item.node_logical_id or item.node_id or "unknown"
                     for item in result.failures

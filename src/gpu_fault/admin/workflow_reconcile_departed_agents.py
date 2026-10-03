@@ -10,10 +10,13 @@ nodes (``Agent coverage drift``) and rolls the deploy back, every time.
 This module is the administrator's answer. It plans with the same evidence as
 the never-dispatched close (``workflow_reconcile_never_dispatched``): the node
 must be absent from the cluster's Kubernetes Nodes *and* its instance absent
-from ``aws sagemaker list-cluster-nodes``, both read on the deploy host. A node
-that is NotReady, cordoned, still in Kubernetes, still listed by HyperPod, on a
-cluster the site does not describe as HyperPod-managed, or behind a failed
-lookup keeps the Agent ineligible, naming why; so does a heartbeat younger
+from the provider -- ``aws sagemaker list-cluster-nodes`` on HyperPod, or on an
+``eks-managed`` cluster ``aws ec2 describe-instances`` reporting the record's
+``node_instance_id`` terminated or unknown -- both read on the deploy host. A
+node that is NotReady, cordoned, still in Kubernetes, still listed by the
+provider, on a cluster the site does not describe (no HyperPod name, or no EC2
+instance id recorded for the Agent), or behind a failed lookup keeps the Agent
+ineligible, naming why; so does a heartbeat younger
 than ``DEPARTED_AGENT_GUARD_AGE`` -- an Agent that spoke ten minutes ago is
 mid-restart, not gone. ``DRAINING`` qualifies beside ``ACTIVE``: a drain whose
 revoke never followed is the same residue.
@@ -55,7 +58,7 @@ GUARD_REASON = "agent heartbeat is younger than the 10-minute departure guard"
 NO_RECORD_REASON = "no Agent record in the fleet"
 KUBERNETES_PRESENT_REASON = (
     "node is still in Kubernetes; an Agent is retired only for a node that "
-    "left Kubernetes and HyperPod"
+    "left Kubernetes and its provider"
 )
 # The fields of an Agent record the plan carries and the apply re-checks.
 RECORD_FIELDS = (
@@ -159,9 +162,9 @@ elif payload["mode"] == "retire-departed-agents":
             ):
                 raise ValueError("departed-node evidence does not prove the node gone")
             # The fleet record's node_instance_id is whatever the node reported
-            # at registration -- on HyperPod/EKS the Kubernetes Node UID, not the
-            # EC2 instance id the evidence carries (live 2026-10-01). Only an
-            # EC2-shaped value can be compared; a UID is recorded in the audit.
+            # at registration -- on HyperPod the Kubernetes Node UID, on an
+            # eks-managed node the providerID's EC2 id (live 2026-10-01). Only
+            # an EC2-shaped value can be compared; a UID is recorded in the audit.
             recorded_instance = str(current.node_instance_id or "")
             if (
                 re.fullmatch(r"i-[0-9a-f]{8,17}", recorded_instance)
@@ -172,16 +175,21 @@ elif payload["mode"] == "retire-departed-agents":
                     "agent instance changed: the record names "
                     f"{recorded_instance}, the evidence {evidence['instance_id']}"
                 )
-            hyperpod = (evidence.get("sources") or {}).get("hyperpod") or {}
+            sources = evidence.get("sources") or {}
+            # ``hyperpod`` (list-cluster-nodes) or ``ec2`` (describe-instances
+            # on an eks-managed cluster); the HyperPod wording is unchanged.
+            source_name = "ec2" if "ec2" in sources else "hyperpod"
+            label = "EC2" if source_name == "ec2" else "HyperPod"
+            provider = sources.get(source_name) or {}
             read_at = evidence.get("read_at") or {}
             audit = (
                 f"operator reconciliation {payload['reference']}: retired Agent "
-                f"{item['node_id']} after its node left Kubernetes and HyperPod "
+                f"{item['node_id']} after its node left Kubernetes and {label} "
                 f"(instance {evidence.get('instance_id')}, record node_instance_id "
-                f"{recorded_instance or 'unset'}, HyperPod cluster "
-                f"{hyperpod.get('cluster_name')} in {hyperpod.get('region')}; "
-                f"kubernetes read {read_at.get('kubernetes')}, hyperpod read "
-                f"{read_at.get('hyperpod')}; actor {payload.get('actor')}; "
+                f"{recorded_instance or 'unset'}, {label} cluster "
+                f"{provider.get('cluster_name')} in {provider.get('region')}; "
+                f"kubernetes read {read_at.get('kubernetes')}, {source_name} read "
+                f"{read_at.get(source_name)}; actor {payload.get('actor')}; "
                 f"admin plan {payload.get('admin_plan_sha256')})"
             )
             if current.lifecycle_state is AgentLifecycleState.ACTIVE:
@@ -238,7 +246,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "retire (REVOKE) the fleet Agent record of every node absent from "
-            "Kubernetes and from the HyperPod node list for over 10 minutes; "
+            "Kubernetes and from its provider (the HyperPod node list, or EC2 "
+            "for an eks-managed cluster) for over 10 minutes; "
             "--dry-run prints the plan with its evidence, --node narrows it"
         ),
     )
@@ -317,14 +326,17 @@ def agent_node_evidence(
     node_id: str,
     *,
     kubernetes_nodes: dict[str, dict[str, Any]],
-    provider_inventories: dict[str, frozenset[str] | str],
+    provider_inventories: dict[str, Any],
     read_at: dict[str, str],
+    recorded_instance_id: str | None = None,
 ) -> dict[str, Any]:
     """The departed-node evidence of one Agent, in the never-dispatched shape.
 
     A node Kubernetes still has is the blocker whatever its condition; a node
-    it no longer has is explained by HyperPod (``absent_from_provider``) or
-    stays blocked with the reason the provider could not clear it.
+    it no longer has is explained by the provider (``absent_from_provider``)
+    or stays blocked with the reason the provider could not clear it. On an
+    eks-managed cluster the provider is asked about ``recorded_instance_id``,
+    the Agent record's own ``node_instance_id``.
     """
 
     target = reconcile.cluster_target(site, cluster_id)
@@ -332,7 +344,12 @@ def agent_node_evidence(
         None
         if kubernetes_nodes.get(node_id) is not None
         else reconcile._departed_node_evidence(
-            site, cluster_id, node_id, provider_inventories, read_at
+            site,
+            cluster_id,
+            node_id,
+            provider_inventories,
+            read_at,
+            instance_id=recorded_instance_id,
         )
     )
     evidence = never_dispatched.node_evidence(
@@ -352,7 +369,7 @@ def _plan_item(
     *,
     evaluated_at: datetime,
     kubernetes_inventories: dict[str, dict[str, dict[str, Any]]],
-    provider_inventories: dict[str, frozenset[str] | str],
+    provider_inventories: dict[str, Any],
     read_at: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     cluster_id = str(agent.get("cluster_id") or "")
@@ -395,6 +412,11 @@ def _plan_item(
         kubernetes_nodes=inventory,
         provider_inventories=provider_inventories,
         read_at=read_at[cluster_id],
+        recorded_instance_id=(
+            str(agent.get("node_instance_id")).strip()
+            if agent.get("node_instance_id")
+            else None
+        ),
     )
     reasons.extend(f"{node_id}: {reason}" for reason in evidence["blockers"])
     item["node_evidence"] = evidence
@@ -419,7 +441,7 @@ def _plan(site: RenderedSite, *, node_ids: Sequence[str]) -> dict[str, Any]:
         and (not wanted or str(item.get("node_id")) in wanted)
     ]
     kubernetes_inventories: dict[str, dict[str, dict[str, Any]]] = {}
-    provider_inventories: dict[str, frozenset[str] | str] = {}
+    provider_inventories: dict[str, Any] = {}
     read_at: dict[str, dict[str, str]] = {}
     items = [
         _plan_item(

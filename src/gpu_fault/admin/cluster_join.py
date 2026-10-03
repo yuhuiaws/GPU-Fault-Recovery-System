@@ -21,6 +21,7 @@ from gpu_fault.admin.bootstrap import (
     discover_cluster,
 )
 from gpu_fault.admin.bootstrap_common import (
+    require_single_provider,
     Arn,
     BootstrapError,
     ClusterIdentity,
@@ -266,6 +267,10 @@ def _validate_target(
         node_selector(target)
     elif target.node_recovery != "None":
         raise JoinTargetIdentityError("GPU join requires NodeRecovery=None")
+    require_single_provider(
+        [item.get("provider") for item in request.site.release_config["clusters"]],
+        joining=target.provider,
+    )
     for item in request.site.release_config["clusters"]:
         if item["eks_cluster_arn"] == target.eks_arn:
             if (

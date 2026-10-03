@@ -28,6 +28,7 @@ from gpu_fault.admin.execution import (
     deadline_scope,
     run_command,
 )
+from gpu_fault.cluster_scope import cluster_provider
 
 _TASK_COMMAND_COUNTS: ContextVar[dict[str, int] | None] = ContextVar(
     "bootstrap_task_command_counts", default=None
@@ -125,6 +126,31 @@ class ClusterIdentity:
         """The name the provider scope carries: HyperPod name, else EKS name."""
 
         return self.hyperpod_name or self.eks_name
+
+
+def require_single_provider(
+    providers: Sequence[object], *, joining: object | None = None
+) -> None:
+    """A site's GPU clusters must all run on one provider.
+
+    The Runtime Profile is site-wide: one ``runtimeProfile.version`` is
+    registered, rendered into every GPU cluster and required of every Agent by
+    the control plane's fleet pin. Its ``nodeReboot`` owner is the HyperPod
+    adapter (``hyperpod-v1``) or the EKS adapter (``eks-v1``), never both, so
+    on a mixed site one provider's reboot path would exist on paper and never
+    be claimed. Refusing the mix is the honest answer until a profile can name
+    an owner per provider.
+    """
+
+    kinds = {cluster_provider(item) for item in providers}
+    if joining is not None:
+        kinds.add(cluster_provider(joining))
+    if len(kinds) > 1:
+        raise BootstrapError(
+            "a site's GPU clusters must share one provider (hyperpod or "
+            "eks-managed): the Runtime Profile and its nodeReboot owner are "
+            "site-wide; use a separate site for the other provider"
+        )
 
 
 def default_cluster_id(cluster: ClusterIdentity) -> str:

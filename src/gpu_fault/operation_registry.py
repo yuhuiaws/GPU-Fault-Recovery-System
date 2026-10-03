@@ -25,6 +25,9 @@ class OperationAdapter(StrEnum):
     NODE_ACTION = "node-action"
     GPU_VALIDATION = "gpu-validation"
     HYPERPOD = "hyperpod"
+    # Plain EKS clusters: the same lifecycle step adapter over EC2
+    # RebootInstances (owner ``gpu-fault-eks-adapter``); replace is OBSERVE.
+    EKS = "eks"
     MANAGED_RECOVERY = "managed-recovery"
     SUPPORT = "support"
 
@@ -201,6 +204,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         CapabilityName.NODE_REBOOT,
         OperationScope.NODE,
         OperationAdapter.HYPERPOD,
+        OperationAdapter.EKS,
         OperationAdapter.MANAGED_RECOVERY,
         destructive=True,
         recovery_rank=50,
@@ -225,6 +229,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         CapabilityName.NODE_REPLACE,
         OperationScope.NODE,
         OperationAdapter.HYPERPOD,
+        OperationAdapter.EKS,
         OperationAdapter.MANAGED_RECOVERY,
         destructive=True,
         recovery_rank=75,  # strictly above the rank-70 remediations it dominates

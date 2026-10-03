@@ -13,10 +13,12 @@ from gpu_fault.cluster_scope import cluster_provider, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault.cluster_scope import (
+    CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
     CONNECTION_SECRET_NODE_SELECTOR_KEY,
     CONNECTION_SECRET_PROVIDER_KEY,
     provider_cluster_name,
 )
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_rendering import (
@@ -401,6 +403,13 @@ def ensure_connection_secret(release: Any, target: ClusterTarget) -> None:
                 getattr(target, "provider", None)
             ).value.encode(),
             CONNECTION_SECRET_NODE_SELECTOR_KEY: node_selector(target).encode(),
+            # The EKS cluster name the eks-managed provider matches against
+            # the eks:cluster-name instance tag; empty for HyperPod.
+            CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY: (
+                target.eks_cluster_arn.rsplit("/", 1)[-1].encode()
+                if is_eks_managed(target)
+                else b""
+            ),
         }
         arguments = release._gpu(
             target,

@@ -12,7 +12,6 @@ from typing import Any, Callable
 
 from gpu_fault.dataplane_metrics import MetricFamily, start_metrics_server
 from gpu_fault.logging_setup import configure_logging
-from gpu_fault.cluster_scope import NODE_SELECTOR_ENV
 from gpu_fault.cluster_scope import node_selector as scope_node_selector
 from gpu_fault.node_installer_rendering import (
     INSTALLER_ARTIFACT_ANNOTATION,
@@ -392,6 +391,7 @@ class NodeInstallerReconciler:
         template_sha256: str,
         job_template: dict[str, Any],
         dcgm_metrics_url_template: str,
+        node_selector: str | None = None,
         template_content_sha256: str | None = None,
         node_dependency_image: str = "",
         node_wheelhouse_sha256: str = "",
@@ -412,6 +412,9 @@ class NodeInstallerReconciler:
         self.metrics = metrics if metrics is not None else node_installer_metrics()
         self.namespace = namespace
         self.cluster_name = cluster_name
+        # ``GPU_FAULT_NODE_SELECTOR`` when given (required on eks-managed);
+        # otherwise the HyperPod cluster-name label every deployment used.
+        self._node_selector = (node_selector or "").strip() or None
         self.version = version
         self.config_digest = config_digest
         if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
@@ -469,16 +472,16 @@ class NodeInstallerReconciler:
     def node_selector(self) -> str:
         """The GPU node selector (``gpu_fault.cluster_scope``).
 
-        ``GPU_FAULT_NODE_SELECTOR`` when the connection Secret carries one (a
-        plain EKS cluster); otherwise the HyperPod cluster label, exactly the
-        text every HyperPod site has always selected on.
+        ``GPU_FAULT_NODE_SELECTOR`` when the connection Secret carries one
+        (required on a plain EKS cluster); otherwise the HyperPod cluster
+        label, exactly the text every HyperPod site has always selected on.
         """
 
         return scope_node_selector(
             None,
             provider="hyperpod",
             hyperpod_cluster_name=self.cluster_name,
-            selector=os.environ.get(NODE_SELECTOR_ENV, ""),
+            selector=self._node_selector or "",
         )
 
     def reconcile_once(self) -> dict[str, int]:
@@ -1072,6 +1075,7 @@ def main() -> None:
         batch,
         namespace=namespace,
         cluster_name=_required_env("GPU_FAULT_HYPERPOD_CLUSTER"),
+        node_selector=os.getenv("GPU_FAULT_NODE_SELECTOR") or None,
         version=_required_env("GPU_FAULT_INSTALLER_VERSION"),
         config_digest=_required_env("GPU_FAULT_INSTALLER_CONFIG_DIGEST"),
         artifact_sha256=_required_env("GPU_FAULT_INSTALLER_ARTIFACT_SHA256"),

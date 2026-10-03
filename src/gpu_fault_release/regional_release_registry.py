@@ -33,6 +33,7 @@ def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
                     "agent_endpoint_allowed_cidrs": sorted(
                         item.agent_endpoint_allowed_cidrs
                     ),
+                    **({"provider": "eks-managed"} if is_eks_managed(item) else {}),
                 }
                 for item in sorted(clusters, key=lambda target: target.cluster_id)
             ],
@@ -117,6 +118,8 @@ def registry_entry(target: ClusterTarget) -> dict[str, Any]:
         "token": token,
         "allowed_namespaces": list(target.allowed_namespaces),
         "agent_endpoint_allowed_cidrs": endpoint_cidrs,
+        # Additive: a HyperPod entry keeps the key set it always had.
+        **({"provider": "eks-managed"} if is_eks_managed(target) else {}),
     }
 
 

@@ -48,6 +48,26 @@ activated, nor may `BatchReplaceClusterNodes` be called.
 `BatchReplaceClusterNodes` is forbidden not only by environment variables and IAM: the runtime provider client
 protocol has removed that method, and any `HyperPodAction.REPLACE` entering provider submit fails directly.
 
+### 2.0 Provider adapter: HyperPod and plain EKS
+
+`GPU_FAULT_CLUSTER_PROVIDER` selects the GPU cluster provider (default `hyperpod`, every
+existing deployment behaves as before; `eks-managed` is a plain EKS cluster with managed node
+groups). Both providers share one lifecycle step adapter (`adapters/hyperpod/lifecycle.py`,
+protocol `node_provider.NodeLifecycleProvider`) and all of its guards: live isolation
+observation, second cluster confirmation (`GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER` carries the
+cluster_id on eks-managed), fencing, durable submission idempotency (`provider_submissions.py`,
+an UNKNOWN outcome requires an operator) and post-reboot confirmation by a new Agent
+incarnation/boot_id. Only the provider call differs:
+
+| provider | RESTART_NODE | preflight | nodeReplace | managed-recovery observer |
+|---|---|---|---|---|
+| `hyperpod` | `BatchRebootClusterNodes` | ClusterStatus InService, `NodeRecovery=None` | local warm-spare switch (D.2) | `HyperPodIdentityRegistry` + observer |
+| `eks-managed` | `ec2:RebootInstances` on exactly the instance ids preflight resolved and the Node providerID re-read at submission confirms; a changed providerID refuses | `eks describe-cluster` ACTIVE and every target's `eks.amazonaws.com/nodegroup` node group ACTIVE; target instances must agree on `eks:cluster-name` (pin with `GPU_FAULT_EKS_CLUSTER_NAME`); EC2 state must be running | unsupported: `REPLACE` is not in the allowlist, the `regional-eks-safe` profile keeps OBSERVE, no spare coordinator is built | not built; no `hyperpod-managed-*` owners |
+
+The eks-managed executor IAM needs only `ec2:DescribeInstances`, `ec2:RebootInstances`
+(conditioned on `aws:ResourceTag/eks:cluster-name`), `eks:DescribeCluster` and `eks:DescribeNodegroup`,
+and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match.
+
 ### 2.1 Regional Acceptance Fixture Boundaries
 
 The plan of a live runner must bind the target, the kubeconfig content, the current source code and a successful preflight;

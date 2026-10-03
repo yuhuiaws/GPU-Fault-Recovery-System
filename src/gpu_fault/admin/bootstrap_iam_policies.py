@@ -118,6 +118,16 @@ def executor_policy_document(
                     "Resource": "*",
                 },
                 {
+                    "Sid": "DescribeEksCluster",
+                    "Effect": "Allow",
+                    "Action": ["eks:DescribeCluster", "eks:DescribeNodegroup"],
+                    "Resource": [
+                        eks_cluster_arn,
+                        f"arn:{eks.partition}:eks:{eks.region}:{eks.account}:"
+                        f"nodegroup/{eks.resource_name}/*/*",
+                    ],
+                },
+                {
                     "Sid": "RebootClusterInstances",
                     "Effect": "Allow",
                     "Action": "ec2:RebootInstances",

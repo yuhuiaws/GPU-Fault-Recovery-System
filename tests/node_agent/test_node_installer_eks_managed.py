@@ -93,23 +93,25 @@ def test_render_tolerates_a_pinned_template_without_the_provider_id() -> None:
         )
 
 
-def test_reconciler_selector_defaults_to_the_hyperpod_label(monkeypatch) -> None:
-    monkeypatch.delenv(NODE_SELECTOR_ENV, raising=False)
+def test_reconciler_selector_defaults_to_the_hyperpod_label() -> None:
     instance = reconciler(CoreApi([]), BatchApi())
     assert (
         instance.node_selector == "sagemaker.amazonaws.com/cluster-name=hp-cluster-a"
     ), "without GPU_FAULT_NODE_SELECTOR the reconciler selects on the HyperPod label"
 
 
-def test_reconciler_selector_follows_the_connection_secret(monkeypatch) -> None:
-    monkeypatch.setenv(NODE_SELECTOR_ENV, "nvidia.com/gpu.present=true")
+def test_reconciler_selector_follows_the_connection_secret() -> None:
+    """``main`` hands ``GPU_FAULT_NODE_SELECTOR`` to the constructor."""
+
     instance = reconciler(CoreApi([]), BatchApi())
+    instance._node_selector = "nvidia.com/gpu.present=true"
     assert instance.node_selector == "nvidia.com/gpu.present=true", (
         "GPU_FAULT_NODE_SELECTOR must override the HyperPod label"
     )
-    monkeypatch.setenv(NODE_SELECTOR_ENV, "nvidia.com/gpu.present=true,")
+    instance._node_selector = "nvidia.com/gpu.present=true,"
     with pytest.raises(ValueError, match="node selector"):
         instance.node_selector
+    assert NODE_SELECTOR_ENV == "GPU_FAULT_NODE_SELECTOR", "contract name"
 
 
 def test_reconciler_passes_the_node_provider_id_into_the_job() -> None:

@@ -24,6 +24,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapRequest,
     ClusterIdentity,
     default_cluster_id,
+    require_single_provider,
 )
 from gpu_fault.admin.bootstrap_discovery import regional_profile_for
 from gpu_fault.admin.cluster_join_types import JoinClusterRequest
@@ -307,9 +308,19 @@ def test_eks_managed_executor_policy_is_ec2_only_and_tag_scoped() -> None:
             else [statement["Action"]]
         )
     }
-    assert actions == {"ec2:DescribeInstances", "ec2:RebootInstances"}, (
-        "an eks-managed executor holds exactly describe and reboot"
+    assert actions == {
+        "ec2:DescribeInstances",
+        "ec2:RebootInstances",
+        "eks:DescribeCluster",
+        "eks:DescribeNodegroup",
+    }, "an eks-managed executor holds EC2 describe/reboot and EKS describe reads"
+    describe_eks = next(
+        item for item in document["Statement"] if item["Sid"] == "DescribeEksCluster"
     )
+    assert describe_eks["Resource"] == [
+        identity.eks_arn,
+        f"arn:aws:eks:{REGION}:{ACCOUNT}:nodegroup/gpu-e/*/*",
+    ], "EKS reads are scoped to this cluster and its node groups"
     reboot = next(
         item
         for item in document["Statement"]
@@ -375,11 +386,27 @@ def _eks_node(name: str = GPU_NODE) -> dict:
 
 
 class EksJoinScenario(JoinScenario):
-    """The HyperPod join world plus one plain EKS cluster, ``gpu-e``."""
+    """The join world rebuilt as a plain EKS site: ``gpu-a`` is eks-managed and
+    the join target ``gpu-e`` is a second plain EKS cluster.
+
+    A site's GPU clusters must share one provider (the Runtime Profile is
+    site-wide), so the existing HyperPod ``gpu-a`` of the shared fixture is
+    rewritten as eks-managed before any join runs.
+    """
+
+    EKS_CONTEXTS = frozenset({"gpu-a", "gpu-e", "gpu-f"})
 
     def __init__(self, tmp_path, monkeypatch):
         super().__init__(tmp_path, monkeypatch, suffixes=("b",))
+        document = yaml.safe_load(self.path.read_text())
+        (existing,) = document["spec"]["clusters"]
+        existing.pop("hyperpodClusterName")
+        existing["provider"] = "eks-managed"
+        existing["nodeSelector"] = "nvidia.com/gpu.present=true"
+        self.path.write_text(yaml.safe_dump(document, sort_keys=False))
+        self.site = load_site(self.path)
         self.targets[eks_target().eks_arn] = eks_target()
+        self.node_names["a"] = "ip-10-0-32-11.us-west-2.compute.internal"
         self.node_names["e"] = GPU_NODE
         self.node_key_environments: list[dict[str, str]] = []
         monkeypatch.setattr(join, "provision_node_action_keys", self.eks_node_keys)
@@ -401,11 +428,12 @@ class EksJoinScenario(JoinScenario):
             if "--context" in arguments
             else "cpu"
         )
-        if "get" in arguments and "nodes" in arguments and context == "gpu-e":
+        if "get" in arguments and "nodes" in arguments and context in self.EKS_CONTEXTS:
             self.commands.append((list(arguments), dict(options)))
+            name = self.node_names[context.rsplit("-", 1)[-1]]
             if any(str(item).startswith("go-template=") for item in arguments):
-                return json.dumps([GPU_NODE])
-            return json.dumps({"items": [_eks_node()]})
+                return json.dumps([name])
+            return json.dumps({"items": [_eks_node(name)]})
         return super().run(arguments, **options)
 
     def eks_request(self, **changes):
@@ -480,19 +508,19 @@ def test_full_eks_managed_join_completes_through_the_state_machine(scenario) -> 
     assert entry["agentEndpointAllowedCidrs"] == ["10.0.0.0/20", "10.0.16.0/20"], (
         "Agent endpoint CIDRs come from the GPU node group subnets"
     )
-    hyperpod_entry = next(
+    sibling = next(
         item for item in document["spec"]["clusters"] if item["clusterId"] == "gpu-a"
     )
-    assert "provider" not in hyperpod_entry and "nodeSelector" not in hyperpod_entry, (
-        "the existing HyperPod entry must be left byte for byte as it was"
+    assert sibling["provider"] == "eks-managed", (
+        "the existing plain EKS entry must be left as it was"
     )
 
     assert _node_selectors(scenario, "gpu-e") == {"nvidia.com/gpu.present=true"}, (
         "every node read of the plain EKS cluster must use its selector"
     )
-    assert _node_selectors(scenario, "gpu-a") == {
-        "sagemaker.amazonaws.com/cluster-name=hp-gpu-a"
-    }, "the HyperPod sibling keeps the historical label selector"
+    assert _node_selectors(scenario, "gpu-a") == {"nvidia.com/gpu.present=true"}, (
+        "the sibling plain EKS cluster is read on its own selector"
+    )
 
     recorded = {item.resource_key for item in scenario.registry.live.resources}
     assert "cluster/gpu-e/eks" in recorded, "the EKS cluster must be registered"
@@ -564,9 +592,32 @@ def test_two_plain_eks_clusters_are_not_mistaken_for_one_another(scenario) -> No
     )
 
 
-def test_hyperpod_join_still_renders_the_historical_selector(scenario) -> None:
+def test_mixing_providers_in_one_site_is_refused(tmp_path, monkeypatch) -> None:
+    """The Runtime Profile is site-wide; a HyperPod site cannot absorb a plain
+    EKS cluster (nor the reverse) until a profile can name both reboot owners."""
+
+    hyperpod_site = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
+    hyperpod_site.targets[eks_target().eks_arn] = eks_target()
+    request = JoinClusterRequest(
+        site=load_site(hyperpod_site.path), gpu_cluster_arn=eks_target().eks_arn
+    )
+    with pytest.raises(BootstrapError, match="must share one provider"):
+        join.join_cluster(request, runner=hyperpod_site)
+    eks_site = EksJoinScenario(tmp_path / "eks", monkeypatch)
+    with pytest.raises(BootstrapError, match="must share one provider"):
+        join.join_cluster(eks_site.request("b"), runner=eks_site)
+    require_single_provider(["hyperpod", None, ""])
+    require_single_provider(["eks-managed"], joining="eks-managed")
+    with pytest.raises(BootstrapError, match="must share one provider"):
+        require_single_provider(["hyperpod"], joining="eks-managed")
+
+
+def test_hyperpod_join_still_renders_the_historical_selector(
+    tmp_path, monkeypatch
+) -> None:
     """The HyperPod path is the fully validated one and must not move."""
 
+    scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
     result = scenario.join("b")
     assert result["phase"] == "COMPLETED", result
     assert _node_selectors(scenario, "gpu-b") == {

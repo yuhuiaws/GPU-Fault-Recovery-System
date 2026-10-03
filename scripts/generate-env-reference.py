@@ -748,6 +748,16 @@ def extract() -> tuple[
 
 def domain(name: str) -> str:
     groups = (
+        # Which provider runs the GPU cluster and how its nodes are scoped.
+        (
+            "Provider",
+            (
+                "GPU_FAULT_CLUSTER_PROVIDER",
+                "GPU_FAULT_NODE_SELECTOR",
+                "GPU_FAULT_EKS_",
+                "GPU_FAULT_EFA_DEVICE_PLUGIN_",
+            ),
+        ),
         (
             "PostgreSQL",
             ("GPU_FAULT_POSTGRES_", "GPU_FAULT_STORE_"),

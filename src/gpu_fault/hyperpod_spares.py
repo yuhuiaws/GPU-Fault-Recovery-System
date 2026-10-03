@@ -18,6 +18,11 @@ from gpu_fault.markers import (
     describe_blocking_marker,
 )
 from gpu_fault.models import AdvisoryNotification
+from gpu_fault.node_provider import (
+    ClusterProvider,
+    instance_group_label,
+    parse_provider_id,
+)
 from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 
 LOGGER = logging.getLogger(__name__)
@@ -106,8 +111,12 @@ class HyperPodSpareCoordinator:
         spare_label_value: str = "true",
         alert_sender: Callable[[str], object] | None = None,
         now: Callable[[], datetime] | None = None,
+        provider: ClusterProvider = ClusterProvider.HYPERPOD,
     ) -> None:
         self.lifecycle = lifecycle
+        # Which provider's node view and health signals apply: HyperPod has
+        # the health-monitoring-agent label, a plain EKS cluster does not.
+        self.provider = provider
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.store = store
         self.notification_sink: NotificationSink | None = (
@@ -294,10 +303,18 @@ class HyperPodSpareCoordinator:
             if isinstance(response, dict)
             else getattr(response, "items", []) or []
         )
-        return [self._kubernetes_provider_view(item) for item in items]
+        return [
+            self._kubernetes_provider_view(item, provider=self.provider)
+            for item in items
+        ]
 
     @classmethod
-    def _kubernetes_provider_view(cls, node: Any) -> HyperPodNode:
+    def _kubernetes_provider_view(
+        cls,
+        node: Any,
+        *,
+        provider: ClusterProvider = ClusterProvider.HYPERPOD,
+    ) -> HyperPodNode:
         metadata = cls._metadata(node)
         labels = dict(cls._labels(node))
         if isinstance(metadata, dict):
@@ -321,24 +338,24 @@ class HyperPodSpareCoordinator:
             if node_name.startswith("hyperpod-i-")
             else None
         )
-        if provider_id:
-            provider_tail = str(provider_id).rsplit("/", 1)[-1]
-            if "-i-" in provider_tail:
-                instance_id = "i-" + provider_tail.rsplit("-i-", 1)[-1]
+        # ``aws:///<zone>/i-...`` (plain EKS) and the HyperPod shapes alike;
+        # the providerID wins over the name-derived guess.
+        parsed = parse_provider_id(provider_id)
+        zone: str | None = None
+        if parsed is not None:
+            zone, instance_id = parsed
         status = "Running" if cls._node_ready(node) else "Unknown"
         labels.setdefault("kubernetes.io/hostname", node_name)
         return HyperPodNode(
             node_logical_id=node_name,
             instance_id=instance_id,
-            instance_group_name=labels.get(
-                "sagemaker.amazonaws.com/instance-group-name"
-            ),
+            instance_group_name=labels.get(instance_group_label(provider)),
             instance_type=(
                 labels.get("node.kubernetes.io/instance-type")
                 or labels.get("beta.kubernetes.io/instance-type")
             ),
             status=status,
-            availability_zone=labels.get("topology.kubernetes.io/zone"),
+            availability_zone=zone or labels.get("topology.kubernetes.io/zone"),
             kubernetes_labels=labels,
         )
 
@@ -463,9 +480,16 @@ class HyperPodSpareCoordinator:
         kubernetes_node = self.core.read_node(node_name)
         if not self._node_ready(kubernetes_node):
             reasons.append("Kubernetes node is not Ready")
-        hyperpod_health = self._labels(kubernetes_node).get(HYPERPOD_NODE_HEALTH_LABEL)
-        if hyperpod_health != HYPERPOD_SCHEDULABLE:
-            reasons.append(f"HyperPod node health is {hyperpod_health or 'unknown'}")
+        if self.provider is ClusterProvider.HYPERPOD:
+            # The health-monitoring-agent label exists only on HyperPod; a
+            # plain EKS node has no such signal and is not gated on it.
+            hyperpod_health = self._labels(kubernetes_node).get(
+                HYPERPOD_NODE_HEALTH_LABEL
+            )
+            if hyperpod_health != HYPERPOD_SCHEDULABLE:
+                reasons.append(
+                    f"HyperPod node health is {hyperpod_health or 'unknown'}"
+                )
         reservation = self._annotation(kubernetes_node)
         pool_state = self._pool_state(kubernetes_node)
         if reservation and reservation != incident_id:

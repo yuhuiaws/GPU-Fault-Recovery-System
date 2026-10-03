@@ -1238,13 +1238,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     kubernetes_nodes = {}
     for target in release.config.clusters:
         nodes = release._get_json(
-            release._gpu(
-                target,
-                "get",
-                "nodes",
-                "-l",
-                node_selector(target),
-            )
+            release._gpu(target, "get", "nodes", "-l", node_selector(target))
         )
         kubernetes_nodes[target.cluster_id] = sorted(
             item["metadata"]["name"] for item in nodes.get("items", [])
@@ -1434,13 +1428,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
         )
         details["deployments"][deployment] = _deployment_readiness(item, deployment)
     nodes = release._get_json(
-        release._gpu(
-            target,
-            "get",
-            "nodes",
-            "-l",
-            node_selector(target),
-        )
+        release._gpu(target, "get", "nodes", "-l", node_selector(target))
     )
     expected_nodes = _ready_nodes(nodes)
     if not expected_nodes:

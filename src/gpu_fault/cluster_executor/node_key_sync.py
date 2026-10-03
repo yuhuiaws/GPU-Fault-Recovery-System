@@ -12,8 +12,9 @@ those keys in.
 
 Invariants, each of them a test:
 
-* only keys for nodes that carry this cluster's HyperPod label are requested,
-  the same selection the deploy host's provisioning helper uses;
+* only keys for nodes the cluster's node selector matches are requested
+  (``GPU_FAULT_NODE_SELECTOR``; for HyperPod the cluster-name label), the
+  same selection the deploy host's provisioning helper uses;
 * only *missing* keys are written, in one merge patch fenced by the Secret's
   ``resourceVersion``, so an existing (possibly rotated) key is never
   overwritten and a concurrent writer makes the patch fail instead of losing;
@@ -33,6 +34,7 @@ from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
 )
+from gpu_fault.node_provider import HYPERPOD_CLUSTER_LABEL as HYPERPOD_CLUSTER_LABEL
 
 # The pre-split module's name: operators filter on ``gpu_fault.cluster_executor``.
 LOGGER = logging.getLogger("gpu_fault.cluster_executor")
@@ -42,8 +44,6 @@ LOGGER = logging.getLogger("gpu_fault.cluster_executor")
 #: within about this long of joining the cluster.
 NODE_KEY_SYNC_INTERVAL_SECONDS = 60.0
 NODE_ACTION_KEYS_SECRET_NAME = "gpu-fault-node-action-keys"
-#: The label the deploy host's provisioning helper selects nodes by.
-HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 #: The control plane bounds one request to this many node ids.
 NODE_KEY_REQUEST_BATCH = 64
 #: ``derive_node_action_secret`` returns 64 hex characters; anything shorter is
@@ -70,14 +70,18 @@ class NodeActionKeySync:
         client: RegionalExecutorClient,
         core: Any,
         *,
-        hyperpod_cluster: str,
+        hyperpod_cluster: str = "",
         namespace: str,
+        node_selector: str | None = None,
         secret_name: str = NODE_ACTION_KEYS_SECRET_NAME,
         interval_seconds: float = NODE_KEY_SYNC_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not hyperpod_cluster.strip():
-            raise ValueError("hyperpod_cluster must not be empty")
+        # Either an explicit selector (any provider) or the HyperPod cluster
+        # name, which implies the cluster-name label selector.
+        selector = (node_selector or "").strip()
+        if not selector and not hyperpod_cluster.strip():
+            raise ValueError("node_selector or hyperpod_cluster must be given")
         if not namespace.strip():
             raise ValueError("namespace must not be empty")
         if not secret_name.strip():
@@ -87,6 +91,9 @@ class NodeActionKeySync:
         self.client = client
         self.core = core
         self.hyperpod_cluster = hyperpod_cluster.strip()
+        self._node_selector = (
+            selector or f"{HYPERPOD_CLUSTER_LABEL}={self.hyperpod_cluster}"
+        )
         self.namespace = namespace.strip()
         self.secret_name = secret_name.strip()
         self.interval_seconds = interval_seconds
@@ -97,13 +104,13 @@ class NodeActionKeySync:
 
     @property
     def node_selector(self) -> str:
-        return f"{HYPERPOD_CLUSTER_LABEL}={self.hyperpod_cluster}"
+        return self._node_selector
 
     def due(self) -> bool:
         return self._next_due is None or self.clock() >= self._next_due
 
     def labelled_nodes(self) -> list[str]:
-        """Names of the Kubernetes nodes carrying this cluster's HyperPod label."""
+        """Names of the Kubernetes nodes this cluster's node selector matches."""
 
         response = self.core.list_node(label_selector=self.node_selector)
         names: set[str] = set()

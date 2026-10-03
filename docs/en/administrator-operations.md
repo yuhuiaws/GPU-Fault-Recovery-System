@@ -965,10 +965,18 @@ Semantics and boundaries of `eks-managed`:
   (`ip-10-0-x-y.<region>.compute.internal`); installer Job names are truncated to DNS-1123 with a deterministic hash.
 - Identity variables: the connection Secret keys `hyperpod-cluster-name` / `hyperpod-confirm-cluster-name` carry the
   `cluster_id` (`GPU_FAULT_HYPERPOD_CLUSTER` keeps meaning "the provider cluster scope"), and the new keys
-  `cluster-provider=eks-managed` and `node-selector` feed `GPU_FAULT_CLUSTER_PROVIDER` / `GPU_FAULT_NODE_SELECTOR`.
+  `cluster-provider=eks-managed`, `node-selector` and `eks-cluster-name` feed `GPU_FAULT_CLUSTER_PROVIDER` /
+  `GPU_FAULT_NODE_SELECTOR` / `GPU_FAULT_EKS_CLUSTER_NAME` (the latter lets the EKS provider check the
+  `eks:cluster-name` tag of every instance it touches).
   The node `--node-instance-id` is the EC2 instance id from `spec.providerID` (HyperPod nodes keep the Node UID).
-- IAM: the Executor role is granted only `ec2:DescribeInstances` and `ec2:RebootInstances` conditioned on
-  `aws:ResourceTag/eks:cluster-name`, no `sagemaker:*` at all; the role name derives from the `cluster_id`.
+- IAM: the Executor role is granted only `ec2:DescribeInstances`, `ec2:RebootInstances` conditioned on
+  `aws:ResourceTag/eks:cluster-name`, and `eks:DescribeCluster` / `eks:DescribeNodegroup` scoped to this cluster and
+  its node group ARNs -- no `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
+  identity running `workflow-reconcile` additionally needs `ec2:DescribeInstances` (the departed-node EC2 proof).
+- The Runtime Profile is site-wide (`hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS
+  adapter), so **a site's GPU clusters must share one provider**: a first `deploy` whose GPU clusters are all plain
+  EKS starts from `config/runtime-profile.regional-eks-safe.example.yaml` (`eks-v1`); joining a plain EKS cluster
+  into a HyperPod site (or the reverse) is refused -- use a separate site.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

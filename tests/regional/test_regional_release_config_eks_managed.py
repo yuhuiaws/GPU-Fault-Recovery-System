@@ -94,8 +94,16 @@ def test_registry_entry_accepts_an_eks_managed_target(tmp_path: Path) -> None:
         "the registry entry carries an empty HyperPod name for eks-managed"
     )
     assert entry["cluster_id"] == "gpu-eks-cluster", "cluster id must be kept"
-    assert "provider" not in entry, (
-        "the control-plane registration schema is additive-only: no new keys"
+    assert entry["provider"] == "eks-managed", (
+        "an eks-managed entry tells the control plane its provider"
+    )
+    hyperpod = _hyperpod_target()
+    hyperpod["token_file"] = str(token)
+    hyperpod_entry = REGISTRY.registry_entry(
+        ClusterTarget.from_mapping(hyperpod, expected_region=REGION)
+    )
+    assert "provider" not in hyperpod_entry, (
+        "a HyperPod entry keeps the key set it always had (additive only)"
     )
 
 
@@ -148,10 +156,21 @@ def test_pre_existing_hyperpod_registration_digests_identically() -> None:
 def test_registration_without_a_hyperpod_name_is_valid() -> None:
     value = dict(PRE_EXISTING_REGISTRATION)
     value.pop("hyperpod_cluster_name")
+    value["provider"] = "eks-managed"
     registration = RegionalClusterRegistration.model_validate(value)
     assert registration.hyperpod_cluster_name == "", (
         "an eks-managed registration carries an empty HyperPod name"
     )
+    assert registration.provider == "eks-managed", "the provider is a real field"
+    assert (
+        RegionalClusterRegistration.model_validate(PRE_EXISTING_REGISTRATION).provider
+        == "hyperpod"
+    ), "a registration without the key is HyperPod"
+    with pytest.raises(ValueError, match="cluster provider must be one of"):
+        RegionalClusterRegistration.model_validate({**value, "provider": "eks"})
+    assert regional_registry_content_sha256([registration]) != (
+        PRE_EXISTING_CONTENT_SHA256
+    ), "an eks-managed registration digests differently from a HyperPod one"
     assert regional_registry_config_sha256([registration]) != (
         PRE_EXISTING_CONFIG_SHA256
     ), "dropping the HyperPod name is a configuration change and must digest so"

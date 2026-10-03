@@ -23,10 +23,12 @@ from typing import Any, Iterable, Mapping
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
 __all__ = [
+    "CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY",
     "CONNECTION_SECRET_NODE_SELECTOR_KEY",
     "CONNECTION_SECRET_PROVIDER_KEY",
     "DEFAULT_EKS_MANAGED_NODE_SELECTOR",
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
+    "EKS_CLUSTER_NAME_ENV",
     "EKS_NODEGROUP_LABEL",
     "HYPERPOD_CLUSTER_LABEL",
     "NODE_SELECTOR_ENV",
@@ -55,6 +57,11 @@ NODE_SELECTOR_ENV = "GPU_FAULT_NODE_SELECTOR"
 #: site renders exactly as it did before the keys existed.
 CONNECTION_SECRET_PROVIDER_KEY = "cluster-provider"
 CONNECTION_SECRET_NODE_SELECTOR_KEY = "node-selector"
+#: The EKS cluster name of an ``eks-managed`` cluster (empty for HyperPod);
+#: feeds the optional ``GPU_FAULT_EKS_CLUSTER_NAME`` the EKS provider matches
+#: against the ``eks:cluster-name`` instance tag.
+CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY = "eks-cluster-name"
+EKS_CLUSTER_NAME_ENV = "GPU_FAULT_EKS_CLUSTER_NAME"
 
 #: The label SageMaker HyperPod stamps on every node it manages.
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"

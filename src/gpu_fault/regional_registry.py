@@ -47,6 +47,10 @@ def regional_registry_config_sha256(
             for field in _CONFIG_DIGEST_FIELDS
             if getattr(item, field) is not None
         }
+        # The provider joins the digest only when it is not the HyperPod
+        # default, so a Secret and head written before plain EKS support
+        # still agree with each other.
+        | ({"provider": item.provider} if item.provider != "hyperpod" else {})
         for item in sorted(registrations, key=lambda value: value.cluster_id)
     ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

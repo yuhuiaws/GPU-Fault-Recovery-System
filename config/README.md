@@ -32,7 +32,10 @@ helper, `gpu_fault.cluster_scope.node_selector`, turns the entry into the
 selector every component uses, so a HyperPod entry still renders the historical
 label text byte for byte. `spec.failureDomainLabels` left unset follows the
 providers: HyperPod-only sites keep the instance-group/zone priority, a site with
-an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`.
+an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`. The runtime profile
+is site-wide, so a site's GPU clusters must share one provider; a first deploy whose GPU
+clusters are all plain EKS starts from `runtime-profile.regional-eks-safe.example.yaml`
+(`eks-v1`).
 
 Successful deployment also registers AWS resource IDs, ownership and delete
 policy in Aurora. Operators do not add those fields to `site.yaml`. Uninstall
@@ -45,6 +48,7 @@ leftover from the same site; foreign name collisions fail closed.
 | Deployment path | Profile terminology | Runtime profile | Required changes | Registration |
 |---|---|---|---|---|
 | Regional CPU control plane with GPU-cluster Executor | `regional-hyperpod-safe` means the gated regional production profile | `runtime-profile.regional-hyperpod-safe.example.yaml` | registration `cluster_id`; diagnostic bundle, GPU reset and fabric recovery are OWN after signed Node Agent/fleet convergence | Register once per profile version on the regional control plane |
+| Regional CPU control plane with a plain EKS (`eks-managed`) GPU cluster Executor | `regional-eks-safe` is the same gated profile for a cluster without HyperPod: `nodeReboot` OWN by `gpu-fault-eks-adapter` (EC2 RebootInstances), `nodeReplace` OBSERVE, no `hyperpod-hma` claims | `runtime-profile.regional-eks-safe.example.yaml` (profile version `eks-v1`, environment `eks`) | registration `cluster_id`; the executor runs with `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` | Register once per profile version on the regional control plane |
 
 The API does not accept a `profiles:` wrapper or multiple profiles in one
 request. Historical single-cluster and multi-environment capability examples

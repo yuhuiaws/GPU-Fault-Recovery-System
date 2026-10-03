@@ -386,6 +386,23 @@ categories:
       - name: GPU_FAULT_DRIVER_REMEDIATION_SHA256
         description: "驱动修复命令固定 SHA-256。"
 
+  - title: 集群 provider 与节点范围（HyperPod / 纯 EKS）
+    description: >-
+      GPU 集群由 SageMaker HyperPod 或纯 EKS 托管节点组承载；数据面按这些变量选择
+      provider adapter 与节点选择器。缺省即 HyperPod，所有既有部署行为不变。
+    variables:
+      - name: GPU_FAULT_CLUSTER_PROVIDER
+        production: 每集群连接 Secret 注入；hyperpod 或 eks-managed
+        default: hyperpod
+        description: "GPU 集群 provider：`hyperpod`（缺省）或 `eks-managed`。决定 RESTART_NODE 走 BatchRebootClusterNodes 还是 EC2 RebootInstances、是否构造 SageMaker client/HyperPod 托管恢复观察者、Completion Watcher 缺省环境（`eks`）。未知值启动失败。"
+      - name: GPU_FAULT_NODE_SELECTOR
+        production: eks-managed 必填（join 时的 --node-selector）；HyperPod 可省略
+        description: "本集群节点的 Kubernetes label selector。HyperPod 缺省为 `sagemaker.amazonaws.com/cluster-name=<GPU_FAULT_HYPERPOD_CLUSTER>`；eks-managed 必须显式给出（CPU 节点组不得匹配）。Node Action key 同步、Node Installer reconciler 与 EKS provider 共用。"
+      - name: GPU_FAULT_EKS_CLUSTER_NAME
+        description: "可选：eks-managed 集群的 EKS 集群名；设置后 preflight 要求目标实例的 `eks:cluster-name` 标签与之一致，未设置时从标签读取（不一致或缺失则 fail closed）。"
+      - name: GPU_FAULT_EFA_DEVICE_PLUGIN_NAME
+        description: "RESTART_EFA_DEVICE_PLUGIN 重启的 DaemonSet `name` 标签；缺省按 provider：HyperPod `hyperpod-dependencies-aws-efa-k8s-device-plugin`，eks-managed `aws-efa-k8s-device-plugin`。"
+
   - title: HyperPod、reboot 与 warm spare
     description: >-
       Provider replace 永久禁止。nodeReplace 只代表 HEALTHY_WARM_SPARE_ONLY；
@@ -396,12 +413,6 @@ categories:
       - name: GPU_FAULT_HYPERPOD_CLUSTER
         production: 每集群连接 Secret 注入真实 HyperPod 名；eks-managed 集群注入 cluster_id
         description: "Provider cluster scope：HyperPod 名，或普通 EKS 集群的 cluster_id；不同于稳定 cluster_id 的语义。"
-      - name: GPU_FAULT_CLUSTER_PROVIDER
-        production: 连接 Secret 键 cluster-provider（hyperpod | eks-managed，缺省 hyperpod）
-        description: "GPU 集群 provider（gpu_fault.cluster_scope）；eks-managed 表示无 HyperPod 的普通 EKS 集群。"
-      - name: GPU_FAULT_NODE_SELECTOR
-        production: 连接 Secret 键 node-selector（缺省为 HyperPod 集群标签）
-        description: "GPU 节点标签选择器；每个节点枚举都使用它，绝不能匹配 CPU 节点组。"
       - name: GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER
         production: 必须与真实 HyperPod 名完全一致
         description: "破坏性 provider 动作的二次集群确认。"

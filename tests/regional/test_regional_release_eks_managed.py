@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from gpu_fault.cluster_scope import (
+    CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
     CONNECTION_SECRET_NODE_SELECTOR_KEY,
     CONNECTION_SECRET_PROVIDER_KEY,
     NODE_SELECTOR_ENV,
@@ -158,7 +159,11 @@ def test_hyperpod_connection_secret_keeps_its_keys_and_gains_the_provider_pair(
         "hyperpod-confirm-cluster-name",
         CONNECTION_SECRET_PROVIDER_KEY,
         CONNECTION_SECRET_NODE_SELECTOR_KEY,
-    }, "the Secret key set must be the historical keys plus the two provider keys"
+        CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
+    }, "the Secret key set must be the historical keys plus the provider keys"
+    assert files[CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY] == "", (
+        "a HyperPod Secret carries no EKS cluster name for the EKS provider"
+    )
 
 
 def test_eks_managed_connection_secret_is_created_with_the_cluster_id_scope(
@@ -175,6 +180,9 @@ def test_eks_managed_connection_secret_is_created_with_the_cluster_id_scope(
     )
     assert files[CONNECTION_SECRET_PROVIDER_KEY] == "eks-managed", "provider key"
     assert files[CONNECTION_SECRET_NODE_SELECTOR_KEY] == EKS_SELECTOR, "selector key"
+    assert files[CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY] == "gpu-eks-cluster", (
+        "the EKS cluster name feeds GPU_FAULT_EKS_CLUSTER_NAME for the EC2 tag check"
+    )
     assert files["cluster-id"] == "gpu-eks-cluster", "cluster id key unchanged"
 
 
@@ -220,10 +228,15 @@ def test_rolled_out_deployments_read_the_provider_keys_optionally(
     hyperpod, eks = _targets(release)
     for target in (hyperpod, eks):
         env = _env(_deployments(release, target)[deployment])
-        for name, key in (
+        keys = [
             (PROVIDER_ENV, CONNECTION_SECRET_PROVIDER_KEY),
             (NODE_SELECTOR_ENV, CONNECTION_SECRET_NODE_SELECTOR_KEY),
-        ):
+        ]
+        if deployment == "gpu-fault-cluster-executor":
+            keys.append(
+                ("GPU_FAULT_EKS_CLUSTER_NAME", CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY)
+            )
+        for name, key in keys:
             reference = env[name]["valueFrom"]["secretKeyRef"]
             assert reference["name"] == "gpu-fault-regional-connection", (
                 f"{deployment}: {name} must come from the connection Secret"

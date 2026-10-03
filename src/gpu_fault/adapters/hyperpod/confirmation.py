@@ -18,6 +18,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepStatus,
 )
+from gpu_fault.node_provider import HYPERPOD_REBOOT_CONFIRMATION_SOURCE
 
 
 class HyperPodConfirmationMixin:
@@ -191,7 +192,15 @@ class HyperPodConfirmationMixin:
                 )
         return {
             "externally_confirmed": True,
-            "confirmation_source": ("hyperpod-running-and-new-agent-incarnation"),
+            # "provider Running plus a new agent incarnation", named per
+            # provider; the HyperPod string is bound into persisted records.
+            "confirmation_source": str(
+                getattr(
+                    self.dispatcher.adapter,
+                    "confirmation_source",
+                    HYPERPOD_REBOOT_CONFIRMATION_SOURCE,
+                )
+            ),
             "agent_observations": observations,
             "provider_observations": provider_observations,
             **snapshot_details,

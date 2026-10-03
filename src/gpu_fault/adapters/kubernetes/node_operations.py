@@ -35,6 +35,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
 )
+from gpu_fault.node_provider import efa_device_plugin_name
 from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
     has_terminal_quarantine_hold,
@@ -109,7 +110,9 @@ class KubernetesNodeOperationsMixin:
             parameters.get(
                 "plugin_label_selector",
                 (
-                    "name=hyperpod-dependencies-aws-efa-k8s-device-plugin"
+                    # The DaemonSet's ``name`` label differs per provider
+                    # (HyperPod dependencies chart vs. the EKS EFA plugin).
+                    f"name={efa_device_plugin_name()}"
                     if efa
                     else "app.kubernetes.io/name=nvidia-device-plugin"
                 ),

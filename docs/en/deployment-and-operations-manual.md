@@ -4181,8 +4181,9 @@ KUBE_CONTEXT="${GPU_EKS_CONTEXT}" NAMESPACE="${NAMESPACE}" \
 # BatchDeleteClusterNodes and sagemaker:* are forbidden; workload log S3 PutObject/
 # AbortMultipartUpload may be granted separately per target prefix.
 # The executor role of a plain EKS cluster (provider: eks-managed) holds no sagemaker:*
-# at all: only ec2:DescribeInstances (EC2 grants it on Resource "*" only) and
-# ec2:RebootInstances conditioned on aws:ResourceTag/eks:cluster-name=<EKS cluster name>;
+# at all: only ec2:DescribeInstances (EC2 grants it on Resource "*" only),
+# ec2:RebootInstances conditioned on aws:ResourceTag/eks:cluster-name=<EKS cluster name>,
+# and eks:DescribeCluster / eks:DescribeNodegroup scoped to this cluster's and node groups' ARNs;
 # every other ec2:*/eks:* is refused (regional_release_iam.EXECUTOR_EKS_MANAGED_ACTIONS).
 export EXECUTOR_IRSA_ROLE_ARN="arn:aws:iam::<account-id>:role/<executor-role>"
 
@@ -5178,7 +5179,9 @@ eks-managed`, a new and less validated form; semantics and boundaries in Adminis
 cluster needs its GPU node selector: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or
 `--gpu-nodegroup <managed-node-group>` (derives `eks.amazonaws.com/nodegroup=<name>`); `--cluster-id` defaults to the EKS
 cluster name. Both options are ignored for HyperPod clusters, whose selector is always
-`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before:
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. The Runtime Profile is site-wide,
+so a site's GPU clusters must share one provider: joining a plain EKS cluster into a HyperPod site (or the reverse) is
+refused:
 
 ```bash
 gpu-fault-admin deploy \

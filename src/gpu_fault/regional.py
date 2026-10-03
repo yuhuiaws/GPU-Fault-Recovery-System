@@ -69,6 +69,11 @@ MAX_TOKEN_ROTATION_WINDOW = timedelta(days=7)
 # published before the field existed. A revision that actually arms rotation
 # carries the keys and therefore digests them.
 _ROTATION_DIGEST_KEYS = ("retiring_token_sha256", "token_rotation_expires_at")
+#: Likewise dropped from the digest while it holds the default: every revision
+#: published before plain EKS support described a HyperPod cluster without
+#: saying so, and must keep digesting as it did.
+_PROVIDER_DIGEST_KEY = "provider"
+_DEFAULT_PROVIDER = "hyperpod"
 
 
 class RegionalClusterLifecycle(StrEnum):
@@ -90,6 +95,8 @@ class RegionalClusterRegistration(StrictModel):
     # re-verified on every load of every durable revision).
     hyperpod_cluster_name: str = ""
     eks_cluster_arn: str
+    #: ``hyperpod`` (default) or ``eks-managed``; see ``gpu_fault.cluster_scope``.
+    provider: str = _DEFAULT_PROVIDER
     token_sha256: str = Field(min_length=64, max_length=64)
     # The credential being retired, not the one being introduced. Rotation sets
     # `token_sha256` to the new token immediately and parks the old digest here
@@ -109,6 +116,13 @@ class RegionalClusterRegistration(StrictModel):
     agent_endpoint_allowed_cidrs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        from gpu_fault.cluster_scope import cluster_provider
+
+        return cluster_provider(value).value
 
     @field_validator(  # type: ignore[untyped-decorator]
         "agent_endpoint_allowed_cidrs"
@@ -288,6 +302,8 @@ def _registry_digest_payload(
     for key in _ROTATION_DIGEST_KEYS:
         if payload.get(key) is None:
             payload.pop(key, None)
+    if payload.get(_PROVIDER_DIGEST_KEY) == _DEFAULT_PROVIDER:
+        payload.pop(_PROVIDER_DIGEST_KEY, None)
     return payload
 
 

@@ -6,15 +6,17 @@ the change is ownership drift unless this workflow's own reboot records
 account for it. Two shapes are accepted:
 
 1. **Confirmed chain** (``_confirmed_transition``): the node's ``RESTART_NODE``
-   executions SUCCEEDED, externally confirmed by HyperPod ``Running`` plus a
-   new Node Agent incarnation, each carrying the ``stop_reboot_authorization_v1``
+   executions SUCCEEDED, externally confirmed by the provider reporting
+   ``Running`` (HyperPod node status, or EC2 instance state on a plain EKS
+   cluster) plus a new Node Agent incarnation -- one of
+   ``REBOOT_CONFIRMATION_SOURCES`` -- each carrying the ``stop_reboot_authorization_v1``
    record the pre-submit check signed for this receipt, and the recorded
    old/new boot ids chain from the receipt's boot id to the current one.
 
 2. **In-flight sibling reboot** (``_in_flight_transition``): the node is not a
    target of the action being checked, and its latest ``RESTART_NODE``
    execution is still WAITING with a real provider submission (``action`` is
-   the HyperPod reboot, ``requires_external_confirmation`` is set, the
+   the provider reboot, ``requires_external_confirmation`` is set, the
    submission key is this workflow's, ``submitted_nodes`` names one logical id
    per target and the record is not a cached duplicate) whose
    ``stop_reboot_authorization_v1`` was signed for this receipt's digest and
@@ -45,6 +47,7 @@ from gpu_fault.models import (
     WorkflowStepExecution,
     WorkflowStepStatus,
 )
+from gpu_fault.node_provider import REBOOT_CONFIRMATION_SOURCES
 from gpu_fault.orchestration.escalation import unknown_outcome_failure
 
 REBOOT_AUTHORIZATION_KEY = "stop_reboot_authorization_v1"
@@ -253,8 +256,7 @@ def _confirmed_transition(
         or index not in workflow.completed_step_indexes
         or unknown_outcome_failure(details)
         or details.get("externally_confirmed") is not True
-        or details.get("confirmation_source")
-        != "hyperpod-running-and-new-agent-incarnation"
+        or details.get("confirmation_source") not in REBOOT_CONFIRMATION_SOURCES
     ):
         return None
     bound = _bound_authorization(

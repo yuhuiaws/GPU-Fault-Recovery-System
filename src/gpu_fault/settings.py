@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from gpu_fault.env import env_bool
+from gpu_fault.node_provider import ClusterProvider, cluster_provider
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.fleet import CURRENT_AGENT_PROTOCOL_VERSION
 
@@ -356,8 +357,16 @@ class ControlPlaneSettings:
             (
                 "gpu-fault-kubernetes-adapter,"
                 "gpu-fault-node-agent,"
-                "gpu-fault-hyperpod-adapter"
+                "gpu-fault-hyperpod-adapter,"
+                "gpu-fault-eks-adapter"
             ),
+        )
+        # A plain EKS cluster has no HyperPod managed recovery to delegate to;
+        # the multi-cluster control plane decides this per registration.
+        default_managed_owners = (
+            ""
+            if cluster_provider(values) is ClusterProvider.EKS_MANAGED
+            else "hyperpod-managed-node-recovery,hyperpod-managed-job-recovery"
         )
         if regional_mode and not remote_owners:
             raise RuntimeError("regional mode requires remote execution owners")
@@ -386,7 +395,7 @@ class ControlPlaneSettings:
             managed_recovery_owners=_csv(
                 values,
                 "GPU_FAULT_MANAGED_RECOVERY_OWNERS",
-                ("hyperpod-managed-node-recovery,hyperpod-managed-job-recovery"),
+                default_managed_owners,
             ),
             remote_execution_owners=remote_owners,
             agent_registry=registry,
