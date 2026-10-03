@@ -774,9 +774,12 @@ def test_tool_replacement_between_admission_and_open_is_rejected(
             path.chmod(0o700)
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_file)
-    with pytest.raises(probe.CollectorEnvGuardError, match="executable changed"):
-        env_host.override()
+    # The fake replaces the global os.open, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_file)
+        with pytest.raises(probe.CollectorEnvGuardError, match="executable changed"):
+            env_host.override()
     assert executed is True
     assert env_host.findmnt_calls == []
     assert env_host.mutations() == []

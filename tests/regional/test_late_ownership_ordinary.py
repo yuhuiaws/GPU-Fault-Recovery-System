@@ -304,24 +304,27 @@ def test_ordinary_proof_is_a_bounded_regular_file_without_link_following(
             raise OSError(errno.ELOOP, "test-only refused link")
         return real_open(path, flags)
 
-    monkeypatch.setattr(binding.os, "open", opened)
     if kind == "missing":
         completed.path.unlink()
     elif kind == "invalid-json":
         completed.path.write_text("{")
     elif kind == "oversized":
         completed.path.write_bytes(b" " * (binding.MAX_EVIDENCE_BYTES + 1))
-    elif kind == "nonregular":
-        real_stat = binding.os.fstat
-        monkeypatch.setattr(
-            binding.os,
-            "fstat",
-            lambda fd: SimpleNamespace(
-                st_mode=stat.S_IFIFO, st_size=real_stat(fd).st_size
-            ),
-        )
-    with pytest.raises((OSError, ValueError, BoundaryDenied)):
-        completed.read()
+    # binding.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fakes to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(binding.os, "open", opened)
+        if kind == "nonregular":
+            real_stat = binding.os.fstat
+            patch.setattr(
+                binding.os,
+                "fstat",
+                lambda fd: SimpleNamespace(
+                    st_mode=stat.S_IFIFO, st_size=real_stat(fd).st_size
+                ),
+            )
+        with pytest.raises((OSError, ValueError, BoundaryDenied)):
+            completed.read()
     assert len(calls) == 1, (
         "ordinary evidence must not be reopened through a permissive fallback"
     )
@@ -354,9 +357,12 @@ def test_changed_ordinary_file_cannot_be_bound_from_partial_or_stale_read(
                 monkeypatch.setattr(binding, "MAX_EVIDENCE_BYTES", info.st_size - 1)
         return info
 
-    monkeypatch.setattr(binding.os, "fstat", changed)
-    with pytest.raises(BoundaryDenied, match="changed while reading|bounded regular"):
-        completed.read()
+    with monkeypatch.context() as patch:
+        patch.setattr(binding.os, "fstat", changed)
+        with pytest.raises(
+            BoundaryDenied, match="changed while reading|bounded regular"
+        ):
+            completed.read()
 
 
 @pytest.mark.parametrize(

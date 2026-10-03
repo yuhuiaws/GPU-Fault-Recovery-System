@@ -169,22 +169,25 @@ def test_xid_write_closes_fake_descriptor_and_never_accepts_incomplete_record(
             raise OSError("fake device write failed")
         return len(data) - int(mode == "short")
 
-    monkeypatch.setattr(probe.os, "open", open_device)
-    monkeypatch.setattr(probe.os, "write", write)
-    monkeypatch.setattr(probe.os, "close", closed.append)
     arguments = argparse.Namespace(
         marker="marker-a", drill_id="drill-a", pci_bdf="0000:01:02"
     )
-    if mode == "complete":
-        probe.write_xid45(arguments)
-        result = json.loads(capsys.readouterr().out)
-        assert result["bytes_written"] == len(writes[0][1])
-    elif mode == "short":
-        with pytest.raises(probe.ProbeError, match="short"):
+    # probe.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fakes to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "open", open_device)
+        patch.setattr(probe.os, "write", write)
+        patch.setattr(probe.os, "close", closed.append)
+        if mode == "complete":
             probe.write_xid45(arguments)
-    else:
-        with pytest.raises(OSError, match="write failed"):
-            probe.write_xid45(arguments)
+            result = json.loads(capsys.readouterr().out)
+            assert result["bytes_written"] == len(writes[0][1])
+        elif mode == "short":
+            with pytest.raises(probe.ProbeError, match="short"):
+                probe.write_xid45(arguments)
+        else:
+            with pytest.raises(OSError, match="write failed"):
+                probe.write_xid45(arguments)
     assert opened[0][0] == "/dev/kmsg"
     assert closed == [23]
     assert writes[0][1].endswith(b"\n"), (
@@ -201,9 +204,10 @@ def test_invalid_injection_identity_is_refused_before_open(monkeypatch, field, v
         marker="marker-a", drill_id="drill-a", pci_bdf="0000:01:02"
     )
     setattr(arguments, field, value)
-    monkeypatch.setattr(probe.os, "open", support.forbidden)
-    with pytest.raises(probe.ProbeError, match="unsafe"):
-        probe.write_xid45(arguments)
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "open", support.forbidden)
+        with pytest.raises(probe.ProbeError, match="unsafe"):
+            probe.write_xid45(arguments)
 
 
 def test_unparseable_gpu_identity_and_ledger_read_failure_are_not_absence(

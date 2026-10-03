@@ -9,6 +9,7 @@ import yaml
 from gpu_fault.admin import bootstrap_dependencies as dependencies
 from gpu_fault.admin import deploy_consent, release_state, source_deploy
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.execution import ProofCache
 from gpu_fault.admin.site import SiteConfigError, load_site
 from tests.admin.test_admin_site import site_file
 
@@ -41,6 +42,11 @@ def toolchain(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(arguments, 0, "fixture-version\n", "")
 
     monkeypatch.setattr(dependencies, "run_command", command)
+    # The process-wide proof cache keys on the manifest, the tool bytes and the
+    # interpreter; two tests whose tmp_path is the same path (pytest reuses
+    # numbers once passed tests' directories are removed) would otherwise share
+    # one proof and only the first would run the tool.
+    monkeypatch.setattr(dependencies, "PROOFS", ProofCache())
     return manifest, data, calls
 
 

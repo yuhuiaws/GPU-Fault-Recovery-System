@@ -391,9 +391,12 @@ def test_regular_file_identity_rejects_replacement_during_read(
             values["st_ino"] += 1
         return SimpleNamespace(**values)
 
-    monkeypatch.setattr(os, "fstat", metadata)
-    with pytest.raises(probe.ProbeError, match="changed while"):
-        probe.file_identity(path)
+    # The fake replaces the global os.fstat, which pytest's own tmp_path
+    # teardown also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fstat", metadata)
+        with pytest.raises(probe.ProbeError, match="changed while"):
+            probe.file_identity(path)
 
 
 def test_publication_and_deletion_are_create_only_and_receipt_bound(

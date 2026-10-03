@@ -30,9 +30,8 @@ from gpu_fault.regional import (
 from gpu_fault.regional_registry import sync_regional_cluster_registry
 from tests._builders import asgi_client, build_context, build_store
 
-# The app-level cases go through the real authentication path, which reads the
-# wall clock, so the reference instant has to be the current one rather than a
-# fixed date that would put every window in the past.
+# The model-level cases do exact window arithmetic against one shared instant;
+# a fixed date would put every window in the past, so it is taken at import.
 NOW = datetime.now(timezone.utc)
 OLD_TOKEN = "o" * 40
 NEW_TOKEN = "n" * 40
@@ -68,6 +67,18 @@ def rotating(
     )
 
 
+def live() -> datetime:
+    """The instant for cases that go through the real authentication path.
+
+    That path reads the wall clock when the request arrives. A registration
+    anchored on the import-time ``NOW`` has a thirty-minute retiring window
+    that lapses while a long run is still going (CI run 37124211673: imported
+    12:53, executed 13:30, old token refused with 403), so these cases anchor
+    on the moment they build the registration.
+    """
+    return datetime.now(timezone.utc)
+
+
 def context_for(registration: RegionalClusterRegistration):
     context = build_context(execution_token="e" * 32)
     context.regional_mode = True
@@ -100,7 +111,7 @@ def authenticate(registration: RegionalClusterRegistration, token: str) -> int:
 
 
 def test_overlap_window_accepts_both_tokens() -> None:
-    registration = rotating()
+    registration = rotating(updated_at=live())
 
     assert authenticate(registration, NEW_TOKEN) == 200
     assert authenticate(registration, OLD_TOKEN) == 200
@@ -110,8 +121,9 @@ def test_overlap_window_accepts_both_tokens() -> None:
 def test_expired_rotation_window_withdraws_only_the_retiring_token() -> None:
     # The window closed an hour ago. Nothing else changed, so the executors that
     # already moved keep working and only the withdrawn credential stops.
+    now = live()
     registration = rotating(
-        updated_at=NOW - timedelta(hours=2), expires_at=NOW - timedelta(hours=1)
+        updated_at=now - timedelta(hours=2), expires_at=now - timedelta(hours=1)
     )
 
     assert authenticate(registration, NEW_TOKEN) == 200
@@ -119,7 +131,7 @@ def test_expired_rotation_window_withdraws_only_the_retiring_token() -> None:
 
 
 def test_registration_without_rotation_accepts_only_the_current_token() -> None:
-    registration = rotating(retiring=None)
+    registration = rotating(retiring=None, updated_at=live())
 
     assert authenticate(registration, NEW_TOKEN) == 200
     assert authenticate(registration, OLD_TOKEN) == 403
@@ -129,7 +141,7 @@ def test_registration_without_rotation_accepts_only_the_current_token() -> None:
     "state", [RegionalClusterLifecycle.REVOKED, RegionalClusterLifecycle.ROLLED_BACK]
 )
 def test_revoked_cluster_rejects_every_slot(state: RegionalClusterLifecycle) -> None:
-    registration = rotating(lifecycle_state=state)
+    registration = rotating(lifecycle_state=state, updated_at=live())
 
     assert authenticate(registration, NEW_TOKEN) == 403
     assert authenticate(registration, OLD_TOKEN) == 403
@@ -143,7 +155,7 @@ def test_retiring_slot_use_is_reported_so_rotation_can_be_finished(caplog) -> No
     plane says whether that is the case.
     """
 
-    registration = rotating()
+    registration = rotating(updated_at=live())
 
     with caplog.at_level(logging.WARNING, logger="gpu_fault.app.factory"):
         assert authenticate(registration, OLD_TOKEN) == 200

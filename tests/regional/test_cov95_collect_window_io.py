@@ -338,8 +338,11 @@ def test_block_preserves_rule_that_appeared_after_initial_scan(
     assert not any("-I" in call[0] for call in window_host.calls), (
         "a rule observed before insertion must not be duplicated"
     )
-    monkeypatch.setattr(probe.os, "open", forbidden)
-    with pytest.raises(probe.ProbeError, match="unsafe marker"):
-        probe.write_kmsg(
-            SimpleNamespace(marker="bad marker", pci_bdf="0000:af:00", kind="xid63")
-        )
+    # probe.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "open", forbidden)
+        with pytest.raises(probe.ProbeError, match="unsafe marker"):
+            probe.write_kmsg(
+                SimpleNamespace(marker="bad marker", pci_bdf="0000:af:00", kind="xid63")
+            )

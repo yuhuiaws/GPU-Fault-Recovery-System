@@ -349,9 +349,18 @@ def test_grant_modified_during_read_is_rejected(
                     output.write(" ")
         return original(descriptor)
 
-    monkeypatch.setattr(postgres_grant.os, "fstat", mutate_during_read)
-    with pytest.raises(PostgresGrantError, match="matching private allocation grant"):
-        postgres_test_environment(
-            {ALLOCATION_ENV: str(directory), POSTGRES_URL_ENV: url, "HOME": "/original"}
-        )
+    # postgres_grant.os is the global os module, which pytest's own tmp_path teardown also
+    # uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(postgres_grant.os, "fstat", mutate_during_read)
+        with pytest.raises(
+            PostgresGrantError, match="matching private allocation grant"
+        ):
+            postgres_test_environment(
+                {
+                    ALLOCATION_ENV: str(directory),
+                    POSTGRES_URL_ENV: url,
+                    "HOME": "/original",
+                }
+            )
     assert reads == 3
