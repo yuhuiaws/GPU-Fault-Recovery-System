@@ -327,14 +327,17 @@ not a fixed SLA:
 | `a6dd742` / `33620340339` | Six signed shards | 6 min 18 s | `runtime_2` 4 min 53 s | unit 57 s |
 | `f90fdad` / `33622247519` | Fresh after the stability fixes | 6 min 10 s | `runtime_1` 4 min 41 s | unit 59 s |
 | `adcaadff` / `37124211673` | Six shards + a single shuffled job (after the suite grew) | 39 min 14 s | `shuffled-order` 39 min; `coverage-deployment` 36 min; `coverage-postgres` 30 min | unit not run |
-| `ci/faster-pipeline` / see below | Twelve shards + four shuffled shards | see below | see below | see below |
+| `453b0dcb` / `37139294375` | Twelve shards + four shuffled shards (PR run, all fresh) | 16 min 42 s | `coverage-postgres_1` 14 min 30 s; `coverage-deployment_2` 11 min 48 s; `shuffled-order-2` 11 min 36 s; `coverage-runtime_2` 10 min 54 s; static 8 min 18 s | unit 2 min (combine 93 s) |
 
-Before the 2026-10-03 re-sharding the suite had grown to about 41,000 nodeids: the single shuffled job, the single
+Before the 2026-10-03 re-sharding the suite had grown to about 43,000 nodeids: the single shuffled job, the single
 deployment shard and the serial PostgreSQL shard each needed 30-40 minutes, and even in parallel they held the whole
 pipeline at 40-45 minutes. Re-sharding only changes which slice each job receives, not the test set, the coverage floors,
 the signing protocol or the shuffled order itself (see the partition proofs in `tests/test_ci_unit_gate.py` and
 `tests/test_test_suite_contracts.py`). The fixed overhead per job (checkout, cached pip install, cosign) is about one
-minute and is not the bottleneck.
+minute and is not the bottleneck; the first sharded run still showed deployment shards at 10-19 minutes, 5-10 of which
+were the per-file collection cost described above, which the directory arguments cut to under two minutes. The same
+shard can differ by 2x in wall clock between Runners (the single deployment shard once took 20 and once 36 minutes),
+so compare several runs.
 
 The long tail of a single test cannot be spread by sharding: the whole-suite collection probe in
 `tests/test_optional_postgres_collection.py` takes about 4.5 minutes and several cases in

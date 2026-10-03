@@ -328,14 +328,17 @@ fault case 的 PASS 必须具备 setup/call/teardown 三个成功阶段；带 se
 | `a6dd742` / `33620340339` | 六个签名shard | 6分18秒 | `runtime_2` 4分53秒 | unit 57秒 |
 | `f90fdad` / `33622247519` | 稳定修复后fresh | 6分10秒 | `runtime_1` 4分41秒 | unit 59秒 |
 | `adcaadff` / `37124211673` | 六个shard + 单job打乱轮（测试集增长后） | 39分14秒 | `shuffled-order` 39分；`coverage-deployment` 36分；`coverage-postgres` 30分 | unit未执行 |
-| `ci/faster-pipeline` / 见下文 | 十二个shard + 四个打乱shard | 见下文 | 见下文 | 见下文 |
+| `453b0dcb` / `37139294375` | 十二个shard + 四个打乱shard（PR run，全部fresh） | 16分42秒 | `coverage-postgres_1` 14分30秒；`coverage-deployment_2` 11分48秒；`shuffled-order-2` 11分36秒；`coverage-runtime_2` 10分54秒；static 8分18秒 | unit 2分（combine 93秒） |
 
-2026-10-03 重新分片前，测试集已经增长到约 4.1 万条 nodeid：单job的打乱轮、单个
+2026-10-03 重新分片前，测试集已经增长到约 4.3 万条 nodeid：单job的打乱轮、单个
 deployment shard和串行PostgreSQL shard各自需要 30-40 分钟，三者并行也让整条流水线
 停在 40-45 分钟。重新分片只改变每个job拿到的切片，不改变测试集、coverage floor、
 签名协议和打乱顺序本身（见 `tests/test_ci_unit_gate.py` 和
 `tests/test_test_suite_contracts.py` 的分区证明）。每个job固定开销（checkout、
-pip cache 安装、cosign）约 1 分钟，不是瓶颈。
+pip cache 安装、cosign）约 1 分钟，不是瓶颈；第一轮分片实测deployment shard仍需
+10-19 分钟，其中 5-10 分钟是上文所述的逐文件参数收集开销，改为目录参数后降到
+2 分钟以内。同一shard在不同Runner上的墙钟相差可达 2 倍（例如 deployment 单shard
+曾分别用时 20 分和 36 分），比较时应看多次运行。
 
 单条用例的长尾不能靠分片摊薄：`tests/test_optional_postgres_collection.py` 的整套
 收集探针约 4.5 分钟，`tests/regional/test_clean_redeploy_script.py` 的若干用例 40-55
