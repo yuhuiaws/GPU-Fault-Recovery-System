@@ -21,13 +21,14 @@ from gpu_fault.admin.bootstrap import (
     discover_cluster,
 )
 from gpu_fault.admin.bootstrap_common import (
-    require_single_provider,
     Arn,
     BootstrapError,
     ClusterIdentity,
     CommandRunner,
     default_cluster_id,
     ensure_namespace as ensure_namespace,
+    require_profile_matches_provider,
+    require_single_provider,
     safe_name,
     write_secret as write_secret,
 )
@@ -270,6 +271,12 @@ def _validate_target(
     require_single_provider(
         [item.get("provider") for item in request.site.release_config["clusters"]],
         joining=target.provider,
+    )
+    profile = request.site.release_config["runtime_profile"]
+    require_profile_matches_provider(
+        Path(str(profile["source"])),
+        version=str(profile["version"]),
+        provider=target.provider,
     )
     for item in request.site.release_config["clusters"]:
         if item["eks_cluster_arn"] == target.eks_arn:

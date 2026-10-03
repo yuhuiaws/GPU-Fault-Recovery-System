@@ -30,6 +30,8 @@ __all__ = [
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
     "EKS_CLUSTER_NAME_ENV",
     "EKS_NODEGROUP_LABEL",
+    "PROVIDER_NODE_REBOOT_OWNERS",
+    "PROVIDER_PROFILE_SOURCES",
     "HYPERPOD_CLUSTER_LABEL",
     "NODE_SELECTOR_ENV",
     "PROVIDER_ENV",
@@ -72,6 +74,20 @@ EKS_NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup"
 #: bundle) sets on nodes that actually expose GPUs. CPU node groups never
 #: carry it.
 DEFAULT_EKS_MANAGED_NODE_SELECTOR = "nvidia.com/gpu.present=true"
+#: The ``nodeReboot`` owner each provider's executor advertises: the lifecycle
+#: adapter it constructs (``adapters/hyperpod/lifecycle.py`` default owner and
+#: ``eks_provider.EKS_ADAPTER_OWNER``). A Runtime Profile whose ``nodeReboot``
+#: claim names the other owner can never have its reboot claimed on that
+#: provider's cluster, so join refuses the pairing up front.
+PROVIDER_NODE_REBOOT_OWNERS: dict[str, str] = {
+    "hyperpod": "gpu-fault-hyperpod-adapter",
+    "eks-managed": "gpu-fault-eks-adapter",
+}
+#: The example profile that names each provider's owners, for remedies.
+PROVIDER_PROFILE_SOURCES: dict[str, str] = {
+    "hyperpod": "config/runtime-profile.regional-hyperpod-safe.example.yaml",
+    "eks-managed": "config/runtime-profile.regional-eks-safe.example.yaml",
+}
 #: Failure-domain label priority for an ``eks-managed`` cluster. The managed
 #: node group plays the role the HyperPod instance group plays, so it comes
 #: first; the zone labels follow as they do for HyperPod.

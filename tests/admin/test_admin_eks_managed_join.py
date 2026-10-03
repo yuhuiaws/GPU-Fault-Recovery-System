@@ -10,8 +10,10 @@ No HyperPod cluster orchestrates it.
 
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import yaml
@@ -24,12 +26,20 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapRequest,
     ClusterIdentity,
     default_cluster_id,
+    profile_node_reboot_owner,
+    require_profile_matches_provider,
     require_single_provider,
 )
 from gpu_fault.admin.bootstrap_discovery import regional_profile_for
 from gpu_fault.admin.cluster_join_types import JoinClusterRequest
 from gpu_fault.admin.site import load_site
-from gpu_fault.cluster_scope import NODE_SELECTOR_ENV, PROVIDER_ENV, node_selector
+from gpu_fault.cluster_scope import (
+    NODE_SELECTOR_ENV,
+    PROVIDER_ENV,
+    PROVIDER_NODE_REBOOT_OWNERS,
+    PROVIDER_PROFILE_SOURCES,
+    node_selector,
+)
 from tests.admin._cov95_join_support import ACCOUNT, REGION, JoinScenario, target
 
 EKS_NAME = "gpu-eks-cluster"
@@ -635,3 +645,122 @@ def test_hyperpod_join_still_renders_the_historical_selector(
     assert "cluster/hp-gpu-b/hyperpod" in recorded, (
         "a HyperPod join still records the gpu_hyperpod resource"
     )
+
+
+# --- the site profile must be able to reboot the provider being joined ----------
+
+HYPERPOD_PROFILE = (
+    Path(__file__).resolve().parents[2]
+    / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+)
+EKS_PROFILE = (
+    Path(__file__).resolve().parents[2]
+    / "config/runtime-profile.regional-eks-safe.example.yaml"
+)
+
+
+def test_owner_map_matches_the_example_profiles_and_the_adapters() -> None:
+    from gpu_fault.adapters.hyperpod.lifecycle import HyperPodLifecycleStepAdapter
+    from gpu_fault.eks_provider import EKS_ADAPTER_OWNER
+
+    assert (
+        profile_node_reboot_owner(HYPERPOD_PROFILE)
+        == (PROVIDER_NODE_REBOOT_OWNERS["hyperpod"])
+    ), "the HyperPod example profile must name the HyperPod adapter"
+    assert (
+        profile_node_reboot_owner(EKS_PROFILE)
+        == (PROVIDER_NODE_REBOOT_OWNERS["eks-managed"])
+    ), "the EKS example profile must name the EKS adapter"
+    assert PROVIDER_NODE_REBOOT_OWNERS["eks-managed"] == EKS_ADAPTER_OWNER, (
+        "the shared owner map must agree with the runtime EKS adapter"
+    )
+    assert (
+        inspect.signature(HyperPodLifecycleStepAdapter.__init__)
+        .parameters["owner"]
+        .default
+        == PROVIDER_NODE_REBOOT_OWNERS["hyperpod"]
+    ), "the shared owner map must agree with the HyperPod adapter default"
+
+
+@pytest.mark.parametrize(
+    ("profile", "provider", "other_owner"),
+    [
+        (HYPERPOD_PROFILE, "eks-managed", "gpu-fault-hyperpod-adapter"),
+        (EKS_PROFILE, "hyperpod", "gpu-fault-eks-adapter"),
+    ],
+)
+def test_profile_owned_by_the_other_adapter_is_refused_with_the_remedy(
+    profile, provider, other_owner
+) -> None:
+    with pytest.raises(BootstrapError) as failure:
+        require_profile_matches_provider(profile, version="site-v1", provider=provider)
+    message = str(failure.value)
+    assert "site-v1" in message and other_owner in message, message
+    assert PROVIDER_NODE_REBOOT_OWNERS[provider] in message, "names the expected owner"
+    assert "--approve-profile-plan" in message and "new version name" in message, (
+        "the remedy must name the profile switch and the approval flow"
+    )
+    assert PROVIDER_PROFILE_SOURCES[provider] in message, "names the matching profile"
+
+
+def test_profile_matching_the_provider_or_without_a_reboot_owner_passes(
+    tmp_path,
+) -> None:
+    require_profile_matches_provider(
+        EKS_PROFILE, version="eks-v1", provider="eks-managed"
+    )
+    require_profile_matches_provider(
+        HYPERPOD_PROFILE, version="hyperpod-v1", provider="hyperpod"
+    )
+    observe_only = tmp_path / "observe.yaml"
+    observe_only.write_text(
+        "claims:\n  - capability: nodeReboot\n    mode: OBSERVE\n"
+        "    owner: gpu-fault-hyperpod-adapter\n",
+        encoding="utf-8",
+    )
+    assert profile_node_reboot_owner(observe_only) is None, "OBSERVE is no owner"
+    require_profile_matches_provider(observe_only, version="o", provider="eks-managed")
+    no_claims = tmp_path / "empty.yaml"
+    no_claims.write_text("claims: []\n", encoding="utf-8")
+    require_profile_matches_provider(no_claims, version="e", provider="hyperpod")
+    with pytest.raises(BootstrapError, match="cannot read runtime profile"):
+        require_profile_matches_provider(
+            tmp_path / "missing.yaml", version="m", provider="hyperpod"
+        )
+
+
+def test_join_refuses_an_eks_cluster_under_a_hyperpod_owned_profile(
+    tmp_path, monkeypatch
+) -> None:
+    scenario = EksJoinScenario(tmp_path, monkeypatch)
+    document = yaml.safe_load(scenario.path.read_text())
+    document["spec"]["runtimeProfile"]["source"] = str(HYPERPOD_PROFILE)
+    document["spec"]["runtimeProfile"]["templateSource"] = str(HYPERPOD_PROFILE)
+    scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(BootstrapError, match="gpu-fault-hyperpod-adapter"):
+        scenario.join_eks()
+    assert not any(event.startswith("executor-role") for event in scenario.events), (
+        "the refusal must come before any AWS mutation"
+    )
+
+
+def test_join_refuses_a_hyperpod_cluster_under_an_eks_owned_profile(
+    tmp_path, monkeypatch
+) -> None:
+    scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
+    document = yaml.safe_load(scenario.path.read_text())
+    document["spec"]["runtimeProfile"]["source"] = str(EKS_PROFILE)
+    document["spec"]["runtimeProfile"]["templateSource"] = str(EKS_PROFILE)
+    scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(BootstrapError, match="gpu-fault-eks-adapter"):
+        scenario.join("b")
+
+
+def test_join_accepts_a_matching_profile(tmp_path, monkeypatch) -> None:
+    scenario = EksJoinScenario(tmp_path, monkeypatch)
+    document = yaml.safe_load(scenario.path.read_text())
+    document["spec"]["runtimeProfile"]["source"] = str(EKS_PROFILE)
+    document["spec"]["runtimeProfile"]["templateSource"] = str(EKS_PROFILE)
+    document["spec"]["runtimeProfile"]["version"] = "eks-v1"
+    scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
+    assert scenario.join_eks()["phase"] == "COMPLETED", "a matching profile joins"

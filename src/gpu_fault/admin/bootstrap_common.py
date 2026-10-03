@@ -28,7 +28,11 @@ from gpu_fault.admin.execution import (
     deadline_scope,
     run_command,
 )
-from gpu_fault.cluster_scope import cluster_provider
+from gpu_fault.cluster_scope import (
+    PROVIDER_NODE_REBOOT_OWNERS,
+    PROVIDER_PROFILE_SOURCES,
+    cluster_provider,
+)
 
 _TASK_COMMAND_COUNTS: ContextVar[dict[str, int] | None] = ContextVar(
     "bootstrap_task_command_counts", default=None
@@ -151,6 +155,56 @@ def require_single_provider(
             "eks-managed): the Runtime Profile and its nodeReboot owner are "
             "site-wide; use a separate site for the other provider"
         )
+
+
+def profile_node_reboot_owner(profile_source: Path) -> str | None:
+    """The executable ``nodeReboot`` owner a Runtime Profile source names.
+
+    ``None`` when the profile has no OWN/DELEGATE ``nodeReboot`` claim: the
+    reboot path then exists for no provider and there is nothing to pair.
+    """
+
+    try:
+        document = yaml.safe_load(profile_source.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise BootstrapError(f"cannot read runtime profile {profile_source}") from exc
+    claims = document.get("claims") if isinstance(document, dict) else None
+    for claim in claims if isinstance(claims, list) else ():
+        if (
+            isinstance(claim, dict)
+            and claim.get("capability") == "nodeReboot"
+            and str(claim.get("mode") or "") in {"OWN", "DELEGATE"}
+        ):
+            return str(claim.get("owner") or "") or None
+    return None
+
+
+def require_profile_matches_provider(
+    profile_source: Path, *, version: str, provider: object
+) -> None:
+    """Refuse a GPU cluster whose provider the site profile cannot reboot.
+
+    The profile is site-wide and its ``nodeReboot`` owner is one adapter. An
+    eks-managed cluster under a profile owned by the HyperPod adapter (or a
+    HyperPod cluster under the EKS adapter) would register, converge and then
+    never have a reboot claimed -- a fail-closed path that only shows up on
+    the first incident. The mismatch is a configuration error named here,
+    with the remedy, before anything is created.
+    """
+
+    kind = cluster_provider(provider).value
+    expected = PROVIDER_NODE_REBOOT_OWNERS[kind]
+    owner = profile_node_reboot_owner(profile_source)
+    if owner is None or owner == expected:
+        return
+    raise BootstrapError(
+        f"runtime profile {version} ({profile_source}) owns nodeReboot through "
+        f"{owner}, which a {kind} cluster's executor never advertises (it "
+        f"advertises {expected}); switch spec.runtimeProfile.source and "
+        f"templateSource to {PROVIDER_PROFILE_SOURCES[kind]} under a new "
+        "version name and run deploy with --approve-profile-plan before "
+        "joining this cluster"
+    )
 
 
 def default_cluster_id(cluster: ClusterIdentity) -> str:

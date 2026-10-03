@@ -5181,7 +5181,10 @@ cluster needs its GPU node selector: `--node-selector <selector>` (default `nvid
 cluster name. Both options are ignored for HyperPod clusters, whose selector is always
 `sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. The Runtime Profile is site-wide,
 so a site's GPU clusters must share one provider: joining a plain EKS cluster into a HyperPod site (or the reverse) is
-refused:
+refused; the site profile's `nodeReboot` owner must also be the target provider's adapter (plain EKS:
+`gpu-fault-eks-adapter`, HyperPod: `gpu-fault-hyperpod-adapter`), otherwise the join is refused before any AWS
+mutation with the remedy: switch to the matching example profile under a new version name and rerun `deploy` with
+`--approve-profile-plan`:
 
 ```bash
 gpu-fault-admin deploy \

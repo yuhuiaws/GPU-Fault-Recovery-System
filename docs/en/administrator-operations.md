@@ -976,7 +976,12 @@ Semantics and boundaries of `eks-managed`:
 - The Runtime Profile is site-wide (`hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS
   adapter), so **a site's GPU clusters must share one provider**: a first `deploy` whose GPU clusters are all plain
   EKS starts from `config/runtime-profile.regional-eks-safe.example.yaml` (`eks-v1`); joining a plain EKS cluster
-  into a HyperPod site (or the reverse) is refused -- use a separate site.
+  into a HyperPod site (or the reverse) is refused -- use a separate site. `join-cluster`/`deploy` also check the
+  site profile's `nodeReboot` owner: a plain EKS cluster requires `gpu-fault-eks-adapter`, a HyperPod cluster
+  `gpu-fault-hyperpod-adapter`; a mismatch is refused before any AWS mutation, and the message names the profile
+  version, the current owner and the remedy (switch `spec.runtimeProfile.source/templateSource` to the matching
+  example profile under a new version name and rerun `deploy` with `--approve-profile-plan`). A profile with no
+  OWN/DELEGATE `nodeReboot` claim is not checked.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

@@ -6,7 +6,10 @@
 
 Profile是站点级授权策略。新版本生效后会被该站点当前纳管的全部GPU集群使用；GPU集群
 加入和注销继续通过`join-cluster/remove-cluster`处理，不进入Profile审批的稳定站点
-身份摘要。
+身份摘要。`join-cluster`/`deploy` 接入 GPU 集群前会核对当前 profile 的 `nodeReboot` owner
+与集群 provider 是否匹配（HyperPod：`gpu-fault-hyperpod-adapter`；普通 EKS `eks-managed`：
+`gpu-fault-eks-adapter`）；不匹配时拒绝接入，补救就是本文的流程——把 `spec.runtimeProfile`
+的 `source/templateSource` 换成对应示例 profile、换一个新版本名，重跑 `deploy` 并按下文审批。
 
 ## 1. 最短操作路径
 
