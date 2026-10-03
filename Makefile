@@ -246,9 +246,16 @@ test:
 # hook, and a seed drawn per process would make the workers disagree about the
 # collection, which xdist aborts on. Pass GPU_FAULT_TEST_SHUFFLE_SEED=<n> to
 # replay a specific red run; the seed is printed here and in the pytest header.
+# CI splits the round across Runners with GPU_FAULT_TEST_SHUFFLE_SHARDS=<N> and
+# GPU_FAULT_TEST_SHUFFLE_SHARD=<i> (see tests/conftest.py); both inherit from the
+# environment, so a local replay of one shard is the same three variables.
 test-shuffled:
 	@seed="$${GPU_FAULT_TEST_SHUFFLE_SEED:-$$($(PYTHON) -c 'import secrets; print(secrets.randbelow(2 ** 32))')}"; \
 		printf 'GPU_FAULT_TEST_SHUFFLE_SEED=%s\n' "$$seed"; \
+		if [ -n "$${GPU_FAULT_TEST_SHUFFLE_SHARDS}$${GPU_FAULT_TEST_SHUFFLE_SHARD}" ]; then \
+			printf 'GPU_FAULT_TEST_SHUFFLE_SHARDS=%s GPU_FAULT_TEST_SHUFFLE_SHARD=%s\n' \
+				"$${GPU_FAULT_TEST_SHUFFLE_SHARDS}" "$${GPU_FAULT_TEST_SHUFFLE_SHARD}"; \
+		fi; \
 		GPU_FAULT_TEST_POSTGRES_URL= \
 		GPU_FAULT_TEST_SHUFFLE_SEED="$$seed" \
 		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \

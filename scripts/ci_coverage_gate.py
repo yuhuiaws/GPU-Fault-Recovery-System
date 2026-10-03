@@ -41,16 +41,19 @@ if TYPE_CHECKING or __package__:
     from scripts.ci_coverage_config import (
         IDENTITY_GROUPS,
         ROOT,
-        RUNTIME_SHARDS,
+        RUNTIME_SHARDS as RUNTIME_SHARDS,
         SHARDS,
         TEST_DOMAINS as TEST_DOMAINS,
         _is_excluded,
         _test_owner,
         deployment_only_source_files,
+        is_postgres_shard,
         load_config,
+        logical_test_domain,
         parse_pytest_workers,
         pytest_targets,
         shard_coverage_sources,
+        shard_partition,
         validate_test_partition,
     )
     from scripts.ci_coverage_floors import (
@@ -74,16 +77,19 @@ else:
     from ci_coverage_config import (
         IDENTITY_GROUPS,
         ROOT,
-        RUNTIME_SHARDS,
+        RUNTIME_SHARDS as RUNTIME_SHARDS,
         SHARDS,
         TEST_DOMAINS as TEST_DOMAINS,
         _is_excluded,
         _test_owner,
         deployment_only_source_files,
+        is_postgres_shard,
         load_config,
+        logical_test_domain,
         parse_pytest_workers,
         pytest_targets,
         shard_coverage_sources,
+        shard_partition,
         validate_test_partition,
     )
     from ci_coverage_floors import (
@@ -320,19 +326,21 @@ def shard_identity(
         else os.getenv("PYTEST_XDIST_WORKERS", str(protocol["pytest_workers"]))
     )
     parse_pytest_workers(protocol["pytest_workers"])
-    if shard != "postgres":
+    if not is_postgres_shard(shard):
         protocol.pop("postgres_stress_rounds")
         protocol.pop("postgres_stress_workers")
-    if shard in RUNTIME_SHARDS:
-        protocol["runtime_partition_index"] = RUNTIME_SHARDS.index(shard)
-    else:
-        protocol.pop("runtime_partitions")
+    # The domain-wide partition table is replaced by this shard's own slot, so
+    # two shards of one domain differ in identity only by their index.
+    protocol.pop("partitions")
+    partition = shard_partition(shard)
+    if partition is not None:
+        protocol["partition_count"], protocol["partition_index"] = partition
     current_environment = os.environ if environment is None else environment
     resolved_environment = (
         dict(environment_identity)
         if environment_identity is not None
         else _environment_identity(
-            postgres_image=postgres_image if shard == "postgres" else "",
+            postgres_image=postgres_image if is_postgres_shard(shard) else "",
             environment=current_environment,
         )
     )
@@ -362,7 +370,7 @@ def _quality_gates(shard: str) -> dict[str, str]:
         "branch_coverage_data": "PASSED",
         "pytest": "PASSED",
     }
-    if shard == "postgres":
+    if is_postgres_shard(shard):
         result["postgres_contract"] = "PASSED"
         result["postgres_stress"] = "PASSED"
     return result
@@ -370,7 +378,7 @@ def _quality_gates(shard: str) -> dict[str, str]:
 
 def _evidence_names(shard: str) -> set[str]:
     result = {"coverage_data", "durations", "pytest_results"}
-    if shard == "postgres":
+    if is_postgres_shard(shard):
         result.add("postgres_stress_results")
     return result
 
@@ -432,7 +440,7 @@ def verify_coverage_data(root: Path, shard: str, path: Path) -> tuple[str, ...]:
         raise CoverageGateError("coverage shard data is invalid") from exc
     if not measured:
         raise CoverageGateError("coverage shard data contains no measured files")
-    if shard != "deployment":
+    if logical_test_domain(shard) != "deployment":
         deployment_only = set(deployment_only_source_files(root))
         leaked = sorted(
             relative
@@ -534,7 +542,7 @@ def verify_shard_gate(
     durations = _load_json(durations_path, "coverage duration evidence is invalid")
     if durations.get("schema_version") != 1 or durations.get("shard") != shard:
         raise CoverageGateError("coverage duration evidence is invalid")
-    if shard == "postgres":
+    if is_postgres_shard(shard):
         stress_path = artifact_root / str(verified["postgres_stress_results"]["path"])
         stress_value = _verify_pytest_results(
             stress_path, root=source_root, identity=identity, suite="postgres_stress"
@@ -686,7 +694,7 @@ def build_shard_gate(
         or duration_value.get("shard") != shard
     ):
         raise CoverageGateError("coverage duration evidence is invalid")
-    if shard == "postgres":
+    if is_postgres_shard(shard):
         if stress_results is None:
             raise CoverageGateError("PostgreSQL stress evidence is required")
         stress_value = _verify_pytest_results(
@@ -884,6 +892,18 @@ def write_durations(
     )
 
 
+def _apply_partition(
+    environment: dict[str, str], partition: tuple[int, int] | None
+) -> None:
+    if partition is None:
+        environment.pop("PYTEST_GPU_FAULT_PARTITION_COUNT", None)
+        environment.pop("PYTEST_GPU_FAULT_PARTITION_INDEX", None)
+        return
+    count, index = partition
+    environment["PYTEST_GPU_FAULT_PARTITION_COUNT"] = str(count)
+    environment["PYTEST_GPU_FAULT_PARTITION_INDEX"] = str(index)
+
+
 def run_shard(
     *,
     root: Path,
@@ -897,11 +917,12 @@ def run_shard(
     postgres_image: str = "",
 ) -> None:
     validate_test_partition(root)
-    if shard == "postgres" and not os.getenv("GPU_FAULT_TEST_POSTGRES_URL", ""):
+    postgres = is_postgres_shard(shard)
+    if postgres and not os.getenv("GPU_FAULT_TEST_POSTGRES_URL", ""):
         raise CoverageGateError("GPU_FAULT_TEST_POSTGRES_URL is required")
-    if include_stress and shard != "postgres":
+    if include_stress and not postgres:
         raise CoverageGateError("only PostgreSQL shard supports stress")
-    if shard == "postgres" and (not include_stress or not postgres_image):
+    if postgres and (not include_stress or not postgres_image):
         raise CoverageGateError("PostgreSQL shard requires stress and image identity")
     identity = shard_identity(
         root, shard, postgres_image=postgres_image, pytest_workers=workers
@@ -923,25 +944,17 @@ def run_shard(
         "GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS",
     ):
         environment.pop(name, None)
-    if shard != "postgres":
+    if not postgres:
         environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
-    if shard in RUNTIME_SHARDS:
-        environment["PYTEST_GPU_FAULT_PARTITION_COUNT"] = str(
-            config["protocol"]["runtime_partitions"]
-        )
-        environment["PYTEST_GPU_FAULT_PARTITION_INDEX"] = str(
-            RUNTIME_SHARDS.index(shard)
-        )
-    else:
-        environment.pop("PYTEST_GPU_FAULT_PARTITION_COUNT", None)
-        environment.pop("PYTEST_GPU_FAULT_PARTITION_INDEX", None)
+    partition = shard_partition(shard)
+    _apply_partition(environment, partition)
     command = [
         python,
         "-m",
         "pytest",
         *pytest_targets(root, shard),
     ]
-    if shard != "postgres":
+    if not postgres:
         command.extend(["-n", workers, f"--dist={distribution}"])
     else:
         command.extend(["-n", "0"])
@@ -965,8 +978,9 @@ def run_shard(
         stress_results = artifact_root / STRESS_RESULTS_NAME
         stress_environment = dict(os.environ)
         stress_environment.pop("PYTEST_ADDOPTS", None)
-        stress_environment.pop("PYTEST_GPU_FAULT_PARTITION_COUNT", None)
-        stress_environment.pop("PYTEST_GPU_FAULT_PARTITION_INDEX", None)
+        # The stress pass re-runs exactly this shard's slice of the suite; the
+        # gate requires both receipts to discover and select the same nodeids.
+        _apply_partition(stress_environment, partition)
         stress_environment["PYTEST_GPU_FAULT_CASE_REPORT"] = str(stress_results)
         stress_environment[CI_CONTEXT_ENV] = json.dumps(
             ci_context(identity, "postgres_stress")
@@ -981,7 +995,7 @@ def run_shard(
             python,
             "-m",
             "pytest",
-            *pytest_targets(root, "postgres"),
+            *pytest_targets(root, shard),
             "-n",
             "0",
             "-p",
@@ -1271,7 +1285,7 @@ def combine_shards(
 
 def _identity_from_options(options: argparse.Namespace) -> dict[str, Any]:
     image = ""
-    if options.shard == "postgres":
+    if is_postgres_shard(options.shard):
         image = postgres_image_identity(
             container=options.postgres_container,
             image=options.postgres_image,
@@ -1357,7 +1371,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         container=options.postgres_container,
                         image=options.postgres_image,
                     )
-                    if options.shard == "postgres"
+                    if is_postgres_shard(options.shard)
                     else ""
                 ),
             )

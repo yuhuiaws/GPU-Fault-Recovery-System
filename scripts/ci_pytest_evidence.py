@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from scripts.ci_coverage_config import (
-    RUNTIME_SHARDS,
     SHARDS,
+    is_postgres_shard,
+    logical_test_domain,
     parse_pytest_workers,
     pytest_targets,
+    shard_partition,
 )
 from scripts.ci_gate_artifacts import CoverageGateError, sha256
 from tools.pytest_result_identity import (
@@ -68,7 +70,7 @@ def _validate_workers(
     actual = selection.get("numprocesses")
     # Legacy numeric receipts name the count; automatic modes need their request.
     requested = selection.get("requested_numprocesses", actual)
-    if shard == "postgres":
+    if is_postgres_shard(shard):
         if (
             type(actual) is not int
             or actual != 0
@@ -120,11 +122,8 @@ def validate_shard_receipt(
     shard = identity["shard"]
     targets = list(pytest_targets(root, shard))
     selection = session.get("selection")
-    partition = (
-        [len(RUNTIME_SHARDS), RUNTIME_SHARDS.index(shard)]
-        if shard in RUNTIME_SHARDS
-        else None
-    )
+    shard_slot = shard_partition(shard)
+    partition = list(shard_slot) if shard_slot is not None else None
     if (
         not isinstance(selection, dict)
         or selection.get("targets") != targets
@@ -138,7 +137,9 @@ def validate_shard_receipt(
     protocol = identity["protocol"]
     _validate_workers(selection, protocol, shard)
     stress = suite == "postgres_stress"
-    if suite not in {"pytest", "postgres_stress"} or (stress and shard != "postgres"):
+    if suite not in {"pytest", "postgres_stress"} or (
+        stress and not is_postgres_shard(shard)
+    ):
         raise ValueError("pytest receipt suite is invalid")
     for field in ("workers", "rounds"):
         expected = str(protocol[f"postgres_stress_{field}"]) if stress else ""
@@ -275,7 +276,9 @@ def parse_aggregate_receipt(
         raise ValueError("pytest aggregate identity or shard inventory is invalid")
     merged: dict[str, object] = {}
     discovered: set[str] = set()
-    runtime_discovery: frozenset[str] | None = None
+    # Shards of one partitioned domain run the same files, so they must have
+    # discovered the same nodeids; a disagreement means a slice went missing.
+    domain_discovery: dict[str, frozenset[str]] = {}
     try:
         for shard, provenance in shards.items():
             identity = provenance["identity"]
@@ -307,15 +310,15 @@ def parse_aggregate_receipt(
             merged.update(receipt.records)
             assert receipt.discovered_nodeids is not None
             discovered.update(receipt.discovered_nodeids)
-            if shard in RUNTIME_SHARDS:
-                if (
-                    runtime_discovery is not None
-                    and runtime_discovery != receipt.discovered_nodeids
-                ):
-                    raise ValueError("runtime shards disagree on pytest discovery")
-                runtime_discovery = receipt.discovered_nodeids
+            if shard_partition(shard) is not None:
+                domain = logical_test_domain(shard)
+                previous = domain_discovery.setdefault(
+                    domain, receipt.discovered_nodeids
+                )
+                if previous != receipt.discovered_nodeids:
+                    raise ValueError(f"{domain} shards disagree on pytest discovery")
             stress = provenance["postgres_stress"]
-            if shard == "postgres":
+            if is_postgres_shard(shard):
                 if not is_sha256(stress["receipt_sha256"]):
                     raise ValueError("PostgreSQL stress evidence digest is invalid")
                 stress_receipt = validate_shard_receipt(

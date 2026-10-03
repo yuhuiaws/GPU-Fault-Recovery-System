@@ -42,7 +42,7 @@ main push
        -> hit: a signed gate with the same identity from a historical successful main CI: verify the signature and reuse the evidence
        -> miss: run this domain's pytest, branch coverage and duration collection
        -> generate the current run gate and sign it independently
-  -> unit: verify the signatures of the six physical shards
+  -> unit: verify the signatures of all eleven physical shards
        -> coverage combine + production 78% floor + per-module floor + two-scope 95% statement/branch
        -> merge pytest results, generate the fault report and the duration summary
        -> generate and sign the aggregated unit gate
@@ -65,7 +65,7 @@ workflow_dispatch or v* tag
   -> upload dist/ as the gpu-fault-release artifact
 ```
 
-PRs also run the same six fresh shards, the unified coverage floor, PostgreSQL stress, `static` and
+PRs also run the same eleven fresh shards, the unified coverage floor, PostgreSQL stress, `static` and
 `artifact`, but the shards are not signed with main trust, no deploy-host bundle is built, and no signed candidate that Release
 could download across runs is generated. The final job is still named `test` so that branch protection keeps a single aggregated status.
 
@@ -89,7 +89,7 @@ That workflow:
 - does not automatically copy GitHub Actions artifacts to `/secure/release/`.
 
 A source-ARN deploy can also automatically download the same-commit candidate when the checkout is clean and `HEAD == refs/remotes/origin/main`:
-it first verifies the main run, the CI/unit/six shard signatures, the commit/tree/repository and the artifact inventory, and then enters
+it first verifies the main run, the CI/unit/eleven shard signatures, the commit/tree/repository and the artifact inventory, and then enters
 `release-build-promoted`. Dirty source and personal clean commits do not query GitHub. When the candidate is unavailable,
 the local `release-build` first runs static/contracts and then, within the CPU budget, runs ordinary pytest, PostgreSQL
 stress and the source-only artifact build in parallel; only after all of them pass does it build the runtime image, generate the deployable Manifest and sign it.
@@ -213,22 +213,25 @@ install the project test extras. The CI execution units are as follows:
 |---|---|
 | `static` | Ruff, mypy strict, compileall, architecture, deployment contracts, documentation and CI tool tests, configuration, YAML, Shell and artifact security checks |
 | `coverage-runtime_0..2` | Ordinary Runtime pytest split into three parts by a stable nodeid hash, each collecting branch coverage and duration evidence |
-| `coverage-deployment` | Release, regional orchestration and deploy-host administrator pytest with the corresponding coverage |
+| `coverage-deployment_0..3` | Release, regional orchestration and deploy-host administrator pytest split into four parts by a stable nodeid hash, each collecting the corresponding coverage |
 | `coverage-fault_runner` | fault scheduler/runner tests and duration evidence |
-| `coverage-postgres` | Serial PostgreSQL contract coverage, followed by the 8 workers × 40 rounds stress |
-| `unit` | Verify the signatures of the six physical shards, merge coverage, unified floor, fault report, duration summary and aggregated signature |
+| `coverage-postgres_0..2` | PostgreSQL contract pytest split into three parts by a stable nodeid hash; each part collects coverage serially (`-n 0`) on its own job-bound PostgreSQL service and then runs the 8 workers × 40 rounds stress over the same part |
+| `shuffled-order-0..3` | The same test set as `test-parallel-release`, shuffled as a whole with the run-id seed and cut into four disjoint subsequences (`tests/conftest.py`), each run with xdist to expose order coupling |
+| `unit` | Verify the signatures of the eleven physical shards, merge coverage, unified floor, fault report, duration summary and aggregated signature |
 | `artifact` | Build and validate the three source-only component wheels and the Node bundle; main additionally builds the unsigned deploy-host bundle |
-| `test` | Aggregate static/unit/artifact and generate the commit-level CI gate for main |
+| `test` | Aggregate static/unit/shuffle/artifact and generate the commit-level CI gate for main |
 
 `config/ci-unit-gate.json` defines the test partitions, the content identity groups, the coverage protocol and the
-documentation/CI tests that do not enter coverage twice. The four logical domains run within the following boundaries, with runtime producing three physical shards:
+documentation/CI tests that do not enter coverage twice. The four logical domains run within the following boundaries; `protocol.partitions`
+(matching `PARTITIONED_DOMAINS` in `scripts/ci_coverage_config.py`) splits runtime, deployment and postgres into three, four and three
+physical shards while fault_runner stays a single shard, eleven in total:
 
 | shard | Test boundary | Content identity highlights |
 |---|---|---|
 | `runtime_0..2` | Ordinary tests other than the static, deployment, fault runner and PostgreSQL entry points; each concrete nodeid enters exactly one part by SHA-256 modulo | dependencies, Runtime source, Runtime tests, shared fixtures, partition total and index |
-| `deployment` | `tests/admin/`, executable regional tests and the release/deploy/artifact root tests | dependencies, shared Runtime source, deployment/deploy-host-only source and deployment tests |
+| `deployment_0..3` | `tests/admin/`, executable regional tests and the release/deploy/artifact root tests; each concrete nodeid enters exactly one part by SHA-256 modulo | dependencies, shared Runtime source, deployment/deploy-host-only source, deployment tests, partition total and index |
 | `fault_runner` | `tests/test_case_scheduler.py`; the full catalog contract is still run by static | dependencies, shared Runtime source, testcases, runner/scheduler and runner tests |
-| `postgres` | The complete explicit inventory in `tests.postgres_files` | dependencies, shared Runtime source, PostgreSQL tests, actual PostgreSQL image |
+| `postgres_0..2` | The complete explicit inventory in `tests.postgres_files`; each concrete nodeid enters exactly one part by SHA-256 modulo, and the contract and stress passes use the same part | dependencies, shared Runtime source, PostgreSQL tests, actual PostgreSQL image, partition total and index |
 
 The entry point of the PostgreSQL shard is governed by `tests.postgres_files` in `config/ci-unit-gate.json`
 and is consistent with the serial PostgreSQL inventory check in the Makefile; a newly added native regression must not be placed only in an ordinary shard.
@@ -268,9 +271,9 @@ changes the runtime identity, invalidating and re-running all three runtime shar
 The runtime, fault runner and PostgreSQL coverage explicitly exclude the deploy-host-only modules;
 the deployment shard collects coverage of the full application source. This way, when only the standalone administrator CLI code changes, the old Runtime
 coverage does not carry stale line numbers of the changed modules, and only the deployment shard is invalidated. The final `unit` job again
-checks that the six shards belong to the current run, verifies their signatures and runs `coverage combine`, and only continues when the production scope reaches the 78% combined
+checks that the eleven shards belong to the current run, verifies their signatures and runs `coverage combine`, and only continues when the production scope reaches the 78% combined
 floor, every module gate passes, and production and runner each reach 95% for both statements and branches.
-All shards measure the cross-domain calls of the runner, so a runner source change conservatively invalidates all six shards; a pure
+All shards measure the cross-domain calls of the runner, so a runner source change conservatively invalidates every shard; a pure
 deploy-host change still does not invalidate the Runtime shards.
 
 The per-module floor is enforced only on the merged report: deployment-only modules are excluded by every runtime shard, and
@@ -285,7 +288,7 @@ Counts are computed as `covered_lines + covered_branches`, not as the total minu
 missing, non-integer, negative and mutually contradictory statistics are all refused. The 95% gate checks statements and branches of both scopes independently;
 see [Coverage and Scenario Matrix](../components/scenario-coverage.md); it does not narrow the existing source scope.
 
-The six pytest results are merged after validating discovery, the selection inventory, the complete execution phases and the shard content identity;
+The eleven pytest results are merged after validating discovery, the selection inventory, the complete execution phases and the shard content identity;
 a numeric worker protocol must also match the actual process count and the recorded request count; an auto-mode receipt must explicitly bind the request
 mode. A missing auto-mode proof or a wrongly typed count is never reused, and an old numeric receipt cannot bypass the actual-count check either.
 The PostgreSQL stress must also provide a complete receipt with no skips. The source identity, session and
@@ -294,7 +297,7 @@ validation subject in `validated_source_identity` and does not rewrite a histori
 unit gate uses schema 3, and old formats must not bypass the newly added gates.
 `make fault-test-cases-ci` maps these results directly onto the 64 unit/component fault cases without
 starting pytest again. The documentation/CI contract tests are run by the `static` job of the current commit, so docs or `.github/`
-changes can reuse the six shards but cannot skip the current static and artifact gates.
+changes can reuse every shard but cannot skip the current static and artifact gates.
 
 The local pytest reporter additionally records the start/end source identity, time, exit status and actual collection.
 A PASS for a fault case must have three successful phases, setup/call/teardown; a report carrying a session may not be reused if the execution
@@ -313,11 +316,23 @@ not a fixed SLA:
 | `863a557` / `33615185401` | Old monolithic unit | 18 min 44 s | unit 18 min 19 s; of which ordinary coverage 14 min 44 s | Included in the same unit |
 | `a6dd742` / `33620340339` | Six signed shards | 6 min 18 s | `runtime_2` 4 min 53 s | unit 57 s |
 | `f90fdad` / `33622247519` | Fresh after the stability fixes | 6 min 10 s | `runtime_1` 4 min 41 s | unit 59 s |
+| `adcaadff` / `37124211673` | Six shards + a single shuffled job (after the suite grew) | 39 min 14 s | `shuffled-order` 39 min; `coverage-deployment` 36 min; `coverage-postgres` 30 min | unit not run |
+| `ci/faster-pipeline` / see below | Eleven shards + four shuffled shards | see below | see below | see below |
 
-The new process reduces the fresh total wall clock by about 66%. Other reference values in the same run are: deployment 3 min 08 s,
-PostgreSQL contract+stress 2 min 20 s, static 2 min 40 s, artifact 1 min 23 s. Later comparisons should also
-check the artifact's `test-durations.json`, so that Runner queueing, dependency installation or the long tail of a single
-test is not missed by looking only at the total duration.
+Before the 2026-10-03 re-sharding the suite had grown to about 41,000 nodeids: the single shuffled job, the single
+deployment shard and the serial PostgreSQL shard each needed 30-40 minutes, and even in parallel they held the whole
+pipeline at 40-45 minutes. Re-sharding only changes which slice each job receives, not the test set, the coverage floors,
+the signing protocol or the shuffled order itself (see the partition proofs in `tests/test_ci_unit_gate.py` and
+`tests/test_test_suite_contracts.py`). The fixed overhead per job (checkout, cached pip install, cosign) is about one
+minute and is not the bottleneck.
+
+The long tail of a single test cannot be spread by sharding: the whole-suite collection probe in
+`tests/test_optional_postgres_collection.py` takes about 4.5 minutes and several cases in
+`tests/regional/test_clean_redeploy_script.py` take 40-55 seconds, so the shard that holds them cannot be shorter than
+they are. Further reduction needs a larger Runner (`CI_TEST_RUNNER` together with `CI_PYTEST_WORKERS`) or shorter tests.
+
+Later comparisons should also check the artifact's `test-durations.json`, so that Runner queueing, dependency
+installation or the long tail of a single test is not missed by looking only at the total duration.
 
 `artifact-check` generates only one set of canonical Control Plane, Executor and Node Runtime wheels and the
 Node bundle. The source-only Manifest has `deployable=false` but includes the physical SHAs,
@@ -333,7 +348,7 @@ workflow to sign after the candidate's signature verification succeeds.
 The aggregation job `test` depends on three jobs and requires `success` from each of them. On a main push it:
 
 1. downloads the complete `dist/` generated by the artifact job;
-2. downloads the aggregated signed gate generated by the unit job in this run, verifies the signature again, and checks the six shard gates,
+2. downloads the aggregated signed gate generated by the unit job in this run, verifies the signature again, and checks the eleven shard gates,
    signature bundles, content identities and evidence inside it;
 3. requires a clean working tree and reads the source-only schema v3 Manifest;
 4. records the Git commit, Git tree, repository, main CI workflow ref and run ID;
@@ -354,7 +369,7 @@ After Release checks out the target commit, it first resolves the matching succe
 1. verifies the CI gate signature with the exact CI workflow certificate identity and the GitHub Actions issuer;
 2. verifies that the gate's commit, tree and repository match the current checkout;
 3. recomputes the candidate Manifest SHA and the complete file inventory;
-4. verifies again the independent Cosign signatures of the aggregated unit gate and the six coverage shards;
+4. verifies again the independent Cosign signatures of the aggregated unit gate and the eleven coverage shards;
 5. only after everything matches does it obtain the AWS OIDC identity, log in to ECR and install the release dependencies.
 
 Therefore a manually supplied other run ID, a tag pointing at a commit that did not pass main CI, a candidate with missing files, or artifacts mixed across runs all
@@ -562,7 +577,7 @@ artifact, not an automatically created GitHub Release asset, and it is not copie
 
 | Location | Producer | Purpose |
 |---|---|---|
-| `dist/ci-domains/unit/unit-gate.json` | main CI `unit` job | Aggregates the six current-run shards and the unified coverage/fault/duration evidence |
+| `dist/ci-domains/unit/unit-gate.json` | main CI `unit` job | Aggregates the eleven current-run shards and the unified coverage/fault/duration evidence |
 | `dist/ci-domains/unit/unit-gate.bundle.json` | main CI `cosign sign-blob` | Sigstore signature of the unit domain gate |
 | `dist/ci-domains/unit/shards/<shard>/coverage-shard-gate.json` | the corresponding coverage job | Binds a single shard's content identity, producer and coverage/pytest/duration evidence |
 | `coverage-shard-gate.bundle.json` in the same directory | `cosign sign-blob` of the corresponding coverage job | Independent Sigstore signature of a single shard |
@@ -593,8 +608,8 @@ Do not confuse the following three names:
 
 The release chain is bound layer by layer through the following relationships:
 
-1. the six coverage shards each bind their own domain content, test environment and evidence, and are signed by the fixed main CI identity;
-2. the unit domain gate verifies the signatures of and aggregates the six current-run shards and the unified coverage floor, fault and duration evidence;
+1. the eleven coverage shards each bind their own domain content, test environment and evidence, and are signed by the fixed main CI identity;
+2. the unit domain gate verifies the signatures of and aggregates the eleven current-run shards and the unified coverage floor, fault and duration evidence;
 3. the CI gate of the current commit verifies the signature of and binds the unit domain gate, and also binds the current tree, static and artifact results;
 4. the Runtime Image descriptor binds the OCI digests, build inputs and the image components in the candidate;
 5. Manifest v4 binds the three wheels, the Node bundle, the independent runtime images, the node wheelhouse inventory and the delivery identity;

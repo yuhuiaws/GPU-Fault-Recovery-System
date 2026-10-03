@@ -12,6 +12,7 @@ from coverage import CoverageData
 
 from scripts import ci_coverage_gate as gate
 from scripts import ci_gate_artifacts, ci_unit_gate
+from scripts.ci_coverage_config import POSTGRES_SHARDS, is_postgres_shard
 from scripts.ci_pytest_evidence import (
     aggregate_pytest_results,
     ci_context,
@@ -41,7 +42,7 @@ def rebuild(root: Path, artifact: Path, identity: dict) -> dict:
         durations=artifact / gate.DURATIONS_NAME,
         stress_results=(
             artifact / gate.STRESS_RESULTS_NAME
-            if identity["shard"] == "postgres"
+            if is_postgres_shard(identity["shard"])
             else None
         ),
     )
@@ -56,7 +57,7 @@ def runtime_shard(tmp_path, monkeypatch):
     return root, artifact, current, json.loads(report.read_text(encoding="utf-8"))
 
 
-@pytest.fixture(params=[shard for shard in gate.SHARDS if shard != "postgres"])
+@pytest.fixture(params=[shard for shard in gate.SHARDS if not is_postgres_shard(shard)])
 def worker_shard(request, tmp_path, monkeypatch):
     root = _committed_root(tmp_path)
     artifact = tmp_path / request.param
@@ -426,7 +427,7 @@ def test_postgres_contract_cannot_substitute_for_mandatory_stress(
 ):
     root = _committed_root(tmp_path)
     artifact = tmp_path / "postgres"
-    current = _build_shard(root, artifact, "postgres", monkeypatch)
+    current = _build_shard(root, artifact, POSTGRES_SHARDS[0], monkeypatch)
     report = artifact / gate.STRESS_RESULTS_NAME
     value = json.loads(report.read_text(encoding="utf-8"))
     record = next(iter(value["records"].values()))
@@ -465,7 +466,7 @@ def test_postgres_worker_receipts_remain_strictly_serial(
 ):
     root = _committed_root(tmp_path)
     artifact = tmp_path / "postgres"
-    current = _build_shard(root, artifact, "postgres", monkeypatch)
+    current = _build_shard(root, artifact, POSTGRES_SHARDS[0], monkeypatch)
     report = artifact / (
         gate.STRESS_RESULTS_NAME
         if suite == "postgres_stress"
@@ -487,7 +488,7 @@ def test_postgres_serial_workers_are_independent_of_nonpostgres_worker_budget(
 ):
     root = _committed_root(tmp_path)
     artifact = tmp_path / "postgres"
-    current = _build_shard(root, artifact, "postgres", monkeypatch)
+    current = _build_shard(root, artifact, POSTGRES_SHARDS[0], monkeypatch)
     identity = identity_with_workers(root, current["identity"], workers)
     report = artifact / (
         gate.STRESS_RESULTS_NAME
@@ -656,7 +657,7 @@ def test_aggregate_cannot_hide_incomplete_or_incompatible_receipts(aggregate, de
     elif defect == "missing-result":
         value["records"].pop(next(iter(value["records"])))
     elif defect == "missing-stress":
-        value["shards"]["postgres"]["postgres_stress"] = None
+        value["shards"][POSTGRES_SHARDS[0]]["postgres_stress"] = None
     elif defect == "relabel":
         value["source_identity"] = source_identity(root)
     elif defect == "source-drift":
@@ -722,7 +723,7 @@ def test_aggregate_revalidates_worker_binding_on_creation_and_reuse(
 @pytest.mark.parametrize("field", ["numprocesses", "requested_numprocesses"])
 def test_aggregate_revalidates_postgres_stress_serial_workers(aggregate, field):
     root, _gates, value = aggregate
-    stress = value["shards"]["postgres"]["postgres_stress"]["receipt"]
+    stress = value["shards"][POSTGRES_SHARDS[0]]["postgres_stress"]["receipt"]
     stress["session"]["selection"][field] = False
     with pytest.raises(ValueError, match="must run serially"):
         gate.parse_combined_pytest_receipt(value, root, source_identity(root))
@@ -734,7 +735,7 @@ def test_aggregate_reuses_automatic_workers_without_relabeling_the_request(
 ):
     root, gates, _value = aggregate
     for shard, (path, current) in list(gates.items()):
-        if shard == "postgres":
+        if is_postgres_shard(shard):
             continue
         identity = identity_with_workers(root, current["identity"], mode)
         report = path.parent / gate.PYTEST_RESULTS_NAME

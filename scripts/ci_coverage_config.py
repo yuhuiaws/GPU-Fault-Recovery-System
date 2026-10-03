@@ -33,11 +33,29 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config/ci-unit-gate.json"
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 POSTGRES_TEST_URL_ENV = "GPU_FAULT_TEST_POSTGRES_URL"
-RUNTIME_SHARDS = ("runtime_0", "runtime_1", "runtime_2")
-SHARDS = (*RUNTIME_SHARDS, "deployment", "fault_runner", "postgres")
 TEST_DOMAINS = ("runtime", "deployment", "fault_runner", "postgres")
+# Logical domains split into physical shards by ``partition_for_nodeid`` (a
+# SHA-256 of the stable pytest nodeid modulo the count): deterministic, disjoint
+# and complete, and every shard of a domain carries the same content identity
+# groups plus its own ``partition_count``/``partition_index``. The counts are
+# the CI matrix widths; ``config/ci-unit-gate.json`` must agree
+# (``protocol.partitions``) and ``.github/workflows/ci.yml`` is pinned to them
+# by tests/test_script_assets.py. Sized from the 2026-10-03 ubuntu-latest
+# measurements (4 workers): deployment 36 min as one shard, postgres 15 min
+# contract + 14 min stress serially, runtime 7-11 min per third.
+PARTITIONED_DOMAINS: dict[str, int] = {"runtime": 3, "deployment": 4, "postgres": 3}
+
+
+def _partition_shards(domain: str) -> tuple[str, ...]:
+    return tuple(f"{domain}_{index}" for index in range(PARTITIONED_DOMAINS[domain]))
+
+
+RUNTIME_SHARDS = _partition_shards("runtime")
+DEPLOYMENT_SHARDS = _partition_shards("deployment")
+POSTGRES_SHARDS = _partition_shards("postgres")
+SHARDS = (*RUNTIME_SHARDS, *DEPLOYMENT_SHARDS, "fault_runner", *POSTGRES_SHARDS)
 IDENTITY_GROUPS = {
     "dependencies",
     "deployment_source",
@@ -82,7 +100,7 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         or not isinstance(value.get("identity"), dict)
         or not isinstance(value.get("protocol"), dict)
         or set(value.get("shards", {})) != set(SHARDS)
-        or value["protocol"].get("runtime_partitions") != len(RUNTIME_SHARDS)
+        or value["protocol"].get("partitions") != PARTITIONED_DOMAINS
     ):
         raise CoverageGateError("coverage shard config is incomplete")
     identity = value["identity"]
@@ -121,15 +139,16 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
             raise CoverageGateError("PostgreSQL stress protocol is incomplete")
     for shard in SHARDS:
         raw = value["shards"][shard]
+        domain = logical_test_domain(shard)
         required_groups = {
             "dependencies",
             "protocol",
             "runtime_source",
             "fault_runner_source",
             "shared_tests",
-            f"{logical_test_domain(shard)}_tests",
+            f"{domain}_tests",
         }
-        if shard == "deployment":
+        if domain == "deployment":
             required_groups.add("deployment_source")
         if (
             not isinstance(raw, dict)
@@ -137,7 +156,7 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
             or not isinstance(raw.get("omit_deployment_source"), bool)
             or not set(raw["identity_groups"]) <= IDENTITY_GROUPS
             or not required_groups <= set(raw["identity_groups"])
-            or raw["omit_deployment_source"] != (shard != "deployment")
+            or raw["omit_deployment_source"] != (domain != "deployment")
         ):
             raise CoverageGateError(f"coverage shard config is invalid: {shard}")
     return value
@@ -350,11 +369,34 @@ def _test_owner(relative: str, config: Mapping[str, Any], *, root: Path) -> str 
 
 
 def logical_test_domain(shard: str) -> str:
-    return "runtime" if shard in RUNTIME_SHARDS else shard
+    """The test domain a shard (or a domain name itself) belongs to."""
+    if shard in TEST_DOMAINS:
+        return shard
+    domain, separator, index = shard.rpartition("_")
+    if separator and domain in PARTITIONED_DOMAINS and index.isdecimal():
+        return domain
+    return shard
+
+
+def shard_partition(shard: str) -> tuple[int, int] | None:
+    """``(count, index)`` for a physical shard of a partitioned domain, else
+    ``None`` for a domain that runs as a single shard."""
+    if shard not in SHARDS:
+        raise CoverageGateError(f"unknown coverage shard: {shard}")
+    domain = logical_test_domain(shard)
+    if domain == shard:
+        return None
+    return PARTITIONED_DOMAINS[domain], int(shard.rsplit("_", 1)[1])
+
+
+def is_postgres_shard(shard: str) -> bool:
+    return logical_test_domain(shard) == "postgres"
 
 
 def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
-    if shard not in SHARDS:
+    """Test files of ``shard``; a logical domain name selects the same files
+    as any of its physical shards (the nodeid partition happens at collection)."""
+    if shard not in SHARDS and shard not in TEST_DOMAINS:
         raise CoverageGateError(f"unknown coverage shard: {shard}")
     config = load_config(root)
     expected_group = f"{logical_test_domain(shard)}_tests"

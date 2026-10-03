@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from scripts.ci_coverage_config import POSTGRES_SHARDS, SHARDS, is_postgres_shard
 from scripts.e2e.render_manifest import (
     RUNTIME_PROFILE_PLACEHOLDER,
     WHEEL_CONFIGMAP_PLACEHOLDER,
@@ -206,13 +207,19 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         "/tmp/"
     ), "static CI must keep compileall output outside the checkout"
     coverage_job = workflow["jobs"]["coverage"]
+    # One matrix leg per physical shard of scripts/ci_coverage_config.py: the
+    # unit gate refuses an incomplete shard set, so a leg missing here would
+    # fail every run, while an extra leg would be an unverified job.
     assert coverage_job["strategy"]["matrix"]["shard"] == [
-        "runtime_0",
-        "runtime_1",
-        "runtime_2",
-        "deployment",
-        "fault_runner",
+        shard for shard in SHARDS if not is_postgres_shard(shard)
     ]
+    assert coverage_job["strategy"]["fail-fast"] is False
+    postgres_job = workflow["jobs"]["postgres"]
+    assert postgres_job["strategy"]["matrix"]["shard"] == list(POSTGRES_SHARDS)
+    assert postgres_job["strategy"]["fail-fast"] is False
+    assert postgres_job["name"] == "coverage-${{ matrix.shard }}", (
+        "the restore step looks a prior shard up by its coverage-<shard> job name"
+    )
     assert "CI_TEST_RUNNER" in coverage_job["runs-on"]
     assert coverage_job["env"]["PYTEST_XDIST_DIST"] == "worksteal"
     coverage_steps = coverage_job["steps"]
@@ -249,6 +256,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         if step.get("name") == "Run PostgreSQL coverage and stress shard"
     )
     assert "COVERAGE_INCLUDE_STRESS=1" in postgres_run["run"]
+    assert 'COVERAGE_SHARD="${{ matrix.shard }}"' in postgres_run["run"]
 
     steps = workflow["jobs"]["unit"]["steps"]
     combine_index = next(

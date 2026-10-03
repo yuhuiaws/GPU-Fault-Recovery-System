@@ -22,6 +22,8 @@ from tests._cluster_binary_guard import MARKER
 from tests._cluster_binary_guard import install as install_binary_guard
 
 SHUFFLE_SEED_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SEED"
+SHUFFLE_SHARDS_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SHARDS"
+SHUFFLE_SHARD_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SHARD"
 
 
 OUTBOX_RETRY_MARKER = "collector_outbox_retry"
@@ -56,7 +58,9 @@ def _isolate_postgres_per_worker() -> None:
     os.environ["GPU_FAULT_TEST_POSTGRES_URL"] = worker_database_url(base_url, worker)
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     """Shuffle the run order when a seed is exported, to expose order coupling.
 
     CI 一直按同一个顺序跑：分片固定、``--dist worksteal`` 的分发也总是从同一个
@@ -75,9 +79,20 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
       跑一遍这个钩子，要是让它们各自摇一个种子，收集结果就对不上，xdist 会直接
       以 "Different tests were collected" 中止。种子由调用方（``make
       test-shuffled``）摇好再传进来，worker 继承同一个环境变量，顺序才一致。
+
+    CI 把这一轮拆到多个 Runner 上跑：``GPU_FAULT_TEST_SHUFFLE_SHARDS=N`` 和
+    ``GPU_FAULT_TEST_SHUFFLE_SHARD=i`` 让本进程只保留整体打乱序列里下标
+    ``i, i+N, i+2N, ...`` 的用例（``shuffle_shard_selection``）。切片取在打乱之后，
+    所以每一份都是完整打乱顺序的子序列，N 份互不相交、并集等于全部收集结果；
+    同一种子不分片重放，得到的就是把 N 份按原位插回去的那一条完整顺序。
     """
     raw = os.environ.get(SHUFFLE_SEED_VARIABLE, "").strip()
+    shards = _shuffle_shard()
     if not raw:
+        if shards is not None:
+            raise pytest.UsageError(
+                f"{SHUFFLE_SHARDS_VARIABLE} requires {SHUFFLE_SEED_VARIABLE}"
+            )
         return
     try:
         seed = int(raw)
@@ -87,6 +102,48 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         ) from None
     items.sort(key=lambda item: item.nodeid)
     random.Random(seed).shuffle(items)
+    if shards is None:
+        return
+    count, index = shards
+    selected = shuffle_shard_selection(items, count, index)
+    selected_ids = {id(item) for item in selected}
+    deselected = [item for item in items if id(item) not in selected_ids]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+
+def _shuffle_shard() -> tuple[int, int] | None:
+    """``(count, index)`` from the shard variables, or ``None`` when unset.
+
+    Both must be present together; a count without an index (or the reverse)
+    is a misconfigured job, not a request for the whole suite.
+    """
+    raw_count = os.environ.get(SHUFFLE_SHARDS_VARIABLE, "").strip()
+    raw_index = os.environ.get(SHUFFLE_SHARD_VARIABLE, "").strip()
+    if not raw_count and not raw_index:
+        return None
+    if not raw_count.isdecimal() or not raw_index.isdecimal():
+        raise pytest.UsageError(
+            f"{SHUFFLE_SHARDS_VARIABLE} and {SHUFFLE_SHARD_VARIABLE} must both be "
+            f"non-negative integers, got {raw_count!r} and {raw_index!r}"
+        )
+    count, index = int(raw_count), int(raw_index)
+    if count < 1 or index >= count:
+        raise pytest.UsageError(
+            f"{SHUFFLE_SHARD_VARIABLE}={index} is outside "
+            f"{SHUFFLE_SHARDS_VARIABLE}={count}"
+        )
+    return count, index
+
+
+def shuffle_shard_selection[T](ordered: list[T], count: int, index: int) -> list[T]:
+    """Shard ``index`` of ``count``: every ``count``-th element of the shuffled
+    order starting at ``index``. Pure, so the partition proof in
+    ``tests/test_test_suite_contracts.py`` can exercise it directly."""
+    if count < 1 or not 0 <= index < count:
+        raise ValueError("shuffle shard index is outside the configured count")
+    return ordered[index::count]
 
 
 def pytest_report_header() -> list[str]:
@@ -98,7 +155,14 @@ def pytest_report_header() -> list[str]:
     raw = os.environ.get(SHUFFLE_SEED_VARIABLE, "").strip()
     if not raw:
         return []
-    return [f"test order shuffled: {SHUFFLE_SEED_VARIABLE}={raw}"]
+    lines = [f"test order shuffled: {SHUFFLE_SEED_VARIABLE}={raw}"]
+    shards = _shuffle_shard()
+    if shards is not None:
+        lines.append(
+            f"shuffled shard {shards[1]} of {shards[0]}: "
+            f"{SHUFFLE_SHARDS_VARIABLE}={shards[0]} {SHUFFLE_SHARD_VARIABLE}={shards[1]}"
+        )
+    return lines
 
 
 @pytest.fixture(autouse=True)

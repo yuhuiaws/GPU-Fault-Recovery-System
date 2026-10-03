@@ -19,6 +19,15 @@ import pytest
 from coverage import CoverageData
 
 from scripts import ci_coverage_gate, ci_gate_artifacts, ci_unit_gate
+from scripts.ci_coverage_config import (
+    DEPLOYMENT_SHARDS,
+    PARTITIONED_DOMAINS,
+    POSTGRES_SHARDS,
+    RUNTIME_SHARDS,
+    is_postgres_shard,
+    logical_test_domain,
+    shard_partition,
+)
 from scripts.ci_pytest_evidence import aggregate_pytest_results, ci_context
 from scripts.component_wheels import APPLICATION_COMPONENT_NAMES, component_modules
 from tools.coverage_objectives import SCOPES, measured_files
@@ -87,11 +96,11 @@ def _identity(root: Path, shard: str) -> dict:
     return ci_coverage_gate.shard_identity(
         root,
         shard,
-        postgres_image="sha256:postgres" if shard == "postgres" else "",
+        postgres_image="sha256:postgres" if is_postgres_shard(shard) else "",
         distributions={"coverage": "7.16.0", "pytest": "9.1.1"},
         environment_identity={
             "machine": "x86_64",
-            "postgres_image": ("sha256:postgres" if shard == "postgres" else ""),
+            "postgres_image": ("sha256:postgres" if is_postgres_shard(shard) else ""),
             "python_cache_tag": "cpython-312",
             "python_implementation": "CPython",
             "python_version": "3.12.14",
@@ -325,13 +334,13 @@ def test_native_activation_and_history_partitions_preserve_shared_backends() -> 
         "native wrappers must not move their Memory/SQLite helpers into PostgreSQL"
     )
     for shard in ci_coverage_gate.SHARDS:
-        if shard == "postgres":
+        if is_postgres_shard(shard):
             continue
         targets = set(ci_coverage_gate.pytest_targets(ROOT, shard))
         assert (native | {history}).isdisjoint(targets), (
             "PostgreSQL-dependent modules must not leak into ordinary coverage"
         )
-        if shard in ci_coverage_gate.RUNTIME_SHARDS:
+        if logical_test_domain(shard) == "runtime":
             assert shared <= targets, (
                 "every runtime nodeid partition must retain the shared backend tests"
             )
@@ -415,17 +424,37 @@ def test_postgres_gate_detection_reads_the_environment_not_mentions(
         assert relative in runtime, f"{relative} must remain an ordinary test"
 
 
-def test_runtime_nodeid_partitions_are_stable_disjoint_and_complete() -> None:
-    nodeids = [f"tests/test_runtime.py::test_case[{index}]" for index in range(1000)]
-    count = len(ci_coverage_gate.RUNTIME_SHARDS)
+@pytest.mark.parametrize("domain", sorted(PARTITIONED_DOMAINS))
+def test_nodeid_partitions_are_stable_disjoint_and_complete(domain: str) -> None:
+    nodeids = [f"tests/test_{domain}.py::test_case[{index}]" for index in range(1000)]
+    count = PARTITIONED_DOMAINS[domain]
+    shards = [shard for shard in ci_coverage_gate.SHARDS if shard.startswith(domain)]
     partitions = [
         {nodeid for nodeid in nodeids if partition_for_nodeid(nodeid, count) == index}
         for index in range(count)
     ]
 
+    assert [shard_partition(shard) for shard in shards] == [
+        (count, index) for index in range(count)
+    ], "every physical shard of the domain must own exactly one partition slot"
     assert set.union(*partitions) == set(nodeids)
     assert sum(len(partition) for partition in partitions) == len(nodeids)
-    assert max(map(len, partitions)) - min(map(len, partitions)) < 80
+    assert max(map(len, partitions)) - min(map(len, partitions)) < 80 * count / 3
+
+
+def test_shard_names_resolve_to_their_logical_domain() -> None:
+    assert logical_test_domain("fault_runner") == "fault_runner"
+    assert shard_partition("fault_runner") is None
+    assert {logical_test_domain(shard) for shard in RUNTIME_SHARDS} == {"runtime"}
+    assert {logical_test_domain(shard) for shard in DEPLOYMENT_SHARDS} == {"deployment"}
+    assert all(is_postgres_shard(shard) for shard in POSTGRES_SHARDS), (
+        "every postgres partition must be recognised as a PostgreSQL shard"
+    )
+    assert not any(
+        is_postgres_shard(shard) for shard in (*RUNTIME_SHARDS, *DEPLOYMENT_SHARDS)
+    ), "no runtime or deployment partition may be treated as PostgreSQL"
+    with pytest.raises(ci_coverage_gate.CoverageGateError, match="unknown"):
+        shard_partition("postgres")
 
 
 def test_coverage_excludes_the_static_documentation_and_ci_tests() -> None:
@@ -524,7 +553,7 @@ def test_coverage_config_names_the_deploy_roots_as_deployment_only_sources() -> 
     config = ci_coverage_gate.load_config(ROOT)
     coverage = config["coverage"]
 
-    assert config["schema_version"] == 4
+    assert config["schema_version"] == 5
     assert "source" not in coverage
     assert coverage["sources"] == [
         "src/gpu_fault",
@@ -621,7 +650,7 @@ def test_only_the_deployment_shard_measures_the_deploy_roots(
     protocol = _identity(root, shard)["protocol"]
     assert "coverage_source" not in protocol
     assert set(protocol["coverage_sources"]) == sources
-    if shard == "deployment":
+    if logical_test_domain(shard) == "deployment":
         assert sources == {
             "src/gpu_fault",
             "src/gpu_fault_release",
@@ -664,14 +693,14 @@ def test_non_deployment_shard_measuring_deploy_source_is_rejected(
         ("requirements/build.lock", set(ci_coverage_gate.SHARDS)),
         ("Makefile", set(ci_coverage_gate.SHARDS)),
         ("src/gpu_fault/runtime.py", set(ci_coverage_gate.SHARDS)),
-        ("src/gpu_fault/admin/only.py", {"deployment"}),
-        ("src/gpu_fault_release/regional_release_config.py", {"deployment"}),
-        ("deploy/control-plane/regional/probes/node_probe.py", {"deployment"}),
-        ("deploy/control-plane/tools/cleanup_state.py", {"deployment"}),
-        ("tests/test_runtime.py", set(ci_coverage_gate.RUNTIME_SHARDS)),
-        ("tests/admin/test_admin.py", {"deployment"}),
+        ("src/gpu_fault/admin/only.py", set(DEPLOYMENT_SHARDS)),
+        ("src/gpu_fault_release/regional_release_config.py", set(DEPLOYMENT_SHARDS)),
+        ("deploy/control-plane/regional/probes/node_probe.py", set(DEPLOYMENT_SHARDS)),
+        ("deploy/control-plane/tools/cleanup_state.py", set(DEPLOYMENT_SHARDS)),
+        ("tests/test_runtime.py", set(RUNTIME_SHARDS)),
+        ("tests/admin/test_admin.py", set(DEPLOYMENT_SHARDS)),
         ("tests/test_case_scheduler.py", {"fault_runner"}),
-        ("tests/store/test_postgres_store.py", {"postgres"}),
+        ("tests/store/test_postgres_store.py", set(POSTGRES_SHARDS)),
         ("testcases/fault-scenarios.yaml", set(ci_coverage_gate.SHARDS)),
         ("tools/case_scheduler.py", set(ci_coverage_gate.SHARDS)),
         ("scripts/e2e/regional/sample.py", set(ci_coverage_gate.SHARDS)),
@@ -706,7 +735,7 @@ def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
         root / "scripts/e2e/regional/sample.py",
         root / "src/gpu_fault/admin/config.py",
     ]
-    if shard == "deployment":
+    if logical_test_domain(shard) == "deployment":
         # Every deployment-only module has a module floor, and a floor that
         # matches no measured file is itself a failure, so the shard that owns
         # them has to measure all of them.
@@ -734,20 +763,18 @@ def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
 def _pytest_value(root: Path, identity: dict, *, suite: str = "pytest") -> dict:
     shard = identity["shard"]
     targets = list(ci_coverage_gate.pytest_targets(root, shard))
-    partition = (
-        [3, ci_coverage_gate.RUNTIME_SHARDS.index(shard)]
-        if shard in ci_coverage_gate.RUNTIME_SHARDS
-        else None
-    )
+    slot = shard_partition(shard)
+    partition = list(slot) if slot is not None else None
     discovered = sorted(
         f"{target}::test_pass[{index}]"
         for target in targets
-        for index in range(12 if partition is not None else 1)
+        for index in range(4 * partition[0] if partition is not None else 1)
     )
     selected = [
         nodeid
         for nodeid in discovered
-        if partition is None or partition_for_nodeid(nodeid, 3) == partition[1]
+        if partition is None
+        or partition_for_nodeid(nodeid, partition[0]) == partition[1]
     ]
     original = source_identity(root)
     return {
@@ -770,7 +797,7 @@ def _pytest_value(root: Path, identity: dict, *, suite: str = "pytest") -> dict:
                 "keyword": "",
                 "markexpr": "",
                 "deselect": [],
-                "numprocesses": 0 if shard == "postgres" else 4,
+                "numprocesses": 0 if is_postgres_shard(shard) else 4,
                 "stress_workers": "8" if suite == "postgres_stress" else "",
                 "stress_rounds": "40" if suite == "postgres_stress" else "",
             },
@@ -804,7 +831,7 @@ def _write_durations(path: Path, shard: str) -> None:
                 "pytest": {"record_count": 1, "slowest": [], "wall_seconds": 1.0},
                 "postgres_stress": (
                     {"record_count": 1, "slowest": [], "wall_seconds": 1.0}
-                    if shard == "postgres"
+                    if is_postgres_shard(shard)
                     else None
                 ),
             }
@@ -837,7 +864,7 @@ def _build_shard(
     durations = destination / ci_coverage_gate.DURATIONS_NAME
     stress = (
         destination / ci_coverage_gate.STRESS_RESULTS_NAME
-        if shard == "postgres"
+        if is_postgres_shard(shard)
         else None
     )
     _write_coverage_data(root, coverage_data, shard)
@@ -1101,9 +1128,18 @@ def test_coverage_combine_uses_the_configured_data_file_basename(
     assert summary["meta"]["branch_coverage"] is True, (
         "branch-enabled shard proofs must combine real branch data"
     )
-    assert len(merged["records"]) == 15, (
-        "all runtime variants and other domains survive"
-    )
+    expected_records = {
+        nodeid
+        for shard in ci_coverage_gate.SHARDS
+        for nodeid in _pytest_value(root, _identity(root, shard))["records"]
+    }
+    assert set(merged["records"]) == expected_records and len(expected_records) == (
+        sum(
+            4 * count * len(ci_coverage_gate.pytest_targets(root, domain))
+            for domain, count in PARTITIONED_DOMAINS.items()
+        )
+        + len(ci_coverage_gate.pytest_targets(root, "fault_runner"))
+    ), "every partition slice of every domain survives the merge exactly once"
 
 
 def test_reusable_artifact_requires_a_successful_producer_job(

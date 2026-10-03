@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "domain": "unit",
   "coverage": {
     "branch": true,
@@ -236,13 +236,17 @@
     ]
   },
   "protocol": {
+    "partitions": {
+      "deployment": 4,
+      "postgres": 3,
+      "runtime": 3
+    },
     "postgres_image": "postgres:16",
     "postgres_stress_rounds": 40,
     "postgres_stress_workers": 8,
     "pytest_dist": "worksteal",
     "pytest_durations": 50,
-    "pytest_workers": 4,
-    "runtime_partitions": 3
+    "pytest_workers": 4
   },
   "shards": {
     "runtime_0": {
@@ -278,7 +282,43 @@
       ],
       "omit_deployment_source": true
     },
-    "deployment": {
+    "deployment_0": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "deployment_source",
+        "deployment_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": false
+    },
+    "deployment_1": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "deployment_source",
+        "deployment_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": false
+    },
+    "deployment_2": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "deployment_source",
+        "deployment_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": false
+    },
+    "deployment_3": {
       "identity_groups": [
         "dependencies",
         "protocol",
@@ -301,7 +341,29 @@
       ],
       "omit_deployment_source": true
     },
-    "postgres": {
+    "postgres_0": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "postgres_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": true
+    },
+    "postgres_1": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "postgres_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": true
+    },
+    "postgres_2": {
       "identity_groups": [
         "dependencies",
         "protocol",

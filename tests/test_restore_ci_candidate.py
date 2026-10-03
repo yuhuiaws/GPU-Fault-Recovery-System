@@ -112,7 +112,8 @@ def test_candidate_verification_covers_gate_unit_and_all_shards(
         )
         == gate
     )
-    assert len(verified) == 8
+    # the CI gate, the unit gate, and one coverage gate per physical shard
+    assert len(verified) == len(restore_ci_candidate.EXPECTED_SHARDS) + 2
     assert {path.parent.name for path in verified if "coverage" in path.name} == (
         restore_ci_candidate.EXPECTED_SHARDS
     )

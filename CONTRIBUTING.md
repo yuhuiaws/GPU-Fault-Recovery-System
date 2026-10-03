@@ -170,14 +170,24 @@ floor（族内某个覆盖良好的模块不得替兄弟模块背书）。新增
 匹配不到任何被测文件同样是失败，避免模块改名后floor被静默作废。
 
 main CI把fresh门禁分成`runtime`、`deployment`、`fault_runner`和`postgres`四个逻辑
-域；其中runtime按稳定pytest nodeid哈希拆成`runtime_0..2`，因此共有六个并行物理
-shard。每个shard按自己的源码、测试、依赖和Runner环境计算内容身份，独立恢复、验签、
+域；其中runtime、deployment和postgres按稳定pytest nodeid哈希拆成`runtime_0..2`、
+`deployment_0..3`和`postgres_0..2`（`config/ci-unit-gate.json`的`protocol.partitions`，
+与`scripts/ci_coverage_config.py`一致），因此共有十一个并行物理shard；每个PostgreSQL
+shard在自己的job级service上仍然串行执行contract和stress。每个shard按自己的源码、
+测试、依赖和Runner环境计算内容身份，独立恢复、验签、
 重签和上传；聚合`unit` job最后执行`coverage combine`，同时强制生产78%组合floor、
 per-module floor 和两范围的95%语句/分支门禁，再生成
 fault report和签名unit gate。deploy-host-only管理员源码只进入deployment shard；
-文档或`.github/`变化由当前static验证，可复用六个历史shard。所有pytest shard保留
+文档或`.github/`变化由当前static验证，可复用全部历史shard。所有pytest shard保留
 `--durations`结构化证据。仓库已配置较高规格Runner时可设置`CI_TEST_RUNNER`及匹配的
 `CI_PYTEST_WORKERS`，未设置时保持`ubuntu-latest`和4个worker。
+
+打乱顺序门禁（`make test-shuffled`）在CI里同样拆成四个Runner：每个job用同一个
+`GPU_FAULT_TEST_SHUFFLE_SEED`（run id）打乱完整收集结果，再由
+`GPU_FAULT_TEST_SHUFFLE_SHARDS=4`和`GPU_FAULT_TEST_SHUFFLE_SHARD=<i>`只保留整体顺序里
+下标`i, i+4, i+8, ...`的用例（`tests/conftest.py`）。四份互不相交、并集等于全部用例，
+每份都是完整打乱顺序的子序列；本地复现某个红shard时导出同样三个变量即可，不带分片
+变量重放同一种子得到的就是整条顺序。
 
 分片回执必须具有完整 discovery、实际选择清单、成功的 setup/call/teardown 和相符的
 内容身份；必跑 PostgreSQL stress 不允许 skip。历史复用保留首次执行的 producer、
@@ -193,7 +203,7 @@ PostgreSQL仍显式串行`-n 0`，不继承普通测试的进程数。
 收集成功不代表运行了PostgreSQL测试。
 测试默认清除从部署进程继承的`KUBECONFIG`，需要Kubernetes配置的用例必须显式设置
 自己的本地夹具。该隔离不替代集群命令守卫，也不授权测试访问部署机上的真实集群。
-所有分片都可能通过跨域测试执行 runner，因此 runner 源码变化保守失效六个分片；
+所有分片都可能通过跨域测试执行 runner，因此 runner 源码变化保守失效全部分片；
 纯 deploy-host 修改仍只失效 deployment，不扩大应用 wheel 的包含范围。
 
 覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`、调低`coverage.module_floors`、

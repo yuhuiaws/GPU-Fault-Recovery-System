@@ -101,11 +101,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Physical shards of scripts/ci_coverage_config.py: runtime and
+        # deployment are split by a SHA-256 of the pytest nodeid (disjoint,
+        # complete, deterministic); tests/test_script_assets.py pins this list.
         shard:
           - runtime_0
           - runtime_1
           - runtime_2
-          - deployment
+          - deployment_0
+          - deployment_1
+          - deployment_2
+          - deployment_3
           - fault_runner
     env:
       CI_TEST_RUNNER_LABEL: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
@@ -203,7 +209,7 @@ jobs:
           retention-days: 30
 
   postgres:
-    name: coverage-postgres
+    name: coverage-${{ matrix.shard }}
     runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
     # actions: read lets the push-only restore step read the Actions artifacts
     # API of a prior run; id-token: write mints the OIDC token cosign signs the
@@ -212,6 +218,16 @@ jobs:
       actions: read
       contents: read
       id-token: write
+    # Each PostgreSQL shard is one nodeid partition of the serial contract and
+    # stress suites, run -n 0 against its own job-bound service container, so
+    # the server-level fixtures keep their one-process-per-server guarantee.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - postgres_0
+          - postgres_1
+          - postgres_2
     services:
       postgres:
         image: postgres:16
@@ -263,7 +279,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
           python scripts/ci_coverage_gate.py restore
-          --shard postgres
+          --shard "${{ matrix.shard }}"
           --postgres-container "${{ job.services.postgres.id }}"
           --destination artifacts/coverage-shard
           --current-run-id "${GITHUB_RUN_ID}"
@@ -274,7 +290,7 @@ jobs:
           steps.restore_shard.outputs.reused != 'true'
         run: >-
           make coverage-shard PYTHON=python
-          COVERAGE_SHARD=postgres
+          COVERAGE_SHARD="${{ matrix.shard }}"
           COVERAGE_SHARD_ROOT=artifacts/coverage-shard
           COVERAGE_INCLUDE_STRESS=1
           COVERAGE_POSTGRES_CONTAINER="${{ job.services.postgres.id }}"
@@ -295,7 +311,7 @@ jobs:
         id: build_shard
         run: >-
           python scripts/ci_coverage_gate.py build
-          --shard postgres
+          --shard "${{ matrix.shard }}"
           --postgres-container "${{ job.services.postgres.id }}"
           --artifact-root artifacts/coverage-shard
           --coverage-data artifacts/coverage-shard/coverage-data
@@ -323,7 +339,7 @@ jobs:
       - name: Verify PostgreSQL coverage shard content identity
         run: >-
           python scripts/ci_coverage_gate.py verify
-          --shard postgres
+          --shard "${{ matrix.shard }}"
           --postgres-container "${{ job.services.postgres.id }}"
           --artifact-root artifacts/coverage-shard
           --gate artifacts/coverage-shard/coverage-shard-gate.json
@@ -487,14 +503,27 @@ jobs:
   # lru_cache, in-process singleton, a global someone else monkeypatched) stays
   # green in that order forever and only fails the day an unrelated test is
   # added. This job is the only thing that looks.
+  #
+  # The round is split across Runners: every leg shuffles the whole collection
+  # with the same seed and keeps slots i, i+N, i+2N, ... of that order
+  # (tests/conftest.py), so the legs are disjoint, their union is the complete
+  # suite, and replaying the seed without the shard variables reproduces the
+  # single whole-suite order. tests/test_test_suite_contracts.py pins the
+  # matrix to GPU_FAULT_TEST_SHUFFLE_SHARDS.
   shuffle:
-    name: shuffled-order
+    name: shuffled-order-${{ matrix.shard }}
     runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     env:
       # Seeded from the run id rather than from chance, so re-running this
       # workflow reproduces the same order and a failure can be triaged instead
       # of merely observed. A different push gets a different order.
       GPU_FAULT_TEST_SHUFFLE_SEED: ${{ github.run_id }}
+      GPU_FAULT_TEST_SHUFFLE_SHARDS: "4"
+      GPU_FAULT_TEST_SHUFFLE_SHARD: ${{ matrix.shard }}
       PYTEST_DURATIONS: "50"
       PYTEST_XDIST_DIST: worksteal
       PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
