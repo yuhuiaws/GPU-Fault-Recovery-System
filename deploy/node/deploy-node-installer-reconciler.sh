@@ -7,6 +7,10 @@ KUBECTL_CONTEXT="${GPU_FAULT_KUBECTL_CONTEXT:-}"
 NAMESPACE="${GPU_FAULT_NAMESPACE:-gpu-fault-system}"
 CLUSTER_ID="${GPU_FAULT_CLUSTER_ID:-}"
 HYPERPOD_CLUSTER="${GPU_FAULT_HYPERPOD_CLUSTER:-${CLUSTER_ID}}"
+# Provider scope (gpu_fault.cluster_scope): the GPU node selector defaults to
+# the HyperPod cluster label; a plain EKS (eks-managed) cluster passes its own.
+CLUSTER_PROVIDER="${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}"
+NODE_SELECTOR="${GPU_FAULT_NODE_SELECTOR:-sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}}"
 VERSION="${GPU_FAULT_VERSION:-0.10.0}"
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
 CONFIG_DIGEST="${GPU_FAULT_INSTALLER_CONFIG_DIGEST:-}"
@@ -222,12 +226,12 @@ kubectl_context -n "${NAMESPACE}" get configmap \
 kubectl_context -n "${NAMESPACE}" get secret \
     gpu-fault-regional-connection >/dev/null
 NODE_INVENTORY_JSON="$(kubectl_context get nodes \
-    -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" -o json)"
+    -l "${NODE_SELECTOR}" -o json)"
 mapfile -t NODES < <(jq -r '.items | sort_by(.metadata.name)[] | .metadata.name' \
     <<<"${NODE_INVENTORY_JSON}")
 (( ${#NODES[@]} > 0 )) || {
-    printf 'ERROR: no HyperPod node found for %s\n' \
-        "${HYPERPOD_CLUSTER}" >&2
+    printf 'ERROR: no GPU node found for %s (selector %s)\n' \
+        "${HYPERPOD_CLUSTER}" "${NODE_SELECTOR}" >&2
     exit 1
 }
 # This digest describes names only and cannot authorize key or template reuse.
@@ -239,6 +243,8 @@ if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" ]]; then
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
     GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
+    GPU_FAULT_CLUSTER_PROVIDER="${CLUSTER_PROVIDER}" \
+    GPU_FAULT_NODE_SELECTOR="${NODE_SELECTOR}" \
     GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
     GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
         "${SCRIPT_DIR}/provision-node-action-keys.sh"
@@ -369,6 +375,7 @@ jq --arg cluster "${CLUSTER_ID}" --arg context "${KUBECTL_CONTEXT}" \
                 metadata: {uid: .metadata.uid, labels: {
                     "node.kubernetes.io/instance-type": .metadata.labels["node.kubernetes.io/instance-type"]
                 }},
+                spec: {providerID: (.spec.providerID // "")},
                 status: {addresses: [.status.addresses[] | select(.type == "InternalIP")]}
             }
         }) | from_entries)
@@ -381,6 +388,7 @@ render_installer_job() {
     GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
+    GPU_FAULT_CLUSTER_PROVIDER="${CLUSTER_PROVIDER}" \
     GPU_FAULT_CONNECTION_MODE=regional \
     GPU_FAULT_REGIONAL_CONNECTION_SECRET=gpu-fault-regional-connection \
     GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \

@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 from gpu_fault.dataplane_metrics import MetricFamily, start_metrics_server
 from gpu_fault.logging_setup import configure_logging
+from gpu_fault.cluster_scope import NODE_SELECTOR_ENV
+from gpu_fault.cluster_scope import node_selector as scope_node_selector
 from gpu_fault.node_installer_rendering import (
     INSTALLER_ARTIFACT_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
@@ -465,7 +467,19 @@ class NodeInstallerReconciler:
 
     @property
     def node_selector(self) -> str:
-        return f"sagemaker.amazonaws.com/cluster-name={self.cluster_name}"
+        """The GPU node selector (``gpu_fault.cluster_scope``).
+
+        ``GPU_FAULT_NODE_SELECTOR`` when the connection Secret carries one (a
+        plain EKS cluster); otherwise the HyperPod cluster label, exactly the
+        text every HyperPod site has always selected on.
+        """
+
+        return scope_node_selector(
+            None,
+            provider="hyperpod",
+            hyperpod_cluster_name=self.cluster_name,
+            selector=os.environ.get(NODE_SELECTOR_ENV, ""),
+        )
 
     def reconcile_once(self) -> dict[str, int]:
         try:
@@ -964,6 +978,11 @@ class NodeInstallerReconciler:
                 uid=str(_value(metadata, "uid")),
                 address=_internal_ip(node),
                 instance_type=str(labels.get("node.kubernetes.io/instance-type", "")),
+                provider_id=str(
+                    _value(_value(node, "spec", {}) or {}, "provider_id", "")
+                    or _value(_value(node, "spec", {}) or {}, "providerID", "")
+                    or ""
+                ),
             ),
             self.installer_identity,
             job_name,

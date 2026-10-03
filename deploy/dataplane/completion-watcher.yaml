@@ -167,6 +167,21 @@ spec:
               value: /etc/gpu-fault/tls/ca.crt
             - name: GPU_FAULT_WATCHER_ENVIRONMENT
               value: hyperpod-eks
+            # Provider scope of this cluster (gpu_fault.cluster_scope). Both
+            # keys are optional: a HyperPod site's Secret may predate them and
+            # the data plane then defaults to hyperpod and the HyperPod label.
+            - name: GPU_FAULT_CLUSTER_PROVIDER
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-provider
+                  optional: true
+            - name: GPU_FAULT_NODE_SELECTOR
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: node-selector
+                  optional: true
             - name: GPU_FAULT_WATCHER_POLL_SECONDS
               value: "3"
             - name: GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS

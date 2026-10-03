@@ -9,8 +9,14 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.cluster_scope import cluster_provider, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
+from gpu_fault.cluster_scope import (
+    CONNECTION_SECRET_NODE_SELECTOR_KEY,
+    CONNECTION_SECRET_PROVIDER_KEY,
+    provider_cluster_name,
+)
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_rendering import (
@@ -348,12 +354,23 @@ def ensure_gpu_namespace(release: Any, target: ClusterTarget) -> None:
 
 
 def ensure_connection_secret(release: Any, target: ClusterTarget) -> None:
+    """Create or confirm the per-cluster ``gpu-fault-regional-connection`` Secret.
+
+    The ``hyperpod-cluster-name`` / ``hyperpod-confirm-cluster-name`` keys carry
+    the provider cluster scope (``cluster_scope.provider_cluster_name``): the
+    HyperPod name, or the ``cluster_id`` of a plain EKS cluster, so the
+    executor's fail-closed startup check passes for both. ``cluster-provider``
+    and ``node-selector`` tell the data plane which provider it runs; the
+    manifests read them as optional keys.
+    """
+
+    provider_name = provider_cluster_name(target)
     if not all(
         (
             target.token_file,
             target.ca_file,
             target.control_plane_url,
-            target.hyperpod_cluster_name,
+            provider_name,
         )
     ):
         release.runner.run(
@@ -378,10 +395,12 @@ def ensure_connection_secret(release: Any, target: ClusterTarget) -> None:
             "control-plane-url": target.control_plane_url.encode(),
             "cluster-id": target.cluster_id.encode(),
             "allowed-namespaces": ",".join(target.allowed_namespaces).encode(),
-            "hyperpod-cluster-name": (target.hyperpod_cluster_name or "").encode(),
-            "hyperpod-confirm-cluster-name": (
-                target.hyperpod_cluster_name or ""
-            ).encode(),
+            "hyperpod-cluster-name": provider_name.encode(),
+            "hyperpod-confirm-cluster-name": provider_name.encode(),
+            CONNECTION_SECRET_PROVIDER_KEY: cluster_provider(
+                getattr(target, "provider", None)
+            ).value.encode(),
+            CONNECTION_SECRET_NODE_SELECTOR_KEY: node_selector(target).encode(),
         }
         arguments = release._gpu(
             target,

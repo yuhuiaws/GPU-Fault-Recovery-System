@@ -38,6 +38,19 @@ NODE_ACTION_KEYS_SECRET="$(
     printf '%s' "${GPU_FAULT_NODE_ACTION_KEYS_SECRET:-gpu-fault-node-action-keys}"
 )"
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
+# Provider of the GPU cluster (gpu_fault.cluster_scope): hyperpod (default) or
+# eks-managed. Baked into the rendered Job so the installer knows which node
+# identity to register: the Kubernetes Node UID on HyperPod, the EC2 instance
+# id from spec.providerID on a plain EKS cluster.
+CLUSTER_PROVIDER="${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}"
+case "${CLUSTER_PROVIDER}" in
+    hyperpod|eks-managed) ;;
+    *)
+        printf 'ERROR: GPU_FAULT_CLUSTER_PROVIDER must be hyperpod or eks-managed, got %s\n' \
+            "${CLUSTER_PROVIDER}" >&2
+        exit 2
+        ;;
+esac
 DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
 NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
@@ -313,6 +326,9 @@ fi
 NODE_IP="$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address] |
     join(" ") | select(length > 0)' <<<"${NODE_DOCUMENT}")"
 NODE_UID="$(jq -er '.metadata.uid | select(type == "string" and length > 0)' <<<"${NODE_DOCUMENT}")"
+# aws:///<zone>/i-... on EKS and HyperPod alike; empty when the node document
+# carries no providerID (older input snapshots). Only eks-managed reads it.
+NODE_PROVIDER_ID="$(jq -r '.spec.providerID // ""' <<<"${NODE_DOCUMENT}")"
 NODE_INSTANCE_TYPE="$(jq -er '.metadata.labels["node.kubernetes.io/instance-type"]' <<<"${NODE_DOCUMENT}")"
 # AWS EC2 DescribeInstanceTypes GPU count and MaximumEfaInterfaces,
 # verified 2026-07-27. HyperPod labels may include the "ml." prefix.
@@ -475,7 +491,20 @@ if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
     JOB_NAME="gpu-fault-preflight-${JOB_ID}"
     HOST_ROOT_READ_ONLY="true"
 else
-    JOB_NAME="gpu-fault-install-${NODE_NAME#hyperpod-}"
+    # HyperPod node names (hyperpod-i-...) keep the name they always had. Any
+    # other node name -- EKS nodes are FQDNs such as
+    # ip-10-0-33-205.us-west-2.compute.internal -- is made DNS-1123 safe and
+    # kept under 63 characters with a deterministic hash of the full name.
+    if [[ "${NODE_NAME}" == hyperpod-* ]]; then
+        JOB_NAME="gpu-fault-install-${NODE_NAME#hyperpod-}"
+    else
+        JOB_NODE_DIGEST="$(printf '%s' "${NODE_NAME}" | sha256sum | awk '{print substr($1, 1, 10)}')"
+        JOB_NODE_SAFE="$(printf '%s' "${NODE_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+        JOB_NODE_PREFIX="gpu-fault-install-${JOB_NODE_SAFE}"
+        JOB_NODE_PREFIX="${JOB_NODE_PREFIX:0:$((63 - ${#JOB_NODE_DIGEST} - 1))}"
+        JOB_NODE_PREFIX="${JOB_NODE_PREFIX%%-}"
+        JOB_NAME="${JOB_NODE_PREFIX}-${JOB_NODE_DIGEST}"
+    fi
     HOST_ROOT_READ_ONLY="false"
 fi
 MANIFEST="$(mktemp)"
@@ -511,6 +540,10 @@ spec:
               value: ${NODE_IP}
             - name: TARGET_NODE_UID
               value: ${NODE_UID}
+            - name: TARGET_NODE_PROVIDER_ID
+              value: "${NODE_PROVIDER_ID}"
+            - name: CLUSTER_PROVIDER
+              value: "${CLUSTER_PROVIDER}"
             - name: INSTALLER_ACTIVE_DEADLINE_SECONDS
               value: "${INSTALLER_ACTIVE_DEADLINE_SECONDS}"
             - name: INSTALL_RUN_ID
@@ -661,6 +694,8 @@ ${CONTROL_PLANE_ENV}
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
+                TARGET_NODE_PROVIDER_ID="\${TARGET_NODE_PROVIDER_ID}" \
+                CLUSTER_PROVIDER="\${CLUSTER_PROVIDER}" \
                 INSTALL_RUN_ID="\${INSTALL_RUN_ID}" \
                 INSTALLER_LOCK_TIMEOUT_SECONDS="\${INSTALLER_LOCK_TIMEOUT_SECONDS}" \
                 GPU_FAULT_INSTALLER_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
@@ -874,6 +909,18 @@ ${CONTROL_PLANE_ENV}
                   else
                     node_action_args+=(--node-action-key-version 2)
                   fi
+                  # Node identity registered with the control plane: the Node
+                  # UID on HyperPod (unchanged); the EC2 instance id behind
+                  # spec.providerID on a plain EKS cluster, so a Spot
+                  # replacement under the same name is a different node.
+                  node_instance_id="\${TARGET_NODE_UID}"
+                  if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
+                    node_instance_id="\${TARGET_NODE_PROVIDER_ID##*/}"
+                    [[ "\${node_instance_id}" =~ ^i-[0-9a-f]{8,17}$ ]] || {
+                      echo "ERROR: eks-managed node \${TARGET_NODE_NAME} has no EC2 instance id in spec.providerID (\${TARGET_NODE_PROVIDER_ID})" >&2
+                      exit 1
+                    }
+                  fi
                   deploy/node/install-gpu-fault-collector.sh \
                     --control-plane-url "\${CONTROL_PLANE_URL}" \
                     ${TOKEN_INSTALLER_ARGS} \
@@ -906,7 +953,7 @@ ${CONTROL_PLANE_ENV}
                     --node-agent-host "\${TARGET_NODE_IP}" \
                     --node-agent-advertise-url \
                       "https://\${TARGET_NODE_IP}:9099" \
-                    --node-instance-id "\${TARGET_NODE_UID}"
+                    --node-instance-id "\${node_instance_id}"
                   /opt/gpu-fault/verify
                 '
           volumeMounts:

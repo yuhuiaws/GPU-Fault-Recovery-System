@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease, Runner
 
+from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release.regional_observability_rollback import (
@@ -192,6 +193,89 @@ def _context_eks_arn(runner: Runner, kubectl: list[str], *, label: str) -> str:
     return cluster
 
 
+def _validate_eks_managed_cluster(
+    runner: Runner,
+    *,
+    region: str,
+    expected_eks_arn: str,
+) -> None:
+    """A plain EKS GPU cluster: the cluster and its managed node groups are ACTIVE.
+
+    There is no HyperPod to describe and no ``NodeRecovery`` to gate on; what
+    can drift is the cluster itself (deleted and recreated under the same
+    name, or a node group mid-update) and that is what is read here.
+    """
+
+    eks_name = expected_eks_arn.rsplit("/", 1)[-1]
+    raw = runner.run(
+        [
+            "aws",
+            "eks",
+            "describe-cluster",
+            "--region",
+            region,
+            "--name",
+            eks_name,
+            "--query",
+            "{Arn:cluster.arn,Status:cluster.status}",
+            "--output",
+            "json",
+        ],
+        capture=True,
+    )
+    value = json.loads(raw)
+    if value.get("Arn") != expected_eks_arn:
+        raise ReleaseError(
+            f"EKS cluster {eks_name} does not match configured EKS ARN {expected_eks_arn}"
+        )
+    if value.get("Status") != "ACTIVE":
+        raise ReleaseError(f"EKS cluster {eks_name} is not ACTIVE")
+    nodegroups = (
+        json.loads(
+            runner.run(
+                [
+                    "aws",
+                    "eks",
+                    "list-nodegroups",
+                    "--region",
+                    region,
+                    "--cluster-name",
+                    eks_name,
+                    "--output",
+                    "json",
+                ],
+                capture=True,
+            )
+        ).get("nodegroups")
+        or []
+    )
+    for nodegroup in sorted(str(item) for item in nodegroups):
+        status = json.loads(
+            runner.run(
+                [
+                    "aws",
+                    "eks",
+                    "describe-nodegroup",
+                    "--region",
+                    region,
+                    "--cluster-name",
+                    eks_name,
+                    "--nodegroup-name",
+                    nodegroup,
+                    "--query",
+                    "nodegroup.status",
+                    "--output",
+                    "json",
+                ],
+                capture=True,
+            )
+        )
+        if status != "ACTIVE":
+            raise ReleaseError(
+                f"EKS node group {nodegroup} of {eks_name} is not ACTIVE ({status})"
+            )
+
+
 def _validate_hyperpod_cluster(
     runner: Runner,
     *,
@@ -233,7 +317,7 @@ def _validate_agent_endpoint_cidrs(
     kubectl: list[str],
     *,
     cluster_id: str,
-    hyperpod_cluster_name: str,
+    node_selector: str,
     configured_cidrs: tuple[str, ...],
 ) -> None:
     networks = tuple(
@@ -247,7 +331,7 @@ def _validate_agent_endpoint_cidrs(
             "get",
             "nodes",
             "-l",
-            f"sagemaker.amazonaws.com/cluster-name={hyperpod_cluster_name}",
+            node_selector,
             "-o",
             "json",
         ],
@@ -305,19 +389,26 @@ def ensure_region_contexts(release: RegionalRelease) -> None:
                 f"GPU context for {target.cluster_id} does not match "
                 "configured eks_cluster_arn"
             )
-        _validate_hyperpod_cluster(
-            runner,
-            region=target.region,
-            cluster_name=target.hyperpod_cluster_name,
-            expected_eks_arn=target.eks_cluster_arn,
-            require_node_recovery_none=True,
-        )
+        if is_eks_managed(target):
+            _validate_eks_managed_cluster(
+                runner,
+                region=target.region,
+                expected_eks_arn=target.eks_cluster_arn,
+            )
+        else:
+            _validate_hyperpod_cluster(
+                runner,
+                region=target.region,
+                cluster_name=target.hyperpod_cluster_name,
+                expected_eks_arn=target.eks_cluster_arn,
+                require_node_recovery_none=True,
+            )
         runner.run(gpu_command(target, "get", "--raw=/readyz"), capture=True)
         _validate_agent_endpoint_cidrs(
             runner,
             gpu_command(target),
             cluster_id=target.cluster_id,
-            hyperpod_cluster_name=target.hyperpod_cluster_name,
+            node_selector=node_selector(target),
             configured_cidrs=target.agent_endpoint_allowed_cidrs,
         )
         release._validate_executor_iam_role(target)

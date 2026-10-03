@@ -4,6 +4,8 @@ import json
 import time
 from typing import Any
 
+from gpu_fault.cluster_scope import selector_matches
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
@@ -167,10 +169,10 @@ def wait_agents(
             item
             for item in nodes
             if (
-                item.get("metadata", {})
-                .get("labels", {})
-                .get("sagemaker.amazonaws.com/cluster-name")
-                == target.hyperpod_cluster_name
+                selector_matches(
+                    item.get("metadata", {}).get("labels", {}),
+                    node_selector(target),
+                )
                 and (
                     expected_nodes is None
                     or str(item.get("metadata", {}).get("name") or "") in expected_nodes

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
 
 import base64
@@ -1242,7 +1243,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 "get",
                 "nodes",
                 "-l",
-                f"sagemaker.amazonaws.com/cluster-name={target.hyperpod_cluster_name}",
+                node_selector(target),
             )
         )
         kubernetes_nodes[target.cluster_id] = sorted(
@@ -1438,7 +1439,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
             "get",
             "nodes",
             "-l",
-            f"sagemaker.amazonaws.com/cluster-name={target.hyperpod_cluster_name}",
+            node_selector(target),
         )
     )
     expected_nodes = _ready_nodes(nodes)

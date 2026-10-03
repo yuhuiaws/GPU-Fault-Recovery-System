@@ -52,12 +52,18 @@ class InstallerNode:
     uid: str
     address: str
     instance_type: str
+    #: ``spec.providerID`` (``aws:///<zone>/i-...``); empty when unknown. A
+    #: plain EKS (``eks-managed``) cluster registers the EC2 instance id behind
+    #: it as the node identity, HyperPod keeps the Node UID.
+    provider_id: str = ""
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", self.name):
             raise ValueError("invalid installer node name")
         if not self.uid or any(character.isspace() for character in self.uid):
             raise ValueError("invalid installer node UID")
+        if any(character.isspace() for character in self.provider_id):
+            raise ValueError("invalid installer node provider id")
         ipaddress.ip_address(self.address)
         gpu_instance_inventory(self.instance_type)
 
@@ -238,6 +244,12 @@ def load_installer_template(
     return template
 
 
+#: Env entries a template may lack without being rejected: they were added
+#: after templates began to be pinned, and a pinned template that predates
+#: them (a rollback's steady template) keeps its own value for that node.
+OPTIONAL_INSTALLER_ENVIRONMENT = frozenset({"TARGET_NODE_PROVIDER_ID"})
+
+
 def set_installer_environment(
     container: dict[str, object], updates: dict[str, str]
 ) -> None:
@@ -251,6 +263,8 @@ def set_installer_environment(
         if name in unfilled:
             item.clear()
             item.update(name=name, value=unfilled.pop(name))
+    for name in OPTIONAL_INSTALLER_ENVIRONMENT:
+        unfilled.pop(name, None)
     if unfilled:
         raise RuntimeError(
             "installer job template has no env entry for "
@@ -308,6 +322,7 @@ def render_installer_job(
             "TARGET_NODE_NAME": node.name,
             "TARGET_NODE_IP": node.address,
             "TARGET_NODE_UID": node.uid,
+            "TARGET_NODE_PROVIDER_ID": node.provider_id,
             "NODE_INSTANCE_TYPE": node.instance_type,
             "EXPECTED_GPU_COUNT": str(expected_gpus),
             "EXPECTED_EFA_DEVICE_COUNT": str(expected_efa),

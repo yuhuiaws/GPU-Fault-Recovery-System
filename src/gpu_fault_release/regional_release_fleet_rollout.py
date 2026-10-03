@@ -22,6 +22,7 @@ from gpu_fault.failure_domains import (
     UNKNOWN_FAILURE_DOMAIN,
     node_failure_domain,
 )
+from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_agent_convergence import (
@@ -30,6 +31,7 @@ from gpu_fault_release.regional_release_agent_convergence import (
 from gpu_fault_release.regional_release_agent_convergence import (
     wait_agents as wait_agents,
 )
+from gpu_fault.cluster_scope import selector_matches
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
@@ -369,23 +371,20 @@ def target_node_names(
     release: Any,
     target: ClusterTarget,
 ) -> tuple[str, ...]:
+    selector = node_selector(target)
     names = tuple(
         sorted(
             str(item.get("metadata", {}).get("name") or "")
             for item in gpu_node_items(release, target)
             if (
-                item.get("metadata", {})
-                .get("labels", {})
-                .get("sagemaker.amazonaws.com/cluster-name")
-                == target.hyperpod_cluster_name
+                selector_matches(item.get("metadata", {}).get("labels", {}), selector)
                 and item.get("metadata", {}).get("name")
             )
         )
     )
     if not names:
-        raise ReleaseError(
-            f"{target.cluster_id} has no HyperPod nodes for fleet rollout"
-        )
+        kind = "GPU" if is_eks_managed(target) else "HyperPod"
+        raise ReleaseError(f"{target.cluster_id} has no {kind} nodes for fleet rollout")
     return names
 
 

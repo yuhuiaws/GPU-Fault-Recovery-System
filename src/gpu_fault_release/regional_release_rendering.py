@@ -9,10 +9,16 @@ from typing import TYPE_CHECKING, Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.cluster_scope import cluster_provider, is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refresh
+from gpu_fault.cluster_scope import (
+    NODE_SELECTOR_ENV,
+    PROVIDER_ENV,
+    provider_cluster_name,
+)
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
@@ -651,6 +657,16 @@ def build_cpu_apply_environment(
     }
 
 
+#: The completion-watcher environment lines as checked in, and what a plain
+#: EKS (``eks-managed``) cluster renders in their place.
+WATCHER_HYPERPOD_ENVIRONMENT = (
+    "- name: GPU_FAULT_WATCHER_ENVIRONMENT\n              value: hyperpod-eks"
+)
+WATCHER_EKS_ENVIRONMENT = (
+    "- name: GPU_FAULT_WATCHER_ENVIRONMENT\n              value: eks"
+)
+
+
 def render_gpu_rollout_manifests(
     release: RegionalRelease,
     target: ClusterTarget,
@@ -689,6 +705,10 @@ def render_gpu_rollout_manifests(
         "REPLACE_WITH_EXECUTOR_ARTIFACT_SHA256": artifact_sha,
         "REPLACE_WITH_EXECUTOR_COMPATIBILITY_DIGEST": compatibility_digest,
     }
+    if is_eks_managed(target):
+        # The checked-in watcher names the HyperPod environment; a plain EKS
+        # cluster runs the ``eks`` one. HyperPod targets render untouched.
+        replacements[WATCHER_HYPERPOD_ENVIRONMENT] = WATCHER_EKS_ENVIRONMENT
     rendered = []
     for filename, deployment in inventory.GPU_ROLLOUT_DEPLOYMENTS:
         if deployment_names is not None and deployment not in deployment_names:
@@ -747,7 +767,11 @@ def build_reconciler_environment(
         "GPU_FAULT_KUBECTL_CONTEXT": target.context,
         "GPU_FAULT_NAMESPACE": config.namespace,
         "GPU_FAULT_CLUSTER_ID": target.cluster_id,
-        "GPU_FAULT_HYPERPOD_CLUSTER": target.hyperpod_cluster_name,
+        # The provider cluster scope: the HyperPod name, or the cluster_id of a
+        # plain EKS cluster; the selector is what the scripts enumerate on.
+        "GPU_FAULT_HYPERPOD_CLUSTER": provider_cluster_name(target),
+        PROVIDER_ENV: cluster_provider(getattr(target, "provider", None)).value,
+        NODE_SELECTOR_ENV: node_selector(target),
         "GPU_FAULT_INSTALLER_CONFIG_MAP": bundle_cm,
         "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
         "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,
@@ -895,10 +919,21 @@ SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 CONFIG_MAP_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
 
 
+#: Provider inputs that joined the digest after plain EKS support. Digested
+#: only when set so a HyperPod site's products keep the digest they had
+#: (``GPU_FAULT_CLUSTER_PROVIDER=hyperpod`` with the HyperPod selector is the
+#: state every recorded product already describes).
+INSTALLER_PRODUCT_PROVIDER_ENV = (PROVIDER_ENV, NODE_SELECTOR_ENV)
+
+
 def installer_product_inputs_digest(environment: dict[str, str]) -> str:
     """Digest of the render inputs the reusable products are a function of."""
 
     inputs = {key: environment.get(key, "") for key in INSTALLER_PRODUCT_INPUT_ENV}
+    if environment.get(PROVIDER_ENV, "hyperpod") != "hyperpod":
+        inputs.update(
+            {key: environment.get(key, "") for key in INSTALLER_PRODUCT_PROVIDER_ENV}
+        )
     return hashlib.sha256(
         json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

@@ -167,6 +167,21 @@ spec:
               value: REPLACE_WITH_CLUSTER_ID
             - name: GPU_FAULT_HYPERPOD_CLUSTER
               value: REPLACE_WITH_HYPERPOD_CLUSTER
+            # Provider scope of this cluster (gpu_fault.cluster_scope). Both
+            # keys are optional: a HyperPod site's Secret may predate them and
+            # the data plane then defaults to hyperpod and the HyperPod label.
+            - name: GPU_FAULT_CLUSTER_PROVIDER
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-provider
+                  optional: true
+            - name: GPU_FAULT_NODE_SELECTOR
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: node-selector
+                  optional: true
             - name: GPU_FAULT_INSTALLER_VERSION
               value: REPLACE_WITH_INSTALLER_VERSION
             - name: GPU_FAULT_INSTALLER_CONFIG_DIGEST

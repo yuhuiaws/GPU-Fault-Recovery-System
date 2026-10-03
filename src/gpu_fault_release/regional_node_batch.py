@@ -115,8 +115,14 @@ def read_private_snapshot(path: Path, scope: NodeScope) -> dict[str, InstallerNo
             isinstance(value, str) and value for value in (*values, *addresses)
         ):
             raise ValueError("node snapshot has incomplete identity or addressing")
+        spec = node.get("spec")
+        provider_id = (
+            str(manifest_object(spec, "node spec").get("providerID") or "")
+            if spec is not None
+            else ""
+        )
         nodes[name] = InstallerNode(
-            name, str(values[0]), str(addresses[0]), str(values[1])
+            name, str(values[0]), str(addresses[0]), str(values[1]), provider_id
         )
         if nodes[name].uid in uids:
             raise ValueError("node snapshot contains duplicate node UIDs")

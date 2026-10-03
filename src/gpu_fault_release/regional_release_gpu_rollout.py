@@ -14,7 +14,9 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault.regional_compatibility import (
     RegionalExecutorCompatibilityPolicy,
 )
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault.cluster_scope import selector_matches
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
@@ -404,10 +406,12 @@ def prune_workload_namespace_rbac(release: Any, target: ClusterTarget) -> list[s
 def gpu_node_command(release: Any, target: ClusterTarget) -> list[str]:
     """Build the one node-inventory read every release path shares.
 
-    The HyperPod cluster label is pushed to the API server so a GPU EKS cluster
-    that also hosts non-HyperPod nodes never ships them over the wire, and so
-    every caller produces an identical `_get_json` cache key: inside
-    `read_snapshot` the whole release reads each cluster's nodes once.
+    The cluster's GPU node selector (``gpu_fault.cluster_scope``: the HyperPod
+    cluster label, or the configured selector of a plain EKS cluster) is pushed
+    to the API server so a GPU EKS cluster that also hosts other nodes never
+    ships them over the wire, and so every caller produces an identical
+    `_get_json` cache key: inside `read_snapshot` the whole release reads each
+    cluster's nodes once.
     """
 
     return release._gpu(
@@ -415,7 +419,7 @@ def gpu_node_command(release: Any, target: ClusterTarget) -> list[str]:
         "get",
         "nodes",
         "-l",
-        f"{HYPERPOD_CLUSTER_LABEL}={target.hyperpod_cluster_name}",
+        node_selector(target),
     )
 
 
@@ -546,14 +550,12 @@ def agents_converged(
     require_node_uid: bool = False,
     node_names: frozenset[str] | None = None,
 ) -> bool:
+    selector = node_selector(target)
     nodes = [
         item
         for item in items
         if (
-            item.get("metadata", {})
-            .get("labels", {})
-            .get("sagemaker.amazonaws.com/cluster-name")
-            == target.hyperpod_cluster_name
+            selector_matches(item.get("metadata", {}).get("labels", {}), selector)
             and (
                 node_names is None
                 or str(item.get("metadata", {}).get("name") or "") in node_names

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from gpu_fault.cluster_scope import ClusterProvider, cluster_provider
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_state import aws_json
 
@@ -14,12 +15,41 @@ EXECUTOR_SAGEMAKER_ACTIONS = frozenset(
         "sagemaker:batchrebootclusternodes",
     }
 )
+#: What a plain EKS (``eks-managed``) cluster's executor may hold on EC2/EKS:
+#: read the instances behind the nodes, reboot them, and nothing that stops,
+#: terminates or launches -- a replacement never comes from the data plane.
+EXECUTOR_EKS_MANAGED_ACTIONS = frozenset(
+    {
+        "ec2:describeinstances",
+        "ec2:describeinstancestatus",
+        "ec2:rebootinstances",
+        "eks:describecluster",
+        "eks:describenodegroup",
+        "eks:listnodegroups",
+    }
+)
+#: Reads EC2 only grants on ``Resource: "*"``; the one place the executor
+#: boundary tolerates the wildcard resource, and only for these actions.
+WILDCARD_RESOURCE_READS = frozenset(
+    {"ec2:describeinstances", "ec2:describeinstancestatus"}
+)
 
 
 def validate_executor_iam_documents(
     role_arn: str,
     documents: list[dict[str, Any]],
+    *,
+    provider: str = ClusterProvider.HYPERPOD.value,
 ) -> None:
+    """Refuse an executor role that exceeds the data-plane boundary.
+
+    HyperPod roles are judged exactly as before. An ``eks-managed`` role may
+    hold no ``sagemaker:`` action at all and only the EC2/EKS actions in
+    ``EXECUTOR_EKS_MANAGED_ACTIONS``; ``ec2:DescribeInstances`` may use
+    ``Resource: "*"`` because EC2 offers no narrower resource for it.
+    """
+
+    eks_managed = cluster_provider(provider) is ClusterProvider.EKS_MANAGED
     forbidden = []
     for document in documents:
         for statement in document.get("Statement", []):
@@ -31,15 +61,20 @@ def validate_executor_iam_documents(
             if statement.get("NotResource") is not None:
                 forbidden.append("Allow/NotResource")
                 continue
+            raw = statement.get("Action", [])
+            actions = raw if isinstance(raw, list) else [raw]
+            normalized_actions = {str(action).lower() for action in actions}
             raw_resource = statement.get("Resource", [])
             resources = (
                 raw_resource if isinstance(raw_resource, list) else [raw_resource]
             )
             for resource in resources:
-                if str(resource).strip() == "*":
+                if str(resource).strip() == "*" and not (
+                    eks_managed
+                    and normalized_actions
+                    and normalized_actions <= WILDCARD_RESOURCE_READS
+                ):
                     forbidden.append('Resource "*"')
-            raw = statement.get("Action", [])
-            actions = raw if isinstance(raw, list) else [raw]
             for action in actions:
                 normalized = str(action).lower()
                 # Least privilege: reject the account-wide wildcard and any
@@ -47,6 +82,14 @@ def validate_executor_iam_documents(
                 if normalized == "*" or normalized.endswith(":*"):
                     forbidden.append(str(action))
                 elif normalized.startswith("ses:"):
+                    forbidden.append(str(action))
+                elif eks_managed and normalized.startswith("sagemaker:"):
+                    forbidden.append(str(action))
+                elif (
+                    eks_managed
+                    and normalized.startswith(("ec2:", "eks:"))
+                    and normalized not in EXECUTOR_EKS_MANAGED_ACTIONS
+                ):
                     forbidden.append(str(action))
                 elif (
                     normalized.startswith("sagemaker:")
@@ -130,4 +173,8 @@ def validate_executor_iam_role(release: Any, target: ClusterTarget) -> None:
         for policy in attached.get("AttachedPolicies", [])
     )
     documents = _fan_out(release, fetches)
-    validate_executor_iam_documents(target.executor_irsa_role_arn, documents)
+    validate_executor_iam_documents(
+        target.executor_irsa_role_arn,
+        documents,
+        provider=cluster_provider(getattr(target, "provider", None)).value,
+    )
