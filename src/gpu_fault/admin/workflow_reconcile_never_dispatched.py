@@ -32,6 +32,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.admin.workflow_reconcile_departed_nodes import (
+    EC2_SOURCE,
+    EKS_PROVIDER,
+)
 from gpu_fault.workflow_resolution import DEPARTED_NODE_PROOF_REASON
 
 NEVER_DISPATCHED = "never-dispatched"
@@ -333,10 +337,17 @@ elif payload["mode"] == "apply-never-dispatched":
                     "incident node set changed: evidence covers "
                     f"{proven}, incident names {sorted(incident.node_ids)}"
                 )
+            # The provider that confirmed the departure: HyperPod's node list,
+            # or EC2 on an eks-managed cluster.
+            provider_label = (
+                "EC2"
+                if any(node.get("provider") == "eks-managed" for node in evidence)
+                else "HyperPod"
+            )
             audit = (
                 f"operator reconciliation {payload['reference']}: closed "
                 f"{request_id}, never dispatched, after its node left "
-                f"Kubernetes and HyperPod ({', '.join(proven)})"
+                f"Kubernetes and {provider_label} ({', '.join(proven)})"
             )
             # Event details are bounded two levels deep; one flat record per
             # node keeps every source, verdict and read time legible.
@@ -347,16 +358,26 @@ elif payload["mode"] == "apply-never-dispatched":
                     "provider": node.get("provider"),
                     "absent_from_kubernetes": True,
                     "absent_from_provider": True,
+                    # ``hyperpod`` on HyperPod, ``ec2`` on an eks-managed cluster.
                     "hyperpod_cluster_name": (
-                        ((node.get("sources") or {}).get("hyperpod") or {}).get(
-                            "cluster_name"
-                        )
+                        (
+                            (node.get("sources") or {}).get("hyperpod")
+                            or (node.get("sources") or {}).get("ec2")
+                            or {}
+                        ).get("cluster_name")
                     ),
                     "region": (
-                        ((node.get("sources") or {}).get("hyperpod") or {}).get("region")
+                        (
+                            (node.get("sources") or {}).get("hyperpod")
+                            or (node.get("sources") or {}).get("ec2")
+                            or {}
+                        ).get("region")
                     ),
                     "kubernetes_read_at": (node.get("read_at") or {}).get("kubernetes"),
-                    "hyperpod_read_at": (node.get("read_at") or {}).get("hyperpod"),
+                    "hyperpod_read_at": (
+                        (node.get("read_at") or {}).get("hyperpod")
+                        or (node.get("read_at") or {}).get("ec2")
+                    ),
                 }
                 for node in evidence
             ]
@@ -440,9 +461,11 @@ def node_evidence(
     ``never-changed`` item, a node that is present is a blocker here whatever
     its scheduling state: the record is closed for a node that is *gone*, not
     for one that is clean. ``sources`` names what was consulted (``target`` is
-    the site's cluster entry, for the HyperPod cluster name and region) and
+    the site's cluster entry, for the provider cluster name and region) and
     what each said; a source that could not be read says so instead of
-    answering.
+    answering. The provider source is ``hyperpod`` (``list-cluster-nodes``)
+    or, on an ``eks-managed`` cluster, ``ec2`` (``describe-instances`` for the
+    recorded instance id).
     """
 
     if departed is None:
@@ -455,20 +478,28 @@ def node_evidence(
             "blockers": [KUBERNETES_PRESENT_BLOCKER],
             "sources": {"kubernetes": {"consulted": True, "present": True}},
         }
+    eks_managed = departed.get("provider") == EKS_PROVIDER
     provider: dict[str, Any] = {
         "consulted": "absent_from_provider" in departed,
-        "cluster_name": str(target.get("hyperpod_cluster_name") or "").strip() or None,
+        "cluster_name": (
+            str(target.get("cluster_id") or "").strip()
+            if eks_managed
+            else str(target.get("hyperpod_cluster_name") or "").strip()
+        )
+        or None,
         "region": str(target.get("region") or aws_region or "").strip() or None,
     }
     if "absent_from_provider" in departed:
         provider["listed"] = not bool(departed["absent_from_provider"])
+    if eks_managed and "ec2_state" in departed:
+        provider["state"] = departed["ec2_state"]
     return {
         **departed,
         "absent_from_kubernetes": True,
         "absent_from_provider": bool(departed.get("absent_from_provider", False)),
         "sources": {
             "kubernetes": {"consulted": True, "present": False},
-            "hyperpod": provider,
+            (EC2_SOURCE if eks_managed else "hyperpod"): provider,
         },
     }
 

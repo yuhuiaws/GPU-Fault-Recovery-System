@@ -52,7 +52,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from gpu_fault import retired_generation
-from gpu_fault.admin import operator_identity, workflow_reconcile_never_dispatched
+from gpu_fault.admin import (
+    operator_identity,
+    workflow_reconcile_departed_nodes,
+    workflow_reconcile_never_dispatched,
+)
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.diagnostics import diagnostic_text
@@ -93,14 +97,14 @@ BRIDGE_MODES = {
     NEVER_DISPATCHED: workflow_reconcile_never_dispatched.BRIDGE_MODE,
 }
 # Items whose missing node may be explained by the provider instead of failing
-# on "node is missing": there is no restore successor to name, and a node
-# HyperPod no longer lists carries no cordon, taint or annotation to restore.
+# on "node is missing": there is no restore successor to name, and a node the
+# provider no longer has carries no cordon, taint or annotation to restore.
 DEPARTED_NODE_TERMINALIZATIONS = frozenset({NEVER_CHANGED, NEVER_CHANGED_NON_PLAN})
-HYPERPOD_PROVIDER = "hyperpod"
-# HyperPod names an EKS node after its EC2 instance.
-HYPERPOD_NODE_NAME = re.compile(r"^hyperpod-(i-[0-9a-f]{8,17})$")
-# Pages of ``list-cluster-nodes`` read before the lookup is declared broken.
-HYPERPOD_INVENTORY_PAGE_LIMIT = 100
+HYPERPOD_PROVIDER = workflow_reconcile_departed_nodes.HYPERPOD_PROVIDER
+# HyperPod names an EKS node after its EC2 instance. Only a HyperPod cluster's
+# nodes are read this way; an eks-managed node is a private DNS name and its
+# instance id comes from the fleet record (``workflow_reconcile_departed_nodes``).
+HYPERPOD_NODE_NAME = workflow_reconcile_departed_nodes.HYPERPOD_NODE_NAME
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
     "gpu-fault.io/fencing-token",
@@ -915,74 +919,10 @@ def node_isolation_evidence(
 
 
 def hyperpod_instance_ids(site: RenderedSite, cluster_id: str) -> frozenset[str]:
-    """The EC2 instance ids HyperPod currently lists for ``cluster_id``.
+    """The EC2 instance ids HyperPod currently lists for ``cluster_id``."""
 
-    Read with ``aws sagemaker list-cluster-nodes`` in the cluster's region,
-    every page. A cluster the site does not describe as HyperPod-managed, a
-    failed call and an unreadable answer all raise ``BootstrapError``: the
-    caller turns that into a blocker, never into "absent".
-    """
-
-    target = cluster_target(site, cluster_id)
-    name = str(target.get("hyperpod_cluster_name") or "").strip()
-    if not name:
-        raise BootstrapError(
-            f"GPU cluster {cluster_id} is not HyperPod-managed in the site"
-        )
-    region = str(
-        target.get("region") or site.release_config.get("aws_region") or ""
-    ).strip()
-    if not region:
-        raise BootstrapError(f"GPU cluster {cluster_id} has no AWS region in the site")
-    instance_ids: set[str] = set()
-    token: str | None = None
-    for _page in range(HYPERPOD_INVENTORY_PAGE_LIMIT):
-        command = [
-            "aws",
-            "sagemaker",
-            "list-cluster-nodes",
-            "--cluster-name",
-            name,
-            "--region",
-            region,
-            "--output",
-            "json",
-        ]
-        if token:
-            command.extend(["--next-token", token])
-        completed = run_command(command, timeout_seconds=120)
-        if completed.returncode:
-            raise BootstrapError(
-                f"cannot list HyperPod nodes of {cluster_id}: "
-                f"{diagnostic_text(completed.stderr, sensitive=True)}"
-            )
-        try:
-            value = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise BootstrapError(
-                f"HyperPod node inventory of {cluster_id} is invalid JSON"
-            ) from exc
-        summaries = (
-            value.get("ClusterNodeSummaries") if isinstance(value, dict) else None
-        )
-        if not isinstance(summaries, list):
-            raise BootstrapError(f"HyperPod node inventory of {cluster_id} is invalid")
-        for row in summaries:
-            if isinstance(row, dict):
-                instance_id = row.get("InstanceId")
-                if isinstance(instance_id, str) and instance_id.strip():
-                    instance_ids.add(instance_id.strip())
-        next_token = value.get("NextToken")
-        if not next_token:
-            return frozenset(instance_ids)
-        if not isinstance(next_token, str) or next_token == token:
-            raise BootstrapError(
-                f"HyperPod node inventory of {cluster_id} repeats its page token"
-            )
-        token = next_token
-    raise BootstrapError(
-        f"HyperPod node inventory of {cluster_id} exceeds "
-        f"{HYPERPOD_INVENTORY_PAGE_LIMIT} pages"
+    return workflow_reconcile_departed_nodes.hyperpod_instance_ids(
+        site, cluster_target(site, cluster_id), cluster_id, run_command=run_command
     )
 
 
@@ -990,71 +930,51 @@ def _departed_node_evidence(
     site: RenderedSite,
     cluster_id: str,
     node_id: str,
-    provider_inventories: dict[str, frozenset[str] | str],
+    provider_inventories: dict[str, Any],
     read_at: dict[str, str] | None = None,
+    *,
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
     """Evidence for a ``never-changed`` item's node that Kubernetes no longer has.
 
-    Restored only when the node name maps to an instance HyperPod no longer
-    lists: nothing exists to carry a cordon, a taint or an isolation
-    annotation. Every other answer keeps the Kubernetes blocker and adds why
-    the provider could not clear it. ``provider_inventories`` caches one
-    provider read (or its failure) per cluster for the plan being built;
-    ``read_at`` records when that read happened (``hyperpod``).
+    Restored only when the provider no longer has the node's instance: on
+    HyperPod, the instance id in the node name is missing from
+    ``list-cluster-nodes``; on an ``eks-managed`` cluster, EC2 reports the
+    fleet-recorded ``instance_id`` terminated or unknown. Nothing then exists
+    to carry a cordon, a taint or an isolation annotation. Every other answer
+    keeps the Kubernetes blocker and adds why the provider could not clear it.
+    ``provider_inventories`` caches one provider read (or its failure) per
+    cluster for the plan being built; ``read_at`` records when that read
+    happened (``hyperpod`` or ``ec2``).
     """
 
     missing = _node_scheduling_evidence(node_id, None)
-    match = HYPERPOD_NODE_NAME.fullmatch(node_id)
-    if match is None:
-        return {
-            **missing,
-            "blockers": [
-                *missing["blockers"],
-                "provider membership unknown: node name carries no HyperPod "
-                "instance id",
-            ],
-        }
-    instance_id = match.group(1)
-    inventory = provider_inventories.get(cluster_id)
-    if inventory is None:
-        if read_at is not None:
-            read_at["hyperpod"] = datetime.now(timezone.utc).isoformat()
-        try:
-            inventory = hyperpod_instance_ids(site, cluster_id)
-        except BootstrapError as exc:
-            inventory = str(exc)
-        provider_inventories[cluster_id] = inventory
-    if isinstance(inventory, str):
-        return {
-            **missing,
-            "instance_id": instance_id,
-            "blockers": [
-                *missing["blockers"],
-                f"provider membership unknown: {inventory}",
-            ],
-        }
-    if instance_id in inventory:
-        return {
-            "node_id": node_id,
-            "exists": False,
-            "provider": HYPERPOD_PROVIDER,
-            "instance_id": instance_id,
-            "absent_from_provider": False,
-            "restored": False,
-            "blockers": [
-                "node is missing from Kubernetes but HyperPod still lists "
-                f"instance {instance_id}"
-            ],
-        }
-    return {
-        "node_id": node_id,
-        "exists": False,
-        "provider": HYPERPOD_PROVIDER,
-        "instance_id": instance_id,
-        "absent_from_provider": True,
-        "restored": True,
-        "blockers": [],
-    }
+    target = cluster_target(site, cluster_id)
+    if (
+        workflow_reconcile_departed_nodes.cluster_provider_of(target)
+        == workflow_reconcile_departed_nodes.EKS_PROVIDER
+    ):
+        return workflow_reconcile_departed_nodes.departed_node_evidence(
+            target,
+            cluster_id,
+            node_id,
+            instance_id=instance_id,
+            aws_region=site.release_config.get("aws_region"),
+            missing=missing,
+            states=provider_inventories.setdefault("ec2", {}),
+            read_at=read_at,
+            run_command=run_command,
+        )
+    return workflow_reconcile_departed_nodes.hyperpod_departed_node_evidence(
+        site,
+        target,
+        cluster_id,
+        node_id,
+        missing=missing,
+        provider_inventories=provider_inventories,
+        read_at=read_at,
+        run_command=run_command,
+    )
 
 
 def _scheduling_evidence(
@@ -1062,11 +982,14 @@ def _scheduling_evidence(
     items: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     inventories: dict[str, dict[str, dict[str, Any]]] = {}
-    provider_inventories: dict[str, frozenset[str] | str] = {}
+    provider_inventories: dict[str, Any] = {}
     # When each cluster's sources were read, reported beside the evidence of a
     # never-dispatched item and left out of its digest.
     read_at: dict[str, dict[str, str]] = {}
     result: dict[str, dict[str, Any]] = {}
+    recorded = workflow_reconcile_departed_nodes.RecordedInstanceIds(
+        site, items, cluster_target=cluster_target, run_script=_run_reconcile
+    )
     for item in items:
         request_id = str(item.get("request_id") or "")
         cluster_id = str(item.get("cluster_id") or "")
@@ -1100,6 +1023,7 @@ def _scheduling_evidence(
                             node_id,
                             provider_inventories,
                             read_at[cluster_id],
+                            instance_id=recorded.get(cluster_id, node_id),
                         )
                     ),
                     target=cluster_target(site, cluster_id),
@@ -1112,7 +1036,13 @@ def _scheduling_evidence(
             # the provider; a verified-restore item is judged on Kubernetes alone.
             departed_allowed = terminalization in DEPARTED_NODE_TERMINALIZATIONS
             nodes = [
-                _departed_node_evidence(site, cluster_id, node_id, provider_inventories)
+                _departed_node_evidence(
+                    site,
+                    cluster_id,
+                    node_id,
+                    provider_inventories,
+                    instance_id=recorded.get(cluster_id, node_id),
+                )
                 if departed_allowed and inventory.get(node_id) is None
                 else _node_scheduling_evidence(node_id, inventory.get(node_id))
                 for node_id in node_ids
