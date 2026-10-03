@@ -511,13 +511,17 @@ assert-message-check:
 public-release-check:
 	$(PYTHON) scripts/check-public-release.py
 
+# Both pytest gates below run under xdist: the same files run that way in
+# test-parallel-release, and serially they were 4 min each of the static job.
 ci-tooling-check:
-	$(PYTHON) -m pytest $(CI_TOOLING_TESTS)
+	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) --dist=$(PYTEST_XDIST_DIST) \
+		$(CI_TOOLING_TESTS)
 
 docs-check:
 	$(MAKE) docs-static-check
 	@if [ "$(DOCS_PYTEST)" != "0" ]; then \
-		$(PYTHON) -m pytest $(DOCUMENTATION_TESTS); \
+		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) --dist=$(PYTEST_XDIST_DIST) \
+			$(DOCUMENTATION_TESTS); \
 	fi
 
 docs-static-check:

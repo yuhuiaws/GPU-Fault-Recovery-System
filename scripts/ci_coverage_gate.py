@@ -51,7 +51,8 @@ if TYPE_CHECKING or __package__:
         load_config,
         logical_test_domain,
         parse_pytest_workers,
-        pytest_targets,
+        pytest_targets as pytest_targets,
+        shard_arguments,
         shard_coverage_sources,
         shard_partition,
         validate_test_partition,
@@ -87,7 +88,8 @@ else:
         load_config,
         logical_test_domain,
         parse_pytest_workers,
-        pytest_targets,
+        pytest_targets as pytest_targets,
+        shard_arguments,
         shard_coverage_sources,
         shard_partition,
         validate_test_partition,
@@ -948,11 +950,12 @@ def run_shard(
         environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
     partition = shard_partition(shard)
     _apply_partition(environment, partition)
+    arguments = shard_arguments(root, shard)
     command = [
         python,
         "-m",
         "pytest",
-        *pytest_targets(root, shard),
+        *arguments.options(),
     ]
     if not postgres:
         command.extend(["-n", workers, f"--dist={distribution}"])
@@ -995,7 +998,7 @@ def run_shard(
             python,
             "-m",
             "pytest",
-            *pytest_targets(root, shard),
+            *arguments.options(),
             "-n",
             "0",
             "-p",

@@ -238,7 +238,7 @@
   "protocol": {
     "partitions": {
       "deployment": 4,
-      "postgres": 3,
+      "postgres": 4,
       "runtime": 3
     },
     "postgres_image": "postgres:16",
@@ -364,6 +364,17 @@
       "omit_deployment_source": true
     },
     "postgres_2": {
+      "identity_groups": [
+        "dependencies",
+        "protocol",
+        "fault_runner_source",
+        "runtime_source",
+        "postgres_tests",
+        "shared_tests"
+      ],
+      "omit_deployment_source": true
+    },
+    "postgres_3": {
       "identity_groups": [
         "dependencies",
         "protocol",

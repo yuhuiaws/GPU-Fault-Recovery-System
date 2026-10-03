@@ -26,6 +26,7 @@ from scripts.ci_coverage_config import (
     RUNTIME_SHARDS,
     is_postgres_shard,
     logical_test_domain,
+    shard_arguments,
     shard_partition,
 )
 from scripts.ci_pytest_evidence import aggregate_pytest_results, ci_context
@@ -442,6 +443,48 @@ def test_nodeid_partitions_are_stable_disjoint_and_complete(domain: str) -> None
     assert max(map(len, partitions)) - min(map(len, partitions)) < 80 * count / 3
 
 
+def _collected_by(arguments, test_files: list[str]) -> set[str]:
+    """The test files pytest would collect for ``arguments``."""
+    collected = set()
+    for path in arguments.paths:
+        if path.endswith(".py"):
+            collected.add(path)
+        else:
+            collected.update(f for f in test_files if f.startswith(path + "/"))
+    return collected - set(arguments.ignores)
+
+
+@pytest.mark.parametrize("shard", ci_coverage_gate.SHARDS)
+def test_shard_arguments_collect_exactly_the_shard_targets(shard: str) -> None:
+    """Directory arguments with ``--ignore`` must select the same files as the
+    explicit target list: nothing dropped, nothing from another shard."""
+    test_files = sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in ci_gate_artifacts.repository_files(ROOT)
+        if path.relative_to(ROOT).as_posix().startswith("tests/")
+        and path.name.startswith("test_")
+        and path.suffix == ".py"
+    )
+    arguments = shard_arguments(ROOT, shard)
+    targets = set(ci_coverage_gate.pytest_targets(ROOT, shard))
+    directories = [path for path in arguments.paths if not path.endswith(".py")]
+
+    assert _collected_by(arguments, test_files) == targets, (
+        "the argument set must collect exactly the shard's test files"
+    )
+    assert set(arguments.ignores) <= {
+        f for d in directories for f in test_files if f.startswith(d + "/")
+    }, "every ignore must lie below a directory argument"
+    assert not any(
+        f.startswith(d + "/") for f in arguments.paths for d in directories
+    ), "a file argument must not repeat a directory argument"
+    assert arguments == shard_arguments(ROOT, shard), "arguments are deterministic"
+    if logical_test_domain(shard) == "deployment":
+        assert "tests/regional" in directories, (
+            "the regional directory is the case this optimisation exists for"
+        )
+
+
 def test_shard_names_resolve_to_their_logical_domain() -> None:
     assert logical_test_domain("fault_runner") == "fault_runner"
     assert shard_partition("fault_runner") is None
@@ -792,7 +835,7 @@ def _pytest_value(root: Path, identity: dict, *, suite: str = "pytest") -> dict:
             "collection_skips": [],
             "ci_context": ci_context(identity, suite),
             "selection": {
-                "targets": targets,
+                "targets": list(shard_arguments(root, shard).paths),
                 "partition": partition,
                 "keyword": "",
                 "markexpr": "",

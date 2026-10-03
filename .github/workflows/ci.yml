@@ -228,6 +228,7 @@ jobs:
           - postgres_0
           - postgres_1
           - postgres_2
+          - postgres_3
     services:
       postgres:
         image: postgres:16

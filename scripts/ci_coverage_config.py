@@ -14,7 +14,7 @@ import ast
 import fnmatch
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 if TYPE_CHECKING or __package__:
     from scripts.ci_coverage_floors import (
@@ -45,7 +45,11 @@ TEST_DOMAINS = ("runtime", "deployment", "fault_runner", "postgres")
 # by tests/test_script_assets.py. Sized from the 2026-10-03 ubuntu-latest
 # measurements (4 workers): deployment 36 min as one shard, postgres 15 min
 # contract + 14 min stress serially, runtime 7-11 min per third.
-PARTITIONED_DOMAINS: dict[str, int] = {"runtime": 3, "deployment": 4, "postgres": 3}
+PARTITIONED_DOMAINS: dict[str, int] = {"runtime": 3, "deployment": 4, "postgres": 4}
+# A directory argument may stand in for its test files when at most this
+# fraction of the test files below it belong to other shards (they become
+# ``--ignore`` options); see ``shard_arguments``.
+DIRECTORY_ARGUMENT_MAX_IGNORED_FRACTION = 0.2
 
 
 def _partition_shards(domain: str) -> tuple[str, ...]:
@@ -413,6 +417,73 @@ def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
     if not targets:
         raise CoverageGateError(f"coverage shard has no pytest targets: {shard}")
     return tuple(sorted(targets))
+
+
+class ShardArguments(NamedTuple):
+    """The pytest command line that collects exactly ``pytest_targets``."""
+
+    paths: tuple[str, ...]
+    ignores: tuple[str, ...]
+
+    def options(self) -> tuple[str, ...]:
+        return (*self.paths, *(f"--ignore={path}" for path in self.ignores))
+
+
+def _is_test_file(relative: str, name: str) -> bool:
+    return (
+        relative.startswith("tests/")
+        and name.startswith("test_")
+        and name.endswith(".py")
+    )
+
+
+def shard_arguments(root: Path, shard: str) -> ShardArguments:
+    """Directory and file arguments whose collection is exactly ``pytest_targets``.
+
+    pytest re-collects a file argument's whole parent directory for every file
+    argument (``Session.collect`` skips its collection cache for bare file
+    paths), so a shard that names 843 files under ``tests/regional`` builds
+    about 800k Module nodes and spends minutes before the first test runs
+    (190 s against 63 s for this form, measured 2026-10-03 on the deployment
+    domain). A directory argument is collected once; the few test files below
+    it that belong to another shard are excluded with ``--ignore``. The result
+    is a pure function of the repository file list and the shard config, and
+    the receipt's ``collected_files`` must still equal ``pytest_targets``, so a
+    wrong argument set fails the shard gate instead of running the wrong tests.
+    """
+
+    targets = set(pytest_targets(root, shard))
+    test_files = sorted(
+        path.relative_to(root).as_posix()
+        for path in repository_files(root)
+        if _is_test_file(path.relative_to(root).as_posix(), path.name)
+    )
+    paths: list[str] = []
+    ignores: list[str] = []
+
+    def visit(directory: str) -> None:
+        prefix = directory + "/"
+        below = [relative for relative in test_files if relative.startswith(prefix)]
+        included = [relative for relative in below if relative in targets]
+        if not included:
+            return
+        excluded = [relative for relative in below if relative not in targets]
+        if len(excluded) <= DIRECTORY_ARGUMENT_MAX_IGNORED_FRACTION * len(included):
+            paths.append(directory)
+            ignores.extend(excluded)
+            return
+        subdirectories = set()
+        for relative in below:
+            remainder = relative[len(prefix) :]
+            if "/" in remainder:
+                subdirectories.add(remainder.split("/", 1)[0])
+            elif relative in targets:
+                paths.append(relative)
+        for name in sorted(subdirectories):
+            visit(f"{directory}/{name}")
+
+    visit("tests")
+    return ShardArguments(tuple(sorted(paths)), tuple(sorted(ignores)))
 
 
 def validate_test_partition(root: Path = ROOT) -> dict[str, int]:

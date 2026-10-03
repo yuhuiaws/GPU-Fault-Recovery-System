@@ -14,6 +14,7 @@ from scripts.ci_coverage_config import (
     logical_test_domain,
     parse_pytest_workers,
     pytest_targets,
+    shard_arguments,
     shard_partition,
 )
 from scripts.ci_gate_artifacts import CoverageGateError, sha256
@@ -121,12 +122,15 @@ def validate_shard_receipt(
         raise ValueError("pytest receipt does not match its shard content identity")
     shard = identity["shard"]
     targets = list(pytest_targets(root, shard))
+    # The command line names directories where it can (see shard_arguments);
+    # the files pytest actually collected must still be exactly the shard's.
+    arguments = list(shard_arguments(root, shard).paths)
     selection = session.get("selection")
     shard_slot = shard_partition(shard)
     partition = list(shard_slot) if shard_slot is not None else None
     if (
         not isinstance(selection, dict)
-        or selection.get("targets") != targets
+        or selection.get("targets") != arguments
         or selection.get("partition") != partition
         or selection.get("keyword") != ""
         or selection.get("markexpr") != ""

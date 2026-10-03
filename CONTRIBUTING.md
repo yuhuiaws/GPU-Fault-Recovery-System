@@ -171,8 +171,8 @@ floor（族内某个覆盖良好的模块不得替兄弟模块背书）。新增
 
 main CI把fresh门禁分成`runtime`、`deployment`、`fault_runner`和`postgres`四个逻辑
 域；其中runtime、deployment和postgres按稳定pytest nodeid哈希拆成`runtime_0..2`、
-`deployment_0..3`和`postgres_0..2`（`config/ci-unit-gate.json`的`protocol.partitions`，
-与`scripts/ci_coverage_config.py`一致），因此共有十一个并行物理shard；每个PostgreSQL
+`deployment_0..3`和`postgres_0..3`（`config/ci-unit-gate.json`的`protocol.partitions`，
+与`scripts/ci_coverage_config.py`一致），因此共有十二个并行物理shard；每个PostgreSQL
 shard在自己的job级service上仍然串行执行contract和stress。每个shard按自己的源码、
 测试、依赖和Runner环境计算内容身份，独立恢复、验签、
 重签和上传；聚合`unit` job最后执行`coverage combine`，同时强制生产78%组合floor、
@@ -188,6 +188,12 @@ fault report和签名unit gate。deploy-host-only管理员源码只进入deploym
 下标`i, i+4, i+8, ...`的用例（`tests/conftest.py`）。四份互不相交、并集等于全部用例，
 每份都是完整打乱顺序的子序列；本地复现某个红shard时导出同样三个变量即可，不带分片
 变量重放同一种子得到的就是整条顺序。
+
+shard的pytest参数由`shard_arguments`生成：目录能整体归属时传目录并用`--ignore=`排除
+少数例外，否则逐个传文件；pytest对每个文件参数都重新收集其所在目录，逐个传入上千个
+文件会让收集慢 3 倍。回执的`collected_files`仍必须精确等于shard文件清单。
+`make ci-tooling-check`和`make docs-check`的pytest与`test-parallel-release`一样
+使用xdist worker。
 
 分片回执必须具有完整 discovery、实际选择清单、成功的 setup/call/teardown 和相符的
 内容身份；必跑 PostgreSQL stress 不允许 skip。历史复用保留首次执行的 producer、

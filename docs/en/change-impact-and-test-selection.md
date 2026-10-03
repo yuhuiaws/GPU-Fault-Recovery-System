@@ -71,8 +71,8 @@ The `unit` gate of main CI does not use the Git commit directly as the sole reus
 4. `postgres`: Runtime shared source, the four PostgreSQL contract tests, the actual PostgreSQL image;
 5. each identity is additionally bound to the Python/Runner, the installed distributions, the coverage protocol and the worker configuration.
 
-The runtime, deployment and postgres domains are further split into `runtime_0..2`, `deployment_0..3` and `postgres_0..2` by a hash
-of the stable pytest nodeid (`protocol.partitions` in `config/ci-unit-gate.json`), so each run actually produces eleven physical
+The runtime, deployment and postgres domains are further split into `runtime_0..2`, `deployment_0..3` and `postgres_0..3` by a hash
+of the stable pytest nodeid (`protocol.partitions` in `config/ci-unit-gate.json`), so each run actually produces twelve physical
 shard artifacts. Each nodeid of a parametrized test enters only one sub-shard of its domain, the union of a domain's sub-shards keeps
 the full test set, and the unit job only merges sub-shards of one domain that report the same discovery.
 
@@ -80,7 +80,7 @@ A historical shard artifact must come from a completed main push whose correspon
 identity, the producer run, the evidence SHA and the current content-identity check; failures of other jobs in the same run
 do not invalidate an independent shard that was already successfully signed. On a hit, the current run uses the historical
 coverage/pytest/duration evidence to generate a new shard gate carrying `reused_from` and re-signs it; shards that miss
-execute independently. Only after the eleven physical shards complete are `coverage combine`, the 78% floor,
+execute independently. Only after the twelve physical shards complete are `coverage combine`, the 78% floor,
 the per-module floor of deployment-only modules and the fault report run together.
 
 When the GitHub artifact query or download is temporarily unavailable, the current shard safely falls back to fresh execution; an already downloaded gate
@@ -92,7 +92,7 @@ Therefore:
 - docs/CI tooling changes are executed by the current static job, and every shard can be reused;
 - deploy-host-only administrator source or corresponding test changes only rerun the four deployment shards;
 - fault catalog/runner changes only rerun the fault_runner shard;
-- PostgreSQL contract tests or related Runtime source changes make the three postgres shards rerun;
+- PostgreSQL contract tests or related Runtime source changes make the four postgres shards rerun;
 - Runtime shared source changes conservatively invalidate the multiple shards that depend on it, but these fresh shards execute in parallel.
 - CI gate, artifact download, coverage/unit signing and candidate recovery belong to the explicit `ci-trust` domain; changes to these files
   continue to escalate to the full gates and are no longer caught by the unclassified runtime fallback.
