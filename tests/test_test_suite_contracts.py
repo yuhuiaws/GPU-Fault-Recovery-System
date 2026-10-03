@@ -384,6 +384,56 @@ def test_shuffle_shard_variables_must_be_a_consistent_pair(
         conftest.pytest_collection_modifyitems(_FakeConfig(), _shuffle_items(8))
 
 
+def test_shuffle_shard_is_taken_from_the_environment_once_and_not_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The controlling session keeps its slice in the stash and strips the
+    variables from the process environment, so a nested pytest a test spawns
+    runs whole; xdist workers receive the slice through ``workerinput``."""
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "9")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARDS_VARIABLE, "3")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, "2")
+    controller = SimpleNamespace(
+        addinivalue_line=lambda *_args: None,
+        stash=pytest.Stash(),
+        hook=SimpleNamespace(pytest_deselected=lambda items: None),
+    )
+
+    conftest.pytest_configure(controller)  # type: ignore[arg-type]
+
+    assert controller.stash[conftest.SHUFFLE_SHARD_KEY] == (3, 2)
+    assert conftest.SHUFFLE_SHARDS_VARIABLE not in os.environ, (
+        "children of the controller must not inherit the shard count"
+    )
+    assert conftest.SHUFFLE_SHARD_VARIABLE not in os.environ, (
+        "children of the controller must not inherit the shard index"
+    )
+    assert os.environ[conftest.SHUFFLE_SEED_VARIABLE] == "9", (
+        "the seed stays exported; a nested session only changes order"
+    )
+    items = _shuffle_items(30)
+    conftest.pytest_collection_modifyitems(controller, items)  # type: ignore[arg-type]
+    assert len(items) == 10, "the stashed slice still shards this session"
+
+    node = SimpleNamespace(config=controller, workerinput={})
+    conftest.pytest_configure_node(node)
+    assert node.workerinput[conftest.SHUFFLE_SHARD_WORKERINPUT] == (3, 2)
+    worker = SimpleNamespace(
+        workerinput=dict(node.workerinput),
+        hook=SimpleNamespace(pytest_deselected=lambda items: None),
+    )
+    worker_items = _shuffle_items(30)
+    conftest.pytest_collection_modifyitems(worker, worker_items)  # type: ignore[arg-type]
+    assert worker_items == items, (
+        "a worker must select the same slice as the controller without the variables"
+    )
+    assert conftest.pytest_report_header(worker) == [  # type: ignore[arg-type]
+        f"test order shuffled: {conftest.SHUFFLE_SEED_VARIABLE}=9",
+        f"shuffled shard 2 of 3: {conftest.SHUFFLE_SHARDS_VARIABLE}=3 "
+        f"{conftest.SHUFFLE_SHARD_VARIABLE}=2",
+    ]
+
+
 def test_shuffle_shards_require_a_seed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A shard without a seed would silently run an unshuffled fraction of the
     suite and let the gate go green on a quarter of its tests."""

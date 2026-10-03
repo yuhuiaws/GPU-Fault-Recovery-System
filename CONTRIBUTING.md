@@ -187,7 +187,9 @@ fault report和签名unit gate。deploy-host-only管理员源码只进入deploym
 `GPU_FAULT_TEST_SHUFFLE_SHARDS=4`和`GPU_FAULT_TEST_SHUFFLE_SHARD=<i>`只保留整体顺序里
 下标`i, i+4, i+8, ...`的用例（`tests/conftest.py`）。四份互不相交、并集等于全部用例，
 每份都是完整打乱顺序的子序列；本地复现某个红shard时导出同样三个变量即可，不带分片
-变量重放同一种子得到的就是整条顺序。
+变量重放同一种子得到的就是整条顺序。分片变量只由控制进程在`pytest_configure`读取一次
+并从进程环境移除，再经xdist `workerinput`交给worker；测试内部再启动的嵌套pytest因此
+完整运行，不会被分片。
 
 shard的pytest参数由`shard_arguments`生成：目录能整体归属时传目录并用`--ignore=`排除
 少数例外，否则逐个传文件；pytest对每个文件参数都重新收集其所在目录，逐个传入上千个

@@ -24,6 +24,11 @@ from tests._cluster_binary_guard import install as install_binary_guard
 SHUFFLE_SEED_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SEED"
 SHUFFLE_SHARDS_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SHARDS"
 SHUFFLE_SHARD_VARIABLE = "GPU_FAULT_TEST_SHUFFLE_SHARD"
+# The shard slice travels from the controller to the xdist workers inside the
+# session (stash / workerinput), never through the environment the workers
+# inherit: a test that spawns its own pytest must run that session whole.
+SHUFFLE_SHARD_KEY = pytest.StashKey[tuple[int, int] | None]()
+SHUFFLE_SHARD_WORKERINPUT = "gpu_fault_shuffle_shard"
 
 
 OUTBOX_RETRY_MARKER = "collector_outbox_retry"
@@ -39,6 +44,32 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{OUTBOX_RETRY_MARKER}: keep the production outbox replay retry schedule.",
     )
     _isolate_postgres_per_worker()
+    if not hasattr(config, "workerinput"):
+        _take_shuffle_shard_from_environment(config)
+
+
+def _take_shuffle_shard_from_environment(config: pytest.Config) -> None:
+    """Read the shard variables once, in the controlling process, and drop them.
+
+    Only this session is a slice of the suite. Several tests run a nested
+    pytest with the inherited environment (``test_alert_rules_promtool`` runs a
+    single nodeid and expects exit 1); with the variables still exported that
+    nested session would shuffle, keep slot ``i`` of its one item and exit 5
+    instead. The seed may stay exported: a nested session merely runs in a
+    different order, which it already did before the round was sharded.
+    """
+    config.stash[SHUFFLE_SHARD_KEY] = _shuffle_shard_from_environment()
+    for name in (SHUFFLE_SHARDS_VARIABLE, SHUFFLE_SHARD_VARIABLE):
+        os.environ.pop(name, None)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: object) -> None:
+    """Hand each xdist worker the controller's shard slice (``workerinput``)."""
+    stash = getattr(getattr(node, "config", None), "stash", None)
+    workerinput = getattr(node, "workerinput", None)
+    if isinstance(stash, pytest.Stash) and isinstance(workerinput, dict):
+        workerinput[SHUFFLE_SHARD_WORKERINPUT] = stash.get(SHUFFLE_SHARD_KEY, None)
 
 
 def _isolate_postgres_per_worker() -> None:
@@ -87,7 +118,7 @@ def pytest_collection_modifyitems(
     同一种子不分片重放，得到的就是把 N 份按原位插回去的那一条完整顺序。
     """
     raw = os.environ.get(SHUFFLE_SEED_VARIABLE, "").strip()
-    shards = _shuffle_shard()
+    shards = _shuffle_shard(config)
     if not raw:
         if shards is not None:
             raise pytest.UsageError(
@@ -113,7 +144,20 @@ def pytest_collection_modifyitems(
     items[:] = selected
 
 
-def _shuffle_shard() -> tuple[int, int] | None:
+def _shuffle_shard(config: object) -> tuple[int, int] | None:
+    """This session's ``(count, index)``: the controller's stash, the slice an
+    xdist worker was handed, or (outside a configured session) the variables."""
+    stash = getattr(config, "stash", None)
+    if isinstance(stash, pytest.Stash) and SHUFFLE_SHARD_KEY in stash:
+        return stash[SHUFFLE_SHARD_KEY]
+    workerinput = getattr(config, "workerinput", None)
+    if isinstance(workerinput, dict) and SHUFFLE_SHARD_WORKERINPUT in workerinput:
+        value = workerinput[SHUFFLE_SHARD_WORKERINPUT]
+        return (int(value[0]), int(value[1])) if value else None
+    return _shuffle_shard_from_environment()
+
+
+def _shuffle_shard_from_environment() -> tuple[int, int] | None:
     """``(count, index)`` from the shard variables, or ``None`` when unset.
 
     Both must be present together; a count without an index (or the reverse)
@@ -146,7 +190,7 @@ def shuffle_shard_selection[T](ordered: list[T], count: int, index: int) -> list
     return ordered[index::count]
 
 
-def pytest_report_header() -> list[str]:
+def pytest_report_header(config: pytest.Config) -> list[str]:
     """Put the seed in the header, so a red CI run can be replayed verbatim.
 
     读环境变量而不是收集钩子里存的值：``pytest_report_header`` 在收集之前就调用，
@@ -156,7 +200,7 @@ def pytest_report_header() -> list[str]:
     if not raw:
         return []
     lines = [f"test order shuffled: {SHUFFLE_SEED_VARIABLE}={raw}"]
-    shards = _shuffle_shard()
+    shards = _shuffle_shard(config)
     if shards is not None:
         lines.append(
             f"shuffled shard {shards[1]} of {shards[0]}: "
