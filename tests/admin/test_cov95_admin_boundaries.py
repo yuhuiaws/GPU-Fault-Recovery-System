@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 import pytest
 import yaml
 
 from gpu_fault.admin import bootstrap_dependencies as dependencies
+from gpu_fault.admin import execution
 from gpu_fault.admin import deploy_consent, release_state, source_deploy
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import SiteConfigError, load_site
@@ -15,6 +17,12 @@ from tests.admin.test_admin_site import site_file
 
 @pytest.fixture
 def toolchain(tmp_path, monkeypatch):
+    # ``tmp_path_retention_policy = "failed"`` hands a passed test's directory
+    # back to the next parametrization, so the fixture binary of the previous
+    # run has the same path and bytes -- the same toolchain identity -- and
+    # the 60 s ``PROOFS`` cache would answer without running the tool again.
+    # Each run proves its own toolchain.
+    execution.PROOFS.invalidate(f"deploy-host:{sys.prefix}")
     manifest = {
         "schema_version": 1,
         "python": {"major": 3, "minor": 12},
