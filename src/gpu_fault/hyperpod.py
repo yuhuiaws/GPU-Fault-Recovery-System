@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from enum import StrEnum
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from pydantic import Field, model_validator
@@ -24,6 +24,12 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
 )
+from gpu_fault.node_provider import (
+    HYPERPOD_REBOOT_CONFIRMATION_SOURCE,
+    NodeLifecycleProvider,
+    resolve_provider_nodes,
+)
+from gpu_fault.provider_submissions import ProviderSubmissionLedger
 
 LOGGER = logging.getLogger(__name__)
 
@@ -347,6 +353,9 @@ class HyperPodAdapterError(ValueError):
 class HyperPodLifecycleAdapter:
     """Safe wrapper over SageMaker HyperPod node lifecycle APIs."""
 
+    provider_label = "HyperPod"
+    confirmation_source = HYPERPOD_REBOOT_CONFIRMATION_SOURCE
+
     def __init__(
         self,
         config: HyperPodAdapterConfig,
@@ -357,14 +366,17 @@ class HyperPodLifecycleAdapter:
         self.config = config
         self.client = client or self._create_client(config)
         # When a store is supplied, submission idempotency survives a
-        # process restart and a replica failover. Without one it degrades
-        # to the process-local dicts below, which is only safe for tests
+        # process restart and a replica failover. Without one the ledger
+        # degrades to process-local dicts, which is only safe for tests
         # and for one-shot CLI use.
         self.store = store
-        self._submissions: dict[str, HyperPodSubmissionResult] = {}
-        self._submission_requests: dict[
-            str, tuple[HyperPodAction, tuple[str, ...]]
-        ] = {}
+        self._ledger = ProviderSubmissionLedger(
+            cluster_name=config.cluster_name,
+            store=store,
+            error=HyperPodAdapterError,
+            provider_label=self.provider_label,
+            record_type=HyperPodSubmissionRecord,
+        )
         self._lock = RLock()
 
     @staticmethod
@@ -613,28 +625,12 @@ class HyperPodLifecycleAdapter:
         *,
         nodes: list[HyperPodNode] | None = None,
     ) -> list[HyperPodNode]:
-        if not identifiers:
-            raise HyperPodAdapterError("at least one target node is required")
-        candidates = self.list_nodes(enrich=True) if nodes is None else nodes
-        index: dict[str, list[HyperPodNode]] = {}
-        for node in candidates:
-            for alias in node.aliases:
-                index.setdefault(alias, []).append(node)
-
-        resolved = []
-        for identifier in identifiers:
-            matches = index.get(identifier, [])
-            if not matches:
-                raise HyperPodAdapterError(
-                    f"node is not part of HyperPod cluster: {identifier}"
-                )
-            unique = {item.node_logical_id: item for item in matches}
-            if len(unique) != 1:
-                raise HyperPodAdapterError(
-                    f"node identifier is ambiguous: {identifier}"
-                )
-            resolved.append(next(iter(unique.values())))
-        return list({node.node_logical_id: node for node in resolved}.values())
+        return resolve_provider_nodes(
+            identifiers,
+            self.list_nodes(enrich=True) if nodes is None else nodes,
+            error=HyperPodAdapterError,
+            membership="HyperPod cluster",
+        )
 
     def preflight(
         self,
@@ -724,26 +720,9 @@ class HyperPodLifecycleAdapter:
                 "use the healthy warm-spare coordinator"
             )
         with self._lock:
-            reserved_record = None
-            if self.store is not None:
-                duplicate = self._replay_durable_submission(
-                    action, node_identifiers, idempotency_key
-                )
-                if duplicate is not None:
-                    return duplicate
-            else:
-                existing = self._submissions.get(idempotency_key)
-                if existing is not None:
-                    request_identity = (
-                        action,
-                        tuple(sorted(node_identifiers)),
-                    )
-                    if self._submission_requests[idempotency_key] != request_identity:
-                        raise HyperPodAdapterError(
-                            "idempotency key was already used for a "
-                            "different HyperPod request"
-                        )
-                    return existing.model_copy(update={"duplicate": True})
+            duplicate = self._ledger.replay(action, node_identifiers, idempotency_key)
+            if duplicate is not None:
+                return duplicate
             if confirm_cluster_name != self.config.cluster_name:
                 raise HyperPodAdapterError(
                     "cluster confirmation does not match configured HyperPod cluster"
@@ -762,35 +741,15 @@ class HyperPodLifecycleAdapter:
                 )
 
             logical_ids = [node.node_logical_id for node in preflight.targets]
-            if self.store is not None:
-                # Write the intent before the provider call. Whoever wins
-                # this reservation is the only caller allowed to submit;
-                # a loser here means a concurrent replica already holds
-                # the key, so replay its outcome instead of submitting a
-                # second batch for the same step.
-                reserved_record, reserved = self.store.reserve_hyperpod_submission(
-                    HyperPodSubmissionRecord(
-                        cluster_name=self.config.cluster_name,
-                        idempotency_key=idempotency_key,
-                        action=action,
-                        requested_node_identifiers=list(node_identifiers),
-                    )
-                )
-                if not reserved:
-                    duplicate = self._durable_submission_outcome(
-                        reserved_record,
-                        action,
-                        node_identifiers,
-                    )
-                    if duplicate is not None:
-                        return duplicate
-                    raise HyperPodAdapterError(
-                        "a HyperPod submission for this idempotency "
-                        "key is already reserved and has no recorded "
-                        "outcome; it is either in flight on another "
-                        "replica or was interrupted, so retrying here "
-                        "could submit a second batch"
-                    )
+            # Write the intent before the provider call. Whoever wins this
+            # reservation is the only caller allowed to submit; a loser here
+            # means a concurrent replica already holds the key, so replay
+            # its outcome instead of submitting a second batch for the step.
+            reserved_record, duplicate = self._ledger.reserve(
+                action, node_identifiers, idempotency_key
+            )
+            if duplicate is not None:
+                return duplicate
             request = {
                 "ClusterName": self.config.cluster_name,
                 "NodeLogicalIds": logical_ids,
@@ -802,7 +761,7 @@ class HyperPodLifecycleAdapter:
                 # record must not go back to a state that permits a
                 # second submission. UNKNOWN is terminal for retries and
                 # forces an operator decision.
-                self._record_submission_outcome(
+                self._ledger.record_outcome(
                     reserved_record,
                     state="UNKNOWN",
                     error=f"{type(exc).__name__}: {exc}",
@@ -831,89 +790,10 @@ class HyperPodLifecycleAdapter:
                 ),
                 failures=failures,
             )
-            self._submissions[idempotency_key] = result
-            self._submission_requests[idempotency_key] = (
-                action,
-                tuple(sorted(node_identifiers)),
-            )
-            self._record_submission_outcome(
-                reserved_record, state="SUBMITTED", result=result
+            self._ledger.remember(
+                idempotency_key, result, action, node_identifiers, reserved_record
             )
             return result
-
-    def _replay_durable_submission(
-        self,
-        action: HyperPodAction,
-        node_identifiers: list[str],
-        idempotency_key: str,
-    ) -> HyperPodSubmissionResult | None:
-        """Return the recorded outcome for an already-used key."""
-
-        try:
-            record = self.store.get_hyperpod_submission(
-                self.config.cluster_name, idempotency_key
-            )
-        except (KeyError, LookupError):
-            return None
-        return self._durable_submission_outcome(record, action, node_identifiers)
-
-    def _durable_submission_outcome(
-        self,
-        record: HyperPodSubmissionRecord,
-        action: HyperPodAction,
-        node_identifiers: list[str],
-    ) -> HyperPodSubmissionResult | None:
-        if record.request_identity != (
-            action,
-            tuple(sorted(node_identifiers)),
-        ):
-            raise HyperPodAdapterError(
-                "idempotency key was already used for a different HyperPod request"
-            )
-        if record.state == "SUBMITTED" and record.result is not None:
-            return record.result.model_copy(update={"duplicate": True})
-        if record.state == "UNKNOWN":
-            raise HyperPodAdapterError(
-                "a previous HyperPod submission for this idempotency "
-                "key has an unknown outcome; an operator must confirm "
-                "the node state before retrying: "
-                + (record.error or "no error recorded")
-            )
-        return None
-
-    def _record_submission_outcome(
-        self,
-        record: HyperPodSubmissionRecord | None,
-        *,
-        state: str,
-        result: HyperPodSubmissionResult | None = None,
-        error: str | None = None,
-    ) -> None:
-        if self.store is None or record is None:
-            return
-        try:
-            self.store.save_hyperpod_submission(
-                record.model_copy(
-                    update={
-                        "state": state,
-                        "result": result,
-                        "error": error,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                )
-            )
-        except Exception:
-            # The provider call already happened. Losing the outcome
-            # record leaves the key reserved in the INTENDED state,
-            # which fails closed on the next attempt rather than
-            # re-submitting, so log and do not mask the real result.
-            LOGGER.exception(
-                "could not persist HyperPod submission outcome: "
-                "cluster=%s key=%s state=%s",
-                record.cluster_name,
-                record.idempotency_key,
-                state,
-            )
 
     def execute_step(
         self,
@@ -989,16 +869,17 @@ class HyperPodLifecycleAdapter:
 
 
 class HyperPodWorkflowDispatcher:
-    """Dispatches only HyperPod-owned lifecycle steps.
+    """Dispatches only provider-owned lifecycle steps.
 
-    A successful result means SageMaker accepted the request. A separate
-    observer must verify node transition and validation gates before marking
-    the incident recovered.
+    A successful result means the provider (SageMaker for HyperPod, EC2 for a
+    plain EKS cluster) accepted the request. A separate observer must verify
+    node transition and validation gates before marking the incident
+    recovered. ``adapter`` is any ``NodeLifecycleProvider``.
     """
 
     def __init__(
         self,
-        adapter: HyperPodLifecycleAdapter,
+        adapter: NodeLifecycleProvider,
         *,
         execution_owner: str = "gpu-fault-hyperpod-adapter",
     ) -> None:
@@ -1015,11 +896,16 @@ class HyperPodWorkflowDispatcher:
     ) -> HyperPodPreflight:
         step = self._step(workflow, step_index)
         action = self._action(step)
-        return self.adapter.preflight(
-            action,
-            step.node_ids,
-            isolation_verified_nodes=isolation_verified_nodes,
-            require_execution_enabled=require_execution_enabled,
+        # The provider protocol is untyped at this edge so it can import
+        # nothing from here; both providers return these models.
+        return cast(
+            HyperPodPreflight,
+            self.adapter.preflight(
+                action,
+                step.node_ids,
+                isolation_verified_nodes=isolation_verified_nodes,
+                require_execution_enabled=require_execution_enabled,
+            ),
         )
 
     def submit(
@@ -1032,16 +918,19 @@ class HyperPodWorkflowDispatcher:
         expected_fencing_token: int,
     ) -> HyperPodSubmissionResult:
         step = self._step(workflow, step_index)
-        return self.adapter.execute_step(
-            step,
-            isolation_verified_nodes=isolation_verified_nodes,
-            confirm_cluster_name=confirm_cluster_name,
-            workflow_fencing_token=workflow.fencing_token,
-            expected_fencing_token=expected_fencing_token,
-            idempotency_key=hyperpod_submission_idempotency_key(
-                workflow.request_id,
-                step_index,
-                step.operation,
+        return cast(
+            HyperPodSubmissionResult,
+            self.adapter.execute_step(
+                step,
+                isolation_verified_nodes=isolation_verified_nodes,
+                confirm_cluster_name=confirm_cluster_name,
+                workflow_fencing_token=workflow.fencing_token,
+                expected_fencing_token=expected_fencing_token,
+                idempotency_key=hyperpod_submission_idempotency_key(
+                    workflow.request_id,
+                    step_index,
+                    step.operation,
+                ),
             ),
         )
 
