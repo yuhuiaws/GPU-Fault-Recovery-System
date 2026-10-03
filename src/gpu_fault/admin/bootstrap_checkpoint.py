@@ -15,7 +15,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapRequest,
     BootstrapState,
     ClusterIdentity,
-    safe_name,
+    default_cluster_id,
 )
 from gpu_fault.admin.grafana import dashboard_asset_digests
 from gpu_fault.admin.rds_ca_bundle import RDS_CA_BUNDLE_PATH
@@ -228,7 +228,8 @@ def bind_bootstrap_inputs(
             cpu=cpu_identity,
             gpu_clusters=gpu_identity,
             cluster_inputs={
-                safe_name(str(item["hyperpod_name"])): item for item in gpu_identity
+                default_cluster_id(cluster): item
+                for cluster, item in zip(gpu_clusters, gpu_identity, strict=True)
             },
             release=release_identity,
             images=images,

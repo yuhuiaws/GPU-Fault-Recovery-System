@@ -25,10 +25,13 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     ClusterIdentity,
     CommandRunner,
+    default_cluster_id,
     ensure_namespace as ensure_namespace,
     safe_name,
     write_secret as write_secret,
 )
+from gpu_fault.admin.bootstrap_discovery import cluster_provider_entries
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault.admin.bootstrap_services import (
     ensure_adot_writer_role,
     ensure_executor_role,
@@ -215,13 +218,22 @@ def _discover_join_target(
     runner: CommandRunner,
 ) -> tuple[ClusterIdentity, str, dict[str, Any] | None]:
     context = _join_context(request.gpu_cluster_arn)
+    try:
+        requested_selector = request.requested_node_selector
+    except ValueError as exc:
+        raise BootstrapError(str(exc)) from None
     target = discover_cluster(
         runner,
         cluster_arn=request.gpu_cluster_arn,
         role="gpu",
         context=context,
+        node_selector=requested_selector,
     )
-    cluster_id = safe_name(request.cluster_id or target.hyperpod_name)
+    cluster_id = (
+        safe_name(request.cluster_id)
+        if request.cluster_id
+        else default_cluster_id(target)
+    )
     _validate_target(request, target, cluster_id)
     existing = next(
         (
@@ -246,7 +258,13 @@ def _validate_target(
         raise BootstrapError("GPU cluster account does not match the existing site")
     if target.eks_arn == request.site.release_config["cpu_eks_arn"]:
         raise JoinTargetIdentityError("the CPU EKS cannot be joined as a GPU cluster")
-    if target.node_recovery != "None" or target.role != "gpu":
+    if target.role != "gpu":
+        raise JoinTargetIdentityError("join targets must be GPU clusters")
+    if target.is_eks_managed:
+        # No NodeRecovery to gate on: the field belongs to HyperPod. The
+        # selector is the whole identity of "the GPU nodes", so it must exist.
+        node_selector(target)
+    elif target.node_recovery != "None":
         raise JoinTargetIdentityError("GPU join requires NodeRecovery=None")
     for item in request.site.release_config["clusters"]:
         if item["eks_cluster_arn"] == target.eks_arn:
@@ -258,7 +276,10 @@ def _validate_target(
             raise BootstrapError(
                 f"GPU EKS cluster is already managed as {item['cluster_id']}"
             )
-        if item["hyperpod_cluster_name"] == target.hyperpod_name:
+        if (
+            target.hyperpod_name
+            and item["hyperpod_cluster_name"] == target.hyperpod_name
+        ):
             raise BootstrapError("GPU HyperPod cluster is already managed")
         if item["cluster_id"] == cluster_id:
             raise BootstrapError(f"cluster_id already exists: {cluster_id}")
@@ -669,7 +690,7 @@ def _cluster_document(
         "clusterId": cluster_id,
         "context": target.context,
         "region": target.region,
-        "hyperpodClusterName": target.hyperpod_name,
+        **cluster_provider_entries(target),
         "eksClusterArn": target.eks_arn,
         "executorIrsaRoleArn": role_arn,
         "allowedNamespaces": list(namespaces),

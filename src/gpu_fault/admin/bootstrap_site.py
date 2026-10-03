@@ -115,29 +115,38 @@ def _validated_initial_target(value: object) -> Mapping[str, Any]:
     ):
         raise BootstrapError("initial deploy target checkpoint is invalid")
     fields = ("input_arn", *_TARGET_PROVIDER_FIELDS)
-    for item in [value.get("cpu"), *value["gpu_clusters"]]:
+    for index, item in enumerate([value.get("cpu"), *value["gpu_clusters"]]):
+        if not isinstance(item, Mapping) or set(item) != set(fields):
+            raise BootstrapError("initial deploy target checkpoint is invalid")
+        # A plain EKS GPU cluster (``eks-managed``) has no HyperPod ARN or
+        # name; both are empty together, and only for a GPU entry.
+        plain_eks = index > 0 and not item["hyperpod_arn"] and not item["hyperpod_name"]
+        required = ("input_arn", "eks_arn") if plain_eks else fields
         if (
-            not isinstance(item, Mapping)
-            or set(item) != set(fields)
-            or any(
+            any(
                 not isinstance(item[key], str)
                 or not item[key]
                 or item[key] != item[key].strip()
-                for key in fields
+                for key in required
             )
+            or any(not isinstance(item[key], str) for key in fields)
             or item["input_arn"] not in (item["eks_arn"], item["hyperpod_arn"])
         ):
             raise BootstrapError("initial deploy target checkpoint is invalid")
         try:
-            eks, hyperpod = Arn.parse(item["eks_arn"]), Arn.parse(item["hyperpod_arn"])
-            valid = (
-                eks.service == "eks"
-                and hyperpod.service == "sagemaker"
-                and eks.resource_name
-                and hyperpod.resource_name
-                and (eks.partition, eks.region, eks.account)
-                == (hyperpod.partition, hyperpod.region, hyperpod.account)
-            )
+            eks = Arn.parse(item["eks_arn"])
+            if plain_eks:
+                valid = bool(eks.service == "eks" and eks.resource_name)
+            else:
+                hyperpod = Arn.parse(item["hyperpod_arn"])
+                valid = bool(
+                    eks.service == "eks"
+                    and hyperpod.service == "sagemaker"
+                    and eks.resource_name
+                    and hyperpod.resource_name
+                    and (eks.partition, eks.region, eks.account)
+                    == (hyperpod.partition, hyperpod.region, hyperpod.account)
+                )
         except BootstrapError:
             valid = False
         if not valid:

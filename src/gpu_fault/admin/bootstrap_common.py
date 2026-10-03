@@ -110,6 +110,31 @@ class ClusterIdentity:
     node_recovery: str
     context: str
     subnet_cidrs: tuple[str, ...] = ()
+    #: ``hyperpod`` (default) or ``eks-managed``; see ``gpu_fault.cluster_scope``.
+    #: Defaults keep every identity recorded before plain EKS support loadable.
+    provider: str = "hyperpod"
+    #: GPU node label selector; empty means the HyperPod cluster label.
+    node_selector: str = ""
+
+    @property
+    def is_eks_managed(self) -> bool:
+        return self.provider == "eks-managed"
+
+    @property
+    def provider_name(self) -> str:
+        """The name the provider scope carries: HyperPod name, else EKS name."""
+
+        return self.hyperpod_name or self.eks_name
+
+
+def default_cluster_id(cluster: ClusterIdentity) -> str:
+    """The stable ``cluster_id`` a GPU cluster gets unless the operator names one.
+
+    The HyperPod name for a HyperPod cluster (unchanged), the EKS cluster name
+    for a plain EKS cluster, which has no other provider-side name.
+    """
+
+    return safe_name(cluster.provider_name)
 
 
 @dataclass(frozen=True)
@@ -128,6 +153,24 @@ class BootstrapRequest:
     # explicit workspace id is operator input; ``grafana_viewer`` is the IAM
     # Identity Center user granted VIEWER on the workspace after the import.
     grafana_workspace_id: str | None = None
+    #: GPU node selector / node group for plain EKS (``eks-managed``) GPU
+    #: clusters on a first deploy; ignored for HyperPod clusters.
+    node_selector: str | None = None
+    gpu_nodegroup: str | None = None
+
+    @property
+    def requested_node_selector(self) -> str | None:
+        if self.node_selector and self.gpu_nodegroup:
+            raise BootstrapError("--node-selector and --gpu-nodegroup are exclusive")
+        if self.gpu_nodegroup:
+            from gpu_fault.cluster_scope import nodegroup_node_selector
+
+            try:
+                return nodegroup_node_selector(self.gpu_nodegroup)
+            except ValueError as exc:
+                raise BootstrapError(str(exc)) from None
+        return self.node_selector or None
+
     grafana_viewer: str | None = None
 
 

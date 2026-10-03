@@ -37,6 +37,7 @@ from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import run_command
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.execution.remediation_budget import FAILURE_DOMAIN_MAP_ENV
+from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.failure_domains import (
     FAILURE_DOMAIN_CONFIGMAP,
     FAILURE_DOMAIN_FILE,
@@ -162,9 +163,15 @@ def cluster_nodes(
             f"failure-domain map cluster is not in the managed site: {cluster_id}"
         )
     command = [*_gpu_kubectl(site, target), "get", "nodes", "-o", "json"]
-    hyperpod = str(target.get("hyperpod_cluster_name") or "")
-    if hyperpod:
-        command.extend(["-l", f"{HYPERPOD_CLUSTER_LABEL}={hyperpod}"])
+    # A HyperPod entry without a name (legacy test sites, a site mid-migration)
+    # keeps listing every node as it always did; anything else is selected on
+    # its provider selector (``gpu_fault.cluster_scope``).
+    try:
+        selector: str | None = node_selector(target)
+    except ValueError:
+        selector = None
+    if selector:
+        command.extend(["-l", selector])
     completed = (run or run_command)(command, capture=True, timeout_seconds=120)
     if completed.returncode:
         raise BootstrapError(
@@ -195,8 +202,7 @@ def cluster_nodes(
             or not isinstance(metadata.get("uid"), str)
             or not metadata["uid"]
             or not isinstance(labels, dict)
-            or hyperpod
-            and labels.get(HYPERPOD_CLUSTER_LABEL) != hyperpod
+            or (selector is not None and not selector_matches(labels, selector))
         ):
             raise BootstrapError(
                 "failure-domain map received an incomplete or conflicting node identity"

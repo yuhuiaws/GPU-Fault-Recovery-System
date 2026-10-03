@@ -16,6 +16,7 @@ from gpu_fault.admin.aws_cleanup import (
     delete_priority,
     is_aurora_resource,
 )
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.bootstrap_common import (
     Arn,
     BootstrapError,
@@ -491,12 +492,10 @@ def _validate_registry(
         ):
             raise BootstrapError("CPU and GPU cluster identities overlap")
         eks_arns[("gpu_eks", gpu_name)] = str(cluster["eks_cluster_arn"])
-        expected.update(
-            {
-                ("gpu_eks", gpu_name),
-                ("gpu_hyperpod", str(cluster["hyperpod_cluster_name"])),
-            }
-        )
+        expected.add(("gpu_eks", gpu_name))
+        # A plain EKS (eks-managed) cluster recorded no HyperPod resource.
+        if not is_eks_managed(cluster):
+            expected.add(("gpu_hyperpod", str(cluster["hyperpod_cluster_name"])))
     cluster_types = {
         "cpu_eks",
         "cpu_hyperpod",

@@ -145,6 +145,8 @@ def prepare_local_inputs(
         {
             "context": target.context,
             "hyperpod_cluster_name": target.hyperpod_name,
+            "provider": target.provider,
+            "node_selector": target.node_selector,
             "expected_node_uids": node_uids,
         },
         nodes,

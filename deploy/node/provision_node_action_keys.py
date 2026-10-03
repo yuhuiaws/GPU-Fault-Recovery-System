@@ -24,6 +24,8 @@ from gpu_fault.admin.node_key_custody_crypto import (
 )
 from gpu_fault.admin.node_key_custody_models import CustodyError
 from gpu_fault.admin.node_key_proof import load_node_key_custody_request
+from gpu_fault.cluster_scope import node_selector as scope_selector
+from gpu_fault.cluster_scope import selector_matches
 from gpu_fault.node_action_keys import derive_node_action_secret
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
@@ -247,14 +249,24 @@ class SecretClient:
         _marker(snapshot.document)
         return snapshot
 
-    def nodes(self, hyperpod_cluster: str) -> dict[str, str]:
+    def nodes(self, hyperpod_cluster: str, node_selector: str = "") -> dict[str, str]:
+        """The GPU nodes keys are provisioned for: ``{name: uid}``.
+
+        ``node_selector`` is the cluster's GPU node selector
+        (``gpu_fault.cluster_scope``); empty means the HyperPod label of
+        ``hyperpod_cluster``, the only form that existed before plain EKS.
+        """
+
+        selector = node_selector or scope_selector(
+            None, provider="hyperpod", hyperpod_cluster_name=hyperpod_cluster
+        )
         result = self.execute(
             [
                 *self.scope.command,
                 "get",
                 "nodes",
                 "-l",
-                f"{HYPERPOD_LABEL}={hyperpod_cluster}",
+                selector,
                 "-o",
                 "json",
                 "--request-timeout=15s",
@@ -293,7 +305,7 @@ class SecretClient:
                 or uid in nodes.values()
                 or node.get("deletionTimestamp")
                 or not isinstance(labels, dict)
-                or labels.get(HYPERPOD_LABEL) != hyperpod_cluster
+                or not selector_matches(labels, selector)
             ):
                 raise ProvisionError("HyperPod node identity is invalid or ambiguous")
             nodes[cast(str, name)] = uid
@@ -534,6 +546,7 @@ def _finish_rotation(
     *,
     hyperpod_cluster: str,
     nodes: dict[str, str],
+    node_selector: str = "",
 ) -> None:
     if _marker(expected.document) is None:
         return
@@ -544,7 +557,7 @@ def _finish_rotation(
             mirror.data.get(node) != value for node, value in expected.data.items()
         ):
             raise ProvisionError("CPU node keys do not confirm the pending rotation")
-        if gpu.nodes(hyperpod_cluster) != nodes:
+        if gpu.nodes(hyperpod_cluster, node_selector) != nodes:
             raise ProvisionError("HyperPod node identities changed")
         if (
             current is not None
@@ -572,6 +585,7 @@ def provision(
     expected_nodes: dict[str, str] | None = None,
     runner: Runner = run_command,
     custody: ProvisionCustody | None = None,
+    node_selector: str = "",
 ) -> int:
     if (
         not cluster_id
@@ -599,7 +613,7 @@ def provision(
         cpu = SecretClient(cpu_scope, runner) if cpu_scope else None
         if cpu is not None:
             cpu.custody = custody
-        nodes = gpu.nodes(hyperpod_cluster)
+        nodes = gpu.nodes(hyperpod_cluster, node_selector)
         if expected_nodes is not None and (
             set(nodes) != set(expected_nodes)
             or any(uid and nodes[node] != uid for node, uid in expected_nodes.items())
@@ -648,7 +662,7 @@ def provision(
         for _attempt in range(ATTEMPTS):
             if current is not None and mirror is not None and current.uid == mirror.uid:
                 raise ProvisionError("CPU and GPU node-key targets must be distinct")
-            if gpu.nodes(hyperpod_cluster) != nodes:
+            if gpu.nodes(hyperpod_cluster, node_selector) != nodes:
                 raise ProvisionError("HyperPod node identities changed")
             plan = _plan(
                 current,
@@ -682,8 +696,9 @@ def provision(
                     current,
                     hyperpod_cluster=hyperpod_cluster,
                     nodes=nodes,
+                    node_selector=node_selector,
                 )
-            if gpu.nodes(hyperpod_cluster) != nodes:
+            if gpu.nodes(hyperpod_cluster, node_selector) != nodes:
                 raise ProvisionError("HyperPod node identities changed")
             final = gpu.read()
             if (
@@ -806,6 +821,9 @@ def main() -> int:
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--cluster-id", required=True)
     parser.add_argument("--hyperpod-cluster", required=True)
+    # The GPU node selector (gpu_fault.cluster_scope); empty means the HyperPod
+    # label of --hyperpod-cluster. A plain EKS cluster passes its own.
+    parser.add_argument("--node-selector", default="")
     parser.add_argument("--master-file", type=Path, required=True)
     parser.add_argument("--secret-name", required=True)
     parser.add_argument("--rotate-node", default="")
@@ -877,6 +895,7 @@ def main() -> int:
                 os.environ.get("GPU_FAULT_NODE_KEY_EXPECTED_NODES_JSON")
             ),
             custody=custody,
+            node_selector=arguments.node_selector.strip(),
         )
     except (ProvisionError, CustodyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

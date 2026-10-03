@@ -46,6 +46,7 @@ PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
         --namespace "${NAMESPACE}" \
         --cluster-id "${CLUSTER_ID}" \
         --hyperpod-cluster "${HYPERPOD_CLUSTER}" \
+        --node-selector "${GPU_FAULT_NODE_SELECTOR:-}" \
         --master-file "${MASTER_FILE}" \
         --secret-name "${SECRET_NAME}" \
         --rotate-node "${ROTATE_NODE}" \

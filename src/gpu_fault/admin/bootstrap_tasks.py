@@ -27,8 +27,8 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
     ReadOnlyProbeRunner,
+    default_cluster_id,
     run_parallel,
-    safe_name,
 )
 from gpu_fault.admin.grafana import GrafanaSettings
 from gpu_fault.admin.notifications import NotificationRouting
@@ -297,7 +297,7 @@ def platform_task_graph(
             ),
         }
         for cluster in gpu_clusters:
-            cluster_id = safe_name(cluster.hyperpod_name)
+            cluster_id = default_cluster_id(cluster)
 
             def node_key_task(
                 cluster: ClusterIdentity = cluster,
@@ -416,7 +416,7 @@ def foundation_task_graph(
         active_state: BootstrapState | None,
     ) -> dict[str, Callable[[], Any]]:
         executor_tasks = {
-            f"executor_role:{safe_name(cluster.hyperpod_name)}": (
+            f"executor_role:{default_cluster_id(cluster)}": (
                 lambda cluster=cluster: ensure_executor_role(
                     active_runner,
                     cluster=cluster,
@@ -429,7 +429,7 @@ def foundation_task_graph(
         # The data-plane collector's role reads the AMP workspace the
         # ``monitoring_resources`` task created (see ``dependencies`` below).
         adot_writer_tasks = {
-            f"adot_writer_role:{safe_name(cluster.hyperpod_name)}": (
+            f"adot_writer_role:{default_cluster_id(cluster)}": (
                 lambda cluster=cluster: ensure_adot_writer_role(
                     active_runner,
                     cluster=cluster,

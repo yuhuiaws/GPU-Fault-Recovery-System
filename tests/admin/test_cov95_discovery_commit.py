@@ -54,17 +54,16 @@ class Discovery:
 
 
 @pytest.mark.parametrize(
-    "failure",
-    ["service", "missing", "ambiguous", "orchestrator", "inactive", "recovery"],
+    "failure", ["service", "ambiguous", "orchestrator", "inactive", "recovery"]
 )
 def test_public_discovery_requires_unique_eks_backed_recovery_disabled_target(failure):
+    """An EKS ARN with *no* HyperPod is not a failure any more: it is a plain
+    EKS (``eks-managed``) cluster, covered by ``test_admin_eks_managed_join``."""
+
     runner = Discovery()
     arn = target().hyperpod_arn
     if failure == "service":
         arn = "arn:aws:sns:us-east-1:123456789012:example"
-    elif failure == "missing":
-        runner.members = []
-        arn = target().eks_arn
     elif failure == "ambiguous":
         runner.members.append({**runner.members[0], "ClusterName": "other-hyperpod"})
         arn = target().eks_arn
@@ -75,7 +74,7 @@ def test_public_discovery_requires_unique_eks_backed_recovery_disabled_target(fa
     else:
         runner.members[0]["NodeRecovery"] = "Automatic"
     with pytest.raises(
-        BootstrapError, match="service|exactly one|orchestrator|not ACTIVE|NodeRecovery"
+        BootstrapError, match="service|at most one|orchestrator|not ACTIVE|NodeRecovery"
     ):
         bootstrap.discover_cluster(
             runner, cluster_arn=arn, role="gpu", context="example"

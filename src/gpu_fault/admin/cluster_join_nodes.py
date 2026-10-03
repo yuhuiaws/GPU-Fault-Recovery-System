@@ -18,6 +18,7 @@ from gpu_fault.admin.cluster_join_state import complete_step, step_done
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.site import RenderedSite, effective_environment
+from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.fleet import derive_node_action_secret
 from gpu_fault_release.regional_deployment_inventory import CPU_INGRESS_DEPLOYMENT
 
@@ -72,6 +73,7 @@ class NodeClaims:
 def read_target_node_inventory(
     runner: CommandRunner, kubeconfig: Path, target: ClusterIdentity
 ) -> dict[str, str]:
+    selector = node_selector(target)
     output = runner.run(
         [
             "kubectl",
@@ -82,7 +84,7 @@ def read_target_node_inventory(
             "get",
             "nodes",
             "-l",
-            "sagemaker.amazonaws.com/cluster-name=" + target.hyperpod_name,
+            selector,
             "-o",
             "json",
         ],
@@ -104,10 +106,7 @@ def read_target_node_inventory(
                 or name in inventory
                 or not isinstance(uid, str)
                 or not uid
-                or (metadata.get("labels") or {}).get(
-                    "sagemaker.amazonaws.com/cluster-name"
-                )
-                != target.hyperpod_name
+                or not selector_matches(metadata.get("labels") or {}, selector)
             ):
                 raise ValueError
             inventory[name] = uid
@@ -151,8 +150,7 @@ def _cluster_nodes(
                 "get",
                 "nodes",
                 "-l",
-                "sagemaker.amazonaws.com/cluster-name="
-                + str(cluster["hyperpod_cluster_name"]),
+                node_selector(cluster),
                 "-o",
                 "go-template=" + NODE_NAMES_TEMPLATE,
             ],

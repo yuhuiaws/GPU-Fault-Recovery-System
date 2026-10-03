@@ -31,6 +31,10 @@ from gpu_fault.admin.bootstrap_common import (
     safe_name,
     tag_map,
 )
+from gpu_fault.admin.bootstrap_iam_policies import (
+    control_plane_policy_document,
+    executor_policy_document,
+)
 from gpu_fault.admin.bootstrap_platform_probes import (
     assert_aurora_refresh_current,
     assert_monitoring_install_current,
@@ -53,7 +57,11 @@ from gpu_fault.admin.monitoring_policy import (
     validate_amp_workspace,
 )
 from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
-from gpu_fault.admin.site import archive_s3_prefix_arn
+from gpu_fault.cluster_scope import (
+    NODE_SELECTOR_ENV,
+    PROVIDER_ENV,
+    node_selector,
+)
 
 # One Pod Identity add-on result per deploy run, keyed by the runner the run was
 # handed. Three call sites ensure the same add-on (`revalidate_pod_identity_agent`,
@@ -511,102 +519,6 @@ def probe_pod_identity_association(
     return _ensure_pod_identity_association(ReadOnlyProbeRunner(runner), **kwargs)
 
 
-def control_plane_policy_document(
-    *,
-    region: str,
-    account_id: str,
-    email_sender: str | None = None,
-    archive_s3_uri: str | None = None,
-    sns_topic_arn: str | None = None,
-) -> dict[str, Any]:
-    """Every AWS permission the regional control plane is allowed to hold.
-
-    This is a value rather than a literal buried in ``ensure_control_plane_role``
-    because it is the whole blast-radius argument for the CPU side: SageMaker
-    read-only, no node mutation of any kind, notifications only to the site's
-    own SNS topic (``channel: sns``) or only from the verified sender
-    (``channel: ses``), and -- only when ``site.yaml`` ``spec.retention`` names
-    an archive bucket -- ``PutObject`` under that one prefix, because the
-    archiver writes bundles and never reads or deletes them. Stated as a
-    document it can be checked against the same validator the release path
-    applies to the executor role, without an AWS account.
-    """
-
-    statements: list[dict[str, Any]] = [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sagemaker:DescribeCluster",
-                "sagemaker:ListClusterNodes",
-                "sagemaker:DescribeClusterNode",
-            ],
-            "Resource": (f"arn:aws:sagemaker:{region}:{account_id}:cluster/*"),
-        }
-    ]
-    if email_sender:
-        statements.append(
-            {
-                "Sid": "AdministratorEmail",
-                "Effect": "Allow",
-                "Action": "ses:SendEmail",
-                "Resource": (
-                    f"arn:aws:ses:{region}:{account_id}:identity/{email_sender}"
-                ),
-                "Condition": {
-                    "StringEquals": {
-                        "ses:FromAddress": email_sender,
-                    }
-                },
-            }
-        )
-    if sns_topic_arn:
-        # Publish only: the control plane never subscribes, lists or deletes;
-        # the topic itself stays a bootstrap-owned resource.
-        statements.append(
-            {
-                "Sid": "AdministratorNotificationTopic",
-                "Effect": "Allow",
-                "Action": "sns:Publish",
-                "Resource": sns_topic_arn,
-            }
-        )
-    if archive_s3_uri:
-        statements.append(
-            {
-                "Sid": "ControlRecordArchive",
-                "Effect": "Allow",
-                "Action": "s3:PutObject",
-                "Resource": archive_s3_prefix_arn(archive_s3_uri),
-            }
-        )
-    return {"Version": "2012-10-17", "Statement": statements}
-
-
-def executor_policy_document(*, hyperpod_arn: str) -> dict[str, Any]:
-    """Every AWS permission one cluster's executor is allowed to hold.
-
-    Scoped to that cluster's HyperPod ARN, with reboot as the only mutation and
-    no SES: notification stays a control-plane concern so deduplication cannot
-    be bypassed from the data plane.
-    """
-
-    return {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "sagemaker:DescribeCluster",
-                    "sagemaker:ListClusterNodes",
-                    "sagemaker:DescribeClusterNode",
-                    "sagemaker:BatchRebootClusterNodes",
-                ],
-                "Resource": hyperpod_arn,
-            }
-        ],
-    }
-
-
 def ensure_control_plane_role(
     runner: CommandRunner,
     *,
@@ -765,8 +677,10 @@ def ensure_executor_role(
         cluster,
         site_id,
     )
+    # The HyperPod name for a HyperPod cluster (unchanged); the EKS cluster
+    # name -- the default cluster_id -- for a plain EKS cluster.
     role_name = safe_name(
-        f"gpu-fault-{site_id}-{cluster.hyperpod_name}-executor",
+        f"gpu-fault-{site_id}-{cluster.provider_name}-executor",
         maximum=64,
     )
     trust = irsa_trust_document(
@@ -775,7 +689,11 @@ def ensure_executor_role(
         namespace=namespace,
         service_account="gpu-fault-cluster-executor",
     )
-    policy = executor_policy_document(hyperpod_arn=cluster.hyperpod_arn)
+    policy = executor_policy_document(
+        hyperpod_arn=cluster.hyperpod_arn,
+        provider=cluster.provider,
+        eks_cluster_arn=cluster.eks_arn,
+    )
     role = _ensure_role(
         runner,
         account_id=cluster.account_id,
@@ -868,7 +786,7 @@ def ensure_adot_writer_role(
 
     if not amp_workspace_id:
         raise BootstrapError(
-            f"cluster {cluster.hyperpod_name}: the data-plane ADOT writer role "
+            f"cluster {cluster.provider_name}: the data-plane ADOT writer role "
             "needs the site's AMP workspace id"
         )
     provider_arn, issuer, provider_ownership = _ensure_oidc_provider(
@@ -877,7 +795,7 @@ def ensure_adot_writer_role(
         site_id,
     )
     role_name = safe_name(
-        f"gpu-fault-{site_id}-{cluster.hyperpod_name}-adot-writer",
+        f"gpu-fault-{site_id}-{cluster.provider_name}-adot-writer",
         maximum=64,
     )
     role = _ensure_role(
@@ -1452,7 +1370,11 @@ def provision_node_action_keys(
         "GPU_FAULT_KUBECTL_CONTEXT": cluster.context,
         "GPU_FAULT_NAMESPACE": namespace,
         "GPU_FAULT_CLUSTER_ID": cluster_id,
-        "GPU_FAULT_HYPERPOD_CLUSTER": cluster.hyperpod_name,
+        # The provider cluster scope: the HyperPod name, or the cluster_id of
+        # a plain EKS cluster, which has no other provider-side name.
+        "GPU_FAULT_HYPERPOD_CLUSTER": cluster.hyperpod_name or cluster_id,
+        PROVIDER_ENV: cluster.provider,
+        NODE_SELECTOR_ENV: node_selector(cluster),
         "GPU_FAULT_FLEET_MASTER_FILE": str(fleet_master_file),
         "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": str(cpu_kubeconfig),
         "GPU_FAULT_CONTROL_PLANE_NAMESPACE": namespace,

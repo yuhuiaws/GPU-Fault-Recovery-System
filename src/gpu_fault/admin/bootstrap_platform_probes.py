@@ -21,6 +21,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.node_key_proof import read_node_key_proof
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release.regional_admin_commands import BOOTSTRAP_PHASES
 
 
@@ -271,7 +272,7 @@ def assert_node_action_keys_current(
             "get",
             "nodes",
             "-l",
-            f"sagemaker.amazonaws.com/cluster-name={cluster.hyperpod_name}",
+            node_selector(cluster),
             "-o",
             'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
         ],
@@ -281,7 +282,7 @@ def assert_node_action_keys_current(
         # An empty inventory is either a read that raced a cluster scale event or
         # a cluster with no nodes; either way the ensure step is the component
         # that knows how to fail closed on it.
-        raise BootstrapMutationRequired(f"{cluster.hyperpod_name} node inventory")
+        raise BootstrapMutationRequired(f"{cluster.provider_name} node inventory")
     on_gpu = read_node_key_proof(
         runner,
         ["kubectl", "--kubeconfig", str(gpu_kubeconfig), "--context", cluster.context],
@@ -289,7 +290,7 @@ def assert_node_action_keys_current(
         secret_name=secret_name,
     )
     if on_gpu is None or set(on_gpu.digests) != set(nodes) or on_gpu.rotation_pending:
-        raise BootstrapMutationRequired(f"{cluster.hyperpod_name} node action keys")
+        raise BootstrapMutationRequired(f"{cluster.provider_name} node action keys")
     on_cpu = read_node_key_proof(
         runner,
         ["kubectl", "--kubeconfig", str(cpu_kubeconfig)],
@@ -304,5 +305,5 @@ def assert_node_action_keys_current(
         or any(on_cpu.digests.get(node) != on_gpu.digests[node] for node in nodes)
     ):
         raise BootstrapMutationRequired(
-            f"{cluster.hyperpod_name} node action key mirror"
+            f"{cluster.provider_name} node action key mirror"
         )

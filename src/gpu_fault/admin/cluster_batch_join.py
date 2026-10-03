@@ -297,7 +297,9 @@ def _checkpoint_readonly_results(
             (
                 str(discovery["cluster_id"]),
                 target.eks_arn,
-                target.hyperpod_name,
+                # Plain EKS clusters have no HyperPod name; two of them must
+                # not read as the same cluster because both are empty.
+                target.hyperpod_name or f"eks:{target.eks_arn}",
                 target.context,
                 target.vpc_id,
             )

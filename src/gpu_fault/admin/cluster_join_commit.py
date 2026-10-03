@@ -10,6 +10,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.cluster_join_evidence import (
     final_membership_identity,
     join_activation_is_irreversible,
@@ -95,17 +96,25 @@ def _joined_resources(
             ownership=InstallationResourceOwnership.EXTERNAL,
             policy=InstallationResourceDeletePolicy.PRESERVE,
         ),
-        _resource(
-            site_id=site_id,
-            key=f"cluster/{cluster_id}/hyperpod",
-            resource_type="gpu_hyperpod",
-            resource_id=target.hyperpod_name,
-            arn=target.hyperpod_arn,
-            region=region,
-            account_id=account_id,
-            ownership=InstallationResourceOwnership.EXTERNAL,
-            policy=InstallationResourceDeletePolicy.PRESERVE,
-            dependencies=[eks_key],
+        # A plain EKS cluster has no HyperPod to record; the registry then
+        # carries the EKS cluster and the IAM roles only.
+        *(
+            ()
+            if target.is_eks_managed
+            else (
+                _resource(
+                    site_id=site_id,
+                    key=f"cluster/{cluster_id}/hyperpod",
+                    resource_type="gpu_hyperpod",
+                    resource_id=target.hyperpod_name,
+                    arn=target.hyperpod_arn,
+                    region=region,
+                    account_id=account_id,
+                    ownership=InstallationResourceOwnership.EXTERNAL,
+                    policy=InstallationResourceDeletePolicy.PRESERVE,
+                    dependencies=[eks_key],
+                ),
+            )
         ),
         _resource(
             site_id=site_id,
@@ -308,7 +317,10 @@ def _commit_site(
         for item in clusters
         if item.get("clusterId") == cluster_id
         or item.get("eksClusterArn") == target.get("eksClusterArn")
-        or item.get("hyperpodClusterName") == target.get("hyperpodClusterName")
+        or (
+            target.get("hyperpodClusterName")
+            and item.get("hyperpodClusterName") == target.get("hyperpodClusterName")
+        )
         or item.get("context") == target.get("context")
     ]
     if existing:
@@ -525,9 +537,15 @@ def activate_and_commit(
         live = join._fetch_installation_registry(updated_site)
         required = {
             f"cluster/{cluster_id}/eks",
-            f"cluster/{cluster_id}/hyperpod",
             f"aws/iam/executor/{cluster_id}/role",
         }
+        # A plain EKS cluster records no HyperPod; the site the join just
+        # committed says which kind this cluster is.
+        if not any(
+            str(item.get("cluster_id")) == cluster_id and is_eks_managed(item)
+            for item in updated_site.release_config["clusters"]
+        ):
+            required.add(f"cluster/{cluster_id}/hyperpod")
         if execution.prerequisites.get("adot_writer_role"):
             required.add(f"aws/iam/adot-writer/{cluster_id}/role")
         active = {

@@ -24,6 +24,7 @@ from gpu_fault.admin.cluster_join_state import (
 from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.process_supervisor import ensure_supervision_safe
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault.admin.site import (
     RenderedSite,
     effective_environment,
@@ -222,7 +223,7 @@ def _node_ownership(
     kubernetes_cleanup.clear_installer_annotations(
         partial(join.run_command, environment=effective_environment(request.site)),
         kubectl,
-        hyperpod_name=str(target["hyperpod_name"]),
+        node_selector=node_selector(target),
         node_uids=uids,
         annotations=(),
     )
@@ -344,6 +345,7 @@ def rollback(
                 **target,
                 "expected_node_uids": dict(local.get("node_uids") or {}),
                 "hyperpod_cluster_name": str(target.get("hyperpod_name") or ""),
+                "node_selector": node_selector(target),
             },
             nodes,
         )

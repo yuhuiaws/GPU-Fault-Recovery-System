@@ -15,6 +15,7 @@ from uuid import uuid4
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
@@ -148,7 +149,10 @@ def read_removal_state(path: Path) -> dict[str, Any]:
             or discovery.get("target") != value["target"]
             or not isinstance(discovery.get("provider_identity"), dict)
             or not discovery["provider_identity"].get("eks_arn")
-            or not discovery["provider_identity"].get("hyperpod_arn")
+            or (
+                not discovery["provider_identity"].get("hyperpod_arn")
+                and not is_eks_managed(value["target"])
+            )
             or not discovery.get("namespace_uid")
             or not discovery.get("registry_digest")
             or not discovery.get("token_sha256")

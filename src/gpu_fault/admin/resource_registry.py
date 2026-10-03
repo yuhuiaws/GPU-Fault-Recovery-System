@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     Arn,
@@ -95,16 +96,22 @@ def _external_clusters(
                     ownership=InstallationResourceOwnership.EXTERNAL,
                     delete_policy=InstallationResourceDeletePolicy.PRESERVE,
                 ),
-                _record(
-                    site_id=site_id,
-                    resource_key=f"cluster/{cluster_id}/hyperpod",
-                    resource_type="gpu_hyperpod",
-                    resource_id=str(cluster["hyperpod_cluster_name"]),
-                    region=region,
-                    account_id=account_id,
-                    ownership=InstallationResourceOwnership.EXTERNAL,
-                    delete_policy=InstallationResourceDeletePolicy.PRESERVE,
-                    dependencies=[f"cluster/{cluster_id}/eks"],
+                *(
+                    ()
+                    if is_eks_managed(cluster)
+                    else (
+                        _record(
+                            site_id=site_id,
+                            resource_key=f"cluster/{cluster_id}/hyperpod",
+                            resource_type="gpu_hyperpod",
+                            resource_id=str(cluster["hyperpod_cluster_name"]),
+                            region=region,
+                            account_id=account_id,
+                            ownership=InstallationResourceOwnership.EXTERNAL,
+                            delete_policy=InstallationResourceDeletePolicy.PRESERVE,
+                            dependencies=[f"cluster/{cluster_id}/eks"],
+                        ),
+                    )
                 ),
             ]
         )

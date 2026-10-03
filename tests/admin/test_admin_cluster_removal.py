@@ -692,8 +692,8 @@ def test_remove_final_checks_run_in_parallel(tmp_path, monkeypatch) -> None:
     for name in (
         "_verify_target_namespace_absent",
         "_verify_control_registry_absent",
-        "_verify_preserved_gpu_eks",
-        "_verify_preserved_hyperpod",
+        "verify_preserved_gpu_eks",
+        "verify_preserved_hyperpod",
         "_verify_remaining_site",
     ):
         monkeypatch.setattr(admin_cluster_removal, name, check)

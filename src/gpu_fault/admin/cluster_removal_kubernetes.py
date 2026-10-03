@@ -13,6 +13,8 @@ from urllib.parse import quote
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
+from gpu_fault.cluster_scope import node_selector as scope_selector
+from gpu_fault.cluster_scope import selector_matches
 from gpu_fault.admin.execution import deadline_scope
 from gpu_fault.admin.process_supervisor import ensure_supervision_safe
 
@@ -137,12 +139,23 @@ def clear_installer_annotations(
     runner: Command,
     kubectl: Sequence[str],
     *,
-    hyperpod_name: str,
+    hyperpod_name: str = "",
     node_uids: Mapping[str, str],
     annotations: Sequence[str],
+    node_selector: str = "",
 ) -> None:
+    """Strip installer annotations from the named nodes after proving identity.
+
+    ``node_selector`` is the cluster's GPU node selector
+    (``gpu_fault.cluster_scope.node_selector``); ``hyperpod_name`` alone still
+    works for HyperPod callers and derives the same label text.
+    """
+
     if not node_uids:
         return
+    selector = node_selector or scope_selector(
+        None, provider="hyperpod", hyperpod_cluster_name=hyperpod_name
+    )
     if any(
         not isinstance(name, str) or not name or not isinstance(uid, str) or not uid
         for name, uid in node_uids.items()
@@ -154,7 +167,7 @@ def clear_installer_annotations(
             "get",
             "nodes",
             "-l",
-            f"sagemaker.amazonaws.com/cluster-name={hyperpod_name}",
+            selector,
             "-o",
             "json",
         ],
@@ -179,10 +192,7 @@ def clear_installer_annotations(
                 or metadata.get("uid") != node_uids[name]
                 or not isinstance(metadata.get("resourceVersion"), str)
                 or not metadata["resourceVersion"]
-                or (metadata.get("labels") or {}).get(
-                    "sagemaker.amazonaws.com/cluster-name"
-                )
-                != hyperpod_name
+                or not selector_matches(metadata.get("labels") or {}, selector)
                 or metadata.get("annotations") is not None
                 and not isinstance(metadata["annotations"], dict)
             ):

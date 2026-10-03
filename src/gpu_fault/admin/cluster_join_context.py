@@ -9,6 +9,7 @@ from typing import Any
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite, effective_environment
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release.regional_deployment_inventory import GPU_RECONCILER_DEPLOYMENT
 
 
@@ -22,7 +23,10 @@ def ensure_kube_context(
     context = target.get("context")
     if any(
         not isinstance(target.get(key), str) or not target[key]
-        for key in ("context", "region", "eks_name", "eks_arn", "hyperpod_arn")
+        for key in ("context", "region", "eks_name", "eks_arn")
+    ) or (
+        not str(target.get("hyperpod_arn") or "")
+        and str(target.get("provider") or "hyperpod") != "eks-managed"
     ):
         raise join.JoinTargetIdentityError("GPU context recovery lacks target identity")
     prefix = ["kubectl", "--kubeconfig", str(kubeconfig), "config"]
@@ -182,7 +186,7 @@ def clear_stale_installer_annotations(
     clear_installer_annotations(
         join.run_command,
         prefix[:-2],
-        hyperpod_name=str(target["hyperpod_cluster_name"]),
+        node_selector=node_selector(target),
         node_uids=node_uids,
         annotations=INSTALLER_NODE_ANNOTATIONS,
     )

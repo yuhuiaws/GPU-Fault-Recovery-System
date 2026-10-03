@@ -16,6 +16,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
+from gpu_fault.cluster_scope import is_eks_managed, node_selector, selector_matches
 from gpu_fault.admin.bootstrap_common import (
     Arn,
     BootstrapError,
@@ -25,6 +26,10 @@ from gpu_fault.admin.cluster_join_evidence import membership_runtime_snapshot
 from gpu_fault.admin.cluster_removal_keys import (
     validate_key_binding,
     verify_node_key_ownership,
+)
+from gpu_fault.admin.cluster_removal_preserved import (
+    verify_preserved_gpu_eks,
+    verify_preserved_hyperpod,
 )
 from gpu_fault.admin.cluster_removal_network import (
     cluster_network as _cluster_network,
@@ -281,8 +286,7 @@ def _target_nodes(
             "get",
             "nodes",
             "-l",
-            "sagemaker.amazonaws.com/cluster-name="
-            + str(target["hyperpod_cluster_name"]),
+            node_selector(target),
             "-o",
             "json",
         ],
@@ -299,10 +303,7 @@ def _target_nodes(
             or not isinstance(metadata.get("name"), str)
             or not metadata["name"]
             or not metadata.get("uid")
-            or (metadata.get("labels") or {}).get(
-                "sagemaker.amazonaws.com/cluster-name"
-            )
-            != target["hyperpod_cluster_name"]
+            or not selector_matches(metadata.get("labels") or {}, node_selector(target))
         ):
             raise BootstrapError("target GPU node response has a conflicting identity")
         nodes.append(metadata["name"])
@@ -321,30 +322,34 @@ def _removal_identity(
     cpu_network: dict[str, Any],
 ) -> tuple[dict[str, str], str | None]:
     region = str(request.site.release_config["aws_region"])
-    hyperpod = runner.aws_json(
-        region,
-        "sagemaker",
-        "describe-cluster",
-        "--cluster-name",
-        str(target.get("expected_hyperpod_arn") or target["hyperpod_cluster_name"]),
-    )
-    hyperpod_arn = str(hyperpod.get("ClusterArn") or "")
-    parsed = Arn.parse(hyperpod_arn)
-    eks = Arn.parse(str(target["eks_cluster_arn"]))
-    if (
-        parsed.service != "sagemaker"
-        or not parsed.resource_name
-        or (parsed.partition, parsed.account, parsed.region)
-        != (eks.partition, eks.account, eks.region)
-        or hyperpod.get("ClusterName") != target["hyperpod_cluster_name"]
-        or ((hyperpod.get("Orchestrator") or {}).get("Eks") or {}).get("ClusterArn")
-        != target["eks_cluster_arn"]
-        or hyperpod.get("NodeRecovery") != "None"
-    ):
-        raise BootstrapError("GPU HyperPod identity or NodeRecovery policy drifted")
+    hyperpod_arn = ""
+    if not is_eks_managed(target):
+        hyperpod = runner.aws_json(
+            region,
+            "sagemaker",
+            "describe-cluster",
+            "--cluster-name",
+            str(target.get("expected_hyperpod_arn") or target["hyperpod_cluster_name"]),
+        )
+        hyperpod_arn = str(hyperpod.get("ClusterArn") or "")
+        parsed = Arn.parse(hyperpod_arn)
+        eks = Arn.parse(str(target["eks_cluster_arn"]))
+        if (
+            parsed.service != "sagemaker"
+            or not parsed.resource_name
+            or (parsed.partition, parsed.account, parsed.region)
+            != (eks.partition, eks.account, eks.region)
+            or hyperpod.get("ClusterName") != target["hyperpod_cluster_name"]
+            or ((hyperpod.get("Orchestrator") or {}).get("Eks") or {}).get("ClusterArn")
+            != target["eks_cluster_arn"]
+            or hyperpod.get("NodeRecovery") != "None"
+        ):
+            raise BootstrapError("GPU HyperPod identity or NodeRecovery policy drifted")
+    # A plain EKS cluster has no HyperPod to describe: its live identity is the
+    # EKS cluster the network discovery already described (ARN, creation time).
     if request.gpu_cluster_arn and request.gpu_cluster_arn.strip() not in {
         target["eks_cluster_arn"],
-        hyperpod_arn,
+        *([hyperpod_arn] if hyperpod_arn else []),
     }:
         raise BootstrapError("requested GPU ARN differs from the live cluster identity")
     for kubectl, network in (
@@ -399,13 +404,22 @@ def _validate_target_registry(
     hyperpod = records.get(f"cluster/{request.cluster_id}/hyperpod")
     role = records.get(f"aws/iam/executor/{request.cluster_id}/role")
     role_arn = str(target["executor_irsa_role_arn"])
+    plain_eks = is_eks_managed(target)
     if (
         eks is None
         or (eks.resource_arn or eks.resource_id) != target["eks_cluster_arn"]
         or eks.delete_policy is not InstallationResourceDeletePolicy.PRESERVE
-        or hyperpod is None
-        or hyperpod.resource_id != target["hyperpod_cluster_name"]
-        or hyperpod.delete_policy is not InstallationResourceDeletePolicy.PRESERVE
+        or (
+            # A plain EKS cluster recorded no HyperPod; a HyperPod cluster must.
+            hyperpod is not None
+            if plain_eks
+            else (
+                hyperpod is None
+                or hyperpod.resource_id != target["hyperpod_cluster_name"]
+                or hyperpod.delete_policy
+                is not InstallationResourceDeletePolicy.PRESERVE
+            )
+        )
         or role is None
         or role.resource_type != "iam_role"
         or (
@@ -417,6 +431,11 @@ def _validate_target_registry(
         raise BootstrapError(
             "installation registry target cluster identity is incomplete"
         )
+    if plain_eks:
+        if identity.get("hyperpod_arn"):
+            raise BootstrapError("plain EKS cluster identity names a HyperPod ARN")
+        return
+    assert hyperpod is not None  # checked above for HyperPod clusters
     expected_hyperpod = hyperpod.resource_arn
     if not expected_hyperpod:
         bootstrap = find_bootstrap_state(request.site) or {}
@@ -609,7 +628,7 @@ def _clear_installer_annotations(
     kubernetes_cleanup.clear_installer_annotations(
         run_command,
         _gpu_kubectl(site, target),
-        hyperpod_name=str(target["hyperpod_cluster_name"]),
+        node_selector=node_selector(target),
         node_uids=node_uids,
         annotations=INSTALLER_ANNOTATIONS,
     )
@@ -969,75 +988,14 @@ def _runtime_membership(site: RenderedSite) -> dict[str, Any]:
     return runtime
 
 
-def _verify_preserved_gpu_eks(
-    request: RemoveClusterRequest,
-    target: dict[str, Any],
-) -> None:
-    region = str(request.site.release_config["aws_region"])
-    eks_name = Arn.parse(str(target["eks_cluster_arn"])).resource_name
-    document = _json_command(
-        [
-            "aws",
-            "eks",
-            "describe-cluster",
-            "--region",
-            region,
-            "--name",
-            eks_name,
-            "--output",
-            "json",
-        ],
-        description="preserved GPU EKS cluster is missing",
-    )
-    cluster = document.get("cluster") or {}
-    if (
-        cluster.get("arn") != target["eks_cluster_arn"]
-        or cluster.get("status") != "ACTIVE"
-        or str(cluster.get("createdAt") or "") != target.get("expected_eks_created_at")
-    ):
-        raise BootstrapError("preserved GPU EKS cluster identity drifted")
-
-
-def _verify_preserved_hyperpod(
-    request: RemoveClusterRequest,
-    target: dict[str, Any],
-) -> None:
-    region = str(request.site.release_config["aws_region"])
-    document = _json_command(
-        [
-            "aws",
-            "sagemaker",
-            "describe-cluster",
-            "--region",
-            region,
-            "--cluster-name",
-            str(target.get("expected_hyperpod_arn") or target["hyperpod_cluster_name"]),
-            "--output",
-            "json",
-        ],
-        description="preserved GPU HyperPod cluster is missing",
-    )
-    if (
-        not target.get("expected_hyperpod_arn")
-        or document.get("ClusterArn") != target["expected_hyperpod_arn"]
-        or document.get("ClusterName") != target["hyperpod_cluster_name"]
-        or ((document.get("Orchestrator") or {}).get("Eks") or {}).get("ClusterArn")
-        != target["eks_cluster_arn"]
-        or document.get("NodeRecovery") != "None"
-    ):
-        raise BootstrapError(
-            "preserved GPU HyperPod identity or NodeRecovery policy drifted"
-        )
-
-
 def _verify_target_absent(
     request: RemoveClusterRequest,
     target: dict[str, Any],
 ) -> None:
     _verify_target_namespace_absent(request, target)
     _verify_control_registry_absent(request)
-    _verify_preserved_gpu_eks(request, target)
-    _verify_preserved_hyperpod(request, target)
+    verify_preserved_gpu_eks(request, target)
+    verify_preserved_hyperpod(request, target)
 
 
 def _verify_remaining_site(site: RenderedSite) -> None:
@@ -1067,8 +1025,8 @@ def _verify_removal_parallel(
             lambda: _verify_target_namespace_absent(request, target),
         ),
         ("control registry", lambda: _verify_control_registry_absent(request)),
-        ("GPU EKS", lambda: _verify_preserved_gpu_eks(request, target)),
-        ("HyperPod", lambda: _verify_preserved_hyperpod(request, target)),
+        ("GPU EKS", lambda: verify_preserved_gpu_eks(request, target)),
+        ("HyperPod", lambda: verify_preserved_hyperpod(request, target)),
         ("remaining site", lambda: _verify_remaining_site(updated_site)),
     ]
     with ThreadPoolExecutor(max_workers=len(checks)) as executor:

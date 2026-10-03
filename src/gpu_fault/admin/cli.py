@@ -32,11 +32,8 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.cluster_batch_join import join_clusters
-from gpu_fault.admin.cluster_join import (
-    DEFAULT_ALLOWED_NAMESPACES,
-    JoinClusterRequest,
-    join_cluster,
-)
+from gpu_fault.admin.cluster_join import join_cluster
+from gpu_fault.admin.cli_join import add_eks_managed_arguments, run_join_cluster
 from gpu_fault.admin.cluster_removal import (
     CONFIRMATION as REMOVE_CLUSTER_CONFIRMATION,
     RemoveClusterRequest,
@@ -529,7 +526,14 @@ def parser() -> argparse.ArgumentParser:
         required=True,
         metavar="GPU_ARN",
     )
-    join.add_argument("--cluster-id")
+    join.add_argument(
+        "--cluster-id",
+        help=(
+            "stable cluster id; defaults to the HyperPod name, or to the EKS "
+            "cluster name for a plain EKS (eks-managed) cluster"
+        ),
+    )
+    add_eks_managed_arguments(join)
     join.add_argument(
         "--allowed-namespace",
         action="append",
@@ -614,37 +618,6 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     return result
-
-
-def _run_join_cluster(arguments: argparse.Namespace) -> int:
-    site_file = _managed_site_file(arguments, command="join-cluster")
-    assert site_file is not None
-    site = load_site(
-        site_file,
-        repository_root=arguments.repo_root,
-    )
-    cluster_arns = tuple(str(value) for value in arguments.gpu_cluster_arn)
-    if len(cluster_arns) > 1 and arguments.cluster_id:
-        raise SiteConfigError(
-            "join-cluster --cluster-id cannot be shared by multiple GPU clusters"
-        )
-    allowed_namespaces = (
-        tuple(arguments.allowed_namespace) or DEFAULT_ALLOWED_NAMESPACES
-    )
-    requests = tuple(
-        JoinClusterRequest(
-            site=site,
-            gpu_cluster_arn=cluster_arn,
-            cluster_id=arguments.cluster_id,
-            allowed_namespaces=allowed_namespaces,
-        )
-        for cluster_arn in cluster_arns
-    )
-    result = (
-        join_cluster(requests[0]) if len(requests) == 1 else join_clusters(requests)
-    )
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
 
 
 def _run_remove_cluster(arguments: argparse.Namespace) -> int:
@@ -1335,7 +1308,15 @@ def run(arguments: argparse.Namespace) -> int:
     if arguments.command == "config":
         return _run_admin_config(arguments)
     if arguments.command == "join-cluster":
-        return _run_join_cluster(arguments)
+        site_file = _managed_site_file(arguments, command="join-cluster")
+        assert site_file is not None
+        return run_join_cluster(
+            arguments,
+            site_file=site_file,
+            load_site=load_site,
+            join_cluster=join_cluster,
+            join_clusters=join_clusters,
+        )
     if arguments.command == "remove-cluster":
         return _run_remove_cluster(arguments)
     if arguments.command == "uninstall":

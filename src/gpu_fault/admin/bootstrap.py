@@ -63,12 +63,20 @@ from gpu_fault.admin.bootstrap_common import (
     describe_or_absent,
     tag_map,
 )
+from gpu_fault.admin.bootstrap_common import default_cluster_id
 from gpu_fault.admin.bootstrap_common import ensure_namespace as _ensure_namespace
 from gpu_fault.admin.bootstrap_common import kubectl_apply as _kubectl_apply
 from gpu_fault.admin.bootstrap_common import safe_name as _safe_name
 from gpu_fault.admin.bootstrap_common import write_secret as _write_secret
 from gpu_fault.admin.bootstrap_common import write_yaml as _write_yaml
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
+from gpu_fault.admin.bootstrap_discovery import (
+    cluster_provider_entries,
+    discover_eks_managed_cluster,
+    find_hyperpod_for_eks,
+    orchestrator_eks_arn,
+    regional_profile_for,
+)
 from gpu_fault.admin.bootstrap_network import RouteTableIndex
 from gpu_fault.admin.bootstrap_network import describe_subnets as _describe_subnets
 from gpu_fault.admin.bootstrap_network import private_subnets as _private_subnets
@@ -81,7 +89,7 @@ from gpu_fault.admin.bootstrap_site import (
     discover_bootstrap_scope,
     discover_subnet_cidrs,
     finalize_bootstrap_site,
-    hyperpod_inventory,
+    hyperpod_inventory,  # noqa: F401  (tests clear its cache through this module)
 )
 from gpu_fault.admin.bootstrap_site import site_identifier as _site_identifier
 from gpu_fault.admin.bootstrap_tasks import (
@@ -176,52 +184,6 @@ def _cluster_name_from_eks_arn(value: str) -> str:
     return arn.resource_name
 
 
-def _orchestrator_eks_arn(hyperpod: Mapping[str, Any]) -> str:
-    return str(
-        ((hyperpod.get("Orchestrator") or {}).get("Eks") or {}).get("ClusterArn", "")
-    )
-
-
-def _find_hyperpod_for_eks(
-    runner: CommandRunner,
-    *,
-    eks_arn: str,
-    region: str,
-    hint: str | None = None,
-) -> dict[str, Any]:
-    """The HyperPod cluster orchestrated by ``eks_arn``.
-
-    With a ``hint`` (the HyperPod ARN a previous run resolved) one describe
-    answers; it is trusted only if the described cluster still names this EKS
-    cluster as its orchestrator, otherwise the region inventory decides as on a
-    first run.
-    """
-
-    if hint:
-        described = describe_or_absent(
-            runner,
-            region,
-            "sagemaker",
-            "describe-cluster",
-            "--cluster-name",
-            hint,
-            not_found=("ResourceNotFound",),
-        )
-        if described is not None and _orchestrator_eks_arn(described) == eks_arn:
-            return described
-    matches = [
-        value
-        for value in hyperpod_inventory(runner, region=region)
-        if _orchestrator_eks_arn(value) == eks_arn
-    ]
-    if len(matches) != 1:
-        raise BootstrapError(
-            f"EKS cluster {eks_arn} must belong to exactly one HyperPod cluster; "
-            f"found {len(matches)}"
-        )
-    return matches[0]
-
-
 def discover_cluster(
     runner: CommandRunner,
     *,
@@ -229,8 +191,20 @@ def discover_cluster(
     role: str,
     context: str,
     hyperpod_hints: Mapping[str, str] | None = None,
+    node_selector: str | None = None,
 ) -> ClusterIdentity:
+    """The identity behind a cluster ARN.
+
+    A HyperPod ARN, or an EKS ARN orchestrated by exactly one HyperPod cluster,
+    yields a ``hyperpod`` identity exactly as before. An EKS ARN that no
+    HyperPod cluster orchestrates is a plain EKS GPU cluster (``eks-managed``,
+    ``bootstrap_discovery.discover_eks_managed_cluster``); ``node_selector`` is
+    its GPU node selector and is ignored for HyperPod clusters, whose selector
+    is the HyperPod label.
+    """
+
     arn = Arn.parse(cluster_arn)
+    hyperpod: dict[str, Any] | None
     if arn.service == "sagemaker":
         hyperpod = runner.aws_json(
             arn.region,
@@ -240,17 +214,28 @@ def discover_cluster(
             cluster_arn,
         )
     elif arn.service == "eks":
-        hyperpod = _find_hyperpod_for_eks(
+        hyperpod = find_hyperpod_for_eks(
             runner,
             eks_arn=cluster_arn,
             region=arn.region,
             hint=(hyperpod_hints or {}).get(cluster_arn),
         )
+        if hyperpod is None:
+            return discover_eks_managed_cluster(
+                runner,
+                cluster_arn=cluster_arn,
+                role=role,
+                context=context,
+                node_selector=node_selector,
+                subnet_cidrs=lambda *args, **kwargs: discover_subnet_cidrs(
+                    *args, **kwargs
+                ),
+            )
     else:
         raise BootstrapError("cluster ARN must use the eks or sagemaker service")
     hyperpod_arn = str(hyperpod.get("ClusterArn") or "")
     hyperpod_name = str(hyperpod.get("ClusterName") or "")
-    eks_arn = _orchestrator_eks_arn(hyperpod)
+    eks_arn = orchestrator_eks_arn(hyperpod)
     if not all((hyperpod_arn, hyperpod_name, eks_arn)):
         raise BootstrapError(
             f"HyperPod cluster {cluster_arn} does not expose an EKS orchestrator"
@@ -836,7 +821,7 @@ def _gpu_nat_eips(
     )
     if not values:
         raise BootstrapError(
-            f"GPU cluster {cluster.hyperpod_name} has no available NAT EIP; "
+            f"GPU cluster {cluster.provider_name} has no available NAT EIP; "
             "the pre-created cluster network must provide egress"
         )
     return values
@@ -1623,7 +1608,7 @@ def _initial_secure_files(
     secure.chmod(0o700)
     tokens = {}
     for cluster in gpu_clusters:
-        cluster_id = _safe_name(cluster.hyperpod_name)
+        cluster_id = default_cluster_id(cluster)
         path = secure / f"{cluster_id}.token"
         _write_secret(path, secrets.token_hex(32))
         tokens[cluster_id] = path
@@ -1653,12 +1638,12 @@ def _site_document(
 ) -> dict[str, Any]:
     cluster_documents = []
     for cluster in gpu_clusters:
-        cluster_id = _safe_name(cluster.hyperpod_name)
+        cluster_id = default_cluster_id(cluster)
         cluster_documents.append(
             {
                 "clusterId": cluster_id,
                 "context": cluster.context,
-                "hyperpodClusterName": cluster.hyperpod_name,
+                **cluster_provider_entries(cluster),
                 "eksClusterArn": cluster.eks_arn,
                 **cluster_irsa_role_entries(roles, cluster_id),
                 "allowedNamespaces": ["gpu-fault-system", "training"],
@@ -1673,7 +1658,9 @@ def _site_document(
     first_cluster = _safe_name(cpu.hyperpod_name)
     if cluster_documents:
         first_cluster = cluster_documents[0]["clusterId"]
-    profile_source = str(request.repository_root / REGIONAL_PROFILE_SOURCE)
+    profile_source, profile_version = regional_profile_for(
+        request.repository_root, gpu_clusters
+    )
     return {
         "apiVersion": "gpu-fault.aws/v1alpha1",
         "kind": "RegionalSite",
@@ -1700,7 +1687,7 @@ def _site_document(
             "runtimeProfile": {
                 "source": profile_source,
                 "templateSource": profile_source,
-                "version": "hyperpod-v1",
+                "version": profile_version,
                 "registrationClusterId": first_cluster,
             },
             "nlb": {
@@ -1773,7 +1760,9 @@ def bootstrap_from_arns(
         request=request,
         runner=active_runner,
         discover=partial(
-            discover_cluster, hyperpod_hints=load_hyperpod_hints(request.state_dir)
+            discover_cluster,
+            hyperpod_hints=load_hyperpod_hints(request.state_dir),
+            node_selector=request.requested_node_selector,
         ),
         alias=_cluster_alias,
     )
