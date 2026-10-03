@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pytest
@@ -113,6 +114,28 @@ def block_cluster_binaries(request: pytest.FixtureRequest, monkeypatch) -> None:
 def kubeconfig_is_never_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only a test's explicit fixture may supply Kubernetes configuration."""
     monkeypatch.delenv("KUBECONFIG", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def process_environment_is_restored() -> Iterator[None]:
+    """Undo environment writes a test made outside ``monkeypatch``.
+
+    Entry points under test legitimately write their own process environment
+    (``collectors_cli.main`` sets the outbox path, boot020 ``check_configs``
+    sets ``KUBECONFIG``, the release-history runner its history directory).
+    Called in-process, those writes outlive the test: ``monkeypatch.delenv``
+    on a name that was absent records nothing to undo, so the next test on the
+    same worker inherits the value, and the shuffled gate turns that into a
+    failure on the day the order changes (three such leaks surfaced in the
+    per-test state scan that triaged the 2026-10-03 shuffled-order run).
+    """
+    before = dict(os.environ)
+    yield
+    for name in [name for name in os.environ if name not in before]:
+        del os.environ[name]
+    for name, value in before.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)

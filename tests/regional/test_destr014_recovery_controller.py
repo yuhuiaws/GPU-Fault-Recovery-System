@@ -398,9 +398,12 @@ def test_journal_lock_rejects_unsafe_metadata(
         info["st_nlink"] = 2
     else:
         info["st_mode"] |= 0o004
-    monkeypatch.setattr(controller.os, "fstat", lambda _fd: SimpleNamespace(**info))
-    with pytest.raises(controller.RegionalFixtureError, match="lock is invalid"):
-        controller.RunJournal(tmp_path / "journal.json", {}).acquire()
+    # controller.os is the global os module, which pytest's own tmp_path
+    # teardown also uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(controller.os, "fstat", lambda _fd: SimpleNamespace(**info))
+        with pytest.raises(controller.RegionalFixtureError, match="lock is invalid"):
+            controller.RunJournal(tmp_path / "journal.json", {}).acquire()
 
 
 def test_real_fresh_process_sees_crash_intent_and_releases_only_its_lock(

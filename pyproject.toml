@@ -116,6 +116,12 @@ gpu_fault = ["data/*.yaml", "data/*.json"]
 addopts = "-q"
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+# Keep only failed tests' tmp_path directories. A full run otherwise leaves a
+# multi-GB basetemp under /tmp/pytest-of-<user>/ that pytest deletes at the exit
+# of later sessions, including the nested pytest runs the suite spawns; on a
+# host that just completed a run those nested sessions then stall for over a
+# minute in the shared rmtree and fail their 30-60 s timeouts (2026-10-03).
+tmp_path_retention_policy = "failed"
 
 [tool.ruff]
 line-length = 88

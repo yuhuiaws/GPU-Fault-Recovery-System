@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -540,6 +541,47 @@ def test_previous_slot_is_verified_against_its_own_dependency_lock(
     helper = load_script_module(SLOTS.with_name("runtime_integrity.py"))
     result = helper.validate_previous_runtime(root, artifact)
     assert result["artifact_sha256"] == artifact
+
+
+def test_previous_slot_verification_leaves_the_interpreter_path_untouched(
+    installed: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    root, _slot, _layer, artifact = previous_runtime(installed, tmp_path)
+    helper = load_script_module(SLOTS.with_name("runtime_integrity.py"))
+    before = list(sys.path)
+    helper.validate_previous_runtime(root, artifact)
+    # The verified venvs lend pip's parsers for the duration of one import only.
+    # Left on sys.path, their site-packages would shadow gpu_fault for every
+    # interpreter this process spawns and double every installed distribution
+    # scan (the 2026-10-03 shuffled gate failed exactly that way).
+    assert sys.path == before, (
+        "validating a node runtime must not leave its site-packages on sys.path"
+    )
+
+
+def test_previous_slot_verification_uses_only_the_verified_sites_pip(
+    installed: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _slot, _layer, artifact = previous_runtime(installed, tmp_path)
+    helper = load_script_module(SLOTS.with_name("runtime_integrity.py"))
+    # A pip loaded earlier in this process is not the one under validation and
+    # may point at a directory that no longer exists (an earlier verified venv
+    # whose tmp_path is gone). The parsers must come from the verified site.
+    for name in [name for name in sys.modules if name.startswith("pip.")]:
+        monkeypatch.delitem(sys.modules, name)
+    stale = types.ModuleType("pip")
+    stale.__path__ = [str(tmp_path / "gone-site/pip")]
+    monkeypatch.setitem(sys.modules, "pip", stale)
+    result = helper.validate_previous_runtime(root, artifact)
+    assert result["artifact_sha256"] == artifact
+    assert sys.modules["pip"] is stale, (
+        "the verified site's pip must not replace the interpreter's own module cache"
+    )
+    assert not any(name.startswith("pip.") for name in sys.modules), (
+        "modules imported from the verified site must not outlive the validation"
+    )
 
 
 def test_damaged_previous_dependency_blocks_upgrade_even_with_a_different_candidate(

@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +19,7 @@ from scripts.e2e.regional.probes import (
     net003_executor,
     node_host_probe,
 )
+from tests.regional._cov95_collect_net import StopLoop
 
 
 def _context(key: str, operation: str = "FREEZE_EVIDENCE"):
@@ -40,10 +40,22 @@ def test_net002_automatic_block_rollback(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(net002_executor, "BLOCK_ROLLBACK_SECONDS", 0.05)
     block.touch()
 
-    Thread(target=net002_executor.rollback_stale_block, daemon=True).start()
+    # The watchdog is a sidecar loop with no exit, so run it inline on the real
+    # clock and stop it at its first nap after the marker is gone. A background
+    # thread would outlive this test and keep calling ``time.sleep`` into any
+    # fake clock a later test installs on the same worker (2026-10-03 shuffle).
     deadline = time.monotonic() + 2
-    while block.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
+
+    def bounded_sleep(seconds: float) -> None:
+        if not block.exists() or time.monotonic() >= deadline:
+            raise StopLoop()
+        time.sleep(seconds)
+
+    monkeypatch.setattr(
+        net002_executor, "time", SimpleNamespace(time=time.time, sleep=bounded_sleep)
+    )
+    with pytest.raises(StopLoop):
+        net002_executor.rollback_stale_block()
 
     assert not block.exists(), "automatic rollback left the network block marker"
     # The record is written (atomically) before the marker is lifted, so the

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import configparser
+import contextlib
 import csv
 import hashlib
 import importlib.metadata
@@ -25,8 +26,10 @@ import sys
 import sysconfig
 import tarfile
 import zipfile
+from collections.abc import Iterator
 from email.parser import BytesParser
 from pathlib import Path
+from typing import Any
 
 BOOTSTRAP_PACKAGES = frozenset({"pip", "setuptools", "wheel"})
 PROJECT = "gpu-fault-node-runtime"
@@ -65,6 +68,42 @@ def site_path(venv: Path) -> Path:
             "purelib", scheme="venv", vars={"base": str(venv), "platbase": str(venv)}
         )
     )
+
+
+def _pip_modules() -> dict[str, Any]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "pip" or name.startswith("pip.")
+    }
+
+
+@contextlib.contextmanager
+def importable(site: Path) -> Iterator[None]:
+    """Resolve the imports inside the block from a verified site-packages only.
+
+    pip may already be loaded from this interpreter's own environment or from
+    a venv verified earlier in the same process; neither is the site under
+    validation, and an earlier one may be gone by now. The block therefore
+    starts without cached pip modules, and what it imports is dropped again
+    afterwards: the objects bound inside the block keep working, while neither
+    the directory nor its modules outlive the import. Left behind, every later
+    ``importlib.metadata`` scan and every interpreter spawned from this process
+    would treat the validated node venv as part of its own environment.
+    """
+    entry = str(site)
+    previous = _pip_modules()
+    for name in previous:
+        del sys.modules[name]
+    sys.path.insert(0, entry)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(entry)
+        for name in _pip_modules():
+            del sys.modules[name]
+        sys.modules.update(previous)
 
 
 def canonical_name(name: str) -> str:
@@ -159,9 +198,9 @@ def verify_records(
 def locked_versions(lock: Path, trusted_site: Path) -> dict[str, str]:
     # pip is required by the installer and its files have already been verified.
     # Reuse its requirement/marker parsers, without running site or .pth files.
-    sys.path.insert(0, str(trusted_site))
-    from pip._internal.req.req_file import break_args_options, preprocess
-    from pip._vendor.packaging.requirements import Requirement
+    with importable(trusted_site):
+        from pip._internal.req.req_file import break_args_options, preprocess
+        from pip._vendor.packaging.requirements import Requirement
 
     content = lock.read_text()
     if "${" in content:
@@ -348,9 +387,9 @@ def validate_dependency_closure(sites: list[Path], versions: dict[str, str]) -> 
     pip_site = next((site for site in sites if (site / "pip").is_dir()), None)
     if pip_site is None:
         raise ValueError("rollback environment has no verified dependency parser")
-    sys.path.insert(0, str(pip_site))
-    from pip._vendor.packaging.requirements import Requirement
-    from pip._vendor.packaging.version import Version
+    with importable(pip_site):
+        from pip._vendor.packaging.requirements import Requirement
+        from pip._vendor.packaging.version import Version
 
     for site in sites:
         for distribution in importlib.metadata.distributions(path=[str(site)]):

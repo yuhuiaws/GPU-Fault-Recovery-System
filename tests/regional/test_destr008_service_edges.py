@@ -422,9 +422,12 @@ def test_controller_independent_host_lock_metadata_is_checked(
         values["st_mode"] = stat.S_IFIFO | 0o600
     else:
         values["st_nlink"] = 2
-    monkeypatch.setattr(os, "fstat", lambda _fd: SimpleNamespace(**values))
-    with pytest.raises(probe.ProbeError, match="lock is not private"):
-        host.window.prepare()
+    # The fake replaces the global os.fstat, which pytest's own tmp_path
+    # teardown also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fstat", lambda _fd: SimpleNamespace(**values))
+        with pytest.raises(probe.ProbeError, match="lock is not private"):
+            host.window.prepare()
 
 
 @pytest.mark.parametrize("command", ["stop-with-failsafe", "restore-service"])

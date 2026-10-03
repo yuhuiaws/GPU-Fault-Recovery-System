@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -137,9 +138,19 @@ def test_real_failure_or_skip_cannot_produce_a_passing_or_credential_leaking_rec
         if mode in {"setup", "teardown"}
         else "call"
     )
+    # Every variant fails the same way, and the record names whichever ran
+    # first. The nested run inherits GPU_FAULT_TEST_SHUFFLE_SEED on purpose
+    # (worker_environment keeps the explicit test controls), so under
+    # ``make test-shuffled`` that is not variant 0.
+    nodeid = first.pop("nodeid", None)
+    if expected_phase == "collect":
+        assert nodeid == CASES, nodeid
+    else:
+        assert isinstance(nodeid, str) and re.fullmatch(
+            re.escape(CASES) + r"::test_variant\[\d+\]", nodeid
+        ), nodeid
     assert first == {
         "failed": True,
-        "nodeid": CASES if expected_phase == "collect" else f"{CASES}::test_variant[0]",
         "phase": expected_phase,
         "outcome": "skipped" if mode in {"skip", "collection-skip"} else "failed",
     }

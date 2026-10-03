@@ -67,9 +67,12 @@ def test_fd_metadata_must_remain_regular_private_and_stable(
             st_ctime_ns=actual.st_ctime_ns,
         )
 
-    monkeypatch.setattr(crypto.os, "fstat", metadata)
-    with pytest.raises(CustodyError):
-        crypto.read_regular(path, private=True)
+    # crypto.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(crypto.os, "fstat", metadata)
+        with pytest.raises(CustodyError):
+            crypto.read_regular(path, private=True)
 
 
 def test_a_public_input_need_not_be_a_private_file(tmp_path):

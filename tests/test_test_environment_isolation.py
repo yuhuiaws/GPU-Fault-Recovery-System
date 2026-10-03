@@ -36,6 +36,58 @@ def test_deploy_repository_requires_explicit_test_configuration(
     )
 
 
+def test_direct_environment_writes_do_not_outlive_their_test(tmp_path: Path) -> None:
+    (tmp_path / "conftest.py").write_text(
+        "from tests.conftest import process_environment_is_restored\n", encoding="utf-8"
+    )
+    # File order is the only order here; the first test leaks the way an
+    # in-process entry point does (``os.environ.setdefault``), the second must
+    # start from the environment the file started with.
+    (tmp_path / "test_leak.py").write_text(
+        "import os\n"
+        "def test_entry_point_writes_its_own_environment():\n"
+        "    os.environ.setdefault('GPU_FAULT_TEST_LEAKED_INPUT', 'leaked')\n"
+        "    os.environ['HOME'] = '/elsewhere'\n"
+        "    del os.environ['GPU_FAULT_TEST_PRESENT_INPUT']\n"
+        "def test_next_test_starts_clean():\n"
+        "    assert 'GPU_FAULT_TEST_LEAKED_INPUT' not in os.environ\n"
+        f"    assert os.environ['HOME'] == {str(tmp_path)!r}\n"
+        "    assert os.environ['GPU_FAULT_TEST_PRESENT_INPUT'] == 'kept'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-q",
+            "-o",
+            "addopts=",
+            "-p",
+            "no:cacheprovider",
+            "test_leak.py",
+        ],
+        cwd=tmp_path,
+        env={
+            "PATH": os.defpath,
+            "HOME": str(tmp_path),
+            "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "src"))),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "GPU_FAULT_TEST_PRESENT_INPUT": "kept",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout, (
+        "the restoring fixture must run for every test, not only the leaking one"
+    )
+
+
 @pytest.mark.parametrize(
     "postgres_url",
     [None, "", " ", "postgresql://127.0.0.1:1/explicit-test"],
