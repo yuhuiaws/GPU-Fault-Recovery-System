@@ -340,9 +340,12 @@ def test_failed_publication_cleans_its_new_private_files(job, monkeypatch):
             raise OSError("simulated publication failure")
         return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(grant.os, "open", open_file)
-    with pytest.raises(OSError, match="publication"):
-        grant.prepare_grant(environment, CONTAINER)
+    # grant.os is the global os module, which pytest's own tmp_path teardown also
+    # uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(grant.os, "open", open_file)
+        with pytest.raises(OSError, match="publication"):
+            grant.prepare_grant(environment, CONTAINER)
     assert not list(Path(environment["RUNNER_TEMP"]).glob("gpu-fault-ci-*")), (
         "a failed prepare cannot leave its database credential behind"
     )

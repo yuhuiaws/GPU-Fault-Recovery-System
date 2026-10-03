@@ -356,6 +356,10 @@ def test_nul_in_exec_identity_is_not_a_literal_safe_argument():
 
 @pytest.fixture
 def child_io(monkeypatch):
+    # Plain monkeypatch on purpose: the tests below re-patch the same os
+    # attributes on this monkeypatch, and a nested context exiting first would
+    # make the outer undo restore the fixture's fakes instead of the originals.
+    # None of these tests use tmp_path, so no cleanup can meet the fakes.
     calls = []
     monkeypatch.setattr(
         child_entry.ctypes,

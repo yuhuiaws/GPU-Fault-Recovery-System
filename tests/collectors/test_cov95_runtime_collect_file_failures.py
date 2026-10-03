@@ -35,9 +35,12 @@ def test_outbox_directory_sync_failure_reports_degradation_after_atomic_write(
             raise OSError("private directory sync denied")
         return original_sync(handle)
 
-    monkeypatch.setattr(outbox_file.os, "open", open_file)
-    monkeypatch.setattr(outbox_file.os, "fsync", sync)
-    outbox.write([{"event_id": "private-event"}])
+    # outbox_file.os is the global os module, which pytest's own tmp_path
+    # teardown also uses; keep the fakes to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(outbox_file.os, "open", open_file)
+        patch.setattr(outbox_file.os, "fsync", sync)
+        outbox.write([{"event_id": "private-event"}])
     assert outbox.read() == [{"event_id": "private-event"}]
     assert "directory" in caplog.text
     assert "denied" in caplog.text

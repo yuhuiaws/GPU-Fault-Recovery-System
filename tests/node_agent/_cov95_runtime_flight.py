@@ -79,36 +79,39 @@ def collect(
             dump.write_bytes(content)
         return len(data)
 
-    monkeypatch.setattr(os, "open", open_pipe)
-    monkeypatch.setattr(os, "write", write_pipe)
-    monkeypatch.setattr(
-        os, "close", lambda fd: None if fd == fake_descriptor else real_close(fd)
-    )
-    commands = []
-
-    def runner(argv: list[str], **kwargs: Any) -> CompletedProcess:
-        commands.append(argv)
-        text = (
-            "invalid\n100, GPU-a, python\n101, GPU-b, ignored\n"
-            if "--query-compute-apps=pid,gpu_uuid,process_name" in argv
-            else "GPU-a, 0, 0, 0x0\n"
+    # The fakes replace global os functions, which pytest's own tmp_path
+    # teardown also uses; keep them to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_pipe)
+        patch.setattr(os, "write", write_pipe)
+        patch.setattr(
+            os, "close", lambda fd: None if fd == fake_descriptor else real_close(fd)
         )
-        return CompletedProcess(argv, 0, stdout=text, stderr="")
+        commands = []
 
-    agent = node_factory(
-        allowed_operations={WorkflowOperation.COLLECT_HUNG_TRIAGE},
-        python_stack_tool="",
-        runner=runner,
-        sleep=clock.sleep,
-    )
-    result = agent.execute(
-        envelope(
-            command(
-                WorkflowOperation.COLLECT_HUNG_TRIAGE,
-                parameters={"triage_timeout_seconds": 2},
+        def runner(argv: list[str], **kwargs: Any) -> CompletedProcess:
+            commands.append(argv)
+            text = (
+                "invalid\n100, GPU-a, python\n101, GPU-b, ignored\n"
+                if "--query-compute-apps=pid,gpu_uuid,process_name" in argv
+                else "GPU-a, 0, 0, 0x0\n"
+            )
+            return CompletedProcess(argv, 0, stdout=text, stderr="")
+
+        agent = node_factory(
+            allowed_operations={WorkflowOperation.COLLECT_HUNG_TRIAGE},
+            python_stack_tool="",
+            runner=runner,
+            sleep=clock.sleep,
+        )
+        result = agent.execute(
+            envelope(
+                command(
+                    WorkflowOperation.COLLECT_HUNG_TRIAGE,
+                    parameters={"triage_timeout_seconds": 2},
+                )
             )
         )
-    )
     assert all(
         argv[0] == "nvidia-smi" and "--gpu-reset" not in argv for argv in commands
     ), "triage must use only the fake read-only query transport"

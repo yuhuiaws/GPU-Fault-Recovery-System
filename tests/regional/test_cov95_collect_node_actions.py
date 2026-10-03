@@ -459,14 +459,17 @@ def test_atomic_env_replacement_copies_owner_and_cleans_failed_tempfile(
         return current
 
     monkeypatch.setattr(probe.tempfile, "NamedTemporaryFile", create)
-    monkeypatch.setattr(probe.os, "fstat", fstat)
-    monkeypatch.setattr(
-        probe.os, "fchown", lambda fd, uid, gid: changes.append((uid, gid))
-    )
-    digest = hashlib.sha256(probe.COLLECTOR_ENV.read_bytes()).hexdigest()
-    probe.replace_collector_env(
-        b"GPU_FAULT_EXPECTED_GPU_COUNT=2\n", expected_sha256=digest
-    )
+    # probe.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fakes to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "fstat", fstat)
+        patch.setattr(
+            probe.os, "fchown", lambda fd, uid, gid: changes.append((uid, gid))
+        )
+        digest = hashlib.sha256(probe.COLLECTOR_ENV.read_bytes()).hexdigest()
+        probe.replace_collector_env(
+            b"GPU_FAULT_EXPECTED_GPU_COUNT=2\n", expected_sha256=digest
+        )
     assert changes == [(owner.st_uid, owner.st_gid)]
     assert not list(probe.COLLECTOR_ENV.parent.glob(".collector-acceptance-*")), (
         "temporary file must be retired"

@@ -422,10 +422,12 @@ def test_requeue_dead_refuses_to_run_when_the_outbox_lock_cannot_be_taken(
             raise PermissionError(13, "Permission denied")
         return real_open(path, flags, mode, **kwargs)
 
-    monkeypatch.setattr(os, "open", refuse_lock_files)
-
-    with pytest.raises(SystemExit) as refused:
-        collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
+    # The fake replaces the global os.open, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_lock_files)
+        with pytest.raises(SystemExit) as refused:
+            collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
 
     assert refused.value.code not in {0, None}, "requeue-dead exited successfully"
     message = str(refused.value)
@@ -546,10 +548,14 @@ def test_requeue_dead_force_proceeds_without_the_lock_and_says_so(
             raise PermissionError(13, "Permission denied")
         return real_open(path, flags, mode, **kwargs)
 
-    monkeypatch.setattr(os, "open", refuse_lock_files)
-
-    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
-        collectors_cli.run_outbox_command(_requeue_arguments(outbox_path, force=True))
+    # The fake replaces the global os.open, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_lock_files)
+        with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+            collectors_cli.run_outbox_command(
+                _requeue_arguments(outbox_path, force=True)
+            )
 
     record = json.loads(outbox_path.read_text())
     assert record["replayable"] is True, "--force did not requeue the dead record"

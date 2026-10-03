@@ -986,7 +986,6 @@ def test_fabric_manager_skips_a_file_that_vanishes_between_glob_and_stat(
             raise FileNotFoundError(str(path))
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", flaky_stat)
     sink = RecordingSink()
     collector = FabricManagerLogCollector(
         sink,
@@ -998,7 +997,11 @@ def test_fabric_manager_skips_a_file_that_vanishes_between_glob_and_stat(
         now=lambda: NOW,
     )
 
-    stats = collector.collect_once()
+    # The fake replaces the global os.stat, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", flaky_stat)
+        stats = collector.collect_once()
 
     assert stats.delivered == 1, "a vanished sibling file stopped the whole round"
     events = [payload for _path, payload in sink.requests if "message" in payload]

@@ -202,7 +202,10 @@ def test_repeated_parent_cancellation_drains_every_owned_child(
             signal.pidfd_send_signal(descriptor, signum)
         finally:
             os.close(descriptor)
-        result = future.result(timeout=20)
+        # The fixture bounds itself (run_owned_command timeout=30 plus the
+        # supervisor's termination grace); wait at least that long so a loaded
+        # CI runner cannot make this assertion race the product's own deadline.
+        result = future.result(timeout=45)
     assert result.returncode == 0, "cancellation process fixture failed"
     assert read_private_json(tmp_path / "result.json") == {
         "status": "interrupted",
@@ -329,7 +332,8 @@ def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
             signal.pidfd_send_signal(descriptor, signum)
         finally:
             os.close(descriptor)
-        result = future.result(timeout=25)
+        # Same rule: the fixture's own run_owned_command timeout is 60 seconds.
+        result = future.result(timeout=75)
     assert result.returncode == 0, "nested cancellation harness failed"
     assert read_private_json(tmp_path / "result.json") == {
         "failure": "KeyboardInterrupt",

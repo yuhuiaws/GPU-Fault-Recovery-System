@@ -157,10 +157,13 @@ def test_lock_holder_metadata_probe_closes_descriptors_on_os_errors(
         if failure == "close":
             raise OSError(errno.EIO, "close reported failure")
 
-    monkeypatch.setattr(os, "open", open_file)
-    monkeypatch.setattr(os, "close", close)
-    monkeypatch.setattr(outbox_file.fcntl, "flock", flock)
-    assert outbox.lock_holder() is None
+    # The fakes replace global os functions, which pytest's own tmp_path
+    # teardown also uses; keep them to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_file)
+        patch.setattr(os, "close", close)
+        patch.setattr(outbox_file.fcntl, "flock", flock)
+        assert outbox.lock_holder() is None
     assert bool(seen) is (failure != "open")
     assert len(closed) == (0 if failure == "open" else 1)
 

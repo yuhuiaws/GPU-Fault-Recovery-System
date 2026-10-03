@@ -590,15 +590,18 @@ def test_unlocked_outbox_writes_are_counted_and_rewarned(
             raise OSError(95, "Operation not supported")
         return real_open(path, flags, mode, **kwargs)
 
-    monkeypatch.setattr(os, "open", refuse_lock_files)
     outbox = tmp_path / "no-flock.ndjson"
     sink = HttpEventSink("https://control", outbox_path=str(outbox))
 
-    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
-        for sequence in range(101):
-            assert sink.buffer_for_replay("/events", {"sequence": sequence}) is True, (
-                f"record {sequence} was not persisted without the lock"
-            )
+    # The fake replaces the global os.open, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_lock_files)
+        with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+            for sequence in range(101):
+                assert (
+                    sink.buffer_for_replay("/events", {"sequence": sequence}) is True
+                ), f"record {sequence} was not persisted without the lock"
 
     assert sink.outbox_unlocked_writes_total == 101, (
         f"unlocked writes were not counted: {sink.outbox_unlocked_writes_total}"
@@ -726,7 +729,6 @@ def test_a_filesystem_without_flock_still_buffers_and_warns_once(
             raise OSError(95, "Operation not supported")
         return real_open(path, flags, mode, **kwargs)
 
-    monkeypatch.setattr(os, "open", refuse_lock_files)
     monkeypatch.setattr(
         "gpu_fault.collectors.sinks.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreachable")),
@@ -739,13 +741,17 @@ def test_a_filesystem_without_flock_still_buffers_and_warns_once(
         sleep=lambda _seconds: None,
     )
 
-    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
-        for sequence in range(2):
-            with pytest.raises(CollectorError) as captured:
-                sink.post("/events", {"event_id": f"e-{sequence}"})
-            assert captured.value.buffered is True, (
-                "a missing outbox lock stopped the record from being buffered"
-            )
+    # The fake replaces the global os.open, which pytest's own tmp_path teardown
+    # also uses; keep it to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", refuse_lock_files)
+        with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+            for sequence in range(2):
+                with pytest.raises(CollectorError) as captured:
+                    sink.post("/events", {"event_id": f"e-{sequence}"})
+                assert captured.value.buffered is True, (
+                    "a missing outbox lock stopped the record from being buffered"
+                )
 
     buffered = [json.loads(line) for line in outbox.read_text().splitlines() if line]
     assert len(buffered) == 2, buffered

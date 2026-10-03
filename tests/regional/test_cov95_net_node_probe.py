@@ -350,8 +350,11 @@ def test_kmsg_protocol_closes_descriptor_and_reports_write_failure(
 
 
 def test_kmsg_rejects_unsafe_bdf_before_open(host: Any, monkeypatch: Any) -> None:
-    monkeypatch.setattr(probe.os, "open", forbidden)
-    with pytest.raises(probe.ToolError, match="unsafe PCI"):
-        probe.write_kmsg(
-            SimpleNamespace(test_id="test", drill_id="drill", pci_bdf="bad")
-        )
+    # probe.os is the global os module, which pytest's own tmp_path teardown
+    # also uses; keep the fake to the call under test.
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "open", forbidden)
+        with pytest.raises(probe.ToolError, match="unsafe PCI"):
+            probe.write_kmsg(
+                SimpleNamespace(test_id="test", drill_id="drill", pci_bdf="bad")
+            )
