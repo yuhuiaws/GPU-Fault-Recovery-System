@@ -14,7 +14,7 @@ import logging
 import os
 import socket
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from gpu_fault.adapters import (
     HyperPodLifecycleStepAdapter,
@@ -44,6 +44,7 @@ from gpu_fault.cluster_executor.regional_client import (
     RegionalHyperPodSubmissionStore,
     RegionalIncidentOwnershipProvider,
 )
+from gpu_fault.eks_provider import EKS_ADAPTER_OWNER, eks_provider_from_environment
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.hyperpod import (
@@ -52,6 +53,12 @@ from gpu_fault.hyperpod import (
 )
 from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
 from gpu_fault.logging_setup import configure_logging
+from gpu_fault.node_provider import (
+    ClusterProvider,
+    NodeLifecycleProvider,
+    cluster_provider,
+    node_selector,
+)
 from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
@@ -114,6 +121,7 @@ def executor_from_environment() -> ClusterActionExecutor:
     regional_client = _regional_client_from_environment()
     fleet_registry = RegionalFleetRegistry(regional_client)
     spare_coordinator: HyperPodSpareCoordinator | None = None
+    hyperpod_confirm_cluster: str | None = None
     kubernetes_adapter = KubernetesWorkflowAdapter(
         owner=os.getenv(
             "GPU_FAULT_KUBERNETES_OWNER",
@@ -147,7 +155,6 @@ def executor_from_environment() -> ClusterActionExecutor:
         ),
     )
     adapters = [kubernetes_adapter]
-    hyperpod_confirm_cluster = None
     # Node agent addressing must come from fleet heartbeats, not from a
     # hand-maintained GPU_FAULT_NODE_AGENT_ENDPOINTS map: nodes are
     # replaced over a cluster's life, and a stale map fails closed only
@@ -160,95 +167,17 @@ def executor_from_environment() -> ClusterActionExecutor:
         )
         adapters.append(node_action_adapter)
     if env_bool("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"):
-        hyperpod_confirm_cluster = os.getenv(
-            "GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER", ""
-        ).strip()
-        if not hyperpod_confirm_cluster:
-            raise ClusterExecutorError(
-                "GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER is required "
-                "when the HyperPod adapter is enabled"
-            )
-        # Fail at startup, not at the first real fault. Enabling the
-        # adapter without the ServiceAccount's role-arn annotation used
-        # to look completely healthy -- Pod Ready, logs clean -- until a
-        # GPU broke hours later and REPLACE_NODE died on
-        # NoCredentialsError. This costs one local credential-chain
-        # resolution and no API call.
-        credential_gap = missing_aws_credentials()
-        if credential_gap is not None:
-            raise ClusterExecutorError(
-                "the HyperPod adapter is enabled but "
-                + credential_gap
-                + "; annotate serviceaccount "
-                "gpu-fault-cluster-executor with "
-                "eks.amazonaws.com/role-arn=<role> and restart, or set "
-                "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false"
-            )
-        lifecycle = HyperPodLifecycleAdapter(
-            HyperPodAdapterConfig.from_environment(),
-            # Reboot and replace restart this very Pod, so submission
-            # idempotency cannot live in its memory. With REMOTE_STATE
-            # the record is held by the control plane; with a local
-            # store it is held there.
-            store=(
-                RegionalHyperPodSubmissionStore(regional_client)
-                if store is None
-                else store
-            ),
-        )
-        # Reboot confirmation always needs the fleet registry to compare
-        # the pre-submit boot/incarnation baseline with the new Agent
-        # heartbeat. Spare failover controls only replacement
-        # allocation; it must not disable the only automatic RESTART_NODE
-        # confirmation path.
-        registry = fleet_registry
-        if registry is None:
-            raise ClusterExecutorError(
-                "HyperPod lifecycle execution requires a fleet "
-                "registry for reboot confirmation"
-            )
-        if env_bool("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER"):
-            if not use_remote_state:
-                raise ClusterExecutorError(
-                    "regional HyperPod spare failover requires "
-                    "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
-                )
-            spare_coordinator = HyperPodSpareCoordinator(
-                lifecycle,
-                registry.store,
-                kubernetes_adapter.core,
-                registry=registry,
-                remote_health_provider=registry,
-                spare_label=os.getenv(
-                    "GPU_FAULT_HYPERPOD_SPARE_LABEL",
-                    "gpu-fault.io/spare",
-                ),
-                spare_label_value=os.getenv(
-                    "GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE",
-                    "true",
-                ),
-            )
-        adapters.append(
-            HyperPodLifecycleStepAdapter(
-                lifecycle,
-                owner=os.getenv(
-                    "GPU_FAULT_HYPERPOD_OWNER",
-                    "gpu-fault-hyperpod-adapter",
-                ),
-                registry=registry,
-                spare_coordinator=spare_coordinator,
-                node_action_adapter=node_action_adapter,
+        step_adapter, spare_coordinator, hyperpod_confirm_cluster = (
+            _lifecycle_adapter_from_environment(
+                regional_client,
+                fleet_registry,
                 kubernetes_adapter=kubernetes_adapter,
+                node_action_adapter=node_action_adapter,
                 store=store,
-                notification_sink=(fleet_registry if store is None else store),
-                post_reboot_stabilization_seconds=int(
-                    os.getenv(
-                        "GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS",
-                        "60",
-                    )
-                ),
+                use_remote_state=use_remote_state,
             )
         )
+        adapters.append(step_adapter)
     namespaces = {
         value.strip()
         for value in os.getenv("GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES", "").split(",")
@@ -280,6 +209,145 @@ def executor_from_environment() -> ClusterActionExecutor:
     return executor
 
 
+def _lifecycle_provider_from_environment(
+    provider: ClusterProvider,
+    regional_client: RegionalExecutorClient,
+    kubernetes_adapter: KubernetesWorkflowAdapter,
+    store: Any | None,
+) -> NodeLifecycleProvider:
+    """The provider behind RESTART_NODE: HyperPod's SageMaker calls or EC2.
+
+    On an ``eks-managed`` cluster the SageMaker client is never constructed;
+    the EKS provider talks to EC2 and EKS only. Both share the durable
+    submission ledger: reboot restarts this very Pod, so idempotency cannot
+    live in its memory -- with REMOTE_STATE the control plane holds the
+    record, with a local store that store does.
+    """
+
+    submission_store = (
+        RegionalHyperPodSubmissionStore(regional_client) if store is None else store
+    )
+    if provider is ClusterProvider.EKS_MANAGED:
+        # The EKS provider lists nodes through the executor's own Kubernetes
+        # client; HyperPod reads them from SageMaker and needs none.
+        return eks_provider_from_environment(
+            kubernetes_adapter.core, store=submission_store
+        )
+    return HyperPodLifecycleAdapter(
+        HyperPodAdapterConfig.from_environment(), store=submission_store
+    )
+
+
+def _lifecycle_adapter_from_environment(
+    regional_client: RegionalExecutorClient,
+    fleet_registry: RegionalFleetRegistry | None,
+    *,
+    kubernetes_adapter: KubernetesWorkflowAdapter,
+    node_action_adapter: NodeActionWorkflowAdapter | None,
+    store: Any | None,
+    use_remote_state: bool,
+) -> tuple[HyperPodLifecycleStepAdapter, HyperPodSpareCoordinator | None, str]:
+    """The provider lifecycle step adapter, its spare coordinator and confirm name.
+
+    ``GPU_FAULT_ENABLE_HYPERPOD_ADAPTER`` switches the step adapter on for
+    every provider (the variable predates plain-EKS support and is not
+    renamed); ``GPU_FAULT_CLUSTER_PROVIDER`` picks which provider backs it.
+    """
+
+    provider = cluster_provider()
+    label = "EKS" if provider is ClusterProvider.EKS_MANAGED else "HyperPod"
+    confirm_cluster = os.getenv("GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER", "").strip()
+    if not confirm_cluster:
+        raise ClusterExecutorError(
+            "GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER is required "
+            f"when the {label} adapter is enabled"
+        )
+    # Fail at startup, not at the first real fault. Enabling the adapter
+    # without the ServiceAccount's role-arn annotation used to look
+    # completely healthy -- Pod Ready, logs clean -- until a GPU broke hours
+    # later and REPLACE_NODE died on NoCredentialsError. This costs one local
+    # credential-chain resolution and no API call.
+    credential_gap = missing_aws_credentials()
+    if credential_gap is not None:
+        raise ClusterExecutorError(
+            f"the {label} adapter is enabled but "
+            + credential_gap
+            + "; annotate serviceaccount "
+            "gpu-fault-cluster-executor with "
+            "eks.amazonaws.com/role-arn=<role> and restart, or set "
+            "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false"
+        )
+    lifecycle = _lifecycle_provider_from_environment(
+        provider, regional_client, kubernetes_adapter, store
+    )
+    # Reboot confirmation always needs the fleet registry to compare the
+    # pre-submit boot/incarnation baseline with the new Agent heartbeat. Spare
+    # failover controls only replacement allocation; it must not disable the
+    # only automatic RESTART_NODE confirmation path.
+    registry = fleet_registry
+    if registry is None:
+        raise ClusterExecutorError(
+            f"{label} lifecycle execution requires a fleet "
+            "registry for reboot confirmation"
+        )
+    spare_coordinator: HyperPodSpareCoordinator | None = None
+    if env_bool("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER"):
+        if provider is ClusterProvider.EKS_MANAGED:
+            # The manifest sets the switch for every provider. Warm-spare
+            # failover needs HyperPod's health signals and a provider that
+            # can list spares; on plain EKS nodeReplace stays OBSERVE, so the
+            # coordinator is not built and REPLACE_NODE fails closed in the
+            # adapter instead.
+            LOGGER.warning(
+                "warm-spare failover is not available on an eks-managed "
+                "cluster; REPLACE_NODE stays observe-only"
+            )
+        else:
+            if not use_remote_state:
+                raise ClusterExecutorError(
+                    "regional HyperPod spare failover requires "
+                    "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
+                )
+            spare_coordinator = HyperPodSpareCoordinator(
+                # Only the HyperPod branch reaches here.
+                cast(HyperPodLifecycleAdapter, lifecycle),
+                registry.store,
+                kubernetes_adapter.core,
+                registry=registry,
+                remote_health_provider=registry,
+                spare_label=os.getenv(
+                    "GPU_FAULT_HYPERPOD_SPARE_LABEL",
+                    "gpu-fault.io/spare",
+                ),
+                spare_label_value=os.getenv(
+                    "GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE",
+                    "true",
+                ),
+            )
+    default_owner = (
+        EKS_ADAPTER_OWNER
+        if provider is ClusterProvider.EKS_MANAGED
+        else "gpu-fault-hyperpod-adapter"
+    )
+    step_adapter = HyperPodLifecycleStepAdapter(
+        lifecycle,
+        owner=os.getenv("GPU_FAULT_HYPERPOD_OWNER", default_owner),
+        registry=registry,
+        spare_coordinator=spare_coordinator,
+        node_action_adapter=node_action_adapter,
+        kubernetes_adapter=kubernetes_adapter,
+        store=store,
+        notification_sink=(fleet_registry if store is None else store),
+        post_reboot_stabilization_seconds=int(
+            os.getenv(
+                "GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS",
+                "60",
+            )
+        ),
+    )
+    return step_adapter, spare_coordinator, confirm_cluster
+
+
 POD_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
 
@@ -299,10 +367,12 @@ def _node_key_sync_from_environment(
     """The node-key sync, or None with one WARNING naming why it is off.
 
     ``GPU_FAULT_NODE_KEY_SYNC_SECONDS`` paces it (default 60); 0 or less turns
-    it off. Off means a node HyperPod replaces after the last deploy gets no
-    Node Action key -- and therefore no Agent -- until the next
+    it off. Off means a node the provider replaces after the last deploy gets
+    no Node Action key -- and therefore no Agent -- until the next
     ``gpu-fault-admin deploy``, which is the pre-sync behaviour, so it is said
-    out loud rather than left to be discovered at the next spot reclaim.
+    out loud rather than left to be discovered at the next spot reclaim. The
+    nodes are selected by ``GPU_FAULT_NODE_SELECTOR`` (for HyperPod, by default
+    the cluster-name label of ``GPU_FAULT_HYPERPOD_CLUSTER``).
     """
 
     interval = float(os.getenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", "60"))
@@ -313,11 +383,12 @@ def _node_key_sync_from_environment(
             interval,
         )
         return None
-    hyperpod_cluster = (os.getenv("GPU_FAULT_HYPERPOD_CLUSTER") or "").strip()
-    if not hyperpod_cluster:
+    selector = node_selector()
+    if not selector:
         LOGGER.warning(
-            "node action key sync is disabled: GPU_FAULT_HYPERPOD_CLUSTER is unset, "
-            "so this executor cannot select its cluster's nodes"
+            "node action key sync is disabled: GPU_FAULT_NODE_SELECTOR and "
+            "GPU_FAULT_HYPERPOD_CLUSTER are unset, so this executor cannot "
+            "select its cluster's nodes"
         )
         return None
     namespace = (
@@ -328,7 +399,7 @@ def _node_key_sync_from_environment(
     return NodeActionKeySync(
         regional_client,
         core,
-        hyperpod_cluster=hyperpod_cluster,
+        node_selector=selector,
         namespace=namespace,
         interval_seconds=interval,
     )

@@ -178,5 +178,50 @@ def test_config_has_no_multi_profile_payload() -> None:
     assert PROFILE_EXAMPLES
     assert not list((ROOT / "config").glob("runtime-profiles*.yaml"))
     assert [path.name for path in PROFILE_EXAMPLES] == [
-        "runtime-profile.regional-hyperpod-safe.example.yaml"
+        "runtime-profile.regional-eks-safe.example.yaml",
+        "runtime-profile.regional-hyperpod-safe.example.yaml",
+    ]
+
+
+def test_regional_eks_safe_profile_owns_reboot_only_through_the_eks_adapter() -> None:
+    hyperpod = yaml.safe_load(
+        (
+            ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+        ).read_text()
+    )
+    payload = yaml.safe_load(
+        (ROOT / "config/runtime-profile.regional-eks-safe.example.yaml").read_text()
+    )
+    assert payload["cluster_id"] == "REPLACE_WITH_CLUSTER_ID"
+    profile = RuntimeProfile.model_validate(payload)
+
+    effective = compile_runtime_profile(profile)
+
+    assert effective.profile_version == "eks-v1"
+    assert profile.environment is Environment.EKS
+    assert effective.warnings == []
+    modes = {
+        item.capability: (item.mode, item.owner) for item in effective.capabilities
+    }
+    assert modes[CapabilityName.NODE_REBOOT] == (
+        CapabilityMode.OWN,
+        "gpu-fault-eks-adapter",
+    )
+    assert modes[CapabilityName.NODE_REPLACE] == (
+        CapabilityMode.OBSERVE,
+        "gpu-fault-eks-adapter",
+    )
+    # No HyperPod health-monitoring-agent on a plain EKS cluster.
+    assert "hyperpod-hma" not in {claim["owner"] for claim in payload["claims"]}
+    # Everything else is the HyperPod profile, claim for claim.
+    node_lifecycle = {"nodeReboot", "nodeReplace"}
+    hma = {"gpuDetection", "providerHealthIsolation"}
+    assert [
+        claim
+        for claim in payload["claims"]
+        if claim["capability"] not in node_lifecycle
+    ] == [
+        claim
+        for claim in hyperpod["claims"]
+        if claim["capability"] not in node_lifecycle | hma
     ]

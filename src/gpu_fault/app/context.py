@@ -20,6 +20,7 @@ from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.env import env_bool
+from gpu_fault.node_provider import ClusterProvider, cluster_provider
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
     ProductionExecutorConfig,
@@ -722,8 +723,15 @@ class ApplicationContext:
             adapters.append(kubernetes_adapter)
         enable_hyperpod_adapter = settings.hyperpod_adapter_enabled
         enable_spare_failover = settings.spare_failover_enabled
+        # A plain EKS cluster has no HyperPod managed recovery to observe; in
+        # single-cluster mode the provider is this process's, in regional mode
+        # it is decided per registration below.
+        local_hyperpod = (
+            bool(os.getenv("GPU_FAULT_HYPERPOD_CLUSTER"))
+            and cluster_provider() is ClusterProvider.HYPERPOD
+        )
         enable_managed_observer = (
-            (context.regional_mode or bool(os.getenv("GPU_FAULT_HYPERPOD_CLUSTER")))
+            (context.regional_mode or local_hyperpod)
             and env_bool("GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER", True)
             and "hyperpod-managed-node-recovery" in managed_owners
         )
@@ -780,7 +788,16 @@ class ApplicationContext:
 
                 def build_observer(
                     registration: RegionalClusterRegistration,
-                ) -> HyperPodManagedRecoveryObserver:
+                ) -> HyperPodManagedRecoveryObserver | None:
+                    # ``provider`` on the registration (default ``hyperpod``):
+                    # an eks-managed cluster gets no HyperPod identity registry
+                    # and no observer -- there is nothing SageMaker could tell
+                    # us about its nodes.
+                    if (
+                        str(getattr(registration, "provider", "") or "hyperpod")
+                        != ClusterProvider.HYPERPOD.value
+                    ):
+                        return None
                     lifecycle = HyperPodLifecycleAdapter(
                         HyperPodAdapterConfig.from_environment(
                             cluster_name=(registration.hyperpod_cluster_name),
@@ -799,8 +816,9 @@ class ApplicationContext:
                     )
 
                 observers = {
-                    registration.cluster_id: build_observer(registration)
+                    registration.cluster_id: observer
                     for registration in context.store.list_regional_clusters()
+                    if (observer := build_observer(registration)) is not None
                 }
                 managed_observer = RegionalHyperPodManagedRecoveryObserver(observers)
                 # Kept so `bind_regional_registry_runtime` can extend the map

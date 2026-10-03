@@ -75,6 +75,7 @@ from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.models import Environment
+from gpu_fault.node_provider import ClusterProvider, cluster_provider
 from gpu_fault.watcher import AttemptObservation, CompletionWatcher
 
 # Every name this module used to define stays importable from here: the
@@ -507,6 +508,14 @@ class KubernetesCompletionController(
         return KubernetesCompletionController._string_list(value, "GPU UUID annotation")
 
 
+def default_watcher_environment() -> Environment:
+    """``GPU_FAULT_WATCHER_ENVIRONMENT``'s default: ``eks`` on a plain EKS cluster."""
+
+    if cluster_provider() is ClusterProvider.EKS_MANAGED:
+        return Environment.EKS
+    return Environment.HYPERPOD_EKS
+
+
 def controller_from_environment() -> KubernetesCompletionController:
     try:
         from kubernetes import client, config, watch
@@ -555,7 +564,9 @@ def controller_from_environment() -> KubernetesCompletionController:
         environment=Environment(
             os.getenv(
                 "GPU_FAULT_WATCHER_ENVIRONMENT",
-                Environment.HYPERPOD_EKS.value,
+                # Unset follows the cluster provider: ``eks`` on a plain EKS
+                # cluster, the HyperPod default everywhere else.
+                default_watcher_environment().value,
             )
         ),
         namespace=os.getenv("GPU_FAULT_WATCH_NAMESPACE") or None,

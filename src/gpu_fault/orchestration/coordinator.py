@@ -10,9 +10,9 @@ from typing import Any, Sequence
 
 from gpu_fault.env import env_bool
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.node_provider import restart_vm_effective_action
 from gpu_fault.models import (
     BlockedKind,
-    Environment,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -1517,16 +1517,9 @@ class IncidentOrchestrator:
             profile = self.store.get_profile(event.runtime_profile_version)
         except NotFoundError:
             return None, None
-        if profile.environment not in {
-            Environment.HYPERPOD_EKS,
-            Environment.HYPERPOD_SLURM,
-        }:
-            return None, None
-        return (
-            RecoveryAction.REBOOT_NODE,
-            "HyperPod maps NVIDIA RESTART_VM to REBOOT_NODE via "
-            "BatchRebootClusterNodes; this is not EC2 stop/start",
-        )
+        # HyperPod and plain EKS both land on REBOOT_NODE, through their own
+        # provider call; neither is an EC2 stop/start.
+        return restart_vm_effective_action(profile.environment)
 
     def ingest_node_health(
         self,

@@ -25,6 +25,9 @@ DEFAULT_DEVICE_SWEEP_PROCESSES = (
     "nv-hostengine",
 )
 
+# Selectors are ``namespace/container``; one that matches no running container
+# (the HyperPod health-monitoring-agent on a plain EKS node) is simply skipped
+# by the quiesce manager, so the same default list serves every provider.
 DEFAULT_QUIESCE_CONTAINERS = (
     "aws-hyperpod/health-monitoring-agent",
     "gpu-fault-system/exporter",
