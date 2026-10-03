@@ -28,7 +28,7 @@ from tests.node_agent.test_node_installer_reconciler import (
 )
 from tests.regional.test_cov95_release_node_batch import SCOPE
 
-PROVIDER_ID = "aws:///us-west-2c/i-0222042756c3a2a68"
+PROVIDER_ID = "aws:///us-west-2c/i-00000000000000001"
 FQDN = "ip-10-0-33-205.us-west-2.compute.internal"
 
 

@@ -22,7 +22,7 @@ SCRIPT = (
     Path(__file__).resolve().parents[2] / "deploy/node/run-hyperpod-installer-job.sh"
 )
 FQDN = "ip-10-0-33-205.us-west-2.compute.internal"
-PROVIDER_ID = "aws:///us-west-2c/i-0222042756c3a2a68"
+PROVIDER_ID = "aws:///us-west-2c/i-00000000000000001"
 DNS_1123 = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
 
@@ -160,7 +160,7 @@ def test_eks_managed_job_registers_the_ec2_instance_id(tmp_path: Path) -> None:
     fragment = script[script.index('node_instance_id="${TARGET_NODE_UID}"') :]
     fragment = fragment[: fragment.index("fi\n") + 3]
     for provider, expected in (
-        ("eks-managed", "i-0222042756c3a2a68"),
+        ("eks-managed", "i-00000000000000001"),
         ("hyperpod", "node-uid-ip-10-0-"),
     ):
         resolved = subprocess.run(

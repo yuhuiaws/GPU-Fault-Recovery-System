@@ -47,7 +47,7 @@ CIDRS = {
     "subnet-cp-b": "10.0.49.0/24",
 }
 GPU_NODE = "ip-10-0-33-205.us-west-2.compute.internal"
-GPU_INSTANCE = "i-0222042756c3a2a68"
+GPU_INSTANCE = "i-00000000000000001"
 
 
 class EksRunner:

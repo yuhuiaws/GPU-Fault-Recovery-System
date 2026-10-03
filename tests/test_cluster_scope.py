@@ -198,8 +198,8 @@ def test_provider_cluster_name_keeps_hyperpod_name_and_uses_cluster_id_for_eks()
 
 def test_ec2_instance_id_is_parsed_from_the_aws_provider_id() -> None:
     assert (
-        ec2_instance_id_from_provider_id("aws:///us-west-2c/i-0222042756c3a2a68")
-        == "i-0222042756c3a2a68"
+        ec2_instance_id_from_provider_id("aws:///us-west-2c/i-00000000000000001")
+        == "i-00000000000000001"
     ), "the EC2 instance id was not extracted from spec.providerID"
     assert ec2_instance_id_from_provider_id("") == "", "empty id must give empty"
     assert ec2_instance_id_from_provider_id("gce://x/y/z") == "", (
