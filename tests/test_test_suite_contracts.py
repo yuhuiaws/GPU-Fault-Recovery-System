@@ -286,7 +286,14 @@ def test_shuffled_order_is_seeded_and_reproducible(
         for index in range(64)
     ]
 
-    monkeypatch.delenv(conftest.SHUFFLE_SEED_VARIABLE, raising=False)
+    # The CI shuffle legs export the shard variables; a test about the seed
+    # alone must not inherit them from the job it happens to run in.
+    for name in (
+        conftest.SHUFFLE_SEED_VARIABLE,
+        conftest.SHUFFLE_SHARDS_VARIABLE,
+        conftest.SHUFFLE_SHARD_VARIABLE,
+    ):
+        monkeypatch.delenv(name, raising=False)
     untouched = list(original)
     conftest.pytest_collection_modifyitems(_FakeConfig(), untouched)
 
@@ -390,6 +397,8 @@ def test_shuffle_shards_require_a_seed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_shuffle_seed_rejects_a_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "not-a-number")
+    monkeypatch.delenv(conftest.SHUFFLE_SHARDS_VARIABLE, raising=False)
+    monkeypatch.delenv(conftest.SHUFFLE_SHARD_VARIABLE, raising=False)
 
     with pytest.raises(pytest.UsageError):
         conftest.pytest_collection_modifyitems(_FakeConfig(), [])
