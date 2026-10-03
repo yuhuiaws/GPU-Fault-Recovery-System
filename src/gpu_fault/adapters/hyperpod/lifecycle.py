@@ -117,7 +117,17 @@ class HyperPodLifecycleStepAdapter(
         self.restart_email_builder = RestartGuardEmailBuilder()
         self.warm_spare_email_builder = WarmSpareReplacementEmailBuilder()
         self.dispatcher = HyperPodWorkflowDispatcher(adapter, execution_owner=owner)
-        self.provider_label = str(getattr(adapter, "provider_label", "HyperPod"))
+
+    @property
+    def provider_label(self) -> str:
+        """``HyperPod`` or ``EKS`` for failure wording.
+
+        Read lazily: a provider is only consulted once a step has passed the
+        ownership guards, and the boundary tests prove that by handing in a
+        provider whose every attribute access fails.
+        """
+
+        return str(getattr(self.dispatcher.adapter, "provider_label", "HyperPod"))
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS

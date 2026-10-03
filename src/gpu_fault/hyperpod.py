@@ -795,6 +795,23 @@ class HyperPodLifecycleAdapter:
             )
             return result
 
+    def _replay_durable_submission(
+        self,
+        action: HyperPodAction,
+        node_identifiers: list[str],
+        idempotency_key: str,
+    ) -> HyperPodSubmissionResult | None:
+        """The recorded outcome for an already-used key (durable store only).
+
+        Kept under its historical name: the DESTR-002 live runner replays a
+        submission through it to prove the control plane's record, never the
+        provider, answers a duplicate.
+        """
+
+        if self.store is None:
+            return None
+        return self._ledger.replay(action, node_identifiers, idempotency_key)
+
     def execute_step(
         self,
         step: WorkflowStepSpec,
