@@ -29,6 +29,43 @@ rules:
     full: true
     counts_as_domain: false
 
+  - id: eks-managed-provider
+    description: >-
+      Plain EKS (eks-managed) GPU cluster provider scope: the shared selector
+      contract, discovery, join flags, release rendering, IAM boundary and
+      installer identity. No regional live case exists for this newer, less
+      validated form; node replacement stays observe-only.
+    paths:
+      - src/gpu_fault/cluster_scope.py
+      - src/gpu_fault/admin/bootstrap_discovery.py
+      - src/gpu_fault/admin/bootstrap_iam_policies.py
+      - src/gpu_fault/admin/cli_join.py
+      - src/gpu_fault/admin/cluster_removal_preserved.py
+      - config/runtime-profile.regional-eks-safe.example.yaml
+      - tests/test_cluster_scope.py
+      - tests/admin/test_admin_site_eks_managed.py
+      - tests/admin/test_admin_eks_managed_join.py
+      - tests/admin/test_admin_eks_managed_lifecycle.py
+      - tests/regional/test_regional_release_config_eks_managed.py
+      - tests/regional/test_regional_release_eks_managed.py
+      - tests/deploy/test_node_installer_eks_managed_job.py
+      - tests/node_agent/test_node_installer_eks_managed.py
+    pytest:
+      - tests/test_cluster_scope.py
+      - tests/admin/test_admin_site_eks_managed.py
+      - tests/admin/test_admin_eks_managed_join.py
+      - tests/admin/test_admin_eks_managed_lifecycle.py
+      - tests/regional/test_regional_release_config_eks_managed.py
+      - tests/regional/test_regional_release_eks_managed.py
+      - tests/deploy/test_node_installer_eks_managed_job.py
+      - tests/node_agent/test_node_installer_eks_managed.py
+      - tests/regional/test_regional_least_privilege_acceptance.py
+    regional_cases: []
+    checks:
+      - docs-check
+    full: false
+    counts_as_domain: true
+
   - id: acceptance-catalog
     description: Regional case catalog, ordering, runner, and generated index.
     paths:

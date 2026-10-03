@@ -81,7 +81,10 @@ The normal path does not require administrators to read the full deployment manu
 | [Deployment and Operations Manual](deployment-and-operations-manual.md) | Detailed commands, item-by-item audit, infrastructure and break-glass |
 | [Walkthrough](deployment-and-operations-manual-walkthrough.md) | How to choose and execute manual chapters |
 
-The only current production form is a regional CPU control plane separated from the HyperPod EKS GPU data plane. The historical
+The only current production form is a regional CPU control plane separated from the EKS GPU data plane: a GPU cluster is a HyperPod EKS
+cluster by default (`provider: hyperpod`, the fully validated form) or a plain EKS cluster without a HyperPod orchestrator
+(`provider: eks-managed`, a new, less validated form in which provider-side node replacement is observe-only; see Administrator
+Operations §5.0). The historical
 single-cluster all-in-one content is used only for migration and compatibility verification and does not constitute a new production deployment entry point.
 
 ## Acceptance and Testing

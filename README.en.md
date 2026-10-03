@@ -11,11 +11,16 @@ The only production delivery form today is:
 ```text
 Regional CPU EKS control plane + Aurora PostgreSQL + NLB
                     |
-                    +-- HyperPod EKS GPU data cluster A
-                    +-- HyperPod EKS GPU data cluster B
+                    +-- HyperPod EKS GPU data cluster A (provider: hyperpod, the default, fully validated form)
+                    +-- plain EKS GPU data cluster B (provider: eks-managed, managed node groups, no HyperPod)
                     +-- ...
 ```
 
+A GPU data cluster is a SageMaker HyperPod EKS cluster by default; a **plain EKS cluster without a HyperPod
+orchestrator** (`provider: eks-managed`) can be joined as well. The latter is a new, less validated form: node
+enumeration uses the cluster's own GPU node selector (default `nvidia.com/gpu.present=true`), the Executor holds only
+EC2 Describe/Reboot, and provider-side node replacement is observe-only; see
+[Administrator Operations §5.0](docs/en/administrator-operations.md).
 Do not infer additional supported scope from historical code or examples in the repository:
 
 - The single-cluster all-in-one HyperPod form is used only for migration, canary and maintenance of historical environments.
@@ -43,7 +48,7 @@ Do not infer additional supported scope from historical code or examples in the 
 
 The following constraints are not tunable defaults:
 
-1. Managed HyperPod GPU clusters must be set to `NodeRecovery=None`.
+1. Managed HyperPod GPU clusters must be set to `NodeRecovery=None` (a plain EKS cluster has no such field and is not gated by it).
 2. This solution never calls `BatchReplaceClusterNodes`; node replacement only uses healthy warm spare nodes that are already managed.
 3. HyperPod Job Auto Restart and EKS auto-resume must be disabled.
 4. Training-job recovery is managed exclusively by this solution's Kubernetes Adapter and restart budget.
@@ -119,7 +124,8 @@ External PostgreSQL does not run under xdist; set `GPU_FAULT_TEST_POSTGRES_URL` 
 Every production deployment must satisfy these common prerequisites before it starts:
 
 1. An existing CPU EKS/HyperPod cluster with at least 3 Ready nodes.
-2. At least one existing GPU EKS/HyperPod cluster; a GPU HyperPod cluster must have `NodeRecovery=None`.
+2. At least one existing GPU EKS/HyperPod cluster; a GPU HyperPod cluster must have `NodeRecovery=None`; a plain EKS GPU
+   cluster must have a managed node group with a supported GPU instance type and a schedulable non-GPU node group besides it.
 3. The GPU VPC already has NAT egress.
 4. The executing identity holds the required AWS, EKS and Kubernetes administrative permissions.
 5. The deploy host has the Python 3.12 project environment plus `aws`, `cosign`, Docker Buildx, `kubectl`, `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the command only verifies these prerequisites and never installs system tools.

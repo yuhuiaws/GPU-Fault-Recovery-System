@@ -53,8 +53,10 @@ links point at `docs/en/administrator-operations.md`.
 | [部署和运维手册](部署和运维手册.md) | 详细命令、逐条审计、基础设施和 break-glass |
 | [逐章解读](部署和运维手册逐章解读.md) | 如何选择并执行手册章节 |
 
-当前唯一生产形态是区域 CPU 控制面与 HyperPod EKS GPU 数据面分离。历史
-单集群一体化内容只用于迁移和兼容验证，不构成新的生产部署入口。
+当前唯一生产形态是区域 CPU 控制面与 EKS GPU 数据面分离：GPU 集群默认是 HyperPod EKS
+（`provider: hyperpod`，完整验收形态），也可以是没有 HyperPod 编排器的普通 EKS 集群
+（`provider: eks-managed`，新增、验证较少的形态，provider 侧节点替换只观察；见管理员日常运维 §5.0）。
+历史单集群一体化内容只用于迁移和兼容验证，不构成新的生产部署入口。
 
 ## 验收与测试
 

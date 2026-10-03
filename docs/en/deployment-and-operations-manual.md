@@ -4180,6 +4180,10 @@ KUBE_CONTEXT="${GPU_EKS_CONTEXT}" NAMESPACE="${NAMESPACE}" \
 # BatchRebootClusterNodes. ses:*, BatchReplaceClusterNodes,
 # BatchDeleteClusterNodes and sagemaker:* are forbidden; workload log S3 PutObject/
 # AbortMultipartUpload may be granted separately per target prefix.
+# The executor role of a plain EKS cluster (provider: eks-managed) holds no sagemaker:*
+# at all: only ec2:DescribeInstances (EC2 grants it on Resource "*" only) and
+# ec2:RebootInstances conditioned on aws:ResourceTag/eks:cluster-name=<EKS cluster name>;
+# every other ec2:*/eks:* is refused (regional_release_iam.EXECUTOR_EKS_MANAGED_ACTIONS).
 export EXECUTOR_IRSA_ROLE_ARN="arn:aws:iam::<account-id>:role/<executor-role>"
 
 # The ARN contains "/", so this substitution uses "#" as the delimiter.
@@ -5168,7 +5172,13 @@ the habit of adding it reflexively. The low-level `resume` gives the same hint o
 ##### REG-8.1.5 Joining a Second GPU Cluster to an Existing Control Plane
 
 The formal entry point is to give `deploy` all managed GPU ARNs plus the new cluster (a superset of the managed set);
-`join-cluster` is kept as an alias, accepting one or several repeated new GPU EKS/HyperPod ARNs:
+`join-cluster` is kept as an alias, accepting one or several repeated new GPU EKS/HyperPod ARNs. A GPU ARN may name a
+HyperPod cluster (`provider: hyperpod`) or a **plain EKS cluster without a HyperPod orchestrator** (`provider:
+eks-managed`, a new and less validated form; semantics and boundaries in Administrator Operations §5.0). A plain EKS
+cluster needs its GPU node selector: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or
+`--gpu-nodegroup <managed-node-group>` (derives `eks.amazonaws.com/nodegroup=<name>`); `--cluster-id` defaults to the EKS
+cluster name. Both options are ignored for HyperPod clusters, whose selector is always
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before:
 
 ```bash
 gpu-fault-admin deploy \
@@ -5182,6 +5192,12 @@ gpu-fault-admin join-cluster \
     arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-b \
   --gpu-cluster-arn \
     arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-c
+
+# A plain EKS GPU cluster (no HyperPod): name the GPU node group or selector explicitly
+gpu-fault-admin join-cluster \
+  --state-dir /secure/gpu-fault \
+  --gpu-cluster-arn arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-cluster \
+  --gpu-nodegroup gpu-p5en-efa-spot-node-group
 ```
 
 The command does not rebuild Aurora, the CPU control plane, the NLB or the GPU clusters. When the first deploy is given several GPU ARNs at once,
@@ -5189,7 +5205,8 @@ the remaining clusters automatically enter batch join after the first cluster co
 `spec.release.upgradeMaxParallelClusters` (default 1, maximum 8), sharing the same policy with deploy;
 batch join no longer has its own concurrency or node installation budget. It:
 
-1. Auto-discovers the EKS/HyperPod, VPC, NAT EIPs and nodes, and validates account, Region and `NodeRecovery`;
+1. Auto-discovers the EKS/HyperPod, VPC, NAT EIPs and nodes, and validates account, Region and `NodeRecovery` (a plain EKS
+   cluster is instead checked for `eks describe-cluster`/`describe-nodegroup` ACTIVE, and its Agent endpoint CIDRs are the GPU node group subnets);
 2. Updates the dedicated GPU kubeconfig, creates the token, Executor IAM/OIDC and node Action keys;
 3. Allows the added NAT EIPs and associates the new VPC with the existing private hosted zone;
 4. Runs read-only discovery and prerequisite resource preparation of each target in parallel; all targets share one candidate preflight; a separate baseline verify of the
@@ -5199,7 +5216,7 @@ batch join no longer has its own concurrency or node installation budget. It:
    identity, the complete registry cluster state/generation/content, the target cluster IDs and the time,
    expiring after 15 minutes -- expiry only means clearing `VERIFIED` and verifying again, and never rolls back an already joined data plane;
    each join reads only three runtime snapshots (before verify, after verify, and the final snapshot after activation);
-7. Writes the EKS, HyperPod, Executor IAM and Route53 association into the Aurora resource registry.
+7. Writes the EKS, HyperPod (a plain EKS cluster records no `gpu_hyperpod`), Executor IAM and Route53 association into the Aurora resource registry.
 
 State and evidence live under `join-cluster/<arn-hash>/`; the new cluster's token is written into the site's `secure/` (the same place as the first token written by bootstrap;
 tokens already written under `join-cluster/<arn-hash>/secure/` on old sites continue to be read by the path in

@@ -11,15 +11,15 @@ English edition: [README.en.md](README.en.md).
 ```text
 区域 CPU EKS 控制面 + Aurora PostgreSQL + NLB
                     |
-                    +-- HyperPod EKS GPU 数据集群 A
-                    +-- HyperPod EKS GPU 数据集群 B
+                    +-- HyperPod EKS GPU 数据集群 A（provider: hyperpod，默认、完整验收形态）
+                    +-- 普通 EKS GPU 数据集群 B（provider: eks-managed，managed node group，无 HyperPod）
                     +-- ...
 ```
 
 不应从仓库中的历史代码或示例推断额外支持范围：
 
 - HyperPod 单集群一体化只用于迁移、Canary 和历史环境维护。
-- 通用 Kubernetes 部署当前未实现为生产交付能力。
+- 通用 Kubernetes 部署当前未实现为生产交付能力；无 HyperPod 的普通 EKS 集群（`provider: eks-managed`）是新增、验证较少的形态：按 GPU 节点选择器枚举、Executor 只持 EC2 Describe/Reboot、节点替换只观察，见[管理员日常运维 §5.0](docs/管理员日常运维.md)。
 - HyperPod Slurm 编排当前不支持。
 - GPU 节点上的 systemd Agent 属于区域数据面，不是独立部署架构。
 
@@ -43,7 +43,7 @@ English edition: [README.en.md](README.en.md).
 
 以下约束不是可调默认值：
 
-1. 受管 HyperPod GPU 集群必须设置 `NodeRecovery=None`。
+1. 受管 HyperPod GPU 集群必须设置 `NodeRecovery=None`（普通 EKS 集群没有该字段，不受此门禁）。
 2. 本方案永不调用 `BatchReplaceClusterNodes`；节点替换只使用已纳管的健康的 warm spare 节点。
 3. HyperPod Job Auto Restart、EKS auto-resume 必须禁用。
 4. 训练任务恢复由本方案的 Kubernetes Adapter 和 restart budget 独占管理。
@@ -115,7 +115,7 @@ make test-parallel
 所有生产部署开始前必须满足以下共同前提：
 
 1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
-2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`。
+2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`；普通EKS需有受支持GPU实例类型的managed node group和可调度的非GPU节点组。
 3. GPU VPC已有NAT出口。
 4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
 5. 部署机已安装Python 3.12项目环境以及`aws`、`cosign`、Docker Buildx、`kubectl`、`helm`、`curl`、`jq`、`openssl`、`sha256sum`和`make`；命令只验证这些前置，不自动安装系统工具。

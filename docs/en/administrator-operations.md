@@ -945,6 +945,47 @@ association into the Aurora registry. After a failed join is rolled back automat
 is `ROLLED_BACK`, and the `failure` field records the reason (`error`) and the last completed step
 (`after_step`); after the fix, rerunning with the same parameters starts a new attempt.
 
+### 5.0 Two GPU cluster forms: `hyperpod` and `eks-managed`
+
+The GPU ARN given to `join-cluster`/`deploy` may name a SageMaker HyperPod cluster or a **plain EKS cluster
+with managed node groups and no HyperPod orchestrator**. Discovery decides the provider from the ARN and writes it
+to the cluster's `provider` field in `site.yaml` (`gpu_fault.cluster_scope.ClusterProvider`):
+
+| provider | decided by | identity | GPU node selector | maturity |
+|---|---|---|---|---|
+| `hyperpod` (default) | the EKS ARN is orchestrated by exactly one HyperPod cluster, or a HyperPod ARN is given | `hyperpodClusterName` required; `cluster_id` defaults to the HyperPod name | `sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before | fully validated form |
+| `eks-managed` | the EKS ARN has no HyperPod orchestrator (`eks describe-cluster` is `ACTIVE`) | no `hyperpodClusterName`; `cluster_id` defaults to the EKS cluster name, `--cluster-id` overrides | `nodeSelector` required: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or `--gpu-nodegroup <name>` (derives `eks.amazonaws.com/nodegroup=<name>`); must never match the CPU node group | **new, less validated** form |
+
+Semantics and boundaries of `eks-managed`:
+
+- Identity and network: `aws eks describe-cluster` must be `ACTIVE`; the Agent endpoint CIDRs come from the subnets of
+  the GPU node groups (`eks describe-nodegroup`: instance types in the GPU inventory, or the one named by
+  `--gpu-nodegroup`), not the whole VPC; the NLB NAT EIP whitelist still discovers the NAT Gateways by VPC, as for
+  HyperPod. There is no `NodeRecovery` gate (the field belongs to HyperPod). Node names are FQDNs
+  (`ip-10-0-x-y.<region>.compute.internal`); installer Job names are truncated to DNS-1123 with a deterministic hash.
+- Identity variables: the connection Secret keys `hyperpod-cluster-name` / `hyperpod-confirm-cluster-name` carry the
+  `cluster_id` (`GPU_FAULT_HYPERPOD_CLUSTER` keeps meaning "the provider cluster scope"), and the new keys
+  `cluster-provider=eks-managed` and `node-selector` feed `GPU_FAULT_CLUSTER_PROVIDER` / `GPU_FAULT_NODE_SELECTOR`.
+  The node `--node-instance-id` is the EC2 instance id from `spec.providerID` (HyperPod nodes keep the Node UID).
+- IAM: the Executor role is granted only `ec2:DescribeInstances` and `ec2:RebootInstances` conditioned on
+  `aws:ResourceTag/eks:cluster-name`, no `sagemaker:*` at all; the role name derives from the `cluster_id`.
+- Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
+  absence and verify only `gpu_eks` and the Executor role.
+- Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds
+  `eks.amazonaws.com/nodegroup` right after the instance-group label (the node group plays the HyperPod instance
+  group's role), then falls back to the zone labels.
+- The Completion Watcher runs with `GPU_FAULT_WATCHER_ENVIRONMENT=eks`.
+
+**Out of scope** (deliberately not provided for `eks-managed`): provider-side node replacement (`nodeReplace` can only
+OBSERVE; after a Spot interruption the node comes back under a new name and instance id -- retire the old Agent with
+`workflow-reconcile --retire-departed-agents` and let the reconciler install the new node), HyperPod health labels /
+HMA signals, `UpdateClusterSoftware` re-imaging, HyperPod advisory notifications and the legacy single-cluster
+`deploy/hyperpod/deploy.sh`; the CPU control-plane cluster must still be HyperPod. When the GPU nodes carry the
+`nvidia.com/gpu=present:NoSchedule` taint, the installer Job and the DCGM exporter DaemonSet already use
+`tolerations: [operator: Exists]`, while the Executor, Watcher and Reconciler Deployments need a schedulable non-GPU
+node group in the cluster. An existing `dcgm-exporter` in the cluster must not bind host ports 9400/5555 over
+hostNetwork (ours binds only `127.0.0.1:9400` and dials the host nv-hostengine).
+
 The join's commit path pays only for the new cluster, and the `evidence` in `state.json` shows the scope of every step:
 
 - `COLLECTORS_READY`: waits only for the "fast" collectors (configured unconditional reporting period <= 60 s, currently

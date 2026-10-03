@@ -394,8 +394,14 @@ categories:
       - name: GPU_FAULT_ENABLE_HYPERPOD_ADAPTER
         description: "启用 HyperPod lifecycle adapter；区域数据面 Executor 使用。"
       - name: GPU_FAULT_HYPERPOD_CLUSTER
-        production: 每集群连接 Secret 注入真实 HyperPod 名
-        description: "Provider cluster name；不同于稳定 cluster_id。"
+        production: 每集群连接 Secret 注入真实 HyperPod 名；eks-managed 集群注入 cluster_id
+        description: "Provider cluster scope：HyperPod 名，或普通 EKS 集群的 cluster_id；不同于稳定 cluster_id 的语义。"
+      - name: GPU_FAULT_CLUSTER_PROVIDER
+        production: 连接 Secret 键 cluster-provider（hyperpod | eks-managed，缺省 hyperpod）
+        description: "GPU 集群 provider（gpu_fault.cluster_scope）；eks-managed 表示无 HyperPod 的普通 EKS 集群。"
+      - name: GPU_FAULT_NODE_SELECTOR
+        production: 连接 Secret 键 node-selector（缺省为 HyperPod 集群标签）
+        description: "GPU 节点标签选择器；每个节点枚举都使用它，绝不能匹配 CPU 节点组。"
       - name: GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER
         production: 必须与真实 HyperPod 名完全一致
         description: "破坏性 provider 动作的二次集群确认。"
