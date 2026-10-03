@@ -271,14 +271,20 @@ def test_close_releases_waiters_and_stops_the_thread():
     store = ScriptedStore()
     hub = _hub(store)
 
+    closer = threading.Timer(0.05, hub.close)
+
     async def scenario():
         async with hub.subscribe("cluster-a") as waiter:
             assert store.started.wait(WAIT), "the listener thread never started"
-            threading.Timer(0.05, hub.close).start()
+            closer.start()
             return await waiter.wait(10.0)
 
     assert _run(scenario()) is WakeupWaitOutcome.CLOSED
-    assert hub.listener_alive is False
+    # close() releases the waiters first and joins the listener afterwards, so
+    # the waiter can return while the closing thread is still joining.
+    closer.join(WAIT)
+    assert closer.is_alive() is False, "close() did not finish"
+    assert hub.listener_alive is False, "close() must stop the listener thread"
 
     async def after_close():
         async with hub.subscribe("cluster-a") as waiter:
