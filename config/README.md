@@ -19,6 +19,21 @@ For an existing site, `make release-deploy SITE=... ADMIN_EMAIL=...` updates the
 declarative value; omitting `ADMIN_EMAIL` preserves the site value or discovers
 the AWS account email when a legacy site has none.
 
+Each `spec.clusters[]` entry names its `provider`: `hyperpod` (the default and
+the fully validated form; `hyperpodClusterName` is required and the GPU nodes are
+the ones labelled `sagemaker.amazonaws.com/cluster-name=<name>`) or `eks-managed`
+(a plain EKS cluster with managed node groups and no HyperPod orchestrator; a
+newer, less validated form in which provider-side node replacement is
+observe-only). An `eks-managed` entry omits `hyperpodClusterName` and must carry
+`nodeSelector`, the label selector of its GPU nodes (`gpu-fault-admin
+join-cluster --node-selector`, default `nvidia.com/gpu.present=true`;
+`--gpu-nodegroup <name>` derives `eks.amazonaws.com/nodegroup=<name>`). One
+helper, `gpu_fault.cluster_scope.node_selector`, turns the entry into the
+selector every component uses, so a HyperPod entry still renders the historical
+label text byte for byte. `spec.failureDomainLabels` left unset follows the
+providers: HyperPod-only sites keep the instance-group/zone priority, a site with
+an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`.
+
 Successful deployment also registers AWS resource IDs, ownership and delete
 policy in Aurora. Operators do not add those fields to `site.yaml`. Uninstall
 uses the generated registry and always preserves GPU EKS/HyperPod clusters;

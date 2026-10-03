@@ -19,6 +19,12 @@ from gpu_fault.admin.config import (
 )
 from gpu_fault.admin.config_parser import boolean_field
 from gpu_fault.admin.python_environment import python_environment
+from gpu_fault.cluster_scope import (
+    ClusterProvider,
+    cluster_provider,
+    default_failure_domain_labels,
+    node_selector,
+)
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
@@ -153,15 +159,22 @@ def _text_list(
     return normalized
 
 
-def _failure_domain_labels(value: object, path: str) -> tuple[str, ...]:
+def _failure_domain_labels(
+    value: object,
+    path: str,
+    providers: Sequence[ClusterProvider] = (),
+) -> tuple[str, ...]:
     """Ordered node label keys, finest domain first; the default priority when absent.
 
     Order is meaning here (the first label a node carries wins), so unlike the
-    other list fields this one is not sorted.
+    other list fields this one is not sorted. The default follows the managed
+    clusters' providers: a HyperPod-only site keeps ``FAILURE_DOMAIN_LABELS``
+    unchanged, a site with an ``eks-managed`` cluster also reads the EKS node
+    group label (``cluster_scope.default_failure_domain_labels``).
     """
 
     if value is None:
-        return FAILURE_DOMAIN_LABELS
+        return default_failure_domain_labels(providers)
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise SiteConfigError(f"{path} must be a list")
     labels = tuple(
@@ -895,6 +908,19 @@ class GpuClusterSiteConfig:
     #: cluster's OIDC issuer for ``gpu-fault-system/gpu-fault-adot-dataplane``).
     #: Without it the release skips the collector for this cluster and says so.
     adot_irsa_role_arn: str | None = None
+    #: ``hyperpod`` (default: a SageMaker HyperPod cluster orchestrated by this
+    #: EKS cluster) or ``eks-managed`` (a plain EKS cluster with managed node
+    #: groups and no HyperPod). See ``gpu_fault.cluster_scope``.
+    provider: str = ClusterProvider.HYPERPOD.value
+    #: GPU node label selector. Required for ``eks-managed``; for ``hyperpod``
+    #: an empty value means the HyperPod cluster label, exactly as before.
+    node_selector: str = ""
+
+    @property
+    def gpu_node_selector(self) -> str:
+        """The selector that enumerates this cluster's GPU nodes."""
+
+        return node_selector(self)
 
     @classmethod
     def from_value(cls, value: object, index: int) -> GpuClusterSiteConfig:
@@ -906,6 +932,8 @@ class GpuClusterSiteConfig:
                 "clusterId",
                 "context",
                 "region",
+                "provider",
+                "nodeSelector",
                 "hyperpodClusterName",
                 "eksClusterArn",
                 "executorIrsaRoleArn",
@@ -927,14 +955,39 @@ class GpuClusterSiteConfig:
         ).rstrip("/")
         if not url.startswith("https://"):
             raise SiteConfigError(f"{path}.controlPlaneUrl must use https://")
+        try:
+            provider = cluster_provider(data.get("provider"))
+        except ValueError as exc:
+            raise SiteConfigError(f"{path}.provider: {exc}") from None
+        selector = _optional_text(data.get("nodeSelector"), f"{path}.nodeSelector")
+        if provider is ClusterProvider.HYPERPOD:
+            hyperpod_cluster_name = _required_text(
+                data.get("hyperpodClusterName"),
+                f"{path}.hyperpodClusterName",
+            )
+        else:
+            hyperpod_cluster_name = (
+                _optional_text(
+                    data.get("hyperpodClusterName"), f"{path}.hyperpodClusterName"
+                )
+                or ""
+            )
+        try:
+            node_selector(
+                None,
+                provider=provider,
+                hyperpod_cluster_name=hyperpod_cluster_name,
+                selector=selector or "",
+            )
+        except ValueError as exc:
+            raise SiteConfigError(f"{path}.nodeSelector: {exc}") from None
         return cls(
             cluster_id=cluster_id,
             context=_required_text(data.get("context"), f"{path}.context"),
             region=_optional_text(data.get("region"), f"{path}.region"),
-            hyperpod_cluster_name=_required_text(
-                data.get("hyperpodClusterName"),
-                f"{path}.hyperpodClusterName",
-            ),
+            hyperpod_cluster_name=hyperpod_cluster_name,
+            provider=provider.value,
+            node_selector=selector or "",
             eks_cluster_arn=_required_text(
                 data.get("eksClusterArn"),
                 f"{path}.eksClusterArn",
@@ -1076,7 +1129,9 @@ class SiteSpec:
             notifications=NotificationSiteConfig.from_value(data.get("notifications")),
             clusters=clusters,
             failure_domain_labels=_failure_domain_labels(
-                data.get("failureDomainLabels"), "spec.failureDomainLabels"
+                data.get("failureDomainLabels"),
+                "spec.failureDomainLabels",
+                [cluster_provider(item.provider) for item in clusters],
             ),
             retention=RetentionSiteConfig.from_value(data.get("retention")),
         )
@@ -1226,6 +1281,12 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
         # this cluster and applies everything else.
         if cluster.adot_irsa_role_arn:
             entry["adot_irsa_role_arn"] = cluster.adot_irsa_role_arn
+        # Written only when they differ from the HyperPod defaults so a site
+        # deployed before plain EKS support renders byte for byte as before.
+        if cluster.provider != ClusterProvider.HYPERPOD.value:
+            entry["provider"] = cluster.provider
+        if cluster.node_selector:
+            entry["node_selector"] = cluster.node_selector
         clusters.append(entry)
     health = site.spec.health
     admin_state_dir = source.parent

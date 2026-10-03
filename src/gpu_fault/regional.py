@@ -83,7 +83,12 @@ class RegionalClusterLifecycle(StrEnum):
 class RegionalClusterRegistration(StrictModel):
     cluster_id: str
     region: str
-    hyperpod_cluster_name: str
+    # Empty for a plain EKS cluster (provider ``eks-managed``), which has no
+    # HyperPod orchestrator. A default rather than ``str | None`` so a
+    # registration published before plain EKS support dumps -- and therefore
+    # digests -- exactly as it did (``regional_registry_content_sha256`` is
+    # re-verified on every load of every durable revision).
+    hyperpod_cluster_name: str = ""
     eks_cluster_arn: str
     token_sha256: str = Field(min_length=64, max_length=64)
     # The credential being retired, not the one being introduced. Rotation sets

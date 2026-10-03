@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
 
+from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
@@ -82,13 +83,13 @@ def registry_entry(target: ClusterTarget) -> dict[str, Any]:
     if not all(
         (
             target.token_file,
-            target.hyperpod_cluster_name,
+            target.hyperpod_cluster_name or is_eks_managed(target),
             target.eks_cluster_arn,
         )
     ):
         raise ReleaseError(
             "regional cluster registry requires token_file, "
-            "hyperpod_cluster_name, and eks_cluster_arn"
+            "hyperpod_cluster_name (HyperPod clusters), and eks_cluster_arn"
         )
     try:
         endpoint_cidrs = sorted(

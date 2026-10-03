@@ -78,6 +78,17 @@ spec:
   clusters:
     - clusterId: gpu-prod-a
       context: REPLACE_WITH_GPU_EKS_CONTEXT
+      # provider: hyperpod (default) is a SageMaker HyperPod cluster orchestrated
+      # by this EKS cluster; hyperpodClusterName is then required and the GPU
+      # nodes are selected on sagemaker.amazonaws.com/cluster-name=<name>.
+      # provider: eks-managed is a plain EKS cluster with managed node groups and
+      # no HyperPod (a newer, less validated form; provider-side node
+      # replacement is observe-only). hyperpodClusterName is then omitted and
+      # nodeSelector is required -- `join-cluster --node-selector` defaults it to
+      # nvidia.com/gpu.present=true, `--gpu-nodegroup <name>` derives
+      # eks.amazonaws.com/nodegroup=<name>. It must never match the CPU nodes.
+      # provider: hyperpod
+      # nodeSelector: nvidia.com/gpu.present=true
       hyperpodClusterName: REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME
       eksClusterArn: REPLACE_WITH_GPU_EKS_ARN
       executorIrsaRoleArn: REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN

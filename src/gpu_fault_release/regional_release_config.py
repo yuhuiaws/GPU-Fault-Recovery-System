@@ -13,6 +13,11 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.admin.site import ADMIN_STATE_DIR_SIDECAR
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
+from gpu_fault.cluster_scope import (
+    ClusterProvider,
+    cluster_provider,
+    node_selector,
+)
 from gpu_fault_release import containing_repository_root, repository_root
 
 ROOT = repository_root()
@@ -201,6 +206,20 @@ class ClusterTarget:
     #: Optional: without it the release skips the collector for this cluster
     #: and says so, rather than applying a collector with no credentials.
     adot_irsa_role_arn: str | None = None
+    #: ``hyperpod`` (default) or ``eks-managed``; see ``gpu_fault.cluster_scope``.
+    provider: str = ClusterProvider.HYPERPOD.value
+    #: GPU node label selector; empty means the HyperPod cluster label.
+    node_selector: str = ""
+
+    @property
+    def is_eks_managed(self) -> bool:
+        return cluster_provider(self.provider) is ClusterProvider.EKS_MANAGED
+
+    @property
+    def gpu_node_selector(self) -> str:
+        """The one selector every node read of this cluster uses."""
+
+        return node_selector(self)
 
     @classmethod
     def from_mapping(
@@ -209,17 +228,43 @@ class ClusterTarget:
         *,
         expected_region: str,
     ) -> ClusterTarget:
+        try:
+            provider = cluster_provider(value.get("provider"))
+        except ValueError as exc:
+            raise ReleaseError(f"cluster target provider: {exc}") from None
         required = (
             "cluster_id",
             "context",
             "executor_irsa_role_arn",
             "region",
-            "hyperpod_cluster_name",
+            *(
+                ("hyperpod_cluster_name",)
+                if provider is ClusterProvider.HYPERPOD
+                else ()
+            ),
             "eks_cluster_arn",
         )
         missing = [name for name in required if not value.get(name)]
         if missing:
             raise ReleaseError("cluster target is missing: " + ", ".join(missing))
+        selector = str(value.get("node_selector") or "").strip()
+        hyperpod_cluster_name = (
+            required_text(
+                value["hyperpod_cluster_name"],
+                "cluster target hyperpod_cluster_name",
+            )
+            if value.get("hyperpod_cluster_name")
+            else ""
+        )
+        try:
+            node_selector(
+                None,
+                provider=provider,
+                hyperpod_cluster_name=hyperpod_cluster_name,
+                selector=selector,
+            )
+        except ValueError as exc:
+            raise ReleaseError(f"cluster target node_selector: {exc}") from None
         region = validate_aws_region(value["region"], "cluster target region")
         if region != expected_region:
             raise ReleaseError(
@@ -257,10 +302,7 @@ class ClusterTarget:
                 "cluster target executor_irsa_role_arn",
             ),
             region=region,
-            hyperpod_cluster_name=required_text(
-                value["hyperpod_cluster_name"],
-                "cluster target hyperpod_cluster_name",
-            ),
+            hyperpod_cluster_name=hyperpod_cluster_name,
             eks_cluster_arn=eks_cluster_arn,
             token_file=value.get("token_file"),
             ca_file=value.get("ca_file"),
@@ -276,6 +318,8 @@ class ClusterTarget:
                 else None
             ),
             fleet_master_file=value.get("fleet_master_file"),
+            provider=provider.value,
+            node_selector=selector,
         )
 
 
