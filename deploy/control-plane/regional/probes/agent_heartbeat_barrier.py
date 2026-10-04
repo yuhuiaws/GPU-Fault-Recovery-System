@@ -4,6 +4,7 @@ Request on stdin::
 
     {"expected_by_cluster": {"<cluster>": ["<node>", ...]},
      "required_identity": {...} | null,
+     "required_identities": {"<cluster>": {...}} | null,
      "timeout_seconds": 600, "poll_seconds": 5,
      "minimum_lease_remaining_seconds": 30}
 
@@ -13,6 +14,11 @@ The barrier is "advanced past a baseline", not "recent": a node that stopped
 heartbeating still has a ``last_seen_at`` that looks fresh for a while, so
 comparing against a timestamp taken before the pin moved is the only reading
 that proves the agent is alive *now* and running the identity we just shipped.
+
+``required_identities`` carries the pin of a cluster that runs its own Runtime
+Profile (its Agent config digest differs from the site's); a cluster it does not
+name is judged against ``required_identity``. A ``pin-not-aligned`` blocker
+records the pin it saw and the one it expected.
 
 ``blockers`` is capped at 100 entries while ``blocker_count`` stays exact: a
 fleet-wide failure would otherwise put thousands of records through a kubectl
@@ -36,6 +42,7 @@ def main() -> None:
     }
     context = ApplicationContext.from_environment()
     required_identity = expected.get("required_identity") or None
+    required_identities = expected.get("required_identities") or {}
 
     def read_agents() -> dict[tuple[str, str], Any]:
         records: dict[tuple[str, str], Any] = {}
@@ -49,16 +56,30 @@ def main() -> None:
             )
         return records
 
-    def pin_aligned(item: Any) -> bool:
-        if required_identity is None:
+    def required_pin(cluster_id: str) -> Any:
+        return required_identities.get(cluster_id) or required_identity
+
+    def observed_pin(item: Any) -> dict[str, Any]:
+        return {
+            "artifact_sha256": item.artifact_sha256,
+            "compatibility_digest": item.compatibility_digest or item.artifact_sha256,
+            "agent_protocol_version": str(item.agent_protocol_version),
+            "config_digest": item.config_digest,
+        }
+
+    def pin_aligned(cluster_id: str, item: Any) -> bool:
+        required = required_pin(cluster_id)
+        if required is None:
             return True
-        return bool(
-            item.artifact_sha256 == required_identity["artifact_sha256"]
-            and (item.compatibility_digest or item.artifact_sha256)
-            == required_identity["compatibility_digest"]
-            and str(item.agent_protocol_version)
-            == str(required_identity["agent_protocol_version"])
-            and item.config_digest == required_identity["config_digest"]
+        observed = observed_pin(item)
+        return all(
+            str(observed[field]) == str(required[field])
+            for field in (
+                "artifact_sha256",
+                "compatibility_digest",
+                "agent_protocol_version",
+                "config_digest",
+            )
         )
 
     baseline = {key: item.last_seen_at for key, item in read_agents().items()}
@@ -101,26 +122,28 @@ def main() -> None:
                     reason = "lease-missing"
                 elif lease_remaining < minimum_lease:
                     reason = "lease-margin"
-                elif not pin_aligned(item):
+                elif not pin_aligned(cluster_id, item):
                     reason = "pin-not-aligned"
                 else:
                     refreshed += 1
                     continue
                 if len(blockers) < 100:
-                    blockers.append(
-                        {
-                            "cluster_id": cluster_id,
-                            "node_id": node_id,
-                            "reason": reason,
-                            "last_seen_at": item.last_seen_at.isoformat(),
-                            "lease_expires_at": (
-                                item.lease_expires_at.isoformat()
-                                if item.lease_expires_at is not None
-                                else None
-                            ),
-                            "lease_remaining_seconds": lease_remaining,
-                        }
-                    )
+                    blocker = {
+                        "cluster_id": cluster_id,
+                        "node_id": node_id,
+                        "reason": reason,
+                        "last_seen_at": item.last_seen_at.isoformat(),
+                        "lease_expires_at": (
+                            item.lease_expires_at.isoformat()
+                            if item.lease_expires_at is not None
+                            else None
+                        ),
+                        "lease_remaining_seconds": lease_remaining,
+                    }
+                    if reason == "pin-not-aligned":
+                        blocker["observed_pin"] = observed_pin(item)
+                        blocker["required_pin"] = required_pin(cluster_id)
+                    blockers.append(blocker)
         expected_count = sum(len(node_ids) for node_ids in expected_by_cluster.values())
         if refreshed == expected_count:
             print(

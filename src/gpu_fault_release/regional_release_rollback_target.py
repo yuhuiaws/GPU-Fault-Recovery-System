@@ -18,6 +18,9 @@ from gpu_fault_release.regional_release_images import (
     previous_node_template_environment,
 )
 from gpu_fault_release.regional_release_legacy import validate_rollback_agent_identity
+from gpu_fault_release.regional_release_rollback_context import (
+    previous_cluster_runtime_profiles,
+)
 
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
@@ -97,9 +100,9 @@ def rollback_target(
     old = (previous.get("clusters") or {}).get(target.cluster_id) or {}
     # A cluster that ran its own Runtime Profile is rolled back to that
     # profile's version and Agent config digest, not the site's.
-    old_profile = (previous.get("cluster_runtime_profiles") or {}).get(
-        target.cluster_id
-    ) or {}
+    old_profile = (
+        previous_cluster_runtime_profiles(self, previous).get(target.cluster_id) or {}
+    )
     if old_profile.get("version"):
         runtime_profile_version = str(old_profile["version"])
     if old_profile.get("agent_config_digest"):

@@ -14,6 +14,9 @@ from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseErro
 from gpu_fault_release.regional_release_diff import ReleaseComponent
 from gpu_fault_release.regional_release_images import previous_executor_image
 from gpu_fault_release.regional_release_interfaces import RollbackTargetArguments
+from gpu_fault_release.regional_release_legacy import rollback_controller_config
+from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_release_profile_model import cluster_runtime_profiles
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
@@ -69,6 +72,69 @@ def apply_rollback_cpu_environment(
         )
     # The restore rolled the CPU ingress Deployment; see render_and_apply_cpu_roles.
     forget_cpu_ingress_pod(self)
+
+
+#: Diff components whose change means the candidate's per-cluster Runtime
+#: Profile overrides are not the previous release's.
+PROFILE_DIFF_COMPONENTS = frozenset(
+    {"cluster_runtime_profiles", "runtime_profile", "agent_config"}
+)
+
+
+def previous_cluster_runtime_profiles(
+    release: Any, previous: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """``{cluster_id: {version, agent_config_digest, ...}}`` of the release
+    being restored, for the clusters that ran their own Runtime Profile.
+
+    The snapshot carries it (``cluster_runtime_profiles``) since 2026-10-04.
+    A transaction opened before that capture (live: the mixed-site rollback of
+    5a2603b39e41 stopped at rollback-controller-staging) has none; when its
+    recorded diff moved no profile component the candidate's overrides are the
+    previous release's and are used, said so in the log. Otherwise the previous
+    per-cluster pins are unknowable and the rollback refuses rather than roll
+    a cluster to the site profile.
+    """
+
+    recorded = previous.get("cluster_runtime_profiles")
+    if isinstance(recorded, dict):
+        return {str(key): dict(value) for key, value in recorded.items()}
+    candidate = cluster_runtime_profiles(release.config)
+    if not candidate:
+        return {}
+    state = getattr(release, "state", None) or {}
+    diff = state.get("release_diff") if isinstance(state, dict) else None
+    changed = set((diff or {}).get("changed") or []) if isinstance(diff, dict) else None
+    if changed is None or changed & PROFILE_DIFF_COMPONENTS:
+        raise ReleaseError(
+            "previous snapshot has no per-cluster Runtime Profile record and the "
+            "transaction "
+            + (
+                "changed " + ", ".join(sorted(changed & PROFILE_DIFF_COMPONENTS))
+                if changed
+                else "recorded no release diff"
+            )
+            + "; the previous pins of "
+            + ", ".join(sorted(candidate))
+            + " cannot be derived"
+        )
+    narrate_step(
+        "rollback-cluster-profiles",
+        source="candidate-config",
+        reason="snapshot-predates-capture; no profile component changed",
+        clusters=",".join(sorted(candidate)),
+    )
+    return candidate
+
+
+def rollback_controller_config_for(
+    release: Any, previous: dict[str, Any], site_runtime_profile_version: str
+) -> dict[str, str]:
+    return rollback_controller_config(
+        previous.get("agent_identities") or {},
+        site_runtime_profile_version=site_runtime_profile_version,
+        cluster_runtime_profiles=previous_cluster_runtime_profiles(release, previous),
+    )
 
 
 def rollback_target_arguments(

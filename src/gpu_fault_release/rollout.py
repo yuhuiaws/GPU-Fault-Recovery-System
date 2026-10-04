@@ -129,6 +129,7 @@ from gpu_fault_release.regional_release_fleet_rollout import (
     agent_heartbeats_converged,
     backup_release_secrets,
     backup_secret,
+    candidate_agent_pin_identities,
     candidate_agent_pin_identity,
     capture_active_agent_node_sets,
     delete_release_secret_backups,
@@ -560,10 +561,9 @@ def render_and_apply_cpu_roles(
             env=environment,
         )
     # The apply rolled the CPU ingress Deployment: a Pod name memoised by the
-    # preflight probes may now be gone, and the mutating fleet execs after
-    # this point never re-resolve on their own (live 2026-09-13: the rollback
-    # after a failed apply exec'd into a replaced Pod and stopped at
-    # rollback-failed).
+    # preflight probes may now be gone, and the mutating fleet execs after this
+    # point never re-resolve on their own (live 2026-09-13: the rollback after a
+    # failed apply exec'd into a replaced Pod and stopped at rollback-failed).
     forget_cpu_ingress_pod(release)
 
 
@@ -1063,6 +1063,7 @@ class RegionalRelease(RegistryDrainContext):
     _wait_candidate_cpu_agent_heartbeats = wait_candidate_cpu_agent_heartbeats
     _capture_active_agent_node_sets = capture_active_agent_node_sets
     _candidate_agent_pin_identity = candidate_agent_pin_identity
+    _candidate_agent_pin_identities = candidate_agent_pin_identities
     _validate_resume_checkpoint = validate_resume_checkpoint
 
     def _validate_release(self) -> None:
@@ -1359,10 +1360,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 # Registry-only modes: served by RegistryDrainContext, which never resolves an
-# image, so the schema v3 image lock cannot refuse them (an uninstall run from
-# a checkout ahead of the deployed release drains under a conflicting pin).
-# Every other mode builds RegionalRelease, whose construction enforces the
-# lock (regional_release_config.resolve_release_image) before any render.
+# image, so the schema v3 image lock cannot refuse them (an uninstall run from a
+# checkout ahead of the deployed release drains under a conflicting pin). Every
+# other mode builds RegionalRelease, whose constructor enforces the lock first.
 IMAGE_LOCK_EXEMPT_MODES = frozenset({"drain-cluster"})
 
 

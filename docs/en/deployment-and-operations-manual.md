@@ -905,6 +905,10 @@ server certificate for that stable hostname:
   GPU node set (the control-plane probe `active_agent_identities` also exports each Agent's lifecycle / lease_expires_at /
   last_seen_at); a mismatch is re-read once after 35 s and only a persistent one refuses, naming the nodes. The refusal commits
   no transaction; rerun the same `deploy` (see Administrator Operations §5.0.2).
+- Mixed-provider sites: the upgrade's finalize judges the Agent pin per cluster's own Runtime Profile (the control-plane
+  probe `agent_heartbeat_barrier` accepts per-cluster `required_identities`) and a rollback restores the profile per cluster;
+  a site stopped in `rollback-failed` reruns the same `deploy` to finish the rollback, then reruns it to open a new
+  transaction (see Administrator Operations §5.0.2).
 - The certificate SAN must cover the full stable private hostname; a short CN alone is not enough.
 - Import the server certificate and private key into ACM and terminate TLS at the NLB 443 listener.
 - The NLB Security Group only allows TCP 443 from the NAT EIPs of each GPU cluster.

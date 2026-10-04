@@ -1294,6 +1294,24 @@ above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
   against the **committed (live) release** and say so in `measured_against` ("the configured release ... has not
   committed"); a real mismatch names both the image the Pod runs and the expected one. The attribution disappears
   once the candidate commits.
+- On a mixed-provider site the upgrade's finalize judges whether the Agents reached the candidate pin **per
+  cluster's own Runtime Profile**: an `eks-v1` cluster's Agents are measured against the eks-v1 Agent config
+  digest and are no longer reported `pin-not-aligned` against the site's `hyperpod-v1` digest; an Agent that is
+  still not aligned has both the pin it reported (`observed_pin`) and the expected one (`required_pin`) in its
+  blocker record.
+- A mixed-site rollback restores the Runtime Profile per cluster: the control-plane env carries only the site
+  profile version, a cluster running its own profile keeps its version and digest through the restored registry
+  registration; the previous-state snapshot records `cluster_runtime_profiles` since 2026-10-04. A transaction
+  opened earlier (no such record) reuses the candidate configuration's per-cluster overrides when its release
+  diff moved no profile component, logging `rollback-cluster-profiles source=candidate-config`; otherwise it
+  refuses and names the clusters whose previous pins cannot be derived.
+- Converging a site that stopped in `rollback-failed` (`status` shows `next deploy: resume rollback`):
+  1. Rerun the **same** `deploy` with the fixed build (same `--state-dir`/`--cpu-cluster-arn`/`--gpu-cluster-arn`/
+     `--gpu-nodegroup`); the engine finds the pending rollback, rolls the site back to the last committed release
+     and ends with `rollback recovery completed; rerun deploy to start a new transaction` (exit code 2 is expected).
+  2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
+  3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.
+     `--supersede-failed-transaction` does not apply to a transaction that is rolling back.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

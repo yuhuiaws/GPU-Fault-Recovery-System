@@ -77,11 +77,14 @@ class CpuRollout(Protocol):
 
     def _candidate_agent_pin_identity(self) -> dict[str, str]: ...
 
+    def _candidate_agent_pin_identities(self) -> dict[str, dict[str, str]]: ...
+
     def _wait_candidate_cpu_agent_heartbeats(
         self,
         agent_identities: dict[str, Any],
         *,
         required_identity: dict[str, str] | None = None,
+        required_identities: dict[str, dict[str, str]] | None = None,
     ) -> None: ...
 
 

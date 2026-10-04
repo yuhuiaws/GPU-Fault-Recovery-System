@@ -1031,6 +1031,9 @@ def _capture_previous(
             live_state.get("release_manifest_schema_version") or 3
         ),
         "node_dependencies": copy.deepcopy(live_state.get("node_dependencies")),
+        "cluster_runtime_profiles": copy.deepcopy(
+            live_state.get("cluster_runtime_profiles") or {}
+        ),
         "node_installer_image": node_installer_image,
         "adot_image": adot_image,
         "observability": observability,

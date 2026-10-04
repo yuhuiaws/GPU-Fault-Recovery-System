@@ -74,9 +74,6 @@ from gpu_fault_release.regional_release_interfaces import (
     RollbackTargetArguments,
     Snapshot,
 )
-from gpu_fault_release.regional_release_legacy import (
-    rollback_controller_config,
-)
 from gpu_fault_release.regional_release_preflight_concurrency import (
     run_rollback_preflight,
     run_upgrade_preflight,
@@ -101,6 +98,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
     forget_cpu_ingress_pod,
 )
 from gpu_fault_release.regional_release_rollback_context import (
+    rollback_controller_config_for,
     apply_rollback_cpu_environment,
     # Re-exported: `rollout_regional_release` and the command tests reach this
     # through the orchestration module, which is the entry point that owns the
@@ -742,6 +740,7 @@ def _apply_upgrade_cpu(
         release._wait_candidate_cpu_agent_heartbeats(
             expected_agents,
             required_identity=release._candidate_agent_pin_identity(),
+            required_identities=release._candidate_agent_pin_identities(),
         )
     # Stale start-up env on a replica: an identical template would not roll it.
     restart = force_restart or diff.has(CPU_POD_PROFILE_DRIFT)
@@ -1324,8 +1323,8 @@ def _stage_rollback_controller(
     if self._restore_registry_backup():
         self._publish_restored_registry()
     if stage_agents:
-        controller_config = rollback_controller_config(
-            previous.get("agent_identities") or {}
+        controller_config = rollback_controller_config_for(
+            self, previous, runtime_profile_version
         )
         patch = json.dumps({"data": controller_config}, sort_keys=True)
         for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:

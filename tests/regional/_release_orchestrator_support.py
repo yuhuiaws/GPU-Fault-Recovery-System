@@ -260,6 +260,9 @@ def phase_release(
             )
         ),
         "_candidate_agent_pin_identity": lambda: {"artifact_sha256": "a" * 64},
+        "_candidate_agent_pin_identities": lambda: {
+            "gpu-a": {"artifact_sha256": "a" * 64}
+        },
         "_validate_release_quick": lambda _plan: calls.append("verify"),
         "_commit_registry_update": lambda: calls.append("commit-registry"),
         "_save_state": save_state,

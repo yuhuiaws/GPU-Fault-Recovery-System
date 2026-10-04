@@ -42,6 +42,7 @@ from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import target_agent_config_digest
 from gpu_fault_release.regional_release_rendering import (
     INSTALLER_PRODUCTS_FILE_ENV,
     build_reconciler_environment,
@@ -719,11 +720,32 @@ def candidate_agent_pin_identity(release: Any) -> dict[str, str]:
     }
 
 
+def candidate_agent_pin_identities(release: Any) -> dict[str, dict[str, str]]:
+    """The pin each cluster's Agents must report, keyed by cluster id.
+
+    A cluster running its own Runtime Profile has its own Agent config digest
+    (``fleet.cluster_policy`` holds its Agents to that one, not the site's), so
+    judging every Agent against the site digest reported a converged mixed
+    site as "pin-not-aligned" (live 2026-10-04: both ``eks-v1`` nodes). On a
+    single-profile site every entry equals ``candidate_agent_pin_identity``.
+    """
+
+    site = candidate_agent_pin_identity(release)
+    return {
+        str(target.cluster_id): {
+            **site,
+            "config_digest": target_agent_config_digest(release.config, target),
+        }
+        for target in release.config.clusters
+    }
+
+
 def wait_candidate_cpu_agent_heartbeats(
     release: Any,
     agent_identities: dict[str, Any],
     *,
     required_identity: dict[str, str] | None = None,
+    required_identities: dict[str, dict[str, str]] | None = None,
     timeout_seconds: float = CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS,
     poll_seconds: float = ROLLOUT_AGENT_POLL_SECONDS,
     minimum_lease_remaining_seconds: int = ROLLOUT_AGENT_LEASE_MARGIN_SECONDS,
@@ -759,6 +781,8 @@ def wait_candidate_cpu_agent_heartbeats(
                 "poll_seconds": poll_seconds,
                 "minimum_lease_remaining_seconds": (minimum_lease_remaining_seconds),
                 "required_identity": required_identity,
+                # Per-cluster pins win over the site pin for the clusters named.
+                "required_identities": required_identities,
             }
         ),
         timeout_seconds=max(30, int(timeout_seconds) + 30),
@@ -785,7 +809,7 @@ def wait_candidate_cpu_agent_heartbeats(
         prefix = (
             "fleet has not reached the candidate Agent pin, so the compatibility "
             "window stays open: "
-            if required_identity is not None
+            if required_identity is not None or required_identities
             else "candidate CPU did not observe refreshed Agent heartbeats: "
         )
         raise ReleaseError(prefix + json.dumps(diagnostics, sort_keys=True))

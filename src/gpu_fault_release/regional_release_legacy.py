@@ -52,11 +52,32 @@ def apply_fleet_request_identity(
 
 def rollback_controller_config(
     identities: dict[str, dict[str, Any]],
+    *,
+    site_runtime_profile_version: str | None = None,
+    cluster_runtime_profiles: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, str]:
+    """The site pins the rolled-back control plane is patched with.
+
+    Agent version and policy version must be one value fleet-wide. The Runtime
+    Profile version is the site's: a cluster running its own profile (named in
+    ``cluster_runtime_profiles``, the previous release's per-cluster overrides)
+    reports that profile's version instead, and keeps it through the restored
+    registry registration, not through this env. Without the overrides map the
+    historical single-value rule applies.
+    """
+
     if not identities:
         raise ReleaseError("previous Agent identity snapshot is empty")
     result: dict[str, str] = {}
     for config_field, identity_field in ROLLBACK_CONTROLLER_CONFIG_FIELDS.items():
+        if (
+            identity_field == "runtime_profile_version"
+            and cluster_runtime_profiles is not None
+        ):
+            result[config_field] = _site_runtime_profile_version(
+                identities, site_runtime_profile_version, cluster_runtime_profiles
+            )
+            continue
         values = {
             str(identity.get(identity_field) or "") for identity in identities.values()
         }
@@ -66,6 +87,36 @@ def rollback_controller_config(
             )
         result[config_field] = values.pop()
     return result
+
+
+def _site_runtime_profile_version(
+    identities: dict[str, dict[str, Any]],
+    site_version: str | None,
+    overrides: dict[str, dict[str, Any]],
+) -> str:
+    site = str(site_version or "")
+    if not site:
+        shared = {
+            str(identity.get("runtime_profile_version") or "")
+            for cluster_id, identity in identities.items()
+            if cluster_id not in overrides
+        }
+        if len(shared) != 1 or not next(iter(shared)):
+            raise ReleaseError(
+                "previous Agent runtime_profile_version differs across the clusters "
+                "on the site profile: " + ", ".join(sorted(shared))
+            )
+        site = shared.pop()
+    for cluster_id, identity in sorted(identities.items()):
+        reported = str(identity.get("runtime_profile_version") or "")
+        expected = str((overrides.get(cluster_id) or {}).get("version") or site)
+        if reported != expected:
+            raise ReleaseError(
+                f"{cluster_id} previous Agent runtime_profile_version {reported!r} "
+                f"is neither the site's {site!r} nor the cluster's own "
+                f"{expected!r}"
+            )
+    return site
 
 
 def validate_rollback_agent_identity(
