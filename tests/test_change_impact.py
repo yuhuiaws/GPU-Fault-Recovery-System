@@ -356,7 +356,10 @@ def test_selected_promql_uses_make_metadata_and_binds_only_the_pytest_child(
     assert native == ["make", "test-postgres-stress", f"PYTHON={sys.executable}"], (
         "PromQL binding cannot alter native test permissions or selection"
     )
-    assert native_options["env"] == parent, (
+    # The native run keeps the build's own environment minus the deploy's
+    # deadline/budget scope -- the selector's derivation, which is the parent
+    # environment itself outside a deployment (the gate runs inside one).
+    assert native_options["env"] == MODULE.isolated_gate_environment(parent), (
         "only the original native environment applies"
     )
     assert dict(os.environ) == parent, (
