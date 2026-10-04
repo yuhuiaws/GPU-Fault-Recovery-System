@@ -324,11 +324,18 @@ def test_impact_selected_postgres_uses_the_same_child_environment(
         assert options["env"]["HOME"] == "/original/build-home"
         assert options["env"].get("PGPASSFILE") == os.environ.get("PGPASSFILE")
         assert options["timeout"] == 30
-    assert all(
-        "env" not in options
-        for command, options in calls
-        if (command, options) not in postgres + metadata
-    ), "impact planning changed HOME for a non-PostgreSQL subprocess"
+    # Selected tests get the gate's isolated environment (no deploy scope),
+    # which must not borrow the PostgreSQL grant's HOME/PGPASSFILE; static
+    # gates keep inheriting the process environment.
+    for command, options in calls:
+        if (command, options) in postgres + metadata:
+            continue
+        if "env" in options:
+            assert command[1:3] == ["-m", "pytest"], command
+            assert options["env"]["HOME"] == "/original/build-home", (
+                "impact planning changed HOME for a non-PostgreSQL subprocess"
+            )
+            assert options["env"].get("PGPASSFILE") == os.environ.get("PGPASSFILE")
     assert os.environ["HOME"] == "/original/build-home"
 
 
