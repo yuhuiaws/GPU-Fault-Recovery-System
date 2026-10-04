@@ -63,6 +63,7 @@ def _render_gpu_dcgm_exporter(
     manifest = render_dcgm_exporter_manifest(
         namespace=release.config.namespace,
         image=image or release.dcgm_exporter_image,
+        provider=getattr(target, "provider", None),
     )
     return rendered_config_map, manifest
 

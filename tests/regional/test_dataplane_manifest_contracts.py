@@ -1334,3 +1334,154 @@ def test_the_dataplane_adot_manifest_gates_the_observability_component() -> None
         ("rolebinding", "gpu-fault-adot-dataplane-discovery"),
     ):
         assert (kind, name) in registered, f"cleanup inventory lacks {kind}/{name}"
+
+
+# --- plain EKS clusters: the exporter runs its own hostengine ----------------------
+#
+# Live 2026-10-04 (gpu-eks-cluster, AL2023_x86_64_NVIDIA AMI): no nv-hostengine,
+# no dcgmi, nothing on 5555 -- the checked-in DaemonSet crash-looped on
+# "Attempting to connect to remote hostengine at 127.0.0.1:5555". The HyperPod
+# AMI runs DCGM as a host service, so its text must not change by a byte.
+
+
+def _exporter_container(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    daemonset = next(
+        document
+        for document in yaml.safe_load_all(text)
+        if isinstance(document, dict) and document.get("kind") == "DaemonSet"
+    )
+    container = next(
+        item
+        for item in _pod_spec(daemonset)["containers"]
+        if item["name"] == "exporter"
+    )
+    return daemonset, container
+
+
+def _env(container: dict[str, Any]) -> dict[str, str]:
+    return {item["name"]: item.get("value") for item in container.get("env", [])}
+
+
+def test_plain_eks_exporter_uses_the_embedded_hostengine() -> None:
+    text = RENDERING.render_dcgm_exporter_manifest(
+        namespace="gpu-fault-system", image=DCGM_EXPORTER_IMAGE, provider="eks-managed"
+    )
+    daemonset, container = _exporter_container(text)
+    env = _env(container)
+    assert "DCGM_REMOTE_HOSTENGINE_INFO" not in env, (
+        "a plain EKS node runs no nv-hostengine to dial"
+    )
+    assert env["NVIDIA_VISIBLE_DEVICES"] == "all", "the runtime injects every GPU"
+    assert env["NVIDIA_DRIVER_CAPABILITIES"] == "utility", "NVML is all DCGM needs"
+    assert (
+        env["DCGM_EXPORTER_COLLECTORS"] == "/etc/dcgm-exporter/gpu-fault-counters.csv"
+    )
+    assert daemonset["metadata"]["annotations"]["gpu-fault.io/dcgm-hostengine"] == (
+        "embedded"
+    ), "the variant is visible to an operator reading the live object"
+    pod = _pod_spec(daemonset)
+    assert pod["hostNetwork"] is True and container["args"][:2] == [
+        "-a",
+        "127.0.0.1:9400",
+    ], "the node collector still dials the exporter on the node's loopback"
+    assert any(item.get("hostPort") == 9400 for item in container["ports"]), (
+        "the loopback bind is published on the host port the collector dials"
+    )
+    assert pod["tolerations"] == [{"operator": "Exists"}], (
+        "the GPU taint (nvidia.com/gpu=present:NoSchedule) is tolerated"
+    )
+    assert container["image"] == DCGM_EXPORTER_IMAGE, "the pinned image is kept"
+    assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}, (
+        "the DEV counters need no SYS_ADMIN; stay least-privilege"
+    )
+
+
+@pytest.mark.parametrize("provider", [None, "hyperpod"])
+def test_hyperpod_exporter_text_is_unchanged_by_the_provider_argument(provider) -> None:
+    plain = RENDERING.render_dcgm_exporter_manifest(
+        namespace="gpu-fault-system", image=DCGM_EXPORTER_IMAGE
+    )
+    assert (
+        RENDERING.render_dcgm_exporter_manifest(
+            namespace="gpu-fault-system", image=DCGM_EXPORTER_IMAGE, provider=provider
+        )
+        == plain
+    ), "HyperPod rendering is byte-identical"
+    _daemonset, container = _exporter_container(plain)
+    assert _env(container)["DCGM_REMOTE_HOSTENGINE_INFO"] == "127.0.0.1:5555", (
+        "HyperPod keeps dialling the host DCGM service"
+    )
+
+
+def test_the_eks_cluster_of_a_mixed_site_is_applied_the_embedded_variant(
+    tmp_path: Path,
+) -> None:
+    from tests.regional.test_regional_release_eks_managed import (
+        ProfileAwareRunner,
+        _eks_cluster_with_profile,
+        _hyperpod_cluster,
+    )
+    from tests.regional.test_regional_release_eks_managed import (
+        config_file as mixed_config_file,
+    )
+
+    config = MODULE.ReleaseConfig.load(
+        mixed_config_file(
+            tmp_path,
+            clusters=[_hyperpod_cluster(tmp_path), _eks_cluster_with_profile(tmp_path)],
+        )
+    )
+    release = MODULE.RegionalRelease(config, ProfileAwareRunner())
+    release.dcgm_exporter_image = DCGM_EXPORTER_IMAGE
+    hyperpod, eks = config.clusters
+    applied: dict[str, list[str]] = {}
+    for target in (hyperpod, eks):
+        before = len(release.runner.calls)  # type: ignore[attr-defined]
+        BOOTSTRAP.preflight_gpu_dcgm_exporter(release, target)
+        applied[target.cluster_id] = [
+            str(options.get("input_text") or "")
+            for _args, options in release.runner.calls[before:]  # type: ignore[attr-defined]
+            if "kind: DaemonSet" in str(options.get("input_text") or "")
+        ]
+    assert applied[hyperpod.cluster_id] and applied[eks.cluster_id], "both rendered"
+    assert "DCGM_REMOTE_HOSTENGINE_INFO" in applied[hyperpod.cluster_id][0]
+    assert "DCGM_REMOTE_HOSTENGINE_INFO" not in applied[eks.cluster_id][0]
+    assert "NVIDIA_VISIBLE_DEVICES" in applied[eks.cluster_id][0]
+    payload = RENDERING.render_release_payload(release)
+    assert {d["kind"] for d in payload["dcgm_eks_managed"]} == {"DaemonSet"}, (
+        "the approver reads the plain EKS variant too"
+    )
+    assert "DCGM_REMOTE_HOSTENGINE_INFO" not in json.dumps(payload["dcgm_eks_managed"])
+
+
+def test_a_hyperpod_only_plan_payload_carries_no_eks_dcgm_variant(
+    tmp_path: Path,
+) -> None:
+    release = _release(tmp_path)
+    payload = RENDERING.render_release_payload(release)
+    assert "dcgm_eks_managed" not in payload, "neutral for HyperPod-only sites"
+
+
+def test_data_plane_deployments_schedule_on_cpu_nodes_only() -> None:
+    """On gpu-eks-cluster the GPU nodes carry nvidia.com/gpu=present:NoSchedule
+    and the only untainted nodes are two m7i-flex CPU nodes: every Deployment
+    the join applies must be able to land there and must not tolerate its way
+    onto a GPU node."""
+
+    deployments = _workloads(DATAPLANE.glob("*.yaml"), "Deployment")
+    assert {name for _path, d in deployments for name in [d["metadata"]["name"]]} >= {
+        "gpu-fault-cluster-executor",
+        "gpu-fault-completion-watcher",
+        "gpu-fault-node-installer-reconciler",
+        "gpu-fault-kubernetes-node-resource-collector",
+        "gpu-fault-adot-dataplane",
+    }
+    for path, deployment in deployments:
+        pod = _pod_spec(deployment)
+        assert not pod.get("nodeSelector"), f"{path.name}: no node pin"
+        assert "nodeAffinity" not in (pod.get("affinity") or {}), f"{path.name}"
+        for toleration in pod.get("tolerations", []):
+            assert toleration.get("key"), f"{path.name}: no wildcard toleration"
+            assert not toleration["key"].startswith("nvidia.com/"), (
+                f"{path.name}: must not tolerate the GPU taint"
+            )

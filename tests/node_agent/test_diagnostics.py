@@ -872,6 +872,39 @@ def test_quick_dcgm_diagnostic_returns_structured_outcome(
     assert calls == [["dcgmi", "diag", "-r", "1", "-j"]]
 
 
+def test_quick_dcgm_diagnostic_without_dcgmi_is_a_configuration_warning(
+    tmp_path,
+) -> None:
+    """A plain EKS node (AL2023 NVIDIA AMI) ships no dcgmi: the quick diagnostic
+    reports the missing tool as a configuration WARN with its own guidance
+    instead of failing the step and draining a healthy node."""
+
+    def runner(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    agent = node_action_executor(
+        tmp_path,
+        "no-dcgmi.db",
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_output_dir=str(tmp_path / "quick-no-dcgmi"),
+        runner=runner,
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.RUN_DCGM_DIAGNOSTIC)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED
+    assert result.details["diagnostic_outcome"] == "WARN"
+    assert result.details["configuration_only_failures"] is True
+    assert result.details["returncode"] == 127
+    assert [item["action_code"] for item in result.details["recommended_actions"]] == [
+        "DCGM_TOOL_UNAVAILABLE"
+    ]
+    evidence = Path(result.details["evidence_ref"].removeprefix("file://"))
+    assert "dcgmi unavailable on this node" in evidence.read_text(), (
+        "the evidence file carries the reason"
+    )
+
+
 def test_quick_dcgm_diagnostic_invalid_json_is_inconclusive(tmp_path) -> None:
     def runner(argv, **_kwargs):
         return CompletedProcess(argv, 0, stdout="not-json", stderr="")

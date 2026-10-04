@@ -534,13 +534,23 @@ class DiagnosticOperationsMixin:
         return statuses
 
     def _run_dcgm_diagnostic(self, command: NodeActionCommand) -> dict[str, Any]:
-        result = self.runner(
-            ["dcgmi", "diag", "-r", "1", "-j"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        tool_unavailable: str | None = None
+        try:
+            result = self.runner(
+                ["dcgmi", "diag", "-r", "1", "-j"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except OSError as exc:
+            # A plain EKS node (AL2023 NVIDIA AMI) ships no DCGM host tools:
+            # no dcgmi, no nv-hostengine. That is a host configuration fact,
+            # not a GPU verdict -- the node must not be drained for it.
+            tool_unavailable = f"dcgmi unavailable on this node: {exc}"
+            result = subprocess.CompletedProcess(
+                ["dcgmi", "diag", "-r", "1", "-j"], 127, "", tool_unavailable
+            )
         output = result.stdout or ""
         if result.stderr:
             output += "\n[stderr]\n" + result.stderr
@@ -594,7 +604,7 @@ class DiagnosticOperationsMixin:
         # configured", e.g. persistence mode disabled) the GPU is not
         # diagnosed as faulty, so the outcome must be WARN rather than
         # FAIL — otherwise a host configuration gap drains the node.
-        configuration_only = (
+        configuration_only = tool_unavailable is not None or (
             parse_error is None
             and dcgm_failures_are_configuration_only(diagnostic_findings)
         )
@@ -608,11 +618,28 @@ class DiagnosticOperationsMixin:
             outcome = "PASS"
         else:
             outcome = "INCONCLUSIVE"
-        recommendations = build_dcgm_recommendations(
-            diagnostic_findings,
-            returncode=result.returncode,
-            parse_error=parse_error,
-            configuration_only=configuration_only,
+        recommendations = (
+            [
+                {
+                    "action_code": "DCGM_TOOL_UNAVAILABLE",
+                    "priority": "REVIEW",
+                    "instruction": (
+                        "dcgmi is not installed on this node (plain EKS NVIDIA "
+                        "AMIs ship no DCGM host tools); GPU metrics still come "
+                        "from the exporter's embedded hostengine. Install "
+                        "datacenter-gpu-manager on the node image if the quick "
+                        "diagnostic is required."
+                    ),
+                    "trigger_tests": ["dcgmi diag"],
+                }
+            ]
+            if tool_unavailable is not None
+            else build_dcgm_recommendations(
+                diagnostic_findings,
+                returncode=result.returncode,
+                parse_error=parse_error,
+                configuration_only=configuration_only,
+            )
         )
         return {
             "diagnostic_outcome": outcome,

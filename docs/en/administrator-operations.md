@@ -1007,6 +1007,16 @@ Semantics and boundaries of `eks-managed`:
     --gpu-nodegroup gpu-p5en-efa-spot-node-group \
     --approve-profile-plan <plan_sha256> --reference CHG-<id>
   ```
+- DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
+  `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has neither nv-hostengine nor dcgmi, so an `eks-managed` cluster's
+  exporter is rendered without `DCGM_REMOTE_HOSTENGINE_INFO` and runs its embedded hostengine in the container
+  (`NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=utility`, GPUs injected by the AMI's default NVIDIA
+  container runtime; annotation `gpu-fault.io/dcgm-hostengine: embedded`). hostNetwork, the loopback bind on 9400, the
+  instance-type affinity and the counters ConfigMap are unchanged, the node collector keeps scraping
+  `http://127.0.0.1:9400/metrics`, and the HyperPod text is byte-identical. No DCGM is installed on the node: the quick
+  DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on such nodes (a configuration warning that
+  never drains the node) and the diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
+  carries an extra `dcgm_eks_managed` document group for the approver.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

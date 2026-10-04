@@ -17,6 +17,7 @@ from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refr
 from gpu_fault.cluster_scope import (
     NODE_SELECTOR_ENV,
     PROVIDER_ENV,
+    ClusterProvider,
     provider_cluster_name,
 )
 from gpu_fault_release.regional_release_config import (
@@ -68,8 +69,63 @@ def _supported_instance_types() -> str:
     return ", ".join(f'"ml.{name}", "{name}"' for name in names)
 
 
-def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
+#: Marks the DaemonSet variant a plain EKS cluster gets (see
+#: :func:`render_dcgm_exporter_manifest`); the HyperPod text carries no mark.
+DCGM_HOSTENGINE_ANNOTATION = "gpu-fault.io/dcgm-hostengine"
+REMOTE_HOSTENGINE_ENV = "DCGM_REMOTE_HOSTENGINE_INFO"
+EMBEDDED_HOSTENGINE_ENV = (
+    # The NVIDIA container runtime (the default runtime of the EKS NVIDIA AMIs)
+    # injects every GPU into a container that asks for them this way; DCGM
+    # needs the NVML (``utility``) driver capability only.
+    {"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"},
+    {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility"},
+)
+
+
+def _embedded_hostengine_documents(text: str) -> str:
+    """The exporter DaemonSet for a cluster whose nodes run no host DCGM.
+
+    The checked-in DaemonSet dials the node's ``nv-hostengine`` at
+    ``127.0.0.1:5555`` (``DCGM_REMOTE_HOSTENGINE_INFO``): the HyperPod AMI runs
+    DCGM as a host service. The EKS AL2023 NVIDIA AMI does not -- live
+    2026-10-04 on gpu-eks-cluster: no nv-hostengine, no dcgmi, nothing on
+    5555 -- so the exporter crash-looped ("Attempting to connect to remote
+    hostengine"). Here the exporter runs its embedded hostengine inside the
+    container instead, as the upstream chart does on EKS. Everything the node
+    collector relies on stays: hostNetwork, the loopback bind on 9400, the
+    instance-type affinity and the counters ConfigMap.
+    """
+
+    documents = list(yaml.safe_load_all(text))
+    for document in documents:
+        if not isinstance(document, dict) or document.get("kind") != "DaemonSet":
+            continue
+        metadata = document.setdefault("metadata", {})
+        annotations = metadata.setdefault("annotations", {})
+        annotations[DCGM_HOSTENGINE_ANNOTATION] = "embedded"
+        pod = document["spec"]["template"]["spec"]
+        for container in pod.get("containers", []):
+            if container.get("name") != "exporter":
+                continue
+            env = [
+                item
+                for item in container.get("env", [])
+                if item.get("name") != REMOTE_HOSTENGINE_ENV
+            ]
+            env.extend(dict(item) for item in EMBEDDED_HOSTENGINE_ENV)
+            container["env"] = env
+    return str(yaml.safe_dump_all(documents, sort_keys=False))
+
+
+def render_dcgm_exporter_manifest(
+    *, namespace: str, image: str, provider: str | None = None
+) -> str:
     """The one exporter DaemonSet text, for the plan payload and for the apply.
+
+    ``provider`` is the GPU cluster's provider (``gpu_fault.cluster_scope``):
+    a plain EKS cluster gets the embedded-hostengine variant
+    (:func:`_embedded_hostengine_documents`); HyperPod, or no provider, the
+    checked-in text byte for byte.
 
     Both used to substitute for themselves and the payload renderer knew only
     about namespace and image, so the plan an approver read carried a literal
@@ -107,6 +163,8 @@ def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
     ):
         if placeholder in text:
             raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")
+    if cluster_provider(provider) is ClusterProvider.EKS_MANAGED:
+        return _embedded_hostengine_documents(text)
     return text
 
 
@@ -486,6 +544,19 @@ def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
         namespace=config.namespace,
         image=release.dcgm_exporter_image,
     )
+    # A mixed site applies a second DaemonSet text to its plain EKS clusters;
+    # the approver reads that one too. Absent on a HyperPod-only site.
+    eks_dcgm_documents = (
+        _documents(
+            render_dcgm_exporter_manifest(
+                namespace=config.namespace,
+                image=release.dcgm_exporter_image,
+                provider=ClusterProvider.EKS_MANAGED.value,
+            )
+        )
+        if any(is_eks_managed(target) for target in config.clusters)
+        else None
+    )
     observability_text = (
         ROOT / "deploy/observability/adot-control-plane.yaml"
     ).read_text(encoding="utf-8")
@@ -504,6 +575,7 @@ def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
         "aurora_refresh": _documents(refresh_text),
         "nlb": nlb_documents,
         "dcgm": _documents(dcgm_text),
+        **({"dcgm_eks_managed": eks_dcgm_documents} if eks_dcgm_documents else {}),
         "observability": _documents(observability_text),
         # Per GPU cluster; an empty list is a cluster the release will skip
         # (no AMP workspace or no IRSA role for the collector yet), so the
