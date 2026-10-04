@@ -5179,12 +5179,14 @@ eks-managed`, a new and less validated form; semantics and boundaries in Adminis
 cluster needs its GPU node selector: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or
 `--gpu-nodegroup <managed-node-group>` (derives `eks.amazonaws.com/nodegroup=<name>`); `--cluster-id` defaults to the EKS
 cluster name. Both options are ignored for HyperPod clusters, whose selector is always
-`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. The Runtime Profile is site-wide,
-so a site's GPU clusters must share one provider: joining a plain EKS cluster into a HyperPod site (or the reverse) is
-refused; the site profile's `nodeReboot` owner must also be the target provider's adapter (plain EKS:
-`gpu-fault-eks-adapter`, HyperPod: `gpu-fault-hyperpod-adapter`), otherwise the join is refused before any AWS
-mutation with the remedy: switch to the matching example profile under a new version name and rerun `deploy` with
-`--approve-profile-plan`:
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. The Runtime Profile applies per
+cluster: the site profile is the default pin; when its `nodeReboot` owner is not the target provider's adapter (plain
+EKS: `gpu-fault-eks-adapter`, HyperPod: `gpu-fault-hyperpod-adapter`) the join writes the cluster's own
+`spec.clusters[].runtimeProfile` (the provider's example profile under version `eks-v1`/`hyperpod-v1`, with that
+version's `agentConfigDigest`). The new version is reviewed first: the join writes `release-deploy/profile-plan.json`
+and stops, and continues on a rerun with `--approve-profile-plan <plan_sha256> --reference <CHG>` (walkthrough in
+Administrator Operations §5.0). The release registers every profile version in use and renders each cluster's
+Executor/Watcher/Reconciler/installer pins from its own version:
 
 ```bash
 gpu-fault-admin deploy \

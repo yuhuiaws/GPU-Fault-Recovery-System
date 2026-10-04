@@ -973,15 +973,37 @@ Semantics and boundaries of `eks-managed`:
   `aws:ResourceTag/eks:cluster-name`, and `eks:DescribeCluster` / `eks:DescribeNodegroup` scoped to this cluster and
   its node group ARNs -- no `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
   identity running `workflow-reconcile` additionally needs `ec2:DescribeInstances` (the departed-node EC2 proof).
-- The Runtime Profile is site-wide (`hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS
-  adapter), so **a site's GPU clusters must share one provider**: a first `deploy` whose GPU clusters are all plain
-  EKS starts from `config/runtime-profile.regional-eks-safe.example.yaml` (`eks-v1`); joining a plain EKS cluster
-  into a HyperPod site (or the reverse) is refused -- use a separate site. `join-cluster`/`deploy` also check the
-  site profile's `nodeReboot` owner: a plain EKS cluster requires `gpu-fault-eks-adapter`, a HyperPod cluster
-  `gpu-fault-hyperpod-adapter`; a mismatch is refused before any AWS mutation, and the message names the profile
-  version, the current owner and the remedy (switch `spec.runtimeProfile.source/templateSource` to the matching
-  example profile under a new version name and rerun `deploy` with `--approve-profile-plan`). A profile with no
-  OWN/DELEGATE `nodeReboot` claim is not checked.
+- The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
+  pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
+  provider the site profile cannot reboot gets **its own** profile (`spec.clusters[].runtimeProfile`:
+  `source`/`templateSource`/`version`/`agentConfigDigest`, filled in by the join from the provider's example profile
+  under its version name `eks-v1`/`hyperpod-v1`); its Agents, Executor, Watcher and installer are pinned to that
+  version, its registration carries `runtime_profile_version`/`agent_config_digest`, and the control plane's fleet
+  pin is checked per cluster (every other cluster keeps the site pins and renders byte for byte as before). A new
+  version is a policy change and goes through the same review as a site profile change: the join writes
+  `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and stops; record `plan_sha256`, rerun the
+  same `join-cluster`/`deploy` with `--approve-profile-plan <sha> --reference <CHG>`; the approval is consumed, the
+  immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
+  reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
+  (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`.
+  `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
+  (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
+
+  **Mixed-site join walkthrough** (an existing `hyperpod-v1` site joining the plain EKS cluster `gpu-eks-cluster`):
+
+  ```bash
+  # 1. discovered as eks-managed, needs eks-v1 -> writes profile-plan.json and stops (no AWS mutation)
+  gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
+    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster \
+    --gpu-nodegroup gpu-p5en-efa-spot-node-group
+  # 2. review /secure/gpu-fault/release-deploy/profile-plan.json, record plan_sha256 on the change request
+  # 3. rerun the same command with the approval: token, Executor IAM (ec2 Describe/Reboot + eks Describe),
+  #    NAT EIP whitelist, Route53 association, Node Action keys, eks-v1 registration, data plane, activation
+  gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
+    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster \
+    --gpu-nodegroup gpu-p5en-efa-spot-node-group \
+    --approve-profile-plan <plan_sha256> --reference CHG-<id>
+  ```
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

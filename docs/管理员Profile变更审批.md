@@ -4,12 +4,17 @@
 绑定外部变更单、让同一条deploy继续并保存审计证据。整个流程只有两步，不需要`jq`、
 内部site路径、`PROFILE_APPROVAL`环境变量或隐藏参数。
 
-Profile是站点级授权策略。新版本生效后会被该站点当前纳管的全部GPU集群使用；GPU集群
-加入和注销继续通过`join-cluster/remove-cluster`处理，不进入Profile审批的稳定站点
-身份摘要。`join-cluster`/`deploy` 接入 GPU 集群前会核对当前 profile 的 `nodeReboot` owner
-与集群 provider 是否匹配（HyperPod：`gpu-fault-hyperpod-adapter`；普通 EKS `eks-managed`：
-`gpu-fault-eks-adapter`）；不匹配时拒绝接入，补救就是本文的流程——把 `spec.runtimeProfile`
-的 `source/templateSource` 换成对应示例 profile、换一个新版本名，重跑 `deploy` 并按下文审批。
+Profile 是授权策略。站点 profile（`spec.runtimeProfile`）新版本生效后被该站点所有**沿用站点
+profile** 的 GPU 集群使用；一个集群也可以拥有自己的 profile（`spec.clusters[].runtimeProfile`，
+由 `join-cluster` 在站点 profile 的 `nodeReboot` owner 不能服务该集群 provider 时从对应示例 profile
+填入：HyperPod 用 `gpu-fault-hyperpod-adapter`/`hyperpod-v1`，普通 EKS `eks-managed` 用
+`gpu-fault-eks-adapter`/`eks-v1`）。每个在用版本都在控制面注册一次；集群条目的
+`agentConfigDigest` 是按其版本计算的 Agent 配置摘要；集群注册表携带该版本与摘要，fleet pin 按
+集群核对。GPU 集群加入和注销继续通过 `join-cluster/remove-cluster` 处理，不进入站点 profile 审批的
+稳定站点身份摘要；但**集群自己的新 profile 版本同样要审批**：join 写出同一份
+`release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`，`registration_cluster_id` 为该集群），
+用 `join-cluster --approve-profile-plan <plan_sha256> --reference <CHG>`（或 `deploy` 的同名参数）
+审批后继续；审批消费后写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
 
 ## 1. 最短操作路径
 

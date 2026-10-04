@@ -6,9 +6,19 @@ This document is for regional site administrators and explains, after a deploy s
 bind an external change ticket, let the same deploy continue and keep the audit evidence. The whole procedure has only two steps and needs no `jq`,
 internal site path, `PROFILE_APPROVAL` environment variable or hidden parameter.
 
-The Profile is a site-level authorisation policy. Once a new version takes effect it is used by all GPU clusters the site currently manages; GPU cluster
-joins and deregistrations continue to be handled by `join-cluster/remove-cluster` and do not enter the stable site
-identity digest of the Profile approval.
+The Profile is an authorisation policy. Once a new version of the site profile (`spec.runtimeProfile`) takes effect it
+is used by every GPU cluster that **follows the site profile**; a cluster may also own its profile
+(`spec.clusters[].runtimeProfile`, filled in by `join-cluster` from the provider's example profile when the site
+profile's `nodeReboot` owner cannot serve the cluster's provider: HyperPod uses `gpu-fault-hyperpod-adapter`/`hyperpod-v1`,
+plain EKS `eks-managed` uses `gpu-fault-eks-adapter`/`eks-v1`). Every version in use is registered once in the control
+plane; the cluster entry's `agentConfigDigest` is the Agent configuration digest computed for its version; the cluster
+registration carries that version and digest and the fleet pin is checked per cluster. GPU cluster joins and
+deregistrations continue to be handled by `join-cluster/remove-cluster` and do not enter the stable site identity digest
+of the site profile approval, but **a cluster's own new profile version is reviewed the same way**: the join writes the
+same `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`, `registration_cluster_id` naming the
+cluster), continues after `join-cluster --approve-profile-plan <plan_sha256> --reference <CHG>` (or the same flags on
+`deploy`), and once the approval is consumed the immutable snapshot `profiles/<version>.yaml` is written and reused by
+later clusters of the same provider.
 
 ## 1. Shortest Operating Path
 
