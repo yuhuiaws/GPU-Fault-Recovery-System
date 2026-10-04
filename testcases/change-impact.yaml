@@ -719,7 +719,7 @@ rules:
       - tests/admin/test_workflow_reconcile_epoch_cas.py
       - tests/execution/test_retired_generation.py
       - tests/execution/test_compile_blocked_sweep.py
-      - tests/execution/test_node_action_confirmation.py
+      - tests/admin/test_node_action_confirmation.py
       - tests/execution/test_orphaned_commands_sweep.py
       - tests/orchestration/test_confirmed_node_action_release_path.py
       - tests/store/test_reconcile_epoch_cas.py
@@ -736,7 +736,7 @@ rules:
       - tests/admin/test_admin_confirm_node_action.py
       - tests/execution/test_retired_generation.py
       - tests/execution/test_compile_blocked_sweep.py
-      - tests/execution/test_node_action_confirmation.py
+      - tests/admin/test_node_action_confirmation.py
       - tests/execution/test_orphaned_commands_sweep.py
       - tests/orchestration/test_confirmed_node_action_release_path.py
       - tests/store/test_reconcile_epoch_cas.py
