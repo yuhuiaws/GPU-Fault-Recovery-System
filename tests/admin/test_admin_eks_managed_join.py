@@ -996,3 +996,108 @@ def test_cli_join_defaults_allowed_namespaces_to_the_sites_list(tmp_path) -> Non
     assert site_allowed_namespaces(site) == tuple(
         sorted(site.release_config["clusters"][0]["allowed_namespaces"])
     ), "a joining cluster inherits the list the site's clusters share"
+
+
+# --- deploy keeps, refreshes or restores a cluster's own profile ---------------
+
+
+def _deploy_document(tmp_path, *, eks_profile):
+    """A generated site document: HyperPod site profile, one HyperPod cluster,
+    one plain EKS cluster with (or without) its override."""
+
+    repo = tmp_path / "repo"
+    (repo / "config").mkdir(parents=True, exist_ok=True)
+    for source in (HYPERPOD_PROFILE, EKS_PROFILE):
+        (repo / "config" / source.name).write_text(source.read_text(encoding="utf-8"))
+    eks = {
+        "clusterId": "gpu-eks-cluster",
+        "provider": "eks-managed",
+        "eksClusterArn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-cluster",
+    }
+    if eks_profile is not None:
+        eks["runtimeProfile"] = eks_profile
+    return repo, {
+        "spec": {
+            "runtimeProfile": {"source": str(repo / "config" / HYPERPOD_PROFILE.name)},
+            "clusters": [{"clusterId": "hp-a"}, eks],
+        }
+    }
+
+
+def _approved_snapshot(state_dir, repo):
+    snapshot = state_dir / "profiles" / "eks-v1.yaml"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    document = yaml.safe_load((repo / "config" / EKS_PROFILE.name).read_text())
+    document["cluster_id"] = "gpu-eks-cluster"
+    document["profile_version"] = "eks-v1"
+    snapshot.write_text(yaml.safe_dump(document, sort_keys=False))
+    return snapshot
+
+
+def test_deploy_restores_a_lost_override_from_the_approved_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """The live site after the 10:44 deploy: the plain EKS entry had lost its
+    runtimeProfile. The approved snapshot still exists, so the deploy restores
+    the override and computes this release's Agent config digest."""
+
+    repo, document = _deploy_document(tmp_path, eks_profile=None)
+    state_dir = tmp_path / "state"
+    snapshot = _approved_snapshot(state_dir, repo)
+    monkeypatch.setattr(
+        cluster_join_profile,
+        "compute_agent_config_digest",
+        lambda _runner, *, repository_root, runtime_profile_version: (
+            runtime_profile_version[:1] * 64
+        ),
+    )
+    cluster_join_profile.reconcile_cluster_runtime_profiles(
+        object(), document, repository_root=repo, state_dir=state_dir
+    )
+    hyperpod, eks = document["spec"]["clusters"]
+    assert "runtimeProfile" not in hyperpod, "the HyperPod cluster follows the site"
+    assert eks["runtimeProfile"] == {
+        "source": str(snapshot),
+        "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+        "version": "eks-v1",
+        "agentConfigDigest": "e" * 64,
+    }
+
+
+def test_deploy_keeps_an_existing_override_and_refreshes_its_digest(
+    tmp_path, monkeypatch
+) -> None:
+    repo, document = _deploy_document(
+        tmp_path,
+        eks_profile={
+            "source": "/elsewhere/eks-v1.yaml",
+            "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+            "version": "eks-v1",
+            "agentConfigDigest": "1" * 64,  # computed by the join's release
+        },
+    )
+    state_dir = tmp_path / "state"
+    snapshot = _approved_snapshot(state_dir, repo)
+    monkeypatch.setattr(
+        cluster_join_profile,
+        "compute_agent_config_digest",
+        lambda _runner, *, repository_root, runtime_profile_version: "2" * 64,
+    )
+    cluster_join_profile.reconcile_cluster_runtime_profiles(
+        object(), document, repository_root=repo, state_dir=state_dir
+    )
+    eks = document["spec"]["clusters"][1]["runtimeProfile"]
+    assert eks["version"] == "eks-v1" and eks["source"] == str(snapshot)
+    assert eks["agentConfigDigest"] == "2" * 64, (
+        "the digest follows this release, as the site-level one does"
+    )
+
+
+def test_deploy_fails_closed_when_the_needed_profile_was_never_approved(
+    tmp_path,
+) -> None:
+    repo, document = _deploy_document(tmp_path, eks_profile=None)
+    with pytest.raises(BootstrapError, match="needs Runtime Profile eks-v1.*approve"):
+        cluster_join_profile.reconcile_cluster_runtime_profiles(
+            object(), document, repository_root=repo, state_dir=tmp_path / "state"
+        )

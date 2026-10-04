@@ -384,8 +384,10 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     monkeypatch.setattr(
         admin_bootstrap,
         "finalize_bootstrap_site",
-        lambda _file, _generated, _existing, discovered, _state, _write: scopes.update(
-            finalize=tuple(cluster.hyperpod_name for cluster in discovered)
+        lambda _file, _generated, _existing, discovered, _state, _write, **_kw: (
+            scopes.update(
+                finalize=tuple(cluster.hyperpod_name for cluster in discovered)
+            )
         ),
     )
 
@@ -993,3 +995,107 @@ def test_existing_site_keeps_its_profile_but_takes_the_current_template_path() -
     assert profile["templateSource"] == "/snapshots/new/config/profile.yaml", (
         "the template path follows the tree being deployed"
     )
+
+
+# --- a deploy over a mixed site keeps what the join decided --------------------
+
+
+def _joined_eks_entry() -> dict[str, Any]:
+    return {
+        "clusterId": "gpu-eks-cluster",
+        "context": "gpu-fault-gpu-gpu-eks-cluster-aa3805df",
+        "provider": "eks-managed",
+        "nodeSelector": "eks.amazonaws.com/nodegroup=gpu-p5en-efa-spot-node-group",
+        "eksClusterArn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-cluster",
+        "allowedNamespaces": ["gpu-fault-system", "training"],
+        "runtimeProfile": {
+            "source": "/secure/site/profiles/eks-v1.yaml",
+            "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+            "version": "eks-v1",
+            "agentConfigDigest": "f" * 64,
+        },
+    }
+
+
+def test_existing_site_keeps_the_joins_provider_selector_and_profile() -> None:
+    """Live 2026-10-04: `deploy` over the mixed site regenerated the plain EKS
+    entry from discovery (default selector, no runtimeProfile), and the
+    release-diff refused on a `clusters` change. Join-time decisions win."""
+
+    generated = {
+        "spec": {
+            "clusters": [
+                {
+                    "clusterId": "gpu-eks-cluster",
+                    "context": "new-context",
+                    "provider": "eks-managed",
+                    "nodeSelector": "nvidia.com/gpu.present=true",
+                    "allowedNamespaces": ["gpu-fault-system", "training"],
+                }
+            ]
+        }
+    }
+    existing = {"spec": {"clusters": [_joined_eks_entry()]}}
+    result = preserve_existing_site_contract(generated, existing)
+    entry = result["spec"]["clusters"][0]
+    assert (
+        entry["nodeSelector"]
+        == "eks.amazonaws.com/nodegroup=gpu-p5en-efa-spot-node-group"
+    )
+    assert entry["runtimeProfile"] == _joined_eks_entry()["runtimeProfile"]
+    assert entry["provider"] == "eks-managed" and entry["context"] == (
+        "gpu-fault-gpu-gpu-eks-cluster-aa3805df"
+    )
+
+
+def test_existing_site_refuses_a_cluster_whose_provider_changed() -> None:
+    generated = {"spec": {"clusters": [{"clusterId": "gpu-eks-cluster"}]}}  # hyperpod
+    existing = {"spec": {"clusters": [_joined_eks_entry()]}}
+    with pytest.raises(BootstrapError, match="provider changed from eks-managed"):
+        preserve_existing_site_contract(generated, existing)
+
+
+def test_finalize_bootstrap_site_reconciles_profiles_on_the_merged_document(
+    tmp_path: Path,
+) -> None:
+    from gpu_fault.admin.bootstrap_site import finalize_bootstrap_site
+
+    seen: list[dict[str, Any]] = []
+    written: list[dict[str, Any]] = []
+    generated = {
+        "spec": {
+            "clusters": [{"clusterId": "gpu-eks-cluster", "provider": "eks-managed"}]
+        }
+    }
+    existing = {"spec": {"clusters": [_joined_eks_entry()]}}
+
+    def reconcile(document: dict[str, Any]) -> None:
+        seen.append(document)
+        document["spec"]["clusters"][0]["runtimeProfile"]["agentConfigDigest"] = (
+            "0" * 64
+        )
+
+    class _State:
+        path = tmp_path / "state.json"
+
+        def record(self, *_args: Any) -> None:
+            pass
+
+        def phase(self, *_args: Any) -> None:
+            pass
+
+    finalize_bootstrap_site(
+        tmp_path / "site.yaml",
+        generated,
+        existing,
+        [],
+        _State(),
+        lambda _path, document: written.append(document),
+        reconcile_profiles=reconcile,
+    )
+    assert seen and seen[0]["spec"]["clusters"][0]["nodeSelector"].startswith("eks."), (
+        "the reconciler sees the document after the existing contract was merged"
+    )
+    assert written[0]["spec"]["clusters"][0]["runtimeProfile"]["agentConfigDigest"] == (
+        "0" * 64
+    ), "the reconciled document is what gets written"

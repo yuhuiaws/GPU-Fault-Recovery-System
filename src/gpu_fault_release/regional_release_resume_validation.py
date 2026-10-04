@@ -16,6 +16,7 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     gpu_node_items,
 )
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_registry import legacy_registry_config_digest
 from gpu_fault_release.regional_release_profile_model import (
     target_agent_config_digest,
     target_runtime_profile_version,
@@ -451,7 +452,10 @@ def validate_resume_checkpoint(
         and release._aurora_refresh_drift()
     ):
         raise ReleaseError("resume Aurora credential refresher drifted")
-    if loaded.get("cluster_registry_digest") != release.cluster_registry_digest:
+    recorded_digest = loaded.get("cluster_registry_digest")
+    if recorded_digest != release.cluster_registry_digest and (
+        recorded_digest != legacy_registry_config_digest(release.config.clusters)
+    ):
         raise ReleaseError("resume cluster identity digest drifted")
     attempt_states = {
         str(cluster_id): str((entry or {}).get("state") or "")

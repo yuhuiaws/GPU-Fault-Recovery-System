@@ -84,6 +84,7 @@ from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
 )
 from gpu_fault.admin.bootstrap_site import cluster_alias as _cluster_alias
+from gpu_fault.admin.cluster_join_profile import reconcile_cluster_runtime_profiles
 from gpu_fault.admin.bootstrap_site import (
     cluster_irsa_role_entries,
     discover_bootstrap_scope,
@@ -132,11 +133,9 @@ def _secret_manifest(
 ) -> str:
     """Render an Opaque Secret as a manifest for ``kubectl apply -f -``.
 
-    The values are carried in ``stringData`` so kubectl base64-encodes them into
-    ``data`` exactly as ``--from-literal`` would, leaving the resulting Secret
-    identical. The point of the manifest is that it is fed to kubectl over stdin
-    instead of on the argv: a secret on the command line is world-readable via
-    ``/proc/<pid>/cmdline`` and lands in shell history, and stdin is neither.
+    ``stringData`` lets kubectl base64-encode the values as ``--from-literal``
+    would; feeding the manifest over stdin keeps the secret off the argv
+    (``/proc/<pid>/cmdline``, shell history).
     """
     document = {
         "apiVersion": "v1",
@@ -196,11 +195,9 @@ def discover_cluster(
     """The identity behind a cluster ARN.
 
     A HyperPod ARN, or an EKS ARN orchestrated by exactly one HyperPod cluster,
-    yields a ``hyperpod`` identity exactly as before. An EKS ARN that no
-    HyperPod cluster orchestrates is a plain EKS GPU cluster (``eks-managed``,
-    ``bootstrap_discovery.discover_eks_managed_cluster``); ``node_selector`` is
-    its GPU node selector and is ignored for HyperPod clusters, whose selector
-    is the HyperPod label.
+    is a ``hyperpod`` identity as before; an EKS ARN no HyperPod cluster
+    orchestrates is plain EKS (``eks-managed``, see ``bootstrap_discovery``).
+    ``node_selector`` is that cluster's GPU selector, ignored for HyperPod.
     """
 
     arn = Arn.parse(cluster_arn)
@@ -324,9 +321,8 @@ def _ensure_base_secrets(
     secure_dir: Path,
 ) -> Path:
     secret_name = "gpu-fault-control-plane-active"
-    # One read answers both "is it there?" and "what is the master?"; only a
-    # NotFound means absent -- an unreachable API server must not mint a second
-    # fleet master over the one the nodes already hold.
+    # One read answers presence and value; only NotFound means absent -- an
+    # unreachable API server must not mint a second fleet master.
     try:
         encoded = runner.run(
             [
@@ -1359,12 +1355,10 @@ def _ensure_aurora(
     site_id: str,
     capacity: AuroraCapacityConfig,
 ) -> dict[str, Any]:
-    """Create Aurora resources, gating replica creation on primary readiness.
+    """Create Aurora resources; the reader waits for the available writer.
 
-    The writer and cluster must be available before creating the reader.
-    Final reader readiness and credentials belong to ``_aurora_ready``.
-    Both tasks overlap independent foundation, monitoring and node-key work.
-    ``_aurora_ready`` is authoritative for the master Secret ARN.
+    Final reader readiness, credentials and the master Secret ARN belong to
+    ``_aurora_ready``; both overlap the other foundation tasks.
     """
 
     cluster_id = _safe_name(f"gpu-fault-{site_id}-aurora", maximum=63)
@@ -1543,10 +1537,8 @@ def _aurora_ready(
 ) -> dict[str, Any]:
     """Wait for final instance readiness, then hand the control plane its DSN.
 
-    Instance creation already enforced the available-primary/cluster barrier.
-    Independent monitoring and node-key tasks run alongside this wait.
-    ``probe_only`` is the read-only re-proof on a rerun -- both instances
-    available and the Secret present -- and costs two reads.
+    ``probe_only`` is the read-only re-proof on a rerun (both instances
+    available, Secret present); other tasks run alongside this wait.
     """
 
     cluster_id = str(aurora["cluster_id"])
@@ -1775,11 +1767,9 @@ def bootstrap_from_arns(
     remember_hyperpod_hints(state, cpu, gpu_clusters)
     # Legacy config migration must finish before either bind hashes desired.json.
     aurora_capacity = bootstrap_aurora_capacity(request.state_dir)
-    # Bound before the release build starts and before any graph reads
-    # ``completed_tasks``: a checkpoint whose inputs changed re-runs in this
-    # deploy rather than the next. The release-independent digests are final
-    # here; the candidate-dependent ones are provisional until the build
-    # rebinds with the signed release (``release_repositories``).
+    # Bound before the release build and before any graph reads
+    # ``completed_tasks``, so a checkpoint whose inputs changed re-runs now;
+    # candidate-dependent digests are rebound with the signed release.
     bind_bootstrap_inputs(
         state,
         request=request,
@@ -1861,9 +1851,8 @@ def _finish_bootstrap(
     fleet_master_file = access.fleet_master_file
 
     grafana = grafana_settings(request, existing_site=existing_site, state=state)
-    # Infrastructure and access tasks start as their dependencies finish.
-    # Versioned monitoring and refresher objects belong to the release that
-    # follows, after its snapshot and candidate gates.
+    # Infrastructure and access tasks start as their dependencies finish;
+    # versioned monitoring/refresher objects belong to the release that follows.
     results = run_bootstrap_tasks(
         state=state,
         access=access.graph,
@@ -1927,8 +1916,7 @@ def _finish_bootstrap(
         pki=cast(dict[str, Any], results["pki"]),
         aurora=aurora,
         monitoring=monitoring,
-        # ``executor_role:*`` and ``adot_writer_role:*`` name the per-cluster roles.
-        roles=results,
+        roles=results,  # ``executor_role:*`` / ``adot_writer_role:*`` per cluster
         token_files=token_files,
         fleet_master_file=fleet_master_file,
         adot_image=str(release["images"]["adot"]),
@@ -1936,6 +1924,18 @@ def _finish_bootstrap(
         routing=routing,
         grafana_health=grafana_site_health(state, grafana),
     )
+    profiles = partial(
+        reconcile_cluster_runtime_profiles,
+        active_runner,
+        repository_root=request.repository_root,
+        state_dir=request.state_dir,
+    )
     return finalize_bootstrap_site(
-        site_file, generated_site, existing_site, gpu_clusters, state, _write_yaml
+        site_file,
+        generated_site,
+        existing_site,
+        gpu_clusters,
+        state,
+        _write_yaml,
+        reconcile_profiles=profiles,
     )

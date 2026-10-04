@@ -992,6 +992,17 @@ Semantics and boundaries of `eks-managed`:
   `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
   (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
 
+  A later `deploy` over the whole site (CPU + every GPU ARN) keeps each managed cluster's join-time decisions:
+  `provider`, `nodeSelector` (the `--gpu-nodegroup` choice) and `runtimeProfile` are carried over and only the
+  override's `agentConfigDigest` is recomputed for this release; an entry that lost its override is restored from the
+  approved snapshot `profiles/<version>.yaml`, and without an approved snapshot the deploy refuses and points to
+  `join-cluster --approve-profile-plan`. The release-diff's `clusters` digests membership only (ids, names, ARNs,
+  namespaces, CIDRs, provider), not the profile pins -- pin changes ride the rollbackable `cluster_runtime_profiles`
+  (a state recorded with the earlier pin-folded digest still reads as the same membership). After a join,
+  `status --full` reporting `next deploy: CONTROL_PLANE_ONLY / observability_drift` means the control-plane ADOT/alert
+  objects differ from the render (`join-cluster` applies only the GPU cluster's observability objects); the next
+  deploy's control-plane release settles it.
+
   **Mixed-site join walkthrough** (an existing `hyperpod-v1` site joining the plain EKS cluster `gpu-eks-cluster`):
 
   ```bash

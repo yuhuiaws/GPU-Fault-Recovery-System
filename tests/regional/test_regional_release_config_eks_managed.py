@@ -319,3 +319,47 @@ def test_registration_pins_digest_only_when_set() -> None:
         RegionalClusterRegistration.model_validate(
             {**PRE_EXISTING_REGISTRATION, "agent_config_digest": "short"}
         )
+
+
+def test_membership_digest_ignores_the_profile_pins_but_legacy_still_matches(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-04: the recorded `cluster_registry_digest` folded the pins
+    in, so a plain EKS entry that lost (or refreshed) its pins read as a
+    `clusters` change -- non-transactional, deploy refused. Membership is
+    membership; the pins ride the rollbackable cluster_runtime_profiles."""
+
+    token = tmp_path / "token"
+    token.write_text("t" * 64, encoding="utf-8")
+    hyperpod = _hyperpod_target()
+    hyperpod["token_file"] = str(token)
+    override = _eks_target(
+        token_file=str(token),
+        runtime_profile={
+            "source": str(EKS_PROFILE),
+            "version": "eks-v1",
+            "agent_config_digest": "e" * 64,
+        },
+    )
+    with_pins = _load(tmp_path, [hyperpod, override]).clusters
+    bare_root = tmp_path / "bare"
+    bare_root.mkdir()
+    without_pins = _load(
+        bare_root, [hyperpod, _eks_target(token_file=str(token))]
+    ).clusters
+    assert REGISTRY.registry_config_digest(with_pins) == (
+        REGISTRY.registry_config_digest(without_pins)
+    ), "the same two clusters are the same membership, pins or not"
+    assert REGISTRY.legacy_registry_config_digest(with_pins) != (
+        REGISTRY.registry_config_digest(with_pins)
+    ), "the legacy digest is the pin-folded one"
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    narrowed = _eks_target(
+        token_file=str(token), allowed_namespaces=["gpu-fault-system"]
+    )
+    assert REGISTRY.registry_config_digest(
+        _load(other_root, [hyperpod, narrowed]).clusters
+    ) != REGISTRY.registry_config_digest(without_pins), (
+        "a real membership attribute change still changes the digest"
+    )

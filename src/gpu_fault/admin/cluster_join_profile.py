@@ -308,3 +308,72 @@ def cluster_profile_document(
         "version": override.version,
         "agentConfigDigest": digest,
     }
+
+
+def reconcile_cluster_runtime_profiles(
+    runner: CommandRunner,
+    document: dict[str, Any],
+    *,
+    repository_root: Path,
+    state_dir: Path,
+) -> None:
+    """Make a deploy's site document carry every per-cluster profile it needs.
+
+    For each GPU cluster whose provider the site profile cannot reboot: keep
+    the override the join recorded (its approved snapshot and version) and
+    recompute ``agentConfigDigest`` for this release's repository, as the site
+    level ``release.agentConfigDigest`` is on every deploy; restore an override
+    that went missing from its approved snapshot (live 2026-10-04: a deploy
+    regenerated the plain EKS entry without it); refuse when no approved
+    snapshot exists -- the review belongs to ``join-cluster``.
+    """
+
+    spec = document.get("spec") or {}
+    site_profile = (spec.get("runtimeProfile") or {}).get("source")
+    owner = profile_node_reboot_owner(Path(str(site_profile))) if site_profile else None
+    for entry in spec.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        provider = cluster_provider(entry.get("provider")).value
+        current = entry.get("runtimeProfile")
+        needs_override = (
+            owner is not None and owner != PROVIDER_NODE_REBOOT_OWNERS[provider]
+        )
+        if isinstance(current, dict) and current.get("version"):
+            version = str(current["version"])
+        elif needs_override:
+            version = PROVIDER_PROFILE_VERSIONS[provider]
+        else:
+            continue
+        reference = PROVIDER_PROFILE_SOURCES[provider]
+        template = repository_root / reference
+        snapshot = state_dir / PROFILES_DIR / f"{version}.yaml"
+        if not snapshot.is_file():
+            cluster_id = entry.get("clusterId")
+            raise BootstrapError(
+                f"{cluster_id} ({provider}) needs Runtime Profile {version}, which "
+                f"has no approved snapshot at {snapshot}; approve it with "
+                f"gpu-fault-admin join-cluster --state-dir {state_dir} "
+                f"--gpu-cluster-arn {entry.get('eksClusterArn')} "
+                "--approve-profile-plan <sha> --reference <CHG>"
+            )
+        if template.is_file() and runtime_profile_policy_sha256(
+            snapshot
+        ) != runtime_profile_policy_sha256(template):
+            raise BootstrapError(
+                f"approved Runtime Profile snapshot {snapshot} has a different policy "
+                f"than {reference}; choose a new version or remove the stale snapshot "
+                "after review"
+            )
+        entry["runtimeProfile"] = {
+            "source": str(snapshot),
+            "templateSource": (
+                str(current.get("templateSource"))
+                if isinstance(current, dict) and current.get("templateSource")
+                else reference
+            ),
+            "version": version,
+            "agentConfigDigest": compute_agent_config_digest(
+                runner, repository_root=repository_root, runtime_profile_version=version
+            ),
+        }

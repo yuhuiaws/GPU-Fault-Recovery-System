@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Iterable
 
 from gpu_fault_release.regional_release_profile_model import cluster_profiles_digest
+from gpu_fault_release.regional_release_registry import legacy_registry_config_digest
 
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
@@ -289,6 +290,20 @@ def _legacy_value(state: dict[str, Any], name: str) -> Any:
     return state.get(name)
 
 
+def _current_registry_digest(release: RegionalRelease, state: dict[str, Any]) -> Any:
+    """A state recorded with the pin-folded membership digest for the same
+    clusters reads as the current membership digest; anything else as itself."""
+
+    current = state.get("cluster_registry_digest")
+    if (
+        current
+        and current != release.cluster_registry_digest
+        and current == legacy_registry_config_digest(release.config.clusters)
+    ):
+        return release.cluster_registry_digest
+    return current
+
+
 def _current_profile_digest(release: RegionalRelease, state: dict[str, Any]) -> Any:
     current = state.get("runtime_profile_policy_sha256")
     if current:
@@ -448,7 +463,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         "endpoint": state.get("endpoint_digest"),
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),
-        "clusters": state.get("cluster_registry_digest"),
+        "clusters": _current_registry_digest(release, state),
         "admin_config_ingress": (
             (state.get("admin_config_role_sha256") or {}).get("ingress")
         ),

@@ -558,3 +558,25 @@ def test_an_agreeing_or_unknown_replica_profile_is_not_a_change(pod_profile) -> 
     assert diff.kind is DIFF.ReleaseChangeKind.NOOP, (
         "matching, unknown (no Running replica) or unprobed never invents a roll"
     )
+
+
+def test_a_state_recorded_with_the_pin_folded_membership_digest_is_unchanged(
+    monkeypatch,
+) -> None:
+    """The join's sync-state recorded `cluster_registry_digest` with the profile
+    pins folded in; the next deploy's membership digest no longer folds them.
+    Same clusters: no `clusters` change. Different clusters: still flagged."""
+
+    release = _release()
+    state = _state()
+    state["cluster_registry_digest"] = "legacy-" + "6" * 57
+    monkeypatch.setattr(
+        DIFF, "legacy_registry_config_digest", lambda _clusters: "legacy-" + "6" * 57
+    )
+    assert "clusters" not in DIFF.classify_release(release, state).changed, (
+        "a legacy digest for the same membership reads as unchanged"
+    )
+    state["cluster_registry_digest"] = "other-" + "6" * 58
+    assert "clusters" in DIFF.classify_release(release, state).changed, (
+        "a genuinely different membership stays a clusters change"
+    )

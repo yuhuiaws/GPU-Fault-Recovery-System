@@ -34,11 +34,15 @@ def finalize_bootstrap_site(
     gpu_clusters: Sequence[ClusterIdentity],
     state: Any,
     write_yaml: Callable[[Path, dict[str, Any]], None],
+    reconcile_profiles: Callable[[dict[str, Any]], None] | None = None,
 ) -> BootstrapResult:
-    write_yaml(
-        site_file,
-        preserve_existing_site_contract(generated_site, existing_site),
-    )
+    document = preserve_existing_site_contract(generated_site, existing_site)
+    if reconcile_profiles is not None:
+        # Per-cluster Runtime Profiles: keep what the join approved, refresh
+        # the Agent config digest for this release, restore a lost override
+        # from its approved snapshot, fail closed when none is approved.
+        reconcile_profiles(document)
+    write_yaml(site_file, document)
     state.record("site_file", str(site_file))
     state.phase("site-ready")
     managed_keys = set(_site_gpu_keys(generated_site))
@@ -582,8 +586,21 @@ def preserve_existing_site_contract(
         # ``adotIrsaRoleArn``: a role the operator declared (hand-made before
         # bootstrap created one) wins over the created role; a cluster that
         # never declared one takes the generated value.
+        # ``provider``/``nodeSelector`` (the join's --gpu-nodegroup choice) and
+        # ``runtimeProfile`` (the reviewed per-cluster profile) are join-time
+        # decisions too: live 2026-10-04 a `deploy` over the mixed site
+        # regenerated the plain EKS entry from discovery, dropped both, and
+        # the release-diff refused on a `clusters` change.
+        if previous.get("provider", "hyperpod") != item.get("provider", "hyperpod"):
+            raise BootstrapError(
+                f"{item.get('clusterId')}: provider changed from "
+                f"{previous.get('provider', 'hyperpod')} to "
+                f"{item.get('provider', 'hyperpod')}; remove and re-join the cluster"
+            )
         for key in (
             "context",
+            "nodeSelector",
+            "runtimeProfile",
             "allowedNamespaces",
             "agentEndpointAllowedCidrs",
             "tokenFile",

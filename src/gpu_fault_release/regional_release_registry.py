@@ -28,7 +28,7 @@ def _cluster_profile_pins(target: ClusterTarget) -> dict[str, str]:
     control plane falls back to its site-wide required pins.
     """
 
-    if not target.overrides_runtime_profile:
+    if not getattr(target, "overrides_runtime_profile", False):
         return {}
     return {
         "runtime_profile_version": target.runtime_profile_version,
@@ -36,28 +36,52 @@ def _cluster_profile_pins(target: ClusterTarget) -> dict[str, str]:
     }
 
 
-def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
+def _membership_rows(
+    clusters: tuple[ClusterTarget, ...], *, with_pins: bool
+) -> list[dict[str, Any]]:
+    # Attribute reads tolerate the partial release doubles the diff tests use;
+    # a real ClusterTarget always carries every field.
+    return [
+        {
+            "cluster_id": item.cluster_id,
+            "region": getattr(item, "region", ""),
+            "hyperpod_cluster_name": getattr(item, "hyperpod_cluster_name", ""),
+            "eks_cluster_arn": getattr(item, "eks_cluster_arn", ""),
+            "allowed_namespaces": sorted(getattr(item, "allowed_namespaces", ())),
+            "agent_endpoint_allowed_cidrs": sorted(
+                getattr(item, "agent_endpoint_allowed_cidrs", ())
+            ),
+            **({"provider": "eks-managed"} if is_eks_managed(item) else {}),
+            **(_cluster_profile_pins(item) if with_pins else {}),
+        }
+        for item in sorted(clusters, key=lambda target: target.cluster_id)
+    ]
+
+
+def _rows_digest(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(
-        json.dumps(
-            [
-                {
-                    "cluster_id": item.cluster_id,
-                    "region": item.region,
-                    "hyperpod_cluster_name": item.hyperpod_cluster_name,
-                    "eks_cluster_arn": item.eks_cluster_arn,
-                    "allowed_namespaces": sorted(item.allowed_namespaces),
-                    "agent_endpoint_allowed_cidrs": sorted(
-                        item.agent_endpoint_allowed_cidrs
-                    ),
-                    **({"provider": "eks-managed"} if is_eks_managed(item) else {}),
-                    **_cluster_profile_pins(item),
-                }
-                for item in sorted(clusters, key=lambda target: target.cluster_id)
-            ],
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
+    """The cluster *membership* digest the release diff calls ``clusters``.
+
+    Membership and identity only -- ids, names, ARNs, namespaces, CIDRs and the
+    provider. A cluster's Runtime Profile pins are release attributes tracked by
+    the rollbackable ``cluster_runtime_profiles`` component; digesting them here
+    (as the first per-cluster-profile release did) turned every Agent config
+    change on a mixed site into a non-transactional ``clusters`` change.
+    """
+
+    return _rows_digest(_membership_rows(clusters, with_pins=False))
+
+
+def legacy_registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
+    """The digest recorded by releases that still folded the profile pins in;
+    a recorded state carrying it describes the same membership."""
+
+    return _rows_digest(_membership_rows(clusters, with_pins=True))
 
 
 def registry_payloads(
