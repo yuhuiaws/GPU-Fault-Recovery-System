@@ -34,6 +34,8 @@ def test_identity_accepts_the_actual_control_plane_wheel_and_its_shared_admin_cl
         "gpu_fault.admin.operation_lock",
         "gpu_fault.admin.python_environment",
         "gpu_fault.admin.site",
+        "gpu_fault.admin.site_cluster_profile",
+        "gpu_fault.admin.site_fields",
     }, (
         "the guard must use the actual reviewed component closure, not an empty admin package"
     )

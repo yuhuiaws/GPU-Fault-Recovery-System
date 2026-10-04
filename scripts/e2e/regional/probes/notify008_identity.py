@@ -23,6 +23,8 @@ SHARED_ADMIN_FILES = frozenset(
         "operation_lock.py",
         "python_environment.py",
         "site.py",
+        "site_cluster_profile.py",
+        "site_fields.py",
     }
 )
 
