@@ -436,7 +436,7 @@ class FleetRegistry:
         self.policy = policy or FleetCompatibilityPolicy()
         # Per-cluster pins resolved from the regional registry, cached briefly:
         # readiness evaluates every heartbeat and the registry rarely changes.
-        self._cluster_policies: dict[str, tuple[float, FleetCompatibilityPolicy]] = {}
+        self._cluster_pins: dict[str, tuple[float, dict[str, str]]] = {}
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._node_locks = tuple(RLock() for _ in range(64))
@@ -708,9 +708,17 @@ class FleetRegistry:
         """
 
         now = time.monotonic()
-        cached = self._cluster_policies.get(cluster_id)
+        cached = self._cluster_pins.get(cluster_id)
         if cached is not None and cached[0] > now:
-            return cached[1]
+            pins = cached[1]
+        else:
+            pins = self._registration_pins(cluster_id)
+            self._cluster_pins[cluster_id] = (now + CLUSTER_POLICY_CACHE_SECONDS, pins)
+        # Composed on every call: the site policy itself follows the applied
+        # pin window, only the registration lookup is cached.
+        return self.policy.model_copy(update=pins) if pins else self.policy
+
+    def _registration_pins(self, cluster_id: str) -> dict[str, str]:
         pins: dict[str, str] = {}
         # A store without a regional registry (single-cluster mode, partial
         # test doubles) has no per-cluster pins; so does an unknown cluster.
@@ -726,12 +734,7 @@ class FleetRegistry:
                 pins["required_runtime_profile_version"] = version
             if digest:
                 pins["required_config_digest"] = digest
-        policy = self.policy.model_copy(update=pins) if pins else self.policy
-        self._cluster_policies[cluster_id] = (
-            now + CLUSTER_POLICY_CACHE_SECONDS,
-            policy,
-        )
-        return policy
+        return pins
 
     def _pinned_fields(
         self,

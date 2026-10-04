@@ -30,9 +30,7 @@ from gpu_fault_release.regional_aurora_credentials import (
     refresh_status_supersedes_failure,
 )
 from gpu_fault_release.regional_notifications import check_notification_channel
-from gpu_fault_release.regional_release_aurora_refresh import (
-    aurora_refresh_preflight,
-)
+from gpu_fault_release.regional_release_aurora_refresh import aurora_refresh_preflight
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
@@ -1637,7 +1635,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             lambda: check_aurora_refresh(release, require_success=True),
         ),
         ("adot_self_metrics", lambda: check_adot_self_metrics(release)),
-        ("runtime_profile", lambda: CheckValue(*verify_runtime_profile_check(release))),
+        ("runtime_profile", lambda: _verify_profile(release)),
         (
             "read_only_verifiers",
             lambda: run_read_only_verifiers(
@@ -1678,3 +1676,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
     if evidence_fallback is not None:
         report["validation_evidence_fallback"] = evidence_fallback
     return report
+
+
+def _verify_profile(release: Any) -> CheckValue:
+    return CheckValue(*verify_runtime_profile_check(release))

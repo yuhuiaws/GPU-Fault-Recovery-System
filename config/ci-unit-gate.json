@@ -33,6 +33,8 @@
       "src/gpu_fault/admin/python_environment.py",
       "src/gpu_fault/admin/operation_lock.py",
       "src/gpu_fault/admin/site.py",
+      "src/gpu_fault/admin/site_cluster_profile.py",
+      "src/gpu_fault/admin/site_fields.py",
       "src/gpu_fault/failure_domains.py"
     ],
     "module_floors": [
