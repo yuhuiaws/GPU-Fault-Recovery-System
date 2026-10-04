@@ -100,7 +100,7 @@ if (( ${#missing_prerequisites[@]} > 0 )); then
     missing_list="${missing_list//,/, }"
     remedy="install them on the node image before joining"
     if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
-        remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them on the node image or in the managed node group launch template user data (dnf install -y python3.12 strace), then rerun the join"
+        remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them in the managed node group launch template user data (dnf install -y python3.12 strace; see 管理员日常运维 / administrator-operations §5.0.1) and roll the node group, then rerun the join"
     fi
     printf '{"node_id":"%s","node_uid":"%s","status":"FAILED","reasons":["host prerequisites unavailable: %s"]}\n' \
         "${TARGET_NODE_NAME}" "${TARGET_NODE_UID}" "${missing_list}"

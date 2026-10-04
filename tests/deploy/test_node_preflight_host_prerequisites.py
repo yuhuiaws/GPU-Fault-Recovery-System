@@ -130,9 +130,10 @@ def test_al2023_node_without_python312_and_strace_fails_with_one_full_verdict(
     assert result.returncode == 1, result.stdout + result.stderr
     assert (
         "ERROR: host prerequisites unavailable: /usr/bin/python3.12, strace; the EKS "
-        "AL2023 NVIDIA AMI does not ship them; install them on the node image or in "
-        "the managed node group launch template user data "
-        "(dnf install -y python3.12 strace), then rerun the join"
+        "AL2023 NVIDIA AMI does not ship them; install them in the managed node group "
+        "launch template user data (dnf install -y python3.12 strace; see "
+        "管理员日常运维 / administrator-operations §5.0.1) and roll the node group, "
+        "then rerun the join"
     ) in result.stderr, result.stderr
     verdict = json.loads(result.stdout.strip().splitlines()[-1])
     assert verdict == {

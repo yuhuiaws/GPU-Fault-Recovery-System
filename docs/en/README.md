@@ -43,6 +43,7 @@ headings are the alert names.
 | [EC2 Source Staging Reproduction](ec2-source-staging-reproduction.md) | [EC2源码Staging复现流程](../EC2源码Staging复现流程.md) | First, dirty-iteration and subsequent staging deployments from source on one EC2 host |
 | [Workflow and Remote Command State Tables](components/postgres-state-tables.md) | [components/postgres-state-tables.md](../components/postgres-state-tables.md) | Two-phase DDL, migration CLI, validation boundary and the preserved original F2 design |
 | [NVIDIA Official Policy Implementation Audit](components/nvidia-policy.md) | [components/nvidia-policy.md](../components/nvidia-policy.md) | Pinned upstream sources, decision semantics, implemented official workflows and SXID handling |
+| [Plain EKS GPU Clusters and Mixed-Provider Sites](components/plain-eks-gpu-cluster.md) | [components/plain-eks-gpu-cluster.md](../components/plain-eks-gpu-cluster.md) | Design, operator prerequisites, limitations and validation status of `eks-managed` |
 
 ## Administrator Entry Points
 

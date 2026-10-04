@@ -1026,8 +1026,8 @@ Semantics and boundaries of `eks-managed`:
   share (`gpu-fault-system, training` on a fresh site); the historical default `training` is no longer forced onto a
   cluster without it, and the control-plane namespace is always included and created by the join itself.
 - Node prerequisites: the node runtime needs `/usr/bin/python3.12`, `strace`, `curl`, `ps`, `ss`, `timeout`, `systemctl`
-  and `nvidia-smi` on the host (manual §3.1). The AL2023 NVIDIA AMI lacks `python3.12` and `strace`; install them on the
-  node image or in the launch template user data. The node preflight Job lists every missing item at once
+  and `nvidia-smi` on the host (manual §3.1). The AL2023 NVIDIA AMI lacks `python3.12` and `strace`; install them through the
+  launch template user data of §5.0.1. The node preflight Job lists every missing item at once
   (`ERROR: host prerequisites unavailable: ...` plus a JSON verdict), and a failed sensitive command in the release log
   keeps those `ERROR:` lines.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
@@ -1209,6 +1209,57 @@ State and evidence live in
 using a separate evidence directory. After a partial site commit, still rerun with the original full ARN and confirmation parameter; an old v1 journal lacking
 the bindings currently required by v2 needs explicit reconciliation, without deleting the directory. When a removed cluster is later re-joined, a new attempt must be created;
 the old `COMPLETED` cannot be reused to skip cleanup; merely rerunning an old completed record also refuses a new namespace or node identity drift.
+
+#### 5.0.1 Plain EKS node prerequisites: AL2023 launch template user data
+
+The node runtime runs on the host (systemd units, a venv built from `/usr/bin/python3.12`, `strace` for hung-process
+diagnostics), and the node preflight Job checks these prerequisites inside `chroot /host`: `/usr/bin/python3.12`,
+`curl`, `nvidia-smi`, `ps`, `ss`, `strace`, `systemctl`, `timeout`, plus `/dev/kmsg` and Python 3.12 venv support. The
+EKS `AL2023_x86_64_NVIDIA` AMI ships the NVIDIA driver, `nvidia-smi`, containerd (NVIDIA CDI) and the EFA tools but
+**not `python3.12` or `strace`** (measured on gpu-eks-cluster, 2026-10-04). Install them in the managed node group's
+launch template and roll the node group; do not `dnf install` by hand on a node -- the next replacement loses it.
+
+AL2023 user data is MIME multipart: keep the `nodeadm` `NodeConfig` part as the EKS documentation describes (a managed
+node group merges its own part automatically, so a custom launch template only needs to append the shell part), and add
+one shell part:
+
+```text
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="==GPU-FAULT=="
+
+--==GPU-FAULT==
+Content-Type: application/node.eks.aws
+
+---
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  cluster:
+    name: gpu-eks-cluster
+    apiServerEndpoint: https://REPLACE_WITH_API_SERVER_ENDPOINT
+    certificateAuthority: REPLACE_WITH_BASE64_CA
+    cidr: 10.100.0.0/16
+
+--==GPU-FAULT==
+Content-Type: text/x-shellscript; charset="us-ascii"
+
+#!/bin/bash
+# gpu-fault node runtime prerequisites (AL2023 NVIDIA AMI ships neither).
+set -euo pipefail
+dnf install -y python3.12 strace
+/usr/bin/python3.12 -c 'import venv'
+command -v strace
+--==GPU-FAULT==--
+```
+
+With a managed node group on the EKS-optimised AMI, EKS injects the `NodeConfig` part, so the launch template's user
+data carries only the MIME envelope and the shell part above; a custom AMI needs both parts. After the nodes have
+joined, confirm on any GPU node: `/usr/bin/python3.12 -c 'import venv' && command -v strace`. When the preflight fails,
+the join's error ends with `ERROR: host prerequisites unavailable: /usr/bin/python3.12, strace; ...` and points back here;
+rerun `join-cluster` with the same arguments once fixed. The other prerequisites (the allowed workload namespaces such as
+`training` must exist; the NVIDIA and EFA device plugins run; a `nvidia.com/gpu=present:NoSchedule` taint on the GPU
+nodes is fine -- the data-plane Deployments never land there and the exporter/installer Jobs tolerate it) are in the list
+above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
