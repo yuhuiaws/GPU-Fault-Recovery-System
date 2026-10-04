@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import hmac
 import ipaddress
+import time
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -391,6 +392,8 @@ class MultiNodeBarrier(StrictModel):
 # The two verdicts ``FleetRegistry._annotate_pin_drift`` can reach for a
 # mismatched pin: the node is behind the fleet, or the pin is ahead of it.
 PIN_DRIFT_KINDS = ("NODE_STALE", "PIN_AHEAD_OF_FLEET")
+#: How long a cluster's resolved pins are reused before the registry is re-read.
+CLUSTER_POLICY_CACHE_SECONDS = 5.0
 
 
 class FleetRegistry:
@@ -431,6 +434,9 @@ class FleetRegistry:
             endpoint_allowed_networks_by_cluster or {}
         )
         self.policy = policy or FleetCompatibilityPolicy()
+        # Per-cluster pins resolved from the regional registry, cached briefly:
+        # readiness evaluates every heartbeat and the registry rarely changes.
+        self._cluster_policies: dict[str, tuple[float, FleetCompatibilityPolicy]] = {}
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._node_locks = tuple(RLock() for _ in range(64))
@@ -690,35 +696,74 @@ class FleetRegistry:
             nodes=nodes,
         )
 
+    def cluster_policy(self, cluster_id: str) -> FleetCompatibilityPolicy:
+        """The pins one cluster's Agents are held to.
+
+        The site policy (``GPU_FAULT_REQUIRED_*``) unless the cluster's regional
+        registration carries its own ``runtime_profile_version`` and
+        ``agent_config_digest`` -- a cluster running its own Runtime Profile --
+        in which case those two pins replace the site's for that cluster only.
+        An Agent whose values match another cluster's registration is still
+        refused: the lookup is by the Agent's own ``cluster_id``.
+        """
+
+        now = time.monotonic()
+        cached = self._cluster_policies.get(cluster_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        pins: dict[str, str] = {}
+        # A store without a regional registry (single-cluster mode, partial
+        # test doubles) has no per-cluster pins; so does an unknown cluster.
+        lookup = getattr(self.store, "get_regional_cluster", None)
+        try:
+            registration = lookup(cluster_id) if callable(lookup) else None
+        except (NotFoundError, NotImplementedError):
+            registration = None
+        if registration is not None:
+            version = str(getattr(registration, "runtime_profile_version", "") or "")
+            digest = str(getattr(registration, "agent_config_digest", "") or "")
+            if version:
+                pins["required_runtime_profile_version"] = version
+            if digest:
+                pins["required_config_digest"] = digest
+        policy = self.policy.model_copy(update=pins) if pins else self.policy
+        self._cluster_policies[cluster_id] = (
+            now + CLUSTER_POLICY_CACHE_SECONDS,
+            policy,
+        )
+        return policy
+
     def _pinned_fields(
         self,
+        cluster_id: str,
     ) -> tuple[tuple[str, str, str], ...]:
         """Pins whose mismatch can be blamed on one side or the other."""
+        policy = self.cluster_policy(cluster_id)
         candidates = (
             (
                 "agent version",
                 "agent_version",
-                self.policy.required_agent_version,
+                policy.required_agent_version,
             ),
             (
                 "artifact SHA-256",
                 "artifact_sha256",
-                self.policy.required_artifact_sha256,
+                policy.required_artifact_sha256,
             ),
             (
                 "policy version",
                 "policy_version",
-                self.policy.required_policy_version,
+                policy.required_policy_version,
             ),
             (
                 "runtime profile",
                 "runtime_profile_version",
-                self.policy.required_runtime_profile_version,
+                policy.required_runtime_profile_version,
             ),
             (
                 "config digest",
                 "config_digest",
-                self.policy.required_config_digest,
+                policy.required_config_digest,
             ),
         )
         return tuple(
@@ -747,7 +792,8 @@ class FleetRegistry:
         running agent has ever served NODE_STALE and send the operator
         off to "restart the agent" on a node that is already current.
         """
-        pins = self._pinned_fields()
+        pins = self._pinned_fields(cluster_id)
+        policy = self.cluster_policy(cluster_id)
         drift_counts = {kind: 0 for kind in PIN_DRIFT_KINDS}
         self.pin_drift_nodes[cluster_id] = drift_counts
         if not pins or not records:
@@ -757,7 +803,7 @@ class FleetRegistry:
                 (label, attribute, required)
                 for label, attribute, required in pins
                 if not pin_value_is_accepted(
-                    self.policy,
+                    policy,
                     attribute,
                     getattr(record, attribute),
                     required,
@@ -997,32 +1043,33 @@ class FleetRegistry:
             age = (now - record.last_seen_at).total_seconds()
             if age > self.policy.max_heartbeat_age_seconds:
                 reasons.append(f"heartbeat is stale ({int(age)} seconds old)")
-        reasons.extend(rollout_compatibility_reasons(self.policy, record))
+        policy = self.cluster_policy(record.cluster_id)
+        reasons.extend(rollout_compatibility_reasons(policy, record))
         for actual, required, label in (
             (
                 record.node_action_key_version,
-                self.policy.required_node_action_key_version,
+                policy.required_node_action_key_version,
                 "node action key version",
             ),
             (
                 record.agent_version,
-                self.policy.required_agent_version,
+                policy.required_agent_version,
                 "agent version",
             ),
             (
                 record.policy_version,
-                self.policy.required_policy_version,
+                policy.required_policy_version,
                 "policy version",
             ),
             (
                 record.runtime_profile_version,
-                self.policy.required_runtime_profile_version,
+                policy.required_runtime_profile_version,
                 "runtime profile",
             ),
         ):
             if required is not None and actual != required:
                 reasons.append(f"{label} mismatch: expected {required}, got {actual}")
-        missing = set(self.policy.required_operations) - set(record.allowed_operations)
+        missing = set(policy.required_operations) - set(record.allowed_operations)
         if missing:
             reasons.append(
                 "missing operations: "
