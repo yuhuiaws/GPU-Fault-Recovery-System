@@ -617,3 +617,176 @@ def test_runtime_identity_reads_the_checks_status_full_nests_under_health() -> N
     )
 
     assert result["passed"] is True, result["reasons"]
+
+
+# -- mixed-provider site: an Agent is measured against its cluster's own pin -------
+
+EKS_DIGEST = "5" * 64
+EKS_AGENT = {
+    "cluster_id": "gpu-eks-cluster",
+    "node_id": "ip-10-0-33-205",
+    "artifact_sha256": NODE_WHEEL,
+    "compatibility_digest": NODE_DIGEST,
+    "config_digest": EKS_DIGEST,
+    "runtime_profile_version": "eks-v1",
+    "node_action_key_version": 2,
+    "cluster_runtime_profile_version": "eks-v1",
+    "cluster_agent_config_digest": EKS_DIGEST,
+}
+HP_AGENT = {
+    **AGENTS[0],
+    "runtime_profile_version": "hyperpod-v1",
+    "cluster_runtime_profile_version": "",
+    "cluster_agent_config_digest": "",
+}
+
+
+def _mixed_report(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    report = {"live_release": {"release_id": "x"}, "health": _report(CPU, EXEC)}
+    if overrides is not None:
+        report["configured_runtime_profile"] = {
+            "version": "hyperpod-v1",
+            "cluster_overrides": overrides,
+        }
+    return report
+
+
+def _eks_override(digest: str = EKS_DIGEST) -> dict[str, Any]:
+    return {"gpu-eks-cluster": {"version": "eks-v1", "agent_config_digest": digest}}
+
+
+def test_runtime_identity_measures_an_agent_against_its_clusters_registered_pin() -> (
+    None
+):
+    """Live 2026-10-04: both eks-v1 Agents of the mixed site were reported as
+    "config digest differs" against the site's hyperpod-v1 digest, the pin the
+    control plane does not hold them to."""
+
+    result = lifecycle.runtime_identity_matches_release(
+        _mixed_report(_eks_override()),
+        manifest=MANIFEST,
+        metadata=METADATA,
+        agents=[HP_AGENT, EKS_AGENT],
+    )
+    assert result["passed"] is True, result["reasons"]
+    assert result["expected"]["cluster_agent_config_digests"] == {
+        "gpu-eks-cluster": EKS_DIGEST
+    }
+    assert result["expected"]["site_agent_config_digest"] == "4" * 64
+    assert result["agent_reasons"] == [] and result["artifact_reasons"] == []
+
+    drifted = {**EKS_AGENT, "config_digest": "4" * 64}  # the site digest, not eks-v1
+    result = lifecycle.runtime_identity_matches_release(
+        _mixed_report(_eks_override()),
+        manifest=MANIFEST,
+        metadata=METADATA,
+        agents=[HP_AGENT, drifted],
+    )
+    assert result["passed"] is False
+    assert result["agent_reasons"] == [
+        "agent gpu-eks-cluster/ip-10-0-33-205 config digest differs from its "
+        "cluster's Runtime Profile pin"
+    ], "a cluster pin is a stricter yardstick, never a bypass"
+    assert result["artifact_reasons"] == [], "Agent drift is not an artifact mismatch"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "agent", "reason"),
+    [
+        (None, EKS_AGENT, "carries no configured Runtime Profile"),
+        ({}, EKS_AGENT, "differs from the configured Runtime Profile override"),
+        (_eks_override("6" * 64), EKS_AGENT, "differs from the configured"),
+        (
+            _eks_override(),
+            {**EKS_AGENT, "cluster_agent_config_digest": ""},
+            "is not registered in the control plane",
+        ),
+        (
+            _eks_override(),
+            {**EKS_AGENT, "cluster_agent_config_digest": "short"},
+            "pins an invalid digest",
+        ),
+    ],
+)
+def test_runtime_identity_requires_the_registered_and_configured_pins_to_agree(
+    overrides: dict[str, Any] | None, agent: dict[str, Any], reason: str
+) -> None:
+    result = lifecycle.runtime_identity_matches_release(
+        _mixed_report(overrides),
+        manifest=MANIFEST,
+        metadata=METADATA,
+        agents=[HP_AGENT, agent],
+    )
+    assert result["passed"] is False
+    assert any(reason in item for item in result["agent_reasons"]), result["reasons"]
+
+
+def test_runtime_identity_without_cluster_pins_keeps_the_site_yardstick() -> None:
+    """Agents whose probe output predates the cluster pins, and Agents on the
+    site profile, are compared with the site digest exactly as before."""
+
+    result = lifecycle.runtime_identity_matches_release(
+        _mixed_report(_eks_override()),
+        manifest=MANIFEST,
+        metadata=METADATA,
+        agents=[AGENTS[0], HP_AGENT],
+    )
+    assert result["passed"] is True, result["reasons"]
+    stale = [{**AGENTS[0], "config_digest": "f" * 64}]
+    result = lifecycle.runtime_identity_matches_release(
+        _report(CPU, EXEC), manifest=MANIFEST, metadata=METADATA, agents=stale
+    )
+    assert result["agent_reasons"] == [
+        "agent cluster-a/node-1 config digest differs from the site pin"
+    ]
+
+
+def test_boot018_reports_artifact_and_agent_checks_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-04: one boolean fed both checks, so an Agent-pin defect read
+    as "rebuilt artifacts differ from the live release" although every rebuilt
+    hash equalled the live record."""
+
+    manifest = {
+        "release_id": "04d4ffeb4e93",
+        "bundle_sha256": "b" * 64,
+        "components": MANIFEST["components"],
+    }
+
+    def build(mask: str, *, base: Path, case_dir: Path) -> dict[str, Any]:
+        checkout = base / f"repo-{mask}"
+        target = checkout / "src/gpu_fault/app/builtin_metric_contributors.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("value = 1\n", encoding="utf-8")
+        return {"checkout": checkout, "manifest": manifest}
+
+    monkeypatch.setattr(lifecycle, "build_release_under_umask", build)
+    monkeypatch.setattr(lifecycle, "run", lambda *_a, **_k: _completed(1))
+    monkeypatch.setattr(
+        lifecycle,
+        "admin_command",
+        lambda *_a, **_k: _completed(0, json.dumps(_mixed_report({}))),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_live_release_identity",
+        lambda _state: {
+            "metadata": METADATA,
+            "agents": [HP_AGENT, EKS_AGENT],  # eks-v1 pin the site file does not name
+            "identity": {"release_id": "5a2603b39e41", "cluster_id": None},
+        },
+    )
+
+    result = lifecycle.boot018_body(tmp_path / "state", tmp_path / "case")
+
+    assert result["verdict"] == "FAIL"
+    assert result["checks"]["rebuilt_artifacts_match_live_release"] is True, (
+        "the rebuilt wheels, bundle and module digests equal the live release"
+    )
+    assert result["checks"]["live_runtime_identity_matches_release"] is False
+    assert result["release_id"] == "5a2603b39e41", "the evidence binds to the live id"
+    assert result["rebuilt_release_id"] == "04d4ffeb4e93"
+    assert any("differ by design" in item for item in result["limitations"]), (
+        "the evidence explains why the rebuilt id differs from the live id"
+    )

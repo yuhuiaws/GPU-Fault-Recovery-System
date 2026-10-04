@@ -3149,6 +3149,14 @@ uninstall target be guessed. Save the original bootstrap task terminal states an
   - the component venvs in the separate CPU and Executor OCI images each match their corresponding descriptor/Manifest
     component item by item; a single shared image field can no longer stand in for both identities;
   - the artifact/config/key-version of live ACTIVE Agents are completely identical to the release pins;
+    the config digest is judged against the Agent's own cluster pin: a cluster running its own Runtime Profile (a plain
+    EKS cluster on `eks-v1`) against the agent config digest its registry registration carries, which must equal the
+    configured value in `status --full`'s `configured_runtime_profile.cluster_overrides`; a cluster without an override
+    against the site pin;
+  - `rebuilt_artifacts_match_live_release` measures only the rebuilt wheel/bundle/module digests against the live
+    replicas and release metadata; the Agent pins are the separate `live_runtime_identity_matches_release`. The rebuilt
+    release id (`rebuilt_release_id`) is not bound to a runtime image, so it differs from the live release id by design;
+    equivalence is proven by the digests;
   - any mismatch fails before rollout; version strings or line counts are not accepted as substitutes.
 
 ### GF-REGIONAL-BOOT-019

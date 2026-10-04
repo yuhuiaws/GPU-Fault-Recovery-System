@@ -329,3 +329,56 @@ def test_cpu_probe_needs_only_shipped_models_and_embedded_stdlib_transport(live)
     proof = run_proof(live)
     assert proof["verdict"] == "PASS"
     assert len(live.api_requests) == 6
+
+
+def _pin_cluster_to_its_own_profile(live, digest: str = "9" * 64) -> None:
+    live.raw["registration"]["agent_config_digest"] = digest
+    live.raw["registration"]["runtime_profile_version"] = "eks-v1"
+    live.raw["release_state"]["cluster_runtime_profiles"] = {
+        "cluster-a": {"version": "eks-v1", "agent_config_digest": digest}
+    }
+    for node in ("node-a", "node-b"):
+        agent = live.raw["agent_snapshot"]["agents"][node]
+        agent["config_digest"] = digest
+        agent["runtime_profile_version"] = "eks-v1"
+
+
+def test_agents_on_a_cluster_with_its_own_profile_bind_to_that_clusters_pins(live):
+    """Live 2026-10-04 (mixed site): a plain-EKS cluster's Agents report the
+    eks-v1 digest and version their registration pins them to, not the site's."""
+
+    _pin_cluster_to_its_own_profile(live)
+    proof = run_proof(live)
+    assert proof["verdict"] == "PASS"
+    assert proof["identity"]["cluster_profile_pins"] == {
+        "config_digest": "9" * 64,
+        "runtime_profile_version": "eks-v1",
+    }
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "agent-on-site-pin",
+        "registration-unrecorded",
+        "recorded-but-unregistered",
+        "registration-invalid-digest",
+        "registration-without-version",
+    ],
+)
+def test_cluster_profile_pins_must_agree_three_ways(live, defect):
+    _pin_cluster_to_its_own_profile(live)
+    if defect == "agent-on-site-pin":
+        live.raw["agent_snapshot"]["agents"]["node-b"]["config_digest"] = "e" * 64
+    elif defect == "registration-unrecorded":
+        del live.raw["release_state"]["cluster_runtime_profiles"]
+    elif defect == "recorded-but-unregistered":
+        live.raw["registration"]["agent_config_digest"] = ""
+        live.raw["registration"]["runtime_profile_version"] = ""
+    elif defect == "registration-invalid-digest":
+        live.raw["registration"]["agent_config_digest"] = "bad"
+    else:
+        live.raw["registration"]["runtime_profile_version"] = ""
+    with pytest.raises(Auth015ProofError):
+        run_proof(live)
+    assert live.pair.requests == [], "unproven pins forbid probing a node"

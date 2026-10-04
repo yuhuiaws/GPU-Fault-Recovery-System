@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import nullcontext
+from collections.abc import Mapping
 from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any, Literal
@@ -393,6 +394,7 @@ def site_custody_context(
     gpu_kubeconfig: Path | None = None,
 ) -> AdminNodeKeyContext:
     config = site.release_config
+    version, digest = cluster_profile_pins(config, cluster_id)
     return AdminNodeKeyContext(
         state_dir=site.source.parent,
         repository_root=site.repository_root,
@@ -404,6 +406,36 @@ def site_custody_context(
         cluster=cluster,
         cluster_id=cluster_id,
         release_manifest=Path(str(config["release"]["manifest"])),
-        runtime_profile_version=str(config["runtime_profile"]["version"]),
-        agent_config_digest=str(config["release"]["agent_config_digest"]),
+        runtime_profile_version=version,
+        agent_config_digest=digest,
     )
+
+
+def cluster_profile_pins(config: Mapping[str, Any], cluster_id: str) -> tuple[str, str]:
+    """``(runtime_profile_version, agent_config_digest)`` the custody binding
+    pins this cluster's Agents to: the cluster's own Runtime Profile override
+    when the site declares one, else the site profile. An override without its
+    computed digest is refused rather than bound to the site's digest."""
+
+    entry: Mapping[str, Any] = next(
+        (
+            item
+            for item in config.get("clusters") or ()
+            if str(item.get("cluster_id") or "") == cluster_id
+        ),
+        {},
+    )
+    override = entry.get("runtime_profile") or {}
+    if not override:
+        return (
+            str(config["runtime_profile"]["version"]),
+            str(config["release"]["agent_config_digest"]),
+        )
+    version = str(override.get("version") or "")
+    digest = str(override.get("agent_config_digest") or "")
+    if not version or not digest:
+        raise CustodyError(
+            f"{cluster_id} Runtime Profile override has no computed Agent config "
+            "digest; approve the cluster profile before binding custody"
+        )
+    return version, digest

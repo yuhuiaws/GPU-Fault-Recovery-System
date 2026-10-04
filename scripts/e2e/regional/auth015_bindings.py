@@ -82,6 +82,43 @@ def pod_binding(pod: dict[str, Any], image: str) -> dict[str, str]:
     }
 
 
+def cluster_profile_pins(
+    state: dict[str, Any],
+    registration: dict[str, Any],
+    cluster_id: str,
+) -> dict[str, str]:
+    """The Agent config digest and Runtime Profile version this cluster's Agents
+    must report: the registration's own (a cluster on its own profile), else the
+    site's; a registered pin must agree with the release state's recorded
+    per-cluster overrides. Raises ``ValueError`` on disagreement."""
+
+    registered_digest = str(registration.get("agent_config_digest") or "")
+    registered_version = str(registration.get("runtime_profile_version") or "")
+    recorded = state.get("cluster_runtime_profiles")
+    if registered_digest or registered_version:
+        if SHA256.fullmatch(registered_digest) is None or not registered_version:
+            raise ValueError
+        if not isinstance(recorded, dict):
+            raise ValueError
+        override = recorded.get(cluster_id)
+        if (
+            not isinstance(override, dict)
+            or str(override.get("version") or "") != registered_version
+            or str(override.get("agent_config_digest") or "") != registered_digest
+        ):
+            raise ValueError
+        return {
+            "config_digest": registered_digest,
+            "runtime_profile_version": registered_version,
+        }
+    if isinstance(recorded, dict) and recorded.get(cluster_id):
+        raise ValueError  # recorded as overriding, registered as the site's
+    return {
+        "config_digest": text(state["agent_config_digest"]),
+        "runtime_profile_version": text(state["runtime_profile_version"]),
+    }
+
+
 def node_binding(
     node: dict[str, Any],
     record: AgentRecord,
@@ -90,7 +127,13 @@ def node_binding(
     state: dict[str, Any],
     cidrs: list[str],
     now: datetime,
+    *,
+    pins: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    pins = pins or {
+        "config_digest": state["agent_config_digest"],
+        "runtime_profile_version": state["runtime_profile_version"],
+    }
     metadata, status = node["metadata"], node["status"]
     provider_id = text(node["spec"].get("providerID"))
     addresses = [
@@ -122,8 +165,8 @@ def node_binding(
         or record.compatibility_digest != release.node_digest
         or record.installer_bundle_sha256 != release.bundle_sha256
         or record.installer_template_sha256 != state["node_template_sha256"]
-        or record.config_digest != state["agent_config_digest"]
-        or record.runtime_profile_version != state["runtime_profile_version"]
+        or record.config_digest != pins["config_digest"]
+        or record.runtime_profile_version != pins["runtime_profile_version"]
         or CHALLENGE_OPERATION in record.allowed_operations
         or record.last_seen_at.tzinfo is None
         or not now - timedelta(seconds=60)
@@ -226,6 +269,7 @@ def bind_snapshot(
             for name in nodes
         }
         now = datetime.now(timezone.utc)
+        pins = cluster_profile_pins(state, registration, target.cluster_id)
         bindings = {
             item["metadata"]["name"]: node_binding(
                 item,
@@ -235,6 +279,7 @@ def bind_snapshot(
                 state,
                 cidrs,
                 now,
+                pins=pins,
             )
             for item in physical
         }
@@ -254,6 +299,7 @@ def bind_snapshot(
                 "release_state_uid": text(release_metadata.get("uid")),
                 "cluster_id": target.cluster_id,
                 "eks_cluster_arn": target.eks_cluster_arn,
+                "cluster_profile_pins": pins,
                 "cpu_pod": pod_binding(raw["pod"], release.runtime_image),
                 "endpoint_cidrs": sorted(cidrs),
                 "nodes": bindings,

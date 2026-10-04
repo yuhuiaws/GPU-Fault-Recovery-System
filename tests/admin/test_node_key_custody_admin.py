@@ -13,6 +13,7 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.node_key_custody_admin import (
     CustodyPreparationRequired,
     CustodyReconciliationRequired,
+    cluster_profile_pins,
 )
 from gpu_fault.admin.node_key_custody_admin_config import load_admin_custody
 from gpu_fault.admin.node_key_custody_admin_entry import assert_site_custody_current
@@ -223,3 +224,35 @@ def test_admin_to_helper_handoff_rejects_changed_authorization_before_key_write(
     assert not list((world.root / "receipts").glob("*.started.json")), (
         "changed authorization must not issue a signed start receipt"
     )
+
+
+def _release_config(**cluster: object) -> dict:
+    return {
+        "runtime_profile": {"version": "hyperpod-v1"},
+        "release": {"agent_config_digest": "e" * 64},
+        "clusters": [
+            {"cluster_id": "hp", "eks_cluster_arn": "arn:hp"},
+            {"cluster_id": "gpu-eks-cluster", "eks_cluster_arn": "arn:eks", **cluster},
+        ],
+    }
+
+
+def test_custody_binds_a_cluster_to_its_own_runtime_profile_pins() -> None:
+    """A plain-EKS cluster on eks-v1 is bound to that profile's version and Agent
+    config digest; a cluster on the site profile keeps the site pins as before."""
+
+    config = _release_config(
+        runtime_profile={"version": "eks-v1", "agent_config_digest": "f" * 64}
+    )
+    assert cluster_profile_pins(config, "gpu-eks-cluster") == ("eks-v1", "f" * 64)
+    assert cluster_profile_pins(config, "hp") == ("hyperpod-v1", "e" * 64)
+    assert cluster_profile_pins(_release_config(), "gpu-eks-cluster") == (
+        "hyperpod-v1",
+        "e" * 64,
+    ), "no override: the site profile, byte for byte as before"
+
+
+def test_custody_refuses_an_override_without_its_computed_digest() -> None:
+    config = _release_config(runtime_profile={"version": "eks-v1"})
+    with pytest.raises(CustodyError, match="no computed Agent config digest"):
+        cluster_profile_pins(config, "gpu-eks-cluster")

@@ -1312,6 +1312,11 @@ above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
   2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
   3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.
      `--supersede-failed-transaction` does not apply to a transaction that is rolling back.
+- When administrator custody (Node Action key custody) binds a release identity for a cluster, the Runtime Profile
+  version and Agent config digest are the cluster's own override (the digest computed after approving
+  `clusters[].runtimeProfile` in the site file), or the site profile without one; an override whose digest is not yet
+  computed refuses the binding until the profile approval completes. Acceptance cases BOOT-018 / AUTH-015 compare
+  Agents against the same per-cluster pin.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

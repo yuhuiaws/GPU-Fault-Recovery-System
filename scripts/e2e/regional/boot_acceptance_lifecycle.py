@@ -39,6 +39,29 @@ from datetime import datetime, timezone
 from gpu_fault.app import ApplicationContext
 
 now = datetime.now(timezone.utc)
+store = ApplicationContext.from_environment().store
+pins = {}
+
+
+def cluster_pins(cluster_id):
+    # The pin the control plane holds this cluster's Agents to: its registration's
+    # own Runtime Profile (a plain-EKS cluster on eks-v1), empty for the site's.
+    if cluster_id not in pins:
+        try:
+            registration = store.get_regional_cluster(cluster_id)
+        except (KeyError, NotImplementedError):
+            registration = None
+        pins[cluster_id] = {
+            "cluster_runtime_profile_version": str(
+                getattr(registration, "runtime_profile_version", "") or ""
+            ),
+            "cluster_agent_config_digest": str(
+                getattr(registration, "agent_config_digest", "") or ""
+            ),
+        }
+    return pins[cluster_id]
+
+
 agents = [
     {
         "cluster_id": item.cluster_id,
@@ -46,9 +69,11 @@ agents = [
         "artifact_sha256": item.artifact_sha256,
         "compatibility_digest": item.compatibility_digest or item.artifact_sha256,
         "config_digest": item.config_digest,
+        "runtime_profile_version": item.runtime_profile_version,
         "node_action_key_version": item.node_action_key_version,
+        **cluster_pins(item.cluster_id),
     }
-    for item in ApplicationContext.from_environment().store.list_agents()
+    for item in store.list_agents()
     if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
     and item.lease_expires_at is not None
     and item.lease_expires_at > now
@@ -713,7 +738,11 @@ def runtime_identity_matches_release(
     a failure, not a skip: a report without replica digests proves nothing.
     """
 
+    # Artifact reasons: the rebuilt manifest against the replicas and release
+    # metadata. Agent reasons: the ACTIVE Agents against their pins. BOOT-018
+    # reports them as two checks; one list fed both until 2026-10-04.
     reasons: list[str] = []
+    agent_reasons: list[str] = []
     components = manifest.get("components") or {}
 
     def component(name: str, field: str) -> str:
@@ -790,21 +819,37 @@ def runtime_identity_matches_release(
             "release metadata lacks a valid required-node-action-key-version"
         )
     if not agents:
-        reasons.append("no ACTIVE Agent identity to compare")
+        agent_reasons.append("no ACTIVE Agent identity to compare")
+    cluster_digests = cluster_agent_config_digests(
+        report, agents, site_digest=config_digest, reasons=agent_reasons
+    )
     for agent in agents:
-        label = f"{agent.get('cluster_id')}/{agent.get('node_id')}"
+        cluster_id = str(agent.get("cluster_id") or "")
+        label = f"{cluster_id}/{agent.get('node_id')}"
         if str(agent.get("artifact_sha256") or "") != node_wheel:
-            reasons.append(f"agent {label} artifact pin differs from the manifest")
+            agent_reasons.append(
+                f"agent {label} artifact pin differs from the manifest"
+            )
         if str(agent.get("compatibility_digest") or "") != node_digest:
-            reasons.append(f"agent {label} compatibility digest differs")
-        if str(agent.get("config_digest") or "") != config_digest:
-            reasons.append(f"agent {label} config digest differs")
+            agent_reasons.append(f"agent {label} compatibility digest differs")
+        expected_digest = cluster_digests.get(cluster_id, config_digest)
+        if str(agent.get("config_digest") or "") != expected_digest:
+            agent_reasons.append(
+                f"agent {label} config digest differs from "
+                + (
+                    "its cluster's Runtime Profile pin"
+                    if cluster_id in cluster_digests
+                    else "the site pin"
+                )
+            )
         if str(agent.get("node_action_key_version") or "") != key_version:
-            reasons.append(f"agent {label} key version differs")
+            agent_reasons.append(f"agent {label} key version differs")
 
     return {
-        "passed": not reasons,
-        "reasons": reasons,
+        "passed": not reasons and not agent_reasons,
+        "reasons": reasons + agent_reasons,
+        "artifact_reasons": reasons,
+        "agent_reasons": agent_reasons,
         "replica_count": len(replicas),
         "agent_count": len(agents),
         "expected": {
@@ -813,8 +858,80 @@ def runtime_identity_matches_release(
             "executor_wheel_sha256": executor_wheel,
             "node_runtime_wheel_sha256": node_wheel,
             "node_runtime_module_digest": node_digest,
+            "site_agent_config_digest": config_digest,
+            "cluster_agent_config_digests": cluster_digests,
         },
     }
+
+
+def cluster_agent_config_digests(
+    report: dict[str, Any],
+    agents: list[dict[str, Any]],
+    *,
+    site_digest: str,
+    reasons: list[str],
+) -> dict[str, str]:
+    """``{cluster_id: digest}`` for the clusters whose Agents are pinned to their
+    own Runtime Profile, proven two ways before it is used as a yardstick.
+
+    Live 2026-10-04 (mixed site): both ``eks-v1`` Agents were reported as
+    "config digest differs" against the site's ``hyperpod-v1`` digest, which is
+    not the pin the control plane holds them to (``fleet.cluster_policy`` uses
+    the cluster's registration). The probe now carries each Agent's cluster
+    registration pin; it counts only when the configured release (``status
+    --full``'s ``configured_runtime_profile.cluster_overrides``) names the same
+    cluster with the same digest, so neither a stray registration nor a stale
+    site file can excuse an Agent on its own.
+    """
+
+    configured = report.get("configured_runtime_profile")
+    overrides = (
+        configured.get("cluster_overrides") if isinstance(configured, dict) else None
+    )
+    digests: dict[str, str] = {}
+    seen: set[str] = set()
+    for agent in agents:
+        cluster_id = str(agent.get("cluster_id") or "")
+        if cluster_id in seen:
+            continue
+        seen.add(cluster_id)
+        registered = str(agent.get("cluster_agent_config_digest") or "")
+        override = (
+            (overrides or {}).get(cluster_id) if isinstance(overrides, dict) else None
+        )
+        configured_digest = (
+            str((override or {}).get("agent_config_digest") or "")
+            if isinstance(override, dict)
+            else ""
+        )
+        if not registered and not configured_digest:
+            continue  # the site pin applies
+        if not registered:
+            reasons.append(
+                f"cluster {cluster_id} configured Runtime Profile override is not "
+                "registered in the control plane"
+            )
+            continue
+        if len(registered) != 64:
+            reasons.append(f"cluster {cluster_id} registration pins an invalid digest")
+            continue
+        if overrides is None:
+            reasons.append(
+                f"cluster {cluster_id} registration pins its own Agent config digest "
+                "but the status report carries no configured Runtime Profile"
+            )
+            continue
+        if configured_digest != registered:
+            reasons.append(
+                f"cluster {cluster_id} registration digest differs from the configured "
+                "Runtime Profile override"
+            )
+            continue
+        if registered == site_digest:
+            # Identical to the site pin: the site yardstick already covers it.
+            continue
+        digests[cluster_id] = registered
+    return digests
 
 
 def _live_release_identity(state_dir: Path) -> dict[str, Any]:
@@ -925,7 +1042,9 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
     )
     checks = {
         "wheel_and_bundle_hashes_identical": identical,
-        "rebuilt_artifacts_match_live_release": identity["passed"],
+        # The rebuilt wheels, bundle and module digests against the live
+        # replicas and release metadata; Agent pins are the next check.
+        "rebuilt_artifacts_match_live_release": not identity["artifact_reasons"],
         "tamper_negative_failed": tamper.returncode == 1,
         "live_status_passed": status.returncode == 0,
         "live_runtime_identity_matches_release": identity["passed"],
@@ -934,13 +1053,19 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "release_id": manifests["077"]["release_id"],
+        # The rebuild is not bound to a runtime image, so its release id differs
+        # from the live one by design; equality is proven by the hashes above.
+        "rebuilt_release_id": manifests["077"]["release_id"],
         "runtime_identity": identity,
         **live["identity"],
         "limitations": [
             "Runtime identity is read from the administrator status --full "
             "report and compared with the release manifest, metadata ConfigMap "
-            "and ACTIVE "
-            "Agent pins; version strings and annotations are not trusted."
+            "and ACTIVE Agent pins (an Agent on a cluster with its own Runtime "
+            "Profile against that cluster's registered and configured digest); "
+            "version strings and annotations are not trusted.",
+            "rebuilt_release_id is the unbound rebuild's id; the live release id "
+            "also hashes the bound runtime image, so the two differ by design.",
         ],
     }
 
