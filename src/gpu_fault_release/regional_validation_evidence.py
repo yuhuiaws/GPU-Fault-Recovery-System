@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault_release import repository_root
+from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_runtime_identity import live_release_images
 
 ROOT = repository_root()
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
@@ -94,26 +96,33 @@ def read_only_verifier_details(
     reused_checks: set[str] | None = None,
 ) -> dict[str, object]:
     reused = reused_checks or set()
+    yardstick = verifier_yardstick(release)
     control_output: object
     if "control_plane_role_split" in reused:
         control_output = {"reused": True}
     else:
-        control_output = release.runner.run(
-            [
-                "python3",
-                str(
-                    ROOT
-                    / "deploy/control-plane/tools/verify_control_plane_role_split.py"
-                ),
-            ],
-            env={
-                **os.environ,
-                "KUBECONFIG": release.config.cpu_kubeconfig,
-                "GPU_FAULT_NAMESPACE": release.config.namespace,
-                "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
-            },
-            capture=True,
-        )
+        try:
+            control_output = release.runner.run(
+                [
+                    "python3",
+                    str(
+                        ROOT
+                        / "deploy/control-plane/tools/verify_control_plane_role_split.py"
+                    ),
+                ],
+                env={
+                    **os.environ,
+                    "KUBECONFIG": release.config.cpu_kubeconfig,
+                    "GPU_FAULT_NAMESPACE": release.config.namespace,
+                    "GPU_FAULT_RUNTIME_IMAGE": yardstick["runtime_image"],
+                },
+                capture=True,
+            )
+        except ReleaseError as error:
+            # Keep the exception (its exit-status attributes ride along) and
+            # say which release the Pods were measured against.
+            error.args = (f"{error}; {yardstick['measured_against']}",)
+            raise
     gpu_outputs = {}
     for target in release.config.clusters:
         check = f"data_plane_executor:{target.cluster_id}"
@@ -132,8 +141,44 @@ def read_only_verifier_details(
                     "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": (
                         release.config.cpu_kubeconfig
                     ),
-                    "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": release.executor_wheel_cm,
+                    "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": yardstick[
+                        "executor_wheel_config_map"
+                    ],
                 },
                 capture=True,
             )
-    return {"cpu": control_output, "clusters": gpu_outputs}
+    details: dict[str, object] = {"cpu": control_output, "clusters": gpu_outputs}
+    if yardstick["release_id"] is not None:
+        details["measured_against"] = yardstick["measured_against"]
+    return details
+
+
+def verifier_yardstick(release: Any) -> dict[str, Any]:
+    """What the read-only verifiers compare the running Pods with.
+
+    Normally the configured release. After a deploy that failed before it
+    mutated anything (live 2026-10-04: the mixed-site settle deploy stopped in
+    its preflight) the site's manifest names a candidate while the Pods still
+    run the committed release; measuring against the candidate reported the
+    healthy control plane as "runtime image does not match" (verifier exit 1).
+    """
+
+    live = live_release_images(release)
+    if live is None:
+        return {
+            "release_id": None,
+            "runtime_image": release.runtime_image,
+            "executor_wheel_config_map": release.executor_wheel_cm,
+            "measured_against": "measured against the configured release",
+        }
+    return {
+        "release_id": live["release_id"],
+        "runtime_image": live["runtime_image"],
+        "executor_wheel_config_map": (
+            live["executor_wheel_config_map"] or release.executor_wheel_cm
+        ),
+        "measured_against": (
+            f"measured against the live release {live['release_id']}: the "
+            f"configured release {release.release_id} has not committed"
+        ),
+    }

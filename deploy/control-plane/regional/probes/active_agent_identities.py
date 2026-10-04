@@ -50,6 +50,20 @@ def main() -> None:
                     "runtime_profile_version": item.runtime_profile_version,
                     "config_digest": item.config_digest,
                     "node_action_key_version": item.node_action_key_version,
+                    # Lease facts for the engine's mismatch diagnosis.
+                    "lifecycle_state": getattr(
+                        item.lifecycle_state, "value", item.lifecycle_state
+                    ),
+                    "lease_expires_at": (
+                        item.lease_expires_at.isoformat()
+                        if item.lease_expires_at is not None
+                        else None
+                    ),
+                    "last_seen_at": (
+                        item.last_seen_at.isoformat()
+                        if getattr(item, "last_seen_at", None) is not None
+                        else None
+                    ),
                 }
                 for item in records
             ],

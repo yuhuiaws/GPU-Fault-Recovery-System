@@ -12,6 +12,7 @@ import yaml
 
 from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_release_agent_set as agent_set
 from gpu_fault_release import regional_release_state as state
 from gpu_fault_release import rollout
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -654,6 +655,8 @@ def test_previous_capture_joins_cluster_reads_and_binds_agent_node_set(
     if fault == "node-set":
         identities["gpu-a"]["node_ids"] = ["other"]
     monkeypatch.setattr(state, "capture_agent_identities", lambda _release: identities)
+    # The diagnosis re-reads lease facts through the same probe; faked alike.
+    monkeypatch.setattr(agent_set, "agent_lease_facts", lambda _release: {})
     barrier = threading.Barrier(2)
     observed = []
 
@@ -677,3 +680,109 @@ def test_previous_capture_joins_cluster_reads_and_binds_agent_node_set(
         assert result["release_id"] == "old"
         assert result["agent_identities"] == identities
     assert sorted(observed) == ["gpu-a", "gpu-b"]
+
+
+# --- the Agent-set invariant names what differs and re-reads once ----------------
+
+
+def _agent_record(node_id: str, **extra: object) -> dict:
+    return {
+        "cluster_id": "gpu-a",
+        "node_id": node_id,
+        "agent_protocol_version": 4,
+        "agent_version": "0.10.0",
+        "artifact_sha256": "a" * 64,
+        "compatibility_digest": "a" * 64,
+        "installer_bundle_sha256": "b" * 64,
+        "installer_template_sha256": "c" * 64,
+        "policy_version": "policy-v1",
+        "runtime_profile_version": "hyperpod-v1",
+        "config_digest": "d" * 64,
+        "node_action_key_version": 1,
+        "lifecycle_state": "ACTIVE",
+        "lease_expires_at": "2026-10-04T12:16:30+00:00",
+        "last_seen_at": "2026-10-04T12:15:00+00:00",
+        **extra,
+    }
+
+
+def _probe_reads(
+    monkeypatch: pytest.MonkeyPatch, reads: list[list[dict]]
+) -> list[float]:
+    """Each probe call (identity capture or lease facts) consumes one read;
+    the wait between the two capture rounds is recorded instead of slept."""
+
+    from gpu_fault_release import regional_release_agent_set as agent_set
+
+    def probe(*_args: object, **_kwargs: object) -> str:
+        return json.dumps(reads.pop(0))
+
+    monkeypatch.setattr(state, "exec_cpu_ingress_probe", probe)
+    monkeypatch.setattr(agent_set, "exec_cpu_ingress_probe", probe)
+    slept: list[float] = []
+    monkeypatch.setattr(agent_set, "SLEEP", slept.append)
+    return slept
+
+
+def test_agent_set_mismatch_names_the_nodes_and_is_reread_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-04: the mixed-site settle deploy refused with a bare
+    "active Agent set does not match HyperPod nodes" while every Agent was
+    ACTIVE minutes later. The refusal now says which nodes lack a live Agent
+    (with the lease facts) and the sets are re-read once after a heartbeat gap."""
+
+    from gpu_fault_release import regional_release_agent_set as agent_set
+
+    release = ResourceRelease()
+    release.node_names = ("node-a", "node-b")
+    only_a = [_agent_record("node-a")]
+    slept = _probe_reads(monkeypatch, [only_a, only_a, only_a, only_a])
+    with pytest.raises(ReleaseError) as refusal:
+        agent_set.capture_agent_identities_matching_nodes(release)
+    message = str(refusal.value)
+    assert message.startswith(
+        "gpu-a active Agent set does not match HyperPod nodes: "
+    ), message
+    assert "nodes without an active Agent=['node-b']" in message, message
+    assert "node-b: no ACTIVE Agent with a live lease" in message, message
+    assert slept == [agent_set.AGENT_SET_RECHECK_SECONDS], (
+        "one re-read after a heartbeat gap"
+    )
+
+
+def test_agent_set_recovers_when_the_second_read_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault_release import regional_release_agent_set as agent_set
+
+    release = ResourceRelease()
+    release.node_names = ("node-a", "node-b")
+    late = [_agent_record("node-a")]  # node-b's heartbeat was late
+    both = [_agent_record("node-a"), _agent_record("node-b")]
+    _probe_reads(monkeypatch, [late, late, both])
+    identities = agent_set.capture_agent_identities_matching_nodes(release)
+    assert identities["gpu-a"]["node_ids"] == ["node-a", "node-b"]
+    assert "records" not in identities["gpu-a"], (
+        "the recorded snapshot shape is unchanged"
+    )
+
+
+def test_agent_set_extra_agent_is_named_with_its_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpu_fault_release import regional_release_agent_set as agent_set
+
+    release = ResourceRelease()
+    release.node_names = ("node-a",)
+    stale = _agent_record("node-gone", lease_expires_at="2026-10-04T12:16:00+00:00")
+    reads = [[_agent_record("node-a"), stale]] * 4
+    _probe_reads(monkeypatch, reads)
+    with pytest.raises(ReleaseError) as refusal:
+        agent_set.capture_agent_identities_matching_nodes(release)
+    message = str(refusal.value)
+    assert "Agents on nodes outside the cluster=['node-gone']" in message, message
+    assert (
+        "node-gone: lifecycle=ACTIVE lease_expires_at=2026-10-04T12:16:00+00:00"
+        in message
+    )

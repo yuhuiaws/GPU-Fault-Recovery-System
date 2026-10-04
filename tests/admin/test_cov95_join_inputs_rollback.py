@@ -254,3 +254,25 @@ def test_registered_rollback_requires_retained_token_identity(attempt, kind):
         compensate(attempt)
     assert state["phase"] == "ROLLBACK_FAILED"
     assert "REMOTE_ROLLBACK_COMPLETED" in state["completed_steps"]
+
+
+def test_join_keeps_the_primary_cluster_as_the_kubeconfig_current_context(local):
+    """Live 2026-10-04: after the plain EKS join, gpu.kubeconfig's current-context
+    was the EKS cluster; tools reading KUBECONFIG without --context targeted the
+    wrong cluster. `update-kubeconfig --alias` makes the new context current;
+    the join switches back to the site's primary cluster context."""
+
+    scenario = local[0]
+    prepare(local)
+    commands = [arguments for arguments, _options in scenario.commands]
+    update = next(i for i, c in enumerate(commands) if "update-kubeconfig" in c)
+    restore = [
+        i
+        for i, c in enumerate(commands)
+        if c[:1] == ["kubectl"] and "config" in c and "use-context" in c
+    ]
+    assert restore, "the primary context is restored"
+    assert restore[0] > update, "right after the alias was added"
+    assert (
+        commands[restore[0]][commands[restore[0]].index("use-context") + 1] == "gpu-a"
+    ), "the first managed cluster's context stays current"

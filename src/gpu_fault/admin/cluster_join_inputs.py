@@ -101,6 +101,7 @@ def prepare_local_inputs(
         )
     if gpu_kubeconfig.exists():
         gpu_kubeconfig.chmod(0o600)
+    keep_primary_current_context(runner, request.site, gpu_kubeconfig, target.context)
     verify_allowed_namespaces_exist(
         runner,
         site=request.site,
@@ -232,3 +233,30 @@ def verify_allowed_namespaces_exist(
             "--allowed-namespace <name> naming only namespaces that exist; the "
             f"control-plane namespace {own} is created by the join itself"
         )
+
+
+def keep_primary_current_context(
+    runner: CommandRunner, site: RenderedSite, kubeconfig: Path, joining: str
+) -> None:
+    """``aws eks update-kubeconfig`` makes the new alias the current-context;
+    the shared GPU kubeconfig keeps pointing at the site's primary cluster.
+
+    Live 2026-10-04: after the plain EKS join, ``gpu.kubeconfig``'s
+    current-context was the EKS cluster, so any tool reading KUBECONFIG without
+    ``--context`` silently targeted the wrong cluster. The join's own commands
+    always pass ``--context``; the default stays with the first managed cluster.
+    """
+
+    clusters = site.release_config.get("clusters") or []
+    primary = str(clusters[0]["context"]) if clusters else ""
+    if not primary or primary == joining:
+        return
+    prefix = ["kubectl", "--kubeconfig", str(kubeconfig), "config"]
+    contexts = runner.run(
+        [*prefix, "get-contexts", "-o", "name"], env=effective_environment(site)
+    )
+    if primary not in str(contexts).splitlines():
+        return
+    runner.run(
+        [*prefix, "use-context", primary], env=effective_environment(site), mutate=True
+    )

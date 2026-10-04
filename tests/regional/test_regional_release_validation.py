@@ -159,3 +159,86 @@ def test_reused_checks_replace_the_verifier_scripts_they_name() -> None:
     assert commands[0][1].endswith("verify_dataplane_executor.py"), (
         "the data-plane verifier must still run when only the CPU check is reused"
     )
+
+
+def _release_with_live_state(run, live_state: dict | None):
+    return SimpleNamespace(
+        runner=SimpleNamespace(run=run),
+        release_id="candidate0001",
+        runtime_image="registry.example/runtime@sha256:" + "2" * 64,
+        executor_wheel_cm="gpu-fault-executor-wheel-0100-candidate",
+        _load_state=lambda: live_state,
+        config=SimpleNamespace(
+            cpu_kubeconfig="/secure/cpu.kubeconfig",
+            namespace="gpu-fault-system",
+            clusters=(SimpleNamespace(cluster_id="gpu-a", context="gpu-a"),),
+        ),
+    )
+
+
+def test_verifiers_measure_pods_against_the_live_release_when_a_candidate_is_configured() -> (
+    None
+):
+    """Live 2026-10-04: after a settle deploy failed in its preflight the site
+    named the candidate; the healthy control plane was reported as
+    "verify_control_plane_role_split.py exited with status 1" because the
+    verifier compared the Pods with the candidate's image."""
+
+    live_image = "registry.example/runtime@sha256:" + "1" * 64
+    environments: list[dict[str, str]] = []
+
+    def run(_arguments, *, env=None, **_kwargs):
+        environments.append(dict(env or {}))
+        return "{}"
+
+    release = _release_with_live_state(
+        run,
+        {
+            "release_id": "live00000001",
+            "runtime_image": live_image,
+            "executor_wheel_config_map": "gpu-fault-executor-wheel-0100-live",
+        },
+    )
+    details = EVIDENCE.read_only_verifier_details(release)
+    assert environments[0]["GPU_FAULT_RUNTIME_IMAGE"] == live_image, (
+        "the role-split verifier compares the Pods with the live release's image"
+    )
+    assert (
+        environments[1]["GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP"]
+        == "gpu-fault-executor-wheel-0100-live"
+    ), "the executor verifier expects the live release's wheel ConfigMap"
+    assert details["measured_against"] == (
+        "measured against the live release live00000001: the configured release "
+        "candidate0001 has not committed"
+    )
+
+    same = _release_with_live_state(
+        run, {"release_id": "candidate0001", "runtime_image": release.runtime_image}
+    )
+    details = EVIDENCE.read_only_verifier_details(same)
+    assert environments[2]["GPU_FAULT_RUNTIME_IMAGE"] == release.runtime_image, (
+        "the configured release is live: it stays the yardstick"
+    )
+    assert "measured_against" not in details, "no attribution when nothing differs"
+
+
+def test_a_failing_verifier_says_which_release_it_measured_against() -> None:
+    from gpu_fault_release.regional_release_config import ReleaseError
+
+    def run(_arguments, **_kwargs):
+        raise ReleaseError("verify_control_plane_role_split.py exited with status 1")
+
+    release = _release_with_live_state(
+        run,
+        {
+            "release_id": "live00000001",
+            "runtime_image": "registry.example/r@sha256:" + "1" * 64,
+        },
+    )
+    with pytest.raises(ReleaseError) as refusal:
+        EVIDENCE.read_only_verifier_details(release)
+    assert str(refusal.value) == (
+        "verify_control_plane_role_split.py exited with status 1; measured against "
+        "the live release live00000001: the configured release candidate0001 has "
+        "not committed"
+    )

@@ -372,8 +372,10 @@ def _running_pods(
                 continue
             containers = (item.get("spec") or {}).get("containers") or []
             if not containers or containers[0].get("image") != expected_image:
+                observed = str((containers[0] if containers else {}).get("image") or "")
                 raise ReleaseError(
-                    f"{deployment} Pod OCI image differs from the release"
+                    f"{deployment} Pod OCI image differs from the release: Pod runs "
+                    f"{observed or '<none>'}, expected {expected_image}"
                 )
     if len(names) != replicas:
         raise ReleaseError(
@@ -438,6 +440,42 @@ def _read_once_more(first: Any, again: Any) -> Any:
             ) from second_error
 
 
+def live_release_images(release: Any) -> dict[str, Any] | None:
+    """The committed release's images when the site's configured release is
+    not the one that is live, else ``None``.
+
+    After a deploy that failed before mutating anything (live 2026-10-04: the
+    mixed-site settle deploy stopped in its preflight), the site's manifest
+    names the candidate while the Pods -- correctly -- still run the committed
+    release; measuring them against the candidate reported a false
+    "Pod OCI image differs from the release".
+    """
+
+    load_state = getattr(release, "_load_state", None)
+    if load_state is None:
+        return None
+    try:
+        state = load_state() or {}
+    except Exception:
+        return None
+    live_id = str(state.get("release_id") or "")
+    runtime_image = str(state.get("runtime_image") or "")
+    if (
+        not live_id
+        or not runtime_image
+        or live_id == getattr(release, "release_id", None)
+    ):
+        return None
+    return {
+        "release_id": live_id,
+        "runtime_image": runtime_image,
+        "executor_image": str(state.get("executor_image") or "") or None,
+        "executor_wheel_config_map": (
+            str(state.get("executor_wheel_config_map") or "") or None
+        ),
+    }
+
+
 def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
     control_digest = str(release.config.component_digests.get("control_plane") or "")
     executor_digest = str(release.config.component_digests.get("executor") or "")
@@ -477,14 +515,25 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
 
     # Listings and Pod execs share one pool; nested per-Deployment pools would
     # multiply the bound as clusters and replicas grow.
+    live = live_release_images(release)
+
     def expected_image(scope: str) -> str | None:
         if release.config.release_manifest_schema_version < 4:
             return None
-        image = (
-            release.runtime_image
-            if scope == "control-plane"
-            else release.executor_image
-        )
+        if live is not None:
+            # The configured manifest is a candidate that never committed; the
+            # Pods are measured against the release that is live.
+            image = (
+                live["runtime_image"]
+                if scope == "control-plane"
+                else (live["executor_image"] or live["runtime_image"])
+            )
+        else:
+            image = (
+                release.runtime_image
+                if scope == "control-plane"
+                else release.executor_image
+            )
         return None if image is None else str(image)
 
     with ThreadPoolExecutor(max_workers=MAX_RUNTIME_IDENTITY_WORKERS) as executor:

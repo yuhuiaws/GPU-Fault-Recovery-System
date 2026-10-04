@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault_release import regional_release_runtime_identity as MODULE
+from gpu_fault_release.regional_release_config import ReleaseError
 from tests.regional._resource_probe_fakes import resource_probe_result
 
 
@@ -400,3 +401,69 @@ def test_a_listing_refused_twice_fails_the_release_naming_both_errors() -> None:
         MODULE.validate_runtime_component_identity(release)
     assert "control-plane/gpu-fault-api-ha" in str(raised.value)
     assert release.listing_calls == 2, "exactly one retry, never a loop"
+
+
+def test_pods_are_measured_against_the_live_release_when_the_site_names_a_candidate() -> (
+    None
+):
+    """Live 2026-10-04: after a deploy that failed in its preflight, the site's
+    manifest named the candidate while the Pods still ran the committed release,
+    and status reported a false "Pod OCI image differs from the release"."""
+
+    live_image = "registry.example/runtime@sha256:" + "1" * 64
+    candidate_image = "registry.example/runtime@sha256:" + "2" * 64
+
+    class LiveRelease(Release):
+        release_id = "candidate0001"
+        live_state: dict = {"release_id": "live00000001", "runtime_image": live_image}
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.config.release_manifest_schema_version = 4
+            self.config.clusters = ()
+            self.runtime_image = candidate_image
+            self.executor_image = candidate_image
+
+        def _load_state(self):
+            return self.live_state
+
+        def _get_json(self, arguments):
+            if "deployment" in arguments:
+                return {"spec": {"replicas": 1}}
+            selector = arguments[arguments.index("-l") + 1]
+            return {
+                "items": [
+                    {
+                        "metadata": {"name": f"{selector.removeprefix('app=')}-pod-0"},
+                        "spec": {"containers": [{"image": live_image}]},
+                    }
+                ]
+            }
+
+    release = LiveRelease()
+    assert MODULE.live_release_images(release) == {
+        "release_id": "live00000001",
+        "runtime_image": live_image,
+        "executor_image": None,
+        "executor_wheel_config_map": None,
+    }, (
+        "the committed release's images are the yardstick while a candidate is configured"
+    )
+    report = MODULE.validate_runtime_component_identity(release)
+    assert not report.get("errors"), (
+        "Pods on the live release's image are not a mismatch against the candidate"
+    )
+    release.live_state = {
+        "release_id": "candidate0001",
+        "runtime_image": candidate_image,
+    }
+    assert MODULE.live_release_images(release) is None, (
+        "the configured release is the live one: measure against it as before"
+    )
+    with pytest.raises(
+        ReleaseError, match="Pod runs .*1111.*, expected .*2222"
+    ) as refusal:
+        MODULE.validate_runtime_component_identity(release)
+    assert "gpu-fault-api-ha Pod OCI image differs from the release" in str(
+        refusal.value
+    ), "a real mismatch names the Deployment and both images"

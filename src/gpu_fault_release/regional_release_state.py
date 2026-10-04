@@ -37,6 +37,7 @@ from gpu_fault.release_state_snapshot import (
     validate_snapshot_config_map,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_release_agent_set as agent_set
 from gpu_fault_release.regional_observability_rollback import (
     capture_previous_monitoring,
 )
@@ -942,23 +943,7 @@ def _capture_previous(
     )
     agent_identities: dict[str, dict[str, Any]] = {}
     if capture_gpu and release.config.clusters:
-        capture_identities = getattr(release, "_capture_agent_identities", None)
-        agent_identities = (
-            capture_identities()
-            if capture_identities is not None
-            else capture_agent_identities(release)
-        )
-        for target, expected_nodes in _map_clusters(
-            release,
-            lambda target: set(release._target_node_names(target)),
-            targets=release.config.clusters,
-            failure="active Agent set capture",
-        ):
-            captured_nodes = set(agent_identities[target.cluster_id]["node_ids"])
-            if expected_nodes != captured_nodes:
-                raise ReleaseError(
-                    f"{target.cluster_id} active Agent set does not match HyperPod nodes"
-                )
+        agent_identities = agent_set.capture_agent_identities_matching_nodes(release)
     role_deployments = cpu_role_deployments(release) if capture_cpu else {}
     role_config_maps = (
         cpu_role_config_maps(release, role_deployments) if capture_cpu else {}

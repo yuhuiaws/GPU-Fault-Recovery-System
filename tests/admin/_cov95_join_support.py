@@ -108,6 +108,7 @@ class JoinScenario(CommandRunner):
         self.failure_error = BootstrapError("modeled join boundary failure")
         self.namespace_uids = {}
         self.contexts = {"gpu-a"}
+        self.current_context = "gpu-a"
         self.vpcs = {"vpc-gpu-a"}
         self.ingress = {"192.0.2.10"}
         self.cluster_states = {"gpu-a": "ACTIVE"}
@@ -192,6 +193,9 @@ class JoinScenario(CommandRunner):
         )
         if "get-contexts" in arguments:
             return "\n".join(sorted(self.contexts))
+        if "config" in arguments and "use-context" in arguments:
+            self.current_context = arguments[arguments.index("use-context") + 1]
+            return ""
         if "get" in arguments and "namespace" in arguments:
             requested = arguments[arguments.index("namespace") + 1]
             if requested != "gpu-fault-system":

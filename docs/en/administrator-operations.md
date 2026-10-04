@@ -1276,6 +1276,25 @@ rerun `join-cluster` with the same arguments once fixed. The other prerequisites
 nodes is fine -- the data-plane Deployments never land there and the exporter/installer Jobs tolerate it) are in the list
 above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
 
+#### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
+
+- After `join-cluster` writes the new cluster's context into `gpu.kubeconfig`, it switches the current-context back
+  to the site's first managed cluster (the registration/primary cluster); a join does not change which cluster the
+  operator's plain `kubectl` points at.
+- An upgrade `deploy` checks, before it changes any object, that every cluster's set of ACTIVE Agents with a live
+  lease equals that cluster's GPU node set. Agents heartbeat every 30 s with a 90 s lease, so one late heartbeat can
+  drop a healthy node for a few seconds; on a mismatch the sets are re-read once after 35 s. Only a persistent
+  mismatch refuses, and the refusal names the nodes without an active Agent, the Agents on nodes outside the
+  cluster, and each node's lifecycle / lease_expires_at / last_seen_at. The refusal happens in the preflight: no
+  transaction was committed. Resolve the named node (or confirm it was a transient heartbeat gap) and rerun the
+  same `deploy`.
+- After a `deploy` failed in its preflight, `site.yaml`'s `release.manifest` already names the uncommitted
+  candidate while the Pods correctly still run the committed release. `status --full`'s
+  `runtime_component_identity` and `read_only_verifiers` measure the Pod images and the Executor wheel ConfigMap
+  against the **committed (live) release** and say so in `measured_against` ("the configured release ... has not
+  committed"); a real mismatch names both the image the Pod runs and the expected one. The attribution disappears
+  once the candidate commits.
+
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
 The remediation concurrency budget `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` (fixed at 1 in production)
