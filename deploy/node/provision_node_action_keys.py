@@ -689,7 +689,9 @@ def provision(
                     continue
             assert current is not None
             if cpu is not None:
-                _synchronize_cpu(gpu, cpu, current, plan, hyperpod_cluster, nodes)
+                _synchronize_cpu(
+                    gpu, cpu, current, plan, hyperpod_cluster, nodes, node_selector
+                )
                 _finish_rotation(
                     gpu,
                     cpu,
@@ -729,13 +731,16 @@ def _synchronize_cpu(
     plan: KeyPlan,
     hyperpod_cluster: str,
     nodes: dict[str, str],
+    node_selector: str = "",
 ) -> None:
     for _attempt in range(ATTEMPTS):
         mirror = cpu.read()
         if mirror is not None and mirror.uid == expected.uid:
             raise ProvisionError("CPU and GPU node-key targets must be distinct")
         _assert_gpu(gpu.read(), expected)
-        if gpu.nodes(hyperpod_cluster) != nodes:
+        # The same selector as every other inventory read: a plain EKS cluster
+        # has no HyperPod label, so the default would find no node at all.
+        if gpu.nodes(hyperpod_cluster, node_selector) != nodes:
             raise ProvisionError("HyperPod node identities changed")
         _check_cpu(mirror, plan)
         data = {**(mirror.data if mirror else {}), **plan.data}

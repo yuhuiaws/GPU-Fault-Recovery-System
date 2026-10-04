@@ -10,7 +10,7 @@ import pytest
 
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import command_log as command_log_module
-from gpu_fault.admin.bootstrap_common import CommandRunner
+from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
 from gpu_fault.admin.command_log import (
     ADMIN_LOG_ENVIRONMENT,
     child_failure,
@@ -18,6 +18,7 @@ from gpu_fault.admin.command_log import (
     last_output_line,
     prune_admin_logs,
     report_failure,
+    sensitive_error_lines,
 )
 from scripts import staging_deploy
 
@@ -502,4 +503,39 @@ def test_a_failed_nested_admin_passes_its_status_through_unwrapped(
     assert capsys.readouterr().err == (
         "staging-deploy: command failed (128): git fetch origin: "
         "fatal: could not read from remote\n"
+    )
+
+
+def test_a_sensitive_failure_keeps_the_drivers_own_error_lines_redacted(
+    tmp_path: Path,
+) -> None:
+    """A sensitive command hides its argv and output, but the ``ERROR:`` lines
+    our own scripts print are the diagnosis the next operator needs; they are
+    kept with any long token masked."""
+
+    script = tmp_path / "provision-node-action-keys.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'derived key: " + "a" * 64 + "' >&2\n"
+        "echo 'ERROR: HyperPod node inventory is empty or invalid' >&2\n"
+        "echo 'ERROR: token " + "b" * 40 + " rejected' >&2\n"
+        "exit 1\n"
+    )
+    script.chmod(0o700)
+    runner = CommandRunner()
+    with pytest.raises(BootstrapError) as failure:
+        runner.run([str(script)], mutate=True, sensitive=True, capture=False)
+    message = str(failure.value)
+    assert message.startswith("command failed (1): provision-node-action-keys.sh"), (
+        message
+    )
+    assert "ERROR: HyperPod node inventory is empty or invalid" in message, (
+        "the script's own diagnosis survives the redaction"
+    )
+    assert "ERROR: token <redacted> rejected" in message, "long tokens are masked"
+    assert "a" * 64 not in message and "derived key" not in message, (
+        "other sensitive output stays hidden"
+    )
+    assert sensitive_error_lines("plain stderr without a marker\n") == (), (
+        "only the driver's ERROR: lines qualify"
     )

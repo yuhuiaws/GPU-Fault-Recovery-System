@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -186,6 +187,34 @@ def last_output_line(text: str | None) -> str:
     return lines[-1] if lines else ""
 
 
+_ERROR_LINE = re.compile(r"^ERROR: (?P<text>.+)$")
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+ERROR_LINE_LIMIT = 3
+ERROR_LINE_CHARACTERS = 200
+
+
+def sensitive_error_lines(text: str | None) -> tuple[str, ...]:
+    """The ``ERROR: ...`` lines of a sensitive command's stderr, redacted.
+
+    A sensitive command's output is hidden because it may carry key material;
+    the diagnosis our own scripts print with the ``ERROR:`` prefix is the one
+    part the next operator needs, so those lines are kept -- at most
+    ``ERROR_LINE_LIMIT`` of them, truncated, with every long token masked.
+    kubectl and aws never use that prefix, so their output stays hidden.
+    """
+
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        match = _ERROR_LINE.match(raw.strip())
+        if match is None:
+            continue
+        line = _LONG_TOKEN.sub("<redacted>", match.group("text"))
+        lines.append("ERROR: " + line[:ERROR_LINE_CHARACTERS])
+        if len(lines) == ERROR_LINE_LIMIT:
+            break
+    return tuple(lines)
+
+
 def child_failure(
     error_type: type[_ErrorT],
     arguments: Sequence[str],
@@ -193,6 +222,7 @@ def child_failure(
     *,
     detail: str = "",
     sensitive: bool = False,
+    error_lines: Sequence[str] = (),
 ) -> _ErrorT:
     """The exception a wrapper raises when a child process exits non-zero.
 
@@ -200,7 +230,9 @@ def child_failure(
     :func:`report_failure` will not print, and the child's exit status rides
     along so the outermost process exits with the first failing cause's code.
     For a foreign command the message is the one line the operator needs:
-    ``command failed (N): <what ran>: <its last stderr line>``.
+    ``command failed (N): <what ran>: <its last stderr line>``; a sensitive
+    command adds its already-redacted ``error_lines`` (see
+    :func:`sensitive_error_lines`) instead of its output.
     """
 
     if is_own_driver(arguments):
@@ -211,6 +243,8 @@ def child_failure(
         message += command_label(arguments, sensitive=sensitive)
         if detail:
             message += f": {diagnostic_text(detail, sensitive=sensitive)}"
+        if error_lines:
+            message += ": " + "; ".join(error_lines)
         error = error_type(message)
     setattr(error, FAILURE_EXIT_CODE_ATTRIBUTE, int(returncode))
     return error

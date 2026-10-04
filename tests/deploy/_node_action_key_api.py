@@ -50,7 +50,9 @@ def secret(
     return document
 
 
-def node_list(*names: str) -> dict[str, Any]:
+def node_list(*names: str, labels: dict[str, str] | None = None) -> dict[str, Any]:
+    """A NodeList; HyperPod-labelled unless ``labels`` says otherwise."""
+
     return {
         "apiVersion": "v1",
         "kind": "NodeList",
@@ -62,12 +64,36 @@ def node_list(*names: str) -> dict[str, Any]:
                 "metadata": {
                     "name": name,
                     "uid": f"fixture-uid-{name}",
-                    "labels": {"sagemaker.amazonaws.com/cluster-name": HYPERPOD},
+                    "labels": dict(
+                        labels
+                        if labels is not None
+                        else {"sagemaker.amazonaws.com/cluster-name": HYPERPOD}
+                    ),
                 },
             }
             for name in names
         ],
     }
+
+
+def _selected_nodes(nodes: dict[str, Any], arguments: list[str]) -> dict[str, Any]:
+    """``kubectl get nodes -l <selector>``: only the matching items, as the API
+    server filters them; without ``-l`` every node."""
+
+    items = nodes.get("items") if isinstance(nodes, dict) else None
+    if "-l" not in arguments or not isinstance(items, list):
+        return nodes  # deliberately malformed inventories reach the script as-is
+    from gpu_fault.cluster_scope import selector_matches
+
+    selector = arguments[arguments.index("-l") + 1]
+
+    def keep(item: Any) -> bool:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        if not isinstance(metadata, dict):
+            return True
+        return selector_matches(metadata.get("labels"), selector)
+
+    return {**nodes, "items": [item for item in items if keep(item)]}
 
 
 class Api:
@@ -151,12 +177,11 @@ class Api:
                 event.get("stderr", ""),
             )
         if verb == "get" and "nodes" in arguments:
+            selected = _selected_nodes(self.state["nodes"], arguments)
             output = (
-                "\n".join(
-                    item["metadata"]["name"] for item in self.state["nodes"]["items"]
-                )
+                "\n".join(item["metadata"]["name"] for item in selected["items"])
                 if any(item.startswith("jsonpath=") for item in arguments)
-                else json.dumps(self.state["nodes"])
+                else json.dumps(selected)
             )
             return subprocess.CompletedProcess(arguments, 0, output, "")
         if verb == "get":

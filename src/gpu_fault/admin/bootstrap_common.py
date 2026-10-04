@@ -19,7 +19,10 @@ from typing import Any, Callable, Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault.admin.command_log import child_failure
+from gpu_fault.admin.command_log import (
+    child_failure,
+    sensitive_error_lines,
+)
 from gpu_fault.admin.bootstrap_task_inputs import TaskInputSpec
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
@@ -323,6 +326,11 @@ class CommandRunner:
                 completed.returncode,
                 detail=completed.stderr.strip() if capture else "",
                 sensitive=sensitive,
+                # The output of a sensitive command is captured but never
+                # shown; the driver's own ERROR: lines are the one exception.
+                error_lines=sensitive_error_lines(completed.stderr)
+                if sensitive
+                else (),
             )
         return completed.stdout.strip() if capture else ""
 

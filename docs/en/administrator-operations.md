@@ -653,6 +653,9 @@ The phase necessity and parallelism boundaries of join/remove/uninstall are in ย
   the same constraint of ยง8 applies here.
 - The duration line of `<sensitive command>` likewise does not expand the arguments. Do not print the arguments of sensitive commands to see a slow command more clearly;
   commands containing passwords/tokens must stay invisible.
+- When a sensitive command fails, the error keeps only the `ERROR:` lines the script itself printed (at most 3, long tokens
+  masked), e.g. `command failed (1): provision-node-action-keys.sh: ERROR: HyperPod node inventory is empty or invalid`;
+  kubectl/aws output stays hidden. Diagnose from those lines; do not drop the `sensitive` marker to see the full output.
 - Do not raise the slow-command threshold to make the log "clean": that re-hides exactly the slow commands you are looking for.
 - When `installer-wait` stays on the same `pending` node for a long time, deal with that node (look at its installer
   Job and `installer-state`), not by shortening the `wait_agents` timeout or relaxing the convergence decision: the membership decision of `pending`

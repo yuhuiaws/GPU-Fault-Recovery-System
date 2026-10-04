@@ -1204,3 +1204,74 @@ def test_script_rotation_retry_roundtrip_keeps_the_committed_random_key(
         for document in state["secrets"].values()
         for value in document["data"].values()
     ), "rotation diagnostics exposed key material"
+
+
+# --- plain EKS (eks-managed) clusters -------------------------------------------
+
+EKS_NODEGROUP_SELECTOR = "eks.amazonaws.com/nodegroup=gpu-p5en-efa-spot-node-group"
+EKS_NODE_LABELS = {
+    "nvidia.com/gpu.present": "true",
+    "eks.amazonaws.com/nodegroup": "gpu-p5en-efa-spot-node-group",
+    "topology.kubernetes.io/zone": "us-west-2c",
+}
+EKS_NODES = (
+    "ip-10-0-33-205.us-west-2.compute.internal",
+    "ip-10-0-41-164.us-west-2.compute.internal",
+)
+
+
+def _eks_environment() -> dict[str, str]:
+    # Exactly what bootstrap_services.provision_node_action_keys passes for a
+    # plain EKS cluster: no HyperPod name (the cluster_id stands in), the
+    # cluster's own node selector, and the control-plane mirror.
+    return {
+        "GPU_FAULT_CLUSTER_ID": "gpu-eks-cluster",
+        "GPU_FAULT_HYPERPOD_CLUSTER": "gpu-eks-cluster",
+        "GPU_FAULT_CLUSTER_PROVIDER": "eks-managed",
+        "GPU_FAULT_NODE_SELECTOR": EKS_NODEGROUP_SELECTOR,
+    }
+
+
+def test_plain_eks_keys_follow_the_node_selector_through_the_cpu_mirror(
+    tmp_path: Path,
+) -> None:
+    """A plain EKS cluster has no HyperPod label: every node inventory read,
+    including the one guarding the control-plane mirror, must use the cluster's
+    own selector, and FQDN node names are valid Secret keys."""
+
+    result, state = run_script(
+        tmp_path,
+        {"nodes": node_list(*EKS_NODES, labels=EKS_NODE_LABELS), "secrets": {}},
+        extra_environment=_eks_environment(),
+    )
+    assert result.returncode == 0, f"provisioning failed: {result.stderr}"
+    assert set(state["secrets"]["gpu"]["data"]) == set(EKS_NODES), (
+        "one key per GPU node, keyed by the FQDN node name"
+    )
+    assert set(state["secrets"]["cpu"]["data"]) == set(EKS_NODES), (
+        "the control-plane mirror carries the same FQDN keys"
+    )
+    inventory_reads = [
+        call for call in state["calls"] if "get" in call and "nodes" in call
+    ]
+    assert inventory_reads, "the inventory was read"
+    assert all(
+        call[call.index("-l") + 1] == EKS_NODEGROUP_SELECTOR for call in inventory_reads
+    ), f"every inventory read uses the cluster selector: {inventory_reads}"
+
+
+def test_plain_eks_nodes_are_invisible_through_the_hyperpod_label(
+    tmp_path: Path,
+) -> None:
+    """Without the selector the historical HyperPod label finds nothing on a
+    plain EKS cluster, and the script says so instead of writing keys."""
+
+    environment = {**_eks_environment(), "GPU_FAULT_NODE_SELECTOR": ""}
+    result, state = run_script(
+        tmp_path,
+        {"nodes": node_list(*EKS_NODES, labels=EKS_NODE_LABELS), "secrets": {}},
+        extra_environment=environment,
+    )
+    assert result.returncode == 1, result.stdout
+    assert "ERROR: HyperPod node inventory is empty or invalid" in result.stderr
+    assert not state["secrets"], "nothing is written without an inventory"
