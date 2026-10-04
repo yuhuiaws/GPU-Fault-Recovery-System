@@ -134,24 +134,63 @@ def ensure_runtime_profile(release: Any) -> None:
                     "instead of overwriting a live policy"
                 )
             continue
-        payload_text = json.dumps(
-            render_runtime_profile_payload(config, own),
-            separators=(",", ":"),
-        )
-        registered = json.loads(
-            exec_cpu_ingress_command(
-                release,
-                arguments=(
-                    CONTROL_PLANE_PYTHON,
-                    "-c",
-                    probe_source("runtime_profile_register"),
-                ),
-                failure="Runtime Profile registration",
-                input_text=payload_text,
-                sensitive=True,
+        _register_profile(release, spec, own, desired)
+
+
+def _register_profile(
+    release: Any,
+    spec: RuntimeProfileSpec,
+    own: RuntimeProfileSpec | None,
+    desired: dict[str, Any],
+) -> None:
+    """Register one profile; a failed POST is re-inspected and retried once.
+
+    Registration is idempotent -- the API stores the compiled profile under
+    its version and the engine compares content before and after -- so a POST
+    that failed or timed out (live 2026-10-04: the eks-v1 registration of a
+    joining cluster got no answer within the probe's budget) is checked for
+    having landed and otherwise sent once more, instead of failing the join on
+    one unanswered request.
+    """
+
+    payload_text = json.dumps(
+        render_runtime_profile_payload(release.config, own), separators=(",", ":")
+    )
+    error: ReleaseError | None = None
+    for attempt in range(2):
+        if attempt:
+            _desired, existing = _validated_inspection(release, own)
+            if existing == desired:
+                return
+            if existing is not None:
+                raise ReleaseError(
+                    f"Runtime Profile {spec.version} already exists with different "
+                    "content; choose a new profile version instead of overwriting "
+                    "a live policy"
+                )
+        try:
+            registered = json.loads(
+                exec_cpu_ingress_command(
+                    release,
+                    arguments=(
+                        CONTROL_PLANE_PYTHON,
+                        "-c",
+                        probe_source("runtime_profile_register"),
+                    ),
+                    failure="Runtime Profile registration",
+                    input_text=payload_text,
+                    sensitive=True,
+                )
             )
-        )
+        except ReleaseError as exc:
+            error = exc
+            continue
         if registered != desired:
             raise ReleaseError(
                 "registered Runtime Profile differs from the validated payload"
             )
+        return
+    assert error is not None
+    raise ReleaseError(
+        f"Runtime Profile {spec.version} registration failed twice: {error}"
+    ) from error

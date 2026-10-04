@@ -112,6 +112,50 @@ def test_profile_registration_cannot_replace_existing_content_or_accept_wrong_ac
     assert len(posted) == 1
 
 
+@pytest.mark.parametrize("outcome", ["landed", "second-post", "twice"])
+def test_profile_registration_retries_an_unanswered_post_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """A POST that failed or timed out is checked for having landed and sent
+    once more; two failures are the error, with the probe's own reason."""
+
+    release = ResourceRelease()
+    path = tmp_path / "profile.yaml"
+    path.write_text("environment: hyperpod-eks\n")
+    release.config.runtime_profile_source = path
+    release.config.runtime_profile_registration_cluster_id = "gpu-a"
+    desired = {"profile": "desired", "warnings": []}
+    inspection: dict[str, Any] = {"desired": desired, "existing": None}
+    monkeypatch.setattr(
+        profiles, "inspect_runtime_profile", lambda _release: copy.deepcopy(inspection)
+    )
+    posts: list[str] = []
+
+    def register(_release: Any, **kwargs: Any) -> str:
+        posts.append(kwargs["input_text"])
+        if len(posts) == 1 or outcome == "twice":
+            if outcome == "landed":
+                inspection["existing"] = desired  # the API stored it after all
+            raise ReleaseError(
+                "command failed (1): kubectl: ERROR: runtime profile registration "
+                "got no answer within 30s from the control-plane API: timed out"
+            )
+        inspection["existing"] = desired
+        return json.dumps(desired)
+
+    monkeypatch.setattr(profiles, "exec_cpu_ingress_command", register)
+    if outcome == "twice":
+        with pytest.raises(ReleaseError, match="registration failed twice.*no answer"):
+            profiles.ensure_runtime_profile(release)
+        assert len(posts) == 2, "exactly one retry"
+        return
+    profiles.ensure_runtime_profile(release)
+    assert len(posts) == (1 if outcome == "landed" else 2), posts
+    assert all(
+        json.loads(post)["profile_version"] == "candidate-profile" for post in posts
+    ), "every attempt posts the same validated payload"
+
+
 @pytest.mark.parametrize(
     "text,problem",
     [

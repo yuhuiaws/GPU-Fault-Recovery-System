@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Iterator, NamedTuple, Sequence, TypeVar
 
-from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
+from gpu_fault.admin.diagnostics import (
+    diagnostic_command,
+    diagnostic_text,
+    redact_text,
+)
 
 ADMIN_LOG_DIRECTORY = Path("logs")
 ADMIN_LOG_ENVIRONMENT = "GPU_FAULT_ADMIN_LOG"
@@ -188,6 +192,10 @@ def last_output_line(text: str | None) -> str:
 
 
 _ERROR_LINE = re.compile(r"^ERROR: (?P<text>.+)$")
+# kubectl's exit-status trailer and empty frames say nothing about the cause.
+_BOILERPLATE = re.compile(
+    r"^(command terminated with exit code \d+|Traceback \(most recent call last\):|File \".*\", line \d+.*|\^+)$"
+)
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
 ERROR_LINE_LIMIT = 3
 ERROR_LINE_CHARACTERS = 200
@@ -200,18 +208,31 @@ def sensitive_error_lines(text: str | None) -> tuple[str, ...]:
     the diagnosis our own scripts print with the ``ERROR:`` prefix is the one
     part the next operator needs, so those lines are kept -- at most
     ``ERROR_LINE_LIMIT`` of them, truncated, with every long token masked.
-    kubectl and aws never use that prefix, so their output stays hidden.
+    kubectl and aws never use that prefix; for them the last meaningful stderr
+    line is kept instead, redacted the same way, so a failed sensitive command
+    always leaves one line of cause.
     """
 
     lines: list[str] = []
+    last_reason = ""
     for raw in (text or "").splitlines():
-        match = _ERROR_LINE.match(raw.strip())
+        stripped = raw.strip()
+        if not stripped or _BOILERPLATE.match(stripped):
+            continue
+        match = _ERROR_LINE.match(stripped)
         if match is None:
+            last_reason = stripped
             continue
         line = _LONG_TOKEN.sub("<redacted>", match.group("text"))
         lines.append("ERROR: " + line[:ERROR_LINE_CHARACTERS])
         if len(lines) == ERROR_LINE_LIMIT:
             break
+    if not lines and last_reason:
+        # kubectl/aws print no ERROR: marker; their last meaningful stderr line
+        # (an HTTP status, a traceback's final line, "connection refused") is
+        # the one-line reason, with every long token and credential masked.
+        reason = _LONG_TOKEN.sub("<redacted>", redact_text(last_reason))
+        lines.append("stderr: " + reason[:ERROR_LINE_CHARACTERS])
     return tuple(lines)
 
 

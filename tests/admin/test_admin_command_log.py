@@ -536,6 +536,41 @@ def test_a_sensitive_failure_keeps_the_drivers_own_error_lines_redacted(
     assert "a" * 64 not in message and "derived key" not in message, (
         "other sensitive output stays hidden"
     )
-    assert sensitive_error_lines("plain stderr without a marker\n") == (), (
-        "only the driver's ERROR: lines qualify"
+    assert sensitive_error_lines("plain stderr without a marker\n") == (
+        "stderr: plain stderr without a marker",
+    ), "without an ERROR: line the last stderr line is the one-line reason"
+
+
+def test_a_sensitive_kubectl_failure_keeps_its_last_stderr_line_redacted(
+    tmp_path: Path,
+) -> None:
+    """kubectl prints no ERROR: marker; the last meaningful stderr line (not
+    the exit-status trailer) is kept, with tokens and credentials masked."""
+
+    script = tmp_path / "exec-probe.sh"  # stands in for kubectl exec
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'Traceback (most recent call last):' >&2\n"
+        "echo '  File \"<string>\", line 30, in <module>' >&2\n"
+        "echo 'urllib.error.HTTPError: HTTP Error 403: Forbidden token="
+        + "c"
+        * 48
+        + "' >&2\n"
+        "echo 'command terminated with exit code 1' >&2\n"
+        "exit 1\n"
     )
+    script.chmod(0o700)
+    with pytest.raises(BootstrapError) as failure:
+        CommandRunner().run(
+            [str(script), "exec", "pod", "--", "python"], sensitive=True
+        )
+    message = str(failure.value)
+    assert (
+        "stderr: urllib.error.HTTPError: HTTP Error 403: Forbidden token=" in message
+    ), message
+    assert "<redacted>" in message.rsplit("token=", 1)[1], "the token value is masked"
+    assert "command terminated" not in message, "the exit trailer is noise"
+    assert "c" * 48 not in message, "tokens are masked"
+    assert sensitive_error_lines(
+        "ERROR: real cause\nurllib.error.URLError: timed out\n"
+    ) == ("ERROR: real cause",), "a driver's own ERROR: line wins over the trailer"

@@ -377,7 +377,7 @@ def test_owned_delete_is_uid_conditioned_and_waits_for_confirmed_absence(
         ("no-fleet", "requires captured fleet inventory"),
         ("active-absent", "active fleet node is missing"),
         ("inactive-absent", "no proven fleet targets"),
-        ("other-cluster", "no proven fleet targets"),
+        ("other-cluster-with-installer-metadata", "no proven fleet targets"),
         ("units", "lacks installed unit inventory"),
     ],
 )
@@ -394,8 +394,11 @@ def test_node_cleanup_target_set_requires_complete_fleet_proof(
         state["fleet_snapshot"][0]["lifecycle_state"] = (
             "ACTIVE" if fault.startswith("active") else "RETIRED"
         )
-    elif fault == "other-cluster":
+    elif fault == "other-cluster-with-installer-metadata":
+        # No fleet record for this cluster, but a node still carries installer
+        # metadata: something was installed, so the proof is missing, not empty.
         state["fleet_snapshot"][0]["cluster_id"] = "other"
+        client.nodes[0]["metadata"]["annotations"] = {"gpu-fault.io/installed": "1"}
     else:
         state["fleet_snapshot"][0]["installed_unit_inventory"] = None
     with pytest.raises(KUBE.CleanupStateError, match=problem):
@@ -1113,3 +1116,91 @@ def test_capture_entrypoint_journals_departed_and_orphaned_nodes(
     }
     assert len(calls) == 1
     assert client.mutations() == []
+
+
+# --- a join that never installed a node runtime --------------------------------
+
+EKS_NODES = (
+    "ip-10-0-33-205.us-west-2.compute.internal",
+    "ip-10-0-41-164.us-west-2.compute.internal",
+    "ip-10-0-12-9.us-west-2.compute.internal",  # a CPU node of the same cluster
+)
+
+
+def _plain_eks_client() -> Client:
+    """gpu-eks-cluster as the failed join left it: FQDN nodes, the GPU ones
+    tainted and labelled by the nodegroup, no gpu-fault.io metadata anywhere."""
+
+    client = Client()
+    client.nodes = [resource("Node", name, namespace=None) for name in EKS_NODES]
+    for node in client.nodes[:2]:
+        node["metadata"]["labels"] = {
+            "nvidia.com/gpu.present": "true",
+            "eks.amazonaws.com/nodegroup": "gpu-p5en-efa-spot-node-group",
+        }
+        node["spec"] = {
+            "taints": [
+                {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+            ]
+        }
+    return client
+
+
+@pytest.mark.parametrize("fleet", ["empty", "other-cluster-only"])
+def test_a_cluster_that_never_received_node_runtimes_is_an_empty_proven_target_set(
+    fleet: str,
+) -> None:
+    """The live 2026-10-04 rollback: the join failed before the node runtime
+    rollout, the fleet holds no record for the cluster and no node carries
+    gpu-fault.io metadata. That is nothing to clean, not missing proof."""
+
+    client, state = _plain_eks_client(), document()
+    state["fleet_snapshot"] = (
+        []
+        if fleet == "empty"
+        else [{**state["fleet_snapshot"][0], "cluster_id": "other"}]
+    )
+    assert KUBE.node_targets(client, state, CONTEXT, "gpu-a") == {}, "nothing to clean"
+    assert state["node_targets"][CONTEXT] == {}, "the empty target set is recorded"
+    assert state["orphaned_installer_nodes"][CONTEXT] == {}, "no orphans either"
+
+
+def test_a_retired_fleet_record_still_demands_proof() -> None:
+    """History for the cluster -- even a RETIRED agent on a departed node --
+    keeps the refusal: the cluster did run a node runtime once."""
+
+    client, state = _plain_eks_client(), document()
+    state["fleet_snapshot"][0].update(node_id="departed", lifecycle_state="RETIRED")
+    with pytest.raises(KUBE.CleanupStateError, match="no proven fleet targets"):
+        KUBE.node_targets(client, state, CONTEXT, "gpu-a")
+
+
+def test_node_cleanup_is_skipped_when_nothing_was_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No DaemonSet is created for an empty target set, the record says why,
+    and the pending-cleanup sweep leaves the skipped record alone."""
+
+    client, state = _plain_eks_client(), document()
+    state["fleet_snapshot"] = []
+    monkeypatch.setattr(KUBE, "CleanupClient", lambda _config, _context: client)
+    state_path = tmp_path / "state.json"
+    KUBE.run_node_cleanup(
+        {},
+        state,
+        state_path,
+        context=CONTEXT,
+        cluster_id="gpu-a",
+        image="example.invalid/cleanup@sha256:" + "0" * 64,
+        mode="uninstall",
+        host_script_b64="",
+    )
+    record = state["node_cleanup"][CONTEXT]
+    assert record["status"] == "SKIPPED", record
+    assert "no node runtime was installed" in record["reason"], record
+    assert client.calls == [], "no kubectl mutation for an empty target set"
+    assert json.loads(state_path.read_text())["node_cleanup"][CONTEXT] == record, (
+        "the skip is checkpointed"
+    )
+    KUBE.cleanup_pending({}, state, state_path)
+    assert client.calls == [], "a skipped record is not a pending DaemonSet"

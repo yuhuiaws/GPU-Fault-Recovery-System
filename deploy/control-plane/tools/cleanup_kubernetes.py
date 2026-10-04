@@ -804,7 +804,7 @@ def node_targets(
             if not (agent.get("installed_unit_inventory") or {}).get("units"):
                 raise CleanupStateError("node cleanup lacks installed unit inventory")
             recorded[name] = object_identity(by_name[name])[3]
-        if not recorded:
+        if not recorded and not nothing_installed(agents, nodes, cluster_id):
             raise CleanupStateError("node cleanup has no proven fleet targets")
         document.setdefault("node_targets", {})[context] = recorded
         journal = document.setdefault("departed_fleet_nodes", [])
@@ -828,6 +828,31 @@ def node_targets(
         )
     document.setdefault("orphaned_installer_nodes", {})[context] = orphaned
     return dict(recorded)
+
+
+def nothing_installed(
+    agents: list[dict[str, Any]], nodes: list[dict[str, Any]], cluster_id: str
+) -> bool:
+    """True when the cluster provably never received a node runtime.
+
+    A join that failed before its node runtime rollout (live 2026-10-04: the
+    eks-managed join of gpu-eks-cluster stopped at the profile registration)
+    leaves no fleet record for the cluster and no ``gpu-fault.io/`` label or
+    annotation on any node. That is an empty, proven target set, not missing
+    proof: a fleet record of any lifecycle, or installer metadata on a node,
+    keeps the "no proven fleet targets" refusal.
+    """
+
+    if any(agent.get("cluster_id") == cluster_id for agent in agents):
+        return False
+    for node in nodes:
+        metadata = node.get("metadata") or {}
+        keys = set(metadata.get("labels") or {}) | set(
+            metadata.get("annotations") or {}
+        )
+        if any(key.startswith("gpu-fault.io/") for key in keys):
+            return False
+    return True
 
 
 def installer_annotation_patch(node: dict[str, Any], uid: str) -> list[dict[str, Any]]:
@@ -1114,7 +1139,7 @@ def cleanup_pending(
             raise CleanupStateError(
                 "temporary cleanup context is outside the selected scope"
             )
-        if record.get("status") == "REMOVED":
+        if record.get("status") in {"REMOVED", "SKIPPED"}:
             continue
         client = CleanupClient(config, context)
         if context not in document.get("cluster_uids", {}):
@@ -1165,6 +1190,17 @@ def run_node_cleanup(
     namespace = document["targets"]["namespace"]
     suffix = hashlib.sha256(f"{document['run_id']}:{context}".encode()).hexdigest()[:16]
     name = f"gpu-fault-node-cleanup-{suffix}"
+    if not nodes:
+        # Nothing was ever installed (node_targets proved it): no DaemonSet to
+        # run, and a DaemonSet pinned to zero nodes would be invalid anyway.
+        document.setdefault("node_cleanup", {})[context] = {
+            "name": name,
+            "uid": None,
+            "status": "SKIPPED",
+            "reason": "no node runtime was installed on this cluster",
+        }
+        atomic_write(state_path, document)
+        return
     manifest = node_manifest(
         name=name,
         namespace=namespace,

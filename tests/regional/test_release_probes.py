@@ -210,3 +210,68 @@ def test_a_probe_body_that_is_not_after_dash_c_is_left_alone(
     source = PROBES.probe_source("remote_command_stats")
 
     assert _echoed_line(capsys, ["-f", source]) == f"+ kubectl -f {source}"
+
+
+# --- runtime_profile_register names its failure --------------------------------
+
+
+def _run_register_probe(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], urlopen
+) -> tuple[int, str]:
+    import io
+    import runpy
+    import sys
+    import urllib.request
+
+    from gpu_fault_release.regional_release_probes import PROBE_DIR
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", "fixture-token")
+    monkeypatch.setattr(
+        sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"profile_version": "eks-v1"}'))
+    )
+    with pytest.raises(SystemExit) as stop:
+        runpy.run_path(
+            str(PROBE_DIR / "runtime_profile_register.py"), run_name="__main__"
+        )
+    return int(stop.value.code or 0), capsys.readouterr().err
+
+
+def test_register_probe_reports_a_refusal_with_the_api_detail(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import urllib.error
+
+    def refused(request, timeout):
+        assert timeout == 30, "the registry client's budget"
+        raise urllib.error.HTTPError(
+            request.full_url,
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(
+                b'{"detail":"runtime profile cluster_id is not a registered regional cluster"}'
+            ),
+        )
+
+    code, err = _run_register_probe(monkeypatch, capsys, refused)
+    assert code == 1, err
+    assert (
+        "ERROR: runtime profile registration refused: HTTP 403 Forbidden: "
+        '{"detail":"runtime profile cluster_id is not a registered regional cluster"}'
+    ) in err, err
+
+
+def test_register_probe_reports_an_unanswered_request(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def silent(_request, timeout):
+        raise TimeoutError("timed out")
+
+    code, err = _run_register_probe(monkeypatch, capsys, silent)
+    assert code == 1, err
+    assert (
+        "ERROR: runtime profile registration got no answer within 30s from the "
+        "control-plane API: timed out"
+    ) in err, err

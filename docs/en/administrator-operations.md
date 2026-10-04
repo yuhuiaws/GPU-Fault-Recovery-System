@@ -1109,7 +1109,10 @@ and remove-cluster likewise.
 | Candidate verify | Verifies all old and new members and the complete runtime identity | Shares one verify; on 15-minute expiry one more round may be verified for the remaining targets, not merely refreshing the timestamp |
 | Commit, activation and terminal re-verification | Guarantees the management site, release, Aurora and ACTIVE membership agree | Commits serially per cluster, stopping on other member/release drift; after the activation intent only fail-forward |
 
-A rerun of an unfinished transaction re-checks the recorded GPU identity. `ROLLBACK_STARTED/ROLLBACK_FAILED` first complete the original compensation,
+A rerun of an unfinished transaction re-checks the recorded GPU identity. `ROLLBACK_STARTED/ROLLBACK_FAILED` first complete the original compensation
+(rerun `join-cluster` with the same arguments: fail-cluster, GPU cleanup, Node Action keys, namespace, network/IAM, then the membership rollback
+that purges the registry entry; a cluster that never received a node runtime records its node cleanup as SKIPPED) and the same invocation then
+starts a fresh attempt;
 `BLOCKED_IDENTITY` must first resolve the identity uncertainty, and `SUPERVISION_LOST` cannot be retried automatically.
 A token still referenced by the rollback registry must stay in the controlled path; do not delete credentials by hand to let a new attempt regenerate them.
 Once `ACTIVATION_STARTED` is recorded, even if the original verify has expired, activation and final re-verification complete only per the original binding,
