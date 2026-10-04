@@ -411,9 +411,18 @@ def test_unrelated_or_full_selections_do_not_gain_a_selective_tool_dependency(
     assert [command for command, _ in execution] == expected, (
         "dependency protection must not expand test or regional execution"
     )
-    assert all("env" not in options for _, options in execution), (
-        "non-PromQL execution must keep its original environment contract"
-    )
+    for command, options in execution:
+        if command[:3] == [sys.executable, "-m", "pytest"]:
+            # Selected tests always get the full gate's isolated environment
+            # (no deploy deadline/budget scope, no signing data); only a PromQL
+            # selection adds the promtool binding on top.
+            child = options["env"]
+            assert not [name for name in child if name.startswith("GPU_FAULT_DEPLOY_")]
+            assert "COSIGN_PASSWORD" not in child, child
+        else:
+            assert "env" not in options, (
+                "static gates must keep their original environment contract"
+            )
     assert len(calls) == len(expected) + bool(targets and not full), (
         "only nonempty selective test plans need read-only Make metadata"
     )
@@ -477,4 +486,62 @@ def test_invalid_tool_binding_refuses_before_selective_work(
         )
     assert len(calls) == 2 and "promtool-preflight" in calls[1], (
         "a zero-exit preflight without a validated binding must not launch any tests"
+    )
+
+
+def test_selected_tests_never_inherit_the_deploys_deadline_or_api_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gpu-fault-admin deploy` runs this selection from inside its own
+    deployment deadline and API budget. On 2026-10-04 the selected pytest run
+    inherited both: tests that fake the clock refused the real deadline
+    ("invalid inherited deployment deadline") and tests that open their own
+    budget reused the deploy's live budget database (UNIQUE leases.id). Every
+    selected test process gets the full gate's isolated environment instead."""
+
+    budget = tmp_path / "gpu-fault-api-live"
+    (budget / "bin").mkdir(parents=True)
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_API_BUDGET_DIR", str(budget))
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_API_PHASE", "deployment")
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_API_PARENT", "parent-lease")
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_DEADLINE_MONOTONIC", "2261959.6")
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_HARD_DEADLINE_MONOTONIC", "2262859.6")
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_RECOVERY_ACTIVE", "false")
+    monkeypatch.setenv("COSIGN_PASSWORD", "example-test-only-signing-password")
+    monkeypatch.setenv("GPU_FAULT_TEST_POSTGRES_URL", "postgresql://example/test")
+    monkeypatch.setenv("PATH", f"{budget / 'bin'}:/usr/bin:/bin")
+    calls: list[tuple[list[str], dict]] = []
+
+    def run(command, **options):
+        calls.append((list(command), options))
+        if "promql-test-files" in command:  # read-only Make metadata, no PromQL hit
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(["tests/native/test_future_rules.py"])
+            )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(
+        MODULE, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    MODULE.execute_plan(
+        execution_plan(("tests/admin/test_deploy_native_deadlines.py",), postgres=True),
+        settings(),
+        root=tmp_path,
+    )
+    children = [options["env"] for command, options in calls if "pytest" in command]
+    children += [
+        options["env"]
+        for command, options in calls
+        if "test-postgres-stress" in command
+    ]
+    assert len(children) == 2, [command for command, _ in calls]
+    for child in children:
+        assert not [name for name in child if name.startswith("GPU_FAULT_DEPLOY_")], (
+            "the deploy's deadline, budget and recovery scope stop at the selection"
+        )
+        assert str(budget / "bin") not in child["PATH"].split(":"), (
+            "the budget shim is not the tests' kubectl/aws"
+        )
+    assert "COSIGN_PASSWORD" not in children[0], (
+        "selected tests cannot consume signing data"
     )

@@ -683,6 +683,19 @@ def render_text(plan: Plan, *, regional_only: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+def gate_environment() -> dict[str, str]:
+    """The environment every selected test process gets.
+
+    ``isolated_gate_environment`` drops the deploy's deadline and API-budget
+    scope (tests own their clocks and budgets; the deploy's supervisor still
+    owns the selection as a whole), and selected tests never see signing data.
+    """
+
+    environment = isolated_gate_environment(os.environ)
+    environment.pop("COSIGN_PASSWORD", None)
+    return environment
+
+
 def promql_pytest_environment(
     targets: Sequence[str], *, root: Path = ROOT
 ) -> dict[str, str] | None:
@@ -690,8 +703,7 @@ def promql_pytest_environment(
 
     if not targets:
         return None
-    environment = isolated_gate_environment(os.environ)
-    environment.pop("COSIGN_PASSWORD", None)
+    environment = gate_environment()
 
     def make_json(target: str) -> Any:
         completed = subprocess.run(
@@ -778,16 +790,25 @@ def execute_plan(plan: Plan, settings: Settings, *, root: Path = ROOT) -> None:
             )
         command = pytest_command(plan)
         if command:
-            if environment is None:
-                subprocess.run(command, cwd=root, check=True)
-            else:
-                subprocess.run(command, cwd=root, env=environment, check=True)
+            # Selected tests run with the same isolation as the full release
+            # gate: the deploy that runs this selection owns a deployment
+            # deadline and an API budget, and a test suite that inherited them
+            # failed 171 tests on 2026-10-04 (faked clocks against the real
+            # deadline, test budgets reusing the deploy's live budget database).
+            subprocess.run(
+                command,
+                cwd=root,
+                env=environment if environment is not None else gate_environment(),
+                check=True,
+            )
     if plan.postgres:
         if not os.environ.get("GPU_FAULT_TEST_POSTGRES_URL"):
             raise ImpactError(
                 "PostgreSQL stress is required; set GPU_FAULT_TEST_POSTGRES_URL"
             )
-        environment = postgres_test_environment(os.environ)
+        # The stress run keeps its native environment (it signs nothing away
+        # and nothing more is removed), minus the deploy's own scope.
+        environment = postgres_test_environment(isolated_gate_environment(os.environ))
         postgres_command = settings.postgres_command
         if ALLOCATION_ENV in environment and postgres_command == (
             "make",
