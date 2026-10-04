@@ -159,21 +159,42 @@ def cpu_runtime_deployments(modules: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(name) for name in names) or CPU_RUNTIME_DEPLOYMENTS
 
 
-def release_for(settings: Settings, modules: dict[str, Any], *, dry_run: bool) -> Any:
-    rollout = modules["rollout_regional_release"]
-    config = modules["regional_release_config"].ReleaseConfig.load(settings.noop_config)
-    target = settings.regional
+def bind_target_cluster(config: Any, target: Any) -> Any:
+    """The NOOP config's entry for the approved acceptance target cluster.
+
+    BOOT-020 hands over the site's own release config, which names every
+    managed cluster with its provider, node selector and Runtime Profile
+    override. The approved target is one of them: it must be present exactly
+    once, under the approved context, and the config's CPU kubeconfig,
+    namespace and Region must be the target's. Until 2026-10-04 the runner also
+    required the config to name only that cluster, which no mixed site can
+    satisfy (live: BOOT-020's hand-off carried both clusters and BOOT-023
+    refused at plan). A single-cluster config binds exactly as before.
+    """
+
+    matches = [
+        cluster
+        for cluster in config.clusters
+        if str(cluster.cluster_id) == str(target.cluster_id)
+    ]
     if (
         Path(config.cpu_kubeconfig).resolve() != target.cpu_kubeconfig.resolve()
         or config.namespace != target.namespace
         or config.aws_region != target.region
-        or len(config.clusters) != 1
-        or config.clusters[0].cluster_id != target.cluster_id
-        or config.clusters[0].context != target.gpu_context
+        or len(matches) != 1
+        or matches[0].context != target.gpu_context
     ):
         raise RegionalFixtureError(
             "NOOP release config does not match the approved target"
         )
+    return matches[0]
+
+
+def release_for(settings: Settings, modules: dict[str, Any], *, dry_run: bool) -> Any:
+    rollout = modules["rollout_regional_release"]
+    config = modules["regional_release_config"].ReleaseConfig.load(settings.noop_config)
+    target = settings.regional
+    bind_target_cluster(config, target)
     gpu_kubeconfig = os.getenv("KUBECONFIG", "")
     if (
         not gpu_kubeconfig

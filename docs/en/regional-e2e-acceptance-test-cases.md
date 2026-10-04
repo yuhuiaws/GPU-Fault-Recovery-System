@@ -3405,7 +3405,10 @@ uninstall target be guessed. Save the original bootstrap task terminal states an
   the `boot023-noop.json` config and the `final_noop_handoff` digest delivered after BOOT-020 FULL completed
   (without `--noop-config` / `GPU_FAULT_NOOP_RELEASE_CONFIG` the runner defaults to this run's
   `cases/GF-REGIONAL-BOOT-020/boot023-noop.json`),
-  not the original `noop.json` that pointed at the old release:
+  not the original `noop.json` that pointed at the old release. That config is the site's own release config and names
+  **every** managed cluster with its `provider`/`node_selector`/`runtime_profile` attributes; the runner binds the target
+  cluster given by `--cluster-id`/`--gpu-context` among them (present exactly once under that context; the CPU kubeconfig,
+  namespace and Region must equal the target's). A single-cluster site behaves as before:
 
   ```bash
   PYTHONPATH=src python3 scripts/e2e/regional/run_boot023_release_history.py \

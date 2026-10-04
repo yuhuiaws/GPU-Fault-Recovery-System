@@ -711,6 +711,26 @@ def test_release_config_accepts_the_exact_approved_scope(
     assert calls == [True], "planning must keep the release Runner read-only"
 
 
+def test_release_config_of_a_mixed_site_binds_the_approved_target_among_its_clusters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-04: BOOT-020's hand-off is the site config and named both
+    clusters of the mixed site; the single-cluster rule refused it at plan."""
+
+    settings, modules, config, calls = _release_scope(monkeypatch)
+    config.clusters.insert(
+        0, SimpleNamespace(cluster_id="hp-cluster", context="test-gpu-1-hp")
+    )
+
+    result = boot023.release_for(settings, modules, dry_run=True)
+
+    assert result["config"] is config, "the whole site config reaches the NOOP release"
+    assert calls == [True]
+    config.clusters.pop()  # the approved target is no longer named
+    with pytest.raises(Exception, match="does not match the approved target"):
+        boot023.release_for(settings, modules, dry_run=True)
+
+
 @pytest.mark.parametrize("field", ["history", "runtime_identity"])
 def test_plan_identity_detects_content_changes_without_count_changes(
     field: str,
@@ -860,3 +880,75 @@ def test_noop_cannot_fall_back_to_an_engine_that_repairs_gpu_resources(
         boot023.run_noop_release(SimpleNamespace(), modules, tmp_path)
 
     assert calls == [], "the old engine must fail before any watcher apply is possible"
+
+
+# -- the NOOP config names every cluster of the site; the target is one of them --
+
+
+def _target(tmp_path: Path, **changes: Any) -> SimpleNamespace:
+    cpu = tmp_path / "cpu.kubeconfig"
+    cpu.write_text("apiVersion: v1\n", encoding="utf-8")
+    values = {
+        "cpu_kubeconfig": cpu,
+        "namespace": "gpu-fault-system",
+        "region": "us-west-2",
+        "cluster_id": "gpu-eks-cluster",
+        "gpu_context": "gpu-fault-gpu-gpu-eks-cluster",
+    }
+    return SimpleNamespace(**{**values, **changes})
+
+
+def _config(
+    tmp_path: Path, *clusters: tuple[str, str], **changes: Any
+) -> SimpleNamespace:
+    values = {
+        "cpu_kubeconfig": str(tmp_path / "cpu.kubeconfig"),
+        "namespace": "gpu-fault-system",
+        "aws_region": "us-west-2",
+        "clusters": tuple(
+            SimpleNamespace(cluster_id=cluster_id, context=context)
+            for cluster_id, context in clusters
+        ),
+    }
+    return SimpleNamespace(**{**values, **changes})
+
+
+HP = ("hp-cluster", "gpu-fault-gpu-1-hp-cluster")
+EKS = ("gpu-eks-cluster", "gpu-fault-gpu-gpu-eks-cluster")
+
+
+def test_the_target_is_bound_among_the_clusters_of_a_mixed_site(tmp_path: Path) -> None:
+    """Live 2026-10-04: BOOT-020's hand-off named both clusters of the mixed site
+    and the runner refused it for not naming exactly one."""
+
+    bound = boot023.bind_target_cluster(_config(tmp_path, HP, EKS), _target(tmp_path))
+    assert bound.cluster_id == "gpu-eks-cluster"
+    assert bound.context == "gpu-fault-gpu-gpu-eks-cluster"
+    single = boot023.bind_target_cluster(_config(tmp_path, EKS), _target(tmp_path))
+    assert single.cluster_id == "gpu-eks-cluster", (
+        "a single-cluster config binds as before"
+    )
+
+
+@pytest.mark.parametrize(
+    ("clusters", "target_changes", "config_changes"),
+    [
+        ((HP,), {}, {}),  # the target cluster is not in the config
+        ((HP, EKS, EKS), {}, {}),  # the target cluster is ambiguous
+        ((HP, ("gpu-eks-cluster", "other-context")), {}, {}),  # another context
+        ((HP, EKS), {"namespace": "other"}, {}),
+        ((HP, EKS), {"region": "eu-west-1"}, {}),
+        ((HP, EKS), {}, {"cpu_kubeconfig": "/elsewhere/cpu.kubeconfig"}),
+    ],
+)
+def test_a_config_without_the_approved_target_is_refused(
+    tmp_path: Path,
+    clusters: tuple[tuple[str, str], ...],
+    target_changes: dict[str, Any],
+    config_changes: dict[str, Any],
+) -> None:
+    with pytest.raises(Exception, match="does not match the approved target"):
+        boot023.bind_target_cluster(
+            _config(tmp_path, *clusters, **config_changes),
+            _target(tmp_path, **target_changes),
+        )
