@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpu_fault.admin.api_budget import api_environment
 from gpu_fault.app import ApplicationContext, create_app
 from tests._builders import asgi_client, build_context, build_store
 
@@ -600,12 +601,20 @@ def test_generated_role_split_manifests_are_current(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         check=False,
-        env={
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-            "GPU_FAULT_CONTROL_WORKER_REPLICAS": "6",
-            "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(rendered_dir),
-        },
+        # The deploy host runs this gate inside a deployment's API budget
+        # scope, where ``kubectl`` on PATH is the budget shim: a stripped
+        # environment made the shim refuse its own ``kubectl kustomize``
+        # ("API shim lost its deployment scope", live 2026-10-04).
+        # ``api_environment`` keeps the scope when there is one and is a
+        # no-op everywhere else, so the render is deterministic in both.
+        env=api_environment(
+            {
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+                "GPU_FAULT_CONTROL_WORKER_REPLICAS": "6",
+                "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(rendered_dir),
+            }
+        ),
     )
     assert rendered.returncode == 0, rendered.stderr
 
