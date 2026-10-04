@@ -16,6 +16,10 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     gpu_node_items,
 )
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 
@@ -295,8 +299,8 @@ def _validate_candidate_components(
         node_count=len(node_names),
         node_names=node_names,
         artifact_sha=release.node_wheel_sha,
-        config_digest=release.config.agent_config_digest,
-        runtime_profile_version=release.config.runtime_profile_version,
+        config_digest=target_agent_config_digest(release.config, target),
+        runtime_profile_version=target_runtime_profile_version(release.config, target),
         bundle_sha=release.bundle_sha,
         template_sha=release.node_template_sha,
     ):
@@ -360,8 +364,8 @@ def _validate_incomplete_agent_state(
         artifact_sha=release.node_wheel_sha,
         bundle_sha=release.bundle_sha,
         template_sha=release.node_template_sha,
-        config_digest=release.config.agent_config_digest,
-        runtime_profile_version=release.config.runtime_profile_version,
+        config_digest=target_agent_config_digest(release.config, target),
+        runtime_profile_version=target_runtime_profile_version(release.config, target),
     )
     raw = exec_cpu_ingress_probe(
         release,
@@ -391,8 +395,8 @@ def _validate_incomplete_agent_state(
                         ),
                         bundle=release.bundle_sha,
                         template=release.node_template_sha,
-                        profile=release.config.runtime_profile_version,
-                        config=release.config.agent_config_digest,
+                        profile=target_runtime_profile_version(release.config, target),
+                        config=target_agent_config_digest(release.config, target),
                     ),
                 ],
             }

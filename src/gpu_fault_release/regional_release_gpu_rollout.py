@@ -29,6 +29,9 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_gpu_stage import GpuStageStep, run_gpu_stage
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+)
 from gpu_fault_release.regional_release_rendering import render_gpu_rollout_manifests
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
@@ -972,7 +975,7 @@ def upgrade_gpu_target(
                 wheel_cm=release.executor_wheel_cm,
                 bundle_cm=release.bundle_cm,
                 artifact_sha=release.node_wheel_sha,
-                config_digest=release.config.agent_config_digest,
+                config_digest=target_agent_config_digest(release.config, target),
                 mutation_started=record_mutation_started,
                 candidate_preflight_completed=candidate_preflighted,
             )
@@ -990,7 +993,7 @@ def upgrade_gpu_target(
                 wheel_cm=release.executor_wheel_cm,
                 bundle_cm=release.bundle_cm,
                 artifact_sha=release.node_wheel_sha,
-                config_digest=release.config.agent_config_digest,
+                config_digest=target_agent_config_digest(release.config, target),
                 node_dependency_target=NodeDependencyTarget.CANDIDATE,
             ),
         )

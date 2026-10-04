@@ -20,11 +20,15 @@ from gpu_fault.cluster_scope import (
 )
 from gpu_fault_release import containing_repository_root, repository_root
 from gpu_fault_release.regional_release_profile_model import (
-    RuntimeProfileSpec as RuntimeProfileSpec,
+    RuntimeProfileSpec,
+    cluster_runtime_profiles,
+    runtime_profile_version_for,
+    runtime_profiles,
+    site_runtime_profile,
+    target_agent_config_digest,
+    target_runtime_profile_version,
 )
-from gpu_fault_release.regional_release_profile_model import (
-    runtime_profile_policy_sha256 as runtime_profile_policy_sha256,
-)
+
 
 ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -237,7 +241,7 @@ class ClusterTarget:
         return node_selector(self)
 
     def runtime_profile_spec(self) -> RuntimeProfileSpec:
-        """The profile this cluster is pinned to (its own, or the site's)."""
+        """This cluster's own profile (see ``overrides_runtime_profile``)."""
 
         if self.runtime_profile_source is None or not self.runtime_profile_version:
             raise ReleaseError(
@@ -1154,50 +1158,27 @@ class ReleaseConfig:
             values[NOTIFICATION_ENVIRONMENT[1]] = self.health.sns_topic_arn
         return values
 
+    # Per-cluster Runtime Profile pins; the logic lives in
+    # ``regional_release_profile_model`` so release-engine code can resolve a
+    # target's pin from any config exposing the same attributes.
+
     def site_runtime_profile(self) -> RuntimeProfileSpec:
-        return RuntimeProfileSpec(
-            source=self.runtime_profile_source,
-            template_source=self.runtime_profile_template_source,
-            version=self.runtime_profile_version,
-            registration_cluster_id=self.runtime_profile_registration_cluster_id,
-            agent_config_digest=self.agent_config_digest,
-        )
+        return site_runtime_profile(self)
 
     def runtime_profiles(self) -> tuple[RuntimeProfileSpec, ...]:
-        """Every distinct profile version in use: the site's first, then each
-        cluster override once, in cluster order."""
-
-        profiles = [self.site_runtime_profile()]
-        for target in self.clusters:
-            if target.overrides_runtime_profile:
-                spec = target.runtime_profile_spec()
-                if spec.version != self.runtime_profile_version and all(
-                    item.version != spec.version for item in profiles
-                ):
-                    profiles.append(spec)
-        return tuple(profiles)
+        return runtime_profiles(self)
 
     def cluster_runtime_profile_version(self, target: ClusterTarget) -> str:
-        return target.runtime_profile_version or self.runtime_profile_version
+        return target_runtime_profile_version(self, target)
+
+    def runtime_profile_version_for(self, cluster_id: str) -> str:
+        return runtime_profile_version_for(self, cluster_id)
 
     def cluster_agent_config_digest(self, target: ClusterTarget) -> str:
-        return target.agent_config_digest or self.agent_config_digest
+        return target_agent_config_digest(self, target)
 
     def cluster_runtime_profiles(self) -> dict[str, dict[str, str]]:
-        """``{cluster_id: {version, agent_config_digest, policy_sha256}}`` for the
-        clusters that override the site profile; empty on a single-profile site."""
-
-        overrides: dict[str, dict[str, str]] = {}
-        for target in self.clusters:
-            if not target.overrides_runtime_profile:
-                continue
-            spec = target.runtime_profile_spec()
-            overrides[target.cluster_id] = {
-                "version": spec.version,
-                "agent_config_digest": spec.agent_config_digest,
-                "policy_sha256": runtime_profile_policy_sha256(spec.source),
-            }
-        return overrides
+        return cluster_runtime_profiles(self)
 
     @classmethod
     def load(cls, path: Path) -> ReleaseConfig:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault_release.regional_release_profile_model import target_agent_config_digest
 from gpu_fault_release.regional_release_rollback_target import (
     rollback_target,
     validate_rollback_node_template,
@@ -610,7 +611,7 @@ def bootstrap_gpu_target(self: RegionalRelease, target: ClusterTarget) -> None:
         wheel_cm=self.executor_wheel_cm,
         bundle_cm=self.bundle_cm,
         artifact_sha=self.node_wheel_sha,
-        config_digest=self.config.agent_config_digest,
+        config_digest=target_agent_config_digest(self.config, target),
     )
 
 
@@ -1015,9 +1016,7 @@ def run_upgrade_phases(
                 phase_complete("data-converged", release_lifecycle="FINALIZING")
             if not phase_done("cpu-finalized"):
                 if plan.has(ReleaseComponent.RUNTIME_PROFILE):
-                    self._ensure_profile_transition_safe(
-                        previous.get("runtime_profile_version")
-                    )
+                    self._ensure_profile_transition_safe(None, previous=previous)
 
                 run_component(
                     ReleaseComponent.CPU_FINALIZE,

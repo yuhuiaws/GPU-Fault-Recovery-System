@@ -29,6 +29,7 @@ from gpu_fault_release import regional_release_preflight as PREFLIGHT
 from gpu_fault_release import regional_release_rendering as RENDERING
 from gpu_fault_release import rollout as MODULE
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_profile_model import cluster_profiles_digest
 from tests.regional._release_orchestrator_support import (
     GPU_EKS_ARN,
     REGION,
@@ -507,3 +508,178 @@ def test_hyperpod_executor_allowlist_is_unchanged() -> None:
                 }
             ],
         )
+
+
+# --- per-cluster runtime profile (mixed-provider site) --------------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+EKS_PROFILE = ROOT / "config/runtime-profile.regional-eks-safe.example.yaml"
+EKS_DIGEST = "e" * 64
+
+
+def _eks_cluster_with_profile(tmp_path: Path) -> dict[str, Any]:
+    value = _eks_cluster(tmp_path)
+    value["runtime_profile"] = {
+        "source": str(EKS_PROFILE),
+        "template_source": str(EKS_PROFILE),
+        "version": "eks-v1",
+        "agent_config_digest": EKS_DIGEST,
+    }
+    return value
+
+
+class ProfileAwareRunner(RecordingRunner):
+    """Answers the ingress exec probes the profile registration performs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.registered: list[dict[str, Any]] = []
+        self.inspected: list[str] = []
+        self.live: dict[str, dict[str, Any]] = {}
+
+    def run(self, args: list[str], **kwargs: Any) -> str:
+        from gpu_fault_release.regional_release_probes import probe_source
+        from tests.regional._release_orchestrator_support import ingress_pod_list_json
+
+        super().run(args, **kwargs)
+        if str(args[0]).endswith("deploy-node-installer-reconciler.sh"):
+            # Dry-run preflight: no nodes were listed, so none are covered.
+            return json.dumps({"node_count": 0, "status": "PASSED"})
+        if "get" in args and "pod" in args:
+            return ingress_pod_list_json()
+        if "exec" in args:
+            payload = json.loads(kwargs.get("input_text") or "{}")
+            version = str(payload.get("profile_version"))
+            if args[-1] == probe_source("runtime_profile_inspect"):
+                self.inspected.append(version)
+                desired = {**payload, "warnings": []}
+                return json.dumps(
+                    {"desired": desired, "existing": self.live.get(version)}
+                )
+            if args[-1] == probe_source("runtime_profile_register"):
+                self.registered.append(payload)
+                self.live[version] = {**payload, "warnings": []}
+                return json.dumps(self.live[version])
+        return ""
+
+
+@pytest.fixture
+def mixed_release(tmp_path: Path) -> MODULE.RegionalRelease:
+    config = MODULE.ReleaseConfig.load(
+        config_file(
+            tmp_path,
+            clusters=[_hyperpod_cluster(tmp_path), _eks_cluster_with_profile(tmp_path)],
+        )
+    )
+    release = MODULE.RegionalRelease(config, ProfileAwareRunner())
+    release.runner.dry_run = False  # type: ignore[attr-defined]
+    return release
+
+
+def test_every_profile_version_in_use_is_registered_once(mixed_release) -> None:
+    runner: ProfileAwareRunner = mixed_release.runner  # type: ignore[assignment]
+    from gpu_fault_release.regional_runtime_profile import ensure_runtime_profile
+
+    ensure_runtime_profile(mixed_release)
+    assert [item["profile_version"] for item in runner.registered] == [
+        "hyperpod-v1",
+        "eks-v1",
+    ], "the site profile and the cluster's own profile must both be registered"
+    eks = next(
+        item for item in runner.registered if item["profile_version"] == "eks-v1"
+    )
+    assert eks["cluster_id"] == "gpu-eks-cluster", (
+        "a cluster override is anchored on its own cluster id"
+    )
+    assert eks["environment"] == "eks", "the EKS example profile is the one registered"
+    runner.registered.clear()
+    ensure_runtime_profile(mixed_release)
+    assert runner.registered == [], "registered profiles are not re-registered"
+
+
+def test_each_gpu_target_renders_its_own_profile_version(mixed_release) -> None:
+    hyperpod, eks = _targets(mixed_release)
+    hyperpod_env = _env(
+        _deployments(mixed_release, hyperpod)[
+            "gpu-fault-kubernetes-node-resource-collector"
+        ]
+    )
+    eks_env = _env(
+        _deployments(mixed_release, eks)["gpu-fault-kubernetes-node-resource-collector"]
+    )
+    assert (
+        hyperpod_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"]["value"] == "hyperpod-v1"
+    ), "the HyperPod cluster stays on the site profile version"
+    assert eks_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"]["value"] == "eks-v1", (
+        "the plain EKS cluster renders its own profile version"
+    )
+    hyperpod_reconciler = _reconciler_environment(mixed_release, hyperpod)
+    eks_reconciler = _reconciler_environment(mixed_release, eks)
+    assert hyperpod_reconciler["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1", "site pin"
+    assert eks_reconciler["GPU_FAULT_RUNTIME_PROFILE"] == "eks-v1", "cluster pin"
+    cpu = RENDERING.build_cpu_apply_environment(mixed_release, finalize=False)
+    assert cpu["GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"] == "hyperpod-v1", (
+        "the CPU pin keeps meaning the site default"
+    )
+    assert cpu["GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST"] == "a" * 64, (
+        "the CPU Agent config pin keeps meaning the site default"
+    )
+
+
+def test_node_runtime_preflight_pins_the_cluster_profile(mixed_release) -> None:
+    from gpu_fault_release import regional_release_node_runtime_rollout as NODE_RUNTIME
+
+    _hyperpod, eks = _targets(mixed_release)
+    runner: ProfileAwareRunner = mixed_release.runner  # type: ignore[assignment]
+    runner.dry_run = True
+    NODE_RUNTIME.preflight_node_runtime(
+        mixed_release,
+        eks,
+        phase="join",
+        wheel_cm="wheel-cm",
+        bundle_cm="bundle-cm",
+        artifact_sha="a" * 64,
+        config_digest=mixed_release.config.cluster_agent_config_digest(eks),
+    )
+    environments = [
+        kwargs["env"]
+        for _args, kwargs in runner.calls
+        if isinstance(kwargs.get("env"), dict)
+        and "GPU_FAULT_RUNTIME_PROFILE" in kwargs["env"]
+    ]
+    assert environments, "the node installer preflight must render the reconciler env"
+    assert {env["GPU_FAULT_RUNTIME_PROFILE"] for env in environments} == {"eks-v1"}, (
+        "a node candidate without an explicit version takes its cluster's"
+    )
+    assert {env["GPU_FAULT_INSTALLER_CONFIG_DIGEST"] for env in environments} == {
+        EKS_DIGEST
+    }, "the cluster's own Agent config digest reaches the installer"
+
+
+def test_release_state_records_cluster_profiles_and_the_diff_sees_them(
+    mixed_release, release
+) -> None:
+    from gpu_fault_release import regional_release_diff as DIFF
+
+    assert cluster_profiles_digest(release.config) is None, (
+        "a site without overrides digests to None so older states compare equal"
+    )
+    assert cluster_profiles_digest(mixed_release.config), "overrides produce a digest"
+    plain_state = {"runtime_profile_version": "hyperpod-v1"}
+    assert DIFF.classify_release(release, plain_state).changed >= set(), "classifies"
+    assert (
+        "cluster_runtime_profiles"
+        not in DIFF.classify_release(
+            release, {**plain_state, "cluster_runtime_profiles_sha256": None}
+        ).changed
+    ), "no override on either side is not a change"
+    assert (
+        "cluster_runtime_profiles"
+        in DIFF.classify_release(mixed_release, plain_state).changed
+    ), "a new cluster override is a profile change for the release plan"
+    plan = DIFF.build_execution_plan(
+        DIFF.diff_from_changed({"cluster_runtime_profiles"})
+    )
+    assert plan.has(DIFF.ReleaseComponent.RUNTIME_PROFILE), "profile registration"
+    assert plan.has(DIFF.ReleaseComponent.AGENT), "the data plane Agents roll"
+    assert plan.has(DIFF.ReleaseComponent.RECONCILER), "the reconciler rolls"

@@ -16,6 +16,10 @@ from gpu_fault_release.regional_release_gpu_rollout import (
 )
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 
 WAIT_AGENTS_POLL_SECONDS = 5
@@ -155,8 +159,12 @@ def wait_agents(
                 else None
             )
         )
-    expected_config = config_digest or release.config.agent_config_digest
-    expected_profile = runtime_profile_version or release.config.runtime_profile_version
+    expected_config = config_digest or target_agent_config_digest(
+        release.config, target
+    )
+    expected_profile = runtime_profile_version or target_runtime_profile_version(
+        release.config, target
+    )
     expected_nodes = frozenset(node_names) if node_names else None
     started = time.monotonic()
     deadline = started + timeout_seconds

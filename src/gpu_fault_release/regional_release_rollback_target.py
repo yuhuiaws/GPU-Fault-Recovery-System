@@ -95,6 +95,15 @@ def rollback_target(
     components: frozenset[ReleaseComponent],
 ) -> None:
     old = (previous.get("clusters") or {}).get(target.cluster_id) or {}
+    # A cluster that ran its own Runtime Profile is rolled back to that
+    # profile's version and Agent config digest, not the site's.
+    old_profile = (previous.get("cluster_runtime_profiles") or {}).get(
+        target.cluster_id
+    ) or {}
+    if old_profile.get("version"):
+        runtime_profile_version = str(old_profile["version"])
+    if old_profile.get("agent_config_digest"):
+        config_digest = str(old_profile["agent_config_digest"])
     if components & {ReleaseComponent.AGENT, ReleaseComponent.RECONCILER}:
         validate_rollback_node_template(self, target, previous=previous)
     if ReleaseComponent.ENDPOINT in components:

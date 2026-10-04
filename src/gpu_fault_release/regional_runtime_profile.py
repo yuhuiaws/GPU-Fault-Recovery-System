@@ -6,12 +6,16 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault_release.regional_release_config import (
-    ReleaseConfig,
-    ReleaseError,
-    runtime_profile_policy_sha256,
-)
+from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import (
+    ProfileModelError,
+    RuntimeProfileSpec,
+    cluster_runtime_profiles,
+    runtime_profile_policy_sha256,
+    runtime_profiles,
+    site_runtime_profile,
+)
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     exec_cpu_ingress_command,
@@ -19,23 +23,35 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 
 
-def render_runtime_profile_payload(config: ReleaseConfig) -> dict[str, Any]:
-    document = yaml.safe_load(config.runtime_profile_source.read_text(encoding="utf-8"))
+def render_runtime_profile_payload(
+    config: ReleaseConfig, spec: RuntimeProfileSpec | None = None
+) -> dict[str, Any]:
+    """The registration payload of one profile: the site's, or a cluster's own."""
+
+    profile = spec or site_runtime_profile(config)
+    if profile.source is None:
+        raise ReleaseError("runtime profile source is not configured")
+    document = yaml.safe_load(profile.source.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ReleaseError("runtime profile source must contain one mapping")
     payload = dict(document)
-    payload["cluster_id"] = config.runtime_profile_registration_cluster_id
-    payload["profile_version"] = config.runtime_profile_version
+    payload["cluster_id"] = profile.registration_cluster_id
+    payload["profile_version"] = profile.version
     return payload
 
 
 def runtime_profile_policy_digest(path: Path) -> str:
-    return runtime_profile_policy_sha256(path)
+    try:
+        return runtime_profile_policy_sha256(path)
+    except ProfileModelError as exc:
+        raise ReleaseError(str(exc)) from exc
 
 
-def inspect_runtime_profile(release: Any) -> dict[str, Any]:
+def inspect_runtime_profile(
+    release: Any, spec: RuntimeProfileSpec | None = None
+) -> dict[str, Any]:
     config = release.config
-    payload = render_runtime_profile_payload(config)
+    payload = render_runtime_profile_payload(config, spec)
     payload_text = json.dumps(payload, separators=(",", ":"))
     return json.loads(
         exec_cpu_ingress_probe(
@@ -49,9 +65,15 @@ def inspect_runtime_profile(release: Any) -> dict[str, Any]:
 
 
 def _validated_inspection(
-    release: Any,
+    release: Any, spec: RuntimeProfileSpec | None = None
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    inspection = inspect_runtime_profile(release)
+    # The site profile keeps the historical one-argument call; only a
+    # cluster's own profile passes its spec.
+    inspection = (
+        inspect_runtime_profile(release)
+        if spec is None
+        else inspect_runtime_profile(release, spec)
+    )
     desired = inspection.get("desired")
     existing = inspection.get("existing")
     if not isinstance(desired, dict):
@@ -68,51 +90,68 @@ def _validated_inspection(
 
 
 def verify_runtime_profile(release: Any) -> None:
-    desired, existing = _validated_inspection(release)
-    if existing is None:
-        raise ReleaseError(
-            f"Runtime Profile {release.config.runtime_profile_version} is not registered"
-        )
-    if existing != desired:
-        raise ReleaseError(
-            "Runtime Profile "
-            f"{release.config.runtime_profile_version} differs from the declared policy"
-        )
+    """Every profile version in use is registered with the declared policy."""
+
+    for index, spec in enumerate(runtime_profiles(release.config)):
+        desired, existing = _validated_inspection(release, spec if index else None)
+        if existing is None:
+            raise ReleaseError(f"Runtime Profile {spec.version} is not registered")
+        if existing != desired:
+            raise ReleaseError(
+                f"Runtime Profile {spec.version} differs from the declared policy"
+            )
+
+
+def verify_runtime_profile_check(release: Any) -> tuple[str, dict[str, Any]]:
+    """``verify_runtime_profile`` as a status check: (summary, details)."""
+
+    verify_runtime_profile(release)
+    return (
+        "declared Runtime Profile is registered without drift",
+        {
+            "version": release.config.runtime_profile_version,
+            "cluster_overrides": cluster_runtime_profiles(release.config),
+        },
+    )
 
 
 def ensure_runtime_profile(release: Any) -> None:
+    """Register every profile version in use: the site's, then each cluster's own."""
+
     runner = release.runner
     config = release.config
     if runner.dry_run:
         return
-    desired, existing = _validated_inspection(release)
-    if existing is not None:
-        if existing != desired:
-            raise ReleaseError(
-                "Runtime Profile "
-                f"{config.runtime_profile_version} already exists "
-                "with different content; choose a new profile version "
-                "instead of overwriting a live policy"
+    for index, spec in enumerate(runtime_profiles(config)):
+        own = spec if index else None
+        desired, existing = _validated_inspection(release, own)
+        if existing is not None:
+            if existing != desired:
+                raise ReleaseError(
+                    "Runtime Profile "
+                    f"{spec.version} already exists "
+                    "with different content; choose a new profile version "
+                    "instead of overwriting a live policy"
+                )
+            continue
+        payload_text = json.dumps(
+            render_runtime_profile_payload(config, own),
+            separators=(",", ":"),
+        )
+        registered = json.loads(
+            exec_cpu_ingress_command(
+                release,
+                arguments=(
+                    CONTROL_PLANE_PYTHON,
+                    "-c",
+                    probe_source("runtime_profile_register"),
+                ),
+                failure="Runtime Profile registration",
+                input_text=payload_text,
+                sensitive=True,
             )
-        return
-    payload_text = json.dumps(
-        render_runtime_profile_payload(config),
-        separators=(",", ":"),
-    )
-    registered = json.loads(
-        exec_cpu_ingress_command(
-            release,
-            arguments=(
-                CONTROL_PLANE_PYTHON,
-                "-c",
-                probe_source("runtime_profile_register"),
-            ),
-            failure="Runtime Profile registration",
-            input_text=payload_text,
-            sensitive=True,
         )
-    )
-    if registered != desired:
-        raise ReleaseError(
-            "registered Runtime Profile differs from the validated payload"
-        )
+        if registered != desired:
+            raise ReleaseError(
+                "registered Runtime Profile differs from the validated payload"
+            )

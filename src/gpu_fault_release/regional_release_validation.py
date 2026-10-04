@@ -28,6 +28,9 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     gpu_node_items,
 )
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import (
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_progress import GPU_COMPONENTS
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
@@ -177,8 +180,32 @@ def _write_quick_validation_evidence(
 def ensure_profile_transition_safe(
     release: Any,
     previous_profile_version: str | None,
+    *,
+    desired: str | None = None,
+    previous: dict[str, Any] | None = None,
 ) -> None:
-    desired = release.config.runtime_profile_version
+    """Refuse to finalize while old-profile workflows or workloads are active.
+
+    With ``previous`` (the recorded release state) the site transition is
+    checked first, then each cluster's own: a cluster that ran its own profile
+    version is checked against that version, the others against the previous
+    site version.
+    """
+
+    if previous is not None:
+        previous_clusters = previous.get("cluster_runtime_profiles") or {}
+        ensure_profile_transition_safe(release, previous.get("runtime_profile_version"))
+        for target in release.config.clusters:
+            old_profile = (previous_clusters.get(target.cluster_id) or {}).get(
+                "version"
+            ) or previous.get("runtime_profile_version")
+            ensure_profile_transition_safe(
+                release,
+                old_profile,
+                desired=target_runtime_profile_version(release.config, target),
+            )
+        return
+    desired = desired or release.config.runtime_profile_version
     if not previous_profile_version or previous_profile_version == desired:
         return
     script = probe_source("runtime_profile_transition")

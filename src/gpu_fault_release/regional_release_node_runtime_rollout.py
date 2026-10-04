@@ -23,6 +23,9 @@ from gpu_fault_release.regional_release_node_preflight import (
     ensure_node_candidate_preflight,
     ensure_pre_node_mutation_barrier,
 )
+from gpu_fault_release.regional_release_profile_model import (
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_rollout_cleanup import (
     terminalize_stranded_cluster_rollouts,
 )
@@ -265,7 +268,9 @@ def _node_runtime_candidate(
     node_installer_image: str | None,
     template_content_sha256: str | None,
 ) -> tuple[NodeMutationPreflight, NodeRolloutPolicy, dict[str, str]]:
-    expected_profile = runtime_profile_version or release.config.runtime_profile_version
+    expected_profile = runtime_profile_version or target_runtime_profile_version(
+        release.config, target
+    )
     expected_compatibility = (
         node_compatibility_digest
         or release.config.component_digests.get("node_runtime")

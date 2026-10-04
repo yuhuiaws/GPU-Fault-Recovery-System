@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_release_profile_model import (
+    cluster_runtime_profiles,
+)
 
 
 def build_release_plan(mode: str) -> list[str]:
@@ -105,6 +108,7 @@ def build_release_status(release: Any) -> dict[str, Any]:
             "source_sha256": release.runtime_profile_sha,
             "template_sha256": release.runtime_profile_template_sha,
             "policy_sha256": release.runtime_profile_policy_sha,
+            "cluster_overrides": cluster_runtime_profiles(config),
         },
         "configured_health": {
             "aurora_cluster_id": config.health.aurora_cluster_id,

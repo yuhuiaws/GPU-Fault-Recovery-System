@@ -6,10 +6,22 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-__all__ = ["RuntimeProfileSpec", "runtime_profile_policy_sha256"]
+__all__ = [
+    "RuntimeProfileSpec",
+    "cluster_profiles_digest",
+    "cluster_runtime_profiles",
+    "runtime_profile_policy_sha256",
+    "runtime_profile_version_for",
+    "runtime_profiles",
+    "site_runtime_profile",
+    "target_agent_config_digest",
+    "target_runtime_profile",
+    "target_runtime_profile_version",
+]
 
 
 class ProfileModelError(ValueError):
@@ -52,8 +64,121 @@ class RuntimeProfileSpec:
     pin the cluster's Agents, Executor and installer carry.
     """
 
-    source: Path
-    template_source: Path
+    #: ``None`` only for a config that declares no profile file at all.
+    source: Path | None
+    template_source: Path | None
     version: str
     registration_cluster_id: str
     agent_config_digest: str
+
+
+# The accessors below read a release config and a cluster target by their
+# attributes (``runtime_profile_version``, ``agent_config_digest`` and the
+# target's optional ``runtime_profile_*`` override), so every release-engine
+# caller resolves "this cluster's pin, else the site's" the same way.
+
+
+def target_runtime_profile_version(config: Any, target: Any) -> str:
+    """The version ``target``'s Agents, Executor and installer are pinned to."""
+
+    return str(
+        getattr(target, "runtime_profile_version", "") or config.runtime_profile_version
+    )
+
+
+def target_agent_config_digest(config: Any, target: Any) -> str:
+    """The Agent configuration digest computed for ``target``'s version."""
+
+    return str(getattr(target, "agent_config_digest", "") or config.agent_config_digest)
+
+
+def site_runtime_profile(config: Any) -> RuntimeProfileSpec:
+    """The site profile every cluster follows unless it overrides it."""
+
+    source = getattr(config, "runtime_profile_source", None)
+    return RuntimeProfileSpec(
+        source=source,
+        template_source=getattr(config, "runtime_profile_template_source", None)
+        or source,
+        version=str(config.runtime_profile_version),
+        registration_cluster_id=str(
+            getattr(config, "runtime_profile_registration_cluster_id", "")
+        ),
+        agent_config_digest=str(getattr(config, "agent_config_digest", "")),
+    )
+
+
+def _overrides(config: Any) -> list[Any]:
+    return [
+        target
+        for target in getattr(config, "clusters", ())
+        if getattr(target, "overrides_runtime_profile", False)
+    ]
+
+
+def target_runtime_profile(config: Any, target: Any) -> RuntimeProfileSpec:
+    """The profile ``target`` is pinned to: its own, or the site's."""
+
+    if not getattr(target, "overrides_runtime_profile", False):
+        return site_runtime_profile(config)
+    source = target.runtime_profile_source
+    return RuntimeProfileSpec(
+        source=source,
+        template_source=target.runtime_profile_template_source or source,
+        version=target.runtime_profile_version,
+        registration_cluster_id=target.cluster_id,
+        agent_config_digest=target.agent_config_digest,
+    )
+
+
+def runtime_profiles(config: Any) -> tuple[RuntimeProfileSpec, ...]:
+    """Every distinct profile version in use: the site's first, then each
+    cluster override once, in cluster order."""
+
+    profiles = [site_runtime_profile(config)]
+    for target in _overrides(config):
+        spec = target_runtime_profile(config, target)
+        if all(item.version != spec.version for item in profiles):
+            profiles.append(spec)
+    return tuple(profiles)
+
+
+def runtime_profile_version_for(config: Any, cluster_id: str) -> str:
+    """The effective version of the named cluster; the site's when unknown."""
+
+    for target in getattr(config, "clusters", ()):
+        if target.cluster_id == cluster_id:
+            return target_runtime_profile_version(config, target)
+    return str(config.runtime_profile_version)
+
+
+def cluster_runtime_profiles(config: Any) -> dict[str, dict[str, str]]:
+    """``{cluster_id: {version, agent_config_digest, policy_sha256}}`` for the
+    clusters that override the site profile; empty on a single-profile site."""
+
+    overrides: dict[str, dict[str, str]] = {}
+    for target in _overrides(config):
+        spec = target_runtime_profile(config, target)
+        if spec.source is None:
+            raise ProfileModelError(
+                f"{target.cluster_id} runtime profile has no source"
+            )
+        overrides[str(target.cluster_id)] = {
+            "version": spec.version,
+            "agent_config_digest": spec.agent_config_digest,
+            "policy_sha256": runtime_profile_policy_sha256(spec.source),
+        }
+    return overrides
+
+
+def cluster_profiles_digest(config: Any) -> str | None:
+    """One digest over every cluster's own Runtime Profile (version, Agent
+    config digest, policy), or ``None`` on a single-profile site so recorded
+    release states written before per-cluster profiles still compare equal."""
+
+    overrides = cluster_runtime_profiles(config)
+    if not overrides:
+        return None
+    return hashlib.sha256(
+        json.dumps(overrides, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()

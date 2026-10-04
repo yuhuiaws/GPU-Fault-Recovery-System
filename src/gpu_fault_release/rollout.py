@@ -203,6 +203,7 @@ from gpu_fault_release.regional_release_prerequisite_repair import (
     prepare_bootstrap_workflows,
 )
 from gpu_fault_release.regional_release_probes import command_label
+from gpu_fault_release.regional_release_profile_model import target_agent_config_digest
 from gpu_fault_release.regional_release_progress import bootstrap_completion_state
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,
@@ -1292,7 +1293,7 @@ class RegionalRelease(RegistryDrainContext):
             wheel_cm=self.executor_wheel_cm,
             bundle_cm=self.bundle_cm,
             artifact_sha=self.node_wheel_sha,
-            config_digest=self.config.agent_config_digest,
+            config_digest=target_agent_config_digest(self.config, target),
         )
         # The joined cluster's absence rule, without waiting for the next deploy.
         self._apply_observability()

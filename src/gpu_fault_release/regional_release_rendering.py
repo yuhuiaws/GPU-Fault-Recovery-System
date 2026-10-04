@@ -37,6 +37,10 @@ from gpu_fault.dcgm_exporter_cadence import (
     DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
 )
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY as INSTANCE_TYPES
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+    target_runtime_profile_version,
+)
 
 ROOT = repository_root()
 if TYPE_CHECKING:
@@ -519,8 +523,10 @@ def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
                 "artifact_sha256": release.node_wheel_sha,
                 "bundle_sha256": release.bundle_sha,
                 "template_source_sha256": release.node_template_sha,
-                "config_digest": config.agent_config_digest,
-                "runtime_profile_version": config.runtime_profile_version,
+                "config_digest": target_agent_config_digest(config, target),
+                "runtime_profile_version": target_runtime_profile_version(
+                    config, target
+                ),
                 "runtime_image": release.executor_image,
                 "node_installer_image": release.node_installer_image,
                 "node_dependencies": config.release_delivery_identity.get(
@@ -680,7 +686,9 @@ def render_gpu_rollout_manifests(
     executor_compatibility_digest: str | None = None,
 ) -> list[tuple[str, str]]:
     config = release.config
-    profile_version = runtime_profile_version or config.runtime_profile_version
+    profile_version = runtime_profile_version or target_runtime_profile_version(
+        config, target
+    )
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
         executor_compatibility_digest
@@ -803,7 +811,7 @@ def build_reconciler_environment(
         ),
         "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": str(sync_registry).lower(),
         "GPU_FAULT_RUNTIME_PROFILE": (
-            runtime_profile_version or config.runtime_profile_version
+            runtime_profile_version or target_runtime_profile_version(config, target)
         ),
     }
     previous_template_identity: dict[str, str] = {}

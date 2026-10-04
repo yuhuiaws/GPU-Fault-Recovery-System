@@ -50,6 +50,10 @@ from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
 from gpu_fault_release.regional_release_node_snapshot import capture_installer_snapshot
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import (
+    cluster_profiles_digest,
+    cluster_runtime_profiles,
+)
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
@@ -1364,6 +1368,8 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
             "runtime_profile_registration_cluster_id": (
                 release.config.runtime_profile_registration_cluster_id
             ),
+            "cluster_runtime_profiles": cluster_runtime_profiles(release.config),
+            "cluster_runtime_profiles_sha256": cluster_profiles_digest(release.config),
             "agent_config_digest": release.config.agent_config_digest,
             "endpoint_digest": release.endpoint_digest,
             "dcgm_digest": release.dcgm_digest,

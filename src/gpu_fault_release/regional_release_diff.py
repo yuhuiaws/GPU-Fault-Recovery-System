@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Iterable
 
+from gpu_fault_release.regional_release_profile_model import cluster_profiles_digest
+
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
 
@@ -133,7 +135,10 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         }
     )
     schema = bool(changed & {"database_schema", "schema_manifests"})
-    profile = bool(changed & {"runtime_profile", "runtime_profile_version"})
+    profile = bool(
+        changed
+        & {"runtime_profile", "runtime_profile_version", "cluster_runtime_profiles"}
+    )
     endpoint = bool(
         changed
         & {
@@ -179,6 +184,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "collector_manifests",
             "executor_image",
             "runtime_profile_version",
+            "cluster_runtime_profiles",
             "clusters",
         }
     )
@@ -195,6 +201,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "agent_protocol",
             "runtime_profile",
             "runtime_profile_version",
+            "cluster_runtime_profiles",
         }
     )
     reconciler = bool(
@@ -207,6 +214,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "executor_image",
             "runtime_profile",
             "runtime_profile_version",
+            "cluster_runtime_profiles",
             "agent_config",
             "agent_protocol",
             "node_runtime_wheel",
@@ -376,6 +384,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         "agent_config": release.config.agent_config_digest,
         "runtime_profile": release.runtime_profile_policy_sha,
         "runtime_profile_version": release.config.runtime_profile_version,
+        "cluster_runtime_profiles": cluster_profiles_digest(release.config),
         "endpoint": release.endpoint_digest,
         "dcgm": release.dcgm_digest,
         "notifications": release.notification_digest,
@@ -435,6 +444,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         "agent_config": state.get("agent_config_digest"),
         "runtime_profile": _current_profile_digest(release, state),
         "runtime_profile_version": state.get("runtime_profile_version"),
+        "cluster_runtime_profiles": state.get("cluster_runtime_profiles_sha256"),
         "endpoint": state.get("endpoint_digest"),
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),

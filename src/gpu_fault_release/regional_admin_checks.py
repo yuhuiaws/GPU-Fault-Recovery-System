@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from gpu_fault.cluster_scope import node_selector
-from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
-
 import base64
 import fnmatch
 import json
@@ -19,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
+from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
@@ -42,6 +40,7 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_preflight import monitoring_repair_preflight
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     EXECUTOR_PYTHON,
@@ -51,7 +50,8 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 from gpu_fault_release.regional_release_state import aws_json
 from gpu_fault_release.regional_release_workflow_safety import workflow_safety_snapshot
-from gpu_fault_release.regional_runtime_profile import verify_runtime_profile
+from gpu_fault_release.regional_runtime_profile import verify_runtime_profile_check
+from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
     read_only_verifier_details,
@@ -1351,10 +1351,9 @@ def _check_control_api(release: Any) -> CheckValue:
     for cluster_id, cluster in report.get("clusters", {}).items():
         # Retired (REVOKED) records are not coverage; see the sibling module.
         agents = agent_coverage.check_agent_coverage(cluster_id, cluster)
+        expected_profile = runtime_profile_version_for(release.config, cluster_id)
         if any(
-            item.get("runtime_profile_version")
-            != release.config.runtime_profile_version
-            for item in agents
+            item.get("runtime_profile_version") != expected_profile for item in agents
         ):
             raise ReleaseError(f"{cluster_id} Agent Runtime Profile drift")
         if not (cluster.get("fleet_readiness") or {}).get("ready"):
@@ -1638,7 +1637,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             lambda: check_aurora_refresh(release, require_success=True),
         ),
         ("adot_self_metrics", lambda: check_adot_self_metrics(release)),
-        ("runtime_profile", lambda: _verify_profile(release)),
+        ("runtime_profile", lambda: CheckValue(*verify_runtime_profile_check(release))),
         (
             "read_only_verifiers",
             lambda: run_read_only_verifiers(
@@ -1679,11 +1678,3 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
     if evidence_fallback is not None:
         report["validation_evidence_fallback"] = evidence_fallback
     return report
-
-
-def _verify_profile(release: Any) -> CheckValue:
-    verify_runtime_profile(release)
-    return CheckValue(
-        "declared Runtime Profile is registered without drift",
-        {"version": release.config.runtime_profile_version},
-    )
