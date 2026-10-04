@@ -87,6 +87,54 @@ async def _publish(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def carry_registration_timestamps(
+    requested: list[RegionalClusterRegistration],
+    current: RegionalRegistryRevision | None,
+    *,
+    observed_at: datetime,
+) -> list[RegionalClusterRegistration]:
+    """Timestamps of a published revision describe each registration, not the
+    publish.
+
+    A full republish (``rotate-token``, ``remove-cluster``, a release) hands
+    every cluster's entry rebuilt from the registry Secret, which carries no
+    timestamps; the model then filled ``created_at``/``updated_at`` with "now"
+    for every entry, so a sibling nobody touched changed on every revision
+    (live 2026-10-04, GF-REGIONAL-AUTH-016 on the mixed site: the rotation of
+    one cluster rewrote the other's registration) and its token-rotation
+    window, measured from ``updated_at``, moved with it. A registration whose
+    identity equals the current revision's keeps both timestamps; a changed or
+    new one keeps ``created_at`` and is stamped ``observed_at`` -- unless the
+    request set the field itself, which stays authoritative.
+    """
+
+    previous = {
+        item.cluster_id: item for item in (current.registrations if current else ())
+    }
+    carried: list[RegionalClusterRegistration] = []
+    for registration in requested:
+        explicit = registration.model_fields_set
+        before = previous.get(registration.cluster_id)
+        update: dict[str, Any] = {}
+        if before is None:
+            if "created_at" not in explicit:
+                update["created_at"] = observed_at
+            if "updated_at" not in explicit:
+                update["updated_at"] = observed_at
+        else:
+            if "created_at" not in explicit:
+                update["created_at"] = before.created_at
+            if "updated_at" not in explicit:
+                unchanged = _registration_identity(before) == _registration_identity(
+                    registration
+                )
+                update["updated_at"] = before.updated_at if unchanged else observed_at
+        carried.append(
+            registration.model_copy(update=update) if update else registration
+        )
+    return carried
+
+
 def _registration_identity(
     registration: RegionalClusterRegistration,
 ) -> dict[str, Any]:
@@ -312,9 +360,20 @@ async def publish_regional_registry_revision(
             stale_seconds=runtime.stale_seconds,
         )
     )
+    current = (
+        await _store_call(
+            dependencies,
+            dependencies.context.store.get_regional_registry_revision,
+            request.expected_generation,
+        )
+        if request.expected_generation
+        else None
+    )
     revision = RegionalRegistryRevision.build(
         generation=request.expected_generation + 1,
-        registrations=request.registrations,
+        registrations=carry_registration_timestamps(
+            request.registrations, current, observed_at=observed
+        ),
         previous_generation=(
             request.expected_generation if request.expected_generation else None
         ),

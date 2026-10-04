@@ -992,6 +992,10 @@ Semantics and boundaries of `eks-managed`:
   `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
   (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
 
+  Registry revision timestamps belong to each registration, not to the publish: when `rotate-token`,
+  `remove-cluster` or a release republishes every entry, a sibling whose identity did not change keeps its
+  `created_at`/`updated_at` byte for byte (what acceptance AUTH-016's `sibling_registrations_unchanged` checks); only
+  changed entries are stamped with that publish.
   A later `deploy` over the whole site (CPU + every GPU ARN) keeps each managed cluster's join-time decisions:
   `provider`, `nodeSelector` (the `--gpu-nodegroup` choice) and `runtimeProfile` are carried over and only the
   override's `agentConfigDigest` is recomputed for this release; an entry that lost its override is restored from the

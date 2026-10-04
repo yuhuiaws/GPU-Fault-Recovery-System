@@ -7,6 +7,7 @@ from gpu_fault.app import create_app
 from gpu_fault.app.routes.regional_registry import _status
 from gpu_fault.regional import (
     RegionalClusterLifecycle,
+    RegionalClusterRegistration,
     RegionalRegistryMember,
     RegionalRegistryRevision,
 )
@@ -266,3 +267,148 @@ def test_registry_api_requires_execution_token() -> None:
         assert response.status_code == 403
 
     asyncio.run(scenario())
+
+
+def _eks_sibling(token: str) -> RegionalClusterRegistration:
+    """gpu-eks-cluster as the join registered it: plain EKS, its own profile pins."""
+
+    return registration("gpu-eks-cluster", token).model_copy(
+        update={
+            "hyperpod_cluster_name": "",
+            "provider": "eks-managed",
+            "runtime_profile_version": "eks-v1",
+            "agent_config_digest": "f" * 64,
+            "allowed_namespaces": ["gpu-fault-system", "training"],
+            "agent_endpoint_allowed_cidrs": ["10.0.32.0/20"],
+        }
+    )
+
+
+def _secret_shaped(entry: RegionalClusterRegistration, **changes: object) -> dict:
+    """What `current_registrations` posts: the Secret entry, no timestamps."""
+
+    value = entry.model_dump(mode="json")
+    value.pop("created_at")
+    value.pop("updated_at")
+    value["lifecycle_state"] = "ACTIVE"
+    value.update(changes)
+    return value
+
+
+def test_a_rotation_republish_leaves_the_sibling_registration_byte_identical() -> None:
+    """GF-REGIONAL-AUTH-016 on the mixed site: rotating hp-cluster's token
+    republished every entry from the Secret and the plain EKS sibling changed
+    (its default-filled timestamps). Unchanged siblings keep their timestamps;
+    the rotated entry is stamped with the publish."""
+
+    context, app = context_and_app()
+    sibling = _eks_sibling(TOKEN_A)
+    context.store.save_regional_cluster(sibling)
+    old_digest = registration("cluster-a", TOKEN_A).token_sha256
+    new_digest = "b" * 64
+
+    async def scenario() -> None:
+        async with asgi_client(app) as client:
+            first = await client.post(
+                "/v1/regional/registry/revisions",
+                headers=operator_headers(),
+                json={
+                    "expected_generation": 1,
+                    "registrations": [
+                        _secret_shaped(registration("cluster-a", TOKEN_A)),
+                        _secret_shaped(sibling),
+                    ],
+                    "reason": "join gpu-eks-cluster active",
+                },
+            )
+            assert first.status_code == 200, first.text
+            before = {
+                item.cluster_id: item.model_dump(mode="json")
+                for item in context.store.get_regional_registry_revision(
+                    2
+                ).registrations
+            }
+            await asyncio.sleep(0.01)
+            rotated = await client.post(
+                "/v1/regional/registry/revisions",
+                headers=operator_headers(),
+                json={
+                    "expected_generation": 2,
+                    "registrations": [
+                        _secret_shaped(
+                            registration("cluster-a", TOKEN_A),
+                            token_sha256=new_digest,
+                            retiring_token_sha256=old_digest,
+                            token_rotation_expires_at=(
+                                datetime.now(timezone.utc) + timedelta(hours=1)
+                            ).isoformat(),
+                        ),
+                        _secret_shaped(sibling),
+                    ],
+                    "reason": "rotate cluster-a",
+                },
+            )
+            assert rotated.status_code == 200, rotated.text
+        after = {
+            item.cluster_id: item.model_dump(mode="json")
+            for item in context.store.get_regional_registry_revision(3).registrations
+        }
+        assert after["gpu-eks-cluster"] == before["gpu-eks-cluster"], (
+            "the sibling nobody touched is byte-identical, timestamps included"
+        )
+        assert after["gpu-eks-cluster"]["provider"] == "eks-managed"
+        assert after["gpu-eks-cluster"]["runtime_profile_version"] == "eks-v1"
+        assert after["cluster-a"]["token_sha256"] == new_digest
+        assert after["cluster-a"]["created_at"] == before["cluster-a"]["created_at"], (
+            "the rotated entry keeps its creation time"
+        )
+        assert after["cluster-a"]["updated_at"] > before["cluster-a"]["updated_at"], (
+            "the rotation window is measured from this publish"
+        )
+        assert (
+            after["cluster-a"]["lifecycle_state"]
+            == RegionalClusterLifecycle.ACTIVE.value
+        )
+
+    asyncio.run(scenario())
+
+
+def test_an_explicit_updated_at_in_the_request_is_kept() -> None:
+    """The acceptance runner's durable payload stamps rotated entries itself."""
+
+    from gpu_fault.app.routes.regional_registry import carry_registration_timestamps
+
+    stamped = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+    original = registration("cluster-a", TOKEN_A)
+    current = RegionalRegistryRevision.build(
+        generation=1,
+        registrations=[original],
+        previous_generation=None,
+        required_member_ids=[],
+        reason="x",
+    )
+    changed = RegionalClusterRegistration.model_validate(
+        {
+            **_secret_shaped(original),
+            "token_sha256": "c" * 64,
+            "updated_at": stamped.isoformat(),
+        }
+    )
+    (carried,) = carry_registration_timestamps(
+        [changed],
+        current,
+        observed_at=datetime(2026, 10, 4, 11, 0, tzinfo=timezone.utc),
+    )
+    assert carried.updated_at == stamped, "an explicit updated_at is authoritative"
+    assert carried.created_at == original.created_at, "creation time is carried"
+    fresh = RegionalClusterRegistration.model_validate(
+        _secret_shaped(_eks_sibling(TOKEN_A))
+    )
+    (new,) = carry_registration_timestamps(
+        [fresh], current, observed_at=datetime(2026, 10, 4, 11, 0, tzinfo=timezone.utc)
+    )
+    assert (
+        new.created_at
+        == new.updated_at
+        == datetime(2026, 10, 4, 11, 0, tzinfo=timezone.utc)
+    ), "a new registration is stamped with the publish"
