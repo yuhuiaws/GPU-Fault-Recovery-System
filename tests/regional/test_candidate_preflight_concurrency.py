@@ -91,3 +91,34 @@ def test_node_inventory_scopes_do_not_leak_between_parallel_derivations() -> Non
     assert reads == 2
     gpu_node_items(release, target)
     assert reads == 3, "inventory escaped its derivation scope"
+
+
+def test_candidate_preflight_pins_each_cluster_to_its_own_runtime_profile() -> None:
+    digests: dict[str, str] = {}
+
+    def preflight(target, **kwargs):
+        digests[target.cluster_id] = kwargs["config_digest"]
+
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            clusters=(
+                SimpleNamespace(cluster_id="hp"),
+                SimpleNamespace(cluster_id="gpu-eks", agent_config_digest="f" * 64),
+            ),
+            agent_config_digest="a" * 64,
+            namespace="gpu-fault-system",
+        ),
+        _get_json=lambda _arguments: {"items": []},
+        _gpu=lambda _target, *arguments: list(arguments),
+        executor_wheel_cm="wheel",
+        bundle_cm="bundle",
+        node_wheel_sha="b" * 64,
+        _preflight_node_runtime=preflight,
+    )
+    preflight_upgrade_mutations(
+        release, ReleaseExecutionPlan(nodes=(ReleaseComponent.AGENT,))
+    )
+
+    assert digests == {"hp": "a" * 64, "gpu-eks": "f" * 64}, (
+        "a cluster on its own Runtime Profile is preflighted under its own digest"
+    )

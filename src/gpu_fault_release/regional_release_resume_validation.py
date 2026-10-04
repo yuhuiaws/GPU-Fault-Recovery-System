@@ -288,7 +288,7 @@ def _validate_candidate_components(
         release.node_wheel_sha,
         bundle_sha=release.bundle_sha,
         template_sha=release.node_template_sha,
-        config_digest=release.config.agent_config_digest,
+        config_digest=target_agent_config_digest(release.config, target),
         require_node_uid=True,
         node_names=frozenset(node_names),
     ):
@@ -418,7 +418,8 @@ def _validate_incomplete_agent_state(
         or {str(item.get("node_id") or "") for item in deployment.get("nodes") or []}
         != set(node_names)
         or deployment.get("desired_artifact_sha256") != release.node_wheel_sha
-        or deployment.get("desired_config_digest") != release.config.agent_config_digest
+        or deployment.get("desired_config_digest")
+        != target_agent_config_digest(release.config, target)
         or deployment.get("desired_bundle_sha256") != release.bundle_sha
         or deployment.get("desired_template_sha256") != release.node_template_sha
     ):

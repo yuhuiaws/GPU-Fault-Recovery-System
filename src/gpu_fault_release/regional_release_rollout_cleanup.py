@@ -20,6 +20,10 @@ import sys
 from typing import Any
 
 from gpu_fault_release.regional_release_diff import ReleaseComponent
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 
 
@@ -41,8 +45,10 @@ def cleanup_candidate_rollout_state(
             artifact_sha=self.node_wheel_sha,
             bundle_sha=self.bundle_sha,
             template_sha=self.node_template_sha,
-            config_digest=self.config.agent_config_digest,
-            runtime_profile_version=self.config.runtime_profile_version,
+            # The id the forward roll used: a cluster on its own Runtime Profile
+            # was rolled under that profile's digest and version.
+            config_digest=target_agent_config_digest(self.config, target),
+            runtime_profile_version=target_runtime_profile_version(self.config, target),
         )
         self._fleet_command(
             "cancel-if-present",

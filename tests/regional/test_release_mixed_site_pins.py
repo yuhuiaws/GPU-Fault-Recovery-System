@@ -24,6 +24,7 @@ from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_release_agent_set as agent_set
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
 from gpu_fault_release import regional_release_legacy as LEGACY
+from gpu_fault_release import regional_release_orchestration as orchestration
 from gpu_fault_release import regional_release_probes as PROBES
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK
 from gpu_fault_release import regional_release_state as state
@@ -530,3 +531,54 @@ def test_previous_snapshot_records_the_live_per_cluster_profiles(
         result["cluster_runtime_profiles"]
         is not release.state["cluster_runtime_profiles"]
     )
+
+
+def test_rollback_cleanup_cancels_a_clusters_own_profile_deployment_id() -> None:
+    """The cancel must name the deployment id the forward roll created: a
+    cluster on its own Runtime Profile rolled under that profile's digest and
+    version, not the site's (mixed site, 2026-10-04)."""
+
+    site_target = SimpleNamespace(cluster_id="gpu-a")
+    eks_target = SimpleNamespace(
+        cluster_id="gpu-eks",
+        agent_config_digest="f" * 64,
+        runtime_profile_version="eks-v1",
+    )
+    identities: list[tuple[str, str, str]] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            admin_config=default_admin_config(),
+            clusters=(site_target, eks_target),
+            agent_config_digest="c" * 64,
+            runtime_profile_version="profile-v2",
+        ),
+        release_id="candidate",
+        node_wheel_sha="a" * 64,
+        bundle_sha="b" * 64,
+        node_template_sha="t" * 64,
+        _cancel_active_installer_jobs=lambda _item: None,
+        _fleet_deployment_id=lambda target, **kwargs: identities.append(
+            (
+                target.cluster_id,
+                kwargs["config_digest"],
+                kwargs["runtime_profile_version"],
+            )
+        )
+        or f"fleet-{target.cluster_id}",
+        _fleet_command=lambda _operation, _payload: {"status": "CANCELLED"},
+    )
+    compensation = orchestration.RollbackCompensationPlan(
+        global_components=frozenset(),
+        cluster_components={
+            "gpu-a": frozenset({Component.AGENT}),
+            "gpu-eks": frozenset({Component.AGENT}),
+        },
+        conservative=False,
+    )
+
+    orchestration.cleanup_candidate_rollout_state(release, compensation)
+
+    assert identities == [
+        ("gpu-a", "c" * 64, "profile-v2"),
+        ("gpu-eks", "f" * 64, "eks-v1"),
+    ]

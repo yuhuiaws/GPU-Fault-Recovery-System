@@ -1473,6 +1473,17 @@ before the point of no return `--rollback` may be added while the policy is unch
 A failed resume re-checks the site and node set and cannot process new nodes with old waves; the terminal state is written to disk before the temporary token is deleted,
 a cleanup failure only continues the cleanup and does not turn an already committed rotation back into a rollback-capable state.
 `--keep-window` keeps the retiring digest until expiry and produces a warning, which does not meet the complete retirement success criterion of no warnings by default above.
+The rotation's node waves judge whether a node is in place by the **rotated cluster's own Runtime Profile pin** (a
+plain-EKS cluster on its own profile by that profile's Agent config digest and version; a cluster without an override by
+the site pin); the release engine's resume validation, candidate preflight and rollback cleanup use the same per-cluster
+pin. If a rotation's node wave exhausts its wait on `installer-wait … pending=<node>:Succeeded` (journal past
+`DATA_PLANE_ROLLED`, `NODES_ROLLED` incomplete, status `IN_PROGRESS`): **rerun the identical `rotate-token`** with the
+fixed build to resume -- the engine hands the remaining nodes' waves over again (a node already on the new token is
+re-installed once more, harmlessly), restores the wave ConfigMap and continues to `RETIRING_TOKEN_DROPPED`; finish
+before the journal's `expires_at` (the overlap window). `--rollback` is permitted until `TOKEN_FILE_WRITTEN` is journaled
+(it returns the moved nodes and the Secret to the old token and republishes the registry) and reuses the same wave
+wait, so it needs the fixed build as well.
+
 ### 6.2 Node Key Custody
 
 This entry point establishes evidence for controlled key delivery in the future; it is off by default and is not a tool for retroactively signing proof for old installations.

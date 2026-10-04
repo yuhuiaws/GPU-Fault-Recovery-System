@@ -351,3 +351,61 @@ def test_only_completed_component_in_partial_cluster_needs_no_previous_probe(
     monkeypatch.setattr(resume, "exec_cpu_ingress_probe", unexpected)
     validate(release, loaded, Component.EXECUTOR)
     assert ("gpu-a", "deployment", inventory.GPU_EXECUTOR_DEPLOYMENT) in release.reads
+
+
+# --- a cluster on its own Runtime Profile resumes under its own pin ------------
+
+
+def _override_target(release: ResourceRelease) -> None:
+    from dataclasses import replace
+
+    release.config.clusters = tuple(
+        replace(
+            target,
+            runtime_profile_version="eks-v1",
+            agent_config_digest="f" * 64,
+            overrides_runtime_profile=True,
+        )
+        for target in release.config.clusters
+    )
+
+
+def test_converged_resume_judges_node_annotations_by_the_cluster_pin() -> None:
+    """Mixed site, 2026-10-04: the resume validation compared every node's
+    installer-config-digest with the site digest, so a converged eks-v1
+    cluster would have read as drifted."""
+
+    release = ResourceRelease()
+    _override_target(release)
+    annotations = release.documents[("gpu-a", "nodes", "")]["items"][0]["metadata"][
+        "annotations"
+    ]
+    annotations["gpu-fault.io/installer-config-digest"] = "f" * 64
+    validate(release, checkpoint(release), *tuple(resume.GPU_COMPONENTS))
+
+    annotations["gpu-fault.io/installer-config-digest"] = (
+        release.config.agent_config_digest
+    )
+    with pytest.raises(ReleaseError, match="node annotations drifted"):
+        validate(release, checkpoint(release), *tuple(resume.GPU_COMPONENTS))
+
+
+def test_mixed_checkpoint_binds_the_fleet_deployment_to_the_cluster_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = ResourceRelease()
+    _override_target(release)
+    loaded = checkpoint(release, "PAUSED")
+    loaded["component_progress"] = {
+        "clusters": {"gpu-a": {Component.AGENT.value: {"status": "STARTED"}}}
+    }
+    response = mixed_probe_result(release)
+    response["deployment"]["desired_config_digest"] = "f" * 64
+    monkeypatch.setattr(
+        resume, "exec_cpu_ingress_probe", lambda *_args, **_kwargs: json.dumps(response)
+    )
+    validate(release, loaded, Component.AGENT)
+
+    response["deployment"]["desired_config_digest"] = release.config.agent_config_digest
+    with pytest.raises(ReleaseError, match="contract drifted"):
+        validate(release, loaded, Component.AGENT)

@@ -1,18 +1,17 @@
 """Rotate one GPU cluster's token as a single, resumable administrator verb.
 
-REG-9 used to be eight manual steps: read the registry generation through an
-``exec``, ``openssl rand``, a ``jq`` rewrite of the registry Secret, a control
-plane restart, a GPU Secret patch, three Deployment restarts, a privileged
-DaemonSet to rewrite every node's ``systemd`` env file, and two log greps. The
-deploy host's own copy of the token (``secure/<cluster-id>.token``) was not one
-of them, which is how a stale file broke a release on 2026-09-04.
+REG-9 used to be eight manual steps (registry generation via ``exec``,
+``openssl rand``, a ``jq`` rewrite of the registry Secret, a control plane
+restart, a GPU Secret patch, three Deployment restarts, a privileged DaemonSet
+rewriting every node's ``systemd`` env file, two log greps); the deploy host's
+own token copy (``secure/<cluster-id>.token``) was not one of them, which is
+how a stale file broke a release on 2026-09-04.
 
-The rotation rides the overlap window the registry already offers: the new
-digest becomes ``token_sha256`` at once and the old one parks in
-``retiring_token_sha256`` until ``token_rotation_expires_at``. Both open the
-door until the window closes, so every data-plane mutation below happens while
-the old credential is still valid, and a failure anywhere before acceptance
-leaves a working fleet.
+The rotation rides the registry's overlap window: the new digest becomes
+``token_sha256`` at once and the old one parks in ``retiring_token_sha256``
+until ``token_rotation_expires_at``; both open the door until the window
+closes, so every data-plane mutation below happens while the old credential is
+still valid and a failure before acceptance leaves a working fleet.
 
 State machine (``<state-dir>/rotate-token/<cluster-id>/state.json``)::
 
@@ -22,11 +21,11 @@ State machine (``<state-dir>/rotate-token/<cluster-id>/state.json``)::
 
 Re-running with the same arguments resumes at the first unfinished step. The
 new token lives only in a 0600 file under the state directory until the data
-plane has proven it authenticates with it; it is never printed and never put
-on a command line. The site's token file is rewritten only after that proof,
-atomically, with the old value kept as ``<file>.retired-<timestamp>``.
-``--rollback`` walks the data plane back onto the old token and republishes
-the old-only registry while the window still accepts both.
+plane has proven it authenticates with it (never printed, never on a command
+line); the site's token file is rewritten only after that proof, atomically,
+keeping the old value as ``<file>.retired-<timestamp>``. ``--rollback`` walks
+the data plane back onto the old token and republishes the old-only registry
+while the window still accepts both.
 
 ``CONTROL_PLANE_ROLLED`` is the control plane restart the manual procedure had
 and the verb at first dropped: the CPU Deployments (api-ha, control-worker,
@@ -44,17 +43,17 @@ the control plane it has just rolled (``regional_release_control_plane_ready``)
 and is idempotent: a head that already holds only the new digest -- a deploy
 republished the registry mid-finish -- is recorded, not republished.
 
-The journal binds the site through ``rotate_token_binding``: the raw
-``site_sha256`` for audit plus a projection of the facts the rotation reads,
+The journal binds the site through ``rotate_token_binding`` (the raw
+``site_sha256`` for audit plus a projection of the facts the rotation reads),
 so a release-only rewrite of ``site.yaml`` does not strand a resume.
 
-Node delivery reuses the release's fleet-wave machinery -- the Agent lease and
-open-command safety barrier, the Reconciler wave ConfigMap handoff and the
-installer/heartbeat convergence wait -- but not a fleet deployment record: a
-token change is not an identity change, so a record would be born SUCCEEDED.
-The installer reads the token from the GPU connection Secret, so marking a
-node ``installer-state=Retrying`` inside its wave is what carries the new
-token onto the host.
+Node delivery reuses the release's fleet-wave machinery (Agent lease and
+open-command safety barrier, Reconciler wave ConfigMap handoff, installer and
+heartbeat convergence wait judged by the rotated cluster's own Runtime Profile
+pin) but not a fleet deployment record: a token change is not an identity
+change, so a record would be born SUCCEEDED. The installer reads the token from
+the GPU connection Secret, so marking a node ``installer-state=Retrying`` inside
+its wave is what carries the new token onto the host.
 """
 
 from __future__ import annotations
@@ -84,11 +83,15 @@ from gpu_fault.admin.membership_lock import (
     reload_site_for_mutation,
 )
 from gpu_fault.admin.operator_identity import resolve_operator_identity
-from gpu_fault.admin.release_state import live_release_state
 from gpu_fault.admin.release_engine import build_release as build_release
+from gpu_fault.admin.release_state import live_release_state
 from gpu_fault.admin.rotate_token_acceptance import (
     CPU_INGRESS_LABEL as CPU_INGRESS_LABEL,
+)
+from gpu_fault.admin.rotate_token_acceptance import (
     RETIRING_TOKEN_LOG_FRAGMENT as RETIRING_TOKEN_LOG_FRAGMENT,
+)
+from gpu_fault.admin.rotate_token_acceptance import (
     collect_retiring_token_authentications,
     wait_for_quiet_token_authentications,
 )
@@ -105,8 +108,6 @@ from gpu_fault.admin.rotate_token_journal import (
     ROLLBACK_REGISTRY_RESTORED,
     ROLLBACK_SECRET_RESTORED,
     ROLLBACK_STEPS,
-    ROTATION_STEPS as ROTATION_STEPS,
-    STATE_ROOT as STATE_ROOT,
     STATE_SCHEMA_VERSION,
     STATUS_COMPLETED,
     STATUS_IN_PROGRESS,
@@ -124,6 +125,12 @@ from gpu_fault.admin.rotate_token_journal import (
     rotation_journal_path,
     step_done,
     step_started,
+)
+from gpu_fault.admin.rotate_token_journal import (
+    ROTATION_STEPS as ROTATION_STEPS,
+)
+from gpu_fault.admin.rotate_token_journal import (
+    STATE_ROOT as STATE_ROOT,
 )
 from gpu_fault.admin.rotate_token_policy import (
     MAX_WINDOW_MINUTES,
@@ -171,6 +178,10 @@ from gpu_fault_release.regional_release_online_registry import (
     current_registrations,
     publish_registry_revision,
 )
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+    target_runtime_profile_version,
+)
 from gpu_fault_release.regional_release_registry import registry, write_registry
 from gpu_fault_release.regional_release_rollout_wait import (
     wait_deployment_rollout,
@@ -192,9 +203,8 @@ MIN_TOKEN_LENGTH = 32
 # Remote command terminal states whose growth during the rotation means a
 # command was cut off by a restart rather than finished by its executor.
 REMOTE_COMMAND_LOSS_STATUSES = ("FAILED", "EXPIRED")
-# The CPU Deployments whose Pods load ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` from
-# the registry Secret at start (api-ha, control-worker, telemetry-spool-worker):
-# the ones a Secret rewrite reaches only through a restart.
+# CPU Deployments that load ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` from the registry
+# Secret at Pod start (api-ha, control-worker, spool-worker): only a restart reaches them.
 CONTROL_PLANE_SECRET_CONSUMERS = inventory.CPU_RUNTIME_DEPLOYMENTS
 
 
@@ -365,9 +375,8 @@ def site_process_environment(site: RenderedSite) -> Iterator[None]:
     """Run the release engine in-process with the site's environment.
 
     The engine reads image overrides and the GPU kubeconfig from the process
-    environment because it was written to run as a subprocess of the CLI; the
-    rotation composes its primitives directly, so it lends the environment for
-    the duration of the command and restores the caller's afterwards.
+    environment (it was written as a CLI subprocess); the rotation composes its
+    primitives directly, so it lends the environment and restores the caller's.
     """
 
     previous = dict(os.environ)
@@ -385,11 +394,10 @@ def site_process_environment(site: RenderedSite) -> Iterator[None]:
 def release_transaction_open(state: Mapping[str, Any]) -> str | None:
     """The phase of an unfinished release transaction, or ``None``.
 
-    The same vocabulary ``deploy``/``resume`` use: a phase a resume would pick
-    up, a rollback or bootstrap in flight, or a ``complete`` whose commit has
-    not happened. A stopped (FAILED/PAUSED) transaction counts as open too: it
-    has left the fleet mixed, and a token rotation on top of it would have to
-    be undone by whichever of the two the operator resolves first.
+    The vocabulary ``deploy``/``resume`` use: a phase a resume would pick up, a
+    rollback or bootstrap in flight, or a ``complete`` whose commit has not
+    happened. A stopped (FAILED/PAUSED) transaction counts as open too: the fleet
+    is mixed, and a rotation on top would be undone by whichever resolves first.
     """
 
     phase = str(state.get("phase") or "")
@@ -449,11 +457,10 @@ def publish_overlap_revision(
 ) -> dict[str, Any]:
     """Publish the revision that accepts both tokens for one cluster.
 
-    Every other entry is exactly what a release would publish from the
-    bootstrap Secret; only the target's digests move. The Secret's own digest
-    for the target must be the one the site's token file yields, or the Secret
-    and the durable head have already drifted and a publish from it would
-    revert somebody else's rotation.
+    Every other entry is exactly what a release would publish from the bootstrap
+    Secret; only the target's digests move. The Secret's digest for the target
+    must be the one the site's token file yields, or Secret and durable head have
+    drifted and a publish from it would revert somebody else's rotation.
     """
 
     registrations = []
@@ -487,9 +494,8 @@ def publish_overlap_revision(
     )
     missing = list(result.get("missing_member_ids") or [])
     if missing:
-        # An engine-level failure of a revision that is already live, so the
-        # caller's old-only republish is the right answer; the refusals above
-        # happen before anything is published and must never trigger it.
+        # An engine failure of an already-live revision: the caller's old-only
+        # republish is right; the refusals above precede any publish, never trigger it.
         raise ReleaseError(
             "registry revision did not reach every control-plane member: "
             + ", ".join(str(item) for item in missing)
@@ -569,11 +575,10 @@ def restart_data_plane(release: Any, target: ClusterTarget) -> dict[str, Any]:
 def restart_control_plane(release: Any) -> dict[str, Any]:
     """Restart every CPU Deployment that loads the registry Secret and wait.
 
-    One Deployment at a time -- restart, then the full rollout barrier -- so at
-    most one control-plane role is rolling while the data plane keeps
-    authenticating against the others; api-ha's own rolling update keeps the
-    ingress serving. A rollout that does not complete raises, and the
-    Deployments after it are left alone for the rerun.
+    One Deployment at a time (restart, then the full rollout barrier), so at most
+    one control-plane role rolls while the data plane authenticates against the
+    others; api-ha's rolling update keeps the ingress serving. A rollout that does
+    not complete raises; the Deployments after it are left for the rerun.
     """
 
     namespace = release.config.namespace
@@ -605,11 +610,8 @@ def token_rollout_waves(
     failure_domains: Mapping[str, str],
     policy: NodeRolloutPolicy,
 ) -> list[tuple[str, ...]]:
-    """The waves a release would roll these nodes in, without a record.
-
-    The digests are placeholders: the request model computes waves from the
-    node list, the failure-domain map and the policy alone, and nothing here is
-    persisted.
+    """The waves a release would roll these nodes in, without a record: the digests
+    are placeholders, waves come from the node list, failure domains and policy only.
     """
 
     request = FleetDeploymentRequest(
@@ -710,8 +712,9 @@ def _wave_context(
         wheel_cm=release.executor_wheel_cm,
         bundle_cm=release.bundle_cm,
         artifact_sha=release.node_wheel_sha,
-        config_digest=release.config.agent_config_digest,
-        expected_profile=release.config.runtime_profile_version,
+        # The rotated cluster's own Runtime Profile pin, not the site's (2026-10-04).
+        config_digest=target_agent_config_digest(release.config, target),
+        expected_profile=target_runtime_profile_version(release.config, target),
         executor_wheel_filename=None,
         expected_compatibility=(
             release.config.component_digests.get("node_runtime")
@@ -739,10 +742,9 @@ def roll_node_tokens(
 ) -> dict[str, Any]:
     """Re-install the cluster's nodes in release-shaped waves.
 
-    ``progress`` is the state file's ``node_rollout`` mapping; ``record`` is
-    called after every mutation so a rerun continues with the nodes still
-    holding the old token. ``only_nodes`` restricts a rollback to the nodes the
-    forward pass already moved.
+    ``progress`` is the state file's ``node_rollout`` mapping, ``record`` runs after
+    every mutation so a rerun continues with the nodes still on the old token, and
+    ``only_nodes`` restricts a rollback to the nodes the forward pass moved.
     """
 
     node_names = target_node_names(release, target)
@@ -824,8 +826,8 @@ def roll_node_tokens(
         release.node_wheel_sha,
         bundle_sha=identity[0],
         template_sha=identity[1],
-        config_digest=release.config.agent_config_digest,
-        runtime_profile_version=release.config.runtime_profile_version,
+        config_digest=target_agent_config_digest(release.config, target),
+        runtime_profile_version=target_runtime_profile_version(release.config, target),
     )
     return {
         "node_count": len(node_names),
@@ -1065,10 +1067,9 @@ def _publish_overlap(context: RotationContext, *, extend: bool = False) -> None:
 def _ensure_window_open(context: RotationContext) -> None:
     """Extend a window a resume would otherwise run past.
 
-    An expired retiring digest cuts off every caller that has not moved yet,
-    so a resume that finds less than the minimum window left republishes the
-    overlap with a fresh deadline (the doc's rule: extend, never rely on
-    expiry) rather than racing it.
+    An expired retiring digest cuts off every caller that has not moved yet, so a
+    resume finding less than the minimum window left republishes the overlap with
+    a fresh deadline rather than racing it (the doc's rule: extend, never expire).
     """
 
     remaining = _expires_at(context) - context.now()
@@ -1149,9 +1150,8 @@ def _finish(context: RotationContext, new_token: str) -> None:
                 f"{context.state['expires_at']} (--keep-window)"
             )
         else:
-            # The control plane was just rolled: wait for its current
-            # ReplicaSets to serve the registry, exec only into one of their
-            # Pods, and retry the transient classes a bounded number of times.
+            # Control plane just rolled: wait for its current ReplicaSets to serve
+            # the registry, exec only into their Pods, retry transient classes boundedly.
             outcome = publish_after_control_plane_roll(
                 context.release,
                 publish=lambda: _drop_retiring_digest(context),

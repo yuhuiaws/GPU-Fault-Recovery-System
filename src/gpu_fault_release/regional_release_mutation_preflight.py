@@ -10,6 +10,9 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseExecutionPlan,
 )
 from gpu_fault_release.regional_release_preflight import preflight_retired_collectors
+from gpu_fault_release.regional_release_profile_model import (
+    target_agent_config_digest,
+)
 
 
 def preflight_upgrade_mutations(
@@ -45,7 +48,7 @@ def preflight_upgrade_mutations(
                 wheel_cm=release.executor_wheel_cm,
                 bundle_cm=release.bundle_cm,
                 artifact_sha=release.node_wheel_sha,
-                config_digest=release.config.agent_config_digest,
+                config_digest=target_agent_config_digest(release.config, target),
             )
 
     targets = release.config.clusters
