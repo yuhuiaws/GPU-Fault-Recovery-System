@@ -13,7 +13,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -29,7 +29,10 @@ from scripts.e2e.regional.live_driver_guard import source_digest  # noqa: E402
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
 )
-from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandFailed,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
 EXECUTION_TOKEN_NAME = re.compile(r"execution[_.-]?token", re.IGNORECASE)
@@ -99,6 +102,38 @@ class ClusterTarget:
     hyperpod_cluster_name: str
     eks_cluster_arn: str
     executor_role_arn: str
+    #: ``hyperpod`` (default) or ``eks-managed``; a plain EKS cluster has no
+    #: HyperPod orchestrator, so the HyperPod reads and verdicts do not apply.
+    provider: str = "hyperpod"
+
+    @property
+    def is_eks_managed(self) -> bool:
+        return self.provider == "eks-managed"
+
+
+def command_step_label(command: Sequence[str]) -> str:
+    """The step a failed command belongs to, without any of its values.
+
+    The CLI, the subcommand words (``aws sagemaker describe-cluster``,
+    ``kubectl get nodes``) and nothing else: no names, flags, paths or payloads,
+    so the label is safe beside the redacted output.
+    """
+
+    words = [item for item in command if not item.startswith("-")]
+    if not words:
+        return ""
+    if words[0] == "kubectl":
+        # ``kubectl --kubeconfig P --context C -n NS exec -i POD -- ...``: the
+        # kubeconfig, context and namespace values precede the verb, so the verb
+        # is the first word that is a kubectl verb; nothing after it is kept.
+        verbs = {"exec", "get", "auth", "describe", "logs", "config", "version"}
+        verb = next((item for item in words[1:] if item in verbs), None)
+        return "kubectl" if verb is None else f"kubectl {verb}"
+    return " ".join(words[:3])
+
+
+def failing_step(exc: BaseException) -> str | None:
+    return getattr(exc, "step", None)
 
 
 def utc_now() -> str:
@@ -501,6 +536,7 @@ class BlastRunnerBase:
                 hyperpod_cluster_name=str(item["hyperpod_cluster_name"]),
                 eks_cluster_arn=str(item["eks_cluster_arn"]),
                 executor_role_arn=str(item["executor_irsa_role_arn"]),
+                provider=str(item.get("provider") or "hyperpod"),
             )
             for item in self.config["clusters"]
         ]
@@ -535,42 +571,58 @@ class BlastRunnerBase:
         if self.input_binding() != self._input_binding:
             raise CheckError("BLAST input identity changed during the audit")
 
+    def _labelled(self, command_line: Sequence[str], call: Callable[[], Any]) -> Any:
+        """Run ``call``; a failure learns which step it was (output stays redacted).
+
+        Live 2026-10-04: three BLAST cases stopped on a mixed site with only
+        ``command failed (254): <sensitive output redacted>`` in the evidence,
+        which names neither the command class nor the cluster.
+        """
+
+        try:
+            return call()
+        except RegionalCommandFailed as exc:
+            if failing_step(exc) is None:
+                exc.step = command_step_label(command_line)  # type: ignore[attr-defined]
+            raise
+
     def aws(self, *args: str) -> Any:
-        return json_command(("aws", *args, "--region", self.region, "--output", "json"))
+        command_line = ("aws", *args, "--region", self.region, "--output", "json")
+        return self._labelled(command_line, lambda: json_command(command_line))
 
     def cpu_json(self, *args: str) -> Any:
-        return json_command(("kubectl", "--kubeconfig", self.cpu_kubeconfig, *args))
+        command_line = ("kubectl", "--kubeconfig", self.cpu_kubeconfig, *args)
+        return self._labelled(command_line, lambda: json_command(command_line))
 
     def cpu_text(self, *args: str, check: bool = True) -> str:
-        return command(
-            ("kubectl", "--kubeconfig", self.cpu_kubeconfig, *args),
-            check=check,
-        ).stdout
-
-    def gpu_json(self, target: ClusterTarget, *args: str) -> Any:
-        return json_command(
-            (
-                "kubectl",
-                "--kubeconfig",
-                self.gpu_kubeconfig,
-                "--context",
-                target.context,
-                *args,
-            )
+        command_line = ("kubectl", "--kubeconfig", self.cpu_kubeconfig, *args)
+        return self._labelled(
+            command_line, lambda: command(command_line, check=check).stdout
         )
 
+    def gpu_json(self, target: ClusterTarget, *args: str) -> Any:
+        command_line = (
+            "kubectl",
+            "--kubeconfig",
+            self.gpu_kubeconfig,
+            "--context",
+            target.context,
+            *args,
+        )
+        return self._labelled(command_line, lambda: json_command(command_line))
+
     def gpu_text(self, target: ClusterTarget, *args: str, check: bool = True) -> str:
-        return command(
-            (
-                "kubectl",
-                "--kubeconfig",
-                self.gpu_kubeconfig,
-                "--context",
-                target.context,
-                *args,
-            ),
-            check=check,
-        ).stdout
+        command_line = (
+            "kubectl",
+            "--kubeconfig",
+            self.gpu_kubeconfig,
+            "--context",
+            target.context,
+            *args,
+        )
+        return self._labelled(
+            command_line, lambda: command(command_line, check=check).stdout
+        )
 
     def notification_config(self) -> dict[str, str]:
         """The control plane's rendered notification config (channel + topic)."""
@@ -873,33 +925,44 @@ class BlastRunnerBase:
             ready = self.gpu_text(target, "get", "--raw=/readyz").strip().endswith("ok")
             if not ready:
                 raise CheckError(f"GPU EKS /readyz is not ok for {target.cluster_id}")
-            hyperpod = self.aws(
-                "sagemaker",
-                "describe-cluster",
-                "--cluster-name",
-                target.hyperpod_cluster_name,
-            )
-            orchestrator_arn = str(
-                hyperpod.get("Orchestrator", {}).get("Eks", {}).get("ClusterArn", "")
-            )
-            node_recovery = str(hyperpod.get("NodeRecovery", ""))
-            if orchestrator_arn != target.eks_cluster_arn:
-                raise CheckError(
-                    f"HyperPod EKS binding mismatch for {target.cluster_id}"
+            if target.is_eks_managed:
+                # No HyperPod orchestrator behind a plain EKS cluster: nothing to
+                # bind and no NodeRecovery to require (live 2026-10-04: the
+                # empty cluster name made the AWS CLI exit 254 before any check).
+                orchestrator_matches: bool | None = None
+                node_recovery = "not-applicable"
+            else:
+                hyperpod = self.aws(
+                    "sagemaker",
+                    "describe-cluster",
+                    "--cluster-name",
+                    target.hyperpod_cluster_name,
                 )
-            if node_recovery != "None":
-                raise CheckError(
-                    f"GPU HyperPod NodeRecovery is not None for {target.cluster_id}"
+                orchestrator_arn = str(
+                    hyperpod.get("Orchestrator", {})
+                    .get("Eks", {})
+                    .get("ClusterArn", "")
                 )
+                node_recovery = str(hyperpod.get("NodeRecovery", ""))
+                if orchestrator_arn != target.eks_cluster_arn:
+                    raise CheckError(
+                        f"HyperPod EKS binding mismatch for {target.cluster_id}"
+                    )
+                if node_recovery != "None":
+                    raise CheckError(
+                        f"GPU HyperPod NodeRecovery is not None for {target.cluster_id}"
+                    )
+                orchestrator_matches = True
             nodes = self.gpu_json(target, "get", "nodes", "-o", "json")
             gpu_results.append(
                 {
                     "cluster_id": target.cluster_id,
                     "context": target.context,
+                    "provider": target.provider,
                     "kubeconfig": self.gpu_kubeconfig,
                     "eks_binding": binding,
                     "readyz": ready,
-                    "hyperpod_orchestrator_matches": True,
+                    "hyperpod_orchestrator_matches": orchestrator_matches,
                     "node_recovery": node_recovery,
                     "node_names": sorted(
                         str(item.get("metadata", {}).get("name", ""))
@@ -964,6 +1027,9 @@ class BlastRunnerBase:
         """
 
         error = f"{type(exc).__name__}: {exc}"
+        step = failing_step(exc)
+        if step:
+            error += f" (step: {step})"
         if not any(item.get("case_id") == self.case_id for item in self.case_statuses):
             self.record_case(
                 self.case_id,

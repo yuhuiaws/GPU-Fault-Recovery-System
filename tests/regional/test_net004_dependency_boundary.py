@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -117,3 +118,132 @@ def test_the_constant_is_gone() -> None:
     assert not hasattr(net004, "EXECUTOR_TIMEOUT_SECONDS"), (
         "the executor timeout must be read from the deployed config, not hard-coded"
     )
+
+
+# -- mixed-provider site: the NLB allow-list spans every managed cluster's VPC ------
+
+
+def _cluster(name: str, vpc: str) -> dict[str, Any]:
+    return {
+        "cluster": {
+            "name": name,
+            "status": "ACTIVE",
+            "endpoint": f"https://{name}.eks",
+            "certificateAuthority": {"data": "Q0E="},
+            "resourcesVpcConfig": {
+                "vpcId": vpc,
+                "endpointPublicAccess": False,
+                "endpointPrivateAccess": True,
+                "publicAccessCidrs": [],
+            },
+        }
+    }
+
+
+def _fake_aws(
+    monkeypatch: pytest.MonkeyPatch, nats: dict[str, list[str]]
+) -> list[tuple]:
+    calls: list[tuple] = []
+    clusters = {
+        "hp-eks": _cluster("hp-eks", "vpc-hp"),
+        "gpu-eks": _cluster("gpu-eks", "vpc-eks"),
+    }
+
+    def aws(service: str, *args: str) -> dict:
+        calls.append((service, *args))
+        if (service, args[0]) == ("eks", "describe-cluster"):
+            return clusters[args[2]]
+        if (service, args[0]) == ("ec2", "describe-nat-gateways"):
+            vpc = args[2].split("=")[-1]
+            return {
+                "NatGateways": [
+                    {"NatGatewayAddresses": [{"PublicIp": ip}]} for ip in nats[vpc]
+                ]
+            }
+        raise AssertionError(f"unexpected aws call {(service, *args)}")
+
+    monkeypatch.setattr(net004, "aws", aws)
+    return calls
+
+
+def test_nat_egress_set_spans_every_managed_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-04: the NLB allowed the plain-EKS cluster's NAT EIP as well,
+    and the audit, reading only the HyperPod VPC, called the allow-list wrong."""
+
+    calls = _fake_aws(
+        monkeypatch,
+        {"vpc-hp": ["34.209.174.128", "34.218.94.223"], "vpc-eks": ["44.233.19.212"]},
+    )
+    monkeypatch.setattr(net004, "GPU_EKS_NAME", "hp-eks")
+    monkeypatch.setattr(net004, "GPU_EKS_NAMES", ("hp-eks", "gpu-eks"))
+
+    eks, nat_public_ips = net004.eks_and_nat_facts()
+
+    assert nat_public_ips == ["34.209.174.128", "34.218.94.223", "44.233.19.212"]
+    assert eks["name"] == "hp-eks" and eks["vpc_id"] == "vpc-hp"
+    assert [item["cluster"] for item in eks["nat_sources"]] == ["hp-eks", "gpu-eks"]
+    assert eks["nat_sources"][1]["nat_public_ips"] == ["44.233.19.212"]
+    assert sum(1 for call in calls if call[1] == "describe-nat-gateways") == 2
+
+    facts = _facts(12.0)
+    facts["load_balancer"]["scheme"] = "internet-facing"
+    facts["load_balancer"]["inbound_443_cidrs"] = [
+        "34.209.174.128/32",
+        "34.218.94.223/32",
+        "44.233.19.212/32",
+    ]
+    facts["nat_public_ips"] = nat_public_ips
+    facts["probes"][0].update(
+        {"resolved_private": [False], "egress_ip": "34.209.174.128"}
+    )
+    assert (
+        net004.evaluate_checks(**facts)["nlb_exposure_matches_deployment_mode"] is True
+    )
+
+
+def test_single_cluster_nat_egress_set_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_aws(monkeypatch, {"vpc-hp": ["34.209.174.128"]})
+    monkeypatch.setattr(net004, "GPU_EKS_NAME", "hp-eks")
+    monkeypatch.setattr(net004, "GPU_EKS_NAMES", ())
+
+    eks, nat_public_ips = net004.eks_and_nat_facts()
+
+    assert nat_public_ips == ["34.209.174.128"]
+    assert [call[:2] for call in calls] == [
+        ("eks", "describe-cluster"),
+        ("ec2", "describe-nat-gateways"),
+    ], "no site: the selected cluster's VPC alone, as before"
+
+
+def test_managed_gpu_eks_names_come_from_the_site_and_must_include_the_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import gpu_fault.admin.site as site_module
+
+    site_path = tmp_path / "site.yaml"
+    site_path.write_text("site", encoding="ascii")
+    monkeypatch.setattr(
+        site_module,
+        "load_site",
+        lambda path: SimpleNamespace(
+            release_config={
+                "clusters": [
+                    {"eks_cluster_arn": "arn:aws:eks:us-west-2:1:cluster/hp-eks"},
+                    {"eks_cluster_arn": "arn:aws:eks:us-west-2:1:cluster/gpu-eks"},
+                ]
+            }
+        ),
+    )
+    assert net004.managed_gpu_eks_names(site_path, selected="hp-eks") == (
+        "hp-eks",
+        "gpu-eks",
+    )
+    assert net004.managed_gpu_eks_names(None, selected="hp-eks") == ("hp-eks",)
+    with pytest.raises(net004.CaseError, match="not a managed cluster"):
+        net004.managed_gpu_eks_names(site_path, selected="other")

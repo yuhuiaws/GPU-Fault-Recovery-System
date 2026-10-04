@@ -29,6 +29,10 @@ CPU_KUBECONFIG = Path()
 GPU_KUBECONFIG = Path()
 GPU_CONTEXT = ""
 GPU_EKS_NAME = ""
+#: Every managed GPU cluster's EKS name when a site file is given (the NLB's
+#: ingress allow-list covers each cluster's VPC NAT); the selected one alone
+#: otherwise, exactly as before.
+GPU_EKS_NAMES: tuple[str, ...] = ()
 NAMESPACE = "gpu-fault-system"
 AWS_REGION = ""
 CONTROL_SERVICE = "gpu-fault-api-nlb"
@@ -74,6 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional; derived from the selected kube context when omitted",
     )
     parser.add_argument(
+        "--site",
+        type=Path,
+        default=(
+            Path(os.environ["GPU_FAULT_SITE_FILE"])
+            if os.getenv("GPU_FAULT_SITE_FILE")
+            else None
+        ),
+        help=(
+            "optional site.yaml; its managed clusters define the NAT egress set "
+            "the NLB must allow (a mixed site has one VPC per cluster)"
+        ),
+    )
+    parser.add_argument(
         "--region",
         default=(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "")),
     )
@@ -107,6 +124,7 @@ def configure(arguments: argparse.Namespace) -> None:
     global EXECUTOR_APP
     global GPU_CONTEXT
     global GPU_EKS_NAME
+    global GPU_EKS_NAMES
     global GPU_KUBECONFIG
     global NAMESPACE
 
@@ -131,6 +149,37 @@ def configure(arguments: argparse.Namespace) -> None:
     CONTROL_APP = arguments.control_app
     EXECUTOR_APP = arguments.executor_app
     GPU_EKS_NAME = arguments.gpu_eks_name or _derive_gpu_eks_name()
+    GPU_EKS_NAMES = managed_gpu_eks_names(
+        getattr(arguments, "site", None), selected=GPU_EKS_NAME
+    )
+
+
+def managed_gpu_eks_names(site_path: Path | None, *, selected: str) -> tuple[str, ...]:
+    """The EKS names whose VPC NAT gateways form the expected NLB ingress set.
+
+    Live 2026-10-04 (mixed site): the NLB's 443 allow-list rightly carried the
+    plain-EKS cluster's NAT EIP as well, while the audit expected only the
+    selected (HyperPod) cluster's VPC and failed
+    ``nlb_exposure_matches_deployment_mode``. With a site file every managed
+    cluster counts; without one the selected cluster alone, as before.
+    """
+
+    if site_path is None:
+        return (selected,)
+    from gpu_fault.admin.site import load_site
+
+    site = load_site(site_path.expanduser().resolve())
+    names = tuple(
+        str(entry["eks_cluster_arn"]).rsplit("/", 1)[-1]
+        for entry in site.release_config["clusters"]
+    )
+    if not names:
+        raise CaseError("site contains no GPU clusters")
+    if selected not in names:
+        raise CaseError(
+            f"selected GPU cluster {selected} is not a managed cluster of the site"
+        )
+    return names
 
 
 def run(
@@ -307,23 +356,55 @@ def load_balancer_facts() -> dict:
     }
 
 
-def eks_and_nat_facts() -> tuple[dict, list[str]]:
-    cluster = aws("eks", "describe-cluster", "--name", GPU_EKS_NAME)["cluster"]
-    vpc = cluster["resourcesVpcConfig"]
+def vpc_nat_public_ips(vpc_id: str) -> list[str]:
     nat_gateways = aws(
         "ec2",
         "describe-nat-gateways",
         "--filter",
-        f"Name=vpc-id,Values={vpc['vpcId']}",
+        f"Name=vpc-id,Values={vpc_id}",
         "Name=state,Values=available",
     ).get("NatGateways", [])
-    nat_public_ips = sorted(
+    return sorted(
         {
             str(address["PublicIp"])
             for gateway in nat_gateways
             for address in gateway.get("NatGatewayAddresses", [])
             if address.get("PublicIp")
         }
+    )
+
+
+def eks_and_nat_facts() -> tuple[dict, list[str]]:
+    """The selected cluster's EKS facts and the NAT EIPs of every managed cluster.
+
+    ``nat_sources`` on the facts records each cluster's VPC and EIPs so the
+    evidence shows where every allowed address came from.
+    """
+
+    cluster = aws("eks", "describe-cluster", "--name", GPU_EKS_NAME)["cluster"]
+    vpc = cluster["resourcesVpcConfig"]
+    sources = [
+        {
+            "cluster": GPU_EKS_NAME,
+            "vpc_id": vpc.get("vpcId"),
+            "nat_public_ips": vpc_nat_public_ips(str(vpc["vpcId"])),
+        }
+    ]
+    for name in GPU_EKS_NAMES or (GPU_EKS_NAME,):
+        if name == GPU_EKS_NAME:
+            continue
+        other_vpc = aws("eks", "describe-cluster", "--name", name)["cluster"][
+            "resourcesVpcConfig"
+        ]
+        sources.append(
+            {
+                "cluster": name,
+                "vpc_id": other_vpc.get("vpcId"),
+                "nat_public_ips": vpc_nat_public_ips(str(other_vpc["vpcId"])),
+            }
+        )
+    nat_public_ips = sorted(
+        {address for source in sources for address in source["nat_public_ips"]}
     )
     return (
         {
@@ -335,6 +416,7 @@ def eks_and_nat_facts() -> tuple[dict, list[str]]:
             "endpoint_public_access": vpc.get("endpointPublicAccess"),
             "endpoint_private_access": vpc.get("endpointPrivateAccess"),
             "public_access_cidrs": vpc.get("publicAccessCidrs", []),
+            "nat_sources": sources,
         },
         nat_public_ips,
     )

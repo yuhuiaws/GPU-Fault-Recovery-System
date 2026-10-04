@@ -606,3 +606,241 @@ def test_succeeded_operations_read_only_succeeded_records() -> None:
     assert found == {"MARK_UNSCHEDULABLE": {"wf-ok"}, "RESTART_WORKLOAD": {"wf-ok"}}, (
         "declared steps, FAILED executions and non-terminal workflows prove nothing"
     )
+
+
+# -- mixed-provider site: a plain EKS cluster has no HyperPod to describe ----------
+
+EKS_ARN = "arn:aws:eks:us-west-2:000000000000:cluster/gpu-eks"
+EKS_ROLE = "arn:aws:iam::000000000000:role/executor-eks"
+
+
+def _mixed_runner(
+    tmp_path: Path,
+    *,
+    case_id: str = "GF-REGIONAL-BLAST-002",
+    cls: type[BlastCasesTwo] | type[BlastCasesOne] = BlastCasesTwo,
+) -> Any:
+    """A HyperPod cluster and a plain-EKS cluster on one site, as the live
+    mixed site is: the EKS entry carries ``provider`` and an empty HyperPod name."""
+
+    site_path = tmp_path / "site.yaml"
+    site_path.write_text("mixed test site", encoding="ascii")
+    run_dir = tmp_path / "run"
+    e2e_dir = run_dir / "cases" / base.E2E001_CASE_ID
+    for plane in ("cpu", "gpu"):
+        (tmp_path / f"{plane}.kubeconfig").write_text(
+            f"{plane} connection fixture", encoding="ascii"
+        )
+    site = SimpleNamespace(
+        source_sha256=base.sha256_bytes(site_path.read_bytes()),
+        environment={},
+        release_config={
+            "namespace": "gpu-fault-system",
+            "aws_region": "us-west-2",
+            "cpu_kubeconfig": str(tmp_path / "cpu.kubeconfig"),
+            "gpu_kubeconfig": str(tmp_path / "gpu.kubeconfig"),
+            "cpu_eks_arn": "arn:aws:eks:us-west-2:000000000000:cluster/cpu",
+            "clusters": [
+                {
+                    "cluster_id": "hp-a",
+                    "context": "ctx-hp",
+                    "hyperpod_cluster_name": "hp-a",
+                    "eks_cluster_arn": "arn:aws:eks:us-west-2:000000000000:cluster/hp-a",
+                    "executor_irsa_role_arn": "arn:aws:iam::000000000000:role/executor-hp",
+                },
+                {
+                    "cluster_id": "gpu-eks",
+                    "context": "ctx-eks",
+                    "hyperpod_cluster_name": "",
+                    "eks_cluster_arn": EKS_ARN,
+                    "executor_irsa_role_arn": EKS_ROLE,
+                    "provider": "eks-managed",
+                    "node_selector": "nvidia.com/gpu.present=true",
+                },
+            ],
+        },
+    )
+    with patch.object(base, "load_site", return_value=site):
+        runner = cls(
+            site_path=site_path,
+            run_dir=run_dir,
+            case_id=case_id,
+            e2e_dir=e2e_dir,
+            trusted_cpu_baseline=e2e_dir / base.E2E001_CPU_NODES_BEFORE,
+            predecessor={"valid": True},
+        )
+    runner.evidence_identity = lambda: {"release_id": "release-1", "cluster_id": None}
+    return runner
+
+
+def test_command_step_label_names_the_step_without_values() -> None:
+    assert (
+        base.command_step_label(
+            (
+                "aws",
+                "sagemaker",
+                "describe-cluster",
+                "--cluster-name",
+                "",
+                "--region",
+                "x",
+            )
+        )
+        == "aws sagemaker describe-cluster"
+    )
+    assert (
+        base.command_step_label(
+            (
+                "kubectl",
+                "--kubeconfig",
+                "/secure/gpu.kubeconfig",
+                "--context",
+                "ctx",
+                "-n",
+                "gpu-fault-system",
+                "exec",
+                "-i",
+                "pod-7",
+                "--",
+                "sh",
+                "-c",
+                "secret",
+            )
+        )
+        == "kubectl exec"
+    ), "a kubectl label carries the verb only: no Pod, namespace or payload"
+    assert base.command_step_label(("kubectl", "get", "--raw=/readyz")) == "kubectl get"
+
+
+def test_preflight_binds_a_plain_eks_cluster_without_a_hyperpod_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-04: BLAST-002/003/004 stopped on the mixed site with
+    ``command failed (254)`` -- the AWS CLI refusing ``--cluster-name ""`` for
+    the eks-managed entry before any check ran."""
+
+    runner = _mixed_runner(tmp_path)
+    aws_calls: list[tuple[str, ...]] = []
+
+    def aws(*args: str) -> Any:
+        aws_calls.append(args)
+        if args[:2] == ("sts", "get-caller-identity"):
+            return {"Account": "000000000000"}
+        if args[:2] == ("eks", "describe-cluster"):
+            return {"cluster": {"name": args[3]}}
+        if args[:2] == ("sagemaker", "describe-cluster"):
+            assert args[3] == "hp-a", "only the HyperPod cluster is described"
+            return {
+                "Orchestrator": {
+                    "Eks": {
+                        "ClusterArn": "arn:aws:eks:us-west-2:000000000000:cluster/hp-a"
+                    }
+                },
+                "NodeRecovery": "None",
+            }
+        raise AssertionError(f"unexpected aws call {args}")
+
+    monkeypatch.setattr(runner, "aws", aws)
+    monkeypatch.setattr(runner, "kubeconfig_binding", lambda **kwargs: {"bound": True})
+    monkeypatch.setattr(runner, "cpu_text", lambda *args, **kwargs: "ok")
+    monkeypatch.setattr(runner, "cpu_json", lambda *args: {"items": []})
+    monkeypatch.setattr(runner, "gpu_text", lambda target, *args, **kwargs: "ok")
+    monkeypatch.setattr(
+        runner,
+        "gpu_json",
+        lambda target, *args: {
+            "items": [{"metadata": {"name": f"node-{target.cluster_id}"}}]
+        },
+    )
+
+    runner.preflight()
+
+    scope = json.loads((runner.run_dir / "execution-scope.json").read_text("utf-8"))
+    by_cluster = {item["cluster_id"]: item for item in scope["gpu_clusters"]}
+    assert by_cluster["hp-a"]["provider"] == "hyperpod"
+    assert by_cluster["hp-a"]["hyperpod_orchestrator_matches"] is True
+    assert by_cluster["hp-a"]["node_recovery"] == "None"
+    assert by_cluster["gpu-eks"]["provider"] == "eks-managed"
+    assert by_cluster["gpu-eks"]["hyperpod_orchestrator_matches"] is None
+    assert by_cluster["gpu-eks"]["node_recovery"] == "not-applicable"
+    assert by_cluster["gpu-eks"]["node_names"] == ["node-gpu-eks"]
+    sagemaker_names = [args[3] for args in aws_calls if args[0] == "sagemaker"]
+    assert sagemaker_names == ["hp-a"], (
+        "no sagemaker describe-cluster for the EKS entry"
+    )
+
+
+def test_a_redacted_command_failure_records_its_step_in_the_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
+    runner = _mixed_runner(tmp_path)
+
+    def json_command(command_line: tuple[str, ...]) -> Any:
+        if command_line[:3] == ("aws", "sts", "get-caller-identity"):
+            raise RegionalCommandFailed(254, "token=SECRET-VALUE usage error")
+        raise AssertionError(f"unexpected command {command_line[:3]}")
+
+    monkeypatch.setattr(base, "json_command", json_command)
+
+    assert runner.run() == 1
+
+    evidence = json.loads(
+        (runner.run_dir / f"{runner.case_id}.json").read_text(encoding="utf-8")
+    )
+    assert evidence["verdict"] == "FAIL"
+    assert evidence["error"] == (
+        "RegionalCommandFailed: command failed (254): <sensitive output redacted> "
+        "(step: aws sts get-caller-identity)"
+    ), "the step is named; the command's output stays redacted"
+    assert "SECRET-VALUE" not in json.dumps(evidence)
+    summary = json.loads(
+        (runner.run_dir / "phase-summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["error"].endswith("(step: aws sts get-caller-identity)"), (
+        "the phase summary carries the same attributed error"
+    )
+
+
+def test_blast_003_judges_a_plain_eks_executor_role_by_the_product_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_fault.admin.bootstrap_iam_policies import executor_policy_document
+
+    runner = _mixed_runner(tmp_path, case_id="GF-REGIONAL-BLAST-003")
+    runner.run_dir.mkdir(parents=True, exist_ok=True)
+    eks_target = next(target for target in runner.targets if target.is_eks_managed)
+    document = executor_policy_document(provider="eks-managed", eks_cluster_arn=EKS_ARN)
+    statements = list(document["Statement"])
+    monkeypatch.setattr(
+        runner,
+        "gpu_json",
+        lambda target, *args: {
+            "metadata": {"annotations": {"eks.amazonaws.com/role-arn": EKS_ROLE}}
+        },
+    )
+    monkeypatch.setattr(runner, "iam_role_policies", lambda role_arn: (statements, {}))
+    monkeypatch.setattr(
+        runner,
+        "aws",
+        lambda *args: pytest.fail(
+            "a plain EKS executor audit must not describe HyperPod"
+        ),
+    )
+
+    result = runner.executor_iam_scope(eks_target, namespace_scopes={})
+
+    assert result["role_binding_matches"] is True
+    assert result["unexpected_actions"] == []
+    assert result["resources_scoped"] is True, (
+        "the live role holds exactly the product's EC2/EKS boundary for this cluster"
+    )
+    assert result["forbidden"] == []
+
+    statements.append(
+        {"Effect": "Allow", "Action": "ec2:TerminateInstances", "Resource": "*"}
+    )
+    widened = runner.executor_iam_scope(eks_target, namespace_scopes={})
+    assert widened["unexpected_actions"] == ["ec2:TerminateInstances"]
+    assert widened["resources_scoped"] is False

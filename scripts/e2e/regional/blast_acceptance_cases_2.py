@@ -4,13 +4,17 @@ import base64
 import binascii
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault_release.regional_release_iam import EXECUTOR_SAGEMAKER_ACTIONS
+from gpu_fault.admin.bootstrap_iam_policies import executor_policy_document
 from gpu_fault_release.regional_release_gpu_rollout import (
     render_workload_namespace_rbac,
+)
+from gpu_fault_release.regional_release_iam import (
+    EXECUTOR_EKS_MANAGED_ACTIONS,
+    EXECUTOR_SAGEMAKER_ACTIONS,
 )
 from scripts.e2e.regional.blast_acceptance_base import (
     EXECUTION_TOKEN_NAME,
@@ -137,6 +141,28 @@ def expected_executor_named_roles(
     return {
         system_namespace: {key: sorted(value) for key, value in sorted(result.items())}
     }
+
+
+def normalized_statements(statements: Iterable[Mapping[str, Any]]) -> list[Any]:
+    """Allow statements as order-free, case-folded (actions, resources, condition)
+    triples, so two policy documents compare by meaning rather than layout."""
+
+    def listed(value: Any) -> tuple[str, ...]:
+        items = value if isinstance(value, list) else [value]
+        return tuple(sorted(str(item) for item in items if item is not None))
+
+    normalized = []
+    for item in statements:
+        if str(item.get("Effect", "")).lower() != "allow":
+            continue
+        normalized.append(
+            (
+                tuple(action.lower() for action in listed(item.get("Action", []))),
+                listed(item.get("Resource", [])),
+                json.dumps(item.get("Condition") or {}, sort_keys=True),
+            )
+        )
+    return sorted(normalized)
 
 
 class BlastCasesTwo(BlastCasesOne):
@@ -270,25 +296,40 @@ class BlastCasesTwo(BlastCasesOne):
         )
         role_binding_matches = annotation_role == target.executor_role_arn
         statements, inventory = self.iam_role_policies(target.executor_role_arn)
-        hyperpod = self.aws(
-            "sagemaker",
-            "describe-cluster",
-            "--cluster-name",
-            target.hyperpod_cluster_name,
-        )
-        hyperpod_arn = hyperpod.get("ClusterArn")
-        if not isinstance(hyperpod_arn, str) or not hyperpod_arn:
-            raise CheckError("executor IAM audit lacks the actual HyperPod ARN")
-        resources_scoped = all(
-            not item.get("NotResource") and set(resources_for(item)) == {hyperpod_arn}
-            for item in statements
-            if str(item.get("Effect", "")).lower() == "allow"
-        )
         patterns = self.allowed_action_patterns(statements)
+        if target.is_eks_managed:
+            # A plain EKS cluster's executor holds the product's EC2/EKS
+            # boundary (``executor_policy_document``): the live statements must
+            # be exactly that document for this cluster -- no sagemaker, no
+            # stop/terminate/launch, EC2 reads on "*" only.
+            scope_arn = target.eks_cluster_arn
+            expected = executor_policy_document(
+                provider=target.provider, eks_cluster_arn=target.eks_cluster_arn
+            )
+            resources_scoped = normalized_statements(
+                statements
+            ) == normalized_statements(expected["Statement"])
+            allowed_actions = EXECUTOR_EKS_MANAGED_ACTIONS
+        else:
+            hyperpod = self.aws(
+                "sagemaker",
+                "describe-cluster",
+                "--cluster-name",
+                target.hyperpod_cluster_name,
+            )
+            hyperpod_arn = hyperpod.get("ClusterArn")
+            if not isinstance(hyperpod_arn, str) or not hyperpod_arn:
+                raise CheckError("executor IAM audit lacks the actual HyperPod ARN")
+            scope_arn = hyperpod_arn
+            resources_scoped = all(
+                not item.get("NotResource")
+                and set(resources_for(item)) == {hyperpod_arn}
+                for item in statements
+                if str(item.get("Effect", "")).lower() == "allow"
+            )
+            allowed_actions = EXECUTOR_SAGEMAKER_ACTIONS
         unexpected_actions = [
-            pattern
-            for pattern in patterns
-            if pattern.lower() not in EXECUTOR_SAGEMAKER_ACTIONS
+            pattern for pattern in patterns if pattern.lower() not in allowed_actions
         ]
         ses_actions = sorted(
             {
@@ -318,6 +359,8 @@ class BlastCasesTwo(BlastCasesOne):
                 "service_account_role_matches_site": role_binding_matches,
                 "unexpected_action_patterns": unexpected_actions,
                 "resources_scoped_to_local_hyperpod": resources_scoped,
+                "provider": target.provider,
+                "scope_arn": scope_arn,
                 "namespace_permissions": namespace_scopes,
             }
         )

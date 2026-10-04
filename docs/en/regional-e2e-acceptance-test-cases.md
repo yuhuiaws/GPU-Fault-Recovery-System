@@ -7742,6 +7742,10 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
   - data plane to control plane is reachable one way;
   - the control plane holds no GPU cluster credentials at all, and token-less requests to a public endpoint get 401/403;
   - executor timeout < NLB idle timeout, avoiding half-open connections.
+- Mixed-provider sites: the NLB's inbound 443 allow-list must cover the NAT EIPs of **every** managed GPU cluster's VPC
+  (one VPC per cluster). With `--site` (default: `GPU_FAULT_SITE_FILE`) the runner gathers the NAT EIPs of all clusters in
+  `site.yaml` and uses their union as the expected set; the evidence's `gpu_eks.nat_sources` lists the source per cluster.
+  Without a site file only the selected cluster's VPC counts, exactly as before.
 
 ### GF-REGIONAL-NET-005
 
@@ -8369,6 +8373,14 @@ The lock name may in future be subdivided by explicit endpoint scope; for now th
   neither), so this case audits least privilege against the currently active channel rather
   than requiring SES unconditionally.
 
+
+- Mixed-provider sites: the BLAST runner's preflight performs the `sagemaker describe-cluster` binding and the
+  `NodeRecovery=None` check only for `hyperpod` clusters; an `eks-managed` cluster has no HyperPod orchestrator and the
+  execution scope records `provider=eks-managed`, `node_recovery=not-applicable`. BLAST-003 judges an `eks-managed`
+  cluster's Executor IAM against the product's EC2/EKS boundary (`executor_policy_document` /
+  `EXECUTOR_EKS_MANAGED_ACTIONS`): the statements must be exactly the product policy for that cluster, and any
+  `sagemaker:*` is out of bounds. When a sensitive command fails, the evidence `error` keeps the output redacted but
+  appends `(step: <cli> <subcommand>)` naming the failing step (no names, argument values or payloads).
 
 ### GF-REGIONAL-BLAST-003
 
