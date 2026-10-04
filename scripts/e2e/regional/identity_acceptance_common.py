@@ -205,6 +205,11 @@ class ClusterTarget:
     executor_role_arn: str
     control_plane_url: str
     ca_file: Path
+    #: ``hyperpod`` (default) or ``eks-managed``, with the cluster's configured
+    #: node selector: ``gpu_fault.cluster_scope.node_selector`` enumerates the
+    #: GPU nodes of either provider from these two.
+    provider: str = "hyperpod"
+    node_selector: str = ""
     # False for a cluster id the site does not list: ISO-003/004 judge a
     # cluster-id binding and may name any other id as "cluster B" on a
     # single-cluster site; the evidence must say so.
@@ -308,6 +313,8 @@ class IdentitySite:
                 executor_role_arn=str(item["executor_irsa_role_arn"]),
                 control_plane_url=str(item["control_plane_url"]),
                 ca_file=Path(str(item["ca_file"])).resolve(),
+                provider=str(item.get("provider") or "hyperpod"),
+                node_selector=str(item.get("node_selector") or ""),
             )
             for item in self.config["clusters"]
         }

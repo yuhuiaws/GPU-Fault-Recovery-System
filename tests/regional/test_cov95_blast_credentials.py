@@ -221,3 +221,64 @@ def test_one_cluster_cannot_pass_cross_cluster_token_isolation(
         "one registered physical GPU cluster" in message
         for message in result["limitations"]
     ), "single-cluster evidence omitted its cross-cluster validation limit"
+
+
+def test_gpu_scan_tolerates_foreign_json_keys_that_are_not_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live 2026-10-04 (plain-EKS cluster of the mixed site): a customer
+    ConfigMap kept non-JSON text under a ``*.json`` key and BLAST-004 stopped
+    with "credential container is not valid JSON". A foreign container is
+    inspected by literal digest and recorded; the solution's own objects stay
+    fail-closed."""
+
+    runner = make_runner(monkeypatch, tmp_path, base.CASE_IDS[3])
+    token = b"copied-execution-token-value-1234567890"
+    foreign = {
+        "kind": "ConfigMap",
+        "metadata": {"name": "dashboards", "namespace": "monitoring"},
+        "data": {
+            "grafana.json": "{{ .Values.dashboard | toJson }}",
+            "copy.json": token.decode(),
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "gpu_json",
+        lambda *args: {"items": [canonical(runner.namespace), foreign]},
+    )
+
+    clean, _own = runner.scan_gpu_objects(runner.targets[0], execution_hash="f" * 64)
+    assert [item["key"] for item in clean["uninspected_json_containers"]] == [
+        "grafana.json",
+        "copy.json",
+    ]
+    assert all(
+        item["namespace"] == "monitoring" and "not valid JSON" in item["reason"]
+        for item in clean["uninspected_json_containers"]
+    ), "every uninspected container names the foreign object and the reason"
+    assert clean["execution_token_value_hash_hits"] == []
+
+    copied, _own = runner.scan_gpu_objects(
+        runner.targets[0], execution_hash=base.sha256_bytes(token)
+    )
+    assert copied["execution_token_value_hash_hits"] == [
+        {
+            "kind": "ConfigMap",
+            "namespace": "monitoring",
+            "name": "dashboards",
+            "key": "copy.json",
+        }
+    ], "a literal copy inside an unparsable container is still found"
+    assert token.decode() not in json.dumps(copied)
+
+    own = {
+        "kind": "ConfigMap",
+        "metadata": {"name": "ours", "namespace": runner.namespace},
+        "data": {"policy.json": "not json"},
+    }
+    monkeypatch.setattr(
+        runner, "gpu_json", lambda *args: {"items": [canonical(runner.namespace), own]}
+    )
+    with pytest.raises(base.CheckError, match="not valid JSON"):
+        runner.scan_gpu_objects(runner.targets[0], execution_hash="f" * 64)

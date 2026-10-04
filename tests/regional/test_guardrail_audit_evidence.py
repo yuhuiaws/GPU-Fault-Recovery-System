@@ -199,3 +199,82 @@ def test_live_audit_requires_one_explicit_case_before_any_reads(
     )
     with pytest.raises(RuntimeError, match="exactly one"):
         audit.main()
+
+
+def test_a_plain_eks_registration_completes_a_mixed_registry() -> None:
+    """Live 2026-10-04: DESTR-005/006/007 on the HyperPod cluster of the mixed
+    site refused with "durable registry identities are incomplete" because the
+    eks-managed registration has no HyperPod cluster name."""
+
+    hyperpod = {
+        "cluster_id": "hp",
+        "region": "region-a",
+        "hyperpod_cluster_name": "managed",
+        "eks_cluster_arn": "arn:aws:eks:region-a:123456789012:cluster/managed",
+        "provider": "hyperpod",
+    }
+    eks = {
+        "cluster_id": "gpu-eks",
+        "region": "region-a",
+        "hyperpod_cluster_name": "",
+        "eks_cluster_arn": "arn:aws:eks:region-a:123456789012:cluster/gpu-eks",
+        "provider": "eks-managed",
+    }
+    registry = {"registrations": [hyperpod, eks]}
+    assert (
+        registration_identity(registry, "managed", "negative", "region-a") == hyperpod
+    )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        registration_identity(
+            {"registrations": [hyperpod, {**eks, "eks_cluster_arn": ""}]},
+            "managed",
+            "negative",
+            "region-a",
+        )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        registration_identity(
+            {"registrations": [{**hyperpod, "hyperpod_cluster_name": ""}]},
+            "managed",
+            "negative",
+            "region-a",
+        )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        (
+            registration_identity(
+                {"registrations": [{**eks, "provider": "hyperpod"}]},
+                "managed",
+                "negative",
+                "region-a",
+            ),
+            "an empty HyperPod name is only legitimate for an eks-managed row",
+        )
+
+
+def test_a_plain_eks_registration_is_named_by_its_cluster_id_or_eks_name() -> None:
+    """The EKS acceptance profile passes the provider cluster scope
+    (``hyperpod-cluster: gpu-eks-cluster``); a plain-EKS registration has no
+    HyperPod name, so it is matched by cluster id or EKS cluster name."""
+
+    hyperpod = {
+        "cluster_id": "hp",
+        "region": "region-a",
+        "hyperpod_cluster_name": "managed",
+        "eks_cluster_arn": "arn:aws:eks:region-a:123456789012:cluster/managed",
+        "provider": "hyperpod",
+    }
+    eks = {
+        "cluster_id": "gpu-eks-cluster",
+        "region": "region-a",
+        "hyperpod_cluster_name": "",
+        "eks_cluster_arn": "arn:aws:eks:region-a:123456789012:cluster/gpu-eks",
+        "provider": "eks-managed",
+    }
+    registry = {"registrations": [hyperpod, eks]}
+    assert registration_identity(registry, "gpu-eks-cluster", "", "region-a") == eks
+    assert registration_identity(registry, "gpu-eks", "", "region-a") == eks
+    assert registration_identity(registry, "managed", "", "region-a") == hyperpod
+    with pytest.raises(RuntimeError, match="does not match"):
+        (
+            registration_identity(registry, "hp", "", "region-a"),
+            ("a HyperPod registration is still named by its HyperPod cluster only"),
+        )

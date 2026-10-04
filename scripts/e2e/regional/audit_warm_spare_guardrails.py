@@ -191,7 +191,16 @@ def write_json(path: Path, value: object) -> None:
         _write_document(path, cast(dict[str, Any], value))
 
 
-def cluster_recovery(name: str) -> dict[str, Any]:
+def cluster_recovery(name: str, provider: str = "hyperpod") -> dict[str, Any]:
+    if provider == "eks-managed":
+        # No HyperPod behind a plain EKS cluster: nothing to describe, and the
+        # AWS CLI would refuse the name with exit 254 (live 2026-10-04).
+        return {
+            "cluster_name": name,
+            "status": "not-applicable",
+            "node_recovery": "not-applicable",
+            "provider": provider,
+        }
     value = json.loads(
         command(
             [
@@ -350,6 +359,7 @@ def audit_identity() -> dict[str, str]:
         "release_id": release_id,
         "cluster_id": registration["cluster_id"],
         "eks_cluster_arn": registration["eks_cluster_arn"],
+        "provider": str(registration.get("provider") or "hyperpod"),
         "registry_generation": str(registry["generation"]),
     }
 
@@ -1233,7 +1243,13 @@ def run_audit(
         or {}
     )
     gpu: dict[str, Any] = (
-        probes.guarded(lambda: cluster_recovery(MANAGED_GPU_CLUSTER)) or {}
+        probes.guarded(
+            lambda: cluster_recovery(
+                MANAGED_GPU_CLUSTER,
+                str((identity or {}).get("provider") or "hyperpod"),
+            )
+        )
+        or {}
     )
     env: list[dict[str, Any]] = probes.guarded(executor_env) or []
     if identity is not None and any(

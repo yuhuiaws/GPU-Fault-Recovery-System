@@ -215,6 +215,16 @@ def write_json(path: Path, payload: Any) -> None:
     path.chmod(0o600)
 
 
+def business_workload_refusal(workloads: list[dict[str, str]]) -> str:
+    """The preflight refusal names every Pod (namespace/name, why) it found."""
+
+    named = ", ".join(
+        f"{item['namespace']}/{item['name']} ({item.get('reason', '')})"
+        for item in workloads
+    )
+    return f"target node has an active business workload: {named}"
+
+
 class Runner:
     def __init__(
         self,
@@ -583,8 +593,10 @@ finally:
         )
 
     def validate_preflight(self) -> None:
-        if self.active_business_workloads():
-            raise CaseError("target node has an active business workload")
+        workloads = self.active_business_workloads()
+        if workloads:
+            write_json(self.case_dir / "business-workloads.json", workloads)
+            raise CaseError(business_workload_refusal(workloads))
         args = [
             "preflight",
             "--endpoint-host",
@@ -740,10 +752,9 @@ finally:
     def replay_converged(snapshot: dict[str, Any], store: dict[str, Any]) -> bool:
         """The replay is done when the three records are in and nothing waits.
 
-        Only the outbox and the evidence decide convergence. Incident state
-        and notification suppression are the processor's and the notifier's
-        business; they are judged in ``validate_final`` as separate checks
-        and must not keep the runner polling for five minutes when the
+        Only the outbox and the evidence decide convergence; incident state and
+        notification suppression are judged in ``validate_final`` as separate
+        checks and must not keep the runner polling for five minutes when the
         replay itself finished in the first fifteen seconds.
         """
 
@@ -794,9 +805,8 @@ finally:
 
         Recorded next to the verdict, not folded into it: the case proves the
         Collector outbox replays and that a monitor-only event never opens a
-        mutation workflow. Whether the incident has already reached RECOVERED
-        or whether the drill notification was suppressed depends on the
-        processor's and the notifier's cadence, which other cases own.
+        mutation workflow; whether the incident reached RECOVERED or the drill
+        notification was suppressed depends on cadences other cases own.
         """
 
         incidents = store.get("incidents") or []

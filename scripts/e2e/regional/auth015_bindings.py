@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.fleet import AgentLifecycleState, AgentRecord
 from gpu_fault.fleet_endpoint import parse_endpoint_networks, validate_agent_endpoint
 from scripts.e2e.regional.auth015_protocol import (
@@ -146,8 +147,7 @@ def node_binding(
         or node.get("kind") != "Node"
         or metadata.get("deletionTimestamp")
         or metadata.get("name") != record.node_id
-        or metadata.get("labels", {}).get("sagemaker.amazonaws.com/cluster-name")
-        != target.hyperpod_cluster_name
+        or not selector_matches(metadata.get("labels", {}), node_selector(target))
         or not any(
             item.get("type") == "Ready" and item.get("status") == "True"
             for item in status.get("conditions", [])

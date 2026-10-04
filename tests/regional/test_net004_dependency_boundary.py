@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,124 @@ def test_managed_gpu_eks_names_come_from_the_site_and_must_include_the_selected(
         "hp-eks",
         "gpu-eks",
     )
-    assert net004.managed_gpu_eks_names(None, selected="hp-eks") == ("hp-eks",)
+    monkeypatch.setattr(net004, "registered_gpu_eks_names", lambda: ("hp-eks",))
+    assert net004.managed_gpu_eks_names(None, selected="hp-eks") == ("hp-eks",), (
+        "without a site file the durable registry names the managed clusters"
+    )
     with pytest.raises(net004.CaseError, match="not a managed cluster"):
         net004.managed_gpu_eks_names(site_path, selected="other")
+
+
+def test_managed_clusters_come_from_the_durable_registry_without_a_site_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-04 (second NET-004 run): the campaign passed no site file,
+    so the audit still saw one VPC. The control plane's durable registry names
+    every managed cluster by its EKS ARN -- plain EKS and HyperPod alike."""
+
+    calls: list[tuple[str, ...]] = []
+
+    def cpu(*args: str, stdin: str | None = None, timeout: int = 120) -> str:
+        calls.append(args)
+        if args[:2] == ("get", "pods"):
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "api-a", "uid": "u1"},
+                            "spec": {"containers": [{"name": "api"}]},
+                            "status": {
+                                "phase": "Running",
+                                "conditions": [{"type": "Ready", "status": "True"}],
+                                "containerStatuses": [
+                                    {
+                                        "name": "api",
+                                        "ready": True,
+                                        "state": {"running": {}},
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            )
+        assert args[:3] == ("exec", "-i", "api-a"), args
+        assert stdin and "get_regional_registry_head" in stdin, "the registry probe"
+        return json.dumps(
+            {
+                "generation": 7,
+                "registrations": [
+                    {
+                        "cluster_id": "hp",
+                        "eks_cluster_arn": "arn:aws:eks:us-west-2:1:cluster/hp-eks",
+                        "provider": "hyperpod",
+                    },
+                    {
+                        "cluster_id": "gpu-eks-cluster",
+                        "eks_cluster_arn": "arn:aws:eks:us-west-2:1:cluster/gpu-eks",
+                        "provider": "eks-managed",
+                    },
+                ],
+            }
+        )
+
+    monkeypatch.setattr(net004, "cpu", cpu)
+    assert net004.managed_gpu_eks_names(None, selected="hp-eks") == (
+        "hp-eks",
+        "gpu-eks",
+    )
+    with pytest.raises(net004.CaseError, match="not a managed cluster"):
+        net004.managed_gpu_eks_names(None, selected="other")
+
+
+def test_managed_contexts_follow_the_kubeconfig_cluster_arns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    view = {
+        "contexts": [
+            {
+                "name": "gpu-fault-gpu-1-hp-eks",
+                "context": {"cluster": "arn:aws:eks:us-west-2:1:cluster/hp-eks"},
+            },
+            {
+                "name": "gpu-fault-gpu-gpu-eks-aa",
+                "context": {"cluster": "arn:aws:eks:us-west-2:1:cluster/gpu-eks"},
+            },
+        ]
+    }
+    monkeypatch.setattr(net004, "gpu", lambda *args, **kwargs: json.dumps(view))
+    monkeypatch.setattr(net004, "GPU_CONTEXT", "gpu-fault-gpu-1-hp-eks")
+    assert net004.managed_gpu_contexts(("hp-eks", "gpu-eks"), selected="hp-eks") == {
+        "hp-eks": "gpu-fault-gpu-1-hp-eks",
+        "gpu-eks": "gpu-fault-gpu-gpu-eks-aa",
+    }
+    assert net004.managed_gpu_contexts(("hp-eks",), selected="hp-eks") == {
+        "hp-eks": "gpu-fault-gpu-1-hp-eks"
+    }, "a single-cluster site probes the selected context alone, as before"
+
+
+def test_fleet_probes_cover_every_managed_cluster_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probed: list[str | None] = []
+
+    def gpu_network_probes(nlb_dns: str, *, check_egress: bool, context=None):
+        probed.append(context)
+        return [{"pod": f"executor-{context or 'selected'}", "egress_ip": None}]
+
+    monkeypatch.setattr(net004, "gpu_network_probes", gpu_network_probes)
+    monkeypatch.setattr(net004, "GPU_EKS_NAME", "hp-eks")
+    monkeypatch.setattr(net004, "GPU_CONTEXT", "ctx-hp")
+    monkeypatch.setattr(
+        net004, "GPU_CONTEXTS", {"hp-eks": "ctx-hp", "gpu-eks": "ctx-eks"}
+    )
+
+    probes = net004.fleet_network_probes("nlb.example", check_egress=True)
+
+    assert probed == [None, "ctx-eks"], (
+        "the selected context first, then each other cluster"
+    )
+    assert [probe["pod"] for probe in probes] == [
+        "executor-selected",
+        "executor-ctx-eks",
+    ]

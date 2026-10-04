@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
@@ -121,7 +121,8 @@ try:
         raise RuntimeError("registry head changed")
     rows = [{"cluster_id": row.cluster_id, "region": row.region,
              "hyperpod_cluster_name": row.hyperpod_cluster_name,
-             "eks_cluster_arn": row.eks_cluster_arn}
+             "eks_cluster_arn": row.eks_cluster_arn,
+             "provider": getattr(row, "provider", "") or "hyperpod"}
             for row in revision.registrations]
     if store.get_regional_registry_head() != head:
         raise RuntimeError("registry changed during audit")
@@ -131,6 +132,23 @@ finally:
 """
 
 
+def _row_identity_complete(row: dict[str, Any]) -> bool:
+    """Every registration names its cluster, Region and EKS cluster; a HyperPod
+    registration also its HyperPod cluster. A plain-EKS registration
+    (``provider: eks-managed``) has no HyperPod and leaves the name empty --
+    the mixed site's second cluster (live 2026-10-04: DESTR-005/006/007 on the
+    HyperPod cluster refused because of it)."""
+
+    for key in ("cluster_id", "region", "eks_cluster_arn"):
+        if not isinstance(row.get(key), str) or not row[key]:
+            return False
+    provider = str(row.get("provider") or "hyperpod")
+    name = row.get("hyperpod_cluster_name")
+    if provider == "eks-managed":
+        return isinstance(name, str)
+    return isinstance(name, str) and bool(name)
+
+
 def registration_identity(
     registry: dict[str, Any], managed_cluster: str, negative_cluster: str, region: str
 ) -> dict[str, str]:
@@ -138,17 +156,7 @@ def registration_identity(
     if not isinstance(rows, list) or not rows:
         raise RuntimeError("durable registry inventory is missing")
     if any(
-        not isinstance(row, dict)
-        or not all(
-            isinstance(row.get(key), str) and row[key]
-            for key in (
-                "cluster_id",
-                "region",
-                "hyperpod_cluster_name",
-                "eks_cluster_arn",
-            )
-        )
-        for row in rows
+        not isinstance(row, dict) or not _row_identity_complete(row) for row in rows
     ):
         raise RuntimeError("durable registry identities are incomplete")
     if negative_cluster and any(
@@ -157,7 +165,20 @@ def registration_identity(
         raise RuntimeError(
             "Automatic negative cluster is registered in the managed fleet"
         )
-    managed = [row for row in rows if row["hyperpod_cluster_name"] == managed_cluster]
+    managed = [row for row in rows if _names_managed_cluster(row, managed_cluster)]
     if len(managed) != 1 or managed[0]["region"] != region:
         raise RuntimeError("managed cluster does not match the durable registry")
     return dict(managed[0])
+
+
+def _names_managed_cluster(row: dict[str, Any], managed_cluster: str) -> bool:
+    """A HyperPod registration is named by its HyperPod cluster; a plain-EKS one
+    (no HyperPod) by its ``cluster_id`` or EKS cluster name -- the value the
+    provider cluster scope (``--hyperpod-cluster``) carries for it."""
+
+    if row.get("hyperpod_cluster_name") == managed_cluster:
+        return True
+    if str(row.get("provider") or "hyperpod") != "eks-managed":
+        return False
+    eks_name = str(row.get("eks_cluster_arn") or "").rsplit("/", 1)[-1]
+    return managed_cluster in {row.get("cluster_id"), eks_name}

@@ -7585,6 +7585,12 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
   The Completion Watcher currently has no disk outbox configured; although it reconciles repeatedly inside the running process,
   there is still a one-off risk of losing a terminal event when the Pod restarts exactly inside the interruption window.
 
+- Mixed-provider sites: the preflight's "target node has an active business workload" verdict classifies Pods rather than
+  namespaces alone: a Pod requesting `nvidia.com/gpu` is a workload in any namespace; non-GPU Pods in the system
+  namespaces, in the solution namespace and **DaemonSet-owned Pods** (device plugins, CNI/EFA plugins, node-exporter and
+  other node agents) are infrastructure; every other non-GPU Pod still fails closed as a workload (a declared workload
+  namespace records `allowed-workload-namespace`, anything else `unclassified-workload`). The refusal's `error` lists
+  `namespace/name (reason)` and the Pods are written to `business-workloads.json`.
 
 ### GF-REGIONAL-NET-002
 
@@ -7743,9 +7749,12 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
   - the control plane holds no GPU cluster credentials at all, and token-less requests to a public endpoint get 401/403;
   - executor timeout < NLB idle timeout, avoiding half-open connections.
 - Mixed-provider sites: the NLB's inbound 443 allow-list must cover the NAT EIPs of **every** managed GPU cluster's VPC
-  (one VPC per cluster). With `--site` (default: `GPU_FAULT_SITE_FILE`) the runner gathers the NAT EIPs of all clusters in
-  `site.yaml` and uses their union as the expected set; the evidence's `gpu_eks.nat_sources` lists the source per cluster.
-  Without a site file only the selected cluster's VPC counts, exactly as before.
+  (one VPC per cluster) -- a site-wide judgement. The managed set comes from `--site` (default `GPU_FAULT_SITE_FILE`) or,
+  without a site file, from the control plane's durable registry (each registration names its cluster by EKS ARN,
+  HyperPod and plain EKS alike); the selected cluster must belong to it. The evidence's `gpu_eks.nat_sources` lists the
+  NAT source per cluster and `managed_gpu_clusters` the set. The executor egress probe runs in **every** managed cluster:
+  the selected `--gpu-context` first, then each other cluster under the GPU kubeconfig context whose `cluster` is its EKS
+  ARN (`probed_gpu_contexts`); a single-cluster site probes the selected context alone, exactly as before.
 
 ### GF-REGIONAL-NET-005
 
@@ -8473,6 +8482,10 @@ The lock name may in future be subdivided by explicit endpoint scope; for now th
 
 
 ---
+- Mixed-provider sites: when an object **outside the solution namespace** keeps non-JSON content under a `*.json` key
+  (such as a customer monitoring stack's templated dashboards), the audit still inspects its bytes by literal digest and
+  records the container in `uninspected_json_containers` (with the reason) instead of stopping the case with
+  `credential container is not valid JSON`; objects in the solution namespace stay fail-closed.
 
 ## 11.5 WORKLOAD: Training workload baseline
 
@@ -8773,6 +8786,15 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
     `expected_status`) and to `reset_notification` in the result.
 - Rollback: if validation fails after the reset, the node stays quarantined; restore the
   services by hand as `RESTORE_GPU_SERVICES` would, then take the reboot path.
+- DESTR/COLLECT preflights on a mixed-provider site: the "pre-existing taints" verdict counts only **isolating** taints.
+  Any taint blocks a `hyperpod` node (as before); an `eks-managed` node (EKS node group label, no HyperPod label) carries
+  its managed node group's `nvidia.com/gpu=present:NoSchedule` by construction, recorded in the snapshot's
+  `tolerated_taints` and not blocking; `gpu-fault.io/*`, `node.kubernetes.io/unschedulable` and any `NoExecute` taint block
+  on every provider. "Non-system running Pods" follow NET-001's rule (DaemonSet-owned Pods without a GPU request are
+  infrastructure). DESTR-005/006/007's `--hyperpod-cluster` carries an `eks-managed` cluster's `cluster_id` (the provider
+  cluster-scope convention), matched in the durable registry by `cluster_id`/EKS name; the HyperPod
+  `describe-cluster`/NodeRecovery facts read `not-applicable`. AUTH-015 selects nodes with `cluster_scope.node_selector`
+  (the HyperPod label, or the cluster's configured node selector).
 
 ### GF-REGIONAL-DESTR-002
 
@@ -9179,6 +9201,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   and the customer's warm-spare node constraint is bypassed. **Blocks go-live.**
 - The original manual path of "first create a real workload, quarantine the node, then deliberately make `REPLACE_NODE` fail"
   has been withdrawn. A negative guard does not need to produce scheduler side effects; continuing to run the old path is invalid acceptance.
+- Mixed-provider sites: the durable registry identity the guardrail audits read requires fields per provider: every
+  registration carries `cluster_id`/`region`/`eks_cluster_arn`; a `hyperpod` registration also its `hyperpod_cluster_name`,
+  while an `eks-managed` registration has no HyperPod and an empty name is legitimate. The managed cluster is still
+  selected by HyperPod name, so DESTR-005/006/007 run on the HyperPod cluster of a mixed site as before.
 
 ### GF-REGIONAL-DESTR-006
 

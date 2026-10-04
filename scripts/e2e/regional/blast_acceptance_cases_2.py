@@ -143,6 +143,31 @@ def expected_executor_named_roles(
     }
 
 
+def inspect_credential_value(
+    location: Mapping[str, Any], raw: bytes, *, product_namespace: str
+) -> tuple[set[str], str | None]:
+    """The digests of one stored value and, for a foreign container that could
+    not be parsed, why only its literal bytes were inspected.
+
+    A ``*.json`` key must parse so JSON-embedded copies are seen. The solution's
+    own objects stay fail-closed (``CheckError``); a foreign object (live
+    2026-10-04: a plain-EKS cluster's monitoring stack keeps non-JSON under
+    ``*.json`` keys) is inspected by literal digest and reported instead of
+    stopping the audit, so the evidence says what was not inspected rather
+    than inferring absence.
+    """
+
+    try:
+        digests = credential_value_digests(
+            raw, require_json=str(location.get("key", "")).endswith(".json")
+        )
+    except CredentialScanError as exc:
+        if location.get("namespace") == product_namespace:
+            raise CheckError(str(exc)) from None
+        return {sha256_bytes(candidate) for candidate in (raw, raw.strip())}, str(exc)
+    return digests, None
+
+
 def normalized_statements(statements: Iterable[Mapping[str, Any]]) -> list[Any]:
     """Allow statements as order-free, case-folded (actions, resources, condition)
     triples, so two policy documents compare by meaning rather than layout."""
@@ -603,12 +628,7 @@ class BlastCasesTwo(BlastCasesOne):
         foreign_cluster_hashes: set[str] | None = None,
     ) -> tuple[dict[str, Any], str]:
         payload = self.gpu_json(
-            target,
-            "get",
-            "secret,configmap,pod",
-            "-A",
-            "-o",
-            "json",
+            target, "get", "secret,configmap,pod", "-A", "-o", "json"
         )
         hits: list[dict[str, Any]] = []
         if not isinstance(payload.get("items"), list) or (
@@ -617,16 +637,16 @@ class BlastCasesTwo(BlastCasesOne):
             raise CheckError("GPU credential object inventory is incomplete")
         foreign_hits: list[dict[str, Any]] = []
         name_hits: list[dict[str, Any]] = []
+        uninspected: list[dict[str, Any]] = []
         cluster_token_hash = ""
         canonical_count = 0
 
         def record_value(location: dict[str, Any], raw: bytes) -> None:
-            try:
-                digests = credential_value_digests(
-                    raw, require_json=str(location.get("key", "")).endswith(".json")
-                )
-            except CredentialScanError as exc:
-                raise CheckError(str(exc)) from None
+            digests, reason = inspect_credential_value(
+                location, raw, product_namespace=self.namespace
+            )
+            if reason:
+                uninspected.append({**location, "reason": reason})
             if execution_hash in digests:
                 hits.append(location)
             if digests & (foreign_cluster_hashes or set()):
@@ -793,6 +813,8 @@ class BlastCasesTwo(BlastCasesOne):
             "execution_token_value_hash_hits": hits,
             "execution_token_name_or_reference_hits": name_hits,
             "foreign_cluster_token_hash_hits": foreign_hits,
+            # Foreign containers inspected by literal digest only.
+            "uninspected_json_containers": uninspected,
         }, cluster_token_hash
 
     def cluster_token_digest(self, target: ClusterTarget) -> str:

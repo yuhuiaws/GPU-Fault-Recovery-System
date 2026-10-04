@@ -18,12 +18,14 @@ from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
     current_acceptance_scope,
     scoped_case_evidence,
 )
-from scripts.e2e.regional.ha_evidence import chain_preflight, require_chain  # noqa: E402
+from scripts.e2e.regional.ha_evidence import (  # noqa: E402
+    chain_preflight,
+    require_chain,
+)
 from scripts.e2e.regional.regional_case_contract import case_evidence_path  # noqa: E402
 from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
-
 
 CPU_KUBECONFIG = Path()
 GPU_KUBECONFIG = Path()
@@ -33,6 +35,9 @@ GPU_EKS_NAME = ""
 #: ingress allow-list covers each cluster's VPC NAT); the selected one alone
 #: otherwise, exactly as before.
 GPU_EKS_NAMES: tuple[str, ...] = ()
+#: ``{eks name: kube context}`` for the managed clusters the GPU kubeconfig can
+#: reach; the executor egress probe runs in each of them.
+GPU_CONTEXTS: dict[str, str] = {}
 NAMESPACE = "gpu-fault-system"
 AWS_REGION = ""
 CONTROL_SERVICE = "gpu-fault-api-nlb"
@@ -123,6 +128,7 @@ def configure(arguments: argparse.Namespace) -> None:
     global CPU_KUBECONFIG
     global EXECUTOR_APP
     global GPU_CONTEXT
+    global GPU_CONTEXTS
     global GPU_EKS_NAME
     global GPU_EKS_NAMES
     global GPU_KUBECONFIG
@@ -152,6 +158,65 @@ def configure(arguments: argparse.Namespace) -> None:
     GPU_EKS_NAMES = managed_gpu_eks_names(
         getattr(arguments, "site", None), selected=GPU_EKS_NAME
     )
+    GPU_CONTEXTS = managed_gpu_contexts(GPU_EKS_NAMES, selected=GPU_EKS_NAME)
+
+
+REGISTRY_CLUSTERS_PROBE = r"""
+import json, os
+from gpu_fault.store import PostgresStore
+from gpu_fault.store.postgres.pool import StoreCredentials
+path = os.getenv("GPU_FAULT_STORE_URL_FILE")
+credentials = StoreCredentials(os.getenv("GPU_FAULT_STORE_URL", ""), path=path)
+url = credentials.conninfo()
+if not url or (path and credentials.source != "file"):
+    raise RuntimeError("current store credential is unavailable")
+store = PostgresStore(url, initialize_schema=False)
+try:
+    head = store.get_regional_registry_head()
+    revision = store.get_regional_registry_revision(head.generation)
+    if revision.content_sha256 != head.content_sha256:
+        raise RuntimeError("registry head changed")
+    rows = [{"cluster_id": row.cluster_id, "eks_cluster_arn": row.eks_cluster_arn,
+             "provider": getattr(row, "provider", "") or "hyperpod"}
+            for row in revision.registrations]
+    print(json.dumps({"generation": head.generation, "registrations": rows}))
+finally:
+    store.close()
+"""
+
+
+def registered_gpu_eks_names() -> tuple[str, ...]:
+    """Every managed cluster's EKS name from the control plane's durable registry.
+
+    The registry is what the control plane serves and what the NLB allow-list
+    was rendered for; it names a plain-EKS cluster by its EKS ARN exactly like
+    a HyperPod cluster, so no site file is needed to see the whole fleet.
+    """
+
+    inventory = json.loads(cpu("get", "pods", "-l", f"app={CONTROL_APP}", "-o", "json"))
+    ready = ready_pod_records(inventory)
+    if not ready:
+        raise CaseError("no Ready control-plane API Pod for the registry read")
+    output = cpu(
+        "exec",
+        "-i",
+        str(ready[0]["name"]),
+        "--",
+        component_python("cpu"),
+        "-",
+        stdin=REGISTRY_CLUSTERS_PROBE,
+    )
+    registry = json.loads(output.splitlines()[-1])
+    rows = registry.get("registrations")
+    if not isinstance(rows, list) or not rows:
+        raise CaseError("durable registry names no GPU clusters")
+    names = []
+    for row in rows:
+        arn = str(row.get("eks_cluster_arn") or "")
+        if "/" not in arn:
+            raise CaseError("durable registry registration lacks an EKS cluster ARN")
+        names.append(arn.rsplit("/", 1)[-1])
+    return tuple(names)
 
 
 def managed_gpu_eks_names(site_path: Path | None, *, selected: str) -> tuple[str, ...]:
@@ -160,26 +225,53 @@ def managed_gpu_eks_names(site_path: Path | None, *, selected: str) -> tuple[str
     Live 2026-10-04 (mixed site): the NLB's 443 allow-list rightly carried the
     plain-EKS cluster's NAT EIP as well, while the audit expected only the
     selected (HyperPod) cluster's VPC and failed
-    ``nlb_exposure_matches_deployment_mode``. With a site file every managed
-    cluster counts; without one the selected cluster alone, as before.
+    ``nlb_exposure_matches_deployment_mode``. The managed clusters come from
+    the site file when one is given, else from the control plane's durable
+    registry; the selected cluster must be one of them. A single-cluster site
+    yields the selected cluster alone either way.
     """
 
     if site_path is None:
-        return (selected,)
-    from gpu_fault.admin.site import load_site
+        names = registered_gpu_eks_names()
+    else:
+        from gpu_fault.admin.site import load_site
 
-    site = load_site(site_path.expanduser().resolve())
-    names = tuple(
-        str(entry["eks_cluster_arn"]).rsplit("/", 1)[-1]
-        for entry in site.release_config["clusters"]
-    )
+        site = load_site(site_path.expanduser().resolve())
+        names = tuple(
+            str(entry["eks_cluster_arn"]).rsplit("/", 1)[-1]
+            for entry in site.release_config["clusters"]
+        )
     if not names:
         raise CaseError("site contains no GPU clusters")
     if selected not in names:
         raise CaseError(
             f"selected GPU cluster {selected} is not a managed cluster of the site"
         )
-    return names
+    return tuple(names)
+
+
+def managed_gpu_contexts(names: tuple[str, ...], *, selected: str) -> dict[str, str]:
+    """``{eks name: context}`` from the GPU kubeconfig for every managed cluster.
+
+    A context whose ``cluster`` entry is the EKS cluster ARN (the administrator's
+    kubeconfig aliases every managed cluster that way) maps to that cluster.
+    The selected cluster keeps the selected context; a managed cluster the
+    kubeconfig cannot reach is left out and recorded by the caller.
+    """
+
+    view = json.loads(gpu("config", "view", "-o", "json"))
+    by_arn_name: dict[str, str] = {}
+    for item in view.get("contexts") or []:
+        cluster = str((item.get("context") or {}).get("cluster") or "")
+        if "/" in cluster:
+            by_arn_name.setdefault(
+                cluster.rsplit("/", 1)[-1], str(item.get("name") or "")
+            )
+    contexts = {selected: GPU_CONTEXT}
+    for name in names:
+        if name != selected and by_arn_name.get(name):
+            contexts[name] = by_arn_name[name]
+    return contexts
 
 
 def run(
@@ -211,14 +303,19 @@ def cpu(*args: str, stdin: str | None = None, timeout: int = 120) -> str:
     )
 
 
-def gpu(*args: str, stdin: str | None = None, timeout: int = 120) -> str:
+def gpu(
+    *args: str,
+    stdin: str | None = None,
+    timeout: int = 120,
+    context: str | None = None,
+) -> str:
     return run(
         [
             "kubectl",
             "--kubeconfig",
             str(GPU_KUBECONFIG),
             "--context",
-            GPU_CONTEXT,
+            context or GPU_CONTEXT,
             "-n",
             NAMESPACE,
             *args,
@@ -422,7 +519,9 @@ def eks_and_nat_facts() -> tuple[dict, list[str]]:
     )
 
 
-def gpu_network_probes(nlb_dns: str, *, check_egress: bool) -> list[dict]:
+def gpu_network_probes(
+    nlb_dns: str, *, check_egress: bool, context: str | None = None
+) -> list[dict]:
     pods = gpu(
         "get",
         "pod",
@@ -431,6 +530,7 @@ def gpu_network_probes(nlb_dns: str, *, check_egress: bool) -> list[dict]:
         "--field-selector=status.phase=Running",
         "-o",
         "jsonpath={.items[*].metadata.name}",
+        context=context,
     ).split()
     if not pods:
         raise CaseError("no running cluster executor Pods")
@@ -493,9 +593,35 @@ print(json.dumps({{
     probes = []
     for pod in pods:
         output = gpu(
-            "exec", "-i", pod, "--", component_python("gpu"), "-", stdin=script
+            "exec",
+            "-i",
+            pod,
+            "--",
+            component_python("gpu"),
+            "-",
+            stdin=script,
+            context=context,
         )
-        probes.append(json.loads(output.splitlines()[-1]))
+        probes.append(
+            {**json.loads(output.splitlines()[-1]), "context": context or GPU_CONTEXT}
+        )
+    return probes
+
+
+def fleet_network_probes(nlb_dns: str, *, check_egress: bool) -> list[dict]:
+    """Executor probes from every managed cluster the kubeconfig reaches.
+
+    The NLB allow-list is one site-wide object, so one cluster's egress proves
+    only that cluster; the selected context comes first, as before, and each
+    other managed cluster's executors follow under their own context.
+    """
+
+    probes = gpu_network_probes(nlb_dns, check_egress=check_egress)
+    for name, context in sorted(GPU_CONTEXTS.items()):
+        if name != GPU_EKS_NAME and context != GPU_CONTEXT:
+            probes.extend(
+                gpu_network_probes(nlb_dns, check_egress=check_egress, context=context)
+            )
     return probes
 
 
@@ -820,7 +946,7 @@ def audit() -> dict:
         load_balancer = load_balancer_facts()
         eks, nat_public_ips = eks_and_nat_facts()
         public_nlb = load_balancer["scheme"] == "internet-facing"
-        probes = gpu_network_probes(
+        probes = fleet_network_probes(
             str(load_balancer["dns_name"]),
             check_egress=public_nlb,
         )
@@ -847,6 +973,8 @@ def audit() -> dict:
             "load_balancer": load_balancer,
             "gpu_eks": safe_eks,
             "nat_public_ips": nat_public_ips,
+            "managed_gpu_clusters": sorted(GPU_EKS_NAMES or (GPU_EKS_NAME,)),
+            "probed_gpu_contexts": dict(sorted(GPU_CONTEXTS.items())),
             "gpu_network_probes": probes,
             "cpu_credential_boundary": credential_boundary,
             "elapsed_seconds": round(time.monotonic() - started, 3),

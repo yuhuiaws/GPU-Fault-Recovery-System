@@ -39,8 +39,10 @@ from scripts.e2e.regional.release_pins import (  # noqa: E402
 from scripts.e2e.regional.regional_store_probe import STORE_PROBE as STORE_PROBE  # noqa: E402
 from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
     SYSTEM_NAMESPACES as SYSTEM_NAMESPACES,
+    blocking_node_taints,
     business_workload_items as business_workload_items,
     pod_gpu_count as pod_gpu_count,
+    tolerated_node_taints,
 )
 
 TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
@@ -146,13 +148,11 @@ def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
 class RegionalFixtureAbort(BaseException):
     """An operator abort delivered by SIGINT/SIGTERM.
 
-    Deliberately *not* an ``Exception``. Every probe helper in this fixture
-    retries on a bare ``except Exception`` -- ``pod_python`` for three attempts,
-    the wait loops for their whole timeout -- so a signal raised as an
-    ``Exception`` is swallowed by the very loop the operator is trying to
-    interrupt, and ^C appears to do nothing until the timeout expires. On a
-    destructive case that gap is the difference between an abort and a
-    completed mutation.
+    Deliberately *not* an ``Exception``: every probe helper here retries on a
+    bare ``except Exception`` (``pod_python`` three attempts, the wait loops
+    their whole timeout), so a signal raised as an ``Exception`` is swallowed by
+    the loop the operator is interrupting and ^C does nothing until the timeout.
+    On a destructive case that gap separates an abort from a completed mutation.
     """
 
     def __init__(self, signum: int) -> None:
@@ -172,10 +172,9 @@ def install_abort_signals() -> None:
 def run_case_main(entry: Callable[[], int]) -> int:
     """Run a case entry point so a signal abort exits instead of tracebacking.
 
-    ``RegionalFixtureAbort`` has to escape the retry loops, which means it also
-    escapes ``main``. Reporting it as ``128 + signum`` keeps the shell contract
-    an operator expects from ^C while still distinguishing an abort from a
-    ``FAIL`` verdict, which exits 1.
+    ``RegionalFixtureAbort`` escapes the retry loops and therefore ``main``;
+    reporting it as ``128 + signum`` keeps the shell contract of ^C while still
+    distinguishing an abort from a ``FAIL`` verdict (exit 1).
     """
 
     try:
@@ -200,10 +199,9 @@ def predecessor_identity_errors(
 ) -> list[str]:
     """Why ``value`` is not evidence from this release and cluster.
 
-    A PASS is only a predecessor if it was earned against the deployment the
-    successor is about to mutate. A run directory reused across a redeploy, or
-    an evidence file copied from another site, otherwise satisfies the chain
-    while proving nothing about the code that is live now.
+    A PASS is a predecessor only if earned against the deployment the successor
+    mutates: a run directory reused across a redeploy, or evidence copied from
+    another site, would satisfy the chain while proving nothing about live code.
     """
 
     errors = []
@@ -438,15 +436,13 @@ def waiting_step_executions(workflow: dict[str, Any]) -> list[dict[str, Any]]:
 class WaitingEvidence:
     """WAITING step executions seen across every store read a case makes.
 
-    The workflow keeps one execution record per step, so a step's WAITING
-    record -- the one carrying `mutation_submitted_by_control_plane: False` --
-    exists only until the step succeeds. `wait_for_workflow` accumulates those
-    while it polls, but a case that does its own polling first (waiting for a
-    lease to appear, timing a failover) reaches `wait_for_workflow` after the
-    early steps have already been replaced by their SUCCEEDED record, and the
-    evidence check then reports them missing although they happened. Feed
-    every snapshot through `observe` and `merged_into` the final state before
-    evaluating it.
+    The workflow keeps one execution record per step, so a step's WAITING record
+    (the one carrying `mutation_submitted_by_control_plane: False`) exists only
+    until the step succeeds. `wait_for_workflow` accumulates those while it
+    polls, but a case that polls on its own first (a lease appearing, a failover
+    timing) reaches it after early steps were replaced by SUCCEEDED records, and
+    the evidence check reports them missing although they happened. Feed every
+    snapshot through `observe` and `merged_into` the final state before judging.
     """
 
     def __init__(self) -> None:
@@ -655,16 +651,17 @@ SPARE_POOL_ANNOTATION_PREFIX = "gpu-fault.io/spare-"
 def project_node_snapshot(value: dict[str, Any]) -> dict[str, Any]:
     """The runner's view of one Node document.
 
-    ``ownership_annotations`` are the marks an incident leaves while it holds
-    the node (incident-id, fencing-token, previous-unschedulable, ...); the
-    installer's identity annotations and the warm-spare pool's bookkeeping
-    (``gpu-fault.io/spare-*``: a released spare keeps ``spare-pool-state:
-    AVAILABLE``) are not ownership and are reported apart, so a validated
-    restore is not judged "still isolated" by a node nothing holds (live
-    COLLECT-016, 2026-09-24).
+    ``ownership_annotations`` are the marks an incident leaves while it holds the
+    node (incident-id, fencing-token, previous-unschedulable, ...); the installer's
+    identity annotations and the warm-spare pool's bookkeeping (``gpu-fault.io/
+    spare-*``; a released spare keeps ``spare-pool-state: AVAILABLE``) are not
+    ownership and are reported apart, so a validated restore is not judged "still
+    isolated" by a node nothing holds (live COLLECT-016, 2026-09-24).
     """
 
     annotations = value["metadata"].get("annotations", {})
+    spec_taints = value["spec"].get("taints", [])
+    labels = value["metadata"].get("labels", {})
     return {
         "name": value["metadata"]["name"],
         "uid": value["metadata"]["uid"],
@@ -690,7 +687,9 @@ def project_node_snapshot(value: dict[str, Any]) -> dict[str, Any]:
         ),
         "installer_boot_id": annotations.get("gpu-fault.io/installer-boot-id"),
         "unschedulable": value["spec"].get("unschedulable", False),
-        "taints": value["spec"].get("taints", []),
+        # Isolating taints only; a plain-EKS node-group GPU taint is tolerated.
+        "taints": blocking_node_taints(spec_taints, labels),
+        "tolerated_taints": tolerated_node_taints(spec_taints, labels),
         "gpu_allocatable": value["status"].get("allocatable", {}).get("nvidia.com/gpu"),
         "ownership_annotations": {
             key: item
@@ -1185,7 +1184,10 @@ class RegionalLiveFixture:
                         None,
                     ),
                     "unschedulable": item["spec"].get("unschedulable", False),
-                    "taints": item["spec"].get("taints", []),
+                    "taints": blocking_node_taints(
+                        item["spec"].get("taints", []),
+                        item["metadata"].get("labels", {}),
+                    ),
                     "labels": item["metadata"].get("labels", {}),
                 }
             )
@@ -1310,7 +1312,10 @@ class RegionalLiveFixture:
                             taint.get("value"),
                             taint["effect"],
                         )
-                        for taint in item["spec"].get("taints", [])
+                        for taint in blocking_node_taints(
+                            item["spec"].get("taints", []),
+                            item["metadata"].get("labels", {}),
+                        )
                     ),
                     "unschedulable": item["spec"].get("unschedulable", False),
                     "labels": {

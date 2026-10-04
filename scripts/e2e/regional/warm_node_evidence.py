@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from scripts.e2e.regional.regional_workload_inventory import blocking_node_taints
+
 GPU_RESOURCE = "nvidia.com/gpu"
 
 
@@ -58,7 +60,9 @@ def project_gpu_nodes(
                     for key in ("key", "value", "effect", "timeAdded")
                     if key in taint
                 }
-                for taint in item.get("spec", {}).get("taints", [])
+                for taint in blocking_node_taints(
+                    item.get("spec", {}).get("taints", []), metadata.get("labels", {})
+                )
             ),
             key=lambda taint: (
                 str(taint.get("key", "")),

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.admin.node_key_custody import (
     key_digests,
     namespace_uid,
@@ -84,16 +85,11 @@ def live_anchors(
             )
             if namespace_uid(json.loads(output), name) != getattr(expected, field):
                 raise CustodyError("AUTH015 custody cluster incarnation differs")
+    # The cluster's provider selector (HyperPod label, or the plain-EKS node
+    # selector), never the HyperPod label alone.
+    selector = node_selector(target)
     inventory = json.loads(
-        site.gpu(
-            target,
-            "get",
-            "nodes",
-            "-l",
-            "sagemaker.amazonaws.com/cluster-name=" + target.hyperpod_cluster_name,
-            "-o",
-            "json",
-        )
+        site.gpu(target, "get", "nodes", "-l", selector, "-o", "json")
     )
     items = objects(inventory, "Node")
     nodes = {}
@@ -104,8 +100,7 @@ def live_anchors(
             or item.get("kind") != "Node"
             or metadata.get("deletionTimestamp")
             or metadata["name"] in nodes
-            or metadata.get("labels", {}).get("sagemaker.amazonaws.com/cluster-name")
-            != target.hyperpod_cluster_name
+            or not selector_matches(metadata.get("labels", {}), selector)
         ):
             raise CustodyError("AUTH015 custody Node inventory is ambiguous")
         nodes[metadata["name"]] = metadata["uid"]
