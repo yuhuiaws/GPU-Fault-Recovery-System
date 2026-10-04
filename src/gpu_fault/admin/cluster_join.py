@@ -10,7 +10,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, cast
+from typing import Any, Mapping, Callable, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -28,11 +28,14 @@ from gpu_fault.admin.bootstrap_common import (
     default_cluster_id,
     ensure_namespace as ensure_namespace,
     require_profile_matches_provider,
-    require_single_provider,
     safe_name,
     write_secret as write_secret,
 )
 from gpu_fault.admin.bootstrap_discovery import cluster_provider_entries
+from gpu_fault.admin.cluster_join_profile import (
+    cluster_profile_override,
+    cluster_runtime_profile,
+)
 from gpu_fault.cluster_scope import node_selector
 from gpu_fault.admin.bootstrap_services import (
     ensure_adot_writer_role,
@@ -268,16 +271,21 @@ def _validate_target(
         node_selector(target)
     elif target.node_recovery != "None":
         raise JoinTargetIdentityError("GPU join requires NodeRecovery=None")
-    require_single_provider(
-        [item.get("provider") for item in request.site.release_config["clusters"]],
-        joining=target.provider,
-    )
-    profile = request.site.release_config["runtime_profile"]
-    require_profile_matches_provider(
-        Path(str(profile["source"])),
-        version=str(profile["version"]),
-        provider=target.provider,
-    )
+    # The profile this cluster will run: the site's, or -- when the site
+    # profile cannot reboot its provider -- its own override. Either way the
+    # effective profile must name this provider's adapter.
+    override = cluster_profile_override(request.site, target, cluster_id)
+    profile = request.site.release_config.get("runtime_profile") or {}
+    if override is not None:
+        require_profile_matches_provider(
+            override.template_source, version=override.version, provider=target.provider
+        )
+    elif profile.get("source"):
+        require_profile_matches_provider(
+            Path(str(profile["source"])),
+            version=str(profile.get("version", "")),
+            provider=target.provider,
+        )
     for item in request.site.release_config["clusters"]:
         if item["eks_cluster_arn"] == target.eks_arn:
             if (
@@ -689,6 +697,7 @@ def _cluster_document(
     ca_file: Path,
     fleet_master_file: Path,
     adot_irsa_role_arn: str | None = None,
+    runtime_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     namespaces = tuple(
         sorted(
@@ -698,7 +707,7 @@ def _cluster_document(
             }
         )
     )
-    document = {
+    document: dict[str, Any] = {
         "clusterId": cluster_id,
         "context": target.context,
         "region": target.region,
@@ -715,6 +724,9 @@ def _cluster_document(
     # Absent means the release skips this cluster's data-plane collector.
     if adot_irsa_role_arn:
         document["adotIrsaRoleArn"] = adot_irsa_role_arn
+    # Absent means the cluster runs the site profile, as every cluster did.
+    if runtime_profile:
+        document["runtimeProfile"] = dict(runtime_profile)
     return document
 
 
@@ -906,6 +918,7 @@ def _prepare_execution(
                 "state_file": str(state_path),
                 "site_file": str(request.site.source),
             }
+        runtime_profile = cluster_runtime_profile(request, runner, target, cluster_id)
         attempt = int(state.get("attempt") or 1)
         registry_path = state_dir / f"installation-resources-before-{attempt:03d}.json"
         _export_registry(request.site, registry_path)
@@ -917,6 +930,7 @@ def _prepare_execution(
                 "target": asdict(target),
                 "cluster_id": cluster_id,
                 "registry_snapshot": str(registry_path),
+                **({"runtime_profile": runtime_profile} if runtime_profile else {}),
             },
         )
     discovery = state["evidence"]["DISCOVERED"]
@@ -997,6 +1011,7 @@ def _prepare_execution(
             request,
             target=target,
             cluster_id=cluster_id,
+            runtime_profile=discovery.get("runtime_profile"),
             role_arn=str(prerequisites["executor_role"]["role_arn"]),
             token_file=Path(local["token_file"]),
             ca_file=Path(local["ca_file"]),

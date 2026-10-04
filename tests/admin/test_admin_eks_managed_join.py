@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import bootstrap as admin_bootstrap
-from gpu_fault.admin import bootstrap_services
+from gpu_fault.admin import bootstrap_services, cluster_join_profile, profile_approval
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
@@ -607,23 +607,13 @@ def test_two_plain_eks_clusters_are_not_mistaken_for_one_another(scenario) -> No
     }, "both plain EKS clusters must be registered side by side"
 
 
-def test_mixing_providers_in_one_site_is_refused(tmp_path, monkeypatch) -> None:
-    """The Runtime Profile is site-wide; a HyperPod site cannot absorb a plain
-    EKS cluster (nor the reverse) until a profile can name both reboot owners."""
+def test_a_first_deploy_still_requires_one_provider() -> None:
+    """A first deploy writes one site profile; the other provider joins later
+    with its own reviewed profile version (see the approval tests below)."""
 
-    hyperpod_site = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
-    hyperpod_site.targets[eks_target().eks_arn] = eks_target()
-    request = JoinClusterRequest(
-        site=load_site(hyperpod_site.path), gpu_cluster_arn=eks_target().eks_arn
-    )
-    with pytest.raises(BootstrapError, match="must share one provider"):
-        join.join_cluster(request, runner=hyperpod_site)
-    eks_site = EksJoinScenario(tmp_path / "eks", monkeypatch)
-    with pytest.raises(BootstrapError, match="must share one provider"):
-        join.join_cluster(eks_site.request("b"), runner=eks_site)
     require_single_provider(["hyperpod", None, ""])
     require_single_provider(["eks-managed"], joining="eks-managed")
-    with pytest.raises(BootstrapError, match="must share one provider"):
+    with pytest.raises(BootstrapError, match="join the others with join-cluster"):
         require_single_provider(["hyperpod"], joining="eks-managed")
 
 
@@ -734,38 +724,204 @@ def test_profile_matching_the_provider_or_without_a_reboot_owner_passes(
         )
 
 
-def test_join_refuses_an_eks_cluster_under_a_hyperpod_owned_profile(
-    tmp_path, monkeypatch
-) -> None:
-    scenario = EksJoinScenario(tmp_path, monkeypatch)
+def _install_example_profiles(scenario) -> None:
+    """Copy both example profiles into the scenario's repository root."""
+
+    root = Path(yaml.safe_load(scenario.path.read_text())["spec"]["repositoryRoot"])
+    (root / "config").mkdir(exist_ok=True)
+    for source in (HYPERPOD_PROFILE, EKS_PROFILE):
+        (root / "config" / source.name).write_text(source.read_text(encoding="utf-8"))
+
+
+def _use_site_profile(scenario, name: str, version: str) -> None:
     document = yaml.safe_load(scenario.path.read_text())
-    document["spec"]["runtimeProfile"]["source"] = str(HYPERPOD_PROFILE)
-    document["spec"]["runtimeProfile"]["templateSource"] = str(HYPERPOD_PROFILE)
+    document["spec"]["runtimeProfile"]["source"] = f"config/{name}"
+    document["spec"]["runtimeProfile"]["templateSource"] = f"config/{name}"
+    document["spec"]["runtimeProfile"]["version"] = version
     scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
-    with pytest.raises(BootstrapError, match="gpu-fault-hyperpod-adapter"):
-        scenario.join_eks()
-    assert not any(event.startswith("executor-role") for event in scenario.events), (
-        "the refusal must come before any AWS mutation"
+
+
+def _approve_pending_plan(state_dir: Path, plan_sha256: str) -> dict:
+    return profile_approval.approve_profile(
+        state_dir,
+        reference="CHG-eks-1",
+        expected_plan_sha256=plan_sha256,
+        approver_identity="tester@fixture",
     )
 
 
-def test_join_refuses_a_hyperpod_cluster_under_an_eks_owned_profile(
+def test_eks_cluster_joining_a_hyperpod_site_gets_its_own_profile_after_review(
+    tmp_path, monkeypatch
+) -> None:
+    """Exactly the live case: a hyperpod-v1 site joining gpu-eks-cluster."""
+
+    scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
+    _install_example_profiles(scenario)
+    _use_site_profile(scenario, HYPERPOD_PROFILE.name, "hyperpod-v1")
+    scenario.targets[eks_target().eks_arn] = eks_target()
+    scenario.node_names["e"] = GPU_NODE
+    monkeypatch.setattr(
+        cluster_join_profile,
+        "compute_agent_config_digest",
+        lambda _runner, *, repository_root, runtime_profile_version: "e" * 64,
+    )
+    original_run = scenario.run
+
+    def run(arguments, **options):
+        context = (
+            arguments[arguments.index("--context") + 1]
+            if "--context" in arguments
+            else "cpu"
+        )
+        if "get" in arguments and "nodes" in arguments and context == "gpu-e":
+            scenario.commands.append((list(arguments), dict(options)))
+            if any(str(item).startswith("go-template=") for item in arguments):
+                return json.dumps([GPU_NODE])
+            return json.dumps({"items": [_eks_node()]})
+        return original_run(arguments, **options)
+
+    monkeypatch.setattr(scenario, "run", run)
+    request = JoinClusterRequest(
+        site=load_site(scenario.path), gpu_cluster_arn=eks_target().eks_arn
+    )
+    state_dir = scenario.path.parent
+
+    # 1. The join stops for review: the EKS cluster needs eks-v1, a new version.
+    with pytest.raises(cluster_join_profile.JoinProfileApprovalRequired) as stop:
+        join.join_cluster(request, runner=scenario)
+    plan = json.loads(
+        profile_approval.profile_plan_path(state_dir).read_text(encoding="utf-8")
+    )
+    assert plan["change_kind"] == "CLUSTER_PROFILE_NEW", plan
+    assert (plan["current_version"], plan["desired_version"]) == (
+        "hyperpod-v1",
+        "eks-v1",
+    )
+    assert plan["registration_cluster_id"] == "gpu-e", "anchored on the joining cluster"
+    assert plan["approval_required"] is True, "a new version always needs review"
+    assert plan["plan_sha256"] in str(stop.value), "the stop names the plan digest"
+    assert "--approve-profile-plan" in str(stop.value), "and the rerun flag"
+    assert not any(event.startswith("executor-role") for event in scenario.events), (
+        "the stop must come before any AWS mutation"
+    )
+    assert not (state_dir / "profiles" / "eks-v1.yaml").exists(), (
+        "no snapshot is written before the approval"
+    )
+
+    # 2. A rerun without approval stops again with the same plan.
+    with pytest.raises(cluster_join_profile.JoinProfileApprovalRequired):
+        join.join_cluster(request, runner=scenario)
+
+    # 3. Approve (what join-cluster --approve-profile-plan SHA --reference does)
+    #    and rerun: the join completes with the cluster's own profile.
+    _approve_pending_plan(state_dir, plan["plan_sha256"])
+    result = join.join_cluster(request, runner=scenario)
+    assert result["phase"] == "COMPLETED", result
+    snapshot = state_dir / "profiles" / "eks-v1.yaml"
+    assert snapshot.is_file(), "the approved profile snapshot is written"
+    snapshot_document = yaml.safe_load(snapshot.read_text(encoding="utf-8"))
+    assert snapshot_document["profile_version"] == "eks-v1", "snapshot version"
+    assert snapshot_document["cluster_id"] == "gpu-e", "snapshot anchor"
+    document = yaml.safe_load(scenario.path.read_text())
+    entry = next(
+        item for item in document["spec"]["clusters"] if item["clusterId"] == "gpu-e"
+    )
+    assert entry["runtimeProfile"] == {
+        "source": str(snapshot),
+        "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+        "version": "eks-v1",
+        "agentConfigDigest": "e" * 64,
+    }, "the cluster entry pins its own profile and Agent config digest"
+    assert "runtimeProfile" not in document["spec"]["clusters"][0], (
+        "the HyperPod cluster stays on the site profile"
+    )
+    assert not profile_approval.profile_plan_path(state_dir).exists(), (
+        "the approved plan is consumed"
+    )
+    consumed = list(
+        (state_dir / "release-deploy" / "profile-approvals").glob("*/consumed.json")
+    )
+    assert len(consumed) == 1, "the approval is archived as consumed"
+    assert json.loads(consumed[0].read_text())["release_id"] == "join-gpu-e", (
+        "the consumption names the join"
+    )
+    site = load_site(scenario.path)
+    eks_entry = next(
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == "gpu-e"
+    )
+    assert eks_entry["runtime_profile"]["version"] == "eks-v1", (
+        "rendered for the release"
+    )
+
+
+def test_a_second_cluster_reuses_an_approved_profile_snapshot(
     tmp_path, monkeypatch
 ) -> None:
     scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
-    document = yaml.safe_load(scenario.path.read_text())
-    document["spec"]["runtimeProfile"]["source"] = str(EKS_PROFILE)
-    document["spec"]["runtimeProfile"]["templateSource"] = str(EKS_PROFILE)
-    scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
-    with pytest.raises(BootstrapError, match="gpu-fault-eks-adapter"):
-        scenario.join("b")
+    _install_example_profiles(scenario)
+    _use_site_profile(scenario, HYPERPOD_PROFILE.name, "hyperpod-v1")
+    site = load_site(scenario.path)
+    override = cluster_join_profile.cluster_profile_override(
+        site, eks_target(), "gpu-e"
+    )
+    assert override is not None and override.version == "eks-v1", "override needed"
+    state_dir = scenario.path.parent
+    with pytest.raises(cluster_join_profile.JoinProfileApprovalRequired):
+        cluster_join_profile.ensure_cluster_profile_approved(
+            site, override, rerun_command="gpu-fault-admin join-cluster ..."
+        )
+    plan = json.loads(profile_approval.profile_plan_path(state_dir).read_text())
+    _approve_pending_plan(state_dir, plan["plan_sha256"])
+    snapshot = cluster_join_profile.ensure_cluster_profile_approved(
+        site, override, rerun_command="x"
+    )
+    assert snapshot.is_file(), "approval writes the snapshot"
+    second = cluster_join_profile.cluster_profile_override(
+        site, replace(eks_target(), eks_name="gpu-f"), "gpu-f"
+    )
+    assert second is not None, "the second plain EKS cluster needs the same version"
+    assert (
+        cluster_join_profile.ensure_cluster_profile_approved(
+            site, second, rerun_command="x"
+        )
+        == snapshot
+    ), "an approved version is reused without a second review"
+    assert not profile_approval.profile_plan_path(state_dir).exists(), "no new plan"
+
+
+def test_hyperpod_cluster_joining_an_eks_site_needs_the_hyperpod_profile(
+    tmp_path, monkeypatch
+) -> None:
+    scenario = EksJoinScenario(tmp_path, monkeypatch)
+    _install_example_profiles(scenario)
+    _use_site_profile(scenario, EKS_PROFILE.name, "eks-v1")
+    site = load_site(scenario.path)
+    override = cluster_join_profile.cluster_profile_override(
+        site, target("b"), "hp-gpu-b"
+    )
+    assert override is not None, "a HyperPod cluster cannot run the EKS profile"
+    assert (override.version, override.owner) == (
+        "hyperpod-v1",
+        "gpu-fault-hyperpod-adapter",
+    ), "it gets the HyperPod example profile under its declared version"
+    assert (
+        cluster_join_profile.cluster_profile_override(site, eks_target(), "gpu-e")
+        is None
+    ), "a plain EKS cluster on an EKS site needs no override"
 
 
 def test_join_accepts_a_matching_profile(tmp_path, monkeypatch) -> None:
     scenario = EksJoinScenario(tmp_path, monkeypatch)
-    document = yaml.safe_load(scenario.path.read_text())
-    document["spec"]["runtimeProfile"]["source"] = str(EKS_PROFILE)
-    document["spec"]["runtimeProfile"]["templateSource"] = str(EKS_PROFILE)
-    document["spec"]["runtimeProfile"]["version"] = "eks-v1"
-    scenario.path.write_text(yaml.safe_dump(document, sort_keys=False))
+    _install_example_profiles(scenario)
+    _use_site_profile(scenario, EKS_PROFILE.name, "eks-v1")
     assert scenario.join_eks()["phase"] == "COMPLETED", "a matching profile joins"
+    document = yaml.safe_load(scenario.path.read_text())
+    entry = next(
+        item for item in document["spec"]["clusters"] if item["clusterId"] == "gpu-e"
+    )
+    assert "runtimeProfile" not in entry, "no override when the site profile fits"
+    assert not profile_approval.profile_plan_path(scenario.path.parent).exists(), (
+        "nothing to review"
+    )

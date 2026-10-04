@@ -135,15 +135,12 @@ class ClusterIdentity:
 def require_single_provider(
     providers: Sequence[object], *, joining: object | None = None
 ) -> None:
-    """A site's GPU clusters must all run on one provider.
+    """A first deploy's GPU clusters must all run on one provider.
 
-    The Runtime Profile is site-wide: one ``runtimeProfile.version`` is
-    registered, rendered into every GPU cluster and required of every Agent by
-    the control plane's fleet pin. Its ``nodeReboot`` owner is the HyperPod
-    adapter (``hyperpod-v1``) or the EKS adapter (``eks-v1``), never both, so
-    on a mixed site one provider's reboot path would exist on paper and never
-    be claimed. Refusing the mix is the honest answer until a profile can name
-    an owner per provider.
+    The first deploy writes one site Runtime Profile for every cluster it
+    creates, and that profile's ``nodeReboot`` owner is one adapter. A cluster
+    of the other provider is joined afterwards (``join-cluster``), which gives
+    it its own reviewed profile version.
     """
 
     kinds = {cluster_provider(item) for item in providers}
@@ -151,9 +148,10 @@ def require_single_provider(
         kinds.add(cluster_provider(joining))
     if len(kinds) > 1:
         raise BootstrapError(
-            "a site's GPU clusters must share one provider (hyperpod or "
-            "eks-managed): the Runtime Profile and its nodeReboot owner are "
-            "site-wide; use a separate site for the other provider"
+            "a first deploy's GPU clusters must share one provider (hyperpod or "
+            "eks-managed): deploy the clusters of one provider first, then join "
+            "the others with join-cluster, which gives them their own Runtime "
+            "Profile version"
         )
 
 

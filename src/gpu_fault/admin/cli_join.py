@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from gpu_fault.admin.cluster_join import DEFAULT_ALLOWED_NAMESPACES, JoinClusterRequest
+from gpu_fault.admin.profile_approval import approve_profile_plan_inline
 from gpu_fault.admin.site import RenderedSite, SiteConfigError
 
 __all__ = ["add_eks_managed_arguments", "run_join_cluster"]
@@ -39,6 +41,20 @@ def add_eks_managed_arguments(parser: argparse.ArgumentParser) -> None:
             "cluster (selects eks.amazonaws.com/nodegroup=NODEGROUP)"
         ),
     )
+    parser.add_argument(
+        "--approve-profile-plan",
+        metavar="PLAN_SHA256",
+        help=(
+            "approve the Runtime Profile plan a previous join stopped for (the "
+            "joining cluster needs its own profile version) and continue; "
+            "requires --reference"
+        ),
+    )
+    parser.add_argument(
+        "--reference",
+        metavar="REFERENCE",
+        help="change request reference recorded with --approve-profile-plan",
+    )
 
 
 def run_join_cluster(
@@ -48,12 +64,34 @@ def run_join_cluster(
     load_site: Callable[..., RenderedSite],
     join_cluster: Callable[[JoinClusterRequest], dict[str, Any]],
     join_clusters: Callable[[tuple[JoinClusterRequest, ...]], dict[str, Any]],
+    approve_profile_plan: Callable[..., Mapping[str, Any]] | None = None,
 ) -> int:
     """``gpu-fault-admin join-cluster``: one or more GPU clusters, any provider.
 
     The collaborators are handed in by ``cli`` so that module stays the one
-    place a test replaces them.
+    place a test replaces them. ``--approve-profile-plan SHA --reference REF``
+    approves the pending Runtime Profile plan (written when the joining
+    cluster needs its own profile version) before the join resumes, exactly
+    as ``deploy`` does.
     """
+
+    plan_sha256 = getattr(arguments, "approve_profile_plan", None)
+    reference = getattr(arguments, "reference", None)
+    if plan_sha256 and not reference:
+        raise SiteConfigError("--approve-profile-plan requires --reference")
+    if reference and not plan_sha256:
+        raise SiteConfigError("--reference is only used with --approve-profile-plan")
+    if plan_sha256:
+        approve = approve_profile_plan or approve_profile_plan_inline
+        record = approve(
+            site_file.parent, plan_sha256=str(plan_sha256), reference=str(reference)
+        )
+        print(
+            f"gpu-fault-admin: Runtime Profile plan {record['plan_sha256']} approved "
+            f"(reference {record['reference']}); continuing the join",
+            file=sys.stderr,
+            flush=True,
+        )
 
     site = load_site(
         site_file,
