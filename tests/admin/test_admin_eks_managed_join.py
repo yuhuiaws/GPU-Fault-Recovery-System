@@ -925,3 +925,74 @@ def test_join_accepts_a_matching_profile(tmp_path, monkeypatch) -> None:
     assert not profile_approval.profile_plan_path(scenario.path.parent).exists(), (
         "nothing to review"
     )
+
+
+# --- allowed workload namespaces must exist on the joining cluster ---------------
+
+
+def test_join_refuses_early_when_an_allowed_namespace_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """Trial 11 (2026-10-04): gpu-eks-cluster had no `training` namespace; the
+    release's server dry-run of the per-namespace Role failed deep inside the
+    join-cluster mode and rolled everything back. The join now refuses before
+    it creates anything on the cluster, naming the namespace and the remedy."""
+
+    scenario = EksJoinScenario(tmp_path, monkeypatch)
+    scenario.missing_namespaces = {"training"}
+    with pytest.raises(BootstrapError) as refusal:
+        scenario.join_eks()
+    message = str(refusal.value)
+    assert "allowed workload namespace(s) do not exist on the cluster: training" in (
+        message
+    ), message
+    assert "--allowed-namespace" in message and "create namespace" in message, (
+        "the remedy names both options"
+    )
+    assert not [event for event in scenario.events if event.startswith("namespace:")], (
+        "nothing was created on the cluster before the refusal"
+    )
+    assert not any(event.startswith("executor-role") for event in scenario.events), (
+        "no AWS mutation either"
+    )
+
+
+def test_join_persists_the_requested_allowed_namespaces_without_forcing_training(
+    tmp_path, monkeypatch
+) -> None:
+    """`--allowed-namespace ml` joins a cluster that has `ml` but no `training`:
+    the cluster entry lists the control-plane namespace plus the requested ones."""
+
+    scenario = EksJoinScenario(tmp_path, monkeypatch)
+    scenario.missing_namespaces = {"training"}
+    request = JoinClusterRequest(
+        site=load_site(scenario.path),
+        gpu_cluster_arn=eks_target().eks_arn,
+        allowed_namespaces=("ml",),
+    )
+    result = join.join_cluster(request, runner=scenario)
+    assert result["phase"] == "COMPLETED", result
+    document = yaml.safe_load(scenario.path.read_text())
+    entry = next(
+        item for item in document["spec"]["clusters"] if item["clusterId"] == "gpu-e"
+    )
+    assert entry["allowedNamespaces"] == ["gpu-fault-system", "ml"], (
+        "the historical default `training` is not forced onto the cluster"
+    )
+    probed = [
+        call[call.index("namespace") + 1]
+        for call, _options in scenario.commands
+        if "get" in call and "namespace" in call
+    ]
+    assert "ml" in probed and "training" not in probed, (
+        "only the requested workload namespaces are checked for existence"
+    )
+
+
+def test_cli_join_defaults_allowed_namespaces_to_the_sites_list(tmp_path) -> None:
+    from gpu_fault.admin.cluster_join_types import site_allowed_namespaces
+
+    site = load_site(JoinScenario(tmp_path, pytest.MonkeyPatch(), suffixes=("b",)).path)
+    assert site_allowed_namespaces(site) == tuple(
+        sorted(site.release_config["clusters"][0]["allowed_namespaces"])
+    ), "a joining cluster inherits the list the site's clusters share"

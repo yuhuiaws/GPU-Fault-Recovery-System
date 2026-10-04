@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from gpu_fault.admin.cluster_join import DEFAULT_ALLOWED_NAMESPACES, JoinClusterRequest
+from gpu_fault.admin.cluster_join import JoinClusterRequest
+from gpu_fault.admin.cluster_join_types import site_allowed_namespaces
 from gpu_fault.admin.profile_approval import approve_profile_plan_inline
 from gpu_fault.admin.site import RenderedSite, SiteConfigError
 
@@ -102,8 +103,8 @@ def run_join_cluster(
         raise SiteConfigError(
             "join-cluster --cluster-id cannot be shared by multiple GPU clusters"
         )
-    allowed_namespaces = (
-        tuple(arguments.allowed_namespace) or DEFAULT_ALLOWED_NAMESPACES
+    allowed_namespaces = tuple(arguments.allowed_namespace) or site_allowed_namespaces(
+        site
     )
     requests = tuple(
         JoinClusterRequest(

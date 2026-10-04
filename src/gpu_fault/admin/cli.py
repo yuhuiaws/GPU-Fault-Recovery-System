@@ -538,7 +538,12 @@ def parser() -> argparse.ArgumentParser:
         "--allowed-namespace",
         action="append",
         default=[],
-        help="additional workload namespace; may be repeated",
+        help=(
+            "workload namespace the joined cluster's Executor and watcher act in; "
+            "repeatable. Default: the list the site's existing GPU clusters share "
+            "(gpu-fault-system, training on a fresh site). Each one must already "
+            "exist on the cluster; the control-plane namespace is created by the join"
+        ),
     )
     add_custody_command(commands)
     detach = commands.add_parser(

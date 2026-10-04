@@ -116,6 +116,7 @@ class JoinScenario(CommandRunner):
         self.network_error = None
         self.discovery_error = None
         self.namespace_read_override = None
+        self.missing_namespaces: set[str] = set()
         self.lock = RLock()
         self.registry = JoinRegistry(self)
         self.map_kubectl = FakeKubectl()
@@ -192,6 +193,15 @@ class JoinScenario(CommandRunner):
         if "get-contexts" in arguments:
             return "\n".join(sorted(self.contexts))
         if "get" in arguments and "namespace" in arguments:
+            requested = arguments[arguments.index("namespace") + 1]
+            if requested != "gpu-fault-system":
+                # A workload namespace (the join's allowed-namespace check):
+                # present unless the scenario removed it.
+                if requested in self.missing_namespaces:
+                    return ""
+                return json.dumps(
+                    {"kind": "Namespace", "metadata": {"name": requested, "uid": "ns"}}
+                )
             if self.namespace_read_override is not None:
                 return self.namespace_read_override
             uid = self.namespace_uids.get(context)

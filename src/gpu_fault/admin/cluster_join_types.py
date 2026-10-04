@@ -12,6 +12,24 @@ from gpu_fault.admin.site import RenderedSite
 DEFAULT_ALLOWED_NAMESPACES = ("gpu-fault-system", "training")
 
 
+def site_allowed_namespaces(site: RenderedSite) -> tuple[str, ...]:
+    """The allowed workload namespaces a joining cluster inherits.
+
+    The list every existing GPU cluster of the site shares; the historical
+    default when the site has no cluster yet or its clusters disagree (then
+    the operator names the list with ``--allowed-namespace``).
+    """
+
+    lists = {
+        tuple(sorted(str(item) for item in cluster.get("allowed_namespaces") or ()))
+        for cluster in site.release_config.get("clusters") or ()
+    }
+    lists.discard(())
+    if len(lists) == 1:
+        return next(iter(lists))
+    return DEFAULT_ALLOWED_NAMESPACES
+
+
 @dataclass(frozen=True)
 class JoinClusterRequest:
     site: RenderedSite

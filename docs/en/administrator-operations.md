@@ -1017,6 +1017,14 @@ Semantics and boundaries of `eks-managed`:
   DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on such nodes (a configuration warning that
   never drains the node) and the diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
   carries an extra `dcgm_eks_managed` document group for the approver.
+- Join prerequisite: every `allowedNamespaces` entry (the workload namespaces the Executor/watcher act in) other than
+  the control-plane namespace must already exist on the target cluster -- the release renders a Role/RoleBinding per
+  namespace and server-dry-runs it, so a missing one failed the join deep inside the release and rolled it back
+  (2026-10-04: `namespaces "training" not found`). The join now checks on its first read of the GPU cluster, before it
+  creates anything, and refuses with the remedy: `kubectl create namespace <name>` first, or `--allowed-namespace
+  <name>` (repeatable) naming only namespaces that exist. The default list is the one the site's existing GPU clusters
+  share (`gpu-fault-system, training` on a fresh site); the historical default `training` is no longer forced onto a
+  cluster without it, and the control-plane namespace is always included and created by the join itself.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

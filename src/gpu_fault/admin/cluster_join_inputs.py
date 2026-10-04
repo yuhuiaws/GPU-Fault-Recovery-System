@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,6 +12,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.cluster_join_state import complete_step, step_done
+from gpu_fault.admin.site import RenderedSite, effective_environment
 from gpu_fault.admin.cluster_join_context import clear_stale_installer_annotations
 
 if TYPE_CHECKING:
@@ -99,6 +101,14 @@ def prepare_local_inputs(
         )
     if gpu_kubeconfig.exists():
         gpu_kubeconfig.chmod(0o600)
+    verify_allowed_namespaces_exist(
+        runner,
+        site=request.site,
+        kubeconfig=gpu_kubeconfig,
+        context=target.context,
+        cluster_id=cluster_id,
+        namespaces=request.allowed_namespaces,
+    )
     namespace_uid = join.probe_join_namespace(
         runner,
         site=request.site,
@@ -164,3 +174,61 @@ def prepare_local_inputs(
             "node_uids": node_uids,
         },
     )
+
+
+def verify_allowed_namespaces_exist(
+    runner: CommandRunner,
+    *,
+    site: RenderedSite,
+    kubeconfig: Path,
+    context: str,
+    cluster_id: str,
+    namespaces: tuple[str, ...],
+) -> None:
+    """Every allowed workload namespace must already exist on the GPU cluster.
+
+    The release renders a Role/RoleBinding per allowed namespace for the
+    completion watcher and applies them with a server dry-run; a namespace
+    that does not exist fails that apply deep inside the join-cluster release
+    (live 2026-10-04: ``namespaces "training" not found`` on gpu-eks-cluster,
+    one rollback later). This is the first read against the GPU cluster, before
+    the join creates anything on it, so the operator gets the answer and the
+    remedy up front. The control-plane namespace is the join's own to create.
+    """
+
+    own = str(site.release_config["namespace"])
+    missing: list[str] = []
+    for namespace in sorted(set(namespaces) - {own}):
+        output = runner.run(
+            [
+                "kubectl",
+                "--kubeconfig",
+                str(kubeconfig),
+                "--context",
+                context,
+                "get",
+                "namespace",
+                namespace,
+                "--ignore-not-found",
+                "-o",
+                "json",
+            ],
+            env=effective_environment(site),
+        )
+        document = json.loads(output) if output.strip() else None
+        name = (
+            (document.get("metadata") or {}).get("name")
+            if isinstance(document, dict) and document.get("kind") == "Namespace"
+            else None
+        )
+        if name != namespace:
+            missing.append(namespace)
+    if missing:
+        listed = ", ".join(missing)
+        raise BootstrapError(
+            f"GPU join refuses {cluster_id}: allowed workload namespace(s) do not "
+            f"exist on the cluster: {listed}. Create them first "
+            f"(kubectl --context {context} create namespace <name>) or join with "
+            "--allowed-namespace <name> naming only namespaces that exist; the "
+            f"control-plane namespace {own} is created by the join itself"
+        )

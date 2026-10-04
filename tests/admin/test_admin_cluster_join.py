@@ -114,6 +114,13 @@ class Runner:
             path = Path(arguments[arguments.index("--kubeconfig") + 1])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("kubeconfig", encoding="utf-8")
+        if "get" in arguments and "namespace" in arguments:
+            requested = arguments[arguments.index("namespace") + 1]
+            if requested != "gpu-fault-system":
+                # The allowed workload namespaces exist on the target cluster.
+                return json.dumps(
+                    {"kind": "Namespace", "metadata": {"name": requested, "uid": "ns"}}
+                )
         return ""
 
 

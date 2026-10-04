@@ -699,10 +699,14 @@ def _cluster_document(
     adot_irsa_role_arn: str | None = None,
     runtime_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # The request's list (the site's existing list by default, or the
+    # operator's --allowed-namespace values) plus the control-plane namespace;
+    # the historical default "training" is no longer forced onto a cluster
+    # that does not have it.
     namespaces = tuple(
         sorted(
             {
-                *DEFAULT_ALLOWED_NAMESPACES,
+                str(request.site.release_config["namespace"]),
                 *request.allowed_namespaces,
             }
         )
