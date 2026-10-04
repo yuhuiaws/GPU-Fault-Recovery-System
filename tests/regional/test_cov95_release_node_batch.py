@@ -270,3 +270,19 @@ def test_node_batch_cli_failure_emits_notes_without_success(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.strip() == "fixture diagnostic"
+
+
+def test_a_failed_host_preflight_note_carries_the_error_marker(tmp_path: Path) -> None:
+    """The Job's verdict travels upstream behind the reconciler's sensitive-command
+    redaction only because it starts with ERROR:."""
+
+    node = prepared_node(tmp_path)
+    runner = Preflight(node)
+    runner.fail_host = True
+    with pytest.raises(RuntimeError, match="host proof failed") as failure:
+        batch.run_node_preflights([node], SCOPE, IDENTITY, runner, workers=1)
+    notes = list(getattr(failure.value, "__notes__", ()))
+    assert any(
+        note.startswith(f"ERROR: host preflight {node.node.name}: fixture diagnostic")
+        for note in notes
+    ), notes

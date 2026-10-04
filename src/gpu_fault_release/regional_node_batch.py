@@ -318,7 +318,13 @@ def run_node_preflights(
                         timeout_seconds=20,
                     )
                     if logs:
-                        failure.add_note("host preflight: " + diagnostic_text(logs))
+                        # The Job's own verdict (its ERROR: line and JSON) is
+                        # what the operator needs; the marker keeps it through
+                        # the sensitive-command redaction upstream.
+                        failure.add_note(
+                            f"ERROR: host preflight {node.node.name}: "
+                            + diagnostic_text(logs)
+                        )
             except Exception:
                 pass
             raise
@@ -460,7 +466,7 @@ def main() -> None:
     except Exception as exc:
         for note in getattr(exc, "__notes__", ()):
             print(note, file=sys.stderr)
-        raise SystemExit(f"node preflight batch failed: {exc}") from None
+        raise SystemExit(f"ERROR: node preflight batch failed: {exc}") from None
     print(
         json.dumps(
             {

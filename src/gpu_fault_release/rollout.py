@@ -14,7 +14,11 @@ from typing import Any, Callable, Unpack
 
 from gpu_fault.admin.api_budget import ApiBudgetError, deployment_api_budget
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
-from gpu_fault.admin.command_log import child_failure, report_failure
+from gpu_fault.admin.command_log import (
+    child_failure,
+    report_failure,
+    sensitive_error_lines,
+)
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import (
     OVERALL_DEPLOY_SECONDS,
@@ -398,26 +402,19 @@ class Runner:
                 f"command exceeded its deployment time budget: {label}"
             ) from None
         finally:
-            # In a `finally` because a command that failed after four minutes is
-            # exactly the one whose duration the reader needs.
+            # `finally`: a command that failed after four minutes needs its duration.
             self._narrate_elapsed(label, started)
         if completed.returncode:
-            # A captured failure has to say what it found. The verifiers this
-            # runner drives report their defects on stdout and exit 1, so
-            # forwarding stderr alone turns an actionable list of findings into
-            # a bare "command failed (1): python3" -- and the release is then
-            # blocked by a reason nobody can read. Sensitive commands stay
-            # silent: their output is what they were marked sensitive for.
-            # Both go to stderr: stdout carries the machine-readable release
-            # report, and a failed command's chatter must not land in it.
+            # A captured failure says what it found (the verifiers report on
+            # stdout and exit 1); both streams go to stderr so the machine-
+            # readable report stays clean. Sensitive output stays silent.
             quoted = capture and not sensitive
             if quoted:
                 for text in (completed.stdout, completed.stderr):
                     if text:
                         print(diagnostic_text(text), file=sys.stderr)
-            # Our own scripts have just reported themselves (above, or on the
-            # inherited descriptors); a foreign command gets one line naming
-            # the step and its last words.
+            # Own scripts reported themselves; a foreign command gets one line
+            # naming the step and its last words.
             raise child_failure(
                 ReleaseError,
                 args,
@@ -426,6 +423,10 @@ class Runner:
                 if capture
                 else "",
                 sensitive=sensitive,
+                # A sensitive command's own ERROR: lines survive the redaction.
+                error_lines=sensitive_error_lines(completed.stderr)
+                if sensitive
+                else (),
             )
         return completed.stdout.strip() if capture else ""
 

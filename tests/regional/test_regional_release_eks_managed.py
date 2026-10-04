@@ -683,3 +683,31 @@ def test_release_state_records_cluster_profiles_and_the_diff_sees_them(
     assert plan.has(DIFF.ReleaseComponent.RUNTIME_PROFILE), "profile registration"
     assert plan.has(DIFF.ReleaseComponent.AGENT), "the data plane Agents roll"
     assert plan.has(DIFF.ReleaseComponent.RECONCILER), "the reconciler rolls"
+
+
+def test_the_release_runner_keeps_a_sensitive_scripts_error_lines(
+    tmp_path: Path,
+) -> None:
+    """The reconciler runs as a sensitive command; its preflight verdict
+    (`ERROR: ...`) must reach the operator instead of `<sensitive output redacted>`."""
+
+    script = tmp_path / "deploy-node-installer-reconciler.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'ERROR: host preflight ip-10-0-33-205.us-west-2.compute.internal: "
+        "ERROR: host prerequisites unavailable: /usr/bin/python3.12, strace' >&2\n"
+        "echo 'ERROR: node preflight batch failed: command failed (1): bash' >&2\n"
+        "exit 1\n"
+    )
+    script.chmod(0o700)
+    runner = MODULE.Runner()
+    with pytest.raises(ReleaseError) as failure:
+        runner.run([str(script)], sensitive=True)
+    message = str(failure.value)
+    assert message.startswith(
+        "command failed (1): deploy-node-installer-reconciler.sh"
+    ), message
+    assert "host prerequisites unavailable: /usr/bin/python3.12, strace" in message, (
+        "the preflight verdict survives the redaction"
+    )
+    assert "node preflight batch failed" in message, "and so does the batch summary"

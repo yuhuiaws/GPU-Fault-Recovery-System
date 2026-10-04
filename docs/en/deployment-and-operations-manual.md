@@ -890,7 +890,10 @@ The complete design rationale and the runtime fail-closed mechanisms are in
 - Control plane to Node Agent 9099.
 - Nodes can reach DCGM Exporter 9400.
 - GPU nodes have the NVIDIA driver and `nvidia-smi` installed.
-- systemd nodes need `curl`, `python3.12`, `/dev/kmsg`; without `/dev/kmsg` another XID source is required.
+- systemd nodes need `curl`, `python3.12`, `strace`, `ps`, `ss`, `timeout` and `/dev/kmsg`; without `/dev/kmsg` another XID source is required.
+  The plain EKS AL2023 NVIDIA AMI ships neither `python3.12` nor `strace`: install them on the node image or in the managed
+  node group launch template user data (`dnf install -y python3.12 strace`); the node preflight lists every missing item at
+  once with that remedy.
 
 ### 3.2 Stable Private DNS, Public NLB and Private CA
 

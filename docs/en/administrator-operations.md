@@ -1025,6 +1025,11 @@ Semantics and boundaries of `eks-managed`:
   <name>` (repeatable) naming only namespaces that exist. The default list is the one the site's existing GPU clusters
   share (`gpu-fault-system, training` on a fresh site); the historical default `training` is no longer forced onto a
   cluster without it, and the control-plane namespace is always included and created by the join itself.
+- Node prerequisites: the node runtime needs `/usr/bin/python3.12`, `strace`, `curl`, `ps`, `ss`, `timeout`, `systemctl`
+  and `nvidia-smi` on the host (manual §3.1). The AL2023 NVIDIA AMI lacks `python3.12` and `strace`; install them on the
+  node image or in the launch template user data. The node preflight Job lists every missing item at once
+  (`ERROR: host prerequisites unavailable: ...` plus a JSON verdict), and a failed sensitive command in the release log
+  keeps those `ERROR:` lines.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds

@@ -79,6 +79,10 @@ host_shell() {
     chroot "${HOST_ROOT}" /bin/bash -ceu "$1"
 }
 
+# Every missing host prerequisite is reported at once, as one verdict: the
+# operator fixing a node image must not learn them one failed Job at a time
+# (live 2026-10-04, plain EKS AL2023 NVIDIA AMI: no python3.12, no strace).
+missing_prerequisites=()
 for command in \
     /usr/bin/python3.12 \
     curl \
@@ -89,8 +93,19 @@ for command in \
     systemctl \
     timeout; do
     host_shell "command -v '${command}' >/dev/null" ||
-        die "host prerequisite is unavailable: ${command}"
+        missing_prerequisites+=("${command}")
 done
+if (( ${#missing_prerequisites[@]} > 0 )); then
+    missing_list="$(IFS=,; printf '%s' "${missing_prerequisites[*]}")"
+    missing_list="${missing_list//,/, }"
+    remedy="install them on the node image before joining"
+    if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
+        remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them on the node image or in the managed node group launch template user data (dnf install -y python3.12 strace), then rerun the join"
+    fi
+    printf '{"node_id":"%s","node_uid":"%s","status":"FAILED","reasons":["host prerequisites unavailable: %s"]}\n' \
+        "${TARGET_NODE_NAME}" "${TARGET_NODE_UID}" "${missing_list}"
+    die "host prerequisites unavailable: ${missing_list}; ${remedy}"
+fi
 host_shell \
     "/usr/bin/python3.12 -c 'import sys, venv; raise SystemExit(sys.version_info < (3, 12))'" ||
     die "host Python 3.12 venv support is unavailable"
