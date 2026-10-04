@@ -1111,7 +1111,9 @@ and remove-cluster likewise.
 
 A rerun of an unfinished transaction re-checks the recorded GPU identity. `ROLLBACK_STARTED/ROLLBACK_FAILED` first complete the original compensation
 (rerun `join-cluster` with the same arguments: fail-cluster, GPU cleanup, Node Action keys, namespace, network/IAM, then the membership rollback
-that purges the registry entry; a cluster that never received a node runtime records its node cleanup as SKIPPED) and the same invocation then
+that purges the registry entry; a cluster that never received a node runtime records its node cleanup as SKIPPED; a GPU cleanup journal
+that never left PREFLIGHT while the site was upgraded afterwards is archived as `rollback-kubernetes-<attempt>.superseded-<n>.json`
+and re-planned under the current release, whereas a journal with cleanup progress keeps the tool's config-digest check) and the same invocation then
 starts a fresh attempt;
 `BLOCKED_IDENTITY` must first resolve the identity uncertainty, and `SUPERVISION_LOST` cannot be retried automatically.
 A token still referenced by the rollback registry must stay in the controlled path; do not delete credentials by hand to let a new attempt regenerate them.

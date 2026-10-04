@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import secrets
+import sys
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -36,13 +38,68 @@ if TYPE_CHECKING:
     from gpu_fault.admin.cluster_join import JoinClusterRequest
 
 
-def _cleanup_candidate(
+def supersede_unstarted_cleanup_journal(path: Path) -> Path | None:
+    """Set aside a GPU cleanup journal that never left PREFLIGHT.
+
+    The cleanup tool binds its journal to the release config it was planned
+    under and refuses to resume under another ("cleanup request differs on
+    config_sha256"). That is right once a phase has mutated the cluster, but a
+    journal still in its first phase recorded only captures: nothing was
+    undone, so there is nothing to resume. Live 2026-10-04: a join rollback
+    failed in PREFLIGHT, the site was upgraded three times, and every rerun of
+    the rollback was refused by the stale digest -- a dead end for the operator.
+    Such a journal is renamed ``<name>.superseded-<n>.json`` (kept for audit)
+    and the rollback plans a fresh one under the current config. A journal with
+    any progress stays where it is, and the cleanup tool's refusal stands.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    phases = document.get("phase_order") or []
+    first = phases[0] if isinstance(phases, list) and phases else "PREFLIGHT"
+    history = document.get("history") or []
+    unstarted = (
+        document.get("phase") == first
+        and document.get("status") != "COMPLETED"
+        and not document.get("node_cleanup")
+        and not document.get("original_resources")
+        and all(
+            isinstance(entry, dict) and entry.get("phase") == first for entry in history
+        )
+    )
+    if not unstarted:
+        return None
+    for index in range(1, 1000):
+        archived = path.with_name(f"{path.stem}.superseded-{index:03d}.json")
+        if not archived.exists():
+            path.replace(archived)
+            print(
+                f"gpu-fault-admin: GPU cleanup journal {path.name} never left "
+                f"{first}; set aside as {archived.name} and re-planned under the "
+                "current release",
+                file=sys.stderr,
+                flush=True,
+            )
+            return archived
+    raise BootstrapError(f"too many superseded cleanup journals beside {path}")
+
+
+def cleanup_candidate(
     candidate: RenderedSite,
     *,
     cluster_id: str,
     state_dir: Path,
     attempt: int,
 ) -> None:
+    supersede_unstarted_cleanup_journal(
+        state_dir / f"rollback-kubernetes-{attempt:03d}.json"
+    )
     with materialized_release_config(candidate) as config:
         result = join.run_driver(
             [
@@ -321,7 +378,7 @@ def rollback(
             if lifecycle in {"PENDING", "FAILED"}:
                 join._run_rollout(candidate, "fail-cluster", cluster_id=cluster_id)
             if namespace_present:
-                _cleanup_candidate(
+                cleanup_candidate(
                     candidate,
                     cluster_id=cluster_id,
                     state_dir=state_dir,

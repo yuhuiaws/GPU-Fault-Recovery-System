@@ -928,3 +928,133 @@ def test_stale_installer_annotations_are_cleared_only_without_a_reconciler(
     assert not broken.matching("patch"), (
         "unreadable Reconciler ownership must not authorize annotation patches"
     )
+
+
+# --- a rollback journal that never left PREFLIGHT survives a site upgrade --------
+
+
+def _journal(phase: str, status: str, **extra: Any) -> dict[str, Any]:
+    order = ["PREFLIGHT", "CLUSTERS_DRAINING", "GPU_DATA_PLANE_SOURCES_STOPPED"]
+    history = [{"phase": "PREFLIGHT", "status": "IN_PROGRESS", "message": "init"}]
+    if phase != "PREFLIGHT":
+        history.append({"phase": phase, "status": status, "message": "running"})
+    else:
+        history.append({"phase": "PREFLIGHT", "status": status, "message": "x"})
+    return {
+        "schema_version": 2,
+        "phase_order": order,
+        "phase": phase,
+        "status": status,
+        "config_sha256": "0" * 64,  # the release config of a since-upgraded site
+        "original_resources": [],
+        "history": history,
+        **extra,
+    }
+
+
+def test_an_unstarted_stale_cleanup_journal_is_set_aside_and_replanned(
+    tmp_path: Path,
+) -> None:
+    """Trial 7 (2026-10-04): the rollback journal failed in PREFLIGHT, the site
+    was upgraded three times, and the resumed cleanup refused on config_sha256
+    forever. A journal that recorded only captures is archived and re-planned."""
+
+    from gpu_fault.admin.cluster_join_rollback import (
+        supersede_unstarted_cleanup_journal,
+    )
+
+    path = tmp_path / "rollback-kubernetes-004.json"
+    path.write_text(json.dumps(_journal("PREFLIGHT", "FAILED")))
+    archived = supersede_unstarted_cleanup_journal(path)
+    assert archived == tmp_path / "rollback-kubernetes-004.superseded-001.json", (
+        "the first archive takes index 001"
+    )
+    assert archived.is_file() and not path.exists(), "archived, not deleted"
+    assert json.loads(archived.read_text())["config_sha256"] == "0" * 64, "audit kept"
+    # A second supersession keeps the first archive.
+    path.write_text(json.dumps(_journal("PREFLIGHT", "IN_PROGRESS")))
+    assert supersede_unstarted_cleanup_journal(path) == (
+        tmp_path / "rollback-kubernetes-004.superseded-002.json"
+    )
+    assert supersede_unstarted_cleanup_journal(path) is None, (
+        "nothing left to set aside"
+    )
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        _journal("CLUSTERS_DRAINING", "FAILED"),
+        _journal("PREFLIGHT", "FAILED", node_cleanup={"gpu:x": {"status": "RUNNING"}}),
+        _journal("PREFLIGHT", "FAILED", original_resources=[{"kind": "deployment"}]),
+        _journal("PREFLIGHT", "COMPLETED"),
+    ],
+    ids=["later-phase", "node-cleanup-running", "captured-resources", "completed"],
+)
+def test_a_cleanup_journal_with_progress_is_never_set_aside(
+    tmp_path: Path, journal: dict[str, Any]
+) -> None:
+    """Once a phase mutated the cluster (or the journal completed) the cleanup
+    tool's own identity check stays authoritative: fail closed."""
+
+    from gpu_fault.admin.cluster_join_rollback import (
+        supersede_unstarted_cleanup_journal,
+    )
+
+    path = tmp_path / "rollback-kubernetes-004.json"
+    path.write_text(json.dumps(journal))
+    assert supersede_unstarted_cleanup_journal(path) is None, "left in place"
+    assert path.is_file() and not list(tmp_path.glob("*.superseded-*")), "untouched"
+
+
+def test_rollback_replans_the_gpu_cleanup_after_a_site_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ROLLBACK_FAILED, then a site upgrade, then a rerun: the GPU cleanup runs
+    again under the current config with the stale PREFLIGHT journal set aside,
+    and the rerun's cleanup driver sees no journal at its --state-file."""
+
+    from gpu_fault.admin import cluster_join_rollback
+
+    state_dir = tmp_path / "join"
+    state_dir.mkdir()
+    stale = state_dir / "rollback-kubernetes-004.json"
+    stale.write_text(json.dumps(_journal("PREFLIGHT", "FAILED")))
+    seen: list[tuple[list[str], bool]] = []
+
+    def driver(arguments, **_options):
+        state_file = Path(arguments[arguments.index("--state-file") + 1])
+        seen.append((list(arguments), state_file.exists()))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(admin_cluster_join, "run_driver", driver)
+
+    class _Config:
+        def __enter__(self):
+            return tmp_path / "release.json"
+
+        def __exit__(self, *_exc):
+            return None
+
+    monkeypatch.setattr(
+        cluster_join_rollback, "materialized_release_config", lambda _site: _Config()
+    )
+    candidate = SimpleNamespace(
+        repository_root=tmp_path, release_config={"aws_region": "us-west-2"}
+    )
+    monkeypatch.setattr(
+        cluster_join_rollback, "effective_environment", lambda _site: {}
+    )
+    cluster_join_rollback.cleanup_candidate(
+        candidate, cluster_id="gpu-eks-cluster", state_dir=state_dir, attempt=4
+    )
+    assert len(seen) == 1, "the cleanup driver ran once"
+    arguments, journal_existed = seen[0]
+    assert arguments[arguments.index("--state-file") + 1] == str(stale), (
+        "the rerun keeps the attempt's journal path"
+    )
+    assert journal_existed is False, "the stale PREFLIGHT journal was set aside first"
+    assert (state_dir / "rollback-kubernetes-004.superseded-001.json").is_file(), (
+        "the stale journal is kept for audit"
+    )
+    assert "--node-mode" in arguments and "uninstall" in arguments, "same request"
