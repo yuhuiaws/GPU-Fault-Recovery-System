@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
-from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity, safe_name
+from gpu_fault.admin.bootstrap_common import (
+    BootstrapError,
+    ClusterIdentity,
+    default_cluster_id,
+)
 from gpu_fault.admin.resource_records import policy, record
 from gpu_fault.installation_resources import (
     RESOURCE_KEY_PATTERN,
@@ -117,7 +121,11 @@ def zone_vpc_associations(
     members: dict[VpcIdentity, set[str]] = {cpu_vpc: set()}
     clusters: dict[str, ClusterIdentity] = {}
     for cluster in gpu_clusters:
-        cluster_id = safe_name(cluster.hyperpod_name)
+        # The same stable id the site, the join and the registry use: the
+        # HyperPod name (unchanged) or the EKS name of a plain EKS cluster,
+        # which has no HyperPod name -- live 2026-10-04 a deploy over a mixed
+        # site refused here with "cannot derive a resource name from ''".
+        cluster_id = default_cluster_id(cluster)
         previous = clusters.setdefault(cluster_id, cluster)
         if previous != cluster:
             raise BootstrapError("Route53 association cluster identity is ambiguous")

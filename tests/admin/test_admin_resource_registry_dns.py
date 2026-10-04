@@ -704,3 +704,26 @@ def test_remove_refuses_unproven_or_dependent_dns_before_draining(
     with pytest.raises(BootstrapError):
         removal.remove_cluster(scenario.request(), runner=object())
     assert scenario.calls == ["snapshot"]
+
+
+def test_zone_entries_name_a_plain_eks_cluster_by_its_eks_name() -> None:
+    """Live 2026-10-04: `deploy` over a mixed site failed in the pki task with
+    "cannot derive a resource name from ''" -- the association member id was
+    the HyperPod name, empty for an eks-managed cluster. It is the cluster's
+    stable id (the EKS name), the one the join recorded."""
+
+    cpu = identity("cpu", CPU_VPC, role="cpu")
+    hyperpod = identity("a", GPU_VPC)
+    eks = replace(
+        identity("gpu-eks-cluster", "vpc-eks"),
+        hyperpod_arn="",
+        hyperpod_name="",
+        provider="eks-managed",
+        node_selector="eks.amazonaws.com/nodegroup=gpu-p5en-efa-spot-node-group",
+    )
+    rows = zone_vpc_associations(cpu, [hyperpod, eks])
+    assert {item["vpc_id"]: item["cluster_ids"] for item in rows} == {
+        CPU_VPC: [],
+        GPU_VPC: ["hp-a"],
+        "vpc-eks": ["gpu-eks-cluster"],
+    }, "HyperPod ids unchanged; the plain EKS cluster carries its EKS name"

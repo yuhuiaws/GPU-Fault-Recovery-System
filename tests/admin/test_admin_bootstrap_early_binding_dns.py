@@ -387,3 +387,71 @@ def test_second_association_failure_preserves_first_creation_proof(
     ] == ["VPCRegion=us-east-1,VPCId=vpc-b"], (
         "retry replayed or adopted an already-proven association"
     )
+
+
+def eks_managed(name: str, vpc: str):
+    """A plain EKS GPU cluster as discovery records it: no HyperPod identity."""
+
+    return replace(
+        gpu(name, vpc),
+        hyperpod_arn="",
+        hyperpod_name="",
+        provider="eks-managed",
+        node_selector="eks.amazonaws.com/nodegroup=gpu-p5en-efa-spot-node-group",
+    )
+
+
+def test_deploy_over_a_mixed_site_recognises_the_joins_route53_association(tmp_path):
+    """The live mixed site: a HyperPod cluster from the first deploy and a plain
+    EKS cluster the join added, whose VPC the join associated (ownership
+    CREATED in the pki checkpoint). A later `deploy` with both ARNs must plan
+    the association under the join's cluster id, keep its ownership, and not
+    associate the VPC a second time."""
+
+    hyperpod = gpu("hp-cluster", "vpc-hyperpod")
+    eks = eks_managed("gpu-eks-cluster", "vpc-eks")
+    runner = Route53([hyperpod, eks])
+    runner.vpcs += [
+        {"VPCRegion": eks.region, "VPCId": "vpc-hyperpod"},
+        {"VPCRegion": eks.region, "VPCId": "vpc-eks"},
+    ]
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="test")
+    # What the first deploy recorded, plus the entry the join appended.
+    previous = {
+        "hosted_zone_id": runner.zone_id,
+        "vpc_associations": [
+            *zone_vpc_associations(
+                runner.cpu,
+                [hyperpod],
+                ownership_by_vpc={
+                    (runner.cpu.region, runner.cpu.vpc_id): "CREATED",
+                    (eks.region, "vpc-hyperpod"): "CREATED",
+                },
+            ),
+            {
+                "vpc_id": "vpc-eks",
+                "vpc_region": eks.region,
+                "ownership": "CREATED",
+                "cluster_ids": ["gpu-eks-cluster"],
+                "resource_key": f"aws/route53/vpc-association/{eks.region}/vpc-eks",
+                "native": False,
+            },
+        ],
+        "certificate_arn": "arn:aws:acm:us-east-1:123456789012:certificate/retained",
+    }
+    state.record("pki", previous)
+
+    dns = ensure(runner, state)
+
+    assert not any(
+        op == "associate-vpc-with-hosted-zone" for op, _ in runner.mutations
+    ), "every VPC was already associated; the deploy must not associate again"
+    by_vpc = {item["vpc_id"]: item for item in dns["vpc_associations"]}
+    assert by_vpc["vpc-eks"]["cluster_ids"] == ["gpu-eks-cluster"], (
+        "the plain EKS member keeps the id the join recorded"
+    )
+    assert by_vpc["vpc-eks"]["ownership"] == "CREATED", "the join's ownership is kept"
+    assert by_vpc["vpc-hyperpod"]["cluster_ids"] == ["hp-cluster"], "HyperPod unchanged"
+    assert (
+        state.value["resources"]["pki"]["vpc_associations"] == dns["vpc_associations"]
+    )
