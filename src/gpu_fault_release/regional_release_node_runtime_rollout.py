@@ -243,7 +243,7 @@ def _dry_run_node_runtime(
         legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
     )
-    return identity
+    return (str(identity[0]), str(identity[1]))
 
 
 def _node_runtime_candidate(

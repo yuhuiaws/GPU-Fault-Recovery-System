@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,12 @@ _ROTATION_DIGEST_KEYS = ("retiring_token_sha256", "token_rotation_expires_at")
 #: saying so, and must keep digesting as it did.
 _PROVIDER_DIGEST_KEY = "provider"
 _DEFAULT_PROVIDER = "hyperpod"
+#: Per-cluster Runtime Profile pins. Empty means "the site default": the
+#: control plane's ``GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION`` /
+#: ``GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST``. Dropped from the digests while
+#: empty so every registration published before per-cluster profiles digests
+#: as it did.
+_CLUSTER_PIN_DIGEST_KEYS = ("runtime_profile_version", "agent_config_digest")
 
 
 class RegionalClusterLifecycle(StrEnum):
@@ -97,6 +104,10 @@ class RegionalClusterRegistration(StrictModel):
     eks_cluster_arn: str
     #: ``hyperpod`` (default) or ``eks-managed``; see ``gpu_fault.cluster_scope``.
     provider: str = _DEFAULT_PROVIDER
+    #: This cluster's own Runtime Profile version and the Agent config digest
+    #: computed for it; empty inherits the site pins.
+    runtime_profile_version: str = ""
+    agent_config_digest: str = ""
     token_sha256: str = Field(min_length=64, max_length=64)
     # The credential being retired, not the one being introduced. Rotation sets
     # `token_sha256` to the new token immediately and parks the old digest here
@@ -123,6 +134,20 @@ class RegionalClusterRegistration(StrictModel):
         from gpu_fault.cluster_scope import cluster_provider
 
         return cluster_provider(value).value
+
+    @field_validator("agent_config_digest")
+    @classmethod
+    def validate_agent_config_digest(cls, value: str) -> str:
+        if value and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("agent_config_digest must be a lowercase SHA-256")
+        return value
+
+    @field_validator("runtime_profile_version")
+    @classmethod
+    def validate_runtime_profile_version(cls, value: str) -> str:
+        if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+            raise ValueError("runtime_profile_version has unsupported characters")
+        return value
 
     @field_validator(  # type: ignore[untyped-decorator]
         "agent_endpoint_allowed_cidrs"
@@ -304,6 +329,9 @@ def _registry_digest_payload(
             payload.pop(key, None)
     if payload.get(_PROVIDER_DIGEST_KEY) == _DEFAULT_PROVIDER:
         payload.pop(_PROVIDER_DIGEST_KEY, None)
+    for key in _CLUSTER_PIN_DIGEST_KEYS:
+        if not payload.get(key):
+            payload.pop(key, None)
     return payload
 
 

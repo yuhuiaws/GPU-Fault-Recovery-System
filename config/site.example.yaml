@@ -89,6 +89,16 @@ spec:
       # eks.amazonaws.com/nodegroup=<name>. It must never match the CPU nodes.
       # provider: hyperpod
       # nodeSelector: nvidia.com/gpu.present=true
+      # Optional: this cluster's own Runtime Profile when the site profile cannot
+      # own its nodeReboot (a plain EKS cluster in a HyperPod site, or the
+      # reverse). deploy/join-cluster fill it in from the provider's example
+      # profile after the profile-plan approval; agentConfigDigest is computed
+      # for that version. Absent means the site profile, as before.
+      # runtimeProfile:
+      #   source: /secure/gpu-fault/profiles/eks-v1.yaml
+      #   templateSource: config/runtime-profile.regional-eks-safe.example.yaml
+      #   version: eks-v1
+      #   agentConfigDigest: REPLACE_WITH_64_HEX_CONFIG_DIGEST
       hyperpodClusterName: REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME
       eksClusterArn: REPLACE_WITH_GPU_EKS_ARN
       executorIrsaRoleArn: REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN

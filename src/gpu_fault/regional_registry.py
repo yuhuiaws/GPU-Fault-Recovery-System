@@ -51,6 +51,16 @@ def regional_registry_config_sha256(
         # default, so a Secret and head written before plain EKS support
         # still agree with each other.
         | ({"provider": item.provider} if item.provider != "hyperpod" else {})
+        | (
+            {"runtime_profile_version": item.runtime_profile_version}
+            if item.runtime_profile_version
+            else {}
+        )
+        | (
+            {"agent_config_digest": item.agent_config_digest}
+            if item.agent_config_digest
+            else {}
+        )
         for item in sorted(registrations, key=lambda value: value.cluster_id)
     ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

@@ -13,7 +13,11 @@ from gpu_fault.regional import (
 from gpu_fault.regional_registry import regional_registry_config_sha256
 from gpu_fault_release import regional_release_registry as REGISTRY
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
-from tests.regional._release_orchestrator_support import GPU_EKS_ARN, REGION
+from tests.regional._release_orchestrator_support import (
+    GPU_EKS_ARN,
+    REGION,
+    config_file,
+)
 
 EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-eks-cluster"
 
@@ -174,3 +178,144 @@ def test_registration_without_a_hyperpod_name_is_valid() -> None:
     assert regional_registry_config_sha256([registration]) != (
         PRE_EXISTING_CONFIG_SHA256
     ), "dropping the HyperPod name is a configuration change and must digest so"
+
+
+# --- per-cluster runtime profile -----------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+EKS_PROFILE = ROOT / "config/runtime-profile.regional-eks-safe.example.yaml"
+
+
+def _load(tmp_path: Path, clusters: list[dict]):
+    from gpu_fault_release import rollout as MODULE
+
+    return MODULE.ReleaseConfig.load(config_file(tmp_path, clusters=clusters))
+
+
+def test_clusters_inherit_the_site_profile_by_default(tmp_path: Path) -> None:
+    config = _load(tmp_path, [_hyperpod_target()])
+    (target,) = config.clusters
+    assert target.runtime_profile_version == config.runtime_profile_version, (
+        "a cluster without an override pins to the site version"
+    )
+    assert target.agent_config_digest == config.agent_config_digest, (
+        "a cluster without an override carries the site Agent config digest"
+    )
+    assert target.runtime_profile_source == config.runtime_profile_source, "source"
+    assert not target.overrides_runtime_profile, "no override is recorded"
+    assert config.runtime_profiles() == (config.site_runtime_profile(),), (
+        "a single-profile site registers exactly one profile"
+    )
+    assert config.cluster_runtime_profiles() == {}, "no overrides to record"
+    assert config.cluster_runtime_profile_version(target) == "hyperpod-v1", "version"
+
+
+def test_cluster_override_pins_its_own_profile_version(tmp_path: Path) -> None:
+    override = _eks_target(
+        runtime_profile={
+            "source": str(EKS_PROFILE),
+            "version": "eks-v1",
+            "agent_config_digest": "e" * 64,
+        }
+    )
+    config = _load(tmp_path, [_hyperpod_target(), override])
+    hyperpod, eks = config.clusters
+    assert eks.overrides_runtime_profile, "the override is recorded"
+    assert config.cluster_runtime_profile_version(eks) == "eks-v1", "cluster version"
+    assert config.cluster_agent_config_digest(eks) == "e" * 64, "cluster digest"
+    assert config.cluster_runtime_profile_version(hyperpod) == "hyperpod-v1", (
+        "the sibling keeps the site version"
+    )
+    versions = [spec.version for spec in config.runtime_profiles()]
+    assert versions == ["hyperpod-v1", "eks-v1"], "both profiles are registered"
+    spec = eks.runtime_profile_spec()
+    assert spec.registration_cluster_id == "gpu-eks-cluster", (
+        "an override is anchored on its own cluster"
+    )
+    assert spec.template_source == EKS_PROFILE, "template defaults to the source"
+    overrides = config.cluster_runtime_profiles()
+    assert set(overrides) == {"gpu-eks-cluster"}, "only overriding clusters appear"
+    assert overrides["gpu-eks-cluster"]["version"] == "eks-v1", "version recorded"
+    assert len(overrides["gpu-eks-cluster"]["policy_sha256"]) == 64, "policy digest"
+
+
+def test_cluster_override_requires_an_existing_file_and_a_digest(
+    tmp_path: Path,
+) -> None:
+    missing = _eks_target(
+        runtime_profile={
+            "source": str(tmp_path / "missing.yaml"),
+            "version": "eks-v1",
+            "agent_config_digest": "e" * 64,
+        }
+    )
+    with pytest.raises(ReleaseError, match="existing file"):
+        _load(tmp_path, [missing])
+    without_digest = _eks_target(
+        runtime_profile={"source": str(EKS_PROFILE), "version": "eks-v1"}
+    )
+    with pytest.raises(ReleaseError, match="agent_config_digest"):
+        _load(tmp_path, [without_digest])
+    bad_version = _eks_target(
+        runtime_profile={
+            "source": str(EKS_PROFILE),
+            "version": "bad version",
+            "agent_config_digest": "e" * 64,
+        }
+    )
+    with pytest.raises(ReleaseError, match="runtime_profile.version"):
+        _load(tmp_path, [bad_version])
+
+
+def test_registry_entry_carries_the_pins_only_for_overriding_clusters(
+    tmp_path: Path,
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("t" * 64, encoding="utf-8")
+    override = _eks_target(
+        token_file=str(token),
+        runtime_profile={
+            "source": str(EKS_PROFILE),
+            "version": "eks-v1",
+            "agent_config_digest": "e" * 64,
+        },
+    )
+    hyperpod = _hyperpod_target()
+    hyperpod["token_file"] = str(token)
+    config = _load(tmp_path, [hyperpod, override])
+    hyperpod_entry, eks_entry = (REGISTRY.registry_entry(t) for t in config.clusters)
+    assert "runtime_profile_version" not in hyperpod_entry, (
+        "an inheriting cluster keeps the registration shape it always had"
+    )
+    assert eks_entry["runtime_profile_version"] == "eks-v1", "the override pins"
+    assert eks_entry["agent_config_digest"] == "e" * 64, "the override digest"
+    single_root = tmp_path / "single"
+    single_root.mkdir()
+    alone = _load(single_root, [hyperpod]).clusters[0]
+    assert REGISTRY.registry_config_digest((config.clusters[0],)) == (
+        REGISTRY.registry_config_digest((alone,))
+    ), "an inheriting cluster's identity digest does not depend on its siblings"
+
+
+def test_registration_pins_digest_only_when_set() -> None:
+    legacy = RegionalClusterRegistration.model_validate(PRE_EXISTING_REGISTRATION)
+    assert (legacy.runtime_profile_version, legacy.agent_config_digest) == ("", ""), (
+        "a registration without pins inherits the site defaults"
+    )
+    assert regional_registry_content_sha256([legacy]) == PRE_EXISTING_CONTENT_SHA256, (
+        "the empty pins must not change a pre-existing registration's digest"
+    )
+    pinned = RegionalClusterRegistration.model_validate(
+        {
+            **PRE_EXISTING_REGISTRATION,
+            "runtime_profile_version": "eks-v1",
+            "agent_config_digest": "e" * 64,
+        }
+    )
+    assert regional_registry_config_sha256([pinned]) != (
+        regional_registry_config_sha256([legacy])
+    ), "a pinned registration is a different configuration"
+    with pytest.raises(ValueError, match="SHA-256"):
+        RegionalClusterRegistration.model_validate(
+            {**PRE_EXISTING_REGISTRATION, "agent_config_digest": "short"}
+        )

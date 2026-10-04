@@ -19,6 +19,14 @@ from gpu_fault.admin.config import (
 )
 from gpu_fault.admin.config_parser import boolean_field
 from gpu_fault.admin.python_environment import python_environment
+from gpu_fault.admin.site_cluster_profile import (
+    ClusterRuntimeProfileSiteConfig as ClusterRuntimeProfileSiteConfig,
+)
+from gpu_fault.admin.site_fields import IDENTIFIER_PATTERN as IDENTIFIER_PATTERN
+from gpu_fault.admin.site_fields import SiteConfigError as SiteConfigError
+from gpu_fault.admin.site_fields import mapping as _mapping
+from gpu_fault.admin.site_fields import optional_text as _optional_text
+from gpu_fault.admin.site_fields import required_text as _required_text
 from gpu_fault.cluster_scope import (
     ClusterProvider,
     cluster_provider,
@@ -31,45 +39,10 @@ from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 SITE_API_VERSION = "gpu-fault.aws/v1alpha1"
 SITE_KIND = "RegionalSite"
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
-IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 OCI_IMAGE_PATTERN = re.compile(r"^[^\s#]+$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
 # SES v2 configuration set names: letters, digits, hyphens and underscores.
 SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-class SiteConfigError(ValueError):
-    pass
-
-
-def _mapping(
-    value: object,
-    path: str,
-    *,
-    allowed: set[str],
-) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise SiteConfigError(f"{path} must be a mapping")
-    normalized = cast(Mapping[str, object], value)
-    unknown = sorted(set(normalized) - allowed)
-    if unknown:
-        raise SiteConfigError(f"{path} contains unknown fields: {', '.join(unknown)}")
-    return normalized
-
-
-def _required_text(value: object, path: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SiteConfigError(f"{path} must be a non-empty string")
-    normalized = value.strip()
-    if normalized.startswith("REPLACE_"):
-        raise SiteConfigError(f"{path} is still a placeholder")
-    return normalized
-
-
-def _optional_text(value: object, path: str) -> str | None:
-    if value is None:
-        return None
-    return _required_text(value, path)
 
 
 def _optional_email(value: object, path: str) -> str | None:
@@ -915,6 +888,8 @@ class GpuClusterSiteConfig:
     #: GPU node label selector. Required for ``eks-managed``; for ``hyperpod``
     #: an empty value means the HyperPod cluster label, exactly as before.
     node_selector: str = ""
+    #: This cluster's own Runtime Profile; ``None`` inherits the site profile.
+    runtime_profile: ClusterRuntimeProfileSiteConfig | None = None
 
     @property
     def gpu_node_selector(self) -> str:
@@ -934,6 +909,7 @@ class GpuClusterSiteConfig:
                 "region",
                 "provider",
                 "nodeSelector",
+                "runtimeProfile",
                 "hyperpodClusterName",
                 "eksClusterArn",
                 "executorIrsaRoleArn",
@@ -988,6 +964,13 @@ class GpuClusterSiteConfig:
             hyperpod_cluster_name=hyperpod_cluster_name,
             provider=provider.value,
             node_selector=selector or "",
+            runtime_profile=(
+                ClusterRuntimeProfileSiteConfig.from_value(
+                    data["runtimeProfile"], f"{path}.runtimeProfile"
+                )
+                if data.get("runtimeProfile") is not None
+                else None
+            ),
             eks_cluster_arn=_required_text(
                 data.get("eksClusterArn"),
                 f"{path}.eksClusterArn",
@@ -1287,6 +1270,22 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             entry["provider"] = cluster.provider
         if cluster.node_selector:
             entry["node_selector"] = cluster.node_selector
+        # A cluster's own Runtime Profile; absent means the site profile, so
+        # a single-profile site renders exactly as before.
+        if cluster.runtime_profile is not None:
+            override = cluster.runtime_profile
+            entry["runtime_profile"] = {
+                "source": str(_resolve(root, override.source).resolve()),
+                "template_source": str(
+                    _resolve(root, override.template_source).resolve()
+                ),
+                "version": override.version,
+                **(
+                    {"agent_config_digest": override.agent_config_digest}
+                    if override.agent_config_digest
+                    else {}
+                ),
+            }
         clusters.append(entry)
     health = site.spec.health
     admin_state_dir = source.parent

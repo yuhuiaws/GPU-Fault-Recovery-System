@@ -32,10 +32,15 @@ helper, `gpu_fault.cluster_scope.node_selector`, turns the entry into the
 selector every component uses, so a HyperPod entry still renders the historical
 label text byte for byte. `spec.failureDomainLabels` left unset follows the
 providers: HyperPod-only sites keep the instance-group/zone priority, a site with
-an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`. The runtime profile
-is site-wide, so a site's GPU clusters must share one provider; a first deploy whose GPU
-clusters are all plain EKS starts from `runtime-profile.regional-eks-safe.example.yaml`
-(`eks-v1`).
+an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`. The site runtime
+profile (`spec.runtimeProfile`) is the default pin for every GPU cluster; a cluster whose
+provider that profile cannot reboot carries its own `spec.clusters[].runtimeProfile`
+(`source`, `templateSource`, `version`, `agentConfigDigest`), which deploy/join-cluster
+fill in from the provider's example profile (`eks-v1` for a plain EKS cluster in a
+HyperPod site) after the profile-plan approval. Every distinct version is registered on
+the control plane; the cluster's registration carries its version and Agent config
+digest so the fleet pin is checked per cluster, while clusters without an override keep
+the site pins and render exactly as before.
 
 Successful deployment also registers AWS resource IDs, ownership and delete
 policy in Aurora. Operators do not add those fields to `site.yaml`. Uninstall

@@ -32,6 +32,7 @@ __all__ = [
     "EKS_NODEGROUP_LABEL",
     "PROVIDER_NODE_REBOOT_OWNERS",
     "PROVIDER_PROFILE_SOURCES",
+    "PROVIDER_PROFILE_VERSIONS",
     "HYPERPOD_CLUSTER_LABEL",
     "NODE_SELECTOR_ENV",
     "PROVIDER_ENV",
@@ -87,6 +88,12 @@ PROVIDER_NODE_REBOOT_OWNERS: dict[str, str] = {
 PROVIDER_PROFILE_SOURCES: dict[str, str] = {
     "hyperpod": "config/runtime-profile.regional-hyperpod-safe.example.yaml",
     "eks-managed": "config/runtime-profile.regional-eks-safe.example.yaml",
+}
+#: The version name each example profile declares; a cluster whose provider
+#: the site profile cannot reboot gets this profile as its own override.
+PROVIDER_PROFILE_VERSIONS: dict[str, str] = {
+    "hyperpod": "hyperpod-v1",
+    "eks-managed": "eks-v1",
 }
 #: Failure-domain label priority for an ``eks-managed`` cluster. The managed
 #: node group plays the role the HyperPod instance group plays, so it comes

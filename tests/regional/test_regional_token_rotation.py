@@ -316,10 +316,13 @@ def test_registry_digest_ignores_unset_rotation_fields() -> None:
     payload = plain.model_dump(mode="json")
     del payload["retiring_token_sha256"]
     del payload["token_rotation_expires_at"]
-    # ``provider`` joined the model after plain EKS support; a revision that
-    # predates it described a HyperPod cluster without saying so and is
-    # digested without the key while the value is that default.
+    # ``provider`` and the per-cluster Runtime Profile pins joined the model
+    # after plain EKS support; a revision that predates them described a
+    # HyperPod cluster on the site profile without saying so and is digested
+    # without the keys while they hold those defaults.
     del payload["provider"]
+    del payload["runtime_profile_version"]
+    del payload["agent_config_digest"]
     legacy = hashlib.sha256(
         json.dumps([payload], sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

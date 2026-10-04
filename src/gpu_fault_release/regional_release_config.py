@@ -19,6 +19,12 @@ from gpu_fault.cluster_scope import (
     node_selector,
 )
 from gpu_fault_release import containing_repository_root, repository_root
+from gpu_fault_release.regional_release_profile_model import (
+    RuntimeProfileSpec as RuntimeProfileSpec,
+)
+from gpu_fault_release.regional_release_profile_model import (
+    runtime_profile_policy_sha256 as runtime_profile_policy_sha256,
+)
 
 ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -210,6 +216,15 @@ class ClusterTarget:
     provider: str = ClusterProvider.HYPERPOD.value
     #: GPU node label selector; empty means the HyperPod cluster label.
     node_selector: str = ""
+    #: This cluster's own Runtime Profile; empty fields inherit the site's.
+    #: ``ReleaseConfig.load`` fills them from the site profile, so every
+    #: reader sees one effective value per cluster.
+    runtime_profile_source: Path | None = None
+    runtime_profile_template_source: Path | None = None
+    runtime_profile_version: str = ""
+    agent_config_digest: str = ""
+    #: Whether the cluster declared its own profile (versus inheriting).
+    overrides_runtime_profile: bool = False
 
     @property
     def is_eks_managed(self) -> bool:
@@ -221,17 +236,80 @@ class ClusterTarget:
 
         return node_selector(self)
 
+    def runtime_profile_spec(self) -> RuntimeProfileSpec:
+        """The profile this cluster is pinned to (its own, or the site's)."""
+
+        if self.runtime_profile_source is None or not self.runtime_profile_version:
+            raise ReleaseError(
+                f"{self.cluster_id} has no effective runtime profile; load it "
+                "through ReleaseConfig"
+            )
+        return RuntimeProfileSpec(
+            source=self.runtime_profile_source,
+            template_source=self.runtime_profile_template_source
+            or self.runtime_profile_source,
+            version=self.runtime_profile_version,
+            registration_cluster_id=self.cluster_id,
+            agent_config_digest=self.agent_config_digest,
+        )
+
     @classmethod
     def from_mapping(
         cls,
         value: dict[str, Any],
         *,
         expected_region: str,
+        site_profile: tuple[Path, Path, str, str] | None = None,
+        config_root: Path | None = None,
     ) -> ClusterTarget:
+        """Parse one cluster entry; ``site_profile`` is
+        ``(source, template_source, version, agent_config_digest)`` of the site
+        profile the cluster inherits unless it declares ``runtime_profile``."""
+
         try:
             provider = cluster_provider(value.get("provider"))
         except ValueError as exc:
             raise ReleaseError(f"cluster target provider: {exc}") from None
+        profile = value.get("runtime_profile") or {}
+        if not isinstance(profile, dict):
+            raise ReleaseError("cluster target runtime_profile must be a mapping")
+        overrides = bool(profile)
+        if overrides:
+            source = Path(
+                required_text(
+                    profile.get("source"), "cluster target runtime_profile.source"
+                )
+            )
+            template = Path(str(profile.get("template_source") or source))
+            if config_root is not None:
+                source = source if source.is_absolute() else config_root / source
+                template = (
+                    template if template.is_absolute() else config_root / template
+                )
+            version = validate_runtime_profile_version(
+                profile.get("version"), "cluster target runtime_profile.version"
+            )
+            digest = str(profile.get("agent_config_digest") or "")
+            if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ReleaseError(
+                    "cluster target runtime_profile.agent_config_digest must be "
+                    "lowercase SHA-256"
+                )
+            if not digest and site_profile is not None:
+                raise ReleaseError(
+                    f"cluster target runtime_profile {version} has no "
+                    "agent_config_digest; deploy or join must compute it"
+                )
+            profile_fields: tuple[Path | None, Path | None, str, str] = (
+                source,
+                template,
+                version,
+                digest,
+            )
+        elif site_profile is not None:
+            profile_fields = site_profile
+        else:
+            profile_fields = (None, None, "", "")
         required = (
             "cluster_id",
             "context",
@@ -320,7 +398,76 @@ class ClusterTarget:
             fleet_master_file=value.get("fleet_master_file"),
             provider=provider.value,
             node_selector=selector,
+            runtime_profile_source=profile_fields[0],
+            runtime_profile_template_source=profile_fields[1],
+            runtime_profile_version=profile_fields[2],
+            agent_config_digest=profile_fields[3],
+            overrides_runtime_profile=overrides,
         )
+
+
+def validate_runtime_profile_files(source: Path, template_source: Path) -> None:
+    """The site profile files exist and the source is a complete RuntimeProfile."""
+
+    if not source.is_file():
+        raise ReleaseError("runtime_profile.source must be an existing file")
+    if not template_source.is_file():
+        raise ReleaseError("runtime_profile.template_source must be an existing file")
+    try:
+        document = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ReleaseError(f"cannot load runtime_profile.source: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ReleaseError(
+            "runtime_profile.source must contain one RuntimeProfile mapping"
+        )
+    missing = sorted(
+        {"cluster_id", "environment", "claims", "observed"} - set(document)
+    )
+    if missing:
+        raise ReleaseError("runtime_profile.source is missing: " + ", ".join(missing))
+
+
+def load_cluster_targets(
+    values: object,
+    *,
+    expected_region: str,
+    site_profile: tuple[Path, Path, str, str],
+    config_root: Path,
+) -> tuple[ClusterTarget, ...]:
+    """Every GPU cluster target of a release config, with its effective profile.
+
+    A cluster without ``runtime_profile`` inherits the site profile; one with
+    it must point at existing profile files. Cluster ids must be unique.
+    """
+
+    if not isinstance(values, list):
+        raise ReleaseError("clusters must be a list")
+    clusters = tuple(
+        ClusterTarget.from_mapping(
+            item,
+            expected_region=expected_region,
+            site_profile=site_profile,
+            config_root=config_root,
+        )
+        for item in values
+    )
+    ids = [item.cluster_id for item in clusters]
+    if len(ids) != len(set(ids)):
+        raise ReleaseError("cluster_id values must be unique")
+    for target in clusters:
+        if not target.overrides_runtime_profile:
+            continue
+        for label, candidate in (
+            ("source", target.runtime_profile_source),
+            ("template_source", target.runtime_profile_template_source),
+        ):
+            if candidate is None or not candidate.is_file():
+                raise ReleaseError(
+                    f"{target.cluster_id} runtime_profile.{label} must be an "
+                    "existing file"
+                )
+    return clusters
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1154,51 @@ class ReleaseConfig:
             values[NOTIFICATION_ENVIRONMENT[1]] = self.health.sns_topic_arn
         return values
 
+    def site_runtime_profile(self) -> RuntimeProfileSpec:
+        return RuntimeProfileSpec(
+            source=self.runtime_profile_source,
+            template_source=self.runtime_profile_template_source,
+            version=self.runtime_profile_version,
+            registration_cluster_id=self.runtime_profile_registration_cluster_id,
+            agent_config_digest=self.agent_config_digest,
+        )
+
+    def runtime_profiles(self) -> tuple[RuntimeProfileSpec, ...]:
+        """Every distinct profile version in use: the site's first, then each
+        cluster override once, in cluster order."""
+
+        profiles = [self.site_runtime_profile()]
+        for target in self.clusters:
+            if target.overrides_runtime_profile:
+                spec = target.runtime_profile_spec()
+                if spec.version != self.runtime_profile_version and all(
+                    item.version != spec.version for item in profiles
+                ):
+                    profiles.append(spec)
+        return tuple(profiles)
+
+    def cluster_runtime_profile_version(self, target: ClusterTarget) -> str:
+        return target.runtime_profile_version or self.runtime_profile_version
+
+    def cluster_agent_config_digest(self, target: ClusterTarget) -> str:
+        return target.agent_config_digest or self.agent_config_digest
+
+    def cluster_runtime_profiles(self) -> dict[str, dict[str, str]]:
+        """``{cluster_id: {version, agent_config_digest, policy_sha256}}`` for the
+        clusters that override the site profile; empty on a single-profile site."""
+
+        overrides: dict[str, dict[str, str]] = {}
+        for target in self.clusters:
+            if not target.overrides_runtime_profile:
+                continue
+            spec = target.runtime_profile_spec()
+            overrides[target.cluster_id] = {
+                "version": spec.version,
+                "agent_config_digest": spec.agent_config_digest,
+                "policy_sha256": runtime_profile_policy_sha256(spec.source),
+            }
+        return overrides
+
     @classmethod
     def load(cls, path: Path) -> ReleaseConfig:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -1063,10 +1255,6 @@ class ReleaseConfig:
                 "release.upgrade_max_parallel_clusters must be within "
                 f"1..{MAX_UPGRADE_PARALLEL_CLUSTERS}"
             )
-        clusters = tuple(
-            ClusterTarget.from_mapping(item, expected_region=aws_region)
-            for item in value.get("clusters", [])
-        )
         runtime_profile = value.get("runtime_profile") or {}
         runtime_profile_source = Path(
             required_text(
@@ -1128,34 +1316,20 @@ class ReleaseConfig:
             character not in "0123456789abcdef" for character in digest
         ):
             raise ReleaseError("release.agent_config_digest must be lowercase SHA-256")
-        ids = [item.cluster_id for item in clusters]
-        if len(ids) != len(set(ids)):
-            raise ReleaseError("cluster_id values must be unique")
-        if not runtime_profile_source.is_file():
-            raise ReleaseError("runtime_profile.source must be an existing file")
-        if not runtime_profile_template_source.is_file():
-            raise ReleaseError(
-                "runtime_profile.template_source must be an existing file"
-            )
-        try:
-            runtime_profile_document = yaml.safe_load(
-                runtime_profile_source.read_text(encoding="utf-8")
-            )
-        except (OSError, yaml.YAMLError) as exc:
-            raise ReleaseError(f"cannot load runtime_profile.source: {exc}") from exc
-        if not isinstance(runtime_profile_document, dict):
-            raise ReleaseError(
-                "runtime_profile.source must contain one RuntimeProfile mapping"
-            )
-        required_profile_fields = {"cluster_id", "environment", "claims", "observed"}
-        missing_profile_fields = sorted(
-            required_profile_fields - set(runtime_profile_document)
+        validate_runtime_profile_files(
+            runtime_profile_source, runtime_profile_template_source
         )
-        if missing_profile_fields:
-            raise ReleaseError(
-                "runtime_profile.source is missing: "
-                + ", ".join(missing_profile_fields)
-            )
+        clusters = load_cluster_targets(
+            value.get("clusters", []),
+            expected_region=aws_region,
+            site_profile=(
+                runtime_profile_source,
+                runtime_profile_template_source,
+                runtime_profile_version,
+                digest,
+            ),
+            config_root=path.parent,
+        )
         return cls(
             site_name=str(value.get("site_name") or path.stem),
             release_id=artifacts.release_id,

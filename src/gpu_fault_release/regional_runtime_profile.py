@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
+from gpu_fault_release.regional_release_config import (
+    ReleaseConfig,
+    ReleaseError,
+    runtime_profile_policy_sha256,
+)
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
@@ -27,32 +30,7 @@ def render_runtime_profile_payload(config: ReleaseConfig) -> dict[str, Any]:
 
 
 def runtime_profile_policy_digest(path: Path) -> str:
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise ReleaseError("runtime profile source must contain one mapping")
-    policy = {
-        key: value
-        for key, value in document.items()
-        if key not in {"cluster_id", "profile_version"}
-    }
-    for field in ("claims", "observed"):
-        values = policy.get(field)
-        if isinstance(values, list):
-            policy[field] = sorted(
-                values,
-                key=lambda item: json.dumps(
-                    item,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-    return hashlib.sha256(
-        json.dumps(
-            policy,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    return runtime_profile_policy_sha256(path)
 
 
 def inspect_runtime_profile(release: Any) -> dict[str, Any]:

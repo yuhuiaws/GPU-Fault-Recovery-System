@@ -389,7 +389,7 @@
   "src/gpu_fault_release/regional_release_gpu_rollout.py:arg-type": 1,
   "src/gpu_fault_release/regional_release_gpu_rollout.py:no-any-return": 3,
   "src/gpu_fault_release/regional_release_gpu_rollout.py:no-untyped-def": 1,
-  "src/gpu_fault_release/regional_release_node_runtime_rollout.py:no-any-return": 2,
+  "src/gpu_fault_release/regional_release_node_runtime_rollout.py:no-any-return": 1,
   "src/gpu_fault_release/regional_release_resume_validation.py:call-overload": 1,
   "src/gpu_fault_release/regional_release_resume_validation.py:no-any-return": 1,
   "src/gpu_fault_release/regional_release_resume_validation.py:var-annotated": 1,

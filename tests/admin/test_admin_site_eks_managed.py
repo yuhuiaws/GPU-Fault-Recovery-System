@@ -140,3 +140,97 @@ def test_configured_failure_domain_labels_still_win(tmp_path: Path) -> None:
     assert site.release_config["failure_domain_labels"] == [
         "topology.kubernetes.io/zone"
     ], "spec.failureDomainLabels must override the provider default"
+
+
+# --- spec.clusters[].runtimeProfile -------------------------------------------------
+
+
+def _eks_profile_override(root: Path) -> dict:
+    return {
+        "source": "config/runtime-profile.regional-eks-safe.example.yaml",
+        "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+        "version": "eks-v1",
+        "agentConfigDigest": "d" * 64,
+    }
+
+
+def test_cluster_without_runtime_profile_renders_no_profile_keys(
+    tmp_path: Path,
+) -> None:
+    site = load_site(site_file(tmp_path))
+    (entry,) = site.release_config["clusters"]
+    assert "runtime_profile" not in entry, (
+        "a cluster on the site profile must render exactly as before"
+    )
+
+
+def test_cluster_runtime_profile_override_is_rendered_with_resolved_paths(
+    tmp_path: Path,
+) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    root = Path(document["spec"]["repositoryRoot"])
+    cluster = _eks_cluster(document)
+    cluster["runtimeProfile"] = _eks_profile_override(root)
+    document["spec"]["clusters"].append(cluster)
+    _write(path, document)
+
+    site = load_site(path)
+
+    hyperpod, eks = site.release_config["clusters"]
+    assert "runtime_profile" not in hyperpod, "the inheriting sibling is unchanged"
+    override = eks["runtime_profile"]
+    assert override["version"] == "eks-v1", "the override version is rendered"
+    assert override["agent_config_digest"] == "d" * 64, "the digest is rendered"
+    assert override["source"] == str(
+        (root / "config/runtime-profile.regional-eks-safe.example.yaml").resolve()
+    ), "the override source is resolved against the repository root"
+    assert override["template_source"] == override["source"], "template resolved"
+
+
+def test_cluster_runtime_profile_override_without_digest_renders_without_it(
+    tmp_path: Path,
+) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    root = Path(document["spec"]["repositoryRoot"])
+    cluster = _eks_cluster(document)
+    override = _eks_profile_override(root)
+    override.pop("agentConfigDigest")
+    override.pop("templateSource")
+    cluster["runtimeProfile"] = override
+    document["spec"]["clusters"].append(cluster)
+    _write(path, document)
+
+    site = load_site(path)
+    rendered = site.release_config["clusters"][1]["runtime_profile"]
+    assert "agent_config_digest" not in rendered, "no digest is invented"
+    assert rendered["template_source"] == rendered["source"], (
+        "templateSource defaults to source as for the site profile"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("version", "bad version!", "unsupported characters"),
+        ("agentConfigDigest", "nope", "SHA-256"),
+        ("source", "REPLACE_WITH_PROFILE", "placeholder"),
+        ("extra", "x", "unknown fields"),
+    ],
+)
+def test_invalid_cluster_runtime_profile_is_refused(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    root = Path(document["spec"]["repositoryRoot"])
+    cluster = _eks_cluster(document)
+    override = _eks_profile_override(root)
+    override[field] = value
+    cluster["runtimeProfile"] = override
+    document["spec"]["clusters"].append(cluster)
+    _write(path, document)
+
+    with pytest.raises(SiteConfigError, match=message):
+        load_site(path)

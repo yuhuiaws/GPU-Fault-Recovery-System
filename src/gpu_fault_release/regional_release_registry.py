@@ -20,6 +20,22 @@ REGISTRY_CURRENT_KEY = "clusters.json"
 REGISTRY_BACKUP_KEY = "previous-clusters.json"
 
 
+def _cluster_profile_pins(target: ClusterTarget) -> dict[str, str]:
+    """The per-cluster Runtime Profile pins a registration carries.
+
+    Only a cluster that overrides the site profile carries them; a cluster on
+    the site profile keeps the registration shape it always had and the
+    control plane falls back to its site-wide required pins.
+    """
+
+    if not target.overrides_runtime_profile:
+        return {}
+    return {
+        "runtime_profile_version": target.runtime_profile_version,
+        "agent_config_digest": target.agent_config_digest,
+    }
+
+
 def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -34,6 +50,7 @@ def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
                         item.agent_endpoint_allowed_cidrs
                     ),
                     **({"provider": "eks-managed"} if is_eks_managed(item) else {}),
+                    **_cluster_profile_pins(item),
                 }
                 for item in sorted(clusters, key=lambda target: target.cluster_id)
             ],
@@ -120,6 +137,7 @@ def registry_entry(target: ClusterTarget) -> dict[str, Any]:
         "agent_endpoint_allowed_cidrs": endpoint_cidrs,
         # Additive: a HyperPod entry keeps the key set it always had.
         **({"provider": "eks-managed"} if is_eks_managed(target) else {}),
+        **_cluster_profile_pins(target),
     }
 
 
