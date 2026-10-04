@@ -470,9 +470,17 @@ def _reached(state: dict[str, Any], phase: str) -> bool:
     return UNINSTALL_PHASES.index(state["phase"]) >= UNINSTALL_PHASES.index(phase)
 
 
-def _validate_registry(
+def validate_registry(
     request: UninstallRequest, snapshot: InstallationResourceSnapshot
 ) -> None:
+    """Refuse an installation registry that does not describe this site.
+
+    Every cluster row the site implies must be present (a plain EKS GPU
+    cluster implies no ``gpu_hyperpod`` row), nothing but historical GPU
+    rows may be extra, and every row's account, Region and policy must fit.
+    Public so the registry shape a provider mix implies can be asserted.
+    """
+
     snapshot.require_source_binding()
     config = request.site.release_config
     cpu_arn = Arn.parse(str(config["cpu_eks_arn"]))
@@ -606,7 +614,7 @@ def _load_or_export_registry(
             legacy = True
             snapshot = build_legacy_installation_snapshot(request.site)
             write_installation_resource_snapshot(request.site, snapshot, path=path)
-    _validate_registry(request, snapshot)
+    validate_registry(request, snapshot)
     if plan_path.is_file():
         plan = load_installation_resource_snapshot(plan_path)
         if [item.immutable_identity() for item in plan.resources] != [

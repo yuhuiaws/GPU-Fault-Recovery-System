@@ -370,18 +370,18 @@ class PreflightRunner:
 
 def test_eks_managed_preflight_requires_active_cluster_and_nodegroups() -> None:
     runner = PreflightRunner()
-    PREFLIGHT._validate_eks_managed_cluster(
+    PREFLIGHT.validate_eks_managed_cluster(
         runner, region=REGION, expected_eks_arn=EKS_ARN
     )
     assert not any("sagemaker" in call for call in runner.calls), (
         "a plain EKS preflight must not describe a HyperPod cluster"
     )
     with pytest.raises(ReleaseError, match="is not ACTIVE"):
-        PREFLIGHT._validate_eks_managed_cluster(
+        PREFLIGHT.validate_eks_managed_cluster(
             PreflightRunner(status="UPDATING"), region=REGION, expected_eks_arn=EKS_ARN
         )
     with pytest.raises(ReleaseError, match="node group gpu-ng .* is not ACTIVE"):
-        PREFLIGHT._validate_eks_managed_cluster(
+        PREFLIGHT.validate_eks_managed_cluster(
             PreflightRunner(nodegroup_status="DEGRADED"),
             region=REGION,
             expected_eks_arn=EKS_ARN,
@@ -390,7 +390,7 @@ def test_eks_managed_preflight_requires_active_cluster_and_nodegroups() -> None:
 
 def test_eks_managed_preflight_refuses_a_different_cluster_arn() -> None:
     with pytest.raises(ReleaseError, match="does not match configured EKS ARN"):
-        PREFLIGHT._validate_eks_managed_cluster(
+        PREFLIGHT.validate_eks_managed_cluster(
             PreflightRunner(),
             region=REGION,
             expected_eks_arn=f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/other",

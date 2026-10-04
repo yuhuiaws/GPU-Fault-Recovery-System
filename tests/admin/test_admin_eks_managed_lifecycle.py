@@ -274,14 +274,14 @@ def test_removal_registry_proof_accepts_a_plain_eks_cluster_without_hyperpod(
     target = _entry(site, "gpu-e")
     identity = {"eks_arn": EKS_ARN, "hyperpod_arn": ""}
 
-    removal._validate_target_registry(request, target, _eks_registry(site), identity)
+    removal.validate_target_registry(request, target, _eks_registry(site), identity)
 
     with pytest.raises(BootstrapError, match="identity is incomplete"):
-        removal._validate_target_registry(
+        removal.validate_target_registry(
             request, target, _eks_registry(site, with_hyperpod=True), identity
         )
     with pytest.raises(BootstrapError, match="names a HyperPod ARN"):
-        removal._validate_target_registry(
+        removal.validate_target_registry(
             request,
             target,
             _eks_registry(site),
@@ -317,7 +317,7 @@ def test_removal_registry_proof_still_requires_the_hyperpod_record_for_hyperpod(
         ),
     )
     with pytest.raises(BootstrapError, match="identity is incomplete"):
-        removal._validate_target_registry(
+        removal.validate_target_registry(
             request,
             target,
             without_hyperpod,
@@ -371,7 +371,7 @@ def test_removal_identity_of_a_plain_eks_cluster_never_describes_sagemaker(
         "eks_created_at": "cpu-created",
         "vpc_id": "vpc-cpu",
     }
-    identity, namespace_uid = removal._removal_identity(
+    identity, namespace_uid = removal.removal_identity(
         request, target, Runner(), networks, cpu_network
     )
     assert aws_calls == [], "no sagemaker describe may run for a plain EKS cluster"
@@ -379,7 +379,7 @@ def test_removal_identity_of_a_plain_eks_cluster_never_describes_sagemaker(
     assert identity["eks_arn"] == EKS_ARN, "the EKS ARN is the live identity"
     assert namespace_uid == "ns", "the GPU namespace identity is still read"
     with pytest.raises(BootstrapError, match="differs from the live cluster identity"):
-        removal._removal_identity(
+        removal.removal_identity(
             RemoveClusterRequest(
                 site=site,
                 cluster_id="gpu-e",
@@ -443,10 +443,10 @@ def test_uninstall_registry_validation_accepts_a_site_with_a_plain_eks_cluster(
         _resource(site_id, "cluster/gpu-a/hyperpod", "gpu_hyperpod", "hp-gpu-a"),
         _resource(site_id, "cluster/gpu-e/eks", "gpu_eks", "gpu-e", arn=EKS_ARN),
     ]
-    uninstall._validate_registry(request, _snapshot(site_id, *rows))
+    uninstall.validate_registry(request, _snapshot(site_id, *rows))
     # The HyperPod cluster still needs its gpu_hyperpod row.
     with pytest.raises(BootstrapError, match="cluster identity differs from site"):
-        uninstall._validate_registry(
+        uninstall.validate_registry(
             request,
             _snapshot(site_id, *[row for row in rows if row.resource_id != "hp-gpu-a"]),
         )
@@ -459,7 +459,7 @@ def test_registry_builder_records_no_hyperpod_for_a_plain_eks_cluster(
     tmp_path: Path,
 ) -> None:
     site = _mixed_site(tmp_path)
-    rows = registry._external_clusters(
+    rows = registry.external_cluster_resources(
         site, site_id="test-site", region=REGION, account_id=ACCOUNT
     )
     keys = {row.resource_key for row in rows}

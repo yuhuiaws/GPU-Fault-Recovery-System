@@ -594,12 +594,17 @@ def test_two_plain_eks_clusters_are_not_mistaken_for_one_another(scenario) -> No
     request = join.JoinClusterRequest(
         site=load_site(scenario.path), gpu_cluster_arn=second.eks_arn
     )
-    # ``_validate_target`` runs during discovery; a false HyperPod-name match
-    # would raise "GPU HyperPod cluster is already managed" here.
-    discovered, cluster_id, existing = join._discover_join_target(request, scenario)
-    assert (discovered.eks_name, cluster_id, existing) == ("gpu-f", "gpu-f", None), (
+    # A false HyperPod-name match would refuse the second cluster as "already
+    # managed" during discovery; instead it joins as its own member.
+    result = join.join_cluster(request, runner=scenario)
+    assert (result["phase"], result["cluster_id"]) == ("COMPLETED", "gpu-f"), (
         "a second plain EKS cluster must be a new, distinct join target"
     )
+    assert scenario.cluster_states == {
+        "gpu-a": "ACTIVE",
+        "gpu-e": "ACTIVE",
+        "gpu-f": "ACTIVE",
+    }, "both plain EKS clusters must be registered side by side"
 
 
 def test_mixing_providers_in_one_site_is_refused(tmp_path, monkeypatch) -> None:

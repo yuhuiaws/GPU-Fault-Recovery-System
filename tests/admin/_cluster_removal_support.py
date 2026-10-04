@@ -201,7 +201,7 @@ class RemovalScenario:
         )
         for name, function in (
             ("_cluster_network", network),
-            ("_removal_identity", identity),
+            ("removal_identity", identity),
             ("_target_nodes", nodes),
             ("_export_registry", export),
             ("_run_kubernetes_cleanup", self.cleanup),

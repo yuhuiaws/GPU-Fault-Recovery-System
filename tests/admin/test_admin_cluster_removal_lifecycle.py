@@ -12,13 +12,13 @@ from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
-    _removal_identity,
     _remove_node_action_keys,
     _run_kubernetes_cleanup,
     _update_bootstrap_state,
     _verify_control_registry_absent,
     _verify_target_namespace_absent,
     _wait_target_namespace_absent,
+    removal_identity,
     remove_cluster,
     resolve_cluster_id,
     resolve_removal_cluster_id,
@@ -579,7 +579,7 @@ def test_live_provider_identity_is_checked_before_cleanup(
         removal, "run_command", lambda *_a, **_k: completed("https://wrong.example")
     )
     with pytest.raises(BootstrapError, match="identity|policy|context"):
-        _removal_identity(
+        removal_identity(
             RemoveClusterRequest(site, "gpu-a", "REMOVE_GPU_CLUSTER", HP_ARN),
             target,
             Runner(),

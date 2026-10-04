@@ -373,7 +373,7 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
     monkeypatch.setattr(admin_cluster_removal, "_cluster_network", network)
     monkeypatch.setattr(
         admin_cluster_removal,
-        "_removal_identity",
+        "removal_identity",
         lambda *_args: (
             {
                 "eks_arn": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",

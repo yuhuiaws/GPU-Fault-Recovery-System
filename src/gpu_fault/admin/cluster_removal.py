@@ -314,13 +314,21 @@ def _target_nodes(
     return sorted(nodes)
 
 
-def _removal_identity(
+def removal_identity(
     request: RemoveClusterRequest,
     target: dict[str, Any],
     runner: CommandRunner,
     target_network: dict[str, Any],
     cpu_network: dict[str, Any],
 ) -> tuple[dict[str, str], str | None]:
+    """The live provider identity of the cluster being removed.
+
+    HyperPod: the SageMaker cluster is described and must still orchestrate
+    the recorded EKS cluster with ``NodeRecovery=None``. Plain EKS
+    (eks-managed): no HyperPod exists, the EKS cluster the network discovery
+    described is the identity. Returns ``(identity, gpu namespace uid)``.
+    """
+
     region = str(request.site.release_config["aws_region"])
     hyperpod_arn = ""
     if not is_eks_managed(target):
@@ -390,12 +398,20 @@ def _removal_identity(
     }, str(gpu_namespace["metadata"]["uid"]) if gpu_namespace else None
 
 
-def _validate_target_registry(
+def validate_target_registry(
     request: RemoveClusterRequest,
     target: dict[str, Any],
     snapshot: InstallationResourceSnapshot,
     identity: dict[str, str],
 ) -> None:
+    """Prove the installation registry names exactly this cluster.
+
+    EKS cluster, executor role and -- for a HyperPod cluster only -- the
+    ``gpu_hyperpod`` row with the HyperPod ARN; a plain EKS (eks-managed)
+    cluster must have no such row. Public so provider-specific registries can
+    be asserted without a live removal.
+    """
+
     snapshot.require_source_binding()
     if snapshot.site_id != request.site.registry_site_id:
         raise BootstrapError("installation registry belongs to another site")
@@ -1099,10 +1115,10 @@ def _discover_removal(
         remaining=remaining,
         cpu_eks_arn=str(request.site.release_config["cpu_eks_arn"]),
     )
-    identity, namespace_uid = _removal_identity(
+    identity, namespace_uid = removal_identity(
         request, target, runner, target_network, cpu_network
     )
-    _validate_target_registry(request, target, snapshot, identity)
+    validate_target_registry(request, target, snapshot, identity)
     runtime = _runtime_membership(request.site)
     cluster_states = dict(runtime["registry_cluster_states"])
     lifecycle = cluster_states.pop(request.cluster_id, None)
@@ -1455,3 +1471,8 @@ def _execute_removal(
     return _removal_result(
         request.site, request.cluster_id, state_path, state, remaining
     )
+
+
+# Historical private names, kept for callers that bound to them.
+_removal_identity = removal_identity
+_validate_target_registry = validate_target_registry

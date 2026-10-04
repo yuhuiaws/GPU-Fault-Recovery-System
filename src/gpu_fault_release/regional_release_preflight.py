@@ -193,7 +193,7 @@ def _context_eks_arn(runner: Runner, kubectl: list[str], *, label: str) -> str:
     return cluster
 
 
-def _validate_eks_managed_cluster(
+def validate_eks_managed_cluster(
     runner: Runner,
     *,
     region: str,
@@ -390,7 +390,7 @@ def ensure_region_contexts(release: RegionalRelease) -> None:
                 "configured eks_cluster_arn"
             )
         if is_eks_managed(target):
-            _validate_eks_managed_cluster(
+            validate_eks_managed_cluster(
                 runner,
                 region=target.region,
                 expected_eks_arn=target.eks_cluster_arn,

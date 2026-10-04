@@ -25,7 +25,12 @@ from gpu_fault.hyperpod import (
     HyperPodRecoveryState,
     HyperPodWorkloadRecoveryEvidence,
 )
-from gpu_fault.models import CapabilityMode, CapabilityName, Environment
+from gpu_fault.models import (
+    CapabilityMode,
+    CapabilityName,
+    Environment,
+    WorkflowOperation,
+)
 from gpu_fault.node_provider import EKS_REBOOT_CONFIRMATION_SOURCE
 from gpu_fault.store import InMemoryStore
 from tests._builders import workflow_step
@@ -51,7 +56,6 @@ from tests.eks_provider._support import (
     gpu_node,
     provider,
 )
-from gpu_fault.models import WorkflowOperation
 
 SUBMIT = {
     "isolation_verified_nodes": [NODE_A],

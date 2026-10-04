@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from gpu_fault.cluster_scope import NODE_SELECTOR_ENV
+from gpu_fault.node_installer_reconciler import NodeInstallerReconciler
 from gpu_fault.node_installer_rendering import (
     InstallerNode,
     load_installer_template,
@@ -21,10 +22,14 @@ from gpu_fault_release import regional_node_batch as batch
 from tests.deploy.test_installer_template_identity import pinned_identity, template_job
 from tests.deploy.test_node_preflight_inputs import inputs
 from tests.node_agent.test_node_installer_reconciler import (
+    ARTIFACT,
+    BUNDLE,
+    TEMPLATE,
     BatchApi,
     CoreApi,
     node,
     reconciler,
+    template,
 )
 from tests.regional.test_cov95_release_node_batch import SCOPE
 
@@ -103,14 +108,27 @@ def test_reconciler_selector_defaults_to_the_hyperpod_label() -> None:
 def test_reconciler_selector_follows_the_connection_secret() -> None:
     """``main`` hands ``GPU_FAULT_NODE_SELECTOR`` to the constructor."""
 
-    instance = reconciler(CoreApi([]), BatchApi())
-    instance._node_selector = "nvidia.com/gpu.present=true"
-    assert instance.node_selector == "nvidia.com/gpu.present=true", (
-        "GPU_FAULT_NODE_SELECTOR must override the HyperPod label"
-    )
-    instance._node_selector = "nvidia.com/gpu.present=true,"
+    def build(selector: str) -> NodeInstallerReconciler:
+        return NodeInstallerReconciler(
+            CoreApi([]),
+            BatchApi(),
+            namespace="gpu-fault-system",
+            cluster_name="hp-cluster-a",
+            node_selector=selector,
+            version="0.10.0",
+            config_digest="config-sha",
+            artifact_sha256=ARTIFACT,
+            bundle_sha256=BUNDLE,
+            template_sha256=TEMPLATE,
+            job_template=template(),
+            dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
+        )
+
+    assert build("nvidia.com/gpu.present=true").node_selector == (
+        "nvidia.com/gpu.present=true"
+    ), "GPU_FAULT_NODE_SELECTOR must override the HyperPod label"
     with pytest.raises(ValueError, match="node selector"):
-        instance.node_selector
+        build("nvidia.com/gpu.present=true,").node_selector
     assert NODE_SELECTOR_ENV == "GPU_FAULT_NODE_SELECTOR", "contract name"
 
 
@@ -122,12 +140,12 @@ def test_reconciler_passes_the_node_provider_id_into_the_job() -> None:
     template["spec"]["template"]["spec"]["containers"][0]["env"].append(
         {"name": "TARGET_NODE_PROVIDER_ID", "value": "old"}
     )
-    rendered = job._build_job(target, "gpu-fault-install-e")
+    rendered = job.build_job(target, "gpu-fault-install-e")
     assert _installer_env(rendered)["TARGET_NODE_PROVIDER_ID"] == PROVIDER_ID, (
         "the reconciler must read spec.providerID off the live Node"
     )
     plain = node()
-    rendered = job._build_job(plain, "gpu-fault-install-a")
+    rendered = job.build_job(plain, "gpu-fault-install-a")
     assert _installer_env(rendered)["TARGET_NODE_PROVIDER_ID"] == "", (
         "a node without a spec renders an empty provider id"
     )

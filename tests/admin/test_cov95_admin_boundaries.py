@@ -8,8 +8,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import bootstrap_dependencies as dependencies
-from gpu_fault.admin import execution
-from gpu_fault.admin import deploy_consent, release_state, source_deploy
+from gpu_fault.admin import deploy_consent, execution, release_state, source_deploy
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.execution import ProofCache
 from gpu_fault.admin.site import SiteConfigError, load_site

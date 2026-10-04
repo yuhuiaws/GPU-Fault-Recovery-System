@@ -8,8 +8,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin.site import SiteConfigError, load_site
-from gpu_fault.cluster_scope import node_selector
-from gpu_fault.cluster_scope import EKS_MANAGED_FAILURE_DOMAIN_LABELS
+from gpu_fault.cluster_scope import EKS_MANAGED_FAILURE_DOMAIN_LABELS, node_selector
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 from tests.admin.test_admin_site import site_file
 

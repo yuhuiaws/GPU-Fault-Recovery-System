@@ -704,7 +704,7 @@ class NodeInstallerReconciler:
             if not budget.allows_create:
                 return "deferred"
             try:
-                body = self._build_job(node, name)
+                body = self.build_job(node, name)
             except ValueError as build_error:
                 LOGGER.error("node %s cannot be installed: %s", node_name, build_error)
                 return "unsupported"
@@ -971,7 +971,10 @@ class NodeInstallerReconciler:
         if state == "Retrying" or retry_after is not None:
             self.metrics.inc("retries_scheduled_total")
 
-    def _build_job(self, node: Any, job_name: str) -> dict[str, Any]:
+    def build_job(self, node: Any, job_name: str) -> dict[str, Any]:
+        """The installer Job for ``node``: the pinned template filled with the
+        node's name, address, UID, instance type and ``spec.providerID``."""
+
         metadata = _metadata(node)
         labels = dict(_value(metadata, "labels", {}) or {})
         return render_installer_job(

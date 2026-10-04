@@ -47,13 +47,16 @@ class LegacyInstallationRegistryMissing(BootstrapError):
     pass
 
 
-def _external_clusters(
+def external_cluster_resources(
     site: RenderedSite,
     *,
     site_id: str,
     region: str,
     account_id: str,
 ) -> list[InstallationResource]:
+    """Externally owned cluster rows: CPU EKS/HyperPod, then per GPU cluster
+    its EKS cluster and, for HyperPod clusters only, its HyperPod cluster."""
+
     config = site.release_config
     cpu_arn = str(config["cpu_eks_arn"])
     resources = [
@@ -910,7 +913,7 @@ def build_installation_snapshot(
     ):
         raise BootstrapError("Route53 bootstrap inventory is not bound to this site")
     runtime_resources = runtime or {}
-    resources = _external_clusters(
+    resources = external_cluster_resources(
         site,
         site_id=site_id,
         region=region,
