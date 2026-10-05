@@ -54,6 +54,9 @@ GPU_CONTEXT = ""
 NAMESPACE = "gpu-fault-system"
 AWS_REGION = ""
 MANAGED_GPU_CLUSTER = ""
+#: The managed registration's provider, learned by ``audit_identity``; a plain
+#: EKS cluster has no HyperPod NodeRecovery to describe.
+MANAGED_PROVIDER = "hyperpod"
 AUTOMATIC_NEGATIVE_CLUSTER = ""
 
 CASE_IDS = (
@@ -355,11 +358,12 @@ def audit_identity() -> dict[str, str]:
         or state.get("phase") != "complete"
     ):
         raise RuntimeError("guard audit requires a complete bound release")
+    global MANAGED_PROVIDER
+    MANAGED_PROVIDER = str(registration.get("provider") or "hyperpod")
     return {
         "release_id": release_id,
         "cluster_id": registration["cluster_id"],
         "eks_cluster_arn": registration["eks_cluster_arn"],
-        "provider": str(registration.get("provider") or "hyperpod"),
         "registry_generation": str(registry["generation"]),
     }
 
@@ -1244,9 +1248,10 @@ def run_audit(
     )
     gpu: dict[str, Any] = (
         probes.guarded(
-            lambda: cluster_recovery(
-                MANAGED_GPU_CLUSTER,
-                str((identity or {}).get("provider") or "hyperpod"),
+            lambda: (
+                cluster_recovery(MANAGED_GPU_CLUSTER)
+                if MANAGED_PROVIDER != "eks-managed"
+                else cluster_recovery(MANAGED_GPU_CLUSTER, MANAGED_PROVIDER)
             )
         )
         or {}

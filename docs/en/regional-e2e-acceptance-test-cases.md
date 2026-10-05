@@ -7750,8 +7750,10 @@ it is deleted only after the incident is RECOVERED, and every cleanup records th
   - executor timeout < NLB idle timeout, avoiding half-open connections.
 - Mixed-provider sites: the NLB's inbound 443 allow-list must cover the NAT EIPs of **every** managed GPU cluster's VPC
   (one VPC per cluster) -- a site-wide judgement. The managed set comes from `--site` (default `GPU_FAULT_SITE_FILE`) or,
-  without a site file, from the control plane's durable registry (each registration names its cluster by EKS ARN,
-  HyperPod and plain EKS alike); the selected cluster must belong to it. The evidence's `gpu_eks.nat_sources` lists the
+  without a site file and when the GPU kubeconfig reaches several EKS clusters, from the control plane's durable registry
+  (each registration names its cluster by EKS ARN, HyperPod and plain EKS alike); the selected cluster must belong to it.
+  A kubeconfig reaching one cluster keeps the historical selected-cluster scope; `managed_gpu_clusters_source` records
+  the source or the fallback reason. The evidence's `gpu_eks.nat_sources` lists the
   NAT source per cluster and `managed_gpu_clusters` the set. The executor egress probe runs in **every** managed cluster:
   the selected `--gpu-context` first, then each other cluster under the GPU kubeconfig context whose `cluster` is its EKS
   ARN (`probed_gpu_contexts`); a single-cluster site probes the selected context alone, exactly as before.

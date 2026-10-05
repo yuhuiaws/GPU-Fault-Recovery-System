@@ -14,6 +14,7 @@ from typing import Any
 from scripts.e2e.regional import run_net001_collector_replay as net001
 from scripts.e2e.regional.regional_workload_inventory import (
     blocking_node_taints,
+    business_workload_details,
     business_workload_items,
     business_workload_reason,
     node_provider,
@@ -66,6 +67,13 @@ def test_gpu_requests_are_workloads_wherever_they_run() -> None:
     ), "a DaemonSet holding a GPU is still a workload the drill would disturb"
     assert (
         business_workload_reason(
+            _pod("kube-system", "gpu-health", owner="DaemonSet", gpus=1),
+            namespace="gpu-fault-system",
+        )
+        is None
+    ), "the system namespaces stay infrastructure even with a GPU, as before"
+    assert (
+        business_workload_reason(
             _pod("gpu-fault-system", "validation-job", owner="Job", gpus=8),
             namespace="gpu-fault-system",
         )
@@ -91,16 +99,17 @@ def test_non_gpu_pods_outside_system_namespaces_stay_fail_closed() -> None:
     )
 
 
-def test_items_carry_owner_and_reason_and_keep_the_legacy_fields() -> None:
-    items = business_workload_items(
-        [
-            _pod("monitoring", "node-exporter-a", owner="DaemonSet"),
-            _pod("training", "trainer-0", owner="Job", gpus=4),
-            _pod("kube-system", "coredns-1"),
-        ],
-        namespace="gpu-fault-system",
-    )
-    assert items == [
+def test_items_keep_the_legacy_shape_and_details_carry_owner_and_reason() -> None:
+    pods = [
+        _pod("monitoring", "node-exporter-a", owner="DaemonSet"),
+        _pod("training", "trainer-0", owner="Job", gpus=4),
+        _pod("kube-system", "coredns-1"),
+    ]
+    assert business_workload_items(pods, namespace="gpu-fault-system") == [
+        {"namespace": "training", "name": "trainer-0"}
+    ], "every preflight keeps reading the fleet-wide namespace/name items"
+    details = business_workload_details(pods, namespace="gpu-fault-system")
+    assert details == [
         {
             "namespace": "training",
             "name": "trainer-0",
@@ -108,7 +117,7 @@ def test_items_carry_owner_and_reason_and_keep_the_legacy_fields() -> None:
             "reason": "gpu-request",
         }
     ]
-    assert net001.business_workload_refusal(items) == (
+    assert net001.business_workload_refusal(details) == (
         "target node has an active business workload: training/trainer-0 (gpu-request)"
     ), "the NET-001 refusal names the Pods instead of a bare sentence"
 

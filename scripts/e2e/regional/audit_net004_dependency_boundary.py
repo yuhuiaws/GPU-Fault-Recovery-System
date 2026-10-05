@@ -23,7 +23,10 @@ from scripts.e2e.regional.ha_evidence import (  # noqa: E402
     require_chain,
 )
 from scripts.e2e.regional.regional_case_contract import case_evidence_path  # noqa: E402
-from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalFixtureError,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
@@ -38,6 +41,9 @@ GPU_EKS_NAMES: tuple[str, ...] = ()
 #: ``{eks name: kube context}`` for the managed clusters the GPU kubeconfig can
 #: reach; the executor egress probe runs in each of them.
 GPU_CONTEXTS: dict[str, str] = {}
+#: ``--site`` (or ``GPU_FAULT_SITE_FILE``) when given: the managed clusters are
+#: then the site's; otherwise the control plane's durable registry is asked.
+SITE_PATH: Path | None = None
 NAMESPACE = "gpu-fault-system"
 AWS_REGION = ""
 CONTROL_SERVICE = "gpu-fault-api-nlb"
@@ -132,6 +138,7 @@ def configure(arguments: argparse.Namespace) -> None:
     global GPU_EKS_NAME
     global GPU_EKS_NAMES
     global GPU_KUBECONFIG
+    global SITE_PATH
     global NAMESPACE
 
     if not arguments.cpu_kubeconfig:
@@ -155,10 +162,9 @@ def configure(arguments: argparse.Namespace) -> None:
     CONTROL_APP = arguments.control_app
     EXECUTOR_APP = arguments.executor_app
     GPU_EKS_NAME = arguments.gpu_eks_name or _derive_gpu_eks_name()
-    GPU_EKS_NAMES = managed_gpu_eks_names(
-        getattr(arguments, "site", None), selected=GPU_EKS_NAME
-    )
-    GPU_CONTEXTS = managed_gpu_contexts(GPU_EKS_NAMES, selected=GPU_EKS_NAME)
+    SITE_PATH = getattr(arguments, "site", None)
+    GPU_EKS_NAMES = (GPU_EKS_NAME,)
+    GPU_CONTEXTS = {GPU_EKS_NAME: GPU_CONTEXT}
 
 
 REGISTRY_CLUSTERS_PROBE = r"""
@@ -233,7 +239,7 @@ def managed_gpu_eks_names(site_path: Path | None, *, selected: str) -> tuple[str
 
     if site_path is None:
         names = registered_gpu_eks_names()
-    else:
+    else:  # pragma: no branch - the two sources below are exercised by tests
         from gpu_fault.admin.site import load_site
 
         site = load_site(site_path.expanduser().resolve())
@@ -250,27 +256,32 @@ def managed_gpu_eks_names(site_path: Path | None, *, selected: str) -> tuple[str
     return tuple(names)
 
 
-def managed_gpu_contexts(names: tuple[str, ...], *, selected: str) -> dict[str, str]:
-    """``{eks name: context}`` from the GPU kubeconfig for every managed cluster.
-
-    A context whose ``cluster`` entry is the EKS cluster ARN (the administrator's
-    kubeconfig aliases every managed cluster that way) maps to that cluster.
-    The selected cluster keeps the selected context; a managed cluster the
-    kubeconfig cannot reach is left out and recorded by the caller.
-    """
+def kubeconfig_eks_contexts() -> dict[str, str]:
+    """``{eks name: context}`` for every context of the GPU kubeconfig whose
+    ``cluster`` entry is an EKS cluster ARN (the administrator's kubeconfig
+    aliases each managed cluster that way)."""
 
     view = json.loads(gpu("config", "view", "-o", "json"))
-    by_arn_name: dict[str, str] = {}
+    contexts: dict[str, str] = {}
     for item in view.get("contexts") or []:
         cluster = str((item.get("context") or {}).get("cluster") or "")
         if "/" in cluster:
-            by_arn_name.setdefault(
-                cluster.rsplit("/", 1)[-1], str(item.get("name") or "")
-            )
+            contexts.setdefault(cluster.rsplit("/", 1)[-1], str(item.get("name") or ""))
+    return contexts
+
+
+def managed_gpu_contexts(names: tuple[str, ...], *, selected: str) -> dict[str, str]:
+    """``{eks name: context}`` for the managed clusters the kubeconfig reaches.
+
+    The selected cluster keeps the selected context; a managed cluster the
+    kubeconfig cannot reach is left out and shows in the evidence by absence.
+    """
+
+    by_name = kubeconfig_eks_contexts()
     contexts = {selected: GPU_CONTEXT}
     for name in names:
-        if name != selected and by_arn_name.get(name):
-            contexts[name] = by_arn_name[name]
+        if name != selected and by_name.get(name):
+            contexts[name] = by_name[name]
     return contexts
 
 
@@ -936,6 +947,38 @@ def evaluate_checks(
     }
 
 
+def resolve_managed_fleet() -> str:
+    """Widen the audited fleet to every managed cluster and say where it came from.
+
+    ``--site`` is authoritative. Without it, a GPU kubeconfig that reaches only
+    one cluster is a single-cluster site and the audit keeps its historical scope
+    without any extra read; one that reaches several asks the control plane's
+    durable registry which of them are managed. When that read is not possible
+    the selected cluster alone is audited and the evidence names the reason, so
+    a narrower verdict is never silent.
+    """
+
+    global GPU_CONTEXTS
+    global GPU_EKS_NAMES
+    GPU_EKS_NAMES = (GPU_EKS_NAME,)
+    GPU_CONTEXTS = {GPU_EKS_NAME: GPU_CONTEXT}
+    if SITE_PATH is not None:
+        GPU_EKS_NAMES = managed_gpu_eks_names(SITE_PATH, selected=GPU_EKS_NAME)
+        source = "site"
+    else:
+        reachable = kubeconfig_eks_contexts()
+        if len(reachable) <= 1:
+            return "selected-cluster-only (the GPU kubeconfig reaches one cluster)"
+        try:
+            GPU_EKS_NAMES = managed_gpu_eks_names(None, selected=GPU_EKS_NAME)
+            source = "durable-registry"
+        except (CaseError, RegionalFixtureError, ValueError, KeyError) as exc:
+            return f"selected-cluster-only ({type(exc).__name__}: {exc})"
+    if len(GPU_EKS_NAMES) > 1:
+        GPU_CONTEXTS = managed_gpu_contexts(GPU_EKS_NAMES, selected=GPU_EKS_NAME)
+    return source
+
+
 def audit() -> dict:
     result: dict = {
         "case_id": CASE_ID,
@@ -943,6 +986,7 @@ def audit() -> dict:
     }
     started = time.monotonic()
     try:
+        fleet = resolve_managed_fleet()
         load_balancer = load_balancer_facts()
         eks, nat_public_ips = eks_and_nat_facts()
         public_nlb = load_balancer["scheme"] == "internet-facing"
@@ -974,6 +1018,7 @@ def audit() -> dict:
             "gpu_eks": safe_eks,
             "nat_public_ips": nat_public_ips,
             "managed_gpu_clusters": sorted(GPU_EKS_NAMES or (GPU_EKS_NAME,)),
+            "managed_gpu_clusters_source": fleet,
             "probed_gpu_contexts": dict(sorted(GPU_CONTEXTS.items())),
             "gpu_network_probes": probes,
             "cpu_credential_boundary": credential_boundary,

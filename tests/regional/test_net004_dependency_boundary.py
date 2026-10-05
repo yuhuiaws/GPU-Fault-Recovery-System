@@ -366,3 +366,42 @@ def test_fleet_probes_cover_every_managed_cluster_context(
         "executor-selected",
         "executor-ctx-eks",
     ]
+
+
+def test_fleet_resolution_prefers_the_site_then_the_registry_then_the_selected_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(net004, "GPU_EKS_NAME", "hp-eks")
+    monkeypatch.setattr(net004, "GPU_CONTEXT", "ctx-hp")
+    monkeypatch.setattr(net004, "SITE_PATH", None)
+    reachable = {"hp-eks": "ctx-hp", "gpu-eks": "ctx-gpu-eks"}
+    monkeypatch.setattr(net004, "kubeconfig_eks_contexts", lambda: dict(reachable))
+
+    monkeypatch.setattr(
+        net004, "registered_gpu_eks_names", lambda: ("hp-eks", "gpu-eks")
+    )
+    assert net004.resolve_managed_fleet() == "durable-registry"
+    assert net004.GPU_EKS_NAMES == ("hp-eks", "gpu-eks")
+    assert net004.GPU_CONTEXTS == {"hp-eks": "ctx-hp", "gpu-eks": "ctx-gpu-eks"}
+
+    def unavailable() -> tuple[str, ...]:
+        raise net004.CaseError("no Ready control-plane API Pod for the registry read")
+
+    monkeypatch.setattr(net004, "registered_gpu_eks_names", unavailable)
+    source = net004.resolve_managed_fleet()
+    assert source.startswith("selected-cluster-only (CaseError: no Ready"), source
+    assert net004.GPU_EKS_NAMES == ("hp-eks",)
+    assert net004.GPU_CONTEXTS == {"hp-eks": "ctx-hp"}, (
+        "an unreadable registry keeps the historical single-cluster scope, named"
+    )
+
+    monkeypatch.setattr(net004, "kubeconfig_eks_contexts", lambda: {"hp-eks": "ctx-hp"})
+    monkeypatch.setattr(
+        net004,
+        "registered_gpu_eks_names",
+        lambda: pytest.fail("a single-cluster kubeconfig never reads the registry"),
+    )
+    assert net004.resolve_managed_fleet().startswith(
+        "selected-cluster-only (the GPU"
+    ), "one reachable cluster keeps the historical scope without a registry read"
+    assert net004.GPU_EKS_NAMES == ("hp-eks",)

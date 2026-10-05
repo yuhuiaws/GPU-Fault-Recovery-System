@@ -105,20 +105,24 @@ def business_workload_reason(
 ) -> str | None:
     """Why a Pod counts as a business workload, or ``None`` for infrastructure.
 
-    A Pod requesting a GPU is a workload wherever it runs. Without a GPU, Pods in
-    the system namespaces, in the solution namespace and DaemonSet-owned Pods
-    (node agents such as device plugins, CNI/EFA plugins, exporters; live
-    2026-10-04 a plain-EKS node carried the customer's node-exporter) are
-    infrastructure. Any other Pod is a workload: in an allowed workload
-    namespace by declaration, elsewhere because it is unclassified and the
-    drill must not disturb it.
+    The historical rule first: Pods in the system namespaces are infrastructure,
+    and in the solution namespace only a Pod requesting a GPU is a workload.
+    Elsewhere a GPU request is a workload wherever it runs; without one, a
+    DaemonSet-owned Pod (node agents such as device plugins, CNI/EFA plugins,
+    exporters; live 2026-10-04 a plain-EKS node carried the customer's
+    node-exporter) is infrastructure, and any other Pod is a workload: in an
+    allowed workload namespace by declaration, elsewhere because it is
+    unclassified and the drill must not disturb it.
     """
 
     pod_namespace = str(item["metadata"].get("namespace", ""))
-    if pod_gpu_count(item) > 0:
-        return "gpu-request"
-    if pod_namespace in SYSTEM_NAMESPACES or pod_namespace == namespace:
+    if pod_namespace in SYSTEM_NAMESPACES:
         return None
+    gpu = pod_gpu_count(item) > 0
+    if pod_namespace == namespace:
+        return "gpu-request" if gpu else None
+    if gpu:
+        return "gpu-request"
     if pod_owner_kind(item) in INFRASTRUCTURE_OWNER_KINDS:
         return None
     if pod_namespace in allowed_namespaces:
@@ -126,13 +130,14 @@ def business_workload_reason(
     return "unclassified-workload"
 
 
-def business_workload_items(
+def business_workload_details(
     items: list[dict[str, Any]],
     *,
     namespace: str,
     allowed_namespaces: frozenset[str] | set[str] = frozenset(),
 ) -> list[dict[str, str]]:
-    """Keep business Pods, including GPU jobs in the solution namespace."""
+    """Business Pods with their owner kind and the reason they count."""
+
     result = []
     for item in items:
         reason = business_workload_reason(
@@ -149,3 +154,18 @@ def business_workload_items(
             }
         )
     return result
+
+
+def business_workload_items(
+    items: list[dict[str, Any]],
+    *,
+    namespace: str,
+    allowed_namespaces: frozenset[str] | set[str] = frozenset(),
+) -> list[dict[str, str]]:
+    """Keep business Pods, including GPU jobs in the solution namespace."""
+    return [
+        {"namespace": item["namespace"], "name": item["name"]}
+        for item in business_workload_details(
+            items, namespace=namespace, allowed_namespaces=allowed_namespaces
+        )
+    ]

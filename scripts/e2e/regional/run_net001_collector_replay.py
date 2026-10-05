@@ -32,9 +32,12 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     run_fixture_command,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    business_workload_items,
     component_python,
     predecessor_evidence,
+)
+from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
+    business_workload_details,
+    business_workload_items,
 )
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
     STORE_DSN_SNIPPET,
@@ -215,6 +218,23 @@ def write_json(path: Path, payload: Any) -> None:
     path.chmod(0o600)
 
 
+def running_pods_on_target(runner: Any) -> list[dict[str, Any]]:
+    """Every Running Pod on the target node, across namespaces."""
+
+    payload = json.loads(
+        runner.gpu(
+            "get",
+            "pods",
+            "-A",
+            "--field-selector",
+            f"spec.nodeName={runner.settings.target_node},status.phase=Running",
+            "-o",
+            "json",
+        ).stdout
+    )
+    return list(payload.get("items", []))
+
+
 def business_workload_refusal(workloads: list[dict[str, str]]) -> str:
     """The preflight refusal names every Pod (namespace/name, why) it found."""
 
@@ -392,19 +412,8 @@ class Runner:
         return payload
 
     def active_business_workloads(self) -> list[dict[str, str]]:
-        payload = json.loads(
-            self.gpu(
-                "get",
-                "pods",
-                "-A",
-                "--field-selector",
-                f"spec.nodeName={self.settings.target_node},status.phase=Running",
-                "-o",
-                "json",
-            ).stdout
-        )
         return business_workload_items(
-            payload.get("items", []), namespace=self.settings.namespace
+            running_pods_on_target(self), namespace=self.settings.namespace
         )
 
     def select_worker(self) -> str:
@@ -593,7 +602,9 @@ finally:
         )
 
     def validate_preflight(self) -> None:
-        workloads = self.active_business_workloads()
+        workloads = business_workload_details(
+            running_pods_on_target(self), namespace=self.settings.namespace
+        )
         if workloads:
             write_json(self.case_dir / "business-workloads.json", workloads)
             raise CaseError(business_workload_refusal(workloads))
@@ -753,9 +764,8 @@ finally:
         """The replay is done when the three records are in and nothing waits.
 
         Only the outbox and the evidence decide convergence; incident state and
-        notification suppression are judged in ``validate_final`` as separate
-        checks and must not keep the runner polling for five minutes when the
-        replay itself finished in the first fifteen seconds.
+        notification suppression are separate ``validate_final`` checks and must
+        not keep the runner polling after the replay itself finished.
         """
 
         return len(store["evidence"]) == 3 and all(
@@ -779,9 +789,8 @@ finally:
     def reconnect_once(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Block and unblock once more; the replay must not duplicate anything.
 
-        Returns the snapshot and store read by the replay wait so the caller
-        judges the same documents that satisfied convergence instead of
-        reading both again.
+        Returns the snapshot and store the replay wait read, so the caller judges
+        the documents that satisfied convergence instead of reading both again.
         """
 
         before = self.store_probe()
@@ -803,10 +812,9 @@ finally:
     def incident_checks(store: dict[str, Any]) -> dict[str, bool]:
         """Non-blocking checks on what the processor made of the replayed records.
 
-        Recorded next to the verdict, not folded into it: the case proves the
-        Collector outbox replays and that a monitor-only event never opens a
-        mutation workflow; whether the incident reached RECOVERED or the drill
-        notification was suppressed depends on cadences other cases own.
+        Recorded beside the verdict, not folded into it: the case proves the outbox
+        replays and that a monitor-only event never opens a mutation workflow;
+        RECOVERED or notification suppression depend on cadences other cases own.
         """
 
         incidents = store.get("incidents") or []
