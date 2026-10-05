@@ -528,16 +528,42 @@ def _cluster_profile_snapshot(
     return successor, override.snapshot_file, reference
 
 
+def _site_reboot_owner(
+    document: dict[str, Any], *, repository_root: Path, strict: bool
+) -> str | None:
+    """The site profile's ``nodeReboot`` owner; a relative source is read
+    under ``repository_root``. The read-only preflight (``strict=False``)
+    treats an unreadable site profile as unknown and leaves the verdict to the
+    site finalization, which reads it with the deploy's full context."""
+
+    spec = _mapping(document.get("spec"))
+    source = _mapping(spec.get("runtimeProfile")).get("source")
+    if not source:
+        return None
+    path = Path(str(source))
+    if not path.is_absolute() and (repository_root / path).is_file():
+        path = repository_root / path
+    try:
+        return profile_node_reboot_owner(path)
+    except BootstrapError:
+        if strict:
+            raise
+        return None
+
+
 def _cluster_entries(
-    document: dict[str, Any], *, repository_root: Path, state_dir: Path
+    document: dict[str, Any],
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    strict: bool = True,
 ) -> list[tuple[dict[str, Any], str, str]]:
     """``(entry, provider, pinned-or-declared version)`` per cluster that needs
     its own profile: one pinned by the join, or one whose provider the site
     profile cannot reboot."""
 
     spec = _mapping(document.get("spec"))
-    site_profile = _mapping(spec.get("runtimeProfile")).get("source")
-    owner = profile_node_reboot_owner(Path(str(site_profile))) if site_profile else None
+    owner = _site_reboot_owner(document, repository_root=repository_root, strict=strict)
     rows: list[tuple[dict[str, Any], str, str]] = []
     for entry in spec.get("clusters") or []:
         if not isinstance(entry, dict):
@@ -632,7 +658,7 @@ def preflight_cluster_profile_plans(state_dir: Path, *, repository_root: Path) -
     if not isinstance(document, dict):
         return
     for entry, provider, version in _cluster_entries(
-        document, repository_root=repository_root, state_dir=state_dir
+        document, repository_root=repository_root, state_dir=state_dir, strict=False
     ):
         _cluster_profile_snapshot(
             entry,
