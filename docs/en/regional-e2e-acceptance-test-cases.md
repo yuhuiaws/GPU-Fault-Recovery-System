@@ -8507,7 +8507,14 @@ successfully" criterion of those cases has no credible basis.
   Completion Watcher to establish the attempt observation automatically; the administrator
   must not `POST /v1/workload-observations` by hand.
 - Steps:
-  1. Confirm that at least three GPU nodes are Ready, schedulable and free of other GPU workloads.
+  1. Confirm that at least two (at most three) GPU nodes are Ready, schedulable, free of isolating taints and of other
+     GPU workloads. The runner derives the training topology from them (`scripts/e2e/regional/training_topology.py`):
+     node count = min(schedulable nodes, 3), GPUs per Pod = the nodes' allocatable `nvidia.com/gpu`, world size = their
+     product, Worker replicas = node count - 1. Three 8-GPU nodes derive the fixtures' native shape and use the checked-in
+     manifest byte for byte; two 8-GPU nodes (plain EKS) get a rewritten copy with Master + 1 Worker, 16 ranks and
+     `all_reduce=136.0`. The check names (`three_pods_on_three_nodes`, `observation_ranks_are_0_1_2`,
+     `expected_critical_ranks`) are unchanged and judged against the derived node count; the evidence records
+     `training_topology`. Fewer than two schedulable GPU nodes is a named refusal.
   2. Confirm that neither a PyTorchJob of the same name nor this job ID exists; refuse to run
      when an old object is found, and never delete or overwrite another run's workload.
   3. Run:
@@ -8799,10 +8806,22 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   "managed recovery is disabled" assertion with the provider's equivalent invariant, recorded as `eks_managed_invariant`:
   the node reboot owner is `gpu-fault-eks-adapter`, nodeReplace is observe-only, and the audit window carries neither
   `sagemaker` mutations nor EC2 `Terminate/Stop/Run/StartInstances` (`replace_events` queries both event sources).
-  DESTR-005 presupposes a warm spare; a spare-less `eks-managed` cluster is refused in preflight (fail closed) and marked
-  BLOCKED by the operator rather than given a PASS/FAIL verdict. AUTH-015 selects nodes with `cluster_scope.node_selector`
+  DESTR-003/005/008/022 on `eks-managed` presuppose a declared warm spare (`gpu-fault-admin config spare --declare`; no
+  HyperPod health label, topology = node group + instance type) and take `--hyperpod-cluster` as the cluster's `cluster_id`
+  (= the EKS cluster name): the cluster fact is `aws eks describe-cluster` (`ACTIVE`, `node_recovery=not-applicable`), the
+  provider inventory is the Kubernetes GPU nodes (name, providerID instance id, node group, instance type, Ready) with a
+  sha256 drift comparison, provider mutation events are read from `sagemaker` and EC2 `Terminate/Stop/Run/StartInstances`,
+  and the profile is expected to OWN `nodeReplace` through `gpu-fault-eks-adapter`; a spare-less cluster is still refused in
+  preflight (fail closed). AUTH-015 selects nodes with `cluster_scope.node_selector`
   (the HyperPod label, or the cluster's configured node selector).
   DESTR-023 on `eks-managed` (an XID 46 injection) exposed two product gaps, both fixed: RESET_GPU failed three times with `In use by another client` and no holder evidence -- the step's `details.gpu_client_holders` now records, at the failure, every holder of any NVIDIA device node with its container attribution, the compute apps and the kernel module reference counts, and the eks-managed quiesce also stops a Kubernetes container outside its name list that still holds the target GPU (`GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS`); the RESTART_NODE escalation rung failed with "expected exactly one adapter for gpu-fault-eks-adapter/RESTART_NODE; found 0" because the control plane's `GPU_FAULT_REMOTE_EXECUTION_OWNERS` lacked `gpu-fault-eks-adapter`, now in the patch and the generated ConfigMaps. Both need a redeploy (control plane plus the GPU cluster's Agents/installer Job). Such a FAILED node-action workflow leaves the incident QUARANTINED: release the node with `gpu-fault-admin submit-remediation --incident-id <id> --disposition restore --reference <CHG>` (`--plan` first) once the quiesce fail-safe timer has restored kubelet and the node is Ready again.
+- Site profile for a two-node plain-EKS cluster: WORKLOAD-001/002, E2E-001 and DESTR-009/012 need only `node-a`/`node-b`
+  (both schedulable); the warm-spare group DESTR-003/005/008/022 needs `fault-node: ip-10-0-33-205...`,
+  `spare-node: ip-10-0-41-164...` (`config spare --declare` first, `--release` after the group) and
+  `hyperpod-cluster: <cluster_id>`. Two nodes cannot be both "spare declared and cordoned" and "two schedulable training
+  nodes" at once: the spare group and the training group run serially with the spare released in between. ISO-001/006/007
+  and E2E-002 need two physical GPU clusters, and DESTR-014 (a two-node DAG plus a third node) stays BLOCKED with only two
+  nodes. The DESTR-009/012 minimum drops to two nodes accordingly.
 - A sensitive command failure in the regional runners (`RegionalCommandFailed`) now always names its step:
   `command failed (1): <sensitive output redacted> (step: kubectl get)` -- CLI and subcommand words only (no names,
   argument values or payloads), so the evidence `error` field locates the failure.
@@ -9510,7 +9529,8 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   is still INCONCLUSIVE.
 - Steps:
   1. Delete the old workload of the same name and pre-pull the training image on every candidate node; via
-     `gpu-training-submit`, submit the three-node 24-GPU upstream Kubeflow PyTorchJob
+     `gpu-training-submit`, submit the multi-node upstream Kubeflow PyTorchJob derived from the cluster topology (three
+     nodes 24 GPUs; two nodes 16 GPUs, see WORKLOAD-001)
      (`scripts/e2e/regional/manifests/training/xid11-three-node-pytorchjob.yaml`);
      the image must remain
      `public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38`,
@@ -9674,7 +9694,7 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   and managed jobs must not enable HyperPod auto-resume; a Profile misconfigured as `DELEGATE`
   must fail-closed, and a violating annotation discovered at runtime must be refused before the workload is written.
 - Preconditions:
-  1. A three-node PyTorchJob that can be safely restarted.
+  1. A multi-node (>= 2, topology-derived) PyTorchJob that can be safely restarted.
   2. Group C uses an independent control-plane database and a unique temporary Profile; the current site Profile is not modified.
   3. **Do not** change `NodeRecovery` at any point -- this case has nothing to do with node-level mode,
      and mixing the two changes would make the conclusion unattributable.

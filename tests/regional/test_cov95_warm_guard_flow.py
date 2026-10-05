@@ -379,9 +379,21 @@ def test_a_plain_eks_managed_cluster_passes_the_recovery_invariant_without_hyper
 ):
     """EKS profile, 2026-10-04: both cases failed "managed GPU cluster
     NodeRecovery is not None". A plain-EKS cluster has no HyperPod NodeRecovery;
-    its invariant is observe-only replacement with no provider mutation."""
+    its invariant is warm-spare-only replacement with no provider mutation, and
+    its executor words the start-up guard for its provider."""
 
     monkeypatch.setattr(audit, "MANAGED_PROVIDER", "eks-managed")
+    monkeypatch.setattr(
+        audit,
+        "deployed_executor_guard_probes",
+        lambda: {
+            **deepcopy(EXECUTOR_GUARDS),
+            "startup_guard_error": (
+                "regional EKS spare failover requires "
+                "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
+            ),
+        },
+    )
     recoveries: list[tuple] = []
     monkeypatch.setattr(
         audit,
@@ -406,7 +418,7 @@ def test_a_plain_eks_managed_cluster_passes_the_recovery_invariant_without_hyper
         "provider": "eks-managed",
         "node_recovery": "not-applicable",
         "node_reboot_owner": "gpu-fault-eks-adapter",
-        "node_replace": "observe-only",
+        "node_replace": "warm-spare-only",
         "provider_mutation_sources": ["sagemaker.amazonaws.com", "ec2.amazonaws.com"],
     }
 

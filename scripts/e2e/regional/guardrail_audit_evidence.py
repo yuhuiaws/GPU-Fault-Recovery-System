@@ -260,8 +260,9 @@ def managed_recovery_invariant_errors(
     HyperPod: ``NodeRecovery`` must be ``None`` (the product, not the provider,
     owns node recovery). Plain EKS has no HyperPod NodeRecovery; its invariant is
     that no provider-side replacement is enabled or observed: the cluster's
-    reboot owner is the EKS adapter, nodeReplace is observe-only, and the
-    CloudTrail window (judged separately) carries no EC2 replacement mutation.
+    reboot owner is the EKS adapter, nodeReplace is the warm-spare handover only
+    (no EC2 instance is replaced), and the CloudTrail window (judged separately)
+    carries no EC2 replacement mutation.
     """
 
     if provider == "eks-managed":
@@ -278,7 +279,7 @@ def eks_managed_invariant() -> dict[str, Any]:
         "provider": "eks-managed",
         "node_recovery": "not-applicable",
         "node_reboot_owner": PROVIDER_NODE_REBOOT_OWNERS["eks-managed"],
-        "node_replace": "observe-only",
+        "node_replace": "warm-spare-only",
         "provider_mutation_sources": [
             source
             for source, _names in provider_event_sources("eks-managed", frozenset())

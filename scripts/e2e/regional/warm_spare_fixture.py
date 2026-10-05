@@ -23,6 +23,7 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
 )
+from scripts.e2e.regional import warm_spare_provider  # noqa: E402
 from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -36,6 +37,7 @@ SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
+EKS_NODEGROUP_LABEL = warm_spare_provider.EKS_NODEGROUP_LABEL
 NODE_PATCH_ATTEMPTS = 3
 INSTANCE_TYPE_LABELS = (
     "node.kubernetes.io/instance-type",
@@ -526,9 +528,29 @@ def instance_type(snapshot: dict[str, Any]) -> str | None:
 
 
 class WarmSpareLiveFixture:
-    def __init__(self, regional: RegionalLiveFixture, hyperpod_cluster: str) -> None:
+    def __init__(
+        self,
+        regional: RegionalLiveFixture,
+        hyperpod_cluster: str,
+        provider: str | None = None,
+    ) -> None:
         self.regional = regional
+        # The provider cluster scope: the HyperPod cluster name, or the cluster
+        # id (= EKS cluster name) of an eks-managed cluster.
         self.hyperpod_cluster = hyperpod_cluster
+        self._provider = provider
+
+    @property
+    def provider(self) -> str:
+        """``hyperpod`` or ``eks-managed``, from the GPU nodes' labels when not given."""
+
+        if self._provider is None:
+            self._provider = warm_spare_provider.gpu_node_provider(self._gpu_nodes())
+        return self._provider
+
+    def _gpu_nodes(self) -> dict[str, Any]:
+        value = json.loads(self.regional.kubectl("gpu", "get", "node", "-o", "json"))
+        return cast(dict[str, Any], value)
 
     def node_snapshot(
         self,
@@ -567,6 +589,7 @@ class WarmSpareLiveFixture:
                     SPARE_LABEL,
                     HYPERPOD_HEALTH_LABEL,
                     INSTANCE_GROUP_LABEL,
+                    EKS_NODEGROUP_LABEL,
                     *INSTANCE_TYPE_LABELS,
                     *extra_label_keys,
                 )
@@ -592,6 +615,8 @@ class WarmSpareLiveFixture:
         return sorted(str(item["metadata"]["name"]) for item in value.get("items", []))
 
     def provider_inventory(self) -> dict[str, Any]:
+        if self.provider == warm_spare_provider.EKS_MANAGED:
+            return warm_spare_provider.eks_provider_inventory(self._gpu_nodes())
         value = json.loads(
             self.regional.run(
                 [
@@ -632,6 +657,26 @@ class WarmSpareLiveFixture:
         }
 
     def cluster_recovery(self) -> dict[str, Any]:
+        if self.provider == warm_spare_provider.EKS_MANAGED:
+            describe = json.loads(
+                self.regional.run(
+                    [
+                        "aws",
+                        "eks",
+                        "describe-cluster",
+                        "--region",
+                        self.regional.settings.region,
+                        "--name",
+                        self.hyperpod_cluster,
+                        "--output",
+                        "json",
+                    ],
+                    timeout=180,
+                ).stdout
+            )
+            return warm_spare_provider.eks_cluster_recovery(
+                describe, self.hyperpod_cluster
+            )
         value = json.loads(
             self.regional.run(
                 [
@@ -653,6 +698,19 @@ class WarmSpareLiveFixture:
             "status": value.get("ClusterStatus"),
             "node_recovery": value.get("NodeRecovery"),
         }
+
+    def replace_events(
+        self, started_at: datetime, ended_at: datetime
+    ) -> list[dict[str, Any]]:
+        """Provider replacement mutations in the window, per the cluster's provider."""
+
+        return warm_spare_provider.replace_events(
+            started_at,
+            ended_at,
+            provider=self.provider,
+            region=self.regional.settings.region,
+            command=lambda argv: self.regional.run(argv, timeout=180).stdout,
+        )
 
     def executor_environment(self) -> list[dict[str, str | None]]:
         result = []

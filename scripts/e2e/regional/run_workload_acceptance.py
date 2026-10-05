@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 from gpu_fault.admin.site import load_site  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
+    training_topology,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
@@ -116,15 +117,9 @@ CASE_IDS = (
     "GF-REGIONAL-E2E-001",
 )
 BASELINE_MANIFEST = ROOT / "examples/hyperpod/three-node-pytorchjob.yaml"
-LONG_RUNNING_MANIFEST = (
-    Path(__file__).with_name("manifests")
-    / "training"
-    / "xid11-three-node-pytorchjob.yaml"
-)
+TRAINING_MANIFESTS = Path(__file__).with_name("manifests") / "training"
+LONG_RUNNING_MANIFEST = TRAINING_MANIFESTS / "xid11-three-node-pytorchjob.yaml"
 E2E001_PROBE = Path(__file__).with_name("probes") / "e2e001_node_probe.py"
-# The executor-log markers E2E-001 step 3 greps for. Matched on word boundaries
-# so `error_count=0`, a `401`-suffixed request ID or a `403`-byte payload size
-# do not fail the preflight; the case-sensitive spelling is the spec's own.
 # `gpu-fault-admin status` costs up to thirty minutes; the group runs it once,
 # on the case that closes it, unless the operator asks otherwise.
 ADMIN_STATUS_CASE = "GF-REGIONAL-WORKLOAD-002"
@@ -284,16 +279,17 @@ def managed_fixture(
     job_id: str,
     attempt_id: str,
 ) -> ManagedWorkloadFixture:
+    topology = topology_for(regional)
     return ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
-            manifest=manifest,
+            manifest=training_topology.render_topology_manifest(manifest, topology),
             site_file=site_file,
             job_id=job_id,
             attempt_id=attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
 
@@ -307,16 +303,17 @@ def readme_fixture(
     attempt_id: str,
     case_dir: Path,
 ) -> ReadmeWorkloadFixture:
+    topology = topology_for(regional)
     return ReadmeWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
-            manifest=manifest,
+            manifest=training_topology.render_topology_manifest(manifest, topology),
             site_file=site_file,
             job_id=job_id,
             attempt_id=attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
         case_dir=case_dir,
         training_container="pytorch",
@@ -377,7 +374,8 @@ def wait_terminal_observation(
             observation = observations[0]
             if (
                 observation.get("workload_phase") == "SUCCEEDED"
-                and len(observation.get("containers") or []) == 3
+                and len(observation.get("containers") or [])
+                == topology_for(regional).node_count
                 and all(
                     item.get("terminated") and item.get("exit_code") == 0
                     for item in observation.get("containers") or []
@@ -390,6 +388,7 @@ def wait_terminal_observation(
 
 def wait_finite_workload(
     fixture: ManagedWorkloadFixture,
+    topology: training_topology.TrainingTopology,
     *,
     timeout_seconds: int = 900,
 ) -> dict[str, Any]:
@@ -403,13 +402,14 @@ def wait_finite_workload(
             continue
         pods = last["pods"]
         logs = last["heartbeat_logs"]
+        marker = topology.all_reduce_marker()
         if (
-            len(pods) == 3
-            and len({item["node"] for item in pods}) == 3
+            len(pods) == topology.node_count
+            and len({item["node"] for item in pods}) == topology.node_count
             and all(item["phase"] == "Succeeded" for item in pods)
             and all(
                 "SUCCESS" in logs.get(str(item["name"]), "")
-                and "all_reduce=300.0" in logs.get(str(item["name"]), "")
+                and marker in logs.get(str(item["name"]), "")
                 for item in pods
             )
         ):
@@ -460,15 +460,20 @@ def admin_status(state_dir: Path) -> dict[str, Any]:
     }
 
 
+# One training topology per cluster, derived from its GPU nodes on first use.
+TOPOLOGIES: dict[str, training_topology.TrainingTopology] = {}
+derive_topology = training_topology.derive_training_topology
+
+
+def topology_for(regional: RegionalLiveFixture) -> training_topology.TrainingTopology:
+    key = regional.settings.cluster_id
+    if key not in TOPOLOGIES:
+        TOPOLOGIES[key] = derive_topology(regional.gpu_nodes())
+    return TOPOLOGIES[key]
+
+
 def prewarm_nodes(regional: RegionalLiveFixture) -> list[str]:
-    nodes = [
-        str(item["name"])
-        for item in regional.gpu_nodes()
-        if item["ready"] == "True" and not item["unschedulable"]
-    ]
-    if len(nodes) < 3:
-        raise RegionalFixtureError("at least three schedulable GPU nodes are required")
-    return nodes
+    return list(topology_for(regional).candidate_nodes)
 
 
 def admin_status_policy(case_id: str, *, skip: bool) -> tuple[bool, str]:
@@ -692,8 +697,7 @@ def run_workload_baseline(
             case_dir=case_dir,
         )
         if case_id == "GF-REGIONAL-WORKLOAD-001":
-            # `submit` raises on a non-zero exit, so reaching this line is
-            # the returncode-0 fact the check below records.
+            # `submit` raises on a non-zero exit: reaching here is returncode 0.
             submission = {**fixture.submit(), "returncode": 0}
             not_applicable["render_contract_equivalent"] = (
                 "WORKLOAD-001 submits through gpu-training-submit directly; the "
@@ -734,7 +738,7 @@ def run_workload_baseline(
                 "annotate_returncode": annotate.returncode,
                 "dry_run_returncode": dry_run.returncode,
             }
-        finite = wait_finite_workload(fixture)
+        finite = wait_finite_workload(fixture, topology_for(regional))
         training_logs = {
             str(item["name"]): regional.kubectl(
                 "gpu",
@@ -762,7 +766,7 @@ def run_workload_baseline(
         )
         terminal_observation = terminal["observations"][0]
         rank_errors = observation_rank_errors(
-            terminal_observation, expected_ranks={0, 1, 2}
+            terminal_observation, expected_ranks=topology_for(regional).ranks
         )
         decision = terminal.get("decision") or {}
         terminal_event_key = f"{target.cluster_id}/{attempt_id}/TrainingAttemptTerminal"
@@ -777,17 +781,18 @@ def run_workload_baseline(
             attempt_id=attempt_id,
         )
         observations = after_delete["observations"]
+        expected = topology_for(regional).node_count
         checks: dict[str, bool] = {
             "submission_succeeded": int(submission["returncode"]) == 0,
             "managed_metadata_complete": not metadata,
-            "three_pods_on_three_nodes": len(finite["pods"]) == 3
-            and len({item["node"] for item in finite["pods"]}) == 3,
+            "three_pods_on_three_nodes": len(finite["pods"]) == expected
+            and len({item["node"] for item in finite["pods"]}) == expected,
             "nccl_all_reduce_succeeded": not collectives,
             "per_rank_loss_non_increasing": not losses,
             "terminal_observation_succeeded": (
                 len(terminal["observations"]) == 1
                 and terminal_observation["workload_phase"] == "SUCCEEDED"
-                and terminal_observation.get("expected_critical_ranks") == 3
+                and terminal_observation.get("expected_critical_ranks") == expected
                 and observation_pod_uids(terminal_observation)
                 == {str(item["uid"]) for item in finite["pods"]}
             ),
@@ -800,12 +805,13 @@ def run_workload_baseline(
                 and observations[0]["workload_phase"] == "SUCCEEDED"
                 and observations[0].get("containers")
                 == terminal_observation.get("containers")
-                and observations[0].get("expected_critical_ranks") == 3
+                and observations[0].get("expected_critical_ranks") == expected
             ),
             "no_remote_mutation_commands": not terminal["commands"],
         }
         if render_equivalence is not None:
             checks["render_contract_equivalent"] = render_equivalence
+        result["training_topology"] = topology_for(regional).evidence()
         status: dict[str, Any]
         if run_status:
             status = admin_status(cast(Path, state_dir))
@@ -834,8 +840,7 @@ def run_workload_baseline(
     except Exception as exc:
         failure = exc
     finally:
-        # Each step in its own guard: a TimeoutExpired from the workload delete
-        # used to skip the prewarm cleanup and replace the original error.
+        # Each step in its own guard: a delete timeout must not skip the prewarm cleanup.
         cleanup_errors: list[str] = []
         if fixture is not None and not deletion_verified:
             cleanup_errors.extend(
@@ -1042,7 +1047,7 @@ def prepare_iso001_workload(
             attempt_id=attempt_id,
         ),
         node=str(source["pods"][0]["node"]),
-        expected_gpu_count=24,
+        expected_gpu_count=topology_for(regional).world_size,
     )
     if source_observation_errors(
         observation,
@@ -1102,9 +1107,8 @@ def run_iso001(
         for regional in fixtures:
             if regional.gpu_workloads():
                 raise RegionalFixtureError("target cluster already has GPU workloads")
-        # Spec step 5's empty baseline, taken before anything is submitted:
-        # a budget, decision or observation left by an earlier run under this
-        # identity would be read as this run's isolation result.
+        # Spec step 5's empty baseline, before anything is submitted: records left
+        # by an earlier run under this identity would read as this run's result.
         baseline_states = [
             workload_store(regional, job_id=job_id, attempt_id=attempt_id)
             for regional in fixtures
@@ -1123,8 +1127,7 @@ def run_iso001(
             attempt_id=attempt_id,
         )
 
-        # The two clusters' prewarm/submit/wait chains share nothing, and each
-        # is the longest stretch of the case; run them together.
+        # The clusters' prewarm/submit/wait chains share nothing; run them together.
         with ThreadPoolExecutor(max_workers=2) as pool:
             prepared = list(
                 pool.map(prepare, zip(fixtures, workloads, prewarms, strict=True))
@@ -1176,7 +1179,7 @@ def run_iso001(
                     attempt_id=attempt_id,
                 ),
                 node=str(source["pods"][0]["node"]),
-                expected_gpu_count=24,
+                expected_gpu_count=topology_for(regional).world_size,
             )
             for regional, source in zip(fixtures, sources, strict=True)
         ]
@@ -1239,7 +1242,8 @@ def run_iso001(
         if workflow_a.get("request_id"):
             injection_context["workflow_request_ids"] = [str(workflow_a["request_id"])]
         workloads[0].authorize_restart(state_a)
-        errors = workload_case.workflow_errors(state_a, expected_gpu_count=24)
+        world = topology_for(regional_a).world_size
+        errors = workload_case.workflow_errors(state_a, expected_gpu_count=world)
         errors.extend(
             recovery_identity_errors(
                 state_a,
@@ -1299,9 +1303,8 @@ def run_iso001(
                     cleanup_errors.append(
                         f"physical Observation restore: {type(exc).__name__}"
                     )
-        # Cluster A's workflow may still be RUNNING when the body fails; its
-        # workload is deleted only once quiescence is proven. Cluster B never
-        # had a workflow, so its workload goes straight away.
+        # Cluster A's workflow may still be RUNNING when the body fails: its workload
+        # is deleted only once quiescence is proven; B never had one and goes now.
         for index, (regional, workload) in enumerate(zip(fixtures, workloads)):
             if not submission_started[index]:
                 continue
@@ -1481,9 +1484,8 @@ def e2e_preflight(
                 "readiness": readiness,
             }
         )
-        # Word-boundary matches with the offending lines recorded: the old
-        # substring scan flagged `error_count=0` and any 401/403 digit run,
-        # and told the operator nothing about what it had seen.
+        # Word-boundary matches with the offending lines recorded: a substring scan
+        # flagged `error_count=0` and any 401/403 digit run and recorded nothing.
         suspicious.extend(
             {"pod": pod["name"], **hit} for hit in suspicious_log_lines(text)
         )
@@ -1495,9 +1497,8 @@ def e2e_preflight(
     if not executor_logs:
         errors.append("no Ready executor was observed")
     for node in nodes:
-        # A spare-pool node is cordoned by design while it waits in the pool
-        # (hyperpod_spares keeps spec.unschedulable=True until it is handed
-        # over), so only its readiness is a preflight condition.
+        # A spare-pool node is cordoned by design while it waits (hyperpod_spares
+        # keeps it unschedulable until handover), so only readiness is checked.
         spare = (node.get("labels") or {}).get("gpu-fault.io/spare") == "true"
         if node["ready"] != "True" or (node["unschedulable"] and not spare):
             errors.append(f"{node['name']} is not Ready and schedulable")
@@ -1550,7 +1551,9 @@ def e2e001_recovery_outcome(
     marker = str(injection_context["marker"])
     injected_at = injection_context["observed_after"]
     workflow = state.get("workflow") or {}
-    errors = workload_case.workflow_errors(state, expected_gpu_count=24)
+    errors = workload_case.workflow_errors(
+        state, expected_gpu_count=topology_for(regional).world_size
+    )
     errors.extend(
         recovery_identity_errors(
             state,
@@ -1636,9 +1639,8 @@ def e2e001_recovery_outcome(
         "workload_pod_uids_changed": {
             str(item["uid"]) for item in target_workload["pods"]
         }.isdisjoint({str(item["uid"]) for item in source["pods"]}),
-        # The new attempt is a different, single, non-empty ID on every
-        # replaced Pod; UID disjointness alone also holds for a plain Pod
-        # restart of the same attempt.
+        # The new attempt is one different, non-empty ID on every replaced Pod;
+        # UID disjointness alone also holds for a plain Pod restart.
         "workload_attempt_id_changed": (
             source_attempts == {attempt_id}
             and len(target_attempts) == 1
@@ -1666,9 +1668,8 @@ def e2e001_recovery_outcome(
         "control_plane_eks_errors": blast_errors,
         "gpu_nodes_after_restart": nodes_after,
     }
-    # Consumed by BLAST-001 (blast_acceptance_cases_1): maintenance_window
-    # .start/.end and control-plane-current.json's workflows[] with their
-    # official_steps/safety_steps/step_executions. Keep these keys.
+    # Consumed by BLAST-001 (blast_acceptance_cases_1): maintenance_window.start/.end
+    # and control-plane-current.json's workflows[] with their steps. Keep these keys.
     return result
 
 
@@ -1717,6 +1718,7 @@ def run_e2e001(
         "verdict": "FAIL",
         "errors": [],
         "baseline_state": baseline_state,
+        "training_topology": topology_for(regional).evidence(),
     }
     failure: BaseException | None = None
     injection_context: dict[str, Any] | None = None
@@ -1737,7 +1739,7 @@ def run_e2e001(
                 attempt_id=attempt_id,
             ),
             node=node,
-            expected_gpu_count=24,
+            expected_gpu_count=topology_for(regional).world_size,
         )
         if source_observation_errors(
             observation,
@@ -1857,8 +1859,7 @@ def run_e2e001(
                 cleanup_errors.append("prewarm resources remain")
         except Exception as exc:
             cleanup_errors.append(f"prewarm: {type(exc).__name__}: {exc}")
-        # "清理后节点恢复 Ready 与可调度" is judged after the cleanup, not on the
-        # snapshot taken while the workload was still being replaced.
+        # "清理后节点恢复 Ready 与可调度" is judged after the cleanup, not mid-replacement.
         try:
             nodes_after_cleanup = regional.gpu_nodes()
             result["gpu_nodes_after_cleanup"] = nodes_after_cleanup
@@ -2060,9 +2061,8 @@ def main() -> int:
     attempt_id = arguments.attempt_id.strip() or (
         f"{job_id}-a001" if arguments.job_id else default_attempt
     )
-    # The release and cluster this evidence is bound to: the predecessor must
-    # have earned its PASS against the same pair, and the result carries it so
-    # the next case can demand the same.
+    # The release and cluster this evidence is bound to: the predecessor earned its
+    # PASS against the same pair, and the result carries it for the next case.
     identity = site.regional(primary).evidence_identity()
     if not identity["release_id"].strip():
         raise WorkloadAcceptanceError("the deployed release identity is missing")

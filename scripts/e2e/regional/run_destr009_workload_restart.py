@@ -45,6 +45,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     settings_from_arguments,
 )
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional import training_topology  # noqa: E402
 
 DEFAULT_MANIFEST = (
     Path(__file__).with_name("manifests")
@@ -268,8 +269,8 @@ def read_only_preflight(
     errors.extend(runtime_identity_errors(runtime_identity))
     if not predecessor["valid"]:
         errors.append("DESTR-002 predecessor evidence is not PASS")
-    if len(candidates) < 3:
-        errors.append("fewer than three Ready schedulable untainted GPU nodes")
+    if len(candidates) < training_topology.MINIMUM_NODES:
+        errors.append("fewer than two Ready schedulable untainted GPU nodes")
     gpu_workloads = fixture.gpu_workloads()
     if gpu_workloads:
         errors.append("GPU cluster already has active or pending GPU workloads")
@@ -300,6 +301,35 @@ def read_only_preflight(
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
+
+
+def case_topology(preflight: dict[str, Any]) -> training_topology.TrainingTopology:
+    """The Master/Worker shape the preflight's candidate nodes can run (>= 2 nodes)."""
+
+    return training_topology.derive_training_topology(
+        preflight["candidate_nodes"], schedulable_only=False
+    )
+
+
+def topology_manifest(
+    settings: Settings, topology: training_topology.TrainingTopology, case_dir: Path
+) -> Path:
+    """The case manifest for ``topology``: the fixture itself on three native nodes."""
+
+    return training_topology.render_topology_manifest(
+        settings.manifest, topology, case_dir / "topology-workload.yaml"
+    )
+
+
+def observe_topology(
+    regional: RegionalLiveFixture,
+    settings: AttemptIdentity,
+    node: str,
+    topology: training_topology.TrainingTopology,
+) -> dict[str, Any]:
+    return wait_observation(
+        regional, settings, node=node, expected_gpu_count=topology.world_size
+    )
 
 
 def observation_gpu_uuids(observation: dict[str, Any]) -> set[str]:
@@ -783,6 +813,7 @@ def workflow_errors(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
+    topology = case_topology(preflight)
     details = {
         "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
@@ -794,10 +825,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             {"name": item["name"], "uid": item["uid"]}
             for item in preflight["candidate_nodes"]
         ],
+        "training_topology": topology.evidence(),
         "mutation": (
-            "prewarm the pinned training image, submit one managed three-node "
-            "24-GPU PyTorchJob, replay XID 11 through the collector API, and "
-            "allow the GPU-side executor to stop and restart it once"
+            f"prewarm the pinned training image, submit one managed "
+            f"{topology.node_count}-node {topology.world_size}-GPU PyTorchJob, replay "
+            "XID 11 through the collector API, and allow the GPU-side executor to "
+            "stop and restart it once"
         ),
         "preflight_identity": {
             "release_id": preflight["release_id"],
@@ -812,10 +845,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             "DESTR-002 has not passed in formal sequence",
             "preflight or focused regression failure",
-            "fewer than three idle Ready GPU nodes",
+            "fewer than two idle Ready GPU nodes",
             "Profile, node inventory or release drift",
             "image prewarm, PyTorchJob scheduling or NCCL heartbeat failure",
-            "attempt observation lacks 24 unique GPU UUIDs",
+            f"attempt observation lacks {topology.world_size} unique GPU UUIDs",
             "processor receipt is not HTTP 200",
             "workflow differs from the three-step workload contract",
             "restart budget, Pod replacement or target GPU count is incorrect",
@@ -1068,16 +1101,17 @@ def execute_case(
     planned = verify_plan_identity(case_dir, preflight)
 
     regional = RegionalLiveFixture(settings.regional)
+    topology = case_topology(preflight)
     workload = ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
-            manifest=settings.manifest,
+            manifest=topology_manifest(settings, topology, case_dir),
             site_file=settings.site_file,
             job_id=settings.job_id,
             attempt_id=settings.attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
     run_id = f"destr009-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
@@ -1105,7 +1139,7 @@ def execute_case(
     try:
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError("maintenance window ended before image prewarm")
-        candidate_names = [str(item["name"]) for item in preflight["candidate_nodes"]]
+        candidate_names = list(topology.candidate_nodes)
         prewarmed = prewarm.create(candidate_names)
         cached = prewarm.cached_nodes()
         write_json_atomic(
@@ -1126,7 +1160,7 @@ def execute_case(
         write_json_atomic(case_dir / "workload-source.json", source)
         source_uids = {str(item["uid"]) for item in source["pods"]}
         target_node = str(source["pods"][0]["node"])
-        observation = wait_observation(regional, settings, node=target_node)
+        observation = observe_topology(regional, settings, target_node, topology)
         write_json_atomic(case_dir / "source-observation.json", observation)
         node_metadata = regional.node_metadata(target_node)
         product = normalize_product(node_metadata.get("product"))
@@ -1167,7 +1201,7 @@ def execute_case(
         workflow_request_id = (state.get("workflow") or {}).get("request_id")
         if workflow_request_id:
             workflow_request_ids.append(str(workflow_request_id))
-        errors = workflow_errors(state)
+        errors = workflow_errors(state, expected_gpu_count=topology.world_size)
         workload.authorize_restart(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "workload-target.json", target)
@@ -1179,15 +1213,14 @@ def execute_case(
         target_uids = {str(item["uid"]) for item in target["pods"]}
         if not target_uids.isdisjoint(source_uids):
             errors.append("old and new PyTorchJob Pod UIDs overlap")
-        if len({item["node"] for item in target["pods"]}) != 3:
-            errors.append("restarted PyTorchJob is not spread across three nodes")
+        if len({item["node"] for item in target["pods"]}) != topology.node_count:
+            errors.append("restarted PyTorchJob is not spread across every node")
         budget = state.get("restart_budget") or {}
         if budget.get("restart_count") != 1 or budget.get("budget") != 1:
             errors.append("restart budget did not advance exactly once")
         provider_window_end = datetime.now(timezone.utc)
         provider = regional.provider_events(injection_started, provider_window_end)
-        # "No provider mutation" cannot be proven inside CloudTrail's delivery
-        # window; an empty read is recorded as provisional, not as proof.
+        # A negative provider claim inside CloudTrail's delivery window is provisional.
         provider_provisional = not provider and regional.provider_events_provisional(
             provider_window_end
         )

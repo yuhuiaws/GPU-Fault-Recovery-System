@@ -1048,6 +1048,24 @@ Semantics and boundaries of `eks-managed`:
   node (`nvidiactl`, `nvidia-uvm`, a `(deleted)` replaced node included) with its cgroup/container attribution,
   `--query-compute-apps`, and the `nvidia*`/`gdrdrv` kernel module reference counts; the error text ends with
   `device holders: <pid>:<comm>:<devices> (container <id>)`. Command lines are never read.
+- Warm spares and `REPLACE_NODE`: an `eks-managed` cluster supports warm spares too. `gpu-fault-admin config spare
+  --declare/--release` judges the node by the cluster's `provider` in the site: no HyperPod health label is required,
+  the node must be Ready and carry `eks.amazonaws.com/nodegroup`, and its topology is compared with the fault node's
+  as node group + instance type (HyperPod keeps instance group + instance type; the report gains `provider`). The
+  Executor builds the spare coordinator on both providers (`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true` requires
+  `GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true`; the start-up guard reads `regional EKS spare failover requires ...`).
+  On `eks-managed`, `REPLACE_NODE` is the **Kubernetes-level warm-spare handover** (`HEALTHY_WARM_SPARE_ONLY`: isolate
+  the fault node, uncordon the declared spare, health snapshot, restart the workload); the provider replacement API is
+  never called (`GPU_FAULT_ALLOW_HYPERPOD_REPLACE` stays false; the EKS preflight no longer refuses a warm-spare-only
+  REPLACE on the allowlist, while `submit(REPLACE)` still refuses). `config/runtime-profile.regional-eks-safe.example.yaml`
+  therefore OWNs `nodeReplace` through `gpu-fault-eks-adapter` with observed version `warm-spare-v1`, the executor's
+  ownership advertisement says OWN, and a deployed site rolls the new `regional-eks-<digest12>` profile version with
+  `gpu-fault-admin deploy --approve-profile-plan`. Without a declared spare REPLACE_NODE still fails closed, exactly as on
+  HyperPod with `NodeRecovery=None`.
+- `submit-remediation` stamps the **target cluster's** Runtime Profile version (`clusters[].runtimeProfile.version` in the
+  site, the site profile only without an override): the control plane compiles step owners, escalation rungs and
+  provider correlation against a workflow's `runtime_profile_version`, so a restore for an `eks-v1` cluster stamped
+  `hyperpod-v1` on a mixed site would hand reboot/replace dispositions to the wrong adapter.
 - Join prerequisite: every `allowedNamespaces` entry (the workload namespaces the Executor/watcher act in) other than
   the control-plane namespace must already exist on the target cluster -- the release renders a Role/RoleBinding per
   namespace and server-dry-runs it, so a missing one failed the join deep inside the release and rolled it back
@@ -1068,8 +1086,8 @@ Semantics and boundaries of `eks-managed`:
   group's role), then falls back to the zone labels.
 - The Completion Watcher runs with `GPU_FAULT_WATCHER_ENVIRONMENT=eks`.
 
-**Out of scope** (deliberately not provided for `eks-managed`): provider-side node replacement (`nodeReplace` can only
-OBSERVE; after a Spot interruption the node comes back under a new name and instance id -- retire the old Agent with
+**Out of scope** (deliberately not provided for `eks-managed`): provider-side node replacement (`nodeReplace` is OWNed
+only as the warm-spare handover and never calls a provider replacement API; after a Spot interruption the node comes back under a new name and instance id -- retire the old Agent with
 `workflow-reconcile --retire-departed-agents` and let the reconciler install the new node), HyperPod health labels /
 HMA signals, `UpdateClusterSoftware` re-imaging, HyperPod advisory notifications and the legacy single-cluster
 `deploy/hyperpod/deploy.sh`; the CPU control-plane cluster must still be HyperPod. When the GPU nodes carry the

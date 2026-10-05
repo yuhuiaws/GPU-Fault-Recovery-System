@@ -1131,8 +1131,10 @@ def probe_errors(
                     "deployed coordinator guard returned an unexpected result"
                 )
             startup_error = str(executor_probes.get("startup_guard_error") or "")
+            # The executor names its provider in the guard: HyperPod or EKS.
+            label = "EKS" if MANAGED_PROVIDER == "eks-managed" else "HyperPod"
             if (
-                "regional HyperPod spare failover requires "
+                f"regional {label} spare failover requires "
                 "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
             ) not in startup_error:
                 errors.append(

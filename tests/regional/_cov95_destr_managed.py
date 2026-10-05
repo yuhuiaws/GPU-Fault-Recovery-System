@@ -126,6 +126,19 @@ class ManagedHarness(ActionHarness):
 
 
 class ManagedRegional(WorkloadRegional):
+    def gpu_nodes(self) -> list[dict[str, Any]]:
+        # Three Ready, schedulable GPU nodes: the fixtures' native topology.
+        return [
+            {
+                "name": f"gpu-{suffix}",
+                "uid": f"uid-{suffix}",
+                "ready": "True",
+                "unschedulable": False,
+                "taints": [],
+            }
+            for suffix in "abc"
+        ]
+
     def __init__(self, harness: ManagedHarness) -> None:
         super().__init__(harness)
         self.settings = harness.settings.regional

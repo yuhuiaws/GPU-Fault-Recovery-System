@@ -90,10 +90,8 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional import warm_spare_provider  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
-    HYPERPOD_HEALTH_LABEL,
-    INSTANCE_GROUP_LABEL,
-    PROVIDER_REPLACE_EVENTS,
     QUARANTINE_TAINT,
     SPARE_LABEL,
     SPARE_POOL_STATE_ANNOTATION,
@@ -306,6 +304,7 @@ def read_only_preflight(
     state["queue"] = fault_state.get("queue")
     state["remote_commands"] = fault_state.get("remote_commands")
     cluster = warm.cluster_recovery()
+    cluster.setdefault("provider", warm.provider)
     executor_env = warm.executor_environment()
     synthetic_gates = warm.synthetic_replacement_gates()
     predecessor = predecessor_evidence(
@@ -342,8 +341,8 @@ def read_only_preflight(
         errors.append("spare node is not Ready and cordoned")
     if spare["labels"].get(SPARE_LABEL) != "true":
         errors.append("spare node is not declared by the spare label")
-    if spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
-        errors.append("spare HyperPod health label is not Schedulable")
+    provider = cluster.get("provider") or warm_spare_provider.HYPERPOD
+    errors.extend(warm_spare_provider.spare_health_errors(spare, provider))
     if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
         errors.append("spare node already has a reservation")
     if spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) not in {
@@ -353,9 +352,9 @@ def read_only_preflight(
         errors.append("spare pool state is not AVAILABLE")
     if warm.spare_nodes() != [settings.spare_node]:
         errors.append("declared spare set does not exactly match --spare-node")
-    if fault["labels"].get(INSTANCE_GROUP_LABEL) != spare["labels"].get(
-        INSTANCE_GROUP_LABEL
-    ) or instance_type(fault) != instance_type(spare):
+    if warm_spare_provider.topology(fault, provider) != warm_spare_provider.topology(
+        spare, provider
+    ):
         errors.append("fault and spare topology do not match at baseline")
     active_targets = [
         item
@@ -369,7 +368,7 @@ def read_only_preflight(
         agent = agent_by_node(state, node)
         if agent is None or agent.get("lifecycle_state") != "ACTIVE":
             errors.append(f"{node} does not have exactly one ACTIVE Agent")
-    errors.extend(profile_errors(state.get("profile")))
+    errors.extend(profile_errors(state.get("profile"), provider))
     capabilities: dict[str, Any] = {}
     try:
         capabilities = read_capabilities(regional)
@@ -394,8 +393,7 @@ def read_only_preflight(
         errors.append("remote command queue state is unknown")
     elif commands["open_by_cluster"]:
         errors.append("remote command queue is not empty")
-    if cluster.get("status") != "InService" or cluster.get("node_recovery") != "None":
-        errors.append("HyperPod cluster is not InService with NodeRecovery=None")
+    errors.extend(warm_spare_provider.cluster_recovery_errors(cluster, provider))
     if len(executor_env) < 1 or any(
         item.get("spare_failover") != "true"
         or item.get("remote_state") != "true"
@@ -544,19 +542,24 @@ class ScenarioFixture:
             )
             return {"removed_spare_label": True}
         if self.scenario == "topology-mismatch":
+            # The provider's failure-domain group label: HyperPod's instance
+            # group, the managed node group on plain EKS.
+            group_label = warm_spare_provider.TOPOLOGY_GROUP_LABELS[
+                warm_spare_provider.normalized(self.warm.provider)
+            ]
             self.node_mutation = NodeMutationFixture(
                 self.warm,
                 self.settings.spare_node,
-                label_keys=(INSTANCE_GROUP_LABEL,),
+                label_keys=(group_label,),
             )
             mismatch = f"acceptance-mismatch-{self.run_id[-12:]}"
             self.node_mutation.apply(
                 NodePatch(
-                    labels={INSTANCE_GROUP_LABEL: mismatch},
+                    labels={group_label: mismatch},
                     annotations={},
                 )
             )
-            return {"instance_group": mismatch}
+            return {"instance_group": mismatch, "label": group_label}
         if self.scenario == "reserved-by-other":
             self.node_mutation = NodeMutationFixture(
                 self.warm,
@@ -1088,12 +1091,11 @@ def _run_scenario(
         )
         provider_after = warm.provider_inventory()
         if provider_after != provider_baseline:
-            errors.append("HyperPod provider inventory changed")
+            errors.append("provider node inventory changed")
         ended_at = datetime.now(timezone.utc)
-        provider_events = regional.provider_events(started_at, ended_at)
-        if any(
-            item["event_name"] in PROVIDER_REPLACE_EVENTS for item in provider_events
-        ):
+        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS).
+        provider_events = warm.replace_events(started_at, ended_at)
+        if provider_events:
             errors.append("provider replace/delete mutation appeared")
         result.update(
             {

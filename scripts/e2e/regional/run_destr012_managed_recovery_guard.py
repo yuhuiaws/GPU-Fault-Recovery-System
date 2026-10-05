@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_restart,
 )
+from scripts.e2e.regional import training_topology  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -410,8 +411,8 @@ def read_only_preflight(
     errors.extend(runtime_identity_errors(runtime_identity))
     if not predecessor["valid"]:
         errors.append("DESTR-009 predecessor evidence is not PASS")
-    if len(candidates) < 3:
-        errors.append("fewer than three Ready schedulable untainted GPU nodes")
+    if len(candidates) < training_topology.MINIMUM_NODES:
+        errors.append("fewer than two Ready schedulable untainted GPU nodes")
     gpu_workloads = regional.gpu_workloads()
     if gpu_workloads:
         errors.append("GPU cluster already has active or pending GPU workloads")
@@ -442,6 +443,14 @@ def read_only_preflight(
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
+
+
+def group_a_topology(
+    regional: RegionalLiveFixture,
+) -> training_topology.TrainingTopology:
+    """Group A's Master/Worker shape: what the cluster's GPU nodes can run (>= 2)."""
+
+    return training_topology.derive_training_topology(regional.gpu_nodes())
 
 
 def workload_settings(
@@ -645,16 +654,19 @@ def run_group_a(
     maintenance_window_end: datetime,
 ) -> dict[str, Any]:
     case_settings = workload_settings(settings, group="A")
+    topology = group_a_topology(regional)
     workload = ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
-            manifest=case_settings.manifest,
+            manifest=training_topology.render_topology_manifest(
+                case_settings.manifest, topology, case_dir / "group-a-topology.yaml"
+            ),
             site_file=case_settings.site_file,
             job_id=case_settings.job_id,
             attempt_id=case_settings.attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
     result: dict[str, Any] = {
@@ -684,7 +696,7 @@ def run_group_a(
             regional,
             case_settings,
             node=target_node,
-            expected_gpu_count=24,
+            expected_gpu_count=topology.world_size,
         )
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError("maintenance window ended before group A")
@@ -720,7 +732,7 @@ def run_group_a(
             workflow_request_ids.append(str(workflow_request_id))
         errors = workload_restart.workflow_errors(
             state,
-            expected_gpu_count=24,
+            expected_gpu_count=topology.world_size,
         )
         official_steps = workload_restart.workflow_official_steps(state)
         errors.extend(group_a_owner_errors(official_steps))
@@ -1179,8 +1191,12 @@ def audit_workload_residuals(
                 job_id=case_settings.job_id,
                 attempt_id=case_settings.attempt_id,
                 restart_budget=1,
-                expected_pods=3 if group == "A" else 1,
-                expected_gpu_count=24 if group == "A" else 1,
+                expected_pods=group_a_topology(regional).node_count
+                if group == "A"
+                else 1,
+                expected_gpu_count=(
+                    group_a_topology(regional).world_size if group == "A" else 1
+                ),
             ),
         )
         try:

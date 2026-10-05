@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, cast
 
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS, cluster_provider
 from scripts.e2e.regional.destr008_journal import SCENARIOS
 from scripts.e2e.regional.warm_spare_fixture import (
     INSTANCE_TYPE_LABELS,
@@ -68,9 +69,16 @@ def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | No
     return None
 
 
-def profile_errors(profile: dict[str, Any] | None) -> list[str]:
+def profile_errors(
+    profile: dict[str, Any] | None, provider: str | None = None
+) -> list[str]:
+    """The capabilities the warm-spare case needs OWNed, by the provider's adapter."""
+
     expected = {
-        "nodeReplace": ("gpu-fault-hyperpod-adapter", "regional-cluster-executor"),
+        "nodeReplace": (
+            PROVIDER_NODE_REBOOT_OWNERS[cluster_provider(provider).value],
+            "regional-cluster-executor",
+        ),
         "workloadStop": (
             "gpu-fault-kubernetes-adapter",
             "regional-cluster-executor",

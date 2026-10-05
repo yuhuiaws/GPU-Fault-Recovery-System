@@ -214,6 +214,11 @@ class _FakeWarm:
     def provider_inventory(self) -> dict[str, Any]:
         return {"count": 2, "sha256": "abc"}
 
+    provider = "hyperpod"
+
+    def replace_events(self, *_args: Any) -> list[dict[str, Any]]:
+        return []
+
 
 def _patch_preflight(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     identity_calls: list[dict[str, Any]] = []

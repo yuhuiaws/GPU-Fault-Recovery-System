@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import run_destr003_warm_spare_failover as failover
+from scripts.e2e.regional import warm_spare_provider
 from scripts.e2e.regional import run_destr008_warm_spare_shortage as shortage
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
 from scripts.e2e.regional.warm_spare_fixture import (
@@ -382,9 +383,19 @@ class FakeRegional:
 
 
 class FakeWarm:
+    provider = "hyperpod"
+
     def __init__(self, harness: WarmHarness):
         self.h = harness
         self.regional = harness.regional
+
+    def replace_events(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        # The real fixture keeps only replacement mutations of the provider.
+        return [
+            item
+            for item in self.regional.provider_events(start, end)
+            if item.get("event_name") in warm_spare_provider.PROVIDER_REPLACE_EVENTS
+        ]
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         self.h.call(f"node.{node}")

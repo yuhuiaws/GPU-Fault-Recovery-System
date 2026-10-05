@@ -43,18 +43,15 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional import warm_spare_provider  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
-    HYPERPOD_HEALTH_LABEL,
-    INSTANCE_GROUP_LABEL,
     OWNERSHIP_ANNOTATIONS,
-    PROVIDER_REPLACE_EVENTS,
     QUARANTINE_TAINT,
     SPARE_LABEL,
     SPARE_POOL_STATE_ANNOTATION,
     SPARE_RESERVATION_ANNOTATION,
     WarmSpareLiveFixture,
     agent_by_node,
-    instance_type,
 )
 
 DEFAULT_MANIFEST = (
@@ -196,9 +193,14 @@ def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | No
     return None
 
 
-def profile_errors(profile: dict[str, Any] | None) -> list[str]:
+def profile_errors(
+    profile: dict[str, Any] | None, provider: str | None = None
+) -> list[str]:
     expected = {
-        "nodeReplace": ("gpu-fault-hyperpod-adapter", "regional-cluster-executor"),
+        "nodeReplace": (
+            warm_spare_provider.lifecycle_owner(provider),
+            "regional-cluster-executor",
+        ),
         "workloadStop": (
             "gpu-fault-kubernetes-adapter",
             "regional-cluster-executor",
@@ -253,8 +255,8 @@ def preflight_errors(
         errors.append("spare node is not Ready and cordoned")
     if spare["labels"].get(SPARE_LABEL) != "true":
         errors.append("spare node is not declared by the spare label")
-    if spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
-        errors.append("spare HyperPod health label is not Schedulable")
+    provider = cluster.get("provider") or warm_spare_provider.HYPERPOD
+    errors.extend(warm_spare_provider.spare_health_errors(spare, provider))
     if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
         errors.append("spare node already has a reservation")
     if spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) not in {
@@ -264,9 +266,9 @@ def preflight_errors(
         errors.append("spare pool state is not AVAILABLE")
     if spare_nodes != [settings.spare_node]:
         errors.append("declared spare set does not exactly match --spare-node")
-    if fault["labels"].get(INSTANCE_GROUP_LABEL) != spare["labels"].get(
-        INSTANCE_GROUP_LABEL
-    ) or instance_type(fault) != instance_type(spare):
+    if warm_spare_provider.topology(fault, provider) != warm_spare_provider.topology(
+        spare, provider
+    ):
         errors.append("fault and spare topology do not match")
     active_on_targets = [
         item
@@ -279,7 +281,7 @@ def preflight_errors(
         agent = agent_by_node(state, node)
         if agent is None or agent.get("lifecycle_state") != "ACTIVE":
             errors.append(f"{node} does not have exactly one ACTIVE Agent")
-    errors.extend(profile_errors(state.get("profile")))
+    errors.extend(profile_errors(state.get("profile"), provider))
     if (state.get("profile") or {}).get("warnings"):
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(state.get("queue")):
@@ -289,8 +291,7 @@ def preflight_errors(
         errors.append("remote command queue state is unknown")
     elif commands["open_by_cluster"]:
         errors.append("remote command queue is not empty")
-    if cluster.get("status") != "InService" or cluster.get("node_recovery") != "None":
-        errors.append("HyperPod cluster is not InService with NodeRecovery=None")
+    errors.extend(warm_spare_provider.cluster_recovery_errors(cluster, provider))
     if len(executor_env) < 1 or any(
         item.get("spare_failover") != "true"
         or item.get("remote_state") != "true"
@@ -377,8 +378,10 @@ def read_only_preflight(
         if reusable_tests is not None
         else read["tests"]
     )
+    cluster.setdefault("provider", warm.provider)
     result = {
         "release_id": state.get("release_id"),
+        "provider": cluster["provider"],
         "fault_node": fault,
         "spare_node": spare,
         "declared_spares": spare_nodes,
@@ -902,9 +905,10 @@ def execute_case(
         provider_after = warm.provider_inventory()
         write_json_atomic(case_dir / "provider-after.json", provider_after)
         if provider_after != preflight["provider_inventory"]:
-            errors.append("HyperPod provider inventory changed")
+            errors.append("provider node inventory changed")
         ended_at = datetime.now(timezone.utc)
-        provider_events = regional.provider_events(started_at, ended_at)
+        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS).
+        provider_events = warm.replace_events(started_at, ended_at)
         # A negative claim cannot be proven inside CloudTrail's delivery lag;
         # it is recorded as provisional and DESTR-013 re-reads the window.
         provider_provisional = regional.provider_events_provisional(ended_at)
@@ -912,14 +916,13 @@ def execute_case(
             case_dir / "provider-events.json",
             {
                 "events": provider_events,
+                "provider": warm.provider,
                 "window_start": started_at.isoformat(),
                 "window_end": ended_at.isoformat(),
                 "provisional": provider_provisional,
             },
         )
-        if any(
-            item["event_name"] in PROVIDER_REPLACE_EVENTS for item in provider_events
-        ):
+        if provider_events:
             errors.append("provider replace/delete mutation appeared")
         cpu_after = regional.cpu_blast_snapshot()
         if cpu_after != preflight["cpu_blast"]:

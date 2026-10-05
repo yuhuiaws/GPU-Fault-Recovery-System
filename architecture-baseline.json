@@ -63,7 +63,7 @@
     "scripts/e2e/regional/run_destr024_watcher_down_fail_closed.py:execute_case": 244,
     "scripts/e2e/regional/run_notification_acceptance.py:run_notify005": 205,
     "scripts/e2e/regional/run_workload_acceptance.py:run_e2e001": 238,
-    "scripts/e2e/regional/run_workload_acceptance.py:run_iso001": 280,
+    "scripts/e2e/regional/run_workload_acceptance.py:run_iso001": 278,
     "scripts/e2e/regional/run_workload_acceptance.py:run_workload_baseline": 221,
     "src/gpu_fault/app/builtin_metric_contributors.py:closed_loop_metric_lines": 208,
     "src/gpu_fault/app/factory.py:create_app": 291,

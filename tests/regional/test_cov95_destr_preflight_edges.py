@@ -232,8 +232,9 @@ def test_workload_preflight_refuses_missing_placement_and_release_proof(
     h = Preflight(module, tmp_path, monkeypatch)
     expected = ""
     if defect == "nodes":
-        h.nodes = h.nodes[:2]
-        expected = "fewer than three"
+        # Two nodes run a Master/Worker job (plain EKS, 2026-10-05); one cannot.
+        h.nodes = h.nodes[:1]
+        expected = "fewer than two"
     elif defect == "workloads":
         h.frame["gpu_workloads"] = [{"name": "busy"}]
         expected = "GPU workloads"
