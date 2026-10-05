@@ -166,6 +166,7 @@ def virtual_states() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         "decision",
         "budget",
         "same-gpu",
+        "watcher-repost",
     ],
 )
 def test_virtual_collision_proof_keeps_both_physical_ownership_sets(
@@ -173,6 +174,12 @@ def test_virtual_collision_proof_keeps_both_physical_ownership_sets(
 ) -> None:
     states, sources = virtual_states()
     b = states[1]
+    if defect == "watcher-repost":
+        # B's Completion Watcher re-posted the attempt's real observation
+        # between the virtual post and the read-back: B's own Pod node, not the
+        # shared name, and still only B's Pods and GPUs. Not an isolation failure.
+        sources[1]["pods"][0]["node"] = "real-b"
+        b["observations"][0]["containers"][0]["node_id"] = "real-b"
     if defect == "count":
         states.pop()
     elif defect == "empty":
@@ -194,7 +201,28 @@ def test_virtual_collision_proof_keeps_both_physical_ownership_sets(
     errors = checks.virtual_isolation_errors(
         states, sources=sources, cluster_ids=["a", "b"], shared_node="shared"
     )
-    assert bool(errors) is (defect != "none"), errors
+    assert bool(errors) is (defect not in {"none", "watcher-repost"}), errors
+    if defect == "node":
+        assert errors == [
+            "b: container node IDs are ['foreign']; expected the virtual node "
+            "'shared' or, after the Completion Watcher's re-post, this cluster's "
+            "own Pod nodes []"
+        ]
+
+
+def test_virtual_observation_current_names_which_store_still_showed_the_virtual_node() -> (
+    None
+):
+    states, sources = virtual_states()
+    states[1]["observations"][0]["containers"][0]["node_id"] = "real-b"
+
+    assert checks.virtual_observation_current(
+        states, cluster_ids=["a", "b"], shared_node="shared"
+    ) == {"a": True, "b": False}
+    assert checks.source_pod_nodes({"pods": [{"node": "n1"}, {"node": "n2"}, {}]}) == {
+        "n1",
+        "n2",
+    }
 
 
 @pytest.mark.parametrize(

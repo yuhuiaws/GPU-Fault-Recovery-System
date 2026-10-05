@@ -92,10 +92,14 @@ from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     observation_pod_names as observation_pod_names,
     observation_pod_uids as observation_pod_uids,
     observation_rank_errors as observation_rank_errors,
+    prove_virtual_isolation as prove_virtual_isolation,
     recovery_identity_errors as recovery_identity_errors,
+    refresh_observation as refresh_observation,
     source_observation_errors as source_observation_errors,
     suspicious_log_lines as suspicious_log_lines,
     virtual_isolation_errors as virtual_isolation_errors,
+    virtual_observation_current as virtual_observation_current,
+    virtualize_observation as virtualize_observation,
     wait_for_notification_results as wait_for_notification_results,
 )
 from scripts.e2e.regional.workload_acceptance_probes import (  # noqa: E402
@@ -906,25 +910,6 @@ def workload_case_settings(
     )
 
 
-def virtualize_observation(
-    observation: dict[str, Any],
-    *,
-    node_id: str,
-) -> dict[str, Any]:
-    value = json.loads(json.dumps(observation))
-    value["observed_at"] = utc_now()
-    value["workload_phase"] = "RUNNING"
-    for container in value.get("containers") or []:
-        container["node_id"] = node_id
-    return cast(dict[str, Any], value)
-
-
-def refresh_observation(observation: dict[str, Any]) -> dict[str, Any]:
-    value = json.loads(json.dumps(observation))
-    value["observed_at"] = utc_now()
-    return cast(dict[str, Any], value)
-
-
 def iso001_recovery_outcome(
     *,
     cluster_ids: list[str],
@@ -943,6 +928,7 @@ def iso001_recovery_outcome(
     virtual_results: list[dict[str, Any]],
     injection: dict[str, Any],
     job_id: str,
+    virtual_current: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     workflow_a = state_a.get("workflow") or {}
     virtual_errors = virtual_isolation_errors(
@@ -998,6 +984,7 @@ def iso001_recovery_outcome(
         "baseline_states": baseline_states,
         "virtual_posts": virtual_results,
         "virtual_states": virtual_states,
+        "virtual_observation_current": virtual_current,
         "injection": injection,
         "primary_state": state_a,
         "primary_target": target_a,
@@ -1137,34 +1124,19 @@ def run_iso001(
         sources = [source for source, _observation in prepared]
         observations = [observation for _source, observation in prepared]
         shared_node = f"iso-collision-node-{attempt}"
-        virtual_results = []
-        for index, (regional, observation) in enumerate(
-            zip(fixtures, observations, strict=True)
-        ):
-            virtual_pending[index] = True
-            virtual_results.append(
-                post_observation(
-                    regional,
-                    virtualize_observation(observation, node_id=shared_node),
-                )
-            )
-        virtual_states = [
-            workload_store(
-                regional,
-                job_id=job_id,
-                attempt_id=attempt_id,
-            )
-            for regional in fixtures
-        ]
-        virtual_errors = virtual_isolation_errors(
-            virtual_states,
-            sources=sources,
+        virtual_results, virtual_states, virtual_current = prove_virtual_isolation(
+            fixtures,
+            observations,
+            sources,
             cluster_ids=cluster_ids,
             shared_node=shared_node,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            virtual_pending=virtual_pending,
+            result=result,
+            post=post_observation,
+            read=workload_store,
         )
-        if virtual_errors:
-            result["virtual_isolation_errors"] = virtual_errors
-            raise RegionalFixtureError("virtual observation isolation failed")
         for index, (regional, observation) in enumerate(
             zip(fixtures, observations, strict=True)
         ):
@@ -1288,6 +1260,7 @@ def run_iso001(
             virtual_results=virtual_results,
             injection=injection,
             job_id=job_id,
+            virtual_current=virtual_current,
         )
     except Exception as exc:
         failure = exc

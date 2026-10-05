@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from scripts.e2e.regional import run_destr009_workload_restart as workload_case
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 SUSPICIOUS_LOG_PATTERN = re.compile(
     r"\b(?:ERROR|Traceback|401|403|CERTIFICATE_VERIFY_FAILED)\b"
@@ -278,6 +280,115 @@ def observation_pod_uids(observation: dict[str, Any]) -> set[str]:
     }
 
 
+def virtualize_observation(
+    observation: dict[str, Any],
+    *,
+    node_id: str,
+) -> dict[str, Any]:
+    """``observation`` re-stamped RUNNING, now, with every container on ``node_id``."""
+
+    value = json.loads(json.dumps(observation))
+    value["observed_at"] = datetime.now(timezone.utc).isoformat()
+    value["workload_phase"] = "RUNNING"
+    for container in value.get("containers") or []:
+        container["node_id"] = node_id
+    return cast(dict[str, Any], value)
+
+
+def refresh_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    """``observation`` with a fresh ``observed_at`` and nothing else changed."""
+
+    value = json.loads(json.dumps(observation))
+    value["observed_at"] = datetime.now(timezone.utc).isoformat()
+    return cast(dict[str, Any], value)
+
+
+def prove_virtual_isolation(
+    fixtures: Sequence[Any],
+    observations: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    *,
+    cluster_ids: Sequence[str],
+    shared_node: str,
+    job_id: str,
+    attempt_id: str,
+    virtual_pending: list[bool],
+    result: dict[str, Any],
+    post: Callable[[Any, dict[str, Any]], dict[str, Any]],
+    read: Callable[..., dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, bool]]:
+    """Post the shared virtual node to both clusters and read each back at once.
+
+    The read follows its own post: the cluster's Completion Watcher re-posts the
+    attempt's real observation every poll (5 s), so waiting for the other
+    cluster's post mostly reads reality again. Everything is recorded in
+    ``result`` before the verdict -- a failed proof used to leave only the
+    error text (live 2026-10-05: ``virtual_posts`` null). ``post`` and ``read``
+    are the runner's ``post_observation`` / ``workload_store``, passed in so a
+    harness that replaces them on the runner module is honoured.
+    """
+
+    posts, states = [], []
+    for index, (regional, observation) in enumerate(
+        zip(fixtures, observations, strict=True)
+    ):
+        virtual_pending[index] = True
+        posts.append(
+            post(regional, virtualize_observation(observation, node_id=shared_node))
+        )
+        states.append(read(regional, job_id=job_id, attempt_id=attempt_id))
+    current = virtual_observation_current(
+        states, cluster_ids=cluster_ids, shared_node=shared_node
+    )
+    result.update(
+        {
+            "virtual_posts": posts,
+            "virtual_states": states,
+            "virtual_observation_current": current,
+        }
+    )
+    errors = virtual_isolation_errors(
+        states, sources=sources, cluster_ids=cluster_ids, shared_node=shared_node
+    )
+    if errors:
+        result["virtual_isolation_errors"] = errors
+        raise RegionalFixtureError("virtual observation isolation failed")
+    return posts, states, current
+
+
+def source_pod_nodes(source: dict[str, Any]) -> set[str]:
+    """The nodes a cluster's own training Pods run on (the derived topology)."""
+
+    return {str(item.get("node") or "") for item in source.get("pods") or []} - {""}
+
+
+def virtual_observation_current(
+    virtual_states: Sequence[dict[str, Any]],
+    *,
+    cluster_ids: Sequence[str],
+    shared_node: str,
+) -> dict[str, bool]:
+    """Per cluster, whether the store still showed the virtual observation.
+
+    ``False`` means the cluster's Completion Watcher re-posted the attempt's
+    real observation between the virtual post and the read-back: it publishes
+    a running attempt on every pass (``GPU_FAULT_WATCHER_POLL_SECONDS``, 5 s),
+    so the virtual one lives at most one poll. Evidence, not a verdict: the
+    isolation proof (``virtual_isolation_errors``) holds either way.
+    """
+
+    result: dict[str, bool] = {}
+    for state, cluster_id in zip(virtual_states, cluster_ids, strict=False):
+        items = state.get("observations") or []
+        nodes = (
+            {container.get("node_id") for container in items[0].get("containers") or []}
+            if len(items) == 1
+            else set()
+        )
+        result[str(cluster_id)] = nodes == {shared_node}
+    return result
+
+
 def virtual_isolation_errors(
     virtual_states: Sequence[dict[str, Any]],
     *,
@@ -292,6 +403,16 @@ def virtual_isolation_errors(
     its own Pods (names, UIDs) and GPUs -- and none of the other side's. A
     check that only compared node_id sets passed when B's observation had been
     overwritten by A's, because both said ``shared_node``.
+
+    The node IDs may read ``shared_node`` or the cluster's **own** Pod nodes:
+    the cluster's Completion Watcher re-posts a running attempt's real
+    observation every poll (5 s), so a read-back that lands after its next
+    pass sees reality again (live 2026-10-05, gpu-eks-cluster: the two-node
+    job's nodes ``ip-10-0-33-205``/``ip-10-0-41-164`` where the virtual name
+    had been posted seconds earlier). The post itself raises on anything but
+    an accepted response, so the proof is the accepted POST plus a store scope
+    that holds only this cluster's Pods, GPUs and nodes; another cluster's
+    nodes, or any other name, are still an isolation failure.
     """
 
     errors = []
@@ -299,6 +420,7 @@ def virtual_isolation_errors(
         return ["virtual isolation needs exactly two clusters"]
     own_uids = [{str(item["uid"]) for item in source["pods"]} for source in sources]
     own_names = [{str(item["name"]) for item in source["pods"]} for source in sources]
+    own_nodes = [source_pod_nodes(source) for source in sources]
     observations: list[dict[str, Any]] = []
     for index, (state, cluster_id) in enumerate(zip(virtual_states, cluster_ids)):
         items = state.get("observations") or []
@@ -318,9 +440,12 @@ def virtual_isolation_errors(
             container.get("node_id")
             for container in observation.get("containers") or []
         }
-        if nodes != {shared_node}:
+        if nodes != {shared_node} and not (nodes and nodes <= own_nodes[index]):
             errors.append(
-                f"{cluster_id}: container node IDs are {sorted(map(str, nodes))}"
+                f"{cluster_id}: container node IDs are {sorted(map(str, nodes))}; "
+                f"expected the virtual node {shared_node!r} or, after the "
+                "Completion Watcher's re-post, this cluster's own Pod nodes "
+                f"{sorted(own_nodes[index])}"
             )
         if observation_pod_uids(observation) != own_uids[index]:
             errors.append(f"{cluster_id}: observation Pod UIDs are not its own")

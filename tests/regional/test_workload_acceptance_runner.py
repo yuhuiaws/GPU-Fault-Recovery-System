@@ -150,6 +150,68 @@ def test_virtual_isolation_compares_each_clusters_own_pods_and_gpus() -> None:
     assert "GPU UUIDs are shared between the two cluster scopes" in errors
 
 
+def test_virtual_isolation_accepts_the_watchers_repost_of_the_clusters_own_nodes() -> (
+    None
+):
+    """Live 2026-10-05 (ISO-001, HyperPod + two-node gpu-eks-cluster): the EKS
+    store read back the job's real observation -- containers on both of its own
+    nodes -- seconds after the virtual post, because the Completion Watcher
+    re-posts a running attempt every 5 s. Own nodes are not a leak; another
+    cluster's nodes are."""
+
+    pods_a = [{"name": "a-0", "uid": "uid-a0", "node": "hp-0"}]
+    pods_b = [
+        {"name": "b-0", "uid": "uid-b0", "node": "ip-10-0-33-205"},
+        {"name": "b-1", "uid": "uid-b1", "node": "ip-10-0-41-164"},
+    ]
+    sources = [{"pods": pods_a}, {"pods": pods_b}]
+    real_b = _observation("cluster-b", pods_b, gpu_prefix="b", node="unused")
+    for container, pod in zip(real_b["containers"], pods_b, strict=True):
+        container["node_id"] = pod["node"]
+    states = [
+        {
+            "cluster_id": "cluster-a",
+            "decision": None,
+            "restart_budget": None,
+            "observations": [
+                _observation("cluster-a", pods_a, gpu_prefix="a", node="shared")
+            ],
+        },
+        {
+            "cluster_id": "cluster-b",
+            "decision": None,
+            "restart_budget": None,
+            "observations": [real_b],
+        },
+    ]
+
+    assert (
+        workload.virtual_isolation_errors(
+            states,
+            sources=sources,
+            cluster_ids=["cluster-a", "cluster-b"],
+            shared_node="shared",
+        )
+        == []
+    )
+    assert workload.virtual_observation_current(
+        states, cluster_ids=["cluster-a", "cluster-b"], shared_node="shared"
+    ) == {"cluster-a": True, "cluster-b": False}
+
+    real_b["containers"][1]["node_id"] = "hp-0"  # A's node inside B's scope
+    errors = workload.virtual_isolation_errors(
+        states,
+        sources=sources,
+        cluster_ids=["cluster-a", "cluster-b"],
+        shared_node="shared",
+    )
+    assert errors == [
+        "cluster-b: container node IDs are ['hp-0', 'ip-10-0-33-205']; expected "
+        "the virtual node 'shared' or, after the Completion Watcher's re-post, "
+        "this cluster's own Pod nodes ['ip-10-0-33-205', 'ip-10-0-41-164']"
+    ]
+
+
 def test_command_ids_in_logs_reports_only_the_leaked_ids() -> None:
     logs = {"exec-0": "claimed cmd-1\nresult cmd-1", "exec-1": "idle"}
 

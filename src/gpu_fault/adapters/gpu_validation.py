@@ -66,6 +66,7 @@ class GpuValidationAdapter:
         required = {"gpu_temperature_c"}
         pending: dict[str, dict[str, list[str]]] = {}
         failures: dict[str, list[str]] = {}
+        node_findings: dict[str, list[dict[str, Any]]] = {}
         clamped: dict[str, dict[str, Any]] = {}
         operation = context.step.operation
         raw_inventory_requirements = context.step.parameters.get(
@@ -191,7 +192,7 @@ class GpuValidationAdapter:
                     pending[node_id] = fabric_pending
                     continue
             finding_pending = self._validate_active_findings(
-                context, node_id, operation, now, failures
+                context, node_id, operation, now, failures, node_findings
             )
             if finding_pending is not None:
                 pending[node_id] = finding_pending
@@ -210,11 +211,16 @@ class GpuValidationAdapter:
             }
             failed_nodes = sorted(failures)
             return WorkflowStepOutcome.failed(
-                "validation failed on nodes: " + ", ".join(failed_nodes),
+                "validation failed on nodes: "
+                + "; ".join(
+                    node_failure_text(node_id, failures[node_id], node_findings)
+                    for node_id in failed_nodes
+                ),
                 details={
                     "failed_nodes": failed_nodes,
                     "node_failures": failures,
                     "validation": operation.value,
+                    **({"node_findings": node_findings} if node_findings else {}),
                     **({"inventory_requirement_clamped": clamped} if clamped else {}),
                 },
             )
@@ -588,12 +594,13 @@ class GpuValidationAdapter:
 
     def _validate_active_findings(
         self,
-        context,
-        node_id,
-        operation,
-        now,
-        failures,
-    ):
+        context: WorkflowStepContext,
+        node_id: str,
+        operation: WorkflowOperation,
+        now: datetime,
+        failures: dict[str, list[str]],
+        node_findings: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, list[str]] | None:
         findings = self.metrics.findings(context.incident.cluster_id, node_id)
         if (
             operation
@@ -647,7 +654,78 @@ class GpuValidationAdapter:
                 ]
             }
         failures.setdefault(node_id, []).append("active_gpu_health_findings")
+        if node_findings is not None:
+            node_findings[node_id] = [finding_summary(item) for item in findings]
         return None
+
+
+#: How many findings the failure text spells out per node; the rest are counted
+#: and every one is in ``details.node_findings``.
+FAILURE_TEXT_FINDINGS = 3
+
+
+def finding_summary(finding: Any) -> dict[str, Any]:
+    """The probe/metric identity of an active finding, for the step record."""
+
+    severity = getattr(finding, "severity", None)
+    return {
+        "finding_id": getattr(finding, "finding_id", None),
+        "canonical_name": getattr(finding, "canonical_name", None),
+        "severity": getattr(severity, "value", severity),
+        "value": getattr(finding, "value", None),
+        "threshold_value": getattr(finding, "threshold_value", None),
+        "gpu_uuid": getattr(finding, "gpu_uuid", None),
+        "pci_bdf": getattr(finding, "pci_bdf", None),
+    }
+
+
+def _finding_text(summary: dict[str, Any]) -> str:
+    parts = [
+        str(summary.get("canonical_name") or summary.get("finding_id") or "finding")
+    ]
+    if summary.get("severity"):
+        parts.append(str(summary["severity"]))
+    value, threshold = summary.get("value"), summary.get("threshold_value")
+    if isinstance(value, (int, float)):
+        parts.append(
+            f"{value:g}"
+            + (f">{threshold:g}" if isinstance(threshold, (int, float)) else "")
+        )
+    if summary.get("gpu_uuid"):
+        parts.append(str(summary["gpu_uuid"]))
+    return " ".join(parts)
+
+
+def node_failure_text(
+    node_id: str,
+    reasons: Sequence[str],
+    node_findings: dict[str, list[dict[str, Any]]],
+) -> str:
+    """``node (reason, ...)`` with the active findings named by probe/metric.
+
+    Live 2026-10-05 (gpu-eks-cluster, ip-10-0-41-164): VALIDATE_GPU failed on a
+    ``temperature_validation`` finding and the step said only ``validation
+    failed on nodes: ip-10-0-41-164``; the operator had to open the finding
+    store to learn which check failed. The text now carries what
+    ``details.node_findings`` records: name, severity, value against threshold
+    and the GPU.
+    """
+
+    items = []
+    for reason in reasons:
+        findings = node_findings.get(node_id) or []
+        if reason != "active_gpu_health_findings" or not findings:
+            items.append(reason)
+            continue
+        shown = [_finding_text(item) for item in findings[:FAILURE_TEXT_FINDINGS]]
+        more = len(findings) - len(shown)
+        items.append(
+            "active_gpu_health_findings["
+            + "; ".join(shown)
+            + (f"; +{more} more" if more > 0 else "")
+            + "]"
+        )
+    return f"{node_id} ({', '.join(items)})"
 
 
 def _warning_only(findings, names: set[str]) -> bool:

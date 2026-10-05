@@ -72,6 +72,51 @@ def test_grace_requires_one_warning_class(monkeypatch, names, expected):
         }
 
 
+def test_the_failure_text_names_the_failing_findings(monkeypatch):
+    """Live 2026-10-05 (gpu-eks-cluster): ``validation failed on nodes:
+    ip-10-0-41-164`` said nothing about the temperature finding behind it."""
+
+    harness = ValidationHarness(WorkflowOperation.VALIDATE_GPU)
+    findings = _findings(("temperature_validation", *POWER, *MEMORY), "CRITICAL")
+    findings[0].value = 91.0
+    findings[0].threshold_value = 85.0
+    monkeypatch.setattr(harness.feed, "findings", lambda *_args: findings)
+
+    outcome = harness.execute()
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert outcome.error == (
+        "validation failed on nodes: node-a (active_gpu_health_findings["
+        "temperature_validation CRITICAL 91>85 GPU-a; "
+        "power_violation_total_us CRITICAL GPU-a; "
+        "composite:POWER_LIMIT_THROTTLING CRITICAL GPU-a; +2 more])"
+    )
+    assert outcome.details["node_failures"] == {
+        "node-a": ["active_gpu_health_findings"]
+    }
+    recorded = outcome.details["node_findings"]["node-a"]
+    assert [item["canonical_name"] for item in recorded] == [
+        "temperature_validation",
+        *POWER,
+        *MEMORY,
+    ], "every finding is in the record even when the text counts the rest"
+    assert recorded[0] == {
+        "finding_id": "finding-0",
+        "canonical_name": "temperature_validation",
+        "severity": "CRITICAL",
+        "value": 91.0,
+        "threshold_value": 85.0,
+        "gpu_uuid": "GPU-a",
+        "pci_bdf": None,
+    }
+    assert (
+        gpu_validation.node_failure_text(
+            "node-b", ["gpu_inventory_active_count=7,expected=8", "network_link_up"], {}
+        )
+        == "node-b (gpu_inventory_active_count=7,expected=8, network_link_up)"
+    )
+
+
 @pytest.mark.parametrize("severity", ["CRITICAL", "UNKNOWN", None])
 @pytest.mark.parametrize("mixed", [False, True], ids=["alone", "with-warning"])
 def test_non_warning_power_findings_never_receive_grace(monkeypatch, severity, mixed):

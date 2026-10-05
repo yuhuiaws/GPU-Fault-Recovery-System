@@ -7,8 +7,9 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
+    training_topology,
 )
 from scripts.e2e.regional import (  # noqa: E402
     run_workload_acceptance as workload_acceptance,
@@ -66,6 +68,38 @@ MANIFEST = (
     / "training"
     / "xid11-three-node-pytorchjob.yaml"
 )
+
+
+def cluster_topologies(
+    settings: Settings, preflight: Mapping[str, Any]
+) -> dict[str, training_topology.TrainingTopology]:
+    """Each cluster's Master/Worker shape, derived from its own node inventory.
+
+    The pair cases demanded the fixtures' native three GPU nodes on both sides
+    and refused a two-node plain-EKS cluster that trains on two nodes (live
+    2026-10-05: ``both clusters require at least three GPU nodes``, ISO-007
+    behind it). The shape is per cluster: HyperPod's three nodes derive the
+    native topology and the fixture is used verbatim, the two-node cluster gets
+    a rewritten copy (``training_topology.render_topology_manifest``), and each
+    side's expected Pods, GPUs and observation world size follow its own
+    derivation -- the same contract WORKLOAD-001/002, E2E-001 and DESTR-009/012
+    already run on.
+    """
+
+    return {
+        settings.multi.cluster_a.cluster_id: (
+            training_topology.derive_training_topology(preflight["nodes_a"])
+        ),
+        settings.multi.cluster_b.cluster_id: (
+            training_topology.derive_training_topology(preflight["nodes_b"])
+        ),
+    }
+
+
+def topology_evidence(
+    topologies: Mapping[str, training_topology.TrainingTopology],
+) -> dict[str, dict[str, Any]]:
+    return {cluster_id: item.evidence() for cluster_id, item in topologies.items()}
 
 
 @dataclass(frozen=True)
@@ -283,8 +317,17 @@ def read_only_preflight(
         errors.append("two enabled physical cluster registrations are required")
     elif not registrations_are_distinct_physical_clusters(registrations):
         errors.append("cluster registrations do not identify two physical clusters")
-    if len(nodes_a) < 3 or len(nodes_b) < 3:
-        errors.append("both clusters require at least three GPU nodes")
+    topologies: dict[str, dict[str, Any]] = {}
+    for cluster_id, nodes in (
+        (settings.multi.cluster_a.cluster_id, nodes_a),
+        (settings.multi.cluster_b.cluster_id, nodes_b),
+    ):
+        try:
+            topologies[cluster_id] = training_topology.derive_training_topology(
+                nodes
+            ).evidence()
+        except training_topology.TrainingTopologyError as exc:
+            errors.append(f"{cluster_id}: {exc}")
     if a.gpu_workloads() or b.gpu_workloads():
         errors.append("a target cluster already has GPU workloads")
     if not settings.site_file.is_file() or not MANIFEST.is_file():
@@ -296,6 +339,7 @@ def read_only_preflight(
         "registrations": registrations,
         "nodes_a": nodes_a,
         "nodes_b": nodes_b,
+        "training_topology": topologies,
         "predecessor": predecessor,
         "cpu_pods": a.ready_pods("cpu", "gpu-fault-api-ha"),
         "cpu_containers": control_plane_container_statuses(a),
@@ -329,19 +373,28 @@ def managed_workload(
     settings: Settings,
     target: ClusterTarget,
     *,
+    topology: training_topology.TrainingTopology,
+    case_dir: Path,
     restart_budget: int = 1,
 ) -> ManagedWorkloadFixture:
+    """This cluster's workload in its own shape: the fixture itself on three
+    native nodes, else a copy rewritten for ``topology`` beside the evidence."""
+
     fixture = settings.multi.regional(target)
     return ManagedWorkloadFixture(
         fixture,
         ManagedWorkloadSettings(
-            manifest=MANIFEST,
+            manifest=training_topology.render_topology_manifest(
+                MANIFEST,
+                topology,
+                case_dir / target.cluster_id / "topology-workload.yaml",
+            ),
             site_file=settings.site_file,
             job_id=settings.job_id,
             attempt_id=settings.attempt_id,
             restart_budget=restart_budget,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
 
@@ -456,9 +509,15 @@ def command_scope_errors(
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
+    topologies = preflight.get("training_topology") or {}
+    shapes = ", ".join(
+        f"{cluster_id}: {item['world_size']} GPUs on {item['node_count']} nodes"
+        for cluster_id, item in sorted(topologies.items())
+    )
     details = {
         "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
+        "training_topology": topologies,
         "cluster_ids": [
             settings.multi.cluster_a.cluster_id,
             settings.multi.cluster_b.cluster_id,
@@ -481,7 +540,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             "ISO-001 predecessor evidence is not PASS",
             "fewer than two enabled physical clusters",
-            "either workload or 24-GPU observation fails",
+            "either workload or its derived-topology GPU observation fails"
+            + (f" ({shapes})" if shapes else ""),
             "injections are more than 60 seconds apart",
             "incident, command, budget or notification crosses cluster scope",
             "a control-plane container restarts",
@@ -510,11 +570,20 @@ class RecoveryBranches:
     case_dir: Path
     expect_a_budget_denial: bool
     sources: list[dict[str, Any]]
+    topologies: dict[str, training_topology.TrainingTopology] = field(
+        default_factory=dict
+    )
+
+    def topology(self, index: int) -> training_topology.TrainingTopology:
+        return self.topologies.get(
+            self.targets[index].cluster_id, training_topology.NATIVE_TOPOLOGY
+        )
 
     def prepare(self, index: int) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Prewarm, submit, wait Running and wait for the 24-GPU observation
-        in one cluster. The two clusters are independent, so they run side by
-        side: serially this phase cost twice the slowest cluster."""
+        """Prewarm, submit, wait Running and wait for the observation of this
+        cluster's whole world (its derived topology). The two clusters are
+        independent, so they run side by side: serially this phase cost twice
+        the slowest cluster."""
 
         fixture, workload, prewarm, target = (
             self.fixtures[index],
@@ -522,7 +591,8 @@ class RecoveryBranches:
             self.prewarms[index],
             self.targets[index],
         )
-        nodes = [
+        topology = self.topology(index)
+        nodes = list(topology.candidate_nodes) or [
             str(item["name"])
             for item in fixture.gpu_nodes()
             if item["ready"] == "True" and not item["unschedulable"]
@@ -535,7 +605,7 @@ class RecoveryBranches:
             fixture,
             workload_settings(self.settings, target),
             node=str(source["pods"][0]["node"]),
-            expected_gpu_count=24,
+            expected_gpu_count=topology.world_size,
         )
         if workload_acceptance.source_observation_errors(
             observation,
@@ -627,6 +697,7 @@ def verify_cluster_recoveries(
     preflight: dict[str, Any],
     result: dict[str, Any],
     expect_a_budget_denial: bool,
+    topologies: Mapping[str, training_topology.TrainingTopology] | None = None,
 ) -> None:
     for index, state in enumerate(states):
         if expect_a_budget_denial and index == 0:
@@ -640,8 +711,13 @@ def verify_cluster_recoveries(
                 )
             )
         else:
+            world = (
+                (topologies or {})
+                .get(cluster_ids[index], training_topology.NATIVE_TOPOLOGY)
+                .world_size
+            )
             result["errors"].extend(
-                workload_case.workflow_errors(state, expected_gpu_count=24)
+                workload_case.workflow_errors(state, expected_gpu_count=world)
             )
     workflow_ids = {(state.get("workflow") or {}).get("request_id") for state in states}
     incident_ids = {
@@ -790,10 +866,13 @@ def execute_case(
     targets = (settings.multi.cluster_a, settings.multi.cluster_b)
     cluster_ids = [target.cluster_id for target in targets]
     fixtures = [settings.multi.regional(target) for target in targets]
+    topologies = cluster_topologies(settings, preflight)
     workloads = [
         managed_workload(
             settings,
             target,
+            topology=topologies[target.cluster_id],
+            case_dir=case_dir,
             restart_budget=0 if expect_a_budget_denial and index == 0 else 1,
         )
         for index, target in enumerate(targets)
@@ -811,6 +890,7 @@ def execute_case(
         "attempt": attempt,
         **fixtures[0].evidence_identity(),
         "cluster_ids": cluster_ids,
+        "training_topology": topology_evidence(topologies),
         "verdict": "FAIL",
         "errors": [],
     }
@@ -828,6 +908,7 @@ def execute_case(
         case_dir=case_dir,
         expect_a_budget_denial=expect_a_budget_denial,
         sources=[],
+        topologies=topologies,
     )
     sources: list[dict[str, Any]] = []
     try:
@@ -915,6 +996,7 @@ def execute_case(
             preflight=preflight,
             result=result,
             expect_a_budget_denial=expect_a_budget_denial,
+            topologies=topologies,
         )
         containers_after = control_plane_container_statuses(fixtures[0])
         result["errors"].extend(

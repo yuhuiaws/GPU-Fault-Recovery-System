@@ -5127,7 +5127,15 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   4. Each reports one workload observation in which
      `containers[].node_id` is set to `${SHARED_NODE_NAME}`
      (each with its own credentials). This step only proves that an identical node name does not overwrite state across
-     `cluster_id`.
+     `cluster_id`. The runner reads a side's store back **immediately** after that side's post: every cluster's
+     Completion Watcher re-posts a running attempt's real observation on each poll (`GPU_FAULT_WATCHER_POLL_SECONDS`,
+     5 s), so the `containers[].node_id` read back may be the virtual name or already **this cluster's own** Pod
+     nodes (the two-node gpu-eks-cluster of a mixed site: `ip-10-0-33-205`/`ip-10-0-41-164`); neither is an isolation
+     failure -- the post itself raises on anything but an accepted response, and the criterion is "post accepted +
+     this cluster's scope holds only its own Pods/GPUs/nodes"; another cluster's nodes or any other name FAIL.
+     The evidence `virtual_posts` (both post responses), `virtual_states` (the stores read back) and
+     `virtual_observation_current` (per cluster: whether the virtual name was still current when read) is written
+     before the verdict and kept on failure.
   5. Inside the CPU worker read each cluster's
      `list_attempt_observations(cluster_id)`; at the same time query the decision and
      restart budget and record the empty baseline before fault injection:
@@ -5365,7 +5373,8 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
 **When cluster A's recovery is refused by the budget, cluster B still completes recovery independently**
 
 - Risk is `live-workload-restart` and it must be executed within an approved maintenance window. The formal prerequisite is E2E-002 on the same release
-  and the same physical cluster pair; it reuses its two cluster contexts, nodes, images and managed training configuration.
+  and the same physical cluster pair; it reuses its two cluster contexts, nodes, images and managed training configuration,
+  including the per-cluster training topology (native three-node HyperPod, two-Pod/16-GPU on a two-node EKS cluster; see the E2E-002 preconditions).
 - Unlike the "both sides succeed" of E2E-002, this case declares A's workload restart budget as 0 and
   B's as 1. It does not tamper with shared budget records, and does not relax the policy or the namespace allowlist live.
 - The fixed entry point generates only the plan by default:
@@ -14605,7 +14614,14 @@ and the collector restarted**.
   plan; before execute it must read `ISO-006=PASS`. The runner uses the same job/attempt
   ID on both sides, but raises XID11 from each side's own Executor Pod using that cluster's
   credentials; any incident, command, budget or notification bound across clusters FAILs.
-- Preconditions: both physical GPU clusters have completed `E2E-001`.
+- Preconditions: both physical GPU clusters have completed `E2E-001`. Each cluster's training topology is
+  derived from **its own** Ready, schedulable, isolation-taint-free GPU nodes (`training_topology`: a
+  three-node HyperPod cluster uses the native three-Pod/24-GPU manifest, a two-node EKS cluster gets a
+  two-Pod/16-GPU rewritten copy at `cases/<case>/<cluster_id>/topology-workload.yaml`); preflight, plan and
+  evidence record `training_topology` per cluster, and three GPU nodes are no longer required on both sides
+  (seen on a mixed site: `both clusters require at least three GPU nodes` kept E2E-002 and ISO-007 behind it
+  at plan). A side with fewer than two schedulable GPU nodes is refused by name: `<cluster_id>: at least 2
+  schedulable GPU nodes are required …`.
 - Steps:
   1. Submit one training job in each cluster (**deliberately using the same job ID and
      attempt ID**, reusing `ISO-001`'s naming).

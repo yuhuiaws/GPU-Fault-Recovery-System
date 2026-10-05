@@ -131,6 +131,13 @@ def lifecycle_harness(
             state["observations"] = [copy.deepcopy(regional.observation)]
             if defect == "virtual" and regional.cluster == "b":
                 state["observations"][0]["containers"][0]["pod_uid"] = "foreign"
+            if defect == "watcher" and regional.cluster == "b":
+                # B's Completion Watcher re-posted reality before the read-back.
+                nodes = {
+                    pod["uid"]: pod["node"] for pod in regional.workload.source["pods"]
+                }
+                for container in state["observations"][0]["containers"]:
+                    container["node_id"] = nodes[container["pod_uid"]]
         return state
 
     def post(regional: Any, value: dict[str, Any]) -> dict[str, bool]:
@@ -252,7 +259,7 @@ def test_e2e001_handoff_is_written_after_cleanup_and_never_hides_failure(
     assert "host-cleanup" in events and "delete-a" in events
 
 
-@pytest.mark.parametrize("defect", ["none", "dirty", "virtual", "binding"])
+@pytest.mark.parametrize("defect", ["none", "dirty", "virtual", "binding", "watcher"])
 def test_iso001_refuses_bad_baselines_and_restores_virtual_observations(
     defect: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -268,9 +275,22 @@ def test_iso001_refuses_bad_baselines_and_restores_virtual_observations(
         "maintenance_window_end": datetime.now(timezone.utc) + timedelta(hours=1),
     }
     if defect in {"dirty", "virtual"}:
-        with pytest.raises(workload.WorkloadCaseError):
+        with pytest.raises(workload.WorkloadCaseError) as failure:
             workload.run_iso001(**kwargs)
         assert "inject-a" not in events
+        if defect == "virtual":
+            outcome = failure.value.outcome
+            assert len(outcome["virtual_posts"]) == 2, (
+                "a failed proof must still record both virtual posts (live: null)"
+            )
+            assert [state["cluster_id"] for state in outcome["virtual_states"]] == [
+                "a",
+                "b",
+            ]
+            assert outcome["virtual_observation_current"] == {"a": True, "b": True}
+            assert outcome["virtual_isolation_errors"] == [
+                "b: observation Pod UIDs are not its own"
+            ]
         if defect == "dirty":
             assert not any(
                 event.startswith(("delete-", "submit-", "prewarm-a", "prewarm-b"))
@@ -284,7 +304,14 @@ def test_iso001_refuses_bad_baselines_and_restores_virtual_observations(
             ), "both physical Observations must be restored after virtual proof failure"
     else:
         result = workload.run_iso001(**kwargs)
-        assert result["verdict"] == ("PASS" if defect == "none" else "FAIL"), result
+        assert result["verdict"] == (
+            "PASS" if defect in {"none", "watcher"} else "FAIL"
+        ), result
+        assert result["virtual_observation_current"] == {
+            "a": True,
+            "b": defect != "watcher",
+        }, "the evidence says whether the virtual node was still current when read"
+        assert len(result["virtual_posts"]) == 2
         assert "delete-a" in events and "delete-b" in events
         assert events.index("authorize-a") < events.index("wait-restarted-a")
         assert "authorize-b" not in events and "wait-restarted-b" not in events
