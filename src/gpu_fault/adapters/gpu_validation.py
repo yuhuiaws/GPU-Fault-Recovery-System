@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -525,7 +526,9 @@ class GpuValidationAdapter:
         return pending
 
     @staticmethod
-    def _node_gpu_targets(context, node_id, latest) -> list[str]:
+    def _node_gpu_targets(
+        context: WorkflowStepContext, node_id: str, latest: Sequence[Any]
+    ) -> list[str]:
         """The step's GPUs this node answers for.
 
         A single-node step answers for every GPU it names (unchanged). A
