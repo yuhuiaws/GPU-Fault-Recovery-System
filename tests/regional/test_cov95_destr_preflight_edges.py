@@ -159,6 +159,9 @@ class Preflight:
                     "allowed_namespaces": ["training"],
                 }
             )
+        if args[0] == "api-resources":
+            # The fake cluster serves every managed workload kind.
+            return "pods\njobs.batch\npytorchjobs.kubeflow.org\n"
         return json.dumps({"items": []})
 
 

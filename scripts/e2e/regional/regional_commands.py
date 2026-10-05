@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded
 from gpu_fault.admin.diagnostics import diagnostic_text
@@ -27,6 +28,11 @@ class RegionalCommandTimeout(RegionalFixtureError):
         super().__init__(f"command timed out after {timeout}s")
         self.command = list(command)
         self.timeout = timeout
+
+
+#: Positional subcommand words a CLI takes before its values; absent means none.
+SUBCOMMAND_WORDS = {"aws": 2, "gpu-fault-admin": 2, "helm": 1}
+SUBCOMMAND_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,40}")
 
 
 def command_step_label(command: Sequence[str]) -> str:
@@ -70,7 +76,17 @@ def command_step_label(command: Sequence[str]) -> str:
         }
         verb = next((item for item in words[1:] if item in verbs), None)
         return "kubectl" if verb is None else f"kubectl {verb}"
-    return " ".join(words[:3])
+    # Only CLIs whose leading positionals are subcommand words keep any; for
+    # every other program (``python -c ... VALUE``) the arguments are values and
+    # the label is the program name alone. 2026-10-05: the first three words of
+    # an interpreter command were its script and an argument.
+    cli = PurePosixPath(words[0]).name
+    label = [cli]
+    for item in words[1 : 1 + SUBCOMMAND_WORDS.get(cli, 0)]:
+        if not SUBCOMMAND_PATTERN.fullmatch(item):
+            break
+        label.append(item)
+    return " ".join(label)
 
 
 class RegionalCommandFailed(RegionalFixtureError):

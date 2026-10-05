@@ -111,3 +111,22 @@ def test_a_command_failure_without_its_command_reads_exactly_as_before() -> None
     assert message.startswith("command failed (1): ") and "(step:" not in message, (
         "without the command the message keeps its historical shape"
     )
+
+
+def test_command_step_label_never_echoes_interpreter_or_option_values() -> None:
+    secret = "only-a-local-command-fixture-secret"
+    label = regional_commands.command_step_label(
+        ["/usr/bin/python3", "-c", "import sys; sys.exit(7)", secret]
+    )
+    assert label == "python3", label
+    assert secret not in label, "an interpreter argument is a value, never a step"
+    assert (
+        regional_commands.command_step_label(
+            ["gpu-fault-admin", "config", "spare", "--node", secret, "--declare"]
+        )
+        == "gpu-fault-admin config spare"
+    ), "known CLIs keep their positional subcommand words only"
+    assert (
+        regional_commands.command_step_label(["aws", "ec2", "Describe/Instances", "x"])
+        == "aws ec2"
+    ), "a word that is not a lowercase subcommand ends the label"
