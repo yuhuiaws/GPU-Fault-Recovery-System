@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from gpu_fault.fleet_compatibility import CURRENT_AGENT_PROTOCOL_VERSION
 from gpu_fault.hyperpod_spares import SpareHealthPending
 from tests._builders import (
@@ -9,8 +11,6 @@ from tests._builders import (
     execute_workflow,
     workflow_step_execution,
 )
-from types import SimpleNamespace
-
 from tests.execution._support import _remote_waiting_state
 
 from ._support import (
