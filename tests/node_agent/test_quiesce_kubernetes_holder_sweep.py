@@ -17,12 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault.node_agent import config as agent_config
 from gpu_fault.node_agent.config import agent_config_payload
 from tests.node_agent._support import (
+    SECRET,
     GpuServiceQuiesceManager,
     ServiceRunner,
     WorkflowOperation,
+    executor_from_environment,
     no_device_clients,
     node_action_executor,
 )
@@ -34,6 +35,19 @@ KUBE_CGROUP = (
     "kubepods-besteffort-pode747090b_fef5_4687_a913_2bcab51934c6.slice/"
     f"cri-containerd-{CONTAINER_ID}.scope"
 )
+
+
+class KillAwareRunner(ServiceRunner):
+    """A ``ServiceRunner`` whose ``kill`` lets go of the holders it signals."""
+
+    def __init__(self) -> None:
+        super().__init__(active={"kubelet"})
+        self.alive: list[dict] = []
+
+    def __call__(self, value, *, check=False, **kwargs):
+        if value[:2] == ["kill", "--signal"]:
+            self.alive.clear()
+        return super().__call__(value, check=check, **kwargs)
 
 
 def _manager(
@@ -63,19 +77,18 @@ def _holder(cgroup: str) -> dict:
     }
 
 
-def _quiesce(manager: GpuServiceQuiesceManager, holder: dict, monkeypatch, runner):
-    alive = [holder]
+def _quiesce(
+    manager: GpuServiceQuiesceManager,
+    holder: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: KillAwareRunner,
+):
+    runner.alive[:] = [holder]
     monkeypatch.setattr(
-        type(manager), "_device_holders", lambda _self, _targets=None: list(alive)
+        type(manager),
+        "_device_holders",
+        lambda _self, _targets=None: list(runner.alive),
     )
-    original = manager._run
-
-    def runner_with_kill(cmd, *, check, timeout=30):
-        if cmd[:2] == ["kill", "--signal"]:
-            alive.clear()
-        return original(cmd, check=check, timeout=timeout)
-
-    monkeypatch.setattr(manager, "_run", runner_with_kill)
     receipt = manager.quiesce(
         incident_id="incident-a",
         workflow_request_id="workflow-a",
@@ -88,13 +101,13 @@ def _quiesce(manager: GpuServiceQuiesceManager, holder: dict, monkeypatch, runne
 def test_the_switch_sweeps_a_kubernetes_holder_of_the_target_gpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner = ServiceRunner(active={"kubelet"})
+    runner = KillAwareRunner()
     manager = _manager(tmp_path, runner, sweep_kubernetes_device_holders=True)
 
     receipt, kills = _quiesce(manager, _holder(KUBE_CGROUP), monkeypatch, runner)
 
-    assert kills == [["kill", "--signal", "TERM", "4321"]]
-    assert receipt["unswept_device_holders"] == []
+    assert kills == [["kill", "--signal", "TERM", "4321"]], kills
+    assert receipt["unswept_device_holders"] == [], receipt
     (swept,) = receipt["swept_device_holders"]
     assert swept["reason"] == "kubernetes_container_on_quarantined_node"
     assert swept["kubernetes"] is True
@@ -110,13 +123,13 @@ def test_the_switch_sweeps_a_kubernetes_holder_of_the_target_gpu(
 def test_without_the_switch_the_kubernetes_holder_is_left_and_attributed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner = ServiceRunner(active={"kubelet"})
+    runner = KillAwareRunner()
     manager = _manager(tmp_path, runner)
 
     receipt, kills = _quiesce(manager, _holder(KUBE_CGROUP), monkeypatch, runner)
 
     assert kills == [], "the HyperPod default never signals an unknown holder"
-    assert receipt["swept_device_holders"] == []
+    assert receipt["swept_device_holders"] == [], receipt
     (skipped,) = receipt["unswept_device_holders"]
     assert skipped["reason"] == "outside_workload_cgroup_and_process_whitelist"
     assert skipped["kubernetes"] is True and skipped["container_id"] == CONTAINER_ID
@@ -125,17 +138,17 @@ def test_without_the_switch_the_kubernetes_holder_is_left_and_attributed(
 def test_the_switch_never_reaches_a_host_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runner = ServiceRunner(active={"kubelet"})
+    runner = KillAwareRunner()
     manager = _manager(tmp_path, runner, sweep_kubernetes_device_holders=True)
 
     receipt, kills = _quiesce(
         manager, _holder("/system.slice/customer-monitor.service"), monkeypatch, runner
     )
 
-    assert kills == []
+    assert kills == [], "a host process outside the whitelist is never signalled"
     (skipped,) = receipt["unswept_device_holders"]
     assert skipped["kubernetes"] is False
-    assert "container_id" not in skipped
+    assert "container_id" not in skipped, skipped
 
 
 def test_the_switch_is_not_part_of_the_agent_config_digest(tmp_path: Path) -> None:
@@ -161,16 +174,23 @@ def test_the_switch_is_not_part_of_the_agent_config_digest(tmp_path: Path) -> No
 
 
 def test_the_switch_is_read_from_the_agent_environment(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_SECRET", SECRET)
+    monkeypatch.setenv("NODE_NAME", "node-a")
+    monkeypatch.setenv("GPU_FAULT_NODE_ALLOWED_OPERATIONS", "QUIESCE_GPU_SERVICES")
     monkeypatch.setenv("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", "true")
+    monkeypatch.setenv("GPU_FAULT_QUIESCE_STATE_DIR", str(tmp_path / "quiesce"))
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_DB", str(tmp_path / "actions.db"))
     monkeypatch.delenv(
         "GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS", raising=False
     )
-    _enabled, default = agent_config._quiesce_from_environment("/proc", set())
-    assert default is not None and default.sweep_kubernetes_device_holders is False
+    default = executor_from_environment(validate_runtime_paths=False).quiesce_manager
+    assert default is not None and default.sweep_kubernetes_device_holders is False, (
+        "the HyperPod default leaves Kubernetes holders alone"
+    )
     monkeypatch.setenv("GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS", "true")
-    _enabled, configured = agent_config._quiesce_from_environment("/proc", set())
+    configured = executor_from_environment(validate_runtime_paths=False).quiesce_manager
     assert configured is not None and configured.sweep_kubernetes_device_holders is True
 
 
