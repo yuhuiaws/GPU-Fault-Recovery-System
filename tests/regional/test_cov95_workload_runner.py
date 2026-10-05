@@ -516,7 +516,7 @@ def test_managed_fixture_factory_passes_complete_workload_expectations(
     )
     assert value.expected_pods == 3 and value.expected_gpu_count == 24
     assert value.restart_budget == 1
-    with pytest.raises(runner.RegionalFixtureError, match="at least three"):
+    with pytest.raises(runner.RegionalFixtureError, match="at least 2 schedulable"):
         runner.prewarm_nodes(SimpleNamespace(gpu_nodes=lambda: []))
 
 

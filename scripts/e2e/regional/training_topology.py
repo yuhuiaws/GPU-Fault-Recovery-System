@@ -34,6 +34,8 @@ from typing import Any
 
 import yaml
 
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
 #: The fixtures' native shape: three Pods, eight GPUs and sixteen EFA devices each.
 NATIVE_NODES = 3
 NATIVE_GPUS_PER_NODE = 8
@@ -45,8 +47,12 @@ EFA_RESOURCE = "vpc.amazonaws.com/efa"
 NPROC_PATTERN = re.compile(r"--nproc-per-node=\d+")
 
 
-class TrainingTopologyError(RuntimeError):
-    """The cluster cannot host the fixtures' distributed training at all."""
+class TrainingTopologyError(RegionalFixtureError):
+    """The cluster cannot host the fixtures' distributed training at all.
+
+    A fixture refusal: the runners' preflights record it by name like any
+    other ``RegionalFixtureError`` instead of dying on an unexpected exception.
+    """
 
 
 @dataclass(frozen=True)

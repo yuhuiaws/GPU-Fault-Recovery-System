@@ -431,8 +431,8 @@ def read_only_preflight(
         "GF-REGIONAL-COLLECT-015",
     } and (not settings.hyperpod_cluster or not settings.executor_role_arn):
         errors.append(
-            f"{settings.case_id} requires the provider cluster scope "
-            "(--hyperpod-cluster; the EKS cluster name on eks-managed) and executor role"
+            f"{settings.case_id} requires the provider cluster scope (--hyperpod-cluster: "
+            "the HyperPod name, or the EKS cluster name on eks-managed) and executor role"
         )
     if not tests["passed"]:
         errors.append("focused regression tests failed")

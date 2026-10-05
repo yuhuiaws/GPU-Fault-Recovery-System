@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import weakref
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -131,13 +132,9 @@ class WorkloadAcceptanceError(RuntimeError):
 
 
 class WorkloadCaseError(WorkloadAcceptanceError):
-    """A case body failed after producing a partial outcome.
-
-    ``outcome`` carries what the case had recorded up to the failure --
-    cleanup_errors, prewarm residuals, a deferred workload -- so the evidence
-    file written by ``main`` shows the state the cluster was left in rather
-    than only the first exception's text.
-    """
+    """A case body failed after producing a partial outcome; ``outcome`` carries
+    what it recorded (cleanup errors, residuals, a deferred workload) so the
+    evidence file shows the state the cluster was left in."""
 
     def __init__(self, cause: BaseException, outcome: dict[str, Any]) -> None:
         super().__init__(f"{type(cause).__name__}: {cause}")
@@ -388,7 +385,7 @@ def wait_terminal_observation(
 
 def wait_finite_workload(
     fixture: ManagedWorkloadFixture,
-    topology: training_topology.TrainingTopology,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
     *,
     timeout_seconds: int = 900,
 ) -> dict[str, Any]:
@@ -460,16 +457,26 @@ def admin_status(state_dir: Path) -> dict[str, Any]:
     }
 
 
-# One training topology per cluster, derived from its GPU nodes on first use.
-TOPOLOGIES: dict[str, training_topology.TrainingTopology] = {}
+# One training topology per fixture instance, derived from its GPU nodes on
+# first use (a case keeps one shape); no fixture means the fixtures' native shape.
+TOPOLOGIES: weakref.WeakKeyDictionary[Any, training_topology.TrainingTopology] = (
+    weakref.WeakKeyDictionary()
+)
 derive_topology = training_topology.derive_training_topology
 
 
-def topology_for(regional: RegionalLiveFixture) -> training_topology.TrainingTopology:
-    key = regional.settings.cluster_id
-    if key not in TOPOLOGIES:
-        TOPOLOGIES[key] = derive_topology(regional.gpu_nodes())
-    return TOPOLOGIES[key]
+def topology_for(
+    regional: RegionalLiveFixture | None,
+) -> training_topology.TrainingTopology:
+    if regional is None:
+        return training_topology.NATIVE_TOPOLOGY
+    try:
+        cached = TOPOLOGIES.get(regional)
+    except TypeError:  # a bare namespace cannot be weakly referenced
+        return derive_topology(regional.gpu_nodes())
+    if cached is None:
+        cached = TOPOLOGIES[regional] = derive_topology(regional.gpu_nodes())
+    return cached
 
 
 def prewarm_nodes(regional: RegionalLiveFixture) -> list[str]:
@@ -524,10 +531,8 @@ def wait_pod_uids_unchanged(
 ) -> dict[str, Any]:
     """Hold that the workload's Pod UIDs stay ``expected_uids`` for the window.
 
-    Reads ``pods()`` -- one kubectl get per poll -- rather than the fixture's
-    ``snapshot()``, which also pulls three Pods' logs every poll for a check
-    that only looks at UIDs. The final snapshot confirms the Pods still
-    heartbeat.
+    Reads ``pods()`` (one kubectl get per poll) rather than ``snapshot()``, which
+    also pulls the Pods' logs; the final snapshot confirms they still heartbeat.
     """
 
     deadline = time.monotonic() + timeout_seconds
@@ -584,11 +589,9 @@ def cleanup_workload(
 ) -> list[str]:
     """Delete the case's workload only once its workflow is provably quiet.
 
-    A delete while STOP_WORKLOADS/RESTART_WORKLOAD is still RUNNING races the
-    executor and leaves a workflow acting on a workload that no longer exists.
-    When the fault was injected (``injection`` names node/marker/time) the
-    DESTR-009 quiescence wait runs first; if it cannot prove quiescence the
-    workload is left in place and ``workload_cleanup_deferred`` says so.
+    A delete during a RUNNING STOP_WORKLOADS/RESTART_WORKLOAD races the executor;
+    after an injection the DESTR-009 quiescence wait runs first, and an unproven
+    quiescence leaves the workload in place (``workload_cleanup_deferred``).
     """
 
     errors: list[str] = []
@@ -1974,12 +1977,8 @@ def case_plan(
 
 
 def failure_outcome(exc: BaseException) -> dict[str, Any]:
-    """The evidence body for a case whose handler raised.
-
-    A ``WorkloadCaseError`` carries the partial result its ``finally`` block
-    annotated (cleanup_errors, residuals, a deferred workload), so the file
-    shows the state the cluster was left in and not only the exception text.
-    """
+    """The evidence body for a case whose handler raised: a ``WorkloadCaseError``
+    carries the partial result its ``finally`` block annotated."""
 
     partial = dict(exc.outcome) if isinstance(exc, WorkloadCaseError) else {}
     partial.pop("verdict", None)

@@ -155,6 +155,14 @@ class FakeRegional:
     def cpu_blast_snapshot(self) -> dict[str, Any]:
         return {"nodes": ["cpu-1"]}
 
+    def gpu_nodes(self) -> list[dict[str, Any]]:
+        # Three schedulable 8-GPU nodes: the native Group A topology.
+        return [
+            {**item, "ready": "True", "unschedulable": False, "taints": []}
+            | {"gpu_allocatable": "8"}
+            for item in CANDIDATES
+        ]
+
     def kubectl(self, _plane: str, *arguments: str, **_kwargs: Any) -> str:
         self.log.entries.append("regional:kubectl:" + " ".join(arguments[:3]))
         if arguments[0] == "logs":

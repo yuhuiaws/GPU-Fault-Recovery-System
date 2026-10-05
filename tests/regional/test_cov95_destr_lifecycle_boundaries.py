@@ -237,7 +237,7 @@ def test_warm_provider_inventory_drift_is_rejected_even_with_expected_workflow(
     else:
         report = scenario_run(h, tmp_path, "no-spare")
     assert report["verdict"] == "FAIL", report
-    assert "HyperPod provider inventory changed" in report["errors"], report
+    assert "provider node inventory changed" in report["errors"], report
 
 
 def test_failover_requires_fault_agent_revocation(

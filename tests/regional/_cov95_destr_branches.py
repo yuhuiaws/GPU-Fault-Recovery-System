@@ -756,6 +756,10 @@ class BranchProbe:
 
 
 class BranchWarm:
+    # The warm-spare fixture names its cluster's provider; the branch harnesses
+    # model a HyperPod cluster.
+    provider = "hyperpod"
+
     def __init__(self, harness: BranchHarness) -> None:
         self.h = harness
 
