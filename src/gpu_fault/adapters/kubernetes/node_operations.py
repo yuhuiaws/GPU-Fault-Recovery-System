@@ -17,6 +17,7 @@ from gpu_fault.adapters.common import (
     ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
     ANNOTATION_PREVIOUS_UNSCHEDULABLE,
     QUARANTINE_TAINT,
+    QUIESCE_TAINT,
     NodeIsolationRejected,
     quarantine_taint_value,
 )
@@ -556,8 +557,12 @@ class KubernetesNodeOperationsMixin:
             raise NodeIsolationRejected(
                 "isolation ownership does not match incident/fencing token"
             )
+        # The quiesce taint (eks-managed) is this incident's too: a restore
+        # that releases the node must not leave a NoExecute taint behind.
         taints = [
-            item for item in self._taints(node) if item.get("key") != QUARANTINE_TAINT
+            item
+            for item in self._taints(node)
+            if item.get("key") not in {QUARANTINE_TAINT, QUIESCE_TAINT}
         ]
         was_unschedulable = (
             annotations.get(

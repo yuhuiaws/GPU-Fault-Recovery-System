@@ -12,7 +12,13 @@ from gpu_fault.node_agent import NodeActionExecutor, NodeActionStatus
 from tests.node_agent._cov95_runtime_support import (
     node_factory_fixture as node_factory_fixture,
 )
-from tests.node_agent._support import FakeRunner, command, envelope
+from tests.node_agent._support import (
+    FakeRunner,
+    command,
+    envelope,
+    no_device_clients,
+    node_action_executor,
+)
 from tests.regional._cov95_runtime_support import offline_runtime as offline_runtime
 
 
@@ -232,3 +238,60 @@ def test_unsupported_minor_number_probe_falls_back_to_a_complete_index_map(
     result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
     assert result.status is NodeActionStatus.SUCCEEDED
     assert sum("--query-gpu=uuid,index" in argv for argv in queries) == 1
+
+
+@pytest.mark.parametrize("kind", ["compute", "device"])
+def test_verify_failure_names_the_holders_it_saw(tmp_path, kind: str) -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): seven minutes of VERIFY
+    retries and not one record said who held the GPU. The failure now carries
+    every holder with its cgroup and Kubernetes container/pod identity."""
+
+    proc = tmp_path / "proc"
+    process = proc / "4242"
+    process.mkdir(parents=True)
+    (process / "cgroup").write_text(
+        "0::/kubepods.slice/kubepods-besteffort.slice/"
+        "kubepods-besteffort-pode747090b_fef5_4687_a913_2bcab51934c6.slice/"
+        "cri-containerd-" + "ab" * 32 + ".scope\n",
+        encoding="ascii",
+    )
+    agent = node_action_executor(
+        tmp_path,
+        "verify-holders.db",
+        allowed_operations={WorkflowOperation.VERIFY_NO_GPU_CLIENTS},
+        reset_enabled=True,
+        runner=FakeRunner(clients="GPU-a, 4242, python\n" if kind == "compute" else ""),
+        proc_root=str(proc),
+        device_client_finder=(
+            no_device_clients
+            if kind == "compute"
+            else lambda _: [
+                {
+                    "gpu_uuid": "GPU-a",
+                    "pid": "4242",
+                    "process_name": "dcgm-exporter",
+                    "device": "/dev/nvidia0",
+                }
+            ]
+        ),
+        gpu_device_path_finder=lambda: {"GPU-a": "/dev/nvidia0"},
+        sleep=lambda _: None,
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.FAILED
+    assert f"GPU {kind} clients are still active" in result.error
+    assert result.details["gpu_client_kind"] == kind
+    assert result.details["gpu_client_holders_total"] == 1
+    (holder,) = result.details["gpu_client_holders"]
+    assert holder["pid"] == "4242" and holder["gpu_uuid"] == "GPU-a"
+    assert holder["kubernetes"] is True
+    assert holder["container_id"] == "ab" * 32
+    assert holder["pod_uid"] == "e747090b-fef5-4687-a913-2bcab51934c6"
+    assert holder["cgroup_paths"][0].startswith("/kubepods.slice/"), (
+        "the cgroup path is what ties the pid to its container"
+    )
+    if kind == "device":
+        assert holder["device"] == "/dev/nvidia0"
+        assert result.details["transient_device_clients"] == []

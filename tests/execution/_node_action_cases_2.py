@@ -756,12 +756,19 @@ def test_busy_spare_client_check_fails_instead_of_waiting(spare_health_check) ->
     )
     registry = StubFleetRegistry({"node-a": "http://node-a:9099"})
 
+    holder = {"gpu_uuid": "GPU-abc", "pid": "4242", "process_name": "python"}
+
     def sender(_endpoint, envelope):
         return node_action_result(
             envelope.command.command_id,
             envelope.command.operation,
             NodeActionStatus.FAILED,
             error=("RuntimeError: GPU compute clients are still active: GPU-abc:4242"),
+            details={
+                "gpu_client_kind": "compute",
+                "gpu_client_holders": [holder],
+                "gpu_client_holders_total": 1,
+            },
         )
 
     adapter = NodeActionWorkflowAdapter({}, "s" * 32, sender=sender, registry=registry)
@@ -789,6 +796,9 @@ def test_busy_spare_client_check_fails_instead_of_waiting(spare_health_check) ->
     )
 
     assert outcome.details["gpu_client_quiesce_attempt"] == 1
+    # Each attempt's record names who held the GPU (live 2026-10-05: none did).
+    assert outcome.details["gpu_client_holders"] == [holder], outcome.details
+    assert outcome.details["gpu_client_kind"] == "compute"
     if spare_health_check:
         assert outcome.status is WorkflowStepStatus.FAILED
         assert "clients are still active" in (outcome.error or "")

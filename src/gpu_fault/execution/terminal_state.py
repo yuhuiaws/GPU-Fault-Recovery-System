@@ -82,6 +82,50 @@ def failure_incident_state(workflow: WorkflowRequest) -> IncidentState:
     return IncidentState.ESCALATED
 
 
+def _completed_nodes(
+    workflow: WorkflowRequest, operations: frozenset[WorkflowOperation]
+) -> set[str]:
+    steps = (
+        workflow.safety_steps
+        if workflow.executes_safety_steps
+        else workflow.official_steps
+    )
+    completed = set(workflow.completed_step_indexes)
+    return {
+        node
+        for index, step in enumerate(steps)
+        if index in completed and step.operation in operations
+        for node in step.node_ids
+    }
+
+
+_RELEASE_OPERATIONS = frozenset({WorkflowOperation.RESTORE_SCHEDULING})
+
+
+def predecessor_holds_isolation(
+    predecessor: WorkflowRequest | None, workflow: WorkflowRequest
+) -> bool:
+    """Nodes the incident's predecessor workflow cordoned or quarantined that
+    neither it nor this successor released with a completed RESTORE_SCHEDULING.
+
+    A successor queued on the incident takes its pointer; when the predecessor
+    then ends FAILED its QUARANTINED verdict is not written (``_save_terminal``
+    keeps a stale snapshot from stealing the pointer back), and the successor's
+    own verdict -- RECOVERED for a plan with no containment -- would call a
+    node that is still cordoned recovered (live 2026-10-05, gpu-eks-cluster: a
+    RESTART_GPU_DEVICE_PLUGIN successor of a failed RESET_GPU). The isolation is
+    the incident's, so the successor's verdict carries it.
+    """
+
+    if predecessor is None or predecessor.incident_id != workflow.incident_id:
+        return False
+    isolated = _completed_nodes(predecessor, _ISOLATION_OPERATIONS)
+    released = _completed_nodes(predecessor, _RELEASE_OPERATIONS) | _completed_nodes(
+        workflow, _RELEASE_OPERATIONS
+    )
+    return bool(isolated - released)
+
+
 def terminal_incident_state(
     workflow: WorkflowRequest, status: WorkflowStatus
 ) -> IncidentState:
@@ -120,8 +164,14 @@ def terminal_decision(
     reason: str | None = None,
     incident_state: IncidentState | None = None,
     updates: Mapping[str, object] | None = None,
+    predecessor: WorkflowRequest | None = None,
 ) -> TerminalDecision:
-    """Build new records without changing the input records or writing anything."""
+    """Build new records without changing the input records or writing anything.
+
+    ``predecessor`` is the incident's previous workflow when this record names
+    one: isolation it left on the nodes keeps the incident QUARANTINED whatever
+    this record's own steps say (``predecessor_holds_isolation``).
+    """
 
     if has_unresolved_node_action(workflow):
         status = WorkflowStatus.BLOCKED
@@ -152,6 +202,12 @@ def terminal_decision(
         if incident_state is not None
         else terminal_incident_state(ended, status)
     )
+    if (
+        incident_state is None
+        and derived_state in {IncidentState.RECOVERED, IncidentState.ESCALATED}
+        and predecessor_holds_isolation(predecessor, ended)
+    ):
+        derived_state = IncidentState.QUARANTINED
     inconclusive = (
         status is WorkflowStatus.FAILED
         and incident_state is None

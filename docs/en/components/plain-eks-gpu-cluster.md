@@ -58,8 +58,9 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - DCGM exporter: the HyperPod AMI runs DCGM as a host service and the DaemonSet dials `127.0.0.1:5555`; the AL2023
   NVIDIA AMI has no nv-hostengine/dcgmi, so the `eks-managed` render drops `DCGM_REMOTE_HOSTENGINE_INFO` and runs the
   embedded hostengine (`NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=utility`, no SYS_ADMIN, no
-  `nvidia.com/gpu` request); hostNetwork, the loopback 9400 bind, instance-type affinity and the wildcard toleration
-  are unchanged; a mixed site's plan adds `dcgm_eks_managed`.
+  `nvidia.com/gpu` request); hostNetwork, the loopback 9400 bind and instance-type affinity are unchanged; the
+  tolerations become explicit `nvidia.com/gpu` and `gpu-fault.io/quarantined` (not the quiesce taint of §2.7; the
+  HyperPod manifest's wildcard toleration is byte for byte unchanged); a mixed site's plan adds `dcgm_eks_managed`.
 - The node collector scrapes DCGM metrics from the exporter over HTTP, never dcgmi; the node agent's quick DCGM
   diagnostic reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on nodes without dcgmi.
 - Data-plane Deployments (executor, watcher, reconciler, node-resource collector, ADOT) carry no node pin and tolerate
@@ -81,6 +82,22 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - Deploy-host gates: the test-impact selection and the role-split render test run inside the deploy's
   deadline/API-budget scope without inheriting it.
 
+### 2.7 The quiesce taint (eks-managed only)
+- A plain EKS quiesce leaves kubelet running, so the GPU client containers the Agent stops (the product's own exporter,
+  the device plugin, GFD) are back within seconds, recreated by their DaemonSets, and the `VERIFY_NO_GPU_CLIENTS` before
+  the reset never sees the GPU free (live, 2026-10-05). The Executor taints the node
+  `gpu-fault.io/quiesce=<incident value>:NoExecute` before it dispatches QUIESCE_GPU_SERVICES
+  (`adapters/node_action/quiesce_taint.py`; if the taint cannot be applied the step FAILS and no Agent command is sent)
+  and removes it before it dispatches RESTORE_GPU_SERVICES (if the removal fails the host services are still restored
+  and the step FAILS naming the error); `cluster_executor/bootstrap.py` wires the Kubernetes core client into the Node
+  Action adapter only under `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`, so HyperPod is unchanged.
+- RESTORE_SCHEDULING (the validated restore) strips a leftover quiesce taint together with the cordon and the
+  quarantine taint; the node evidence of `workflow-reconcile`, the orphaned-annotation cleanup and `config spare`
+  treat it as isolation still in place.
+- DaemonSet Pods that do not tolerate the taint are evicted for the window and return after it; third-party GPU
+  clients with a key-less wildcard toleration (`operator: Exists`) stay inside the window and the reset still answers
+  `In use by another client` -- see §3 item 6.
+
 ## 3. Operator prerequisites (plain EKS cluster)
 
 1. Node group: `AL2023_x86_64_NVIDIA` (or equivalent) AMI; launch template user data installing `python3.12 strace`
@@ -92,6 +109,10 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 4. Approval: the first plain EKS cluster joining a HyperPod site needs `--approve-profile-plan <sha> --reference <CHG>`
    (eks-v1).
 5. Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn> --gpu-nodegroup <ng>`.
+6. Third-party GPU client DaemonSets (the customer's own dcgm-exporter, GPU feature discovery, monitoring agents)
+   **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such
+   as `nvidia.com/gpu` instead) and must tolerate being stopped/evicted inside a quiesce window; the default NVIDIA
+   device plugin and GFD manifests tolerate only `nvidia.com/gpu` and need no change.
 
 ## 4. Limitations
 
@@ -102,6 +123,9 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - A first `deploy` refuses mixed providers (deploy one provider, join the other).
 - The embedded hostengine relies on the AMI's default NVIDIA container runtime; a cluster without `nvidia` as the
   default runtime would need `runtimeClassName` on the DaemonSet (not needed on this cluster).
+- The quiesce taint evicts only Pods that do not tolerate it: DaemonSets with a wildcard toleration, static Pods and
+  non-Kubernetes processes are untouched, and a reset may still answer `In use by another client` because of them (the
+  step's `details.gpu_client_holders` names the holders).
 
 ## 5. Validation status (honest)
 
@@ -112,7 +136,7 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - Unit/contract: `tests/*eks_managed*`, `tests/fleet/test_cluster_profile_pins.py`,
   `tests/eks_provider/test_mixed_site_owner_resolution.py`, `tests/deploy/test_node_preflight_host_prerequisites.py`
   and others; HyperPod neutrality is pinned by digest constants and byte-identical render assertions.
-- **Not validated**: the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
+- **Not validated**: the quiesce taint (§2.7) and the restore exit for a RECOVERED incident have unit tests only; the third live DESTR-001 round is still to run; the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
   confirmation, departed nodes, token rotation, the live `remove-cluster`/`uninstall` paths for eks-managed, Agent
   upgrade/rollback, long-run stability); more than one plain EKS cluster; non-AL2023 AMIs; workload namespaces other
   than `training`; clusters without the NVIDIA runtime as default.

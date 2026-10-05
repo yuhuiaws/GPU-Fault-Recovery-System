@@ -111,6 +111,30 @@ def test_do_not_run_case_cannot_be_planned_or_authorized(method, tmp_path) -> No
             )
 
 
+@pytest.mark.parametrize("recorded", [False, True])
+def test_plan_details_name_the_failed_preflight_conditions(recorded: bool) -> None:
+    """A refused plan must say which condition fired, not only
+    ``preflight_passed: false`` next to a generic ``stop_conditions`` list."""
+
+    details = {"stop_conditions": ["a target node is busy"]}
+    if recorded:
+        details["preflight_errors"] = ["runner's own wording"]
+    preflight = {"errors": ["node-b is not Ready and schedulable"], "store": {}}
+
+    merged = guard.details_with_preflight_errors(details, preflight)
+
+    assert merged["preflight_errors"] == (
+        ["runner's own wording"]
+        if recorded
+        else ["node-b is not Ready and schedulable"]
+    )
+    assert merged["stop_conditions"] == ["a target node is busy"]
+    assert guard.details_with_preflight_errors({}, {"errors": []}) == {
+        "preflight_errors": []
+    }
+    assert guard.details_with_preflight_errors({}, {})["preflight_errors"] == []
+
+
 def test_missing_details_object_rejects_an_otherwise_matching_plan(
     tmp_path, monkeypatch
 ) -> None:

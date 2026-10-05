@@ -218,7 +218,12 @@ def parser() -> argparse.ArgumentParser:
 
     add = commands.add_parser("block")
     add.add_argument("--run-id", required=True)
-    add.add_argument("--control-plane-cidr", action="append", required=True)
+    add.add_argument(
+        "--control-plane-cidr",
+        action="append",
+        required=True,
+        help="IPv4 CIDR the control-plane URL resolves to from this node (repeatable)",
+    )
     add.add_argument("--restore-seconds", type=int, default=2100)
     add.set_defaults(handler=block)
 

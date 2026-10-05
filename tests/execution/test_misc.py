@@ -3,6 +3,7 @@
 # ruff: noqa: F401
 from ._misc_cases_1 import (
     test_expired_quiesce_allows_restore_but_not_hardware_action,
+    test_expired_window_verdict_keeps_the_last_attempts_holders,
     test_failed_reset_runs_restore_compensation_before_terminal,
     test_hung_bundle_fans_out_to_all_attempt_nodes_after_failure,
     test_hung_triage_dispatches_nodes_concurrently,

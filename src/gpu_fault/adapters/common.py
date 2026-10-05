@@ -52,6 +52,12 @@ LABEL_ATTEMPT_ID = "gpu-fault.io/attempt-id"
 LABEL_JOB_ID = "gpu-fault.io/job-id"
 
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
+#: The NoExecute taint the executor puts on an eks-managed node for the quiesce
+#: window (QUIESCE_GPU_SERVICES -> RESTORE_GPU_SERVICES): kubelet stays up
+#: there, so a GPU client container the node agent stops is restarted seconds
+#: later by its DaemonSet; a taint the GPU DaemonSets do not tolerate evicts
+#: them for the window instead. Value: ``quarantine_taint_value(incident_id)``.
+QUIESCE_TAINT = "gpu-fault.io/quiesce"
 
 
 class NodeIsolationRejected(ValueError):

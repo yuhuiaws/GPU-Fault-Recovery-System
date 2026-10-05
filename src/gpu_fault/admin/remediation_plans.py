@@ -5,8 +5,8 @@ built here from the control plane's inspection and the live nodes, and
 ``gpu_fault.admin.submit_remediation`` submits them.
 
 ``restore`` (``RestorePlan``)
-    the validated restore of a QUARANTINED incident, or of an ESCALATED one
-    whose workflows have all ended (``RESTORABLE_STATES``). Judged *per
+    the validated restore of a QUARANTINED incident, or of an ESCALATED or
+    RECOVERED one whose workflows have all ended (``RESTORABLE_STATES``). Judged *per
     node*: a node still isolated by this incident (its
     ``gpu-fault.io/quarantined`` taint, or its isolation annotation -- the
     ownership the restore's kubernetes patch reads) is restored; a node already
@@ -23,7 +23,14 @@ built here from the control plane's inspection and the live nodes, and
     would have orphaned the isolation. The same validated restore under the
     same incident and fencing token is the exit; the ownership check on the
     node is unchanged, and a BLOCKED record still goes through
-    ``confirm-node-action`` / ``workflow-reconcile`` first.
+    ``confirm-node-action`` / ``workflow-reconcile`` first. The RECOVERED case
+    is a node whose isolating workflow FAILED while a sibling workflow of the
+    same incident SUCCEEDED and recovered the incident (live 2026-10-05,
+    gpu-eks-cluster: a RESET_GPU chain failed after MARK_UNSCHEDULABLE and a
+    queued RESTART_GPU_DEVICE_PLUGIN successor took the incident to RECOVERED):
+    the node stayed cordoned, tainted and annotated and ``restore`` refused it
+    as "RECOVERED". Same rule as ESCALATED: every workflow ended, a node still
+    carries this incident's isolation, same incident and fencing token.
 
 ``confirm-node-action`` (``ConfirmNodeActionPlan``)
     the operator's confirmation of a node action whose outcome the executor
@@ -64,10 +71,15 @@ OPEN_WORKFLOW_STATUSES = frozenset({"PENDING", "RUNNING", "SAFETY_PENDING"})
 ENDED_WORKFLOW_STATUSES = frozenset({"FAILED", "SUPERSEDED", "SUCCEEDED"})
 QUARANTINED_STATE = "QUARANTINED"
 ESCALATED_STATE = "ESCALATED"
-# The incident states ``restore`` accepts: QUARANTINED, or ESCALATED once every
-# workflow of the incident has ended (an exhausted ladder whose last rung
-# FAILED can leave the node isolated under an ESCALATED record).
-RESTORABLE_STATES = frozenset({QUARANTINED_STATE, ESCALATED_STATE})
+RECOVERED_STATE = "RECOVERED"
+# The incident states ``restore`` accepts: QUARANTINED, or ESCALATED / RECOVERED
+# once every workflow of the incident has ended (an exhausted ladder whose last
+# rung FAILED, or a sibling workflow that recovered the incident, can leave the
+# node isolated under such a record); the per-node decisions then require a node
+# that still carries this incident's isolation.
+RESTORABLE_STATES = frozenset({QUARANTINED_STATE, ESCALATED_STATE, RECOVERED_STATE})
+# The states whose restore needs every workflow of the incident ended first.
+ENDED_WORKFLOWS_REQUIRED_STATES = frozenset({ESCALATED_STATE, RECOVERED_STATE})
 BLOCKED_STATE = "BLOCKED"
 DECISION_RESTORE = "restore"
 DECISION_SKIP = "skip"
@@ -222,9 +234,10 @@ def _validate_restore_identity(
     state = str(incident.get("state"))
     if state not in RESTORABLE_STATES:
         raise BootstrapError(
-            f"incident {incident_id} is {state}, not {QUARANTINED_STATE} or "
-            f"{ESCALATED_STATE}; {DISPOSITION_RESTORE} applies to a quarantined "
-            "node, or to an escalated incident whose workflows have all ended"
+            f"incident {incident_id} is {state}, not {QUARANTINED_STATE}, "
+            f"{ESCALATED_STATE} or {RECOVERED_STATE}; {DISPOSITION_RESTORE} applies "
+            "to a quarantined node, or to an escalated or recovered incident whose "
+            "workflows have all ended while a node still carries its isolation"
         )
     if workflow is None:
         raise BootstrapError(
@@ -246,17 +259,22 @@ def _validate_restore_identity(
         )
     if not incident.get("node_ids"):
         raise BootstrapError(f"incident {incident_id} names no nodes")
-    if state == ESCALATED_STATE:
-        _validate_escalated_restore(
-            inspection, incident_id=incident_id, workflow=workflow
+    if state in ENDED_WORKFLOWS_REQUIRED_STATES:
+        _validate_ended_restore(
+            inspection, incident_id=incident_id, workflow=workflow, state=state
         )
     return incident, workflow
 
 
-def _validate_escalated_restore(
-    inspection: Mapping[str, Any], *, incident_id: str, workflow: Mapping[str, Any]
+def _validate_ended_restore(
+    inspection: Mapping[str, Any],
+    *,
+    incident_id: str,
+    workflow: Mapping[str, Any],
+    state: str,
 ) -> None:
-    """An ESCALATED incident is restorable only once every workflow has ended.
+    """An ESCALATED or RECOVERED incident is restorable only once every
+    workflow has ended.
 
     Its pointer workflow may be FAILED / SUPERSEDED / SUCCEEDED (an open one is
     refused by the shared open-workflow check); a BLOCKED record -- the pointer
@@ -275,12 +293,12 @@ def _validate_escalated_restore(
         blocked.insert(0, str(workflow.get("request_id")))
     if blocked:
         raise BootstrapError(
-            f"incident {incident_id} is {ESCALATED_STATE} with BLOCKED workflow "
+            f"incident {incident_id} is {state} with BLOCKED workflow "
             + ", ".join(blocked)
             + " still parked on its nodes; answer it with --disposition "
             "confirm-node-action or gpu-fault-admin workflow-reconcile first -- "
-            f"{DISPOSITION_RESTORE} of an escalated incident needs every workflow "
-            "ended (" + "/".join(sorted(ENDED_WORKFLOW_STATUSES)) + ")"
+            f"{DISPOSITION_RESTORE} of a {state.lower()} incident needs every "
+            "workflow ended (" + "/".join(sorted(ENDED_WORKFLOW_STATUSES)) + ")"
         )
 
 

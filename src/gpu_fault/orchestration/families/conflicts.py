@@ -19,6 +19,30 @@ from gpu_fault.operation_registry import (
 from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 from gpu_fault.store import NotFoundError
 
+#: Operations during which the node's GPU device plugin is stopped or being
+#: replaced on purpose: the quiesce stops its container, the restore starts it,
+#: the plugin restart deletes its Pod. A ``gpu_kubernetes_allocatable_mismatch``
+#: raised while one of them runs is the workflow's own side effect, not a new
+#: fault (live 2026-10-05, gpu-eks-cluster: the quiesce of a RESET_GPU chain
+#: raised it, the planner queued a RESTART_GPU_DEVICE_PLUGIN successor on the
+#: same incident, and that successor took the incident pointer -- the reset's
+#: QUARANTINED verdict never reached the incident).
+DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+    }
+)
+#: Finding -> the operations of a RUNNING node-exclusive workflow that make the
+#: finding transient while they run (validated by the workflow's own VALIDATE_GPU).
+TRANSIENT_INVENTORY_FINDINGS = {
+    "gpu_inventory_mismatch": TRANSIENT_GPU_INVENTORY_OPERATIONS,
+    "gpu_kubernetes_allocatable_mismatch": (
+        TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
+    ),
+}
+
 
 class NodeConflictService:
     EXECUTABLE_STATUSES = frozenset(
@@ -145,7 +169,8 @@ class NodeConflictService:
         self,
         finding: NodeHealthFinding,
     ) -> tuple[FaultIncident, WorkflowRequest] | None:
-        if finding.metric_name != "gpu_inventory_mismatch":
+        covering = TRANSIENT_INVENTORY_FINDINGS.get(finding.metric_name or "")
+        if covering is None:
             return None
         workflow = self.active_node_exclusive_workflow(
             finding.cluster_id,
@@ -154,7 +179,7 @@ class NodeConflictService:
         if workflow is None or workflow.status is not WorkflowStatus.RUNNING:
             return None
         operations = {step.operation for step in workflow.official_steps}
-        if not operations.intersection(TRANSIENT_GPU_INVENTORY_OPERATIONS):
+        if not operations.intersection(covering):
             return None
         validation = {
             index

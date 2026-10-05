@@ -317,6 +317,98 @@ def test_inventory_coverage_still_reports_a_present_incumbent() -> None:
     assert covered[1].request_id == "wf-run"
 
 
+def _allocatable_finding() -> NodeHealthFinding:
+    return node_health_finding(
+        "finding-allocatable",
+        "event-allocatable",
+        cluster_id=CLUSTER,
+        node_id="node-a",
+        observed_at=NOW,
+        category=NodeHealthCategory.GPU,
+        severity="critical",
+        metric_name="gpu_kubernetes_allocatable_mismatch",
+        reason="Node allocatable nvidia.com/gpu 0 below the host inventory 8",
+        recommended_action=RecoveryAction.RESTART_GPU_DEVICE_PLUGIN,
+        runtime_profile_version="simulated-v1",
+    )
+
+
+def _running_reset(store, operations=None) -> None:
+    operations = operations or [
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        WorkflowOperation.VALIDATE_GPU,
+    ]
+    incident = fault_incident(
+        "inc-reset",
+        "event-reset",
+        cluster_id=CLUSTER,
+        node_ids=["node-a"],
+        workflow_request_id="wf-reset",
+    )
+    workflow = workflow_request(
+        "wf-reset",
+        "inc-reset",
+        status=WorkflowStatus.RUNNING,
+        official_steps=[workflow_step(operation) for operation in operations],
+        completed_step_indexes=[0, 1],
+        completed_operations=operations[:2],
+    )
+    store.save_incident_and_workflow(incident, workflow)
+
+
+def test_a_reset_chain_covers_the_allocatable_dip_its_own_quiesce_causes() -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the chain's QUIESCE stopped
+    the device plugin container, kubelet's allocatable dropped, the finding was
+    queued as a RESTART_GPU_DEVICE_PLUGIN successor on the same incident and
+    that successor took the incident pointer -- the reset's QUARANTINED verdict
+    never reached the incident. The dip is the reset's own side effect."""
+
+    store = build_store()
+    _running_reset(store)
+    service = NodeConflictService(store, RecoveryArbiter())
+
+    covered = service.active_workflow_covers_inventory_finding(_allocatable_finding())
+
+    assert covered is not None, "the running reset owns the allocatable dip"
+    assert covered[0].incident_id == "inc-reset"
+    assert covered[1].request_id == "wf-reset"
+
+
+def test_a_running_workflow_that_leaves_the_plugin_alone_does_not_cover_it() -> None:
+    store = build_store()
+    _running_reset(
+        store, [WorkflowOperation.RUN_FIELD_DIAGNOSTIC, WorkflowOperation.VALIDATE_GPU]
+    )
+    service = NodeConflictService(store, RecoveryArbiter())
+
+    assert (
+        service.active_workflow_covers_inventory_finding(_allocatable_finding()) is None
+    ), "a diagnostic never stops the device plugin; the mismatch is a real finding"
+
+
+def test_the_allocatable_dip_joins_the_running_reset_without_a_successor() -> None:
+    store = build_store()
+    store.save_profile(default_simulated_profile())
+    _running_reset(store)
+    orchestrator = IncidentOrchestrator(store, multi_node_aggregation_window_seconds=30)
+
+    incident, workflow = orchestrator.ingest_node_health(_allocatable_finding())
+
+    assert incident.incident_id == "inc-reset"
+    assert workflow is not None and workflow.request_id == "wf-reset"
+    assert [item.request_id for item in store.list_workflows()] == ["wf-reset"], (
+        "no RESTART_GPU_DEVICE_PLUGIN successor is queued on the reset's incident"
+    )
+    current = store.get_incident("inc-reset")
+    assert current.workflow_request_id == "wf-reset", "the incident pointer stays"
+    linked = store.get_incident_by_event("event-allocatable")
+    assert linked is not None and linked.incident_id == "inc-reset"
+
+
 # --- deterministic family ids -----------------------------------------------
 
 

@@ -36,6 +36,7 @@ from gpu_fault.node_agent.operations import (
     RemediationOperationsMixin,
     ResetOperationsMixin,
 )
+from gpu_fault.node_agent.operations.clients import GpuClientsActive
 from gpu_fault.node_agent.operations.collector_outbox import CollectorOutboxRefused
 from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
 from gpu_fault.node_agent.operations.reset import ResetProgressError
@@ -562,6 +563,7 @@ class NodeActionExecutor(
                             InstallOutcomeUnknownError,
                             CollectorOutboxRefused,
                             OwnershipRefused,
+                            GpuClientsActive,
                         ),
                     )
                     else {}

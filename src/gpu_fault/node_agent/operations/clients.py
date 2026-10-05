@@ -8,9 +8,31 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from xml.etree import ElementTree as ET
 
+from gpu_fault.node_agent.operations.holders import (
+    CGROUP_PATH_LIMIT,
+    GPU_CLIENT_HOLDER_LIMIT,
+    kubernetes_attribution,
+    process_cgroup_paths,
+)
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+
+
+class GpuClientsActive(RuntimeError):
+    """``VERIFY_NO_GPU_CLIENTS`` found a client; ``action_details`` names it.
+
+    The message keeps the ``clients are still active`` wording the executor's
+    retry fold matches on; the details carry every holder it saw -- pid,
+    process name, device, cgroup paths and the Kubernetes container/pod the
+    cgroup names -- so the step record of each attempt says who held the GPU
+    (live 2026-10-05, gpu-eks-cluster: seven minutes of retries and a record
+    that said only "quiesce maintenance window expired").
+    """
+
+    def __init__(self, message: str, *, action_details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.action_details = action_details
 
 
 class ClientOperationsMixin:
@@ -270,6 +292,32 @@ class ClientOperationsMixin:
         except (OSError, UnicodeError):
             return "unknown"
 
+    def _client_holder_details(
+        self, kind: str, clients: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """The verification's holders with their cgroup and Kubernetes identity.
+
+        The same attribution the busy-reset evidence uses (``holders``): the
+        cgroup paths of ``/proc/<pid>`` and the container id / pod uid a
+        ``kubepods`` path names. Bounded, no command lines.
+        """
+
+        holders: list[dict[str, Any]] = []
+        for item in clients[:GPU_CLIENT_HOLDER_LIMIT]:
+            cgroups = process_cgroup_paths(Path(self.proc_root) / str(item["pid"]))
+            holders.append(
+                {
+                    **item,
+                    "cgroup_paths": cgroups[:CGROUP_PATH_LIMIT],
+                    **kubernetes_attribution(cgroups),
+                }
+            )
+        return {
+            "gpu_client_kind": kind,
+            "gpu_client_holders": holders,
+            "gpu_client_holders_total": len(clients),
+        }
+
     def _device_clients(self, gpu_uuids: set[str]) -> list[dict[str, str]]:
         device_paths = self.gpu_device_path_finder()
         targets = {
@@ -453,11 +501,12 @@ class ClientOperationsMixin:
             if not target or item["gpu_uuid"] in target
         ]
         if compute_clients:
-            raise RuntimeError(
+            raise GpuClientsActive(
                 "GPU compute clients are still active: "
                 + ", ".join(
                     f"{item['gpu_uuid']}:{item['pid']}" for item in compute_clients
-                )
+                ),
+                action_details=self._client_holder_details("compute", compute_clients),
             )
         transient_device_clients: list[dict[str, str]] = []
         if include_device_clients:
@@ -472,12 +521,16 @@ class ClientOperationsMixin:
                     transient_device_clients,
                 ) = self._persistent_device_clients(target)
             if device_clients:
-                raise RuntimeError(
+                raise GpuClientsActive(
                     "GPU device clients are still active: "
                     + ", ".join(
                         f"{item['gpu_uuid']}:{item['pid']}:{item['process_name']}"
                         for item in device_clients
-                    )
+                    ),
+                    action_details={
+                        **self._client_holder_details("device", device_clients),
+                        "transient_device_clients": transient_device_clients,
+                    },
                 )
         return {
             "verified_no_gpu_clients": True,

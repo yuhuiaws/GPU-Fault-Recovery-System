@@ -11,12 +11,27 @@ from gpu_fault.adapters.common import (
     dcgm_result_is_configuration_only,
     node_action_accepted_nodes,
 )
+from gpu_fault.adapters.node_action.quiesce_taint import (
+    apply_quiesce_taint,
+    remove_quiesce_taint,
+)
 from gpu_fault.adapters.node_action.reset_outcome import normalize_legacy_reset_failure
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
 from gpu_fault.orchestration.escalation import unknown_outcome_failure
+
+
+#: The holder evidence a VERIFY_NO_GPU_CLIENTS result carries (node agent
+#: ``GpuClientsActive``), kept on the WAITING record of every attempt and on
+#: the FAILED record that ends the retries.
+VERIFY_EVIDENCE_KEYS = (
+    "gpu_client_kind",
+    "gpu_client_holders",
+    "gpu_client_holders_total",
+    "transient_device_clients",
+)
 
 
 @dataclass
@@ -28,6 +43,8 @@ class NodeActionBatchState:
     triage_pending: dict[str, str] = field(default_factory=dict)
     diagnostic_failures: dict[str, str] = field(default_factory=dict)
     diagnostic_waiting: dict[str, str] = field(default_factory=dict)
+    quiesce_taint_nodes: list[str] = field(default_factory=list)
+    quiesce_taint_error: str | None = None
 
 
 class NodeActionExecutionService:
@@ -50,10 +67,52 @@ class NodeActionExecutionService:
             readiness=readiness,
             verify_attempt=self.adapter._verify_attempt(context),
         )
+        refused = self._quiesce_taint(context, state)
+        if refused is not None:
+            return refused
         outcome = self._dispatch(context, state)
         if outcome is not None:
             return outcome
         return self._finalize(context, state)
+
+    def _quiesce_taint(
+        self, context: WorkflowStepContext, state: NodeActionBatchState
+    ) -> WorkflowStepOutcome | None:
+        """Taint the node for the quiesce window / untaint it for the restore.
+
+        Only when the adapter was wired a Kubernetes core (eks-managed). The
+        taint goes on before the quiesce is dispatched and comes off before the
+        restore is, so the agent's wait for the named containers to come back
+        can succeed. A quiesce whose taint fails is refused before any agent
+        command (fail closed); a restore whose untaint fails still restores the
+        host services and ends FAILED naming the error (RESTORE_SCHEDULING and
+        the validated restore strip the key too).
+        """
+
+        core = getattr(self.adapter, "quiesce_taint_core", None)
+        operation = context.step.operation
+        if core is None or operation not in {
+            WorkflowOperation.QUIESCE_GPU_SERVICES,
+            WorkflowOperation.RESTORE_GPU_SERVICES,
+        }:
+            return None
+        nodes = list(context.step.node_ids)
+        try:
+            if operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
+                state.quiesce_taint_nodes = apply_quiesce_taint(
+                    core, nodes, context.incident.incident_id
+                )
+            else:
+                state.quiesce_taint_nodes = remove_quiesce_taint(core, nodes)
+        except Exception as exc:  # noqa: BLE001 - the error is the evidence
+            error = f"{type(exc).__name__}: {exc}"
+            if operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
+                return WorkflowStepOutcome.failed(
+                    f"quiesce taint could not be applied before the quiesce: {error}",
+                    details={"quiesce_taint_error": error, "quiesce_taint_nodes": []},
+                )
+            state.quiesce_taint_error = error
+        return None
 
     def _preflight(
         self,
@@ -272,6 +331,14 @@ class NodeActionExecutionService:
                 operation_id=context.idempotency_key,
                 details={
                     **self._partial_progress(state),
+                    # Who held the GPU on this attempt (pid, process, cgroup,
+                    # container/pod): the agent's VERIFY names them, and a
+                    # window that expires later keeps the last attempt's list.
+                    **{
+                        key: result.details[key]
+                        for key in VERIFY_EVIDENCE_KEYS
+                        if key in result.details
+                    },
                     "gpu_client_quiesce_attempt": state.verify_attempt,
                     "waiting_node": node_id,
                     "reason": result.error,
@@ -290,6 +357,7 @@ class NodeActionExecutionService:
                     # live 2026-10-05 the record carried only remote_status.
                     "gpu_client_holders",
                     "gpu_reset_busy_attempts",
+                    *VERIFY_EVIDENCE_KEYS,
                 )
                 if key in result.details
             },
@@ -436,6 +504,12 @@ class NodeActionExecutionService:
             if outcome is not None:
                 return outcome
         self._decorate_success(context, state, details)
+        if state.quiesce_taint_error is not None:
+            return WorkflowStepOutcome.failed(
+                "GPU services restored but the quiesce taint could not be removed: "
+                + state.quiesce_taint_error,
+                details={**details, "quiesce_taint_error": state.quiesce_taint_error},
+            )
         return WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
             details=details,
@@ -604,6 +678,13 @@ class NodeActionExecutionService:
 
     def _decorate_success(self, context, state, details) -> None:
         operation = context.step.operation
+        if state.quiesce_taint_nodes:
+            key = (
+                "quiesce_taint_nodes"
+                if operation is WorkflowOperation.QUIESCE_GPU_SERVICES
+                else "quiesce_taint_removed_nodes"
+            )
+            details[key] = list(state.quiesce_taint_nodes)
         if operation is WorkflowOperation.QUIESCE_GPU_SERVICES and state.readiness:
             started = (
                 self.adapter.registry.now()

@@ -2144,19 +2144,11 @@ class ProductionWorkflowExecutor:
         updates: Mapping[str, object] | None = None,
         actor: str | None = None,
     ) -> WorkflowExecutionResult:
-        """The one way a claimed workflow ends (F-C9).
-
-        Every terminal path used to write its own copy of the same four
-        fields and its own incident state, and each drift between them was a
-        bug in the release of restart reservations. This writes the terminal
-        ``status``, drops the owner and lease, applies the path's own
-        ``updates`` (a blocked kind, a preemption reason, cleared compensation
-        markers), derives the incident state from the status unless the path
-        names one, appends the one ``TERMINAL`` audit event, and saves
-        through ``_save_terminal`` -- which is where the unattempted restart
-        reservations are released. ``reason`` is the error the result
-        carries; ``actor`` defaults to this executor.
-        """
+        """The one way a claimed workflow ends (F-C9): the terminal ``status``,
+        owner and lease dropped, the path's ``updates`` applied, the incident
+        state derived unless the path names one (a predecessor's unreleased
+        isolation keeps it QUARANTINED), the one ``TERMINAL`` event, and the
+        save through ``_save_terminal`` that releases restart reservations."""
 
         if updates:
             workflow = workflow.model_copy(update=dict(updates))
@@ -2170,6 +2162,7 @@ class ProductionWorkflowExecutor:
             incident_state=incident_state,
             actor=actor or self.config.executor_id,
             now=datetime.now(timezone.utc),
+            predecessor=self._terminal_predecessor(workflow),
         )
         incident_written = self._save_terminal(
             decision.workflow, decision.incident, execution_epoch
@@ -2184,13 +2177,15 @@ class ProductionWorkflowExecutor:
             )
         return self._result(decision.workflow, decision.incident, error=decision.error)
 
-    @staticmethod
-    def _inconclusive_reason(error: str | None) -> str:
-        return terminal_state.inconclusive_reason(error)
-
-    @staticmethod
-    def _diagnostic_only(workflow: WorkflowRequest) -> bool:
-        return terminal_state.diagnostic_only(workflow)
+    def _terminal_predecessor(
+        self, workflow: WorkflowRequest
+    ) -> WorkflowRequest | None:
+        if workflow.predecessor_workflow_id is None:
+            return None
+        try:
+            return self.store.get_workflow(workflow.predecessor_workflow_id)
+        except NotFoundError:
+            return None
 
     def _close_inconclusive_diagnostic(
         self,

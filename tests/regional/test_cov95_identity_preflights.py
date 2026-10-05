@@ -174,13 +174,34 @@ def test_focused_test_wrappers_reuse_proof_or_record_the_actual_returncode(
 
 
 @pytest.mark.parametrize(
-    "shape", ["literal", "field-ref", "missing", "ambiguous", "wrong-ref", "not-ready"]
+    "shape",
+    [
+        "literal",
+        "cluster-literal",
+        "field-ref",
+        "missing",
+        "missing-with-settings",
+        "ambiguous",
+        "wrong-ref",
+        "not-ready",
+    ],
 )
 def test_e2e002_executor_identity_is_explicit_and_not_ambiguous(shape: str) -> None:
+    """The lease owner is GPU_FAULT_CLUSTER_EXECUTOR_ID, by default
+    ``<cluster_id>/<pod>``; the stock Deployment sets no identity variable, so an
+    executor without one is identified by its defaults, not refused (live
+    2026-10-05: every E2E-002/ISO-007 preflight died "missing or ambiguous")."""
+
     document = pod_document()
     pod = document["items"][0]
-    entry: dict[str, Any] = {"name": "GPU_FAULT_EXECUTOR_ID"}
-    if shape == "literal":
+    entry: dict[str, Any] = {
+        "name": (
+            "GPU_FAULT_CLUSTER_EXECUTOR_ID"
+            if shape == "cluster-literal"
+            else "GPU_FAULT_EXECUTOR_ID"
+        )
+    }
+    if shape in {"literal", "cluster-literal"}:
         entry["value"] = "a/executor"
     elif shape in {"field-ref", "wrong-ref"}:
         entry["valueFrom"] = {
@@ -190,20 +211,28 @@ def test_e2e002_executor_identity_is_explicit_and_not_ambiguous(shape: str) -> N
         }
     pod["spec"]["containers"][0]["env"] = [
         {"name": "IGNORED", "value": "ignore"},
-        entry,
+        *([] if shape.startswith("missing") else [entry]),
     ]
     if shape == "ambiguous":
         entry["value"] = "first"
         pod["spec"]["containers"][1]["env"] = [
-            {"name": "GPU_FAULT_EXECUTOR_ID", "value": "second"}
+            {"name": "GPU_FAULT_CLUSTER_EXECUTOR_ID", "value": "second"}
         ]
     elif shape == "not-ready":
         pod["status"]["phase"] = "Pending"
     region = SimpleNamespace(kubectl=lambda *args: json.dumps(document))
-    if shape in {"literal", "field-ref"}:
+    if shape == "missing-with-settings":
+        region.settings = SimpleNamespace(cluster_id="b")
+    if shape in {"literal", "cluster-literal", "field-ref"}:
         assert e2e.executor_identities(region) == [
-            "a/executor" if shape == "literal" else "api"
+            "api" if shape == "field-ref" else "a/executor"
         ]
+    elif shape == "missing":
+        assert e2e.executor_identities(region) == ["api"], "the Pod name is the default"
+    elif shape == "missing-with-settings":
+        assert e2e.executor_identities(region) == ["api", "b/api"], (
+            "the executor's default identity is <cluster_id>/<pod>"
+        )
     else:
         with pytest.raises(
             e2e.RegionalFixtureError, match="Ready|missing or ambiguous"

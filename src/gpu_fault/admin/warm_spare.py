@@ -93,6 +93,7 @@ OWNERSHIP_ANNOTATIONS = (
     "gpu-fault.io/previous-unschedulable",
 )
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
+QUIESCE_TAINT = "gpu-fault.io/quiesce"
 GPU_RESOURCE = "nvidia.com/gpu"
 FINISHED_POD_PHASES = frozenset({"Succeeded", "Failed"})
 
@@ -407,7 +408,8 @@ def declared_spares(api: NodeApi) -> list[str]:
 
 def has_quarantine_ownership(snapshot: Mapping[str, Any]) -> bool:
     return any(
-        item.get("key") == QUARANTINE_TAINT for item in snapshot["taints"]
+        item.get("key") in {QUARANTINE_TAINT, QUIESCE_TAINT}
+        for item in snapshot["taints"]
     ) or any(snapshot["annotations"].get(key) for key in OWNERSHIP_ANNOTATIONS)
 
 

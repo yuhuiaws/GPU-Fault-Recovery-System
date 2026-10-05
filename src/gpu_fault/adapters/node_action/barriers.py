@@ -58,6 +58,39 @@ class NodeActionBarrierMixin:
         except (TypeError, ValueError):
             return 1
 
+    @staticmethod
+    def _last_attempt_evidence(context: WorkflowStepContext) -> dict[str, Any]:
+        """What the step's latest record (a WAITING retry) saw: the attempt
+        number, the holders and the agent's reason. ``record_attempt`` replaces
+        that record when the window-expiry verdict lands, so the verdict carries
+        it (live 2026-10-05: every VERIFY record ended with empty details)."""
+
+        previous = next(
+            (
+                item
+                for item in reversed(context.workflow.step_executions)
+                if item.step_index == context.step_index
+                and item.operation is context.step.operation
+            ),
+            None,
+        )
+        if previous is None:
+            return {}
+        evidence = {
+            key: previous.details[key]
+            for key in (
+                "gpu_client_quiesce_attempt",
+                "gpu_client_kind",
+                "gpu_client_holders",
+                "gpu_client_holders_total",
+                "waiting_node",
+            )
+            if key in previous.details
+        }
+        if previous.details.get("reason"):
+            evidence["last_attempt_reason"] = previous.details["reason"]
+        return evidence
+
     def _readiness(
         self, context: WorkflowStepContext
     ) -> dict[str, int] | WorkflowStepOutcome:
@@ -135,7 +168,11 @@ class NodeActionBarrierMixin:
             and context.step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
         ):
             return WorkflowStepOutcome.failed(
-                f"quiesce maintenance window expired at {expires_at.isoformat()}"
+                f"quiesce maintenance window expired at {expires_at.isoformat()}",
+                details={
+                    "maintenance_window_expires_at": expires_at.isoformat(),
+                    **self._last_attempt_evidence(context),
+                },
             )
         generations: dict[str, int] = {}
         for node_id in context.step.node_ids:

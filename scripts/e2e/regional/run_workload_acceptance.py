@@ -347,7 +347,7 @@ def assert_clean_identity_baseline(
     if findings:
         raise RegionalFixtureError(
             f"job {job_id}/{attempt_id} already has control-plane state "
-            f"({' | '.join(findings)}); change --attempt/--job-id and rerun"
+            f"({' | '.join(findings)}); rerun with a new --attempt (or --job-id)"
         )
 
 

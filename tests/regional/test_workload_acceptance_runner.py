@@ -62,7 +62,9 @@ def test_identity_baseline_must_be_empty_or_the_operator_changes_the_identity() 
         "restart_budget": {"restart_count": 1},
         "observations": [{"workload_phase": "RUNNING"}],
     }
-    with pytest.raises(RegionalFixtureError, match="change --attempt/--job-id") as info:
+    with pytest.raises(
+        RegionalFixtureError, match="rerun with a new --attempt"
+    ) as info:
         workload.assert_clean_identity_baseline(
             [clean, dirty], job_id="j", attempt_id="j-a001"
         )

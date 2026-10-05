@@ -164,6 +164,13 @@ def executor_from_environment() -> ClusterActionExecutor:
     if env_bool("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER"):
         node_action_adapter = NodeActionWorkflowAdapter.from_environment(
             registry=fleet_registry,
+            # eks-managed only: the quiesce window taints the node so the GPU
+            # DaemonSets kubelet would restart stay away (quiesce_taint.py).
+            quiesce_taint_core=(
+                kubernetes_adapter.core
+                if cluster_provider() is ClusterProvider.EKS_MANAGED
+                else None
+            ),
         )
         adapters.append(node_action_adapter)
     if env_bool("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"):

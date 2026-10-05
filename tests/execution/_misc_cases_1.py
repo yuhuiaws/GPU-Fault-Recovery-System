@@ -578,6 +578,98 @@ def test_expired_quiesce_allows_restore_but_not_hardware_action(
         assert "maintenance window expired" in (outcome.error or "")
 
 
+def test_expired_window_verdict_keeps_the_last_attempts_holders() -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the window-expiry verdict
+    replaced the WAITING record that held the last holder list, so the FAILED
+    step said only "quiesce maintenance window expired". The verdict now carries
+    the expiry and what the last attempt saw."""
+
+    store = build_store()
+    incident, workflow = workflow_state(
+        store,
+        [
+            WorkflowOperation.QUIESCE_GPU_SERVICES,
+            WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+        ],
+    )
+    steps = [
+        copy_model(
+            step,
+            execution_owner="gpu-fault-node-agent",
+            node_ids=["node-a"],
+            gpu_uuids=["GPU-a"],
+        )
+        for step in workflow.official_steps
+    ]
+    expired_at = datetime(2026, 10, 5, 15, 14, 32, tzinfo=timezone.utc)
+    holder = {
+        "gpu_uuid": "GPU-a",
+        "pid": "4242",
+        "process_name": "nvidia-device-plugin",
+    }
+    workflow = copy_model(
+        workflow,
+        official_steps=steps,
+        step_executions=[
+            workflow_step_execution(
+                0,
+                WorkflowOperation.QUIESCE_GPU_SERVICES,
+                details={
+                    "agent_generations": {"node-a": 7},
+                    "maintenance_window_expires_at": expired_at.isoformat(),
+                },
+            ),
+            workflow_step_execution(
+                1,
+                WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+                WorkflowStepStatus.WAITING,
+                details={
+                    "gpu_client_quiesce_attempt": 41,
+                    "gpu_client_kind": "device",
+                    "gpu_client_holders": [holder],
+                    "gpu_client_holders_total": 1,
+                    "waiting_node": "node-a",
+                    "reason": "RuntimeError: GPU device clients are still active",
+                },
+            ),
+        ],
+    )
+    registry = StubFleetRegistry({"node-a": "http://node-a:9099"}, generation=7)
+    registry.now = lambda: expired_at + timedelta(seconds=1)
+    sent = []
+
+    def sender(_, envelope):
+        sent.append(envelope.command.operation)
+        return node_action_result(
+            envelope.command.command_id, envelope.command.operation
+        )
+
+    outcome = NodeActionWorkflowAdapter(
+        {}, "s" * 32, sender=sender, registry=registry
+    ).execute(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=incident,
+            step=steps[1],
+            step_index=1,
+            request=WorkflowExecutionRequest(expected_fencing_token=3),
+            idempotency_key="workflow/expired/VERIFY_NO_GPU_CLIENTS",
+        )
+    )
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert sent == [], "an expired window never reaches the agent"
+    assert "maintenance window expired" in (outcome.error or "")
+    assert outcome.details["maintenance_window_expires_at"] == expired_at.isoformat()
+    assert outcome.details["gpu_client_holders"] == [holder], outcome.details
+    assert outcome.details["gpu_client_quiesce_attempt"] == 41
+    assert outcome.details["gpu_client_kind"] == "device"
+    assert outcome.details["waiting_node"] == "node-a"
+    assert outcome.details["last_attempt_reason"].endswith(
+        "clients are still active"
+    ), "the verdict names why the last attempt waited"
+
+
 def test_post_reboot_handoff_restore_uses_fresh_agent_generation() -> None:
     store = build_store()
     incident, workflow = workflow_state(

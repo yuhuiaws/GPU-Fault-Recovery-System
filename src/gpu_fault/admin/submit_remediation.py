@@ -23,17 +23,18 @@ generation, deadline passed), and submits:
     hardware action; the original incident is never rewritten.
 ``restore``
     not a CHECK_MECHANICALS answer but the exit of a QUARANTINED incident whose
-    node was repaired by hand -- or of an ESCALATED incident whose workflows
-    have all ended while a node still carries its isolation (an exhausted
-    escalation ladder whose last rung FAILED): a validated restore workflow
+    node was repaired by hand -- or of an ESCALATED or RECOVERED incident whose
+    workflows have all ended while a node still carries its isolation (an
+    exhausted escalation ladder whose last rung FAILED; a sibling workflow that
+    recovered the incident while the failed one's cordon stood): a validated restore workflow
     (VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING)
     under the *same* incident and fencing token, built by
     ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod, for the
     nodes still isolated by this incident (its taint or its isolation
     annotation); nodes already clean, or another incident's business, are
     skipped and the plan says why (``gpu_fault.admin.remediation_plans``).
-    Refused unless the incident is QUARANTINED, or ESCALATED with every
-    workflow FAILED/SUPERSEDED/SUCCEEDED, with no open workflow and at least
+    Refused unless the incident is QUARANTINED, or ESCALATED / RECOVERED with
+    every workflow FAILED/SUPERSEDED/SUCCEEDED, with no open workflow and at least
     one node still isolated by it; with none left the advice is to close the
     incident. Until 2026-09-10 only the acceptance fixture could create this
     workflow.
@@ -1160,8 +1161,8 @@ def add_submit_remediation_command(
             "acknowledge a CHECK_MECHANICALS inspection and, for a hardware "
             "disposition, submit the operator marker and terminal trigger built "
             "from the incident record; restore: create the validated restore of "
-            "a QUARANTINED incident, or of an ESCALATED one whose workflows have "
-            "all ended, for the nodes it still isolates; "
+            "a QUARANTINED incident, or of an ESCALATED or RECOVERED one whose "
+            "workflows have all ended, for the nodes it still isolates; "
             "confirm-node-action: record, on fleet and node evidence, the outcome "
             "of a node action a BLOCKED workflow could not observe"
         ),
@@ -1173,8 +1174,8 @@ def add_submit_remediation_command(
         metavar="INCIDENT_ID",
         help=(
             "the incident whose workflow is waiting on CHECK_MECHANICALS, "
-            "(restore) the QUARANTINED or ended ESCALATED incident that owns the "
-            "node's isolation, or "
+            "(restore) the QUARANTINED, or ended ESCALATED / RECOVERED, incident "
+            "that owns the node's isolation, or "
             "(confirm-node-action) the incident whose BLOCKED workflow left a node "
             "action outcome unknown"
         ),

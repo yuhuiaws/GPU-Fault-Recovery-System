@@ -296,6 +296,7 @@ def test_declaration_is_refused_when_the_pool_state_is_not_available() -> None:
     "overrides",
     [
         {"taints": [{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}]},
+        {"taints": [{"key": "gpu-fault.io/quiesce", "effect": "NoExecute"}]},
         {"annotations": {"gpu-fault.io/incident-id": "INC-1"}},
         {"annotations": {"gpu-fault.io/fencing-token": "7"}},
         {"annotations": {"gpu-fault.io/previous-unschedulable": "false"}},

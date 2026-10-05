@@ -220,6 +220,9 @@ def test_cluster_pressure_rejects_nonfinite_negative_or_duplicate_depth(
         "same-hyperpod",
         "missing-eks",
         "missing-hyperpod",
+        "eks-managed-pair",
+        "eks-managed-same-arn",
+        "two-eks-managed",
     ],
 )
 def test_two_logical_registrations_do_not_prove_two_physical_clusters(
@@ -235,6 +238,14 @@ def test_two_logical_registrations_do_not_prove_two_physical_clusters(
         }
         for name in ("a", "b")
     ]
+    if defect.startswith("eks-managed") or defect == "two-eks-managed":
+        # A plain EKS registration has no HyperPod name by design; its
+        # physical identity is the cluster id (and the EKS ARN).
+        registrations[1].update(provider="eks-managed", hyperpod_cluster_name="")
+        if defect == "two-eks-managed":
+            registrations[0].update(provider="eks-managed", hyperpod_cluster_name="")
+        elif defect == "eks-managed-same-arn":
+            registrations[1]["eks_cluster_arn"] = registrations[0]["eks_cluster_arn"]
     if defect == "one":
         registrations.pop()
     elif defect == "id":
@@ -250,5 +261,8 @@ def test_two_logical_registrations_do_not_prove_two_physical_clusters(
         key = "eks_cluster_arn" if defect == "missing-eks" else "hyperpod_cluster_name"
         registrations[1][key] = ""
     assert multi.registrations_are_distinct_physical_clusters(registrations) is (
-        defect == "none"
-    )
+        defect in {"none", "eks-managed-pair", "two-eks-managed"}
+    ), defect
+    if defect == "eks-managed-pair":
+        assert multi.physical_cluster_name(registrations[0]) == "hp-a"
+        assert multi.physical_cluster_name(registrations[1]) == "b"

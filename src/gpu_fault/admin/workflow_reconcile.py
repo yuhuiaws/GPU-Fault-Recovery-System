@@ -66,6 +66,10 @@ from gpu_fault.admin.site import RenderedSite
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 HISTORY_PATH = Path("workflow-reconcile/history")
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
+# The eks-managed quiesce window's NoExecute taint; a node still carrying it is
+# still isolated (the restore and RESTORE_SCHEDULING strip it).
+QUIESCE_TAINT = "gpu-fault.io/quiesce"
+ISOLATION_TAINTS = frozenset({QUARANTINE_TAINT, QUIESCE_TAINT})
 # The bridge for a record the *deployed* planner refuses for lacking a source
 # recovery plan while naming a verified restore successor. A job DAG's node
 # branch is never plan-driven; when it parks BLOCKED and a later validated
@@ -712,7 +716,7 @@ def _orphaned_isolation_metadata(
         or any(
             not isinstance(taint, dict)
             or not isinstance(taint.get("key"), str)
-            or taint["key"] == QUARANTINE_TAINT
+            or taint["key"] in ISOLATION_TAINTS
             for taint in taints
         )
     ):
@@ -815,11 +819,16 @@ def cluster_nodes(
     return nodes
 
 
-def _node_scheduling_evidence(
+def node_scheduling_evidence(
     node_id: str,
     node: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """What ``node`` (a ``kubectl get node -o json`` item) carries.
+
+    Pure: no kubeconfig, no command. ``restored`` is false while the node keeps
+    a cordon, the quarantine taint, the quiesce taint (``gpu-fault.io/quiesce``,
+    the eks-managed quiesce window's NoExecute taint) or an isolation annotation;
+    ``blockers`` names each one.
 
     ``quarantine_taint_value`` and ``isolation_annotation_values`` (key ->
     value) are the ownership facts ``IncidentClosureService`` needs to judge a
@@ -857,6 +866,11 @@ def _node_scheduling_evidence(
             taint_value = str(item.get("value") or "")
             break
     quarantine = taint_value is not None
+    # The eks-managed quiesce window's NoExecute taint: a node that still
+    # carries it is not released (the restore's RESTORE_SCHEDULING strips it).
+    quiesced = any(
+        isinstance(item, dict) and item.get("key") == QUIESCE_TAINT for item in taints
+    )
     isolation_annotation_values = {
         key: str(annotations[key])
         for key in ISOLATION_ANNOTATIONS
@@ -868,6 +882,8 @@ def _node_scheduling_evidence(
         blockers.append("node remains unschedulable")
     if quarantine:
         blockers.append("node retains the gpu-fault quarantine taint")
+    if quiesced:
+        blockers.append("node retains the gpu-fault quiesce taint")
     if isolation_annotations:
         blockers.append("node retains gpu-fault isolation annotations")
     return {
@@ -903,7 +919,7 @@ def node_isolation_evidence(
     nodes = inventory if inventory is not None else cluster_nodes(site, cluster_id)
     evidence: list[dict[str, Any]] = []
     for node_id in sorted({str(item) for item in node_ids}):
-        raw = _node_scheduling_evidence(node_id, nodes.get(node_id))
+        raw = node_scheduling_evidence(node_id, nodes.get(node_id))
         evidence.append(
             {
                 "node_id": node_id,
@@ -948,7 +964,7 @@ def _departed_node_evidence(
     happened (``hyperpod`` or ``ec2``).
     """
 
-    missing = _node_scheduling_evidence(node_id, None)
+    missing = node_scheduling_evidence(node_id, None)
     target = cluster_target(site, cluster_id)
     if (
         workflow_reconcile_departed_nodes.cluster_provider_of(target)
@@ -1044,7 +1060,7 @@ def _scheduling_evidence(
                     instance_id=recorded.get(cluster_id, node_id),
                 )
                 if departed_allowed and inventory.get(node_id) is None
-                else _node_scheduling_evidence(node_id, inventory.get(node_id))
+                else node_scheduling_evidence(node_id, inventory.get(node_id))
                 for node_id in node_ids
             ]
         blockers = [

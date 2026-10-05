@@ -73,6 +73,16 @@ def _supported_instance_types() -> str:
 #: :func:`render_dcgm_exporter_manifest`); the HyperPod text carries no mark.
 DCGM_HOSTENGINE_ANNOTATION = "gpu-fault.io/dcgm-hostengine"
 REMOTE_HOSTENGINE_ENV = "DCGM_REMOTE_HOSTENGINE_INFO"
+#: What the eks-managed exporter tolerates instead of the checked-in wildcard
+#: ``operator: Exists``: the GPU node group's own taint and the product's
+#: quarantine taint (NoSchedule, never evicts) -- and NOT the quiesce taint
+#: ``gpu-fault.io/quiesce`` (NoExecute) the executor puts on the node for the
+#: quiesce window, so the exporter's embedded hostengine leaves the GPU with
+#: the other GPU DaemonSets instead of being restarted by kubelet into it.
+EMBEDDED_EXPORTER_TOLERATIONS = (
+    {"key": "nvidia.com/gpu", "operator": "Exists"},
+    {"key": "gpu-fault.io/quarantined", "operator": "Exists"},
+)
 EMBEDDED_HOSTENGINE_ENV = (
     # The NVIDIA container runtime (the default runtime of the EKS NVIDIA AMIs)
     # injects every GPU into a container that asks for them this way; DCGM
@@ -104,6 +114,7 @@ def _embedded_hostengine_documents(text: str) -> str:
         annotations = metadata.setdefault("annotations", {})
         annotations[DCGM_HOSTENGINE_ANNOTATION] = "embedded"
         pod = document["spec"]["template"]["spec"]
+        pod["tolerations"] = [dict(item) for item in EMBEDDED_EXPORTER_TOLERATIONS]
         for container in pod.get("containers", []):
             if container.get("name") != "exporter":
                 continue

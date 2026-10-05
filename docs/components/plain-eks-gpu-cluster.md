@@ -51,7 +51,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - DCGM exporter：HyperPod AMI 以主机服务运行 DCGM，DaemonSet 连接 `127.0.0.1:5555`；AL2023 NVIDIA AMI 没有
   nv-hostengine/dcgmi，`eks-managed` 渲染去掉 `DCGM_REMOTE_HOSTENGINE_INFO`，容器内嵌 hostengine
   （`NVIDIA_VISIBLE_DEVICES=all`、`NVIDIA_DRIVER_CAPABILITIES=utility`，无 SYS_ADMIN、不申请 `nvidia.com/gpu`），
-  hostNetwork/回环 9400/实例类型亲和/通配容忍不变；混合站点 plan 多出 `dcgm_eks_managed`。
+  hostNetwork/回环 9400/实例类型亲和不变；容忍改为显式的 `nvidia.com/gpu` 与 `gpu-fault.io/quarantined`
+  （不容忍 §2.7 的 quiesce 污点；HyperPod 清单的通配容忍逐字节不变）；混合站点 plan 多出 `dcgm_eks_managed`。
 - 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断在无 dcgmi 节点记为
   `WARN`/`DCGM_TOOL_UNAVAILABLE`。
 - 数据面 Deployment（executor、watcher、reconciler、node-resource collector、ADOT）不钉节点、不容忍 GPU 污点，
@@ -69,6 +70,18 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   被留档并按当前 release 重新规划；`ROLLBACK_FAILED` 用同样参数重跑即可恢复并接着开始新 attempt。
 - 部署机门禁：测试影响选择与角色拆分渲染测试在部署的 deadline/API-budget 作用域内运行而不继承它。
 
+### 2.7 quiesce 污点（仅 eks-managed）
+- 普通 EKS 节点的 quiesce 不停 kubelet，Agent 停掉的 GPU 客户端容器（产品自己的 exporter、device plugin、GFD）几秒内
+  被 DaemonSet 拉回，reset 前的 `VERIFY_NO_GPU_CLIENTS` 永远看不到 GPU 空闲（2026-10-05 真机）。Executor 在派发
+  QUIESCE_GPU_SERVICES 前给节点打 `gpu-fault.io/quiesce=<incident 值>:NoExecute`（`adapters/node_action/quiesce_taint.py`；
+  打不上则该步 FAILED、不发 Agent 命令），在派发 RESTORE_GPU_SERVICES 前摘掉（摘不掉则主机服务照常恢复、该步 FAILED 点名）；
+  仅当 `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` 时 `cluster_executor/bootstrap.py` 把 Kubernetes core 客户端接给 Node Action
+  适配器，HyperPod 不接、行为不变。
+- RESTORE_SCHEDULING（validated restore）连同 cordon/隔离污点一起摘掉残留的 quiesce 污点；`workflow-reconcile` 的节点证据、
+  孤儿注解清理与 `config spare` 把它视为仍在隔离。
+- 不容忍该污点的 DaemonSet Pod 在窗口内被驱逐、窗口后回来；带无 key 通配容忍（`operator: Exists`）的第三方 GPU 客户端会留在
+  窗口里，reset 仍会 `In use by another client`——见 §3 第 6 条。
+
 ## 3. 操作员前置（普通 EKS 集群）
 
 1. 节点组：`AL2023_x86_64_NVIDIA`（或等价）AMI；launch template user data 安装 `python3.12 strace`
@@ -79,6 +92,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    需要相应 AWS 权限。
 4. 审批：首个普通 EKS 集群加入 HyperPod 站点需 `--approve-profile-plan <sha> --reference <CHG>`（eks-v1）。
 5. 命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn> --gpu-nodegroup <ng>`。
+6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**
+   `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
+   quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。
 
 ## 4. 限制
 
@@ -88,6 +104,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 首次 `deploy` 不接受混合 provider（先部署一种，再 join 另一种）。
 - 嵌入式 hostengine 依赖 AMI 的默认 NVIDIA 容器运行时；若集群不是默认 `nvidia` runtime，需为 DaemonSet 加
   `runtimeClassName`（本次集群不需要）。
+- quiesce 污点只驱逐不容忍它的 Pod：带通配容忍的 DaemonSet、静态 Pod 与非 Kubernetes 进程不受影响，reset 对它们仍可能
+  `In use by another client`（步骤 `details.gpu_client_holders` 点名持有者）。
 
 ## 5. 验证状态（诚实版）
 
@@ -97,7 +115,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 单元/契约：`tests/*eks_managed*`、`tests/fleet/test_cluster_profile_pins.py`、
   `tests/eks_provider/test_mixed_site_owner_resolution.py`、`tests/deploy/test_node_preflight_host_prerequisites.py`
   等；HyperPod 中立性以摘要固定值与逐字节渲染断言保证。
-- **未验证**：混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
+- **未验证**：quiesce 污点（§2.7）与 RECOVERED 事件的 restore 出口只有单元测试，真机 DESTR-001 第三轮待跑；混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
   remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群；
   非 AL2023 AMI；`training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。
 

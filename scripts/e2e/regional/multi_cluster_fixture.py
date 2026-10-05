@@ -17,6 +17,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
 )
+from gpu_fault.cluster_scope import ClusterProvider, cluster_provider  # noqa: E402
 from scripts.e2e.regional.regional_commands import RegionalFixtureError  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 
@@ -105,6 +106,7 @@ for cluster_id in cluster_ids:
         "allowed_namespaces": registration.allowed_namespaces,
         "hyperpod_cluster_name": registration.hyperpod_cluster_name,
         "eks_cluster_arn": registration.eks_cluster_arn,
+        "provider": getattr(registration, "provider", "") or "hyperpod",
         "token_sha256_length": len(registration.token_sha256),
     })
 print(json.dumps({"clusters": result}, sort_keys=True))
@@ -304,17 +306,31 @@ def control_plane_pressure(
     return cluster_pressure_reading(text, cluster_id)
 
 
+def physical_cluster_name(registration: dict[str, Any]) -> str:
+    """The provider-side identity of a registration: the HyperPod cluster name
+    on HyperPod, the ``cluster_id`` itself on a plain EKS cluster, which has no
+    HyperPod name (``RegionalClusterRegistration.hyperpod_cluster_name`` is
+    empty there by design; live 2026-10-05 the mixed site's pair cases were
+    refused "requires two physical clusters" because of it)."""
+
+    if cluster_provider(registration.get("provider") or "") is ClusterProvider.HYPERPOD:
+        return str(registration.get("hyperpod_cluster_name") or "").strip()
+    return str(registration.get("cluster_id") or "").strip()
+
+
 def registrations_are_distinct_physical_clusters(
     registrations: list[dict[str, Any]],
 ) -> bool:
+    """Two enabled, non-synthetic registrations that name two different physical
+    clusters: distinct EKS cluster ARNs (every provider has one) and distinct
+    provider identities (``physical_cluster_name``)."""
+
     if len(registrations) != 2:
         return False
     eks_arns = {
         str(item.get("eks_cluster_arn") or "").strip() for item in registrations
     }
-    hyperpod_names = {
-        str(item.get("hyperpod_cluster_name") or "").strip() for item in registrations
-    }
+    physical_names = {physical_cluster_name(item) for item in registrations}
     return (
         len({item.get("cluster_id") for item in registrations}) == 2
         and all(
@@ -325,7 +341,7 @@ def registrations_are_distinct_physical_clusters(
             for item in registrations
         )
         and "" not in eks_arns
-        and "" not in hyperpod_names
+        and "" not in physical_names
         and len(eks_arns) == 2
-        and len(hyperpod_names) == 2
+        and len(physical_names) == 2
     )

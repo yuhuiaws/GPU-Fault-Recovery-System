@@ -1387,8 +1387,13 @@ def test_plain_eks_exporter_uses_the_embedded_hostengine() -> None:
     assert any(item.get("hostPort") == 9400 for item in container["ports"]), (
         "the loopback bind is published on the host port the collector dials"
     )
-    assert pod["tolerations"] == [{"operator": "Exists"}], (
-        "the GPU taint (nvidia.com/gpu=present:NoSchedule) is tolerated"
+    assert pod["tolerations"] == [
+        {"key": "nvidia.com/gpu", "operator": "Exists"},
+        {"key": "gpu-fault.io/quarantined", "operator": "Exists"},
+    ], (
+        "the GPU taint and the quarantine taint are tolerated, the quiesce taint "
+        "(gpu-fault.io/quiesce, NoExecute) is not: kubelet would otherwise restart "
+        "the embedded hostengine into the quiesce window (live 2026-10-05)"
     )
     assert container["image"] == DCGM_EXPORTER_IMAGE, "the pinned image is kept"
     assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}, (

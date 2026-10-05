@@ -65,6 +65,7 @@ class NodeActionWorkflowAdapter(
         poll_timeout_seconds: int = 5,
         max_parallel_node_actions: int = 16,
         node_action_retry_limit: int = 3,
+        quiesce_taint_core: Any | None = None,
     ) -> None:
         node_secrets = dict(node_secrets or {})
         if secret and len(secret) < 32:
@@ -126,6 +127,10 @@ class NodeActionWorkflowAdapter(
         if not 0 <= node_action_retry_limit <= 20:
             raise ValueError("node action retry limit must be between 0 and 20")
         self.node_action_retry_limit = node_action_retry_limit
+        # The Kubernetes core client that taints an eks-managed node for the
+        # quiesce window (``quiesce_taint``); None on HyperPod, where the
+        # quiesce stops kubelet and nothing restarts the stopped containers.
+        self.quiesce_taint_core = quiesce_taint_core
 
     @classmethod
     def from_environment(
@@ -135,6 +140,7 @@ class NodeActionWorkflowAdapter(
         barriers: BarrierCoordinator | None = None,
         store: Any | None = None,
         alert_sender=None,
+        quiesce_taint_core: Any | None = None,
     ) -> NodeActionWorkflowAdapter:
         try:
             endpoints = json.loads(os.getenv("GPU_FAULT_NODE_AGENT_ENDPOINTS", "{}"))
@@ -188,6 +194,7 @@ class NodeActionWorkflowAdapter(
             node_action_retry_limit=int(
                 os.getenv("GPU_FAULT_NODE_ACTION_RETRY_LIMIT", "3")
             ),
+            quiesce_taint_core=quiesce_taint_core,
         )
 
     def supports(self, step: WorkflowStepSpec) -> bool:

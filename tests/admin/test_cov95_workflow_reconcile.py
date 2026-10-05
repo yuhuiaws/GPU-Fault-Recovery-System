@@ -147,6 +147,62 @@ def test_node_evidence_retains_unknown_nodes_as_missing(context):
     assert len(transport.calls) == 1
 
 
+def test_a_lingering_quiesce_taint_is_a_release_blocker() -> None:
+    """The eks-managed quiesce window's NoExecute taint: a reset that FAILED
+    between the quiesce and the restore leaves it on the node, and a node that
+    still carries it is not released (the validated restore strips it)."""
+
+    node = {
+        "metadata": {"name": "node-a", "annotations": {}},
+        "spec": {
+            "unschedulable": False,
+            "taints": [
+                {
+                    "key": reconcile.QUIESCE_TAINT,
+                    "value": "incident-abc",
+                    "effect": "NoExecute",
+                }
+            ],
+        },
+    }
+
+    evidence = reconcile.node_scheduling_evidence("node-a", node)
+
+    assert evidence["restored"] is False
+    assert evidence["blockers"] == ["node retains the gpu-fault quiesce taint"]
+    assert evidence["quarantine_taint"] is False, "it is not the quarantine taint"
+
+
+def test_orphaned_annotations_are_not_stripped_under_a_quiesce_taint(context) -> None:
+    site, transport, _root = context
+    node = {
+        "metadata": {
+            "name": "node-a",
+            "uid": "uid-a",
+            "resourceVersion": "9",
+            "annotations": {
+                reconcile.ISOLATION_ANNOTATIONS[0]: "inc-q1",
+                reconcile.ISOLATION_ANNOTATIONS[1]: "3",
+            },
+        },
+        "spec": {
+            "unschedulable": False,
+            "taints": [{"key": reconcile.QUIESCE_TAINT, "effect": "NoExecute"}],
+        },
+    }
+
+    with pytest.raises(BootstrapError, match="node is still isolated"):
+        reconcile.strip_node_isolation_annotations(
+            site, "gpu-a", node, incident_id="inc-q1", expected_node=node, dry_run=True
+        )
+    node["spec"]["taints"] = []
+    stripped = reconcile.strip_node_isolation_annotations(
+        site, "gpu-a", node, incident_id="inc-q1", expected_node=node, dry_run=True
+    )
+    assert stripped["node_id"] == "node-a"
+    assert transport.calls == [], "dry run: nothing is patched"
+
+
 @pytest.mark.parametrize(
     "options",
     [

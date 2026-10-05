@@ -61,6 +61,15 @@ PROBE = Path(__file__).with_name("probes") / "cluster_network_probe.py"
 # sampling every 30 s, 900 s gives 30 A-claim samples and is the default. The
 # catalog's 30-minute window remains reachable through --duration-seconds.
 DEFAULT_DURATION_SECONDS = 900
+#: What ``--control-plane-cidr`` must name; the probe REJECTs TCP 443 to exactly
+#: these destinations on every B node, so they have to be the addresses the
+#: control-plane URL resolves to from B, not a VPC range that may not contain them.
+CIDR_HELP = (
+    "IPv4 CIDR(s) covering the addresses GPU_FAULT_CONTROL_PLANE_URL resolves "
+    "to from cluster B's nodes: the control-plane NLB's per-AZ addresses as /32s "
+    "or their subnet CIDRs (a control-plane VPC CIDR does not cover a public "
+    "NLB); repeatable; 0.0.0.0/0 is refused"
+)
 SAMPLE_INTERVAL_SECONDS = 30
 BASELINE_SAMPLES = 5
 BASELINE_INTERVAL_SECONDS = 10
@@ -165,7 +174,10 @@ def configure(arguments: argparse.Namespace) -> Settings:
     if not 60 <= arguments.duration_seconds <= 1800:
         raise RegionalFixtureError("duration seconds is outside 60..1800")
     if not arguments.control_plane_cidr:
-        raise RegionalFixtureError("at least one control-plane CIDR is required")
+        raise RegionalFixtureError(
+            "at least one control-plane CIDR is required: --control-plane-cidr "
+            + CIDR_HELP
+        )
     job_id, attempt_id = derived_identity(arguments.run_dir, arguments.attempt, CASE_ID)
     configured_job = arguments.job_id.strip() or job_id
     return Settings(
@@ -732,7 +744,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--cluster-b", required=True)
     value.add_argument("--gpu-b-kubeconfig", required=True)
     value.add_argument("--gpu-b-context", required=True)
-    value.add_argument("--control-plane-cidr", action="append", default=[])
+    value.add_argument(
+        "--control-plane-cidr", action="append", default=[], help=CIDR_HELP
+    )
     value.add_argument("--duration-seconds", type=int, default=DEFAULT_DURATION_SECONDS)
     value.add_argument("--host-probe-image", default="")
     value.add_argument("--predecessor-evidence", default="")

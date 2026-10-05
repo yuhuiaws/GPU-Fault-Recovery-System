@@ -304,6 +304,16 @@ def test_multi_cluster_registry_requires_distinct_eks_and_hyperpod_identities() 
             },
         ]
     ), "duplicate HyperPod identity was accepted as a second physical cluster"
+    mixed = [
+        registrations[0],
+        {**registrations[1], "provider": "eks-managed", "hyperpod_cluster_name": ""},
+    ]
+    assert registrations_are_distinct_physical_clusters(mixed), (
+        "a HyperPod + plain-EKS pair is two physical clusters (live mixed site)"
+    )
+    assert not registrations_are_distinct_physical_clusters(
+        [mixed[0], {**mixed[1], "cluster_id": mixed[0]["cluster_id"]}]
+    ), "the plain-EKS identity is its cluster id; a shared id is one cluster"
 
 
 def test_multi_cluster_runners_are_plan_only(tmp_path: Path) -> None:

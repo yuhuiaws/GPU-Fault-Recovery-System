@@ -489,6 +489,26 @@ def _case_dir(arguments: argparse.Namespace, case_id: str) -> Path:
     return case_dir
 
 
+def details_with_preflight_errors(
+    details: dict[str, Any], preflight: dict[str, Any]
+) -> dict[str, Any]:
+    """``details`` plus ``preflight_errors``: the concrete conditions the
+    read-only preflight failed, so a refused plan (``preflight_passed`` false,
+    exit 1) is diagnosable from ``plan.json`` alone instead of from a generic
+    ``stop_conditions`` list (live 2026-10-05: DESTR-014/015/016 plans named no
+    reason). A runner that already records the key keeps its own value."""
+
+    if "preflight_errors" in details:
+        return details
+    errors = preflight.get("errors")
+    return {
+        **details,
+        "preflight_errors": (
+            [str(item) for item in errors] if isinstance(errors, list) else []
+        ),
+    }
+
+
 def _plan_case(
     case: CaseSurface[S],
     arguments: argparse.Namespace,
@@ -506,7 +526,9 @@ def _plan_case(
         attempt=arguments.attempt,
         confirmation=confirmation,
         environment=settings.environment(),
-        details=case.plan_details(settings, preflight),
+        details=details_with_preflight_errors(
+            case.plan_details(settings, preflight), preflight
+        ),
         arguments=arguments,
         preflight_passed=passed,
     )
@@ -605,7 +627,9 @@ def run_plain_case(case: PlainCaseRunner[S]) -> int:
             )
         preflight = case.read_only_preflight(settings, case_dir)
         passed = preflight_succeeded(preflight)
-        details = {**case.plan_details(), "preflight": preflight}
+        details = details_with_preflight_errors(
+            {**case.plan_details(), "preflight": preflight}, preflight
+        )
         evidence.bind(preflight, details, passed=passed)
         if not arguments.execute:
             plan = build_plan(

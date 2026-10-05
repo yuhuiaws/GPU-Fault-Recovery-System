@@ -184,7 +184,8 @@ def test_restore_refuses_the_planning_states_by_name() -> None:
     inspection["incident"]["state"] = "ACTION_PENDING"
 
     with pytest.raises(
-        BootstrapError, match="is ACTION_PENDING, not QUARANTINED or ESCALATED"
+        BootstrapError,
+        match="is ACTION_PENDING, not QUARANTINED, ESCALATED or RECOVERED",
     ):
         _plan(inspection)
 

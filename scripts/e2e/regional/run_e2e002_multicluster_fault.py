@@ -197,18 +197,30 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
     }
 
 
+EXECUTOR_ID_ENV = ("GPU_FAULT_CLUSTER_EXECUTOR_ID", "GPU_FAULT_EXECUTOR_ID")
+
+
 def executor_identities(fixture: RegionalLiveFixture) -> list[str]:
     """The identities a cluster's executor may lease commands under.
 
-    The lease owner is the executor's ``GPU_FAULT_EXECUTOR_ID``; the
-    Deployment either sets it literally or from the Pod name, so both the
-    literal values and the executor Pod names are accepted.
+    The lease owner is the executor's ``GPU_FAULT_CLUSTER_EXECUTOR_ID``
+    (``cluster_executor/bootstrap.py``): when the Deployment sets it -- literally
+    or from the Pod name -- that value alone; otherwise the executor's default
+    ``<cluster_id>/<hostname>``, where the hostname is the Pod name, so both the
+    prefixed form and the bare Pod name are accepted. The stock data-plane
+    manifest sets neither variable, which is why reading only an explicit
+    ``GPU_FAULT_EXECUTOR_ID`` refused every executor Pod as "missing" (live
+    2026-10-05, E2E-002 and ISO-007 on the mixed site). Two different literals
+    on one Pod are ambiguous.
     """
 
     document = json.loads(
         fixture.kubectl(
             "gpu", "get", "pod", "-l", "app=gpu-fault-cluster-executor", "-o", "json"
         )
+    )
+    cluster_id = str(
+        getattr(getattr(fixture, "settings", None), "cluster_id", "") or ""
     )
     identities: set[str] = set()
     ready = ready_pod_records(document)
@@ -217,21 +229,28 @@ def executor_identities(fixture: RegionalLiveFixture) -> list[str]:
             "executor identity inventory is not completely Ready"
         )
     for item in document["items"]:
-        selected = []
+        pod_name = str(item["metadata"]["name"])
+        selected: set[str] = set()
         for container in item.get("spec", {}).get("containers", []):
             for entry in container.get("env", []):
-                if entry.get("name") != "GPU_FAULT_EXECUTOR_ID":
+                if entry.get("name") not in EXECUTOR_ID_ENV:
                     continue
                 if entry.get("value"):
-                    selected.append(str(entry["value"]))
+                    selected.add(str(entry["value"]))
                 elif (entry.get("valueFrom") or {}).get("fieldRef", {}).get(
                     "fieldPath"
                 ) == "metadata.name":
-                    selected.append(str(item["metadata"]["name"]))
-        if len(selected) != 1:
+                    selected.add(pod_name)
+                else:
+                    raise RegionalFixtureError(
+                        "executor lease identity is missing or ambiguous"
+                    )
+        if len(selected) > 1:
             raise RegionalFixtureError(
                 "executor lease identity is missing or ambiguous"
             )
+        if not selected:
+            selected = {pod_name, *([f"{cluster_id}/{pod_name}"] if cluster_id else [])}
         identities.update(selected)
     return sorted(identity for identity in identities if identity)
 

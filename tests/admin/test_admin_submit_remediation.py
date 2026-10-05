@@ -749,7 +749,8 @@ def test_restore_is_refused_unless_the_incident_is_quarantined_or_settled() -> N
     inspection["incident"]["state"] = "ACTION_PENDING"
 
     with pytest.raises(
-        BootstrapError, match="is ACTION_PENDING, not QUARANTINED or ESCALATED"
+        BootstrapError,
+        match="is ACTION_PENDING, not QUARANTINED, ESCALATED or RECOVERED",
     ):
         _restore_plan(inspection)
 
