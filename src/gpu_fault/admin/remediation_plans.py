@@ -5,14 +5,25 @@ built here from the control plane's inspection and the live nodes, and
 ``gpu_fault.admin.submit_remediation`` submits them.
 
 ``restore`` (``RestorePlan``)
-    the validated restore of a QUARANTINED incident. Judged *per node*: a node
-    still isolated by this incident (its ``gpu-fault.io/quarantined`` taint, or
-    its isolation annotation -- the ownership the restore's kubernetes patch
-    reads) is restored; a node already clean, or another incident's business,
-    is skipped and the plan says why. A two-node job DAG whose workflow
-    restored one node itself and parked on the other (GF-REGIONAL-DESTR-014)
-    used to be refused on the clean node; now the isolated one is restored.
-    When no node is isolated any more the advice stays: close the incident.
+    the validated restore of a QUARANTINED incident, or of an ESCALATED one
+    whose workflows have all ended (``RESTORABLE_STATES``). Judged *per
+    node*: a node still isolated by this incident (its
+    ``gpu-fault.io/quarantined`` taint, or its isolation annotation -- the
+    ownership the restore's kubernetes patch reads) is restored; a node already
+    clean, or another incident's business, is skipped and the plan says why. A
+    two-node job DAG whose workflow restored one node itself and parked on the
+    other (GF-REGIONAL-DESTR-014) used to be refused on the clean node; now the
+    isolated one is restored. When no node is isolated any more the advice
+    stays: close the incident. The ESCALATED case is the exhausted escalation
+    ladder whose last rung FAILED after it isolated the node (a
+    ``reboot-after-<wf>`` successor on HyperPod, GF-REGIONAL-COLLECT-016): the
+    incident is ESCALATED, every workflow is terminal, the node is Ready yet
+    still cordoned, tainted and annotated with the incident -- ``restore``
+    refused it as "not QUARANTINED" and ``workflow-reconcile --close-incident``
+    would have orphaned the isolation. The same validated restore under the
+    same incident and fencing token is the exit; the ownership check on the
+    node is unchanged, and a BLOCKED record still goes through
+    ``confirm-node-action`` / ``workflow-reconcile`` first.
 
 ``confirm-node-action`` (``ConfirmNodeActionPlan``)
     the operator's confirmation of a node action whose outcome the executor
@@ -49,7 +60,14 @@ DISPOSITION_RESTORE = "restore"
 DISPOSITION_CONFIRM_NODE_ACTION = "confirm-node-action"
 # A workflow in one of these still owns its node; ``restore`` waits for it.
 OPEN_WORKFLOW_STATUSES = frozenset({"PENDING", "RUNNING", "SAFETY_PENDING"})
+# A workflow in one of these has ended: nothing acts on its nodes for it again.
+ENDED_WORKFLOW_STATUSES = frozenset({"FAILED", "SUPERSEDED", "SUCCEEDED"})
 QUARANTINED_STATE = "QUARANTINED"
+ESCALATED_STATE = "ESCALATED"
+# The incident states ``restore`` accepts: QUARANTINED, or ESCALATED once every
+# workflow of the incident has ended (an exhausted ladder whose last rung
+# FAILED can leave the node isolated under an ESCALATED record).
+RESTORABLE_STATES = frozenset({QUARANTINED_STATE, ESCALATED_STATE})
 BLOCKED_STATE = "BLOCKED"
 DECISION_RESTORE = "restore"
 DECISION_SKIP = "skip"
@@ -66,7 +84,7 @@ def _utc_now() -> datetime:
 @dataclass(frozen=True)
 class RestorePlan:
     """The validated restore ``--disposition restore`` will create, derived
-    from the QUARANTINED incident record and the live nodes.
+    from the QUARANTINED (or ended ESCALATED) incident record and the live nodes.
 
     ``steps`` are the exact steps the product builder yields (operation,
     owner, nodes, GPU scope) for ``restore_node_ids`` -- the nodes still
@@ -202,10 +220,11 @@ def _validate_restore_identity(
     if str(incident.get("incident_id")) != incident_id:
         raise BootstrapError("the control plane returned a different incident")
     state = str(incident.get("state"))
-    if state != QUARANTINED_STATE:
+    if state not in RESTORABLE_STATES:
         raise BootstrapError(
-            f"incident {incident_id} is {state}, not {QUARANTINED_STATE}; "
-            f"{DISPOSITION_RESTORE} applies to a quarantined node only"
+            f"incident {incident_id} is {state}, not {QUARANTINED_STATE} or "
+            f"{ESCALATED_STATE}; {DISPOSITION_RESTORE} applies to a quarantined "
+            "node, or to an escalated incident whose workflows have all ended"
         )
     if workflow is None:
         raise BootstrapError(
@@ -227,7 +246,42 @@ def _validate_restore_identity(
         )
     if not incident.get("node_ids"):
         raise BootstrapError(f"incident {incident_id} names no nodes")
+    if state == ESCALATED_STATE:
+        _validate_escalated_restore(
+            inspection, incident_id=incident_id, workflow=workflow
+        )
     return incident, workflow
+
+
+def _validate_escalated_restore(
+    inspection: Mapping[str, Any], *, incident_id: str, workflow: Mapping[str, Any]
+) -> None:
+    """An ESCALATED incident is restorable only once every workflow has ended.
+
+    Its pointer workflow may be FAILED / SUPERSEDED / SUCCEEDED (an open one is
+    refused by the shared open-workflow check); a BLOCKED record -- the pointer
+    or any BLOCKED workflow of the incident on its nodes -- still waits on an
+    operator (``confirm-node-action``, ``workflow-reconcile``) and may hold a
+    node action in flight, so the restore does not pass it.
+    """
+
+    status = str(workflow.get("status"))
+    blocked = [
+        str(item.get("request_id"))
+        for item in inspection.get("blocked_workflows") or []
+        if isinstance(item, dict)
+    ]
+    if status == BLOCKED_STATE and str(workflow.get("request_id")) not in blocked:
+        blocked.insert(0, str(workflow.get("request_id")))
+    if blocked:
+        raise BootstrapError(
+            f"incident {incident_id} is {ESCALATED_STATE} with BLOCKED workflow "
+            + ", ".join(blocked)
+            + " still parked on its nodes; answer it with --disposition "
+            "confirm-node-action or gpu-fault-admin workflow-reconcile first -- "
+            f"{DISPOSITION_RESTORE} of an escalated incident needs every workflow "
+            "ended (" + "/".join(sorted(ENDED_WORKFLOW_STATUSES)) + ")"
+        )
 
 
 def _validate_restore_record(
@@ -240,8 +294,9 @@ def _validate_restore_record(
 
     Returns the incident, its last workflow, the id of a validated restore
     workflow already open under it (the idempotent rerun; no node is judged
-    then) and the per-node decisions, or raises the first refusal: not
-    QUARANTINED; another workflow still open; a node missing from the cluster
+    then) and the per-node decisions, or raises the first refusal: neither
+    QUARANTINED nor ESCALATED-with-every-workflow-ended; another workflow still
+    open; a node missing from the cluster
     (its isolation cannot be judged); incident and workflow fencing tokens
     differing (a stale generation the node's annotation would reject); no
     node still isolated by this incident (close it instead).
@@ -301,7 +356,7 @@ def build_restore_plan(
     live_nodes: Mapping[str, Mapping[str, Any]],
     now: datetime | None = None,
 ) -> RestorePlan:
-    """Turn the QUARANTINED record into the restore it will get, or refuse."""
+    """Turn the QUARANTINED / settled ESCALATED record into its restore, or refuse."""
 
     stamp = now or _utc_now()
     incident, workflow, existing, decisions = _validate_restore_record(

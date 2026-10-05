@@ -744,11 +744,13 @@ def test_restore_plan_is_the_product_workflow_under_the_same_incident_and_token(
     assert plan.as_dict()["next_operations"] == RESTORE_STEPS
 
 
-def test_restore_is_refused_unless_the_incident_is_quarantined() -> None:
+def test_restore_is_refused_unless_the_incident_is_quarantined_or_settled() -> None:
     inspection = _quarantined_inspection()
-    inspection["incident"]["state"] = "ESCALATED"
+    inspection["incident"]["state"] = "ACTION_PENDING"
 
-    with pytest.raises(BootstrapError, match="is ESCALATED, not QUARANTINED"):
+    with pytest.raises(
+        BootstrapError, match="is ACTION_PENDING, not QUARANTINED or ESCALATED"
+    ):
         _restore_plan(inspection)
 
 

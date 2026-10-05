@@ -23,17 +23,20 @@ generation, deadline passed), and submits:
     hardware action; the original incident is never rewritten.
 ``restore``
     not a CHECK_MECHANICALS answer but the exit of a QUARANTINED incident whose
-    node was repaired by hand: a validated restore workflow (VALIDATE_GPU ->
-    VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING) under the *same*
-    incident and fencing token, built by
+    node was repaired by hand -- or of an ESCALATED incident whose workflows
+    have all ended while a node still carries its isolation (an exhausted
+    escalation ladder whose last rung FAILED): a validated restore workflow
+    (VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING)
+    under the *same* incident and fencing token, built by
     ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod, for the
     nodes still isolated by this incident (its taint or its isolation
     annotation); nodes already clean, or another incident's business, are
     skipped and the plan says why (``gpu_fault.admin.remediation_plans``).
-    Refused unless the incident is QUARANTINED with no open workflow and at
-    least one node is still isolated by it; with none left the advice is to
-    close the incident. Until 2026-09-10 only the acceptance fixture could
-    create this workflow.
+    Refused unless the incident is QUARANTINED, or ESCALATED with every
+    workflow FAILED/SUPERSEDED/SUCCEEDED, with no open workflow and at least
+    one node still isolated by it; with none left the advice is to close the
+    incident. Until 2026-09-10 only the acceptance fixture could create this
+    workflow.
 ``confirm-node-action``
     the exit of a workflow parked BLOCKED / NEEDS_OPERATOR on a node action
     whose outcome the executor never observed (``outcome_unknown`` on a
@@ -85,8 +88,10 @@ from gpu_fault.admin.remediation_plans import (
     BLOCKED_STATE,
     DISPOSITION_CONFIRM_NODE_ACTION,
     DISPOSITION_RESTORE,
+    ESCALATED_STATE,
     OPEN_WORKFLOW_STATUSES,
     QUARANTINED_STATE,
+    RESTORABLE_STATES,
     ConfirmNodeActionPlan,
     RestorePlan,
     build_confirm_node_action_plan,
@@ -106,8 +111,10 @@ __all__ = [
     "DISPOSITIONS",
     "DISPOSITION_CONFIRM_NODE_ACTION",
     "DISPOSITION_RESTORE",
+    "ESCALATED_STATE",
     "OPEN_WORKFLOW_STATUSES",
     "QUARANTINED_STATE",
+    "RESTORABLE_STATES",
     "REMEDIATION_SCRIPT",
     "ConfirmNodeActionPlan",
     "RemediationPlan",
@@ -665,7 +672,7 @@ def build_remediation_plan(
 
 
 # --------------------------------------------------------------------------
-# restore: the validated restore of a QUARANTINED incident
+# restore: the validated restore of a QUARANTINED (or ended ESCALATED) incident
 
 
 def submit_restore(
@@ -1153,7 +1160,8 @@ def add_submit_remediation_command(
             "acknowledge a CHECK_MECHANICALS inspection and, for a hardware "
             "disposition, submit the operator marker and terminal trigger built "
             "from the incident record; restore: create the validated restore of "
-            "a QUARANTINED incident for the nodes it still isolates; "
+            "a QUARANTINED incident, or of an ESCALATED one whose workflows have "
+            "all ended, for the nodes it still isolates; "
             "confirm-node-action: record, on fleet and node evidence, the outcome "
             "of a node action a BLOCKED workflow could not observe"
         ),
@@ -1165,7 +1173,8 @@ def add_submit_remediation_command(
         metavar="INCIDENT_ID",
         help=(
             "the incident whose workflow is waiting on CHECK_MECHANICALS, "
-            "(restore) the QUARANTINED incident that owns the node's isolation, or "
+            "(restore) the QUARANTINED or ended ESCALATED incident that owns the "
+            "node's isolation, or "
             "(confirm-node-action) the incident whose BLOCKED workflow left a node "
             "action outcome unknown"
         ),
@@ -1178,8 +1187,9 @@ def add_submit_remediation_command(
             "inspected: inspection complete, no hardware action; reset-gpu, "
             "reboot-node, quarantine: compile a new fenced workflow for that action; "
             "restore: VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> "
-            "RESTORE_SCHEDULING under the same QUARANTINED incident for the nodes "
-            "still isolated by it; confirm-node-action: confirm the outcome of an "
+            "RESTORE_SCHEDULING under the same QUARANTINED (or ESCALATED with every "
+            "workflow ended) incident for the nodes still isolated by it; "
+            "confirm-node-action: confirm the outcome of an "
             "unknown RESTART_NODE (or other node action) on --node -- the node must "
             "be Ready with its Node Agent ACTIVE on a boot id different from the one "
             "recorded before the action -- so the parked record can be restored "

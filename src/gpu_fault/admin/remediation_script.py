@@ -9,8 +9,12 @@ One script, four modes, chosen by ``payload["mode"]`` on stdin:
     workflows reduced to their evidence keys, and the GPU inventory of the
     nodes. Every disposition starts here; nothing is written.
 ``restore``
-    the validated restore of a QUARANTINED incident, for the nodes the admin
-    side found still isolated by it (``node_ids``; default: every node).
+    the validated restore of a QUARANTINED incident -- or of an ESCALATED one
+    whose workflows have all ended, judged on the admin side -- for the nodes
+    the admin side found still isolated by it (``node_ids``; default: every
+    node). The script binds the state it inspected (``expected``) and refuses
+    open workflows; it does not re-judge the state, so the deployed image
+    needs no change for the ESCALATED exit.
 ``submit``
     a CHECK_MECHANICALS hardware disposition: the operator marker and the
     terminal trigger, through the completion service.
