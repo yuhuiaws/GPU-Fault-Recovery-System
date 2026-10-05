@@ -1236,6 +1236,15 @@
     "GPU_FAULT_QUIESCE_SETTLE_SECONDS": {
       "kind": "number"
     },
+    "GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_RANK_LIVENESS_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
@@ -2046,6 +2055,7 @@
     "GPU_FAULT_QUIESCE_SERVICES",
     "GPU_FAULT_QUIESCE_SETTLE_SECONDS",
     "GPU_FAULT_QUIESCE_STATE_DIR",
+    "GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS",
     "GPU_FAULT_RANK_LIVENESS_ENABLED",
     "GPU_FAULT_RANK_PROGRESS_GPU_IDLE_PERCENT",
     "GPU_FAULT_RANK_PROGRESS_MIN_CPU_CORES",

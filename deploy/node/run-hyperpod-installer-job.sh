@@ -914,6 +914,15 @@ ${CONTROL_PLANE_ENV}
                   # UID on HyperPod (unchanged); the EC2 instance id behind
                   # spec.providerID on a plain EKS cluster, so a Spot
                   # replacement under the same name is a different node.
+                  # Plain EKS nodes run no host DCGM; the GPU clients a reset
+                  # must clear are Kubernetes containers, so the quiesce may
+                  # stop a container still holding the target GPU (customer
+                  # DCGM exporter, GPU feature discovery) once the named ones
+                  # are down. HyperPod keeps the name list only.
+                  quiesce_args=()
+                  if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
+                    quiesce_args=(--quiesce-sweep-kubernetes-device-holders)
+                  fi
                   node_instance_id="\${TARGET_NODE_UID}"
                   if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
                     node_instance_id="\${TARGET_NODE_PROVIDER_ID##*/}"
@@ -950,6 +959,7 @@ ${CONTROL_PLANE_ENV}
                     --allow-gpu-reset \
                     --allow-fabric-reset \
                     --allow-service-quiesce \
+                    "\${quiesce_args[@]}" \
                     --allow-fabric-manager-restart \
                     --node-agent-host "\${TARGET_NODE_IP}" \
                     --node-agent-advertise-url \

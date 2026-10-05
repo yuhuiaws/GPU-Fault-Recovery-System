@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.node_agent.operations.holders import kubernetes_attribution
 from gpu_fault.node_agent.common import (
     DEFAULT_DEVICE_SWEEP_PROCESSES,
     DEFAULT_QUIESCE_CONTAINERS,
@@ -102,12 +103,10 @@ def _arm_quiesce_failsafe(
 class GpuServiceQuiesceManager:
     """Quiesces host GPU services with an independent systemd restore timer.
 
-    The timer is a transient unit, so a reboot takes it with it while the
-    ``quiesce-*.json`` state file survives on disk. ``reconcile_after_boot``
-    restores such a file when the agent starts on a boot other than the one
-    that wrote it, so the node neither reports quiesce residue forever nor
-    lets the same incident pass ``assert_quiesced`` on a boot that never
-    quiesced.
+    The timer is a transient unit a reboot takes with it while the
+    ``quiesce-*.json`` state file survives; ``reconcile_after_boot`` restores
+    such a file on a later boot, so the node neither reports quiesce residue
+    forever nor passes ``assert_quiesced`` on a boot that never quiesced.
     """
 
     def __init__(
@@ -125,6 +124,7 @@ class GpuServiceQuiesceManager:
         container_restore_timeout_seconds: int = 180,
         device_sweep_timeout_seconds: int = 20,
         device_sweep_processes: tuple[str, ...] = (DEFAULT_DEVICE_SWEEP_PROCESSES),
+        sweep_kubernetes_device_holders: bool = False,
         proc_root: str = "/proc",
         restore_command: str = (
             "/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services"
@@ -188,6 +188,10 @@ class GpuServiceQuiesceManager:
         self.container_restore_timeout_seconds = container_restore_timeout_seconds
         self.device_sweep_timeout_seconds = device_sweep_timeout_seconds
         self.device_sweep_processes = frozenset(device_sweep_processes)
+        # eks-managed: also stop a Kubernetes container (customer DCGM exporter,
+        # GPU feature discovery) still holding the target GPU; kubelet is down
+        # and restarts it on restore. Off (HyperPod), VERIFY fails closed on it.
+        self.sweep_kubernetes_device_holders = sweep_kubernetes_device_holders
         self.proc_root = Path(proc_root)
         self.restore_command = restore_command
         self.runner = runner
@@ -301,14 +305,11 @@ class GpuServiceQuiesceManager:
         return False
 
     def _kill_task(self, container_id: str, signal_name: str) -> None:
-        """Signal a container task, letting ``ctr``'s exit status be advisory.
+        """Signal a container task; ``ctr``'s exit status is advisory.
 
-        A target task can exit on its own between ``_running_container_ids``
-        and the kill -- kubelet is already stopped, so nothing restarts it --
-        and ``ctr`` then answers "process already finished" with a non-zero
-        status. Failing the whole quiesce on that would leave the node with
-        kubelet/FM/DCGM down for nothing. ``_wait_task_stopped`` is the
-        authority on whether the task is gone.
+        A task can exit on its own before the kill (kubelet is stopped, nothing
+        restarts it) and ``ctr`` then fails with "process already finished";
+        ``_wait_task_stopped`` is the authority on whether the task is gone.
         """
 
         completed = self._run(
@@ -494,24 +495,16 @@ class GpuServiceQuiesceManager:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Terminate GPU clients that survived the service/container stop.
 
-        ``systemctl stop`` only reaches what systemd owns.  A
-        ``nvidia-persistenced`` started by hand outside systemd reports
-        ``MainPID=0 ActiveState=inactive`` -- the stop is a silent no-op
-        -- while the process keeps every ``/dev/nvidiaN`` open, so
-        ``nvidia-smi --gpu-reset`` can never run.  Before this sweep the
-        only backstop was ``GPU_FAULT_QUIESCE_PROCESSES``, an operator
-        maintained name list that is empty by default, so quiesce
-        returned ``quiesced: True`` and the very next step,
-        ``VERIFY_NO_GPU_CLIENTS``, failed closed forever. The sweep is
-        now limited to the target GPU and either an explicit system
-        process whitelist or the affected workload's cgroup. Unknown
-        holders are left alive so the verification step fails closed
-        instead of killing an unrelated workload.
-
-        Returns the holders that were signalled, in the order they were
-        found.  Survivors are *not* an error here: quiesce stays
-        advisory and ``VERIFY_NO_GPU_CLIENTS`` remains the authority
-        that refuses to reset.
+        ``systemctl stop`` only reaches what systemd owns: a hand-started
+        ``nvidia-persistenced`` (``MainPID=0``) keeps every ``/dev/nvidiaN``
+        open while the stop is a silent no-op, so before this sweep quiesce
+        said ``quiesced: True`` and ``VERIFY_NO_GPU_CLIENTS`` failed closed
+        forever. The sweep is limited to the target GPU and to an explicit
+        process whitelist, the affected workload's cgroup, or -- when
+        ``sweep_kubernetes_device_holders`` is set -- a Kubernetes container.
+        Other holders stay alive so verification fails closed rather than kill
+        an unrelated workload. Returns the signalled holders in the order found;
+        survivors are not an error here, VERIFY remains the authority.
         """
         swept: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -522,15 +515,23 @@ class GpuServiceQuiesceManager:
                 holder.get("cgroup_paths", []),
                 workload_cgroup_paths,
             )
-            if not process_allowed and not cgroup_allowed:
+            attribution = kubernetes_attribution(holder.get("cgroup_paths", []))
+            kubernetes_allowed = (
+                self.sweep_kubernetes_device_holders and attribution["kubernetes"]
+            )
+            if not process_allowed and not cgroup_allowed and not kubernetes_allowed:
                 skipped.append(
                     {
                         **holder,
+                        **attribution,
                         "reason": ("outside_workload_cgroup_and_process_whitelist"),
                     }
                 )
                 continue
             record = dict(holder)
+            if kubernetes_allowed and not process_allowed and not cgroup_allowed:
+                record.update(attribution)
+                record["reason"] = "kubernetes_container_on_quarantined_node"
             record["signal"] = "TERM"
             self._run(
                 ["kill", "--signal", "TERM", holder["pid"]],

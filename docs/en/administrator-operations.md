@@ -1032,6 +1032,22 @@ Semantics and boundaries of `eks-managed`:
   DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on such nodes (a configuration warning that
   never drains the node) and the diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
   carries an extra `dcgm_eks_managed` document group for the approver.
+- GPU reset quiesce: on both providers `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
+  containers it knows by name (`gpu-fault-system/exporter`, `kube-system/nvidia-device-plugin-ctr`, HyperPod's HMA). A
+  plain EKS node runs no host DCGM, so every GPU client is a container, and the `eks-managed` node installer Job adds
+  `--quiesce-sweep-kubernetes-device-holders` (Agent environment `GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS=true`):
+  a **Kubernetes container** outside that list that still holds the target GPU (a customer `dcgm-exporter`, GPU feature
+  discovery, any monitoring client) is TERM/KILLed as well, recorded as
+  `swept_device_holders[].reason=kubernetes_container_on_quarantined_node` with its container id and Pod UID; kubelet is
+  already down so nothing restarts it, and `RESTORE_GPU_SERVICES` starting kubelet brings it back. HyperPod does not pass
+  the switch; its environment file and Agent config digest are byte for byte unchanged. **Third-party GPU clients on GPU
+  nodes must therefore tolerate being stopped inside a quarantine window**, or be kept off nodes carrying the
+  `gpu-fault.io/quarantined` taint by their own affinity. When `nvidia-smi --gpu-reset` still answers `In use by another
+  client` (2026-10-05, gpu-eks-cluster, XID 46: named containers stopped, no `/dev/nvidiaN` holder, busy on all three
+  retries), the step's `details.gpu_client_holders` records, at the moment of failure, every holder of any NVIDIA device
+  node (`nvidiactl`, `nvidia-uvm`, a `(deleted)` replaced node included) with its cgroup/container attribution,
+  `--query-compute-apps`, and the `nvidia*`/`gdrdrv` kernel module reference counts; the error text ends with
+  `device holders: <pid>:<comm>:<devices> (container <id>)`. Command lines are never read.
 - Join prerequisite: every `allowedNamespaces` entry (the workload namespaces the Executor/watcher act in) other than
   the control-plane namespace must already exist on the target cluster -- the release renders a Role/RoleBinding per
   namespace and server-dry-runs it, so a missing one failed the join deep inside the release and rolled it back

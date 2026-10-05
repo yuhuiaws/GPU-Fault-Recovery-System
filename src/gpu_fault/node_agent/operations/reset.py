@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault.node_agent.protocol import (
@@ -12,6 +13,10 @@ from gpu_fault.node_agent.late_ownership import (
     OwnershipRefused,
     final_ownership_boundary,
     require_physical_ownership,
+)
+from gpu_fault.node_agent.operations.holders import (
+    gpu_client_holder_evidence,
+    gpu_client_holder_summary,
 )
 
 MAX_RESET_BUSY_ATTEMPTS = 3
@@ -28,6 +33,26 @@ class ResetProgressError(RuntimeError):
     def __init__(self, message: str, *, action_details: dict[str, Any]) -> None:
         super().__init__(message)
         self.action_details = action_details
+
+
+class GpuResetBusy(ResetProgressError):
+    """``In use by another client`` after every busy retry, naming who held it.
+
+    The holders travel in ``gpu_client_holders`` (every NVIDIA device node, the
+    compute apps and the kernel modules in use at the failure) so the operator
+    reads the client from the step instead of logging in to the node.
+    """
+
+    def __init__(
+        self, message: str, *, evidence: dict[str, Any], attempts: int
+    ) -> None:
+        super().__init__(
+            f"{message}; {gpu_client_holder_summary(evidence)}",
+            action_details={
+                "gpu_client_holders": evidence,
+                "gpu_reset_busy_attempts": attempts,
+            },
+        )
 
 
 class ResetOutcomeUnknown(ResetProgressError):
@@ -52,12 +77,15 @@ class ResetOperationsMixin:
     _gpu_inventory: Callable[..., Any]
     _run_checked: Callable[..., Any]
     _verify_no_clients: Callable[..., Any]
-    device_client_sample_interval_seconds: Any
-    fabric_manager_restart_enabled: Any
-    fabric_reset_enabled: Any
-    reset_enabled: Any
-    single_gpu_reset_supported: Any
-    sleep: Callable[..., Any]
+    _compute_clients: Callable[[], list[dict[str, str]]]
+    _gpu_device_paths: Callable[[], dict[str, str]]
+    proc_root: Path
+    device_client_sample_interval_seconds: float
+    fabric_manager_restart_enabled: bool
+    fabric_reset_enabled: bool
+    reset_enabled: bool
+    single_gpu_reset_supported: bool
+    sleep: Callable[[float], None]
 
     _RESET_BUSY_ATTEMPTS = MAX_RESET_BUSY_ATTEMPTS
 
@@ -86,14 +114,32 @@ class ResetOperationsMixin:
                     gpu_uuids=gpu_uuids,
                 ) from exc
             except (RuntimeError, OwnershipRefused) as exc:
-                if (
-                    "In use by another client" not in str(exc)
-                    or attempt == self._RESET_BUSY_ATTEMPTS
-                ):
+                busy = "In use by another client" in str(exc)
+                if busy and attempt == self._RESET_BUSY_ATTEMPTS:
+                    if isinstance(exc, OwnershipRefused):
+                        raise
+                    # The last busy refusal carries who held the device: the
+                    # sampled preflight saw nobody on /dev/nvidiaN, so the
+                    # client is elsewhere (nvidiactl, uvm, a replaced device
+                    # node, a kernel module) and only this moment can show it.
+                    raise GpuResetBusy(
+                        str(exc),
+                        evidence=self._gpu_client_holder_evidence(gpu_uuids),
+                        attempts=attempt,
+                    ) from exc
+                if not busy:
                     raise
                 self.sleep(self.device_client_sample_interval_seconds)
                 self._verify_no_clients(gpu_uuids)
         raise AssertionError("unreachable GPU reset retry state")
+
+    def _gpu_client_holder_evidence(self, gpu_uuids: list[str]) -> dict[str, Any]:
+        return gpu_client_holder_evidence(
+            proc_root=self.proc_root,
+            gpu_uuids=gpu_uuids,
+            compute_clients=self._compute_clients,
+            device_paths=self._gpu_device_paths,
+        )
 
     def _reset_gpu_preflight(self, gpu_uuids: list[str]) -> None:
         """Everything a single-GPU reset can refuse on, before it resets.

@@ -113,6 +113,8 @@ FIRMWARE_VERIFY_SHA256=""
 QUIESCE_SERVICES="nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet"
 QUIESCE_PROCESSES=""
 QUIESCE_CONTAINERS="aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr"
+# eks-managed only: quiesce also stops Kubernetes containers still holding the target GPU.
+QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="false"
 CONTAINER_STOP_TIMEOUT_SECONDS="30"
 CONTAINER_RESTORE_TIMEOUT_SECONDS="180"
 # How long quiesce waits for a TERMed /dev/nvidiaN holder to let go
@@ -586,6 +588,7 @@ while [[ $# -gt 0 ]]; do
         --quiesce-services) require_value "$@"; QUIESCE_SERVICES="$2"; shift 2 ;;
         --quiesce-processes) require_value "$@"; QUIESCE_PROCESSES="$2"; shift 2 ;;
         --quiesce-containers) require_value "$@"; QUIESCE_CONTAINERS="$2"; shift 2 ;;
+        --quiesce-sweep-kubernetes-device-holders) QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="true"; shift ;;
         --container-stop-timeout) require_value "$@"; CONTAINER_STOP_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --container-restore-timeout) require_value "$@"; CONTAINER_RESTORE_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --device-sweep-timeout) require_value "$@"; DEVICE_SWEEP_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -1518,21 +1521,16 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
     install -m 0600 /dev/null /etc/gpu-fault/node-agent.env
     {
         write_env GPU_FAULT_NODE_ACTION_SECRET "${NODE_ACTION_SECRET}"
-        write_env GPU_FAULT_NODE_ACTION_KEY_VERSION \
-            "${NODE_ACTION_KEY_VERSION}"
-        write_env GPU_FAULT_NODE_ALLOWED_OPERATIONS \
-            "${NODE_ALLOWED_OPERATIONS}"
+        write_env GPU_FAULT_NODE_ACTION_KEY_VERSION "${NODE_ACTION_KEY_VERSION}"
+        write_env GPU_FAULT_NODE_ALLOWED_OPERATIONS "${NODE_ALLOWED_OPERATIONS}"
         write_env GPU_FAULT_NODE_ALLOW_GPU_RESET "${ALLOW_GPU_RESET}"
         write_env GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED \
             "${SINGLE_GPU_RESET_SUPPORTED}"
-        write_env GPU_FAULT_NODE_ALLOW_FABRIC_RESET \
-            "${ALLOW_FABRIC_RESET}"
+        write_env GPU_FAULT_NODE_ALLOW_FABRIC_RESET "${ALLOW_FABRIC_RESET}"
         write_env GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART \
             "${ALLOW_FABRIC_MANAGER_RESTART}"
-        write_env GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE \
-            "${ALLOW_SERVICE_QUIESCE}"
-        write_env GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR \
-            "${DIAGNOSTIC_OUTPUT_DIR}"
+        write_env GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE "${ALLOW_SERVICE_QUIESCE}"
+        write_env GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR "${DIAGNOSTIC_OUTPUT_DIR}"
         write_env GPU_FAULT_DIAGNOSTIC_S3_URI \
             "${DIAGNOSTIC_S3_URI}"
         write_env GPU_FAULT_DIAGNOSTIC_RETENTION_SECONDS \
@@ -1577,6 +1575,8 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_QUIESCE_SERVICES "${QUIESCE_SERVICES}"
         write_env GPU_FAULT_QUIESCE_PROCESSES "${QUIESCE_PROCESSES}"
         write_env GPU_FAULT_QUIESCE_CONTAINERS "${QUIESCE_CONTAINERS}"
+        # Only when set: a HyperPod agent environment file stays byte for byte the same.
+        if [[ "${QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS}" == "true" ]]; then write_env GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS "true"; fi
         write_env GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS \
             "${CONTAINER_STOP_TIMEOUT_SECONDS}"
         write_env GPU_FAULT_CONTAINER_RESTORE_TIMEOUT_SECONDS \

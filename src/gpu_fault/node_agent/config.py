@@ -236,6 +236,9 @@ def _quiesce_from_environment(proc_root, operations):
                     ",".join(DEFAULT_DEVICE_SWEEP_PROCESSES),
                 )
             ),
+            sweep_kubernetes_device_holders=env_bool(
+                "GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS", False
+            ),
             proc_root=proc_root,
             restore_command=os.getenv(
                 "GPU_FAULT_QUIESCE_RESTORE_COMMAND",
