@@ -26,11 +26,8 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveSettings,
     component_python,
 )
-from scripts.e2e.regional.warm_spare_fixture import (
-    INSTANCE_GROUP_LABEL,
-    SPARE_LABEL,
-    instance_type,
-)
+from scripts.e2e.regional import warm_spare_provider
+from scripts.e2e.regional.warm_spare_fixture import SPARE_LABEL
 
 
 class PreflightSettings(Protocol):
@@ -211,11 +208,13 @@ def preflight_errors(
             "a warm spare is declared; the sibling REPLACE_NODE must exhaust: "
             f"{spare_nodes}"
         )
-    if cluster.get("status") != "InService" or cluster.get("node_recovery") != "None":
-        errors.append("HyperPod cluster is not InService with NodeRecovery=None")
-    if (fault.get("labels") or {}).get(INSTANCE_GROUP_LABEL) != (
-        sibling.get("labels") or {}
-    ).get(INSTANCE_GROUP_LABEL) or instance_type(fault) != instance_type(sibling):
+    # The provider's own facts: HyperPod InService/NodeRecovery=None and the
+    # instance group, or the plain-EKS cluster ACTIVE and the managed node group.
+    provider = cluster.get("provider") or warm_spare_provider.HYPERPOD
+    errors.extend(warm_spare_provider.cluster_recovery_errors(cluster, provider))
+    if warm_spare_provider.topology(fault, provider) != warm_spare_provider.topology(
+        sibling, provider
+    ):
         errors.append("fault and sibling node topology do not match")
     if not executor_env:
         errors.append("no ready executor replica reported its environment")

@@ -10409,7 +10409,12 @@ Also, among the three switches, the passing criterion for `GPU_FAULT_ALLOW_WITH_
 is "**unset** or `false`",
 so the evidence capture must distinguish "value is false" from "key does not exist";
 when `env | grep` finds nothing, that must not be judged FAIL outright.
-
+- `eks-managed`: the preflight's cluster recovery and topology checks follow the provider
+  (`destr014_preflight` uses `warm_spare_provider.cluster_recovery_errors(cluster, provider)` /
+  `topology(...)`, and the runner hands it `warm.provider` together with `cluster_recovery()`), so a
+  plain EKS cluster is no longer asked `sagemaker describe-cluster` (previously
+  `warm_spare_fixture.provider_inventory` reported ResourceNotFound). The `--release` path is
+  provider-aware the same way (`config spare` judges by the provider's topology label).
 
 ### GF-REGIONAL-DESTR-015
 
@@ -12849,9 +12854,11 @@ the same time, and adding the gate there would discard true positives.
   `load_seconds > restore_seconds` raises `ProbeError` outright
   (the load must end before the restore, otherwise the restore lands in the middle of the load).
 - It does not touch `NodeRecovery`, performs no replacement, and does not write `/dev/kmsg`.
-
-
-
+- Named refusal on an `eks-managed` node: the plain EKS (AL2023 NVIDIA) node image ships no host DCGM
+  and no `/usr/bin/dcgmproftester*`; the probe snapshot gains `dcgm_load_generator` (the binary path
+  found, or `null`) and `run_collect002` refuses with `the target node has no DCGM load generator ...`
+  before it mutates anything (previously `HostProbeError ... at proftester_binary:426`). Install DCGM
+  on the node image, or run the case on a HyperPod node.
 
 ### GF-REGIONAL-COLLECT-003
 
@@ -13015,6 +13022,20 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
     are correlated by strict scope and the submission time window, without claiming an exact RequestId
     link. A negative CloudTrail conclusion within the visibility window remains marked provisional and
     is supplemented by a later full-window audit.
+  - `eks-managed` (a plain EKS managed node group): the scope derives the provider from the Node's
+    labels (`eks.amazonaws.com/nodegroup` without `sagemaker.amazonaws.com/cluster-name`) and
+    `--hyperpod-cluster` carries the EKS cluster name; `collector_reboot_scope` reads only
+    `eks describe-cluster` (ACTIVE), the `eks describe-nodegroup` the Node's label names (ACTIVE) and
+    the `ec2 describe-instances` behind the providerID (`running`, `eks:cluster-name` /
+    `eks:nodegroup-name` tags of this cluster/node group); the provider inventory is the list of GPU
+    Nodes, `node_logical_id` is the Node name (what the EKS provider's submission records),
+    `cluster_arn=eks_cluster_arn`, `node_recovery=not-applicable`, `cluster_status=ACTIVE`. The reboot
+    evidence reads `RebootInstances` from CloudTrail's `ec2.amazonaws.com` source instead
+    (`reboot_event_names` / `provider_event_source`,
+    `regional_live_fixture.provider_events(event_source=...)`); the request must name exactly that
+    instance and the response `_return=true` -- EC2 reports no logical nodes, so the proof rests on
+    EC2's boolean answer. The HyperPod path (SageMaker scope and `BatchRebootClusterNodes`) is
+    unchanged byte for byte.
 - ⚠ **This alternative path is not non-destructive.** The `gpu_inventory_mismatch` production policy
   plans `REBOOT_NODE`; as long as workflow execution is allowed, a real HyperPod reboot is invoked.
   This item must be executed as `destructive-provider-reboot` in the maintenance window, with a

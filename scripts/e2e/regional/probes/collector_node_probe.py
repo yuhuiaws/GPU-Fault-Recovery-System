@@ -66,13 +66,9 @@ SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 def normalize_bdf(value: str) -> str:
     """The one `0000:bb:dd.f` spelling for every way the node writes a BDF.
 
-    `nvidia-smi --query-gpu=pci.bus_id` prints an eight-digit domain
-    (`00000000:59:00.0`), the destructive host probe and the collector's own
-    inventory print `0000:59:00` without the function, and sysfs prints
-    `0000:5e:00.0`. This probe's actions all validate against SAFE_BDF, so a
-    snapshot taken by this very probe used to hand back a value its own
-    `append-sxid` rejected as "unsafe PCI BDF" (COLLECT-005, 2026-09-06).
-    Canonicalise first; the allowlist stays as strict as before.
+    nvidia-smi prints an eight-digit domain, the probe's inventory omits the
+    function and sysfs prints `0000:5e:00.0`; this probe's own snapshot once
+    handed `append-sxid` a BDF it rejected (COLLECT-005). Canonicalise first.
     """
 
     text = value.strip().lower()
@@ -182,12 +178,9 @@ def collector_runner(
 ) -> subprocess.CompletedProcess[str]:
     """``HostTelemetryCollector.runner`` with the ``BoundedProcessRunner`` call shape.
 
-    The Collector calls ``runner(argv, capture_output=True, text=True,
-    timeout=..., check=False)``; ``run`` takes only ``check``/``timeout``, so
-    handing it over directly made every isolated sample a collection error.
-    ``run`` always captures both pipes as text, so the two flags only assert
-    the contract; a ``TimeoutExpired`` propagates unchanged because the
-    Collector's nvidia-smi circuit breaker classifies it itself.
+    The Collector passes ``capture_output``/``text`` that ``run`` only asserts
+    (it always captures both pipes as text); a ``TimeoutExpired`` propagates
+    unchanged for the Collector's own nvidia-smi circuit breaker.
     """
     if not (capture_output and text):
         raise ProbeError("isolated collector runner only returns captured text")
@@ -408,6 +401,15 @@ def gpu_power_state(*, strict: bool = False) -> list[dict[str, Any]]:
     if strict and not result:
         raise ProbeError("GPU power query is empty")
     return result
+
+
+def dcgm_load_generator() -> str | None:
+    """The ``dcgmproftester*`` path, or None on a node without host DCGM (plain EKS)."""
+
+    try:
+        return proftester_binary()
+    except ProbeError:
+        return None
 
 
 def proftester_binary() -> str:
@@ -2016,6 +2018,7 @@ def snapshot(_arguments: argparse.Namespace) -> None:
             "services": service_snapshot(),
             "gpu_inventory": gpu_inventory(),
             "gpu_power": gpu_power_state(),
+            "dcgm_load_generator": dcgm_load_generator(),
             "persistence_mode": persistence_mode(),
             "efa_inventory": efa_inventory(),
             "kernel_collector": kernel_collector_fd(),
@@ -2038,13 +2041,9 @@ def workload_processes(
 ) -> list[dict[str, Any]]:
     """Every process whose cgroup names ``pod_uid``, both kubelet spellings.
 
-    kubelet writes the Pod UID into the cgroup path with the dashes either
-    kept (``pod<uid>``) or replaced by underscores
-    (``kubepods-pod<uid>_.slice``), depending on the cgroup driver; a probe
-    that matched only one spelling silently killed nothing on the other. The
-    ``pause`` sandbox container shares the Pod's cgroup but is not the training
-    process and is left alone -- SIGKILLing it would tear the Pod down as a
-    sandbox failure rather than let the trainer exit non-zero.
+    kubelet writes the Pod UID with dashes kept or replaced by underscores,
+    depending on the cgroup driver; matching one spelling killed nothing on the
+    other. The ``pause`` sandbox shares the cgroup and is left alone.
     """
 
     if SAFE_POD_UID.fullmatch(pod_uid) is None:

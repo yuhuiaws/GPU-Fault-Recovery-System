@@ -59,6 +59,7 @@ class ProviderEvent(TypedDict):
 
 
 class RebootScope(TypedDict):
+    provider: str
     cluster_id: str
     node_id: str
     node_uid: str
@@ -103,7 +104,42 @@ _INSTANCE = re.compile(r"i-[0-9a-f]{17}\Z")
 _TEXT = re.compile(r"[A-Za-z0-9_./:@+=,-]{1,512}\Z")
 _EXECUTOR = "gpu-fault-cluster-executor"
 _REBOOT_EVENTS = frozenset({"BatchRebootClusterNodes", "RebootClusterNodes"})
+#: The provider mutation a RESTART_NODE leaves in CloudTrail, per provider: the
+#: SageMaker reboot on HyperPod, EC2 RebootInstances on a plain EKS cluster.
+_PROVIDER_REBOOT_EVENTS = {
+    "hyperpod": _REBOOT_EVENTS,
+    "eks-managed": frozenset({"RebootInstances"}),
+}
+_PROVIDER_EVENT_SOURCES = {
+    "hyperpod": "sagemaker.amazonaws.com",
+    "eks-managed": "ec2.amazonaws.com",
+}
+_PROVIDER_HEALTHY_CLUSTER = {
+    "hyperpod": ("InService", "None"),
+    "eks-managed": ("ACTIVE", "not-applicable"),
+}
+EKS_NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup"
 _JSON_LIMIT = 16 * 1024 * 1024
+
+
+def scope_provider(scope: Mapping[str, Any]) -> str:
+    """``hyperpod`` or ``eks-managed``; a scope without the field is HyperPod."""
+
+    provider = scope.get("provider") or "hyperpod"
+    _require(provider in _PROVIDER_REBOOT_EVENTS, "scope provider is unknown")
+    return str(provider)
+
+
+def reboot_event_names(provider: str | None) -> frozenset[str]:
+    """The CloudTrail event names a product reboot leaves on ``provider``."""
+
+    return _PROVIDER_REBOOT_EVENTS[provider or "hyperpod"]
+
+
+def provider_event_source(provider: str | None) -> str:
+    """The CloudTrail event source a product reboot lands in on ``provider``."""
+
+    return _PROVIDER_EVENT_SOURCES[provider or "hyperpod"]
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -302,6 +338,19 @@ def normalize_provider_event(item: Mapping[str, Any]) -> ProviderEvent:
             result["request_node_logical_ids"] = _strings(logical_ids, "nodeLogicalIds")
         if node_ids is not None:
             result["request_node_ids"] = _strings(node_ids, "nodeIds")
+        instances = _alias(parameters, "instancesSet", "InstancesSet")
+        if instances is not None:
+            # EC2 RebootInstances (plain EKS): the instance ids are the targets.
+            result["request_node_ids"] = _strings(
+                [
+                    _mapping(row, "EC2 instance item").get("instanceId")
+                    for row in _rows(
+                        _mapping(instances, "EC2 instancesSet").get("items"),
+                        "EC2 instance items",
+                    )
+                ],
+                "instancesSet",
+            )
         dry_run = _alias(parameters, "dryRun", "DryRun")
         if dry_run is not None:
             _require(type(dry_run) is bool, "provider dryRun must be boolean")
@@ -345,6 +394,14 @@ def normalize_provider_event(item: Mapping[str, Any]) -> ProviderEvent:
             if value is not None:
                 failures.extend(_rows(value, "provider failures"))
         result["response_failed_node_count"] = len(failures)
+        if result["event_name"] == "RebootInstances":
+            # EC2 answers a boolean ``_return``; a false or missing one is a
+            # failed reboot of the whole request.
+            returned = response.get("_return")
+            _require(
+                type(returned) is bool, "EC2 RebootInstances _return is not boolean"
+            )
+            result["response_failed_node_count"] = 0 if returned else 1
     except RebootEvidenceError as exc:
         result["normalization_errors"].append(str(exc))
     return result
@@ -371,9 +428,15 @@ def _scope_identity(scope: Mapping[str, Any]) -> None:
         "instance_id",
     ):
         _text(scope.get(field), f"scope {field}")
-    hp = _arn(scope.get("cluster_arn"), "sagemaker")
+    provider = scope_provider(scope)
     eks = _arn(scope.get("eks_cluster_arn"), "eks")
+    # HyperPod scopes carry the SageMaker cluster ARN; a plain EKS cluster has
+    # no provider cluster of its own, so its cluster ARN is the EKS ARN.
+    hp = _arn(
+        scope.get("cluster_arn"), "sagemaker" if provider == "hyperpod" else "eks"
+    )
     role = _arn(scope.get("executor_role_arn"), "iam")
+    status, recovery = _PROVIDER_HEALTHY_CLUSTER[provider]
     _require(
         hp[:3] == eks[:3]
         and hp[0] == role[0]
@@ -381,9 +444,13 @@ def _scope_identity(scope: Mapping[str, Any]) -> None:
         and hp[1] == scope.get("region")
         and role[1] == ""
         and _INSTANCE.fullmatch(scope["instance_id"]) is not None
-        and scope.get("node_recovery") == "None"
-        and scope.get("cluster_status") == "InService",
-        "scope HyperPod/EKS/role/account/Region or recovery invariants differ",
+        and scope.get("node_recovery") == recovery
+        and scope.get("cluster_status") == status
+        and (
+            provider == "hyperpod"
+            or scope.get("cluster_arn") == scope.get("eks_cluster_arn")
+        ),
+        "scope provider/EKS/role/account/Region or recovery invariants differ",
     )
     inventory = _rows(scope.get("provider_inventory"), "scope provider inventory")
     _require(
@@ -582,9 +649,15 @@ def _event_binding(
         event.get("request_dry_run") is None or event.get("request_dry_run") is False,
         "CloudTrail dry-run cannot prove an actual reboot",
     )
+    provider = scope_provider(scope)
     _require(
-        event.get("event_name") == "BatchRebootClusterNodes"
-        and event.get("event_source") == "sagemaker.amazonaws.com"
+        event.get("event_name")
+        in (
+            {"BatchRebootClusterNodes"}
+            if provider == "hyperpod"
+            else reboot_event_names(provider)
+        )
+        and event.get("event_source") == provider_event_source(provider)
         and event.get("aws_region") == scope["region"]
         and event.get("recipient_account_id") == scope["account_id"],
         "CloudTrail API/Region/account differs from the approved scope",
@@ -611,28 +684,43 @@ def _event_binding(
         for key in ("request_cluster_name", "request_cluster_arn")
         if event.get(key) is not None
     ]
-    _require(
-        bool(clusters)
-        and all(
-            value in {scope["cluster_name"], scope["cluster_arn"]} for value in clusters
-        ),
-        "CloudTrail request cluster differs or is ambiguous",
-    )
     requested = event.get("request_node_logical_ids")
     instances = event.get("request_node_ids")
-    _require(
-        requested == [scope["node_logical_id"]]
-        and instances in (None, [scope["instance_id"]]),
-        "CloudTrail request does not match the exact logical/EC2 singleton",
-    )
+    if provider == "hyperpod":
+        _require(
+            bool(clusters)
+            and all(
+                value in {scope["cluster_name"], scope["cluster_arn"]}
+                for value in clusters
+            ),
+            "CloudTrail request cluster differs or is ambiguous",
+        )
+        _require(
+            requested == [scope["node_logical_id"]]
+            and instances in (None, [scope["instance_id"]]),
+            "CloudTrail request does not match the exact logical/EC2 singleton",
+        )
+    else:
+        # EC2 RebootInstances names instances only; the one requested must be
+        # the exact instance the Node's providerID was bound to.
+        _require(
+            not clusters and requested is None and instances == [scope["instance_id"]],
+            "CloudTrail EC2 request does not match the exact instance singleton",
+        )
+    # EC2 answers RebootInstances with a boolean only (folded into the failed
+    # count); SageMaker names the successful logical nodes.
+    successful = event.get("response_successful_node_logical_ids")
     _require(
         event.get("api_error") is False
         and event.get("api_error_code") is None
         and event.get("api_error_message_present") is False
         and type(event.get("response_failed_node_count")) is int
         and event["response_failed_node_count"] == 0
-        and event.get("response_successful_node_logical_ids")
-        == [scope["node_logical_id"]]
+        and (
+            successful == [scope["node_logical_id"]]
+            if provider == "hyperpod"
+            else successful in (None, [])
+        )
         and event.get("response_successful_node_ids")
         in (None, [], [scope["instance_id"]]),
         "CloudTrail response is failed, incomplete or names other nodes",
@@ -787,7 +875,11 @@ import boto3
 from botocore.config import Config
 from gpu_fault.hyperpod import HyperPodAction, HyperPodAdapterConfig
 from gpu_fault.env import env_bool
-config = HyperPodAdapterConfig.from_environment()
+if os.getenv("GPU_FAULT_CLUSTER_PROVIDER", "hyperpod").strip() == "eks-managed":
+    from gpu_fault.eks_provider import EksProviderConfig
+    config = EksProviderConfig.from_environment()
+else:
+    config = HyperPodAdapterConfig.from_environment()
 session = boto3.Session()
 credentials = session.get_credentials()
 caller = session.client("sts", config=Config(
@@ -796,11 +888,11 @@ caller = session.client("sts", config=Config(
 print(json.dumps({
     "cluster_id": os.getenv("GPU_FAULT_CLUSTER_ID"),
     "hyperpod_cluster": config.cluster_name,
-    "region": config.region_name,
+    "region": config.region_name or os.getenv("AWS_REGION"),
     "role_arn": os.getenv("AWS_ROLE_ARN"),
     "allow_reboot": config.action_enabled(HyperPodAction.REBOOT),
     "allow_replace": env_bool("GPU_FAULT_ALLOW_HYPERPOD_REPLACE", False),
-    "allow_automatic": config.allow_when_node_recovery_automatic,
+    "allow_automatic": bool(getattr(config, "allow_when_node_recovery_automatic", False)),
     "pod": os.getenv("HOSTNAME"),
     "credential_method": credentials.method if credentials else None,
     "caller_arn": caller.get("Arn"),
@@ -1247,159 +1339,22 @@ def capture_reboot_scope(
     node: str,
     hyperpod_cluster: str,
     executor_role_arn: str,
+    provider: str | None = None,
 ) -> RebootScope:
-    """Capture actual read-only identities; raise safely on missing/drifted facts.
+    """Capture the reboot scope for either provider (``collector_reboot_scope``).
 
-    Call before injection and after recovery. Node UID/instance/logical identity
-    must stay fixed; a new boot ID is an expected *separate* reboot observation.
-    These sequential reads do not lock external actors or promise atomicity.
+    Kept here so every caller and test keeps importing it from the evidence
+    module; the capture itself lives beside it to hold this module's size.
     """
-    try:
-        _text(node, "target Node")
-        _text(hyperpod_cluster, "HyperPod cluster")
-        _text(regional.settings.cluster_id, "managed cluster ID")
-        role = _arn(executor_role_arn, "iam")
-        cluster = _aws(
-            regional,
-            "sagemaker",
-            "describe-cluster",
-            "--cluster-name",
-            hyperpod_cluster,
-        )
-        hp_arn = _text(cluster.get("ClusterArn"), "HyperPod ARN")
-        hp = _arn(hp_arn, "sagemaker")
-        _require(
-            cluster.get("ClusterName") == hyperpod_cluster
-            and hp[0] == role[0]
-            and hp[2] == role[2]
-            and not role[1]
-            and hp[1] == regional.settings.region
-            and cluster.get("NodeRecovery") == "None"
-            and cluster.get("ClusterStatus") == "InService",
-            "actual HyperPod name/ARN/Region/account or recovery state differs",
-        )
-        orchestrator = _mapping(cluster.get("Orchestrator"), "HyperPod orchestrator")
-        _require(
-            set(orchestrator) == {"Eks"}, "HyperPod orchestrator is not exclusively EKS"
-        )
-        eks = _mapping(orchestrator["Eks"], "HyperPod EKS orchestrator")
-        eks_arn = _text(eks.get("ClusterArn"), "orchestrator EKS ARN")
-        eks_facts = _eks_identity(regional, eks_arn, hp[2])
-        before = _node_identity(
-            _mapping(_kube(regional, "get", "node", node, "-o", "json"), "Node"),
-            node,
-            regional.settings.region,
-            hyperpod_cluster_arn=hp_arn,
-            hyperpod_cluster_name=hyperpod_cluster,
-        )
-        inventory = _aws(
-            regional,
-            "sagemaker",
-            "list-cluster-nodes",
-            "--cluster-name",
-            hp_arn,
-            "--include-node-logical-ids",
-        )
-        _require(not inventory.get("NextToken"), "HyperPod inventory is incomplete")
-        rows = _rows(inventory.get("ClusterNodeSummaries"), "HyperPod node inventory")
-        logical_ids = [
-            _text(row.get("NodeLogicalId"), "provider logical node ID") for row in rows
-        ]
-        _require(
-            len(set(logical_ids)) == len(logical_ids),
-            "HyperPod inventory repeats a logical node",
-        )
-        matches = [
-            row for row in rows if row.get("InstanceId") == before["instance_id"]
-        ]
-        _require(
-            len(matches) == 1, "Node providerID has no unique HyperPod node mapping"
-        )
-        target = matches[0]
-        _require(
-            _mapping(target.get("InstanceStatus"), "HyperPod node status").get("Status")
-            == "Running",
-            "HyperPod target instance is not Running",
-        )
-        deployment_uid, template_digest, executors = _executor_identity(
-            regional, hyperpod_cluster, executor_role_arn
-        )
-        after = _node_identity(
-            _mapping(_kube(regional, "get", "node", node, "-o", "json"), "Node"),
-            node,
-            regional.settings.region,
-            hyperpod_cluster_arn=hp_arn,
-            hyperpod_cluster_name=hyperpod_cluster,
-        )
-        _require(after == before, "Node identity changed during scope capture")
-        detail = _aws(
-            regional,
-            "sagemaker",
-            "describe-cluster-node",
-            "--cluster-name",
-            hp_arn,
-            "--node-logical-id",
-            target["NodeLogicalId"],
-        )
-        details = _mapping(detail.get("NodeDetails"), "HyperPod node detail")
-        _require(
-            details.get("NodeLogicalId") == target["NodeLogicalId"]
-            and details.get("InstanceId") == before["instance_id"],
-            "HyperPod node mapping changed during scope capture",
-        )
-        cluster_after = _aws(
-            regional, "sagemaker", "describe-cluster", "--cluster-name", hp_arn
-        )
-        _require(
-            all(
-                cluster_after.get(key) == cluster.get(key)
-                for key in (
-                    "ClusterArn",
-                    "ClusterName",
-                    "NodeRecovery",
-                    "ClusterStatus",
-                    "Orchestrator",
-                )
-            ),
-            "HyperPod identity or recovery settings changed during scope capture",
-        )
-        result: RebootScope = {
-            "cluster_id": regional.settings.cluster_id,
-            "node_id": node,
-            "node_uid": before["node_uid"],
-            "node_provider_id": before["provider_id"],
-            "boot_id": before["boot_id"],
-            "instance_id": before["instance_id"],
-            "node_logical_id": target["NodeLogicalId"],
-            "cluster_name": hyperpod_cluster,
-            "cluster_arn": hp_arn,
-            "eks_cluster_arn": eks_arn,
-            "region": regional.settings.region,
-            "account_id": hp[2],
-            "executor_role_arn": executor_role_arn,
-            "gpu_context": regional.settings.gpu_context,
-            "provider_inventory": [
-                {
-                    "node_logical_id": row["NodeLogicalId"],
-                    "instance_id": _optional_text(row.get("InstanceId")),
-                }
-                for row in sorted(rows, key=lambda item: str(item["NodeLogicalId"]))
-            ],
-            "eks_namespace_uid": eks_facts["eks_namespace_uid"],
-            "eks_endpoint_sha256": eks_facts["eks_endpoint_sha256"],
-            "eks_ca_sha256": eks_facts["eks_ca_sha256"],
-            "executor_deployment_uid": deployment_uid,
-            "executor_template_sha256": template_digest,
-            "executor_pods": executors,
-            "node_recovery": "None",
-            "cluster_status": "InService",
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _scope_identity(result)
-        return result
-    except RebootEvidenceError:
-        raise
-    except (KeyError, TypeError, ValueError, AttributeError):
-        raise RebootEvidenceError(
-            "reboot scope identity evidence is malformed"
-        ) from None
+
+    from scripts.e2e.regional.collector_reboot_scope import (
+        capture_reboot_scope as capture,
+    )
+
+    return capture(
+        regional,
+        node=node,
+        hyperpod_cluster=hyperpod_cluster,
+        executor_role_arn=executor_role_arn,
+        provider=provider,
+    )

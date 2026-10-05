@@ -430,7 +430,10 @@ def read_only_preflight(
         "GF-REGIONAL-COLLECT-004",
         "GF-REGIONAL-COLLECT-015",
     } and (not settings.hyperpod_cluster or not settings.executor_role_arn):
-        errors.append(f"{settings.case_id} requires HyperPod cluster and executor role")
+        errors.append(
+            f"{settings.case_id} requires the provider cluster scope "
+            "(--hyperpod-cluster; the EKS cluster name on eks-managed) and executor role"
+        )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
@@ -976,14 +979,12 @@ def run_collect014(
     bdf = str(gpu["pci_bdf"])
     fail_marker = f"c014-fail-{int(time.time())}-a{attempt}"
     # The fail-closed direction is "SXID 10003 with no inventory evidence".
-    # Ingest accepts an inventory sample as evidence only while
-    # -30s <= event.observed_at - sample.observed_at <= 180s (snapshot) or
-    # 600s (legacy metrics), so the event is back-dated far enough that the
-    # newest stored sample is still *newer* than event + 30s. Eight minutes
-    # tolerates a 7.5 min delivery lag and stays under the 900s
-    # STALE_FAULT_GENERATION fence, which would block for the wrong reason.
-    # And because the premise is a bet on inventory freshness, the store is
-    # read first and the post refused when the bet would not hold.
+    # Ingest accepts an inventory sample as evidence only while -30s <=
+    # event.observed_at - sample.observed_at <= 180s (snapshot) or 600s (legacy
+    # metrics), so the event is back-dated far enough that the newest stored
+    # sample is still *newer* than event + 30s; eight minutes tolerates a 7.5
+    # min delivery lag and stays under the 900s STALE_FAULT_GENERATION fence.
+    # The premise bets on inventory freshness, so the store is read first.
     posted_at = datetime.now(timezone.utc)
     old_time = posted_at - FAIL_CLOSED_EVENT_AGE
     inventory = regional.cpu_python(
@@ -1048,13 +1049,12 @@ def run_collect014(
         errors.append("fail-closed SXID produced node-side actions")
     if after_fail["boot_id"] != baseline["boot_id"]:
         errors.append("node rebooted during the fail-closed SXID")
-    # The fail-closed SXID quarantines the node (its BLOCKED workflow still
-    # owns the isolation). The positive injection that follows must run
-    # MARK_UNSCHEDULABLE itself; while the fail-closed incident holds the
-    # node that step fails with "node is already isolated by another
-    # incident/token" and the positive workflow is FAILED, not SUCCEEDED
-    # (same ownership fence as COLLECT-012, observed 2026-09-06 04:00Z). So
-    # the node is returned through the validated path between the two SXIDs.
+    # The fail-closed SXID quarantines the node (its BLOCKED workflow owns the
+    # isolation). The positive injection must run MARK_UNSCHEDULABLE itself;
+    # while the fail-closed incident holds the node that step fails with "node
+    # is already isolated by another incident/token" and the positive workflow
+    # is FAILED (same ownership fence as COLLECT-012), so the node is returned
+    # through the validated path between the two SXIDs.
     restores = [
         cleanup.restore(
             collector,

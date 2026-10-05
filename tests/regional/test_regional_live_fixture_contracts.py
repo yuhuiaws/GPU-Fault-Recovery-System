@@ -549,7 +549,12 @@ def test_wait_provider_events_polls_until_the_expected_count_is_visible(
     windows: list[datetime] = []
     sleeps: list[int] = []
 
-    def provider_events(_started: datetime, ended: datetime) -> list[dict[str, str]]:
+    def provider_events(
+        _started: datetime, ended: datetime, *, event_source: str
+    ) -> list[dict[str, str]]:
+        assert event_source == "sagemaker.amazonaws.com", (
+            "the HyperPod default event source reaches the lookup"
+        )
         windows.append(ended)
         return next(lookups)
 
@@ -582,7 +587,9 @@ def test_wait_provider_events_returns_what_it_saw_at_the_deadline(
         clock["now"] += 500.0
         return clock["now"]
 
-    def provider_events(_started: datetime, _ended: datetime) -> list[dict[str, str]]:
+    def provider_events(
+        _started: datetime, _ended: datetime, *, event_source: str
+    ) -> list[dict[str, str]]:
         lookups.append(1)
         return []
 

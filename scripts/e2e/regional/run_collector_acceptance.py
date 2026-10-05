@@ -154,11 +154,9 @@ print(json.dumps({"records": [
 """
 
 # The two on-node delivery chains COLLECT-001 judges, keyed by the ``batch_id``
-# prefix the producing collector stamps. The prefix is load-bearing: a collector
-# status row is keyed by (cluster, node, collector), and the control plane's own
-# Kubernetes allocatable collector reports on the same HOST_TELEMETRY channel as
-# the on-node host collector, on its own summary phase. Counting the merged
-# channel would measure two collectors and attribute the result to one.
+# prefix the producing collector stamps. The prefix is load-bearing: the control
+# plane's Kubernetes allocatable collector shares the HOST_TELEMETRY channel, so
+# the merged channel would measure two collectors and attribute it to one.
 COLLECT001_PRODUCERS = {
     "GPU_METRICS": "dcgm-",
     "HOST_TELEMETRY": "host-",
@@ -419,14 +417,11 @@ def run_collect001(
     duration = max(
         item["summary"] * 2 + item["interval"] * 4 for item in chains.values()
     )
-    # Poll the collector statuses rather than reading the evidence history once
-    # at the end. Steady-state deliveries are deliberately *not* persisted as
-    # evidence -- the control plane skips capture when a batch has no findings,
-    # no collection errors and no reason but `health-summary` -- so the evidence
-    # table cannot see the suppressed cadence this case exists to measure. It
-    # counted zero GPU_METRICS records on a healthy node and called the chain
-    # dead. The status row is upserted on every accepted batch, and polling once
-    # per collection interval cannot miss a delivery that is a summary apart.
+    # Poll the collector statuses, not the evidence history: steady-state
+    # deliveries (no findings, no errors, reason `health-summary`) are not
+    # persisted as evidence, which once read a healthy node as a dead chain. The
+    # status row is upserted on every accepted batch; one poll per interval
+    # cannot miss a delivery that is a summary apart.
     deliveries: dict[str, list[str]] = {key: [] for key in COLLECT001_PRODUCERS}
     timeline: list[dict[str, Any]] = []
     deadline = time.monotonic() + duration
@@ -502,12 +497,9 @@ def run_collect001(
                 f"{kind} never went a full summary window without delivering, "
                 f"so no suppression was observed: gaps {gaps}"
             )
-    # And the other half of the same mechanism: a batch whose only reason is the
-    # periodic summary must not be persisted as evidence at all. This is what
-    # the control plane's capture condition promises, and a collector that
-    # mislabels its own periodic delivery breaks it silently -- the Kubernetes
-    # allocatable collector called every healthy summary a `recovered:` edge and
-    # so wrote one raw evidence record per node per summary, forever.
+    # The other half: a batch whose only reason is the periodic summary must not
+    # be persisted at all -- the Kubernetes allocatable collector once called
+    # every healthy summary a `recovered:` edge and wrote evidence forever.
     persisted_summaries = [
         item
         for item in records
@@ -519,11 +511,9 @@ def run_collect001(
             f"{len(persisted_summaries)} steady-state health summaries were "
             "persisted as raw evidence"
         )
-    # A recovery is a transition, and preflight established that nothing was
-    # broken when the window opened, so nothing inside it can have recovered.
-    # `recovered:<resource>` is the mislabel that made every healthy Kubernetes
-    # summary look like an edge; the host collector's own recovery reason is the
-    # bare `recovered`, which stays legitimate here.
+    # Nothing was broken when the window opened, so nothing inside it recovered:
+    # `recovered:<resource>` is the Kubernetes mislabel; the host collector's
+    # bare `recovered` stays legitimate.
     false_recoveries = [
         item
         for item in records
@@ -638,6 +628,18 @@ def power_load_started_at(
     return started
 
 
+def require_dcgm_load_generator(baseline: dict[str, Any]) -> None:
+    """No ``dcgmproftester`` (plain EKS AMI, no host DCGM): refuse by name, not opaquely."""
+
+    if "dcgm_load_generator" in baseline and not baseline["dcgm_load_generator"]:
+        raise RegionalFixtureError(
+            "the target node has no DCGM load generator (/usr/bin/dcgmproftester*): "
+            "COLLECT-002 drives GPU power through dcgmproftester, which the plain EKS "
+            "node image does not ship; install DCGM on the node image or run the case "
+            "on a HyperPod node"
+        )
+
+
 def run_collect002(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -650,6 +652,7 @@ def run_collect002(
     confirmation = collector_setting(env, "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES")
     if not baseline.get("gpu_power"):
         raise RegionalFixtureError("host probe could not read GPU power limits")
+    require_dcgm_load_generator(baseline)
     identity = f"{case_dir.resolve()}\0{attempt}".encode()
     run_id = f"collect002-{hashlib.sha256(identity).hexdigest()[:24]}-a{attempt}"
     write_json_atomic(
@@ -660,9 +663,8 @@ def run_collect002(
             "run_id": run_id,
         },
     )
-    # Step one of the procedure: begin from a delivery that just happened, so the
-    # next health summary is a whole summary period away. Injecting just before a
-    # summary would let the periodic delivery masquerade as the anomaly edge.
+    # Step one: start right after a delivery, a whole summary period before the
+    # next, or the periodic delivery could masquerade as the anomaly edge.
     opening = gpu_metrics_stamp(fixture)
     phase_sleep = seconds_until_next_summary(opening, summary=summary)
     if phase_sleep > 0:
@@ -679,10 +681,8 @@ def run_collect002(
             )
         time.sleep(interval)
     quiet_stamp: str = current
-    # The edge filter deliberately confirms a candidate over
-    # `confirmation` consecutive samples before it speaks, so the earliest
-    # honest bound is that many intervals plus the one the anomaly appeared in.
-    # Anything past that is the filter waiting for its summary, which is the P0.
+    # The edge filter confirms a candidate over `confirmation` samples, so the
+    # earliest honest bound is that many intervals plus the anomaly's own.
     allowed_latency = interval * (confirmation + 1)
     load_seconds = interval * (confirmation + 6)
     requested_at = datetime.now(timezone.utc)

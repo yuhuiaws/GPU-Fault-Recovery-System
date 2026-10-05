@@ -267,3 +267,37 @@ def test_first_persisted_delivery_wins_over_a_later_status_snapshot(
     assert result["preparation_seconds"] == 10
     assert result["sampled_status_at"] == (origin + timedelta(seconds=76)).isoformat()
     assert result["delivered_at"] == (origin + timedelta(seconds=61)).isoformat()
+
+
+def test_a_node_without_the_dcgm_load_generator_is_refused_by_name_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain EKS (AL2023 NVIDIA) nodes run no host DCGM and ship no dcgmproftester.
+
+    Live 2026-10-05 on gpu-eks-cluster the throttle died inside the probe with
+    an opaque ``ProbeError ... at proftester_binary`` and its output withheld;
+    the snapshot now reports the generator and the case refuses before it
+    touches a power limit.
+    """
+
+    monkeypatch.setattr(runner, "seconds_until_next_summary", lambda *a, **k: 0)
+    monkeypatch.setattr(runner, "require_action_time", lambda *a: None)
+    executed: list[str] = []
+    fixture = SimpleNamespace(
+        snapshot=lambda: {
+            "collector_env": {
+                "GPU_FAULT_METRICS_INTERVAL_SECONDS": "5",
+                "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS": "60",
+                "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES": "2",
+            },
+            "gpu_power": [{"index": 0}],
+            "dcgm_load_generator": None,
+        },
+        execute=lambda command, *a, **k: executed.append(command),
+    )
+    with pytest.raises(runner.RegionalFixtureError, match="no DCGM load generator"):
+        runner.run_collect002(fixture, tmp_path, 1)
+    assert executed == [], "nothing is executed on the node without the generator"
+    assert not (tmp_path / "power-operation-a1.json").exists(), (
+        "the refusal happens before the run identity is written"
+    )

@@ -1026,6 +1026,8 @@ def test_read_only_preflight_records_arbiter_placement_and_passes_it_on(
             return {}
 
     class _Warm:
+        provider = "hyperpod"
+
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
 

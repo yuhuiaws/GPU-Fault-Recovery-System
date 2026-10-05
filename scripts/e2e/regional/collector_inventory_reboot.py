@@ -33,6 +33,9 @@ from scripts.e2e.regional.collector_inventory_sampling import (
 from scripts.e2e.regional.collector_reboot_evidence import (
     capture_reboot_scope,
     prove_reboot_scope,
+    provider_event_source,
+    reboot_event_names,
+    scope_provider,
     submitted_reboot_errors,
 )
 from scripts.e2e.regional.collector_recovery_safety import require_settled_recovery
@@ -46,7 +49,6 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveSettings,
 )
 
-REBOOT_EVENTS = {"BatchRebootClusterNodes", "RebootClusterNodes"}
 
 HOST_INVENTORY_EVIDENCE = r"""
 import json
@@ -679,6 +681,27 @@ def require_idle_target(
         raise RegionalFixtureError("inventory reboot target is not idle and unchanged")
 
 
+def reboot_provider_events(
+    regional: RegionalLiveFixture, scope: Mapping[str, Any], started_at: datetime
+) -> tuple[datetime, list[dict[str, Any]]]:
+    """Wait for the reboot's provider mutation, then read the whole window.
+
+    The reboot lands in the provider's own API: SageMaker on HyperPod, EC2
+    RebootInstances on a plain EKS node group (``scope["provider"]``).
+    """
+
+    provider = scope_provider(scope)
+    source = provider_event_source(provider)
+    regional.wait_provider_events(
+        started_at,
+        event_names=set(reboot_event_names(provider)),
+        expected_count=1,
+        event_source=source,
+    )
+    ended_at = datetime.now(timezone.utc)
+    return ended_at, regional.provider_events(started_at, ended_at, event_source=source)
+
+
 def run_collect004(
     settings: InventoryRebootSettings,
     regional: RegionalLiveFixture,
@@ -885,13 +908,7 @@ def run_collect004(
         result["collector_env_after"] = after.get("collector_env_file")
         if (after.get("collector_env_file") or {}).get("sha256") != baseline_sha256:
             result["errors"].append("collector.env differs from the baseline")
-        regional.wait_provider_events(
-            started_at,
-            event_names=REBOOT_EVENTS,
-            expected_count=1,
-        )
-        ended_at = datetime.now(timezone.utc)
-        events = regional.provider_events(started_at, ended_at)
+        ended_at, events = reboot_provider_events(regional, scope, started_at)
         result["provider_events"] = events
         submissions = state.get("submissions", [])
         if len(submissions) != 1:

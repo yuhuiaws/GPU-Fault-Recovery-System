@@ -46,6 +46,7 @@ from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
 )
 
 TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
+# HyperPod (SageMaker) node mutations plus a plain EKS node group's EC2 ones.
 PROVIDER_MUTATIONS = {
     "BatchDeleteClusterNodes",
     "BatchRebootClusterNodes",
@@ -53,7 +54,13 @@ PROVIDER_MUTATIONS = {
     "DeleteClusterNodes",
     "RebootClusterNodes",
     "ReplaceClusterNodes",
+    "RebootInstances",
+    "RunInstances",
+    "StartInstances",
+    "StopInstances",
+    "TerminateInstances",
 }
+HYPERPOD_EVENT_SOURCE = "sagemaker.amazonaws.com"
 RUNTIME_IDENTITY_DEPLOYMENTS = {
     "cpu": (
         "gpu-fault-api-ha",
@@ -1359,6 +1366,8 @@ class RegionalLiveFixture:
         self,
         started_at: datetime,
         ended_at: datetime,
+        *,
+        event_source: str = HYPERPOD_EVENT_SOURCE,
     ) -> list[dict[str, Any]]:
         from scripts.e2e.regional.collector_reboot_evidence import (
             normalize_provider_event,
@@ -1378,7 +1387,7 @@ class RegionalLiveFixture:
                     "--end-time",
                     ended_at.isoformat(),
                     "--lookup-attributes",
-                    "AttributeKey=EventSource,AttributeValue=sagemaker.amazonaws.com",
+                    f"AttributeKey=EventSource,AttributeValue={event_source}",
                     "--output",
                     "json",
                 ],
@@ -1409,27 +1418,18 @@ class RegionalLiveFixture:
         ended_at: datetime | None = None,
         timeout_seconds: int = PROVIDER_EVENT_VISIBILITY_SECONDS,
         poll_seconds: int = 60,
+        event_source: str = HYPERPOD_EVENT_SOURCE,
     ) -> list[dict[str, Any]]:
         """Poll CloudTrail until ``expected_count`` of ``event_names`` are visible.
 
-        CloudTrail is eventually consistent -- a mutation typically appears
-        within 5 minutes and is only guaranteed within 15 -- so a single lookup
-        taken right after a reboot finished reads "no RebootClusterNodes" and
-        fails a case that did exactly what it should. The intended pattern:
-
-        * a *positive* claim ("the executor issued exactly one reboot") polls
-          here and then asserts on the returned list; the poll stops as soon as
-          enough events are visible, or at ``timeout_seconds``;
-        * a *negative* claim ("no provider mutation happened") cannot be proven
-          inside the window -- see ``provider_events_provisional`` -- and the
-          case labels it ``provisional``; DESTR-013 re-checks the whole run's
-          window once CloudTrail has caught up.
-
-        ``ended_at`` defaults to *now at each poll*, so late-delivered events
-        are seen. Returns whatever was visible when it stopped; the caller
-        decides what the count means. No event is accepted as a successful
-        scoped reboot merely because it is visible; the caller must validate
-        the normalized identity, targets, response and submission interval.
+        CloudTrail is eventually consistent (typically 5 minutes, guaranteed
+        15), so one lookup right after a reboot reads "no RebootClusterNodes".
+        A *positive* claim polls here, then asserts on the returned list; a
+        *negative* claim cannot be proven inside the window (see
+        ``provider_events_provisional``) and DESTR-013 re-checks the whole run
+        later. ``ended_at`` defaults to *now at each poll* so late events are
+        seen; ``event_source`` selects the provider API. The caller validates
+        identity, targets, response and submission interval of what is returned.
         """
 
         if type(expected_count) is not int or expected_count < 0:
@@ -1444,7 +1444,9 @@ class RegionalLiveFixture:
             window_end = ended_at or datetime.now(timezone.utc)
             events = [
                 item
-                for item in self.provider_events(started_at, window_end)
+                for item in self.provider_events(
+                    started_at, window_end, event_source=event_source
+                )
                 if item.get("event_name") in event_names
             ]
             if len(events) >= expected_count or time.monotonic() >= deadline:
@@ -1459,10 +1461,9 @@ class RegionalLiveFixture:
     ) -> bool:
         """True while CloudTrail may still be delivering events up to ``ended_at``.
 
-        A runner that saw no provider mutation and whose window ended inside
-        the last 15 minutes has a provisional negative, not a PASS. Record it
-        as ``provider_events_provisional: True`` so the auditor knows the claim
-        rests on DESTR-013's later full-window lookup.
+        A window that ended inside the last 15 minutes holds a provisional
+        negative, not a PASS; record it so the auditor knows the claim rests
+        on DESTR-013's later full-window lookup.
         """
 
         current = now or datetime.now(timezone.utc)

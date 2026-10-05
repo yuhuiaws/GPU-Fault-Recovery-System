@@ -425,7 +425,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         fault_agent=agent_by_node(state, settings.fault_node) or {},
         sibling_agent=agent_by_node(state, settings.sibling_node) or {},
         spare_nodes=warm.spare_nodes(),
-        cluster=warm.cluster_recovery(),
+        cluster={"provider": warm.provider, **warm.cluster_recovery()},
         executor_env=executor_env_snapshot(regional),
         reboot_probe_errors=[],
         control_env=control_env,
