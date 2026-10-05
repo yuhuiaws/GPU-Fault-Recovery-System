@@ -75,6 +75,7 @@ from gpu_fault.operation_registry import (
     DESTRUCTIVE_OPERATIONS,
     NODE_WIDE_RECOVERY_OPERATIONS,
 )
+from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 
 # Re-exported on purpose: the QUARANTINED exit path is built by this module's
@@ -521,7 +522,74 @@ class IncidentClosureService:
                 reason,
                 workflow.request_id,
             )
+        closed.extend(self._close_escalation_predecessors(incident, workflow, restored))
         return closed
+
+    def _close_escalation_predecessors(
+        self,
+        incident: FaultIncident,
+        workflow: WorkflowRequest,
+        restored: set[str],
+    ) -> list[str]:
+        """Close the QUARANTINED incidents this escalation chain descends from.
+
+        A ``reboot-after`` / ``replace-after`` successor takes over the node its
+        predecessor left cordoned (``node_operations.escalation_continues``);
+        once the successor restored scheduling, the predecessor's isolation is
+        gone by observation -- the node carried the successor's ownership when
+        RESTORE_SCHEDULING released it -- so the predecessor record, parked
+        QUARANTINED with its FAILED workflow, is closed like the ESCALATED ones
+        above. Walks the whole chain; stops at an open workflow, a predecessor
+        with nodes outside ``restored``, or a row another writer moved.
+        """
+
+        closed: list[str] = []
+        event_id = incident.event_id
+        seen = {incident.incident_id}
+        while True:
+            origin = escalation_origin(event_id)
+            if origin is None:
+                return closed
+            try:
+                source_workflow = self.store.get_workflow(origin[1])
+                predecessor = self.store.get_incident(source_workflow.incident_id)
+            except NotFoundError:
+                return closed
+            if predecessor.incident_id in seen:
+                return closed
+            seen.add(predecessor.incident_id)
+            event_id = predecessor.event_id
+            if (
+                predecessor.state is not IncidentState.QUARANTINED
+                or predecessor.cluster_id != incident.cluster_id
+                or not predecessor.node_ids
+                or not set(predecessor.node_ids) <= restored
+                or self._open_workflow(predecessor) is not None
+            ):
+                continue
+            try:
+                self._close(
+                    predecessor,
+                    reason=(
+                        f"node restored via escalation successor {incident.incident_id}"
+                    ),
+                    actor=AUTO_CLOSE_ACTOR,
+                    kind=WorkflowEventKind.TERMINAL,
+                    details={
+                        "closed_by": CLOSED_BY_RESTORE,
+                        "restored_by_incident_id": incident.incident_id,
+                        "restored_by_workflow_id": workflow.request_id,
+                    },
+                )
+            except StaleWriteError:
+                LOGGER.info(
+                    "predecessor %s moved while successor %s was closing it; left alone",
+                    predecessor.incident_id,
+                    incident.incident_id,
+                )
+                continue
+            self.auto_closed_by_restore_total += 1
+            closed.append(predecessor.incident_id)
 
     # --------------------------------------------------------------- shared
 

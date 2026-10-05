@@ -737,6 +737,13 @@ class RemoteIncidentOwnershipReport(StrictModel):
     terminal: bool = False
     incident_state: str | None = None
     quarantine_hold: bool = False
+    #: Whether the hold is a *terminal* quarantine -- an RMA-class QUARANTINE
+    #: without readmission, or a spare failover's original node -- that no
+    #: successor may lift. ``quarantine_hold`` alone also covers an incident
+    #: left QUARANTINED by a workflow that failed mid-way; that hold the
+    #: predecessor's own escalation successor may take over. ``None`` from a
+    #: control plane that predates the field reads as unknown: no takeover.
+    terminal_quarantine: bool | None = None
 
 
 class RemoteFleetRolloutFence(StrictModel):

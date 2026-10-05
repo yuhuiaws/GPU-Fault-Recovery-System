@@ -2938,6 +2938,22 @@ which node a GPU belongs to, GPU/Fabric validation expands per node, and all mus
 are not excluded because the current inventory lacks that UUID; such a failure should first be investigated as a lost card or a wrong historical scope,
 and must not be released by narrowing the validation scope or lifting isolation by hand.
 
+**The escalation ladder and node ownership (reset -> reboot -> replace)**: when the predecessor workflow fails after
+its cordon (RESET_GPU, or the VALIDATE_GPU after it) the incident reads QUARANTINED and the Dispatcher opens the successor
+`workflow-reboot-after-<id>` (then `workflow-replace-after-<id>`). The successor's MARK_UNSCHEDULABLE/QUARANTINE now
+**takes over** the isolation the predecessor left on the node (the `gpu-fault.io/incident-id`/`fencing-token`
+annotations are rewritten to the successor incident, the `previous-unschedulable` baseline is kept) when: the incident on
+the node's annotations is the one whose workflow this successor escalates (event id `reboot-after-<workflow>`), that
+workflow has ended, and its hold is **not a terminal quarantine** (an RMA-class QUARANTINE without RESTORE_SCHEDULING, or
+a spare failover's original node -- those still transfer only to a workflow that preserves the hold). The storeless
+regional executor decides on the `terminal_quarantine` field of the control plane's `incident-ownership` report; an
+older control plane that lacks the field licenses no takeover. Once the successor's RESTORE_SCHEDULING succeeds, the
+executor also closes the chain's predecessors that are still QUARANTINED (reasons gain
+`node restored via escalation successor <id>`), leaving no record for an operator to close. **Before**: the successor's
+MARK_UNSCHEDULABLE on the same node was refused with `node is already isolated by another incident/token` (containment
+refused), the ladder ended in a support ticket and the node stayed with the predecessor's QUARANTINED incident, to be
+released by hand with `restore` per this section.
+
 ### 9.3 Remotely Requeueing Collector Dead Letters
 
 **When to use**: after `GpuFaultCollectorSilent`/`GpuFaultCollectorCollectionErrors` triage or a token rotation or control-plane outage,

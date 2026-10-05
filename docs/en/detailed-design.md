@@ -1202,7 +1202,10 @@ flowchart LR
 
 Figure 2-9-1 Hardware recovery escalation ladder. Each level is triggered idempotently by the Dispatcher on a `FAILED` workflow;
 the escalation direction matches the action ladder of §2.3.1, no level is skipped, and no failure falls back to a weaker
-action
+action. A successor takes over the non-terminal isolation its predecessor left on the node (the node annotations are
+rewritten to the successor incident; a terminal QUARANTINE and a spare failover's original node excepted), and once its
+RESTORE_SCHEDULING succeeds the chain's still-QUARANTINED predecessors are closed automatically; a failed validation
+escalates only the nodes the recovery action acted on.
 
 `KernelLogCollector` is the current production primary collector for SXIDs. NVIDIA's official documentation states that NVSwitch runtime
 errors are written by the driver to the OS kernel/event log; the Collector reads the

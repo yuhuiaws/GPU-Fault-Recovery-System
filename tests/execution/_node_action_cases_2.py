@@ -926,7 +926,11 @@ def test_completed_spare_failover_keeps_old_node_safety_hold() -> None:
         store=store,
     )
 
-    assert adapter._incident_ownership(incident.incident_id) == (True, True)
+    ownership = adapter._incident_ownership(incident.incident_id)
+    assert (ownership.terminal, ownership.quarantine_hold) == (True, True)
+    assert ownership.terminal_quarantine is True, (
+        "a spare failover's original node is a terminal hold no successor lifts"
+    )
 
 
 def test_node_action_adapter_uses_prederived_node_secret() -> None:

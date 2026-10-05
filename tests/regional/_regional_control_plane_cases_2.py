@@ -182,6 +182,7 @@ def test_incident_ownership_route_answers_takeover_question() -> None:
                 "terminal": True,
                 "incident_state": "ACTION_PENDING",
                 "quarantine_hold": False,
+                "terminal_quarantine": False,
             }
 
             live = await client.get(
@@ -198,6 +199,10 @@ def test_incident_ownership_route_answers_takeover_question() -> None:
             assert quarantined.json()["terminal"] is True
             assert quarantined.json()["incident_state"] == "QUARANTINED"
             assert quarantined.json()["quarantine_hold"] is True
+            assert quarantined.json()["terminal_quarantine"] is True, (
+                "a QUARANTINE with no readmission is a terminal hold: no "
+                "escalation successor may take the node over"
+            )
 
             # Fails closed rather than 404: an unknown incident must
             # read as "not finished", never as a licence to take over.
@@ -256,6 +261,7 @@ def test_regional_ownership_provider_reads_the_route() -> None:
     quarantined = provider.incident_ownership("inc-quarantined")
     assert quarantined.terminal is True
     assert quarantined.quarantine_hold is True
+    assert quarantined.terminal_quarantine is True
     assert provider.incident_workflow_is_terminal("inc-never-existed") is False
 
 

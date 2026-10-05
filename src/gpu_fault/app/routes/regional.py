@@ -558,14 +558,13 @@ async def get_remote_incident_ownership(
             WorkflowStatus.FAILED,
             WorkflowStatus.SUPERSEDED,
         }
+        terminal_quarantine = has_terminal_quarantine_hold(workflow) or any(
+            execution.operation is WorkflowOperation.REPLACE_NODE
+            and execution.details.get("action") == "SPARE_FAILOVER"
+            for execution in workflow.step_executions
+        )
         quarantine_hold = (
-            incident.state is IncidentState.QUARANTINED
-            or has_terminal_quarantine_hold(workflow)
-            or any(
-                execution.operation is WorkflowOperation.REPLACE_NODE
-                and execution.details.get("action") == "SPARE_FAILOVER"
-                for execution in workflow.step_executions
-            )
+            incident.state is IncidentState.QUARANTINED or terminal_quarantine
         )
         return RemoteIncidentOwnershipReport(
             incident_id=incident_id,
@@ -575,6 +574,7 @@ async def get_remote_incident_ownership(
             terminal=terminal,
             incident_state=incident.state.value,
             quarantine_hold=quarantine_hold,
+            terminal_quarantine=terminal_quarantine,
         )
 
     return await _store_call(dependencies, lookup)

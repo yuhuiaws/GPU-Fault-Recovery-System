@@ -37,6 +37,10 @@ from tests.execution._support import UnusedApi
 
 PREDECESSOR = "inc-reset-drill"
 SUCCESSOR = "inc-reboot-after-wf-reset-drill"
+#: The successor's event id names the predecessor workflow it escalates.
+SUCCESSOR_EVENT = "reboot-after-wf-reset-drill"
+#: An incident that is not the predecessor's escalation (another fault).
+UNRELATED_EVENT = "event-another-fault"
 HEALTHY = "node-sibling"
 OWNED = "node-reset"
 
@@ -87,22 +91,40 @@ class TwoNodeCore:
         node["spec"].update(body["spec"])
 
 
-def _records(store, *, successor_nodes: list[str]):
+def _records(
+    store,
+    *,
+    successor_nodes: list[str],
+    event_id: str = UNRELATED_EVENT,
+    terminal_quarantine: bool = False,
+):
+    """A predecessor reset workflow that failed after cordoning ``OWNED`` and a
+    step of ``SUCCESSOR`` isolating ``successor_nodes``. ``event_id`` decides
+    whether the successor is the predecessor's own escalation;
+    ``terminal_quarantine`` makes the predecessor an RMA-class hold (QUARANTINE
+    with no readmission) instead of a reset that never reached its restore."""
+
+    predecessor_steps = (
+        [
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=[OWNED]),
+            workflow_step(WorkflowOperation.QUARANTINE, node_ids=[OWNED]),
+            workflow_step(WorkflowOperation.ESCALATE_SUPPORT, node_ids=[OWNED]),
+        ]
+        if terminal_quarantine
+        else [
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=[OWNED]),
+            workflow_step(WorkflowOperation.RESET_GPU, node_ids=[OWNED]),
+            workflow_step(WorkflowOperation.RESTORE_SCHEDULING, node_ids=[OWNED]),
+        ]
+    )
     predecessor_workflow = workflow_request(
         "wf-reset-drill",
         PREDECESSOR,
         status=WorkflowStatus.FAILED,
         fencing_token=1,
-        official_steps=[
-            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=[OWNED]),
-            workflow_step(WorkflowOperation.RESET_GPU, node_ids=[OWNED]),
-            workflow_step(WorkflowOperation.RESTORE_SCHEDULING, node_ids=[OWNED]),
-        ],
+        official_steps=predecessor_steps,
         completed_step_indexes=[0, 1],
-        completed_operations=[
-            WorkflowOperation.MARK_UNSCHEDULABLE,
-            WorkflowOperation.RESET_GPU,
-        ],
+        completed_operations=[step.operation for step in predecessor_steps[:2]],
     )
     predecessor = fault_incident(
         PREDECESSOR,
@@ -134,7 +156,7 @@ def _records(store, *, successor_nodes: list[str]):
     )
     successor = fault_incident(
         SUCCESSOR,
-        "reboot-after-wf-reset-drill",
+        event_id,
         state=IncidentState.ACTION_PENDING,
         workflow_request_id=successor_workflow.request_id,
         node_ids=successor_nodes,
@@ -210,6 +232,51 @@ def test_an_unowned_step_still_isolates_every_node_it_names() -> None:
         annotations = core.nodes[name]["metadata"]["annotations"]
         assert annotations["gpu-fault.io/incident-id"] == SUCCESSOR
         assert core.nodes[name]["spec"]["unschedulable"] is True
+
+
+def test_the_predecessors_own_escalation_takes_its_cordoned_node_over() -> None:
+    """The live chain, after the fix: the reboot-after successor of a reset
+    that failed past its cordon continues on the same node instead of being
+    refused and ending the ladder in a support ticket."""
+
+    store = build_store()
+    core = TwoNodeCore()
+    core.own(OWNED, PREDECESSOR)
+    context = _records(store, successor_nodes=[OWNED], event_id=SUCCESSOR_EVENT)
+
+    outcome = _adapter(core, store).execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome.error
+    annotations = core.nodes[OWNED]["metadata"]["annotations"]
+    assert annotations["gpu-fault.io/incident-id"] == SUCCESSOR, (
+        "ownership moves to the successor so its RESTORE_SCHEDULING can release"
+    )
+    assert annotations["gpu-fault.io/fencing-token"] == "1"
+    assert annotations["gpu-fault.io/previous-unschedulable"] == "false", (
+        "the scheduling baseline from before the first cordon is kept"
+    )
+    taints = {item["value"] for item in core.nodes[OWNED]["spec"]["taints"]}
+    assert taints == {quarantine_taint_value(SUCCESSOR)}, taints
+
+
+def test_a_terminal_quarantine_is_not_taken_over_by_the_escalation_successor() -> None:
+    store = build_store()
+    core = TwoNodeCore()
+    core.own(OWNED, PREDECESSOR)
+    context = _records(
+        store,
+        successor_nodes=[OWNED],
+        event_id=SUCCESSOR_EVENT,
+        terminal_quarantine=True,
+    )
+
+    outcome = _adapter(core, store).execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "already isolated by another incident" in (outcome.error or "")
+    assert core.nodes[OWNED]["metadata"]["annotations"]["gpu-fault.io/incident-id"] == (
+        PREDECESSOR
+    ), "an RMA-class hold stays with the incident that placed it"
 
 
 def test_a_refusal_that_lands_after_the_precheck_names_the_nodes_it_isolated() -> None:

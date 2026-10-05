@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from gpu_fault.adapters.common import (
     ANNOTATION_EFA_PLUGIN_RESTART_OPERATION,
@@ -36,6 +36,7 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.node_provider import efa_device_plugin_name
+from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
     has_terminal_quarantine_hold,
@@ -449,7 +450,7 @@ class KubernetesNodeOperationsMixin:
     def _isolate(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         # One ownership verdict per incident for the whole step: the pre-check
         # and the patch ask the same question (a remote lookup each, storeless).
-        ownership: dict[str, tuple[bool, bool]] = {}
+        ownership: dict[str, IsolationOwnership] = {}
         refusal = isolation_refusal(
             self.core,
             lambda node, step_context: self._node_isolation_patch(
@@ -704,67 +705,35 @@ class KubernetesNodeOperationsMixin:
         except Exception:
             return False
 
-    def _incident_ownership(self, incident_id: str) -> tuple[bool, bool]:
-        if self.store is not None:
-            try:
-                incident = self.store.get_incident(incident_id)
-                workflow = self.store.get_workflow(incident.workflow_request_id)
-            except (NotFoundError, KeyError, TypeError):
-                return False, False
-            terminal = workflow.status in {
-                WorkflowStatus.BLOCKED,
-                WorkflowStatus.SUCCEEDED,
-                WorkflowStatus.FAILED,
-                WorkflowStatus.SUPERSEDED,
-            }
-            quarantine_hold = (
-                incident.state is IncidentState.QUARANTINED
-                or has_terminal_quarantine_hold(workflow)
-                or any(
-                    execution.operation is WorkflowOperation.REPLACE_NODE
-                    and execution.details.get("action") == "SPARE_FAILOVER"
-                    for execution in workflow.step_executions
-                )
-            )
-            return terminal, quarantine_hold
-        if self.ownership_provider is None:
-            return False, False
-        try:
-            if hasattr(
-                self.ownership_provider,
-                "incident_ownership",
-            ):
-                report = self.ownership_provider.incident_ownership(incident_id)
-                return (
-                    bool(report.known and report.terminal),
-                    bool(report.quarantine_hold),
-                )
-            return (
-                bool(
-                    self.ownership_provider.incident_workflow_is_terminal(incident_id)
-                ),
-                False,
-            )
-        except Exception:
-            return False, False
+    def _incident_ownership(self, incident_id: str) -> IsolationOwnership:
+        return isolation_ownership(self.store, self.ownership_provider, incident_id)
 
     def _can_take_over_node_isolation(
         self,
         node: Any,
         incident_id: str,
         context: WorkflowStepContext,
-        ownership: dict[str, tuple[bool, bool]] | None = None,
+        ownership: dict[str, IsolationOwnership] | None = None,
     ) -> bool:
+        """Whether this step's incident may take ``node`` over from
+        ``incident_id``: an ended owner; a non-quarantine hold freely; a
+        non-terminal quarantine to the owner's own escalation successor
+        (``escalation_continues``); a terminal one only to a workflow that
+        preserves it (see ``isolation_ownership``)."""
+
         if ownership is None or incident_id not in ownership:
             verdict = self._incident_ownership(incident_id)
             if ownership is not None:
                 ownership[incident_id] = verdict
         else:
             verdict = ownership[incident_id]
-        terminal, quarantine_hold = verdict
-        if not terminal:
+        if not verdict.terminal:
             return False
-        if not quarantine_hold:
+        if not verdict.quarantine_hold:
+            return True
+        if verdict.terminal_quarantine is False and escalation_continues(
+            context, verdict.workflow_request_id
+        ):
             return True
         node_id = node_name(node)
         return node_id is not None and preserves_terminal_quarantine(
@@ -775,7 +744,7 @@ class KubernetesNodeOperationsMixin:
         self,
         node: Any,
         context: WorkflowStepContext,
-        ownership: dict[str, tuple[bool, bool]] | None = None,
+        ownership: dict[str, IsolationOwnership] | None = None,
     ) -> dict[str, Any]:
         annotations = self._annotations(node)
         existing_incident = annotations.get(ANNOTATION_INCIDENT)
@@ -872,6 +841,99 @@ class KubernetesNodeOperationsMixin:
                 "taints": taints,
             },
         }
+
+
+class IsolationOwnership(NamedTuple):
+    """What the previous owner of a node's isolation still holds.
+
+    ``terminal``: its workflow ended. ``quarantine_hold``: the node is held
+    quarantined (incident QUARANTINED, or a terminal quarantine).
+    ``terminal_quarantine``: that hold is RMA-class / a spare failover's
+    original and no successor may lift it; ``None`` when the owner's control
+    plane cannot say (an older release). ``workflow_request_id``: the owner's
+    current workflow, which an escalation successor names as its origin.
+    """
+
+    terminal: bool
+    quarantine_hold: bool
+    terminal_quarantine: bool | None
+    workflow_request_id: str | None
+
+
+def isolation_ownership(
+    store: Any, ownership_provider: Any, incident_id: str
+) -> IsolationOwnership:
+    """What ``incident_id`` still holds on the nodes it isolated.
+
+    Read from the store when the executor has one, else from the control
+    plane's ownership report (``RemoteIncidentOwnershipReport``); a lookup that
+    fails or an unknown incident reads as a live owner. ``terminal_quarantine``
+    is the RMA-class / spare-failover hold no successor may lift; the plain
+    QUARANTINED state of a workflow that failed mid-way (cordon done,
+    readmission never run) is a hold the owner's own escalation successor may
+    take over -- live 2026-10-05 the reboot rung was refused with "already
+    isolated by another incident/token" and the chain ended in a support
+    ticket. A report without the field (an older control plane) says ``None``:
+    no quarantine transfers.
+    """
+
+    if store is not None:
+        try:
+            incident = store.get_incident(incident_id)
+            workflow = store.get_workflow(incident.workflow_request_id)
+        except (NotFoundError, KeyError, TypeError):
+            return IsolationOwnership(False, False, None, None)
+        terminal = workflow.status in {
+            WorkflowStatus.BLOCKED,
+            WorkflowStatus.SUCCEEDED,
+            WorkflowStatus.FAILED,
+            WorkflowStatus.SUPERSEDED,
+        }
+        terminal_quarantine = has_terminal_quarantine_hold(workflow) or any(
+            execution.operation is WorkflowOperation.REPLACE_NODE
+            and execution.details.get("action") == "SPARE_FAILOVER"
+            for execution in workflow.step_executions
+        )
+        return IsolationOwnership(
+            terminal,
+            incident.state is IncidentState.QUARANTINED or terminal_quarantine,
+            terminal_quarantine,
+            workflow.request_id,
+        )
+    if ownership_provider is None:
+        return IsolationOwnership(False, False, None, None)
+    try:
+        if hasattr(ownership_provider, "incident_ownership"):
+            report = ownership_provider.incident_ownership(incident_id)
+            reported = getattr(report, "terminal_quarantine", None)
+            return IsolationOwnership(
+                bool(report.known and report.terminal),
+                bool(report.quarantine_hold),
+                bool(reported) if report.known and reported is not None else None,
+                getattr(report, "workflow_request_id", None),
+            )
+        return IsolationOwnership(
+            bool(ownership_provider.incident_workflow_is_terminal(incident_id)),
+            False,
+            None,
+            None,
+        )
+    except Exception:
+        return IsolationOwnership(False, False, None, None)
+
+
+def escalation_continues(
+    context: WorkflowStepContext, source_workflow_id: str | None
+) -> bool:
+    """Whether this step's incident is the escalation successor of the
+    workflow ``source_workflow_id`` (its event id is ``<rung>-after-<that>``)."""
+
+    origin = escalation_origin(context.incident.event_id)
+    return (
+        origin is not None
+        and source_workflow_id is not None
+        and origin[1] == source_workflow_id
+    )
 
 
 def absent_node_failure(node_id: str, isolated: list[str]) -> WorkflowStepOutcome:
