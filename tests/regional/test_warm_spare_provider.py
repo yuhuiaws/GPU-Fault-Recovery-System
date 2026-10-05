@@ -16,8 +16,8 @@ from typing import Any
 
 import pytest
 
-from scripts.e2e.regional import warm_spare_provider as provider
 from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
+from scripts.e2e.regional import warm_spare_provider as provider
 from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
 
 EKS_NODEGROUP = "eks.amazonaws.com/nodegroup"
