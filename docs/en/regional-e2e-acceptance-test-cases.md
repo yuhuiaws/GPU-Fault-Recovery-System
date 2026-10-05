@@ -8802,6 +8802,22 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   DESTR-005 presupposes a warm spare; a spare-less `eks-managed` cluster is refused in preflight (fail closed) and marked
   BLOCKED by the operator rather than given a PASS/FAIL verdict. AUTH-015 selects nodes with `cluster_scope.node_selector`
   (the HyperPod label, or the cluster's configured node selector).
+- A sensitive command failure in the regional runners (`RegionalCommandFailed`) now always names its step:
+  `command failed (1): <sensitive output redacted> (step: kubectl get)` -- CLI and subcommand words only (no names,
+  argument values or payloads), so the evidence `error` field locates the failure.
+- A plain EKS cluster usually has no Kubeflow training operator (`pytorchjobs.kubeflow.org` is not served): DESTR-012's
+  managed-workload enumeration first reads `kubectl api-resources`, enumerates only the kinds the cluster serves and records
+  the missing ones in `unavailable_resource_kinds`; cases that create a PyTorchJob (DESTR-015 and others) check that API
+  before submitting and refuse by name when it is absent ("install the Kubeflow training operator or use a manifest of a
+  served kind"), and cleanup performs no residual check for an object that was never created. DESTR-002 audits the HyperPod
+  reboot adapter; on an `eks-managed` cluster's Executor (owner `gpu-fault-eks-adapter`) the probe reports the adapters it
+  found and the case refuses by name instead of a redacted failure. The DESTR-009/012 count of "three Ready, schedulable,
+  untainted GPU nodes" follows the per-provider taint rule (the node group GPU taint does not count).
+- A concurrent control-plane change fails a case at cleanup without being a runner defect: a `gpu-fault-admin config`
+  apply or a `rotate-token` `CONTROL_PLANE_ROLLED` rolls the CPU Deployments (generation/template digest change); a case
+  in cleanup then reports "release/runtime deployment identity drifted" (DESTR-017) and a case binding Aurora sees the old
+  Pods Terminating. The Aurora binding now counts only non-Terminating, non-terminal Pods (fewer than `replicas` still
+  fails closed); do not run control-plane changes while cases are running.
 
 ### GF-REGIONAL-DESTR-002
 

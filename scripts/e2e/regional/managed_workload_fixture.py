@@ -23,6 +23,10 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalCommandFailed,
     RegionalFixtureError,
 )
+from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
+    resource_kind_served,
+    served_resource_names,
+)
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveFixture  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 from scripts.e2e.regional.fixture_ownership import (  # noqa: E402
@@ -582,6 +586,8 @@ class ManagedWorkloadFixture:
         return True
 
     def delete(self) -> None:
+        if not getattr(self, "kind_served", True):
+            return  # never created: the cluster does not serve the kind
         if self.ownership is not None:
             self.ownership.require_acknowledged()
         if not self.submission_started:
@@ -806,11 +812,36 @@ class ManagedWorkloadFixture:
             )
         self.owned_uids[(kind, name)] = uid
 
+    def require_served_kind(self) -> None:
+        """Refuse by name when the GPU cluster does not serve the workload's API.
+
+        A plain-EKS cluster without the Kubeflow training operator has no
+        ``pytorchjobs.kubeflow.org``; every ``kubectl get`` of the kind then exits
+        1 and the case would stop on a redacted failure (live 2026-10-04,
+        DESTR-015). The refusal names the kind, its API and the remedy.
+        """
+
+        group, plural = RESOURCE_APIS[str(self.kind).lower()]
+        served = served_resource_names(
+            self.regional.kubectl("gpu", "api-resources", "-o", "name")
+        )
+        name = (
+            f"{plural}.{group.split('/')[1]}" if group.startswith("apis/") else plural
+        )
+        self.kind_served = resource_kind_served(served, name)
+        if not self.kind_served:
+            raise RegionalFixtureError(
+                f"the GPU cluster does not serve {self.kind} ({group}); install the "
+                "controller that serves it (Kubeflow training operator for "
+                "PyTorchJob) or run the case with a manifest of a served kind"
+            )
+
     def submit_rendered(self, rendered: str) -> dict[str, Any]:
         if self.ownership is not None and self.ownership.resuming:
             raise RegionalFixtureError("an existing managed workload is cleanup-only")
         if self.submission_started:
             raise RegionalFixtureError("managed workload submission already started")
+        self.require_served_kind()
         if (
             read_resource(self.regional, self.resource, self.name) is not None
             or self.inventory()

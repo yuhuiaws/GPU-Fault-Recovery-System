@@ -186,7 +186,19 @@ class ManagedRegional(WorkloadRegional):
                     "allowed_namespaces": ["training"],
                 }
             )
-        if args[:2] == ("get", "pytorchjobs.kubeflow.org,jobs.batch,pods"):
+        if args[0] == "api-resources":
+            return "\n".join(
+                getattr(
+                    self.h,
+                    "served_kinds",
+                    ("pytorchjobs.kubeflow.org", "jobs.batch", "pods"),
+                )
+            )
+        if args[0] == "get" and set(args[1].split(",")) <= {
+            "pytorchjobs.kubeflow.org",
+            "jobs.batch",
+            "pods",
+        }:
             return json.dumps({"items": self.h.namespace_objects})
         if args[0] == "logs":
             return "healthy executor"

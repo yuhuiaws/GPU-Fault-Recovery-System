@@ -169,3 +169,25 @@ def business_workload_items(
             items, namespace=namespace, allowed_namespaces=allowed_namespaces
         )
     ]
+
+
+#: The workload kinds the managed-workload audits enumerate, as ``kubectl
+#: api-resources -o name`` spells them. A plain-EKS cluster without the Kubeflow
+#: training operator serves no ``pytorchjobs.kubeflow.org`` (live 2026-10-04:
+#: DESTR-012 and DESTR-015 stopped on "the server doesn't have a resource type").
+WORKLOAD_RESOURCE_KINDS = ("pytorchjobs.kubeflow.org", "jobs.batch", "pods")
+
+
+def served_resource_names(api_resources_output: str) -> frozenset[str]:
+    """The resource names a cluster serves, from ``kubectl api-resources -o name``."""
+
+    return frozenset(
+        line.strip() for line in api_resources_output.splitlines() if line.strip()
+    )
+
+
+def resource_kind_served(served: frozenset[str], kind: str) -> bool:
+    """Whether ``kind`` (``pods``, ``jobs.batch``, ``pytorchjobs.kubeflow.org``)
+    is served; a core kind may be listed without its empty group suffix."""
+
+    return kind in served or kind.split(".", 1)[0] in served

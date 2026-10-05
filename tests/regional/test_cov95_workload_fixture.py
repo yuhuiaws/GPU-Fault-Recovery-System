@@ -600,3 +600,22 @@ def test_prewarm_refuses_an_incomplete_node_inventory(
     monkeypatch.setattr(fixture.regional, "kubectl", lambda *args, **kwargs: "{}")
     with pytest.raises(managed.RegionalFixtureError, match="inventory is incomplete"):
         prewarm.cached_nodes()
+
+
+def test_submit_refuses_by_name_when_the_cluster_does_not_serve_the_kind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live 2026-10-04 (DESTR-015 on the plain-EKS cluster): without the Kubeflow
+    training operator every PyTorchJob read exits 1 and the case stopped on a
+    redacted failure; the refusal now names the kind, API and remedy, and the
+    cleanup knows nothing was created."""
+
+    fixture, api, rendered = harness(tmp_path, monkeypatch)
+    api.served = ("pods", "services")  # neither Jobs nor PyTorchJobs are served
+    with pytest.raises(managed.RegionalFixtureError, match="does not serve") as refusal:
+        fixture.submit_rendered(rendered)
+    assert "Kubeflow training operator" in str(refusal.value)
+    assert api.created == [] and fixture.submission_started is False
+    assert fixture.kind_served is False
+    fixture.delete()
+    assert api.deletes == [], "nothing was created, so cleanup deletes nothing"

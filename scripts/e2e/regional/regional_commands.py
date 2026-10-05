@@ -29,12 +29,62 @@ class RegionalCommandTimeout(RegionalFixtureError):
         self.timeout = timeout
 
 
+def command_step_label(command: Sequence[str]) -> str:
+    """The step a failed command belongs to, without any of its values.
+
+    The CLI and the subcommand words (``aws sagemaker describe-cluster``,
+    ``kubectl get``) and nothing else: no names, flags, paths or payloads, so the
+    label is safe beside redacted output. Live 2026-10-04: several cases
+    stopped with only ``command failed (1): <sensitive output redacted>``, which
+    names neither the command class nor the step.
+    """
+
+    words = [item for item in command if not item.startswith("-")]
+    if not words:
+        return ""
+    if words[0] == "kubectl":
+        # ``kubectl --kubeconfig P --context C -n NS exec -i POD -- ...``: the
+        # kubeconfig, context and namespace values precede the verb, so the verb
+        # is the first word that is a kubectl verb; nothing after it is kept.
+        verbs = {
+            "exec",
+            "get",
+            "auth",
+            "describe",
+            "logs",
+            "config",
+            "version",
+            "create",
+            "apply",
+            "delete",
+            "patch",
+            "annotate",
+            "label",
+            "api-resources",
+            "wait",
+            "rollout",
+            "cordon",
+            "uncordon",
+            "drain",
+            "taint",
+        }
+        verb = next((item for item in words[1:] if item in verbs), None)
+        return "kubectl" if verb is None else f"kubectl {verb}"
+    return " ".join(words[:3])
+
+
 class RegionalCommandFailed(RegionalFixtureError):
-    def __init__(self, returncode: int, stderr: str) -> None:
+    def __init__(
+        self, returncode: int, stderr: str, command: Sequence[str] | None = None
+    ) -> None:
         self.replica_disappeared = replica_vanished(RuntimeError(stderr))
-        super().__init__(
-            f"command failed ({returncode}): " + diagnostic_text(stderr, sensitive=True)
+        self.step = command_step_label(command) if command else ""
+        message = f"command failed ({returncode}): " + diagnostic_text(
+            stderr, sensitive=True
         )
+        if self.step:
+            message += f" (step: {self.step})"
+        super().__init__(message)
 
 
 def run_fixture_command(
@@ -86,5 +136,5 @@ def run_fixture_command(
             f"command could not start ({type(exc).__name__}, errno={exc.errno})"
         ) from None
     if check and completed.returncode:
-        raise RegionalCommandFailed(completed.returncode, completed.stderr)
+        raise RegionalCommandFailed(completed.returncode, completed.stderr, command)
     return completed

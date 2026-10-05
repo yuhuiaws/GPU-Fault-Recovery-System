@@ -31,6 +31,22 @@ MASTER_FILE = "/etc/gpu-fault/aurora/master-secret-arn"
 REFRESH_POLICY = "ReadAuroraManagedMasterSecret"
 
 
+def live_pod_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The Pods that are part of the live replica set: not Terminating, not in a
+    terminal phase. A control-plane roll in flight (live 2026-10-05: an admin
+    config apply during HA-003) leaves old Pods Terminating beside the new ones;
+    counting them read as "inventory is incomplete" although every live replica
+    was present, while fewer live Pods than replicas still fails closed."""
+
+    return [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and not (item.get("metadata") or {}).get("deletionTimestamp")
+        and (item.get("status") or {}).get("phase") not in {"Succeeded", "Failed"}
+    ]
+
+
 class BindingError(RegionalFixtureError):
     """Only fixed, credential-free reasons may cross this boundary."""
 
@@ -354,9 +370,11 @@ class AuroraBinding:
                 container.get("image") == release["runtime_image"],
                 "CPU image differs from release",
             )
-            pods = json.loads(
-                self.control("get", "pods", "-l", f"app={name}", "-o", "json")
-            )["items"]
+            pods = live_pod_items(
+                json.loads(
+                    self.control("get", "pods", "-l", f"app={name}", "-o", "json")
+                )["items"]
+            )
             require(len(pods) == replicas, "CPU Pod inventory is incomplete")
             pod_ids = {}
             for pod in pods:

@@ -31,6 +31,7 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 )
 from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalCommandFailed,
+    command_step_label,
     run_fixture_command,
 )
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
@@ -109,27 +110,6 @@ class ClusterTarget:
     @property
     def is_eks_managed(self) -> bool:
         return self.provider == "eks-managed"
-
-
-def command_step_label(command: Sequence[str]) -> str:
-    """The step a failed command belongs to, without any of its values.
-
-    The CLI, the subcommand words (``aws sagemaker describe-cluster``,
-    ``kubectl get nodes``) and nothing else: no names, flags, paths or payloads,
-    so the label is safe beside the redacted output.
-    """
-
-    words = [item for item in command if not item.startswith("-")]
-    if not words:
-        return ""
-    if words[0] == "kubectl":
-        # ``kubectl --kubeconfig P --context C -n NS exec -i POD -- ...``: the
-        # kubeconfig, context and namespace values precede the verb, so the verb
-        # is the first word that is a kubectl verb; nothing after it is kept.
-        verbs = {"exec", "get", "auth", "describe", "logs", "config", "version"}
-        verb = next((item for item in words[1:] if item in verbs), None)
-        return "kubectl" if verb is None else f"kubectl {verb}"
-    return " ".join(words[:3])
 
 
 def failing_step(exc: BaseException) -> str | None:
@@ -582,8 +562,9 @@ class BlastRunnerBase:
         try:
             return call()
         except RegionalCommandFailed as exc:
-            if failing_step(exc) is None:
-                exc.step = command_step_label(command_line)  # type: ignore[attr-defined]
+            if not failing_step(exc):
+                exc.step = command_step_label(command_line)
+                exc.args = (f"{exc} (step: {exc.step})",)
             raise
 
     def aws(self, *args: str) -> Any:
@@ -1027,9 +1008,6 @@ class BlastRunnerBase:
         """
 
         error = f"{type(exc).__name__}: {exc}"
-        step = failing_step(exc)
-        if step:
-            error += f" (step: {step})"
         if not any(item.get("case_id") == self.case_id for item in self.case_statuses):
             self.record_case(
                 self.case_id,

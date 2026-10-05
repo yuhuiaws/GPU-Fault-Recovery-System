@@ -13,11 +13,14 @@ from typing import Any
 
 from scripts.e2e.regional import run_net001_collector_replay as net001
 from scripts.e2e.regional.regional_workload_inventory import (
+    WORKLOAD_RESOURCE_KINDS,
     blocking_node_taints,
     business_workload_details,
     business_workload_items,
     business_workload_reason,
     node_provider,
+    resource_kind_served,
+    served_resource_names,
     tolerated_node_taints,
 )
 
@@ -167,3 +170,27 @@ def test_hyperpod_and_unknown_nodes_block_on_every_taint_as_before() -> None:
     assert blocking_node_taints([GPU_TAINT], {}) == [GPU_TAINT]
     assert blocking_node_taints([], HP_LABELS) == []
     assert tolerated_node_taints([GPU_TAINT], HP_LABELS) == []
+
+
+# -- served resource kinds: no Kubeflow on a plain EKS cluster -------------------
+
+
+def test_served_resource_names_follow_kubectl_api_resources_output() -> None:
+    """Live 2026-10-04: DESTR-012 and DESTR-015 stopped on the plain-EKS cluster
+    because `kubectl get pytorchjobs.kubeflow.org,...` exits 1 when the Kubeflow
+    training operator is not installed."""
+
+    served = served_resource_names("pods\njobs.batch\nnodes\n\n")
+    assert resource_kind_served(served, "pods"), "core kinds are listed bare"
+    assert resource_kind_served(served, "jobs.batch"), "grouped kinds carry their group"
+    assert not resource_kind_served(served, "pytorchjobs.kubeflow.org"), (
+        "an unserved CRD is reported, never assumed"
+    )
+    assert [k for k in WORKLOAD_RESOURCE_KINDS if resource_kind_served(served, k)] == [
+        "jobs.batch",
+        "pods",
+    ]
+    hyperpod = served_resource_names("pytorchjobs.kubeflow.org\njobs.batch\npods\n")
+    assert all(resource_kind_served(hyperpod, k) for k in WORKLOAD_RESOURCE_KINDS), (
+        "a HyperPod cluster with Kubeflow enumerates every kind, as before"
+    )

@@ -76,7 +76,15 @@ class Kubernetes:
         assert kwargs.get("check", True) is True
         args = command[command.index("-n") + 2 :]
         output = ""
-        if args[0] == "create":
+        if args[0] == "api-resources":
+            output = "\n".join(
+                getattr(
+                    self,
+                    "served",
+                    ("pods", "jobs.batch", "pytorchjobs.kubeflow.org", "services"),
+                )
+            )
+        elif args[0] == "create":
             document = json.loads(kwargs["input_text"])
             key = (document["kind"].lower(), document["metadata"]["name"])
             if key in self.objects:

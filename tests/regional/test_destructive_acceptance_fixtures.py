@@ -1465,3 +1465,25 @@ def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> No
         baseline, twice, expected_gpu_count=8, target_bdf="0000:59:00"
     )
     assert any("more than one reset" in error for error in errors), errors
+
+
+def test_destr002_refuses_by_name_without_a_hyperpod_reboot_adapter() -> None:
+    """EKS profile, 2026-10-04: the preflight probe failed with a redacted error
+    because the plain-EKS executor has no gpu-fault-hyperpod-adapter. The probe
+    now reports the adapters it found and the case refuses by name."""
+
+    destr002 = importlib.import_module(
+        "scripts.e2e.regional.run_destr002_hyperpod_reboot"
+    )
+    errors = destr002.preflight_probe_errors(
+        {"hyperpod_adapter": False, "adapter_owners": ["gpu-fault-eks-adapter"]},
+        "gpu-eks-cluster",
+    )
+    assert errors == [
+        "executor has no HyperPod reboot adapter (owners: gpu-fault-eks-adapter); "
+        "DESTR-002 audits the HyperPod reboot path and does not apply to an "
+        "eks-managed cluster"
+    ]
+    assert "hyperpod_adapter" in destr002.PREFLIGHT_PROBE, (
+        "the probe reports instead of raising"
+    )

@@ -69,11 +69,22 @@ from gpu_fault.hyperpod import (
 
 node = sys.argv[1]
 executor = executor_from_environment()
-step_adapter = next(
-    item
-    for item in executor.adapters
-    if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
+owners = sorted(
+    str(getattr(item, "owner", "")) for item in executor.adapters if getattr(item, "owner", "")
 )
+step_adapter = next(
+    (
+        item
+        for item in executor.adapters
+        if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
+    ),
+    None,
+)
+if step_adapter is None:
+    # A plain-EKS executor reboots through gpu-fault-eks-adapter; this case
+    # audits the HyperPod reboot adapter and says so instead of failing.
+    print(json.dumps({"hyperpod_adapter": False, "adapter_owners": owners}))
+    raise SystemExit(0)
 lifecycle = step_adapter.dispatcher.adapter
 positive = lifecycle.preflight(
     HyperPodAction.REBOOT,
@@ -282,6 +293,13 @@ def preflight_probe_errors(
     hyperpod_cluster: str,
 ) -> list[str]:
     errors = []
+    if probe.get("hyperpod_adapter") is False:
+        owners = ", ".join(probe.get("adapter_owners") or []) or "none"
+        return [
+            "executor has no HyperPod reboot adapter (owners: "
+            f"{owners}); DESTR-002 audits the HyperPod reboot path and does not "
+            "apply to an eks-managed cluster"
+        ]
     positive = probe.get("positive") or {}
     missing = probe.get("missing_isolation") or {}
     wrong = probe.get("wrong_isolation") or {}

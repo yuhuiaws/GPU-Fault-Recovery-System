@@ -989,6 +989,8 @@ def cleanup_case(
     try:
         if cleanup_deferred:
             workload_residual = True
+        elif not getattr(workload, "kind_served", True):
+            workload_residual = False  # never created: the kind is not served
         else:
             workload.delete()
             workload_residual = bool(

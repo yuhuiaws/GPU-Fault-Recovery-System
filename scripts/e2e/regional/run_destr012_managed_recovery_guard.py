@@ -39,6 +39,11 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
 )
+from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
+    WORKLOAD_RESOURCE_KINDS,
+    resource_kind_served,
+    served_resource_names,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -300,16 +305,18 @@ def namespace_auto_resume_audit(
 ) -> dict[str, Any]:
     objects = []
     errors = []
-    for namespace in namespaces:
+    served = served_resource_names(
+        regional.kubectl("gpu", "api-resources", "-o", "name", all_namespaces=False)
+    )
+    kinds = [k for k in WORKLOAD_RESOURCE_KINDS if resource_kind_served(served, k)]
+    unavailable = [k for k in WORKLOAD_RESOURCE_KINDS if k not in kinds]
+    if not kinds:
+        errors.append("the GPU cluster serves none of the managed workload kinds")
+    for namespace in namespaces if kinds else []:
         try:
             value = json.loads(
                 regional.kubectl(
-                    "gpu",
-                    "get",
-                    "pytorchjobs.kubeflow.org,jobs.batch,pods",
-                    "-o",
-                    "json",
-                    namespace=namespace,
+                    "gpu", "get", ",".join(kinds), "-o", "json", namespace=namespace
                 )
             )
         except Exception as exc:
@@ -340,6 +347,7 @@ def namespace_auto_resume_audit(
     if enabled:
         errors.append("managed namespaces contain auto-resume=true resources")
     return {
+        "unavailable_resource_kinds": unavailable,
         "namespaces": namespaces,
         "objects": objects,
         "enabled": enabled,

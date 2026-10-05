@@ -227,3 +227,25 @@ def test_managed_group_b_failure_and_plan_drift_refuse_before_prewarm(
     h.preflight["release_id"] = "changed"
     with pytest.raises(RegionalFixtureError, match="plan drifted"):
         h.execute(tmp_path)
+
+
+def test_group_b_enumerates_only_the_kinds_the_cluster_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain-EKS cluster without Kubeflow serves no pytorchjobs: the audit
+    enumerates Jobs and Pods and records the unavailable kind instead of
+    stopping on a redacted kubectl failure."""
+
+    h = ManagedHarness(tmp_path, monkeypatch)
+    h.served_kinds = ("jobs.batch", "pods")
+    result = case.namespace_auto_resume_audit(
+        h.regional, ["gpu-fault-system", "training"]
+    )
+    assert result["errors"] == []
+    assert result["unavailable_resource_kinds"] == ["pytorchjobs.kubeflow.org"]
+
+    h.served_kinds = ("nodes",)
+    result = case.namespace_auto_resume_audit(h.regional, ["training"])
+    assert result["errors"] == [
+        "the GPU cluster serves none of the managed workload kinds"
+    ]
