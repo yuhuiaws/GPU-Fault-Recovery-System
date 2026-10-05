@@ -1056,9 +1056,13 @@ Semantics and boundaries of `eks-managed`:
   `--query-compute-apps`, and the `nvidia*`/`gdrdrv` kernel module reference counts; the error text ends with
   `device holders: <pid>:<comm>:<devices> (container <id>)`. Command lines are never read.
 - The agent when a provider mutation is not submitted: `RESTART_NODE`/`REPLACE_NODE` revoke (drain + revoke) the target
-  node's Agent before submitting, because the reboot replaces its incarnation. When the submission does not happen (the
-  control plane refuses it with 403, the provider rejects the node, the submit raises) the step undoes its own revocation
-  (step `details.revoked_agents`/`reactivated_agents`) and the Agent keeps heartbeating under its incarnation. Releases
+  node's Agent before submitting, because the reboot replaces its incarnation. When the submission **provably** did not
+  happen -- the submit raised and the submission ledger holds no record for the step (for example the control plane
+  refused the reservation with 403), or the provider rejected every node -- the step undoes its own revocation (the
+  provider-rejection path writes step `details.revoked_agents`/`reactivated_agents`; the exception path keeps the
+  executor's own failure/retry classification and logs an Executor WARNING `agent <cluster>/<node> reactivated`) and
+  the Agent keeps heartbeating under its incarnation. A recorded submission (INTENDED/UNKNOWN/SUBMITTED) or a partial
+  acceptance keeps the Agent REVOKED: the provider may still reboot it. Releases
   before 2026-10-05 left the Agent REVOKED with every heartbeat answered 409 `agent incarnation has been retired`.
   Recovery **without rebooting the node**: read `generation` and `transition_id` (the revoking
   `<workflow>/<step>/<op>/hyperpod-lifecycle`) from `GET /v1/fleet/agents/{cluster_id}/{node_id}`, then

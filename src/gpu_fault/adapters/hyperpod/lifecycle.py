@@ -779,20 +779,26 @@ class HyperPodLifecycleStepAdapter(
                 confirm_cluster_name=(context.request.confirm_cluster_name),
                 expected_fencing_token=(context.request.expected_fencing_token),
             )
-        except Exception as exc:  # noqa: BLE001 - the agents must not stay revoked
-            # No mutation was submitted, so no reboot will replace the agent's
-            # incarnation: give the revoked agents back before failing.
-            reactivated = self._reactivate_agents(context, revoked_agents)
-            return WorkflowStepOutcome.failed(
-                f"{self.provider_label} submission failed: {type(exc).__name__}: {exc}",
-                details={
-                    "revoked_agents": revoked_agents,
-                    "reactivated_agents": reactivated,
-                    "exception_type": type(exc).__name__,
-                },
-            )
+        except Exception:
+            # The executor classifies the exception (transient retry, bounded
+            # adapter retry, FAILED step) exactly as before; only the agents
+            # change hands: when the submission ledger holds no record for
+            # this step nothing was submitted, no reboot will replace their
+            # incarnation, and they are given back (live 2026-10-05: a 403 at
+            # the reservation left the agent REVOKED, every heartbeat 409).
+            # A record in any state (INTENDED/UNKNOWN/SUBMITTED) keeps them
+            # revoked: the provider may still act on it.
+            if self._submission_unrecorded(context):
+                self._reactivate_agents(context, revoked_agents)
+            raise
         if result.failures:
-            reactivated = self._reactivate_agents(context, revoked_agents)
+            # The provider refused nodes. Only a wholesale refusal proves no
+            # reboot is coming; a partial acceptance keeps every agent revoked.
+            reactivated = (
+                self._reactivate_agents(context, revoked_agents)
+                if not result.successful_node_logical_ids
+                else []
+            )
             return WorkflowStepOutcome.failed(
                 f"{self.provider_label} rejected nodes: "
                 + ", ".join(

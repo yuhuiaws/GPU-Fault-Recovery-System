@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Callable
 
@@ -10,9 +11,13 @@ from gpu_fault.fleet import (
     AgentLifecycleState,
     AgentTransitionRequest,
 )
+from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
 from gpu_fault.models import (
     WorkflowOperation,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class HyperPodNotificationMixin:
@@ -148,6 +153,33 @@ class HyperPodNotificationMixin:
         match = re.search(r"-xid-(\d+)$", context.incident.event_id)
         return int(match.group(1)) if match is not None else None
 
+    def _submission_unrecorded(self, context: WorkflowStepContext) -> bool:
+        """True only when the submission ledger provably holds no record for
+        this step: the reservation itself was refused before any provider call.
+        No ledger, a record in any state, or a failing lookup all answer False
+        (fail closed: the agents stay revoked)."""
+
+        store = getattr(getattr(self, "dispatcher", None), "adapter", None)
+        store = getattr(store, "store", None)
+        if store is None:
+            return False
+        try:
+            record = store.get_hyperpod_submission(
+                context.request.confirm_cluster_name,
+                hyperpod_submission_idempotency_key(
+                    context.workflow.request_id,
+                    context.step_index,
+                    context.step.operation,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - an unreadable ledger keeps the revoke
+            LOGGER.exception(
+                "submission ledger lookup failed; agents of %s stay revoked",
+                context.workflow.request_id,
+            )
+            return False
+        return record is None
+
     def _reactivate_agents(
         self, context: WorkflowStepContext, node_ids: list[str]
     ) -> list[str]:
@@ -184,6 +216,15 @@ class HyperPodNotificationMixin:
                         "the agent keeps its incarnation"
                     ),
                 ),
+            )
+            LOGGER.warning(
+                "agent %s/%s reactivated: %s submission for workflow %s step %s "
+                "was not made",
+                context.incident.cluster_id,
+                node_id,
+                context.step.operation.value,
+                context.workflow.request_id,
+                context.step_index,
             )
             reactivated.append(node_id)
         return reactivated

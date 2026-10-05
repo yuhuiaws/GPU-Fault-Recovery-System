@@ -9,6 +9,8 @@ from tests._builders import (
     execute_workflow,
     workflow_step_execution,
 )
+from types import SimpleNamespace
+
 from tests.execution._support import _remote_waiting_state
 
 from ._support import (
@@ -956,14 +958,18 @@ def test_hyperpod_step_waits_for_external_confirmation() -> None:
     assert record.transition_id == ("workflow-active/0/RESTART_NODE/hyperpod-lifecycle")
 
 
-@pytest.mark.parametrize("failure", ["raises", "rejected"])
+@pytest.mark.parametrize(
+    "failure", ["raises", "raises-recorded", "rejected", "partially-rejected"]
+)
 def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) -> None:
     """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the control plane refused the
     RESTART_NODE reservation (403), the step failed, and the agent the adapter
     had revoked for the coming reboot stayed REVOKED -- every heartbeat was
     answered 409 "agent incarnation has been retired" although the node never
-    rebooted. A revocation whose mutation was not submitted is undone by the
-    step itself, under its own transition id."""
+    rebooted. A revocation whose mutation provably was not submitted (no ledger
+    record for the step, or every node refused) is undone by the step itself
+    under its own transition id; a recorded or partially accepted submission
+    keeps the agents revoked, because the provider may still reboot them."""
 
     from gpu_fault.hyperpod import (
         HyperPodAction,
@@ -972,9 +978,15 @@ def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) ->
     )
 
     class RefusingLifecycle(FakeHyperPodLifecycle):
+        store = SimpleNamespace(
+            get_hyperpod_submission=lambda cluster_name, key: (
+                {"state": "UNKNOWN"} if failure == "raises-recorded" else None
+            )
+        )
+
         def execute_step(self, step, **kwargs):
             self.calls += 1
-            if failure == "raises":
+            if failure.startswith("raises"):
                 raise RuntimeError(
                     "HTTP 403: submission cluster_name does not match the "
                     "registered provider cluster for this cluster_id"
@@ -984,7 +996,9 @@ def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) ->
                 action=HyperPodAction.REBOOT,
                 cluster_name="hp-cluster",
                 requested_node_logical_ids=step.node_ids,
-                successful_node_logical_ids=[],
+                successful_node_logical_ids=(
+                    ["node-b"] if failure == "partially-rejected" else []
+                ),
                 failures=[
                     HyperPodNodeFailure(
                         node_logical_id="node-a",
@@ -992,7 +1006,7 @@ def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) ->
                         message="refused",
                     )
                 ],
-                submitted=False,
+                submitted=failure == "partially-rejected",
             )
 
     store = build_store()
@@ -1042,17 +1056,30 @@ def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) ->
     assert lifecycle.calls == 1
     execution = store.get_workflow(workflow.request_id).step_executions[0]
     assert execution.status is WorkflowStepStatus.FAILED, execution
-    assert execution.details["revoked_agents"] == ["node-a"], execution.details
-    assert execution.details["reactivated_agents"] == ["node-a"], execution.details
-    if failure == "raises":
-        assert execution.details["exception_type"] == "RuntimeError"
-        assert "submission failed: RuntimeError: HTTP 403" in (execution.error or "")
+    record = store.get_agent("cluster-a", "node-a")
+    if failure.startswith("raises"):
+        # The exception still travels the executor's own path (the retry
+        # classification and the FAILED record are unchanged); only the agent
+        # changes hands, and only when the ledger proves nothing was submitted.
+        assert "HTTP 403" in (execution.error or ""), execution.error
+        assert "revoked_agents" not in execution.details, execution.details
     else:
         assert "rejected nodes: node-a" in (execution.error or ""), execution.error
-    record = store.get_agent("cluster-a", "node-a")
-    assert record.lifecycle_state is AgentLifecycleState.ACTIVE, record
-    assert record.transition_id is None and record.transition_reason is None
-    assert record.agent_incarnation_id == "incarnation-a"
-    assert "incarnation-a" not in record.retired_incarnation_ids, (
-        "the incarnation that never rebooted heartbeats again"
-    )
+        assert execution.details["revoked_agents"] == ["node-a"], execution.details
+        assert execution.details["reactivated_agents"] == (
+            ["node-a"] if failure == "rejected" else []
+        ), execution.details
+    if failure in {"raises", "rejected"}:
+        assert record.lifecycle_state is AgentLifecycleState.ACTIVE, record
+        assert record.transition_id is None and record.transition_reason is None
+        assert record.agent_incarnation_id == "incarnation-a"
+        assert "incarnation-a" not in record.retired_incarnation_ids, (
+            "the incarnation that never rebooted heartbeats again"
+        )
+    else:
+        assert record.lifecycle_state is AgentLifecycleState.REVOKED, (
+            "a recorded or partially accepted submission may still reboot the node"
+        )
+        assert record.transition_id == (
+            "workflow-active/0/RESTART_NODE/hyperpod-lifecycle"
+        )
