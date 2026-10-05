@@ -654,7 +654,7 @@ def replay_from_replacement(
     value = json.loads(lines[-1]) if lines else None
     if not isinstance(value, dict):
         raise RegionalFixtureError(
-            f"replacement executor {target['name']} replay printed no JSON object"
+            f"replacement executor {target['name']} replay returned no object"
         )
     return {**value, "executor_pod": target["name"], "executor_pod_uid": target["uid"]}
 

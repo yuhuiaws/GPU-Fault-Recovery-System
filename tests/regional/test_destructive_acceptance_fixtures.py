@@ -683,11 +683,9 @@ def test_destr002_duplicate_replay_requires_exact_submitted_record(
         ]
     )
     monkeypatch.setattr(executor_module, "executor_from_environment", lambda: executor)
-    command = {
-        "step": {"node_ids": ["node-a"]},
-        "result_details": {"submission_idempotency_key": "key-a"},
-    }
-    monkeypatch.setattr(sys, "argv", ["probe", json.dumps(command)])
+    # The runner hands the probe only the recorded key and the step's nodes.
+    request = {"submission_idempotency_key": "key-a", "node_ids": ["node-a"]}
+    monkeypatch.setattr(sys, "argv", ["probe", json.dumps(request)])
 
     exec(destr002.STORE_REPLAY_PROBE, {"__name__": "isolated_test_probe"})
 
