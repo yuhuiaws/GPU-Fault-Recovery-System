@@ -80,7 +80,8 @@ class EksReadOnlyRegional(ReadOnlyRegional):
             "items": [
                 gpu_node(OTHER_NODE, OTHER_INSTANCE),
                 gpu_node(NODE, INSTANCE),
-                gpu_node("cpu-only", "i-00000000000000003", gpus=""),
+                # A CPU-only node (no GPU allocatable) never enters the inventory.
+                gpu_node("cpu-only", OTHER_INSTANCE, gpus=""),
             ]
         }
         self.data["nodegroup"] = {
