@@ -989,10 +989,16 @@ def test_join_persists_the_requested_allowed_namespaces_without_forcing_training
     )
 
 
-def test_cli_join_defaults_allowed_namespaces_to_the_sites_list(tmp_path) -> None:
+def test_cli_join_defaults_allowed_namespaces_to_the_sites_list(
+    tmp_path, monkeypatch
+) -> None:
     from gpu_fault.admin.cluster_join_types import site_allowed_namespaces
 
-    site = load_site(JoinScenario(tmp_path, pytest.MonkeyPatch(), suffixes=("b",)).path)
+    # The scenario patches join's drivers and discovery; a bare
+    # pytest.MonkeyPatch() here was never undone and the custody join tests
+    # that ran after this one saw the fakes ("join rollout preceded custody
+    # completion").
+    site = load_site(JoinScenario(tmp_path, monkeypatch, suffixes=("b",)).path)
     assert site_allowed_namespaces(site) == tuple(
         sorted(site.release_config["clusters"][0]["allowed_namespaces"])
     ), "a joining cluster inherits the list the site's clusters share"

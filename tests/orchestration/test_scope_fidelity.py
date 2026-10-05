@@ -157,6 +157,20 @@ def test_the_branch_variant_applies_the_same_rules():
 # ------------------------------------------------------------ widening
 
 
+def _widen(existing: WorkflowRequest, scope: dict[str, list[str]]) -> WorkflowRequest:
+    """The orchestrator's widening with only the class attributes it reads."""
+
+    fake_self = type(
+        "Self",
+        (),
+        {
+            "_WORKLOAD_SCOPED_OPERATIONS": WORKLOAD_SCOPED_OPERATIONS,
+            "_NODE_ACTION_OPERATIONS": NODE_ACTION_SCOPE_OPERATIONS,
+        },
+    )()
+    return IncidentOrchestrator._widen_node_action_scope(fake_self, existing, scope)
+
+
 def test_a_node_without_gpus_is_kept_in_scope_and_widened_onto_host_steps_only():
     existing = _workflow(
         workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
@@ -174,16 +188,8 @@ def test_a_node_without_gpus_is_kept_in_scope_and_widened_onto_host_steps_only()
         ),
     )
     scope = RecoveryArbiter().merged_gpu_scope(existing, "node-b", set())
-    fake_self = type(
-        "Self",
-        (),
-        {
-            "_WORKLOAD_SCOPED_OPERATIONS": WORKLOAD_SCOPED_OPERATIONS,
-            "_NODE_ACTION_OPERATIONS": NODE_ACTION_SCOPE_OPERATIONS,
-        },
-    )()
 
-    widened = IncidentOrchestrator._widen_node_action_scope(fake_self, existing, scope)
+    widened = _widen(existing, scope)
 
     assert scope == {"node-a": ["GPU-1"], "node-b": []}
     # Host-level steps take the new node ...
@@ -218,3 +224,98 @@ def test_a_terminal_branch_only_supersedes_the_restore_it_wholly_owns():
     # Only node-b's own release goes; the shared release and the job restart
     # that node-a still needs stay (F-B6 (5), F-C5).
     assert superseded == {1}
+
+
+# ------------------------------------------- widening keeps workload nodes out of isolation
+# A merge widens isolation to the faulted nodes only: the job's STOP_WORKLOADS
+# participants (healthy siblings that only host the workload) never enter a
+# workflow's MARK_UNSCHEDULABLE / QUARANTINE (asked live, GF-REGIONAL-COLLECT-016).
+
+FAULT_NODE = "node-a"
+SECOND_FAULT = "node-b"
+HEALTHY_SIBLING = "node-c"
+JOB_NODES = [FAULT_NODE, SECOND_FAULT, HEALTHY_SIBLING]
+JOB = "training/job/c016"
+
+
+def _reset_workflow() -> WorkflowRequest:
+    one = [FAULT_NODE]
+    return workflow_request(
+        "wf-reset",
+        "inc-reset",
+        status=WorkflowStatus.PENDING,
+        official_steps=[
+            workflow_step(WorkflowOperation.FREEZE_EVIDENCE, node_ids=one),
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=one),
+            workflow_step(
+                WorkflowOperation.STOP_WORKLOADS, node_ids=JOB_NODES, workload_ids=[JOB]
+            ),
+            workflow_step(WorkflowOperation.QUIESCE_GPU_SERVICES, node_ids=one),
+            workflow_step(
+                WorkflowOperation.RESET_GPU,
+                node_ids=one,
+                gpu_uuids=["GPU-a"],
+                parameters={"gpu_uuids_by_node": {FAULT_NODE: ["GPU-a"]}},
+            ),
+            workflow_step(WorkflowOperation.RESTORE_GPU_SERVICES, node_ids=one),
+            workflow_step(
+                WorkflowOperation.VALIDATE_GPU, node_ids=one, gpu_uuids=["GPU-a"]
+            ),
+            workflow_step(WorkflowOperation.RESTORE_SCHEDULING, node_ids=one),
+            workflow_step(
+                WorkflowOperation.RESTART_WORKLOAD,
+                node_ids=JOB_NODES,
+                workload_ids=[JOB],
+            ),
+        ],
+    )
+
+
+def _by_operation(workflow: WorkflowRequest) -> dict[WorkflowOperation, list[str]]:
+    return {step.operation: list(step.node_ids) for step in workflow.official_steps}
+
+
+def test_the_merged_scope_names_faulted_nodes_never_workload_participants() -> None:
+    existing = _reset_workflow()
+
+    scope = RecoveryArbiter().merged_gpu_scope(existing, SECOND_FAULT, {"GPU-b"})
+
+    assert scope == {FAULT_NODE: ["GPU-a"], SECOND_FAULT: ["GPU-b"]}
+    assert HEALTHY_SIBLING not in scope, (
+        "a node that only hosts the stopped job is not a faulted node"
+    )
+
+
+def test_widening_isolates_the_second_fault_and_leaves_the_sibling_alone() -> None:
+    existing = _reset_workflow()
+    scope = RecoveryArbiter().merged_gpu_scope(existing, SECOND_FAULT, {"GPU-b"})
+
+    nodes = _by_operation(_widen(existing, scope))
+
+    faulted = [FAULT_NODE, SECOND_FAULT]
+    assert nodes[WorkflowOperation.MARK_UNSCHEDULABLE] == faulted
+    assert nodes[WorkflowOperation.RESTORE_SCHEDULING] == faulted
+    assert nodes[WorkflowOperation.VALIDATE_GPU] == faulted
+    assert nodes[WorkflowOperation.RESET_GPU] == faulted, (
+        "GPU actions widen to the faulted nodes that carry GPUs"
+    )
+    assert nodes[WorkflowOperation.STOP_WORKLOADS] == JOB_NODES
+    assert nodes[WorkflowOperation.RESTART_WORKLOAD] == JOB_NODES
+    for operation, node_ids in nodes.items():
+        if operation not in WORKLOAD_SCOPED_OPERATIONS:
+            assert HEALTHY_SIBLING not in node_ids, (operation, node_ids)
+
+
+def test_a_sibling_fault_merged_without_gpus_joins_host_steps_only() -> None:
+    """A node-health fault with no GPU identity on a job sibling: the sibling
+    is cordoned and validated, the GPU reset stays on the node whose GPU it is."""
+
+    existing = _reset_workflow()
+    scope = RecoveryArbiter().merged_gpu_scope(existing, SECOND_FAULT, set())
+
+    nodes = _by_operation(_widen(existing, scope))
+
+    assert nodes[WorkflowOperation.MARK_UNSCHEDULABLE] == [FAULT_NODE, SECOND_FAULT]
+    assert nodes[WorkflowOperation.RESET_GPU] == [FAULT_NODE]
+    assert nodes[WorkflowOperation.STOP_WORKLOADS] == JOB_NODES
+    assert HEALTHY_SIBLING not in nodes[WorkflowOperation.MARK_UNSCHEDULABLE]
