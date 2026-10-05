@@ -16,6 +16,9 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     gpu_node_items,
 )
 from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_product_isolation import (
+    recorded_product_isolated_nodes,
+)
 from gpu_fault_release.regional_release_registry import legacy_registry_config_digest
 from gpu_fault_release.regional_release_profile_model import (
     target_agent_config_digest,
@@ -357,8 +360,14 @@ def _validate_incomplete_agent_state(
     node_names: tuple[str, ...],
     *,
     category: str,
+    excluded: tuple[str, ...] = (),
 ) -> None:
     old = (previous.get("agent_identities") or {}).get(target.cluster_id) or {}
+    # A PARTIAL checkpoint rolled the cluster minus the nodes the product had
+    # isolated: its fleet record covers exactly the included set, under the
+    # partial wave's id (``node_subset``). The excluded nodes are still asked
+    # about by the probe -- they must be back inside the window to resume.
+    included = tuple(name for name in node_names if name not in set(excluded))
     deployment_id = release._fleet_deployment_id(
         target,
         phase="upgrade",
@@ -367,6 +376,7 @@ def _validate_incomplete_agent_state(
         template_sha=release.node_template_sha,
         config_digest=target_agent_config_digest(release.config, target),
         runtime_profile_version=target_runtime_profile_version(release.config, target),
+        **({"node_subset": included} if excluded else {}),
     )
     raw = exec_cpu_ingress_probe(
         release,
@@ -416,7 +426,7 @@ def _validate_incomplete_agent_state(
     if (
         deployment.get("cluster_id") != target.cluster_id
         or {str(item.get("node_id") or "") for item in deployment.get("nodes") or []}
-        != set(node_names)
+        != set(included)
         or deployment.get("desired_artifact_sha256") != release.node_wheel_sha
         or deployment.get("desired_config_digest")
         != target_agent_config_digest(release.config, target)
@@ -569,4 +579,5 @@ def validate_resume_checkpoint(
                 previous,
                 node_names,
                 category=category,
+                excluded=recorded_product_isolated_nodes(loaded, target.cluster_id),
             )

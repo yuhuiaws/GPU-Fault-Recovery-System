@@ -23,6 +23,12 @@ from gpu_fault_release.regional_release_node_preflight import (
     ensure_node_candidate_preflight,
     ensure_pre_node_mutation_barrier,
 )
+from gpu_fault_release.regional_release_product_isolation import (
+    EXCLUDING_PHASES,
+    ProductIsolatedNodesError,
+    product_isolated_nodes,
+    record_product_isolated_nodes,
+)
 from gpu_fault_release.regional_release_profile_model import (
     target_runtime_profile_version,
 )
@@ -113,6 +119,7 @@ def _create_fleet_rollout(
         template_sha=fleet_template,
         config_digest=candidate.config_digest,
         runtime_profile_version=candidate.runtime_profile_version,
+        **({"node_subset": candidate.node_names} if candidate.excluded_nodes else {}),
     )
     request = {
         "deployment_id": deployment_id,
@@ -188,7 +195,10 @@ def _finalize_node_runtime(
             or steady_template_config_map == candidate.template_config_map
             else None
         ),
-        allowed_node_names=None,
+        # A partial wave keeps the steady-state Reconciler off the excluded
+        # nodes until the resume: an installer Job on a quarantined node would
+        # only cycle Pending -> Failed and stamp installer-state=Failed on it.
+        allowed_node_names=(candidate.node_names if candidate.excluded_nodes else None),
         max_unavailable=candidate.max_unavailable,
         runtime_image=steady_runtime_image or candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
@@ -205,6 +215,8 @@ def _finalize_node_runtime(
         template_sha=desired_template,
         config_digest=candidate.config_digest,
         runtime_profile_version=candidate.runtime_profile_version,
+        # Only a partial wave narrows the wait; otherwise the call is unchanged.
+        **({"node_names": candidate.node_names} if candidate.excluded_nodes else {}),
         legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
     )
@@ -282,6 +294,16 @@ def _node_runtime_candidate(
         node_names = (
             () if release.runner.dry_run else release._target_node_names(target)
         )
+        excluded: list[dict[str, Any]] = []
+        if node_names and phase in EXCLUDING_PHASES:
+            excluded = product_isolated_nodes(release, target, node_names)
+            record_product_isolated_nodes(release, target, excluded)
+            isolated = {str(item["node_id"]) for item in excluded}
+            node_names = tuple(name for name in node_names if name not in isolated)
+            if excluded and not node_names:
+                # Nothing left to roll: the cluster pauses with every node
+                # named, the same PARTIAL exit as a wave that rolled the rest.
+                raise ProductIsolatedNodesError(target.cluster_id, excluded)
         failure_domains = (
             {}
             if release.runner.dry_run
@@ -318,6 +340,7 @@ def _node_runtime_candidate(
             runtime_image=runtime_image,
             node_installer_image=node_installer_image,
             template_content_sha256=template_content_sha256,
+            excluded_nodes=tuple(excluded),
         ),
         policy,
         failure_domains,
@@ -526,7 +549,7 @@ def roll_node_runtime(
         ),
         deployment,
     )
-    return _finalize_node_runtime(
+    identity = _finalize_node_runtime(
         release,
         target,
         candidate,
@@ -536,3 +559,8 @@ def roll_node_runtime(
         allow_legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
     )
+    if candidate.excluded_nodes:
+        # Every other node converged; the cluster still ends PARTIAL so the
+        # release is not verified over a node the product is repairing.
+        raise ProductIsolatedNodesError(target.cluster_id, candidate.excluded_nodes)
+    return identity

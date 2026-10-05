@@ -5133,6 +5133,25 @@ field, and only then reads with the new model. Therefore, when adding required f
 payloads must not be required to pass the new model first; the declared configuration must provide the complete new fields, and the final object after migration still fails closed.
 On a cluster-local failure the site enters `PAUSED`: completed clusters stay `CONVERGED`, the failed cluster keeps its current
 checkpoint, and subsequent clusters stay `PENDING`. After the fix, rerunning the same four-parameter deploy resumes automatically.
+**A node the product itself isolated no longer rolls the whole release back (PARTIAL).** When the upgrade's node wave builds
+its candidate it reads the nodes once: a node carrying the `gpu-fault.io/quarantined` or `gpu-fault.io/quiesce` taint, or
+cordoned with the `gpu-fault.io/incident-id` annotation, is a node the product is repairing and is **excluded** from this
+wave (`src/gpu_fault_release/regional_release_product_isolation.py`; log line `fleet-node-excluded cluster=… nodes=…
+incidents=…`); the remaining nodes are waved, installed and converged as usual, and the cluster then ends as a
+**cluster-local** failure -- `data-plane-paused` (`failure_scope=cluster-local`) -> `partial-convergence`,
+`release_lifecycle=PAUSED`, no automatic rollback, the other converged clusters keep `CONVERGED`. The release state's
+`product_isolated_nodes.<cluster_id>.nodes[]` records each excluded node's `node_id`, `reasons`, `incident_id`,
+`fencing_token` and `quarantine_taint_value`; `status` repeats it under `live_release.product_isolated_nodes`, lists the
+exit commands under `live_release.operator_recovery`, and adds the header line `partial: N node(s) excluded by the
+product's own isolation: …`. The way out: `submit-remediation --disposition restore` for each `incident_id` (administrator
+operations §9.2; the node is validated, its taints and annotations lifted), then **rerun the same `deploy` unchanged** --
+the resume redoes only the unfinished cluster, the candidate reads the nodes again, the restored node joins this wave and
+the fleet record is opened anew for the whole node set (a partial wave's record id carries a `node_subset` digest, so the
+two never collide); a node still isolated ends PARTIAL again, named the same way. Meanwhile that cluster's steady-state
+Reconciler covers only the nodes this round rolled (`allowed_node_names`) and never cycles installer Jobs on the isolated
+node; the first join, bootstrap and rollback waves do not exclude and keep refusing isolated nodes. Only the product's own
+isolation is excused: a cordon without the product's annotation/taints, a NotReady node or a foreign taint stays the hard
+failure `pre-node-mutation node state is unsafe` and still rolls back.
 `resume` accepts only the `failed` or upgrade-checkpoint state of the same uncommitted release, reads the completed phases,
 clusters and Fleet waves and skips completed work. It rebuilds and validates from persistent state the retry diff, the previous snapshot
 digest, the CPU required/compatible window, the cluster identities and the node sets, and must not fall back to the default `FULL`; the low-level command

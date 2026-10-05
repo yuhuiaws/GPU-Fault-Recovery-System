@@ -1397,6 +1397,17 @@ above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
   2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
   3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.
      `--supersede-failed-transaction` does not apply to a transaction that is rolling back.
+- Converging a site that stopped in `partial-convergence` with the extra `status` header line `partial: N node(s)
+  excluded by the product's own isolation: …` (the upgrade wave excluded nodes the product itself isolated -- a
+  `gpu-fault.io/quarantined`/`gpu-fault.io/quiesce` taint or a cordon with `gpu-fault.io/incident-id` -- and rolled the
+  rest; deployment manual §5.3 "PARTIAL"):
+  1. `gpu-fault-admin status --state-dir <dir>`: `live_release.product_isolated_nodes` names the cluster, node and
+     `incident_id`; `live_release.operator_recovery` carries the complete commands of the next two steps.
+  2. For each `incident_id`, `submit-remediation --disposition restore … --plan`, then without `--plan` (§9.2), and wait
+     for the validated restore to return the node to scheduling (Ready, no `gpu-fault.io/*` taint or annotation); a node
+     whose hardware is not repaired gets the hardware fixed first.
+  3. **Rerun the same `deploy` unchanged**: the resume redoes only the paused cluster and rolls the restored node in this
+     wave; a node still isolated ends PARTIAL again, named the same way. Do not uncordon or untaint by hand to skip it.
 - When administrator custody (Node Action key custody) binds a release identity for a cluster, the Runtime Profile
   version and Agent config digest are the cluster's own override (the digest computed after approving
   `clusters[].runtimeProfile` in the site file), or the site profile without one; an override whose digest is not yet

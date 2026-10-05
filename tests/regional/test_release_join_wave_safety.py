@@ -82,6 +82,8 @@ def _roll(
     target = config.clusters[0]
     seen: dict[str, Any] = {"deploys": [], "live_probes": 0}
     monkeypatch.setattr(release, "_target_node_names", lambda _target: nodes)
+    # The product-isolation scan is a live node read; no node is isolated here.
+    monkeypatch.setattr(RUNTIME, "product_isolated_nodes", lambda *_args: [])
     monkeypatch.setattr(
         RUNTIME,
         "target_node_failure_domains",

@@ -46,6 +46,10 @@ from gpu_fault_release.regional_release_prerequisite_repair import (
     matches_pre_repair_state,
     prepare_prerequisite_repair,
 )
+from gpu_fault_release.regional_release_product_isolation import (
+    PRODUCT_ISOLATED_NODES_STATE_KEY,
+    operator_recovery_commands,
+)
 from gpu_fault_release.regional_release_progress import (
     BOOTSTRAP_PHASES as BOOTSTRAP_PHASES,
 )
@@ -917,11 +921,40 @@ def build_release_summary(
             # Present only for a transaction that crossed a schema version with
             # --accept-schema-change: the operator reads the snapshot id here.
             "schema_change_acceptance": state.get("schema_change_acceptance"),
+            **product_isolation_summary(state),
         }
         result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:
         result["next_deploy_error"] = str(exc)
     return result
+
+
+def product_isolation_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """The PARTIAL release's excluded nodes and the commands that finish it.
+
+    Present only while the release is paused with product-isolated nodes
+    recorded for this release id; a committed release carries nothing here.
+    """
+
+    entries = state.get(PRODUCT_ISOLATED_NODES_STATE_KEY)
+    if not isinstance(entries, dict) or not entries:
+        return {}
+    mine = {
+        str(cluster_id): entry
+        for cluster_id, entry in entries.items()
+        if isinstance(entry, dict)
+        and entry.get("release_id") == state.get("release_id")
+    }
+    if not mine or str(state.get("phase") or "") not in {
+        "data-plane-paused",
+        "partial-convergence",
+        "data-plane-progress",
+    }:
+        return {}
+    return {
+        "product_isolated_nodes": mine,
+        "operator_recovery": operator_recovery_commands(mine),
+    }
 
 
 def build_full_status(
@@ -1019,6 +1052,21 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
     )
     if next_deploy.get("resume"):
         next_kind += f" (resume {next_deploy.get('action')})"
+    isolated = live.get("product_isolated_nodes")
+    partial = []
+    if isinstance(isolated, dict) and isolated:
+        nodes = [
+            f"{cluster_id}/{node.get('node_id')} ({node.get('incident_id') or 'no incident'})"
+            for cluster_id, entry in sorted(isolated.items())
+            for node in (entry.get("nodes") or [] if isinstance(entry, dict) else [])
+            if isinstance(node, dict)
+        ]
+        partial = [
+            f"partial: {len(nodes)} node(s) excluded by the product's own isolation: "
+            + ", ".join(nodes)
+            + "; restore the incident(s), then rerun deploy -- commands in "
+            "live_release.operator_recovery"
+        ]
     return [
         f"healthy: {'yes' if report.get('healthy') else 'NO'}"
         f" ({report.get('health_scope') or 'full'} health, {total} checks)",
@@ -1026,6 +1074,7 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
         f" phase={live.get('phase') or 'unknown'}"
         f" committed={'yes' if live.get('transaction_committed') else 'no'}",
         f"next deploy: {next_kind}",
+        *partial,
         "failing checks: " + (", ".join(failing) if failing else "none"),
         f"full JSON report: {json_destination}",
     ]

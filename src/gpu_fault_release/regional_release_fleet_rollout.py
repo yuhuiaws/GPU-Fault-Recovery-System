@@ -460,6 +460,7 @@ def fleet_deployment_id(
     template_sha: str | None,
     config_digest: str,
     runtime_profile_version: str,
+    node_subset: tuple[str, ...] | None = None,
 ) -> str:
     inputs: dict[str, Any] = {
         "phase": phase,
@@ -482,6 +483,12 @@ def fleet_deployment_id(
     )
     if transaction:
         inputs["transaction"] = transaction
+    if node_subset is not None:
+        # A partial wave (product-isolated nodes excluded) rolls a subset; the
+        # resume that rolls the whole cluster must open its own record.
+        inputs["node_subset_sha256"] = hashlib.sha256(
+            "\n".join(sorted(node_subset)).encode()
+        ).hexdigest()[:12]
     identity = hashlib.sha256(
         json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:20]

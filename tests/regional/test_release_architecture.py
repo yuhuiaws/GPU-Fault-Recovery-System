@@ -43,6 +43,7 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(
         release, "_target_node_names", lambda _target: ("node-a", "node-b", "node-c")
     )
+    monkeypatch.setattr(runtime_module, "product_isolated_nodes", lambda *_args: [])
     monkeypatch.setattr(
         runtime_module,
         "target_node_failure_domains",
@@ -306,6 +307,7 @@ def test_pre_node_barrier_failure_starts_no_reconciler_or_fleet(
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     target = config.clusters[0]
     monkeypatch.setattr(release, "_target_node_names", lambda _target: ("node-a",))
+    monkeypatch.setattr(runtime_module, "product_isolated_nodes", lambda *_args: [])
     monkeypatch.setattr(
         runtime_module,
         "target_node_failure_domains",

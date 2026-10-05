@@ -48,6 +48,10 @@ class NodeMutationPreflight:
     runtime_image: str | None
     node_installer_image: str | None
     template_content_sha256: str | None = None
+    #: Nodes the product had isolated when the candidate was built (upgrade
+    #: only): kept out of ``node_names``, the wave, the steady-state Reconciler
+    #: and the convergence wait; the cluster ends PARTIAL when they exist.
+    excluded_nodes: tuple[dict[str, Any], ...] = ()
 
     @property
     def node_dependency_target(self) -> NodeDependencyTarget:
