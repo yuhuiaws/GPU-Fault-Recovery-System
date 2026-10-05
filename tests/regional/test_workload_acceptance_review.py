@@ -15,7 +15,11 @@ from scripts.e2e.regional import run_workload_acceptance as runner
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
 
-def training_logs() -> dict[str, str]:
+def training_logs(pods: int = 3) -> dict[str, str]:
+    """The fixture job's logs for ``pods`` nodes of eight ranks each."""
+
+    world = pods * 8
+    marker = world * (world + 1) / 2
     return {
         f"pod-{pod}": "\n".join(
             [
@@ -25,12 +29,12 @@ def training_logs() -> dict[str, str]:
                     for step in range(3)
                 ),
                 *(
-                    f"SUCCESS rank={rank}/24 all_reduce=300.0"
+                    f"SUCCESS rank={rank}/{world} all_reduce={marker}"
                     for rank in range(pod * 8, (pod + 1) * 8)
                 ),
             ]
         )
-        for pod in range(3)
+        for pod in range(pods)
     }
 
 
@@ -147,12 +151,32 @@ def baseline() -> dict[str, Any]:
 
 
 def baseline_harness(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, defect: str = ""
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, defect: str = "", nodes: int = 3
 ) -> tuple[Any, Any, list[str]]:
+    """A cluster of ``nodes`` schedulable GPU nodes running the fixture job.
+
+    ``defect`` ``missing-rank`` drops the last rank's lines from the last Pod
+    (the collective marker stays, so the waiter passes and the checks judge);
+    ``native-ranks`` renders the manifest for the fixtures' three nodes
+    whatever ``nodes`` says, so its expected-critical-ranks disagree.
+    """
+
     events: list[str] = []
-    logs = training_logs()
+    logs = training_logs(nodes)
+    if defect == "missing-rank":
+        last = f"pod-{nodes - 1}"
+        dropped = f"rank={nodes * 8 - 1}"
+        logs[last] = "\n".join(
+            line
+            for line in logs[last].splitlines()
+            if not (line.startswith(dropped + " ") or f"SUCCESS {dropped}/" in line)
+        )
+    manifest = yaml.safe_load(runner.BASELINE_MANIFEST.read_text())
+    manifest["spec"]["pytorchReplicaSpecs"]["Worker"]["replicas"] = (
+        2 if defect == "native-ranks" else nodes - 1
+    )
     metadata = inject_metadata(
-        yaml.safe_load(runner.BASELINE_MANIFEST.read_text()),
+        manifest,
         job_id="job-test",
         attempt_id="attempt-test",
         runtime_profile="profile-test",
@@ -171,7 +195,7 @@ def baseline_harness(
             "node": f"node-{index}",
             "phase": "Succeeded",
         }
-        for index in range(3)
+        for index in range(nodes)
     ]
     containers = [
         {"rank": index, "pod_uid": pod["uid"], "terminated": True, "exit_code": 0}
@@ -183,7 +207,7 @@ def baseline_harness(
             {
                 "workload_phase": "SUCCEEDED",
                 "containers": containers,
-                "expected_critical_ranks": 3,
+                "expected_critical_ranks": nodes,
             }
         ],
         "decision": {"event_key": "cluster-a/attempt-test/TrainingAttemptTerminal"},
@@ -285,7 +309,7 @@ def baseline_harness(
         gpu_workloads=lambda: [],
         gpu_nodes=lambda: [
             {"name": f"node-{index}", "ready": "True", "unschedulable": False}
-            for index in range(3)
+            for index in range(nodes)
         ],
         kubectl=kubectl,
         run=run,
@@ -349,6 +373,71 @@ def test_finite_workload_lifecycle_uses_the_selected_submission_path(
             "delete",
             "prewarm-cleanup",
         ]
+
+
+def test_a_two_node_cluster_is_judged_and_recorded_by_its_own_topology(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live 2026-10-05 on the two-node EKS cluster: the job ran 16 ranks while
+    the checks still expected the fixtures' 24 and the evidence had no
+    training_topology. Every check now reads the same derived topology."""
+
+    site, target, events = baseline_harness(monkeypatch, tmp_path, nodes=2)
+
+    result = runner.run_workload_baseline(
+        case_id="GF-REGIONAL-WORKLOAD-001",
+        site=site,
+        target=target,
+        case_dir=tmp_path,
+        job_id="job-test",
+        attempt_id="attempt-test",
+        state_dir=tmp_path,
+        attempt=1,
+    )
+
+    assert result["verdict"] == "PASS", result
+    assert result["collective_errors"] == [] and result["loss_errors"] == []
+    assert result["metadata_errors"] == [], "expected-critical-ranks is the node count"
+    assert result["training_topology"]["node_count"] == 2
+    assert result["training_topology"]["world_size"] == 16
+    assert result["checks"]["three_pods_on_three_nodes"] is True, (
+        "the check keeps its name; its expectation is the derived node count"
+    )
+    assert events[-1] == "prewarm-cleanup"
+
+
+@pytest.mark.parametrize("defect", ["missing-rank", "native-ranks"])
+def test_two_node_proof_defects_are_judged_against_the_two_node_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
+) -> None:
+    site, target, _events = baseline_harness(
+        monkeypatch, tmp_path, nodes=2, defect=defect
+    )
+
+    result = runner.run_workload_baseline(
+        case_id="GF-REGIONAL-WORKLOAD-001",
+        site=site,
+        target=target,
+        case_dir=tmp_path,
+        job_id="job-test",
+        attempt_id="attempt-test",
+        state_dir=tmp_path,
+        attempt=1,
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["training_topology"]["world_size"] == 16
+    if defect == "missing-rank":
+        assert (
+            "collective ranks do not cover exactly 0..15"
+            in (result["collective_errors"])
+        )
+        assert result["loss_errors"] == ["loss ranks do not cover exactly 0..15"]
+    else:
+        assert result["metadata_errors"] == [
+            "Master expected critical ranks differs",
+            "Worker expected critical ranks differs",
+        ], "the manifest still carries the fixtures' three; the cluster has two"
 
 
 @pytest.mark.parametrize("defect", ["metadata", "loss", "containers", "ranks"])

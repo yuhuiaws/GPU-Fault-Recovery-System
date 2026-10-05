@@ -383,6 +383,19 @@ def wait_terminal_observation(
     raise RegionalFixtureError(f"terminal observation did not converge: {last}")
 
 
+def pod_logs(
+    regional: RegionalLiveFixture, pods: list[dict[str, Any]]
+) -> dict[str, str]:
+    """The last 400 log lines of each finished training Pod, by Pod name."""
+
+    return {
+        str(item["name"]): regional.kubectl(
+            "gpu", "logs", str(item["name"]), "--tail=400", timeout=60
+        )
+        for item in pods
+    }
+
+
 def wait_finite_workload(
     fixture: ManagedWorkloadFixture,
     topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
@@ -457,8 +470,7 @@ def admin_status(state_dir: Path) -> dict[str, Any]:
     }
 
 
-# One training topology per fixture instance, derived from its GPU nodes on
-# first use (a case keeps one shape); no fixture means the fixtures' native shape.
+# One topology per fixture instance (a case keeps one shape); none means native.
 TOPOLOGIES: weakref.WeakKeyDictionary[Any, training_topology.TrainingTopology] = (
     weakref.WeakKeyDictionary()
 )
@@ -529,11 +541,8 @@ def wait_pod_uids_unchanged(
     timeout_seconds: int = 60,
     poll_seconds: int = 5,
 ) -> dict[str, Any]:
-    """Hold that the workload's Pod UIDs stay ``expected_uids`` for the window.
-
-    Reads ``pods()`` (one kubectl get per poll) rather than ``snapshot()``, which
-    also pulls the Pods' logs; the final snapshot confirms they still heartbeat.
-    """
+    """Hold that the Pod UIDs stay ``expected_uids`` for the window, reading
+    ``pods()`` per poll (``snapshot()`` also pulls logs); the final snapshot heartbeats."""
 
     deadline = time.monotonic() + timeout_seconds
     last: list[dict[str, Any]] = []
@@ -587,12 +596,9 @@ def cleanup_workload(
     result: dict[str, Any],
     label: str,
 ) -> list[str]:
-    """Delete the case's workload only once its workflow is provably quiet.
-
-    A delete during a RUNNING STOP_WORKLOADS/RESTART_WORKLOAD races the executor;
-    after an injection the DESTR-009 quiescence wait runs first, and an unproven
-    quiescence leaves the workload in place (``workload_cleanup_deferred``).
-    """
+    """Delete the case's workload only once its workflow is provably quiet: after
+    an injection the DESTR-009 quiescence wait runs first, and an unproven
+    quiescence leaves the workload in place (``workload_cleanup_deferred``)."""
 
     errors: list[str] = []
     if injection:
@@ -741,19 +747,11 @@ def run_workload_baseline(
                 "annotate_returncode": annotate.returncode,
                 "dry_run_returncode": dry_run.returncode,
             }
-        finite = wait_finite_workload(fixture, topology_for(regional))
-        training_logs = {
-            str(item["name"]): regional.kubectl(
-                "gpu",
-                "logs",
-                str(item["name"]),
-                "--tail=400",
-                timeout=60,
-            )
-            for item in finite["pods"]
-        }
-        losses = loss_errors(training_logs)
-        collectives = collective_errors(training_logs)
+        topology = topology_for(regional)
+        finite = wait_finite_workload(fixture, topology)
+        training_logs = pod_logs(regional, finite["pods"])
+        losses = loss_errors(training_logs, world_size=topology.world_size)
+        collectives = collective_errors(training_logs, world_size=topology.world_size)
         workload = fixture.workload()
         profile_version = str(site.config["runtime_profile"]["version"])
         metadata = metadata_errors(
@@ -761,6 +759,7 @@ def run_workload_baseline(
             job_id=job_id,
             attempt_id=attempt_id,
             profile_version=profile_version,
+            expected_critical_ranks=topology.node_count,
         )
         terminal = wait_terminal_observation(
             regional,
@@ -769,7 +768,7 @@ def run_workload_baseline(
         )
         terminal_observation = terminal["observations"][0]
         rank_errors = observation_rank_errors(
-            terminal_observation, expected_ranks=topology_for(regional).ranks
+            terminal_observation, expected_ranks=topology.ranks
         )
         decision = terminal.get("decision") or {}
         terminal_event_key = f"{target.cluster_id}/{attempt_id}/TrainingAttemptTerminal"
@@ -784,7 +783,7 @@ def run_workload_baseline(
             attempt_id=attempt_id,
         )
         observations = after_delete["observations"]
-        expected = topology_for(regional).node_count
+        expected = topology.node_count
         checks: dict[str, bool] = {
             "submission_succeeded": int(submission["returncode"]) == 0,
             "managed_metadata_complete": not metadata,
@@ -814,7 +813,6 @@ def run_workload_baseline(
         }
         if render_equivalence is not None:
             checks["render_contract_equivalent"] = render_equivalence
-        result["training_topology"] = topology_for(regional).evidence()
         status: dict[str, Any]
         if run_status:
             status = admin_status(cast(Path, state_dir))
@@ -835,6 +833,7 @@ def run_workload_baseline(
             "loss_errors": losses,
             "collective_errors": collectives,
             "observation_rank_errors": rank_errors,
+            "training_topology": topology.evidence(),
             "workload": finite,
             "terminal": terminal,
             "after_delete": after_delete,

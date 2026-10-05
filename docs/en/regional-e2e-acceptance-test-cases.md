@@ -8576,7 +8576,15 @@ by default `GF-REGIONAL-WORKLOAD-002` (`ADMIN_STATUS_CASE`) runs it in its wrap-
 For an attempt that is still `RUNNING/PENDING` but has no Pods left, the Watcher first waits
 `cleanup_timeout_seconds` to guard against a transient watch break, then publishes a `STOPPED` tombstone;
 the control plane must not keep treating the last `RUNNING` record as the current ownership.
-
+- Two-node topology (a two-node `eks-managed` cluster): the submission, every check and the evidence
+  use **one** derived topology (`run_workload_acceptance.topology_for`): the world size of
+  `collective_errors`/`loss_errors`, the `expected-critical-ranks` of `metadata_errors`, and the
+  terminal observation's `expected_critical_ranks` and rank set are node count x GPUs per node, and the
+  evidence carries `training_topology` (node_count, gpus_per_node, world_size, candidate_nodes). The
+  `checks` keys (`three_pods_on_three_nodes`, `observation_ranks_are_0_1_2`) keep their names; their
+  expectations follow the topology. Previously the job ran 16 ranks successfully on two nodes while the
+  verdict failed against 24 ranks / 3 nodes (`collective differs`, `loss ranks do not cover exactly
+  0..23`, `expected critical ranks differs`) and the evidence had no `training_topology`.
 
 ### GF-REGIONAL-WORKLOAD-002
 
@@ -8950,6 +8958,14 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   barrier, and old pre-action samples cannot be used to pass.
   The passive plans of `REBOOT_NODE` / `REPLACE_NODE` expand `VALIDATE_NODE` into
   `VALIDATE_GPU → VALIDATE_HOST → VALIDATE_FABRIC`; if any of the three is missing, the case does not pass.
+- Durable-submission replay probe on the replacement executor: the probe receives only the recorded
+  `submission_idempotency_key` and the step's `node_ids` (no longer the whole command record in one
+  argv), reports any in-Pod failure as JSON `error` + `stage` (import/executor/adapter/record/replay)
+  and exits 0, and the runner records
+  `durable HyperPod replay probe failed in replacement executor <pod> at stage <stage>: <error>` and
+  FAILs; when `kubectl exec` itself fails the error names
+  `DESTR-002 store-level replay could not run in replacement executor Pod <pod> (uid ...)`. Previously
+  the step left only `command failed (1): <sensitive output redacted> (step: kubectl exec)`.
 
 ### GF-REGIONAL-DESTR-003
 

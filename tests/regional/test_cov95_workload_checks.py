@@ -72,6 +72,29 @@ def test_training_metadata_requires_all_watcher_identity_fields(field: str) -> N
         assert len(errors) == 1, errors
 
 
+def test_training_metadata_expected_critical_ranks_follow_the_topology() -> None:
+    two_node = metadata()
+    for role in ("Master", "Worker"):
+        two_node["spec"]["pytorchReplicaSpecs"][role]["template"]["metadata"][
+            "annotations"
+        ]["gpu-fault.io/expected-critical-ranks"] = "2"
+    arguments = {"job_id": "job", "attempt_id": "attempt", "profile_version": "profile"}
+
+    assert (
+        checks.metadata_errors(two_node, expected_critical_ranks=2, **arguments) == []
+    )
+    assert checks.metadata_errors(two_node, **arguments) == [
+        "Master expected critical ranks differs",
+        "Worker expected critical ranks differs",
+    ], "the default is still the fixtures' three nodes"
+    assert checks.metadata_errors(
+        metadata(), expected_critical_ranks=2, **arguments
+    ) == [
+        "Master expected critical ranks differs",
+        "Worker expected critical ranks differs",
+    ]
+
+
 @pytest.mark.parametrize(
     ("logs", "message"),
     [

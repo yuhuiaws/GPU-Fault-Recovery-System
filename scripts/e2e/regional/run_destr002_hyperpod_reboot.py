@@ -31,6 +31,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     reusable_focused_tests,
     run_standard_case,
 )
+from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -131,51 +132,67 @@ print(json.dumps({
 # would -- without asking the provider to consider a second reboot. The key
 # is taken from the command's result_details and never recomputed: a runner
 # that derives its own key can only confirm its own arithmetic.
+# The probe takes only the two facts it needs (the recorded key and the step's
+# node ids) -- never the whole command record, whose evidence can exceed one
+# argv string -- and reports every in-Pod failure as a JSON ``error`` with the
+# ``stage`` that raised, exiting 0: a non-zero exit therefore means the exec
+# itself failed, and the runner names that (live 2026-10-05 the case died with
+# only "command failed (1): <sensitive output redacted> (step: kubectl exec)").
 STORE_REPLAY_PROBE = r"""
 import json
 import sys
 
-from gpu_fault.cluster_executor import executor_from_environment
-from gpu_fault.hyperpod import HyperPodAction
+request = json.loads(sys.argv[1])
+submission_key = str(request["submission_idempotency_key"])
+node_ids = [str(item) for item in request["node_ids"]]
+result = {"replay_mode": "store-level", "duplicate": False, "checks": {}}
+stage = "import"
+try:
+    from gpu_fault.cluster_executor import executor_from_environment
+    from gpu_fault.hyperpod import HyperPodAction
 
-command = json.loads(sys.argv[1])
-submission_key = str(command["result_details"]["submission_idempotency_key"])
-expected_identity = (
-    HyperPodAction.REBOOT,
-    tuple(sorted(str(item) for item in command["step"]["node_ids"])),
-)
-executor = executor_from_environment()
-step_adapter = next(
-    item
-    for item in executor.adapters
-    if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
-)
-lifecycle = step_adapter.dispatcher.adapter
-if lifecycle.store is None:
-    raise RuntimeError("HyperPod durable submission store is unavailable")
-record = lifecycle.store.get_hyperpod_submission(
-    lifecycle.config.cluster_name,
-    submission_key,
-)
-checks = {
-    "idempotency_key_matches": record.idempotency_key == submission_key,
-    "request_identity_matches": record.request_identity == expected_identity,
-    "state_submitted": record.state == "SUBMITTED",
-    "result_present": record.result is not None,
-}
-outcome = None
-if all(checks.values()):
-    outcome = lifecycle._replay_durable_submission(
-        HyperPodAction.REBOOT,
-        list(command["step"]["node_ids"]),
+    stage = "executor"
+    executor = executor_from_environment()
+    stage = "adapter"
+    step_adapter = next(
+        (
+            item
+            for item in executor.adapters
+            if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
+        ),
+        None,
+    )
+    if step_adapter is None:
+        raise RuntimeError(
+            "executor advertises no gpu-fault-hyperpod-adapter: "
+            + ", ".join(sorted(str(getattr(item, "owner", "")) for item in executor.adapters))
+        )
+    lifecycle = step_adapter.dispatcher.adapter
+    if lifecycle.store is None:
+        raise RuntimeError("HyperPod durable submission store is unavailable")
+    stage = "record"
+    record = lifecycle.store.get_hyperpod_submission(
+        lifecycle.config.cluster_name,
         submission_key,
     )
-print(json.dumps({
-    "replay_mode": "store-level",
-    "duplicate": outcome is not None and outcome.duplicate is True,
-    "checks": checks,
-    "record": record.model_dump(mode="json"),
-}, sort_keys=True, default=str))
+    expected_identity = (HyperPodAction.REBOOT, tuple(sorted(node_ids)))
+    result["checks"] = {
+        "idempotency_key_matches": record.idempotency_key == submission_key,
+        "request_identity_matches": record.request_identity == expected_identity,
+        "state_submitted": record.state == "SUBMITTED",
+        "result_present": record.result is not None,
+    }
+    result["record"] = record.model_dump(mode="json")
+    if all(result["checks"].values()):
+        stage = "replay"
+        outcome = lifecycle._replay_durable_submission(
+            HyperPodAction.REBOOT, node_ids, submission_key
+        )
+        result["duplicate"] = outcome is not None and outcome.duplicate is True
+except Exception as exc:  # noqa: BLE001 - the runner reads the stage and type
+    result["stage"] = stage
+    result["error"] = f"{type(exc).__name__}: {exc}"
+print(json.dumps(result, sort_keys=True, default=str))
 """
 
 
@@ -604,21 +621,41 @@ def replay_from_replacement(
     metadata = current.get("metadata") or {}
     if metadata.get("uid") != target["uid"] or metadata.get("deletionTimestamp"):
         raise RegionalFixtureError("replacement executor Pod UID changed before replay")
-    output = regional.kubectl(
-        "gpu",
-        "exec",
-        "-i",
-        str(target["name"]),
-        "--",
-        component_python("gpu"),
-        "-",
-        json.dumps(command, sort_keys=True),
-        input_text=STORE_REPLAY_PROBE,
-        timeout=180,
-    )
-    value = json.loads(output.splitlines()[-1])
+    request = {
+        "submission_idempotency_key": str(
+            (command.get("result_details") or {}).get("submission_idempotency_key")
+        ),
+        "node_ids": [
+            str(item) for item in (command.get("step") or {}).get("node_ids") or []
+        ],
+    }
+    try:
+        output = regional.kubectl(
+            "gpu",
+            "exec",
+            "-i",
+            str(target["name"]),
+            "--",
+            component_python("gpu"),
+            "-",
+            json.dumps(request, sort_keys=True),
+            input_text=STORE_REPLAY_PROBE,
+            timeout=180,
+        )
+    except RegionalCommandFailed as exc:
+        # The probe reports its own failures as JSON and exits 0, so this is
+        # the exec itself: the Pod not yet accepting exec, the container or
+        # the interpreter missing. Name the step; the output stays redacted.
+        raise RegionalFixtureError(
+            "DESTR-002 store-level replay could not run in replacement executor "
+            f"Pod {target['name']} (uid {target['uid']}): {exc}"
+        ) from exc
+    lines = [line for line in output.splitlines() if line.strip()]
+    value = json.loads(lines[-1]) if lines else None
     if not isinstance(value, dict):
-        raise RegionalFixtureError("replacement executor replay returned no object")
+        raise RegionalFixtureError(
+            f"replacement executor {target['name']} replay printed no JSON object"
+        )
     return {**value, "executor_pod": target["name"], "executor_pod_uid": target["uid"]}
 
 
@@ -804,7 +841,13 @@ def verify_duplicate_replay(
         )
     else:
         duplicate = replay_from_replacement(regional, command, executor_restart)
-        if duplicate.get("duplicate") is not True:
+        if duplicate.get("error"):
+            replay_errors.append(
+                "durable HyperPod replay probe failed in replacement executor "
+                f"{duplicate.get('executor_pod')} at stage {duplicate.get('stage')}: "
+                f"{duplicate['error']}"
+            )
+        elif duplicate.get("duplicate") is not True:
             replay_errors.append(
                 "durable HyperPod submission record is not replayable from "
                 f"the replacement executor: {duplicate.get('checks')}"

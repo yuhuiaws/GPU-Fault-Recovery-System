@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import run_destr002_hyperpod_reboot as destr002
+from scripts.e2e.regional.regional_commands import RegionalCommandFailed
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -344,9 +345,13 @@ def test_destr002_replays_the_durable_record_from_the_replacement_executor(
     assert len(replays) == 1, regional.calls
     assert replays[0]["input_text"] == destr002.STORE_REPLAY_PROBE
     assert replays[0]["arguments"][2] == "executor-c"
-    # The probe receives the command as the executor recorded it, key included,
-    # and never a recomputed one.
-    assert json.loads(replays[0]["arguments"][-1]) == _reboot_command()
+    # The probe receives the key as the executor recorded it (never recomputed)
+    # and the step's node ids -- nothing else, so the request fits one argv
+    # string whatever evidence the command record carries.
+    assert json.loads(replays[0]["arguments"][-1]) == {
+        "submission_idempotency_key": SUBMISSION_KEY,
+        "node_ids": [NODE],
+    }
     assert evidence["duplicate_replay"]["duplicate"] is True
     assert evidence["duplicate_replay"]["executor_pod_uid"] == "uid-c"
     # The replay runs after the submitting Pod was deleted.
@@ -362,6 +367,75 @@ def test_destr002_replays_the_durable_record_from_the_replacement_executor(
         for index, item in enumerate(commands)
         if item["arguments"][:2] == ("delete", "pod")
     )
+
+
+def test_destr002_reports_an_in_pod_replay_probe_failure_by_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe prints its own failure as JSON (exit 0); the case fails with
+    the stage and the exception named instead of a redacted command error."""
+
+    original = SpyRegional.kubectl
+
+    def kubectl(self: SpyRegional, plane: str, *arguments: str, **kwargs: Any) -> str:
+        if arguments[:2] == ("exec", "-i"):
+            self._record("kubectl", plane=plane, arguments=arguments, **kwargs)
+            return json.dumps(
+                {
+                    "replay_mode": "store-level",
+                    "duplicate": False,
+                    "checks": {},
+                    "stage": "executor",
+                    "error": "ClusterExecutorError: GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER is required",
+                }
+            )
+        return original(self, plane, *arguments, **kwargs)
+
+    monkeypatch.setattr(SpyRegional, "kubectl", kubectl)
+
+    exit_code, evidence, _, _ = _drive_execute_case(tmp_path, monkeypatch)
+
+    assert exit_code == 1
+    assert evidence["verdict"] == "FAIL"
+    assert evidence["duplicate_replay"]["stage"] == "executor"
+    assert any(
+        error.startswith(
+            "durable HyperPod replay probe failed in replacement executor executor-c "
+            "at stage executor: ClusterExecutorError"
+        )
+        for error in evidence["errors"]
+    ), evidence["errors"]
+
+
+def test_destr002_names_the_replacement_pod_when_the_replay_exec_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-05: the case died with "command failed (1): <sensitive output
+    redacted> (step: kubectl exec)" and nothing said which exec."""
+
+    original = SpyRegional.kubectl
+
+    def kubectl(self: SpyRegional, plane: str, *arguments: str, **kwargs: Any) -> str:
+        if arguments[:2] == ("exec", "-i"):
+            raise RegionalCommandFailed(
+                1,
+                "Traceback: secret token abc",
+                ["kubectl", "exec", "-i", arguments[2]],
+            )
+        return original(self, plane, *arguments, **kwargs)
+
+    monkeypatch.setattr(SpyRegional, "kubectl", kubectl)
+
+    exit_code, evidence, _, _ = _drive_execute_case(tmp_path, monkeypatch)
+
+    assert exit_code == 1
+    error = evidence["error"]
+    assert error.startswith(
+        "RegionalFixtureError: DESTR-002 store-level replay could not run in "
+        "replacement executor Pod executor-c (uid uid-c): command failed (1): "
+    ), error
+    assert "(step: kubectl exec)" in error
+    assert "secret token" not in error, "the exec output stays redacted"
 
 
 def test_destr002_workflow_wait_is_scoped_to_the_submitted_workflow(

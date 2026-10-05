@@ -98,7 +98,14 @@ def metadata_errors(
     job_id: str,
     attempt_id: str,
     profile_version: str,
+    expected_critical_ranks: int = 3,
 ) -> list[str]:
+    """Why the submitted PyTorchJob does not carry the watcher's identity.
+
+    ``expected_critical_ranks`` is the training topology's node count: the
+    fixtures' three by default, two on a two-node cluster.
+    """
+
     errors = []
     labels = workload["metadata"].get("labels", {})
     expected_labels = {
@@ -121,7 +128,9 @@ def metadata_errors(
         }.items():
             if template_labels.get(key) != value:
                 errors.append(f"{role} template label {key} differs")
-        if annotations.get("gpu-fault.io/expected-critical-ranks") != "3":
+        if annotations.get("gpu-fault.io/expected-critical-ranks") != str(
+            expected_critical_ranks
+        ):
             errors.append(f"{role} expected critical ranks differs")
         if annotations.get("gpu-fault.io/rank-offset") != expected_offset:
             errors.append(f"{role} rank offset differs")
