@@ -285,11 +285,17 @@ def test_dry_run_prints_the_plan_and_exits_zero_on_a_clean_preflight(
         "attempt": 1,
         "confirmation": CONFIRMATION,
         "environment": {"GPU_FAULT_TEST_ENVIRONMENT": "recorded"},
-        "details": {"preflight": {"errors": [], "probe": "seen"}},
+        "details": {
+            "preflight": {"errors": [], "probe": "seen"},
+            "preflight_errors": [],
+        },
     }
     printed = json.loads(capsys.readouterr().out)
     assert printed["case_id"] == CASE_ID
-    assert printed["details"] == {"preflight": {"errors": [], "probe": "seen"}}
+    assert printed["details"] == {
+        "preflight": {"errors": [], "probe": "seen"},
+        "preflight_errors": [],
+    }, "every plan names its unmet preconditions; a clean preflight names none"
 
 
 def test_dry_run_still_prints_the_plan_but_exits_one_on_preflight_errors(
@@ -311,6 +317,9 @@ def test_dry_run_still_prints_the_plan_but_exits_one_on_preflight_errors(
     assert plan_kwargs["preflight_passed"] is False
     printed = json.loads(capsys.readouterr().out)
     assert printed["details"]["preflight"]["errors"] == ["target node is not Ready"]
+    assert printed["details"]["preflight_errors"] == ["target node is not Ready"], (
+        "rc 1 plans name the unmet preconditions in details.preflight_errors"
+    )
 
 
 def test_execute_authorizes_then_runs_the_case_with_the_deadline(
@@ -400,6 +409,7 @@ def test_plain_case_prints_a_preflight_bound_plan_after_installing_the_profile(
                 },
                 "predecessor": {"case_id": "previous-case", "valid": True},
             },
+            "preflight_errors": [],
         },
     }, "the plan must include the actual identity preflight and environment"
     printed = json.loads(capsys.readouterr().out)
