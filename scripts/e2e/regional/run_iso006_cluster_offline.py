@@ -84,10 +84,12 @@ VALIDATION_LIMITATIONS = [
     "store_io admission and the processor worker pool are shared across the "
     "whole region; there is no per-cluster quota, so a blocked cluster's "
     "backlog is bounded only by the absence of its requests.",
-    "The block is an iptables REJECT on cluster B's nodes toward the "
-    "control-plane CIDRs, not a security-group change; B's inbound requests "
-    "never reach the control plane, so cluster_queue_depth for B is recorded "
-    "rather than required to grow.",
+    "The block is an iptables REJECT (OUTPUT and FORWARD, so Pod egress is "
+    "covered) on every cluster B node that hosts a gpu-fault component -- the "
+    "GPU nodes and the executor Pods' nodes -- toward the control-plane CIDRs, "
+    "not a security-group change; B's inbound requests never reach the control "
+    "plane, so cluster_queue_depth for B is recorded rather than required to "
+    "grow. Each block receipt names the node, its roles and the rules read back.",
     "A-cluster claim latency is sampled from one Ready executor Pod with the "
     "acceptance probe owner; it measures the authenticated claim path, not "
     "the executor's own poll loop.",
@@ -240,6 +242,74 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
     }
 
 
+#: Why a cluster B node is blocked: it carries GPU node agents / exporters, or
+#: it hosts a cluster executor Pod (on eks-managed the executor Deployment does
+#: not tolerate the GPU node taint, so it runs on a CPU node the GPU-node block
+#: never covered -- live the executor claimed straight through the "cut").
+ROLE_GPU_NODE = "gpu-node"
+ROLE_EXECUTOR_NODE = "executor-pod-node"
+EXECUTOR_APP = "gpu-fault-cluster-executor"
+
+
+def block_targets(
+    gpu_nodes: list[dict[str, Any]],
+    executor_pods: list[dict[str, Any]],
+    read_node: Any,
+) -> dict[str, Any]:
+    """The nodes the cut must cover, with the role each one plays.
+
+    Every GPU node (the agents and exporters talk to the control plane from
+    there) plus every node a Ready executor Pod runs on. ``read_node`` fetches a
+    node document by name for the executor nodes that are not GPU nodes; a Pod
+    whose node is unknown is recorded, not blocked -- the cut proof that follows
+    the block still refuses a cluster that keeps claiming.
+    """
+
+    targets: dict[str, dict[str, Any]] = {}
+    for node in gpu_nodes:
+        targets[str(node["name"])] = {**node, "roles": [ROLE_GPU_NODE]}
+    without_node: list[str] = []
+    for pod in executor_pods:
+        node_name = pod.get("node")
+        if not node_name:
+            without_node.append(str(pod.get("name")))
+            continue
+        node_name = str(node_name)
+        if node_name in targets:
+            targets[node_name]["roles"].append(ROLE_EXECUTOR_NODE)
+            continue
+        document = read_node(node_name)
+        metadata = document.get("metadata") or {}
+        conditions = (document.get("status") or {}).get("conditions") or []
+        targets[node_name] = {
+            "name": node_name,
+            "uid": str(metadata.get("uid") or ""),
+            "ready": next(
+                (
+                    str(item.get("status"))
+                    for item in conditions
+                    if isinstance(item, dict) and item.get("type") == "Ready"
+                ),
+                "Unknown",
+            ),
+            "roles": [ROLE_EXECUTOR_NODE],
+        }
+    return {
+        "nodes": [targets[name] for name in sorted(targets)],
+        "executor_pods": [
+            {"name": pod.get("name"), "node": pod.get("node")} for pod in executor_pods
+        ],
+        "executor_pods_without_node": without_node,
+    }
+
+
+def cluster_b_block_targets(b: Any, nodes_b: list[dict[str, Any]]) -> dict[str, Any]:
+    def read_node(name: str) -> dict[str, Any]:
+        return json.loads(b.kubectl("gpu", "get", "node", name, "-o", "json"))
+
+    return block_targets(nodes_b, b.ready_pods("gpu", EXECUTOR_APP), read_node)
+
+
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
@@ -257,6 +327,7 @@ def read_only_preflight(
     )
     nodes_a = a.gpu_nodes()
     nodes_b = b.gpu_nodes()
+    targets_b = cluster_b_block_targets(b, nodes_b)
     tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     # Both clusters must claim successfully before anything is blocked; the
     # "cut proven" step later compares against exactly this.
@@ -281,6 +352,8 @@ def read_only_preflight(
         errors.append("A recovery requires an existing site file")
     if any(item["ready"] != "True" for item in [*nodes_a, *nodes_b]):
         errors.append("a GPU node is not Ready")
+    if any(item["ready"] != "True" for item in targets_b["nodes"]):
+        errors.append("a cluster B node hosting an executor Pod is not Ready")
     if claim_a.get("status") != 200 or claim_b.get("status") != 200:
         errors.append("a cluster cannot claim before the block")
     if not tests["passed"]:
@@ -290,6 +363,7 @@ def read_only_preflight(
         "registrations": registrations,
         "nodes_a": nodes_a,
         "nodes_b": nodes_b,
+        "block_targets_b": targets_b,
         "cpu_pods": cpu_pod_snapshot(a),
         "cpu_containers": control_plane_container_statuses(a),
         "claim_a": claim_a,
@@ -532,6 +606,45 @@ def observe_recovery_during_cut(
     return errors
 
 
+def host_probes(
+    settings: Settings, case_dir: Path, run_id: str, targets: dict[str, Any]
+) -> list[HostProbeFixture]:
+    """One host probe per block target, in the target order the receipts follow."""
+
+    return [
+        HostProbeFixture(
+            HostProbeSettings(
+                state_directory=case_dir / "host-probes",
+                kubeconfig=settings.multi.cluster_b.gpu_kubeconfig,
+                context=settings.multi.cluster_b.gpu_context,
+                namespace=settings.multi.namespace,
+                node=str(item["name"]),
+                image=settings.host_probe_image,
+                case_id=CASE_ID,
+                run_id=f"{run_id}-{index}",
+                probe_script=PROBE,
+                active_deadline_seconds=3600,
+            )
+        )
+        for index, item in enumerate(targets["nodes"])
+    ]
+
+
+def _identities(nodes: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    return {(str(item["name"]), str(item["uid"])) for item in nodes}
+
+
+def block_targets_changed(b: Any, preflight: dict[str, Any]) -> bool:
+    """Whether cluster B's GPU nodes or the executor's placement moved since
+    the preflight: the plan would then block the wrong set of nodes."""
+
+    live_nodes_b = b.gpu_nodes()
+    return _identities(live_nodes_b) != _identities(preflight["nodes_b"]) or (
+        _identities(cluster_b_block_targets(b, live_nodes_b)["nodes"])
+        != _identities(preflight["block_targets_b"]["nodes"])
+    )
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -551,23 +664,7 @@ def execute_case(
     b = settings.multi.regional(settings.multi.cluster_b)
     cluster_b = settings.multi.cluster_b.cluster_id
     run_id = f"iso006-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    probes = [
-        HostProbeFixture(
-            HostProbeSettings(
-                state_directory=case_dir / "host-probes",
-                kubeconfig=settings.multi.cluster_b.gpu_kubeconfig,
-                context=settings.multi.cluster_b.gpu_context,
-                namespace=settings.multi.namespace,
-                node=str(item["name"]),
-                image=settings.host_probe_image,
-                case_id=CASE_ID,
-                run_id=f"{run_id}-{index}",
-                probe_script=PROBE,
-                active_deadline_seconds=3600,
-            )
-        )
-        for index, item in enumerate(preflight["nodes_b"])
-    ]
+    probes = host_probes(settings, case_dir, run_id, preflight["block_targets_b"])
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -577,6 +674,7 @@ def execute_case(
         "baseline_samples": [],
         "samples": [],
         "errors": [],
+        "block_targets": preflight["block_targets_b"],
         "validation_limitations": VALIDATION_LIMITATIONS,
     }
     blocked = False
@@ -621,19 +719,19 @@ def execute_case(
             raise RegionalFixtureError(
                 "maintenance window cannot cover block and restoration"
             )
-        if {(item["name"], item["uid"]) for item in b.gpu_nodes()} != {
-            (item["name"], item["uid"]) for item in preflight["nodes_b"]
-        }:
-            raise RegionalFixtureError("cluster B node identities changed before block")
+        if block_targets_changed(b, preflight):
+            raise RegionalFixtureError(
+                "cluster B node identities or executor placement changed before block"
+            )
         first_block = time.monotonic()
         blocks = []
-        for probe in probes:
+        for probe, target in zip(probes, preflight["block_targets_b"]["nodes"]):
             # The remote block may have committed even when its receipt is lost.
             blocked = True
             receipt = probe.execute(*block_arguments(settings, run_id))
             if receipt.get("blocked") is not True:
                 raise RegionalFixtureError("network block has no verified receipt")
-            blocks.append(receipt)
+            blocks.append({**receipt, "node": target["name"], "roles": target["roles"]})
         block_span = time.monotonic() - first_block
         result["blocks"] = blocks
         result["block_span_seconds"] = block_span

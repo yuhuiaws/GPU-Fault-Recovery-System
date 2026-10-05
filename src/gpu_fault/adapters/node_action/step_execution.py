@@ -47,6 +47,46 @@ class NodeActionBatchState:
     quiesce_taint_error: str | None = None
 
 
+#: Agent result key -> step detail key, per operation. The agent reports what it
+#: stopped under ``active_services`` (the configured services that were active
+#: when the window opened); the step says ``stopped_services`` so an operator
+#: reading the record does not have to know the agent's vocabulary. Live
+#: (gpu-eks-cluster, XID 46): the reset failed "In use by another client" and
+#: the QUIESCE record carried no word on which host services the quiesce had
+#: stopped, skipped or protected -- the journal had no systemd stop line and
+#: nothing in the record said why.
+QUIESCE_SERVICE_EVIDENCE = (
+    ("active_services", "stopped_services"),
+    ("inactive_services", "inactive_services"),
+    ("protected_services", "protected_services"),
+    ("stopped_containers", "stopped_containers"),
+)
+RESTORE_SERVICE_EVIDENCE = (("restored_services", "restored_services"),)
+
+
+def service_evidence(
+    operation: WorkflowOperation, node_results: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Per-node service evidence lifted from the agents' results to the step."""
+
+    mapping = {
+        WorkflowOperation.QUIESCE_GPU_SERVICES: QUIESCE_SERVICE_EVIDENCE,
+        WorkflowOperation.RESTORE_GPU_SERVICES: RESTORE_SERVICE_EVIDENCE,
+    }.get(operation)
+    if mapping is None:
+        return {}
+    evidence: dict[str, dict[str, Any]] = {}
+    for source, target in mapping:
+        per_node = {
+            node_id: result[source]
+            for node_id, result in node_results.items()
+            if isinstance(result, dict) and source in result
+        }
+        if per_node:
+            evidence[target] = per_node
+    return evidence
+
+
 class NodeActionExecutionService:
     def __init__(self, adapter) -> None:
         self.adapter = adapter
@@ -72,8 +112,44 @@ class NodeActionExecutionService:
             return refused
         outcome = self._dispatch(context, state)
         if outcome is not None:
-            return outcome
+            return self._quiesce_taint_evidence(context, state, outcome)
         return self._finalize(context, state)
+
+    def _quiesce_taint_evidence(
+        self,
+        context: WorkflowStepContext,
+        state: NodeActionBatchState,
+        outcome: WorkflowStepOutcome,
+    ) -> WorkflowStepOutcome:
+        """Put the taint this step applied (or removed) on every outcome it
+        returns, and lift it again when the quiesce itself failed.
+
+        The taint goes on before the agent is told, so a quiesce that then
+        fails (the agent refused, the window expired) or is still waiting has
+        tainted the node while its step record said nothing about it. The
+        executor's compensation and the successors' isolation steps read
+        ``quiesce_taint_nodes`` / ``quiesce_taint_removed_nodes`` from the
+        record to know what is still owed; a failed quiesce untaints at once so
+        the node is not left NoExecute for a window that never opened.
+        """
+
+        if not state.quiesce_taint_nodes:
+            return outcome
+        operation = context.step.operation
+        details: dict[str, Any] = dict(outcome.details or {})
+        if operation is WorkflowOperation.RESTORE_GPU_SERVICES:
+            details["quiesce_taint_removed_nodes"] = list(state.quiesce_taint_nodes)
+            return replace(outcome, details=details)
+        details["quiesce_taint_nodes"] = list(state.quiesce_taint_nodes)
+        if outcome.status is WorkflowStepStatus.FAILED:
+            core = getattr(self.adapter, "quiesce_taint_core", None)
+            try:
+                details["quiesce_taint_removed_nodes"] = remove_quiesce_taint(
+                    core, list(state.quiesce_taint_nodes)
+                )
+            except Exception as exc:  # noqa: BLE001 - the error is the evidence
+                details["quiesce_taint_error"] = f"{type(exc).__name__}: {exc}"
+        return replace(outcome, details=details)
 
     def _quiesce_taint(
         self, context: WorkflowStepContext, state: NodeActionBatchState
@@ -685,6 +761,7 @@ class NodeActionExecutionService:
                 else "quiesce_taint_removed_nodes"
             )
             details[key] = list(state.quiesce_taint_nodes)
+        details.update(service_evidence(operation, state.node_results))
         if operation is WorkflowOperation.QUIESCE_GPU_SERVICES and state.readiness:
             started = (
                 self.adapter.registry.now()

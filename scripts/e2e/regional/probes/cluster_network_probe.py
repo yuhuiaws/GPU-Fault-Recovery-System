@@ -170,7 +170,8 @@ def block(arguments: argparse.Namespace) -> None:
             )
         for host_chain in HOST_CHAINS:
             run(["iptables", "-I", host_chain, "1", "-j", chain])
-        if not chain_state(chain)["blocked"]:
+        state = chain_state(chain)
+        if not state["blocked"]:
             raise ProbeError("network block could not be read back")
     except Exception:
         remove_chain(chain, run_id, allow_empty=True)
@@ -183,6 +184,10 @@ def block(arguments: argparse.Namespace) -> None:
             "chain": chain,
             "host_chains": list(HOST_CHAINS),
             "cidrs": cidrs,
+            # The rules as the kernel read them back, so the evidence says what
+            # was installed on this node rather than what was asked for.
+            "rules": [shlex.join(rule) for rule in state["rules"]],
+            "jumps": state["jumps"],
             "restore_unit": unit + ".timer",
             "restore_seconds": arguments.restore_seconds,
             "blocked": True,

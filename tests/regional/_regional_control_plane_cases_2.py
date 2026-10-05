@@ -186,6 +186,7 @@ def test_incident_ownership_route_answers_takeover_question() -> None:
                 "incident_state": "ACTION_PENDING",
                 "quarantine_hold": False,
                 "terminal_quarantine": False,
+                "escalation_lineage": None,
             }
 
             live = await client.get(

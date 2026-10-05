@@ -20,9 +20,12 @@ from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
+from gpu_fault.adapters.common import quarantine_taint_value
+from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.telemetry import (
     CollectorKind,
 )
+from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
 
 
 class GpuValidationAdapter:
@@ -153,7 +156,10 @@ class GpuValidationAdapter:
                 required_collectors,
             )
             if isinstance(recent, dict):
-                pending[node_id] = recent
+                pending[node_id] = {
+                    **recent,
+                    **quiesce_taint_pending(self.store, context, node_id),
+                }
                 continue
             all_host_latest, host_latest = recent
             inventory_pending = self._validate_inventory(
@@ -182,7 +188,10 @@ class GpuValidationAdapter:
                 context, node_id, now, readiness_after, required
             )
             if metric_pending is not None:
-                pending[node_id] = metric_pending
+                pending[node_id] = {
+                    **metric_pending,
+                    **quiesce_taint_pending(self.store, context, node_id),
+                }
                 continue
             if operation is WorkflowOperation.VALIDATE_FABRIC:
                 fabric_pending = self._validate_fabric_metrics(
@@ -662,6 +671,70 @@ class GpuValidationAdapter:
 #: How many findings the failure text spells out per node; the rest are counted
 #: and every one is in ``details.node_findings``.
 FAILURE_TEXT_FINDINGS = 3
+
+
+def quiesce_taint_pending(
+    store: Any, context: WorkflowStepContext, node_id: str
+) -> dict[str, Any]:
+    """Why GPU telemetry may be missing: a ``gpu-fault.io/quiesce`` taint a
+    workflow of this incident's lineage applied to ``node_id`` and never
+    recorded removing.
+
+    The validation adapter has no cluster client; the step records do carry
+    the taint's history (``quiesce_taint_nodes`` / ``quiesce_taint_removed_nodes``
+    on the QUIESCE and RESTORE executions). Live (gpu-eks-cluster, XID 46): the
+    reset chain's compensation was fenced, its NoExecute taint stayed, the
+    exporter was evicted, and the reboot successor's VALIDATE_GPU "stayed
+    non-terminal for 602s" with ``missing_recent_metrics`` as its only word.
+    The wait is the same; its reason is now named, so the operator strips the
+    taint (``submit-remediation --disposition restore`` of the owner incident)
+    instead of waiting out the cap. Lineage: this workflow, its
+    ``predecessor_workflow_id`` chain and the ``<rung>-after-<workflow>`` origins
+    of its incidents, bounded; an unreadable record simply contributes nothing.
+    """
+
+    holders: dict[str, str] = {}
+    frontier: list[str] = [context.workflow.request_id]
+    seen: set[str] = set()
+    while frontier and len(seen) < 16:
+        request_id = frontier.pop()
+        if request_id in seen:
+            continue
+        seen.add(request_id)
+        if request_id == context.workflow.request_id:
+            workflow = context.workflow
+        else:
+            try:
+                workflow = store.get_workflow(request_id)
+            except Exception:  # noqa: BLE001 - lineage evidence is best effort
+                continue
+        if node_id in quiesce_taint_nodes_held(workflow):
+            holders[workflow.request_id] = quarantine_taint_value(workflow.incident_id)
+        if workflow.predecessor_workflow_id:
+            frontier.append(workflow.predecessor_workflow_id)
+        try:
+            incident = (
+                context.incident
+                if workflow.incident_id == context.incident.incident_id
+                else store.get_incident(workflow.incident_id)
+            )
+        except Exception:  # noqa: BLE001 - lineage evidence is best effort
+            continue
+        origin = escalation_origin(incident.event_id)
+        if origin is not None:
+            frontier.append(origin[1])
+    if not holders:
+        return {}
+    return {
+        "quiesce_taint_present": True,
+        "quiesce_taint_holders": holders,
+        "reason": (
+            "the node still carries the gpu-fault quiesce taint (NoExecute) of "
+            + ", ".join(sorted(holders))
+            + "; the exporter cannot run until it is removed -- restore the owner "
+            "incident (gpu-fault-admin submit-remediation --disposition restore)"
+        ),
+    }
 
 
 def finding_summary(finding: Any) -> dict[str, Any]:

@@ -100,6 +100,28 @@ def _arm_quiesce_failsafe(
     )
 
 
+def _service_inventory(
+    manager: GpuServiceQuiesceManager,
+) -> tuple[list[str], list[str]]:
+    """``(active, inactive)`` among the configured, unprotected services.
+
+    ``active`` is what the quiesce stops (and the restore starts); ``inactive``
+    is what it found nothing to stop -- a unit that is not running or not
+    installed on this image. Both travel in the receipt and the state file:
+    live (gpu-eks-cluster, XID 46) the reset failed busy and nothing in the
+    record said whether ``nvidia-persistenced`` / ``nvidia-fabricmanager`` had
+    been stopped or were simply not there to stop.
+    """
+
+    active: list[str] = []
+    inactive: list[str] = []
+    for service in manager.services:
+        if service in manager.protected_services:
+            continue
+        (active if manager._service_active(service) else inactive).append(service)
+    return active, inactive
+
+
 class GpuServiceQuiesceManager:
     """Quiesces host GPU services with an independent systemd restore timer.
 
@@ -193,10 +215,9 @@ class GpuServiceQuiesceManager:
         # GPU feature discovery) still holding the target GPU; kubelet is down
         # and restarts it on restore. Off (HyperPod), VERIFY fails closed on it.
         self.sweep_kubernetes_device_holders = sweep_kubernetes_device_holders
-        # eks-managed: kubelet and containerd stay up -- a plain EKS node has no
-        # HyperPod health agent to carry a NotReady node, and the GPU clients
-        # are containers the runtime stops. Not part of the config digest, like
-        # the sweep switch, so the configured list stays the HyperPod one.
+        # eks-managed: kubelet and containerd stay up (no HyperPod health agent
+        # carries a NotReady node; the GPU clients are containers the runtime
+        # stops). Not in the config digest, so the configured list stays HyperPod's.
         self.protected_services = tuple(protected_services)
         self.proc_root = Path(proc_root)
         self.restore_command = restore_command
@@ -632,12 +653,7 @@ class GpuServiceQuiesceManager:
                     "state_path": str(state_path),
                 }
 
-            active_services = [
-                service
-                for service in self.services
-                if service not in self.protected_services
-                and self._service_active(service)
-            ]
+            active_services, inactive_services = _service_inventory(self)
             container_targets = self._resolve_container_targets()
             state = {
                 "schema_version": 1,
@@ -645,6 +661,7 @@ class GpuServiceQuiesceManager:
                 "workflow_request_id": workflow_request_id,
                 "phase": "ARMING",
                 "active_services": active_services,
+                "inactive_services": inactive_services,
                 "configured_services": list(self.services),
                 "protected_services": list(self.protected_services),
                 "container_targets": container_targets,
@@ -696,6 +713,7 @@ class GpuServiceQuiesceManager:
             return {
                 "quiesced": True,
                 "active_services": active_services,
+                "inactive_services": inactive_services,
                 "protected_services": list(self.protected_services),
                 "terminated_process_names": list(self.processes),
                 "swept_device_holders": swept_device_holders,

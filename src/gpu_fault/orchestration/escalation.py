@@ -144,6 +144,73 @@ def escalation_origin(event_id: str) -> tuple[str, str] | None:
     return name, source_request_id
 
 
+#: ``remote_status_source`` of a command the cluster executor refused before any
+#: adapter ran it (``cluster_executor.dispatch._validate``: cluster mismatch, a
+#: stale fencing token, no or an ambiguous adapter, a namespace outside the
+#: executor's scope). Deterministic per command and never a node failure.
+EXECUTOR_REJECTED_STATUS_SOURCE = "executor-rejected"
+
+
+def executor_rejected_failure(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED step never reached its node: the executor refused the
+    command before dispatch.
+
+    Neither ladder climbs on it. Live (gpu-eks-cluster, XID 46 reset): the
+    reset chain's generation was fenced by a successor's plan rewrite, the
+    RESTART_NODE rung was refused "command fencing token does not match
+    workflow/incident", the branch ladder appended REPLACE_NODE, that was
+    refused the same way, and the compensation restore too -- three rungs
+    spent on a record whose incident had already moved on. The refusal names
+    the stale generation; nothing about the hardware was learned.
+    """
+
+    return (
+        details is not None
+        and details.get("remote_status_source") == EXECUTOR_REJECTED_STATUS_SOURCE
+    )
+
+
+def escalation_descends_from(
+    store: Any, workflow_request_id: str | None, incident_id: str, *, limit: int = 16
+) -> bool:
+    """Whether workflow ``workflow_request_id`` is, by escalation or queueing,
+    a descendant of a workflow of ``incident_id``.
+
+    Walks ``predecessor_workflow_id`` and the ``<rung>-after-<workflow>`` event
+    ids of the incidents on the way (``escalation_origin``), at most ``limit``
+    records. A node's isolation names the incident that placed it; the
+    successor asking to take it over may be two rungs away (live: the reboot
+    successor of a failed plugin restart was refused, its support successor
+    then asked about the *original* incident, whose current workflow the one
+    -hop check ``escalation_continues`` did not know). An unreadable record ends
+    the walk as "no": the caller fails closed.
+    """
+
+    frontier = [workflow_request_id] if workflow_request_id else []
+    seen: set[str] = set()
+    while frontier and len(seen) < limit:
+        request_id = frontier.pop()
+        if request_id in seen:
+            continue
+        seen.add(request_id)
+        try:
+            workflow = store.get_workflow(request_id)
+        except (NotFoundError, KeyError, TypeError):
+            continue
+        if workflow.incident_id == incident_id and request_id != workflow_request_id:
+            return True
+        if workflow.predecessor_workflow_id:
+            frontier.append(workflow.predecessor_workflow_id)
+        try:
+            incident = store.get_incident(workflow.incident_id)
+        except (NotFoundError, KeyError, TypeError):
+            continue
+        origin = escalation_origin(incident.event_id)
+        if origin is not None:
+            frontier.append(origin[1])
+    return False
+
+
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 
@@ -517,6 +584,20 @@ class HardwareEscalationService:
                 WorkflowOperation.ESCALATE_SUPPORT,
                 lifetime_failures,
             )
+        failed_executions = [
+            execution
+            for execution in workflow.step_executions
+            if execution.status is WorkflowStepStatus.FAILED
+        ]
+        if failed_executions and all(
+            executor_rejected_failure(execution.details)
+            for execution in failed_executions
+        ):
+            # Every failed step was refused by the cluster executor before it
+            # ran (a stale generation, a scope mismatch): the node was never
+            # touched, so there is no hardware verdict to climb from and no
+            # ticket to open. The record's terminal reason names the refusal.
+            return None
         unknown_failures = _unknown_outcome_failures(workflow.step_executions)
         if unknown_failures:
             # The step may have run, or may still be running, on the node. An

@@ -64,11 +64,29 @@ def validated_restore_steps(
     gpu_uuids: Sequence[str] = (),
     *,
     node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
+    release_only_node_ids: Sequence[str] = (),
 ) -> list[WorkflowStepSpec]:
-    """Validate all targets before restoring scheduling, retaining every named GPU."""
+    """Validate all targets before restoring scheduling, retaining every named GPU.
 
-    nodes = list(node_ids)
-    gpus = list(gpu_uuids)
+    ``release_only_node_ids`` are restored (RESTORE_SCHEDULING) but not
+    validated: nodes whose only isolation of this incident is the eks-managed
+    quiesce taint while another incident's cordon keeps them out of scheduling.
+    Validating them would wait on the exporter that taint evicts, and a node
+    that stays cordoned afterwards has nothing to prove here.
+    """
+
+    release_only = {node for node in release_only_node_ids if node in node_ids}
+    nodes = [node for node in node_ids if node not in release_only]
+    gpus = list(gpu_uuids) if nodes else []
+    if not nodes:
+        return [
+            WorkflowStepSpec(
+                operation=WorkflowOperation.RESTORE_SCHEDULING,
+                execution_owner=KUBERNETES_OWNER,
+                node_ids=sorted(release_only),
+                gpu_uuids=[],
+            )
+        ]
     scopes: dict[str, list[str]] = {}
     if gpus and len(nodes) > 1 and node_gpu_uuids is not None:
         inventories = [node_gpu_uuids.get(node) for node in nodes]
@@ -91,6 +109,8 @@ def validated_restore_steps(
     steps = []
     for operation in VALIDATED_RESTORE_OPERATIONS:
         targets = [(nodes, gpus)]
+        if operation is WorkflowOperation.RESTORE_SCHEDULING and release_only:
+            targets = [(sorted({*nodes, *release_only}), gpus)]
         if scopes and operation in {
             WorkflowOperation.VALIDATE_GPU,
             WorkflowOperation.VALIDATE_FABRIC,
@@ -122,6 +142,7 @@ def build_validated_restore_workflow(
     runtime_profile_version: str | None = None,
     reason: str | None = None,
     node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
+    release_only_node_ids: Sequence[str] = (),
 ) -> tuple[FaultIncident, WorkflowRequest]:
     """The ``(incident, workflow)`` pair of a validated restore of ``incident``.
 
@@ -160,7 +181,10 @@ def build_validated_restore_workflow(
         official_action=RESTORE_OFFICIAL_ACTION,
         fencing_token=incident.fencing_token,
         official_steps=validated_restore_steps(
-            step_nodes, gpu_uuids, node_gpu_uuids=node_gpu_uuids
+            step_nodes,
+            gpu_uuids,
+            node_gpu_uuids=node_gpu_uuids,
+            release_only_node_ids=release_only_node_ids,
         ),
         created_at=now,
         updated_at=now,

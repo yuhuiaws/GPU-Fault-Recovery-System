@@ -132,6 +132,29 @@ def widen_in_place(
     return steps
 
 
+def replacement_fencing_token(existing_workflow: WorkflowRequest) -> int:
+    """The generation a plan replaced in place runs under.
+
+    The bump fences the replaced plan's commands: an executor rejects a command
+    whose token is behind the incident's. A queued successor shares its
+    predecessor's generation (``_successor`` copies it) and, being replaceable
+    only while pristine, has issued no command of its own -- so there is nothing
+    to fence, and bumping it moves the *incident's* generation away from the
+    predecessor that is still RUNNING on it. Live (gpu-eks-cluster, XID 46
+    reset): the drain route merged a second allocatable finding into the PENDING
+    plugin-restart successor, the generation went 1 -> 2 while the reset chain
+    held 1, and every later command of the chain -- the reboot rung, the
+    RESTORE_GPU_SERVICES compensation -- was refused with "command fencing token
+    does not match workflow/incident", leaving the quiesce taint on the node. A
+    record without a predecessor keeps the bump: nothing else of the incident is
+    executing under its generation.
+    """
+
+    if existing_workflow.predecessor_workflow_id is not None:
+        return existing_workflow.fencing_token
+    return existing_workflow.fencing_token + 1
+
+
 @dataclass
 class DispositionApplier:
     """Apply a :class:`Disposition` to an (existing, candidate) pair.
@@ -344,7 +367,7 @@ class DispositionApplier:
                 # and its lifetime do not (F-B5, F-N1).
                 "predecessor_workflow_id": (existing_workflow.predecessor_workflow_id),
                 "lifetime_deadline_at": existing_workflow.lifetime_deadline_at,
-                "fencing_token": existing_workflow.fencing_token + 1,
+                "fencing_token": replacement_fencing_token(existing_workflow),
                 "not_before": not_before,
                 "aggregation_max_deadline": maximum,
                 "created_at": existing_workflow.created_at,

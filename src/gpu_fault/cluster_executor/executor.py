@@ -47,6 +47,8 @@ from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 # carries ``%(name)s`` and operators filter on ``gpu_fault.cluster_executor``, so
 # every layer of the package logs under the one name it always had.
 LOGGER = logging.getLogger("gpu_fault.cluster_executor")
+#: An idle executor logs that it is polling at most this often.
+HEARTBEAT_LOG_SECONDS = 30.0
 
 
 class ClusterExecutorClaimError(ClusterExecutorError):
@@ -196,6 +198,7 @@ class ClusterActionExecutor:
         self.max_execution_seconds = max_execution_seconds
         self.liveness_interval_seconds = liveness_interval_seconds
         self.clock = clock
+        self._last_heartbeat_log_at: float | None = None
         # Only the report backoff sleeps inside a command's own thread, so it
         # is injectable: a test must not really wait half a second to prove the
         # retry happened.
@@ -552,6 +555,7 @@ class ClusterActionExecutor:
         self.metrics.claimed()
         self._record_successful_claim(self.last_successful_claim_at)
         self.last_cycle_advanced = True
+        self._log_claims(commands)
         if commands:
             pool = ThreadPoolExecutor(
                 max_workers=min(
@@ -578,6 +582,7 @@ class ClusterActionExecutor:
                     self.metrics.in_flight(len(pending))
                     self._record_liveness()
                 outcomes = [future.result() for future in futures]
+                self._log_outcomes(commands, outcomes)
             finally:
                 # Never wait: a worker that abandoned a stuck command has
                 # returned, but the thread it abandoned may still be inside a
@@ -615,6 +620,62 @@ class ClusterActionExecutor:
             self.consecutive_transport_degraded_cycles
         )
         return len(commands)
+
+    def _log_claims(self, commands: list[RemoteActionCommand]) -> None:
+        """What this executor took on, at INFO -- the first thing an operator
+        reads, and what the acceptance runner's log window expects to find.
+
+        One line per claimed command (id, cluster, step, owner, nodes,
+        workflow, generation; never the lease token), plus a heartbeat at most
+        every ``HEARTBEAT_LOG_SECONDS`` so an idle executor still shows it is
+        polling. Live (ISO-001): the executors logged only the metrics
+        listener's start line and executed everything in silence; the runner
+        refused the empty window as missing evidence.
+        """
+
+        for command in commands:
+            step = getattr(command, "step", None)
+            LOGGER.info(
+                "regional cluster executor claimed command=%s cluster=%s "
+                "operation=%s owner=%s nodes=%s workflow=%s step=%s generation=%s",
+                getattr(command, "command_id", "?"),
+                getattr(command, "cluster_id", "?"),
+                getattr(getattr(step, "operation", None), "value", "?"),
+                getattr(step, "execution_owner", "?"),
+                ",".join(getattr(step, "node_ids", None) or ()),
+                getattr(getattr(command, "workflow", None), "request_id", "?"),
+                getattr(command, "step_index", "?"),
+                getattr(command, "fencing_token", "?"),
+            )
+        now = self.clock()
+        if (
+            self._last_heartbeat_log_at is None
+            or now - self._last_heartbeat_log_at >= HEARTBEAT_LOG_SECONDS
+        ):
+            self._last_heartbeat_log_at = now
+            LOGGER.info(
+                "regional cluster executor heartbeat: executor=%s claimed_now=%d "
+                "claimed_total=%d transport_degraded_cycles=%d",
+                self.executor_id,
+                len(commands),
+                self.claimed_total,
+                self.consecutive_transport_degraded_cycles,
+            )
+
+    @staticmethod
+    def _log_outcomes(
+        commands: list[RemoteActionCommand], outcomes: list[CommandOutcome]
+    ) -> None:
+        for command, outcome in zip(commands, outcomes, strict=False):
+            step = getattr(command, "step", None)
+            LOGGER.info(
+                "regional cluster executor finished command=%s operation=%s "
+                "nodes=%s status=%s",
+                getattr(command, "command_id", "?"),
+                getattr(getattr(step, "operation", None), "value", "?"),
+                ",".join(getattr(step, "node_ids", None) or ()),
+                getattr(getattr(outcome, "status", None), "value", "?"),
+            )
 
     def _execute_and_report(
         self, command: RemoteActionCommand, watch: CommandLeaseWatch | None = None

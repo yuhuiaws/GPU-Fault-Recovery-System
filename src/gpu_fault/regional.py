@@ -744,6 +744,14 @@ class RemoteIncidentOwnershipReport(StrictModel):
     #: predecessor's own escalation successor may take over. ``None`` from a
     #: control plane that predates the field reads as unknown: no takeover.
     terminal_quarantine: bool | None = None
+    #: Whether the workflow named by the request's ``successor_workflow_id`` is,
+    #: by escalation (``<rung>-after-<workflow>``) or queueing
+    #: (``predecessor_workflow_id``), a descendant of one of this incident's
+    #: workflows -- across any number of rungs. The one-hop check the executor
+    #: can do alone (``escalation_continues``) misses the support successor of
+    #: a refused reboot successor; the control plane walks the chain.
+    #: ``None``: not asked, or a control plane that predates the field.
+    escalation_lineage: bool | None = None
 
 
 class RemoteFleetRolloutFence(StrictModel):

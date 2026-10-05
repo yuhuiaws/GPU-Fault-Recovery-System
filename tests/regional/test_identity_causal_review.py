@@ -379,7 +379,7 @@ def test_iso006_recovers_a_during_b_cut_and_cleans_both_on_failure(
         evidence_identity=lambda: {"release_id": "release-test", "cluster_id": "a"},
         ready_pods=lambda *args: [{"name": "executor-a"}],
     )
-    b = SimpleNamespace(cluster="b", gpu_nodes=lambda: nodes)
+    b = SimpleNamespace(cluster="b", gpu_nodes=lambda: nodes, ready_pods=lambda *a: [])
     multi = SimpleNamespace(
         cluster_a=SimpleNamespace(cluster_id="a"),
         cluster_b=SimpleNamespace(
@@ -457,6 +457,11 @@ def test_iso006_recovers_a_during_b_cut_and_cleans_both_on_failure(
         lambda *args, **kwargs: {
             "errors": [],
             "nodes_b": nodes,
+            "block_targets_b": {
+                "nodes": [{**node, "roles": [offline.ROLE_GPU_NODE]} for node in nodes],
+                "executor_pods": [],
+                "executor_pods_without_node": [],
+            },
             "cpu_containers": containers,
             "cpu_pods": {"api": "api-uid"},
         },

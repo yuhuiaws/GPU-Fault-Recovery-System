@@ -31,7 +31,11 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.dag_branching import branch_node_ids
-from gpu_fault.orchestration.escalation import next_rung, unknown_outcome_failure
+from gpu_fault.orchestration.escalation import (
+    executor_rejected_failure,
+    next_rung,
+    unknown_outcome_failure,
+)
 
 if TYPE_CHECKING:
     from gpu_fault.orchestration.dag_branching import DagBrancher
@@ -124,7 +128,10 @@ class BranchEscalator:
         lineage_node = lineage_nodes[0] if len(lineage_nodes) == 1 else node_id
         recovery_context = self._recovery_context(workflow, branch_indexes)
         unknown = unknown_outcome_failure(details)
-        rung = None if unknown else next_rung(step.operation, recovery_context)
+        rejected = executor_rejected_failure(details)
+        rung = (
+            None if unknown or rejected else next_rung(step.operation, recovery_context)
+        )
         taken = workflow.branch_escalation_counts.get(lineage_node, 0)
         if rung is None or taken >= self.max_rungs:
             return self._exhaust(
@@ -138,6 +145,11 @@ class BranchEscalator:
                     + (
                         "outcome unknown, an operator confirms it; no rung"
                         if unknown
+                        else "the cluster executor refused the command before "
+                        "dispatch (this record holds generation "
+                        f"{workflow.fencing_token}); the node was not touched, "
+                        "no rung"
+                        if rejected
                         else "no further rung"
                         if rung is None
                         else f"{taken} rung(s) already taken"

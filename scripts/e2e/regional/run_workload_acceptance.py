@@ -84,6 +84,7 @@ from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
     collective_errors as collective_errors,
     command_ids_in_logs as command_ids_in_logs,
     control_plane_blast_errors as control_plane_blast_errors,
+    executor_logs_since,
     gpu_nodes_clean as gpu_nodes_clean,
     identity_baseline_errors as identity_baseline_errors,
     loss_errors as loss_errors,
@@ -128,7 +129,6 @@ E2E001_PROBE = Path(__file__).with_name("probes") / "e2e001_node_probe.py"
 # `gpu-fault-admin status` costs up to thirty minutes; the group runs it once,
 # on the case that closes it, unless the operator asks otherwise.
 ADMIN_STATUS_CASE = "GF-REGIONAL-WORKLOAD-002"
-EXECUTOR_LOG_MAX_WINDOW_SECONDS = 4 * 3600
 
 
 class WorkloadAcceptanceError(RuntimeError):
@@ -510,32 +510,6 @@ def admin_status_policy(case_id: str, *, skip: bool) -> tuple[bool, str]:
             f"{case_id} records the workload checks only"
         )
     return True, f"{case_id} closes the WORKLOAD group"
-
-
-def executor_logs_since(
-    regional: RegionalLiveFixture,
-    *,
-    since: datetime,
-) -> dict[str, str]:
-    """Each Ready executor Pod's log since ``since`` (bounded, never negative)."""
-
-    elapsed = int((datetime.now(timezone.utc) - since).total_seconds())
-    window = max(60, min(elapsed + 60, EXECUTOR_LOG_MAX_WINDOW_SECONDS))
-    logs = {}
-    pods = regional.ready_pods("gpu", "gpu-fault-cluster-executor")
-    if not pods:
-        raise RegionalFixtureError("no Ready executor for the log window")
-    for pod in pods:
-        logs[str(pod["name"])] = regional.kubectl(
-            "gpu",
-            "logs",
-            str(pod["name"]),
-            f"--since={window}s",
-            timeout=120,
-        )
-        if not logs[str(pod["name"])].strip():
-            raise RegionalFixtureError("executor log window is empty")
-    return logs
 
 
 def wait_pod_uids_unchanged(

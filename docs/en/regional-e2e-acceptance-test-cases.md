@@ -5174,7 +5174,11 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
     (the UID of B's training Pod is unchanged).
   - Step 8: if a finding is produced it may appear only in A's scope; both sides being empty also matches the current model of XID
     ingestion.
-  - No `command_id` of A appears in cluster B's executor logs.
+  - No `command_id` of A appears in cluster B's executor logs. The runner reads every Ready executor Pod's
+    `kubectl logs --since=<window>s` from the injection on; the executor now logs at INFO every command it claims
+    (command/cluster/operation/owner/nodes/workflow/generation, never the lease token), every command it finishes and a
+    heartbeat at most every 30 s, so the window is never empty; an empty one is still refused, as
+    "executor log window is empty: Pod <name> logged nothing in the last <N>s ..." with a pointer to `GPU_FAULT_LOG_LEVEL`.
 - Meaning of failure: multiple clusters sharing a control plane would trigger each other's recovery actions by mistake. **Blocks go-live.**
 - Cleanup: delete the training jobs on both sides and clean up A's taint/cordon.
 
@@ -5328,7 +5332,12 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   `--control-plane-cidr` (repeatable) takes the IPv4 CIDR(s) covering the addresses `GPU_FAULT_CONTROL_PLANE_URL`
   resolves to from cluster B -- the NLB's per-AZ /32s, or their subnet CIDRs; the control-plane VPC's CIDR does not
   cover a public NLB; without it the plan refuses with `at least one control-plane CIDR is required` and the same guidance.
-  The rule on every GPU node of cluster B first creates a host-side automatic recovery timer;
+  The block targets **every cluster B node that hosts a gpu-fault component**: all GPU nodes (Node Agents, exporters)
+  plus the node of every Ready `gpu-fault-cluster-executor` Pod -- the `eks-managed` executor Deployment does not
+  tolerate the `nvidia.com/gpu` taint and runs on a CPU node, so a GPU-node-only block left it claiming (on the mixed
+  site `cut_proof` came back 200); the preflight's `block_targets_b` and the evidence's `block_targets` list each node's
+  `roles` (`gpu-node`/`executor-pod-node`), and every block receipt carries `node`, `roles` and the `rules` read back
+  from the kernel. The rule on every target node first creates a host-side automatic recovery timer;
   the runner's `finally` then unblocks node by node. Passing `0.0.0.0/0` in place of the control-plane CIDR is forbidden.
   The block lands on both the `OUTPUT` and `FORWARD` chains of every B node (blocking only TCP 443 to the explicit control-plane
   CIDR); once blocked, the runner first samples one claim from B as `cut_proof`, which must fail at the **transport layer**
@@ -8728,6 +8737,17 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   cleanup does not mean the GPU has recovered.
   When validation fails the node stays quarantined, and the reboot must be carried by a
   separately approved subsequent `DESTR-002`.
+  The reset-chain gaps the third eks-managed XID 46 drill exposed are closed on the product side (administrator
+  operations §5.0/§9.2): `RESET_GPU` unloads the idle `nvidia_drm`/`nvidia_modeset` when it stays busy with no process
+  holding a device node, retries and reloads them (`released_kernel_modules`); QUIESCE details carry
+  `stopped_services`/`inactive_services`/`protected_services`; an in-place replacement of a queued successor no longer
+  bumps the fencing token (it used to turn the RESTART_NODE and REPLACE_NODE rungs and the RESTORE_GPU_SERVICES
+  compensation into `command fencing token does not match`); a step the executor refused does not escalate; the
+  support-after successor takes over the predecessor's isolation along the whole lineage; a RUNNING reset chain absorbs
+  the EFA/GPU allocatable dips it causes instead of queueing a RESTART_GPU_DEVICE_PLUGIN successor beside itself; and
+  the quiesce taint has an exit in the FAILED compensation, the successor's isolation, the device plugin restart, the
+  validated restore (`quiesce_taint_only`) and the VALIDATE_GPU pending reason. This case asserts that these details
+  keys are present, not their values.
 - Steps:
   1. Confirm the executor has `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true` and the Node Action
      signing key is identical on both sides; the target Node Agent endpoint, generation and

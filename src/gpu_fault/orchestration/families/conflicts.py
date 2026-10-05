@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
     FaultIncident,
@@ -27,20 +29,45 @@ from gpu_fault.store import NotFoundError
 #: raised it, the planner queued a RESTART_GPU_DEVICE_PLUGIN successor on the
 #: same incident, and that successor took the incident pointer -- the reset's
 #: QUARANTINED verdict never reached the incident).
+#: The eks-managed quiesce taint (NoExecute) evicts every device plugin that
+#: does not tolerate it -- the EFA plugin included (live, gpu-eks-cluster: the
+#: quiesce raised ``efa_kubernetes_allocatable_mismatch`` first, the drain route
+#: queued a RESTART_EFA_DEVICE_PLUGIN successor behind the RUNNING reset, and
+#: the GPU finding that followed merged into that PENDING successor instead of
+#: the running incumbent).
 DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS = frozenset(
     {
         WorkflowOperation.QUIESCE_GPU_SERVICES,
         WorkflowOperation.RESTORE_GPU_SERVICES,
         WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
     }
 )
 #: Finding -> the operations of a RUNNING node-exclusive workflow that make the
-#: finding transient while they run (validated by the workflow's own VALIDATE_GPU).
+#: finding transient while they run (validated by the workflow's own validation
+#: step, see ``INVENTORY_FINDING_VALIDATIONS``).
 TRANSIENT_INVENTORY_FINDINGS = {
     "gpu_inventory_mismatch": TRANSIENT_GPU_INVENTORY_OPERATIONS,
     "gpu_kubernetes_allocatable_mismatch": (
         TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
     ),
+    "efa_inventory_mismatch": TRANSIENT_GPU_INVENTORY_OPERATIONS,
+    "efa_kubernetes_allocatable_mismatch": (
+        TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
+    ),
+}
+#: The validation step of the incumbent that must still be ahead for the finding
+#: to be absorbed: a GPU finding is judged by VALIDATE_GPU; an EFA one by
+#: VALIDATE_FABRIC when the plan has it, else by the GPU validation that ends a
+#: reset chain (the EFA plugin returns with the quiesce taint's removal, and a
+#: mismatch that outlives the chain is raised again by the next scan).
+_GPU_VALIDATIONS = frozenset({WorkflowOperation.VALIDATE_GPU})
+_EFA_VALIDATIONS = _GPU_VALIDATIONS | {WorkflowOperation.VALIDATE_FABRIC}
+INVENTORY_FINDING_VALIDATIONS = {
+    "gpu_inventory_mismatch": _GPU_VALIDATIONS,
+    "gpu_kubernetes_allocatable_mismatch": _GPU_VALIDATIONS,
+    "efa_inventory_mismatch": _EFA_VALIDATIONS,
+    "efa_kubernetes_allocatable_mismatch": _EFA_VALIDATIONS,
 }
 
 
@@ -125,14 +152,21 @@ class NodeConflictService:
     ) -> bool:
         return any(step.operation in NODE_EXCLUSIVE_OPERATIONS for step in steps)
 
-    def active_node_exclusive_workflow(
+    def active_node_exclusive_workflows(
         self,
         cluster_id: str,
         node_ids: set[str],
         *,
         exclude_request_ids: frozenset[str] = frozenset(),
         candidate_steps: list[WorkflowStepSpec] | None = None,
-    ) -> WorkflowRequest | None:
+    ) -> Iterator[WorkflowRequest]:
+        """Every active node-exclusive workflow on ``node_ids``, store order.
+
+        A node can carry more than one: a RUNNING incumbent and the PENDING
+        successor queued behind it. ``active_node_exclusive_workflow`` names the
+        first; a caller that needs the one actually executing iterates.
+        """
+
         candidate_claims = (
             self.steps_resource_claims_by_node(candidate_steps)
             if candidate_steps is not None
@@ -162,8 +196,25 @@ class NodeConflictService:
                     for node_id in node_ids.intersection(incident.node_ids)
                 ):
                     continue
-            return workflow
-        return None
+            yield workflow
+
+    def active_node_exclusive_workflow(
+        self,
+        cluster_id: str,
+        node_ids: set[str],
+        *,
+        exclude_request_ids: frozenset[str] = frozenset(),
+        candidate_steps: list[WorkflowStepSpec] | None = None,
+    ) -> WorkflowRequest | None:
+        return next(
+            self.active_node_exclusive_workflows(
+                cluster_id,
+                node_ids,
+                exclude_request_ids=exclude_request_ids,
+                candidate_steps=candidate_steps,
+            ),
+            None,
+        )
 
     def active_workflow_covers_inventory_finding(
         self,
@@ -172,28 +223,35 @@ class NodeConflictService:
         covering = TRANSIENT_INVENTORY_FINDINGS.get(finding.metric_name or "")
         if covering is None:
             return None
-        workflow = self.active_node_exclusive_workflow(
-            finding.cluster_id,
-            {finding.node_id},
-        )
-        if workflow is None or workflow.status is not WorkflowStatus.RUNNING:
-            return None
-        operations = {step.operation for step in workflow.official_steps}
-        if not operations.intersection(covering):
-            return None
-        validation = {
-            index
-            for index, step in enumerate(workflow.official_steps)
-            if step.operation is WorkflowOperation.VALIDATE_GPU
-        }
-        # A superseded validation will never run either (F-C2).
-        if not validation - set(resolved_step_indexes(workflow)):
-            return None
-        try:
-            incident = self.store.get_incident(workflow.incident_id)
-        except NotFoundError:
-            # Listed a moment ago, gone now. "No incumbent" is the safe answer:
-            # the finding takes the normal path and at worst repeats one
-            # exclusivity check, instead of failing the whole batch (P2-51H).
-            return None
-        return incident, workflow
+        validations = INVENTORY_FINDING_VALIDATIONS[finding.metric_name or ""]
+        # The RUNNING incumbent, not the first active row: a PENDING successor
+        # already queued on the node (live, gpu-eks-cluster: the EFA plugin
+        # restart the quiesce taint provoked) hid the running reset, so the GPU
+        # finding merged into the successor and replaced its plan -- the
+        # generation bump that fenced every later command of the reset.
+        for workflow in self.active_node_exclusive_workflows(
+            finding.cluster_id, {finding.node_id}
+        ):
+            if workflow.status is not WorkflowStatus.RUNNING:
+                continue
+            operations = {step.operation for step in workflow.official_steps}
+            if not operations.intersection(covering):
+                continue
+            validation = {
+                index
+                for index, step in enumerate(workflow.official_steps)
+                if step.operation in validations
+            }
+            # A superseded validation will never run either (F-C2).
+            if not validation - set(resolved_step_indexes(workflow)):
+                continue
+            try:
+                incident = self.store.get_incident(workflow.incident_id)
+            except NotFoundError:
+                # Listed a moment ago, gone now. "No incumbent" is the safe
+                # answer: the finding takes the normal path and at worst
+                # repeats one exclusivity check, instead of failing the whole
+                # batch (P2-51H).
+                return None
+            return incident, workflow
+        return None

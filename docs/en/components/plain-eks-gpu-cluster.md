@@ -94,6 +94,20 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - RESTORE_SCHEDULING (the validated restore) strips a leftover quiesce taint together with the cordon and the
   quarantine taint; the node evidence of `workflow-reconcile`, the orphaned-annotation cleanup and `config spare`
   treat it as isolation still in place.
+- Every stage of the taint's life has an exit: each QUIESCE outcome records `quiesce_taint_nodes` and a FAILED quiesce
+  untaints at once; a QUIESCE that tainted but never completed owes the RESTORE_GPU_SERVICES compensation too; the
+  successor's MARK_UNSCHEDULABLE strips an orphaned taint; RESTART_GPU_DEVICE_PLUGIN WAITs under a taint somebody still
+  holds and names it, stripping an orphaned one first; a starved VALIDATE_GPU writes `quiesce_taint_present`/
+  `quiesce_taint_holders` into its pending details; `--disposition restore` runs RESTORE_SCHEDULING alone for a node whose
+  only isolation of the incident is its quiesce taint (`quiesce_taint_only`). See administrator operations §5.0 and §9.2.
+- An in-place plan replacement of a queued successor no longer bumps the fencing token (it shares its RUNNING
+  predecessor's generation), a RUNNING reset chain absorbs the EFA/GPU allocatable dips its own taint causes, a step the
+  executor refused before dispatch climbs neither ladder, and the takeover of a predecessor's isolation follows the whole
+  escalation lineage (`escalation_descends_from`; `escalation_lineage` of
+  `/executors/incident-ownership?successor_workflow_id=`) instead of one hop.
+- A busy reset with no process holding a device node unloads the idle `nvidia_drm`/`nvidia_modeset`, retries at once
+  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`); QUIESCE details carry
+  `stopped_services`/`inactive_services`/`protected_services`.
 - DaemonSet Pods that do not tolerate the taint are evicted for the window and return after it; third-party GPU
   clients with a key-less wildcard toleration (`operator: Exists`) stay inside the window and the reset still answers
   `In use by another client` -- see §3 item 6.

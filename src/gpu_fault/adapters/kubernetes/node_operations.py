@@ -22,6 +22,7 @@ from gpu_fault.adapters.common import (
     quarantine_taint_value,
 )
 from gpu_fault.adapters.kubernetes.primitives import (
+    KubernetesPrimitivesMixin,
     NodePatchConflict,
     node_name,
     node_scheduling_snapshot,
@@ -37,11 +38,15 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.node_provider import efa_device_plugin_name
-from gpu_fault.orchestration.escalation import escalation_origin
+from gpu_fault.orchestration.escalation import (
+    escalation_descends_from,
+    escalation_origin,
+)
 from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
     has_terminal_quarantine_hold,
     preserves_terminal_quarantine,
+    quiesce_taint_nodes_held,
     terminal_quarantine_nodes,
 )
 
@@ -53,6 +58,9 @@ SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 SPARE_POOL_STATE_ALLOCATED = "ALLOCATED"
 
 LOGGER = logging.getLogger(__name__)
+#: Taints that say gpu-fault isolated a node: the quarantine and (eks-managed)
+#: the quiesce window's NoExecute taint.
+ISOLATION_TAINTS = frozenset({QUARANTINE_TAINT, QUIESCE_TAINT})
 
 ANNOTATION_EFA_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/efa-plugin-restart-incident"
 
@@ -196,6 +204,11 @@ class KubernetesNodeOperationsMixin:
         now: datetime,
     ) -> WorkflowStepOutcome | tuple[dict[str, Any], bool]:
         node = self.core.read_node(node_id)
+        quiesce_hold = quiesce_taint_hold(
+            self.core, node, node_id, context, self._stale_quiesce_taint_values
+        )
+        if quiesce_hold is not None:
+            return quiesce_hold
         allocatable = self._node_allocatable(node, resource_name)
         annotations = self._annotations(node)
         operation = annotations.get(keys.operation)
@@ -223,11 +236,13 @@ class KubernetesNodeOperationsMixin:
             operation = None
             old_uid = ""
             started = None
-        pods = self._efa_plugin_pods(
+        listed = self._efa_plugin_pods(
             node_id,
             namespace=namespace,
             label_selector=selector,
         )
+        pods = [pod for pod in listed if not pod_terminating(pod)]
+        terminating = len(listed) - len(pods)
         ready_new_pods = [
             pod
             for pod in pods
@@ -276,7 +291,8 @@ class KubernetesNodeOperationsMixin:
             return result, True
         if len(pods) != 1:
             return WorkflowStepOutcome.failed(
-                f"expected at most one device plugin Pod on {node_id}, found {len(pods)}"
+                f"expected at most one device plugin Pod on {node_id}, found {len(pods)}",
+                details={"terminating_plugin_pods": terminating},
             )
         pod = pods[0]
         pod_uid = self._pod_uid(pod)
@@ -310,6 +326,13 @@ class KubernetesNodeOperationsMixin:
         if took_over is not None:
             result["took_over_incident"] = took_over
         return result, True
+
+    def _stale_quiesce_taint_values(
+        self, node: Any, context: WorkflowStepContext
+    ) -> set[str]:
+        return stale_quiesce_taint_values(
+            node, context, lambda owner: self._incident_ownership(owner, context)
+        )
 
     @staticmethod
     def _plugin_restart_started(raw: str | None) -> datetime | None:
@@ -532,7 +555,7 @@ class KubernetesNodeOperationsMixin:
         return (
             ANNOTATION_INCIDENT in annotations
             or ANNOTATION_FENCING in annotations
-            or any(item.get("key") == QUARANTINE_TAINT for item in self._taints(node))
+            or any(item.get("key") in ISOLATION_TAINTS for item in self._taints(node))
         )
 
     def _node_restore_patch(
@@ -554,6 +577,9 @@ class KubernetesNodeOperationsMixin:
         ) != context.incident.incident_id or annotations.get(ANNOTATION_FENCING) != str(
             context.workflow.fencing_token
         ):
+            own_quiesce = own_quiesce_taint_release(node, context.incident.incident_id)
+            if own_quiesce is not None:
+                return own_quiesce
             raise NodeIsolationRejected(
                 "isolation ownership does not match incident/fencing token"
             )
@@ -710,8 +736,16 @@ class KubernetesNodeOperationsMixin:
         except Exception:
             return False
 
-    def _incident_ownership(self, incident_id: str) -> IsolationOwnership:
-        return isolation_ownership(self.store, self.ownership_provider, incident_id)
+    def _incident_ownership(
+        self, incident_id: str, context: WorkflowStepContext | None = None
+    ) -> IsolationOwnership:
+        successor = context.workflow.request_id if context is not None else None
+        return isolation_ownership(
+            self.store,
+            self.ownership_provider,
+            incident_id,
+            successor_workflow_id=successor,
+        )
 
     def _can_take_over_node_isolation(
         self,
@@ -727,7 +761,7 @@ class KubernetesNodeOperationsMixin:
         preserves it (see ``isolation_ownership``)."""
 
         if ownership is None or incident_id not in ownership:
-            verdict = self._incident_ownership(incident_id)
+            verdict = self._incident_ownership(incident_id, context)
             if ownership is not None:
                 ownership[incident_id] = verdict
         else:
@@ -736,8 +770,9 @@ class KubernetesNodeOperationsMixin:
             return False
         if not verdict.quarantine_hold:
             return True
-        if verdict.terminal_quarantine is False and escalation_continues(
-            context, verdict.workflow_request_id
+        if verdict.terminal_quarantine is False and (
+            verdict.escalation_lineage
+            or escalation_continues(context, verdict.workflow_request_id)
         ):
             return True
         node_id = node_name(node)
@@ -816,6 +851,12 @@ class KubernetesNodeOperationsMixin:
         taints = self._taints(node)
         if takeover:
             taints = [item for item in taints if item.get("key") != QUARANTINE_TAINT]
+        # An orphaned quiesce taint would evict the exporter the successor's
+        # VALIDATE_GPU waits on: the first step on the node strips it.
+        stale_quiesce = self._stale_quiesce_taint_values(node, context)
+        if takeover and existing_incident:
+            stale_quiesce.add(quarantine_taint_value(str(existing_incident)))
+        taints = without_quiesce_taints(taints, stale_quiesce)
         owned_taint_values = {
             context.incident.incident_id,
             quarantine_taint_value(context.incident.incident_id),
@@ -848,6 +889,151 @@ class KubernetesNodeOperationsMixin:
         }
 
 
+def pod_terminating(pod: Any) -> bool:
+    """Whether kubelet is tearing ``pod`` down (``deletionTimestamp`` set).
+
+    Such a Pod is the old device plugin on its way out, not a second plugin to
+    choose between: live the DaemonSet had already replaced the evicted Pod and
+    the restart step refused "expected at most one device plugin Pod, found 2".
+    """
+
+    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else pod.metadata
+    stamp = (
+        metadata.get("deletionTimestamp")
+        if isinstance(metadata, dict)
+        else getattr(metadata, "deletion_timestamp", None)
+    )
+    return stamp is not None
+
+
+def without_quiesce_taints(
+    taints: list[dict[str, Any]], values: set[str]
+) -> list[dict[str, Any]]:
+    """``taints`` minus the ``gpu-fault.io/quiesce`` entries whose value is in
+    ``values``."""
+
+    return [
+        item
+        for item in taints
+        if not (item.get("key") == QUIESCE_TAINT and item.get("value") in values)
+    ]
+
+
+def _taint_only_patch(node: Any, taints: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "resourceVersion": KubernetesPrimitivesMixin._resource_version(node),
+            "annotations": {},
+        },
+        "spec": {"taints": taints},
+    }
+
+
+def stale_quiesce_taint_values(
+    node: Any,
+    context: WorkflowStepContext,
+    ownership_of: Callable[[str], IsolationOwnership],
+) -> set[str]:
+    """Quiesce taint values on ``node`` that no live workflow still holds.
+
+    This incident's own value is stale unless a QUIESCE step of *this* workflow
+    applied it and has not untainted yet (``quiesce_taint_nodes_held``): an
+    earlier generation that ended without its restore left it (live: the reset
+    chain's compensation was fenced; the taint stayed, evicted the exporter and
+    starved the successor's VALIDATE_GPU for 600 s). The annotation owner's
+    value is stale once that owner's workflow ended (``ownership_of``). A value
+    nobody here can vouch for is left alone.
+    """
+
+    present = {
+        str(item.get("value") or "")
+        for item in KubernetesPrimitivesMixin._taints(node)
+        if item.get("key") == QUIESCE_TAINT
+    }
+    if not present:
+        return set()
+    stale: set[str] = set()
+    own = quarantine_taint_value(context.incident.incident_id)
+    node_id = node_name(node) or ""
+    if own in present and node_id not in quiesce_taint_nodes_held(context.workflow):
+        stale.add(own)
+    owner = KubernetesPrimitivesMixin._annotations(node).get(ANNOTATION_INCIDENT)
+    if owner and owner != context.incident.incident_id:
+        owner_value = quarantine_taint_value(str(owner))
+        if owner_value in present and ownership_of(str(owner)).terminal:
+            stale.add(owner_value)
+    return stale
+
+
+def quiesce_taint_hold(
+    core: Any,
+    node: Any,
+    node_id: str,
+    context: WorkflowStepContext,
+    stale_values: Callable[[Any, WorkflowStepContext], set[str]],
+) -> tuple[dict[str, Any], bool] | None:
+    """What a device plugin restart does about a ``gpu-fault.io/quiesce`` taint.
+
+    Under the NoExecute taint the restart cannot succeed: kubelet evicts the
+    replacement Pod as soon as the DaemonSet creates it (live: the restart
+    failed under the reset chain's taint and the ladder rebooted a node whose
+    GPUs were fine). A taint no live workflow holds is stripped first and the
+    restart goes on (``None``); a live quiesce is waited out, the taint named as
+    the reason instead of a silent timeout.
+    """
+
+    taints = KubernetesPrimitivesMixin._taints(node)
+    present = [item for item in taints if item.get("key") == QUIESCE_TAINT]
+    if not present:
+        return None
+    stale = stale_values(node, context)
+    live = [item for item in present if item.get("value") not in stale]
+    if live:
+        return {
+            "quiesce_taint_present": True,
+            "quiesce_taint_values": sorted(
+                str(item.get("value") or "") for item in live
+            ),
+            "waiting_for_quiesce_taint_removal": True,
+        }, True
+    patch_node_with_retry(
+        core,
+        node_id,
+        lambda current: _taint_only_patch(
+            current,
+            without_quiesce_taints(KubernetesPrimitivesMixin._taints(current), stale),
+        ),
+    )
+    LOGGER.warning(
+        "stripped orphaned quiesce taint(s) %s from %s before the device plugin "
+        "restart of %s",
+        sorted(stale),
+        node_id,
+        context.workflow.request_id,
+    )
+    return None
+
+
+def own_quiesce_taint_release(node: Any, incident_id: str) -> dict[str, Any] | None:
+    """The patch that strips only ``incident_id``'s quiesce taint from a node
+    whose cordon another incident owns; ``None`` when there is none.
+
+    The isolation annotation keys ownership of the cordon and the quarantine
+    taint. The quiesce taint is keyed on its own incident value, so a node a
+    later incident re-isolated (live: the support successor's cordon over the
+    reset chain's orphaned ``gpu-fault.io/quiesce``) still carries a taint that
+    is this incident's to lift -- and nobody else's: the other incident's
+    restore judges ownership by the annotation and would refuse to touch it.
+    The cordon, the annotations and the other incident's taints stay as they are.
+    """
+
+    taints = KubernetesPrimitivesMixin._taints(node)
+    kept = without_quiesce_taints(taints, {quarantine_taint_value(incident_id)})
+    if len(kept) == len(taints):
+        return None
+    return _taint_only_patch(node, kept)
+
+
 class IsolationOwnership(NamedTuple):
     """What the previous owner of a node's isolation still holds.
 
@@ -863,10 +1049,18 @@ class IsolationOwnership(NamedTuple):
     quarantine_hold: bool
     terminal_quarantine: bool | None
     workflow_request_id: str | None
+    #: Whether the asking workflow descends from this owner by escalation or
+    #: queueing, over any number of rungs (``escalation_descends_from``);
+    #: ``None`` when nobody asked or the owner's control plane cannot say.
+    escalation_lineage: bool | None = None
 
 
 def isolation_ownership(
-    store: Any, ownership_provider: Any, incident_id: str
+    store: Any,
+    ownership_provider: Any,
+    incident_id: str,
+    *,
+    successor_workflow_id: str | None = None,
 ) -> IsolationOwnership:
     """What ``incident_id`` still holds on the nodes it isolated.
 
@@ -904,18 +1098,26 @@ def isolation_ownership(
             incident.state is IncidentState.QUARANTINED or terminal_quarantine,
             terminal_quarantine,
             workflow.request_id,
+            (
+                escalation_descends_from(store, successor_workflow_id, incident_id)
+                if successor_workflow_id
+                else None
+            ),
         )
     if ownership_provider is None:
         return IsolationOwnership(False, False, None, None)
     try:
         if hasattr(ownership_provider, "incident_ownership"):
-            report = ownership_provider.incident_ownership(incident_id)
+            report = _ownership_report(
+                ownership_provider, incident_id, successor_workflow_id
+            )
             reported = getattr(report, "terminal_quarantine", None)
             return IsolationOwnership(
                 bool(report.known and report.terminal),
                 bool(report.quarantine_hold),
                 bool(reported) if report.known and reported is not None else None,
                 getattr(report, "workflow_request_id", None),
+                getattr(report, "escalation_lineage", None),
             )
         return IsolationOwnership(
             bool(ownership_provider.incident_workflow_is_terminal(incident_id)),
@@ -925,6 +1127,22 @@ def isolation_ownership(
         )
     except Exception:
         return IsolationOwnership(False, False, None, None)
+
+
+def _ownership_report(
+    ownership_provider: Any, incident_id: str, successor_workflow_id: str | None
+) -> Any:
+    """The provider's report, asking about the successor's lineage when the
+    provider can answer it (an older provider takes the incident id alone)."""
+
+    if successor_workflow_id:
+        try:
+            return ownership_provider.incident_ownership(
+                incident_id, successor_workflow_id=successor_workflow_id
+            )
+        except TypeError:
+            pass
+    return ownership_provider.incident_ownership(incident_id)
 
 
 def escalation_continues(

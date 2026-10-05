@@ -173,6 +173,42 @@ def nvidia_kernel_module_clients(proc_root: Path) -> list[dict[str, Any]]:
     return modules
 
 
+#: The display stack: ``nvidia_drm`` registers a DRM device per GPU and, with
+#: modeset on, holds a client on it that ``nvidia-smi --gpu-reset`` reports as
+#: "In use by another client" although no process has any device node open
+#: (live, gpu-eks-cluster XID 46: ``nvidia_modeset refcount=1 used_by
+#: nvidia_drm``, ``nvidia refcount=2``, no holder anywhere). Unload order: the
+#: DRM module first, then modeset once nothing uses it. Never ``nvidia_uvm``,
+#: ``nvidia_peermem`` or ``gdrdrv``: those are compute / RDMA clients.
+IDLE_DISPLAY_MODULES = ("nvidia_drm", "nvidia_modeset")
+
+
+def idle_display_modules(proc_root: Path) -> list[str]:
+    """The display-stack modules that are loaded and used by nothing but each
+    other, in unload order: ``nvidia_drm`` when its refcount is 0, then
+    ``nvidia_modeset`` when nothing else (``nvidia_drm`` aside) uses it. Empty
+    when a process holds the DRM device (an X server, a container with
+    ``/dev/dri``) -- that holder is in ``device_holders`` and is not unloaded
+    from under it."""
+
+    modules = {item["module"]: item for item in nvidia_kernel_module_clients(proc_root)}
+    releasable: list[str] = []
+    drm = modules.get("nvidia_drm")
+    if drm is not None and drm["refcount"] == 0:
+        releasable.append("nvidia_drm")
+    modeset = modules.get("nvidia_modeset")
+    if modeset is not None:
+        users = set(modeset["used_by"]) - ({"nvidia_drm"} if releasable else set())
+        if (
+            modeset["refcount"]
+            - (1 if releasable and "nvidia_drm" in modeset["used_by"] else 0)
+            == 0
+            and not users
+        ):
+            releasable.append("nvidia_modeset")
+    return releasable
+
+
 def gpu_client_holder_evidence(
     *,
     proc_root: Path,

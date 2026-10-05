@@ -79,6 +79,16 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   适配器，HyperPod 不接、行为不变。
 - RESTORE_SCHEDULING（validated restore）连同 cordon/隔离污点一起摘掉残留的 quiesce 污点；`workflow-reconcile` 的节点证据、
   孤儿注解清理与 `config spare` 把它视为仍在隔离。
+- 污点的生命周期全部有出口：QUIESCE 的每个结果都记 `quiesce_taint_nodes`，FAILED 的 quiesce 当场摘掉；打了污点未完成的 QUIESCE 同样欠
+  RESTORE_GPU_SERVICES 补偿；后继的 MARK_UNSCHEDULABLE 摘掉孤儿污点；RESTART_GPU_DEVICE_PLUGIN 在别人仍持有的污点下 WAITING 并点名、
+  孤儿污点先摘；VALIDATE_GPU 的 pending 里写 `quiesce_taint_present`/`quiesce_taint_holders`；`--disposition restore` 对只剩本事件
+  quiesce 污点的节点只跑 RESTORE_SCHEDULING（`quiesce_taint_only`）。详见管理员日常运维 §5.0 与 §9.2。
+- 排队后继的 plan 就地替换不再抬 fencing token（与 RUNNING 前驱共享世代），RUNNING 的 reset 链吸收自己的污点引起的 EFA/GPU
+  allocatable 下降，被 executor 在派发前拒绝的步骤两条梯子都不升级；接管前驱隔离的判定走整条升级谱系
+  （`escalation_descends_from`，`/executors/incident-ownership?successor_workflow_id=` 的 `escalation_lineage`），
+  不再只认一跳。
+- reset 忙碌且 `/proc` 无进程持有设备时，Agent 卸载空闲的 `nvidia_drm`/`nvidia_modeset` 后立刻重试并在 reset 后装回
+  （`released_kernel_modules`/`reloaded_kernel_modules`）；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
 - 不容忍该污点的 DaemonSet Pod 在窗口内被驱逐、窗口后回来；带无 key 通配容忍（`operator: Exists`）的第三方 GPU 客户端会留在
   窗口里，reset 仍会 `In use by another client`——见 §3 第 6 条。
 

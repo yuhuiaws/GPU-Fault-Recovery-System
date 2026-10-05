@@ -230,7 +230,6 @@
   "src/gpu_fault/orchestration/escalation.py:list-item": 1,
   "src/gpu_fault/orchestration/escalation.py:no-untyped-def": 4,
   "src/gpu_fault/orchestration/escalation.py:type-arg": 4,
-  "src/gpu_fault/orchestration/families/conflicts.py:no-any-return": 1,
   "src/gpu_fault/orchestration/families/conflicts.py:no-untyped-def": 1,
   "src/gpu_fault/orchestration/families/drain.py:no-any-return": 2,
   "src/gpu_fault/orchestration/families/evidence.py:no-untyped-def": 5,

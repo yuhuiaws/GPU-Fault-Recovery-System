@@ -332,6 +332,11 @@ def test_network_lifecycle_arms_before_reject_and_verifies_both_jump_cleanup(
         assert blocked["blocked"] is True
         assert blocked["cidrs"] == ["10.0.0.0/24"]
         assert blocked["host_chains"] == ["OUTPUT", "FORWARD"]
+        assert blocked["jumps"] == {"OUTPUT": True, "FORWARD": True}
+        assert blocked["rules"] and all(
+            "-d 10.0.0.0/24" in rule and rule.endswith("-j REJECT")
+            for rule in blocked["rules"]
+        ), "the receipt carries the rules as read back, not as requested"
         network.status(SimpleNamespace(run_id="unit-cut"))
         status = json.loads(capsys.readouterr().out)
         assert status["blocked"] is status["residual"] is True

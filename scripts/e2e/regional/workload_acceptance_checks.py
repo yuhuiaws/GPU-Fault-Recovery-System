@@ -467,6 +467,48 @@ def virtual_isolation_errors(
     return errors
 
 
+EXECUTOR_LOG_MAX_WINDOW_SECONDS = 4 * 3600
+
+
+def executor_logs_since(
+    regional: Any,
+    *,
+    since: datetime,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> dict[str, str]:
+    """Each Ready executor Pod's log since ``since`` (bounded, never negative).
+
+    An empty window is refused as missing evidence, naming the Pod and the
+    window: the executor logs every claim, every finished command and a
+    heartbeat at INFO (``cluster_executor.executor``), so a Pod that logged
+    nothing in the window either runs below INFO (``GPU_FAULT_LOG_LEVEL``) or
+    is not the one executing. Live (ISO-001 on a576e9a6af9c): the executors
+    had logged one start-up line since boot and the refusal said only
+    "executor log window is empty".
+    """
+
+    elapsed = int((now() - since).total_seconds())
+    window = max(60, min(elapsed + 60, EXECUTOR_LOG_MAX_WINDOW_SECONDS))
+    logs: dict[str, str] = {}
+    pods = regional.ready_pods("gpu", "gpu-fault-cluster-executor")
+    if not pods:
+        raise RegionalFixtureError("no Ready executor for the log window")
+    for pod in pods:
+        name = str(pod["name"])
+        logs[name] = regional.kubectl(
+            "gpu", "logs", name, f"--since={window}s", timeout=120
+        )
+        if not logs[name].strip():
+            raise RegionalFixtureError(
+                f"executor log window is empty: Pod {name} logged nothing in the "
+                f"last {window}s (since {since.isoformat()}); the executor logs "
+                "claims, finished commands and a heartbeat at INFO -- check "
+                "GPU_FAULT_LOG_LEVEL on the Deployment and that this Pod is the "
+                "one executing"
+            )
+    return logs
+
+
 def command_ids_in_logs(command_ids: Sequence[str], logs: dict[str, str]) -> list[str]:
     """Which of ``command_ids`` appear in any of the executor ``logs``."""
 

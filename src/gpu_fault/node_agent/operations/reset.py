@@ -17,6 +17,7 @@ from gpu_fault.node_agent.late_ownership import (
 from gpu_fault.node_agent.operations.holders import (
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
+    idle_display_modules,
 )
 
 MAX_RESET_BUSY_ATTEMPTS = 3
@@ -89,13 +90,55 @@ class ResetOperationsMixin:
 
     _RESET_BUSY_ATTEMPTS = MAX_RESET_BUSY_ATTEMPTS
 
+    def _release_idle_display_modules(
+        self, gpu_uuids: list[str], released: list[str]
+    ) -> bool:
+        """Unload ``nvidia_drm`` / ``nvidia_modeset`` when they are the only
+        thing between a busy reset and a free GPU; appends what it unloaded to
+        ``released`` and says whether it unloaded anything.
+
+        Only when no process holds any NVIDIA device node and no compute app
+        is running (``gpu_client_holder_evidence``): a holder is a client to
+        wait for or report, not something to pull a kernel module from under.
+        The modules are loaded again after the reset (``_reload_display_modules``).
+        """
+
+        evidence = self._gpu_client_holder_evidence(gpu_uuids)
+        if evidence.get("device_holders") or evidence.get("compute_client_count"):
+            return False
+        unloaded = False
+        for module in idle_display_modules(self.proc_root):
+            require_physical_ownership()
+            self._run_checked(["rmmod", module], timeout=30)
+            released.append(module)
+            unloaded = True
+        return unloaded
+
+    def _reload_display_modules(self, released: list[str]) -> dict[str, Any]:
+        """Load the display stack this reset unloaded; evidence, never a failure."""
+
+        if not released:
+            return {}
+        details: dict[str, Any] = {"released_kernel_modules": list(released)}
+        # ``nvidia_drm`` depends on ``nvidia_modeset``: loading the outermost
+        # module restores the stack exactly as the image had it.
+        outermost = "nvidia_drm" if "nvidia_drm" in released else released[-1]
+        try:
+            self._run_checked(["modprobe", outermost], timeout=60)
+            details["reloaded_kernel_modules"] = list(released)
+        except Exception as exc:  # noqa: BLE001 - the error is the evidence
+            details["kernel_module_reload_error"] = f"{type(exc).__name__}: {exc}"
+        return details
+
     def _run_reset_with_busy_retry(
         self,
         command: list[str],
         *,
         gpu_uuids: list[str],
         timeout: int,
+        released: list[str] | None = None,
     ) -> int:
+        released = [] if released is None else released
         for attempt in range(1, self._RESET_BUSY_ATTEMPTS + 1):
             require_physical_ownership()
             try:
@@ -129,6 +172,11 @@ class ResetOperationsMixin:
                     ) from exc
                 if not busy:
                     raise
+                if self._release_idle_display_modules(gpu_uuids, released):
+                    # The DRM client was the holder; the next attempt is the
+                    # first one that can succeed, so it needs no settle time.
+                    self._verify_no_clients(gpu_uuids)
+                    continue
                 self.sleep(self.device_client_sample_interval_seconds)
                 self._verify_no_clients(gpu_uuids)
         raise AssertionError("unreachable GPU reset retry state")
@@ -200,6 +248,7 @@ class ResetOperationsMixin:
             self._reset_gpu_preflight(gpu_uuids)
         reset_attempts = 0
         completed: list[str] = []
+        released: list[str] = []
         for index, gpu_uuid in enumerate(gpu_uuids):
             try:
                 reset_attempts += self._run_reset_with_busy_retry(
@@ -211,6 +260,7 @@ class ResetOperationsMixin:
                     ],
                     gpu_uuids=[gpu_uuid],
                     timeout=120,
+                    released=released,
                 )
             except (RuntimeError, OwnershipRefused) as exc:
                 # Report the loop's progress: the GPUs already reset, the one
@@ -235,6 +285,7 @@ class ResetOperationsMixin:
                         "reset_outcome_unknown": [gpu_uuid] if unknown else [],
                         "reset_failed": [] if unknown else [gpu_uuid],
                         "reset_not_attempted": gpu_uuids[index + 1 :],
+                        **self._reload_display_modules(released),
                     },
                 ) from exc
             completed.append(gpu_uuid)
@@ -244,6 +295,7 @@ class ResetOperationsMixin:
             "reset_attempts": reset_attempts,
             "reset_successes": len(completed),
             "reset_busy_refusals": reset_attempts - len(completed),
+            **self._reload_display_modules(released),
         }
 
     def _reset_all_preflight(self, gpu_uuids: list[str]) -> list[str]:
@@ -280,11 +332,16 @@ class ResetOperationsMixin:
     ) -> dict[str, Any]:
         with self._pre_spawn_guard(window_claimed=window_claimed):
             local_inventory = self._reset_all_preflight(gpu_uuids)
-        reset_attempts = self._run_reset_with_busy_retry(
-            ["nvidia-smi", "--gpu-reset"],
-            gpu_uuids=local_inventory,
-            timeout=180,
-        )
+        released: list[str] = []
+        try:
+            reset_attempts = self._run_reset_with_busy_retry(
+                ["nvidia-smi", "--gpu-reset"],
+                gpu_uuids=local_inventory,
+                timeout=180,
+                released=released,
+            )
+        finally:
+            reload = self._reload_display_modules(released)
         observed_after = self._gpu_inventory()
         if observed_after != local_inventory:
             raise RuntimeError(
@@ -301,6 +358,7 @@ class ResetOperationsMixin:
             "reset_attempts": reset_attempts,
             "reset_successes": 1,
             "reset_busy_refusals": reset_attempts - 1,
+            **reload,
         }
 
     @final_ownership_boundary

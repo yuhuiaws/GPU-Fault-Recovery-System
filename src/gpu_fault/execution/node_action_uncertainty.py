@@ -21,6 +21,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
 from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY, RemoteCommandStatus
+from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
@@ -434,11 +435,19 @@ def unrestored_quiesces(
             else workflow.official_steps
         )
     completed = set(workflow.completed_step_indexes)
+    # A quiesce that did not complete can still have tainted its node: the
+    # eks-managed taint goes on before the agent is told, so a quiesce that
+    # failed or timed out afterwards (live: VERIFY window expired, ladder
+    # climbed) owes the node its untaint as much as a completed one owes the
+    # restore. The step record says which nodes it tainted and which it already
+    # untainted itself.
+    tainted = quiesce_taint_nodes_held(workflow)
     owed: list[tuple[int, WorkflowStepSpec, frozenset[str]]] = []
     for quiesce_index, quiesce in enumerate(steps):
-        if (
-            quiesce_index not in completed
-            or quiesce.operation is not WorkflowOperation.QUIESCE_GPU_SERVICES
+        if quiesce.operation is not WorkflowOperation.QUIESCE_GPU_SERVICES:
+            continue
+        if quiesce_index not in completed and not tainted.intersection(
+            quiesce.node_ids
         ):
             continue
         restored: set[str] = set()
@@ -452,7 +461,11 @@ def unrestored_quiesces(
                 )
             ):
                 restored.update(restore.node_ids)
-        unrestored = frozenset(quiesce.node_ids) - restored
+        unrestored = (
+            frozenset(quiesce.node_ids)
+            if quiesce_index in completed
+            else frozenset(tainted.intersection(quiesce.node_ids))
+        ) - restored
         if unrestored:
             owed.append((quiesce_index, quiesce, unrestored))
     return owed

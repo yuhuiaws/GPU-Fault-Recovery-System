@@ -59,6 +59,7 @@ from gpu_fault.regional_compatibility import (
     REMOTE_STEP_BATCHING_PROTOCOL_VERSION,
     RegionalExecutorCompatibilityPolicy,
 )
+from gpu_fault.orchestration.escalation import escalation_descends_from
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import RawEvidenceRecord
 from gpu_fault.workflow_quarantine import has_terminal_quarantine_hold
@@ -534,6 +535,7 @@ async def get_remote_hyperpod_submission(
 @authorization_bucket("cluster-token")
 async def get_remote_incident_ownership(
     incident_id: str,
+    successor_workflow_id: str | None = None,
     cluster_id: str | None = Header(
         default=None,
         alias="X-GPU-Fault-Cluster-ID",
@@ -541,11 +543,27 @@ async def get_remote_incident_ownership(
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> RemoteIncidentOwnershipReport:
     cluster_id = _require_cluster(cluster_id)
+    store = dependencies.context.store
+
+    def lineage() -> bool | None:
+        # Only a workflow of the authenticated cluster may be named as the
+        # asking successor; anything else reads as "not a descendant".
+        if not successor_workflow_id:
+            return None
+        try:
+            successor = store.get_incident(
+                store.get_workflow(successor_workflow_id).incident_id
+            )
+        except (NotFoundError, KeyError):
+            return False
+        if successor.cluster_id != cluster_id:
+            return False
+        return escalation_descends_from(store, successor_workflow_id, incident_id)
 
     def lookup() -> RemoteIncidentOwnershipReport:
         unknown = RemoteIncidentOwnershipReport(incident_id=incident_id)
         try:
-            incident = dependencies.context.store.get_incident(incident_id)
+            incident = store.get_incident(incident_id)
         except (NotFoundError, KeyError):
             return unknown
         if incident.cluster_id != cluster_id:
@@ -558,9 +576,7 @@ async def get_remote_incident_ownership(
         if not incident.workflow_request_id:
             return unknown
         try:
-            workflow = dependencies.context.store.get_workflow(
-                incident.workflow_request_id
-            )
+            workflow = store.get_workflow(incident.workflow_request_id)
         except (NotFoundError, KeyError):
             return RemoteIncidentOwnershipReport(
                 incident_id=incident_id,
@@ -590,6 +606,7 @@ async def get_remote_incident_ownership(
             incident_state=incident.state.value,
             quarantine_hold=quarantine_hold,
             terminal_quarantine=terminal_quarantine,
+            escalation_lineage=lineage(),
         )
 
     return await _store_call(dependencies, lookup)

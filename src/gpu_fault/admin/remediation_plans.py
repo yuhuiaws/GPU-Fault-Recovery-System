@@ -46,7 +46,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, cast
 
-from gpu_fault.adapters.common import ANNOTATION_INCIDENT, QUARANTINE_TAINT
+from gpu_fault.adapters.common import (
+    ANNOTATION_INCIDENT,
+    QUARANTINE_TAINT,
+    QUIESCE_TAINT,
+)
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.execution.node_action_confirmation import (
     AgentEvidence,
@@ -142,14 +146,22 @@ class RestorePlan:
         }
 
 
-def _quarantine_taint(node: Mapping[str, Any]) -> str | None:
+def _taint_value(node: Mapping[str, Any], key: str) -> str | None:
     spec = node.get("spec")
     if not isinstance(spec, dict):
         return None
     for item in spec.get("taints") or []:
-        if isinstance(item, dict) and item.get("key") == QUARANTINE_TAINT:
+        if isinstance(item, dict) and item.get("key") == key:
             return str(item.get("value") or "")
     return None
+
+
+def _quarantine_taint(node: Mapping[str, Any]) -> str | None:
+    return _taint_value(node, QUARANTINE_TAINT)
+
+
+def _quiesce_taint(node: Mapping[str, Any]) -> str | None:
+    return _taint_value(node, QUIESCE_TAINT)
 
 
 def _node_annotations(node: Mapping[str, Any]) -> dict[str, Any]:
@@ -176,16 +188,36 @@ def node_restore_decision(
     owner = annotations.get(ANNOTATION_INCIDENT)
     owner = str(owner) if owner else None
     taint = _quarantine_taint(node)
+    quiesce = _quiesce_taint(node)
     spec = node.get("spec")
     decision: dict[str, Any] = {
         "node_id": node_id,
         "quarantine_taint_value": taint,
+        "quiesce_taint_value": quiesce,
         "incident_annotation": owner,
         "unschedulable": bool(
             isinstance(spec, dict) and spec.get("unschedulable", False)
         ),
+        "quiesce_taint_only": False,
     }
     if owner and owner != incident_id:
+        if quiesce is not None and quiesce in owned:
+            # The eks-managed quiesce taint is keyed on its own incident value,
+            # so it is this incident's even when a later incident re-isolated
+            # the node (live: the support successor's cordon over the reset
+            # chain's orphaned NoExecute taint, which evicted the exporter).
+            # The restore strips that one taint and leaves the owner's cordon.
+            reason = (
+                f"node {node_id} is isolated by incident {owner} but still carries "
+                f"the {QUIESCE_TAINT} taint of {incident_id}; the restore strips "
+                "only that taint and leaves the owner's isolation in place"
+            )
+            return {
+                **decision,
+                "decision": DECISION_RESTORE,
+                "quiesce_taint_only": True,
+                "reason": reason,
+            }
         reason = (
             f"node {node_id} is isolated by incident {owner}, not {incident_id}; "
             "its restore releases it"
@@ -209,6 +241,22 @@ def node_restore_decision(
             f"without its {QUARANTINE_TAINT} taint; the restore releases the annotation"
         )
         return {**decision, "decision": DECISION_RESTORE, "reason": reason}
+    if quiesce is not None and quiesce in owned and owner is None:
+        reason = (
+            f"node {node_id} carries the {QUIESCE_TAINT} taint of {incident_id} "
+            "and no isolation annotation; the restore strips that taint"
+            + (
+                f" and leaves the {QUARANTINE_TAINT} taint of another incident ({taint})"
+                if taint is not None and taint not in owned
+                else ""
+            )
+        )
+        return {
+            **decision,
+            "decision": DECISION_RESTORE,
+            "quiesce_taint_only": taint is None or taint not in owned,
+            "reason": reason,
+        }
     if taint is not None:
         reason = (
             f"node {node_id} is quarantined by another incident (taint {taint}), "
@@ -386,6 +434,15 @@ def build_restore_plan(
         for item in decisions
         if item["decision"] == DECISION_RESTORE
     )
+    # A node whose only isolation of this incident is the quiesce taint is not
+    # readmitted by this restore (another incident's cordon stays), so it is
+    # not validated either: VALIDATE_GPU would wait on an exporter the very
+    # taint evicts, and validating a node that stays cordoned proves nothing.
+    release_only = tuple(
+        str(item["node_id"])
+        for item in decisions
+        if item["decision"] == DECISION_RESTORE and item.get("quiesce_taint_only")
+    )
     inventory = inspection.get("node_gpu_uuids")
     _, preview = build_validated_restore_workflow(
         record,
@@ -394,6 +451,7 @@ def build_restore_plan(
         now=stamp,
         node_ids=list(restore_nodes) or None,
         node_gpu_uuids=inventory if isinstance(inventory, Mapping) else None,
+        release_only_node_ids=list(release_only),
     )
     warnings = tuple(
         f"node {item['node_id']} is cordoned without gpu-fault isolation metadata of "

@@ -736,10 +736,17 @@ class RegionalIncidentOwnershipProvider:
     def __init__(self, client: RegionalExecutorClient) -> None:
         self.client = client
 
-    def incident_ownership(self, incident_id: str) -> RemoteIncidentOwnershipReport:
+    def incident_ownership(
+        self, incident_id: str, *, successor_workflow_id: str | None = None
+    ) -> RemoteIncidentOwnershipReport:
+        """The owner's hold; with ``successor_workflow_id`` also whether that
+        workflow descends from the owner by escalation (``escalation_lineage``)."""
+
+        query: dict[str, str] = {"incident_id": incident_id}
+        if successor_workflow_id:
+            query["successor_workflow_id"] = successor_workflow_id
         response = self.client._get(
-            "/v1/regional/executors/incident-ownership?"
-            + urlencode({"incident_id": incident_id})
+            "/v1/regional/executors/incident-ownership?" + urlencode(query)
         )
         if not response:
             return RemoteIncidentOwnershipReport(incident_id=incident_id)

@@ -309,10 +309,49 @@ def test_replace_in_place_keeps_the_predecessor_pointer_and_the_lifetime():
     assert winner is candidate_incident
     assert workflow.request_id == "wf-a"
     assert workflow.incident_id == "inc-a"
-    assert workflow.fencing_token == existing.fencing_token + 1
+    assert workflow.fencing_token == existing.fencing_token, (
+        "a queued successor shares its predecessor's generation; bumping it "
+        "fenced the predecessor still RUNNING under that generation"
+    )
     assert workflow.predecessor_workflow_id == "wf-0"
     assert workflow.lifetime_deadline_at == lifetime
     assert workflow.official_steps[0].operation is WorkflowOperation.RESTART_NODE
+
+
+def test_replace_in_place_bumps_the_generation_only_without_a_predecessor():
+    """The bump fences the replaced plan's commands. A pristine record with no
+    predecessor is the incident's only plan, so the bump costs nothing; a queued
+    successor's generation is its RUNNING predecessor's, and moving the
+    incident past it is what refused the reset chain's reboot rung and restore
+    compensation live ("command fencing token does not match")."""
+
+    candidate = workflow_request(
+        "wf-b",
+        "inc-b",
+        official_steps=[
+            workflow_step(WorkflowOperation.RESTART_NODE, node_ids=["node-a"])
+        ],
+    )
+    alone = _reset_workflow("wf-a", "node-a", ["GPU-1"], status=WorkflowStatus.PENDING)
+    queued = copy_model(alone, predecessor_workflow_id="wf-running")
+
+    def replaced(existing: WorkflowRequest) -> WorkflowRequest:
+        workflow, _ = _applier().apply(
+            Disposition.REPLACE_IN_PLACE,
+            node_id="node-a",
+            candidate=fault_incident("inc-b", "event-b"),
+            candidate_workflow=candidate,
+            existing_incident=fault_incident("inc-a", "event-a"),
+            existing_workflow=existing,
+            gpu_uuids={"GPU-1"},
+            mutable=True,
+            now=NOW,
+        )
+        return workflow
+
+    assert replaced(alone).fencing_token == alone.fencing_token + 1
+    assert replaced(queued).fencing_token == queued.fencing_token
+    assert replaced(queued).predecessor_workflow_id == "wf-running"
 
 
 # ------------------------------------------------------------ QUEUE_BRANCH_SUCCESSOR

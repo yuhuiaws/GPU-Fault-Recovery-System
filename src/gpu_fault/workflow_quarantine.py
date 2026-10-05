@@ -22,6 +22,40 @@ from gpu_fault.recovery_safety import unresolved_details
 TERMINAL_QUARANTINE_NODES = "terminal_quarantine_node_ids"
 
 
+#: Step details the node-action adapter writes when it taints a node for the
+#: eks-managed quiesce window and when it removes that taint again.
+QUIESCE_TAINT_NODES_DETAIL = "quiesce_taint_nodes"
+QUIESCE_TAINT_REMOVED_NODES_DETAIL = "quiesce_taint_removed_nodes"
+
+
+def _detail_nodes(details: object, key: str) -> set[str]:
+    value = details.get(key) if isinstance(details, dict) else None
+    return {str(item) for item in value} if isinstance(value, list) else set()
+
+
+def quiesce_taint_nodes_held(workflow: WorkflowRequest) -> set[str]:
+    """Nodes whose ``gpu-fault.io/quiesce`` taint ``workflow`` applied and has
+    not recorded removing.
+
+    Read from the step records: a QUIESCE_GPU_SERVICES execution lists the nodes
+    it tainted (``quiesce_taint_nodes``, whatever the step's outcome -- a
+    quiesce that failed after the taint went on records it too), and a later
+    record -- the RESTORE_GPU_SERVICES, or the failed quiesce's own cleanup --
+    lists the nodes it untainted (``quiesce_taint_removed_nodes``). What is left
+    is a taint this workflow still owes the node. Other workflows' taints are
+    not visible here: a value that matches the incident but is held by no step
+    of the asking workflow is an older generation's leftover.
+    """
+
+    held: set[str] = set()
+    removed: set[str] = set()
+    for execution in workflow.step_executions:
+        if execution.operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
+            held |= _detail_nodes(execution.details, QUIESCE_TAINT_NODES_DETAIL)
+        removed |= _detail_nodes(execution.details, QUIESCE_TAINT_REMOVED_NODES_DETAIL)
+    return held - removed
+
+
 def fixed_quarantine_nodes(step: WorkflowStepSpec) -> frozenset[str]:
     raw = step.parameters.get(TERMINAL_QUARANTINE_NODES, [])
     if (
