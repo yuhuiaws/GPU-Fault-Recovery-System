@@ -47,6 +47,12 @@ _VALIDATION_OPERATIONS = frozenset(
         WorkflowOperation.VALIDATE_FABRIC,
     }
 )
+# The node actions a validation judges: the reset, reboot, replacement,
+# remediation or diagnostic that ran before it. A failed validation escalates
+# the nodes one of these acted on, never a sibling the step merely checked.
+_RECOVERY_ACTION_OPERATIONS = (
+    HARDWARE_ESCALATION_RELEVANT_OPERATIONS - _VALIDATION_OPERATIONS
+)
 # Containment and release steps. Their failure is not a hardware rung but it
 # is not nothing either: a node whose RESTORE_SCHEDULING failed stays
 # cordoned until someone acts, so the failure goes to an operator (F-H1).
@@ -149,6 +155,52 @@ def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     return details is not None and any(
         details.get(flag) is True for flag in _UNKNOWN_OUTCOME_FLAGS
     )
+
+
+def _acted_nodes(workflow: WorkflowRequest, before_index: int) -> set[str]:
+    """Nodes a recovery action ran on before step ``before_index``."""
+
+    steps = workflow.official_steps
+    return {
+        node_id
+        for execution in workflow.step_executions
+        if execution.operation in _RECOVERY_ACTION_OPERATIONS
+        and 0 <= execution.step_index < min(before_index, len(steps))
+        for node_id in steps[execution.step_index].node_ids
+    }
+
+
+def _failed_step_nodes(
+    workflow: WorkflowRequest,
+    execution: WorkflowStepExecution,
+    step_nodes: list[str],
+) -> list[str]:
+    """The nodes a failed step escalates.
+
+    The step's ``failed_nodes`` when it reported them; the ``pending_nodes``
+    of a step the per-step cap failed (its last WAITING details are what it
+    keeps); else every node of the step. A failed *validation* is narrowed to
+    the nodes the recovery action acted on: after a merge the validation
+    names siblings the fault never touched, and the rung it fails into is a
+    hardware action on the acted node, not on the sibling (live 2026-10-05: a
+    RESET_GPU on one node escalated to a reboot that cordoned two).
+    """
+
+    reported = execution.details.get("failed_nodes")
+    if not isinstance(reported, list):
+        reported = execution.details.get("pending_nodes")
+    selected = (
+        [node_id for node_id in reported if node_id in step_nodes]
+        if isinstance(reported, list)
+        else list(step_nodes)
+    ) or list(step_nodes)
+    if execution.operation in _VALIDATION_OPERATIONS:
+        acted = _acted_nodes(workflow, execution.step_index) & set(step_nodes)
+        if acted:
+            selected = [node_id for node_id in selected if node_id in acted] or sorted(
+                acted
+            )
+    return selected
 
 
 def _unknown_outcome_failures(
@@ -687,14 +739,7 @@ class HardwareEscalationService:
                 if execution.step_index < len(workflow.official_steps)
                 else source.node_ids
             )
-            reported = execution.details.get("failed_nodes")
-            selected = (
-                [node_id for node_id in reported if node_id in step_nodes]
-                if isinstance(reported, list)
-                else list(step_nodes)
-            )
-            if not selected:
-                selected = list(step_nodes)
+            selected = _failed_step_nodes(workflow, execution, list(step_nodes))
             failed_nodes.update(selected)
             reported_failures = execution.details.get("node_failures", {})
             for node_id in selected:

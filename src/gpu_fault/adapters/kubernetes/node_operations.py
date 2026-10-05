@@ -447,6 +447,18 @@ class KubernetesNodeOperationsMixin:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     def _isolate(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        # One ownership verdict per incident for the whole step: the pre-check
+        # and the patch ask the same question (a remote lookup each, storeless).
+        ownership: dict[str, tuple[bool, bool]] = {}
+        refusal = isolation_refusal(
+            self.core,
+            lambda node, step_context: self._node_isolation_patch(
+                node, step_context, ownership
+            ),
+            context,
+        )
+        if refusal is not None:
+            return refusal
         baselines: dict[str, dict[str, Any]] = {}
         conflicts: list[str] = []
         for node_id in context.step.node_ids:
@@ -457,16 +469,19 @@ class KubernetesNodeOperationsMixin:
             def isolation_body(node: Any) -> dict[str, Any]:
                 before.clear()
                 before.update(node_scheduling_snapshot(node))
-                return self._node_isolation_patch(node, context)
+                return self._node_isolation_patch(node, context, ownership)
 
             try:
                 patch_node_with_retry(self.core, node_id, isolation_body)
             except NodeIsolationRejected as exc:
+                # Refused after the pre-check (the node moved between reads):
+                # the nodes already cordoned keep the incident QUARANTINED.
                 return WorkflowStepOutcome.failed(
                     str(exc),
                     details={
                         "safety_rejection": True,
                         "node_id": node_id,
+                        "isolated_nodes": sorted(baselines),
                     },
                 )
             except NodePatchConflict:
@@ -474,18 +489,7 @@ class KubernetesNodeOperationsMixin:
                 continue
             except Exception as exc:
                 if getattr(exc, "status", None) == 404:
-                    # A node this workflow must isolate is not there to be
-                    # isolated. Calling that "already isolated" was memory
-                    # standing in for observation; nothing downstream can
-                    # verify a node that cannot be read.
-                    return WorkflowStepOutcome.failed(
-                        f"node {node_id} is absent; isolation cannot be observed",
-                        details={
-                            "safety_rejection": True,
-                            "node_id": node_id,
-                            "absent": True,
-                        },
-                    )
+                    return absent_node_failure(node_id, sorted(baselines))
                 raise
             baselines[node_id] = {
                 "before": dict(before),
@@ -749,8 +753,15 @@ class KubernetesNodeOperationsMixin:
         node: Any,
         incident_id: str,
         context: WorkflowStepContext,
+        ownership: dict[str, tuple[bool, bool]] | None = None,
     ) -> bool:
-        terminal, quarantine_hold = self._incident_ownership(incident_id)
+        if ownership is None or incident_id not in ownership:
+            verdict = self._incident_ownership(incident_id)
+            if ownership is not None:
+                ownership[incident_id] = verdict
+        else:
+            verdict = ownership[incident_id]
+        terminal, quarantine_hold = verdict
         if not terminal:
             return False
         if not quarantine_hold:
@@ -761,7 +772,10 @@ class KubernetesNodeOperationsMixin:
         )
 
     def _node_isolation_patch(
-        self, node: Any, context: WorkflowStepContext
+        self,
+        node: Any,
+        context: WorkflowStepContext,
+        ownership: dict[str, tuple[bool, bool]] | None = None,
     ) -> dict[str, Any]:
         annotations = self._annotations(node)
         existing_incident = annotations.get(ANNOTATION_INCIDENT)
@@ -795,14 +809,14 @@ class KubernetesNodeOperationsMixin:
                 or (
                     existing_incident != context.incident.incident_id
                     and self._can_take_over_node_isolation(
-                        node, existing_incident, context
+                        node, existing_incident, context, ownership
                     )
                 )
                 or (
                     existing_incident == context.incident.incident_id
                     and existing_fencing_token is None
                     and self._can_take_over_node_isolation(
-                        node, existing_incident, context
+                        node, existing_incident, context, ownership
                     )
                 )
             )
@@ -858,3 +872,55 @@ class KubernetesNodeOperationsMixin:
                 "taints": taints,
             },
         }
+
+
+def absent_node_failure(node_id: str, isolated: list[str]) -> WorkflowStepOutcome:
+    """A node this workflow must isolate is not there to be isolated.
+
+    Calling that "already isolated" was memory standing in for observation;
+    nothing downstream can verify a node that cannot be read.
+    """
+
+    return WorkflowStepOutcome.failed(
+        f"node {node_id} is absent; isolation cannot be observed",
+        details={
+            "safety_rejection": True,
+            "node_id": node_id,
+            "absent": True,
+            "isolated_nodes": isolated,
+        },
+    )
+
+
+def isolation_refusal(
+    core: Any,
+    build_patch: Callable[[Any, WorkflowStepContext], dict[str, Any]],
+    context: WorkflowStepContext,
+) -> WorkflowStepOutcome | None:
+    """Judge every node of an isolation step before any of them is patched.
+
+    A multi-node isolation used to cordon its nodes one by one and stop at the
+    first refusal, leaving the earlier nodes isolated under a step that FAILED
+    (live 2026-10-05: a reboot successor cordoned a healthy sibling, was
+    refused on the node its predecessor still owned, and ended ESCALATED with
+    the sibling's isolation orphaned). The refusal is the one the patch would
+    raise; it is only raised before anything is written.
+    """
+
+    for node_id in context.step.node_ids:
+        try:
+            build_patch(core.read_node(node_id), context)
+        except NodeIsolationRejected as exc:
+            return WorkflowStepOutcome.failed(
+                str(exc),
+                details={
+                    "safety_rejection": True,
+                    "node_id": node_id,
+                    "isolated_nodes": [],
+                },
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return absent_node_failure(node_id, [])
+            raise
+    return None

@@ -497,7 +497,11 @@ class GpuValidationAdapter:
             missing.extend(missing_fabric_metric_groups(names))
         # The node-wide union above lets a sibling GPU answer for one that
         # fell off the bus after RESET_GPU. When the step names its GPUs,
-        # every one of them must have reported for itself.
+        # every one of them must have reported for itself -- on the node that
+        # owns it: a multi-node step carries the union of its nodes' GPUs
+        # (a merge widens validation across the faulted nodes), and a node
+        # can never report a sibling's GPU (live 2026-10-05: that wait only
+        # ended at the per-step cap and escalated a healthy node to a reboot).
         by_gpu: dict[str, list[str]] = {}
         if required and context.step.gpu_uuids:
             fresh_by_gpu: dict[str, set[str]] = {}
@@ -507,7 +511,7 @@ class GpuValidationAdapter:
                     fresh_by_gpu.setdefault(str(gpu_uuid), set()).add(
                         item.sample.canonical_name
                     )
-            for gpu_uuid in dict.fromkeys(context.step.gpu_uuids):
+            for gpu_uuid in self._node_gpu_targets(context, node_id, latest):
                 gpu_missing = sorted(required - fresh_by_gpu.get(gpu_uuid, set()))
                 if gpu_missing:
                     by_gpu[gpu_uuid] = gpu_missing
@@ -519,6 +523,33 @@ class GpuValidationAdapter:
         if by_gpu:
             pending["missing_recent_metrics_by_gpu"] = by_gpu
         return pending
+
+    @staticmethod
+    def _node_gpu_targets(context, node_id, latest) -> list[str]:
+        """The step's GPUs this node answers for.
+
+        A single-node step answers for every GPU it names (unchanged). A
+        multi-node step answers per node: the node's entry in
+        ``gpu_uuids_by_node`` when the step carries one, else the GPUs the
+        node has ever reported -- a GPU that fell off the bus is still in its
+        latest samples and stays required; a sibling's GPU never appears and
+        is not. A node owning none of them validates node-wide.
+        """
+
+        targets = list(dict.fromkeys(context.step.gpu_uuids))
+        if len(context.step.node_ids) <= 1:
+            return targets
+        mapping = context.step.parameters.get("gpu_uuids_by_node")
+        owned: set[str]
+        if isinstance(mapping, dict) and isinstance(mapping.get(node_id), list):
+            owned = {str(value) for value in mapping[node_id]}
+        else:
+            owned = {
+                str(gpu_uuid)
+                for item in latest
+                if (gpu_uuid := getattr(item.sample, "gpu_uuid", None))
+            }
+        return [gpu_uuid for gpu_uuid in targets if gpu_uuid in owned]
 
     def _validate_fabric_metrics(self, latest, node_id, failures):
         link_states = [item.value for item in latest if item.name == "network_link_up"]

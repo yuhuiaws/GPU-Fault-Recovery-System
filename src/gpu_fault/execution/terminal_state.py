@@ -20,6 +20,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepStatus,
     bounded_reasons,
     record_workflow_event,
 )
@@ -58,11 +59,23 @@ def diagnostic_only(workflow: WorkflowRequest) -> bool:
     )
 
 
+_ISOLATION_OPERATIONS = frozenset(
+    {WorkflowOperation.MARK_UNSCHEDULABLE, WorkflowOperation.QUARANTINE}
+)
+
+
 def failure_incident_state(workflow: WorkflowRequest) -> IncidentState:
-    if {
-        WorkflowOperation.MARK_UNSCHEDULABLE,
-        WorkflowOperation.QUARANTINE,
-    }.intersection(workflow.completed_operations):
+    if _ISOLATION_OPERATIONS.intersection(workflow.completed_operations):
+        return IncidentState.QUARANTINED
+    if any(
+        execution.operation in _ISOLATION_OPERATIONS
+        and execution.status is WorkflowStepStatus.FAILED
+        and execution.details.get("isolated_nodes")
+        for execution in workflow.step_executions
+    ):
+        # An isolation that failed after cordoning some of its nodes still
+        # holds those nodes: the record says QUARANTINED so the operator exit
+        # is the validated restore, not a close that orphans the isolation.
         return IncidentState.QUARANTINED
     if diagnostic_only(workflow):
         return IncidentState.RECOVERED
@@ -144,6 +157,18 @@ def terminal_decision(
         and incident_state is None
         and diagnostic_only(ended)
     )
+    if status is WorkflowStatus.FAILED and reason and not ended.terminal_failure_reason:
+        # The reason is the record's, not only the audit event's: the API, the
+        # acceptance verdicts and the failure handler read the field (live
+        # 2026-10-05 both records of a reset-to-reboot chain ended FAILED with
+        # the field None and the reason only in the TERMINAL event).
+        ended = ended.model_copy(
+            update={
+                "terminal_failure_reason": (
+                    inconclusive_reason(reason) if inconclusive else reason
+                )
+            }
+        )
     if incident is not None:
         update: dict[str, Any] = {"state": derived_state, "updated_at": now}
         if inconclusive:
