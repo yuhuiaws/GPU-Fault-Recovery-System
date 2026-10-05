@@ -43,7 +43,7 @@ data:
   GPU_FAULT_REGISTRY_POLL_SECONDS: '1'
   GPU_FAULT_REGISTRY_STALE_SECONDS: '90'
   GPU_FAULT_REMOTE_EXECUTION_OWNERS: gpu-fault-kubernetes-adapter, gpu-fault-node-agent,
-    gpu-fault-hyperpod-adapter
+    gpu-fault-hyperpod-adapter, gpu-fault-eks-adapter
   GPU_FAULT_REMOTE_STEP_BATCHING: 'true'
   GPU_FAULT_REQUEST_BUDGET_SECONDS: '15'
   GPU_FAULT_REQUIRED_AGENT_VERSION: 0.10.0

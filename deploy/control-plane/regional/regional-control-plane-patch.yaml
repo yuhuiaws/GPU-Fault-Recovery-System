@@ -183,11 +183,19 @@ spec:
               value: "true"
             - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
               value: "false"
+            # Every owner a GPU cluster executor can advertise, for both
+            # providers: a step owned by gpu-fault-eks-adapter (RESTART_NODE,
+            # REPLACE_NODE on a plain EKS cluster) is a remote command for that
+            # cluster's executor. Left out, the control worker executed it
+            # itself and failed every rung with "expected exactly one adapter
+            # for gpu-fault-eks-adapter/RESTART_NODE; found 0" (live
+            # 2026-10-05, gpu-eks-cluster, XID 46 escalation).
             - name: GPU_FAULT_REMOTE_EXECUTION_OWNERS
               value: >-
                 gpu-fault-kubernetes-adapter,
                 gpu-fault-node-agent,
-                gpu-fault-hyperpod-adapter
+                gpu-fault-hyperpod-adapter,
+                gpu-fault-eks-adapter
           # Liveness is process-local: /livez never touches Aurora or the
           # registry, so a writer failover makes Pods NotReady (readiness stays
           # on /healthz) without restarting them into a start-up that needs

@@ -1424,3 +1424,41 @@ def test_rendered_alertmanager_passes_the_live_verifier_with_the_drill_sink(
     path.write_text(leaky, encoding="utf-8")
     defects, _receivers = verifier.alertmanager_defects(path)
     assert any("drops alerts into sink" in item for item in defects), defects
+
+
+def test_remote_execution_owners_cover_every_provider_reboot_owner() -> None:
+    """Each provider's lifecycle owner is a remote owner on the control plane.
+
+    Live 2026-10-05 (gpu-eks-cluster, XID 46): the reset's RESTART_NODE rung is
+    owned by gpu-fault-eks-adapter, which the shipped list did not name, so the
+    control worker tried to run it itself and failed with "expected exactly one
+    adapter for gpu-fault-eks-adapter/RESTART_NODE; found 0". The patch is the
+    source and the three generated ``-config-core`` ConfigMaps are what the
+    Pods read, so all four are pinned.
+    """
+    from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
+
+    def owners(value: str) -> set[str]:
+        return {item.strip() for item in value.split(",") if item.strip()}
+
+    patch = (
+        ROOT / "deploy/control-plane/regional/regional-control-plane-patch.yaml"
+    ).read_text(encoding="utf-8")
+    patch_env = [
+        item
+        for document in yaml.safe_load_all(patch)
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+        for item in container(document).get("env", [])
+        if item["name"] == "GPU_FAULT_REMOTE_EXECUTION_OWNERS"
+    ]
+    assert patch_env, "the regional patch sets GPU_FAULT_REMOTE_EXECUTION_OWNERS"
+    expected = set(PROVIDER_NODE_REBOOT_OWNERS.values())
+    for item in patch_env:
+        assert expected <= owners(item["value"]), item
+    for name in (
+        "gpu-fault-api-ha-config-core",
+        "gpu-fault-control-worker-config-core",
+        "gpu-fault-telemetry-spool-worker-config-core",
+    ):
+        data = load(GENERATED / f"{name}.yaml")["data"]
+        assert expected <= owners(data["GPU_FAULT_REMOTE_EXECUTION_OWNERS"]), name
