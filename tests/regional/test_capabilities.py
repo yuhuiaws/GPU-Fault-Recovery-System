@@ -183,7 +183,9 @@ def test_config_has_no_multi_profile_payload() -> None:
     ]
 
 
-def test_regional_eks_safe_profile_owns_reboot_only_through_the_eks_adapter() -> None:
+def test_regional_eks_safe_profile_owns_reboot_and_replace_through_the_eks_adapter() -> (
+    None
+):
     hyperpod = yaml.safe_load(
         (
             ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
@@ -208,9 +210,12 @@ def test_regional_eks_safe_profile_owns_reboot_only_through_the_eks_adapter() ->
         "gpu-fault-eks-adapter",
     )
     assert modes[CapabilityName.NODE_REPLACE] == (
-        CapabilityMode.OBSERVE,
+        CapabilityMode.OWN,
         "gpu-fault-eks-adapter",
-    )
+    ), "nodeReplace is the warm-spare handover the EKS executor's coordinator runs"
+    observed = {item["capability"]: item["version"] for item in payload["observed"]}
+    assert observed["nodeReplace"] == "warm-spare-v1"
+    assert observed["nodeReboot"] == "ec2-reboot-v1"
     # No HyperPod health-monitoring-agent on a plain EKS cluster.
     assert "hyperpod-hma" not in {claim["owner"] for claim in payload["claims"]}
     # Everything else is the HyperPod profile, claim for claim.

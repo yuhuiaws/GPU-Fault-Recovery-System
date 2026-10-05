@@ -16,6 +16,7 @@ from gpu_fault.adapters import HyperPodLifecycleStepAdapter
 from gpu_fault.eks_provider import EKS_ADAPTER_OWNER
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.fleet import AgentLifecycleState
+from gpu_fault.hyperpod import HyperPodAction
 from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
 from gpu_fault.node_provider import EKS_REBOOT_CONFIRMATION_SOURCE
 from gpu_fault.store import InMemoryStore
@@ -24,6 +25,7 @@ from tests.eks_provider._support import (
     CLUSTER_ID,
     INSTANCE_A,
     NODE_A,
+    NODE_B,
     FakeCore,
     FakeEc2,
     default_instances,
@@ -274,3 +276,101 @@ def test_a_node_whose_instance_is_gone_is_not_rebooted() -> None:
     assert "non-actionable EC2 state" in outcome.error
     assert f"{NODE_A}:NotFound" in outcome.error
     assert harness.ec2.reboots == []
+
+
+def test_a_warm_spare_only_replace_passes_the_eks_preflight_without_a_coordinator() -> (
+    None
+):
+    """HEALTHY_WARM_SPARE_ONLY reads the cluster, never the REPLACE allowlist.
+
+    Without a coordinator the step still fails closed -- on the coordinator,
+    not on "no provider node replacement", which would hide that the handover
+    path exists on plain EKS.
+    """
+
+    harness = Harness(WorkflowOperation.REPLACE_NODE)
+    step = harness.context.step.model_copy(
+        update={"parameters": {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}}
+    )
+    context = WorkflowStepContext(
+        workflow=harness.workflow.model_copy(update={"official_steps": [step]}),
+        incident=harness.incident,
+        step=step,
+        step_index=0,
+        request=harness.context.request,
+        idempotency_key=harness.context.idempotency_key,
+    )
+
+    outcome = harness.adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert outcome.error == (
+        "healthy warm-spare replacement is required but the spare coordinator is disabled"
+    )
+    assert harness.ec2.reboots == []
+    assert (
+        harness.provider.preflight(
+            HyperPodAction.REPLACE, [NODE_A], isolation_verified_nodes=[NODE_A]
+        ).safe_to_submit
+        is False
+    ), "a provider replacement is still refused outright"
+
+
+def test_a_warm_spare_handover_on_eks_moves_the_workload_without_ec2() -> None:
+    """The HyperPod warm-spare path, with the EKS provider behind it.
+
+    The coordinator hands the step a declared spare, the Kubernetes adapter
+    isolates it, the node agent snapshot confirms it, and no EC2 call is made:
+    ``provider_mutation_submitted`` is False and the confirmation source is the
+    running spare.
+    """
+    from gpu_fault.hyperpod_spares import SpareAllocation
+    from tests.execution._support import (
+        FakeSpareCoordinator,
+        RecordingNodeActionAdapter,
+    )
+
+    harness = Harness(WorkflowOperation.REPLACE_NODE)
+    spares = FakeSpareCoordinator(
+        SpareAllocation(
+            applicable=True, sufficient=True, required=1, selected_node_ids=(NODE_B,)
+        )
+    )
+    node_actions = RecordingNodeActionAdapter({NODE_B: "https://spare:9099"})
+    adapter = HyperPodLifecycleStepAdapter(
+        harness.provider,
+        owner=EKS_ADAPTER_OWNER,
+        registry=harness.registry,
+        spare_coordinator=spares,
+        node_action_adapter=node_actions,
+        kubernetes_adapter=harness.scheduler,
+        store=harness.store,
+        post_reboot_stabilization_seconds=0,
+    )
+    step = harness.context.step.model_copy(
+        update={"parameters": {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}}
+    )
+    context = WorkflowStepContext(
+        workflow=harness.workflow.model_copy(update={"official_steps": [step]}),
+        incident=harness.incident,
+        step=step,
+        step_index=0,
+        request=harness.context.request,
+        idempotency_key=harness.context.idempotency_key,
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome.error
+    details = outcome.details or {}
+    assert details["action"] == "SPARE_FAILOVER"
+    assert details["activated_spare_nodes"] == [NODE_B]
+    assert details["node_rebindings"] == {NODE_A: NODE_B}
+    assert details["provider_mutation_submitted"] is False
+    assert details["confirmation_source"] == "healthy-running-warm-spare"
+    assert harness.ec2.reboots == [], "a handover never touches EC2"
+    assert spares.calls[0]["local_only"] is True, "spares are read from Kubernetes"
+    assert [item.step.operation for item in node_actions.contexts] == [
+        WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT
+    ]
+    assert node_actions.contexts[0].step.node_ids == [NODE_B]

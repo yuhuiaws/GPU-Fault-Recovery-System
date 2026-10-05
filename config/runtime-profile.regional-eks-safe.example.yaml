@@ -2,7 +2,8 @@
 # 区域生产 profile；术语映射见 config/README.md。与 regional-hyperpod-safe 的差别只有
 # 节点生命周期：nodeReboot 由 gpu-fault-eks-adapter OWN（executor 对绑定的 EC2 实例
 # 调用 RebootInstances，确认条件为 EC2 state running + 新 Agent incarnation/boot_id），
-# nodeReplace 保持 OBSERVE（纯 EKS 没有 provider 侧替换，也不启用 warm-spare）。
+# nodeReplace 由 gpu-fault-eks-adapter OWN 为 warm-spare 交接（observed warm-spare-v1）：
+# 纯 EKS 没有 provider 侧替换，REPLACE_NODE 只把工作负载交接到已声明的热备节点。
 # 没有 HyperPod health-monitoring-agent，因此不声明 hyperpod-hma 的 gpuDetection /
 # providerHealthIsolation。
 # 每个 OWN/DELEGATE 的 owner 必须由目标 GPU 集群 executor 实际构造的 adapter 广告出来：
@@ -87,11 +88,13 @@ claims:
     mode: OWN
     owner: gpu-fault-eks-adapter
     adapter: regional-cluster-executor
-  # Provider-side replacement does not exist on a plain EKS cluster and the
-  # warm-spare coordinator is HyperPod-only, so REPLACE_NODE is observed only.
+  # Provider-side replacement does not exist on a plain EKS cluster; REPLACE_NODE
+  # is the Kubernetes-level warm-spare handover (HEALTHY_WARM_SPARE_ONLY) the
+  # executor's spare coordinator runs, and fails closed without a declared spare.
   - capability: nodeReplace
-    mode: OBSERVE
+    mode: OWN
     owner: gpu-fault-eks-adapter
+    adapter: regional-cluster-executor
 observed:
   - capability: evidenceCapture
     owner: gpu-fault-control-plane
@@ -149,3 +152,7 @@ observed:
     owner: gpu-fault-eks-adapter
     available: true
     version: ec2-reboot-v1
+  - capability: nodeReplace
+    owner: gpu-fault-eks-adapter
+    available: true
+    version: warm-spare-v1

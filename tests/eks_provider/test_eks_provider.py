@@ -522,7 +522,18 @@ def test_recovery_ownership_is_reboot_only_with_no_managed_recovery() -> None:
     by_capability = {item.capability: item for item in ownership.capabilities}
     assert by_capability[CapabilityName.NODE_REBOOT].mode is CapabilityMode.OWN
     assert by_capability[CapabilityName.NODE_REBOOT].owner == EKS_ADAPTER_OWNER
-    assert by_capability[CapabilityName.NODE_REPLACE].mode is CapabilityMode.OBSERVE
+    assert by_capability[CapabilityName.NODE_REPLACE].mode is CapabilityMode.OWN, (
+        "replacement is the warm-spare handover, owned like reboot"
+    )
+    assert by_capability[CapabilityName.NODE_REPLACE].owner == EKS_ADAPTER_OWNER
+    assert by_capability[CapabilityName.NODE_REPLACE].adapter == "eks-warm-spare"
+    observed = {
+        item.capability: item.version for item in ownership.runtime_profile.observed
+    }
+    assert observed[CapabilityName.NODE_REBOOT] == "ec2-reboot-v1"
+    assert observed[CapabilityName.NODE_REPLACE] == "warm-spare-v1", (
+        "the profile's observed nodeReplace version is the handover, not EC2"
+    )
     assert by_capability[CapabilityName.WORKLOAD_RESTART].owner == (
         "gpu-fault-restart-controller"
     )

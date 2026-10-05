@@ -53,6 +53,12 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from gpu_fault.admin import operator_identity
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.cluster_scope import (
+    EKS_NODEGROUP_LABEL,
+    HYPERPOD_CLUSTER_LABEL,
+    ClusterProvider,
+    cluster_provider,
+)
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import run_command
 from gpu_fault.admin.membership_lock import (
@@ -71,6 +77,12 @@ SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
+#: The failure-domain group label per provider: HyperPod's instance group, or
+#: the EKS managed node group on a plain EKS cluster (``node_provider``).
+TOPOLOGY_GROUP_LABELS = {
+    ClusterProvider.HYPERPOD.value: INSTANCE_GROUP_LABEL,
+    ClusterProvider.EKS_MANAGED.value: EKS_NODEGROUP_LABEL,
+}
 INSTANCE_TYPE_LABELS = (
     "node.kubernetes.io/instance-type",
     "beta.kubernetes.io/instance-type",
@@ -287,9 +299,13 @@ def node_snapshot(raw: Any) -> dict[str, Any]:
                 SPARE_LABEL,
                 HYPERPOD_HEALTH_LABEL,
                 INSTANCE_GROUP_LABEL,
+                EKS_NODEGROUP_LABEL,
                 *INSTANCE_TYPE_LABELS,
             )
         },
+        # Which provider's rules apply to this node: HyperPod's health label is
+        # a gate only where the health-monitoring-agent exists.
+        "provider": node_provider_of(labels),
         "annotations": {
             key: annotations.get(key)
             for key in (
@@ -313,9 +329,26 @@ def instance_type(snapshot: Mapping[str, Any]) -> str | None:
     )
 
 
-def topology(snapshot: Mapping[str, Any]) -> dict[str, str | None]:
+def node_provider_of(labels: Mapping[str, Any]) -> str:
+    """``eks-managed`` for a node that carries only an EKS node group label."""
+
+    if labels.get(HYPERPOD_CLUSTER_LABEL) or labels.get(HYPERPOD_HEALTH_LABEL):
+        return ClusterProvider.HYPERPOD.value
+    if labels.get(EKS_NODEGROUP_LABEL):
+        return ClusterProvider.EKS_MANAGED.value
+    return ClusterProvider.HYPERPOD.value
+
+
+def topology(
+    snapshot: Mapping[str, Any], provider: str | None = None
+) -> dict[str, str | None]:
+    """The failure-domain group and instance type a spare must share with the fault."""
+
+    label = TOPOLOGY_GROUP_LABELS[
+        cluster_provider(provider or snapshot.get("provider")).value
+    ]
     return {
-        "instance_group": snapshot["labels"].get(INSTANCE_GROUP_LABEL),
+        "instance_group": snapshot["labels"].get(label),
         "instance_type": instance_type(snapshot),
     }
 
@@ -387,9 +420,17 @@ def declare_refusals(
     declared: Sequence[str],
     workloads: Sequence[Mapping[str, Any]],
     agent: AgentState,
+    provider: str | None = None,
 ) -> list[str]:
-    """Why ``node`` cannot honestly be a spare; empty means it can."""
+    """Why ``node`` cannot honestly be a spare; empty means it can.
 
+    ``provider`` defaults to the one the spare's own labels show. The HyperPod
+    health label is a gate only on HyperPod: a plain EKS node has no
+    health-monitoring-agent, so its readiness is the Kubernetes Ready condition
+    plus the Agent, and its topology is the node group and instance type.
+    """
+
+    kind = cluster_provider(provider or spare.get("provider")).value
     refusals = []
     if spare["ready"] != "True":
         refusals.append("node is not Ready")
@@ -397,8 +438,15 @@ def declare_refusals(
         # Already labeled *and* cordoned: nothing to declare. Labeled but
         # schedulable is a half-declared spare and re-declaring completes it.
         refusals.append("node is already declared as a spare and cordoned")
-    if spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
+    if (
+        kind == ClusterProvider.HYPERPOD.value
+        and spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable"
+    ):
         refusals.append("HyperPod health label is not Schedulable")
+    if kind == ClusterProvider.EKS_MANAGED.value and not spare["labels"].get(
+        EKS_NODEGROUP_LABEL
+    ):
+        refusals.append("eks-managed node carries no managed node group label")
     if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
         refusals.append("node already carries a spare reservation")
     if spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) not in {None, "AVAILABLE"}:
@@ -419,10 +467,10 @@ def declare_refusals(
     if fault is not None:
         if node == fault_node:
             refusals.append("spare and fault node are identical")
-        if topology(fault) != topology(spare):
+        if topology(fault, kind) != topology(spare, kind):
             refusals.append(
                 "topology does not match the fault node: "
-                f"{topology(fault)} vs {topology(spare)}"
+                f"{topology(fault, kind)} vs {topology(spare, kind)}"
             )
     return refusals
 
@@ -486,16 +534,23 @@ def survey(
     fault_node: str,
     cluster_id: str,
     agent_lookup: AgentLookup,
+    provider: str | None = None,
 ) -> dict[str, Any]:
-    """Everything the refusals read, gathered once; also the run's report."""
+    """Everything the refusals read, gathered once; also the run's report.
+
+    ``provider`` is the site's word for the cluster when the caller has it
+    (``run_warm_spare``); otherwise the node's labels say which rules apply.
+    """
 
     spare = node_snapshot(api.read_node(node))
+    kind = cluster_provider(provider or spare["provider"]).value
     agent = agent_lookup(cluster_id, node)
     result: dict[str, Any] = {
         "observed_at": now(),
         "cluster_id": cluster_id,
+        "provider": kind,
         "node": spare,
-        "topology": topology(spare),
+        "topology": topology(spare, kind),
         "declared_spares": declared_spares(api),
         "gpu_workloads": gpu_workloads(listed(api.list_pod_for_all_namespaces()), node),
         "agent": {"lifecycle_state": agent.lifecycle_state, "error": agent.error},
@@ -503,7 +558,7 @@ def survey(
     if fault_node:
         fault = node_snapshot(api.read_node(fault_node))
         result["fault_node"] = fault
-        result["fault_topology"] = topology(fault)
+        result["fault_topology"] = topology(fault, kind)
     return result
 
 
@@ -883,6 +938,7 @@ def perform_warm_spare(
     record: Path,
     agent_lookup: AgentLookup,
     actor: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Check, declare or release against ``api``; the report is the result.
 
@@ -900,6 +956,7 @@ def perform_warm_spare(
         fault_node=request.fault_node,
         cluster_id=cluster_id,
         agent_lookup=agent_lookup,
+        provider=provider,
     )
     report["mode"] = request.mode
     report["record"] = str(record)
@@ -917,6 +974,7 @@ def perform_warm_spare(
                 lifecycle_state=report["agent"]["lifecycle_state"],
                 error=report["agent"]["error"],
             ),
+            provider=str(report["provider"]),
         )
     report["refusals"] = refusals
     report["ready"] = not refusals
@@ -969,6 +1027,9 @@ def run_warm_spare(
             if agent_lookup is not None
             else control_plane_agent_lookup(site)
         ),
+        # The site's provider for the cluster; absent (a site rendered before
+        # plain-EKS support) means HyperPod, as everywhere in the release.
+        provider=cluster_provider(target.get("provider")).value,
     )
 
 

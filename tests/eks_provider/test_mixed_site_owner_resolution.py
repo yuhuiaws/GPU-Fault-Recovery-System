@@ -52,9 +52,10 @@ def test_node_reboot_owner_follows_the_event_profile_version() -> None:
         owner(None, eks_profile, CapabilityName.NODE_REBOOT)
         == (PROVIDER_NODE_REBOOT_OWNERS["eks-managed"])
     ), "a plain EKS cluster's events (eks-v1) are rebooted by the EKS adapter"
-    assert owner(None, eks_profile, CapabilityName.NODE_REPLACE) is None, (
-        "nodeReplace is OBSERVE on eks-v1: no executable owner, so it fails closed"
-    )
+    assert (
+        owner(None, eks_profile, CapabilityName.NODE_REPLACE)
+        == (PROVIDER_NODE_REBOOT_OWNERS["eks-managed"])
+    ), "nodeReplace on eks-v1 is the EKS executor's warm-spare handover"
     assert (
         owner(None, hyperpod_profile, CapabilityName.NODE_REPLACE)
         == (PROVIDER_NODE_REBOOT_OWNERS["hyperpod"])

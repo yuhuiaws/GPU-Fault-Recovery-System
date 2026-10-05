@@ -10,7 +10,6 @@ from gpu_fault.adapters.kubernetes.primitives import patch_node_with_retry
 from gpu_fault.fleet import FleetRegistry
 from gpu_fault.hyperpod import (
     HyperPodAdapterError,
-    HyperPodLifecycleAdapter,
     HyperPodNode,
 )
 from gpu_fault.markers import (
@@ -20,6 +19,7 @@ from gpu_fault.markers import (
 from gpu_fault.models import AdvisoryNotification
 from gpu_fault.node_provider import (
     ClusterProvider,
+    NodeLifecycleProvider,
     instance_group_label,
     parse_provider_id,
 )
@@ -101,7 +101,7 @@ class HyperPodSpareCoordinator:
 
     def __init__(
         self,
-        lifecycle: HyperPodLifecycleAdapter,
+        lifecycle: NodeLifecycleProvider,
         store,
         core_api: Any,
         *,

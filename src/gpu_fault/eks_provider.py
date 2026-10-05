@@ -10,7 +10,13 @@ cluster and every target's managed node group to be ``ACTIVE``. Reboot is
 ``ec2 reboot-instances`` on exactly the instance ids the targets were bound to
 when preflight resolved them; a Node whose providerID moved in between refuses
 the submission. Provider-side replacement does not exist here: ``REPLACE`` is
-never in the allowlist and ``nodeReplace`` stays OBSERVE in the profile.
+never in the allowlist and ``submit`` refuses it. ``nodeReplace`` is still OWNed
+by this adapter's executor as a warm-spare handover (``warm-spare-v1``): the
+spare coordinator moves the workload to a declared, cordoned spare node at the
+Kubernetes level and no EC2 instance is replaced, exactly as on HyperPod with
+``NodeRecovery=None``. The step adapter runs that path with
+``require_execution_enabled=False``, so the preflight below reads the cluster
+without demanding a provider action it will never submit.
 
 Statuses are mapped onto the vocabulary the confirmation code already speaks:
 an EC2 instance in state ``running`` reads ``Running``, so the reboot
@@ -123,7 +129,7 @@ class EksProviderConfig(StrictModel):
         if self.replace_enabled or HyperPodAction.REPLACE in self.allowed_actions:
             raise ValueError(
                 "provider node replacement is unsupported on eks-managed "
-                "clusters; nodeReplace stays OBSERVE"
+                "clusters; REPLACE_NODE is a warm-spare handover only"
             )
         if not self.cluster_id.strip():
             raise ValueError("cluster_id must not be blank")
@@ -456,7 +462,10 @@ class EksManagedNodeProvider:
         nodes = self.list_nodes(enrich=True)
         targets = self.resolve_nodes(node_identifiers, nodes=nodes)
         failures: list[str] = []
-        if action not in self.config.allowed_actions:
+        if require_execution_enabled and action not in self.config.allowed_actions:
+            # A warm-spare handover (``require_execution_enabled=False``) never
+            # submits a provider action, so the allowlist is not its gate; the
+            # cluster and node-group reads below still are.
             failures.append(
                 f"action {action.value} is not in adapter allowlist; an "
                 "eks-managed cluster has no provider node replacement"
@@ -651,8 +660,10 @@ class EksManagedNodeProvider:
         """The EKS counterpart of the HyperPod ownership resolution.
 
         A plain EKS cluster has no managed node recovery: reboot is owned by
-        this adapter, replacement is observed only, and workload recovery
-        follows the same evidence as on HyperPod.
+        this adapter (EC2 RebootInstances), replacement is owned as the
+        Kubernetes-level warm-spare handover (``warm-spare-v1``; the provider
+        replacement API is never called), and workload recovery follows the
+        same evidence as on HyperPod.
         """
 
         capabilities = [
@@ -669,10 +680,13 @@ class EksManagedNodeProvider:
                 capability=CapabilityName.NODE_REPLACE,
                 state=HyperPodRecoveryState.DISABLED,
                 owner_type=HyperPodRecoveryOwner.GPU_FAULT_ADAPTER,
-                mode=CapabilityMode.OBSERVE,
+                mode=CapabilityMode.OWN,
                 owner=EKS_ADAPTER_OWNER,
-                adapter="eks-lifecycle",
-                reason="provider node replacement is unsupported on eks-managed",
+                adapter="eks-warm-spare",
+                reason=(
+                    "provider node replacement is unsupported on eks-managed; "
+                    "REPLACE_NODE is a warm-spare handover to a declared spare"
+                ),
             ),
             HyperPodLifecycleAdapter._recovery_capability(
                 CapabilityName.WORKLOAD_STOP,
@@ -714,6 +728,8 @@ class EksManagedNodeProvider:
                     version=(
                         "ec2-reboot-v1"
                         if item.capability is CapabilityName.NODE_REBOOT
+                        else "warm-spare-v1"
+                        if item.capability is CapabilityName.NODE_REPLACE
                         else workload_recovery.source
                     ),
                 )

@@ -14,7 +14,7 @@ import logging
 import os
 import socket
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any
 
 from gpu_fault.adapters import (
     HyperPodLifecycleStepAdapter,
@@ -292,38 +292,33 @@ def _lifecycle_adapter_from_environment(
         )
     spare_coordinator: HyperPodSpareCoordinator | None = None
     if env_bool("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER"):
-        if provider is ClusterProvider.EKS_MANAGED:
-            # The manifest sets the switch for every provider. Warm-spare
-            # failover needs HyperPod's health signals and a provider that
-            # can list spares; on plain EKS nodeReplace stays OBSERVE, so the
-            # coordinator is not built and REPLACE_NODE fails closed in the
-            # adapter instead.
-            LOGGER.warning(
-                "warm-spare failover is not available on an eks-managed "
-                "cluster; REPLACE_NODE stays observe-only"
+        if not use_remote_state:
+            raise ClusterExecutorError(
+                f"regional {label} spare failover requires "
+                "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
             )
-        else:
-            if not use_remote_state:
-                raise ClusterExecutorError(
-                    "regional HyperPod spare failover requires "
-                    "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true"
-                )
-            spare_coordinator = HyperPodSpareCoordinator(
-                # Only the HyperPod branch reaches here.
-                cast(HyperPodLifecycleAdapter, lifecycle),
-                registry.store,
-                kubernetes_adapter.core,
-                registry=registry,
-                remote_health_provider=registry,
-                spare_label=os.getenv(
-                    "GPU_FAULT_HYPERPOD_SPARE_LABEL",
-                    "gpu-fault.io/spare",
-                ),
-                spare_label_value=os.getenv(
-                    "GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE",
-                    "true",
-                ),
-            )
+        # Warm-spare failover is a Kubernetes-level handover on both providers:
+        # the coordinator reads the declared spares through this executor's own
+        # Kubernetes client and their health through the fleet registry. On
+        # plain EKS there is no HyperPod health label to gate on and the node
+        # group label plays the instance group's role (``provider`` selects
+        # both); the provider's own replacement API is never called.
+        spare_coordinator = HyperPodSpareCoordinator(
+            lifecycle,
+            registry.store,
+            kubernetes_adapter.core,
+            registry=registry,
+            remote_health_provider=registry,
+            spare_label=os.getenv(
+                "GPU_FAULT_HYPERPOD_SPARE_LABEL",
+                "gpu-fault.io/spare",
+            ),
+            spare_label_value=os.getenv(
+                "GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE",
+                "true",
+            ),
+            provider=provider,
+        )
     default_owner = (
         EKS_ADAPTER_OWNER
         if provider is ClusterProvider.EKS_MANAGED

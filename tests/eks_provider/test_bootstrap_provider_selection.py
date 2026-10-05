@@ -2,9 +2,9 @@
 
 On ``eks-managed`` the SageMaker-backed ``HyperPodLifecycleAdapter`` is never
 constructed; the step adapter is the same class with owner
-``gpu-fault-eks-adapter`` over an ``EksManagedNodeProvider``, warm-spare
-failover is declined with a warning rather than built, and the node-key sync
-selects by ``GPU_FAULT_NODE_SELECTOR``.
+``gpu-fault-eks-adapter`` over an ``EksManagedNodeProvider``, the warm-spare
+coordinator is built for the provider (a Kubernetes-level handover), and the
+node-key sync selects by ``GPU_FAULT_NODE_SELECTOR``.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from gpu_fault.cluster_executor.bootstrap import (
 )
 from gpu_fault.cluster_executor.regional_client import ClusterExecutorError
 from gpu_fault.eks_provider import EksManagedNodeProvider
+from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
+from gpu_fault.node_provider import ClusterProvider
 from tests.eks_provider._support import (
     CLUSTER_ID,
     SELECTOR,
@@ -119,12 +121,14 @@ def test_eks_managed_executor_never_builds_the_sagemaker_adapter(
         "submission idempotency is held by the control plane"
     )
     assert captured["owner"] == "gpu-fault-eks-adapter"
-    assert captured["spare_coordinator"] is None, (
-        "no warm-spare coordinator on plain EKS"
+    coordinator = captured["spare_coordinator"]
+    assert isinstance(coordinator, HyperPodSpareCoordinator), (
+        "warm-spare failover is a Kubernetes-level handover on plain EKS too"
     )
-    assert "warm-spare failover is not available on an eks-managed cluster" in (
-        caplog.text
-    )
+    assert coordinator.provider is ClusterProvider.EKS_MANAGED
+    assert coordinator.lifecycle is lifecycle, "the coordinator reads the EKS provider"
+    assert coordinator.core is core, "spares are read through the executor's client"
+    assert "warm-spare failover is not available" not in caplog.text
     assert executor.confirm_cluster_name == CLUSTER_ID
     assert executor.node_key_sync is not None
     assert executor.node_key_sync.node_selector == SELECTOR
@@ -132,6 +136,21 @@ def test_eks_managed_executor_never_builds_the_sagemaker_adapter(
         "gpu-fault-kubernetes-adapter",
         "gpu-fault-eks-adapter",
     ]
+
+
+def test_eks_managed_spare_failover_requires_remote_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same start-up guard as HyperPod's, worded for the provider."""
+
+    _environment(monkeypatch, provider="eks-managed")
+    monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", "true")
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE", "false")
+    _fake_kubernetes_adapter(monkeypatch)
+    _capture_step_adapter(monkeypatch)
+
+    with pytest.raises(ClusterExecutorError, match="regional EKS spare failover"):
+        executor_from_environment()
 
 
 def test_eks_managed_owner_can_still_be_overridden(
