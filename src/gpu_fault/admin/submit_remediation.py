@@ -94,6 +94,7 @@ from gpu_fault.admin.remediation_plans import (
 )
 from gpu_fault.admin.remediation_script import REMEDIATION_SCRIPT
 from gpu_fault.admin.site import RenderedSite
+from gpu_fault.admin.site_cluster_profile import cluster_runtime_profile_version
 from gpu_fault.admin.workflow_reconcile import (
     cluster_nodes,
     gpu_kubectl_command,
@@ -695,8 +696,10 @@ def submit_restore(
             "node_ids": list(plan.restore_node_ids) or None,
             "operator": operator,
             "reference": reference,
-            "runtime_profile_version": str(
-                site.release_config["runtime_profile"]["version"]
+            # The cluster's own profile version on a mixed-provider site: the
+            # restore workflow is compiled and escalated against it.
+            "runtime_profile_version": cluster_runtime_profile_version(
+                site.release_config, plan.cluster_id
             ),
         },
         script=REMEDIATION_SCRIPT,
@@ -1073,7 +1076,9 @@ def submit_remediation(
         inspection,
         incident_id=request.incident_id,
         disposition=request.disposition,
-        profile_version=str(site.release_config["runtime_profile"]["version"]),
+        profile_version=cluster_runtime_profile_version(
+            site.release_config, str(incident.get("cluster_id") or "")
+        ),
         reference=request.reference,
         live_nodes=live_nodes,
         resubmission=resubmission,
