@@ -583,13 +583,34 @@ class HostProbeFixture:
                     diagnostic += f"; collector-env guard {code}"
                 if site:
                     diagnostic += f" at {site}"
+            if kind == "power_identity":
+                # A power restore refused after a reboot (exit 78): the digest
+                # and site as above, plus the *kinds* of files the operation
+                # left on the node -- fixed identifiers, never paths -- so the
+                # operator knows what the cleanup-only restore has to close.
+                if code:
+                    diagnostic += f"; power identity {code}"
+                if site:
+                    diagnostic += f" at {site}"
+                left = payload.get("left_behind")
+                if (
+                    isinstance(left, list)
+                    and left
+                    and all(
+                        isinstance(item, str) and re.fullmatch(r"[a-z_]{1,40}", item)
+                        for item in left
+                    )
+                ):
+                    diagnostic += "; left behind: " + ",".join(left)
             # A probe's generic failure line carries ``error_kind: probe`` with
             # the exception class, digest and site (collector_node_probe.main);
             # older probes print ``{"error": <ExceptionType>}`` and the bare
             # type name is the one clue left. Anything wordier (a message, a
             # path) stays withheld.
             error = (
-                payload.get("error_class") if kind == "probe" else payload.get("error")
+                payload.get("error_class")
+                if kind in {"probe", "power_identity"}
+                else payload.get("error")
             )
             if isinstance(error, str) and re.fullmatch(
                 r"[A-Za-z_][A-Za-z0-9_]*", error

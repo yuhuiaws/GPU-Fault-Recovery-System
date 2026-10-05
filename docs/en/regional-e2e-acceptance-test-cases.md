@@ -12811,7 +12811,10 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      the original UUID set and verify per GPU, and only at the end revoke the timer and the unit with
      proven ownership.
      On identity drift, a load that has not stopped or an unknown recovery result, keep the independent
-     recovery material and do not record cleanup success.
+     recovery material and do not record cleanup success. When the boot id changed (the node rebooted
+     inside the window) the probe exits 78 and the runner's error reads
+     `power identity <digest> at power_load_record:<line>; left behind: owner,record,...` -- the **kinds**
+     of files still on the node (see the cleanup entry under Safety notes), never a path or message.
 - Verdict (PASS only if all hold):
   - a new `observed_at` appears after injection;
   - the delivery latency is ≤ `interval x (EDGE_CONFIRMATION_SAMPLES + 1)`
@@ -12871,6 +12874,25 @@ the same time, and adding the gate there would discard true positives.
   `load_seconds > restore_seconds` raises `ProbeError` outright
   (the load must end before the restore, otherwise the restore lands in the middle of the load).
 - It does not touch `NodeRecovery`, performs no replacement, and does not write `/dev/kmsg`.
+- A power run id is **single-use** on the node: the probe keeps the change record
+  `gpu-fault-power-limit-restore-<digest16>.json` and the load-start receipt `.load-start.json`
+  (`/var/lib/gpu-fault/acceptance/`) as its journal -- neither cleanup nor a reboot removes them -- and a
+  second `throttle-gpu` under the same id is refused (`power run ID has already been used; cleanup only`).
+  The id derives from the run-dir and `--attempt`, so **re-executing an attempt is legitimate only when the
+  earlier execution never mutated**: the runner's `power-operation-a<attempt>.json` records `mutation_started`
+  and `cleanup_error`, and a spent attempt is refused by name before any probe runs ("attempt N of this
+  run-dir already drove power operation <run id> ...; rerun with a new --attempt"). After a failed restore
+  (for example a reboot inside the window, by COLLECT-004 or otherwise: `exit 78`) the node keeps
+  `gpu-power-owner.json`, the change record, the `.py` copy and the three systemd units; the supported
+  cleanup is `scripts/e2e/regional/collect002_power_cleanup.py --run-dir <RUN_DIR> --attempt <N> --node
+  <GPU_NODE> --host-probe-image <IMAGE> [--after-reboot] --plan`, then `--execute --confirm
+  COLLECT002_POWER_CLEANUP --maintenance-window-end <UTC>`: it runs the probe's `restore-gpu-power-limit`
+  for the journaled run id; `--after-reboot` hands the probe the node's current boot id as the reboot
+  confirmation, and the probe checks that it is this boot, that the record belongs to another boot and
+  that the limits read back at the recorded baseline (the reboot itself reset them and ended the load)
+  before it removes only the units, the owner record and the `.py` copy, **never writing power**; limits off
+  the baseline are still refused with 78. The result is written to `power-cleanup-a<N>.json`. Rerun the case
+  with a new `--attempt` afterwards. Do not delete files on the node by hand.
 - Named refusal on an `eks-managed` node: the plain EKS (AL2023 NVIDIA) node image ships no host DCGM
   and no `/usr/bin/dcgmproftester*`; the probe snapshot gains `dcgm_load_generator` (the binary path
   found, or `null`) and `run_collect002` refuses with `the target node has no DCGM load generator ...`

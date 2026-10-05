@@ -71,6 +71,40 @@ def test_host_guard_diagnostic_is_whitelisted_and_does_not_expose_error_message(
     )
 
 
+@pytest.mark.parametrize("valid", [False, True])
+def test_power_identity_failure_names_the_kinds_of_files_left_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid: bool
+) -> None:
+    """The restore after a reboot used to read "exit 78; output withheld"; the
+    operator now sees the class, digest, site and which kinds of files the
+    operation left on the node -- identifiers only, never a path or message."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 78
+    api.probe_stdout = json.dumps(
+        {
+            "error_kind": "power_identity",
+            "error_class": "PowerRecoveryIdentityError",
+            "error_code": "e" * 16,
+            "error_site": "power_load_record:826",
+            "error": "private-error-detail /var/lib/private",
+            "left_behind": ["owner", "record"] if valid else ["/var/lib/private"],
+            "manual_confirmation_required": True,
+        }
+    )
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("restore-gpu-power-limit", "--run-id", "unit")
+    message = str(caught.value)
+    assert "private" not in message, message
+    assert "; power identity " + "e" * 16 + " at power_load_record:826" in message
+    assert "; error PowerRecoveryIdentityError" in message, message
+    assert ("; left behind: owner,record" in message) is valid, message
+    assert message.endswith("; output withheld"), message
+
+
 @pytest.mark.parametrize(
     ("error", "exposed"),
     [

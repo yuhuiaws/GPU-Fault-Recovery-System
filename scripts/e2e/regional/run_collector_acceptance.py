@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -42,6 +41,7 @@ from scripts.e2e.regional.collector_kernel_evidence import (  # noqa: E402
 from scripts.e2e.regional.collector_inventory_evidence import (  # noqa: E402
     run_collect003 as run_collect003,
 )
+from scripts.e2e.regional import collect002_power_journal as journal  # noqa: E402
 from scripts.e2e.regional.collector_power_delivery import delivery_evidence  # noqa: E402
 from scripts.e2e.regional.collector_negative_evidence import (  # noqa: E402
     COLLECT011_SXIDS,
@@ -653,16 +653,7 @@ def run_collect002(
     if not baseline.get("gpu_power"):
         raise RegionalFixtureError("host probe could not read GPU power limits")
     require_dcgm_load_generator(baseline)
-    identity = f"{case_dir.resolve()}\0{attempt}".encode()
-    run_id = f"collect002-{hashlib.sha256(identity).hexdigest()[:24]}-a{attempt}"
-    write_json_atomic(
-        case_dir / f"power-operation-a{attempt}.json",
-        {
-            "case_id": "GF-REGIONAL-COLLECT-002",
-            "attempt": attempt,
-            "run_id": run_id,
-        },
-    )
+    run_id = journal.claim_power_run(case_dir, attempt)
     # Step one: start right after a delivery, a whole summary period before the
     # next, or the periodic delivery could masquerade as the anomaly edge.
     opening = gpu_metrics_stamp(fixture)
@@ -706,6 +697,7 @@ def run_collect002(
             str(load_seconds + max(60, interval * 8)),
             timeout=300,
         )
+        journal.record_power_outcome(case_dir, attempt, mutation_started=True)
         if any(
             injection.get(key) is not True
             for key in ("mutation_started", "timer_armed", "load_unit_active")
@@ -740,12 +732,19 @@ def run_collect002(
         # the exception that got us here: the deadman timer still covers the
         # power limit, and the case's error is the one the operator needs.
         try:
-            fixture.execute("restore-gpu-power-limit", "--run-id", run_id, timeout=300)
+            receipt = fixture.execute(
+                "restore-gpu-power-limit", "--run-id", run_id, timeout=300
+            )
+            # A baseline in the receipt means the probe had written its record.
+            journal.record_power_outcome(
+                case_dir, attempt, power_record_seen="baseline" in receipt
+            )
         except Exception as exc:  # noqa: BLE001 - recorded, original re-raised
             cleanup_error = f"{type(exc).__name__}: {exc}"
             write_json_atomic(
                 case_dir / "cleanup-error.json", {"cleanup_error": cleanup_error}
             )
+            journal.record_power_outcome(case_dir, attempt, cleanup_error=cleanup_error)
         raise
     else:
         try:
@@ -764,6 +763,7 @@ def run_collect002(
                 raise RegionalFixtureError("GPU power restoration proof is incomplete")
         except Exception as exc:  # noqa: BLE001 - recorded as a case failure
             cleanup_error = f"{type(exc).__name__}: {exc}"
+        journal.record_power_outcome(case_dir, attempt, cleanup_error=cleanup_error)
     records = recent_evidence(
         fixture.regional,
         node=fixture.node,

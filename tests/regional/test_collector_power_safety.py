@@ -1223,6 +1223,126 @@ def test_new_boot_reports_manual_recovery_without_a_restart_loop(
     assert not host.emitted[-1]["restored"]
 
 
+NEW_BOOT = "22222222-2222-2222-2222-222222222222"
+
+
+def test_new_boot_failure_names_the_kinds_of_files_it_left(
+    power_host: PowerHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live HyperPod COLLECT-002: the restore after a reboot answered a bare
+    "exit 78; output withheld" and the operator could not tell what the node
+    kept. The 78 payload now carries the whitelisted diagnostics and the kinds
+    (never paths) of the operation's files still present."""
+
+    host = power_host
+    probe.throttle_gpu(host.arguments())
+    probe.BOOT_ID_FILE.write_text(NEW_BOOT)
+    monkeypatch.setattr(
+        sys, "argv", ["probe", "restore-gpu-power-limit", "--run-id", "power-safety-a1"]
+    )
+    assert probe.main() == 78
+    payload = host.emitted[-1]
+    assert payload["error_kind"] == "power_identity"
+    assert payload["error_class"] == "PowerRecoveryIdentityError"
+    assert payload["error_site"].startswith("power_load_record:"), payload["error_site"]
+    assert payload["manual_confirmation_required"] and not payload["cleanup_verified"]
+    assert payload["left_behind"] == [
+        "owner",
+        "record",
+        "load_start_receipt",
+        "probe_copy",
+        "restore_service_unit",
+        "restore_timer_unit",
+        "load_service_unit",
+    ], payload["left_behind"]
+    assert "/" not in json.dumps(payload["left_behind"]), "kinds, never paths"
+
+
+def test_a_confirmed_reboot_closes_the_operation_without_a_power_write(
+    power_host: PowerHost,
+) -> None:
+    host = power_host
+    probe.throttle_gpu(host.arguments())
+    receipt = probe.power_load_start_path(host.arguments().run_id).read_bytes()
+    # The boot reset every limit to the default and ended the load.
+    probe.BOOT_ID_FILE.write_text(NEW_BOOT)
+    for gpu in host.gpus:
+        gpu["power_limit_w"] = 700.0
+    host.active.clear()
+    host.calls.clear()
+
+    probe.restore_gpu_power_limit(host.arguments(after_reboot=NEW_BOOT))
+
+    result = host.emitted[-1]
+    assert result["rebooted"] and result["cleanup_verified"] and result["restored"]
+    assert result["load_stopped"] and result["timer_disarmed"]
+    assert not host.power_writes(), "a reboot already restored the limits"
+    assert probe.power_left_behind(host.arguments().run_id) == [
+        "record",
+        "load_start_receipt",
+    ], "the journal stays; units, owner and the probe copy are gone"
+    record = host.record()
+    assert record["phase"] == "CLEANED" and record["reconciled_boot_id"] == NEW_BOOT
+    assert probe.power_load_start_path(host.arguments().run_id).read_bytes() == receipt
+    assert not host.enabled and not list(probe.SYSTEMD_UNIT_DIR.iterdir())
+    with pytest.raises(probe.ProbeError, match="already been used"):
+        probe.throttle_gpu(host.arguments())
+    host.calls.clear()
+    probe.restore_gpu_power_limit(host.arguments(after_reboot=NEW_BOOT))
+    assert not host.power_writes(), "a closed operation closes idempotently"
+    assert host.emitted[-1]["cleanup_verified"] and host.emitted[-1]["rebooted"]
+
+
+def test_a_confirmed_reboot_refuses_limits_off_the_recorded_baseline(
+    power_host: PowerHost,
+) -> None:
+    host = power_host
+    probe.throttle_gpu(host.arguments())
+    probe.BOOT_ID_FILE.write_text(NEW_BOOT)
+    host.gpus[0]["power_limit_w"] = 700.0  # GPU 1 still reads its capped 250 W
+    host.calls.clear()
+    with pytest.raises(
+        probe.PowerRecoveryIdentityError, match="differ from the baseline"
+    ):
+        probe.restore_gpu_power_limit(host.arguments(after_reboot=NEW_BOOT))
+    assert not host.power_writes() and host.units()[0] in host.active
+    assert (probe.ACCEPTANCE_STATE / "gpu-power-owner.json").exists(), (
+        "nothing is closed on an unexplained limit"
+    )
+
+
+@pytest.mark.parametrize("confirmed", ["current-boot", "wrong-boot"])
+def test_a_reboot_confirmation_must_name_this_new_boot(
+    power_host: PowerHost, confirmed: str
+) -> None:
+    host = power_host
+    probe.throttle_gpu(host.arguments())
+    original = probe.BOOT_ID_FILE.read_text()
+    host.calls.clear()
+    if confirmed == "current-boot":
+        with pytest.raises(probe.ProbeError, match="belongs to this boot"):
+            probe.restore_gpu_power_limit(host.arguments(after_reboot=original))
+    else:
+        probe.BOOT_ID_FILE.write_text(NEW_BOOT)
+        with pytest.raises(probe.ProbeError, match="not this boot"):
+            probe.restore_gpu_power_limit(host.arguments(after_reboot="33333333-3333"))
+    assert not host.calls, "a refused confirmation touches nothing"
+    assert (probe.ACCEPTANCE_STATE / "gpu-power-owner.json").exists(), (
+        "the owner record is kept until a confirmed reboot closes the operation"
+    )
+
+
+def test_a_confirmed_reboot_with_no_record_reports_nothing_to_close(
+    power_host: PowerHost,
+) -> None:
+    probe.restore_gpu_power_limit(
+        power_host.arguments(after_reboot=probe.BOOT_ID_FILE.read_text().strip())
+    )
+    result = power_host.emitted[-1]
+    assert result["no_mutation"] and result["cleanup_verified"] and result["rebooted"]
+    assert not power_host.calls, "nothing to close means nothing is touched"
+
+
 def test_timer_verification_accepts_multiweek_systemd_uptime(
     power_host: PowerHost,
 ) -> None:

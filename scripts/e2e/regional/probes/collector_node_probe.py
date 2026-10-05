@@ -46,10 +46,8 @@ ENV_KEYS = {
     "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES",
     "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED",
     "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
-    # The metrics collector's sampling interval. It is *not* named
-    # `GPU_FAULT_DCGM_INTERVAL_SECONDS`: the installer never writes such a key
-    # and `collectors_cli` never reads one, so asking for that name silently
-    # produced an env snapshot with a hole in it.
+    # The metrics sampling interval; not `GPU_FAULT_DCGM_INTERVAL_SECONDS`, a
+    # key neither the installer writes nor `collectors_cli` reads (a silent hole).
     "GPU_FAULT_METRICS_INTERVAL_SECONDS",
     "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
@@ -64,12 +62,9 @@ SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 
 def normalize_bdf(value: str) -> str:
-    """The one `0000:bb:dd.f` spelling for every way the node writes a BDF.
-
-    nvidia-smi prints an eight-digit domain, the probe's inventory omits the
-    function and sysfs prints `0000:5e:00.0`; this probe's own snapshot once
-    handed `append-sxid` a BDF it rejected (COLLECT-005). Canonicalise first.
-    """
+    """The one `0000:bb:dd.f` spelling for every way the node writes a BDF
+    (nvidia-smi's eight-digit domain, the inventory's missing function, sysfs);
+    the snapshot once handed `append-sxid` a BDF it rejected (COLLECT-005)."""
 
     text = value.strip().lower()
     parts = text.split(":")
@@ -176,12 +171,9 @@ def collector_runner(
     timeout: float | None = None,
     check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """``HostTelemetryCollector.runner`` with the ``BoundedProcessRunner`` call shape.
-
-    The Collector passes ``capture_output``/``text`` that ``run`` only asserts
-    (it always captures both pipes as text); a ``TimeoutExpired`` propagates
-    unchanged for the Collector's own nvidia-smi circuit breaker.
-    """
+    """``HostTelemetryCollector.runner`` with the ``BoundedProcessRunner`` call
+    shape: ``capture_output``/``text`` are only asserted (both pipes are always
+    captured as text); ``TimeoutExpired`` propagates for the circuit breaker."""
     if not (capture_output and text):
         raise ProbeError("isolated collector runner only returns captured text")
     return run(list(argv), check=check, timeout=180 if timeout is None else timeout)
@@ -347,12 +339,9 @@ def kernel_collector_fd() -> dict[str, Any]:
 
 
 def gpu_power_state(*, strict: bool = False) -> list[dict[str, Any]]:
-    """Per-GPU power limits and load, the inputs of the throttle candidate.
-
-    The control plane only calls a power violation a candidate when the draw sits
-    at the enforced limit *and* utilization is high, so the acceptance run has to
-    be able to read all three from the node rather than assume them.
-    """
+    """Per-GPU power limits and load, the inputs of the throttle candidate: the
+    control plane needs the draw at the enforced limit *and* high utilization,
+    so the acceptance run reads all three from the node rather than assume them."""
 
     completed = run(
         [
@@ -413,12 +402,8 @@ def dcgm_load_generator() -> str | None:
 
 
 def proftester_binary() -> str:
-    """The DCGM load generator installed on this node.
-
-    The binary carries the DCGM major version in its name
-    (``dcgmproftester13``), so the acceptance run must discover it instead of
-    pinning a version that a driver bump will rename.
-    """
+    """The DCGM load generator installed on this node; its name carries the DCGM
+    major version (``dcgmproftester13``), so it is discovered, not pinned."""
 
     candidates = sorted(
         (path for path in Path("/usr/bin").glob("dcgmproftester*") if path.is_file()),
@@ -811,7 +796,9 @@ def power_intent_digest(record: dict[str, Any]) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def power_load_record(run_id: str) -> dict[str, Any] | None:
+def power_load_record(
+    run_id: str, *, reboot_confirmed: bool = False
+) -> dict[str, Any] | None:
     owner = power_read_json(ACCEPTANCE_STATE / "gpu-power-owner.json")
     if owner is not None and owner.get("run_id") != run_id:
         raise ProbeError("another power operation owns this node")
@@ -820,10 +807,13 @@ def power_load_record(run_id: str) -> dict[str, Any] | None:
         if owner is not None:
             raise ProbeError("owned power recovery record is missing")
         return None
-    if record.get("boot_id") != BOOT_ID_FILE.read_text().strip():
+    rebooted = record.get("boot_id") != BOOT_ID_FILE.read_text().strip()
+    if rebooted and not reboot_confirmed:
         raise PowerRecoveryIdentityError(
             "power recovery boot identity changed; manual confirmation is required"
         )
+    if reboot_confirmed and not rebooted:
+        raise ProbeError("power record belongs to this boot; restore it plainly")
     if (
         record.get("schema_version") != 1
         or record.get("run_id") != run_id
@@ -864,6 +854,81 @@ def power_load_record(run_id: str) -> dict[str, Any] | None:
     return record
 
 
+def power_result(
+    run_id: str,
+    record: dict[str, Any] | None = None,
+    *,
+    clean: bool = False,
+    **values: Any,
+) -> dict[str, Any]:
+    """A restore receipt; ``clean`` is the whole cleanup proof, ``record`` the facts."""
+    mutated = record is not None and bool(record["mutation_started"])
+    result: dict[str, Any] = {
+        "run_id": run_id,
+        "restored": mutated,
+        "no_mutation": record is not None and not mutated,
+        "mutation_started": mutated,
+        "cleanup_verified": clean,
+        "load_stopped": clean,
+        "timer_disarmed": clean,
+        "gpu_power": [],
+    }
+    if record is not None:
+        result["baseline"] = record["baseline"]
+    return {**result, **values}
+
+
+def power_left_behind(run_id: str) -> list[str]:
+    """Kinds (never paths) of the power operation's files still on the node."""
+    try:
+        unit = power_limit_restore_unit(run_id)
+    except ProbeError:
+        return []
+    path = power_record_path(run_id)
+    kinds = {
+        "owner": ACCEPTANCE_STATE / "gpu-power-owner.json",
+        "record": path,
+        "load_start_receipt": power_load_start_path(run_id),
+        "probe_copy": path.with_suffix(".py"),
+        "restore_service_unit": SYSTEMD_UNIT_DIR / f"{unit}.service",
+        "restore_timer_unit": SYSTEMD_UNIT_DIR / f"{unit}.timer",
+        "load_service_unit": SYSTEMD_UNIT_DIR / f"{unit}-load.service",
+    }
+    return [kind for kind, item in kinds.items() if item.exists() or item.is_symlink()]
+
+
+def power_reconcile_after_reboot(run_id: str, boot_id: str) -> None:
+    """Close a power operation whose boot ended before its restore (78 from the
+    plain restore): the operator names this boot; a boot resets the limits and
+    ends the load, so limits at the baseline let units and owner go unwritten."""
+    if boot_id != BOOT_ID_FILE.read_text().strip():
+        raise ProbeError("confirmed boot id is not this boot")
+    record = power_load_record(run_id, reboot_confirmed=True)
+    if record is None:
+        emit(power_result(run_id, clean=True, no_mutation=True, rebooted=True))
+        return
+    path = power_record_path(run_id)
+    state = checked_power_state(record["baseline"])
+    if any(
+        current["power_limit_w"] != original["power_limit_w"]
+        for current, original in zip(state, record["baseline"], strict=True)
+    ):
+        raise PowerRecoveryIdentityError(
+            "GPU power limits differ from the baseline after the reboot; "
+            "manual confirmation is required"
+        )
+    power_stop_load(record)
+    record.update(phase="RESTORED", load_closed=True, reconciled_boot_id=boot_id)
+    power_write_json(path, record)
+    power_finish_units(record)
+    record["phase"] = "CLEANED"
+    power_write_json(path, record)
+    path.with_suffix(".py").unlink(missing_ok=True)
+    (ACCEPTANCE_STATE / "gpu-power-owner.json").unlink(missing_ok=True)
+    power_sync_directory(ACCEPTANCE_STATE)
+    emit(power_result(run_id, record, clean=True, rebooted=True, gpu_power=state))
+
+
 def power_assert_stopped(state: dict[str, str], name: str) -> None:
     if (
         state.get("ActiveState") not in {"inactive", "failed"}
@@ -896,6 +961,10 @@ def power_stop_load(record: dict[str, Any]) -> None:
         run(["systemctl", "stop", name], timeout=20)
         state = power_owned_unit(record, name)
     power_assert_stopped(state, name)
+
+
+def power_set_limit(gpu: dict[str, Any], key: str) -> None:
+    run([str(POWER_SMI), "-i", gpu["uuid"], "-pl", str(gpu[key])], timeout=10)
 
 
 def power_check_limits(
@@ -1174,16 +1243,7 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
             state = checked_power_state(baseline)
             power_check_limits(record, state)
             power_require_load_time(record)
-            run(
-                [
-                    str(POWER_SMI),
-                    "-i",
-                    original["uuid"],
-                    "-pl",
-                    str(original["power_min_limit_w"]),
-                ],
-                timeout=10,
-            )
+            power_set_limit(original, "power_min_limit_w")
         state = checked_power_state(baseline)
         if any(item["power_limit_w"] != item["power_min_limit_w"] for item in state):
             raise ProbeError("GPU cap readback does not match the owned target")
@@ -1214,31 +1274,17 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
 def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     automatic = getattr(arguments, "automatic", False)
+    confirmed_boot = getattr(arguments, "after_reboot", "")
     with power_operation_lock():
+        if confirmed_boot:
+            power_reconcile_after_reboot(run_id, confirmed_boot)
+            return
         record = power_load_record(run_id)
         if record is None:
-            emit(
-                {
-                    "run_id": run_id,
-                    "restored": False,
-                    "no_mutation": True,
-                    "mutation_started": False,
-                    "cleanup_verified": True,
-                    "load_stopped": True,
-                    "timer_disarmed": True,
-                    "gpu_power": [],
-                }
-            )
+            emit(power_result(run_id, clean=True, no_mutation=True))
             return
         if automatic and time.monotonic() < record["restore_deadline_monotonic"]:
-            emit(
-                {
-                    "run_id": run_id,
-                    "restored": False,
-                    "cleanup_verified": False,
-                    "deferred": True,
-                }
-            )
+            emit(power_result(run_id, deferred=True))
             return
         path = power_record_path(run_id)
         if record["phase"] != "CLEANED":
@@ -1252,32 +1298,20 @@ def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
             power_check_limits(record, state, restored=record["phase"] == "CLEANED")
             for current, original in zip(state, record["baseline"], strict=True):
                 if current["power_limit_w"] != original["power_limit_w"]:
-                    run(
-                        [
-                            str(POWER_SMI),
-                            "-i",
-                            original["uuid"],
-                            "-pl",
-                            str(original["power_limit_w"]),
-                        ],
-                        timeout=10,
-                    )
+                    power_set_limit(original, "power_limit_w")
             state = checked_power_state(record["baseline"])
             power_check_limits(record, state, restored=True)
         if automatic and record["phase"] != "CLEANED":
             record["phase"] = "RESTORED"
             power_write_json(path, record)
             emit(
-                {
-                    "run_id": run_id,
-                    "restored": record["mutation_started"],
-                    "no_mutation": not record["mutation_started"],
-                    "load_stopped": True,
-                    "timer_disarmed": False,
-                    "cleanup_verified": False,
-                    "cleanup_deferred": True,
-                    "gpu_power": state,
-                }
+                power_result(
+                    run_id,
+                    record,
+                    load_stopped=True,
+                    cleanup_deferred=True,
+                    gpu_power=state,
+                )
             )
             return
         if record["phase"] != "CLEANED":
@@ -1291,19 +1325,7 @@ def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
         path.with_suffix(".py").unlink(missing_ok=True)
         (ACCEPTANCE_STATE / "gpu-power-owner.json").unlink(missing_ok=True)
         power_sync_directory(ACCEPTANCE_STATE)
-        emit(
-            {
-                "run_id": run_id,
-                "restored": record["mutation_started"],
-                "no_mutation": not record["mutation_started"],
-                "mutation_started": record["mutation_started"],
-                "cleanup_verified": True,
-                "load_stopped": True,
-                "timer_disarmed": True,
-                "gpu_power": state,
-                "baseline": record["baseline"],
-            }
-        )
+        emit(power_result(run_id, record, clean=True, gpu_power=state))
 
 
 def persistence_mode() -> bool | None:
@@ -1341,14 +1363,8 @@ def file_snapshot(path: Path) -> dict[str, Any] | None:
 
 
 def fabric_manager_cursor() -> dict[str, Any] | None:
-    """The Fabric Manager file collector's persisted cursor, decoded.
-
-    COLLECT-005 compared the log's size to itself and called that "the cursor
-    advanced". The cursor is the ``files[<path>]`` entry of the collector's
-    state file -- device, inode and byte offset -- and only that entry can say
-    whether the collector caught up to the line the case appended and kept
-    that position across a restart.
-    """
+    """The FM file collector's persisted cursor (``files[<path>]``: device, inode,
+    offset), the only proof it caught up and kept its position (COLLECT-005)."""
 
     for path in FM_STATE_CANDIDATES:
         if not path.is_file():
@@ -1452,13 +1468,9 @@ def active_unit_identity(unit: str, what: str) -> tuple[dict[str, Any], str]:
 
 
 def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
-    """Read an inclusive, bounded receipt window without exposing general logs.
-
-    The window is the running boot's only: ``__MONOTONIC_TIMESTAMP`` restarts
-    at every boot, so an un-anchored tail spanning a reboot fails the
-    journal-order check for hours (live COLLECT-005, 2026-09-21). journald is
-    asked for the boot and every row's ``_BOOT_ID`` is checked regardless.
-    """
+    """Read an inclusive, bounded receipt window of the running boot only (an
+    un-anchored tail across a reboot fails the journal-order check for hours --
+    live COLLECT-005 2026-09-21); every row's ``_BOOT_ID`` is checked too."""
 
     cursor = arguments.cursor
     if cursor and not SAFE_JOURNAL_CURSOR.fullmatch(cursor):
@@ -1469,10 +1481,8 @@ def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
     before, _ = active_unit_identity(FM_UNIT, "FM producer")
     if not HEX32.fullmatch(str(before["InvocationID"])):
         raise ProbeError("FM producer process identity is unknown")
-    # No ``--grep``: systemd 252 hands ``--grep`` matches back newest-first once
-    # ``--lines`` is given and walks *backwards* from ``--cursor`` (live
-    # 2026-09-17). The receipt filter is applied here, on the unit's own lines,
-    # and the window must arrive in journal order.
+    # No ``--grep``: with ``--lines`` systemd 252 returns matches newest-first and
+    # walks backwards from ``--cursor`` (live 2026-09-17); filter here, in order.
     command = [
         "journalctl",
         f"--unit={FM_UNIT}",
@@ -1549,11 +1559,8 @@ def fm_delivery_evidence(arguments: argparse.Namespace) -> None:
 
 
 def efa_inventory_command(_arguments: argparse.Namespace) -> None:
-    """Only the EFA inventory: COLLECT-017 polls it every few seconds.
-
-    A full ``snapshot`` runs nvidia-smi three times and stats every unit; the
-    unbind wait needs the sysfs walk alone.
-    """
+    """Only the EFA inventory (COLLECT-017 polls it every few seconds); a full
+    ``snapshot`` runs nvidia-smi three times and stats every unit."""
 
     emit(
         {
@@ -2039,12 +2046,9 @@ SAFE_POD_UID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 def workload_processes(
     pod_uid: str, *, proc: Path = Path("/proc"), excluded_pids: Iterable[int] = ()
 ) -> list[dict[str, Any]]:
-    """Every process whose cgroup names ``pod_uid``, both kubelet spellings.
-
-    kubelet writes the Pod UID with dashes kept or replaced by underscores,
-    depending on the cgroup driver; matching one spelling killed nothing on the
-    other. The ``pause`` sandbox shares the cgroup and is left alone.
-    """
+    """Every process whose cgroup names ``pod_uid`` in either kubelet spelling
+    (dashes kept or replaced by underscores, per cgroup driver); the ``pause``
+    sandbox shares the cgroup and is left alone."""
 
     if SAFE_POD_UID.fullmatch(pod_uid) is None:
         raise ProbeError("unsafe pod UID")
@@ -2080,13 +2084,9 @@ def kill_workload(
     proc: Path = Path("/proc"),
     kill: Callable[[int, int], None] = os.kill,
 ) -> None:
-    """SIGKILL the training processes of one Pod so the container exits non-zero.
-
-    The Pod object and PyTorchJob are never touched: deleting the Pod reads as
-    a user stop and suppresses the passive restart, so the drill has to make
-    the container die on its own. Refusing when nothing matched keeps a
-    mistyped UID from reading as a silent success.
-    """
+    """SIGKILL one Pod's training processes so the container exits non-zero;
+    the Pod object and PyTorchJob are never touched (deleting the Pod reads as
+    a user stop), and nothing matched is a refusal, not a silent success."""
 
     pod_uid = arguments.pod_uid
     processes = workload_processes(pod_uid, proc=proc)
@@ -3794,14 +3794,9 @@ def unbind_efa(arguments: argparse.Namespace) -> None:
 
 
 def restore_efa(arguments: argparse.Namespace) -> None:
-    """Disarm the bind fail-safe and say who rebound the function.
-
-    COLLECT-017 A passes only when the control plane's REMEDIATE_EFA_DRIVER
-    rebound the BDF, so the runner needs to know whether the function was
-    already bound when this ran (``already_bound``) and whether the fail-safe
-    timer's service had fired and done it instead (``timer_fired``). Both are
-    read before anything here changes them.
-    """
+    """Disarm the bind fail-safe and say who rebound the function: COLLECT-017 A
+    needs ``already_bound`` (bound before this ran) and ``timer_fired`` (the
+    fail-safe did it), both read before anything here changes them."""
 
     run_id = safe_id(arguments.run_id, "run ID")
     bdf = normalize_bdf(arguments.pci_bdf)
@@ -3901,6 +3896,7 @@ def parser() -> argparse.ArgumentParser:
     restore_power = command("restore-gpu-power-limit", restore_gpu_power_limit)
     restore_power.add_argument("--run-id", required=True)
     restore_power.add_argument("--automatic", action="store_true")
+    restore_power.add_argument("--after-reboot", default="", metavar="BOOT_ID")
 
     override = command("override-expected-gpu-count", override_expected_gpu_count)
     override.add_argument("--run-id", required=True)
@@ -3954,7 +3950,8 @@ def main() -> int:
     except PowerRecoveryIdentityError as exc:
         emit(
             {
-                "error": f"{type(exc).__name__}: {exc}",
+                **error_fields(exc, "power_identity"),
+                "left_behind": power_left_behind(getattr(arguments, "run_id", "")),
                 "restored": False,
                 "cleanup_verified": False,
                 "manual_confirmation_required": True,
@@ -3966,21 +3963,21 @@ def main() -> int:
             retryable = isinstance(exc, CollectorEnvBusyError) or not isinstance(
                 exc, CollectorEnvGuardError
             )
-            error_site = exception_site(exc)
-            error_code = hashlib.sha256(str(exc).encode()).hexdigest()[:16]
+            fields = error_fields(exc, "collector_env_guard")
+            if not isinstance(exc, CollectorEnvGuardError):
+                fields["error"] = (
+                    f"collector env recovery failed ({type(exc).__name__})"
+                )
+            else:
+                fields["error"] = str(exc)
             failure_receipt = collector_guard_failure(
-                arguments, error_code=error_code, error_site=error_site
+                arguments,
+                error_code=fields["error_code"],
+                error_site=fields["error_site"],
             )
             emit(
                 {
-                    "error": (
-                        str(exc)
-                        if isinstance(exc, CollectorEnvGuardError)
-                        else f"collector env recovery failed ({type(exc).__name__})"
-                    ),
-                    "error_kind": "collector_env_guard",
-                    "error_code": error_code,
-                    "error_site": error_site,
+                    **fields,
                     "failure_receipt": failure_receipt,
                     "cleanup_verified": False,
                     "manual_confirmation_required": True,
@@ -3990,17 +3987,19 @@ def main() -> int:
             return 1 if retryable else 78
         # The host fixture withholds this output; the class, a digest of the
         # message and the site are the message-free trail it may show.
-        emit(
-            {
-                "error": f"{type(exc).__name__}: {exc}",
-                "error_kind": "probe",
-                "error_class": type(exc).__name__,
-                "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
-                "error_site": exception_site(exc),
-            }
-        )
+        emit(error_fields(exc, "probe"))
         return 1
     return 0
+
+
+def error_fields(exc: BaseException, kind: str) -> dict[str, Any]:
+    return {
+        "error": f"{type(exc).__name__}: {exc}",
+        "error_kind": kind,
+        "error_class": type(exc).__name__,
+        "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+        "error_site": exception_site(exc),
+    }
 
 
 if __name__ == "__main__":
