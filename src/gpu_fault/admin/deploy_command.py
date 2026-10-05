@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_checkpoint import load_hyperpod_hints
+from gpu_fault.admin.cluster_join_profile import preflight_cluster_profile_plans
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     BootstrapRequest,
@@ -615,6 +616,13 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)
+    # A deployed cluster whose own Runtime Profile template changed policy
+    # stops for review here, before the release bundle and its gates; the
+    # approval a rerun carries is consumed when the site is finalized.
+    preflight_cluster_profile_plans(
+        state_dir,
+        repository_root=(getattr(arguments, "repo_root", None) or Path.cwd()).resolve(),
+    )
     # The admin-config refusal ("existing sites must use gpu-fault-admin
     # config") is about the operator's input and is reported before any
     # identity comparison, so a wrong --config is never masked by an ARN typo.

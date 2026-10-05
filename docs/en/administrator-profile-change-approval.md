@@ -67,6 +67,41 @@ gpu-fault-admin deploy \
 This command first completes the approval on the same state-dir, then continues the original deployment until verify, stability and commit finish.
 There is no step three.
 
+### 1.1 A cluster's own profile on a deployed site
+
+A GPU cluster whose provider the site profile cannot reboot (a plain EKS cluster on a HyperPod site, or
+the reverse) is pinned to its own profile version, recorded on `spec.clusters[].runtimeProfile`
+(`version`, `source`, `templateSource`, `agentConfigDigest`). Its first version is the provider's declared
+one (`eks-v1` / `hyperpod-v1`) and is reviewed by `join-cluster` (`change_kind: CLUSTER_PROFILE_NEW`,
+`registration_cluster_id: <cluster>`). The snapshot `profiles/<version>.yaml` is immutable: a version never
+names two policies.
+
+When the provider's example profile changes policy after the pin (`templateSource` differs from the pinned
+snapshot), `deploy` does not reuse the version. It computes the successor version
+`regional-<provider>-<digest12>` (the first 12 hex digits of the template's policy digest), writes the plan
+and stops before the release bundle and its gates:
+
+```text
+Runtime Profile policy changed; the deploy stopped for review.
+Review /secure/gpu-fault/release-deploy/profile-plan.json:
+  ...
+  cluster: gpu-eks-cluster
+  version: eks-v1 -> regional-eks-8e51b0c2a7f3 (this cluster only)
+  change_kind: CLUSTER_PROFILE_NEW
+  changes:
+    - cluster gpu-eks-cluster (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
+  plan_sha256: <plan_sha256>
+Record plan_sha256 on the change request; once it is approved, rerun:
+  gpu-fault-admin deploy --state-dir /secure/gpu-fault --approve-profile-plan <plan_sha256> --reference CHG-<id>
+```
+
+The resume command approves the plan, writes `profiles/regional-eks-<digest12>.yaml`, re-pins the cluster
+entry (version, source, templateSource, the release's `agentConfigDigest`), registers the version with the
+release and continues; the node wave re-pins the cluster's Agents. `eks-v1` keeps its snapshot untouched.
+A cluster joining after the change derives the same successor version and reuses its approved snapshot.
+Do not delete the pinned snapshot to "free" the version name: the snapshot is the proof of the policy that
+was approved under it.
+
 ## 2. State Transitions
 
 ```text
@@ -204,6 +239,7 @@ Success criteria:
 | Release completed but archive finalisation failed | Rerun the original four-parameter deploy; the system completes consumption with `ALREADY_APPLIED` |
 | Message that an approval or release is in progress | Wait for the current process to finish; do not delete the lock file |
 | GPU cluster join or deregistration | Use the formal join/remove commands; the GPU set does not change the stable Profile approval identity |
+| `approved Runtime Profile snapshot ... has a different policy than ...` on a cluster-owned version | The template policy changed under a pinned version; rerun `deploy` -- it plans the successor `regional-<provider>-<digest12>` (section 1.1) and prints the resume command. Do not remove the pinned snapshot |
 
 ## 8. Forbidden Operations
 

@@ -1059,8 +1059,9 @@ Semantics and boundaries of `eks-managed`:
   never called (`GPU_FAULT_ALLOW_HYPERPOD_REPLACE` stays false; the EKS preflight no longer refuses a warm-spare-only
   REPLACE on the allowlist, while `submit(REPLACE)` still refuses). `config/runtime-profile.regional-eks-safe.example.yaml`
   therefore OWNs `nodeReplace` through `gpu-fault-eks-adapter` with observed version `warm-spare-v1`, the executor's
-  ownership advertisement says OWN, and a deployed site rolls the new `regional-eks-<digest12>` profile version with
-  `gpu-fault-admin deploy --approve-profile-plan`. Without a declared spare REPLACE_NODE still fails closed, exactly as on
+  ownership advertisement says OWN; on a deployed site `gpu-fault-admin deploy` stops before the release and writes the
+  `CLUSTER_PROFILE_NEW` plan (`eks-v1 -> regional-eks-<digest12>`, see profile change approval §1.1), and
+  `deploy --approve-profile-plan <sha> --reference <CHG>` writes the new snapshot, re-pins the cluster and continues. Without a declared spare REPLACE_NODE still fails closed, exactly as on
   HyperPod with `NodeRecovery=None`.
 - `submit-remediation` stamps the **target cluster's** Runtime Profile version (`clusters[].runtimeProfile.version` in the
   site, the site profile only without an override): the control plane compiles step owners, escalation rungs and

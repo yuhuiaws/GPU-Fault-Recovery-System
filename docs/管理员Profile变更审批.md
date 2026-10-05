@@ -63,6 +63,36 @@ gpu-fault-admin deploy \
 该命令先在同一state-dir上完成审批，再继续原部署直到verify、stability和commit结束。
 没有第三步。
 
+### 1.1 已部署站点上集群自有 Profile 的版本升级
+
+站点 Profile 无法重启其 provider 的 GPU 集群（HyperPod 站点上的纯 EKS 集群，或反之）pin 在自己的 Profile 版本上，
+记录在 `spec.clusters[].runtimeProfile`（`version`、`source`、`templateSource`、`agentConfigDigest`）。首个版本是
+provider 声明的版本（`eks-v1` / `hyperpod-v1`），由 `join-cluster` 审核（`change_kind: CLUSTER_PROFILE_NEW`，
+`registration_cluster_id: <cluster>`）。快照 `profiles/<version>.yaml` 不可变：一个版本永不对应两种策略。
+
+pin 之后 provider 示例 Profile 的策略变化（`templateSource` 与已 pin 快照不同）时，`deploy` 不复用版本名，而是
+计算后继版本 `regional-<provider>-<digest12>`（模板策略摘要的前 12 位十六进制），写出计划并在 release bundle
+与各项 gate 之前停止：
+
+```text
+Runtime Profile policy changed; the deploy stopped for review.
+Review /secure/gpu-fault/release-deploy/profile-plan.json:
+  ...
+  cluster: gpu-eks-cluster
+  version: eks-v1 -> regional-eks-8e51b0c2a7f3 (this cluster only)
+  change_kind: CLUSTER_PROFILE_NEW
+  changes:
+    - cluster gpu-eks-cluster (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
+  plan_sha256: <plan_sha256>
+Record plan_sha256 on the change request; once it is approved, rerun:
+  gpu-fault-admin deploy --state-dir /secure/gpu-fault --approve-profile-plan <plan_sha256> --reference CHG-<id>
+```
+
+续跑命令先审批该计划，写入 `profiles/regional-eks-<digest12>.yaml`，重新 pin 集群条目（version、source、
+templateSource、本次发布的 `agentConfigDigest`），随发布注册该版本并继续；节点 wave 随后重新 pin 该集群的 Agent。
+`eks-v1` 的快照原样保留。变化之后再加入的集群会推导出同一后继版本并复用其已审批快照。不要为了"腾出"版本名而删除
+已 pin 的快照：快照就是该版本下被批准策略的证据。
+
 ## 2. 状态流转
 
 ```text
@@ -200,6 +230,7 @@ superseded.json
 | 发布已完成但归档收尾失败 | 重跑原四参数deploy；系统以`ALREADY_APPLIED`完成消费 |
 | 提示审批或发布正在进行 | 等待当前进程结束；不删除lock文件 |
 | GPU集群加入或注销 | 使用正式join/remove命令；GPU集合不改变稳定Profile审批身份 |
+| 集群自有版本上出现 `approved Runtime Profile snapshot ... has a different policy than ...` | 模板策略在已 pin 版本下变化；重跑 `deploy`——它会规划后继版本 `regional-<provider>-<digest12>`（第 1.1 节）并打印续跑命令。不要删除已 pin 的快照 |
 
 ## 8. 禁止操作
 
