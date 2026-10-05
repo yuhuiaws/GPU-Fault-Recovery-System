@@ -10,8 +10,8 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import run_destr003_warm_spare_failover as failover
-from scripts.e2e.regional import warm_spare_provider
 from scripts.e2e.regional import run_destr008_warm_spare_shortage as shortage
+from scripts.e2e.regional import warm_spare_provider
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
 from scripts.e2e.regional.warm_spare_fixture import (
     HYPERPOD_HEALTH_LABEL,
