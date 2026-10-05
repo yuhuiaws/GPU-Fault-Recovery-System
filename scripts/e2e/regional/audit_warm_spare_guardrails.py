@@ -31,6 +31,9 @@ from scripts.e2e.regional.destr_net_isolation_probe import (  # noqa: E402
 from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
     REGISTRY_PROBE,
     complete_pod_population,
+    eks_managed_invariant,
+    managed_recovery_invariant_errors,
+    provider_replace_events,
     registration_identity,
     validate_provider_record,
 )
@@ -459,35 +462,21 @@ def node_state_drift(
 
 
 def replace_events(started_at: datetime, ended_at: datetime) -> list[dict[str, Any]]:
-    value = json.loads(
-        command(
-            [
-                "aws",
-                "cloudtrail",
-                "lookup-events",
-                "--region",
-                AWS_REGION,
-                "--start-time",
-                started_at.isoformat(),
-                "--end-time",
-                ended_at.isoformat(),
-                "--lookup-attributes",
-                "AttributeKey=EventSource,AttributeValue=sagemaker.amazonaws.com",
-                "--output",
-                "json",
-            ]
-        )
+    """Provider mutations in the window: HyperPod's for a HyperPod cluster, and
+    for a plain-EKS cluster the EC2 replacement mutations as well."""
+
+    return provider_replace_events(
+        started_at,
+        ended_at,
+        provider=MANAGED_PROVIDER,
+        region=AWS_REGION,
+        command=command,
+        hyperpod_mutations=PROVIDER_MUTATIONS,
     )
-    if not isinstance(value, dict) or not isinstance(value.get("Events"), list):
-        raise RuntimeError("CloudTrail event inventory is unreadable")
-    return [
-        {
-            "event_name": item.get("EventName"),
-            "event_time": str(item.get("EventTime")),
-        }
-        for item in value.get("Events", [])
-        if item.get("EventName") in PROVIDER_MUTATIONS
-    ]
+
+
+def managed_recovery_errors(gpu: dict[str, Any]) -> list[str]:
+    return managed_recovery_invariant_errors(gpu, provider=MANAGED_PROVIDER)
 
 
 def _pod_python(
@@ -1330,8 +1319,7 @@ def run_audit(
                 automatic_probe if case_id == "GF-REGIONAL-DESTR-006" else None,
             )
         )
-        if gpu.get("node_recovery") != "None":
-            errors.append("managed GPU cluster NodeRecovery is not None")
+        errors.extend(managed_recovery_errors(gpu))
         if case_id == "GF-REGIONAL-DESTR-006":
             if automatic is None or automatic["node_recovery"] != "Automatic":
                 errors.append("negative cluster is not Automatic")
@@ -1360,6 +1348,12 @@ def run_audit(
             "focused_pytest": definitions[case_id],
             "focused_pytest_log": str(run_dir / "cases" / "pytest.log"),
             "gpu_cluster": gpu,
+            "provider": MANAGED_PROVIDER,
+            **(
+                {"eks_managed_invariant": eks_managed_invariant()}
+                if MANAGED_PROVIDER == "eks-managed"
+                else {}
+            ),
             "executor_env": env,
             # The negative claim is provisional while CloudTrail may still be
             # delivering; DESTR-013 re-reads the whole run's window later.

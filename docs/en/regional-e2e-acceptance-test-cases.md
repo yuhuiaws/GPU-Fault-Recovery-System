@@ -8795,7 +8795,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   on every provider. "Non-system running Pods" follow NET-001's rule (DaemonSet-owned Pods without a GPU request are
   infrastructure). DESTR-005/006/007's `--hyperpod-cluster` carries an `eks-managed` cluster's `cluster_id` (the provider
   cluster-scope convention), matched in the durable registry by `cluster_id`/EKS name; the HyperPod
-  `describe-cluster`/NodeRecovery facts read `not-applicable`. AUTH-015 selects nodes with `cluster_scope.node_selector`
+  `describe-cluster`/NodeRecovery facts read `not-applicable`. For an `eks-managed` managed cluster DESTR-006/007 replace the
+  "managed recovery is disabled" assertion with the provider's equivalent invariant, recorded as `eks_managed_invariant`:
+  the node reboot owner is `gpu-fault-eks-adapter`, nodeReplace is observe-only, and the audit window carries neither
+  `sagemaker` mutations nor EC2 `Terminate/Stop/Run/StartInstances` (`replace_events` queries both event sources).
+  DESTR-005 presupposes a warm spare; a spare-less `eks-managed` cluster is refused in preflight (fail closed) and marked
+  BLOCKED by the operator rather than given a PASS/FAIL verdict. AUTH-015 selects nodes with `cluster_scope.node_selector`
   (the HyperPod label, or the cluster's configured node selector).
 
 ### GF-REGIONAL-DESTR-002

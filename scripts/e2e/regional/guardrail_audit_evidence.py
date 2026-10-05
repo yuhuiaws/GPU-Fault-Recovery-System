@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
 
 
@@ -182,3 +183,104 @@ def _names_managed_cluster(row: dict[str, Any], managed_cluster: str) -> bool:
         return False
     eks_name = str(row.get("eks_cluster_arn") or "").rsplit("/", 1)[-1]
     return managed_cluster in {row.get("cluster_id"), eks_name}
+
+
+#: The EC2 mutations that replace, stop or launch a plain-EKS GPU node; the
+#: provider-side counterpart of HyperPod's node mutations for ``eks-managed``.
+EC2_REPLACEMENT_MUTATIONS = frozenset(
+    {"TerminateInstances", "StopInstances", "RunInstances", "StartInstances"}
+)
+
+
+def provider_event_sources(
+    provider: str, hyperpod_mutations: frozenset[str]
+) -> tuple[tuple[str, frozenset[str]], ...]:
+    """Which CloudTrail event sources (and event names) count as provider
+    mutations for a managed cluster of ``provider``."""
+
+    sources: tuple[tuple[str, frozenset[str]], ...] = (
+        ("sagemaker.amazonaws.com", hyperpod_mutations),
+    )
+    if provider == "eks-managed":
+        sources += (("ec2.amazonaws.com", EC2_REPLACEMENT_MUTATIONS),)
+    return sources
+
+
+def provider_replace_events(
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    provider: str,
+    region: str,
+    command: Any,
+    hyperpod_mutations: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Provider mutations in the window, read from CloudTrail per event source."""
+
+    events: list[dict[str, Any]] = []
+    for source, names in provider_event_sources(provider, hyperpod_mutations):
+        value = json.loads(
+            command(
+                [
+                    "aws",
+                    "cloudtrail",
+                    "lookup-events",
+                    "--region",
+                    region,
+                    "--start-time",
+                    started_at.isoformat(),
+                    "--end-time",
+                    ended_at.isoformat(),
+                    "--lookup-attributes",
+                    f"AttributeKey=EventSource,AttributeValue={source}",
+                    "--output",
+                    "json",
+                ]
+            )
+        )
+        if not isinstance(value, dict) or not isinstance(value.get("Events"), list):
+            raise RuntimeError("CloudTrail event inventory is unreadable")
+        events.extend(
+            {
+                "event_name": item.get("EventName"),
+                "event_time": str(item.get("EventTime")),
+                "event_source": source,
+            }
+            for item in value.get("Events", [])
+            if item.get("EventName") in names
+        )
+    return events
+
+
+def managed_recovery_invariant_errors(
+    gpu: dict[str, Any], *, provider: str
+) -> list[str]:
+    """The provider-side recovery invariant of the managed cluster.
+
+    HyperPod: ``NodeRecovery`` must be ``None`` (the product, not the provider,
+    owns node recovery). Plain EKS has no HyperPod NodeRecovery; its invariant is
+    that no provider-side replacement is enabled or observed: the cluster's
+    reboot owner is the EKS adapter, nodeReplace is observe-only, and the
+    CloudTrail window (judged separately) carries no EC2 replacement mutation.
+    """
+
+    if provider == "eks-managed":
+        if gpu.get("node_recovery") != "not-applicable":
+            return ["plain-EKS managed cluster reports a HyperPod NodeRecovery"]
+        return []
+    if gpu.get("node_recovery") != "None":
+        return ["managed GPU cluster NodeRecovery is not None"]
+    return []
+
+
+def eks_managed_invariant() -> dict[str, Any]:
+    return {
+        "provider": "eks-managed",
+        "node_recovery": "not-applicable",
+        "node_reboot_owner": PROVIDER_NODE_REBOOT_OWNERS["eks-managed"],
+        "node_replace": "observe-only",
+        "provider_mutation_sources": [
+            source
+            for source, _names in provider_event_sources("eks-managed", frozenset())
+        ],
+    }

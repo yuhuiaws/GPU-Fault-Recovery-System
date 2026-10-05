@@ -371,3 +371,82 @@ def test_main_requires_an_explicit_run_directory(monkeypatch, main_reads):
     assert main_reads["calls"] == [0o077], (
         "missing run directory must fail before identity reads or configuration"
     )
+
+
+@pytest.mark.parametrize("case_id", ["GF-REGIONAL-DESTR-006", "GF-REGIONAL-DESTR-007"])
+def test_a_plain_eks_managed_cluster_passes_the_recovery_invariant_without_hyperpod(
+    tmp_path, live_reads, monkeypatch, case_id
+):
+    """EKS profile, 2026-10-04: both cases failed "managed GPU cluster
+    NodeRecovery is not None". A plain-EKS cluster has no HyperPod NodeRecovery;
+    its invariant is observe-only replacement with no provider mutation."""
+
+    monkeypatch.setattr(audit, "MANAGED_PROVIDER", "eks-managed")
+    recoveries: list[tuple] = []
+    monkeypatch.setattr(
+        audit,
+        "cluster_recovery",
+        lambda name, provider="hyperpod": recoveries.append((name, provider))
+        or {
+            "cluster_name": name,
+            "status": "not-applicable",
+            "node_recovery": "not-applicable",
+            "provider": provider,
+        },
+    )
+
+    code = audit.run_audit(tmp_path, [case_id], identity=IDENTITY)
+    observed = result(tmp_path, case_id)
+
+    assert code == 0 and observed["verdict"] == "PASS", observed["errors"]
+    assert recoveries == [(audit.MANAGED_GPU_CLUSTER, "eks-managed")]
+    assert observed["provider"] == "eks-managed"
+    assert observed["gpu_cluster"]["node_recovery"] == "not-applicable"
+    assert observed["eks_managed_invariant"] == {
+        "provider": "eks-managed",
+        "node_recovery": "not-applicable",
+        "node_reboot_owner": "gpu-fault-eks-adapter",
+        "node_replace": "observe-only",
+        "provider_mutation_sources": ["sagemaker.amazonaws.com", "ec2.amazonaws.com"],
+    }
+
+
+def test_a_plain_eks_managed_cluster_that_reports_hyperpod_recovery_is_refused(
+    tmp_path, live_reads, monkeypatch
+):
+    monkeypatch.setattr(audit, "MANAGED_PROVIDER", "eks-managed")
+    monkeypatch.setattr(
+        audit,
+        "cluster_recovery",
+        lambda name, provider="hyperpod": {
+            "cluster_name": name,
+            "node_recovery": "None",
+        },
+    )
+    code = audit.run_audit(tmp_path, ["GF-REGIONAL-DESTR-007"], identity=IDENTITY)
+    observed = result(tmp_path, "GF-REGIONAL-DESTR-007")
+    assert (
+        code == 1
+        and "plain-EKS managed cluster reports a HyperPod NodeRecovery"
+        in (observed["errors"])
+    ), "a provider mismatch is a refusal, never a pass by another provider's rule"
+
+
+def test_a_hyperpod_managed_cluster_keeps_the_node_recovery_none_rule(
+    tmp_path, live_reads, monkeypatch
+):
+    monkeypatch.setattr(audit, "MANAGED_PROVIDER", "hyperpod")
+    monkeypatch.setattr(
+        audit,
+        "cluster_recovery",
+        lambda name: {"cluster_name": name, "node_recovery": "Automatic"},
+    )
+    code = audit.run_audit(tmp_path, ["GF-REGIONAL-DESTR-007"], identity=IDENTITY)
+    observed = result(tmp_path, "GF-REGIONAL-DESTR-007")
+    assert (
+        code == 1
+        and "managed GPU cluster NodeRecovery is not None" in observed["errors"]
+    )
+    assert (
+        observed["provider"] == "hyperpod" and "eks_managed_invariant" not in observed
+    )

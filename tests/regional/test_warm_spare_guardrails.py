@@ -442,3 +442,47 @@ def test_the_isolated_node_reader_carries_the_probes_past_the_isolation_fence() 
     with pytest.raises(KeyError, match="unrelated node"):
         reader.read_node("another-node")
     assert reader.reads == ["audit-node"], "foreign identities cannot satisfy the probe"
+
+
+def test_replace_events_cover_ec2_replacement_mutations_for_a_plain_eks_cluster(
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+
+    calls: list[str] = []
+
+    def command(argv, **_kwargs):
+        source = next(a for a in argv if a.startswith("AttributeKey=EventSource"))
+        calls.append(source.split("=")[-1])
+        if source.endswith("ec2.amazonaws.com"):
+            return json.dumps(
+                {
+                    "Events": [
+                        {"EventName": "TerminateInstances", "EventTime": "t1"},
+                        {"EventName": "DescribeInstances", "EventTime": "t2"},
+                    ]
+                }
+            )
+        return json.dumps({"Events": []})
+
+    monkeypatch.setattr(warm_spare, "command", command)
+    monkeypatch.setattr(warm_spare, "AWS_REGION", "us-west-2")
+    window = (
+        datetime(2026, 10, 4, tzinfo=timezone.utc),
+        datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+
+    monkeypatch.setattr(warm_spare, "MANAGED_PROVIDER", "hyperpod")
+    assert warm_spare.replace_events(*window) == []
+    assert calls == ["sagemaker.amazonaws.com"], "HyperPod reads exactly as before"
+
+    calls.clear()
+    monkeypatch.setattr(warm_spare, "MANAGED_PROVIDER", "eks-managed")
+    assert warm_spare.replace_events(*window) == [
+        {
+            "event_name": "TerminateInstances",
+            "event_time": "t1",
+            "event_source": "ec2.amazonaws.com",
+        }
+    ], "an EC2 node replacement in the window is a provider mutation on plain EKS"
+    assert calls == ["sagemaker.amazonaws.com", "ec2.amazonaws.com"]
