@@ -771,20 +771,38 @@ class HyperPodLifecycleStepAdapter(
         # The dispatcher owns the provider submission key; it is distinct
         # from the remote command idempotency key carried by this context.
         require_mutation_ownership(context)
-        result = self.dispatcher.submit(
-            context.workflow,
-            context.step_index,
-            isolation_verified_nodes=isolation,
-            confirm_cluster_name=(context.request.confirm_cluster_name),
-            expected_fencing_token=(context.request.expected_fencing_token),
-        )
+        try:
+            result = self.dispatcher.submit(
+                context.workflow,
+                context.step_index,
+                isolation_verified_nodes=isolation,
+                confirm_cluster_name=(context.request.confirm_cluster_name),
+                expected_fencing_token=(context.request.expected_fencing_token),
+            )
+        except Exception as exc:  # noqa: BLE001 - the agents must not stay revoked
+            # No mutation was submitted, so no reboot will replace the agent's
+            # incarnation: give the revoked agents back before failing.
+            reactivated = self._reactivate_agents(context, revoked_agents)
+            return WorkflowStepOutcome.failed(
+                f"{self.provider_label} submission failed: {type(exc).__name__}: {exc}",
+                details={
+                    "revoked_agents": revoked_agents,
+                    "reactivated_agents": reactivated,
+                    "exception_type": type(exc).__name__,
+                },
+            )
         if result.failures:
+            reactivated = self._reactivate_agents(context, revoked_agents)
             return WorkflowStepOutcome.failed(
                 f"{self.provider_label} rejected nodes: "
                 + ", ".join(
                     item.node_logical_id or item.node_id or "unknown"
                     for item in result.failures
-                )
+                ),
+                details={
+                    "revoked_agents": revoked_agents,
+                    "reactivated_agents": reactivated,
+                },
             )
         return WorkflowStepOutcome.waiting(
             operation_id=result.operation_id,

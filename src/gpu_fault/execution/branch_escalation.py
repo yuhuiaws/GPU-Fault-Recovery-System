@@ -376,3 +376,17 @@ def exhausted_node_ids(workflow: WorkflowRequest) -> frozenset[str]:
 
 def failed_execution(execution: WorkflowStepExecution) -> bool:
     return execution.status is WorkflowStepStatus.FAILED
+
+
+def last_failed_step_index(workflow: WorkflowRequest) -> int:
+    """The step an exhausted ladder's verdict is parked on: the latest FAILED
+    step record (the rung that exhausted it), 0 when none was recorded."""
+
+    return max(
+        (
+            item.step_index
+            for item in workflow.step_executions
+            if failed_execution(item)
+        ),
+        default=0,
+    )

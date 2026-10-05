@@ -125,6 +125,7 @@ class GpuServiceQuiesceManager:
         device_sweep_timeout_seconds: int = 20,
         device_sweep_processes: tuple[str, ...] = (DEFAULT_DEVICE_SWEEP_PROCESSES),
         sweep_kubernetes_device_holders: bool = False,
+        protected_services: tuple[str, ...] = (),
         proc_root: str = "/proc",
         restore_command: str = (
             "/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services"
@@ -192,6 +193,11 @@ class GpuServiceQuiesceManager:
         # GPU feature discovery) still holding the target GPU; kubelet is down
         # and restarts it on restore. Off (HyperPod), VERIFY fails closed on it.
         self.sweep_kubernetes_device_holders = sweep_kubernetes_device_holders
+        # eks-managed: kubelet and containerd stay up -- a plain EKS node has no
+        # HyperPod health agent to carry a NotReady node, and the GPU clients
+        # are containers the runtime stops. Not part of the config digest, like
+        # the sweep switch, so the configured list stays the HyperPod one.
+        self.protected_services = tuple(protected_services)
         self.proc_root = Path(proc_root)
         self.restore_command = restore_command
         self.runner = runner
@@ -421,15 +427,9 @@ class GpuServiceQuiesceManager:
         self,
         target_device_paths: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """PIDs holding an open fd on a /dev/nvidiaN device node.
-
-        Read straight from ``/proc`` rather than via ``fuser``/``lsof``
-        so the sweep needs no extra package on the node image, and so it
-        sees exactly what :meth:`NodeActionExecutor._device_clients`
-        sees.  Control-plane and per-GPU accounting live there; here we
-        only need "who is still holding a GPU", so the result is keyed
-        by PID.
-        """
+        """PIDs holding an open fd on a /dev/nvidiaN device node, read straight
+        from ``/proc`` (no ``fuser``/``lsof`` on the image) exactly as
+        :meth:`NodeActionExecutor._device_clients` reads them; keyed by PID."""
         holders: dict[str, dict[str, str]] = {}
         try:
             entries = list(self.proc_root.iterdir())
@@ -563,19 +563,11 @@ class GpuServiceQuiesceManager:
         state_path: Path,
         existing: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Clear a failed quiesce window so the same command can retry.
-
-        A stop, container kill or sweep that raises leaves ``QUIESCE_FAILED``
-        behind, and a restore that cannot start a service leaves
-        ``RESTORE_FAILED``. Both used to make every retry raise "quiesce is
-        incomplete" until the fail-safe timer fired minutes later, by which
-        time the workflow was already dead with kubelet/FM/DCGM down. Restore
-        inline instead (idempotent: it starts what the file names and cancels
-        the timer) and return None so the caller quiesces from scratch. A
-        restore that itself fails keeps the window closed.
-
-        Returns the state unchanged when it is a healthy ``QUIESCED`` window.
-        """
+        """Clear a failed quiesce window (``QUIESCE_FAILED`` / ``RESTORE_FAILED``)
+        by restoring it inline so the same command can retry from scratch;
+        every retry used to raise "quiesce is incomplete" until the fail-safe
+        fired. Returns the state unchanged for a healthy ``QUIESCED`` window,
+        None after a restore; a restore that itself fails keeps the window."""
 
         phase = existing.get("phase")
         if phase == "QUIESCED":
@@ -641,7 +633,10 @@ class GpuServiceQuiesceManager:
                 }
 
             active_services = [
-                service for service in self.services if self._service_active(service)
+                service
+                for service in self.services
+                if service not in self.protected_services
+                and self._service_active(service)
             ]
             container_targets = self._resolve_container_targets()
             state = {
@@ -651,6 +646,7 @@ class GpuServiceQuiesceManager:
                 "phase": "ARMING",
                 "active_services": active_services,
                 "configured_services": list(self.services),
+                "protected_services": list(self.protected_services),
                 "container_targets": container_targets,
                 "target_device_paths": normalized_target_paths,
                 "workload_cgroup_paths": sorted(workload_cgroup_paths),
@@ -700,6 +696,7 @@ class GpuServiceQuiesceManager:
             return {
                 "quiesced": True,
                 "active_services": active_services,
+                "protected_services": list(self.protected_services),
                 "terminated_process_names": list(self.processes),
                 "swept_device_holders": swept_device_holders,
                 "unswept_device_holders": unswept_device_holders,
@@ -749,16 +746,10 @@ class GpuServiceQuiesceManager:
             self._write_state(state_path, state)
 
     def reconcile_after_boot(self) -> dict[str, Any]:
-        """Restore quiesce state files that a reboot orphaned.
-
-        A state file is stale when it was written on another boot, or -- for a
-        file from before the boot id was recorded -- when its fail-safe timer no
-        longer exists. A stale file's services were re-enabled by systemd at
-        boot, so restoring is mostly bookkeeping: start what the file names
-        (idempotent), drop the dead timer and remove the file. A file of the
-        current boot whose timer is still armed is an in-flight quiesce and is
-        left alone; an agent restart must not undo a maintenance window.
-        """
+        """Restore quiesce state files that a reboot orphaned: a file from
+        another boot (or, before boot ids were recorded, without its timer) is
+        bookkeeping -- start what it names, drop the timer, remove it; a file
+        of this boot whose timer is armed is an in-flight window and stays."""
 
         boot_id = self.boot_id_reader()
         report: dict[str, Any] = {

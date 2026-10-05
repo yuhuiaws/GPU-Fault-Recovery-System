@@ -134,9 +134,9 @@ def _job_dag(
     return incident, workflow
 
 
-def _run(store, workflow, outcomes, *, escalator):
+def _run(store, workflow, outcomes, *, escalator, operations=ALL_OPERATIONS):
     adapter = FakeAdapter(outcomes)
-    executor = active_workflow_executor(store, [adapter], ALL_OPERATIONS)
+    executor = active_workflow_executor(store, [adapter], operations)
     executor.branch_escalator = escalator
     result = executor.execute(
         workflow.request_id,
@@ -209,6 +209,64 @@ def test_an_exhausted_branch_fails_the_workflow_without_restarting_the_job():
     assert [
         call.rsplit("/", 1)[1] for call in adapter.calls if "node" not in call
     ].count("REPLACE_NODE") == 1
+    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+
+
+def test_an_exhausted_ladder_restores_the_quiesce_it_climbed_past():
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): QUIESCE stopped the node's
+    GPU services, RESET_GPU was busy, the ladder's RESTART_NODE was refused and
+    no spare was declared. The branch replacement had superseded the chain's
+    RESTORE_GPU_SERVICES, so the exhausted record ended FAILED with the node's
+    services down until the agent's fail-safe timer. The record now appends and
+    runs the owed restore before it ends, as a parked step failure does.
+    """
+
+    QUIESCE = WorkflowOperation.QUIESCE_GPU_SERVICES
+    RESTORE = WorkflowOperation.RESTORE_GPU_SERVICES
+    store = build_store()
+    incident, workflow = _job_dag(store, node_c_operation=BUNDLE)
+    steps = list(workflow.official_steps)
+    # node-b: QUIESCE (1) -> RESET (2) -> RESTORE (3); node-c: BUNDLE (4); join (5)
+    quiesce = copy_model(steps[1], operation=QUIESCE)
+    reset = copy_model(steps[1], depends_on_step_indexes=[1])
+    restore = copy_model(steps[1], operation=RESTORE, depends_on_step_indexes=[2])
+    bundle = copy_model(steps[2])
+    join = copy_model(steps[3], depends_on_step_indexes=[3, 4])
+    workflow = copy_model(
+        workflow, official_steps=[steps[0], quiesce, reset, restore, bundle, join]
+    )
+    store.save_workflow(workflow)
+    outcomes = {
+        RESET: WorkflowStepOutcome.failed("reset refused: In use by another client"),
+        REBOOT: WorkflowStepOutcome.failed("submission cluster_name does not match"),
+        REPLACE: WorkflowStepOutcome.failed("no healthy warm spare"),
+        **_ok(QUIESCE, RESTORE, BUNDLE, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(
+        store,
+        workflow,
+        outcomes,
+        escalator=_escalator(),
+        operations=ALL_OPERATIONS | {QUIESCE, RESTORE},
+    )
+
+    assert result.status is WorkflowStatus.FAILED, result
+    assert str(saved.terminal_failure_reason).startswith(
+        "node branch escalation exhausted: branch:node-b"
+    ), saved.terminal_failure_reason
+    operations = [call.rsplit("/", 1)[1] for call in adapter.calls]
+    assert operations.count("RESTORE_GPU_SERVICES") == 1, adapter.calls
+    assert operations.index("RESTORE_GPU_SERVICES") > operations.index(
+        "REPLACE_NODE"
+    ), "the restore is the compensation after the last rung, not the chain's own"
+    assert 3 in saved.superseded_step_indexes, "the chain's restore was replaced"
+    appended = saved.official_steps[-1]
+    assert appended.operation is RESTORE and appended.node_ids == ["node-b"], appended
+    assert appended.parameters == {"compensation_for_step_indexes": [1]}, appended
+    assert len(saved.official_steps) - 1 in saved.completed_step_indexes, saved
+    assert saved.pending_failure_step_index is None, saved
+    assert all("RESTART_WORKLOAD" not in call for call in adapter.calls), adapter.calls
     assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
 
 

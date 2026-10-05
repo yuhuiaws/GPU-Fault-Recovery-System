@@ -672,6 +672,69 @@ def test_retryable_node_action_failure_returns_waiting() -> None:
     assert outcome.details["retryable_node_action"] is True
 
 
+def test_busy_reset_failure_carries_the_holder_evidence_into_the_step() -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the agent's RESET_GPU result
+    named the holders it found when nvidia-smi answered ``In use by another
+    client`` (``gpu_client_holders``), but the step record carried only
+    ``remote_status``; the operator had to read the agent ledger."""
+
+    store = build_store()
+    incident, workflow = workflow_state(store, [WorkflowOperation.RESET_GPU])
+    registry = StubFleetRegistry({"node-a": "http://node-a:9099"})
+    holders = [
+        {
+            "pid": "4321",
+            "process_name": "dcgm-exporter",
+            "devices": "/dev/nvidia0",
+            "container_id": "fd28" * 16,
+        }
+    ]
+
+    def sender(_endpoint, envelope):
+        return node_action_result(
+            envelope.command.command_id,
+            envelope.command.operation,
+            NodeActionStatus.FAILED,
+            error=(
+                "nvidia-smi --gpu-reset: In use by another client; "
+                "device holders: 4321:dcgm-exporter:/dev/nvidia0"
+            ),
+            details={
+                "reset_failed": True,
+                "gpu_client_holders": holders,
+                "gpu_reset_busy_attempts": 3,
+                "agent_private_key": "stays on the agent",
+            },
+        )
+
+    adapter = NodeActionWorkflowAdapter({}, "s" * 32, sender=sender, registry=registry)
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        node_ids=["node-a"],
+        gpu_uuids=["GPU-a"],
+    )
+    outcome = adapter.execute(
+        WorkflowStepContext(
+            workflow=copy_model(workflow, official_steps=[step]),
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=WorkflowExecutionRequest(
+                expected_fencing_token=workflow.fencing_token
+            ),
+            idempotency_key="workflow/busy",
+        )
+    )
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert "In use by another client" in (outcome.error or ""), outcome.error
+    assert outcome.details["gpu_client_holders"] == holders, outcome.details
+    assert outcome.details["gpu_reset_busy_attempts"] == 3, outcome.details
+    assert outcome.details["reset_failed"] is True, outcome.details
+    assert "agent_private_key" not in outcome.details, "the allow-list still filters"
+
+
 @pytest.mark.parametrize("spare_health_check", [False, True])
 def test_busy_spare_client_check_fails_instead_of_waiting(spare_health_check) -> None:
     """Quiesce-waiting belongs to the faulted node, not to a spare candidate.

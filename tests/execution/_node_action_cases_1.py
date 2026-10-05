@@ -954,3 +954,105 @@ def test_hyperpod_step_waits_for_external_confirmation() -> None:
     record = store.get_agent("cluster-a", "node-a")
     assert record.lifecycle_state is AgentLifecycleState.REVOKED
     assert record.transition_id == ("workflow-active/0/RESTART_NODE/hyperpod-lifecycle")
+
+
+@pytest.mark.parametrize("failure", ["raises", "rejected"])
+def test_a_provider_submission_that_is_not_made_gives_the_agent_back(failure) -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the control plane refused the
+    RESTART_NODE reservation (403), the step failed, and the agent the adapter
+    had revoked for the coming reboot stayed REVOKED -- every heartbeat was
+    answered 409 "agent incarnation has been retired" although the node never
+    rebooted. A revocation whose mutation was not submitted is undone by the
+    step itself, under its own transition id."""
+
+    from gpu_fault.hyperpod import (
+        HyperPodAction,
+        HyperPodNodeFailure,
+        HyperPodSubmissionResult,
+    )
+
+    class RefusingLifecycle(FakeHyperPodLifecycle):
+        def execute_step(self, step, **kwargs):
+            self.calls += 1
+            if failure == "raises":
+                raise RuntimeError(
+                    "HTTP 403: submission cluster_name does not match the "
+                    "registered provider cluster for this cluster_id"
+                )
+            return HyperPodSubmissionResult(
+                idempotency_key=kwargs["idempotency_key"],
+                action=HyperPodAction.REBOOT,
+                cluster_name="hp-cluster",
+                requested_node_logical_ids=step.node_ids,
+                successful_node_logical_ids=[],
+                failures=[
+                    HyperPodNodeFailure(
+                        node_logical_id="node-a",
+                        error_code="ValidationException",
+                        message="refused",
+                    )
+                ],
+                submitted=False,
+            )
+
+    store = build_store()
+    secret = "agent-secret-" + "x" * 32
+    fleet = FleetRegistry(store, secret, now=lambda: NOW)
+    heartbeat = AgentHeartbeat(
+        cluster_id="cluster-a",
+        node_id="node-a",
+        endpoint="http://node-a:9099",
+        agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
+        agent_version="0.10.0",
+        artifact_sha256="a" * 64,
+        policy_version="610",
+        runtime_profile_version="active-v1",
+        config_digest="c" * 64,
+        allowed_operations=[WorkflowOperation.RESET_GPU],
+        boot_id="boot-a",
+        node_instance_id="instance-a",
+        agent_incarnation_id="incarnation-a",
+        observed_at=NOW,
+    )
+    fleet.register(
+        SignedAgentHeartbeat(
+            heartbeat=heartbeat, signature=sign_agent_heartbeat(heartbeat, secret)
+        )
+    )
+    _, workflow = workflow_state(store, [WorkflowOperation.RESTART_NODE])
+    lifecycle = RefusingLifecycle()
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle, registry=fleet, kubernetes_adapter=isolated_kubernetes_adapter()
+    )
+    step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
+    workflow = copy_model(workflow, official_steps=[step])
+    store.save_workflow(workflow)
+    active = active_workflow_executor(
+        store, [adapter], {WorkflowOperation.RESTART_NODE}
+    )
+    request = WorkflowExecutionRequest(
+        expected_fencing_token=3,
+        isolation_verified_nodes=["node-a"],
+        confirm_cluster_name="hp-cluster",
+    )
+
+    result = active.execute(workflow.request_id, request)
+
+    assert result.status is WorkflowStatus.FAILED, result
+    assert lifecycle.calls == 1
+    execution = store.get_workflow(workflow.request_id).step_executions[0]
+    assert execution.status is WorkflowStepStatus.FAILED, execution
+    assert execution.details["revoked_agents"] == ["node-a"], execution.details
+    assert execution.details["reactivated_agents"] == ["node-a"], execution.details
+    if failure == "raises":
+        assert execution.details["exception_type"] == "RuntimeError"
+        assert "submission failed: RuntimeError: HTTP 403" in (execution.error or "")
+    else:
+        assert "rejected nodes: node-a" in (execution.error or ""), execution.error
+    record = store.get_agent("cluster-a", "node-a")
+    assert record.lifecycle_state is AgentLifecycleState.ACTIVE, record
+    assert record.transition_id is None and record.transition_reason is None
+    assert record.agent_incarnation_id == "incarnation-a"
+    assert "incarnation-a" not in record.retired_incarnation_ids, (
+        "the incarnation that never rebooted heartbeats again"
+    )

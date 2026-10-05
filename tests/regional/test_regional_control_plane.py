@@ -26,6 +26,7 @@ from ._regional_control_plane_cases_1 import (
     test_unclaimed_remote_commands_are_dead_lettered,
 )
 from ._regional_control_plane_cases_2 import (
+    test_eks_managed_submissions_bind_to_the_cluster_id_not_a_hyperpod_name,
     test_hyperpod_submission_paths_require_a_cluster_token,
     test_incident_ownership_route_answers_takeover_question,
     test_node_installer_can_read_back_its_own_gpu_metrics,
@@ -38,5 +39,6 @@ from ._regional_control_plane_cases_2 import (
     test_regional_registry_satisfies_the_notification_sink_protocol,
     test_remote_hyperpod_submission_endpoints_enforce_cluster_binding,
     test_the_data_plane_can_read_its_own_fleet_rollout_fence,
+    test_the_executor_can_give_back_an_agent_it_revoked_for_an_unmade_submission,
     test_the_fleet_rollout_fence_route_is_cluster_scoped,
 )

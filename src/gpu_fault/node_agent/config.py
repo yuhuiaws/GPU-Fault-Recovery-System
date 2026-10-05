@@ -6,6 +6,7 @@ import os
 import shlex
 import socket
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from gpu_fault.env import env_bool
@@ -183,6 +184,24 @@ def executor_from_environment(
     )
 
 
+#: Services an ``eks-managed`` quiesce leaves running whatever the configured
+#: list says: the plain EKS node has no HyperPod health agent behind a NotReady
+#: node, and stopping kubelet took the node out of the cluster (live 2026-10-05).
+EKS_MANAGED_PROTECTED_QUIESCE_SERVICES = ("kubelet", "containerd")
+
+
+def protected_quiesce_services(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Services the node's provider forbids the quiesce to stop."""
+
+    values = os.environ if environ is None else environ
+    provider = str(values.get("GPU_FAULT_CLUSTER_PROVIDER") or "hyperpod").strip()
+    if provider == "eks-managed":
+        return EKS_MANAGED_PROTECTED_QUIESCE_SERVICES
+    return ()
+
+
 def _quiesce_from_environment(proc_root, operations):
     quiesce_enabled = env_bool("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", False)
     state_dir = os.getenv(
@@ -239,6 +258,7 @@ def _quiesce_from_environment(proc_root, operations):
             sweep_kubernetes_device_holders=env_bool(
                 "GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS", False
             ),
+            protected_services=protected_quiesce_services(),
             proc_root=proc_root,
             restore_command=os.getenv(
                 "GPU_FAULT_QUIESCE_RESTORE_COMMAND",

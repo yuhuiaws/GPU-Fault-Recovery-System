@@ -148,6 +148,46 @@ class HyperPodNotificationMixin:
         match = re.search(r"-xid-(\d+)$", context.incident.event_id)
         return int(match.group(1)) if match is not None else None
 
+    def _reactivate_agents(
+        self, context: WorkflowStepContext, node_ids: list[str]
+    ) -> list[str]:
+        """Undo this step's own revocation when its provider mutation was not
+        submitted: the node is not going to reboot, so its agent must keep
+        heartbeating (live 2026-10-05 a RESTART_NODE refused by the control
+        plane left the agent REVOKED and every heartbeat answered 409 "agent
+        incarnation has been retired")."""
+
+        if self.registry is None:
+            return []
+        transition_id = f"{context.idempotency_key}/hyperpod-lifecycle"
+        reactivated = []
+        for node_id in node_ids:
+            try:
+                record = self.registry.store.get_agent(
+                    context.incident.cluster_id, node_id
+                )
+            except KeyError:
+                continue
+            if (
+                record.lifecycle_state is not AgentLifecycleState.REVOKED
+                or record.transition_id != transition_id
+            ):
+                continue
+            self.registry.reactivate_agent(
+                context.incident.cluster_id,
+                node_id,
+                AgentTransitionRequest(
+                    expected_generation=record.generation,
+                    transition_id=transition_id,
+                    reason=(
+                        f"{context.step.operation.value} submission was not made; "
+                        "the agent keeps its incarnation"
+                    ),
+                ),
+            )
+            reactivated.append(node_id)
+        return reactivated
+
     def _revoke_agents(self, context: WorkflowStepContext) -> list[str]:
         if self.registry is None:
             return []

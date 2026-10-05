@@ -589,6 +589,14 @@ class RegionalFleetRegistry:
     ) -> AgentRecord:
         return self._transition(cluster_id, node_id, "revoke", request)
 
+    def reactivate_agent(
+        self,
+        cluster_id: str,
+        node_id: str,
+        request: AgentTransitionRequest,
+    ) -> AgentRecord:
+        return self._transition(cluster_id, node_id, "reactivate", request)
+
     def _transition(
         self,
         cluster_id: str,

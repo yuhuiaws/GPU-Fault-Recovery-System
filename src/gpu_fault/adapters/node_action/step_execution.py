@@ -285,6 +285,11 @@ class NodeActionExecutionService:
                     "reset_outcome_unknown",
                     "reset_failed",
                     "reset_not_attempted",
+                    # A reset refused as "In use by another client" names the
+                    # holders it found (node_agent.operations.reset.GpuResetBusy);
+                    # live 2026-10-05 the record carried only remote_status.
+                    "gpu_client_holders",
+                    "gpu_reset_busy_attempts",
                 )
                 if key in result.details
             },

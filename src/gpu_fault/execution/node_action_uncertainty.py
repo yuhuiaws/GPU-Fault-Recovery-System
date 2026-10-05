@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from gpu_fault.execution.models import WorkflowStepOutcome
@@ -16,6 +17,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_matches_step,
     execution_phase,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
 from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY, RemoteCommandStatus
@@ -415,13 +417,15 @@ def restoration_refusal(
     )
 
 
-def quiesce_needs_restoration(
+def unrestored_quiesces(
     workflow: WorkflowRequest,
     steps: list[WorkflowStepSpec] | None,
     *,
     settling_operations: Collection[WorkflowOperation],
-) -> bool:
-    """Match completed quiesce and restoration by node and execution order."""
+) -> list[tuple[int, WorkflowStepSpec, frozenset[str]]]:
+    """Completed quiesce steps whose nodes no later completed restore (or
+    settling reboot/replacement) covered, with those nodes; matched by node
+    and execution order."""
 
     if steps is None:
         steps = (
@@ -430,6 +434,7 @@ def quiesce_needs_restoration(
             else workflow.official_steps
         )
     completed = set(workflow.completed_step_indexes)
+    owed: list[tuple[int, WorkflowStepSpec, frozenset[str]]] = []
     for quiesce_index, quiesce in enumerate(steps):
         if (
             quiesce_index not in completed
@@ -447,6 +452,116 @@ def quiesce_needs_restoration(
                 )
             ):
                 restored.update(restore.node_ids)
-        if set(quiesce.node_ids) - restored:
-            return True
-    return False
+        unrestored = frozenset(quiesce.node_ids) - restored
+        if unrestored:
+            owed.append((quiesce_index, quiesce, unrestored))
+    return owed
+
+
+def quiesce_needs_restoration(
+    workflow: WorkflowRequest,
+    steps: list[WorkflowStepSpec] | None,
+    *,
+    settling_operations: Collection[WorkflowOperation],
+) -> bool:
+    """Match completed quiesce and restoration by node and execution order."""
+
+    return bool(
+        unrestored_quiesces(workflow, steps, settling_operations=settling_operations)
+    )
+
+
+def pending_restore_step(
+    workflow: WorkflowRequest, steps: list[WorkflowStepSpec]
+) -> tuple[int, WorkflowStepSpec] | None:
+    """The first RESTORE_GPU_SERVICES step of ``steps`` that may still run."""
+
+    resolved = resolved_step_indexes(workflow)
+    return next(
+        (
+            (index, step)
+            for index, step in enumerate(steps)
+            if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+            and index not in resolved
+        ),
+        None,
+    )
+
+
+#: ``parameters`` key of a restore step the executor appended itself: the
+#: indexes of the completed quiesce steps it restores.
+COMPENSATION_RESTORE_KEY = "compensation_for_step_indexes"
+
+
+def compensation_restore_step(
+    workflow: WorkflowRequest,
+    steps: list[WorkflowStepSpec],
+    *,
+    settling_operations: Collection[WorkflowOperation],
+) -> WorkflowStepSpec | None:
+    """A RESTORE_GPU_SERVICES step for the nodes a completed quiesce left
+    stopped when no step of ``steps`` is left to restore them.
+
+    The chain's own restore can be gone: the branch ladder replaces a failed
+    node branch -- its completed quiesce, its failed reset and its pending
+    restore alike -- with a reboot rung, and a reboot that then fails (live
+    2026-10-05: reset busy, reboot refused, no spare) settles nothing. The
+    services stay down until the agent's fail-safe timer unless the record
+    restores them before it ends. The step is owned by the chain's restore
+    owner when it had one (superseded or not), else the quiesce's; ``None``
+    when nothing is owed.
+    """
+
+    owed = unrestored_quiesces(workflow, steps, settling_operations=settling_operations)
+    if not owed:
+        return None
+    owner = next(
+        (
+            step.execution_owner
+            for step in steps
+            if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+        ),
+        owed[0][1].execution_owner,
+    )
+    return WorkflowStepSpec(
+        operation=WorkflowOperation.RESTORE_GPU_SERVICES,
+        execution_owner=owner,
+        node_ids=sorted(set().union(*(nodes for _, _, nodes in owed))),
+        gpu_uuids=sorted({uuid for _, step, _ in owed for uuid in step.gpu_uuids}),
+        workload_ids=sorted(
+            {item for _, step, _ in owed for item in step.workload_ids}
+        ),
+        parameters={COMPENSATION_RESTORE_KEY: [index for index, _, _ in owed]},
+    )
+
+
+def with_compensation_step(
+    workflow: WorkflowRequest, step: WorkflowStepSpec, *, is_safety: bool
+) -> WorkflowRequest:
+    """``workflow`` with ``step`` appended to the phase's step list; a DAG
+    record moves to the next revision, as for any step-list rewrite."""
+
+    field = "safety_steps" if is_safety else "official_steps"
+    update: dict[str, Any] = {
+        field: [*getattr(workflow, field), step],
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if workflow.dag_enabled:
+        update["dag_revision"] = workflow.dag_revision + 1
+    return workflow.model_copy(update=update)
+
+
+def park_failure(
+    workflow: WorkflowRequest, step_index: int, error: str
+) -> WorkflowRequest:
+    """Record the failure verdict on the workflow (``pending_failure_*``) so the
+    compensation owed before it lands -- an unrestored quiesce -- runs first and
+    survives the lease renewals that re-read the row."""
+
+    return workflow.model_copy(
+        update={
+            "pending_failure_step_index": step_index,
+            "pending_failure_error": error,
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )

@@ -202,9 +202,18 @@ def test_only_the_eks_managed_installer_job_asks_for_the_sweep() -> None:
         encoding="utf-8"
     )
     assert 'if [[ "\\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then' in job
-    assert "quiesce_args=(--quiesce-sweep-kubernetes-device-holders)" in job
+    assert (
+        "quiesce_args=(--quiesce-sweep-kubernetes-device-holders "
+        "--cluster-provider eks-managed)"
+    ) in job, "the eks-managed agent learns its provider with the sweep switch"
     assert '"\\${quiesce_args[@]}"' in job, "the installer receives the provider's args"
     assert "--quiesce-sweep-kubernetes-device-holders)" in installer
+    assert "--cluster-provider) require_value" in installer
+    assert (
+        'if [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]]; then '
+        'write_env GPU_FAULT_CLUSTER_PROVIDER "${CLUSTER_PROVIDER}"; fi'
+    ) in installer, "the provider reaches the Agent environment on eks-managed only"
+    assert 'CLUSTER_PROVIDER="hyperpod"' in installer
     assert (
         'write_env GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS "true"'
         in installer

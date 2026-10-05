@@ -5,16 +5,19 @@ import asyncio
 import httpx
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.app.routes.regional import provider_cluster_name
 from gpu_fault.cluster_executor import (
     RegionalExecutorClient,
     RegionalFleetRegistry,
     RegionalIncidentOwnershipProvider,
 )
+from gpu_fault.fleet import AgentLifecycleState, AgentTransitionRequest
 from gpu_fault.hyperpod import HyperPodAction, HyperPodSubmissionRecord
 from gpu_fault.hyperpod_spares import NotificationSink
 from gpu_fault.regional import RemoteEvidenceCaptureRequest
 from gpu_fault.telemetry import EvidenceKind
 from tests._builders import asgi_client, build_context, copy_model
+from tests.fleet._support import heartbeat, registry, signed
 from tests.regional._regional_support import (
     NOW,
     TOKEN_A,
@@ -263,6 +266,132 @@ def test_regional_ownership_provider_reads_the_route() -> None:
     assert quarantined.quarantine_hold is True
     assert quarantined.terminal_quarantine is True
     assert provider.incident_workflow_is_terminal("inc-never-existed") is False
+
+
+def test_eks_managed_submissions_bind_to_the_cluster_id_not_a_hyperpod_name() -> None:
+    """Live 2026-10-05 (gpu-eks-cluster DESTR-001): the executor's RESTART_NODE
+    reservation named ``EksProviderConfig.cluster_name`` -- the cluster id, a
+    plain EKS cluster has no HyperPod name -- and the route compared it with the
+    registration's empty ``hyperpod_cluster_name``: 403 on every reboot."""
+
+    eks = copy_model(
+        registration("gpu-eks-cluster", TOKEN_A),
+        provider="eks-managed",
+        hyperpod_cluster_name="",
+    )
+    hyperpod = registration("cluster-b", TOKEN_B)
+    assert provider_cluster_name(eks) == "gpu-eks-cluster"
+    assert provider_cluster_name(hyperpod) == "hp-cluster-b"
+    context = build_context()
+    context.regional_mode = True
+    context.store.save_regional_cluster(eks)
+    context.store.save_regional_cluster(hyperpod)
+
+    def submission(cluster_id: str, token: str, cluster_name: str) -> dict:
+        record = HyperPodSubmissionRecord(
+            cluster_name=cluster_name,
+            idempotency_key="workflow-1/restart-node/0",
+            action=HyperPodAction.REBOOT,
+            requested_node_identifiers=["ip-10-0-33-205.us-west-2.compute.internal"],
+        )
+        return {
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "X-GPU-Fault-Cluster-ID": cluster_id,
+            },
+            "json": {
+                "cluster_id": cluster_id,
+                "record": record.model_dump(mode="json"),
+            },
+        }
+
+    path = "/v1/regional/executors/hyperpod-submissions/reserve"
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            accepted = await client.post(
+                path, **submission("gpu-eks-cluster", TOKEN_A, "gpu-eks-cluster")
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["reserved"] is True
+            named = await client.post(
+                path, **submission("gpu-eks-cluster", TOKEN_A, "hp-gpu-eks-cluster")
+            )
+            assert named.status_code == 403, named.text
+            assert "eks-managed" in named.json()["detail"], named.json()
+            # A HyperPod registration still binds to its HyperPod name, never
+            # to its cluster id.
+            by_id = await client.post(
+                path, **submission("cluster-b", TOKEN_B, "cluster-b")
+            )
+            assert by_id.status_code == 403, by_id.text
+            by_name = await client.post(
+                path, **submission("cluster-b", TOKEN_B, "hp-cluster-b")
+            )
+            assert by_name.status_code == 200, by_name.text
+
+    asyncio.run(scenario())
+
+
+def test_the_executor_can_give_back_an_agent_it_revoked_for_an_unmade_submission() -> (
+    None
+):
+    """The regional executor revokes an agent before it submits the reboot; when
+    the submission is refused it reactivates the agent through this route under
+    the revoking transition id, as the local ``FleetRegistry`` does for it."""
+
+    context = build_context()
+    context.regional_mode = True
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+    fleet = registry(context.store)
+    context.fleet_registry = fleet
+    fleet.register(signed(heartbeat("node-a")))
+    transition = AgentTransitionRequest(
+        expected_generation=context.store.get_agent("cluster-a", "node-a").generation,
+        transition_id="workflow-1/0/RESTART_NODE/hyperpod-lifecycle",
+        reason="HyperPod RESTART_NODE submission",
+    )
+    fleet.drain_agent("cluster-a", "node-a", transition)
+    fleet.revoke_agent("cluster-a", "node-a", transition)
+    revoked = context.store.get_agent("cluster-a", "node-a")
+    assert revoked.lifecycle_state is AgentLifecycleState.REVOKED
+    headers = {
+        "Authorization": f"Bearer {TOKEN_A}",
+        "X-GPU-Fault-Cluster-ID": "cluster-a",
+    }
+    body = {
+        "expected_generation": revoked.generation,
+        "transition_id": transition.transition_id,
+        "reason": "RESTART_NODE submission was not made; the agent keeps its incarnation",
+    }
+    path = "/v1/regional/executors/agents/node-a/reactivate"
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            foreign = await client.post(
+                path,
+                headers={**headers, "Authorization": f"Bearer {TOKEN_B}"},
+                json=body,
+            )
+            assert foreign.status_code in {401, 403}, foreign.text
+            wrong = await client.post(
+                path, headers=headers, json={**body, "transition_id": "someone-else"}
+            )
+            assert wrong.status_code == 409, wrong.text
+            assert "revoking transition" in wrong.json()["detail"], wrong.json()
+            assert (
+                context.store.get_agent("cluster-a", "node-a").lifecycle_state
+                is AgentLifecycleState.REVOKED
+            )
+            response = await client.post(path, headers=headers, json=body)
+            assert response.status_code == 200, response.text
+            assert response.json()["lifecycle_state"] == "ACTIVE", response.json()
+            assert response.json()["transition_id"] is None
+
+    asyncio.run(scenario())
+    record = context.store.get_agent("cluster-a", "node-a")
+    assert record.lifecycle_state is AgentLifecycleState.ACTIVE, record
+    assert record.retired_incarnation_ids == [], record
 
 
 def test_hyperpod_submission_paths_require_a_cluster_token() -> None:

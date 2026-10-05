@@ -200,7 +200,7 @@ def test_lease_less_command_cannot_send_progress_or_renewal(
 
 
 @pytest.mark.parametrize(
-    "action", ["fence", "list", "get", "drain", "revoke", "evidence"]
+    "action", ["fence", "list", "get", "drain", "revoke", "reactivate", "evidence"]
 )
 def test_fleet_proxy_rejects_foreign_cluster_before_http(
     monkeypatch: pytest.MonkeyPatch, action: str
@@ -221,6 +221,8 @@ def test_fleet_proxy_rejects_foreign_cluster_before_http(
             fleet.drain_agent("foreign", "node-a", transition)
         elif action == "revoke":
             fleet.revoke_agent("foreign", "node-a", transition)
+        elif action == "reactivate":
+            fleet.reactivate_agent("foreign", "node-a", transition)
         else:
             fleet.capture_evidence(
                 RemoteEvidenceCaptureRequest(
@@ -293,6 +295,10 @@ def test_fleet_proxy_keeps_positive_readiness_transition_notification_and_eviden
     )
     assert fleet.drain_agent("cluster-a", "node-a", transition) == record
     assert fleet.revoke_agent("cluster-a", "node-a", transition) == record
+    assert fleet.reactivate_agent("cluster-a", "node-a", transition) == record
+    assert wire.calls[-1][0].full_url.endswith(
+        "/v1/regional/executors/agents/node-a/reactivate"
+    ), "the executor undoes its own revocation through the regional route"
     wire.response = {"ready": False, "reasons": ["HMA_HEALTH_UNKNOWN"]}
     assert fleet.spare_health_reasons(
         cluster_id="cluster-a",

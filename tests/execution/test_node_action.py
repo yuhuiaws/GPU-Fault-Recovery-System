@@ -2,6 +2,7 @@
 
 # ruff: noqa: F401
 from ._node_action_cases_1 import (
+    test_a_provider_submission_that_is_not_made_gives_the_agent_back,
     test_control_plane_persists_remote_warm_spare_success_email,
     test_hyperpod_automatic_recovery_cannot_bypass_spare_only_mode,
     test_hyperpod_replace_is_blocked_when_spares_are_insufficient,
@@ -25,6 +26,7 @@ from ._node_action_cases_2 import (
     test_a_quiesce_wait_on_the_second_node_keeps_the_first_nodes_result,
     test_a_rejected_second_node_still_reports_the_first_nodes_result,
     test_an_early_held_or_interrupted_node_keeps_the_earlier_node_results,
+    test_busy_reset_failure_carries_the_holder_evidence_into_the_step,
     test_busy_spare_client_check_fails_instead_of_waiting,
     test_completed_spare_failover_keeps_old_node_safety_hold,
     test_hyperpod_preflight_credential_error_is_a_configuration_failure,

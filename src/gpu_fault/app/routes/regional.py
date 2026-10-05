@@ -15,6 +15,7 @@ from gpu_fault.async_store import (
     RequestDeadlineExceeded,
     StoreIoCapacityExceeded,
 )
+from gpu_fault.cluster_scope import ClusterProvider, cluster_provider
 from gpu_fault.execution.fleet_preflight import (
     fleet_rollout_fence_deployment_ids,
 )
@@ -33,6 +34,7 @@ from gpu_fault.models import (
 from gpu_fault.fleet_compatibility import NODE_ACTION_KEY_VERSION_DERIVED
 from gpu_fault.node_action_keys import resolve_node_action_secret
 from gpu_fault.regional import (
+    RegionalClusterRegistration,
     RegionalExecutorReadinessReport,
     RegionalExecutorReadinessRequest,
     RemoteActionCommand,
@@ -442,18 +444,31 @@ async def complete_remote_command(
     return command
 
 
+def provider_cluster_name(registration: RegionalClusterRegistration) -> str:
+    """The cluster scope a provider submission names for ``registration``:
+    the HyperPod cluster name, or -- a plain EKS cluster has none -- the
+    cluster id itself, which is what ``EksProviderConfig.cluster_name`` sends
+    (live 2026-10-05 an eks-managed RESTART_NODE was refused 403 against the
+    empty HyperPod name)."""
+
+    if cluster_provider(registration.provider) is ClusterProvider.EKS_MANAGED:
+        return registration.cluster_id
+    return registration.hyperpod_cluster_name
+
+
 def _registered_submission(
     dependencies: RegionalRouterDependencies,
     cluster_id: str | None,
     cluster_name: str,
 ):
     registration = dependencies.auth_registry.get(cluster_id or "")
-    if registration is None or cluster_name != registration.hyperpod_cluster_name:
+    if registration is None or cluster_name != provider_cluster_name(registration):
         raise HTTPException(
             status_code=403,
             detail=(
-                "submission cluster_name does not match the "
-                "registered HyperPod cluster for this cluster_id"
+                "submission cluster_name does not match the registered provider "
+                "cluster for this cluster_id (the HyperPod cluster name, or the "
+                "cluster id on an eks-managed cluster)"
             ),
         )
     return registration
@@ -987,3 +1002,26 @@ async def regional_revoke_agent(
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> AgentRecord:
     return await _agent_transition("revoke", cluster_id, node_id, request, dependencies)
+
+
+@router.post(
+    "/executors/agents/{node_id}/reactivate",
+    response_model=AgentRecord,
+)
+@authorization_bucket("cluster-token")
+async def regional_reactivate_agent(
+    node_id: str,
+    request: AgentTransitionRequest,
+    cluster_id: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> AgentRecord:
+    """The executor undoes the revocation it made for a provider mutation that
+    was never submitted (``AgentTransitionRequest.transition_id`` must be the
+    revoking one; the registry refuses anything else)."""
+
+    return await _agent_transition(
+        "reactivate", cluster_id, node_id, request, dependencies
+    )

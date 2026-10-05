@@ -5,6 +5,7 @@ import pytest
 from gpu_fault.execution import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
 from tests._builders import (
+    active_workflow_executor,
     fault_incident,
     workflow_request,
     workflow_step,
@@ -93,16 +94,54 @@ def test_failed_reset_waits_for_compensation_without_replaying_the_reset(
     ), saved
 
 
-def test_missing_compensation_is_reported_without_inventing_successful_cleanup() -> (
-    None
-):
+def test_a_missing_restore_step_is_appended_from_the_quiesce_and_run() -> None:
+    """The record restores what it quiesced even when no step of its own is left.
+
+    Live 2026-10-05 (gpu-eks-cluster DESTR-001): the branch ladder replaced the
+    failed reset branch -- its pending RESTORE_GPU_SERVICES included -- with a
+    reboot rung that was refused, and the exhausted record ended with the
+    node's services stopped until the agent's fail-safe timer. The restore is
+    appended as a step of the record (``compensation_for_step_indexes`` names
+    the quiesce it undoes), owned by the quiesce's owner, and executed.
+    """
+
     h = FlowHarness([QUIESCE, RESET])
+    h.executor = active_workflow_executor(
+        h.store, [h.adapter], [QUIESCE, RESET, RESTORE]
+    )
     h.adapter.outcomes[RESET] = WorkflowStepOutcome.failed("reset failed")
     result = h.execute()
     assert result.status is WorkflowStatus.FAILED, result
-    assert "no RESTORE_GPU_SERVICES compensation step" in (result.error or ""), result
+    assert result.error == "reset failed", result
     saved = h.store.get_workflow(h.workflow.request_id)
-    assert saved.completed_operations == [QUIESCE], saved
+    assert [context.step.operation for context in h.adapter.calls] == [
+        QUIESCE,
+        RESET,
+        RESTORE,
+    ], h.adapter.calls
+    appended = saved.official_steps[2]
+    assert appended.operation is RESTORE and appended.node_ids == ["node-a"], appended
+    assert appended.execution_owner == saved.official_steps[0].execution_owner
+    assert appended.parameters == {"compensation_for_step_indexes": [0]}, appended
+    assert saved.completed_operations == [QUIESCE, RESTORE], saved
+    assert saved.completed_step_indexes == [0, 2], saved
+    assert h.adapter.calls[2].idempotency_key.endswith("/2/RESTORE_GPU_SERVICES"), (
+        "the appended step runs under its own index and key"
+    )
+    assert saved.terminal_failure_reason == "reset failed", saved
+
+
+def test_an_appended_restore_that_cannot_run_is_reported_not_invented() -> None:
+    h = FlowHarness([QUIESCE, RESET])  # RESTORE_GPU_SERVICES is not allowed here
+    h.adapter.outcomes[RESET] = WorkflowStepOutcome.failed("reset failed")
+    result = h.execute()
+    assert result.status is WorkflowStatus.FAILED, result
+    assert result.error is not None and result.error.startswith(
+        "reset failed; restore compensation failed: operation RESTORE_GPU_SERVICES"
+    ), result.error
+    saved = h.store.get_workflow(h.workflow.request_id)
+    assert saved.completed_operations == [QUIESCE], "no cleanup is claimed"
+    assert saved.official_steps[2].operation is RESTORE, "the owed step is on record"
     assert [context.step.operation for context in h.adapter.calls] == [
         QUIESCE,
         RESET,

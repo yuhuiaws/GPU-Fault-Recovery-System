@@ -115,6 +115,8 @@ QUIESCE_PROCESSES=""
 QUIESCE_CONTAINERS="aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr"
 # eks-managed only: quiesce also stops Kubernetes containers still holding the target GPU.
 QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="false"
+# hyperpod (default) or eks-managed; only eks-managed reaches the Agent environment (it keeps kubelet/containerd up).
+CLUSTER_PROVIDER="hyperpod"
 CONTAINER_STOP_TIMEOUT_SECONDS="30"
 CONTAINER_RESTORE_TIMEOUT_SECONDS="180"
 # How long quiesce waits for a TERMed /dev/nvidiaN holder to let go
@@ -231,6 +233,7 @@ usage() {
         "  --firmware-verify-command CMD   Command whose stdout is the exact version" \
         "  --firmware-verify-sha256 HEX    Pinned verification executable SHA-256" \
         "  --quiesce-services NAMES        Ordered restore list; comma-separated" \
+        "  --cluster-provider NAME         hyperpod (default) or eks-managed; eks-managed never quiesces kubelet/containerd" \
         "  --quiesce-processes NAMES       Exact process names sent TERM" \
         "  --quiesce-containers NAMES      Kubernetes namespace/container selectors" \
         "  --container-stop-timeout SEC    Graceful container stop timeout; default: 30" \
@@ -589,6 +592,7 @@ while [[ $# -gt 0 ]]; do
         --quiesce-processes) require_value "$@"; QUIESCE_PROCESSES="$2"; shift 2 ;;
         --quiesce-containers) require_value "$@"; QUIESCE_CONTAINERS="$2"; shift 2 ;;
         --quiesce-sweep-kubernetes-device-holders) QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="true"; shift ;;
+        --cluster-provider) require_value "$@"; CLUSTER_PROVIDER="$2"; shift 2 ;;
         --container-stop-timeout) require_value "$@"; CONTAINER_STOP_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --container-restore-timeout) require_value "$@"; CONTAINER_RESTORE_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --device-sweep-timeout) require_value "$@"; DEVICE_SWEEP_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -945,6 +949,7 @@ if [[ "${ALLOW_SERVICE_QUIESCE}" == "true" &&
     "${ALLOW_GPU_RESET}" != "true" ]]; then
     die "--allow-service-quiesce requires --allow-gpu-reset"
 fi
+[[ "${CLUSTER_PROVIDER}" == "hyperpod" || "${CLUSTER_PROVIDER}" == "eks-managed" ]] || die "--cluster-provider must be hyperpod or eks-managed"
 if [[ "${ALLOW_FABRIC_RESET}" == "true" &&
     "${ALLOW_SERVICE_QUIESCE}" != "true" ]]; then
     die "--allow-fabric-reset requires --allow-service-quiesce"
@@ -1577,20 +1582,15 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_QUIESCE_CONTAINERS "${QUIESCE_CONTAINERS}"
         # Only when set: a HyperPod agent environment file stays byte for byte the same.
         if [[ "${QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS}" == "true" ]]; then write_env GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS "true"; fi
-        write_env GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS \
-            "${CONTAINER_STOP_TIMEOUT_SECONDS}"
+        if [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]]; then write_env GPU_FAULT_CLUSTER_PROVIDER "${CLUSTER_PROVIDER}"; fi
+        write_env GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS "${CONTAINER_STOP_TIMEOUT_SECONDS}"
         write_env GPU_FAULT_CONTAINER_RESTORE_TIMEOUT_SECONDS \
             "${CONTAINER_RESTORE_TIMEOUT_SECONDS}"
-        write_env GPU_FAULT_DEVICE_SWEEP_TIMEOUT_SECONDS \
-            "${DEVICE_SWEEP_TIMEOUT_SECONDS}"
-        write_env GPU_FAULT_QUIESCE_FAILSAFE_SECONDS \
-            "${QUIESCE_FAILSAFE_SECONDS}"
-        write_env GPU_FAULT_QUIESCE_RETRY_SECONDS \
-            "${QUIESCE_RETRY_SECONDS}"
-        write_env GPU_FAULT_QUIESCE_SETTLE_SECONDS \
-            "${QUIESCE_SETTLE_SECONDS}"
-        write_env GPU_FAULT_RESTORE_SETTLE_SECONDS \
-            "${RESTORE_SETTLE_SECONDS}"
+        write_env GPU_FAULT_DEVICE_SWEEP_TIMEOUT_SECONDS "${DEVICE_SWEEP_TIMEOUT_SECONDS}"
+        write_env GPU_FAULT_QUIESCE_FAILSAFE_SECONDS "${QUIESCE_FAILSAFE_SECONDS}"
+        write_env GPU_FAULT_QUIESCE_RETRY_SECONDS "${QUIESCE_RETRY_SECONDS}"
+        write_env GPU_FAULT_QUIESCE_SETTLE_SECONDS "${QUIESCE_SETTLE_SECONDS}"
+        write_env GPU_FAULT_RESTORE_SETTLE_SECONDS "${RESTORE_SETTLE_SECONDS}"
         write_env GPU_FAULT_QUIESCE_STATE_DIR \
             "/var/lib/gpu-fault/quiesce"
         write_env GPU_FAULT_QUIESCE_RESTORE_COMMAND \

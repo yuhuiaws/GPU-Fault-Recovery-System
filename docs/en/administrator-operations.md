@@ -1032,15 +1032,22 @@ Semantics and boundaries of `eks-managed`:
   DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on such nodes (a configuration warning that
   never drains the node) and the diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
   carries an extra `dcgm_eks_managed` document group for the approver.
-- GPU reset quiesce: on both providers `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
+- GPU reset quiesce: on HyperPod `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
   containers it knows by name (`gpu-fault-system/exporter`, `kube-system/nvidia-device-plugin-ctr`, HyperPod's HMA). A
   plain EKS node runs no host DCGM, so every GPU client is a container, and the `eks-managed` node installer Job adds
   `--quiesce-sweep-kubernetes-device-holders` (Agent environment `GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS=true`):
   a **Kubernetes container** outside that list that still holds the target GPU (a customer `dcgm-exporter`, GPU feature
   discovery, any monitoring client) is TERM/KILLed as well, recorded as
-  `swept_device_holders[].reason=kubernetes_container_on_quarantined_node` with its container id and Pod UID; kubelet is
-  already down so nothing restarts it, and `RESTORE_GPU_SERVICES` starting kubelet brings it back. HyperPod does not pass
-  the switch; its environment file and Agent config digest are byte for byte unchanged. **Third-party GPU clients on GPU
+  `swept_device_holders[].reason=kubernetes_container_on_quarantined_node` with its container id and Pod UID; on HyperPod
+  kubelet is already down so nothing restarts it, and `RESTORE_GPU_SERVICES` starting kubelet brings it back.
+  **An `eks-managed` quiesce never stops `kubelet` or `containerd`** (2026-10-05, gpu-eks-cluster DESTR-001: stopping
+  kubelet took the node NotReady, and a plain EKS node has no HyperPod health agent to carry it): the installer Job adds
+  `--cluster-provider eks-managed` (Agent environment `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`), the Agent skips the two
+  protected services at quiesce time (`protected_services` in the receipt and the state file), and the configured service
+  list and the Agent config digest are unchanged; GPU client containers are still stopped through containerd, kubelet
+  restarts them with its back-off, and the `/dev/nvidiaN` holder check before the reset plus the sweep on each retry cover
+  that window; `RESTORE_GPU_SERVICES` starts only what the quiesce really stopped. HyperPod passes neither switch; its
+  environment file and Agent config digest are byte for byte unchanged. **Third-party GPU clients on GPU
   nodes must therefore tolerate being stopped inside a quarantine window**, or be kept off nodes carrying the
   `gpu-fault.io/quarantined` taint by their own affinity. When `nvidia-smi --gpu-reset` still answers `In use by another
   client` (2026-10-05, gpu-eks-cluster, XID 46: named containers stopped, no `/dev/nvidiaN` holder, busy on all three
@@ -1048,6 +1055,28 @@ Semantics and boundaries of `eks-managed`:
   node (`nvidiactl`, `nvidia-uvm`, a `(deleted)` replaced node included) with its cgroup/container attribution,
   `--query-compute-apps`, and the `nvidia*`/`gdrdrv` kernel module reference counts; the error text ends with
   `device holders: <pid>:<comm>:<devices> (container <id>)`. Command lines are never read.
+- The agent when a provider mutation is not submitted: `RESTART_NODE`/`REPLACE_NODE` revoke (drain + revoke) the target
+  node's Agent before submitting, because the reboot replaces its incarnation. When the submission does not happen (the
+  control plane refuses it with 403, the provider rejects the node, the submit raises) the step undoes its own revocation
+  (step `details.revoked_agents`/`reactivated_agents`) and the Agent keeps heartbeating under its incarnation. Releases
+  before 2026-10-05 left the Agent REVOKED with every heartbeat answered 409 `agent incarnation has been retired`.
+  Recovery **without rebooting the node**: read `generation` and `transition_id` (the revoking
+  `<workflow>/<step>/<op>/hyperpod-lifecycle`) from `GET /v1/fleet/agents/{cluster_id}/{node_id}`, then
+  `POST /v1/fleet/agents/{cluster_id}/{node_id}/reactivate` (dual credentials) with body
+  `{"expected_generation": <generation>, "transition_id": "<transition_id>", "reason": "<CHG>"}`; or run the
+  `REACTIVATE_AGENT` snippet of `scripts/e2e/regional/warm_spare_fixture.py` inside the CPU Pod
+  (`context.fleet_registry.reactivate_agent`). The Executor's own route is
+  `POST /v1/regional/executors/agents/{node_id}/reactivate` (cluster-token). The same day's other gap: the
+  `hyperpod-submissions/*` routes compare the submission's `cluster_name` with the registration's **provider cluster
+  name** -- `hyperpod_cluster_name` on HyperPod, the `cluster_id` itself on `eks-managed` (`EksProviderConfig.cluster_name`);
+  until then every eks-managed RESTART_NODE was refused 403.
+- Restore when the ladder is exhausted: the in-place branch escalation replaces the failed branch -- its completed QUIESCE
+  and pending RESTORE_GPU_SERVICES included -- with a reboot rung; when the reboot is refused and no spare is declared the
+  workflow ends `node branch escalation exhausted: ...`. The Executor now appends the owed `RESTORE_GPU_SERVICES` as a new
+  step of the record and runs it first (`parameters.compensation_for_step_indexes` names the restored QUIESCE step
+  indexes; the owner is the chain's RESTORE owner); `terminal_failure_reason` stays the exhaustion reason, and a failed
+  restore ends the error with `; restore compensation failed: <reason>`. Until then the node's GPU services waited for
+  the Agent's quiesce fail-safe timer.
 - Warm spares and `REPLACE_NODE`: an `eks-managed` cluster supports warm spares too. `gpu-fault-admin config spare
   --declare/--release` judges the node by the cluster's `provider` in the site: no HyperPod health label is required,
   the node must be Ready and carry `eks.amazonaws.com/nodegroup`, and its topology is compared with the fault node's

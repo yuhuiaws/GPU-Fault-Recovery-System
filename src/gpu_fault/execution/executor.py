@@ -15,7 +15,11 @@ from pydantic import ValidationError
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
 import gpu_fault.execution.step_bounds as step_bounds
 from gpu_fault.execution import node_rebinding, terminal_state
-from gpu_fault.execution.branch_escalation import BranchEscalation, BranchEscalator
+from gpu_fault.execution.branch_escalation import (
+    BranchEscalation,
+    BranchEscalator,
+    last_failed_step_index,
+)
 from gpu_fault.execution.config import (
     MAX_DAG_STEPS as MAX_DAG_STEPS,
     ProductionExecutorConfig,
@@ -38,9 +42,13 @@ from gpu_fault.execution.models import (
     _failure_details,
 )
 from gpu_fault.execution.node_action_uncertainty import (
+    compensation_restore_step,
+    park_failure,
+    pending_restore_step,
     quiesce_needs_restoration,
     refresh_remote_action_state,
     restoration_refusal,
+    with_compensation_step,
 )
 from gpu_fault.execution.remediation_budget import escalation_budget_claims
 from gpu_fault.execution.transient_errors import (
@@ -506,7 +514,7 @@ class ProductionWorkflowExecutor:
                     return self._finish_withdrawn(workflow, incident, execution_epoch)
                 if workflow.exhausted_branch_ids:
                     return self._fail_exhausted_branches(
-                        workflow, incident, execution_epoch
+                        workflow, incident, request, execution_epoch
                     )
                 return self._complete_claimed_workflow(
                     workflow,
@@ -532,7 +540,7 @@ class ProductionWorkflowExecutor:
                     if step.branch_id != "join"
                 ):
                     return self._fail_exhausted_branches(
-                        workflow, incident, execution_epoch
+                        workflow, incident, request, execution_epoch
                     )
             if not ready:
                 self._save_waiting(workflow, execution_epoch)
@@ -677,14 +685,10 @@ class ProductionWorkflowExecutor:
                     is not WorkflowOperation.RESTORE_GPU_SERVICES
                     and self._has_unrestored_quiesce(workflow, steps)
                 ):
-                    workflow = workflow.model_copy(
-                        update={
-                            "pending_failure_step_index": (failure_index),
-                            "pending_failure_error": (
-                                failure_outcome.error or "workflow DAG step failed"
-                            ),
-                            "updated_at": datetime.now(timezone.utc),
-                        }
+                    workflow = park_failure(
+                        workflow,
+                        failure_index,
+                        failure_outcome.error or "workflow DAG step failed",
                     )
                     self._save_leased(workflow, execution_epoch)
                     return self._resume_failure_compensation(
@@ -797,11 +801,7 @@ class ProductionWorkflowExecutor:
 
         if self._has_unrestored_quiesce(workflow):
             return self._resume_failure_compensation(
-                workflow,
-                incident,
-                request,
-                execution_epoch,
-                is_safety=is_safety,
+                workflow, incident, request, execution_epoch, is_safety=is_safety
             )
         return self._finalize_compensated_failure(
             workflow, incident, execution_epoch, compensation_error=None
@@ -913,22 +913,20 @@ class ProductionWorkflowExecutor:
         self,
         workflow: WorkflowRequest,
         incident: FaultIncident,
+        request: WorkflowExecutionRequest,
         execution_epoch: int,
     ) -> WorkflowExecutionResult:
         reason = "node branch escalation exhausted: " + ", ".join(
             workflow.exhausted_branch_ids
         )
-        # The reason is the record's, not only the audit event's: the field is
-        # what the API, the acceptance verdicts and the failure handler read
-        # (live 2026-09-09 the exhausted DESTR-014 workflow ended FAILED with
-        # ``terminal_failure_reason`` None and the reason only in TERMINAL).
-        return self._terminalize(
-            workflow,
-            incident,
-            WorkflowStatus.FAILED,
-            execution_epoch,
-            reason=reason,
-            updates={"terminal_failure_reason": reason},
+        # Lands like a parked step failure: the reason becomes the record's
+        # ``terminal_failure_reason`` (live 2026-09-09), and a quiesce the ladder
+        # climbed past without a reboot settling it (live 2026-10-05) is restored.
+        workflow = park_failure(workflow, last_failed_step_index(workflow), reason)
+        self._save_leased(workflow, execution_epoch)
+        is_safety = workflow.executes_safety_steps
+        return self._land_pending_failure(
+            workflow, incident, request, execution_epoch, is_safety=is_safety
         )
 
     # Steps that undo what an earlier step did to a node; they still run for a
@@ -1106,22 +1104,24 @@ class ProductionWorkflowExecutor:
         is_safety: bool,
     ) -> WorkflowExecutionResult:
         steps = workflow.safety_steps if is_safety else workflow.official_steps
-        restore_match = next(
-            (
-                (index, step)
-                for index, step in enumerate(steps)
-                if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
-                and index not in resolved_step_indexes(workflow)
-            ),
-            None,
-        )
+        restore_match = pending_restore_step(workflow, steps)
         if restore_match is None:
-            return self._finalize_compensated_failure(
-                workflow,
-                incident,
-                execution_epoch,
-                compensation_error=("no RESTORE_GPU_SERVICES compensation step"),
+            # No restore left to run (the ladder replaced the chain's own):
+            # the record appends the owed one as a step of its own, so what
+            # restored the node is evidence, not a fail-safe timer's silence.
+            appended = compensation_restore_step(
+                workflow, steps, settling_operations=self._QUIESCE_SETTLING_OPERATIONS
             )
+            if appended is None:
+                return self._finalize_compensated_failure(
+                    workflow,
+                    incident,
+                    execution_epoch,
+                    compensation_error=("no RESTORE_GPU_SERVICES compensation step"),
+                )
+            workflow = with_compensation_step(workflow, appended, is_safety=is_safety)
+            self._save_leased(workflow, execution_epoch)
+            restore_match = (len(steps), appended)
         restore_index, restore_step = restore_match
         outcome = self._execute_step(
             workflow,

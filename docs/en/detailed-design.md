@@ -3779,6 +3779,7 @@ production semantics, fully protected by the cluster-token/execution-token middl
 | POST | `/v1/regional/executors/spares/health` | cluster-token | `regional_spare_health` |
 | POST | `/v1/regional/executors/agents/{node_id}/drain` | cluster-token | `regional_drain_agent` |
 | POST | `/v1/regional/executors/agents/{node_id}/revoke` | cluster-token | `regional_revoke_agent` |
+| POST | `/v1/regional/executors/agents/{node_id}/reactivate` | cluster-token | `regional_reactivate_agent` |
 | POST | `/v1/regional/executors/evidence` | cluster-token | `regional_capture_evidence` |
 | POST | `/v1/regional/executors/advisory-notifications` | cluster-token | `regional_save_advisory_notification` |
 

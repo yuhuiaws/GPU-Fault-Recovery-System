@@ -919,9 +919,12 @@ ${CONTROL_PLANE_ENV}
                   # stop a container still holding the target GPU (customer
                   # DCGM exporter, GPU feature discovery) once the named ones
                   # are down. HyperPod keeps the name list only.
+                  # The provider also reaches the Agent environment: an
+                  # eks-managed quiesce never stops kubelet or containerd
+                  # (the configured list and the config digest stay the same).
                   quiesce_args=()
                   if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
-                    quiesce_args=(--quiesce-sweep-kubernetes-device-holders)
+                    quiesce_args=(--quiesce-sweep-kubernetes-device-holders --cluster-provider eks-managed)
                   fi
                   node_instance_id="\${TARGET_NODE_UID}"
                   if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
