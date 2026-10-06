@@ -71,6 +71,7 @@ from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     host_errors,
     incident_reason_errors,
     lifetime_errors,
+    node_reboot_verdict,
     node_recovery_errors,
     provider_errors,
     reboot_events,
@@ -207,6 +208,12 @@ def preflight_errors(
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
+    # Judged first and alone: the case audits BatchRebootClusterNodes and the
+    # HyperPod health labels, so nothing else about an eks-managed cluster is
+    # worth listing beside "not applicable".
+    not_applicable, reboot_errors = node_reboot_verdict(CASE_ID, profile)
+    if not_applicable:
+        return [not_applicable]
     errors: list[str] = list(identity_errors)
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
@@ -240,15 +247,7 @@ def preflight_errors(
         errors.append("the runtime profile has no gpuReset capability")
     elif reset.get("mode") != "OWN" or reset.get("owner") != "gpu-fault-node-agent":
         errors.append("gpuReset is not OWN by the Node Agent")
-    reboot = reboot_case.capability(profile, "nodeReboot")
-    if reboot is None:
-        errors.append("the runtime profile has no nodeReboot capability")
-    elif (
-        reboot.get("mode") != "OWN"
-        or reboot.get("owner") != "gpu-fault-hyperpod-adapter"
-        or reboot.get("adapter") != "regional-cluster-executor"
-    ):
-        errors.append("nodeReboot is not OWN by the HyperPod adapter")
+    errors.extend(reboot_errors)
     if (profile or {}).get("warnings"):
         errors.append("the runtime profile has warnings")
     if processor_queue_backlog(queue):

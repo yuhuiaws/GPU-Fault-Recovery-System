@@ -8936,6 +8936,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 
 ### GF-REGIONAL-DESTR-002
 
+> HyperPod only: the preflight refuses an executor without the HyperPod reboot adapter with the single reason
+> `DESTR-002 audits the HyperPod reboot path and does not apply to an eks-managed cluster`; the campaign records the case as
+> not applicable there.
+
 **Real node reboot via the provider**
 
 - Level: `destructive-provider-reboot`. Calls `batch_reboot_cluster_nodes`.
@@ -10811,6 +10815,11 @@ The detailed protocol and limitations are in [Physical Late-Ownership Acceptance
 
 ### GF-REGIONAL-DESTR-016
 
+> HyperPod only: the case audits the HyperPod reboot path (`BatchRebootClusterNodes`) and its health labels. On an
+> `eks-managed` cluster -- whose runtime profile has `nodeReboot` OWN by `gpu-fault-eks-adapter` (EC2 `RebootInstances`) --
+> the preflight refuses with the single reason `... does not apply to an eks-managed cluster`, as DESTR-002 does, and the
+> campaign records the case as not applicable rather than failed.
+
 **A second fault on the same node arrives while a physical step is in progress: the same-tier XID is absorbed, the higher-tier XID 79 preempts the reset workflow, takes over the quiesce and completes a real reboot**
 
 Barrier location must use the remote command the workflow actually references, and must verify the incident, the fencing and the
@@ -11910,6 +11919,10 @@ taken over, `RESTORE_SCHEDULING` still converges under concurrent 409s, isolatio
 - Level: `live-node-mutation`. Writes three annotations only onto the warm spare already declared by `DESTR-003/008` and
   waits for the deployed executor to reclaim them; **no uncordon, no workflow triggered, no provider call, no other
   node touched.**
+- Provider-agnostic: the spare gate is the provider's (`warm_spare_provider.spare_health_errors`) -- on HyperPod the
+  health-monitoring label `Schedulable`, on an `eks-managed` cluster the managed node group label and no health label at
+  all; both still require Ready, cordoned, `gpu-fault.io/spare=true` and no reservation annotations. The preflight used to
+  ask an eks-managed spare for the HyperPod label and refused every one.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr022_spare_reservation_reclaim.py`. By default it only generates the
   plan; before execute it must read `DESTR-008=PASS`, and the spare must still be in the declared state (this case is ordered
@@ -12182,6 +12195,10 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
 
 
 ### GF-REGIONAL-DESTR-025
+
+> HyperPod only: the case audits the HyperPod reboot path (`BatchRebootClusterNodes`). On an `eks-managed` cluster the
+> preflight refuses with the single reason `... does not apply to an eks-managed cluster`, as DESTR-002 does, and the
+> campaign records the case as not applicable rather than failed.
 
 **Known failure of a single-node RESET_GPU: escalates to a real RESTART_NODE inside the same workflow record and closes there, producing no reboot-after successor**
 

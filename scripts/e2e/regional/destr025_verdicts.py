@@ -36,6 +36,7 @@ from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     AGENT_OPERATIONS,
     holder_errors,
     lifetime_errors,
+    node_reboot_verdict,
 )
 from scripts.e2e.regional.run_destr002_hyperpod_reboot import (  # noqa: E402
     capability,
@@ -477,22 +478,16 @@ def _node_errors(
     return errors
 
 
-def _profile_errors(profile: dict[str, Any] | None) -> list[str]:
+def _profile_errors(
+    profile: dict[str, Any] | None, reboot_errors: list[str]
+) -> list[str]:
     errors: list[str] = []
     reset = capability(profile, "gpuReset")
     if reset is None:
         errors.append("the runtime profile has no gpuReset capability")
     elif reset.get("mode") != "OWN" or reset.get("owner") != "gpu-fault-node-agent":
         errors.append("gpuReset is not OWN by the Node Agent")
-    reboot = capability(profile, "nodeReboot")
-    if reboot is None:
-        errors.append("the runtime profile has no nodeReboot capability")
-    elif (
-        reboot.get("mode") != "OWN"
-        or reboot.get("owner") != "gpu-fault-hyperpod-adapter"
-        or reboot.get("adapter") != "regional-cluster-executor"
-    ):
-        errors.append("nodeReboot is not OWN by the HyperPod adapter")
+    errors.extend(reboot_errors)
     if (profile or {}).get("warnings"):
         errors.append("the runtime profile has warnings")
     return errors
@@ -532,6 +527,11 @@ def preflight_errors(
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
+    # Judged first and alone, as DESTR-002 and DESTR-016 do: the case audits
+    # BatchRebootClusterNodes, which an eks-managed cluster has not.
+    not_applicable, reboot_errors = node_reboot_verdict(CASE_ID, profile)
+    if not_applicable:
+        return [not_applicable]
     errors: list[str] = list(identity_errors)
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
@@ -545,7 +545,7 @@ def preflight_errors(
     if event is not None:
         errors.append(f"{node} has a recent XID event")
     errors.extend(open_incident_errors(node, open_incidents))
-    errors.extend(_profile_errors(profile))
+    errors.extend(_profile_errors(profile, reboot_errors))
     if processor_queue_backlog(queue):
         errors.append("the processor queue is not empty")
     if remote_commands.get("open_by_cluster"):

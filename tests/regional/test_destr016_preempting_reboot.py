@@ -1027,6 +1027,25 @@ def test_the_preflight_refuses_a_profile_that_does_not_own_the_operations(
     assert any(expected in item for item in errors), errors
 
 
+def test_an_eks_managed_reboot_owner_makes_the_case_not_applicable() -> None:
+    """The eks adapter owns nodeReboot (EC2 RebootInstances); DESTR-016 audits
+    BatchRebootClusterNodes. The preflight says so once, as DESTR-002 does, so
+    the campaign records N/A instead of a FAIL buried under unrelated noise."""
+
+    arguments = happy_preflight_arguments()
+    profile = json.loads(json.dumps(arguments["profile"]))
+    for item in profile["capabilities"]:
+        if item["capability"] == "nodeReboot":
+            item["owner"] = "gpu-fault-eks-adapter"
+    arguments["profile"] = profile
+    arguments["event"] = {"xid": 46, "node": NODE}
+    errors = destr016.preflight_errors(**arguments)
+    assert len(errors) == 1, errors
+    assert "does not apply to an eks-managed cluster" in errors[0]
+    assert "GF-REGIONAL-DESTR-016" in errors[0]
+    assert "gpu-fault-eks-adapter" in errors[0]
+
+
 def test_the_preflight_refuses_a_missing_capability_or_a_warned_profile() -> None:
     arguments = happy_preflight_arguments()
     arguments["profile"] = {"capabilities": [], "warnings": ["driver mismatch"]}

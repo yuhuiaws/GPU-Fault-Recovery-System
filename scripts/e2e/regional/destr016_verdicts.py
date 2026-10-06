@@ -39,7 +39,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
 from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY
+from scripts.e2e.regional.acceptance_runner_common import hyperpod_only_reason
 from scripts.e2e.regional.remote_command_shapes import command_operations
 
 # The reset workflow the first XID 46 must build, in order, exactly once.
@@ -1035,3 +1037,37 @@ def window_fit_errors(
             f"room for an escalation {latest_delay_seconds}s after the quiesce"
         ]
     return []
+
+
+def node_reboot_verdict(
+    case_id: str, profile: dict[str, Any] | None
+) -> tuple[str | None, list[str]]:
+    """``(not_applicable, errors)`` for the runtime profile's ``nodeReboot``.
+
+    The HyperPod-only reboot cases need ``nodeReboot`` OWN by the HyperPod
+    adapter through the regional executor. When the owner is the eks adapter
+    instead (EC2 ``RebootInstances`` on an ``eks-managed`` cluster) the case
+    does not apply to the cluster at all, and ``not_applicable`` says so in
+    DESTR-002's words so a preflight returns it alone; otherwise ``errors``
+    lists what is wrong with the capability, as the runners always did.
+    """
+
+    reboot = next(
+        (
+            item
+            for item in (profile or {}).get("capabilities", [])
+            if isinstance(item, dict) and item.get("capability") == "nodeReboot"
+        ),
+        None,
+    )
+    if reboot is None:
+        return None, ["the runtime profile has no nodeReboot capability"]
+    if reboot.get("owner") == PROVIDER_NODE_REBOOT_OWNERS["eks-managed"]:
+        return hyperpod_only_reason(case_id, reboot.get("owner")), []
+    if (
+        reboot.get("mode") != "OWN"
+        or reboot.get("owner") != "gpu-fault-hyperpod-adapter"
+        or reboot.get("adapter") != "regional-cluster-executor"
+    ):
+        return None, ["nodeReboot is not OWN by the HyperPod adapter"]
+    return None, []

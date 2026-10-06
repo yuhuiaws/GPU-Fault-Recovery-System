@@ -516,6 +516,19 @@ def test_a_clean_idle_node_passes_preflight() -> None:
     )
 
 
+def test_an_eks_managed_reboot_owner_makes_the_case_not_applicable() -> None:
+    arguments = _clean_preflight_arguments()
+    for item in arguments["profile"]["capabilities"]:
+        if item["capability"] == "nodeReboot":
+            item["owner"] = "gpu-fault-eks-adapter"
+    arguments["event"] = {"xid": 46, "node": NODE}
+    arguments["predecessor"] = {"valid": False}
+    errors = verdicts.preflight_errors(**arguments)
+    assert len(errors) == 1, errors
+    assert "does not apply to an eks-managed cluster" in errors[0]
+    assert "GF-REGIONAL-DESTR-025" in errors[0]
+
+
 def test_preflight_refuses_owned_nodes_open_incidents_and_missing_predecessor() -> None:
     arguments = _clean_preflight_arguments()
     arguments["node_snapshot"]["taints"] = [{"key": "gpu-fault.io/quarantined"}]

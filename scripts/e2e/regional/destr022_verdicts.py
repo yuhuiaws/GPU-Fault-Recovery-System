@@ -23,6 +23,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from scripts.e2e.regional import warm_spare_provider
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
 
 CASE_ID = "GF-REGIONAL-DESTR-022"
@@ -105,8 +106,15 @@ def breadcrumb_claimed_at(breadcrumb: dict[str, Any] | None) -> datetime | None:
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
-def spare_refusals(spare: dict[str, Any]) -> list[str]:
-    """Why this node cannot carry the synthetic reservation."""
+def spare_refusals(spare: dict[str, Any], provider: str | None = None) -> list[str]:
+    """Why this node cannot carry the synthetic reservation.
+
+    The provider health gate is ``warm_spare_provider.spare_health_errors``:
+    the HyperPod health-monitoring label on HyperPod, the managed node group
+    label (and no health label at all) on an ``eks-managed`` cluster. The
+    reservation sweep this case exercises is provider-agnostic; reading the
+    HyperPod label here refused every eks-managed spare at preflight.
+    """
 
     errors: list[str] = []
     if spare.get("ready") != "True":
@@ -116,8 +124,7 @@ def spare_refusals(spare: dict[str, Any]) -> list[str]:
     labels = spare.get("labels") or {}
     if labels.get(SPARE_LABEL) != "true":
         errors.append("spare node is not declared by the spare label")
-    if labels.get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
-        errors.append("spare HyperPod health label is not Schedulable")
+    errors.extend(warm_spare_provider.spare_health_errors(spare, provider))
     annotations = spare.get("annotations") or {}
     if annotations.get(SPARE_RESERVATION_ANNOTATION):
         errors.append("spare node already carries a reservation")
@@ -148,8 +155,9 @@ def preflight_errors(
     incident_lookup: dict[str, Any],
     predecessor_valid: bool,
     tests_passed: bool,
+    provider: str | None = None,
 ) -> list[str]:
-    errors = spare_refusals(spare)
+    errors = spare_refusals(spare, provider)
     if declared_spares != [spare_node]:
         errors.append(
             f"declared spare set {declared_spares} is not exactly [{spare_node}]"

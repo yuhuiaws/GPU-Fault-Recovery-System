@@ -239,6 +239,7 @@ def read_only_preflight(
         incident_lookup=lookup,
         predecessor_valid=bool(predecessor["valid"]),
         tests_passed=tests["passed"],
+        provider=warm.provider,
     )
     errors.extend(runtime_identity_errors(runtime_identity))
     result = {
@@ -383,7 +384,9 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
 def _inject(run: _LiveRun) -> list[str]:
     """Write the stale reservation; the spare stays cordoned."""
 
-    refusals = verdicts.spare_refusals(run.warm.node_snapshot(run.settings.spare_node))
+    refusals = verdicts.spare_refusals(
+        run.warm.node_snapshot(run.settings.spare_node), run.warm.provider
+    )
     if refusals:
         raise RegionalFixtureError(
             "the spare changed since preflight: " + "; ".join(refusals)

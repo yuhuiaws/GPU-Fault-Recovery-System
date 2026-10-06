@@ -683,3 +683,39 @@ def test_the_spare_snapshot_reports_the_reserved_at_annotation_the_case_writes()
     assert set(verdicts.TRACKED_ANNOTATIONS) <= set(
         warm_spare_fixture.SNAPSHOT_ANNOTATIONS
     ), "every annotation the case mutates must be in the baseline it restores from"
+
+
+# --------------------------------------------------------------------------- #
+# The spare gate per provider
+# --------------------------------------------------------------------------- #
+def test_the_spare_gate_reads_the_hyperpod_health_label_on_hyperpod_only() -> None:
+    """Live (gpu-eks-cluster): the declared spare of an eks-managed cluster was
+    refused "spare HyperPod health label is not Schedulable" -- a label that
+    cluster never carries. The gate is the provider's: the health label on
+    HyperPod, the managed node group label on plain EKS."""
+
+    from scripts.e2e.regional.warm_spare_provider import EKS_NODEGROUP_LABEL
+
+    hyperpod_spare = _spare()
+    assert verdicts.spare_refusals(hyperpod_spare) == []
+    assert verdicts.spare_refusals(hyperpod_spare, "hyperpod") == []
+    unlabeled = _spare(labels={verdicts.SPARE_LABEL: "true"})
+    unlabeled["labels"].pop(verdicts.HYPERPOD_HEALTH_LABEL)
+    assert verdicts.spare_refusals(unlabeled) == [
+        "spare HyperPod health label is not Schedulable"
+    ], "no provider named still reads as HyperPod"
+
+    eks_spare = _spare(
+        labels={verdicts.SPARE_LABEL: "true", EKS_NODEGROUP_LABEL: "gpu"}
+    )
+    eks_spare["labels"].pop(verdicts.HYPERPOD_HEALTH_LABEL)
+    assert verdicts.spare_refusals(eks_spare, "eks-managed") == [], (
+        "cordoned, Ready, declared, in a managed node group: the eks spare passes"
+    )
+    eks_spare["labels"].pop(EKS_NODEGROUP_LABEL)
+    assert verdicts.spare_refusals(eks_spare, "eks-managed") == [
+        "spare eks-managed node carries no managed node group label"
+    ]
+    assert not any(
+        "HyperPod" in item for item in verdicts.spare_refusals(eks_spare, "eks-managed")
+    ), "the HyperPod label is never asked of an eks-managed spare"
