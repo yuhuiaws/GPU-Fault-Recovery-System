@@ -547,63 +547,61 @@ def execute_with_final_ownership(
             "OWNERSHIP_BOUNDARY_UNSUPPORTED", boundary="AGENT_ADMISSION"
         )
     receipts: list[dict[str, Any]] = []
+    client_recheck = command.operation in _CLIENT_RECHECK_OPERATIONS
+    device_recheck = (
+        client_recheck
+        and command.operation is not WorkflowOperation.RESTART_FABRIC_MANAGER
+    )
 
-    def physical_check() -> None:
-        assert gate is not None
-        permit = gate.require(command)
-        receipt_extra: dict[str, Any] = {}
-        try:
-            _validate_local_authority(agent, envelope)
-            if command.operation in _CLIENT_RECHECK_OPERATIONS:
-                # Retain the handler's full sampled preflight, then reject any
-                # new client seen after the potentially long ownership wait.
-                agent._verify_no_clients(
-                    command.gpu_uuids, include_device_clients=False
+    def refuse_persistent_holders(receipt_extra: dict[str, Any]) -> None:
+        """Refuse on a persistent non-query holder; record the queries ignored."""
+
+        holders, query_only = classify_final_device_clients(
+            agent, set(command.gpu_uuids)
+        )
+        if query_only:
+            seen = {
+                (item.get("gpu_uuid"), item.get("pid"), item.get("device")): item
+                for item in receipt_extra.get("query_only_device_clients", [])
+            }
+            ignored, omitted = device_holder_attribution(query_only)
+            for item in ignored:
+                seen.setdefault(
+                    (item.get("gpu_uuid"), item.get("pid"), item.get("device")), item
                 )
-                if command.operation is not WorkflowOperation.RESTART_FABRIC_MANAGER:
-                    with agent._device_path_cache_window():
-                        agent._require_resolvable_targets(command.gpu_uuids)
-                        holders, query_only = classify_final_device_clients(
-                            agent, set(command.gpu_uuids)
-                        )
-                        if query_only:
-                            ignored, omitted = device_holder_attribution(query_only)
-                            receipt_extra["query_only_device_clients"] = ignored
-                            receipt_extra["query_only_device_client_count"] = (
-                                len(ignored) + omitted
-                            )
-                            LOGGER.info(
-                                "final ownership recheck ignored query-only "
-                                "device clients command_id=%s node_id=%s clients=%s",
-                                command.command_id,
-                                command.node_id,
-                                device_holder_summary(ignored, omitted),
-                            )
-                        if holders:
-                            refusal = OwnershipRefused(
-                                "OWNERSHIP_FINAL_CLIENTS_CHANGED",
-                                device_clients=holders,
-                            )
-                            # The executor's failure line only carries the
-                            # error class; this is the journal's one record of
-                            # who held the device when the reset was refused.
-                            LOGGER.warning(
-                                "final ownership recheck refused command_id=%s "
-                                "operation=%s node_id=%s "
-                                "persistent_device_clients=%s",
-                                command.command_id,
-                                command.operation.value,
-                                command.node_id,
-                                " ".join(
-                                    f"{item['gpu_uuid']}:{item['pid']}:"
-                                    f"{item['device']}:{item['process_name']}"
-                                    for item in refusal.action_details[
-                                        "persistent_device_clients"
-                                    ]
-                                ),
-                            )
-                            raise refusal
-            _validate_local_authority(agent, envelope)
+            receipt_extra["query_only_device_clients"] = list(seen.values())
+            receipt_extra["query_only_device_client_count"] = len(seen) + omitted
+            LOGGER.info(
+                "final ownership recheck ignored query-only "
+                "device clients command_id=%s node_id=%s clients=%s",
+                command.command_id,
+                command.node_id,
+                device_holder_summary(ignored, omitted),
+            )
+        if holders:
+            refusal = OwnershipRefused(
+                "OWNERSHIP_FINAL_CLIENTS_CHANGED", device_clients=holders
+            )
+            # The executor's failure line only carries the error class; this
+            # is the journal's one record of who held the device when the
+            # reset was refused.
+            LOGGER.warning(
+                "final ownership recheck refused command_id=%s operation=%s "
+                "node_id=%s persistent_device_clients=%s",
+                command.command_id,
+                command.operation.value,
+                command.node_id,
+                " ".join(
+                    f"{item['gpu_uuid']}:{item['pid']}:"
+                    f"{item['device']}:{item['process_name']}"
+                    for item in refusal.action_details["persistent_device_clients"]
+                ),
+            )
+            raise refusal
+
+    def local_guard(check: Callable[[], None], extra: dict[str, Any] | None) -> None:
+        try:
+            check()
         except OwnershipRefused:
             # A fence that moved names itself (fence, clients); it is not a
             # foreign failure of the local reads.
@@ -616,9 +614,78 @@ def execute_with_final_ownership(
             raise OwnershipRefused(
                 "OWNERSHIP_FINAL_SAFETY_CHANGED", cause=type(exc).__name__
             ) from None
+
+    def physical_check() -> None:
+        assert gate is not None
+        receipt_extra: dict[str, Any] = {}
+
+        # The slow local reads run *before* the permit is asked for. The permit
+        # lives PERMIT_SECONDS from the control plane's check; the compute-apps
+        # query is an nvidia-smi that pays the whole driver initialisation
+        # while the quiesce has persistence mode off (seconds per GPU on an
+        # 8-GPU node), and the device-holder classification samples twice.
+        # Spent inside the window they expired every permit (live,
+        # gpu-eks-cluster p5en: ~20 s between permit and recheck,
+        # OWNERSHIP_PERMIT_EXPIRED on a reset that was never spawned).
+        def before_permit() -> None:
+            if client_recheck:
+                # Retain the handler's full sampled preflight, then reject any
+                # new client seen since it.
+                agent._verify_no_clients(
+                    command.gpu_uuids, include_device_clients=False
+                )
+                if device_recheck:
+                    with agent._device_path_cache_window():
+                        agent._require_resolvable_targets(command.gpu_uuids)
+                        refuse_persistent_holders(receipt_extra)
+
+        started = time.monotonic()
+        local_guard(before_permit, receipt_extra)
+        pre_permit_seconds = time.monotonic() - started
+        requested = time.monotonic()
+        permit = gate.require(command)
+        permit_wait_seconds = time.monotonic() - requested
+        granted_at = time.monotonic()
+
+        # Inside the window only what is fast: the fence and quiesce checks,
+        # and one more holder sample (a second one only when a holder shows
+        # up) for a client that arrived during the ownership wait.
+        def after_permit() -> None:
+            _validate_local_authority(agent, envelope)
+            if device_recheck:
+                with agent._device_path_cache_window():
+                    refuse_persistent_holders(receipt_extra)
+            _validate_local_authority(agent, envelope)
+
+        local_guard(after_permit, receipt_extra)
+        post_permit_seconds = time.monotonic() - granted_at
+        timing = {
+            "pre_permit_seconds": round(pre_permit_seconds, 3),
+            "permit_wait_seconds": round(permit_wait_seconds, 3),
+            "post_permit_seconds": round(post_permit_seconds, 3),
+            "permit_lifetime_seconds": round(
+                (permit.expires_at - permit.checked_at).total_seconds(), 3
+            ),
+        }
         if not permit.checked_at <= agent.now() < permit.expires_at:
-            raise OwnershipRefused("OWNERSHIP_PERMIT_EXPIRED")
+            LOGGER.warning(
+                "final ownership permit expired before the physical call "
+                "command_id=%s node_id=%s timing=%s",
+                command.command_id,
+                command.node_id,
+                timing,
+            )
+            refusal = OwnershipRefused("OWNERSHIP_PERMIT_EXPIRED")
+            refusal.action_details["ownership_permit_timing"] = timing
+            raise refusal
         permit.validate_delivery()
+        if post_permit_seconds > 1.0 or pre_permit_seconds > 5.0:
+            LOGGER.info(
+                "final ownership recheck timing command_id=%s node_id=%s timing=%s",
+                command.command_id,
+                command.node_id,
+                timing,
+            )
         receipts.append(
             {
                 "boundary": permit.challenge.boundary,
@@ -626,6 +693,7 @@ def execute_with_final_ownership(
                 "sequence": permit.challenge.sequence,
                 "checked_at": permit.checked_at.isoformat(),
                 "expires_at": permit.expires_at.isoformat(),
+                **timing,
                 **receipt_extra,
             }
         )

@@ -3166,6 +3166,19 @@ release the node with the restore of §9.2 first), then the same command with `-
 control plane already running this release the close alone does both: `--close-incident` reports `evidence_required`,
 the CLI reads the node evidence through the GPU kubeconfig and submits again, and the incident ends RECOVERED with the
 parked record SUPERSEDED.
+**A refusal that applied nothing is handed off, not quarantined**: when the Node Agent refuses a node action at its safety
+boundary and attests that nothing was applied (`safety_rejection` with `node_action_outcome_known` or
+`node_action_not_started`, `reset_verdict` `not-attempted`/`not-applied`, nothing completed), the chain ends FAILED without
+parking, the branch ladder takes no rung, and the whole-workflow hand-off (`support-after-<workflow>`, stage
+`node_action_refused`) plans FREEZE_EVIDENCE and ESCALATE_SUPPORT only -- no MARK_UNSCHEDULABLE, no QUARANTINE, no reboot
+successor; the node keeps the chain's own cordon and the incident is yours as ESCALATED with the ticket. Exits: fix the
+cause the refusal names and let a new workflow run the reset, or release the node with the restore of §9.2. Live
+(gpu-eks-cluster) the successor of such a refusal quarantined and cordoned a node nothing had been done to. The refusal's
+cause is on the step: a persistent device holder is named in `persistent_device_clients`; an expired ownership permit
+(`OWNERSHIP_PERMIT_EXPIRED`) carries `ownership_permit_timing` -- `pre_permit_seconds` (the compute-apps query and the
+sampled holder classification, run before the permit is asked for), `permit_wait_seconds`, `post_permit_seconds` (the
+fence/quiesce checks and one holder sample inside the window) and `permit_lifetime_seconds` -- and every granted checkpoint
+in `physical_ownership_checks` carries the same four figures, so a slow node shows where its seconds went.
 
 ```bash
 # Read-only: prints the confirmation that would be written (step, command, boot id before/after the reboot, Agent generation, node/Agent evidence), writing nothing

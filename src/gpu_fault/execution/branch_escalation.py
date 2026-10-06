@@ -33,6 +33,7 @@ from gpu_fault.models import (
 from gpu_fault.orchestration.dag_branching import branch_node_ids
 from gpu_fault.orchestration.escalation import (
     executor_rejected_failure,
+    node_action_refused_before_acting,
     next_rung,
     unknown_outcome_failure,
 )
@@ -127,10 +128,16 @@ class BranchEscalator:
         )
         lineage_node = lineage_nodes[0] if len(lineage_nodes) == 1 else node_id
         recovery_context = self._recovery_context(workflow, branch_indexes)
-        unknown = unknown_outcome_failure(details)
+        # An attested safety refusal carries ``manual_confirmation_required``
+        # like every agent refusal; judged first, it is a decision for an
+        # operator, not an outcome to confirm.
+        refused = node_action_refused_before_acting(details)
+        unknown = not refused and unknown_outcome_failure(details)
         rejected = executor_rejected_failure(details)
         rung = (
-            None if unknown or rejected else next_rung(step.operation, recovery_context)
+            None
+            if unknown or rejected or refused
+            else next_rung(step.operation, recovery_context)
         )
         taken = workflow.branch_escalation_counts.get(lineage_node, 0)
         if rung is None or taken >= self.max_rungs:
@@ -150,6 +157,10 @@ class BranchEscalator:
                         f"{workflow.fencing_token}); the node was not touched, "
                         "no rung"
                         if rejected
+                        else "the Node Agent refused the command at its safety "
+                        "boundary before touching the GPU; nothing was applied, "
+                        "an operator decides; no rung"
+                        if refused
                         else "no further rung"
                         if rung is None
                         else f"{taken} rung(s) already taken"
@@ -274,7 +285,11 @@ class BranchEscalator:
         node_id = step.node_ids[0]
         if any(set(item.node_ids) - {node_id} for item in workflow.official_steps):
             return None
-        if unknown_outcome_failure(details):
+        if unknown_outcome_failure(details) and not node_action_refused_before_acting(
+            details
+        ):
+            # An attested safety refusal is adopted like an executor rejection:
+            # exhausted with its reason, never confirmed as an outcome.
             return None
         recovery_context = self._recovery_context(
             workflow, set(range(len(workflow.official_steps)))

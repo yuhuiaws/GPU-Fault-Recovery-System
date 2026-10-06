@@ -8777,7 +8777,19 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   really unknown outcome); the display stack is unloaded with a re-read of `/proc/modules` per module,
   `reloaded_kernel_modules` is written in load order and whatever stayed loaded is in `display_modules_retained`; a
   validated restore's VALIDATE_GPU FAILS at once naming the collectors that have not reported after
-  `restore_collector_grace` (default 120 s) instead of waiting out the 600 s cap.
+  `restore_collector_grace` (default 120 s) instead of waiting out the 600 s cap. The final ownership boundary asks for
+  its permit only after the slow local reads -- the compute-apps `nvidia-smi` (which pays the whole driver initialisation
+  while the quiesce has persistence mode off, seconds per GPU on an 8-GPU node) and the sampled device-holder
+  classification -- so the 3-s permit covers only the fence/quiesce checks and one more holder sample; each receipt in
+  `physical_ownership_checks` records `pre_permit_seconds`/`permit_wait_seconds`/`post_permit_seconds`/
+  `permit_lifetime_seconds`, and an `OWNERSHIP_PERMIT_EXPIRED` refusal carries the same timing as `ownership_permit_timing`
+  (on the mixed site ~20 s of pre-spawn reads expired every permit and the reset never spawned). A safety refusal the Agent
+  attests applied nothing (`safety_rejection` with `node_action_outcome_known` or `node_action_not_started`, `reset_verdict`
+  `not-attempted`/`not-applied`, nothing completed) climbs neither ladder: the branch is exhausted naming the refusal and the
+  whole-workflow hand-off (`node_action_refused` stage, `support-after-<workflow>`) plans FREEZE_EVIDENCE and ESCALATE_SUPPORT
+  only -- no reboot or drain successor, no quarantine of a node nothing was done to; the chain's cordon stays, the incident
+  ends ESCALATED with the ticket, and the operator's `restore` (§9.2 of the administrator operations) puts the node back or
+  the reset is re-run.
 - Steps:
   1. Confirm the executor has `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true` and the Node Action
      signing key is identical on both sides; the target Node Agent endpoint, generation and

@@ -457,16 +457,29 @@ def test_final_check_routes_only_the_required_local_guards(
         if quiesce == "enabled" and operation is WorkflowOperation.RESET_GPU
         else []
     )
+    # The slow local reads (the compute-apps query, the sampled holder
+    # classification) run before the permit is asked for; inside the permit
+    # window only the fence/quiesce checks and one more holder sample run.
+    device_recheck = ["cache", "devices"] if "devices" in checks else []
     assert agent.calls == [
+        *checks,
         "permit",
         "validate",
         *quiesce_calls,
-        *checks,
+        *device_recheck,
         "validate",
         *quiesce_calls,
         "effect",
     ]
-    assert result["physical_ownership_checks"][0]["sequence"] == 1
+    receipt = result["physical_ownership_checks"][0]
+    assert receipt["sequence"] == 1
+    assert {
+        "pre_permit_seconds",
+        "permit_wait_seconds",
+        "post_permit_seconds",
+        "permit_lifetime_seconds",
+    } <= set(receipt), receipt
+    assert receipt["permit_lifetime_seconds"] == 3.0
     assert supports_final_ownership(agent.effect), (
         "decorated Agent handler must expose its final ownership boundary"
     )
@@ -531,10 +544,11 @@ class NativeHarness:
 
         class Runner(FakeRunner):
             def __call__(self, command: Any, **kwargs: Any) -> Any:
-                if (
-                    box.granted
-                    and "--query-compute-apps=gpu_uuid,pid,process_name" in command
-                ):
+                # The compute-apps query runs before the permit is asked for
+                # (the preflight, then the boundary's pre-permit read), so it
+                # is recorded whenever it runs; the device sample inside the
+                # permit window is recorded only once the permit was granted.
+                if "--query-compute-apps=gpu_uuid,pid,process_name" in command:
                     box.reads.append("compute")
                     box.on_compute()
                 run: Callable[..., Any] = super().__call__
@@ -631,23 +645,54 @@ def assert_native_refusal(harness: NativeHarness, result: Any) -> None:
     )
 
 
-@pytest.mark.parametrize("read", ["compute", "device"])
 @pytest.mark.parametrize("elapsed", [3, 4])
-def test_permit_expiry_after_client_read_never_spawns_or_escalates(
-    native: NativeHarness, read: str, elapsed: int
+def test_permit_expiry_after_the_device_read_never_spawns_or_escalates(
+    native: NativeHarness, elapsed: int
 ) -> None:
+    """The holder sample inside the permit window is the one read that can
+    still outlive the permit; when it does, nothing is spawned, and the
+    refusal carries the measured timing."""
+
     def expire() -> None:
         native.clock.now = NOW + timedelta(seconds=elapsed)
         native.clock.elapsed = float(elapsed)
 
-    if read == "compute":
-        native.on_compute = expire
-    else:
-        native.on_device = expire
+    native.on_device = expire
     result = native.execute()
     assert result.details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
-    assert read in native.reads
+    assert "device" in native.reads
+    timing = result.details["ownership_permit_timing"]
+    assert timing["permit_lifetime_seconds"] == 3.0
+    assert {"pre_permit_seconds", "permit_wait_seconds", "post_permit_seconds"} <= set(
+        timing
+    )
     assert_native_refusal(native, result)
+
+
+@pytest.mark.parametrize("elapsed", [3, 20])
+def test_a_slow_compute_read_before_the_permit_does_not_expire_it(
+    native: NativeHarness, elapsed: int
+) -> None:
+    """Live (gpu-eks-cluster, p5en): with persistence mode off the compute-apps
+    query took the better part of 20 s on eight GPUs and every 3-s permit
+    expired under it. The query now runs before the permit is asked for, so
+    its duration is outside the window; the receipt records it."""
+
+    def slow_query() -> None:
+        native.clock.now = native.clock.now + timedelta(seconds=elapsed)
+        native.clock.elapsed += float(elapsed)
+
+    native.on_compute = slow_query
+    result = native.execute()
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.details
+    assert "compute" in native.reads
+    assert any("--gpu-reset" in args for args in native.hardware.commands), (
+        "the reset was spawned inside a permit the slow read did not consume"
+    )
+    (receipt,) = result.details["physical_ownership_checks"]
+    assert receipt["permit_lifetime_seconds"] == 3.0
+    assert receipt["post_permit_seconds"] < receipt["permit_lifetime_seconds"]
 
 
 @pytest.mark.parametrize("drift", ["generation", "node", "key-source", "fence"])

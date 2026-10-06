@@ -78,6 +78,11 @@ _CLASSIFIABLE_OPERATIONS = (
 # support workflow carries no isolation (ARCH-E2E-2A finding 1, DESTR-020).
 CONTAINMENT_STAGE = "containment_or_release"
 CONTAINMENT_REFUSED_STAGE = "containment_refused"
+# The Node Agent refused the action at its safety boundary and attests that
+# nothing was applied (``node_action_refused_before_acting``): the hand-off
+# plans evidence and the support ticket only -- no quarantine, no reboot --
+# because the chain's own cordon is already on a node nothing was done to.
+NODE_ACTION_REFUSED_STAGE = "node_action_refused"
 # A failure whose outcome nobody knows. Three producers write it into the step
 # details (``status_source`` never crosses into a step record, so details are
 # the contract): the node-action fold, when the agent's attempt closed
@@ -168,6 +173,89 @@ def executor_rejected_failure(details: Mapping[str, Any] | None) -> bool:
         details is not None
         and details.get("remote_status_source") == EXECUTOR_REJECTED_STATUS_SOURCE
     )
+
+
+def node_action_refused_before_acting(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED node action was refused by the Node Agent's own safety
+    boundary without anything being applied to the node.
+
+    ``safety_rejection`` is the agent's refusal (a persistent device holder,
+    an expired ownership permit, a moved fence); with it, either the agent
+    attests that every physical call it made returned a verdict
+    (``node_action_outcome_known``: a reset refused busy and then refused at
+    the boundary before its retry) or says nothing was started
+    (``node_action_not_started``), nothing completed and no outcome-unknown
+    flag stands. Neither ladder climbs on it: a reboot or a drain would act
+    on a node the refusal left untouched (live, gpu-eks-cluster: a reset
+    refused for an expired permit opened a drain successor that quarantined
+    and cordoned a healthy node). The incident is the operator's as
+    ESCALATED, cordoned by the chain's own MARK_UNSCHEDULABLE, and the
+    restore of the administrator's ``restore`` disposition puts it back.
+    """
+
+    if (
+        details is None
+        or details.get(SAFETY_REJECTION_DETAIL) is not True
+        or details.get("reset_completed")
+    ):
+        return False
+    # ``manual_confirmation_required`` rides on every agent refusal ("an
+    # operator, never a reboot rung"); with the attestation it asks for a
+    # decision, not for a confirmation of an outcome. The other flags say the
+    # outcome is really unknown, and those keep the operator-confirmation stage.
+    if any(
+        details.get(flag) is True
+        for flag in _UNKNOWN_OUTCOME_FLAGS
+        if flag != "manual_confirmation_required"
+    ):
+        return False
+    attested = (
+        details.get("node_action_outcome_known") is True
+        or details.get("node_action_not_started") is True
+    )
+    verdict = details.get("reset_verdict")
+    return attested and verdict in (None, "not-attempted", "not-applied")
+
+
+def _pre_action_classification(
+    failed_executions: list[WorkflowStepExecution],
+) -> tuple[bool, Any]:
+    """``(handled, classification)`` for failures that never acted on the node.
+
+    Every failed step refused by the cluster executor before dispatch (a stale
+    generation, a scope mismatch): the node was never touched, so there is no
+    hardware verdict to climb from and no ticket to open -- handled, no
+    successor; the record's terminal reason names the refusal. Every failed
+    step refused before acting with at least one refused by the Node Agent's
+    safety boundary (``node_action_refused_before_acting``): handled, and an
+    operator decides with the evidence and the ticket while the node keeps the
+    chain's cordon (``NODE_ACTION_REFUSED_STAGE``: no quarantine, no reboot).
+    Anything else is not handled here and climbs the ladder.
+    """
+
+    if not failed_executions:
+        return False, None
+    rejected = [
+        executor_rejected_failure(execution.details) for execution in failed_executions
+    ]
+    refused = [
+        node_action_refused_before_acting(execution.details)
+        for execution in failed_executions
+    ]
+    if all(rejected):
+        return True, None
+    if all(left or right for left, right in zip(rejected, refused, strict=True)):
+        return True, (
+            NODE_ACTION_REFUSED_STAGE,
+            RecoveryAction.ESCALATE_OPERATOR,
+            WorkflowOperation.ESCALATE_SUPPORT,
+            [
+                execution
+                for execution, flagged in zip(failed_executions, refused, strict=True)
+                if flagged
+            ],
+        )
+    return False, None
 
 
 def escalation_descends_from(
@@ -348,11 +436,14 @@ def _escalation_operations(
 ) -> list[WorkflowOperation]:
     """The operation sequence the escalation workflow plans (see ``emit``)."""
 
-    if failed_stage == CONTAINMENT_REFUSED_STAGE:
+    if failed_stage in (CONTAINMENT_REFUSED_STAGE, NODE_ACTION_REFUSED_STAGE):
         # The adapter refused the isolation (absent node, foreign
         # generation): there is nothing this workflow can isolate, and
         # planning MARK_UNSCHEDULABLE / QUARANTINE again on the same node
-        # only reproduces the refusal. Evidence and the hand-off remain.
+        # only reproduces the refusal. Evidence and the hand-off remain. The
+        # Node Agent's attested refusal takes the same shape: the chain's
+        # cordon is on the node, nothing was applied to it, and a quarantine
+        # would isolate a healthy node (live, gpu-eks-cluster).
         operations = [WorkflowOperation.FREEZE_EVIDENCE]
     elif next_action is RecoveryAction.DRAIN:
         operations = [
@@ -589,15 +680,9 @@ class HardwareEscalationService:
             for execution in workflow.step_executions
             if execution.status is WorkflowStepStatus.FAILED
         ]
-        if failed_executions and all(
-            executor_rejected_failure(execution.details)
-            for execution in failed_executions
-        ):
-            # Every failed step was refused by the cluster executor before it
-            # ran (a stale generation, a scope mismatch): the node was never
-            # touched, so there is no hardware verdict to climb from and no
-            # ticket to open. The record's terminal reason names the refusal.
-            return None
+        handled, verdict = _pre_action_classification(failed_executions)
+        if handled:
+            return verdict
         unknown_failures = _unknown_outcome_failures(workflow.step_executions)
         if unknown_failures:
             # The step may have run, or may still be running, on the node. An

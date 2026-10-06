@@ -83,10 +83,16 @@ def assert_refusal_does_not_escalate(outcome):
     assert classified is not None and classified[1] is RecoveryAction.ESCALATE_OPERATOR
 
 
-@pytest.mark.parametrize("slow", ["compute", "device"])
+@pytest.mark.parametrize("slow", ["device", "compute-before-permit"])
 def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
     tmp_path, slow
 ):
+    """The device sample inside the permit window can still outlive the permit
+    and then nothing spawns. The compute-apps query runs before the permit is
+    asked for, so however slow it is the permit -- signed afterwards -- is not
+    consumed and the reset spawns (live, gpu-eks-cluster p5en: ~20 s of
+    pre-spawn reads expired every 3-s permit)."""
+
     _state, _kube, validator, context = stopped_runtime()
     context = replace(
         context, step=context.step.model_copy(update={"gpu_uuids": ["GPU-a"]})
@@ -97,11 +103,10 @@ def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
     class Runner(FakeRunner):
         def __call__(self, command, **kwargs):
             if (
-                clock["permitted"]
-                and slow == "compute"
+                slow == "compute-before-permit"
                 and "--query-compute-apps=gpu_uuid,pid,process_name" in command
             ):
-                clock["now"] += timedelta(seconds=4)
+                clock["now"] += timedelta(seconds=20)
                 calls.append("long-compute-read")
             return super().__call__(command, **kwargs)
 
@@ -153,18 +158,29 @@ def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
         boundary="AGENT_PRE_SPAWN",
         expires_at=command.expires_at,
     )
-    permit = sign_permit(challenge, SECRET, allowed=True, reason="OK", now=clock["now"])
 
     def granted(value):
         assert value == command
         clock["permitted"] = True
-        return permit
+        # Signed when the control plane checks, i.e. after the pre-permit reads.
+        return sign_permit(
+            challenge, SECRET, allowed=True, reason="OK", now=clock["now"]
+        )
 
     agent.ownership_gate.require = granted
     result = agent.execute(
         SignedNodeAction(command=command, signature=sign_node_action(command, SECRET))
     )
-    assert calls == [f"long-{slow}-read"]
+    if slow == "compute-before-permit":
+        assert calls and all(call == "long-compute-read" for call in calls), calls
+        assert result.status is NodeActionStatus.SUCCEEDED, result.details
+        assert any("--gpu-reset" in command for command in hardware.commands), (
+            "the slow read before the permit did not consume the permit"
+        )
+        (receipt,) = result.details["physical_ownership_checks"]
+        assert receipt["permit_lifetime_seconds"] == 3.0
+        return
+    assert calls == ["long-device-read"]
     assert result.status is NodeActionStatus.FAILED and not result.retryable
     assert result.details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
     assert (

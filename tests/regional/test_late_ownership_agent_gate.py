@@ -421,7 +421,9 @@ def test_a_transient_device_holder_does_not_abort_the_final_recheck(seen_in):
     def finder(targets):
         calls.append(sorted(targets))
         hit = {"gpu_uuid": "GPU-a", "pid": "4242", "device": "/dev/nvidia0"}
-        return [hit] if (len(calls) == 1) == (seen_in == "first") else []
+        # Seen in exactly one sample: the first of the pre-permit pair, or the
+        # first post-permit sample (a query that started during the wait).
+        return [hit] if len(calls) == (1 if seen_in == "first" else 2) else []
 
     slept = []
     agent = SimpleNamespace(
@@ -441,10 +443,12 @@ def test_a_transient_device_holder_does_not_abort_the_final_recheck(seen_in):
     result = execute_with_final_ownership(agent, signed, handler)
     assert effects == ["owned-command"]
     # An empty sample already proves there is no persistent holder, so a
-    # holder seen only in the first sample costs one more sample; a clean
-    # first sample ends the recheck without sleeping.
-    assert calls == ([["GPU-a"], ["GPU-a"]] if seen_in == "first" else [["GPU-a"]])
-    assert slept == ([pytest.approx(0.5)] if seen_in == "first" else [])
+    # holder seen in one sample costs exactly one more; a clean sample ends
+    # that check without sleeping. Before the permit the pair runs once; after
+    # it a single clean sample suffices (``seen_in == "first"``: two samples
+    # before, one after; ``"second"``: one before, two after).
+    assert calls == [["GPU-a"], ["GPU-a"], ["GPU-a"]]
+    assert slept == [pytest.approx(0.5)]
     assert result["physical_ownership_checks"]
 
 
