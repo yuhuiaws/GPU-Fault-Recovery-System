@@ -24,7 +24,10 @@ from gpu_fault.node_agent.protocol import (
 from gpu_fault.operation_registry import (
     MAINTENANCE_GENERATION_OPERATIONS,
 )
-from gpu_fault.orchestration.escalation import unknown_outcome_failure
+from gpu_fault.orchestration.escalation import (
+    node_action_refused_before_acting,
+    unknown_outcome_failure,
+)
 from gpu_fault.store import NotFoundError
 
 
@@ -393,6 +396,20 @@ class NodeActionBarrierMixin:
         details = dict(result.details or {})
         if result.status is NodeActionStatus.INTERRUPTED:
             details["node_action_interrupted"] = True
+        if node_action_refused_before_acting(details):
+            # The Node Agent refused at its safety boundary and attests that
+            # nothing was applied: a verdict, not an outcome to confirm. It is
+            # recorded against the participant and surfaces at the step's top
+            # level, where the parking rules and both ladders read it; nested
+            # under node_failure_details alone it would read as unknown.
+            error = result.error or "node action refused before acting"
+            record = (
+                self.barriers.record_prepare if prepare else self.barriers.record_commit
+            )
+            barrier = record(barrier_id, node_id, details=details, error=error)
+            return self._refused_barrier_failure(
+                barrier, node_id, error=error, details=details
+            )
         if not unknown_outcome_failure(details):
             return None
         details["manual_confirmation_required"] = True
@@ -403,6 +420,35 @@ class NodeActionBarrierMixin:
         barrier = record(barrier_id, node_id, details=details, error=error)
         return self._manual_barrier_failure(
             barrier, failed_node=node_id, error=error, failed_details=details
+        )
+
+    @staticmethod
+    def _refused_barrier_failure(
+        barrier: MultiNodeBarrier,
+        node_id: str,
+        *,
+        error: str,
+        details: dict[str, Any],
+    ) -> WorkflowStepOutcome:
+        completed = {
+            item.node_id: item.commit_details
+            for item in barrier.participants
+            if item.state is BarrierParticipantState.COMMITTED
+        }
+        return WorkflowStepOutcome.failed(
+            f"barrier {barrier.barrier_id} refused by node agent {node_id}: {error}",
+            details={
+                **details,
+                "barrier_id": barrier.barrier_id,
+                "barrier_state": barrier.state.value,
+                "failed_nodes": [node_id],
+                "node_failures": {
+                    node_id: [f"node action refused before acting: {error}"]
+                },
+                "node_failure_details": {node_id: dict(details)},
+                "node_results": completed,
+                "completed_nodes": sorted(completed),
+            },
         )
 
     @staticmethod

@@ -102,13 +102,16 @@ def test_refusal_retains_prior_checkpoints_without_claiming_physical_completion(
     )
     assert effects == list(range(prior))
     assert "physical_completed" not in details
+    # The boundary's own refusal lands before the spawn it guards and after
+    # every earlier call returned: a verdict for any operation, not an unknown
+    # outcome; only the "nothing started" claim depends on the checkpoints.
+    assert details["node_action_outcome_known"] is True
+    assert "outcome_unknown" not in details
+    assert details["manual_confirmation_required"] is True
     if prior:
         assert "node_action_not_started" not in details
-        assert details["outcome_unknown"] is True
-        assert details["manual_confirmation_required"] is True
     else:
         assert details["node_action_not_started"] is True
-        assert "outcome_unknown" not in details
     require_physical_ownership()
     assert requests == prior + 1
 
@@ -149,7 +152,10 @@ def test_later_local_guard_failures_retain_earlier_permission_receipts(
         )
 
     details = caught.value.action_details
-    assert details["outcome_unknown"] is True
+    assert details["node_action_outcome_known"] is True, (
+        "the local guard refused before the second call was spawned"
+    )
+    assert "outcome_unknown" not in details
     assert "node_action_not_started" not in details
     assert [item["sequence"] for item in details["physical_ownership_checks"]] == [1]
 

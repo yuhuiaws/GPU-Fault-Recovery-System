@@ -182,10 +182,12 @@ def node_action_refused_before_acting(details: Mapping[str, Any] | None) -> bool
     ``safety_rejection`` is the agent's refusal (a persistent device holder,
     an expired ownership permit, a moved fence); with it, either the agent
     attests that every physical call it made returned a verdict
-    (``node_action_outcome_known``: a reset refused busy and then refused at
-    the boundary before its retry) or says nothing was started
-    (``node_action_not_started``), nothing completed and no outcome-unknown
-    flag stands. Neither ladder climbs on it: a reboot or a drain would act
+    (``node_action_outcome_known``: the final ownership boundary attests its
+    own refusals for every operation it guards -- a reset refused busy and
+    then refused at the boundary before its retry, a fabric reset or a Fabric
+    Manager restart refused before its spawn) or says nothing was started
+    (``node_action_not_started``), nothing completed on any node and no
+    outcome-unknown flag stands. Neither ladder climbs on it: a reboot or a drain would act
     on a node the refusal left untouched (live, gpu-eks-cluster: a reset
     refused for an expired permit opened a drain successor that quarantined
     and cordoned a healthy node). The incident is the operator's as
@@ -197,6 +199,7 @@ def node_action_refused_before_acting(details: Mapping[str, Any] | None) -> bool
         details is None
         or details.get(SAFETY_REJECTION_DETAIL) is not True
         or details.get("reset_completed")
+        or details.get("completed_nodes")
     ):
         return False
     # ``manual_confirmation_required`` rides on every agent refusal ("an

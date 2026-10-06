@@ -28,6 +28,7 @@ from gpu_fault.node_agent.protocol import (
 from tests.node_agent._support import (
     SECRET,
     FakeRunner,
+    Quiesced,
     no_device_clients,
     node_action_executor,
 )
@@ -42,17 +43,25 @@ HOLDER = {
 }
 
 
-def _agent(tmp_path: Path, runner: FakeRunner):
+def _agent(tmp_path: Path, runner: FakeRunner, *, fabric: bool = False):
     proc = tmp_path / "proc"
     proc.mkdir()
     (proc / "modules").write_text(
         "nvidia_uvm 1507328 0 -\nnvidia 8933376 44 nvidia_uvm\n", encoding="ascii"
     )
+    operation = (
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+        if fabric
+        else WorkflowOperation.RESET_GPU
+    )
     return node_action_executor(
         tmp_path,
         "pre-spawn.db",
-        allowed_operations={WorkflowOperation.RESET_GPU},
+        allowed_operations={operation},
         reset_enabled=True,
+        fabric_reset_enabled=fabric,
+        service_quiesce_enabled=fabric,
+        quiesce_manager=Quiesced() if fabric else None,
         now=lambda: NOW,
         runner=runner,
         require_final_ownership=True,
@@ -69,13 +78,18 @@ def _agent(tmp_path: Path, runner: FakeRunner):
     )
 
 
-def _signed(gpu_uuids: list[str]) -> SignedNodeAction:
+def _signed(gpu_uuids: list[str], *, fabric: bool = False) -> SignedNodeAction:
     value = NodeActionCommand(
         command_id="pre-spawn/reset",
         workflow_request_id="workflow-reset",
-        incident_id="incident-reset",
+        # The quiesce window stub of the fabric reset knows this incident.
+        incident_id="incident-a" if fabric else "incident-reset",
         fencing_token=1,
-        operation=WorkflowOperation.RESET_GPU,
+        operation=(
+            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+            if fabric
+            else WorkflowOperation.RESET_GPU
+        ),
         node_id="node-a",
         agent_generation=1,
         gpu_uuids=gpu_uuids,
@@ -86,21 +100,91 @@ def _signed(gpu_uuids: list[str]) -> SignedNodeAction:
     return SignedNodeAction(command=value, signature=sign_node_action(value, SECRET))
 
 
-def _refuse_after(agent, grants: int, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Grant the first ``grants`` ownership checks, refuse every later one for
-    the holder: the boundary's refusal lands before the next spawn."""
+def _refuse_after(
+    agent, grants: int, monkeypatch: pytest.MonkeyPatch, *, expired: bool = False
+) -> None:
+    """Grant the first ``grants`` ownership checks, refuse every later one --
+    for the holder, or (``expired``) as the gate refuses a permit that ran out:
+    the boundary's refusal lands before the next spawn."""
 
     requests = {"count": 0}
 
     def require(current: NodeActionCommand):
         requests["count"] += 1
         if requests["count"] > grants:
+            if expired:
+                raise OwnershipRefused("OWNERSHIP_PERMIT_EXPIRED")
             raise OwnershipRefused(
                 "OWNERSHIP_FINAL_CLIENTS_CHANGED", device_clients=[HOLDER]
             )
         return granted(current, requests["count"], SECRET)
 
     monkeypatch.setattr(agent.ownership_gate, "require", require)
+
+
+def test_a_fabric_reset_refused_before_its_first_spawn_is_not_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RESET_ALL_GPUS_NVSWITCHES refused at the boundary before the one fabric
+    reset was spawned: the same known verdict RESET_GPU reports, for the whole
+    inventory; nothing to confirm, nothing to park on."""
+
+    runner = FakeRunner()
+    agent = _agent(tmp_path, runner, fabric=True)
+    _refuse_after(agent, 0, monkeypatch, expired=True)
+
+    result = agent.execute(_signed(["GPU-a"], fabric=True))
+
+    assert result.status is NodeActionStatus.FAILED
+    assert result.retryable is False
+    assert result.error == "OwnershipRefused: OWNERSHIP_PERMIT_EXPIRED"
+    details = result.details
+    assert not any("--gpu-reset" in item for item in runner.commands), (
+        "nothing was spawned for the fabric reset"
+    )
+    assert details["gpu_reset_attempts_spawned"] == 0
+    assert details["reset_verdict"] == "not-attempted"
+    assert details["reset_scope"] == "ALL_LOCAL_GPUS_AND_NVSWITCHES"
+    assert details["reset_not_attempted"] == ["GPU-a"]
+    assert details["reset_failed"] == []
+    assert details["reset_completed"] == []
+    assert details["reset_outcome_unknown"] == []
+    assert details["node_action_outcome_known"] is True
+    assert details["node_action_not_started"] is True
+    assert details["physical_ownership_checks"] == []
+    assert "outcome_unknown" not in details
+    assert details["manual_confirmation_required"] is True
+
+
+def test_a_fabric_reset_refused_before_the_retry_of_a_busy_reset_is_not_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live (gpu-eks-cluster, COLLECT-013, SXID 10003): the fabric reset was
+    refused busy, then its retry was refused OWNERSHIP_PERMIT_EXPIRED at the
+    boundary. The previous Agent reported it as an unknown outcome; the record
+    parked and kept the node's occupancy against the next incident."""
+
+    runner = FakeRunner(reset_error="GPU 00000000:59:00.0: In use by another client")
+    agent = _agent(tmp_path, runner, fabric=True)
+    _refuse_after(agent, 1, monkeypatch, expired=True)
+
+    result = agent.execute(_signed(["GPU-a"], fabric=True))
+
+    assert result.status is NodeActionStatus.FAILED
+    details = result.details
+    assert [item for item in runner.commands if "--gpu-reset" in item] == [
+        ["nvidia-smi", "--gpu-reset"]
+    ], "one fabric reset was spawned and refused busy before the boundary refused"
+    assert details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
+    assert details["gpu_reset_attempts_spawned"] == 1
+    assert details["reset_verdict"] == "not-applied"
+    assert details["reset_failed"] == ["GPU-a"]
+    assert details["reset_not_attempted"] == []
+    assert details["reset_completed"] == []
+    assert details["node_action_outcome_known"] is True
+    assert "node_action_not_started" not in details, "a reset was spawned once"
+    assert "outcome_unknown" not in details
+    assert len(details["physical_ownership_checks"]) == 1
 
 
 def test_a_refusal_before_the_first_spawn_is_a_not_attempted_verdict(

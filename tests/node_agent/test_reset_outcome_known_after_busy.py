@@ -16,6 +16,7 @@ runs and the record does not park.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -78,6 +79,67 @@ def test_an_attested_refusal_after_a_granted_checkpoint_is_not_unknown() -> None
         "still a safety refusal: an operator, never a reboot rung"
     )
     assert details["node_action_outcome_known"] is True
+
+
+def _spawning_handler(checkpoints: int):
+    """A handler of any operation: one checkpoint per physical call, no
+    attestation of its own."""
+
+    @boundary_handler
+    def handler(_: Any) -> dict[str, Any]:
+        for _ in range(checkpoints):
+            require_physical_ownership()
+        return {"done": True}
+
+    return handler
+
+
+def _expiring_gate(agent: FakeNodeAgent, grants: int) -> None:
+    requests = {"count": 0}
+
+    def require(value: Any):
+        requests["count"] += 1
+        if requests["count"] > grants:
+            raise OwnershipRefused("OWNERSHIP_PERMIT_EXPIRED")
+        return agent.grant(value)
+
+    agent.ownership_gate = SimpleNamespace(require=require)
+
+
+@pytest.mark.parametrize("granted_first", [0, 1], ids=["first-checkpoint", "retry"])
+def test_the_boundary_attests_its_own_refusal_for_any_operation(
+    granted_first: int,
+) -> None:
+    """A refusal the boundary raises lands before the physical call it guards
+    is spawned, and a handler reaches a checkpoint only after every earlier
+    call returned: nothing is in flight, so the boundary attests the verdict
+    itself, whatever the operation (live, gpu-eks-cluster: a fabric reset
+    refused OWNERSHIP_PERMIT_EXPIRED before its retry carried no attestation
+    and parked the record)."""
+
+    agent = FakeNodeAgent()
+    _expiring_gate(agent, granted_first)
+
+    with pytest.raises(OwnershipRefused) as caught:
+        execute_with_final_ownership(agent, _signed(), _spawning_handler(2))
+
+    details = caught.value.action_details
+    assert details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
+    assert details["node_action_outcome_known"] is True
+    assert details.get("outcome_unknown") is None
+    assert details["manual_confirmation_required"] is True
+    assert details["safety_rejection"] is True
+    assert len(details["physical_ownership_checks"]) == granted_first
+    if granted_first:
+        assert "node_action_not_started" not in details, "a call was spawned first"
+    else:
+        assert details["node_action_not_started"] is True
+    assert not unresolved_details(details), "nothing to hold a restore on"
+    assert not unresolved_node_action(
+        workflow_step_execution(
+            0, OP.RESET_ALL_GPUS_NVSWITCHES, WorkflowStepStatus.FAILED, details=details
+        )
+    ), "the executor reads the attested refusal as resolved"
 
 
 def test_an_unattested_refusal_after_a_granted_checkpoint_stays_unknown() -> None:

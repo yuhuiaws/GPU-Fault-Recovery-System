@@ -434,6 +434,34 @@ class ResetOperationsMixin:
                 timeout=180,
                 released=released,
             )
+        except OwnershipRefused as refused:
+            # The boundary refused before the one fabric reset was (re)spawned:
+            # a verdict for the whole inventory, reported as ``_reset_gpu``
+            # reports it per GPU -- not attempted when nothing was spawned,
+            # not applied when the first reset was refused busy and the retry
+            # was refused here. ``node_action_not_started`` stays only while
+            # the boundary granted no checkpoint (live, gpu-eks-cluster: the
+            # bare refusal read as an unknown outcome and parked the record).
+            not_attempted = (
+                refused.action_details.get("gpu_reset_attempts_spawned") == 0
+            )
+            refused.action_details.update(
+                {
+                    "node_action_outcome_known": True,
+                    "node_action_not_started": True,
+                    "reset_verdict": "not-attempted"
+                    if not_attempted
+                    else "not-applied",
+                    "reset_scope": "ALL_LOCAL_GPUS_AND_NVSWITCHES",
+                    "reset_completed": [],
+                    "reset_outcome_unknown": [],
+                    "reset_failed": [] if not_attempted else list(local_inventory),
+                    "reset_not_attempted": (
+                        list(local_inventory) if not_attempted else []
+                    ),
+                }
+            )
+            raise
         finally:
             reload = self._reload_display_modules(released)
         observed_after = self._gpu_inventory()

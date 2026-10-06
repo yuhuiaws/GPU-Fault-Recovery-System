@@ -77,13 +77,15 @@ def _compile_steps(workflow: Any, operations: Any, node: str, gpus: Any) -> list
     ]
 
 
-def _reset_chain(details: dict[str, Any]) -> tuple[Any, int]:
+def _reset_chain(
+    details: dict[str, Any], reset: WorkflowOperation = OP.RESET_GPU
+) -> tuple[Any, int]:
     steps = [
         workflow_step(OP.MARK_UNSCHEDULABLE, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
         workflow_step(
             OP.QUIESCE_GPU_SERVICES, node_ids=["node-a"], gpu_uuids=["GPU-a"]
         ),
-        workflow_step(OP.RESET_GPU, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
+        workflow_step(reset, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
         workflow_step(
             OP.RESTORE_GPU_SERVICES, node_ids=["node-a"], gpu_uuids=["GPU-a"]
         ),
@@ -102,7 +104,7 @@ def _reset_chain(details: dict[str, Any]) -> tuple[Any, int]:
             workflow_step_execution(1, OP.QUIESCE_GPU_SERVICES),
             workflow_step_execution(
                 2,
-                OP.RESET_GPU,
+                reset,
                 WorkflowStepStatus.FAILED,
                 error=str(details.get("reason") or "In use by another client"),
                 details=details,
@@ -110,6 +112,39 @@ def _reset_chain(details: dict[str, Any]) -> tuple[Any, int]:
         ],
     )
     return workflow, 2
+
+
+def test_the_fabric_reset_refusal_is_handed_off_the_same_way() -> None:
+    """Live (gpu-eks-cluster, COLLECT-013, SXID 10003): RESET_ALL_GPUS_NVSWITCHES
+    refused OWNERSHIP_PERMIT_EXPIRED before the retry of a busy reset. With the
+    boundary's attestation it is the same refusal as RESET_GPU's: no reboot
+    rung, the hand-off stage, nothing else."""
+
+    details = {
+        **NOT_APPLIED,
+        "reason": "OWNERSHIP_PERMIT_EXPIRED",
+        "reset_scope": "ALL_LOCAL_GPUS_AND_NVSWITCHES",
+        "ownership_permit_timing": {"post_permit_seconds": 3.6},
+    }
+    workflow, failed_index = _reset_chain(details, OP.RESET_ALL_GPUS_NVSWITCHES)
+
+    escalation = BranchEscalator(
+        DagBrancher(RecoveryArbiter()), _compile_steps
+    ).escalate_branch(workflow, failed_index, details["reason"], details=details)
+    assert escalation is not None and escalation.outcome == "exhausted"
+    assert OP.RESTART_NODE not in {
+        step.operation for step in escalation.workflow.official_steps
+    }
+
+    classified = HardwareEscalationService.classify(
+        copy_model(workflow, status=WorkflowStatus.FAILED)
+    )
+    assert classified is not None
+    stage, action, operation, flagged = classified
+    assert stage == NODE_ACTION_REFUSED_STAGE
+    assert action is RecoveryAction.ESCALATE_OPERATOR
+    assert operation is OP.ESCALATE_SUPPORT
+    assert [item.operation for item in flagged] == [OP.RESET_ALL_GPUS_NVSWITCHES]
 
 
 @pytest.mark.parametrize(
@@ -120,6 +155,7 @@ def _reset_chain(details: dict[str, Any]) -> tuple[Any, int]:
         (BUSY, False),
         ({**NOT_APPLIED, "outcome_unknown": True}, False),
         ({**NOT_ATTEMPTED, "reset_completed": ["GPU-a"]}, False),
+        ({**NOT_ATTEMPTED, "completed_nodes": ["node-b"]}, False),
         ({**NOT_ATTEMPTED, "safety_rejection": False}, False),
         ({"safety_rejection": True}, False),
         (None, False),
@@ -130,6 +166,7 @@ def _reset_chain(details: dict[str, Any]) -> tuple[Any, int]:
         "busy-after-retries",
         "unknown",
         "something-completed",
+        "another-node-committed",
         "not-a-safety-refusal",
         "unattested",
         "no-details",

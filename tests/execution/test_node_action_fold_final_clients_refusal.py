@@ -44,10 +44,13 @@ def test_the_step_details_keep_the_holders_the_agent_named(
     assert outcome.details["persistent_device_client_count"] == 1, outcome.details
     assert outcome.details["manual_confirmation_required"] is True, outcome.details
     assert outcome.details["node_action_not_started"] is True, outcome.details
-    # The per-node failure text the support reason quotes names the holder.
+    # The per-node failure text the support reason quotes names the holder,
+    # and calls the attested pre-spawn refusal what it is.
     assert outcome.details["node_failures"] == {
-        "node-a": [f"node action outcome unknown: {result.error}"]
+        "node-a": [f"node action refused before acting: {result.error}"]
     }, outcome.details
+    assert outcome.details["node_action_outcome_known"] is True, outcome.details
+    assert "outcome_unknown" not in outcome.details, outcome.details
     assert "GPU-a:4242:dcgm-exporter" in outcome.details["node_failures"]["node-a"][0]
     assert (outcome.error or "").startswith(
         f"node agent node-a: ResetProgressError: {REASON}: GPU-a:4242:dcgm-exporter"

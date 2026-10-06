@@ -3172,7 +3172,19 @@ boundary and attests that nothing was applied (`safety_rejection` with `node_act
 parking, the branch ladder takes no rung, and the whole-workflow hand-off (`support-after-<workflow>`, stage
 `node_action_refused`) plans FREEZE_EVIDENCE and ESCALATE_SUPPORT only -- no MARK_UNSCHEDULABLE, no QUARANTINE, no reboot
 successor; the node keeps the chain's own cordon and the incident is yours as ESCALATED with the ticket. Exits: fix the
-cause the refusal names and let a new workflow run the reset, or release the node with the restore of §9.2. Live
+cause the refusal names and let a new workflow run the reset, or release the node with the restore of §9.2. This holds for every node-mutating
+operation that passes the final ownership boundary (RESET_GPU, RESET_ALL_GPUS_NVSWITCHES, RESTART_FABRIC_MANAGER,
+REMEDIATE_DRIVER, UPDATE_SOFTWARE_FIRMWARE, ...): the boundary attests `node_action_outcome_known` on every
+`OwnershipRefused` it raises itself -- the refusal lands before the guarded physical call is spawned, and a handler reaches
+its next checkpoint only after the previous call returned, so nothing is in flight; `RESET_ALL_GPUS_NVSWITCHES` carries
+RESET_GPU's `reset_verdict` (`not-attempted` before the first spawn, `not-applied` before the retry of a busy reset),
+`reset_scope` and the four reset lists, and the step's `node_failures` read `node action refused before acting: ...`. Live
+(gpu-eks-cluster, COLLECT-013, SXID 10003): the fabric reset was refused `OWNERSHIP_PERMIT_EXPIRED` before the retry of a
+busy reset, the previous Agent attested nothing, the record parked BLOCKED/NEEDS_OPERATOR on `outcome_unknown`, the
+product's own validated restore then put the node back while the parked record kept the node's exclusive occupancy -- the
+next incident's REBOOT_NODE workflow sat PENDING for half an hour and the `config`/`deploy` preflight was blocked; a record
+of that shape written by the previous release is still closed per §9.4 with `confirm-node-action` → `workflow-reconcile` →
+close incident. Live
 (gpu-eks-cluster) the successor of such a refusal quarantined and cordoned a node nothing had been done to. The refusal's
 cause is on the step: a persistent device holder is named in `persistent_device_clients`; an expired ownership permit
 (`OWNERSHIP_PERMIT_EXPIRED`) carries `ownership_permit_timing` -- `pre_permit_seconds` (the compute-apps query and the

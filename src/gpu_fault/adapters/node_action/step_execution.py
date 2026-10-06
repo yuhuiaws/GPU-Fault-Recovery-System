@@ -20,7 +20,10 @@ from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
-from gpu_fault.orchestration.escalation import unknown_outcome_failure
+from gpu_fault.orchestration.escalation import (
+    node_action_refused_before_acting,
+    unknown_outcome_failure,
+)
 
 
 #: The holder evidence a VERIFY_NO_GPU_CLIENTS result carries (node agent
@@ -454,13 +457,18 @@ class NodeActionExecutionService:
             # climbing; ``node_failures`` is what the support reason quotes,
             # so the cause is named per node exactly as for INTERRUPTED.
             failure_details.update(result.details)
+            # A refusal the agent attests applied nothing is a verdict the
+            # hand-off quotes, not an outcome the operator has to confirm.
+            cause = (
+                "node action refused before acting"
+                if node_action_refused_before_acting(result.details)
+                else "node action outcome unknown"
+            )
             failure_details.update(
                 {
                     "operation": context.step.operation.value,
                     "failed_nodes": [node_id],
-                    "node_failures": {
-                        node_id: [f"node action outcome unknown: {result.error}"]
-                    },
+                    "node_failures": {node_id: [f"{cause}: {result.error}"]},
                 }
             )
         # Last, so this step's own accounting of what it finished cannot be

@@ -8797,7 +8797,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   whole-workflow hand-off (`node_action_refused` stage, `support-after-<workflow>`) plans FREEZE_EVIDENCE and ESCALATE_SUPPORT
   only -- no reboot or drain successor, no quarantine of a node nothing was done to; the chain's cordon stays, the incident
   ends ESCALATED with the ticket, and the operator's `restore` (§9.2 of the administrator operations) puts the node back or
-  the reset is re-run.
+  the reset is re-run. The boundary attests `node_action_outcome_known` on every `OwnershipRefused` it raises itself (the
+  refusal lands before the guarded call is spawned and every earlier call has returned), so the verdict holds for every
+  node-mutating operation that passes the final ownership boundary; `RESET_ALL_GPUS_NVSWITCHES` carries RESET_GPU's
+  `reset_verdict`/`reset_scope` and the four reset lists -- COLLECT-013's SXID 10003 fabric reset, refused
+  `OWNERSHIP_PERMIT_EXPIRED` before the retry of a busy reset, used to park on `outcome_unknown` and leave the node's
+  exclusive occupancy to a parked record, blocking the next incident's REBOOT_NODE and the deploy preflight.
 - Steps:
   1. Confirm the executor has `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true` and the Node Action
      signing key is identical on both sides; the target Node Agent endpoint, generation and
@@ -13679,6 +13684,15 @@ both directions must fail-closed**
   `In use by another client`, re-running the fail-closed client check before each retry;
   other reset errors still fail immediately, and a persistent occupant fails once the limit is reached.
   **Do not sidestep this race by stopping the sampler**, or the core evidence of this case is lost.
+- A fabric reset (`RESET_ALL_GPUS_NVSWITCHES`, the SXID decision this harness may also drive) refused at the Node Agent's
+  final ownership boundary -- an expired permit before the retry of a reset the driver refused busy, a holder that appeared
+  -- is a known verdict, not an unknown outcome: the boundary attests `node_action_outcome_known` on every refusal it raises
+  and the fabric reset carries RESET_GPU's `reset_verdict` (`not-attempted` before the first spawn, `not-applied` before the
+  retry), `reset_scope` and the four reset lists; the step's `node_failures` read `node action refused before acting: ...`,
+  the chain ends FAILED with the RESTORE compensation run, the record neither parks nor keeps the node's occupancy, and the
+  escalation is the `node_action_refused` hand-off (no reboot, no quarantine). The previous release's record of such a
+  refusal (`outcome_unknown`, no verdict) still parks BLOCKED / NEEDS_OPERATOR and is closed with `confirm-node-action` and
+  `workflow-reconcile`.
 
 #### Steps
 
