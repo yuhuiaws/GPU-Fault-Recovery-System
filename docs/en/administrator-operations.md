@@ -1128,7 +1128,18 @@ Semantics and boundaries of `eks-managed`:
   once the record is landing its failure and the Agent has answered -- the command is no longer PENDING/LEASED -- the host
   services are restored and the taint removed, then the record parks; the node is isolated, and a dark node blocks every
   later validation; the residual risk is the in-kernel tail of an nvidia-smi killed at its deadline, and the restarted
-  services attach only once the GPU answers). The Agent's quiesce fail-safe timer (`GPU_FAULT_QUIESCE_FAILSAFE_SECONDS`,
+  services attach only once the GPU answers). The judgement reads **the restore's own nodes only**
+  (`unresolved_actions_for`): a sibling branch's reset still in its busy-retry loop never holds this node's restore
+  (gpu-eks-cluster DESTR-015: branch A's restore was refused `NODE_ACTION_OUTCOME_UNRESOLVED` two seconds before branch
+  B's reset returned, the branch was read as exhausted and the hand-off quarantined a node whose own reset had succeeded).
+  While an action on the restore's own node may still be executing on the Agent (a command PENDING/LEASED, a reset in its
+  retry loop, a step wait that ran out over an open command) the restore is recorded WAITING (`restore_gpu_services_held`,
+  `awaiting_step_indexes`) and re-reads the terminal result on the next tick, bounded by the step's own waiting cap
+  (`step_waiting_timeout_seconds`), instead of being refused as unknown; only an outcome the Agent answered unknown, on a
+  record not landing a failure, is withheld. A held or withheld restore is no longer a branch's hardware verdict:
+  `BranchEscalator.escalate_branch` returns None for a RESTORE_GPU_SERVICES failure carrying
+  `reason=NODE_ACTION_OUTCOME_UNRESOLVED`, and the whole-record path lands it (the compensation restore, then
+  NEEDS_OPERATOR for `confirm-node-action`) -- never a quarantine. The Agent's quiesce fail-safe timer (`GPU_FAULT_QUIESCE_FAILSAFE_SECONDS`,
   default 420 s) remains the last line. The display-stack unload re-reads `/proc/modules` after every module: `nvidia_modeset` is judged with
   `nvidia_drm` really gone (the single snapshot used to unload drm alone and leave modeset at refcount 1), whatever stayed
   loaded is recorded with its refcount/users in `display_modules_retained`, and `reloaded_kernel_modules` is written in

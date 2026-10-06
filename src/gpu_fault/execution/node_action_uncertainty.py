@@ -28,6 +28,12 @@ if TYPE_CHECKING:
     from gpu_fault.store.contracts import ControlPlaneStore
 
 UNRESOLVED_NODE_ACTION = "NODE_ACTION_OUTCOME_UNRESOLVED"
+# ``details`` key of a RESTORE_GPU_SERVICES WAITING record: the restore is held
+# (re-read every tick, bounded by the step's waiting cap) while a node action
+# on its own node may still be executing; distinct from
+# ``restore_gpu_services_withheld``, the FAILED record of a restore refused for
+# an outcome the agent answered unknown.
+RESTORE_HELD_KEY = "restore_gpu_services_held"
 # ``details`` key under which ``gpu-fault-admin submit-remediation --disposition
 # confirm-node-action`` records the operator's confirmation of a node action
 # whose outcome the executor never observed (DESTR-014: the node rebooted while
@@ -406,39 +412,112 @@ def node_actions_operator_confirmed(workflow: WorkflowRequest) -> bool:
     return confirmed and not any(unresolved_node_action(item) for item in latest)
 
 
+def _execution_step_nodes(
+    workflow: WorkflowRequest, execution: WorkflowStepExecution
+) -> frozenset[str] | None:
+    """The nodes the execution's own step targets, or ``None`` when the step
+    cannot be resolved (a stale index, a rebound operation); callers read
+    ``None`` as "every node" -- fail-closed."""
+
+    phase = execution.phase or execution_phase(workflow)
+    steps = workflow.safety_steps if phase == "safety" else workflow.official_steps
+    if not 0 <= execution.step_index < len(steps):
+        return None
+    step = steps[execution.step_index]
+    if step.operation is not execution.operation:
+        return None
+    return frozenset(step.node_ids)
+
+
+def unresolved_actions_for(
+    workflow: WorkflowRequest, node_ids: Collection[str]
+) -> list[WorkflowStepExecution]:
+    """The latest unresolved node actions that touch any of ``node_ids``.
+
+    Judged per node: a restore on one node answers for that node's own
+    actions, not for a sibling branch's reset still in its busy-retry loop
+    (live, gpu-eks-cluster DESTR-015: branch A's RESTORE_GPU_SERVICES was
+    withheld two seconds before branch B's reset returned, the withheld
+    restore exhausted branch A and the hand-off quarantined a node whose own
+    reset had succeeded). Restores themselves are never in the set; an
+    execution whose step cannot be resolved, or whose step names no node,
+    counts for every node.
+    """
+
+    wanted = frozenset(node_ids)
+    found: list[WorkflowStepExecution] = []
+    for execution in latest_node_action_executions(workflow):
+        if (
+            execution.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+            or not unresolved_node_action(execution)
+        ):
+            continue
+        nodes = _execution_step_nodes(workflow, execution)
+        if nodes is None or not nodes or not wanted or nodes & wanted:
+            found.append(execution)
+    return found
+
+
 def restoration_refusal(
     workflow: WorkflowRequest, step: WorkflowStepSpec
 ) -> WorkflowStepOutcome | None:
-    """Withhold an in-chain RESTORE_GPU_SERVICES while a node action's outcome
-    is unresolved -- except the restore that compensates a failure.
+    """Hold or withhold a RESTORE_GPU_SERVICES whose own node has a node action
+    with an unresolved outcome; a sibling node's action never holds it.
 
-    A chain that is landing a failure (``pending_failure_step_index`` set) has
-    its node isolated already; withholding its restore left the host services
-    stopped, the quiesce taint on, and a dark node that no later validation
-    could read (live, gpu-eks-cluster: the record parked BLOCKED on a refused
-    reset and every operator exit -- restore, confirm-node-action, reconcile
-    -- was refused until an EC2 reboot). The compensation restore now runs;
-    the record still parks for ``confirm-node-action`` when the outcome is
-    really unknown, with its services up and its taint gone. The residual
-    risk is the in-kernel tail of a reset whose nvidia-smi was killed at its
-    deadline: the restarted services attach to the GPU only once it answers.
+    Three readings, judged on the restore's own nodes only
+    (``unresolved_actions_for``):
+
+    * the action is executing under this live record (a command PENDING on
+      the agent or open in the Store, a reset in its busy-retry loop, with no
+      deadline, lifetime, step cap or cancellation landed over it): the
+      restore **waits** and re-reads the terminal result on the next tick,
+      bounded by the step's own waiting cap
+      (``step_bounds.bounded_waiting_outcome``), instead of being refused as
+      unknown while the reset is seconds from its verdict. A command the
+      control plane gave up on is not waited for: the record parks and
+      ``receipt_settled_resume`` resumes it when the receipt settles;
+    * the agent answered -- unknown or unconfirmed, but answered -- and the
+      chain is landing a failure (``pending_failure_step_index`` set): the
+      compensation restore runs. Its node is isolated already; withholding
+      left the host services stopped, the quiesce taint on, and a dark node
+      that no later validation could read (live, gpu-eks-cluster: the record
+      parked BLOCKED on a refused reset and every operator exit -- restore,
+      confirm-node-action, reconcile -- was refused until an EC2 reboot). The
+      record still parks for ``confirm-node-action`` with its services up and
+      its taint gone; the residual risk is the in-kernel tail of a reset
+      whose nvidia-smi was killed at its deadline, and the restarted services
+      attach to the GPU only once it answers;
+    * otherwise the restore is withheld (FAILED, ``restore_gpu_services_withheld``).
     """
 
-    if (
-        step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
-        or not has_unresolved_node_action(workflow, include_restoration=False)
-    ):
+    if step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES:
         return None
+    relevant = unresolved_actions_for(workflow, step.node_ids)
+    if not relevant:
+        return None
+    executing = [
+        item for item in relevant if _in_flight_under_this_record(item.details)
+    ]
+    if executing and not _landing_a_bound(workflow):
+        return WorkflowStepOutcome.waiting(
+            details={
+                "reason": UNRESOLVED_NODE_ACTION,
+                RESTORE_HELD_KEY: True,
+                "awaiting_step_indexes": sorted(
+                    {item.step_index for item in executing}
+                ),
+                "awaiting_remote_command_ids": sorted(
+                    {
+                        str(item.details["remote_command_id"])
+                        for item in executing
+                        if item.details.get("remote_command_id")
+                    }
+                ),
+            }
+        )
     if workflow.pending_failure_step_index is not None and not any(
-        _may_still_execute(execution.details)
-        for execution in latest_node_action_executions(workflow)
-        if execution.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
-        and unresolved_node_action(execution)
+        _may_still_execute(item.details) for item in relevant
     ):
-        # The agent answered -- unknown or unconfirmed, but answered; nothing
-        # is executing on the node any more. A command still PENDING on the
-        # agent (a deadline landing over a reset in flight) keeps the refusal:
-        # that reset may be running this very second.
         return None
     return WorkflowStepOutcome.failed(
         "automatic GPU service restoration requires resolved node actions",
@@ -454,6 +533,58 @@ def restoration_refusal(
 
 #: Remote command statuses under which the agent may still be executing.
 _OPEN_REMOTE_STATUSES = frozenset({"PENDING", "LEASED", "WAITING"})
+
+
+def _landing_a_bound(workflow: WorkflowRequest) -> bool:
+    """Whether the failure this record is landing is a control-plane bound --
+    a workflow deadline or lifetime, a step cap, a cancellation -- rather than
+    a step's own verdict. Such a record no longer owns the wait for anything
+    still open on its nodes: it parks, and the receipt resumes it."""
+
+    index = workflow.pending_failure_step_index
+    if index is None:
+        return False
+    for execution in reversed(workflow.step_executions):
+        if execution.step_index != index:
+            continue
+        details = execution.details
+        return (
+            "workflow_execution_deadline" in details
+            or details.get("workflow_lifetime_exceeded") is True
+            or "workflow_deadline_remote_command_cancellation" in details
+            or "step_waiting_timeout_seconds" in details
+        )
+    return False
+
+
+def _in_flight_under_this_record(details: Mapping[str, Any]) -> bool:
+    """Whether the node action is executing *and* this record still owns it.
+
+    The command is PENDING on the agent or open in the Store and nothing has
+    given up on it: no workflow deadline or lifetime landed over it, no step
+    wait ran out, no workflow-side cancellation. That is a reset in its
+    busy-retry loop under a live record -- the restore re-reads it on the next
+    tick. Once the control plane has given up on an open command, waiting is
+    not the answer: the record parks, and ``receipt_settled_resume`` resumes
+    it when the agent's receipt settles the question.
+    """
+
+    if details.get("workflow_lifetime_exceeded") is True:
+        return False
+    if "step_waiting_timeout_seconds" in details:
+        return False
+    cancellation = details.get("workflow_deadline_remote_command_cancellation")
+    if isinstance(cancellation, Mapping):
+        return False
+    source = details.get("remote_status_source")
+    if isinstance(source, str) and source.startswith("workflow-"):
+        return False
+    if details.get("node_action_state") == "PENDING" and details.get(
+        "node_action_command_id"
+    ):
+        return True
+    status = details.get("remote_status")
+    return isinstance(status, str) and status.upper() in _OPEN_REMOTE_STATUSES
 
 
 def _may_still_execute(details: Mapping[str, Any]) -> bool:

@@ -30,6 +30,7 @@ from gpu_fault.models import (
     record_workflow_event,
     resolved_step_indexes,
 )
+from gpu_fault.execution.node_action_uncertainty import UNRESOLVED_NODE_ACTION
 from gpu_fault.orchestration.dag_branching import branch_node_ids
 from gpu_fault.orchestration.escalation import (
     executor_rejected_failure,
@@ -118,6 +119,17 @@ class BranchEscalator:
             workflow = adopted
         step = workflow.official_steps[failed_index]
         if step.branch_id in JOB_LEVEL_BRANCH_IDS or len(step.node_ids) != 1:
+            return None
+        if (
+            step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+            and (details or {}).get("reason") == UNRESOLVED_NODE_ACTION
+        ):
+            # A restore held or withheld for an unresolved node action is a
+            # safety hold, not this branch's hardware verdict: no rung fits
+            # it, and exhausting the branch handed a node whose own reset had
+            # succeeded to a drain (live, gpu-eks-cluster DESTR-015). The
+            # whole-workflow path lands it: the compensation restore, then
+            # NEEDS_OPERATOR for confirm-node-action -- never a quarantine.
             return None
         node_id = step.node_ids[0]
         branch_id = step.branch_id
