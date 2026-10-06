@@ -72,7 +72,11 @@ def node_recovery_guard_errors(
 
 
 def reboot_count_errors(
-    events: list[dict[str, Any]], *, provider: str | None, executor_role_arn: str
+    events: list[dict[str, Any]],
+    *,
+    provider: str | None,
+    executor_role_arn: str,
+    waited: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Exactly one accepted reboot call, by the executor role, no replacement.
 
@@ -81,12 +85,20 @@ def reboot_count_errors(
     never counted -- on plain EKS Karpenter dry-runs ``RunInstances`` about
     once a minute (``Client.DryRunOperation``); a refused reboot attempt is
     reported in the reboot count's own words rather than mistaken for the one.
+    ``waited`` is the visibility wait's own (name-filtered) inventory when the
+    caller polled for the reboot; the reboot is counted from it, the whole
+    window from ``events`` carries the replacement claim and the refused calls.
     """
 
     mutations, refused = partition_provider_events(events)
     accepted = [dict(item) for item in mutations if isinstance(item, dict)]
     names = reboot_event_names(normalized(provider))
-    reboot = [item for item in accepted if item.get("event_name") in names]
+    counted = accepted if waited is None else partition_provider_events(waited)[0]
+    reboot = [
+        dict(item)
+        for item in counted
+        if isinstance(item, dict) and item.get("event_name") in names
+    ]
     refused_reboots = [item for item in refused if item.get("event_name") in names]
     replace = [
         item
@@ -130,7 +142,7 @@ def provider_calls(
     """
 
     source = provider_event_source(normalized(provider))
-    regional.wait_provider_events(
+    waited = regional.wait_provider_events(
         started_at,
         event_names=set(reboot_event_names(normalized(provider))),
         expected_count=1,
@@ -139,7 +151,7 @@ def provider_calls(
     ended_at = datetime.now(timezone.utc)
     events = regional.provider_events(started_at, ended_at, event_source=source)
     errors, evidence = reboot_count_errors(
-        events, provider=provider, executor_role_arn=executor_role_arn
+        events, provider=provider, executor_role_arn=executor_role_arn, waited=waited
     )
     return {
         "errors": errors,

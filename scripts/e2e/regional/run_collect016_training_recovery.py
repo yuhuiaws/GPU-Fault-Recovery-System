@@ -945,9 +945,7 @@ def execute_case(
         raise RegionalFixtureError("approved maintenance window has ended")
     regional = RegionalLiveFixture(settings.regional)
     candidates = [str(item["name"]) for item in preflight["candidate_nodes"]]
-    topology = training_topology.derive_training_topology(
-        preflight["candidate_nodes"], schedulable_only=False
-    )
+    topology = training_topology.execution_topology(preflight)
     prewarm = ImagePrewarmFixture(
         regional,
         case_id=CASE_ID,

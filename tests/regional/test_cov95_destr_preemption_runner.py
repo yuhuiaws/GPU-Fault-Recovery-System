@@ -147,8 +147,8 @@ def test_preemption_restores_isolation_through_bound_incident(
     h.restored = "SUCCEEDED" if succeeded else "FAILED"
     original = h.regional.provider_events
 
-    def events(*args: Any) -> list[dict[str, Any]]:
-        result = original(*args)
+    def events(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        result = original(*args, **kwargs)
         h.node["unschedulable"] = True
         return result
 

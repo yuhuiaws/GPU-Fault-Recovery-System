@@ -193,6 +193,33 @@ def preflight_topology(
         return None
 
 
+def from_evidence(value: object) -> TrainingTopology | None:
+    """The topology a preflight recorded (``TrainingTopology.evidence``), or
+    ``None`` when the document carries none."""
+
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return TrainingTopology(
+            node_count=int(str(value["node_count"])),
+            gpus_per_node=int(str(value["gpus_per_node"])),
+            candidate_nodes=tuple(
+                str(item) for item in value.get("candidate_nodes", ())
+            ),
+            efa_per_node=int(str(value.get("efa_per_node", NATIVE_EFA_PER_NODE))),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def execution_topology(preflight: Mapping[str, Any]) -> TrainingTopology:
+    """The topology a case executes on: what its own preflight derived and
+    recorded, else the fixtures' native shape (a preflight that recorded none
+    was not refused for its node count, so nothing is re-derived here)."""
+
+    return from_evidence(preflight.get("training_topology")) or NATIVE_TOPOLOGY
+
+
 def topology_limitations(topology: TrainingTopology, *, what: str) -> list[str]:
     """What a run on a non-native topology cannot prove; empty when native.
 

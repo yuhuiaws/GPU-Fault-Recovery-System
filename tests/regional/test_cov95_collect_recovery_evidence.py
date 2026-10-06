@@ -308,7 +308,7 @@ def test_fatal_sxid_reboot_verifies_provider_identity_actor_and_no_replace(
                 else "Executor",
             }
         ],
-        provider_events=lambda *a: [{"event_name": "ReplaceClusterNodes"}]
+        provider_events=lambda *a, **k: [{"event_name": "ReplaceClusterNodes"}]
         if problem == "replacement"
         else [],
         provider_events_provisional=lambda ended: True,

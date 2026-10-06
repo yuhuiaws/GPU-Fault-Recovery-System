@@ -314,7 +314,20 @@ class PreemptionRegional:
             self.h.node["boot_id"] = "boot-after"
         return deepcopy(self.h.node)
 
-    def provider_events(self, *args: Any) -> list[dict[str, Any]]:
+    def wait_provider_events(
+        self, started_at: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        self.h.call("provider.wait", kwargs.get("event_source"))
+        return [
+            deepcopy(item)
+            for item in self.h.events
+            if item.get("event_name") in kwargs["event_names"]
+        ]
+
+    def provider_events_provisional(self, *args: Any) -> bool:
+        return True
+
+    def provider_events(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         self.h.call("provider.events")
         return deepcopy(self.h.events)
 

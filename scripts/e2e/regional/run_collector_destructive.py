@@ -1222,6 +1222,7 @@ def run_collect015(
             settings.hyperpod_cluster,
         )
     recovery = provider.cluster_recovery()
+    provider_name = getattr(provider, "provider", None)
     executor_flags = regional.executor_python(EXECUTOR_REPLACE_FLAG)
     errors.extend(
         collect015_workflow_errors(
@@ -1230,7 +1231,7 @@ def run_collect015(
             node_after=regional.node_snapshot(settings.node),
             node_recovery=recovery.get("node_recovery"),
             allow_replace=executor_flags.get("GPU_FAULT_ALLOW_HYPERPOD_REPLACE"),
-            provider=provider.provider,
+            provider=provider_name,
         )
     )
     if node_after["boot_id"] == baseline_node["boot_id"]:
@@ -1238,12 +1239,11 @@ def run_collect015(
     provider_after = provider.provider_inventory()
     if provider_after != baseline_provider:
         errors.append("provider node identity changed during reboot")
-    # Plain EKS has no NodeRecovery: no replacement may be in flight instead.
     guard = collect015.replacement_guard(
         regional,
         node=settings.node,
         cluster_name=settings.hyperpod_cluster,
-        provider=provider.provider,
+        provider=provider_name,
         recovery=recovery,
     )
     errors.extend(guard["errors"])
@@ -1252,7 +1252,7 @@ def run_collect015(
     calls = collect015.provider_calls(
         regional,
         started_at,
-        provider=provider.provider,
+        provider=provider_name,
         executor_role_arn=settings.executor_role_arn,
     )
     errors.extend(calls["errors"])
