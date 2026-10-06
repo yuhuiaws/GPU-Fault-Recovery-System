@@ -93,6 +93,11 @@ VALIDATION_LIMITATIONS = [
     "A-cluster claim latency is sampled from one Ready executor Pod with the "
     "acceptance probe owner; it measures the authenticated claim path, not "
     "the executor's own poll loop.",
+    "Cluster B's executor Pods are NotReady for the length of the block by "
+    "design -- their readiness probe is an authenticated POST to the control "
+    "plane the block rejects -- so B's cut proof, in-window claims and "
+    "recovery watch run in a Running, not Ready, executor Pod; readiness "
+    "stays the control plane's signal and is required of cluster A only.",
     "A recovery uses authenticated software XID11 replay and run-owned training "
     "workloads, not hardware damage or hardware-origin fault evidence.",
 ]
@@ -549,7 +554,7 @@ def observe_recovery_during_cut(
         a_recovery = pool.submit(
             primary.recover,
             deadline,
-            cut_is_active=lambda: cut_proven(claim_sample(b)),
+            cut_is_active=lambda: cut_proven(claim_sample(b, offline=True)),
         )
         while time.monotonic() < deadline:
             if datetime.now(timezone.utc) >= maintenance_window_end:
@@ -567,7 +572,7 @@ def observe_recovery_during_cut(
                 "b_pressure": control_plane_pressure(a, cluster_b),
                 "cpu_pods": cpu_pod_snapshot(a),
                 "cpu_containers": control_plane_container_statuses(a),
-                "b_claim": claim_sample(b),
+                "b_claim": claim_sample(b, offline=True),
             }
             result["samples"].append(sample)
             if not sample["a_ready_executors"]:
@@ -740,8 +745,11 @@ def execute_case(
                 f"blocking B nodes took {block_span:.0f}s; a restore timer could "
                 "fire inside the observation window"
             )
-        # Refuse to observe a block that is not a block.
-        cut = claim_sample(b)
+        # Refuse to observe a block that is not a block. B's executor Pods are
+        # NotReady from here until the unblock takes -- their readiness probe
+        # is an authenticated POST to the control plane the block rejects --
+        # so every B claim until recovery runs in a Running Pod.
+        cut = claim_sample(b, offline=True)
         result["cut_proof"] = cut
         if not cut_proven(cut):
             raise RegionalFixtureError(
@@ -767,7 +775,7 @@ def execute_case(
         recovery: dict[str, Any] | None = None
         recovery_deadline = unblocked_at + RECOVERY_TIMEOUT_SECONDS
         while time.monotonic() < recovery_deadline:
-            sample = claim_sample(b)
+            sample = claim_sample(b, offline=True)
             if sample.get("status") == 200:
                 recovery = sample
                 break

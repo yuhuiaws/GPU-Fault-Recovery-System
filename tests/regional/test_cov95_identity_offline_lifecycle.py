@@ -136,7 +136,7 @@ def test_iso006_lifecycle_fails_closed_and_cleans_every_started_resource(
     def is_blocked() -> bool:
         return any(probe.blocked for probe in probes)
 
-    def claim(region: Any) -> dict[str, Any]:
+    def claim(region: Any, *, offline: bool = False) -> dict[str, Any]:
         if region is a:
             return {
                 "status": 503 if defect == "baseline" else 200,

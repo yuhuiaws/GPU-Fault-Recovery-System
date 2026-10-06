@@ -489,7 +489,7 @@ def test_iso006_recovers_a_during_b_cut_and_cleans_both_on_failure(
     monkeypatch.setattr(
         offline,
         "claim_sample",
-        lambda region: {
+        lambda region, *, offline=False: {
             "status": None,
             "transport_error": "ConnectionRefusedError",
             "transport_failure_kind": "network",

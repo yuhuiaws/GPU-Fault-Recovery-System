@@ -5342,7 +5342,13 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   and, with neither present, refuses in the probe's own JSON shape naming the gap (`missing binary on the node:
   python3`) instead of "returned no JSON (exit 127)"; the network probe checks `iptables`/`systemd-run`/`systemctl`
   **before** it creates the recovery timer or any rule and names the missing one (`error_kind=missing_binary`, the
-  fixture's `host probe failed (...; missing binary on the node: <name>)`). The rule on every target node first creates a host-side automatic recovery timer;
+  fixture's `host probe failed (...; missing binary on the node: <name>)`). B's in-cluster claim probe
+  (`claim_sample(..., offline=True)`) execs into a **Running** executor Pod rather than a Ready one for the `cut_proof`,
+  the in-window `b_claim` samples and the recovery watch after the unblock: the executor's readinessProbe is an
+  authenticated POST to the control plane, so both executor Pods are NotReady for the length of the block by design
+  (Running, no restarts, Ready again after the unblock) and a probe that insisted on Ready aborted the whole run with
+  `no Ready gpu Pod for app=gpu-fault-cluster-executor`; cluster A's probes still require Ready, and readiness stays
+  the control plane's own signal. The rule on every target node first creates a host-side automatic recovery timer;
   the runner's `finally` then unblocks node by node. Passing `0.0.0.0/0` in place of the control-plane CIDR is forbidden.
   The block lands on both the `OUTPUT` and `FORWARD` chains of every B node (blocking only TCP 443 to the explicit control-plane
   CIDR); once blocked, the runner first samples one claim from B as `cut_proof`, which must fail at the **transport layer**

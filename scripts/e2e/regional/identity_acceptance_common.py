@@ -695,15 +695,26 @@ def claim(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
     return site.pod_json("gpu", target, pod, CLAIM_PROBE)
 
 
-def claim_sample(fixture: RegionalLiveFixture) -> dict[str, Any]:
-    """One probe-owner claim from a Ready executor Pod of ``fixture``'s cluster.
+def claim_sample(
+    fixture: RegionalLiveFixture, *, offline: bool = False
+) -> dict[str, Any]:
+    """One probe-owner claim from an executor Pod of ``fixture``'s cluster.
 
     ``attempts=1``: the claim is authenticated traffic against the control
     plane and its latency is the measurement; a kubectl retry would both
     double the request and report the retry's latency as the sample's.
+
+    ``offline=True`` is for the cluster a case has cut off from the control
+    plane: its executor Pods are NotReady by design for as long as the cut
+    holds (their readiness probe is an authenticated POST to the control plane),
+    so the claim runs in a Running Pod instead of waiting for a Ready one the
+    block guarantees does not exist. The sample is the same measurement -- a
+    transport failure proves the cut, a 200 proves the recovery.
     """
 
-    return fixture.executor_python(CLAIM_PROBE, timeout=60, attempts=1)
+    return fixture.executor_python(
+        CLAIM_PROBE, timeout=60, attempts=1, require_ready=not offline
+    )
 
 
 def secret_digest(value: str) -> str:

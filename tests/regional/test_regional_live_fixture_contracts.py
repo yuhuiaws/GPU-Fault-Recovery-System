@@ -162,7 +162,37 @@ def test_python_wrappers_pass_attempts_through(
             "app": "gpu-fault-cluster-executor",
             "timeout": 30,
             "attempts": 2,
+            "require_ready": True,
         },
+    ], seen
+
+
+def test_claim_sample_probes_an_offline_cluster_in_a_running_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ISO-006 cuts cluster B off from the control plane; its executor Pods are
+    NotReady by design for the length of the block (their readiness probe is
+    an authenticated POST to the control plane), so the claim that proves the
+    cut and watches the recovery runs in a Running Pod. Every other claim
+    keeps requiring a Ready one."""
+
+    from scripts.e2e.regional.identity_acceptance_common import claim_sample
+
+    regional = _regional(tmp_path)
+    seen: list[dict[str, Any]] = []
+
+    def executor_python(script: str, *arguments: str, **kwargs: Any) -> dict[str, Any]:
+        seen.append(dict(kwargs))
+        return {"status": None}
+
+    monkeypatch.setattr(regional, "executor_python", executor_python)
+
+    claim_sample(regional)
+    claim_sample(regional, offline=True)
+
+    assert seen == [
+        {"timeout": 60, "attempts": 1, "require_ready": True},
+        {"timeout": 60, "attempts": 1, "require_ready": False},
     ], seen
 
 

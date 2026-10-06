@@ -131,6 +131,6 @@ def preflight_environment(
         monkeypatch.setattr(
             module,
             "claim_sample",
-            lambda region: {"status": 200, "latency_seconds": 0.1},
+            lambda region, *, offline=False: {"status": 200, "latency_seconds": 0.1},
         )
     return settings, regions, registrations, reads

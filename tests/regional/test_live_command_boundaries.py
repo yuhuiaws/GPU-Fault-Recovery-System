@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.e2e.regional import regional_pod_inventory as inventory_module
 from scripts.e2e.regional.acceptance_runner_common import replica_vanished
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalCommandTimeout,
@@ -14,6 +15,7 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
     RegionalLiveSettings,
 )
+from scripts.e2e.regional.regional_pod_inventory import running_pod, running_pods
 
 
 def process_is_running(pid: int) -> bool:
@@ -181,3 +183,95 @@ def test_complete_pod_inventory_remains_usable(
     assert regional.ready_pods("cpu", "test-app") == [
         {"name": "test-pod", "uid": "test-pod-uid", "node": None}
     ]
+
+
+def running_not_ready_pod() -> dict:
+    """An executor Pod of a cluster the case cut off from the control plane:
+    Running, every container running, readiness failing by design."""
+
+    pod = ready_pod()
+    pod["status"]["conditions"][0]["status"] = "False"
+    for status in pod["status"]["containerStatuses"]:
+        status["ready"] = False
+        status["state"] = {"running": {"startedAt": "2026-01-01T00:00:00Z"}}
+    return pod
+
+
+def test_running_pods_accept_a_not_ready_pod_whose_containers_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = fixture(tmp_path)
+    monkeypatch.setattr(
+        regional,
+        "kubectl",
+        lambda *_args, **_kwargs: json.dumps({"items": [running_not_ready_pod()]}),
+    )
+
+    assert regional.ready_pods("gpu", "test-app") == [], (
+        "readiness is still the control plane's signal; a NotReady Pod is not Ready"
+    )
+    assert [item["name"] for item in running_pods(regional, "gpu", "test-app")] == [
+        "test-pod"
+    ]
+    assert running_pod(regional, "gpu", "test-app") == "test-pod"
+
+
+@pytest.mark.parametrize(
+    "defect", ["terminating", "pending", "waiting-container", "partial"]
+)
+def test_running_pods_still_exclude_pods_that_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    regional = fixture(tmp_path)
+    pod = running_not_ready_pod()
+    if defect == "terminating":
+        pod["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    elif defect == "pending":
+        pod["status"]["phase"] = "Pending"
+    elif defect == "waiting-container":
+        pod["status"]["containerStatuses"][1]["state"] = {
+            "waiting": {"reason": "CrashLoopBackOff"}
+        }
+    else:
+        pod["status"]["containerStatuses"].pop()
+    monkeypatch.setattr(
+        regional, "kubectl", lambda *_args, **_kwargs: json.dumps({"items": [pod]})
+    )
+
+    assert running_pods(regional, "gpu", "test-app") == []
+    with pytest.raises(
+        RegionalFixtureError, match="no Running gpu Pod for app=test-app"
+    ):
+        running_pod(regional, "gpu", "test-app")
+
+
+def test_pod_python_execs_into_a_running_pod_only_when_told(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = fixture(tmp_path)
+    selections: list[str] = []
+    calls: list[tuple] = []
+
+    def ready_pod_name(*_args: object) -> str:
+        selections.append("ready")
+        return "ready-pod"
+
+    def running_pod_name(_fixture: object, *_args: object) -> str:
+        selections.append("running")
+        return "running-pod"
+
+    def kubectl(*args, **kwargs):
+        calls.append(args)
+        return '{"ok": true}\n'
+
+    monkeypatch.setattr(regional, "ready_pod", ready_pod_name)
+    monkeypatch.setattr(inventory_module, "running_pod", running_pod_name)
+    monkeypatch.setattr(regional, "kubectl", kubectl)
+
+    regional.pod_python("gpu", "test-app", "print()", attempts=1)
+    regional.pod_python("gpu", "test-app", "print()", attempts=1, require_ready=False)
+
+    assert selections == ["ready", "running"], "Ready is the default selection"
+    assert "ready-pod" in calls[0] and "running-pod" in calls[1], calls

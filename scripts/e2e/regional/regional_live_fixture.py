@@ -31,7 +31,7 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalFixtureError as RegionalFixtureError,
     run_fixture_command,
 )
-from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional import regional_pod_inventory  # noqa: E402
 from scripts.e2e.regional.release_pins import (  # noqa: E402
     RELEASE_METADATA_CONFIGMAP,
     release_pins_from_metadata,
@@ -775,18 +775,9 @@ class RegionalLiveFixture:
         ).stdout
 
     def ready_pods(self, plane: str, app: str) -> list[dict[str, Any]]:
-        value = json.loads(
-            self.kubectl(
-                plane,
-                "get",
-                "pod",
-                "-l",
-                f"app={app}",
-                "-o",
-                "json",
-            )
+        return regional_pod_inventory.ready_pod_records(
+            regional_pod_inventory.pod_inventory(self, plane, app)
         )
-        return ready_pod_records(value)
 
     def ready_pod(self, plane: str, app: str) -> str:
         pods = self.ready_pods(plane, app)
@@ -802,6 +793,7 @@ class RegionalLiveFixture:
         *arguments: str,
         timeout: int = 180,
         attempts: int = 3,
+        require_ready: bool = True,
     ) -> dict[str, Any]:
         """Run ``script`` under the installed component interpreter in a Ready Pod.
 
@@ -810,7 +802,9 @@ class RegionalLiveFixture:
         releases a spare -- must pass ``attempts=1``, because a retry after a
         failure that happened *after* the mutation performs it again. A timeout
         is never retried whatever the budget: the first attempt may have run to
-        completion and only the receipt was lost.
+        completion and only the receipt was lost. ``require_ready=False`` execs
+        into a Running Pod that need not be Ready (``running_pod``): a component
+        the runner itself cut off from the control plane.
         """
 
         if attempts < 1:
@@ -818,11 +812,14 @@ class RegionalLiveFixture:
         last_error: Exception | None = None
         for _attempt in range(attempts):
             try:
+                pod = self.ready_pod(plane, app) if require_ready else None
+                if pod is None:
+                    pod = regional_pod_inventory.running_pod(self, plane, app)
                 output = self.kubectl(
                     plane,
                     "exec",
                     "-i",
-                    self.ready_pod(plane, app),
+                    pod,
                     "--",
                     component_python(plane),
                     "-",
@@ -867,6 +864,7 @@ class RegionalLiveFixture:
         *arguments: str,
         timeout: int = 180,
         attempts: int = 3,
+        require_ready: bool = True,
     ) -> dict[str, Any]:
         return self.pod_python(
             "gpu",
@@ -875,6 +873,7 @@ class RegionalLiveFixture:
             *arguments,
             timeout=timeout,
             attempts=attempts,
+            require_ready=require_ready,
         )
 
     def store_snapshot(

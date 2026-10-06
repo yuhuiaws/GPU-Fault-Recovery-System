@@ -138,7 +138,9 @@ def test_iso006_preflight_requires_healthy_claims_and_node_readiness(
         monkeypatch.setattr(
             offline,
             "claim_sample",
-            lambda region: {"status": 503 if region is regions[1] else 200},
+            lambda region, *, offline=False: {
+                "status": 503 if region is regions[1] else 200
+            },
         )
     result = offline.read_only_preflight(settings, tmp_path)
     assert any(
