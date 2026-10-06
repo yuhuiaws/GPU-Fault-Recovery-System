@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -429,7 +430,7 @@ class FakeNodeAgent:
 @pytest.mark.parametrize(
     ("operation", "checks"),
     [
-        (WorkflowOperation.RESET_GPU, ["compute", "cache", "targets", "devices"]),
+        (WorkflowOperation.RESET_GPU, ["cache", "compute", "targets", "devices"]),
         (WorkflowOperation.RESTART_FABRIC_MANAGER, ["compute"]),
         (WorkflowOperation.REMEDIATE_EFA_DRIVER, []),
     ],
@@ -458,9 +459,10 @@ def test_final_check_routes_only_the_required_local_guards(
         else []
     )
     # The slow local reads (the compute-apps query, the sampled holder
-    # classification) run before the permit is asked for; inside the permit
-    # window only the fence/quiesce checks and one more holder sample run.
-    device_recheck = ["cache", "devices"] if "devices" in checks else []
+    # classification) run before the permit is asked for, inside one device
+    # map window that spans the permit; inside the window only the
+    # fence/quiesce checks and one bounded holder sample run.
+    device_recheck = ["devices"] if "devices" in checks else []
     assert agent.calls == [
         *checks,
         "permit",
@@ -596,7 +598,12 @@ class NativeHarness:
         )
 
     def execute(self) -> NodeActionResult:
+        """Answer every challenge the Agent posts, as the control plane does:
+        the first checkpoint's, and the renewal it asks for when the in-window
+        checks outlived the permit."""
+
         self.clock.ready.clear()
+        self.grants = 0
         with ThreadPoolExecutor(max_workers=1) as pool:
             execute: Callable[[SignedNodeAction], NodeActionResult] = self.agent.execute
             pending = pool.submit(execute, self.signed)
@@ -604,14 +611,22 @@ class NativeHarness:
                 assert self.clock.ready.wait(3), (
                     "the native Agent did not publish its physical-boundary challenge"
                 )
-                current = self.gate.challenge(self.signed.command.command_id)
-                assert current is not None
-                self.permit = sign_permit(
-                    current, SECRET, allowed=True, reason="OK", now=self.clock.now
-                )
-                self.granted = True
-                self.on_permit()
-                self.gate.authorize(self.permit)
+                deadline = time.monotonic() + 3
+                answered: set[str] = set()
+                while not pending.done():
+                    current = self.gate.challenge(self.signed.command.command_id)
+                    if current is None or current.nonce in answered:
+                        assert time.monotonic() < deadline, "the Agent never finished"
+                        time.sleep(0.01)
+                        continue
+                    answered.add(current.nonce)
+                    self.permit = sign_permit(
+                        current, SECRET, allowed=True, reason="OK", now=self.clock.now
+                    )
+                    self.granted = True
+                    self.grants += 1
+                    self.on_permit()
+                    self.gate.authorize(self.permit)
                 return pending.result(timeout=3)
             finally:
                 self.gate.cancel_all()
@@ -646,12 +661,16 @@ def assert_native_refusal(harness: NativeHarness, result: Any) -> None:
 
 
 @pytest.mark.parametrize("elapsed", [3, 4])
-def test_permit_expiry_after_the_device_read_never_spawns_or_escalates(
+def test_a_device_read_that_outlives_the_permit_renews_it_once_before_spawning(
     native: NativeHarness, elapsed: int
 ) -> None:
     """The holder sample inside the permit window is the one read that can
-    still outlive the permit; when it does, nothing is spawned, and the
-    refusal carries the measured timing."""
+    still outlive the permit. Every local read is then done and nothing was
+    spawned, so the Agent asks the control plane once more and spawns under
+    the fresh permit after re-validating only the fast local authority (live,
+    p5en: the in-window sample behind a host sampler's queries took 5-8 s and
+    every 3-s permit expired, OWNERSHIP_PERMIT_EXPIRED on a reset never
+    spawned). The receipt carries the renewal."""
 
     def expire() -> None:
         native.clock.now = NOW + timedelta(seconds=elapsed)
@@ -659,13 +678,59 @@ def test_permit_expiry_after_the_device_read_never_spawns_or_escalates(
 
     native.on_device = expire
     result = native.execute()
-    assert result.details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
-    assert "device" in native.reads
-    timing = result.details["ownership_permit_timing"]
-    assert timing["permit_lifetime_seconds"] == 3.0
-    assert {"pre_permit_seconds", "permit_wait_seconds", "post_permit_seconds"} <= set(
-        timing
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.details
+    assert native.grants == 2, "one renewal, answered by the control plane"
+    assert any("--gpu-reset" in args for args in native.hardware.commands), (
+        "the reset spawned under the renewed permit"
     )
+    (receipt,) = result.details["physical_ownership_checks"]
+    assert receipt["permit_renewals"] == 1
+    assert receipt["challenge_nonce"] == native.permit.challenge.nonce, (
+        "the receipt is the renewed permit's"
+    )
+    assert {"renewal_wait_seconds", "post_renewal_seconds"} <= set(receipt)
+    assert receipt["permit_lifetime_seconds"] == 3.0
+    assert receipt["in_window_holder_samples"] == 1
+
+
+def test_a_renewed_permit_that_also_expires_refuses_without_spawning(
+    native: NativeHarness,
+) -> None:
+    """The renewal is single-shot: when the renewed permit has run out as well
+    by the time the fast re-validation ends, the boundary refuses and the
+    refusal's timing names the renewal."""
+
+    def expire() -> None:
+        native.clock.now = native.clock.now + timedelta(seconds=4)
+        native.clock.elapsed += 4.0
+
+    validate = native.agent.validate_submission
+
+    def slow_validation_after_the_renewal(envelope: SignedNodeAction) -> Any:
+        # The renewed permit was granted; the re-validation that follows it
+        # takes long enough to spend the renewed window as well.
+        result = validate(envelope)
+        if native.grants == 2:
+            expire()
+        return result
+
+    native.on_device = expire
+    native.agent.validate_submission = slow_validation_after_the_renewal  # type: ignore[method-assign]
+    result = native.execute()
+
+    assert result.details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
+    assert native.grants == 2
+    timing = result.details["ownership_permit_timing"]
+    assert timing["permit_renewals"] == 1
+    assert {
+        "pre_permit_seconds",
+        "permit_wait_seconds",
+        "post_permit_seconds",
+        "renewal_wait_seconds",
+        "post_renewal_seconds",
+        "permit_lifetime_seconds",
+    } <= set(timing)
     assert_native_refusal(native, result)
 
 

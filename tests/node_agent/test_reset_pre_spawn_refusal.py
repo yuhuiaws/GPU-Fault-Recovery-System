@@ -185,6 +185,14 @@ def test_a_fabric_reset_refused_before_the_retry_of_a_busy_reset_is_not_applied(
     assert "node_action_not_started" not in details, "a reset was spawned once"
     assert "outcome_unknown" not in details
     assert len(details["physical_ownership_checks"]) == 1
+    assert details["physical_calls"] == [
+        {"command": "nvidia-smi --gpu-reset", "attempt": 1, "outcome": "busy"},
+        {
+            "command": "nvidia-smi --gpu-reset",
+            "attempt": 2,
+            "outcome": "refused: OWNERSHIP_PERMIT_EXPIRED",
+        },
+    ]
 
 
 def test_a_refusal_before_the_first_spawn_is_a_not_attempted_verdict(
@@ -237,6 +245,17 @@ def test_a_refusal_before_the_retry_of_a_busy_reset_stays_not_applied(
     assert details["node_action_outcome_known"] is True
     assert "node_action_not_started" not in details, "a reset was spawned once"
     assert "outcome_unknown" not in details
+    # What each checkpoint led to, in checkpoint order: the first spawned a
+    # reset the driver refused busy, the second was refused before its retry
+    # (live the journal showed two granted checkpoints and said nothing).
+    assert details["physical_calls"] == [
+        {"command": "nvidia-smi --gpu-reset -i GPU-a", "attempt": 1, "outcome": "busy"},
+        {
+            "command": "nvidia-smi --gpu-reset -i GPU-a",
+            "attempt": 2,
+            "outcome": "refused: OWNERSHIP_FINAL_CLIENTS_CHANGED",
+        },
+    ]
 
 
 def test_the_untouched_gpus_follow_the_refused_one_into_not_attempted(

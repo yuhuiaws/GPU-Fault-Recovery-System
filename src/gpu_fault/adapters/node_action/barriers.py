@@ -8,6 +8,7 @@ from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.execution.node_action_uncertainty import COMPENSATION_RESTORE_KEY
 from gpu_fault.fleet import (
     BarrierParticipantState,
     BarrierState,
@@ -136,49 +137,68 @@ class NodeActionBarrierMixin:
             # agent and use RESTORE only to clear the predecessor's
             # durable quiesce state/timer.
             return None
-        quiesce = next(
-            (
-                item
-                for item in reversed(context.workflow.step_executions)
-                if item.step_index < context.step_index
-                and item.operation is WorkflowOperation.QUIESCE_GPU_SERVICES
-                and item.status is WorkflowStepStatus.SUCCEEDED
-            ),
-            None,
-        )
-        if quiesce is None:
+        quiesces = [
+            item
+            for item in reversed(context.workflow.step_executions)
+            if item.step_index < context.step_index
+            and item.operation is WorkflowOperation.QUIESCE_GPU_SERVICES
+            and item.status is WorkflowStepStatus.SUCCEEDED
+        ]
+        owed = context.step.parameters.get(COMPENSATION_RESTORE_KEY)
+        if isinstance(owed, list) and owed:
+            # A compensation restore names the quiesces it undoes: a DAG's
+            # branches each quiesced their own node, and the one restore
+            # appended for both reads each node's generation from its own
+            # quiesce. Judged from the latest quiesce alone it FAILED before
+            # any dispatch, "missing agent generation" for the other branch's
+            # node (live, gpu-eks-cluster: two refused resets, services left
+            # stopped on both nodes, both quarantined by the hand-off).
+            quiesces = [item for item in quiesces if item.step_index in owed]
+        if not quiesces:
             return None
-        raw_generations = quiesce.details.get("agent_generations")
-        raw_expires_at = quiesce.details.get("maintenance_window_expires_at")
-        if not isinstance(raw_generations, dict) or not isinstance(raw_expires_at, str):
-            return WorkflowStepOutcome.failed(
-                "quiesce maintenance evidence is incomplete"
-            )
-        try:
-            expires_at = datetime.fromisoformat(raw_expires_at)
-        except ValueError:
-            return WorkflowStepOutcome.failed("quiesce maintenance expiry is invalid")
-        if expires_at.tzinfo is None:
-            return WorkflowStepOutcome.failed(
-                "quiesce maintenance expiry must include a timezone"
-            )
-        now = self.registry.now()
-        # Restore is idempotent and must still run after the fail-safe
-        # timer: the agent reports already_restored if the timer won.
-        # Hardware actions must never reuse expired quiesce evidence.
-        if (
-            now >= expires_at
-            and context.step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
-        ):
-            return WorkflowStepOutcome.failed(
-                f"quiesce maintenance window expired at {expires_at.isoformat()}",
-                details={
-                    "maintenance_window_expires_at": expires_at.isoformat(),
-                    **self._last_attempt_evidence(context),
-                },
-            )
         generations: dict[str, int] = {}
         for node_id in context.step.node_ids:
+            quiesce = next(
+                (
+                    item
+                    for item in quiesces
+                    if isinstance(item.details.get("agent_generations"), dict)
+                    and node_id in item.details["agent_generations"]
+                ),
+                quiesces[0],
+            )
+            raw_generations = quiesce.details.get("agent_generations")
+            raw_expires_at = quiesce.details.get("maintenance_window_expires_at")
+            if not isinstance(raw_generations, dict) or not isinstance(
+                raw_expires_at, str
+            ):
+                return WorkflowStepOutcome.failed(
+                    "quiesce maintenance evidence is incomplete"
+                )
+            try:
+                expires_at = datetime.fromisoformat(raw_expires_at)
+            except ValueError:
+                return WorkflowStepOutcome.failed(
+                    "quiesce maintenance expiry is invalid"
+                )
+            if expires_at.tzinfo is None:
+                return WorkflowStepOutcome.failed(
+                    "quiesce maintenance expiry must include a timezone"
+                )
+            # Restore is idempotent and must still run after the fail-safe
+            # timer: the agent reports already_restored if the timer won.
+            # Hardware actions must never reuse expired quiesce evidence.
+            if (
+                self.registry.now() >= expires_at
+                and context.step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
+            ):
+                return WorkflowStepOutcome.failed(
+                    f"quiesce maintenance window expired at {expires_at.isoformat()}",
+                    details={
+                        "maintenance_window_expires_at": expires_at.isoformat(),
+                        **self._last_attempt_evidence(context),
+                    },
+                )
             generation = raw_generations.get(node_id)
             if not isinstance(generation, int) or generation < 1:
                 return WorkflowStepOutcome.failed(

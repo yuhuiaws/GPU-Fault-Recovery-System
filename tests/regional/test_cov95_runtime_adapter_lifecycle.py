@@ -156,6 +156,108 @@ def test_quiesce_evidence_cannot_authorize_a_reset_after_scope_or_time_drift(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "named", [True, False], ids=["compensation", "latest-per-node"]
+)
+def test_a_restore_for_two_branches_reads_each_nodes_own_quiesce(named: bool) -> None:
+    """Live (gpu-eks-cluster, DESTR-015): both DAG branches quiesced their own
+    node and both resets were refused; the one RESTORE_GPU_SERVICES appended
+    for both nodes was judged from the latest quiesce alone and FAILED before
+    any dispatch -- "missing agent generation" for the other branch's node --
+    so the services stayed stopped and the hand-off quarantined both nodes.
+    Each node's generation now comes from its own quiesce, the ones a
+    compensation names (``compensation_for_step_indexes``) or, unnamed, the
+    latest that covers the node."""
+
+    from gpu_fault.execution.node_action_uncertainty import COMPENSATION_RESTORE_KEY
+
+    sent = []
+
+    def send(endpoint: str, signed: SignedNodeAction) -> NodeActionResult:
+        sent.append(signed.command)
+        return success(signed, restored=True)
+
+    adapter = fleet_adapter(sender=send)
+    expires = (NOW + timedelta(minutes=30)).isoformat()
+    context = context_for(
+        adapter,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        nodes=["node-a", "node-b"],
+        parameters={COMPENSATION_RESTORE_KEY: [0, 3]} if named else {},
+        step_index=6,
+    )
+    context = replace(
+        context,
+        workflow=context.workflow.model_copy(
+            update={
+                "step_executions": [
+                    workflow_step_execution(
+                        0,
+                        WorkflowOperation.QUIESCE_GPU_SERVICES,
+                        details={
+                            "agent_generations": {"node-a": 1},
+                            "maintenance_window_expires_at": expires,
+                        },
+                    ),
+                    workflow_step_execution(
+                        3,
+                        WorkflowOperation.QUIESCE_GPU_SERVICES,
+                        details={
+                            "agent_generations": {"node-b": 1},
+                            "maintenance_window_expires_at": expires,
+                        },
+                    ),
+                ]
+            }
+        ),
+    )
+
+    result = adapter.execute(context)
+
+    assert result.status is WorkflowStepStatus.SUCCEEDED, result.error
+    assert sorted(command.node_id for command in sent) == ["node-a", "node-b"]
+    assert all(command.agent_generation == 1 for command in sent), (
+        "each node is addressed at the generation its own quiesce recorded"
+    )
+
+
+def test_a_node_no_quiesce_covers_is_still_missing_evidence() -> None:
+    calls = []
+    adapter = fleet_adapter(sender=lambda *args: calls.append(args))
+    context = context_for(
+        adapter,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        nodes=["node-a", "node-b"],
+        parameters={},
+        step_index=2,
+    )
+    context = replace(
+        context,
+        workflow=context.workflow.model_copy(
+            update={
+                "step_executions": [
+                    workflow_step_execution(
+                        0,
+                        WorkflowOperation.QUIESCE_GPU_SERVICES,
+                        details={
+                            "agent_generations": {"node-a": 1},
+                            "maintenance_window_expires_at": (
+                                NOW + timedelta(seconds=30)
+                            ).isoformat(),
+                        },
+                    )
+                ]
+            }
+        ),
+    )
+
+    result = adapter.execute(context)
+
+    assert result.status is WorkflowStepStatus.FAILED
+    assert "missing agent generation for node-b" in result.error
+    assert calls == []
+
+
 @pytest.mark.parametrize("mode", ["expired-restore", "spare", "reboot-handoff"])
 def test_cleanup_and_spare_probes_use_their_own_liveness_contract(mode: str) -> None:
     sent = []

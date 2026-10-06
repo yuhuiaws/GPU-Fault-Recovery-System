@@ -3190,7 +3190,17 @@ cause is on the step: a persistent device holder is named in `persistent_device_
 (`OWNERSHIP_PERMIT_EXPIRED`) carries `ownership_permit_timing` -- `pre_permit_seconds` (the compute-apps query and the
 sampled holder classification, run before the permit is asked for), `permit_wait_seconds`, `post_permit_seconds` (the
 fence/quiesce checks and one holder sample inside the window) and `permit_lifetime_seconds` -- and every granted checkpoint
-in `physical_ownership_checks` carries the same four figures, so a slow node shows where its seconds went.
+in `physical_ownership_checks` carries the same four figures, so a slow node shows where its seconds went. The in-window
+path is bounded: nothing is spawned inside the window (the device-node map is resolved before the permit and cached
+across it), holders are sampled once from `/proc`, a query-only holder is ignored at once and only a holder that is not a
+query is sampled once more (`in_window_holder_samples`); when the window still runs out the boundary asks for one fresh
+permit and re-validates only the fast local authority before the physical call (`permit_renewals`/`renewal_wait_seconds`/
+`post_renewal_seconds`; a clock that went backwards is not renewed over). `physical_calls` lists, in checkpoint order, what
+each checkpoint led to (`nvidia-smi --gpu-reset` attempt n busy/reset, `rmmod <module>`, "refused: ..."), one to one with
+`physical_ownership_checks[i]`. When two branches are refused, the RESTORE_GPU_SERVICES compensation appended for both
+nodes reads each node's agent generation from its own QUIESCE (`compensation_for_step_indexes`): the services come back
+and the hand-off does not quarantine; judged from the latest quiesce alone it used to fail before dispatch with "missing
+agent generation" and both nodes were quarantined.
 
 ```bash
 # Read-only: prints the confirmation that would be written (step, command, boot id before/after the reboot, Agent generation, node/Agent evidence), writing nothing

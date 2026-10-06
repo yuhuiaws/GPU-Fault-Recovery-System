@@ -8791,7 +8791,18 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   classification -- so the 3-s permit covers only the fence/quiesce checks and one more holder sample; each receipt in
   `physical_ownership_checks` records `pre_permit_seconds`/`permit_wait_seconds`/`post_permit_seconds`/
   `permit_lifetime_seconds`, and an `OWNERSHIP_PERMIT_EXPIRED` refusal carries the same timing as `ownership_permit_timing`
-  (on the mixed site ~20 s of pre-spawn reads expired every permit and the reset never spawned). A safety refusal the Agent
+  (on the mixed site ~20 s of pre-spawn reads expired every permit and the reset never spawned). The in-window path is
+  bounded: the device-node map is resolved by the slow reads before the permit and one cache window spans the permit
+  (nothing spawns `nvidia-smi -q -x` inside it); inside the window holders are sampled once from `/proc`, a query-only
+  holder (`nvidia-smi` without `/dev/nvidia-uvm`) is ignored at once without a second sample, and only a holder that is
+  not a query is sampled once more (the receipt's `in_window_holder_samples` reads 1 or 2); when the in-window checks
+  still outlive the permit the boundary asks the control plane for one fresh permit and re-validates only the fast local
+  authority before the physical call (`permit_renewals`/`renewal_wait_seconds`/`post_renewal_seconds` on the receipt; a
+  single renewal, and a clock that went backwards is refused, not renewed over); `physical_calls` lists, in checkpoint
+  order, what each checkpoint led to -- `nvidia-smi --gpu-reset` attempt n busy/reset, `rmmod <module>`, or
+  "refused: ..." -- one to one with `physical_ownership_checks[i]` (seventh round: the two in-window checkpoints were
+  followed by a reset the driver refused busy and by `rmmod nvidia_drm`, and the third spent its permit in the second
+  sample a host sampler's fresh `nvidia-smi` pid every few seconds had triggered). A safety refusal the Agent
   attests applied nothing (`safety_rejection` with `node_action_outcome_known` or `node_action_not_started`, `reset_verdict`
   `not-attempted`/`not-applied`, nothing completed) climbs neither ladder: the branch is exhausted naming the refusal and the
   whole-workflow hand-off (`node_action_refused` stage, `support-after-<workflow>`) plans FREEZE_EVIDENCE and ESCALATE_SUPPORT
@@ -10545,6 +10556,13 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
 - Level: `destructive`. Each of the two nodes performs one real `RESET_GPU` (through the executor and
   the Node Agent, including quiesce/restore); **no reboot, no warm spare declared,
   no provider API called at all**.
+- Two branches refused at the Agent's boundary (both `RESET_GPU` `OWNERSHIP_PERMIT_EXPIRED`, `reset_verdict`
+  `not-applied`, nothing in flight) end the record FAILED with one `RESTORE_GPU_SERVICES` appended for both nodes
+  (`compensation_for_step_indexes` names both quiesces); that restore reads each node's agent generation from its own
+  `QUIESCE_GPU_SERVICES`, so it runs on both nodes, and the hand-off is the `node_action_refused` stage (FREEZE_EVIDENCE +
+  ESCALATE_SUPPORT, no quarantine). Judged from the latest quiesce alone it used to FAIL before any dispatch with
+  "quiesce maintenance evidence is missing agent generation" for the other branch's node, leaving the services stopped
+  on both nodes and the ladder quarantining both.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr015_parallel_branch_join.py`. By default it only generates the
   plan; before execute it must read `DESTR-012=PASS` (chain: `010 → 001 → 002 → 009 →

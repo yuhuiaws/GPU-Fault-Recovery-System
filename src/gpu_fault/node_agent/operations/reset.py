@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -23,6 +24,9 @@ from gpu_fault.node_agent.operations.holders import (
 )
 
 MAX_RESET_BUSY_ATTEMPTS = 3
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ResetProgressError(RuntimeError):
@@ -192,9 +196,25 @@ class ResetOperationsMixin:
         gpu_uuids: list[str],
         timeout: int,
         released: list[str] | None = None,
+        calls: list[dict[str, Any]] | None = None,
     ) -> int:
+        """Spawn ``command`` behind the final ownership checkpoint, retrying a
+        driver refusal "In use by another client" up to ``_RESET_BUSY_ATTEMPTS``.
+
+        ``calls`` receives one record per physical call the loop made or was
+        refused before making -- the reset attempts and the display-module
+        unloads between them -- in the order of the boundary's checkpoints, so
+        ``physical_ownership_checks[i]`` is answered by ``physical_calls[i]``
+        (live the journal showed two granted checkpoints and a refusal and
+        nothing said the first had spawned a reset the driver refused busy and
+        the second an ``rmmod``).
+        """
+
         released = [] if released is None else released
+        calls = [] if calls is None else calls
         for attempt in range(1, self._RESET_BUSY_ATTEMPTS + 1):
+            record: dict[str, Any] = {"command": " ".join(command), "attempt": attempt}
+            calls.append(record)
             try:
                 require_physical_ownership()
             except OwnershipRefused as refused:
@@ -203,9 +223,11 @@ class ResetOperationsMixin:
                 # never attempted from one refused busy and then refused at
                 # the boundary before its retry (``_reset_gpu``).
                 refused.action_details["gpu_reset_attempts_spawned"] = attempt - 1
+                record["outcome"] = f"refused: {refused.action_details['reason']}"
                 raise
             try:
                 self._run_checked(command, timeout=timeout)
+                record["outcome"] = "reset"
                 return attempt
             except subprocess.TimeoutExpired as exc:
                 # subprocess.run SIGKILLs nvidia-smi, but the reset it asked
@@ -214,6 +236,7 @@ class ResetOperationsMixin:
                 # plane would resubmit, so convert it to a RuntimeError that
                 # nothing retries. Recovery is a human decision (re-quiesce,
                 # or reboot the node).
+                record["outcome"] = f"timeout after {timeout}s; outcome unknown"
                 raise ResetOutcomeUnknown(
                     f"gpu reset outcome unknown after {timeout}s; "
                     "refusing to retry automatically",
@@ -221,6 +244,14 @@ class ResetOperationsMixin:
                 ) from exc
             except (RuntimeError, OwnershipRefused) as exc:
                 busy = "In use by another client" in str(exc)
+                record["outcome"] = "busy" if busy else f"error: {type(exc).__name__}"
+                if busy:
+                    LOGGER.info(
+                        "gpu reset attempt %d/%d refused busy by the driver command=%s",
+                        attempt,
+                        self._RESET_BUSY_ATTEMPTS,
+                        " ".join(command),
+                    )
                 if busy and attempt == self._RESET_BUSY_ATTEMPTS:
                     if isinstance(exc, OwnershipRefused):
                         raise
@@ -235,7 +266,13 @@ class ResetOperationsMixin:
                     ) from exc
                 if not busy:
                     raise
+                unloaded_before = len(released)
                 if self._release_idle_display_modules(gpu_uuids, released):
+                    # Each unload passed its own checkpoint before the rmmod.
+                    calls.extend(
+                        {"command": f"rmmod {module}", "outcome": "released"}
+                        for module in released[unloaded_before:]
+                    )
                     # The DRM client was the holder; the next attempt is the
                     # first one that can succeed, so it needs no settle time.
                     self._verify_no_clients(gpu_uuids)
@@ -312,6 +349,7 @@ class ResetOperationsMixin:
         reset_attempts = 0
         completed: list[str] = []
         released: list[str] = []
+        calls: list[dict[str, Any]] = []
         for index, gpu_uuid in enumerate(gpu_uuids):
             try:
                 reset_attempts += self._run_reset_with_busy_retry(
@@ -324,6 +362,7 @@ class ResetOperationsMixin:
                     gpu_uuids=[gpu_uuid],
                     timeout=120,
                     released=released,
+                    calls=calls,
                 )
             except (RuntimeError, OwnershipRefused) as exc:
                 # Report the loop's progress: the GPUs already reset, the one
@@ -372,6 +411,7 @@ class ResetOperationsMixin:
                             }
                         ),
                         "reset_completed": completed,
+                        "physical_calls": calls,
                         "reset_outcome_unknown": [gpu_uuid] if unknown else [],
                         "reset_failed": (
                             [] if unknown or not_attempted else [gpu_uuid]
@@ -389,6 +429,7 @@ class ResetOperationsMixin:
             "reset_attempts": reset_attempts,
             "reset_successes": len(completed),
             "reset_busy_refusals": reset_attempts - len(completed),
+            "physical_calls": calls,
             **self._reload_display_modules(released),
         }
 
@@ -427,13 +468,18 @@ class ResetOperationsMixin:
         with self._pre_spawn_guard(window_claimed=window_claimed):
             local_inventory = self._reset_all_preflight(gpu_uuids)
         released: list[str] = []
+        calls: list[dict[str, Any]] = []
         try:
             reset_attempts = self._run_reset_with_busy_retry(
                 ["nvidia-smi", "--gpu-reset"],
                 gpu_uuids=local_inventory,
                 timeout=180,
                 released=released,
+                calls=calls,
             )
+        except ResetProgressError as exc:
+            exc.action_details["physical_calls"] = calls
+            raise
         except OwnershipRefused as refused:
             # The boundary refused before the one fabric reset was (re)spawned:
             # a verdict for the whole inventory, reported as ``_reset_gpu``
@@ -449,6 +495,7 @@ class ResetOperationsMixin:
                 {
                     "node_action_outcome_known": True,
                     "node_action_not_started": True,
+                    "physical_calls": calls,
                     "reset_verdict": "not-attempted"
                     if not_attempted
                     else "not-applied",
@@ -480,6 +527,7 @@ class ResetOperationsMixin:
             "reset_attempts": reset_attempts,
             "reset_successes": 1,
             "reset_busy_refusals": reset_attempts - 1,
+            "physical_calls": calls,
             **reload,
         }
 

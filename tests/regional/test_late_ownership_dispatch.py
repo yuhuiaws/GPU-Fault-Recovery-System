@@ -83,21 +83,23 @@ def assert_refusal_does_not_escalate(outcome):
     assert classified is not None and classified[1] is RecoveryAction.ESCALATE_OPERATOR
 
 
-@pytest.mark.parametrize("slow", ["device", "compute-before-permit"])
-def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
-    tmp_path, slow
-):
-    """The device sample inside the permit window can still outlive the permit
-    and then nothing spawns. The compute-apps query runs before the permit is
-    asked for, so however slow it is the permit -- signed afterwards -- is not
-    consumed and the reset spawns (live, gpu-eks-cluster p5en: ~20 s of
-    pre-spawn reads expired every 3-s permit)."""
+@pytest.mark.parametrize(
+    "slow", ["device", "device-stale-renewal", "compute-before-permit"]
+)
+def test_a_recheck_that_outlives_the_permit_renews_it_once_or_refuses(tmp_path, slow):
+    """The device sample inside the permit window can still outlive the permit.
+    The Agent then asks the control plane once more and spawns under the fresh
+    permit ("device"); when that answer is itself stale, nothing spawns and the
+    refusal names the renewal ("device-stale-renewal"). The compute-apps query
+    runs before the permit is asked for, so however slow it is the permit --
+    signed afterwards -- is not consumed and the reset spawns (live,
+    gpu-eks-cluster p5en: ~20 s of pre-spawn reads expired every 3-s permit)."""
 
     _state, _kube, validator, context = stopped_runtime()
     context = replace(
         context, step=context.step.model_copy(update={"gpu_uuids": ["GPU-a"]})
     )
-    clock = {"now": datetime.now(timezone.utc), "permitted": False}
+    clock = {"now": datetime.now(timezone.utc), "permitted": False, "grants": 0}
     calls = []
 
     class Runner(FakeRunner):
@@ -113,7 +115,7 @@ def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
     hardware = Runner()
 
     def devices(targets):
-        if clock["permitted"] and slow == "device":
+        if clock["permitted"] and slow.startswith("device"):
             clock["now"] += timedelta(seconds=4)
             calls.append("long-device-read")
         return []
@@ -162,10 +164,13 @@ def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
     def granted(value):
         assert value == command
         clock["permitted"] = True
-        # Signed when the control plane checks, i.e. after the pre-permit reads.
-        return sign_permit(
-            challenge, SECRET, allowed=True, reason="OK", now=clock["now"]
-        )
+        clock["grants"] += 1
+        # Signed when the control plane checks, i.e. after the pre-permit reads;
+        # a stale renewal answer is one signed before the window it is for.
+        signed_at = clock["now"]
+        if slow == "device-stale-renewal" and clock["grants"] == 2:
+            signed_at = clock["now"] - timedelta(seconds=4)
+        return sign_permit(challenge, SECRET, allowed=True, reason="OK", now=signed_at)
 
     agent.ownership_gate.require = granted
     result = agent.execute(
@@ -181,14 +186,25 @@ def test_permit_expiring_during_final_client_recheck_cannot_spawn_or_escalate(
         assert receipt["permit_lifetime_seconds"] == 3.0
         return
     assert calls == ["long-device-read"]
+    assert clock["grants"] == 2, "the permit that ran out was renewed once"
+    if slow == "device":
+        assert result.status is NodeActionStatus.SUCCEEDED, result.details
+        assert any("--gpu-reset" in command for command in hardware.commands), (
+            "the reset spawned under the renewed permit"
+        )
+        (receipt,) = result.details["physical_ownership_checks"]
+        assert receipt["permit_renewals"] == 1
+        assert "renewal_wait_seconds" in receipt
+        return
     assert result.status is NodeActionStatus.FAILED and not result.retryable
     assert result.details["reason"] == "OWNERSHIP_PERMIT_EXPIRED"
+    assert result.details["ownership_permit_timing"]["permit_renewals"] == 1
     assert (
         result.details["manual_confirmation_required"]
         and result.details["node_action_not_started"]
     )
     assert not any("--gpu-reset" in command for command in hardware.commands), (
-        "permit expiry during final recheck must prevent a GPU reset"
+        "a stale renewal must prevent a GPU reset"
     )
     adapter = NodeActionWorkflowAdapter(
         {}, SECRET, registry=LocalRegistry(), sender=lambda *args: result
