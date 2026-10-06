@@ -11,6 +11,9 @@ import pytest
 from scripts.e2e.regional.collector_power_delivery import (
     DeliveryEvidence,
     delivery_evidence,
+    load_generator_failure,
+    load_window_fields,
+    poll_load_window,
 )
 
 START = datetime(2026, 9, 17, 8, 24, 56, 674222, tzinfo=timezone.utc)
@@ -548,3 +551,161 @@ def test_delivery_ties_have_stable_record_id_order() -> None:
         result = evidence(rows)
         assert result["record_ids"] == sorted([first["record_id"], second["record_id"]])
         assert result["errors"] == []
+
+
+IDLE_GPU = {
+    "index": 0,
+    "utilization_percent": 0.0,
+    "power_draw_w": 76.5,
+    "power_limit_w": 200.0,
+}
+LOADED_GPU = {
+    "index": 0,
+    "utilization_percent": 99.0,
+    "power_draw_w": 199.0,
+    "power_limit_w": 200.0,
+}
+
+
+@pytest.mark.parametrize(
+    ("gpu", "elapsed", "expected"),
+    [
+        (
+            IDLE_GPU,
+            31.0,
+            "GPU load generator is not loading GPU 0: 0% utilization and 76 W at a 200 W cap 31s into the load",
+        ),
+        (IDLE_GPU, 29.0, None),
+        (LOADED_GPU, 31.0, None),
+        ({**IDLE_GPU, "utilization_percent": 85.0}, 31.0, None),
+        ({**IDLE_GPU, "power_draw_w": 191.0}, 31.0, None),
+        ({"index": 0}, 31.0, None),
+        ({**IDLE_GPU, "power_limit_w": 0.0}, 31.0, None),
+        (None, 31.0, None),
+    ],
+    ids=[
+        "idle-after-two-cycles",
+        "idle-but-early",
+        "loaded",
+        "utilization-alone-counts",
+        "power-alone-counts",
+        "no-reading",
+        "no-limit",
+        "no-gpu",
+    ],
+)
+def test_the_load_is_judged_by_the_collectors_own_correlation_thresholds(
+    gpu: Any, elapsed: float, expected: str | None
+) -> None:
+    """Live (plain EKS): dcgmproftester12 ran as an active unit for the whole
+    window while the loaded GPU stayed at 0 % and 76 W under its 200 W cap, so
+    no power_limit_correlation candidate could exist and the case failed on the
+    chain's silence. The window now names the load that never reached the GPU,
+    judged by the very thresholds the candidate needs, and never before two
+    collection cycles or without a finite reading."""
+
+    assert (
+        load_generator_failure(
+            gpu, elapsed_seconds=elapsed, minimum_elapsed_seconds=30.0
+        )
+        == expected
+    )
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.monotonic_value = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.monotonic_value
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.monotonic_value += seconds
+
+
+def _window(tmp_path: Any, *, stamps: list[str | None], gpu: dict[str, Any] | None):
+    clock = _Clock()
+    stamp_values = iter(stamps)
+    return clock, poll_load_window(
+        stamp=lambda: next(stamp_values),
+        snapshot=lambda: {"gpu_power": [gpu] if gpu is not None else []},
+        quiet_stamp="quiet",
+        gpu_index=0,
+        started_at=START,
+        interval=15.0,
+        load_seconds=135.0,
+        now=lambda: START + timedelta(seconds=clock.monotonic_value - 1000.0),
+        clock=clock,
+        timeline_path=tmp_path / "timeline.json",
+    )
+
+
+def test_an_unloaded_gpu_ends_the_window_early_by_name(tmp_path: Any) -> None:
+    clock, window = _window(tmp_path, stamps=["quiet"] * 10, gpu=IDLE_GPU)
+
+    assert window["delivered_at"] is None
+    assert window["load_failure"] is not None
+    assert window["load_failure"].startswith(
+        "GPU load generator is not loading GPU 0"
+    ), window["load_failure"]
+    assert window["errors"] == [window["load_failure"]]
+    assert clock.sleeps == [15.0, 15.0], (
+        "two cycles, then the verdict; not the whole window"
+    )
+    assert [item["elapsed_seconds"] for item in window["load_status"]] == [15.0, 30.0]
+    assert window["timeline"][0].get("load_status") is None, (
+        "the first poll only reads the chain"
+    )
+    assert window["timeline"][-1]["load_status"]["gpu"] == IDLE_GPU
+    assert (tmp_path / "timeline.json").exists(), (
+        "every poll is written to the timeline"
+    )
+
+
+def test_a_loaded_gpu_lets_the_window_run_to_the_delivery(tmp_path: Any) -> None:
+    clock, window = _window(
+        tmp_path, stamps=["quiet", "quiet", "quiet", "delivered"], gpu=LOADED_GPU
+    )
+
+    assert window["delivered_at"] == "delivered"
+    assert window["load_failure"] is None and window["errors"] == []
+    assert len(window["load_status"]) == 2, (
+        "read on the silent polls only, never after the delivery"
+    )
+    assert clock.sleeps == [15.0, 15.0, 15.0]
+
+
+def test_a_silent_chain_and_a_loaded_gpu_run_the_whole_window(tmp_path: Any) -> None:
+    clock, window = _window(tmp_path, stamps=["quiet"] * 20, gpu=LOADED_GPU)
+
+    assert window["delivered_at"] is None and window["load_failure"] is None
+    assert clock.monotonic_value - 1000.0 >= 135.0
+
+
+def test_the_result_carries_the_load_units_own_account_from_the_restore() -> None:
+    window = {
+        "load_status": [{"elapsed_seconds": 30.0, "gpu": IDLE_GPU}],
+        "load_failure": "not loading",
+    }
+    restore = {
+        "restored": True,
+        "load_unit_active_at_restore": False,
+        "load_unit_result": "exit-code",
+        "load_exit_status": "1",
+        "load_journal_tail": ["dcgmproftester12: unable to load libcublas"],
+    }
+    assert load_window_fields(window, restore) == {
+        "load_status": window["load_status"],
+        "load_failure": "not loading",
+        "load_unit": {
+            "load_unit_active_at_restore": False,
+            "load_unit_result": "exit-code",
+            "load_exit_status": "1",
+            "load_journal_tail": ["dcgmproftester12: unable to load libcublas"],
+        },
+    }
+    assert load_window_fields(window, {"restored": True})["load_unit"] is None, (
+        "an older probe's receipt carries no account; none is invented"
+    )

@@ -633,32 +633,13 @@ def power_unit_contents(record: dict[str, Any]) -> dict[str, bytes]:
 
 def power_unit_state(name: str) -> dict[str, str]:
     properties = (
-        "Id",
-        "LoadState",
-        "ActiveState",
-        "SubState",
-        "FragmentPath",
-        "DropInPaths",
-        "NeedDaemonReload",
-        "ExecStart",
-        "Type",
-        "Restart",
-        "RestartUSec",
-        "RestartPreventExitStatus",
-        "TimeoutStartUSec",
-        "RuntimeMaxUSec",
-        "TimeoutStopUSec",
-        "KillMode",
-        "SendSIGKILL",
-        "MainPID",
-        "ControlPID",
-        "ControlGroup",
-        "Job",
-        "Unit",
-        "NextElapseUSecMonotonic",
-        "AccuracyUSec",
-        "RandomizedDelayUSec",
-    )
+        "Id LoadState ActiveState SubState FragmentPath DropInPaths "
+        "NeedDaemonReload ExecStart Type Restart RestartUSec "
+        "RestartPreventExitStatus TimeoutStartUSec RuntimeMaxUSec TimeoutStopUSec "
+        "KillMode SendSIGKILL MainPID ControlPID ControlGroup Job Unit "
+        "NextElapseUSecMonotonic AccuracyUSec RandomizedDelayUSec Result "
+        "ExecMainStatus ExecMainCode"
+    ).split()
     result = run(
         ["systemctl", "show", name, "--property=" + ",".join(properties)],
         check=False,
@@ -954,13 +935,30 @@ def power_assert_stopped(state: dict[str, str], name: str) -> None:
             raise ProbeError("owned power cgroup still contains processes")
 
 
-def power_stop_load(record: dict[str, Any]) -> None:
+def power_stop_load(record: dict[str, Any]) -> dict[str, Any]:
+    """Stop the owned load; return its pre-stop state, result, exit status and log."""
+
     name = power_limit_restore_unit(record["run_id"]) + "-load.service"
     state = power_owned_unit(record, name, allow_absent=True)
+    try:
+        journal = run(
+            ["journalctl", "-u", name, "-n", "20", "--no-pager", "-o", "cat"],
+            check=False,
+            timeout=20,
+        ).stdout
+    except OSError:
+        journal = ""
+    account = {
+        "load_unit_active_at_restore": state.get("ActiveState") == "active",
+        "load_unit_result": state.get("Result"),
+        "load_exit_status": state.get("ExecMainStatus"),
+        "load_journal_tail": [line[:200] for line in str(journal).splitlines()[-20:]],
+    }
     if state["LoadState"] != "not-found":
         run(["systemctl", "stop", name], timeout=20)
         state = power_owned_unit(record, name)
     power_assert_stopped(state, name)
+    return account
 
 
 def power_set_limit(gpu: dict[str, Any], key: str) -> None:
@@ -1287,11 +1285,12 @@ def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
             emit(power_result(run_id, deferred=True))
             return
         path = power_record_path(run_id)
+        load_unit: dict[str, Any] = {}
         if record["phase"] != "CLEANED":
             record["load_closed"] = True
             record["phase"] = "RESTORING"
             power_write_json(path, record)
-            power_stop_load(record)
+            load_unit = power_stop_load(record)
         state: list[dict[str, Any]] = []
         if record["mutation_started"]:
             state = checked_power_state(record["baseline"])
@@ -1311,6 +1310,7 @@ def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
                     load_stopped=True,
                     cleanup_deferred=True,
                     gpu_power=state,
+                    **load_unit,
                 )
             )
             return
@@ -1325,7 +1325,7 @@ def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
         path.with_suffix(".py").unlink(missing_ok=True)
         (ACCEPTANCE_STATE / "gpu-power-owner.json").unlink(missing_ok=True)
         power_sync_directory(ACCEPTANCE_STATE)
-        emit(power_result(run_id, record, clean=True, gpu_power=state))
+        emit(power_result(run_id, record, clean=True, gpu_power=state, **load_unit))
 
 
 def persistence_mode() -> bool | None:

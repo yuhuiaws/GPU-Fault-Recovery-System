@@ -46,6 +46,7 @@ class PowerHost:
         self.inventory_returncode = 0
         self.command_returncodes: dict[tuple[str, ...], int] = {}
         self.ignore_writes = False
+        self.journal_lines = ["dcgmproftester12: load line one", "load line two"]
         self.gpus: list[dict[str, Any]] = [
             {
                 "index": index,
@@ -221,6 +222,11 @@ class PowerHost:
             )
         elif command[:2] == ["systemctl", "daemon-reload"]:
             pass
+        elif command[0] == "journalctl":
+            assert command[1:3] == ["-u", self.units()[2]], (
+                "only the owned load unit's log"
+            )
+            stdout = "\n".join(self.journal_lines) + "\n"
         elif command[0] == "systemctl" and command[1] in {
             "enable",
             "disable",

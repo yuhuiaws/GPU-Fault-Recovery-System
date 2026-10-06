@@ -301,3 +301,121 @@ def test_a_node_without_the_dcgm_load_generator_is_refused_by_name_before_mutati
     assert not (tmp_path / "power-operation-a1.json").exists(), (
         "the refusal happens before the run identity is written"
     )
+
+
+def test_a_load_that_never_reaches_the_gpu_is_named_and_the_window_ends_early(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live (plain EKS, seventh round): the load unit stayed active for the
+    whole 135-s window while the loaded GPU sat at 0 %/76 W, the chain
+    delivered nothing for it and the case failed on the chain. The window now
+    ends two cycles in with the load named first, the restore still runs, and
+    the load unit's own account from the restore receipt is on the result."""
+
+    origin = datetime(2026, 9, 17, tzinfo=timezone.utc)
+    clock = {"monotonic": 5000.0}
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["monotonic"] += seconds
+
+    monkeypatch.setattr(
+        runner,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["monotonic"], sleep=sleep),
+    )
+    monkeypatch.setattr(
+        runner,
+        "datetime",
+        SimpleNamespace(
+            now=lambda tz=None: origin + timedelta(seconds=clock["monotonic"] - 5000.0),
+            fromisoformat=datetime.fromisoformat,
+        ),
+    )
+    monkeypatch.setattr(runner, "seconds_until_next_summary", lambda *a, **k: 0)
+    monkeypatch.setattr(runner, "require_action_time", lambda *a: None)
+    monkeypatch.setattr(runner, "recent_evidence", lambda *a, **k: [])
+    stamps = iter(["2000-01-01T00:00:00Z", "quiet"])
+    monkeypatch.setattr(
+        runner, "gpu_metrics_stamp", lambda _fixture: next(stamps, "quiet")
+    )
+    limit = {"w": 700.0}
+    calls: list[str] = []
+
+    def execute(command: str, *arguments: str, **kwargs: object) -> dict[str, Any]:
+        calls.append(command)
+        if command == "throttle-gpu":
+            limit["w"] = 200.0
+            return {
+                **load_receipt(
+                    arguments[arguments.index("--run-id") + 1],
+                    origin + timedelta(seconds=clock["monotonic"] - 5000.0),
+                ),
+                "mutation_started": True,
+                "timer_armed": True,
+                "load_unit_active": True,
+            }
+        limit["w"] = 700.0
+        return {
+            "restored": True,
+            "load_stopped": True,
+            "timer_disarmed": True,
+            "cleanup_verified": True,
+            "load_unit_active_at_restore": True,
+            "load_unit_result": "success",
+            "load_exit_status": "0",
+            "load_journal_tail": [
+                "dcgmproftester12: Error: unable to load the CUDA libraries"
+            ],
+        }
+
+    fixture = SimpleNamespace(
+        node="node-a",
+        regional=SimpleNamespace(settings=SimpleNamespace(cluster_id="cluster-a")),
+        execute=execute,
+        snapshot=lambda: {
+            "collector_env": {
+                "GPU_FAULT_METRICS_INTERVAL_SECONDS": "15",
+                "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS": "300",
+                "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES": "3",
+            },
+            "gpu_power": [
+                {
+                    "index": 0,
+                    "power_limit_w": limit["w"],
+                    "power_default_limit_w": 700.0,
+                    "power_draw_w": 76.5,
+                    "utilization_percent": 0.0,
+                }
+            ],
+        },
+    )
+
+    result = runner.run_collect002(fixture, tmp_path, 1)
+
+    assert result["verdict"] == "FAIL"
+    assert result["errors"][0].startswith(
+        "GPU load generator is not loading GPU 0: 0% utilization and 76 W at a 200 W cap"
+    ), result["errors"]
+    assert any(
+        "GPU metrics chain delivered nothing" in error for error in result["errors"][1:]
+    ), "the chain's silence is listed as the consequence, after the cause"
+    assert result["load_failure"] == result["errors"][0]
+    assert [item["elapsed_seconds"] for item in result["load_status"]] == [15.0, 30.0]
+    assert result["load_unit"] == {
+        "load_unit_active_at_restore": True,
+        "load_unit_result": "success",
+        "load_exit_status": "0",
+        "load_journal_tail": [
+            "dcgmproftester12: Error: unable to load the CUDA libraries"
+        ],
+    }
+    assert sleeps == [15.0, 15.0], "the window ended on the named failure, not at 135 s"
+    assert calls == ["throttle-gpu", "restore-gpu-power-limit"]
+    assert (
+        json.loads((tmp_path / "timeline.json").read_text())["entries"][-1][
+            "load_status"
+        ]["gpu"]["power_limit_w"]
+        == 200.0
+    )

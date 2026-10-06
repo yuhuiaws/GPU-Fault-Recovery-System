@@ -12937,7 +12937,20 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      time must not be counted as Collector response time, and a later sample time must not be used to
      backfill the starting point.
   3. Poll the GPU chain's `observed_at` once per collection cycle (written to
-     `timeline.json` each time) until it changes or the load ends.
+     `timeline.json` each time) until it changes or the load ends. From the second cycle on, while the
+     chain has not delivered, the runner also reads the loaded GPU through the host snapshot
+     (`nvidia-smi` utilization, power draw and enforced limit) and ends the window at once, by name,
+     when the GPU stays below both correlation thresholds two cycles into the load (`load_failure`,
+     `load_status`): the chain's own "delivered nothing" is then its consequence, listed after it. The
+     restore receipt carries the load unit's own account from before it was stopped -- whether it was
+     still active, its systemd result and exit status, its journal tail (`load_unit`) -- so a load
+     generator that exited or could not load the GPU explains itself in the evidence.
+     Seventh plain-EKS round: `dcgmproftester12` ran as an active unit for the whole window while the
+     loaded GPU stayed at 0 %/76 W under its 200 W cap, so no `power_limit_correlation` candidate
+     could exist; the one batch confirmed in the window came from the violation counters of the capped
+     idle GPUs and the runner rightly rejected it. Neither the collector's duty-cycle write-off (a
+     violation counter advancing faster than wall clock is refused as "not a duration", by design) nor
+     the exporter's 15-s period decided that case; the load did.
      `collector_status` is an overwritable latest state; the polled values serve only as auxiliary
      observation. The anomaly latency is taken from the `ingested_at` of the earliest matching
      persistent DCGM candidate batch in this window, validating cluster/node, batch/record ID, the

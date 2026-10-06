@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TypedDict
 
 from gpu_fault.gpu_metrics import GpuMetricsThresholds
+from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 
 
 class DeliveryEvidence(TypedDict):
@@ -315,3 +317,147 @@ def delivery_evidence(
             "no valid accepted DCGM power candidate in the load window"
         )
     return result
+
+
+def _finite(value: object) -> float | None:
+    return (
+        float(value)
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        else None
+    )
+
+
+def load_generator_failure(
+    gpu: object, *, elapsed_seconds: float, minimum_elapsed_seconds: float
+) -> str | None:
+    """Why the load is not reaching the GPU, or None.
+
+    ``gpu`` is the loaded GPU's nvidia-smi reading in the middle of the load
+    window (power draw, enforced limit, utilization). Past
+    ``minimum_elapsed_seconds`` a GPU below both correlation thresholds -- the
+    very thresholds the collector's ``power_limit_correlation`` candidate needs
+    -- is not being loaded (live, plain EKS: ``dcgmproftester12`` ran as an
+    active unit while the loaded GPU stayed at 0 % and 76 W under its 200 W
+    cap; no candidate could exist, and the case failed on the chain instead of
+    on the load). A reading without finite power, limit and utilization is not
+    judged: nothing is invented.
+    """
+
+    if not isinstance(gpu, Mapping) or elapsed_seconds < minimum_elapsed_seconds:
+        return None
+    utilization = _finite(gpu.get("utilization_percent"))
+    draw = _finite(gpu.get("power_draw_w"))
+    limit = _finite(gpu.get("power_limit_w"))
+    if utilization is None or draw is None or limit is None or limit <= 0:
+        return None
+    thresholds = GpuMetricsThresholds()
+    if (
+        utilization >= thresholds.power_correlation_min_utilization_percent
+        or draw >= thresholds.power_limit_ratio * limit
+    ):
+        return None
+    return (
+        f"GPU load generator is not loading GPU {gpu.get('index')}: "
+        f"{utilization:.0f}% utilization and {draw:.0f} W at a {limit:.0f} W cap "
+        f"{elapsed_seconds:.0f}s into the load"
+    )
+
+
+def poll_load_window(
+    *,
+    stamp: Callable[[], str | None],
+    snapshot: Callable[[], Mapping[str, Any]],
+    quiet_stamp: str,
+    gpu_index: int,
+    started_at: datetime,
+    interval: float,
+    load_seconds: float,
+    now: Callable[[], datetime],
+    clock: Any,
+    timeline_path: Path,
+) -> dict[str, Any]:
+    """Poll the GPU chain through the load window, reading the loaded GPU
+    whenever the chain is still silent.
+
+    ``delivered_at`` is the first stamp that differs from ``quiet_stamp``;
+    ``timeline`` is written to ``timeline_path`` on every poll; from the
+    second poll on, while nothing was delivered, the host snapshot's reading
+    of the loaded GPU is recorded (``load_status``) and judged
+    (``load_generator_failure``) -- the first named reason ends the window
+    early, so the case fails on the load, not on the chain's silence.
+    """
+
+    deadline = clock.monotonic() + load_seconds
+    timeline: list[dict[str, Any]] = []
+    load_status: list[dict[str, Any]] = []
+    load_failure: str | None = None
+    delivered_at: str | None = None
+    polls = 0
+    while True:
+        current = stamp()
+        entry: dict[str, Any] = {
+            "observed_at": now().isoformat(),
+            "gpu_metrics_stamp": current,
+        }
+        delivered = current is not None and current != quiet_stamp
+        if polls and not delivered:
+            reading = snapshot()
+            gpu = next(
+                (
+                    item
+                    for item in (reading.get("gpu_power") or [])
+                    if isinstance(item, Mapping) and item.get("index") == gpu_index
+                ),
+                None,
+            )
+            elapsed = (now() - started_at).total_seconds()
+            status = {"elapsed_seconds": round(elapsed, 3), "gpu": gpu}
+            load_status.append(status)
+            entry["load_status"] = status
+            load_failure = load_generator_failure(
+                gpu, elapsed_seconds=elapsed, minimum_elapsed_seconds=interval * 2
+            )
+        timeline.append(entry)
+        write_json_atomic(timeline_path, {"entries": timeline})
+        if delivered:
+            delivered_at = current
+            break
+        if load_failure is not None or clock.monotonic() >= deadline:
+            break
+        polls += 1
+        clock.sleep(interval)
+    return {
+        "delivered_at": delivered_at,
+        "timeline": timeline,
+        "load_status": load_status,
+        "load_failure": load_failure,
+        "errors": [load_failure] if load_failure else [],
+    }
+
+
+def load_window_fields(window: Mapping[str, Any], restore: object) -> dict[str, Any]:
+    """The window's evidence for the case result, with the load unit's own
+    account from the restore receipt (whether it was still active, its result
+    and exit status, its journal tail) when the receipt carries one."""
+
+    unit = (
+        {
+            key: restore.get(key)
+            for key in (
+                "load_unit_active_at_restore",
+                "load_unit_result",
+                "load_exit_status",
+                "load_journal_tail",
+            )
+            if key in restore
+        }
+        if isinstance(restore, Mapping)
+        else {}
+    )
+    return {
+        "load_status": window["load_status"],
+        "load_failure": window["load_failure"],
+        "load_unit": unit or None,
+    }

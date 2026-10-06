@@ -42,7 +42,7 @@ from scripts.e2e.regional.collector_inventory_evidence import (  # noqa: E402
     run_collect003 as run_collect003,
 )
 from scripts.e2e.regional import collect002_power_journal as journal  # noqa: E402
-from scripts.e2e.regional.collector_power_delivery import delivery_evidence  # noqa: E402
+from scripts.e2e.regional import collector_power_delivery as power  # noqa: E402
 from scripts.e2e.regional.collector_negative_evidence import (  # noqa: E402
     COLLECT011_SXIDS,
     SCOPE_DEPENDENT_ACTIONS as SCOPE_DEPENDENT_ACTIONS,
@@ -679,7 +679,7 @@ def run_collect002(
     requested_at = datetime.now(timezone.utc)
     started_at = requested_at
     injection: dict[str, Any] = {}
-    timeline: list[dict[str, Any]] = []
+    window: dict[str, Any] = {"load_status": [], "load_failure": None, "errors": []}
     delivered_at: str | None = None
     restore: dict[str, Any] = {}
     cleanup_error: str | None = None
@@ -711,22 +711,19 @@ def run_collect002(
             requested_at=requested_at,
             received_at=datetime.now(timezone.utc),
         )
-        deadline = time.monotonic() + load_seconds
-        while True:
-            current = gpu_metrics_stamp(fixture)
-            timeline.append(
-                {
-                    "observed_at": datetime.now(timezone.utc).isoformat(),
-                    "gpu_metrics_stamp": current,
-                }
-            )
-            write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
-            if current is not None and current != quiet_stamp:
-                delivered_at = current
-                break
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(interval)
+        window = power.poll_load_window(
+            stamp=lambda: gpu_metrics_stamp(fixture),
+            snapshot=fixture.snapshot,
+            quiet_stamp=quiet_stamp,
+            gpu_index=int(injection["gpu_index"]),
+            started_at=started_at,
+            interval=interval,
+            load_seconds=load_seconds,
+            now=lambda: datetime.now(timezone.utc),
+            clock=time,
+            timeline_path=case_dir / "timeline.json",
+        )
+        delivered_at = window["delivered_at"]
     except BaseException:
         # The restore must still run, but its own failure must not replace
         # the exception that got us here: the deadman timer still covers the
@@ -784,7 +781,7 @@ def run_collect002(
         for item in injection["baseline"]
         if item["index"] == injection["load_start"]["gpu_index"]
     )
-    delivery = delivery_evidence(
+    delivery = power.delivery_evidence(
         records,
         cluster_id=fixture.regional.settings.cluster_id,
         node_id=fixture.node,
@@ -793,7 +790,7 @@ def run_collect002(
         observed_until=datetime.now(timezone.utc),
     )
     delivered_at = delivery["delivered_at"]
-    errors = []
+    errors = list(window["errors"])
     errors.extend(delivery["errors"])
     if cleanup_error:
         errors.append(f"GPU power limit restore failed: {cleanup_error}")
@@ -840,6 +837,7 @@ def run_collect002(
         "summary_seconds": summary,
         "delivered_at": delivered_at,
         "sampled_status_at": sampled_status_at,
+        **power.load_window_fields(window, restore),
         "delivery_evidence": delivery,
         "delivery_latency_seconds": latency,
         "candidate_records": candidate,
