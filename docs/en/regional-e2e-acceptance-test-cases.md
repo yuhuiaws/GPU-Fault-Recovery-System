@@ -8956,9 +8956,21 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 
 ### GF-REGIONAL-DESTR-002
 
-> HyperPod only: the preflight refuses an executor without the HyperPod reboot adapter with the single reason
-> `DESTR-002 audits the HyperPod reboot path and does not apply to an eks-managed cluster`; the campaign records the case as
-> not applicable there.
+> Both providers: the case runs under this id on HyperPod and on an `eks-managed` cluster. The preflight probe finds the
+> executor's node lifecycle adapter by the `nodeReboot` owner the cluster's runtime profile names
+> (`gpu-fault-hyperpod-adapter` → SageMaker `BatchRebootClusterNodes`; `gpu-fault-eks-adapter` → EC2 `RebootInstances`),
+> records `provider`, and refuses by name an executor that advertises neither. The eks branch answers the same four
+> read-only preflights in the eks adapter's words (`safe_to_submit` with trusted isolation evidence,
+> `trusted scheduler isolation evidence is missing` without it, `EKS REBOOT mutation is disabled by configuration` with the
+> switch off); it has no HyperPod `NodeRecovery` to read (its preflight reports none) and the EKS cluster must be `ACTIVE`.
+> The durable replay reads the same `HyperPodSubmissionRecord` table under the cluster id (`--hyperpod-cluster` names the
+> cluster id on plain EKS) through the eks provider's ledger; the submission names the Kubernetes node. CloudTrail is read
+> from `ec2.amazonaws.com`: exactly one accepted `RebootInstances` by the executor role, refused calls (Karpenter's
+> `RunInstances` dry-runs) set aside as `refused_provider_calls`, and no accepted
+> `RunInstances`/`TerminateInstances`/`StopInstances`/`StartInstances`. The verdict contract below is the same on both
+> providers; the evidence carries `provider`, `provider_events`, `reboot_events` and `refused_provider_calls`. Plain-EKS
+> prerequisites: `DESTR-001=PASS` on the same node, the executor's `ec2:RebootInstances` (granted by `join-cluster`) and
+> `GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true` (the shared reboot switch).
 
 **Real node reboot via the provider**
 
@@ -10423,8 +10435,9 @@ replacement should ever be attempted.
   timezone-less time fields that are present, or an existing case with no time evidence at all can
   never be silently skipped; this audit's own older output does not count as proof of predecessor
   coverage. One exception is named, not silent: a destructive case planned on this cluster and refused
-  by its own preflight as not applicable to its provider -- the HyperPod-only DESTR-002/016/025 on a
-  plain EKS cluster, whose `preflight.json` errors carry `does not apply to an eks-managed cluster` and
+  by its own preflight as not applicable to its provider -- an earlier release's HyperPod-only
+  DESTR-002/016/025 on a plain EKS cluster (the three now run on both providers), whose
+  `preflight.json` errors carry `does not apply to an eks-managed cluster` and
   whose `plan.json` says `preflight_passed: false`, `mutation_performed: false` -- holds no run timestamp
   and is recorded in the audit evidence as `not_applicable_cases` (case id and the preflight's own
   words) instead of failing the audit; a plan-only directory refused for any other reason is still
@@ -10848,10 +10861,14 @@ The detailed protocol and limitations are in [Physical Late-Ownership Acceptance
 
 ### GF-REGIONAL-DESTR-016
 
-> HyperPod only: the case audits the HyperPod reboot path (`BatchRebootClusterNodes`) and its health labels. On an
-> `eks-managed` cluster -- whose runtime profile has `nodeReboot` OWN by `gpu-fault-eks-adapter` (EC2 `RebootInstances`) --
-> the preflight refuses with the single reason `... does not apply to an eks-managed cluster`, as DESTR-002 does, and the
-> campaign records the case as not applicable rather than failed.
+> Both providers: the case runs under this id on HyperPod and on an `eks-managed` cluster. The preflight requires
+> `nodeReboot` OWN through the regional executor by the cluster provider's lifecycle adapter (`gpu-fault-hyperpod-adapter`
+> or `gpu-fault-eks-adapter`) and records `provider`; the successor's real reboot is then `BatchRebootClusterNodes` or
+> EC2 `RebootInstances`, read from the provider's own CloudTrail source with refused calls (Karpenter dry-runs) set aside
+> and the EC2 launch/terminate/stop/start mutations as the forbidden replacement set
+> (`destr016_verdicts.provider_reboot_evidence`). The HyperPod health labels have no plain-EKS counterpart and are not part
+> of the eks branch; the barrier, the absorb, the preemption, the quiesce handoff, the host ledger and the node identity are
+> judged identically on both providers. Plain-EKS prerequisites as in DESTR-002 (`DESTR-002=PASS` on the same node).
 
 **A second fault on the same node arrives while a physical step is in progress: the same-tier XID is absorbed, the higher-tier XID 79 preempts the reset workflow, takes over the quiesce and completes a real reboot**
 
@@ -12232,9 +12249,13 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
 
 ### GF-REGIONAL-DESTR-025
 
-> HyperPod only: the case audits the HyperPod reboot path (`BatchRebootClusterNodes`). On an `eks-managed` cluster the
-> preflight refuses with the single reason `... does not apply to an eks-managed cluster`, as DESTR-002 does, and the
-> campaign records the case as not applicable rather than failed.
+> Both providers: the case runs under this id on HyperPod and on an `eks-managed` cluster. The preflight requires
+> `nodeReboot` OWN through the regional executor by the cluster provider's lifecycle adapter (`gpu-fault-hyperpod-adapter`
+> or `gpu-fault-eks-adapter`) and records `provider`; the same workflow record's `RESTART_NODE` rung is then
+> `BatchRebootClusterNodes` or EC2 `RebootInstances`, read from the provider's own CloudTrail source with refused calls
+> (Karpenter dry-runs) set aside and the EC2 launch/terminate/stop/start mutations as the forbidden replacement set
+> (`destr016_verdicts.provider_reboot_evidence`). Everything else -- the known RESET_GPU refusal, the one-branch DAG, the
+> executor env window, the host ledger, the node identity -- is judged identically. Plain-EKS prerequisites as in DESTR-002.
 
 **Known failure of a single-node RESET_GPU: escalates to a real RESTART_NODE inside the same workflow record and closes there, producing no reboot-after successor**
 

@@ -41,7 +41,15 @@ from typing import Any
 
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
 from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY
-from scripts.e2e.regional.acceptance_runner_common import hyperpod_only_reason
+from scripts.e2e.regional.collector_reboot_evidence import (
+    partition_provider_events,
+    provider_event_source,
+    reboot_event_names,
+)
+from scripts.e2e.regional.guardrail_audit_evidence import EC2_REPLACEMENT_MUTATIONS
+from scripts.e2e.regional.regional_live_fixture import (
+    provider_event_actor_matches_role,
+)
 from scripts.e2e.regional.remote_command_shapes import command_operations
 
 # The reset workflow the first XID 46 must build, in order, exactly once.
@@ -101,6 +109,9 @@ CANCELLED_STATUS_SOURCE = "workflow-preempted"
 PREEMPTION_REASON_SUBSTRING = "strictly stronger recovery action"
 WAITING_REASON_SUBSTRING = "clients are still active"
 QUARANTINE_TAINT_PREFIX = "gpu-fault.io/"
+# The HyperPod vocabulary; ``provider_reboot_events``/``provider_forbidden_events``
+# select the EC2 one (RebootInstances; Run/Terminate/Stop/StartInstances) for an
+# eks-managed cluster, so both providers run the case under the same id.
 REBOOT_EVENTS = ("BatchRebootClusterNodes", "RebootClusterNodes")
 FORBIDDEN_EVENTS = (
     "BatchDeleteClusterNodes",
@@ -887,21 +898,50 @@ def node_recovery_errors(
     return errors
 
 
-def reboot_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [item for item in events if item.get("event_name") in REBOOT_EVENTS]
+def provider_reboot_events(provider: str | None) -> frozenset[str]:
+    """The CloudTrail event names the product's reboot leaves on ``provider``."""
+
+    return frozenset(reboot_event_names(provider or "hyperpod"))
 
 
-def forbidden_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [item for item in events if item.get("event_name") in FORBIDDEN_EVENTS]
+def provider_forbidden_events(provider: str | None) -> frozenset[str]:
+    """The provider mutations that would mean a replacement, not a reboot."""
+
+    if provider == "eks-managed":
+        return EC2_REPLACEMENT_MUTATIONS
+    return frozenset(FORBIDDEN_EVENTS)
+
+
+def _accepted(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    mutations, _refused = partition_provider_events(events)
+    return [dict(item) for item in mutations if isinstance(item, dict)]
+
+
+def reboot_events(
+    events: list[dict[str, Any]], *, provider: str | None = None
+) -> list[dict[str, Any]]:
+    names = provider_reboot_events(provider)
+    return [item for item in _accepted(events) if item.get("event_name") in names]
+
+
+def forbidden_events(
+    events: list[dict[str, Any]], *, provider: str | None = None
+) -> list[dict[str, Any]]:
+    names = provider_forbidden_events(provider)
+    return [item for item in _accepted(events) if item.get("event_name") in names]
 
 
 def provider_errors(
     events: list[dict[str, Any]],
     *,
     actor_matches_role: bool | None,
+    provider: str | None = None,
 ) -> list[str]:
-    """Exactly one reboot call, made by the executor role, and nothing else.
+    """Exactly one accepted reboot call, made by the executor role, and no
+    replacement -- in the vocabulary of ``provider`` (HyperPod by default).
 
+    Calls AWS refused (an ``errorCode``: Karpenter's ``RunInstances`` dry-runs
+    on plain EKS) are not mutations and are set aside, named in the count.
     ``actor_matches_role`` is supplied by the caller (the shared
     ``provider_event_actor_matches_role`` helper needs the role ARN, which is
     site topology this module must not carry) and is ``None`` when there is no
@@ -909,21 +949,73 @@ def provider_errors(
     """
 
     errors: list[str] = []
-    reboots = reboot_events(events)
+    reboots = reboot_events(events, provider=provider)
     if len(reboots) != 1:
+        refused = partition_provider_events(events)[1]
+        note = f" ({len(refused)} refused provider calls set aside)" if refused else ""
         errors.append(
             "CloudTrail does not contain exactly one reboot event: "
-            f"{[item.get('event_name') for item in reboots]}"
+            f"{[item.get('event_name') for item in reboots]}{note}"
         )
     elif actor_matches_role is not True:
         errors.append("the CloudTrail reboot actor is not the executor role")
-    forbidden = forbidden_events(events)
+    forbidden = forbidden_events(events, provider=provider)
     if forbidden:
         errors.append(
             "CloudTrail contains a replace/delete mutation: "
             f"{sorted({str(item.get('event_name')) for item in forbidden})}"
         )
     return errors
+
+
+def provider_reboot_evidence(
+    regional: Any,
+    *,
+    started_at: datetime,
+    provider: str | None,
+    executor_role_arn: str,
+) -> tuple[list[str], dict[str, Any]]:
+    """Wait for the provider's reboot mutation, read the window, judge it.
+
+    The positive claim (one reboot by the executor role) polls CloudTrail in
+    the provider's own event source until it is visible or the delivery window
+    closes; the negative claim (no replacement) is recorded as provisional
+    inside that window, for DESTR-013's later full-window audit.
+    """
+
+    source = provider_event_source(provider or "hyperpod")
+    # The waited-for events are the positive claim's own inventory (name
+    # filtered, with their actor); the whole window carries the negative claim
+    # and the refused calls set aside.
+    waited = regional.wait_provider_events(
+        started_at,
+        event_names=set(provider_reboot_events(provider)),
+        expected_count=1,
+        event_source=source,
+    )
+    ended_at = datetime.now(timezone.utc)
+    events = regional.provider_events(started_at, ended_at, event_source=source)
+    unique = reboot_events(waited, provider=provider)
+    actor = (
+        provider_event_actor_matches_role(unique[0], executor_role_arn)
+        if len(unique) == 1
+        else None
+    )
+    refused = partition_provider_events(events)[1]
+    errors = provider_errors(
+        [*unique, *refused, *forbidden_events(events, provider=provider)],
+        actor_matches_role=actor,
+        provider=provider,
+    )
+    return errors, {
+        "provider": provider or "hyperpod",
+        "event_source": source,
+        "events": events,
+        "reboot_events": unique,
+        "forbidden_events": forbidden_events(events, provider=provider),
+        "refused_provider_calls": partition_provider_events(events)[1],
+        "provider_events_provisional": regional.provider_events_provisional(ended_at),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1039,17 +1131,23 @@ def window_fit_errors(
     return []
 
 
-def node_reboot_verdict(
-    case_id: str, profile: dict[str, Any] | None
-) -> tuple[str | None, list[str]]:
-    """``(not_applicable, errors)`` for the runtime profile's ``nodeReboot``.
+NODE_REBOOT_OWNER_ERROR = (
+    "nodeReboot is not OWN by a provider lifecycle adapter "
+    "(gpu-fault-hyperpod-adapter or gpu-fault-eks-adapter) through the "
+    "regional executor"
+)
 
-    The HyperPod-only reboot cases need ``nodeReboot`` OWN by the HyperPod
-    adapter through the regional executor. When the owner is the eks adapter
-    instead (EC2 ``RebootInstances`` on an ``eks-managed`` cluster) the case
-    does not apply to the cluster at all, and ``not_applicable`` says so in
-    DESTR-002's words so a preflight returns it alone; otherwise ``errors``
-    lists what is wrong with the capability, as the runners always did.
+
+def node_reboot_verdict(
+    profile: dict[str, Any] | None,
+) -> tuple[str | None, list[str]]:
+    """``(provider, errors)`` for the runtime profile's ``nodeReboot``.
+
+    The reboot cases run on both providers under one case id: ``nodeReboot``
+    must be OWN through the regional executor by the provider's lifecycle
+    adapter -- ``gpu-fault-hyperpod-adapter`` (``BatchRebootClusterNodes``) or
+    ``gpu-fault-eks-adapter`` (EC2 ``RebootInstances``) -- and ``provider``
+    names which, so the live run reads the matching CloudTrail vocabulary.
     """
 
     reboot = next(
@@ -1062,12 +1160,18 @@ def node_reboot_verdict(
     )
     if reboot is None:
         return None, ["the runtime profile has no nodeReboot capability"]
-    if reboot.get("owner") == PROVIDER_NODE_REBOOT_OWNERS["eks-managed"]:
-        return hyperpod_only_reason(case_id, reboot.get("owner")), []
+    provider = next(
+        (
+            name
+            for name, owner in PROVIDER_NODE_REBOOT_OWNERS.items()
+            if owner == reboot.get("owner")
+        ),
+        None,
+    )
     if (
-        reboot.get("mode") != "OWN"
-        or reboot.get("owner") != "gpu-fault-hyperpod-adapter"
+        provider is None
+        or reboot.get("mode") != "OWN"
         or reboot.get("adapter") != "regional-cluster-executor"
     ):
-        return None, ["nodeReboot is not OWN by the HyperPod adapter"]
-    return None, []
+        return provider, [NODE_REBOOT_OWNER_ERROR]
+    return provider, []

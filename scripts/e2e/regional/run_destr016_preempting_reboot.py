@@ -73,8 +73,7 @@ from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     lifetime_errors,
     node_reboot_verdict,
     node_recovery_errors,
-    provider_errors,
-    reboot_events,
+    provider_reboot_evidence,
     reset_workflow_errors,
     restore_after_reboot_errors,
     schedulability_errors,
@@ -107,7 +106,6 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
-    provider_event_actor_matches_role,
     required,
     run_case_main,
     runtime_identity_errors,
@@ -208,12 +206,10 @@ def preflight_errors(
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
-    # Judged first and alone: the case audits BatchRebootClusterNodes and the
-    # HyperPod health labels, so nothing else about an eks-managed cluster is
-    # worth listing beside "not applicable".
-    not_applicable, reboot_errors = node_reboot_verdict(CASE_ID, profile)
-    if not_applicable:
-        return [not_applicable]
+    # Both providers run the case: nodeReboot's owner names the provider whose
+    # reboot vocabulary (BatchRebootClusterNodes or EC2 RebootInstances) the
+    # live run reads from CloudTrail.
+    _provider, reboot_errors = node_reboot_verdict(profile)
     errors: list[str] = list(identity_errors)
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
@@ -505,6 +501,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "predecessor": preflight.get("predecessor"),
         "node": settings.node,
         "hyperpod_cluster": settings.hyperpod_cluster,
+        "provider": preflight.get("provider"),
         "control_env": preflight.get("control_env"),
         "mutation": (
             "write one XID 46 to /dev/kmsg on one idle GPU node and hold a GPU "
@@ -514,8 +511,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "later writes are pre-authorized on the node before the first "
             "injection (the quiesce stops kubelet, so nothing can be authorized "
             "afterwards) and fire only when the node's own ledger shows the "
-            "barrier. The successor workflow reboots the node through HyperPod "
-            "for real (BatchRebootClusterNodes, once), restores GPU services "
+            "barrier. The successor workflow reboots the node through the "
+            "cluster provider's adapter for real (HyperPod BatchRebootClusterNodes "
+            "or EC2 RebootInstances on eks-managed, once), restores GPU services "
             "after the reboot, validates GPU/host/fabric and restores scheduling. "
             "No GPU reset is allowed to commit; no replacement or deletion is "
             "authorized."
@@ -528,7 +526,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the node still carries an open incident, so the XID would be merged "
             "into it and open no workflow",
             "gpuReset is not OWN by the Node Agent, or nodeReboot not OWN by the "
-            "HyperPod adapter",
+            "cluster provider's lifecycle adapter (hyperpod or eks)",
             "the deployed step timeout leaves no room for both escalation "
             "injections inside the barrier's WAITING window, or the agent "
             "maintenance window leaves no room for the escalation",
@@ -634,6 +632,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     workloads = regional.business_workloads(settings.node)
     result: dict[str, Any] = {
         "release_id": state.get("release_id"),
+        "provider": node_reboot_verdict(state.get("profile"))[0],
         "node": node,
         "store": state,
         "business_workloads": workloads,
@@ -1212,19 +1211,14 @@ def _data_plane_errors(
             final_node,
         )
     )
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(case_dir / "provider-events.json", {"events": provider})
-    unique = reboot_events(provider)
-    errors.extend(
-        provider_errors(
-            provider,
-            actor_matches_role=(
-                provider_event_actor_matches_role(unique[0], settings.executor_role_arn)
-                if len(unique) == 1
-                else None
-            ),
-        )
+    provider_failures, provider_evidence = provider_reboot_evidence(
+        run.regional,
+        started_at=run.started_at,
+        provider=run.preflight.get("provider"),
+        executor_role_arn=settings.executor_role_arn,
     )
+    write_json_atomic(case_dir / "provider-events.json", provider_evidence)
+    errors.extend(provider_failures)
     errors.extend(restore_after_reboot_errors(state.get("workflow") or {}))
     cpu_after = run.regional.cpu_blast_snapshot()
     write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)

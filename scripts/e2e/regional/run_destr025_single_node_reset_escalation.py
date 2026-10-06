@@ -48,9 +48,9 @@ from scripts.e2e.regional.destr014_preflight import (  # noqa: E402
     executor_env_snapshot,
 )
 from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
+    node_reboot_verdict,
     node_recovery_errors,
-    provider_errors,
-    reboot_events,
+    provider_reboot_evidence,
     schedulability_errors,
     step_transitions,
 )
@@ -87,7 +87,6 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
-    provider_event_actor_matches_role,
     required,
     run_case_main,
     runtime_identity_errors,
@@ -208,6 +207,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "predecessor": preflight.get("predecessor"),
         "node": settings.node,
         "hyperpod_cluster": settings.hyperpod_cluster,
+        "provider": preflight.get("provider"),
         "verify_max_attempts": settings.verify_max_attempts,
         "gpu_hold_seconds": GPU_HOLD_SECONDS,
         "control_env": preflight.get("control_env"),
@@ -217,7 +217,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "VERIFY_NO_GPU_CLIENTS succeeds makes the RESET_GPU fail with a "
             "known outcome (clients are still active); the record must grow "
             "into a one-branch DAG and append a RESTART_NODE rung that reboots "
-            "the node through HyperPod for real (BatchRebootClusterNodes, once), "
+            "the node through the cluster provider's adapter for real (HyperPod "
+            "BatchRebootClusterNodes or EC2 RebootInstances on eks-managed, once), "
             "then validate GPU/host/fabric and restore scheduling inside the "
             "same record"
         ),
@@ -299,6 +300,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     budget = budget_headroom(regional, settings)
     result: dict[str, Any] = {
         "release_id": state.get("release_id"),
+        "provider": node_reboot_verdict(state.get("profile"))[0],
         "node": node,
         "store": state,
         "business_workloads": workloads,
@@ -661,19 +663,14 @@ def _data_plane_errors(
     errors.extend(
         node_recovery_errors(run.preflight["node"], node_after_boot, final_node)
     )
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(case_dir / "provider-events.json", {"events": provider})
-    unique = reboot_events(provider)
-    errors.extend(
-        provider_errors(
-            provider,
-            actor_matches_role=(
-                provider_event_actor_matches_role(unique[0], settings.executor_role_arn)
-                if len(unique) == 1
-                else None
-            ),
-        )
+    provider_failures, provider_evidence = provider_reboot_evidence(
+        run.regional,
+        started_at=run.started_at,
+        provider=run.preflight.get("provider"),
+        executor_role_arn=settings.executor_role_arn,
     )
+    write_json_atomic(case_dir / "provider-events.json", provider_evidence)
+    errors.extend(provider_failures)
     cpu_after = run.regional.cpu_blast_snapshot()
     write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
     if cpu_after != run.preflight["cpu_blast"]:
@@ -698,7 +695,8 @@ def _data_plane_errors(
         "ledger_rows_added": len(after.get("ledger") or [])
         - len(run.baseline.get("ledger") or []),
         "holder_hold_started_at": holder.get("hold_started_at"),
-        "provider_reboot_events": len(unique),
+        "provider": provider_evidence["provider"],
+        "provider_reboot_events": len(provider_evidence["reboot_events"]),
     }
 
 

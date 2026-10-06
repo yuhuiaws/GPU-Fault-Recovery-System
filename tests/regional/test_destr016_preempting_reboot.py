@@ -1005,13 +1005,9 @@ def test_the_preflight_refuses_a_node_that_is_not_idle_and_clean() -> None:
         (
             "nodeReboot",
             {"adapter": "legacy-hyperpod"},
-            "nodeReboot is not OWN by the HyperPod adapter",
+            verdicts.NODE_REBOOT_OWNER_ERROR,
         ),
-        (
-            "nodeReboot",
-            {"mode": "OBSERVE"},
-            "nodeReboot is not OWN by the HyperPod adapter",
-        ),
+        ("nodeReboot", {"mode": "OBSERVE"}, verdicts.NODE_REBOOT_OWNER_ERROR),
     ],
 )
 def test_the_preflight_refuses_a_profile_that_does_not_own_the_operations(
@@ -1027,23 +1023,32 @@ def test_the_preflight_refuses_a_profile_that_does_not_own_the_operations(
     assert any(expected in item for item in errors), errors
 
 
-def test_an_eks_managed_reboot_owner_makes_the_case_not_applicable() -> None:
-    """The eks adapter owns nodeReboot (EC2 RebootInstances); DESTR-016 audits
-    BatchRebootClusterNodes. The preflight says so once, as DESTR-002 does, so
-    the campaign records N/A instead of a FAIL buried under unrelated noise."""
+def test_an_eks_managed_reboot_owner_runs_the_case_on_its_own_provider() -> None:
+    """The eks adapter owns nodeReboot (EC2 RebootInstances): the case runs
+    under the same id and the live run reads the EC2 vocabulary; the provider
+    is never a refusal. A stranger owning nodeReboot still is."""
 
     arguments = happy_preflight_arguments()
+    hyperpod_profile = json.loads(json.dumps(arguments["profile"]))
     profile = json.loads(json.dumps(arguments["profile"]))
     for item in profile["capabilities"]:
         if item["capability"] == "nodeReboot":
             item["owner"] = "gpu-fault-eks-adapter"
     arguments["profile"] = profile
-    arguments["event"] = {"xid": 46, "node": NODE}
-    errors = destr016.preflight_errors(**arguments)
-    assert len(errors) == 1, errors
-    assert "does not apply to an eks-managed cluster" in errors[0]
-    assert "GF-REGIONAL-DESTR-016" in errors[0]
-    assert "gpu-fault-eks-adapter" in errors[0]
+    assert destr016.preflight_errors(**arguments) == []
+    assert verdicts.node_reboot_verdict(profile) == ("eks-managed", [])
+    assert verdicts.node_reboot_verdict(hyperpod_profile) == ("hyperpod", [])
+    for item in profile["capabilities"]:
+        if item["capability"] == "nodeReboot":
+            item["owner"] = "someone-else"
+    assert verdicts.node_reboot_verdict(profile) == (
+        None,
+        [verdicts.NODE_REBOOT_OWNER_ERROR],
+    )
+    assert verdicts.node_reboot_verdict({"capabilities": []}) == (
+        None,
+        ["the runtime profile has no nodeReboot capability"],
+    )
 
 
 def test_the_preflight_refuses_a_missing_capability_or_a_warned_profile() -> None:
@@ -1357,3 +1362,122 @@ def test_the_host_must_fire_after_the_runner_observed_the_barrier() -> None:
     assert authorization.fired_after_barrier_errors(
         None, store_proof=barrier_observation(3), label="escalation injection"
     ) == ["escalation injection: the host recorded no fire"]
+
+
+def _eks_provider_events() -> list[dict[str, Any]]:
+    """The EC2 source of a plain EKS cluster: the product's accepted
+    RebootInstances between Karpenter's refused RunInstances dry-runs."""
+
+    dry_run = {
+        "event_name": "RunInstances",
+        "username": "karpenter-session",
+        "api_error_code": "Client.DryRunOperation",
+    }
+    return [
+        dict(dry_run),
+        {
+            "event_name": "RebootInstances",
+            "username": "gpu-fault-executor-role",
+            "session_issuer_role_name": "gpu-fault-executor-role",
+        },
+        dict(dry_run),
+    ]
+
+
+def test_the_eks_vocabulary_counts_one_accepted_reboot_beside_refused_calls() -> None:
+    events = _eks_provider_events()
+    assert [
+        item["event_name"]
+        for item in verdicts.reboot_events(events, provider="eks-managed")
+    ] == ["RebootInstances"]
+    assert (
+        verdicts.provider_errors(
+            events, actor_matches_role=True, provider="eks-managed"
+        )
+        == []
+    )
+    # The HyperPod vocabulary sees no SageMaker reboot in that window.
+    assert verdicts.provider_errors(events, actor_matches_role=True) == [
+        "CloudTrail does not contain exactly one reboot event: [] "
+        "(2 refused provider calls set aside)"
+    ]
+    terminated = [*events, {"event_name": "TerminateInstances", "username": "asg"}]
+    assert verdicts.provider_errors(
+        terminated, actor_matches_role=True, provider="eks-managed"
+    ) == ["CloudTrail contains a replace/delete mutation: ['TerminateInstances']"]
+    refused_reboot = [
+        {
+            "event_name": "RebootInstances",
+            "api_error_code": "Client.UnauthorizedOperation",
+        }
+    ]
+    assert verdicts.provider_errors(
+        refused_reboot, actor_matches_role=None, provider="eks-managed"
+    ) == [
+        "CloudTrail does not contain exactly one reboot event: [] "
+        "(1 refused provider calls set aside)"
+    ], "a refused reboot attempt is never the one accepted reboot"
+
+
+class _ProviderRegional:
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+        self.calls: list[dict[str, Any]] = []
+
+    def wait_provider_events(self, started_at: Any, **kwargs: Any) -> list:
+        self.calls.append({"wait": kwargs})
+        return [
+            item for item in self.events if item["event_name"] in kwargs["event_names"]
+        ]
+
+    def provider_events(
+        self, started_at: Any, ended_at: Any, *, event_source: str
+    ) -> list:
+        self.calls.append({"read": event_source})
+        return self.events
+
+    @staticmethod
+    def provider_events_provisional(_ended_at: Any) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("provider", "events", "source", "names"),
+    [
+        (
+            "eks-managed",
+            _eks_provider_events(),
+            "ec2.amazonaws.com",
+            {"RebootInstances"},
+        ),
+        (
+            None,
+            provider_events(),
+            "sagemaker.amazonaws.com",
+            {"BatchRebootClusterNodes", "RebootClusterNodes"},
+        ),
+    ],
+)
+def test_provider_reboot_evidence_reads_the_providers_own_source(
+    provider: str | None, events: list[dict[str, Any]], source: str, names: set[str]
+) -> None:
+    from datetime import datetime, timezone
+
+    regional = _ProviderRegional(events)
+    errors, evidence = verdicts.provider_reboot_evidence(
+        regional,
+        started_at=datetime.now(timezone.utc),
+        provider=provider,
+        executor_role_arn="arn:aws:iam::123456789012:role/gpu-fault-executor-role",
+    )
+    assert errors == [], errors
+    assert regional.calls == [
+        {"wait": {"event_names": names, "expected_count": 1, "event_source": source}},
+        {"read": source},
+    ]
+    assert evidence["provider"] == (provider or "hyperpod")
+    assert evidence["event_source"] == source
+    assert len(evidence["reboot_events"]) == 1
+    assert evidence["forbidden_events"] == []
+    assert len(evidence["refused_provider_calls"]) == (2 if provider else 0)
+    assert evidence["provider_events_provisional"] is True

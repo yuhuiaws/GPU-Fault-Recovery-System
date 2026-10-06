@@ -184,9 +184,9 @@ class SpyRegional:
         ]
 
     def provider_events(
-        self, started: datetime, ended: datetime
+        self, started: datetime, ended: datetime, **kwargs: Any
     ) -> list[dict[str, str]]:
-        self._record("provider_events", started=started, ended=ended)
+        self._record("provider_events", started=started, ended=ended, **kwargs)
         events = [{"event_name": "RebootClusterNodes"}]
         if self.forbidden_event:
             events.append({"event_name": "BatchReplaceClusterNodes"})
@@ -314,6 +314,9 @@ def test_destr002_counts_the_reboot_with_the_visibility_wait(
     assert len(waits) == 1, regional.calls
     assert waits[0]["event_names"] == destr002.REBOOT_EVENTS
     assert waits[0]["expected_count"] == 1
+    assert waits[0]["event_source"] == "sagemaker.amazonaws.com"
+    assert evidence["provider"] == "hyperpod"
+    assert evidence["refused_provider_calls"] == []
     # The negative claim (no replace/delete) is provisional inside the
     # delivery window and is recorded as such.
     assert evidence["provider_events_provisional"] is True

@@ -527,11 +527,9 @@ def preflight_errors(
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
-    # Judged first and alone, as DESTR-002 and DESTR-016 do: the case audits
-    # BatchRebootClusterNodes, which an eks-managed cluster has not.
-    not_applicable, reboot_errors = node_reboot_verdict(CASE_ID, profile)
-    if not_applicable:
-        return [not_applicable]
+    # Both providers run the case: nodeReboot's owner names the provider whose
+    # reboot vocabulary the live run reads from CloudTrail.
+    _provider, reboot_errors = node_reboot_verdict(profile)
     errors: list[str] = list(identity_errors)
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")

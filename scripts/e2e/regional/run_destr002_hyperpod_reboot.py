@@ -16,10 +16,18 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
-    NOT_APPLICABLE_PROVIDER_PHRASE,
     processor_queue_backlog,
     write_json_atomic,
+)
+from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
+    partition_provider_events,
+    provider_event_source,
+    reboot_event_names,
+)
+from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
+    EC2_REPLACEMENT_MUTATIONS,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -50,6 +58,8 @@ CASE_ID = "GF-REGIONAL-DESTR-002"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-001"
 CONFIRMATION = "DESTR002_REBOOT_ISOLATED_NODE"
 EXPECTED_ACTION = "REBOOT_NODE"
+# The HyperPod vocabulary; ``provider_reboot_evidence`` reads the EC2 one
+# (RebootInstances; Run/Terminate/Stop/StartInstances) on an eks-managed cluster.
 REBOOT_EVENTS = {"BatchRebootClusterNodes", "RebootClusterNodes"}
 FORBIDDEN_EVENTS = {
     "BatchDeleteClusterNodes",
@@ -59,11 +69,18 @@ FORBIDDEN_EVENTS = {
 }
 
 
+# Finds the executor's node lifecycle adapter by the owner each provider's
+# profile names for nodeReboot (gpu-fault-hyperpod-adapter: SageMaker
+# BatchRebootClusterNodes; gpu-fault-eks-adapter: EC2 RebootInstances) and runs
+# the same four read-only preflights through it, so both providers are audited
+# under one case id. The "disabled" variant is a second adapter instance built
+# from the live config with the reboot switch off; it never submits.
 PREFLIGHT_PROBE = r"""
 import json
 import sys
 
 from gpu_fault.cluster_executor import executor_from_environment
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
 from gpu_fault.hyperpod import (
     HyperPodAction,
     HyperPodLifecycleAdapter,
@@ -74,19 +91,19 @@ executor = executor_from_environment()
 owners = sorted(
     str(getattr(item, "owner", "")) for item in executor.adapters if getattr(item, "owner", "")
 )
+providers_by_owner = {owner: name for name, owner in PROVIDER_NODE_REBOOT_OWNERS.items()}
 step_adapter = next(
     (
         item
         for item in executor.adapters
-        if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
+        if getattr(item, "owner", "") in providers_by_owner
     ),
     None,
 )
 if step_adapter is None:
-    # A plain-EKS executor reboots through gpu-fault-eks-adapter; this case
-    # audits the HyperPod reboot adapter and says so instead of failing.
-    print(json.dumps({"hyperpod_adapter": False, "adapter_owners": owners}))
+    print(json.dumps({"lifecycle_adapter": False, "adapter_owners": owners}))
     raise SystemExit(0)
+provider = providers_by_owner[step_adapter.owner]
 lifecycle = step_adapter.dispatcher.adapter
 positive = lifecycle.preflight(
     HyperPodAction.REBOOT,
@@ -103,18 +120,29 @@ wrong = lifecycle.preflight(
     [node],
     isolation_verified_nodes=["audit-other-node"],
 )
-disabled = HyperPodLifecycleAdapter(
-    lifecycle.config.model_copy(
-        update={"execution_enabled": False, "reboot_enabled": False}
-    ),
-    client=lifecycle.client,
+disabled_config = lifecycle.config.model_copy(
+    update={"execution_enabled": False, "reboot_enabled": False}
 )
+if provider == "eks-managed":
+    from gpu_fault.eks_provider import EksManagedNodeProvider
+
+    disabled = EksManagedNodeProvider(
+        disabled_config,
+        lifecycle.core,
+        ec2_client=lifecycle.ec2,
+        eks_client=lifecycle.eks,
+        store=None,
+    )
+else:
+    disabled = HyperPodLifecycleAdapter(disabled_config, client=lifecycle.client)
 disabled_result = disabled.preflight(
     HyperPodAction.REBOOT,
     [node],
     isolation_verified_nodes=[node],
 )
 print(json.dumps({
+    "provider": provider,
+    "adapter_owner": step_adapter.owner,
     "configured_cluster_name": lifecycle.config.cluster_name,
     "positive": positive.model_dump(mode="json"),
     "missing_isolation": missing.model_dump(mode="json"),
@@ -127,10 +155,12 @@ print(json.dumps({
 # Runs in the *replacement* executor Pod after the submitting one was deleted,
 # and reads the durable submission record through that Pod's own lifecycle
 # adapter store. It never calls `submit`: the adapter's dedupe rule for a
-# replay (HyperPodLifecycleAdapter._replay_durable_submission) is "same idempotency
-# key, same request identity, state SUBMITTED, result present", and reading
-# that record from the new Pod proves the same thing a second live submit
-# would -- without asking the provider to consider a second reboot. The key
+# replay (HyperPodLifecycleAdapter._replay_durable_submission; the eks
+# provider's ProviderSubmissionLedger.replay behind the same record type) is
+# "same idempotency key, same request identity, state SUBMITTED, result
+# present", and reading that record from the new Pod proves the same thing a
+# second live submit would -- without asking the provider for a second reboot.
+# The key
 # is taken from the command's result_details and never recomputed: a runner
 # that derives its own key can only confirm its own arithmetic.
 # The probe takes only the two facts it needs (the recorded key and the step's
@@ -150,27 +180,33 @@ result = {"replay_mode": "store-level", "duplicate": False, "checks": {}}
 stage = "import"
 try:
     from gpu_fault.cluster_executor import executor_from_environment
+    from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
     from gpu_fault.hyperpod import HyperPodAction
 
     stage = "executor"
     executor = executor_from_environment()
     stage = "adapter"
+    lifecycle_owners = set(PROVIDER_NODE_REBOOT_OWNERS.values())
     step_adapter = next(
         (
             item
             for item in executor.adapters
-            if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
+            if getattr(item, "owner", "") in lifecycle_owners
         ),
         None,
     )
     if step_adapter is None:
         raise RuntimeError(
-            "executor advertises no gpu-fault-hyperpod-adapter: "
+            "executor advertises no node lifecycle adapter: "
             + ", ".join(sorted(str(getattr(item, "owner", "")) for item in executor.adapters))
         )
     lifecycle = step_adapter.dispatcher.adapter
+    result["adapter_owner"] = step_adapter.owner
     if lifecycle.store is None:
-        raise RuntimeError("HyperPod durable submission store is unavailable")
+        raise RuntimeError("the durable provider submission store is unavailable")
+    replay = getattr(lifecycle, "_replay_durable_submission", None) or (
+        lambda action, ids, key: lifecycle._ledger.replay(action, ids, key)
+    )
     stage = "record"
     record = lifecycle.store.get_hyperpod_submission(
         lifecycle.config.cluster_name,
@@ -186,9 +222,7 @@ try:
     result["record"] = record.model_dump(mode="json")
     if all(result["checks"].values()):
         stage = "replay"
-        outcome = lifecycle._replay_durable_submission(
-            HyperPodAction.REBOOT, node_ids, submission_key
-        )
+        outcome = replay(HyperPodAction.REBOOT, node_ids, submission_key)
         result["duplicate"] = outcome is not None and outcome.duplicate is True
 except Exception as exc:  # noqa: BLE001 - the runner reads the stage and type
     result["stage"] = stage
@@ -282,6 +316,10 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
         "test_hyperpod_reboot_waits_for_post_reboot_stabilization",
         "tests/regional/test_destructive_acceptance_fixtures.py::"
         "test_destr002_allows_transient_zero_gpu_capacity_before_validation",
+        "tests/eks_provider/test_eks_provider.py::"
+        "test_preflight_fails_closed_on_each_gate",
+        "tests/eks_provider/test_eks_provider.py::"
+        "test_durable_submission_survives_a_provider_restart",
     ]
     completed = RegionalLiveFixture.run(
         command,
@@ -306,28 +344,58 @@ def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | No
     return None
 
 
+def probe_provider(probe: dict[str, Any]) -> str:
+    """The provider the preflight probe found; HyperPod when it says nothing."""
+
+    return str(probe.get("provider") or "hyperpod")
+
+
 def preflight_probe_errors(
     probe: dict[str, Any],
     hyperpod_cluster: str,
 ) -> list[str]:
+    """The four read-only preflights, in the found adapter's own words.
+
+    Both providers answer the same contract: a positive preflight that is safe
+    to submit, two isolation gates that fail closed, a disabled switch that
+    fails closed. HyperPod must also read ``NodeRecovery=None``; a plain EKS
+    cluster has no NodeRecovery (its preflight reports none) and must be
+    ``ACTIVE`` instead.
+    """
+
     errors = []
-    if probe.get("hyperpod_adapter") is False:
+    if (
+        probe.get("lifecycle_adapter") is False
+        or probe.get("hyperpod_adapter") is False
+    ):
         owners = ", ".join(probe.get("adapter_owners") or []) or "none"
         return [
-            "executor has no HyperPod reboot adapter (owners: "
-            f"{owners}); DESTR-002 audits the HyperPod reboot path and "
-            f"{NOT_APPLICABLE_PROVIDER_PHRASE}"
+            "executor has no node lifecycle adapter owning nodeReboot (owners: "
+            f"{owners}); DESTR-002 audits the provider reboot path (HyperPod "
+            "BatchRebootClusterNodes or EC2 RebootInstances) and needs one"
         ]
+    provider = probe_provider(probe)
     positive = probe.get("positive") or {}
     missing = probe.get("missing_isolation") or {}
     wrong = probe.get("wrong_isolation") or {}
     disabled = probe.get("disabled") or {}
     if probe.get("configured_cluster_name") != hyperpod_cluster:
-        errors.append("executor HyperPod cluster name differs from the plan")
+        errors.append("executor provider cluster name differs from the plan")
     if not positive.get("safe_to_submit"):
         errors.append("positive reboot preflight is not safe_to_submit")
-    if positive.get("node_recovery") != "None":
-        errors.append("HyperPod NodeRecovery is not None")
+    if provider == "hyperpod":
+        if positive.get("node_recovery") != "None":
+            errors.append("HyperPod NodeRecovery is not None")
+    else:
+        if positive.get("node_recovery") is not None:
+            errors.append(
+                "an eks-managed preflight reports a HyperPod NodeRecovery: "
+                f"{positive.get('node_recovery')!r}"
+            )
+        if positive.get("cluster_status") != "ACTIVE":
+            errors.append(
+                f"the EKS cluster is not ACTIVE: {positive.get('cluster_status')!r}"
+            )
     for name, result in (("missing", missing), ("wrong", wrong)):
         failures = " ".join(result.get("gate_failures") or [])
         if result.get("safe_to_submit") or (
@@ -336,10 +404,79 @@ def preflight_probe_errors(
             errors.append(f"{name} isolation preflight did not fail closed")
     disabled_failures = " ".join(disabled.get("gate_failures") or [])
     if disabled.get("safe_to_submit") or (
-        "HyperPod REBOOT mutation is disabled by configuration" not in disabled_failures
+        "REBOOT mutation is disabled by configuration" not in disabled_failures
     ):
         errors.append("disabled reboot preflight did not fail closed")
     return errors
+
+
+def provider_reboot_evidence(
+    regional: RegionalLiveFixture,
+    settings: Settings,
+    *,
+    injection_started: datetime,
+    provider: str,
+) -> tuple[list[str], dict[str, Any]]:
+    """Exactly one accepted reboot by the executor role in the provider's own
+    CloudTrail source, and no replace/delete.
+
+    The positive claim polls until the event is visible or the delivery window
+    closes; the negative claim cannot be proven inside that window and is
+    recorded as provisional unless a forbidden mutation is already visible.
+    Calls AWS refused (Karpenter's ``RunInstances`` dry-runs on plain EKS) are
+    set aside and named in the count, never counted as the reboot.
+    """
+
+    source = provider_event_source(provider)
+    reboot_names = set(reboot_event_names(provider))
+    forbidden_names = (
+        EC2_REPLACEMENT_MUTATIONS if provider == "eks-managed" else FORBIDDEN_EVENTS
+    )
+    # The waited-for events are the positive claim's own inventory (name
+    # filtered, with their actor); the whole window carries the negative claim.
+    waited = regional.wait_provider_events(
+        injection_started,
+        event_names=reboot_names,
+        expected_count=1,
+        event_source=source,
+    )
+    window_end = datetime.now(timezone.utc)
+    events = regional.provider_events(
+        injection_started, window_end, event_source=source
+    )
+    reboots = [
+        dict(item)
+        for item in partition_provider_events(waited)[0]
+        if isinstance(item, dict) and item.get("event_name") in reboot_names
+    ]
+    mutations, refused = partition_provider_events(events)
+    forbidden = [
+        dict(item)
+        for item in mutations
+        if isinstance(item, dict) and item.get("event_name") in forbidden_names
+    ]
+    errors: list[str] = []
+    if len(reboots) != 1:
+        errors.append(
+            "CloudTrail does not contain exactly one reboot event "
+            f"({len(reboots)} accepted {sorted(reboot_names)}; {len(refused)} "
+            "refused provider calls set aside)"
+        )
+    elif not provider_event_actor_matches_role(reboots[0], settings.executor_role_arn):
+        errors.append("CloudTrail reboot actor is not the executor role")
+    if forbidden:
+        errors.append("CloudTrail contains replace/delete mutation")
+    return errors, {
+        "provider": provider,
+        "event_source": source,
+        "events": events,
+        "reboot_events": reboots,
+        "forbidden_events": forbidden,
+        "refused_provider_calls": refused,
+        "provider_events_provisional": (
+            not forbidden and regional.provider_events_provisional(window_end)
+        ),
+    }
 
 
 def read_only_preflight(
@@ -358,6 +495,7 @@ def read_only_preflight(
     workloads = fixture.business_workloads(settings.node)
     tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     probe = fixture.executor_python(PREFLIGHT_PROBE, settings.node)
+    provider = probe_provider(probe)
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
@@ -377,14 +515,18 @@ def read_only_preflight(
     if (state.get("agent") or {}).get("lifecycle_state") != "ACTIVE":
         errors.append("target Node Agent is not ACTIVE")
     reboot = capability(state.get("profile"), "nodeReboot")
+    expected_owner = PROVIDER_NODE_REBOOT_OWNERS.get(provider)
     if reboot is None:
         errors.append("runtime profile has no nodeReboot capability")
     elif (
         reboot.get("mode") != "OWN"
-        or reboot.get("owner") != "gpu-fault-hyperpod-adapter"
+        or reboot.get("owner") != expected_owner
         or reboot.get("adapter") != "regional-cluster-executor"
     ):
-        errors.append("nodeReboot is not OWN by the HyperPod adapter")
+        errors.append(
+            f"nodeReboot is not OWN by the {provider} lifecycle adapter "
+            f"({expected_owner}) through the regional executor"
+        )
     if (state.get("profile") or {}).get("warnings"):
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(state.get("queue") or {}):
@@ -398,6 +540,7 @@ def read_only_preflight(
     result = {
         "release_id": state.get("release_id"),
         "evidence_identity": identity,
+        "provider": provider,
         "node": node,
         "business_workloads": workloads,
         "store": state,
@@ -745,10 +888,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
         "hyperpod_cluster": settings.hyperpod_cluster,
+        "provider": preflight.get("provider"),
         "provider_targets": targets,
         "mutation": (
             "write one synthetic XID 79 to /dev/kmsg, allow the executor role "
-            "to submit one HyperPod reboot, then restart the submitting "
+            "to submit one provider reboot (HyperPod BatchRebootClusterNodes, or "
+            "EC2 RebootInstances on eks-managed), then restart the submitting "
             "executor Pod and verify the durable submission record from the "
             "replacement Pod (store-level replay; no second submit)"
         ),
@@ -765,7 +910,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             "DESTR-001 has not passed in formal sequence",
             "preflight or focused regression failure",
-            "NodeRecovery is not None",
+            "HyperPod NodeRecovery is not None (eks-managed: the EKS cluster is "
+            "not ACTIVE)",
             "target node is not Ready/schedulable/idle",
             "node, Agent, Profile, cluster name or release drift",
             "submission record does not reach SUBMITTED",
@@ -978,41 +1124,15 @@ def execute_case(
             expected_boot_id=(preflight["store"].get("agent") or {}).get("boot_id"),
         )
         errors.extend(replay_errors)
-        # The positive claim -- exactly one reboot, by the executor role --
-        # polls CloudTrail until the event is visible or the delivery window
-        # closes; the negative claim -- no replace/delete -- cannot be proven
-        # inside that window and is recorded as provisional when empty.
-        reboot_events = regional.wait_provider_events(
-            injection_started,
-            event_names=REBOOT_EVENTS,
-            expected_count=1,
+        provider_name = str(preflight.get("provider") or "hyperpod")
+        provider_failures, provider_evidence = provider_reboot_evidence(
+            regional,
+            settings,
+            injection_started=injection_started,
+            provider=provider_name,
         )
-        provider_window_end = datetime.now(timezone.utc)
-        provider = regional.provider_events(injection_started, provider_window_end)
-        forbidden = [
-            item for item in provider if item["event_name"] in FORBIDDEN_EVENTS
-        ]
-        provider_provisional = not forbidden and regional.provider_events_provisional(
-            provider_window_end
-        )
-        write_json_atomic(
-            case_dir / "provider-events.json",
-            {
-                "events": provider,
-                "reboot_events": reboot_events,
-                "forbidden_events": forbidden,
-                "provider_events_provisional": provider_provisional,
-            },
-        )
-        if len(reboot_events) != 1:
-            errors.append("CloudTrail does not contain exactly one reboot event")
-        elif not provider_event_actor_matches_role(
-            reboot_events[0],
-            settings.executor_role_arn,
-        ):
-            errors.append("CloudTrail reboot actor is not the executor role")
-        if forbidden:
-            errors.append("CloudTrail contains replace/delete mutation")
+        write_json_atomic(case_dir / "provider-events.json", provider_evidence)
+        errors.extend(provider_failures)
         submission = state.get("submission") or {}
         target_aliases = {
             str(item)
@@ -1060,8 +1180,13 @@ def execute_case(
                 ),
                 "submission": submission,
                 "duplicate_replay": duplicate,
-                "provider_events": provider,
-                "provider_events_provisional": provider_provisional,
+                "provider": provider_name,
+                "provider_events": provider_evidence["events"],
+                "reboot_events": provider_evidence["reboot_events"],
+                "refused_provider_calls": provider_evidence["refused_provider_calls"],
+                "provider_events_provisional": provider_evidence[
+                    "provider_events_provisional"
+                ],
                 "executor_restart": executor_restart,
             }
         )

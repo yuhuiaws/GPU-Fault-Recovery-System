@@ -1465,23 +1465,25 @@ def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> No
     assert any("more than one reset" in error for error in errors), errors
 
 
-def test_destr002_refuses_by_name_without_a_hyperpod_reboot_adapter() -> None:
-    """EKS profile, 2026-10-04: the preflight probe failed with a redacted error
-    because the plain-EKS executor has no gpu-fault-hyperpod-adapter. The probe
-    now reports the adapters it found and the case refuses by name."""
+def test_destr002_refuses_by_name_without_a_node_lifecycle_adapter() -> None:
+    """An executor advertising neither provider's lifecycle adapter cannot run
+    the case; the probe reports the adapters it found and the case refuses by
+    name (the legacy ``hyperpod_adapter: false`` report reads the same way)."""
 
     destr002 = importlib.import_module(
         "scripts.e2e.regional.run_destr002_hyperpod_reboot"
     )
-    errors = destr002.preflight_probe_errors(
-        {"hyperpod_adapter": False, "adapter_owners": ["gpu-fault-eks-adapter"]},
-        "gpu-eks-cluster",
-    )
-    assert errors == [
-        "executor has no HyperPod reboot adapter (owners: gpu-fault-eks-adapter); "
-        "DESTR-002 audits the HyperPod reboot path and does not apply to an "
-        "eks-managed cluster"
+    expected = [
+        "executor has no node lifecycle adapter owning nodeReboot (owners: "
+        "gpu-fault-node-agent); DESTR-002 audits the provider reboot path "
+        "(HyperPod BatchRebootClusterNodes or EC2 RebootInstances) and needs one"
     ]
-    assert "hyperpod_adapter" in destr002.PREFLIGHT_PROBE, (
+    for report in ("lifecycle_adapter", "hyperpod_adapter"):
+        errors = destr002.preflight_probe_errors(
+            {report: False, "adapter_owners": ["gpu-fault-node-agent"]},
+            "gpu-eks-cluster",
+        )
+        assert errors == expected, report
+    assert "lifecycle_adapter" in destr002.PREFLIGHT_PROBE, (
         "the probe reports instead of raising"
     )
