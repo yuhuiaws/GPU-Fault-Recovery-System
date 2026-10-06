@@ -533,10 +533,10 @@ def test_an_eks_managed_reboot_owner_runs_the_case_on_its_own_provider() -> None
     for item in arguments["profile"]["capabilities"]:
         if item["capability"] == "nodeReboot":
             item["owner"] = "someone-else"
+    stranger = verdicts.preflight_errors(**arguments)
     assert any(
-        "not OWN by a provider lifecycle adapter" in item
-        for item in (verdicts.preflight_errors(**arguments))
-    )
+        "not OWN by a provider lifecycle adapter" in item for item in stranger
+    ), stranger
 
 
 def test_preflight_refuses_owned_nodes_open_incidents_and_missing_predecessor() -> None:
