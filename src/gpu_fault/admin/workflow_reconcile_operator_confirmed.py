@@ -36,10 +36,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from gpu_fault.workflow_reconcile import (
+from gpu_fault.workflow_resolution import (
     NODE_RESTORE_PROOF_REASON as NODE_RESTORE_PROOF_REASON,
 )
-from gpu_fault.workflow_reconcile import OPERATOR_CONFIRMED as OPERATOR_CONFIRMED
+from gpu_fault.workflow_resolution import OPERATOR_CONFIRMED as OPERATOR_CONFIRMED
 
 BRIDGE_MODE = "apply-operator-confirmed"
 

@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 __all__ = [
     "DEPARTED_NODE_PROOF_REASON",
     "NEVER_DISPATCHED_GUARD_AGE",
+    "NODE_RESTORE_PROOF_REASON",
+    "OPERATOR_CONFIRMED",
     "OPEN_REMOTE_STATUSES",
     "RETIRED_GENERATION_STATUSES",
     "SETTLED_INCIDENT_STATES",
@@ -72,6 +74,17 @@ NEVER_DISPATCHED_GUARD_AGE = timedelta(minutes=10)
 # cannot read the GPU cluster or the provider, so the record is closable only
 # once the administrator has proven the node departed from both; the admin
 # layer replaces this one reason with that evidence (``workflow-reconcile``).
+# The fourth reconcile shape (``gpu_fault.workflow_reconcile``): a BLOCKED
+# record parked on a node action an operator confirmed on evidence. Its node
+# proof -- the node back in service, or gone -- is the administrator's, read
+# through the GPU kubeconfig, so the Pod lists it as missing. Here beside the
+# departed-node reason because the admin bridge imports the names and the
+# deploy-host wheel does not carry the reconcile engine, only this module.
+OPERATOR_CONFIRMED = "operator-confirmed"
+NODE_RESTORE_PROOF_REASON = (
+    "node restoration is unproven: the administrator reads the GPU node's "
+    "scheduling state"
+)
 DEPARTED_NODE_PROOF_REASON = (
     "node departure is unproven: the administrator reads Kubernetes and HyperPod"
 )

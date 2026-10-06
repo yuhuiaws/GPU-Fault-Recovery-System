@@ -27,7 +27,7 @@ import pytest
 from gpu_fault.admin import workflow_reconcile as reconcile
 from gpu_fault.admin import workflow_reconcile_operator_confirmed as confirmed
 from gpu_fault.admin.bootstrap_common import BootstrapError
-from gpu_fault.workflow_reconcile import NODE_RESTORE_PROOF_REASON, OPERATOR_CONFIRMED
+from gpu_fault.workflow_resolution import NODE_RESTORE_PROOF_REASON, OPERATOR_CONFIRMED
 from tests.admin.conftest import TEST_OPERATOR_ARN
 
 NODE = "ip-10-0-41-164.us-west-2.compute.internal"

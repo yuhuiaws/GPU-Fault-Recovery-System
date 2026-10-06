@@ -35,7 +35,9 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.workflow_resolution import (
     NEVER_DISPATCHED_GUARD_AGE,
+    NODE_RESTORE_PROOF_REASON,
     OPEN_REMOTE_STATUSES,
+    OPERATOR_CONFIRMED,
     SETTLED_INCIDENT_STATES,
     completed_containment_operations,
     never_dispatched_reconciliation_reasons,
@@ -68,11 +70,8 @@ NEVER_DISPATCHED = "never-dispatched"
 # (``gpu_fault.admin.workflow_reconcile_operator_confirmed``). Live: the
 # deployed release's own gate counted such a record as an active destructive
 # workflow, and the record could end only with the release it was blocking.
-OPERATOR_CONFIRMED = "operator-confirmed"
-NODE_RESTORE_PROOF_REASON = (
-    "node restoration is unproven: the administrator reads the GPU node's "
-    "scheduling state"
-)
+# The names live in ``workflow_resolution`` (the admin bridge imports them and
+# the deploy-host wheel does not carry this module).
 
 
 def _canonical_sha256(value: object) -> str:
