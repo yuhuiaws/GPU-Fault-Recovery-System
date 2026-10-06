@@ -58,7 +58,18 @@ def unresolved_details(value: object, *, depth: int = 0) -> bool:
         "node_action_response_unknown",
         "ownership_permit_delivery_unknown",
     )
-    if any(value.get(key) is not None and value.get(key) is not False for key in flags):
+    if any(
+        value.get(key) is not None
+        and value.get(key) is not False
+        # A refusal the agent attests ended every physical call with a verdict
+        # (``node_action_outcome_known``) wants an operator, not a hold on an
+        # outcome: ``manual_confirmation_required`` alone does not hold it.
+        and not (
+            key == "manual_confirmation_required"
+            and value.get("node_action_outcome_known") is True
+        )
+        for key in flags
+    ):
         return True
     if "reset_outcome_unknown" in value and (
         not isinstance(value["reset_outcome_unknown"], list)

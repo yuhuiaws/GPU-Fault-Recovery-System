@@ -27,6 +27,7 @@ from gpu_fault.operation_registry import (
 
 if TYPE_CHECKING:
     from gpu_fault.node_agent.protocol import NodeActionCommand, SignedNodeAction
+from gpu_fault.node_agent.query_clients import query_only_device_client
 
 LOGGER = logging.getLogger(__name__)
 
@@ -471,7 +472,35 @@ FINAL_CLIENT_SAMPLES: Final = 2
 FINAL_CLIENT_SAMPLE_INTERVAL_SECONDS: Final = 0.5
 
 
+def classify_final_device_clients(
+    agent: Any, targets: set[str]
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """``(blocking, query_only)`` among the holders that survive every sample.
+
+    A persistent holder that is a read-only NVML query (``nvidia-smi`` without
+    ``/dev/nvidia-uvm``, see ``operations.clients.query_only_device_client``)
+    does not refuse the reset; it is returned apart so the receipt can say it
+    was seen and ignored. The classification needs the agent's ``proc_root``;
+    without one nothing is ignored.
+    """
+
+    persistent = _persistent_final_device_clients(agent, targets)
+    proc_root = getattr(agent, "proc_root", None)
+    blocking = [
+        item for item in persistent if not query_only_device_client(proc_root, item)
+    ]
+    return blocking, [item for item in persistent if item not in blocking]
+
+
 def persistent_final_device_clients(
+    agent: Any, targets: set[str]
+) -> list[dict[str, str]]:
+    """The holders the final recheck refuses on: persistent and not query-only."""
+
+    return classify_final_device_clients(agent, targets)[0]
+
+
+def _persistent_final_device_clients(
     agent: Any, targets: set[str]
 ) -> list[dict[str, str]]:
     """Device holders that survive every short final sample.
@@ -522,6 +551,7 @@ def execute_with_final_ownership(
     def physical_check() -> None:
         assert gate is not None
         permit = gate.require(command)
+        receipt_extra: dict[str, Any] = {}
         try:
             _validate_local_authority(agent, envelope)
             if command.operation in _CLIENT_RECHECK_OPERATIONS:
@@ -533,9 +563,22 @@ def execute_with_final_ownership(
                 if command.operation is not WorkflowOperation.RESTART_FABRIC_MANAGER:
                     with agent._device_path_cache_window():
                         agent._require_resolvable_targets(command.gpu_uuids)
-                        holders = persistent_final_device_clients(
+                        holders, query_only = classify_final_device_clients(
                             agent, set(command.gpu_uuids)
                         )
+                        if query_only:
+                            ignored, omitted = device_holder_attribution(query_only)
+                            receipt_extra["query_only_device_clients"] = ignored
+                            receipt_extra["query_only_device_client_count"] = (
+                                len(ignored) + omitted
+                            )
+                            LOGGER.info(
+                                "final ownership recheck ignored query-only "
+                                "device clients command_id=%s node_id=%s clients=%s",
+                                command.command_id,
+                                command.node_id,
+                                device_holder_summary(ignored, omitted),
+                            )
                         if holders:
                             refusal = OwnershipRefused(
                                 "OWNERSHIP_FINAL_CLIENTS_CHANGED",
@@ -583,6 +626,7 @@ def execute_with_final_ownership(
                 "sequence": permit.challenge.sequence,
                 "checked_at": permit.checked_at.isoformat(),
                 "expires_at": permit.expires_at.isoformat(),
+                **receipt_extra,
             }
         )
 
@@ -603,8 +647,15 @@ def execute_with_final_ownership(
             if receipts:
                 # A granted checkpoint is not completion proof, but rules out
                 # claiming that the entire command was denied before dispatch.
+                # The handler may still attest that every physical call it
+                # made returned a verdict (``node_action_outcome_known``: a
+                # reset refused "In use by another client", then refused here
+                # before its retry was spawned -- live, gpu-eks-cluster); then
+                # nothing is in flight and the outcome is not unknown, only
+                # refused.
                 action_details.pop("node_action_not_started", None)
-                action_details["outcome_unknown"] = True
+                if action_details.get("node_action_outcome_known") is not True:
+                    action_details["outcome_unknown"] = True
                 action_details["manual_confirmation_required"] = True
         raise
     if receipts:

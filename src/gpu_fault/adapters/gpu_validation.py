@@ -22,6 +22,7 @@ from gpu_fault.operation_registry import (
 )
 from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.orchestration.escalation import escalation_origin
+from gpu_fault.orchestration.validated_restore import is_validated_restore_workflow
 from gpu_fault.telemetry import (
     CollectorKind,
 )
@@ -42,6 +43,7 @@ class GpuValidationAdapter:
         require_rdma: bool = False,
         temperature_warning_grace: timedelta = timedelta(minutes=2),
         transient_warning_grace: timedelta = timedelta(minutes=2),
+        restore_collector_grace: timedelta = timedelta(seconds=120),
     ) -> None:
         self.metrics = metrics
         self.store = store or metrics.store
@@ -57,6 +59,13 @@ class GpuValidationAdapter:
         if transient_warning_grace < timedelta(seconds=15):
             raise ValueError("transient warning grace must be at least 15 seconds")
         self.transient_warning_grace = transient_warning_grace
+        if restore_collector_grace < timedelta(seconds=15):
+            raise ValueError("restore collector grace must be at least 15 seconds")
+        # How long a validated restore waits for the node's collectors before
+        # it fails naming them: an operator-driven restore of a node whose
+        # DaemonSets are not running (live: the exporter evicted, 604 s of
+        # silence under the 600 s cap) learns nothing from the cap.
+        self.restore_collector_grace = restore_collector_grace
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS
@@ -156,6 +165,9 @@ class GpuValidationAdapter:
                 required_collectors,
             )
             if isinstance(recent, dict):
+                dark = self._restore_collectors_dark(context, node_id, recent, now)
+                if dark is not None:
+                    return dark
                 pending[node_id] = {
                     **recent,
                     **quiesce_taint_pending(self.store, context, node_id),
@@ -239,6 +251,57 @@ class GpuValidationAdapter:
                 "validated_nodes": context.step.node_ids,
                 "validation": context.step.operation.value,
                 **({"inventory_requirement_clamped": clamped} if clamped else {}),
+            },
+        )
+
+    def _restore_collectors_dark(
+        self,
+        context: WorkflowStepContext,
+        node_id: str,
+        pending: dict[str, Any],
+        now: datetime,
+    ) -> WorkflowStepOutcome | None:
+        """Fail a validated restore whose collectors stayed silent past the grace.
+
+        Only the operator-driven validated restore (``workflow-validated-restore-``):
+        the chain's own post-action validation keeps the step cap, because the
+        exporter it waits for is the one its RESTORE just let back. The wait is
+        measured from the step's first attempt (``step_executions``).
+        """
+
+        stale = pending.get("missing_or_stale_collectors")
+        if not stale or not is_validated_restore_workflow(context.workflow.request_id):
+            return None
+        started = next(
+            (
+                execution.started_at
+                for execution in reversed(context.workflow.step_executions)
+                if execution.step_index == context.step_index
+                and execution.operation is context.step.operation
+            ),
+            None,
+        )
+        if started is None or now - started < self.restore_collector_grace:
+            return None
+        waited = int((now - started).total_seconds())
+        collectors = ", ".join(str(item) for item in stale)
+        reason = (
+            f"the gpu-fault collectors on {node_id} ({collectors}) have not "
+            f"reported for {waited}s: the node's DaemonSets are not running "
+            "(check the Pods on the node, the gpu-fault.io/quiesce taint and the "
+            "quiesced host services), then rerun the restore"
+        )
+        return WorkflowStepOutcome.failed(
+            f"validation failed on nodes: {node_id}: {reason}",
+            details={
+                "failed_nodes": [node_id],
+                "node_failures": {node_id: [f"collectors_not_reporting: {collectors}"]},
+                "validation": context.step.operation.value,
+                "collectors_not_reporting": {node_id: list(stale)},
+                "restore_collector_grace_seconds": int(
+                    self.restore_collector_grace.total_seconds()
+                ),
+                **quiesce_taint_pending(self.store, context, node_id),
             },
         )
 

@@ -17,6 +17,7 @@ from gpu_fault.node_agent.operations.holders import (
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+from gpu_fault.node_agent.query_clients import query_only_device_client
 
 
 class GpuClientsActive(RuntimeError):
@@ -486,7 +487,20 @@ class ClientOperationsMixin:
             for key, item in sorted(sample.items())
             if key not in shared
         ]
-        return persistent, transient
+        # A query that outlived every sample (``nvidia-smi`` with persistence
+        # mode off initialises the driver on each call) is still not a GPU
+        # user; it is reported with the transient holders, classified.
+        blocking = [
+            item
+            for item in persistent
+            if not query_only_device_client(self.proc_root, item)
+        ]
+        transient.extend(
+            {**item, "classification": "query-only"}
+            for item in persistent
+            if item not in blocking
+        )
+        return blocking, transient
 
     def _verify_no_clients(
         self,
@@ -537,4 +551,9 @@ class ClientOperationsMixin:
             "gpu_uuids": gpu_uuids,
             "device_clients_checked": include_device_clients,
             "transient_device_clients": transient_device_clients,
+            "query_only_device_clients": [
+                item
+                for item in transient_device_clients
+                if item.get("classification") == "query-only"
+            ],
         }

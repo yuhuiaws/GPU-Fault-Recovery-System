@@ -22,6 +22,13 @@ from scripts.e2e.regional.regional_commands import (
 )
 
 
+#: The interpreter a host probe runs under: the Agent's venv when the node
+#: runs the Agent, else the node's own python3 (AL2023 ships it; the probe
+#: scripts are stdlib-only).
+HOST_PROBE_AGENT_PYTHON = "/opt/gpu-fault/current/venv/bin/python"
+HOST_PROBE_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
 class HostProbeError(RuntimeError):
     pass
 
@@ -510,6 +517,17 @@ class HostProbeFixture:
             raise HostProbeError("host probe has no ownership record")
         self._record["script_may_exist"] = True
         self._save()
+        # The agent's venv is the interpreter on a node that runs the Agent; a
+        # node without it (the executor's CPU node on eks-managed, where the
+        # ISO-006 block is also aimed) falls back to the system python3, and a
+        # node with neither says so in the probe's own JSON shape instead of
+        # dying "exit 127" before any JSON (live, ISO-006 attempt 4). The
+        # choice is made inside the chroot, where the paths are the node's.
+        interpreters = " ".join((HOST_PROBE_AGENT_PYTHON, HOST_PROBE_SYSTEM_PYTHON))
+        missing = (
+            '{\\"error\\":\\"host probe interpreter missing\\",'
+            '\\"error_kind\\":\\"missing_binary\\",\\"missing_binary\\":\\"python3\\"}'
+        )
         command = (
             "reject() { printf '%s\\n' "
             """'{"error":"host probe setup rejected"}'; exit 1; }; """
@@ -517,7 +535,10 @@ class HostProbeFixture:
             'digest="$(sha256sum -- "$2" 2>/dev/null)" || reject; '
             'test "${digest%% *}" = "$3" || reject; fi; '
             'install -m 0700 "$1" "$2" 2>/dev/null || reject; shift 3; '
-            'exec chroot /host /opt/gpu-fault/current/venv/bin/python "$@"'
+            "exec chroot /host /bin/sh -c '"
+            f'for p in {interpreters}; do test -x "$p" && exec "$p" "$@"; done; '
+            f'printf "%s\\n" "{missing}"; exit 1'
+            '\' sh "$@"'
         )
         completed = self._kubectl(
             "exec",
@@ -578,6 +599,15 @@ class HostProbeFixture:
                 site = None
             kind = payload.get("error_kind")
             diagnostic = ""
+            missing = payload.get("missing_binary")
+            if (
+                kind == "missing_binary"
+                and isinstance(missing, str)
+                and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", missing)
+            ):
+                # The basename of a binary the probe needs and the node lacks:
+                # a fixed token (iptables, systemd-run, python3), never a path.
+                diagnostic += f"; missing binary on the node: {missing}"
             if kind == "collector_env_guard":
                 if code:
                     diagnostic += f"; collector-env guard {code}"

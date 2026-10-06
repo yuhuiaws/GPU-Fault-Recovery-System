@@ -99,9 +99,17 @@ def _unresolved_details(details: Mapping[str, Any]) -> bool:
         and details["node_action_command_id"]
     ):
         return True
+    # ``node_action_outcome_known``: the agent attests that every physical
+    # call it made returned a verdict (a reset refused busy, then refused at
+    # the final ownership boundary before its retry was spawned). A safety
+    # refusal that still wants an operator, but nothing is in flight to
+    # confirm -- the restore compensation may run and the record need not park
+    # (live, gpu-eks-cluster: FM and persistenced stayed stopped on an
+    # isolated node for a reset that was never performed).
     return (
         details.get("manual_confirmation_required") is True
         and details.get("node_action_not_started") is not True
+        and details.get("node_action_outcome_known") is not True
     )
 
 
@@ -401,10 +409,36 @@ def node_actions_operator_confirmed(workflow: WorkflowRequest) -> bool:
 def restoration_refusal(
     workflow: WorkflowRequest, step: WorkflowStepSpec
 ) -> WorkflowStepOutcome | None:
+    """Withhold an in-chain RESTORE_GPU_SERVICES while a node action's outcome
+    is unresolved -- except the restore that compensates a failure.
+
+    A chain that is landing a failure (``pending_failure_step_index`` set) has
+    its node isolated already; withholding its restore left the host services
+    stopped, the quiesce taint on, and a dark node that no later validation
+    could read (live, gpu-eks-cluster: the record parked BLOCKED on a refused
+    reset and every operator exit -- restore, confirm-node-action, reconcile
+    -- was refused until an EC2 reboot). The compensation restore now runs;
+    the record still parks for ``confirm-node-action`` when the outcome is
+    really unknown, with its services up and its taint gone. The residual
+    risk is the in-kernel tail of a reset whose nvidia-smi was killed at its
+    deadline: the restarted services attach to the GPU only once it answers.
+    """
+
     if (
         step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
         or not has_unresolved_node_action(workflow, include_restoration=False)
     ):
+        return None
+    if workflow.pending_failure_step_index is not None and not any(
+        _may_still_execute(execution.details)
+        for execution in latest_node_action_executions(workflow)
+        if execution.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
+        and unresolved_node_action(execution)
+    ):
+        # The agent answered -- unknown or unconfirmed, but answered; nothing
+        # is executing on the node any more. A command still PENDING on the
+        # agent (a deadline landing over a reset in flight) keeps the refusal:
+        # that reset may be running this very second.
         return None
     return WorkflowStepOutcome.failed(
         "automatic GPU service restoration requires resolved node actions",
@@ -416,6 +450,21 @@ def restoration_refusal(
             "safety_rejection": True,
         },
     )
+
+
+#: Remote command statuses under which the agent may still be executing.
+_OPEN_REMOTE_STATUSES = frozenset({"PENDING", "LEASED", "WAITING"})
+
+
+def _may_still_execute(details: Mapping[str, Any]) -> bool:
+    """Whether the node action behind ``details`` may be running on the agent."""
+
+    if details.get("node_action_state") == "PENDING" and details.get(
+        "node_action_command_id"
+    ):
+        return True
+    status = details.get("remote_status")
+    return isinstance(status, str) and status.upper() in _OPEN_REMOTE_STATUSES
 
 
 def unrestored_quiesces(

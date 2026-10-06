@@ -209,6 +209,17 @@ def idle_display_modules(proc_root: Path) -> list[str]:
     return releasable
 
 
+def display_module_state(proc_root: Path) -> list[dict[str, Any]]:
+    """The display-stack modules still loaded, with refcount and users -- the
+    evidence of what a release left in place."""
+
+    return [
+        item
+        for item in nvidia_kernel_module_clients(proc_root)
+        if item["module"] in IDLE_DISPLAY_MODULES
+    ]
+
+
 def gpu_client_holder_evidence(
     *,
     proc_root: Path,

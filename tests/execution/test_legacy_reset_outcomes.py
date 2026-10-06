@@ -194,9 +194,13 @@ def test_compatible_old_agent_ledger_failure_stays_unknown_end_to_end(
         assert "reset_completed" not in failure.details, (
             "the legacy exception-only result does not prove any per-GPU completion"
         )
-    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE]
+    # The agent answered (unknown, but answered): the failure compensation
+    # restores the quiesced services before the record parks -- the node is
+    # isolated, and a dark node blocked every later validation (live,
+    # gpu-eks-cluster). The reset itself is never resubmitted.
+    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE, RESTORE]
     assert saved.branch_escalation_counts == {}
-    assert RESTORE not in saved.completed_operations
+    assert RESTORE in saved.completed_operations
     classification = HardwareEscalationService.classify(saved)
     assert classification is not None
     assert classification[:3] == (

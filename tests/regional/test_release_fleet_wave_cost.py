@@ -208,10 +208,11 @@ def _probe_report(
                 SAFETY_PENDING="SAFETY_PENDING",
                 BLOCKED="BLOCKED",
                 RUNNING="RUNNING",
-            )
+            ),
+            WorkflowStepStatus=SimpleNamespace(WAITING="WAITING"),
         ),
         "gpu_fault.operation_registry": SimpleNamespace(
-            DESTRUCTIVE_OPERATIONS=frozenset()
+            DESTRUCTIVE_OPERATIONS=frozenset(), NODE_MUTATING_OPERATIONS=frozenset()
         ),
         "gpu_fault.workflow_resolution": SimpleNamespace(
             verified_restore_successor=lambda *_args: None

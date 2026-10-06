@@ -5337,7 +5337,12 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   tolerate the `nvidia.com/gpu` taint and runs on a CPU node, so a GPU-node-only block left it claiming (on the mixed
   site `cut_proof` came back 200); the preflight's `block_targets_b` and the evidence's `block_targets` list each node's
   `roles` (`gpu-node`/`executor-pod-node`), and every block receipt carries `node`, `roles` and the `rules` read back
-  from the kernel. The rule on every target node first creates a host-side automatic recovery timer;
+  from the kernel. The executor's CPU node runs no Node Agent and so has no `/opt/gpu-fault/current/venv/bin/python`:
+  the host probe falls back to the node's own `/usr/bin/python3` (AL2023 ships it; the probe scripts are stdlib-only)
+  and, with neither present, refuses in the probe's own JSON shape naming the gap (`missing binary on the node:
+  python3`) instead of "returned no JSON (exit 127)"; the network probe checks `iptables`/`systemd-run`/`systemctl`
+  **before** it creates the recovery timer or any rule and names the missing one (`error_kind=missing_binary`, the
+  fixture's `host probe failed (...; missing binary on the node: <name>)`). The rule on every target node first creates a host-side automatic recovery timer;
   the runner's `finally` then unblocks node by node. Passing `0.0.0.0/0` in place of the control-plane CIDR is forbidden.
   The block lands on both the `OUTPUT` and `FORWARD` chains of every B node (blocking only TCP 443 to the explicit control-plane
   CIDR); once blocked, the runner first samples one claim from B as `cut_proof`, which must fail at the **transport layer**
@@ -8747,7 +8752,17 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   the EFA/GPU allocatable dips it causes instead of queueing a RESTART_GPU_DEVICE_PLUGIN successor beside itself; and
   the quiesce taint has an exit in the FAILED compensation, the successor's isolation, the device plugin restart, the
   validated restore (`quiesce_taint_only`) and the VALIDATE_GPU pending reason. This case asserts that these details
-  keys are present, not their values.
+  keys are present, not their values. The fourth round's gaps are closed too: this case's own host sampler (an
+  `nvidia-smi` query) spans both samples of the final ownership recheck while persistence mode is off and is now
+  classified query-only, recorded in `physical_ownership_checks[].query_only_device_clients`, no longer
+  `OWNERSHIP_FINAL_CLIENTS_CHANGED`; an ownership refusal after a busy retry carries `node_action_outcome_known`,
+  `reset_verdict=not-applied` and `gpu_readback` (the target GPU re-read with `nvidia-smi -q` after the refusal); the
+  failure compensation's RESTORE_GPU_SERVICES runs even while the record carries an unresolved node action (the node is
+  isolated; host services and taint come back first, the record then parks BLOCKED for `confirm-node-action` on a
+  really unknown outcome); the display stack is unloaded with a re-read of `/proc/modules` per module,
+  `reloaded_kernel_modules` is written in load order and whatever stayed loaded is in `display_modules_retained`; a
+  validated restore's VALIDATE_GPU FAILS at once naming the collectors that have not reported after
+  `restore_collector_grace` (default 120 s) instead of waiting out the 600 s cap.
 - Steps:
   1. Confirm the executor has `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true` and the Node Action
      signing key is identical on both sides; the target Node Agent endpoint, generation and

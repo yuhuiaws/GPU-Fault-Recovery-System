@@ -34,6 +34,19 @@ against whatever ``gpu_fault`` is *already deployed* -- which, for the release
 that first carries the fix, is a module without it.
 ``tests/regional/test_release_workflow_safety.py`` pins the two copies together.
 
+``operator_confirmed_parked`` -- a BLOCKED / NEEDS_OPERATOR record whose node
+action an operator confirmed on evidence (``operator_confirmed`` on the step,
+the product's ``node_actions_operator_confirmed``) and that holds nothing live:
+no owner, no live lease, no WAITING step, no open remote command. It cannot act
+and its physical question is answered; the incident close and the dispatcher's
+settled-incident sweep end it. Live (gpu-eks-cluster, XID 46): a RESET_GPU
+refused at the final ownership boundary parked with ``outcome_unknown``, the
+operator rebooted the node and confirmed the action, and the record still held
+``gpu-fault-admin config`` and every release -- including the one carrying the
+close that would have ended it -- because this probe read the uncertainty flags
+beside the confirmation. The product's reader lets a confirmation beat them;
+so does this copy now.
+
 The ``except Exception: return False`` arms fail closed: a Store read that
 cannot prove a workflow harmless leaves it counted as a blocker.
 """
@@ -63,6 +76,29 @@ STATUSES = {
 }
 
 
+# The product's ``operator_confirmation`` reader (``execution.node_action_uncertainty``):
+# a confirmation counts only when it says who, under which reference, when, on
+# which node and for which operation. Inlined for the same reason as the rest.
+OPERATOR_CONFIRMED_KEY = "operator_confirmed"
+OPERATOR_CONFIRMATION_REQUIRED_KEYS = (
+    "actor",
+    "reference",
+    "confirmed_at",
+    "node_id",
+    "operation",
+)
+
+
+def operator_confirmed(details: Any) -> bool:
+    value = details.get(OPERATOR_CONFIRMED_KEY) if isinstance(details, dict) else None
+    if not isinstance(value, dict):
+        return False
+    return all(
+        isinstance(value.get(key), str) and value.get(key)
+        for key in OPERATOR_CONFIRMATION_REQUIRED_KEYS
+    )
+
+
 def has_unresolved_node_action(workflow: Any) -> bool:
     # Older deployed releases do not have the uncertainty helper. Match its
     # latest-result-per-step rule without importing a candidate-only module.
@@ -84,6 +120,9 @@ def has_unresolved_node_action(workflow: Any) -> bool:
                 execution.operation is WorkflowOperation.RESTORE_GPU_SERVICES
                 and details.get("restore_gpu_services_withheld") is True
             )
+            # An operator confirmation beats the uncertainty flags beside it:
+            # the operator judged later evidence than the receipt that set them.
+            or operator_confirmed(details)
         ):
             continue
         if (
@@ -140,6 +179,34 @@ def no_open_commands(store: Any, workflow: Any) -> bool:
         )
         for command in commands
     )
+
+
+def operator_confirmed_parked(store: Any, workflow: Any, now: datetime) -> bool:
+    # The parked record an operator answered: BLOCKED / NEEDS_OPERATOR, at least
+    # one node-mutating step carries a complete confirmation, none is unresolved
+    # (the caller checked), and nothing on it is live. Its incident may still be
+    # ESCALATED or QUARANTINED: the close or the validated restore that ends it
+    # needs the very release this gate guards.
+    if (
+        workflow.status is not WorkflowStatus.BLOCKED
+        or str(getattr(workflow, "blocked_kind", None) or "") != "NEEDS_OPERATOR"
+        or workflow.execution_owner_id is not None
+        or (
+            workflow.execution_lease_expires_at is not None
+            and workflow.execution_lease_expires_at > now
+        )
+        or any(
+            execution.status is WorkflowStepStatus.WAITING
+            for execution in workflow.step_executions
+        )
+        or not any(
+            execution.operation in NODE_MUTATING_OPERATIONS
+            and operator_confirmed(execution.details)
+            for execution in workflow.step_executions
+        )
+    ):
+        return False
+    return no_open_commands(store, workflow)
 
 
 def main() -> None:
@@ -288,6 +355,7 @@ def main() -> None:
     abandoned: list[str] = []
     compile_time: list[str] = []
     settled: list[str] = []
+    confirmed: list[str] = []
     for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
         if has_unresolved_node_action(workflow):
             blockers.append(workflow.request_id)
@@ -304,6 +372,8 @@ def main() -> None:
             compile_time.append(workflow.request_id)
         elif settled_incident_blocked(workflow):
             settled.append(workflow.request_id)
+        elif operator_confirmed_parked(store, workflow, now):
+            confirmed.append(workflow.request_id)
         else:
             blockers.append(workflow.request_id)
     print(
@@ -319,6 +389,8 @@ def main() -> None:
                 "compile_blocked_count": len(compile_time),
                 "settled_incident_blocked": settled[:100],
                 "settled_incident_blocked_count": len(settled),
+                "operator_confirmed_parked": confirmed[:100],
+                "operator_confirmed_parked_count": len(confirmed),
             },
             sort_keys=True,
         )

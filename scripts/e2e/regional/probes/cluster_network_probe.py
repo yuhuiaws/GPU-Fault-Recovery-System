@@ -18,19 +18,40 @@ class ProbeError(RuntimeError):
     pass
 
 
+class MissingBinary(ProbeError):
+    """A command the probe needs is not on this node (exit 127 territory).
+
+    Live (mixed site, ISO-006 attempt 4): the block was aimed at the executor
+    Pods' CPU nodes too, and the probe died "returned no JSON (exit 127)" with
+    nothing naming what was missing. The binary's basename is a fixed token
+    the fixture may show; the node's PATH and paths never leave the node.
+    """
+
+    def __init__(self, binary: str) -> None:
+        super().__init__(f"required binary is missing on the node: {binary}")
+        self.binary = binary
+
+
+#: Every binary ``block`` touches, checked before the first mutation.
+REQUIRED_BINARIES = ("iptables", "systemd-run", "systemctl")
+
+
 def run(
     command: list[str],
     *,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=120,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
+    except FileNotFoundError as exc:
+        raise MissingBinary(command[0].rsplit("/", 1)[-1]) from exc
     if check and completed.returncode:
         raise ProbeError(
             f"command failed ({completed.returncode}): "
@@ -127,9 +148,25 @@ def restore_script(chain: str) -> str:
     return f"{deletes}; iptables -F {chain} || true; iptables -X {chain} || true"
 
 
+def require_binaries() -> None:
+    """Refuse by name before the restore timer or any rule exists.
+
+    Probed through ``run`` (``--version`` is read-only), so a binary that is
+    not on the node surfaces as ``MissingBinary`` here rather than halfway
+    through the block with a timer already armed.
+    """
+
+    for binary in REQUIRED_BINARIES:
+        if binary == "iptables":
+            run(["iptables", "-S"])
+        else:
+            run([binary, "--version"], check=False)
+
+
 def block(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     cidrs = normalized_cidrs(arguments.control_plane_cidr)
+    require_binaries()
     chain = chain_name(run_id)
     if chain_state(chain)["residual"]:
         raise ProbeError("network probe chain already exists; refusing to replace it")
@@ -250,7 +287,11 @@ def main() -> int:
             raise ProbeError("restore seconds is outside 60..3600")
         arguments.handler(arguments)
     except Exception as exc:
-        emit({"error": f"{type(exc).__name__}: {exc}"})
+        payload: dict[str, Any] = {"error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(exc, MissingBinary):
+            payload["error_kind"] = "missing_binary"
+            payload["missing_binary"] = exc.binary
+        emit(payload)
         return 1
     return 0
 

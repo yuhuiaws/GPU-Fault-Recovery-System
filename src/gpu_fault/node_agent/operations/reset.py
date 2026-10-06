@@ -15,6 +15,8 @@ from gpu_fault.node_agent.late_ownership import (
     require_physical_ownership,
 )
 from gpu_fault.node_agent.operations.holders import (
+    IDLE_DISPLAY_MODULES,
+    display_module_state,
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
     idle_display_modules,
@@ -52,6 +54,9 @@ class GpuResetBusy(ResetProgressError):
             action_details={
                 "gpu_client_holders": evidence,
                 "gpu_reset_busy_attempts": attempts,
+                # Every reset this command spawned returned "In use by another
+                # client": a verdict, not an outcome in flight.
+                "node_action_outcome_known": True,
             },
         )
 
@@ -89,6 +94,38 @@ class ResetOperationsMixin:
     sleep: Callable[[float], None]
 
     _RESET_BUSY_ATTEMPTS = MAX_RESET_BUSY_ATTEMPTS
+    #: What a refused or busy reset reads back from its GPU afterwards: that the
+    #: device is still enumerated and answers, and the driver's own view of
+    #: whether a reset is wanted. Evidence for the record (live the refused
+    #: reset was recorded as an unknown outcome and every operator exit was
+    #: refused until an EC2 reboot); never a failure of its own.
+    _GPU_READBACK_FIELDS = (
+        "uuid",
+        "pstate",
+        "retired_pages.pending",
+        "reset_status.reset_required",
+        "reset_status.drain_and_reset_recommended",
+    )
+
+    def _gpu_readback(self, gpu_uuid: str) -> dict[str, Any]:
+        fields = list(self._GPU_READBACK_FIELDS)
+        try:
+            completed = self._run_checked(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=" + ",".join(fields),
+                    "--format=csv,noheader",
+                    "-i",
+                    gpu_uuid,
+                ],
+                timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 - the readback is evidence only
+            return {"error": type(exc).__name__}
+        values = [item.strip() for item in str(completed.stdout).strip().split(",")]
+        if len(values) != len(fields):
+            return {"raw": str(completed.stdout).strip()[:200]}
+        return dict(zip(fields, values, strict=True))
 
     def _release_idle_display_modules(
         self, gpu_uuids: list[str], released: list[str]
@@ -107,10 +144,20 @@ class ResetOperationsMixin:
         if evidence.get("device_holders") or evidence.get("compute_client_count"):
             return False
         unloaded = False
-        for module in idle_display_modules(self.proc_root):
+        # Re-read ``/proc/modules`` after every unload: ``nvidia_modeset`` is
+        # judged with ``nvidia_drm`` really gone (live the single snapshot
+        # released the DRM module alone and left modeset at refcount 1).
+        for _ in IDLE_DISPLAY_MODULES:
+            candidates = [
+                module
+                for module in idle_display_modules(self.proc_root)
+                if module not in released
+            ]
+            if not candidates:
+                break
             require_physical_ownership()
-            self._run_checked(["rmmod", module], timeout=30)
-            released.append(module)
+            self._run_checked(["rmmod", candidates[0]], timeout=30)
+            released.append(candidates[0])
             unloaded = True
         return unloaded
 
@@ -120,12 +167,20 @@ class ResetOperationsMixin:
         if not released:
             return {}
         details: dict[str, Any] = {"released_kernel_modules": list(released)}
+        try:
+            retained = display_module_state(self.proc_root)
+        except Exception:  # noqa: BLE001 - evidence only
+            retained = []
+        if retained:
+            # What the release left loaded (and why: its refcount and users),
+            # so a modeset that stayed behind is readable from the record.
+            details["display_modules_retained"] = retained
         # ``nvidia_drm`` depends on ``nvidia_modeset``: loading the outermost
-        # module restores the stack exactly as the image had it.
+        # module restores the stack exactly as the image had it, modeset first.
         outermost = "nvidia_drm" if "nvidia_drm" in released else released[-1]
         try:
             self._run_checked(["modprobe", outermost], timeout=60)
-            details["reloaded_kernel_modules"] = list(released)
+            details["reloaded_kernel_modules"] = list(reversed(released))
         except Exception as exc:  # noqa: BLE001 - the error is the evidence
             details["kernel_module_reload_error"] = f"{type(exc).__name__}: {exc}"
         return details
@@ -280,6 +335,22 @@ class ResetOperationsMixin:
                             {"node_action_not_started": not completed}
                             if isinstance(exc, OwnershipRefused)
                             else {}
+                        ),
+                        # Every nvidia-smi this loop spawned returned (the
+                        # unknown case is ``ResetOutcomeUnknown``): a refusal
+                        # at the final ownership boundary after a busy retry is
+                        # a known verdict -- not applied -- and the GPU is
+                        # read back to say so, not an outcome to confirm.
+                        **(
+                            {}
+                            if unknown
+                            else {
+                                "node_action_outcome_known": True,
+                                "reset_verdict": "not-applied",
+                                "gpu_readback": {
+                                    gpu_uuid: self._gpu_readback(gpu_uuid)
+                                },
+                            }
                         ),
                         "reset_completed": completed,
                         "reset_outcome_unknown": [gpu_uuid] if unknown else [],

@@ -323,8 +323,18 @@ class IncidentClosureService:
             ),
             "cluster_id": incident.cluster_id,
             "node_ids": list(incident.node_ids),
-            "evidence_required": (
-                incident.state in EVIDENCE_CLOSABLE_STATES and evidence is None
+            "evidence_required": evidence is None
+            and (
+                incident.state in EVIDENCE_CLOSABLE_STATES
+                # An ESCALATED incident held open only by a parked record whose
+                # node action an operator confirmed: node evidence that clears
+                # every node is what lets the close end that record too, so
+                # the CLI's second pass reads it (live, gpu-eks-cluster).
+                or (
+                    incident.state in OPERATOR_CLOSABLE_STATES
+                    and open_workflow is not None
+                    and self._operator_settled(open_workflow)
+                )
             ),
             "isolation_reasons": isolation_reasons,
         }
@@ -618,6 +628,16 @@ class IncidentClosureService:
                     None,
                     [],
                 )
+        elif incident.state in OPERATOR_CLOSABLE_STATES and evidence is not None:
+            # ESCALATED closes on the operator's authority alone; evidence that
+            # does not clear the nodes changes nothing. Evidence that does is
+            # what lets a parked, operator-confirmed record of the incident end
+            # with the close (live, gpu-eks-cluster: an ESCALATED XID 46
+            # incident whose reset record was confirmed on the node's reboot
+            # stayed un-closable while that record was open).
+            cleared, reasons = isolation_verdict(incident, evidence)
+            if cleared is None:
+                isolation_reasons = reasons
         elif incident.state not in OPERATOR_CLOSABLE_STATES:
             return (
                 f"incident {incident.incident_id} is {incident.state.value}; only an "

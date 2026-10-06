@@ -16,7 +16,11 @@ Three independent things make a wave unsafe, and each is counted separately:
   mid-``RESET_GPU`` leaves the GPU in whatever state the reset reached.
   ``verified_restore_successor`` splits these: one whose restore was already
   verified by a later workflow is reported separately, because it is a record
-  waiting to be closed rather than live danger;
+  waiting to be closed rather than live danger; so is a BLOCKED record whose
+  node action an operator confirmed on evidence and that holds nothing live
+  (``operator_confirmed_destructive_workflows``, the same predicate as the
+  preflight's ``operator_confirmed_parked``) -- it cannot act, and the agent a
+  wave restarts is not mid-anything on its behalf;
 * nodes *outside* the wave whose agent is not healthy -- taking the wave down
   then leaves the cluster with no margin at all.
 
@@ -34,8 +38,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowStatus
-from gpu_fault.operation_registry import DESTRUCTIVE_OPERATIONS
+from gpu_fault.models import WorkflowStatus, WorkflowStepStatus
+from gpu_fault.operation_registry import (
+    DESTRUCTIVE_OPERATIONS,
+    NODE_MUTATING_OPERATIONS,
+)
+from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.workflow_resolution import verified_restore_successor
 
 NONTERMINAL = {
@@ -44,6 +52,65 @@ NONTERMINAL = {
     WorkflowStatus.BLOCKED,
     WorkflowStatus.RUNNING,
 }
+# The product's ``operator_confirmation`` reader, inlined like the preflight's
+# ``workflow_safety.py`` copy: the Pod runs whatever ``gpu_fault`` is deployed.
+OPERATOR_CONFIRMED_KEY = "operator_confirmed"
+OPERATOR_CONFIRMATION_REQUIRED_KEYS = (
+    "actor",
+    "reference",
+    "confirmed_at",
+    "node_id",
+    "operation",
+)
+
+
+def operator_confirmed(details: Any) -> bool:
+    value = details.get(OPERATOR_CONFIRMED_KEY) if isinstance(details, dict) else None
+    if not isinstance(value, dict):
+        return False
+    return all(
+        isinstance(value.get(key), str) and value.get(key)
+        for key in OPERATOR_CONFIRMATION_REQUIRED_KEYS
+    )
+
+
+def operator_confirmed_parked(store: Any, workflow: Any, now: datetime) -> bool:
+    """BLOCKED / NEEDS_OPERATOR, a confirmed node action, nothing live on it."""
+
+    if (
+        workflow.status is not WorkflowStatus.BLOCKED
+        or str(getattr(workflow, "blocked_kind", None) or "") != "NEEDS_OPERATOR"
+        or workflow.execution_owner_id is not None
+        or (
+            workflow.execution_lease_expires_at is not None
+            and workflow.execution_lease_expires_at > now
+        )
+        or any(
+            execution.status is WorkflowStepStatus.WAITING
+            for execution in workflow.step_executions
+        )
+        or not any(
+            execution.operation in NODE_MUTATING_OPERATIONS
+            and operator_confirmed(execution.details)
+            for execution in workflow.step_executions
+        )
+    ):
+        return False
+    try:
+        commands = store.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+    except Exception:
+        return False
+    return not any(
+        command.status
+        in (
+            RemoteCommandStatus.PENDING,
+            RemoteCommandStatus.LEASED,
+            RemoteCommandStatus.WAITING,
+        )
+        for command in commands
+    )
 
 
 def main() -> None:
@@ -54,8 +121,10 @@ def main() -> None:
         status: int((remote.get("by_status") or {}).get(status, 0))
         for status in ("PENDING", "LEASED", "WAITING")
     }
+    now = datetime.now(timezone.utc)
     destructive: list[str] = []
     resolved_destructive: list[str] = []
+    confirmed_destructive: list[str] = []
     for item in context.store.list_workflows(statuses=NONTERMINAL, limit=1001):
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in item.official_steps
@@ -63,9 +132,10 @@ def main() -> None:
             continue
         if verified_restore_successor(context.store, item) is not None:
             resolved_destructive.append(item.request_id)
+        elif operator_confirmed_parked(context.store, item, now):
+            confirmed_destructive.append(item.request_id)
         else:
             destructive.append(item.request_id)
-    now = datetime.now(timezone.utc)
     excluded = set(expected["wave"])
     required = set(expected["nodes"]) - excluded
     agents = {
@@ -120,6 +190,8 @@ def main() -> None:
         "destructive_workflows": destructive[:20],
         "resolved_destructive_workflow_count": len(resolved_destructive),
         "resolved_destructive_workflows": resolved_destructive[:20],
+        "operator_confirmed_destructive_workflow_count": len(confirmed_destructive),
+        "operator_confirmed_destructive_workflows": confirmed_destructive[:20],
         "agent_blocker_count": agent_blocker_count,
         "agent_blockers": agent_blockers,
         "minimum_lease_remaining_seconds": (

@@ -795,6 +795,16 @@ def _confirmation(
         "terminal_node_result": terminal[0],
         "terminal_node_result_source": terminal[1],
         "validated_by_workflow": validated_by,
+        "settled_by": (
+            "terminal_node_result"
+            if terminal[0] is not None
+            else "validated_restore"
+            if validated_by is not None
+            else "reboot_since_action"
+            if previous is not None
+            and execution.operation not in BOOT_TRANSITION_OPERATIONS
+            else "boot_transition"
+        ),
         "superseded_flags": {
             key: execution.details[key]
             for key in UNCERTAINTY_FLAGS
@@ -867,13 +877,27 @@ def confirm_node_action(
             terminal = _terminal_node_result(execution, node_id, remote_commands)
             validated_by = successor_validation(successor, workflow, incident, node_id)
             if terminal[0] is None and validated_by is None:
-                reasons.append(
-                    f"no terminal Node Agent result for {execution.operation.value} on "
-                    f"node {node_id} is recorded on step {execution.step_index} or its "
-                    "remote commands, and no later validated restore of this incident "
-                    "validated the node; the agent ledger on the node is the only "
-                    "record and this disposition cannot read it"
+                # A reboot since the action settles it as surely as its own
+                # answer would: no GPU reset survives a boot, and the driver
+                # the node runs now is a fresh load. Live (gpu-eks-cluster,
+                # XID 46): the reset's refusal was recorded unknown, the
+                # operator rebooted the node, and this disposition still
+                # refused for want of the agent's ledger line -- an open record
+                # nothing could close (the ``uninstall`` "active workflows"
+                # gate included).
+                rebooted, previous = _boot_transition_refusals(
+                    execution, incident, node_id, node, agent, remote_commands
                 )
+                if rebooted:
+                    previous = None
+                    reasons.append(
+                        f"no terminal Node Agent result for {execution.operation.value} "
+                        f"on node {node_id} is recorded on step {execution.step_index} or "
+                        "its remote commands, no later validated restore of this "
+                        "incident validated the node, and no reboot since the action "
+                        "is proven (" + "; ".join(rebooted) + "); the agent ledger on "
+                        "the node is the only record and this disposition cannot read it"
+                    )
         if reasons:
             refusals.extend(reasons)
             continue

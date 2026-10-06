@@ -8646,10 +8646,23 @@ needs `--node`, see item 9).
    (`agent_baselines` / `stop_reboot_authorization_v1` / the single-node incident's `source_boot_id`;
    refused when none exists); other node actions require the Agent's terminal answer (`node_results`) on the remote command, or a later validated restore of the same incident
    having completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node and made the incident
-   RECOVERED. Effect: the step's uncertainty flags are set to false, `operator_confirmed` records the evidence verbatim, the step stays FAILED,
+   RECOVERED, or -- the same evidence as `RESTART_NODE` -- a reboot of the node since the action (no GPU reset survives a boot;
+   the confirmation's `settled_by` names `terminal_node_result`/`validated_restore`/`reboot_since_action`). Effect: the step's uncertainty flags are set to false, `operator_confirmed` records the evidence verbatim, the step stays FAILED,
    and the record stays BLOCKED; afterwards the restore of item 8 makes the incident RECOVERED and produces a verified restore successor,
    and `workflow-reconcile` closes out the record (Administrator Operations §10.2). Idempotent: rerunning for an already confirmed node gives `no_op=true`.
    The evidence file is `<state-dir>/submit-remediation/<incident-id>/confirm-node-action-<time>.json`.
+   **The release gate and a confirmed parked record**: the workflow safety probe of the `deploy`/`gpu-fault-admin config`
+   preflight (`deploy/control-plane/regional/probes/workflow_safety.py`; the fleet wave's `rollout_wave_safety.py` likewise)
+   ships with the CLI bundle and runs in the Pod as source; like the product, it lets an operator confirmation beat the
+   `outcome_unknown` flags beside it and sets a "BLOCKED/NEEDS_OPERATOR, node action confirmed, no owner / live lease /
+   WAITING step / open remote command" record aside as `operator_confirmed_parked` (the wave probe:
+   `operator_confirmed_destructive_workflows`), outside `blocker_count` -- such a record used to hold `config` and every
+   release with `active destructive workflows block release`, including the release carrying its own close. Sequence:
+   refresh the CLI bundle -> `confirm-node-action` -> the preflight passes, release -> once it has landed,
+   `workflow-reconcile --close-incident <incident>` (an ESCALATED incident closes with node evidence that clears the nodes
+   too; `preview` reports `evidence_required` for the confirmed parked record and the CLI reads the node evidence and
+   submits a second pass) -> the incident ends RECOVERED and the dispatcher sweep ends the record SUPERSEDED
+   (Administrator Operations §9.4).
 
 <a id="104-手工删除无-ttl-的-incident-审计记录"></a>
 <a id="84-手工删除无-ttl-的-incident-审计记录"></a>

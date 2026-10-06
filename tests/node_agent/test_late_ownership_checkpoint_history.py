@@ -223,7 +223,13 @@ def test_real_reset_wrapper_and_ledger_preserve_checkpoint_uncertainty(
     else:
         assert resets == [["nvidia-smi", "--gpu-reset", "-i", "GPU-a"]]
         assert "node_action_not_started" not in result.details
-        assert result.details["outcome_unknown"] is True
+        # Every nvidia-smi this command spawned returned (busy, or GPU-a done):
+        # the refusal that followed is a verdict, not an outcome to confirm
+        # (live, gpu-eks-cluster: the unknown outcome parked the record and
+        # withheld the restore on a reset that was never performed).
+        assert "outcome_unknown" not in result.details, result.details
+        assert result.details["node_action_outcome_known"] is True
+        assert result.details["reset_verdict"] == "not-applied"
         assert result.details["manual_confirmation_required"] is True
         assert [
             item["sequence"] for item in result.details["physical_ownership_checks"]

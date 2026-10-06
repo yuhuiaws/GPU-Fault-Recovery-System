@@ -37,13 +37,29 @@ MODULES_WITH_IDLE_DRM = (
 
 
 class DisplayStackRunner:
-    """The reset is busy until ``nvidia_drm`` is unloaded; records every call."""
+    """The reset is busy until ``nvidia_drm`` is unloaded; records every call.
 
-    def __init__(self, *, modules: Path, busy_forever: bool = False) -> None:
+    ``modeset_user``: a module that keeps ``nvidia_modeset`` loaded besides
+    ``nvidia_drm``; ``modeset_user_leaves_with_drm`` makes that user vanish
+    once the DRM module is gone (the live shape: the single snapshot said
+    modeset had another reference, a re-read after the unload would not).
+    """
+
+    def __init__(
+        self,
+        *,
+        modules: Path,
+        busy_forever: bool = False,
+        modeset_user: str | None = None,
+        modeset_user_leaves_with_drm: bool = True,
+    ) -> None:
         self.modules = modules
         self.busy_forever = busy_forever
+        self.modeset_user = modeset_user
+        self.modeset_user_leaves_with_drm = modeset_user_leaves_with_drm
         self.commands: list[list[str]] = []
         self.loaded = {"nvidia_drm", "nvidia_modeset"}
+        self._write()
 
     def __call__(self, cmd, **_):
         self.commands.append(cmd)
@@ -71,8 +87,13 @@ class DisplayStackRunner:
         if "nvidia_drm" in self.loaded:
             rows.append("nvidia_drm 94208 0 -")
         if "nvidia_modeset" in self.loaded:
-            users = "nvidia_drm" if "nvidia_drm" in self.loaded else "-"
-            rows.append(f"nvidia_modeset 1327104 {1 if users != '-' else 0} {users}")
+            users = ["nvidia_drm"] if "nvidia_drm" in self.loaded else []
+            if self.modeset_user and (
+                "nvidia_drm" in self.loaded or not self.modeset_user_leaves_with_drm
+            ):
+                users.append(self.modeset_user)
+            used_by = ",".join(users) + "," if users else "-"
+            rows.append(f"nvidia_modeset 1327104 {len(users)} {used_by}")
         rows.append("nvidia 8933376 2 nvidia_uvm,nvidia_modeset")
         self.modules.write_text("\n".join(rows) + "\n", encoding="ascii")
 
@@ -148,7 +169,11 @@ def test_the_busy_reset_unloads_the_display_stack_retries_and_reloads(
     )
     assert reloads[0] > resets[1]
     assert result.details["released_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
-    assert result.details["reloaded_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
+    assert result.details["reloaded_kernel_modules"] == [
+        "nvidia_modeset",
+        "nvidia_drm",
+    ], "recorded in load order: modprobe nvidia_drm pulls modeset in first"
+    assert "display_modules_retained" not in result.details
     assert result.details["reset_attempts"] == 2
     assert result.details["reset_busy_refusals"] == 1
 
@@ -169,7 +194,7 @@ def test_a_reset_that_stays_busy_still_reloads_and_reports_the_release(
         "the busy retry budget is unchanged"
     )
     assert result.details["released_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
-    assert result.details["reloaded_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
+    assert result.details["reloaded_kernel_modules"] == ["nvidia_modeset", "nvidia_drm"]
     assert result.details["reset_failed"] == ["GPU-a"]
     assert result.details["gpu_client_holders"]["device_holders"] == []
 
@@ -187,3 +212,40 @@ def test_a_visible_device_holder_keeps_every_module_loaded(tmp_path: Path) -> No
     )
     assert "released_kernel_modules" not in result.details
     assert result.details["gpu_client_holders"]["device_holder_count"] == 1
+
+
+def test_modeset_is_released_on_the_re_read_after_drm_is_gone(tmp_path: Path) -> None:
+    """Live (release 5377615bd785): only ``nvidia_drm`` was unloaded and
+    ``nvidia_modeset`` stayed at refcount 1. A single snapshot judged modeset
+    while a second reference was still on it; the agent now re-reads
+    ``/proc/modules`` after every unload and judges modeset with drm gone."""
+
+    proc = _proc(tmp_path)
+    runner = DisplayStackRunner(modules=proc / "modules", modeset_user="ghost_user")
+    agent = _agent(tmp_path, runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.RESET_GPU)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["released_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
+    assert result.details["reloaded_kernel_modules"] == ["nvidia_modeset", "nvidia_drm"]
+    assert "display_modules_retained" not in result.details
+
+
+def test_a_modeset_user_that_stays_is_recorded_as_retained(tmp_path: Path) -> None:
+    proc = _proc(tmp_path)
+    runner = DisplayStackRunner(
+        modules=proc / "modules",
+        modeset_user="ghost_user",
+        modeset_user_leaves_with_drm=False,
+    )
+    agent = _agent(tmp_path, runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.RESET_GPU)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["released_kernel_modules"] == ["nvidia_drm"]
+    assert result.details["reloaded_kernel_modules"] == ["nvidia_drm"]
+    assert result.details["display_modules_retained"] == [
+        {"module": "nvidia_modeset", "refcount": 1, "used_by": ["ghost_user"]}
+    ], "what stayed loaded, and who kept it, is in the record"

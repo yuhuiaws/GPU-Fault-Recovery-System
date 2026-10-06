@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import runpy
 from datetime import datetime, timedelta, timezone
@@ -256,3 +257,161 @@ def test_compile_time_probe_requires_the_runtime_never_claimed_shape(
     report = probe_report(monkeypatch, capsys, workflow, incident)
     assert report["blocker_count"] == int(bool(reasons)), reasons
     assert report["compile_blocked_count"] == int(not reasons), reasons
+
+
+def _confirmed_parked_pair(
+    *, confirmation: dict | None, incident_state=IncidentState.ESCALATED
+):
+    """The live shape: a RESET_GPU parked ``outcome_unknown`` whose node action an
+    operator confirmed on the node's reboot; the incident ESCALATED, pointing at
+    a failed restore attempt."""
+
+    details = {"outcome_unknown": True, "manual_confirmation_required": True}
+    if confirmation is not None:
+        details["operator_confirmed"] = confirmation
+    workflow = workflow_request(
+        "workflow-ec95fa59",
+        "inc-xid-46",
+        status=WorkflowStatus.BLOCKED,
+        blocked_kind=BlockedKind.NEEDS_OPERATOR,
+        execution_epoch=4,
+        official_steps=[
+            workflow_step(WorkflowOperation.QUIESCE_GPU_SERVICES),
+            workflow_step(WorkflowOperation.RESET_GPU),
+        ],
+        completed_step_indexes=[0],
+        step_executions=[
+            workflow_step_execution(0, WorkflowOperation.QUIESCE_GPU_SERVICES),
+            workflow_step_execution(
+                1,
+                WorkflowOperation.RESET_GPU,
+                WorkflowStepStatus.FAILED,
+                details=details,
+            ),
+        ],
+    )
+    incident = fault_incident(
+        "inc-xid-46",
+        "kernel-log-kmsg-xid-46",
+        state=incident_state,
+        workflow_request_id="workflow-validated-restore-attempt",
+        fencing_token=workflow.fencing_token,
+    )
+    return workflow, incident
+
+
+COMPLETE_CONFIRMATION = {
+    "actor": "arn:aws:sts::123456789012:assumed-role/Admin/ops",
+    "reference": "CHG-2026-1006-01",
+    "confirmed_at": "2026-10-06T01:00:00+00:00",
+    "node_id": "node-a",
+    "operation": "RESET_GPU",
+    "settled_by": "reboot_since_action",
+}
+
+
+def test_an_operator_confirmed_parked_record_is_set_aside_not_a_blocker(
+    monkeypatch, capsys
+) -> None:
+    """Live (gpu-eks-cluster, XID 46): the confirmed record held
+    ``gpu-fault-admin config`` and every release, the one carrying its close
+    included. It holds nothing live; the gate reports it and rolls past."""
+
+    workflow, incident = _confirmed_parked_pair(confirmation=COMPLETE_CONFIRMATION)
+
+    report = probe_report(monkeypatch, capsys, workflow, incident)
+
+    assert report["blocker_count"] == 0, report
+    assert report["operator_confirmed_parked"] == ["workflow-ec95fa59"]
+    assert report["operator_confirmed_parked_count"] == 1
+    assert report["settled_incident_blocked_count"] == 0, (
+        "ESCALATED is not RECOVERED: this is the confirmed shape, not the settled one"
+    )
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["unconfirmed", "incomplete-confirmation", "live-lease", "waiting", "open-command"],
+)
+def test_the_confirmed_set_aside_needs_a_complete_confirmation_and_nothing_live(
+    monkeypatch, capsys, condition
+) -> None:
+    confirmation = dict(COMPLETE_CONFIRMATION)
+    if condition == "incomplete-confirmation":
+        confirmation["reference"] = ""
+    workflow, incident = _confirmed_parked_pair(
+        confirmation=None if condition == "unconfirmed" else confirmation
+    )
+    commands = []
+    if condition == "live-lease":
+        workflow.execution_lease_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=1
+        )
+    elif condition == "waiting":
+        workflow.step_executions.append(
+            workflow_step_execution(
+                1, WorkflowOperation.RESET_GPU, WorkflowStepStatus.WAITING
+            )
+        )
+    elif condition == "open-command":
+        commands = [
+            SimpleNamespace(command_id="command-a", status=RemoteCommandStatus.LEASED)
+        ]
+
+    report = probe_report(monkeypatch, capsys, workflow, incident, commands)
+
+    assert report["blocker_count"] == 1, (condition, report)
+    assert report["operator_confirmed_parked"] == [], condition
+
+
+WAVE_PROBE = Path(__file__).resolve().parents[2] / (
+    "deploy/control-plane/regional/probes/rollout_wave_safety.py"
+)
+
+
+def wave_report(monkeypatch, capsys, workflow, incident, commands=()):
+    store = SimpleNamespace(
+        remote_command_stats=lambda: {"by_status": {}},
+        list_workflows=lambda **_kwargs: [workflow],
+        get_incident=lambda _incident_id: incident,
+        get_workflow=lambda request_id: (_ for _ in ()).throw(KeyError(request_id)),
+        list_remote_commands=lambda **_kwargs: commands,
+        list_agents=lambda _cluster_id: [],
+    )
+    monkeypatch.setattr(
+        ApplicationContext,
+        "from_environment",
+        staticmethod(lambda: SimpleNamespace(store=store)),
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "cluster_id": "gpu-a",
+                    "nodes": [],
+                    "wave": [],
+                    "minimum_lease_remaining_seconds": 30,
+                }
+            )
+        ),
+    )
+    runpy.run_path(str(WAVE_PROBE))
+    return json.loads(capsys.readouterr().out)
+
+
+def test_the_wave_probe_sets_the_confirmed_parked_record_aside_too(
+    monkeypatch, capsys
+) -> None:
+    workflow, incident = _confirmed_parked_pair(confirmation=COMPLETE_CONFIRMATION)
+
+    report = wave_report(monkeypatch, capsys, workflow, incident)
+
+    assert report["destructive_workflow_count"] == 0, report
+    assert report["operator_confirmed_destructive_workflows"] == ["workflow-ec95fa59"]
+    assert report["operator_confirmed_destructive_workflow_count"] == 1
+
+    unconfirmed, incident = _confirmed_parked_pair(confirmation=None)
+    report = wave_report(monkeypatch, capsys, unconfirmed, incident)
+    assert report["destructive_workflow_count"] == 1
+    assert report["operator_confirmed_destructive_workflow_count"] == 0

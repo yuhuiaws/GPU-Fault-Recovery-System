@@ -144,7 +144,15 @@ def test_restore_polling_is_exempt_but_an_unresolved_restore_cannot_release_node
 
 
 @pytest.mark.parametrize("dag", [False, True])
-def test_unknown_reset_blocks_compensation_and_keeps_node_occupied(dag: bool) -> None:
+def test_unknown_reset_restores_services_then_parks_and_keeps_node_occupied(
+    dag: bool,
+) -> None:
+    """The agent answered FAILED with an unknown verdict: nothing executes on the
+    node any more, so the failure compensation restores the quiesced services
+    (live, gpu-eks-cluster: withholding it left FM/persistenced stopped and the
+    quiesce taint on an isolated node, and every operator exit refused); the
+    record still parks BLOCKED for ``confirm-node-action``."""
+
     h = FlowHarness([QUIESCE, RESET, RESTORE])
     h.amend(dag_enabled=dag)
     h.adapter.outcomes[RESET] = WorkflowStepOutcome.failed(
@@ -158,10 +166,14 @@ def test_unknown_reset_blocks_compensation_and_keeps_node_occupied(dag: bool) ->
     assert workflow_is_open(saved.status, saved.blocked_kind), (
         "operator-blocked physical uncertainty must continue to occupy its node"
     )
-    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE, RESET]
-    assert RESTORE not in saved.completed_operations
+    assert [context.step.operation for context in h.adapter.calls] == [
+        QUIESCE,
+        RESET,
+        RESTORE,
+    ], "the compensation restore runs before the record parks"
+    assert RESTORE in saved.completed_operations
     assert h.execute().status is WorkflowStatus.BLOCKED
-    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE, RESET]
+    assert len(h.adapter.calls) == 3, "a parked record dispatches nothing more"
 
 
 @pytest.mark.parametrize("known_refusal", [False, True])

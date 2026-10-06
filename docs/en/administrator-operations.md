@@ -1092,7 +1092,30 @@ Semantics and boundaries of `eks-managed`:
   predecessor -- the reboot rung, the restore compensation -- into `command fencing token does not match
   workflow/incident`); and a step the executor refused before dispatch (`remote_status_source=executor-rejected`) climbs
   neither ladder (the branch is exhausted with "refused the command before dispatch ... generation N" and the
-  whole-workflow classifier opens no reboot-after/support-after). **Third-party GPU client DaemonSets on GPU nodes must therefore not tolerate
+  whole-workflow classifier opens no reboot-after/support-after). **A read-only `nvidia-smi` is not a GPU client**: in the
+  sampled preflight and the final ownership recheck a holder whose `comm` is `nvidia-smi`, whose descriptor table can be
+  read in full and names no `/dev/nvidia-uvm` (every CUDA context opens it) is classified query-only and no longer refuses
+  the reset with `OWNERSHIP_FINAL_CLIENTS_CHANGED` (with persistence mode off -- the quiesce stopped `nvidia-persistenced`
+  -- each `nvidia-smi` query initialises the driver and holds the device for seconds, so one query by the acceptance
+  sampler spanned both 0.5 s samples); the VERIFY receipt's `query_only_device_clients` and the ownership receipt's
+  `physical_ownership_checks[].query_only_device_clients` record what was ignored; any other name, a UVM descriptor or an
+  unreadable descriptor table still refuses. **An ownership refusal after a busy retry is not an unknown outcome**: when
+  every `nvidia-smi --gpu-reset` the loop spawned has returned (a busy refusal is a verdict) the Agent attests
+  `node_action_outcome_known: true`; the final ownership boundary no longer writes `outcome_unknown` for a safety refusal
+  after a granted checkpoint (it keeps `manual_confirmation_required`: a safety refusal goes to an operator, never to a
+  reboot rung), and the control plane (`node_action_uncertainty._unresolved_details`, `recovery_safety.unresolved_details`)
+  reads a record carrying that attestation as resolved -- the RESTORE_GPU_SERVICES compensation runs, the taint comes
+  off, the host services come back, and the record no longer parks BLOCKED on "automatic GPU service restoration requires
+  resolved node actions". A really unknown outcome (an nvidia-smi timeout) still parks for `confirm-node-action`, but
+  **the failure compensation's RESTORE_GPU_SERVICES runs first** (`execution/node_action_uncertainty.restoration_refusal`:
+  once the record is landing its failure and the Agent has answered -- the command is no longer PENDING/LEASED -- the host
+  services are restored and the taint removed, then the record parks; the node is isolated, and a dark node blocks every
+  later validation; the residual risk is the in-kernel tail of an nvidia-smi killed at its deadline, and the restarted
+  services attach only once the GPU answers). The Agent's quiesce fail-safe timer (`GPU_FAULT_QUIESCE_FAILSAFE_SECONDS`,
+  default 420 s) remains the last line. The display-stack unload re-reads `/proc/modules` after every module: `nvidia_modeset` is judged with
+  `nvidia_drm` really gone (the single snapshot used to unload drm alone and leave modeset at refcount 1), whatever stayed
+  loaded is recorded with its refcount/users in `display_modules_retained`, and `reloaded_kernel_modules` is written in
+  load order (`nvidia_modeset` before `nvidia_drm`; `modprobe nvidia_drm` pulls the dependency in itself). **Third-party GPU client DaemonSets on GPU nodes must therefore not tolerate
   `gpu-fault.io/quiesce`** (a key-less `operator: Exists` wildcard toleration keeps them inside the window and the
   reset still fails with `In use by another client`) and must tolerate being stopped inside the window; otherwise keep
   them off nodes carrying the `gpu-fault.io/quarantined` taint by their own affinity. When `nvidia-smi --gpu-reset`
@@ -3097,6 +3120,35 @@ with details carrying `outcome_unknown: true, manual_confirmation_required: true
 (the Agent happened to be stopped while the node rebooted), and the product stopped the record fail-closed by design. That record occupies all nodes of the incident:
 `restore`, `--close-quarantined` and `workflow-reconcile` all refuse, and new faults on the two nodes no longer open incidents. On site you see
 the node Ready on a new boot with the Agent back, but the product had no entry point to record that fact -- this command is that entry point.
+**Reboot evidence is accepted for a `RESET_GPU` with unknown outcome too**: the confirmation of a GPU reset used to
+accept only two kinds of evidence -- the Agent's terminal receipt (SUCCEEDED/FAILED in the step's or the remote command's
+`node_results`) or a later SUCCEEDED validated restore of the same incident -- and refused "no terminal Node Agent result
+... and no later validated restore" when both were missing, even after the node had been rebooted from EC2 and the
+Agent was back: an open workflow nothing could close (and the `uninstall` "active workflows" gate with it). It now works
+like `RESTART_NODE`: a reboot since the action -- kubelet and the Agent agree on a boot id that differs from the one
+recorded before the action (`agent_baselines`, `stop_reboot_authorization`, or a single-node incident's `source_boot_id`;
+the Agent incarnation changed too) -- is enough: no GPU reset survives a boot, and the node runs a freshly loaded driver.
+The confirmation's `settled_by` names the basis: `terminal_node_result`/`validated_restore`/`reboot_since_action`
+(`boot_transition` for `RESTART_NODE` itself). Afterwards: a QUARANTINED incident takes the restore of §9.2 or
+`--close-quarantined` with node evidence; an ESCALATED one (a restore attempt FAILED, say) is closed RECOVERED on the
+operator's authority with `workflow-reconcile --close-incident <id>`, the parked record ends SUPERSEDED with it and the
+node is no longer occupied.
+**The release gate no longer stops on a confirmed parked record**: the workflow safety probe behind `gpu-fault-admin
+config`/`deploy` (`deploy/control-plane/regional/probes/workflow_safety.py`; the fleet wave's `rollout_wave_safety.py`
+likewise) used to read `outcome_unknown` in the step details as still unresolved even beside an operator confirmation;
+it now agrees with the product -- a confirmation beats the uncertainty flags -- and sets a "BLOCKED/NEEDS_OPERATOR,
+node action confirmed, no owner / live lease / WAITING step / open remote command" record aside as
+`operator_confirmed_parked` (the wave probe: `operator_confirmed_destructive_workflows`), outside `blocker_count`. The
+probes ship with the CLI bundle and run in the Pod as source, so refreshing the bundle is enough; no release has to
+land first. The sequence on site (control plane still on the previous release): 1) refresh the deploy host's CLI
+bundle; 2) `submit-remediation --disposition confirm-node-action --node <node> --reference <CHG> --plan`, then submit
+without `--plan` (the CLI judges the reboot evidence under the new rule; the Pod writes it verbatim); 3) the
+`gpu-fault-admin config`/`deploy` preflight reports the record as `operator_confirmed_parked` with `blocker_count=0`
+and the release proceeds; 4) once it has landed, `workflow-reconcile --state-dir ... --close-incident <id> --reason
+... --reference <CHG>`: the first pass reports `evidence_required`, the CLI reads the node evidence through the GPU
+kubeconfig and submits again, the incident ends RECOVERED, and the dispatcher's sweep ends the parked record
+SUPERSEDED on its next tick (`workflow-reconcile --dry-run` no longer lists it; the uninstall/cleanup activity counts no
+longer see it).
 
 ```bash
 # Read-only: prints the confirmation that would be written (step, command, boot id before/after the reboot, Agent generation, node/Agent evidence), writing nothing

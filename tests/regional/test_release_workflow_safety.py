@@ -341,3 +341,25 @@ def test_a_blocker_names_the_departed_node_remedy() -> None:
         message
     )
     assert "left Kubernetes and HyperPod" in message
+
+
+def test_both_probes_read_the_products_operator_confirmation_shape() -> None:
+    """The gate's copies of ``operator_confirmation`` must read exactly the key
+    and the required fields the product writes; a drift would either hide a
+    live record or keep refusing a confirmed one (live, gpu-eks-cluster)."""
+
+    from gpu_fault.execution.node_action_uncertainty import (
+        OPERATOR_CONFIRMATION_REQUIRED_KEYS,
+        OPERATOR_CONFIRMED_KEY,
+    )
+
+    for name in ("workflow_safety", "rollout_wave_safety"):
+        source = PROBES.probe_source(name)
+        assert f'OPERATOR_CONFIRMED_KEY = "{OPERATOR_CONFIRMED_KEY}"' in source, name
+        for key in OPERATOR_CONFIRMATION_REQUIRED_KEYS:
+            assert f'"{key}",' in source, (name, key)
+        assert "operator_confirmed_parked" in source, name
+    assert "operator_confirmed_parked_count" in PROBES.probe_source("workflow_safety")
+    assert "operator_confirmed_destructive_workflow_count" in PROBES.probe_source(
+        "rollout_wave_safety"
+    )
