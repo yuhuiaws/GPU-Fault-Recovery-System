@@ -45,7 +45,7 @@ def _eks_probe(**overrides: Any) -> dict[str, Any]:
             "cluster_status": "ACTIVE",
             "gate_failures": [],
             "targets": [
-                {"node_logical_id": NODE, "instance_id": "i-0123456789abcdef0"}
+                {"node_logical_id": NODE, "instance_id": "i-00000000000000001"}
             ],
         },
         "missing_isolation": missing,

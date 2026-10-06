@@ -28,7 +28,7 @@ from tests.regional.test_collector_reboot_scope_eks import (
     karpenter_run_instances_item,
 )
 
-INSTANCE = "i-0123456789abcdef0"
+INSTANCE = "i-00000000000000001"
 NODE = "ip-10-0-41-164.us-west-2.compute.internal"
 
 

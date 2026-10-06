@@ -78,7 +78,7 @@ DCGM_UNAVAILABLE_GUIDANCE = {
 }
 
 
-def dcgm_hostengine_unreachable(result: subprocess.CompletedProcess) -> bool:
+def dcgm_hostengine_unreachable(result: subprocess.CompletedProcess[str]) -> bool:
     """True when dcgmi ran but reached no hostengine and graded nothing."""
 
     try:
