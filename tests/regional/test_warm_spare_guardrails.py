@@ -100,7 +100,11 @@ def _patch_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     )
     monkeypatch.setattr(warm_spare, "executor_env", _healthy_env)
-    monkeypatch.setattr(warm_spare, "replace_events", lambda _start, _end: [])
+    monkeypatch.setattr(
+        warm_spare,
+        "provider_calls",
+        lambda _start, _end: {"mutations": [], "refused_calls": []},
+    )
     monkeypatch.setattr(
         warm_spare, "deployed_managed_owner_probe", lambda: MANAGED_GUARD
     )
@@ -284,6 +288,7 @@ def test_a_negative_cloudtrail_read_is_provisional_inside_the_delivery_lag(
     result = _result(tmp_path, "GF-REGIONAL-DESTR-005")
     # The window just ended, so "no replace event" is not yet proof.
     assert result["replace_events"] == []
+    assert result["refused_provider_calls"] == []
     assert result["replace_events_provisional"] is True
     assert result["verdict"] == "PASS"
     now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)

@@ -30,10 +30,11 @@ from scripts.e2e.regional.destr_net_isolation_probe import (  # noqa: E402
 )
 from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
     REGISTRY_PROBE,
+    ProviderCallInventory,
     complete_pod_population,
     eks_managed_invariant,
     managed_recovery_invariant_errors,
-    provider_replace_events,
+    provider_call_inventory,
     registration_identity,
     validate_provider_record,
 )
@@ -461,11 +462,12 @@ def node_state_drift(
     return errors
 
 
-def replace_events(started_at: datetime, ended_at: datetime) -> list[dict[str, Any]]:
-    """Provider mutations in the window: HyperPod's for a HyperPod cluster, and
-    for a plain-EKS cluster the EC2 replacement mutations as well."""
+def provider_calls(started_at: datetime, ended_at: datetime) -> ProviderCallInventory:
+    """Provider calls in the window: HyperPod's for a HyperPod cluster, and for
+    a plain-EKS cluster the EC2 replacement calls as well; the mutations AWS
+    accepted and the calls it refused are kept apart."""
 
-    return provider_replace_events(
+    return provider_call_inventory(
         started_at,
         ended_at,
         provider=MANAGED_PROVIDER,
@@ -473,6 +475,12 @@ def replace_events(started_at: datetime, ended_at: datetime) -> list[dict[str, A
         command=command,
         hyperpod_mutations=PROVIDER_MUTATIONS,
     )
+
+
+def replace_events(started_at: datetime, ended_at: datetime) -> list[dict[str, Any]]:
+    """The accepted provider mutations in the window."""
+
+    return provider_calls(started_at, ended_at)["mutations"]
 
 
 def managed_recovery_errors(gpu: dict[str, Any]) -> list[str]:
@@ -1278,9 +1286,10 @@ def run_audit(
         )
 
     ended_at = datetime.now(timezone.utc)
-    events: list[dict[str, Any]] | None = probes.guarded(
-        lambda: replace_events(started_at, ended_at)
+    calls: ProviderCallInventory | None = probes.guarded(
+        lambda: provider_calls(started_at, ended_at)
     )
+    events = None if calls is None else calls["mutations"]
     provisional = cloudtrail_provisional(ended_at)
     postflight: list[dict[str, Any]] = []
     drift_errors: list[str] = []
@@ -1360,6 +1369,7 @@ def run_audit(
             # The negative claim is provisional while CloudTrail may still be
             # delivering; DESTR-013 re-reads the whole run's window later.
             "replace_events": events if events is not None else [],
+            "refused_provider_calls": [] if calls is None else calls["refused_calls"],
             "replace_events_provisional": provisional,
             "node_baseline": baseline,
             "node_postflight": postflight,

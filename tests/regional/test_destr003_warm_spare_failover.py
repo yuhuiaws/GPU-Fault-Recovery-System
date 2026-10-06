@@ -216,8 +216,8 @@ class _FakeWarm:
 
     provider = "hyperpod"
 
-    def replace_events(self, *_args: Any) -> list[dict[str, Any]]:
-        return []
+    def provider_calls(self, *_args: Any) -> dict[str, Any]:
+        return {"mutations": [], "refused_calls": []}
 
 
 def _patch_preflight(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:

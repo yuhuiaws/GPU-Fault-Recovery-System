@@ -8898,11 +8898,15 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   "managed recovery is disabled" assertion with the provider's equivalent invariant, recorded as `eks_managed_invariant`:
   the node reboot owner is `gpu-fault-eks-adapter`, nodeReplace is observe-only, and the audit window carries neither
   `sagemaker` mutations nor EC2 `Terminate/Stop/Run/StartInstances` (`replace_events` queries both event sources).
+  Calls AWS refused (`errorCode` set -- Karpenter's `RunInstances` dry-runs answer `Client.DryRunOperation`) ran
+  nothing and are not mutations: `provider_calls` keeps them apart and the evidence records them as
+  `refused_provider_calls`.
   DESTR-003/005/008/022 on `eks-managed` presuppose a declared warm spare (`gpu-fault-admin config spare --declare`; no
   HyperPod health label, topology = node group + instance type) and take `--hyperpod-cluster` as the cluster's `cluster_id`
   (= the EKS cluster name): the cluster fact is `aws eks describe-cluster` (`ACTIVE`, `node_recovery=not-applicable`), the
   provider inventory is the Kubernetes GPU nodes (name, providerID instance id, node group, instance type, Ready) with a
-  sha256 drift comparison, provider mutation events are read from `sagemaker` and EC2 `Terminate/Stop/Run/StartInstances`,
+  sha256 drift comparison, provider mutation events are read from `sagemaker` and EC2 `Terminate/Stop/Run/StartInstances`
+  (refused calls recorded apart as `refused_provider_calls`),
   and the profile is expected to OWN `nodeReplace` through `gpu-fault-eks-adapter`; a spare-less cluster is still refused in
   preflight (fail closed). AUTH-015 selects nodes with `cluster_scope.node_selector`
   (the HyperPod label, or the cluster's configured node selector).
@@ -13178,6 +13182,15 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
     instance and the response `_return=true` -- EC2 reports no logical nodes, so the proof rests on
     EC2's boolean answer. The HyperPod path (SageMaker scope and `BatchRebootClusterNodes`) is
     unchanged byte for byte.
+  - Refused calls are not mutations: a CloudTrail record with an `errorCode` is a call AWS refused, so
+    nothing ran. The proof sets such records apart (`partition_provider_events`) and reports them as
+    `refused_provider_calls` (event name, time, error code, caller role, requested targets -- never the
+    error message); the singleton rule counts accepted calls only and its error names both counts. On a
+    plain EKS cluster Karpenter dry-runs `RunInstances` (`Client.DryRunOperation`) about once a minute,
+    so an `eks-managed` window regularly carries such records beside the product's `RebootInstances`.
+    The inventory is deliberately not scoped to the instance or the reboot verb: an accepted foreign or
+    wrong-target mutation in the window still fails the proof, and a record whose detail cannot be read
+    stays an invalid mutation, never an absence.
 - ⚠ **This alternative path is not non-destructive.** The `gpu_inventory_mismatch` production policy
   plans `REBOOT_NODE`; as long as workflow execution is allowed, a real HyperPod reboot is invoked.
   This item must be executed as `destructive-provider-reboot` in the maintenance window, with a

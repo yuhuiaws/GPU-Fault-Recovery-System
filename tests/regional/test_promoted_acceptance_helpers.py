@@ -641,7 +641,11 @@ def test_warm_spare_audit_records_postflight_after_probe_failure(
         "cluster_recovery",
         lambda _name: (_ for _ in ()).throw(RuntimeError("probe unavailable")),
     )
-    monkeypatch.setattr(warm_spare, "replace_events", lambda _start, _end: [])
+    monkeypatch.setattr(
+        warm_spare,
+        "provider_calls",
+        lambda _start, _end: {"mutations": [], "refused_calls": []},
+    )
 
     exit_code = warm_spare.run_audit(tmp_path, ["GF-REGIONAL-DESTR-005"])
 
@@ -677,7 +681,11 @@ def test_warm_spare_audit_separates_an_unrun_pytest_from_a_failed_one(
             RuntimeError("pytest unavailable")
         ),
     )
-    monkeypatch.setattr(warm_spare, "replace_events", lambda _start, _end: [])
+    monkeypatch.setattr(
+        warm_spare,
+        "provider_calls",
+        lambda _start, _end: {"mutations": [], "refused_calls": []},
+    )
 
     exit_code = warm_spare.run_audit(tmp_path, ["GF-REGIONAL-DESTR-005"])
 

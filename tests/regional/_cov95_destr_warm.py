@@ -389,13 +389,17 @@ class FakeWarm:
         self.h = harness
         self.regional = harness.regional
 
-    def replace_events(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
-        # The real fixture keeps only replacement mutations of the provider.
-        return [
-            item
-            for item in self.regional.provider_events(start, end)
-            if item.get("event_name") in warm_spare_provider.PROVIDER_REPLACE_EVENTS
-        ]
+    def provider_calls(self, start: datetime, end: datetime) -> dict[str, Any]:
+        # The real fixture keeps only replacement mutations of the provider,
+        # with the calls AWS refused set apart.
+        return {
+            "mutations": [
+                item
+                for item in self.regional.provider_events(start, end)
+                if item.get("event_name") in warm_spare_provider.PROVIDER_REPLACE_EVENTS
+            ],
+            "refused_calls": [],
+        }
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         self.h.call(f"node.{node}")

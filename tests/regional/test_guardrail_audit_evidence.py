@@ -10,6 +10,8 @@ import pytest
 from scripts.e2e.regional import audit_warm_spare_guardrails as audit
 from scripts.e2e.regional.guardrail_audit_evidence import (
     complete_pod_population,
+    provider_call_inventory,
+    provider_replace_events,
     registration_identity,
     validate_provider_record,
 )
@@ -181,6 +183,114 @@ def test_readonly_guard_checks_every_provider_mutation(monkeypatch, event) -> No
     )
     now = datetime.now(timezone.utc)
     assert audit.replace_events(now, now)[0]["event_name"] == event
+
+
+def _ec2_item(name: str, detail: object, *, username: str = "session") -> dict:
+    return {
+        "EventName": name,
+        "EventTime": "2026-10-06T08:52:04Z",
+        "Username": username,
+        "CloudTrailEvent": detail if isinstance(detail, str) else json.dumps(detail),
+    }
+
+
+def test_refused_ec2_calls_are_kept_apart_from_the_mutation_inventory() -> None:
+    """On a plain EKS cluster Karpenter dry-runs RunInstances about once a
+    minute; AWS refuses the call (``Client.DryRunOperation``) and nothing runs.
+    Such calls are on the record as refused, not as mutations. A record whose
+    detail cannot be read stays a mutation (fail closed)."""
+
+    karpenter = {
+        "errorCode": "Client.DryRunOperation",
+        "errorMessage": "Request would have succeeded, but DryRun flag is set.",
+        "userIdentity": {
+            "sessionContext": {
+                "sessionIssuer": {
+                    "arn": "arn:aws:iam::123456789012:role/KarpenterController-x"
+                }
+            }
+        },
+    }
+
+    def command(argv, **_kwargs):
+        source = next(a for a in argv if a.startswith("AttributeKey=EventSource"))
+        if not source.endswith("ec2.amazonaws.com"):
+            return json.dumps({"Events": []})
+        return json.dumps(
+            {
+                "Events": [
+                    _ec2_item("RunInstances", karpenter, username="karpenter-a"),
+                    _ec2_item("TerminateInstances", {"responseElements": {}}),
+                    _ec2_item("RunInstances", "not json"),
+                    _ec2_item("StopInstances", {"errorCode": ""}),
+                    _ec2_item("DescribeInstances", karpenter),
+                ]
+            }
+        )
+
+    now = datetime.now(timezone.utc)
+    inventory = provider_call_inventory(
+        now,
+        now,
+        provider="eks-managed",
+        region="us-west-2",
+        command=command,
+        hyperpod_mutations=frozenset(),
+    )
+    assert inventory["mutations"] == [
+        {
+            "event_name": "TerminateInstances",
+            "event_time": "2026-10-06T08:52:04Z",
+            "event_source": "ec2.amazonaws.com",
+        },
+        {
+            "event_name": "RunInstances",
+            "event_time": "2026-10-06T08:52:04Z",
+            "event_source": "ec2.amazonaws.com",
+        },
+        {
+            "event_name": "StopInstances",
+            "event_time": "2026-10-06T08:52:04Z",
+            "event_source": "ec2.amazonaws.com",
+        },
+    ], "accepted, unreadable and empty-code records are all mutations"
+    assert inventory["refused_calls"] == [
+        {
+            "event_name": "RunInstances",
+            "event_time": "2026-10-06T08:52:04Z",
+            "event_source": "ec2.amazonaws.com",
+            "api_error_code": "Client.DryRunOperation",
+            "username": "karpenter-a",
+            "session_issuer_role_name": "KarpenterController-x",
+        }
+    ]
+    assert "DryRun flag is set" not in json.dumps(inventory)
+    assert (
+        provider_replace_events(
+            now,
+            now,
+            provider="eks-managed",
+            region="us-west-2",
+            command=command,
+            hyperpod_mutations=frozenset(),
+        )
+        == inventory["mutations"]
+    )
+
+
+def test_a_malformed_cloudtrail_event_row_is_unreadable_not_absent() -> None:
+    now = datetime.now(timezone.utc)
+    with pytest.raises(RuntimeError, match="event inventory is unreadable"):
+        provider_call_inventory(
+            now,
+            now,
+            provider="hyperpod",
+            region="us-west-2",
+            command=lambda *_a, **_k: json.dumps(
+                {"Events": ["BatchRebootClusterNodes"]}
+            ),
+            hyperpod_mutations=frozenset({"BatchRebootClusterNodes"}),
+        )
 
 
 @pytest.mark.parametrize(

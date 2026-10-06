@@ -907,8 +907,10 @@ def execute_case(
         if provider_after != preflight["provider_inventory"]:
             errors.append("provider node inventory changed")
         ended_at = datetime.now(timezone.utc)
-        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS).
-        provider_events = warm.replace_events(started_at, ended_at)
+        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS);
+        # calls AWS refused (Karpenter's RunInstances dry-runs) are kept apart.
+        calls = warm.provider_calls(started_at, ended_at)
+        provider_events = calls["mutations"]
         # A negative claim cannot be proven inside CloudTrail's delivery lag;
         # it is recorded as provisional and DESTR-013 re-reads the window.
         provider_provisional = regional.provider_events_provisional(ended_at)
@@ -916,6 +918,7 @@ def execute_case(
             case_dir / "provider-events.json",
             {
                 "events": provider_events,
+                "refused_calls": calls["refused_calls"],
                 "provider": warm.provider,
                 "window_start": started_at.isoformat(),
                 "window_end": ended_at.isoformat(),
@@ -939,6 +942,7 @@ def execute_case(
                 "source_pod_uids": sorted(source_uids),
                 "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
                 "provider_events": provider_events,
+                "refused_provider_calls": calls["refused_calls"],
                 "provider_events_provisional": provider_provisional,
             }
         )

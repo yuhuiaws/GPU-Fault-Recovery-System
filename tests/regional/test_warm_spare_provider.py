@@ -195,11 +195,12 @@ def test_the_fixture_reads_eks_facts_without_sagemaker() -> None:
         "provider": "eks-managed",
     }
     assert warm.provider_inventory()["count"] == 2
-    events = warm.replace_events(NOW, NOW)
-    assert {item["event_name"] for item in events} == {
+    calls = warm.provider_calls(NOW, NOW)
+    assert {item["event_name"] for item in calls["mutations"]} == {
         "TerminateInstances",
         "BatchReplaceClusterNodes",
     }, "both event sources are read and only replacement mutations kept"
+    assert calls["refused_calls"] == [], "accepted calls only; nothing was refused"
     sources = [
         item[item.index("--lookup-attributes") + 1]
         for item in regional.commands

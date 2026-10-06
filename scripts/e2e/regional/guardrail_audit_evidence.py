@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypedDict
 
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
@@ -206,7 +206,46 @@ def provider_event_sources(
     return sources
 
 
-def provider_replace_events(
+class ProviderCallInventory(TypedDict):
+    """A CloudTrail window's provider calls: the ones AWS accepted (mutations)
+    and the ones it refused (``errorCode`` set, nothing ran -- on a plain EKS
+    cluster Karpenter's ``RunInstances`` dry-runs are the common case)."""
+
+    mutations: list[dict[str, Any]]
+    refused_calls: list[dict[str, Any]]
+
+
+def _object(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _refusal(item: dict[str, Any]) -> dict[str, Any] | None:
+    """The error code and caller of a refused call; None when the record has no
+    readable ``errorCode`` (it then stays a mutation, fail closed)."""
+
+    try:
+        detail = _object(json.loads(item["CloudTrailEvent"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    code = detail.get("errorCode")
+    if not isinstance(code, str) or not code:
+        return None
+    issuer = _object(
+        _object(_object(detail.get("userIdentity")).get("sessionContext")).get(
+            "sessionIssuer"
+        )
+    )
+    arn = issuer.get("arn")
+    return {
+        "api_error_code": code,
+        "username": item.get("Username"),
+        "session_issuer_role_name": (
+            arn.rsplit("/", 1)[-1] if isinstance(arn, str) and ":role/" in arn else None
+        ),
+    }
+
+
+def provider_call_inventory(
     started_at: datetime,
     ended_at: datetime,
     *,
@@ -214,10 +253,11 @@ def provider_replace_events(
     region: str,
     command: Any,
     hyperpod_mutations: frozenset[str],
-) -> list[dict[str, Any]]:
-    """Provider mutations in the window, read from CloudTrail per event source."""
+) -> ProviderCallInventory:
+    """Provider calls in the window, read from CloudTrail per event source and
+    split into accepted mutations and refused calls (``_refusal``)."""
 
-    events: list[dict[str, Any]] = []
+    inventory: ProviderCallInventory = {"mutations": [], "refused_calls": []}
     for source, names in provider_event_sources(provider, hyperpod_mutations):
         value = json.loads(
             command(
@@ -240,16 +280,43 @@ def provider_replace_events(
         )
         if not isinstance(value, dict) or not isinstance(value.get("Events"), list):
             raise RuntimeError("CloudTrail event inventory is unreadable")
-        events.extend(
-            {
+        for item in value["Events"]:
+            if not isinstance(item, dict):
+                raise RuntimeError("CloudTrail event inventory is unreadable")
+            if item.get("EventName") not in names:
+                continue
+            record = {
                 "event_name": item.get("EventName"),
                 "event_time": str(item.get("EventTime")),
                 "event_source": source,
             }
-            for item in value.get("Events", [])
-            if item.get("EventName") in names
-        )
-    return events
+            refusal = _refusal(item)
+            if refusal is None:
+                inventory["mutations"].append(record)
+            else:
+                inventory["refused_calls"].append({**record, **refusal})
+    return inventory
+
+
+def provider_replace_events(
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    provider: str,
+    region: str,
+    command: Any,
+    hyperpod_mutations: frozenset[str],
+) -> list[dict[str, Any]]:
+    """The accepted provider mutations in the window (``provider_call_inventory``)."""
+
+    return provider_call_inventory(
+        started_at,
+        ended_at,
+        provider=provider,
+        region=region,
+        command=command,
+        hyperpod_mutations=hyperpod_mutations,
+    )["mutations"]
 
 
 def managed_recovery_invariant_errors(

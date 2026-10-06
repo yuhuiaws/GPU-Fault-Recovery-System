@@ -1093,8 +1093,10 @@ def _run_scenario(
         if provider_after != provider_baseline:
             errors.append("provider node inventory changed")
         ended_at = datetime.now(timezone.utc)
-        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS).
-        provider_events = warm.replace_events(started_at, ended_at)
+        # Replacement mutations only (sagemaker's, plus EC2's on plain EKS);
+        # calls AWS refused (Karpenter's RunInstances dry-runs) are kept apart.
+        calls = warm.provider_calls(started_at, ended_at)
+        provider_events = calls["mutations"]
         if provider_events:
             errors.append("provider replace/delete mutation appeared")
         result.update(
@@ -1110,6 +1112,7 @@ def _run_scenario(
                     fixture.bound_at.isoformat() if fixture.bound_at else None
                 ),
                 "provider_events": provider_events,
+                "refused_provider_calls": calls["refused_calls"],
                 # The negative claim cannot be proven inside CloudTrail's lag;
                 # DESTR-013 re-reads the whole run's window later.
                 "provider_events_provisional": regional.provider_events_provisional(

@@ -26,7 +26,10 @@ from gpu_fault.cluster_scope import (
     PROVIDER_NODE_REBOOT_OWNERS,
     cluster_provider,
 )
-from scripts.e2e.regional.guardrail_audit_evidence import provider_replace_events
+from scripts.e2e.regional.guardrail_audit_evidence import (
+    ProviderCallInventory,
+    provider_call_inventory,
+)
 from scripts.e2e.regional.regional_workload_inventory import node_provider
 
 HYPERPOD = "hyperpod"
@@ -180,6 +183,27 @@ def eks_provider_inventory(nodes_document: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def provider_calls(
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    provider: str | None,
+    region: str,
+    command: Callable[[list[str]], str],
+) -> ProviderCallInventory:
+    """Provider replacement calls in the window (sagemaker's, plus EC2's on
+    EKS): the accepted mutations, and the calls AWS refused kept apart."""
+
+    return provider_call_inventory(
+        started_at,
+        ended_at,
+        provider=normalized(provider),
+        region=region,
+        command=command,
+        hyperpod_mutations=PROVIDER_REPLACE_EVENTS,
+    )
+
+
 def replace_events(
     started_at: datetime,
     ended_at: datetime,
@@ -188,13 +212,8 @@ def replace_events(
     region: str,
     command: Callable[[list[str]], str],
 ) -> list[dict[str, Any]]:
-    """Provider replacement mutations in the window: sagemaker's, plus EC2's on EKS."""
+    """The accepted provider replacement mutations in the window."""
 
-    return provider_replace_events(
-        started_at,
-        ended_at,
-        provider=normalized(provider),
-        region=region,
-        command=command,
-        hyperpod_mutations=PROVIDER_REPLACE_EVENTS,
-    )
+    return provider_calls(
+        started_at, ended_at, provider=provider, region=region, command=command
+    )["mutations"]

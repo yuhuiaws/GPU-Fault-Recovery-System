@@ -97,6 +97,7 @@ class RebootProof(TypedDict):
     submission_idempotency_key: str | None
     submission_started_at: str | None
     submission_completed_at: str | None
+    refused_provider_calls: list[dict[str, object]]
     limitations: list[str]
 
 
@@ -140,6 +141,67 @@ def provider_event_source(provider: str | None) -> str:
     """The CloudTrail event source a product reboot lands in on ``provider``."""
 
     return _PROVIDER_EVENT_SOURCES[provider or "hyperpod"]
+
+
+#: The whitelisted facts kept of a provider call AWS refused: who asked for
+#: what, and the error code -- never the error message or the raw event.
+REFUSED_CALL_FIELDS = (
+    "event_name",
+    "event_time",
+    "event_source",
+    "event_id",
+    "api_error_code",
+    "session_issuer_role_name",
+    "username",
+    "request_node_ids",
+    "request_node_logical_ids",
+    "request_dry_run",
+    "normalization_errors",
+)
+
+
+def refused_provider_call(event: object) -> bool:
+    """True when CloudTrail recorded an ``errorCode`` for the call.
+
+    AWS answered with an error, so the request mutated nothing: Karpenter's
+    ``RunInstances`` dry-runs (``Client.DryRunOperation``), a denied reboot, a
+    throttled retry. Only a readable error code counts; a record that could not
+    be read at all keeps its place in the mutation inventory (invalid, never
+    absent).
+    """
+
+    if not isinstance(event, Mapping):
+        return False
+    code = event.get("api_error_code")
+    return isinstance(code, str) and bool(code)
+
+
+def refused_call_record(event: Mapping[str, Any]) -> dict[str, object]:
+    return {key: event.get(key) for key in REFUSED_CALL_FIELDS}
+
+
+def partition_provider_events(
+    events: Sequence[object],
+) -> tuple[list[object], list[dict[str, object]]]:
+    """Split an observed CloudTrail inventory into mutations and refused calls.
+
+    A plain EKS cluster's ``ec2.amazonaws.com`` source carries calls that ran
+    nothing beside the product's reboot: Karpenter dry-runs ``RunInstances``
+    (``Client.DryRunOperation``) about once a minute. They stay visible as
+    refused calls so a negative audit still reports them, but they are not
+    mutations, so the singleton rule counts accepted calls only. Nothing is
+    scoped by target or verb on purpose: an accepted foreign or wrong-target
+    mutation must still fail that rule.
+    """
+
+    mutations: list[object] = []
+    refused: list[dict[str, object]] = []
+    for event in events:
+        if refused_provider_call(event):
+            refused.append(refused_call_record(cast(Mapping[str, Any], event)))
+        else:
+            mutations.append(event)
+    return mutations, refused
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -339,8 +401,9 @@ def normalize_provider_event(item: Mapping[str, Any]) -> ProviderEvent:
         if node_ids is not None:
             result["request_node_ids"] = _strings(node_ids, "nodeIds")
         instances = _alias(parameters, "instancesSet", "InstancesSet")
-        if instances is not None:
-            # EC2 RebootInstances (plain EKS): the instance ids are the targets.
+        if instances is not None and result["event_name"] != "RunInstances":
+            # EC2 Reboot/Stop/Start/TerminateInstances (plain EKS) name their
+            # targets here; RunInstances' instancesSet is a launch count.
             result["request_node_ids"] = _strings(
                 [
                     _mapping(row, "EC2 instance item").get("instanceId")
@@ -372,7 +435,14 @@ def normalize_provider_event(item: Mapping[str, Any]) -> ProviderEvent:
                 },
                 "reboot request has unrecognized scope fields",
             )
-        response = _mapping(detail.get("responseElements"), "provider response")
+        response = _mapping(
+            # A call AWS refused has no response elements (CloudTrail writes
+            # null); an accepted call must still carry an object.
+            {}
+            if result["api_error"] and detail.get("responseElements") is None
+            else detail.get("responseElements"),
+            "provider response",
+        )
         logical_success = _alias(
             response, "successfulNodeLogicalIds", "SuccessfulNodeLogicalIds"
         )
@@ -750,8 +820,11 @@ def prove_reboot_scope(
 ) -> RebootProof:
     """Validate the bounded singleton proof; raw inputs never enter diagnostics.
 
-    Pass the complete provider mutation inventory, not a prefiltered matching
-    event. Visibility delay and final negative audits remain caller obligations.
+    Pass the complete observed provider inventory, not a prefiltered matching
+    event: calls AWS refused are set apart here (``partition_provider_events``,
+    reported as ``refused_provider_calls``) and exactly one accepted mutation
+    must remain. Visibility delay and final negative audits remain caller
+    obligations.
     """
     proof: RebootProof = {
         "valid": False,
@@ -764,20 +837,28 @@ def prove_reboot_scope(
         "submission_idempotency_key": None,
         "submission_started_at": None,
         "submission_completed_at": None,
+        "refused_provider_calls": [],
         "limitations": [
             "Runtime does not persist AWS RequestId; this is not an AWS request-ID join.",
             "CloudTrail delivery is eventual; a bounded observation is not global exactly-once proof.",
         ],
     }
     try:
+        mutations, refused = partition_provider_events(events)
+        proof["refused_provider_calls"] = refused
         _scope_identity(scope)
         start, end = _time(started_at, "window start"), _time(ended_at, "window end")
         _require(start < end, "reboot observation interval is empty or reversed")
         result, created, completed = _submission_binding(
             scope, workflow, commands, submission, start, end
         )
-        _require(len(events) == 1, "exactly one provider mutation event is required")
-        event = _mapping(events[0], "provider event")
+        _require(
+            len(mutations) == 1,
+            "exactly one provider mutation event is required "
+            f"({len(mutations)} accepted and {len(refused)} refused provider "
+            "calls observed)",
+        )
+        event = _mapping(mutations[0], "provider event")
         _event_binding(scope, event, created, completed)
         proof.update(
             {

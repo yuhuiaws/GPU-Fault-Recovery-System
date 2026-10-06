@@ -699,12 +699,12 @@ class WarmSpareLiveFixture:
             "node_recovery": value.get("NodeRecovery"),
         }
 
-    def replace_events(
+    def provider_calls(
         self, started_at: datetime, ended_at: datetime
-    ) -> list[dict[str, Any]]:
-        """Provider replacement mutations in the window, per the cluster's provider."""
+    ) -> warm_spare_provider.ProviderCallInventory:
+        """Provider replacement calls in the window: mutations and refused calls."""
 
-        return warm_spare_provider.replace_events(
+        return warm_spare_provider.provider_calls(
             started_at,
             ended_at,
             provider=self.provider,

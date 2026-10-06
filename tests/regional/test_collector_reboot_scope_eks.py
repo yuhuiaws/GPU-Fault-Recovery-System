@@ -207,6 +207,78 @@ def ec2_cloudtrail_item(*, returned: bool = True) -> dict[str, Any]:
     }
 
 
+KARPENTER_ROLE = f"arn:aws:iam::{ACCOUNT}:role/KarpenterController-synthetic"
+KARPENTER_SESSION = f"arn:aws:sts::{ACCOUNT}:assumed-role/KarpenterController-synthetic/eks-cl-karpenter-session"
+
+
+def karpenter_run_instances_item(
+    index: int, *, dry_run: bool = True, role: str = KARPENTER_ROLE
+) -> dict[str, Any]:
+    """CloudTrail's record of Karpenter's ``RunInstances`` on a plain EKS cluster.
+
+    Karpenter dry-runs the launch about once a minute (``Client.DryRunOperation``,
+    no response elements); ``dry_run=False`` is the accepted launch for contrast.
+    """
+
+    stamp = (START + timedelta(minutes=5, seconds=index)).isoformat()
+    detail: dict[str, Any] = {
+        "eventID": f"event-karpenter-{index:03d}",
+        "requestID": f"aws-request-karpenter-{index:03d}",
+        "eventName": "RunInstances",
+        "eventTime": stamp,
+        "eventSource": "ec2.amazonaws.com",
+        "awsRegion": REGION,
+        "recipientAccountId": ACCOUNT,
+        "userIdentity": {
+            "type": "AssumedRole",
+            "accountId": ACCOUNT,
+            "arn": KARPENTER_SESSION,
+            "accessKeyId": "SHOULD-NOT-BE-EXPORTED",
+            "sessionContext": {
+                "sessionIssuer": {"type": "Role", "accountId": ACCOUNT, "arn": role}
+            },
+        },
+        "requestParameters": {
+            "instancesSet": {"items": [{"minCount": 1, "maxCount": 1}]},
+            "instanceType": "p5en.48xlarge",
+            "launchTemplate": {"launchTemplateName": "karpenter-synthetic"},
+        },
+        "responseElements": None,
+    }
+    if dry_run:
+        detail["errorCode"] = "Client.DryRunOperation"
+        detail["errorMessage"] = "Request would have succeeded, but DryRun flag is set."
+    else:
+        detail["responseElements"] = {
+            "instancesSet": {"items": [{"instanceId": OTHER_INSTANCE}]}
+        }
+    return {
+        "EventName": "RunInstances",
+        "EventTime": stamp,
+        "EventId": f"event-karpenter-{index:03d}",
+        "Username": "eks-cl-karpenter-session",
+        "CloudTrailEvent": json.dumps(detail),
+    }
+
+
+def refused_reboot_item(code: str, *, caller: str, role: str) -> dict[str, Any]:
+    item = ec2_cloudtrail_item()
+    detail = json.loads(item["CloudTrailEvent"])
+    detail.update(
+        {
+            "eventID": "event-ec2-refused",
+            "requestID": "aws-request-ec2-refused",
+            "errorCode": code,
+            "errorMessage": "PRIVATE-FAILURE-CONTENT",
+            "responseElements": None,
+        }
+    )
+    detail["userIdentity"]["arn"] = caller
+    detail["userIdentity"]["sessionContext"]["sessionIssuer"]["arn"] = role
+    item.update({"EventId": "event-ec2-refused", "CloudTrailEvent": json.dumps(detail)})
+    return item
+
+
 def eks_inputs() -> dict[str, Any]:
     """The HyperPod proof inputs rebound to the EKS provider's records."""
 
@@ -420,6 +492,120 @@ def test_eks_reboot_proof_fails_closed_on_wrong_provider_facts(
 
     assert proof["valid"] is False
     assert any(reason in error for error in proof["errors"]), proof["errors"]
+
+
+def test_karpenter_dry_runs_are_refused_calls_beside_the_one_accepted_reboot() -> None:
+    """The live attempt-6 inventory: the product's accepted RebootInstances and
+    three Karpenter RunInstances dry-runs (``Client.DryRunOperation``), newest
+    first. Nothing ran for the dry-runs, so they are refused calls on the record,
+    not mutations, and the singleton rule holds for the one accepted call."""
+
+    value = eks_inputs()
+    dry_runs = [
+        dict(evidence.normalize_provider_event(karpenter_run_instances_item(index)))
+        for index in (3, 2, 1)
+    ]
+    value["events"] = [*dry_runs, *value["events"]]
+
+    proof = evidence.prove_reboot_scope(**value)
+
+    assert proof["errors"] == [], proof
+    assert proof["valid"] is True and proof["event_id"] == "event-ec2-001"
+    assert [item["event_name"] for item in proof["refused_provider_calls"]] == [
+        "RunInstances"
+    ] * 3
+    assert {item["api_error_code"] for item in proof["refused_provider_calls"]} == {
+        "Client.DryRunOperation"
+    }
+    assert {
+        item["session_issuer_role_name"] for item in proof["refused_provider_calls"]
+    } == {"KarpenterController-synthetic"}
+    for record in proof["refused_provider_calls"]:
+        assert record["normalization_errors"] == [], (
+            "a launch request's instancesSet is a count, not a malformed target list"
+        )
+        assert record["request_node_ids"] is None
+        assert set(record) == set(evidence.REFUSED_CALL_FIELDS)
+    exported = json.dumps(proof)
+    assert "SHOULD-NOT-BE-EXPORTED" not in exported
+    assert "DryRun flag is set" not in exported, "error messages stay unexported"
+    assert evidence.reboot_evidence_errors(**value) == []
+
+
+def test_a_refused_call_is_reported_but_never_counted_as_the_mutation() -> None:
+    """Refused RebootInstances, by a foreign role or by the executor itself, are
+    on the record; only the accepted call is the mutation. Alone, a refused
+    reboot proves nothing."""
+
+    foreign = refused_reboot_item(
+        "Client.UnauthorizedOperation", caller=KARPENTER_SESSION, role=KARPENTER_ROLE
+    )
+    throttled = refused_reboot_item(
+        "Client.RequestLimitExceeded", caller=CALLER, role=ROLE
+    )
+    value = eks_inputs()
+    value["events"] = [
+        dict(evidence.normalize_provider_event(foreign)),
+        *value["events"],
+        dict(evidence.normalize_provider_event(throttled)),
+    ]
+    proof = evidence.prove_reboot_scope(**value)
+    assert proof["valid"] is True and proof["errors"] == [], proof
+    assert [
+        (item["api_error_code"], item["session_issuer_role_name"])
+        for item in proof["refused_provider_calls"]
+    ] == [
+        ("Client.UnauthorizedOperation", "KarpenterController-synthetic"),
+        ("Client.RequestLimitExceeded", "executor"),
+    ]
+    assert "PRIVATE-FAILURE-CONTENT" not in json.dumps(proof)
+
+    alone = eks_inputs()
+    alone["events"] = [dict(evidence.normalize_provider_event(throttled))]
+    proof = evidence.prove_reboot_scope(**alone)
+    assert proof["valid"] is False
+    assert proof["errors"] == [
+        "exactly one provider mutation event is required "
+        "(0 accepted and 1 refused provider calls observed)"
+    ]
+    assert len(proof["refused_provider_calls"]) == 1
+
+
+def test_an_accepted_foreign_launch_still_breaks_the_singleton_rule() -> None:
+    """A RunInstances AWS accepted is a mutation in the window whatever its
+    target or actor: the inventory is not scoped down to the instance or the
+    reboot verb, so the proof fails closed on it."""
+
+    value = eks_inputs()
+    launch = evidence.normalize_provider_event(
+        karpenter_run_instances_item(7, dry_run=False)
+    )
+    assert launch["api_error"] is False and launch["normalization_errors"] == []
+    value["events"] = [*value["events"], dict(launch)]
+    proof = evidence.prove_reboot_scope(**value)
+    assert proof["valid"] is False
+    assert proof["errors"] == [
+        "exactly one provider mutation event is required "
+        "(2 accepted and 0 refused provider calls observed)"
+    ]
+    assert proof["refused_provider_calls"] == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event_name": "RunInstances", "api_error": True, "api_error_code": None},
+        {"event_name": "RunInstances", "api_error": True, "api_error_code": ""},
+        {"event_name": "RunInstances", "api_error_code": 403},
+        "not-a-record",
+    ],
+)
+def test_only_a_readable_error_code_makes_a_refused_call(event: Any) -> None:
+    """An unreadable record is an invalid mutation, never an absence."""
+
+    assert evidence.refused_provider_call(event) is False
+    mutations, refused = evidence.partition_provider_events([event])
+    assert mutations == [event] and refused == []
 
 
 def test_hyperpod_proof_inputs_are_unchanged_by_the_eks_branch() -> None:

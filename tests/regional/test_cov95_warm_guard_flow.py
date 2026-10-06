@@ -83,7 +83,11 @@ def live_reads(monkeypatch):
         "cluster_recovery",
         lambda name: {"cluster_name": name, "node_recovery": "None"},
     )
-    monkeypatch.setattr(audit, "replace_events", lambda *_args: state["events"])
+    monkeypatch.setattr(
+        audit,
+        "provider_calls",
+        lambda *_args: {"mutations": state["events"], "refused_calls": []},
+    )
     monkeypatch.setattr(
         audit, "deployed_managed_owner_probe", lambda: dict(MANAGED_GUARD)
     )
