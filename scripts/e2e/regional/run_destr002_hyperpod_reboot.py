@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    NOT_APPLICABLE_PROVIDER_PHRASE,
     processor_queue_backlog,
     write_json_atomic,
 )
@@ -314,8 +315,8 @@ def preflight_probe_errors(
         owners = ", ".join(probe.get("adapter_owners") or []) or "none"
         return [
             "executor has no HyperPod reboot adapter (owners: "
-            f"{owners}); DESTR-002 audits the HyperPod reboot path and does not "
-            "apply to an eks-managed cluster"
+            f"{owners}); DESTR-002 audits the HyperPod reboot path and "
+            f"{NOT_APPLICABLE_PROVIDER_PHRASE}"
         ]
     positive = probe.get("positive") or {}
     missing = probe.get("missing_isolation") or {}

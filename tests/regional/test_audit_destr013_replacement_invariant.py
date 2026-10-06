@@ -382,6 +382,110 @@ def test_one_valid_case_does_not_cover_missing_evidence(
         destr013.run_timestamps(tmp_path)
 
 
+NOT_APPLICABLE_REASON = (
+    "executor has no HyperPod reboot adapter (owners: gpu-fault-eks-adapter, "
+    "gpu-fault-kubernetes-adapter, gpu-fault-node-agent); DESTR-002 audits the "
+    "HyperPod reboot path and does not apply to an eks-managed cluster"
+)
+
+
+def _plan_only_case(
+    root: Path, case_id: str, errors: list[str], *, mutated: bool = False
+) -> Path:
+    """What a destructive case's directory holds after its preflight refused:
+    the plan and the preflight, no execute evidence, no run timestamp."""
+
+    case = root / "cases" / case_id
+    _write(
+        case / "plan.json",
+        {
+            "case_id": case_id,
+            "attempt": 5,
+            "preflight_passed": False,
+            "mutation_performed": mutated,
+            "execution_scope": "selective",
+        },
+    )
+    _write(case / "preflight.json", {"errors": errors, "node": {}})
+    return case
+
+
+def test_a_case_its_preflight_refused_as_not_applicable_is_not_missing_evidence(
+    tmp_path: Path,
+) -> None:
+    """Live (plain EKS run dir): the HyperPod-only DESTR-002/016/025 were
+    planned, refused by their own preflight as not applicable to an eks-managed
+    cluster and recorded SKIPPED; the audit read their plan-only directories as
+    "no run timestamp evidence" and failed."""
+
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-003" / "GF-REGIONAL-DESTR-003.json",
+        {"started_at": "2026-09-07T09:00:00Z"},
+    )
+    _plan_only_case(
+        tmp_path,
+        "GF-REGIONAL-DESTR-002",
+        [NOT_APPLICABLE_REASON, "target node is already unschedulable"],
+    )
+    _plan_only_case(
+        tmp_path,
+        "GF-REGIONAL-DESTR-016",
+        [
+            "nodeReboot is OWN by gpu-fault-eks-adapter (EC2 RebootInstances), not "
+            "the HyperPod adapter; GF-REGIONAL-DESTR-016 audits the HyperPod reboot "
+            "path (BatchRebootClusterNodes) and does not apply to an eks-managed "
+            "cluster"
+        ],
+    )
+
+    found = destr013.run_timestamps(tmp_path)
+
+    assert [item["path"] for item in found] == [
+        "cases/GF-REGIONAL-DESTR-003/GF-REGIONAL-DESTR-003.json"
+    ], "the executed case is the window's evidence; the refused ones add none"
+    assert destr013.not_applicable_cases(tmp_path) == [
+        {"case_id": "GF-REGIONAL-DESTR-002", "reason": NOT_APPLICABLE_REASON},
+        {
+            "case_id": "GF-REGIONAL-DESTR-016",
+            "reason": (
+                "nodeReboot is OWN by gpu-fault-eks-adapter (EC2 RebootInstances), "
+                "not the HyperPod adapter; GF-REGIONAL-DESTR-016 audits the HyperPod "
+                "reboot path (BatchRebootClusterNodes) and does not apply to an "
+                "eks-managed cluster"
+            ),
+        },
+    ], "each refusal is recorded with the preflight's own words"
+
+
+@pytest.mark.parametrize(
+    ("errors", "mutated"),
+    [
+        (["target node is already unschedulable"], False),
+        (["nodeReboot is not OWN by the HyperPod adapter"], False),
+        ([NOT_APPLICABLE_REASON], True),
+        ([], False),
+    ],
+    ids=["other-refusal", "generic-owner-refusal", "mutation-performed", "no-errors"],
+)
+def test_a_plan_only_case_refused_for_any_other_reason_is_still_missing_evidence(
+    tmp_path: Path, errors: list[str], mutated: bool
+) -> None:
+    """Only the explicit not-applicable words settle a plan-only directory; a
+    preflight refused for the node's state, the older generic owner wording,
+    or a plan that says a mutation happened keeps the fail-closed rule."""
+
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-003" / "GF-REGIONAL-DESTR-003.json",
+        {"started_at": "2026-09-07T09:00:00Z"},
+    )
+    case = _plan_only_case(tmp_path, "GF-REGIONAL-DESTR-002", errors, mutated=mutated)
+
+    assert destr013.not_applicable_reason(case) is None
+    with pytest.raises(destr013.AuditError, match="no run timestamp evidence"):
+        destr013.run_timestamps(tmp_path)
+    assert destr013.not_applicable_cases(tmp_path) == []
+
+
 def test_the_audit_cannot_supply_its_own_window_evidence(tmp_path: Path) -> None:
     _write(
         tmp_path / "cases" / destr013.CASE_ID / f"{destr013.CASE_ID}.json",

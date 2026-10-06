@@ -291,6 +291,12 @@ def open_incident_errors(
     return errors
 
 
+#: The words every preflight uses to say a case does not apply to the cluster's
+#: provider; the campaign records such a case N/A, and the DESTR-013 audit
+#: recognises its plan-only evidence directory by them.
+NOT_APPLICABLE_PROVIDER_PHRASE = "does not apply to an eks-managed cluster"
+
+
 def hyperpod_only_reason(case_id: str, reboot_owner: object) -> str:
     """The single preflight reason of a HyperPod-only reboot case on an
     ``eks-managed`` cluster, worded like DESTR-002's so the campaign records
@@ -301,5 +307,5 @@ def hyperpod_only_reason(case_id: str, reboot_owner: object) -> str:
     return (
         f"nodeReboot is OWN by {reboot_owner} (EC2 RebootInstances), not the "
         f"HyperPod adapter; {case_id} audits the HyperPod reboot path "
-        "(BatchRebootClusterNodes) and does not apply to an eks-managed cluster"
+        f"(BatchRebootClusterNodes) and {NOT_APPLICABLE_PROVIDER_PHRASE}"
     )

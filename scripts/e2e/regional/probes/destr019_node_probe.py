@@ -24,7 +24,10 @@ except the one restart the case exists to perform:
   statements (``git show 84ce59f:src/gpu_fault/node_agent/ledger.py``), seeds
   legacy rows, then opens it with the **deployed** ``NodeActionLedger`` (this
   probe runs under ``/opt/gpu-fault/current/venv``) and reports what the
-  in-place migration did. It never touches the real ledger.
+  in-place migration did. It never touches the real ledger. The scratch rows
+  are dated at the drill's clock; a clock older than the ledger's retention is
+  refused, because the ledger would purge such rows at open and the drill
+  would read a lost row count that is not the migration's doing.
 
 The only mutating verbs are ``restart`` on the Agent unit and ``stop``/
 ``reset-failed`` on the fail-safe unit this probe named after its own run id.
@@ -672,7 +675,11 @@ def _migration_drill_report(
     """
 
     from gpu_fault.models import WorkflowOperation
-    from gpu_fault.node_agent.ledger import LEDGER_SCHEMA_VERSION, NodeActionLedger
+    from gpu_fault.node_agent.ledger import (
+        DEFAULT_RETENTION_SECONDS,
+        LEDGER_SCHEMA_VERSION,
+        NodeActionLedger,
+    )
     from gpu_fault.node_agent.protocol import (
         NodeActionCommand,
         NodeActionResult,
@@ -680,6 +687,17 @@ def _migration_drill_report(
     )
 
     moment = now or datetime.now(timezone.utc)
+    # The shipped ledger purges rows older than its retention the moment it
+    # opens; scratch rows dated at a clock older than that would vanish for a
+    # reason that is not the migration under drill (a fixed test clock aged
+    # past the 30 days and read "row count changed across migration: 3 -> 0").
+    if datetime.now(timezone.utc) - moment >= timedelta(
+        seconds=DEFAULT_RETENTION_SECONDS - 3600
+    ):
+        raise ProbeError(
+            "drill clock is older than the ledger retention; the scratch rows "
+            "would be purged at open, not migrated"
+        )
     scratch.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     command_ids = build_legacy_ledger(scratch, now=moment)
     before = ledger_audit_rows(scratch)

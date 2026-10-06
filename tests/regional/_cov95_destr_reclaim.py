@@ -123,6 +123,10 @@ class ReclaimHarness:
 
 
 class ReclaimWarm:
+    # The spare gate reads the provider off the fixture (a HyperPod spare
+    # carries the Schedulable health label; an eks-managed one does not).
+    provider = "hyperpod"
+
     def __init__(self, harness: ReclaimHarness) -> None:
         self.h = harness
         self.regional = harness.regional

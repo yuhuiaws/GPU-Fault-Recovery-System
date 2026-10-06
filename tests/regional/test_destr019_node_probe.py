@@ -229,7 +229,12 @@ def test_the_migration_drill_report_satisfies_the_case_verdict(tmp_path: Path) -
     opens under the shipped ``NodeActionLedger``, keeps every row, gains the
     audit columns and the per-attempt key, and accepts an appended attempt."""
 
-    report = probe.migration_drill_report(tmp_path / "drill" / "legacy.db", now=T0)
+    # The drill rows are dated at this clock; the shipped ledger purges rows
+    # older than its 30-day retention when it opens, so the clock is the real
+    # one (a fixed T0 aged past the retention and the drill read 3 -> 0 rows).
+    report = probe.migration_drill_report(
+        tmp_path / "drill" / "legacy.db", now=datetime.now(timezone.utc)
+    )
 
     assert verdicts.migration_errors(report) == [], report
     assert report["after_open"]["user_version"] == LEDGER_SCHEMA_VERSION, report
@@ -240,7 +245,9 @@ def test_the_migration_drill_report_satisfies_the_case_verdict(tmp_path: Path) -
 def test_migration_verdict_rejects_a_ledger_that_did_not_migrate(
     tmp_path: Path,
 ) -> None:
-    report = probe.migration_drill_report(tmp_path / "legacy.db", now=T0)
+    report = probe.migration_drill_report(
+        tmp_path / "legacy.db", now=datetime.now(timezone.utc)
+    )
     stale = dict(report)
     stale["after_open"] = dict(report["before"])
     errors = verdicts.migration_errors(stale)
@@ -258,6 +265,19 @@ def test_migration_verdict_rejects_a_ledger_that_did_not_migrate(
     assert any(
         "row count changed" in item for item in verdicts.migration_errors(lost_row)
     ), "a migration that dropped rows must fail the drill"
+
+
+def test_the_drill_refuses_a_clock_older_than_the_ledger_retention(
+    tmp_path: Path,
+) -> None:
+    """Rows dated past the retention are purged at open, not migrated: the
+    drill refuses instead of reporting a lost row count."""
+
+    with pytest.raises(probe.ProbeError, match="older than the ledger retention"):
+        probe.migration_drill_report(
+            tmp_path / "legacy.db", now=datetime.now(timezone.utc) - timedelta(days=31)
+        )
+    assert not (tmp_path / "legacy.db").exists(), "nothing is built for a refused drill"
 
 
 # --------------------------------------------------------------------------- #

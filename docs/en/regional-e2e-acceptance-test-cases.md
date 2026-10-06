@@ -10411,7 +10411,13 @@ replacement should ever be attempted.
   `--window-start/--window-end`, otherwise the window is rejected. Unreadable JSON, illegal or
   timezone-less time fields that are present, or an existing case with no time evidence at all can
   never be silently skipped; this audit's own older output does not count as proof of predecessor
-  coverage.
+  coverage. One exception is named, not silent: a destructive case planned on this cluster and refused
+  by its own preflight as not applicable to its provider -- the HyperPod-only DESTR-002/016/025 on a
+  plain EKS cluster, whose `preflight.json` errors carry `does not apply to an eks-managed cluster` and
+  whose `plan.json` says `preflight_passed: false`, `mutation_performed: false` -- holds no run timestamp
+  and is recorded in the audit evidence as `not_applicable_cases` (case id and the preflight's own
+  words) instead of failing the audit; a plan-only directory refused for any other reason is still
+  missing evidence.
   When the window end is less than 15 minutes from now (CloudTrail delivery lag) it refuses by
   default; passing `--accept-recent-window` continues the collection but records only
   `INCOMPLETE/FAIL`, `cloudtrail_provisional: true` and `formal_sequence_satisfied: false`, exits
@@ -11672,7 +11678,10 @@ the ledger migrates in place, and the next real command leaves a complete audit 
      with the deployed venv's `NodeActionLedger`, reads back `PRAGMA user_version`, primary key,
      columns, row count, `attempt_history`, `get()`, `accept_fencing`, then appends once with
      `mark_in_progress(attempt=2)`+`save(exit_code=7)`, and finally deletes the temporary file.
-     **The real ledger is not touched.**
+     **The real ledger is not touched.** The legacy rows are dated at the drill's clock; a clock older
+     than the ledger's retention (30 days by default) is refused -- the ledger purges such rows the
+     moment it opens, and the "row count changed" it would read is not the migration's doing (a fixed
+     test clock that aged past the retention once read 3 -> 0 rows).
   3. Restart: the probe first runs `systemd-run --on-active=<restore>s systemctl start
      gpu-fault-node-agent.service` (fail-safe), then
      `systemctl restart gpu-fault-node-agent.service`, waits for active, records

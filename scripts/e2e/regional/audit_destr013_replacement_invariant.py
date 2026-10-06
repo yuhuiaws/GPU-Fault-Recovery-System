@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from gpu_fault.admin.diagnostics import diagnostic_text  # noqa: E402
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    NOT_APPLICABLE_PROVIDER_PHRASE,
     write_json_atomic,
 )
 from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # noqa: E402
@@ -291,6 +292,74 @@ def timeline_entries(value: Any, label: str) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], value)
 
 
+def _json_object(path: Path, label: str) -> dict[str, Any] | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise AuditError(
+            f"destructive evidence cannot be read as JSON: {label}"
+        ) from None
+    return document if isinstance(document, dict) else None
+
+
+def not_applicable_reason(case_dir: Path) -> str | None:
+    """Why a plan-only destructive case directory does not apply here, or None.
+
+    A HyperPod-only case planned on a plain EKS cluster (DESTR-002/016/025) is
+    refused by its own preflight with the words of
+    ``NOT_APPLICABLE_PROVIDER_PHRASE``; its directory then holds ``plan.json``
+    (``preflight_passed`` false, ``mutation_performed`` false) and
+    ``preflight.json`` only, no execute evidence and no run timestamp. That is
+    a case the campaign records N/A, not missing evidence. A plan-only
+    directory refused for any other reason, or one whose plan says a mutation
+    was performed, is still missing evidence.
+    """
+
+    plan = _json_object(case_dir / "plan.json", f"{case_dir.name}/plan.json")
+    preflight = _json_object(
+        case_dir / "preflight.json", f"{case_dir.name}/preflight.json"
+    )
+    if (
+        plan is None
+        or preflight is None
+        or plan.get("preflight_passed") is not False
+        or plan.get("mutation_performed") is not False
+    ):
+        return None
+    errors = preflight.get("errors")
+    if not isinstance(errors, list):
+        return None
+    return next(
+        (
+            item
+            for item in errors
+            if isinstance(item, str) and NOT_APPLICABLE_PROVIDER_PHRASE in item
+        ),
+        None,
+    )
+
+
+def not_applicable_cases(run_dir: Path) -> list[dict[str, str]]:
+    """The destructive cases whose plan-only evidence says they do not apply."""
+
+    found: list[dict[str, str]] = []
+    try:
+        cases = sorted((run_dir / "cases").iterdir())
+    except OSError:
+        raise AuditError(
+            "--run-dir destructive evidence inventory cannot be read"
+        ) from None
+    for case_dir in cases:
+        if not case_dir.name.startswith("GF-REGIONAL-DESTR-") or not case_dir.is_dir():
+            continue
+        reason = not_applicable_reason(case_dir)
+        if reason is not None:
+            found.append({"case_id": case_dir.name, "reason": reason})
+    return found
+
+
 def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
     """Every run timestamp recorded under the destructive cases' evidence.
 
@@ -353,11 +422,25 @@ def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
             for key, raw in candidates:
                 parsed = parse_time(raw, f"destructive evidence {label} {key}")
                 found.append({"path": label, "key": key, "at": parsed.isoformat()})
-        if len(found) == case_count:
+        if len(found) == case_count and not_applicable_reason(case_dir) is None:
             raise AuditError(
                 f"destructive case has no run timestamp evidence: {case_dir.name}"
             )
     return found
+
+
+def run_evidence_fields(
+    run_dir: Path, timestamps: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The run-dir evidence the audit records: every run timestamp it checked
+    the window against, and the destructive cases planned on this cluster that
+    their own preflight refused as not applicable to its provider (recorded,
+    not missing evidence)."""
+
+    return {
+        "run_evidence_timestamps": timestamps,
+        "not_applicable_cases": not_applicable_cases(run_dir),
+    }
 
 
 def coverage_errors(
@@ -863,7 +946,7 @@ def audit(
             "iam_decisions": decisions,
             "cloudtrail_events": events,
             "cloudtrail_provisional": provisional,
-            "run_evidence_timestamps": timestamps,
+            **run_evidence_fields(arguments.run_dir, timestamps),
             "manifest_invariants": manifests,
             "inventory_before": inventory_before,
             "inventory_after": inventory_after,
