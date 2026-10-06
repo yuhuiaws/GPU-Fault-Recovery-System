@@ -190,6 +190,43 @@ def test_control_plane_pressure_reads_the_requested_cluster_only() -> None:
     assert calls == [multi.METRICS_PROBE]
 
 
+def test_an_absent_cluster_series_reads_zero_while_the_family_is_rendered() -> None:
+    """The family is "incomplete processor requests by cluster": a cluster with
+    none has no series. Under ISO-006 that is cluster B by design, and the
+    reading used to call it an unknown depth (``None``) -- which the runner's
+    delta then crashed on after a clean block."""
+
+    with_family = (
+        "# HELP gpu_fault_processor_cluster_queue_depth Incomplete processor "
+        "requests by cluster.\n"
+        "# TYPE gpu_fault_processor_cluster_queue_depth gauge\n"
+        "gpu_fault_store_io_rejections_total 0\n"
+    )
+    reading = multi.cluster_pressure_reading(with_family, "b")
+    assert reading["cluster_queue_depth"] == 0.0
+    assert reading["cluster_queue_depth_series_present"] is False
+
+    sibling_only = 'gpu_fault_processor_cluster_queue_depth{cluster_id="a"} 3\n'
+    reading = multi.cluster_pressure_reading(sibling_only, "b")
+    assert reading["cluster_queue_depth"] == 0.0, (
+        "another cluster's series proves the family is rendered"
+    )
+    assert reading["cluster_queue_depth_series_present"] is False
+
+    reading = multi.cluster_pressure_reading(
+        'gpu_fault_processor_cluster_queue_depth{cluster_id="b"} 2\n', "b"
+    )
+    assert reading["cluster_queue_depth"] == 2.0
+    assert reading["cluster_queue_depth_series_present"] is True
+
+
+def test_a_metrics_text_without_the_family_leaves_the_depth_unknown() -> None:
+    reading = multi.cluster_pressure_reading("other_metric 8\n", "b")
+
+    assert reading["cluster_queue_depth"] is None
+    assert reading["cluster_queue_depth_series_present"] is False
+
+
 @pytest.mark.parametrize(
     "lines",
     [

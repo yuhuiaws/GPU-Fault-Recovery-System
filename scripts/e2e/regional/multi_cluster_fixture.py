@@ -276,16 +276,32 @@ def parse_metrics(text: str) -> list[tuple[str, dict[str, str], float]]:
         raise RegionalFixtureError("control-plane metrics are malformed") from exc
 
 
+CLUSTER_QUEUE_DEPTH_FAMILY = "gpu_fault_processor_cluster_queue_depth"
+
+
 def cluster_pressure_reading(text: str, cluster_id: str) -> dict[str, Any]:
-    """Queue depth for one cluster and the region's rejection counters."""
+    """Queue depth for one cluster and the region's rejection counters.
+
+    ``gpu_fault_processor_cluster_queue_depth`` is "incomplete processor
+    requests by cluster": the control plane renders a series only for a
+    cluster that has one, so an idle cluster -- or one whose requests never
+    reach the control plane, which is what ISO-006 arranges -- has no series
+    while the family (its ``# TYPE`` line) is still rendered. That reads as
+    zero, and ``cluster_queue_depth_series_present`` says the series was
+    absent. Only a ``/metrics`` without the family leaves the depth unknown
+    (``None``): an older control plane, or a reading that is not the control
+    plane's. Live (ISO-006 attempt 6) the absent series was recorded as a null
+    depth and the delta computation failed on it after a clean block.
+    """
 
     depth: float | None = None
     rejections: dict[str, float | None] = {name: None for name in REJECTION_COUNTERS}
+    family_present = f"# TYPE {CLUSTER_QUEUE_DEPTH_FAMILY} " in text
     for name, labels, value in parse_metrics(text):
-        if (
-            name == "gpu_fault_processor_cluster_queue_depth"
-            and labels.get("cluster_id") == cluster_id
-        ):
+        if name == CLUSTER_QUEUE_DEPTH_FAMILY:
+            family_present = True
+            if labels.get("cluster_id") != cluster_id:
+                continue
             if not math.isfinite(value) or value < 0 or depth is not None:
                 raise RegionalFixtureError(
                     "cluster queue depth is invalid or duplicated"
@@ -295,7 +311,14 @@ def cluster_pressure_reading(text: str, cluster_id: str) -> dict[str, Any]:
             if not math.isfinite(value) or value < 0:
                 raise RegionalFixtureError("rejection counter is invalid")
             rejections[name] = (rejections[name] or 0) + value
-    return {"cluster_queue_depth": depth, "rejections": rejections}
+    series_present = depth is not None
+    if depth is None and family_present:
+        depth = 0.0
+    return {
+        "cluster_queue_depth": depth,
+        "cluster_queue_depth_series_present": series_present,
+        "rejections": rejections,
+    }
 
 
 def control_plane_pressure(

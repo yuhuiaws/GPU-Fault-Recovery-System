@@ -5348,7 +5348,12 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   authenticated POST to the control plane, so both executor Pods are NotReady for the length of the block by design
   (Running, no restarts, Ready again after the unblock) and a probe that insisted on Ready aborted the whole run with
   `no Ready gpu Pod for app=gpu-fault-cluster-executor`; cluster A's probes still require Ready, and readiness stays
-  the control plane's own signal. The rule on every target node first creates a host-side automatic recovery timer;
+  the control plane's own signal. `gpu_fault_processor_cluster_queue_depth` is "incomplete processor requests by cluster":
+  a cluster with none has no series while the family is still rendered, which is cluster B's state under the block by
+  design; the reading records it as depth `0` with `cluster_queue_depth_series_present=false`, and only a `/metrics`
+  without the family leaves `b_queue_depth_delta` unavailable (`b_queue_depth_available=false`, a `validation_limitations`
+  line) -- the delta is recorded, never judged; a null depth used to crash the delta after an otherwise clean block. The
+  rule on every target node first creates a host-side automatic recovery timer;
   the runner's `finally` then unblocks node by node. Passing `0.0.0.0/0` in place of the control-plane CIDR is forbidden.
   The block lands on both the `OUTPUT` and `FORWARD` chains of every B node (blocking only TCP 443 to the explicit control-plane
   CIDR); once blocked, the runner first samples one claim from B as `cut_proof`, which must fail at the **transport layer**

@@ -476,6 +476,31 @@ def latency_errors(
     return errors
 
 
+def queue_depth_delta(before: dict[str, Any], after: dict[str, Any]) -> float | None:
+    """B's queue-depth change over the block, or ``None`` when either reading
+    has no depth (the family was absent from ``/metrics``). Recorded, never
+    judged: B's requests do not reach the control plane under the block, so
+    the rejection counters are what the verdict reads (``pressure_errors``).
+    Live (attempt 6) a null depth raised ``TypeError`` here after a clean run.
+    """
+
+    values = [reading.get("cluster_queue_depth") for reading in (before, after)]
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in values
+    ):
+        return None
+    return float(values[1]) - float(values[0])
+
+
+QUEUE_DEPTH_UNAVAILABLE = (
+    "cluster B's processor queue depth was not reported by the control plane in "
+    "both phases (the gpu_fault_processor_cluster_queue_depth family was absent "
+    "from /metrics), so b_queue_depth_delta is unavailable; the block was judged "
+    "on the rejection counters, which were read."
+)
+
+
 def pressure_errors(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     errors = []
     previous = before.get("rejections")
@@ -600,9 +625,18 @@ def observe_recovery_during_cut(
     errors.extend(container_status_errors(containers_before, containers_after))
     result["pressure_before"] = pressure_before
     result["pressure_after"] = pressure_after
-    result["b_queue_depth_delta"] = float(
-        pressure_after.get("cluster_queue_depth", 0.0)
-    ) - float(pressure_before.get("cluster_queue_depth", 0.0))
+    delta = queue_depth_delta(pressure_before, pressure_after)
+    result["b_queue_depth_delta"] = delta
+    result["b_queue_depth_available"] = delta is not None
+    result["b_queue_depth_series_present"] = [
+        bool(reading.get("cluster_queue_depth_series_present"))
+        for reading in (pressure_before, pressure_after)
+    ]
+    if delta is None:
+        result["validation_limitations"] = [
+            *result.get("validation_limitations", VALIDATION_LIMITATIONS),
+            QUEUE_DEPTH_UNAVAILABLE,
+        ]
     result["cpu_containers_after"] = containers_after
     result["a_claim_p95_baseline_seconds"] = latency_p95(result["baseline_samples"])
     result["a_claim_p95_window_seconds"] = latency_p95(

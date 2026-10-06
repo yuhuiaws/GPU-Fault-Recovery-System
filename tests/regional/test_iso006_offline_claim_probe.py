@@ -35,8 +35,13 @@ class FakeClock:
         self.now += max(float(seconds), 0.001)
 
 
+@pytest.mark.parametrize(
+    ("depth", "expected_delta"),
+    [(0.0, 0.0), (None, None)],
+    ids=["depth-zero", "depth-unknown"],
+)
 def test_the_observation_window_probes_cluster_b_in_a_running_pod(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, depth: float | None, expected_delta: float | None
 ) -> None:
     calls: list[tuple[str, bool]] = []
 
@@ -59,7 +64,13 @@ def test_the_observation_window_probes_cluster_b_in_a_running_pod(
     monkeypatch.setattr(runner, "time", clock)
     monkeypatch.setattr(runner, "claim_sample", claim_sample)
     monkeypatch.setattr(
-        runner, "control_plane_pressure", lambda _f, _c: {"cluster_queue_depth": 0.0}
+        runner,
+        "control_plane_pressure",
+        lambda _f, _c: {
+            "cluster_queue_depth": depth,
+            "cluster_queue_depth_series_present": False,
+            "rejections": {"gpu_fault_store_io_rejections_total": 0.0},
+        },
     )
     monkeypatch.setattr(runner, "cpu_pod_snapshot", lambda _f: [])
     monkeypatch.setattr(runner, "control_plane_container_statuses", lambda _f: {})
@@ -73,7 +84,11 @@ def test_the_observation_window_probes_cluster_b_in_a_running_pod(
         multi=SimpleNamespace(cluster_b=SimpleNamespace(cluster_id="gpu-b")),
         duration_seconds=2 * runner.SAMPLE_INTERVAL_SECONDS,
     )
-    result: dict[str, Any] = {"samples": [], "baseline_samples": []}
+    result: dict[str, Any] = {
+        "samples": [],
+        "baseline_samples": [],
+        "validation_limitations": list(runner.VALIDATION_LIMITATIONS),
+    }
 
     errors = runner.observe_recovery_during_cut(
         a=a,
@@ -81,12 +96,26 @@ def test_the_observation_window_probes_cluster_b_in_a_running_pod(
         primary=Primary(),
         settings=settings,
         preflight={"cpu_containers": {}, "cpu_pods": []},
-        pressure_before={},
+        pressure_before={
+            "cluster_queue_depth": depth,
+            "cluster_queue_depth_series_present": False,
+            "rejections": {"gpu_fault_store_io_rejections_total": 0.0},
+        },
         result=result,
         maintenance_window_end=datetime.now(timezone.utc) + timedelta(hours=1),
     )
 
     assert errors == []
+    assert result["b_queue_depth_delta"] == expected_delta
+    assert result["b_queue_depth_available"] is (expected_delta is not None)
+    assert result["b_queue_depth_series_present"] == [False, False]
+    if expected_delta is None:
+        assert result["validation_limitations"][-1] == runner.QUEUE_DEPTH_UNAVAILABLE
+        assert runner.QUEUE_DEPTH_UNAVAILABLE not in runner.VALIDATION_LIMITATIONS, (
+            "the module constant is not mutated"
+        )
+    else:
+        assert runner.QUEUE_DEPTH_UNAVAILABLE not in result["validation_limitations"]
     assert len(result["samples"]) == 2, result["samples"]
     b_calls = [offline for name, offline in calls if name == "b"]
     a_calls = [offline for name, offline in calls if name == "a"]
@@ -103,3 +132,20 @@ def test_the_limitation_names_why_readiness_is_not_required_of_cluster_b() -> No
         "NotReady" in item and "Running, not Ready" in item
         for item in runner.VALIDATION_LIMITATIONS
     ), runner.VALIDATION_LIMITATIONS
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        ({"cluster_queue_depth": 1.0}, {"cluster_queue_depth": 4.0}, 3.0),
+        ({"cluster_queue_depth": 2}, {"cluster_queue_depth": 2}, 0.0),
+        ({"cluster_queue_depth": None}, {"cluster_queue_depth": 4.0}, None),
+        ({"cluster_queue_depth": 1.0}, {"cluster_queue_depth": None}, None),
+        ({}, {"cluster_queue_depth": 1.0}, None),
+        ({"cluster_queue_depth": True}, {"cluster_queue_depth": 1.0}, None),
+    ],
+)
+def test_the_queue_depth_delta_never_raises_on_a_missing_depth(
+    before: dict[str, Any], after: dict[str, Any], expected: float | None
+) -> None:
+    assert runner.queue_depth_delta(before, after) == expected
