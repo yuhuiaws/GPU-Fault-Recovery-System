@@ -30,7 +30,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
-| Converge historical workflows that recovered but stay BLOCKED, and never-dispatched PENDING workflows whose node left with a spot replacement | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
 | Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
@@ -3138,22 +3138,33 @@ whole; a traceback still is, but names its exception class). Afterwards: a QUARA
 `--close-quarantined` with node evidence; an ESCALATED one (a restore attempt FAILED, say) is closed RECOVERED on the
 operator's authority with `workflow-reconcile --close-incident <id>`, the parked record ends SUPERSEDED with it and the
 node is no longer occupied.
-**The release gate no longer stops on a confirmed parked record**: the workflow safety probe behind `gpu-fault-admin
+**The release gates and a confirmed parked record**: the workflow safety probe behind `gpu-fault-admin
 config`/`deploy` (`deploy/control-plane/regional/probes/workflow_safety.py`; the fleet wave's `rollout_wave_safety.py`
 likewise) used to read `outcome_unknown` in the step details as still unresolved even beside an operator confirmation;
 it now agrees with the product -- a confirmation beats the uncertainty flags -- and sets a "BLOCKED/NEEDS_OPERATOR,
 node action confirmed, no owner / live lease / WAITING step / open remote command" record aside as
-`operator_confirmed_parked` (the wave probe: `operator_confirmed_destructive_workflows`), outside `blocker_count`. The
-probes ship with the CLI bundle and run in the Pod as source, so refreshing the bundle is enough; no release has to
-land first. The sequence on site (control plane still on the previous release): 1) refresh the deploy host's CLI
-bundle; 2) `submit-remediation --disposition confirm-node-action --node <node> --reference <CHG> --plan`, then submit
-without `--plan` (the CLI judges the reboot evidence under the new rule; the Pod writes it verbatim); 3) the
-`gpu-fault-admin config`/`deploy` preflight reports the record as `operator_confirmed_parked` with `blocker_count=0`
-and the release proceeds; 4) once it has landed, `workflow-reconcile --state-dir ... --close-incident <id> --reason
-... --reference <CHG>`: the first pass reports `evidence_required`, the CLI reads the node evidence through the GPU
-kubeconfig and submits again, the incident ends RECOVERED, and the dispatcher's sweep ends the parked record
-SUPERSEDED on its next tick (`workflow-reconcile --dry-run` no longer lists it; the uninstall/cleanup activity counts no
-longer see it).
+`operator_confirmed_parked` (the wave probe: `operator_confirmed_destructive_workflows`), outside `blocker_count`. Which
+probe runs is decided by which engine runs the release, not by the CLI bundle: `deploy` (an upgrade) builds from the
+source checkout and runs that checkout's engine and probes, so its gate takes the new rule as soon as the checkout
+carries it; `gpu-fault-admin config` re-rolls the **deployed** release from the site's own source snapshot (`site.yaml`
+`spec.repositoryRoot`), so its gate is the deployed release's probe until the next deploy lands. On a release that
+predates the rule a confirmed record therefore still blocks `config`, and the exit is to end the record through the
+audited reconcile, which works against the deployed image: `workflow-reconcile` plans the `operator-confirmed` shape
+(§10.2) in the Pod with the CLI-shipped script, proves the node back in service through the GPU kubeconfig and ends the
+record SUPERSEDED through a bridge of existing store primitives; the ESCALATED incident then closes on the operator's
+authority (`--close-incident`; no open workflow is left) and every gate -- deployed or new -- sees a terminal record.
+The sequence on site (control plane still on the previous release): 1) refresh the deploy host's CLI bundle; 2)
+`submit-remediation --disposition confirm-node-action --node <node> --reference <CHG> --plan`, then submit without
+`--plan` (the CLI judges the reboot evidence under the new rule; the Pod writes it verbatim); 3) `workflow-reconcile
+--state-dir ... --workflow-id <record> --dry-run` shows the record as `terminalization=operator-confirmed` and
+`eligible=true` when the node carries no cordon, isolation taint or isolation annotation (otherwise it names the blocker:
+release the node with the restore of §9.2 first), then the same command with `--reference <CHG>` ends it SUPERSEDED; 4)
+`workflow-reconcile --state-dir ... --close-incident <id> --reason ... --reference <CHG>` ends the incident RECOVERED;
+5) the `gpu-fault-admin config`/`deploy` preflight reports `blocker_count=0` with nothing left to set aside
+(`workflow-reconcile --dry-run` no longer lists the record; the uninstall/cleanup activity counts do not see it). On a
+control plane already running this release the close alone does both: `--close-incident` reports `evidence_required`,
+the CLI reads the node evidence through the GPU kubeconfig and submits again, and the incident ends RECOVERED with the
+parked record SUPERSEDED.
 
 ```bash
 # Read-only: prints the confirmation that would be written (step, command, boot id before/after the reboot, Agent generation, node/Agent evidence), writing nothing
@@ -3409,6 +3420,55 @@ Kubernetes Node the refusal ends with a hint naming this switch. The same `workf
   no longer produces `collector readiness failed` or `GpuFaultCollectorSilent`. The node's `collector_status` rows are not
   deleted -- the Store has no deletion path and they are evidence -- readers simply stop counting them. Should a node
   re-register under the same name, the registry's normal heartbeat path makes it `ACTIVE` again.
+
+**The fifth shape: a parked record whose node action the operator confirmed (`operator-confirmed`).** A node
+action whose outcome the Node Agent could not report parks its record `BLOCKED/NEEDS_OPERATOR` (§9.4); once the
+operator has confirmed it with `confirm-node-action`, the record holds its node as paperwork only -- yet it is neither
+of the two BLOCKED shapes above (it completed a node-mutating operation, and its own incident has no verified restore
+successor), so the deployed planner refuses it, `--close-incident` refuses the ESCALATED incident while the record is
+open, and `gpu-fault-admin config`, which re-rolls the deployed release from the site's source snapshot, is held by the
+deployed workflow safety gate. The same `workflow-reconcile` closes it:
+
+- **Rule** (Pod side, `gpu_fault.workflow_reconcile.operator_confirmed_reconciliation_reasons`, all required):
+  `status=BLOCKED`; no execution owner, no unexpired lease, no WAITING step, no open remote command; at least one
+  node-mutating step carries a complete operator confirmation (actor, reference, time, node, operation) and no node
+  action is still unresolved (a confirmation answers the uncertainty flags beside it; an unconfirmed one does not); the
+  incident exists, is `ESCALATED`/`RECOVERED` (nobody is waiting on this record to act) and names every confirmed node.
+  The deployed `BLOCKED` discovery already lists such records (and `--workflow-id` names them); the CLI-shipped script
+  judges every item of that plan again and a record the deployed planner refused takes this verdict when it carries a
+  confirmation -- a record without one, or one the deployed planner found eligible, keeps the deployed verdict. The
+  item carries `confirmations` (step, operation, actor, reference, time, node, `settled_by`) inside the digest, so the
+  approval binds exactly the attestations the operator saw.
+- **Node evidence** (command-line side): the same proof every BLOCKED reconcile reads through the GPU kubeconfig -- the
+  node carries no cordon, no `gpu-fault.io/quarantined` or `gpu-fault.io/quiesce` taint and no isolation annotation --
+  or, as for a `never-changed` record, the node left Kubernetes and the provider. The Pod gives the item exactly one
+  reason, `node restoration is unproven: the administrator reads the GPU node's scheduling state`; the command-line
+  side marks it `eligible` only when that is the only reason and every node is restored. A node still isolated keeps
+  the record ineligible (`GPU node scheduling state has not been restored`): release it with the restore of §9.2 first.
+- **Write**: through the in-Pod `apply-operator-confirmed` bridge, which uses only existing store primitives (so it
+  works on the very release the record blocks; when the deployed planner does not know the shape, the command-line side
+  ships the same rule with its script): fencing token, execution epoch and every condition above are re-checked, the
+  confirmations must be exactly the ones approved, and the node set the evidence covers must equal the incident's
+  `node_ids`; `amend_workflow` sets the record `SUPERSEDED` (`preempted_by_workflow_id` empty, the budget claims
+  released, `preemption_reason` the audit text `... closed <id>, whose node action the operator confirmed settled
+  (step N <operation> (<settled_by>)) on <nodes>, with its incident <state>`), the `OPERATOR_RECONCILED` event in the
+  same write records `terminalization=operator-confirmed`, the operator ARN, `admin_plan_sha256`, the
+  `operator_confirmations` and the per-node `node_evidence`; a source plan the record names gets
+  `reconciliation_reference`/`reconciled_at` (`resolved_plan_ids`); a compare-and-set `save_incident` appends the same
+  audit line to the incident's `reasons` and leaves its state alone -- an ESCALATED incident is the operator's to close.
+- **Afterwards**: `--close-incident <id>` closes the ESCALATED incident on the operator's authority (no open workflow is
+  left, so the deployed close accepts it too); the release gates, the deployed one included, no longer see the record,
+  and neither do the uninstall/cleanup activity counts. `records_deleted` is always 0.
+
+```bash
+# Look first: the record shows terminalization=operator-confirmed, its confirmations and the node evidence
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --workflow-id <workflow-id> --dry-run
+# After confirming, execute once (plan, re-check and write in the same invocation)
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --workflow-id <workflow-id> --reference CHG-12345
+# Then close the ESCALATED incident
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-incident <incident-id> \
+  --reason "node rebooted and validated after the reset; record confirmed and reconciled" --reference CHG-12345
+```
 
 **The complete sequence after a spot node is reclaimed** (three residues, one verb, one `--reference`):
 

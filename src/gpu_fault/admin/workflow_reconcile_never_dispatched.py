@@ -52,8 +52,10 @@ KUBERNETES_PRESENT_BLOCKER = (
 )
 
 # Appended to ``workflow_reconcile.RECONCILE_SCRIPT``'s mode chain, which ends
-# with ``result = None`` for a mode it does not know. Everything below runs
-# against whatever ``gpu_fault`` is deployed in the Pod.
+# with ``result = None`` for a mode it does not know; the chain's end -- the
+# refusal of an unknown mode and the print -- is ``workflow_reconcile``'s, after
+# the tails of the shapes bridged after this one. Everything below runs against
+# whatever ``gpu_fault`` is deployed in the Pod.
 SCRIPT_TAIL = """
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -441,9 +443,6 @@ elif payload["mode"] == "apply-never-dispatched":
         "archive_eligible_incident_ids": sorted(incidents),
         "records_deleted": 0,
     }
-elif result is None:
-    raise ValueError("unsupported workflow reconcile mode")
-print(json.dumps(result, sort_keys=True))
 """
 
 

@@ -8653,16 +8653,19 @@ needs `--node`, see item 9).
    The evidence file is `<state-dir>/submit-remediation/<incident-id>/confirm-node-action-<time>.json`.
    **The release gate and a confirmed parked record**: the workflow safety probe of the `deploy`/`gpu-fault-admin config`
    preflight (`deploy/control-plane/regional/probes/workflow_safety.py`; the fleet wave's `rollout_wave_safety.py` likewise)
-   ships with the CLI bundle and runs in the Pod as source; like the product, it lets an operator confirmation beat the
-   `outcome_unknown` flags beside it and sets a "BLOCKED/NEEDS_OPERATOR, node action confirmed, no owner / live lease /
-   WAITING step / open remote command" record aside as `operator_confirmed_parked` (the wave probe:
+   runs in the Pod as source carried by the engine that runs the release; like the product, it lets an operator confirmation
+   beat the `outcome_unknown` flags beside it and sets a "BLOCKED/NEEDS_OPERATOR, node action confirmed, no owner / live
+   lease / WAITING step / open remote command" record aside as `operator_confirmed_parked` (the wave probe:
    `operator_confirmed_destructive_workflows`), outside `blocker_count` -- such a record used to hold `config` and every
-   release with `active destructive workflows block release`, including the release carrying its own close. Sequence:
-   refresh the CLI bundle -> `confirm-node-action` -> the preflight passes, release -> once it has landed,
-   `workflow-reconcile --close-incident <incident>` (an ESCALATED incident closes with node evidence that clears the nodes
-   too; `preview` reports `evidence_required` for the confirmed parked record and the CLI reads the node evidence and
-   submits a second pass) -> the incident ends RECOVERED and the dispatcher sweep ends the record SUPERSEDED
-   (Administrator Operations §9.4).
+   release with `active destructive workflows block release`, including the release carrying its own close. `deploy`
+   builds from the source checkout and carries that checkout's probe; `gpu-fault-admin config` re-rolls the deployed
+   release from the site's source snapshot and carries the deployed probe, so until the next deploy lands a confirmed record
+   still blocks `config` there. Sequence: refresh the CLI bundle -> `confirm-node-action` -> `workflow-reconcile
+   --workflow-id <record>` (the `operator-confirmed` shape, applied through a bridge of existing store primitives: the record
+   ends SUPERSEDED) -> `workflow-reconcile --close-incident <incident>` (closes on the operator's authority; no open
+   workflow is left) -> the `config`/`deploy` preflight reports `blocker_count=0`. On this release the close alone also
+   ends a confirmed record when the node evidence clears the nodes (`preview` reports `evidence_required`, the CLI reads the
+   node evidence and submits a second pass) (Administrator Operations §9.4, §10.2).
 
 <a id="104-手工删除无-ttl-的-incident-审计记录"></a>
 <a id="84-手工删除无-ttl-的-incident-审计记录"></a>

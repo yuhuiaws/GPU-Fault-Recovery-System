@@ -56,6 +56,7 @@ from gpu_fault.admin import (
     operator_identity,
     workflow_reconcile_departed_nodes,
     workflow_reconcile_never_dispatched,
+    workflow_reconcile_operator_confirmed,
 )
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
@@ -93,17 +94,24 @@ NON_PLAN_REASON = "workflow has no source recovery plan"
 # The PENDING record never dispatched whose node left Kubernetes and HyperPod;
 # the Pod plans it, this layer proves the departure and bridges the apply.
 NEVER_DISPATCHED = workflow_reconcile_never_dispatched.NEVER_DISPATCHED
+# The BLOCKED record parked on a node action an operator confirmed on evidence;
+# the Pod plans it, this layer proves the node back in service (or gone) and
+# bridges the apply (``workflow_reconcile_operator_confirmed``).
+OPERATOR_CONFIRMED = workflow_reconcile_operator_confirmed.OPERATOR_CONFIRMED
 # Which bridge mode applies a promoted item; anything else goes through the
 # deployed ``apply_workflow_reconcile_plan``.
 BRIDGE_MODES = {
     VERIFIED_RESTORE_NON_PLAN: "apply-verified-restore",
     NEVER_CHANGED_NON_PLAN: "apply-never-changed",
     NEVER_DISPATCHED: workflow_reconcile_never_dispatched.BRIDGE_MODE,
+    OPERATOR_CONFIRMED: workflow_reconcile_operator_confirmed.BRIDGE_MODE,
 }
 # Items whose missing node may be explained by the provider instead of failing
 # on "node is missing": there is no restore successor to name, and a node the
 # provider no longer has carries no cordon, taint or annotation to restore.
-DEPARTED_NODE_TERMINALIZATIONS = frozenset({NEVER_CHANGED, NEVER_CHANGED_NON_PLAN})
+DEPARTED_NODE_TERMINALIZATIONS = frozenset(
+    {NEVER_CHANGED, NEVER_CHANGED_NON_PLAN, OPERATOR_CONFIRMED}
+)
 HYPERPOD_PROVIDER = workflow_reconcile_departed_nodes.HYPERPOD_PROVIDER
 # HyperPod names an EKS node after its EC2 instance. Only a HyperPod cluster's
 # nodes are read this way; an eks-managed node is a private DNS name and its
@@ -114,9 +122,11 @@ ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/fencing-token",
     "gpu-fault.io/previous-unschedulable",
 )
-# The mode chain; a mode it does not know leaves ``result`` unset for the tail
-# (``workflow_reconcile_never_dispatched.SCRIPT_TAIL``), which also extends the
-# plan with the never-dispatched shape and prints the result.
+# The mode chain; a mode it does not know leaves ``result`` unset for the tails
+# (``workflow_reconcile_never_dispatched.SCRIPT_TAIL``,
+# ``workflow_reconcile_operator_confirmed.SCRIPT_TAIL``), which also extend the
+# plan with their shapes; ``_RECONCILE_SCRIPT_END`` refuses a mode nobody knew
+# and prints the result.
 _RECONCILE_SCRIPT_CORE = """
 import inspect
 import json
@@ -418,8 +428,17 @@ elif payload["mode"] == "apply-never-changed":
 else:
     result = None
 """
+_RECONCILE_SCRIPT_END = """
+if result is None:
+    raise ValueError("unsupported workflow reconcile mode")
+print(json.dumps(result, sort_keys=True))
+"""
+
 RECONCILE_SCRIPT = (
-    _RECONCILE_SCRIPT_CORE + workflow_reconcile_never_dispatched.SCRIPT_TAIL
+    _RECONCILE_SCRIPT_CORE
+    + workflow_reconcile_never_dispatched.SCRIPT_TAIL
+    + workflow_reconcile_operator_confirmed.SCRIPT_TAIL
+    + _RECONCILE_SCRIPT_END
 )
 
 
@@ -509,13 +528,17 @@ def _bridge_payload(
 
     The verified-restore bridge names the successor it supersedes the record
     with; the never-changed bridge has none to name; the never-dispatched
-    bridge carries the departed-node evidence the close rests on.
+    bridge carries the departed-node evidence the close rests on; the
+    operator-confirmed bridge carries the confirmations and the node evidence.
     """
 
     bound: list[dict[str, Any]] = []
     for item in items:
         if mode == BRIDGE_MODES[NEVER_DISPATCHED]:
             bound.append(workflow_reconcile_never_dispatched.bridge_entry(item))
+            continue
+        if mode == BRIDGE_MODES[OPERATOR_CONFIRMED]:
+            bound.append(workflow_reconcile_operator_confirmed.bridge_entry(item))
             continue
         entry: dict[str, Any] = {"request_id": str(item["request_id"])}
         if mode == BRIDGE_MODES[VERIFIED_RESTORE_NON_PLAN]:
@@ -1188,6 +1211,7 @@ def _finalize_plan(
         if read_at is not None:
             item["evidence_read_at"] = read_at
         workflow_reconcile_never_dispatched.promote_never_dispatched(item)
+        workflow_reconcile_operator_confirmed.promote_operator_confirmed(item)
         if not evidence["restored"]:
             item["eligible"] = False
             item["reasons"] = [

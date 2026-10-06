@@ -5,6 +5,11 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action,
+    latest_node_action_executions,
+    operator_confirmation,
+)
 from gpu_fault.execution.restart_budget_preflight import (
     release_unattempted_restart_reservations,
 )
@@ -30,6 +35,8 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.workflow_resolution import (
     NEVER_DISPATCHED_GUARD_AGE,
+    OPEN_REMOTE_STATUSES,
+    SETTLED_INCIDENT_STATES,
     completed_containment_operations,
     never_dispatched_reconciliation_reasons,
     reconciled_restore_records,
@@ -50,6 +57,22 @@ NEVER_CHANGED = "never-changed"
 # layer of ``workflow-reconcile`` adds the evidence and applies through its
 # own bridge (``gpu_fault.admin.workflow_reconcile_never_dispatched``).
 NEVER_DISPATCHED = "never-dispatched"
+# The fourth shape is planned here and never eligible here either: a BLOCKED
+# record parked on a node action whose outcome the Node Agent could not report
+# and that an operator later confirmed on evidence (``submit-remediation
+# --disposition confirm-node-action``). Its incident is settled -- ESCALATED,
+# or RECOVERED by a later workflow -- and nothing on it is live; whether its
+# node is back in service is a Kubernetes fact the Pod cannot read, so every
+# item carries ``NODE_RESTORE_PROOF_REASON`` and the admin layer answers it
+# and applies through its own bridge
+# (``gpu_fault.admin.workflow_reconcile_operator_confirmed``). Live: the
+# deployed release's own gate counted such a record as an active destructive
+# workflow, and the record could end only with the release it was blocking.
+OPERATOR_CONFIRMED = "operator-confirmed"
+NODE_RESTORE_PROOF_REASON = (
+    "node restoration is unproven: the administrator reads the GPU node's "
+    "scheduling state"
+)
 
 
 def _canonical_sha256(value: object) -> str:
@@ -203,6 +226,186 @@ def never_dispatched_plan_items(
             }
         )
     return items, report
+
+
+def operator_confirmed_node_actions(workflow: WorkflowRequest) -> list[dict[str, Any]]:
+    """The operator confirmations the record's node-mutating steps carry.
+
+    One flat record per confirmed step -- the newest execution of each step
+    answering, as ``has_unresolved_node_action`` reads them -- naming the step,
+    the operation and the attribution the confirmation was written with
+    (``node_action_uncertainty.operator_confirmation``). The list is what an
+    approval binds: a confirmation added, removed or rewritten after the plan
+    is drift, not a detail.
+    """
+
+    confirmed: list[dict[str, Any]] = []
+    for execution in latest_node_action_executions(workflow):
+        confirmation = operator_confirmation(execution.details)
+        if confirmation is None:
+            continue
+        settled_by = confirmation.get("settled_by")
+        confirmed.append(
+            {
+                "step_index": execution.step_index,
+                "operation": execution.operation.value,
+                "phase": execution.phase,
+                "node_id": confirmation["node_id"],
+                "actor": confirmation["actor"],
+                "reference": confirmation["reference"],
+                "confirmed_at": confirmation["confirmed_at"],
+                "settled_by": settled_by if isinstance(settled_by, str) else None,
+            }
+        )
+    return confirmed
+
+
+def operator_confirmed_reconciliation_reasons(
+    workflow: WorkflowRequest,
+    incident: FaultIncident | None,
+    remote_commands: list[Any],
+    *,
+    evaluated_at: datetime,
+) -> list[str]:
+    """Why a BLOCKED record is *not* a confirmed parked record ready to end.
+
+    Every condition is required: the record is BLOCKED and holds nothing live
+    (no owner, no unexpired lease, no WAITING step, no open remote command);
+    at least one node-mutating step carries a complete operator confirmation
+    and no node action is still unresolved (a confirmation answers the
+    uncertainty flags beside it; an unconfirmed one does not); the incident
+    exists, is settled (``SETTLED_INCIDENT_STATES``: nobody is waiting on this
+    record to act) and names every confirmed node. The node proof itself --
+    no cordon, no isolation taint, no isolation annotation, or the node gone
+    from the provider -- is the administrator's and is always listed as
+    missing here.
+    """
+
+    reasons: list[str] = []
+    if workflow.status is not WorkflowStatus.BLOCKED:
+        reasons.append(f"workflow status is {workflow.status.value}, not BLOCKED")
+    if workflow.execution_owner_id is not None:
+        reasons.append("workflow still has an execution owner")
+    if (
+        workflow.execution_lease_expires_at is not None
+        and workflow.execution_lease_expires_at > evaluated_at
+    ):
+        reasons.append("workflow execution lease has not expired")
+    if any(
+        item.status is WorkflowStepStatus.WAITING for item in workflow.step_executions
+    ):
+        reasons.append("workflow has an unknown provider action")
+    if any(
+        item.workflow_request_id == workflow.request_id
+        and item.status in OPEN_REMOTE_STATUSES
+        for item in remote_commands
+    ):
+        reasons.append("workflow has open remote commands")
+    confirmations = operator_confirmed_node_actions(workflow)
+    if not confirmations:
+        reasons.append("no node action of the record carries an operator confirmation")
+    if has_unresolved_node_action(workflow):
+        reasons.append("workflow has an unresolved node action no operator confirmed")
+    if incident is None:
+        reasons.append("incident is missing")
+    else:
+        if incident.state not in SETTLED_INCIDENT_STATES:
+            reasons.append(
+                f"incident is {incident.state.value}, still waiting on a workflow"
+            )
+        outside = sorted(
+            {str(item["node_id"]) for item in confirmations} - set(incident.node_ids)
+        )
+        if outside:
+            reasons.append(
+                "confirmation names a node outside the incident: " + ", ".join(outside)
+            )
+    reasons.append(NODE_RESTORE_PROOF_REASON)
+    return reasons
+
+
+def operator_confirmed_plan_items(
+    store: ControlPlaneStore,
+    workflow_ids: Iterable[str] | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Plan items for the confirmed parked records among ``workflow_ids``.
+
+    Judged as given, no discovery of its own: the BLOCKED backlog the deployed
+    planner discovers already holds these records, under a verdict that does
+    not know the shape (no verified restore successor, a node-mutating
+    operation completed). The admin script hands that plan's ids here and
+    takes this verdict for every record that carries a confirmation; a record
+    without one, or one that does not exist, is left to the deployed verdict.
+    Every item is ineligible on the Pod side (``NODE_RESTORE_PROOF_REASON``);
+    ``confirmations`` is in the digest, so the approval binds exactly the
+    attestations the operator saw.
+    """
+
+    evaluated_at = now or datetime.now(timezone.utc)
+    request_ids = requested_workflow_ids(workflow_ids or ())
+    commands = (
+        store.list_remote_commands(workflow_request_ids=request_ids)
+        if request_ids
+        else []
+    )
+    items: list[dict[str, Any]] = []
+    for request_id in request_ids:
+        try:
+            workflow: WorkflowRequest = store.get_workflow(request_id)
+        except (KeyError, NotFoundError):
+            continue
+        confirmations = operator_confirmed_node_actions(workflow)
+        if not confirmations:
+            continue
+        incident: FaultIncident | None
+        try:
+            incident = store.get_incident(workflow.incident_id)
+        except (KeyError, NotFoundError):
+            incident = None
+        source_plan: RecoveryPlan | None = None
+        if workflow.source_plan_id:
+            try:
+                source_plan = store.get_plan(workflow.source_plan_id)
+            except (KeyError, NotFoundError):
+                source_plan = None
+        items.append(
+            {
+                "request_id": request_id,
+                "incident_id": workflow.incident_id,
+                "cluster_id": incident.cluster_id if incident is not None else None,
+                "node_ids": sorted(incident.node_ids) if incident is not None else [],
+                "incident_state": (
+                    incident.state.value if incident is not None else None
+                ),
+                "blocked_kind": (
+                    workflow.blocked_kind.value
+                    if workflow.blocked_kind is not None
+                    else None
+                ),
+                "fencing_token": workflow.fencing_token,
+                "execution_epoch": workflow.execution_epoch,
+                "workflow_updated_at": workflow.updated_at.isoformat(),
+                "source_plan_id": workflow.source_plan_id,
+                "source_plan_status": (
+                    source_plan.status.value if source_plan is not None else None
+                ),
+                "open_remote_commands": sorted(
+                    item.command_id
+                    for item in commands
+                    if item.workflow_request_id == request_id
+                    and item.status in OPEN_REMOTE_STATUSES
+                ),
+                "confirmations": confirmations,
+                "terminalization": OPERATOR_CONFIRMED,
+                "eligible": False,
+                "reasons": operator_confirmed_reconciliation_reasons(
+                    workflow, incident, commands, evaluated_at=evaluated_at
+                ),
+            }
+        )
+    return items
 
 
 def _plan_item(
