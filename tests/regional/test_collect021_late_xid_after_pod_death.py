@@ -359,7 +359,7 @@ def test_passive_side_passes_on_the_documented_readings() -> None:
         # RUNNING with the killed container terminated is the failure-detected
         # reading and counts as Pod death; SUCCEEDED never does.
         ("death", lambda d: d.__setitem__("workload_phase", "SUCCEEDED"), "phase"),
-        ("restarted", lambda r: r["pods"].pop(), "three"),
+        ("restarted", lambda r: r["pods"].pop(), "all 3 Running pods"),
         ("restarted", lambda r: r["pods"][0].__setitem__("uid", "s1"), "source"),
         (
             "restarted",

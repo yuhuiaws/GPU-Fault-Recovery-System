@@ -26,6 +26,7 @@ from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
 )
+from scripts.e2e.regional import training_topology  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -154,8 +155,7 @@ def read_only_preflight(
         errors.append("COLLECT-016 predecessor evidence is not PASS")
     if not settings.site_file.is_file():
         errors.append("regional site file does not exist")
-    if len(candidates) < 3:
-        errors.append("fewer than three idle Ready GPU nodes")
+    topology = training_topology.preflight_topology(candidates, errors)
     if regional.gpu_workloads():
         errors.append("GPU cluster already has active GPU workloads")
     if completed.returncode:
@@ -163,6 +163,7 @@ def read_only_preflight(
     result = {
         **identity,
         "candidate_nodes": candidates,
+        "training_topology": topology.evidence() if topology else None,
         "predecessor": predecessor,
         "focused_tests_passed": completed.returncode == 0,
         "cpu_blast": regional.cpu_blast_snapshot(),
@@ -178,6 +179,7 @@ def managed_fixture(
     manifest: Path,
     job_id: str,
     attempt_id: str,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
 ) -> ManagedWorkloadFixture:
     return ManagedWorkloadFixture(
         RegionalLiveFixture(settings.regional),
@@ -187,8 +189,8 @@ def managed_fixture(
             job_id=job_id,
             attempt_id=attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
 
@@ -403,8 +405,11 @@ def passive_errors(
         )
     )
     pods = restarted.get("pods") or []
-    if len(pods) != 3:
-        errors.append(f"restart did not bring up three Running pods: {len(pods)}")
+    if len(pods) != len(source_uids):
+        errors.append(
+            f"restart did not bring up all {len(source_uids)} Running pods "
+            f"(the topology's Pod count): {len(pods)}"
+        )
     if {str(item.get("uid")) for item in pods} & source_uids:
         errors.append("a source pod uid survived the restart")
     if any(item.get("attempt_id") == attempt_id for item in pods):
@@ -754,6 +759,7 @@ def run_late_xid_section(
     workloads: list[ManagedWorkloadFixture],
     fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
     cleanup: base.CaseCleanup | None = None,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
 ) -> dict[str, Any]:
     """Submit, kill the process before any XID, then judge both sides.
 
@@ -765,15 +771,20 @@ def run_late_xid_section(
     cleanup = cleanup or base.CaseCleanup()
     job_id = f"c021-{suffix}"
     attempt_id = f"{job_id}-a001"
-    manifest = base.render_named_training_manifest(
-        case_dir / "workload.yaml",
-        name=f"gpu-fault-c021-{suffix}",
+    manifest = training_topology.render_topology_manifest(
+        base.render_named_training_manifest(
+            case_dir / "workload.yaml",
+            name=f"gpu-fault-c021-{suffix}",
+        ),
+        topology,
+        case_dir / "workload-topology.yaml",
     )
     workload = managed_fixture(
         settings,
         manifest=manifest,
         job_id=job_id,
         attempt_id=attempt_id,
+        topology=topology,
     )
     workloads.append(workload)
     require_action_time(180)
@@ -789,7 +800,7 @@ def run_late_xid_section(
             settings, manifest=manifest, job_id=job_id, attempt_id=attempt_id
         ),
         node=target_node,
-        expected_gpu_count=24,
+        expected_gpu_count=topology.world_size,
     )
     collector = CollectorAcceptanceFixture(
         regional,
@@ -937,9 +948,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
         "mutation": (
-            "submit a managed 24-GPU workload, SIGKILL its training process "
-            "before any XID, then inject a late RESTART_APP kmsg XID"
+            "submit a managed distributed-training workload sized by the derived "
+            "training topology (natively 3 nodes x 8 GPUs), SIGKILL its training "
+            "process before any XID, then inject a late RESTART_APP kmsg XID"
         ),
+        "training_topology": preflight.get("training_topology"),
         "preflight_identity": {
             "release_id": preflight["release_id"],
             "candidate_node_uids": sorted(
@@ -948,7 +961,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "stop_conditions": [
             "COLLECT-016 predecessor evidence is not PASS",
-            "fewer than three idle GPU nodes or image prewarm fails",
+            "fewer than 2 schedulable GPU nodes (the derived training "
+            "topology) or image prewarm fails",
             "the kill did not make the container exit non-zero",
             "the late XID quarantined the node or opened a workflow",
             "the attempt was not restarted by the passive path",
@@ -981,6 +995,9 @@ def execute_case(
         raise RegionalFixtureError("approved maintenance window has ended")
     regional = RegionalLiveFixture(settings.regional)
     candidates = [str(item["name"]) for item in preflight["candidate_nodes"]]
+    topology = training_topology.derive_training_topology(
+        preflight["candidate_nodes"], schedulable_only=False
+    )
     prewarm = ImagePrewarmFixture(regional, case_id=CASE_ID, run_id=f"c021-{attempt}")
     workloads: list[ManagedWorkloadFixture] = []
     fixtures: list[CollectorAcceptanceFixture | HostProbeFixture] = []
@@ -989,6 +1006,10 @@ def execute_case(
         "attempt": attempt,
         "verdict": "FAIL",
         "errors": [],
+        "training_topology": topology.evidence(),
+        "limitations": training_topology.topology_limitations(
+            topology, what="COLLECT-021"
+        ),
         **regional.evidence_identity(),
     }
     cleanup = base.CaseCleanup()
@@ -1004,6 +1025,7 @@ def execute_case(
             workloads=workloads,
             fixtures=fixtures,
             cleanup=cleanup,
+            topology=topology,
         )
         result["errors"].extend(section["errors"])
         result["late_xid"] = section

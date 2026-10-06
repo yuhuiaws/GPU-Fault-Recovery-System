@@ -336,11 +336,11 @@ def make_training_workload_collectors(
                         "phase": "Running",
                         "ready": True,
                     }
-                    for index in range(3)
+                    for index in range(settings.expected_pods)
                 ],
                 "heartbeat_logs": {
                     f"trainer-{index}": "HEARTBEAT step=0 all_reduce=300"
-                    for index in range(3)
+                    for index in range(settings.expected_pods)
                 },
             }
             harness.workloads.append(self)
@@ -373,7 +373,7 @@ def make_training_workload_collectors(
             self.progress += 1
             value["heartbeat_logs"] = {
                 f"trainer-{index}": (f"HEARTBEAT step={self.progress} all_reduce=300")
-                for index in range(3)
+                for index in range(self.settings.expected_pods)
             }
             if harness.problem == "pod-change":
                 value["pods"][0]["uid"] = "changed"

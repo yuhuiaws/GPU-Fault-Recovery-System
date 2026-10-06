@@ -180,6 +180,40 @@ def derive_training_topology(
     )
 
 
+def preflight_topology(
+    candidates: Sequence[Mapping[str, Any]], errors: list[str]
+) -> TrainingTopology | None:
+    """The topology an already-filtered candidate list can run, or ``None``
+    with the refusal appended to ``errors`` (a preflight's reading)."""
+
+    try:
+        return derive_training_topology(candidates, schedulable_only=False)
+    except TrainingTopologyError as exc:
+        errors.append(str(exc))
+        return None
+
+
+def topology_limitations(topology: TrainingTopology, *, what: str) -> list[str]:
+    """What a run on a non-native topology cannot prove; empty when native.
+
+    The restart and recovery contracts are proven for the derived world size,
+    and "the other nodes were untouched" is observed on the peers that exist:
+    one on a two-node cluster, not the two a three-node job leaves beside the
+    target.
+    """
+
+    if topology.is_native:
+        return []
+    return [
+        f"{what} ran on the derived {topology.node_count}-node/"
+        f"{topology.world_size}-rank topology, not the native {NATIVE_NODES}-node/"
+        f"{NATIVE_TOPOLOGY.world_size}-rank job: the restart and recovery "
+        "contracts are proven for that world size only, and 'other nodes "
+        f"untouched' is observed on {topology.node_count - 1} peer node(s) "
+        f"rather than {NATIVE_NODES - 1}."
+    ]
+
+
 def _rewrite_container(container: dict[str, Any], topology: TrainingTopology) -> None:
     command = container.get("command")
     if isinstance(command, list):

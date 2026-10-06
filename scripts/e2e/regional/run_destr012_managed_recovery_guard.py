@@ -1148,7 +1148,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "B finds auto-resume=true or replica/Profile disagreement",
             "preflight or focused regression failure",
             "release rollback is active or a required deployment is not fully rolled out",
-            "fewer than three idle Ready GPU nodes",
+            "fewer than two Ready schedulable untainted GPU nodes",
             "A differs from the DESTR-009 restart contract",
             "D mutates spec.suspend or Pod UIDs before failing",
             "D details omit the violating workload or remediation command",

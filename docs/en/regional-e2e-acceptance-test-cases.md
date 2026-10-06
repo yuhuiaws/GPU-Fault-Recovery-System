@@ -13857,6 +13857,17 @@ actually running to completion the execution segment that COLLECT-012 declares "
   segment D additionally quiesces the node, including stopping kubelet).
 - ⚠⚠ **Must be ordered before COLLECT-015**: 015 really reboots the node,
   which would destroy the training job and the sampler together.
+- Two-node topology (a two-node `eks-managed` cluster): the preflight derives the training topology
+  from the Ready, schedulable, untainted GPU nodes (`training_topology.preflight_topology`: node count
+  = min(candidates, 3), GPUs per Pod = what every chosen node allocates, else 8; fewer than two nodes is
+  the named refusal `at least 2 schedulable GPU nodes are required ...`, replacing the old "fewer than
+  three idle Ready GPU nodes"). Every A/B/D PyTorchJob is the named manifest rewritten for that topology
+  (`<phase>-workload-topology.yaml` beside the evidence; the native three-node shape uses the manifest
+  unchanged), the fixture expects `node_count` Pods and `world_size` GPU UUIDs, the restart-budget
+  workflow and the post-restart observation are judged against that world size, and the evidence and
+  plan carry `training_topology`. What a two-node run cannot prove is recorded in `limitations`: the
+  contracts are proven for the 16-rank world only and "other nodes untouched" is observed on one peer
+  node, not two. The verdicts themselves are unchanged -- nothing is relaxed, only sized.
 
 #### The real increment of this case (stated up front, to avoid duplicating existing cases)
 
@@ -14481,6 +14492,13 @@ constitute an atomic mutual exclusion against external writers.
   independent passive stop flow may temporarily disable scheduling, and must restore the
   original baseline before final verification. Still ordered before `COLLECT-015`'s
   reboot. Confirmation string `COLLECT021_EXECUTE`.
+- Two-node topology (a two-node `eks-managed` cluster): as in COLLECT-016, the preflight derives the
+  training topology from the schedulable GPU nodes (`training_topology.preflight_topology`; fewer than
+  two is the named refusal), the PyTorchJob is the named manifest rewritten for it
+  (`workload-topology.yaml`), the fixture expects `node_count` Pods and `world_size` GPU UUIDs, the
+  passive restart must bring up exactly the source Pod count (`all N Running pods`), and the evidence
+  and plan carry `training_topology`; a non-native run records in `limitations` that the passive
+  restart is proven for that world size only. Nothing in the verdict is relaxed.
 - Coverage gap: after a `RESTART_APP`-class XID kills the training process, **the Pod
   terminates before the kernel line is collected**, `WorkloadTopologyService.resolve` sees
   no live container and resolves the node as **IDLE**. Before 55272a0 the policy still

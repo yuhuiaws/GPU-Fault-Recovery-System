@@ -281,3 +281,103 @@ def test_configuration_and_plan_keep_bound_identity(
     }
     details = module.plan_details(configured, preflight)
     assert details["preflight_identity"]["release_id"] == "release-a"
+
+
+@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+def test_two_schedulable_gpu_nodes_run_the_case_on_the_derived_topology(
+    training_case: Any,
+) -> None:
+    """A two-node ``eks-managed`` cluster: the preflight derives a two-node /
+    sixteen-rank topology instead of refusing "fewer than three idle Ready GPU
+    nodes", the fixture expects that many Pods and GPUs, the manifest copy is
+    rewritten for it, and the evidence records the topology and what a run of
+    that size cannot prove."""
+
+    harness = training_case
+    harness.candidate_count = 2
+    preflight = harness.module.read_only_preflight(harness.settings, harness.root)
+    assert preflight["errors"] == []
+    assert preflight["training_topology"]["node_count"] == 2
+    assert preflight["training_topology"]["world_size"] == 16
+    assert preflight["training_topology"]["candidate_nodes"] == ["node-a", "node-b"]
+
+    assert execute(harness) == 0
+    result = report(harness)
+    assert result["verdict"] == "PASS", result
+    assert result["training_topology"]["native"] is False
+    assert result["training_topology"]["ranks"] == [0, 1]
+    assert len(result["limitations"]) == 1
+    assert "2-node/16-rank topology" in result["limitations"][0]
+    assert "1 peer node(s) rather than 2" in result["limitations"][0]
+    for workload in harness.workloads:
+        assert workload.settings.expected_pods == 2
+        assert workload.settings.expected_gpu_count == 16
+        assert workload.settings.manifest.name.endswith("-topology.yaml"), (
+            "the PyTorchJob copy is rewritten for the derived topology"
+        )
+    case_dir = harness.root / "cases" / harness.module.CASE_ID
+    rendered = next(case_dir.glob("*-topology.yaml")).read_text(encoding="utf-8")
+    assert "replicas: 1" in rendered, "one Worker beside the Master on two nodes"
+
+
+@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+def test_one_schedulable_gpu_node_is_refused_by_name(training_case: Any) -> None:
+    harness = training_case
+    harness.candidate_count = 1
+    preflight = harness.module.read_only_preflight(harness.settings, harness.root)
+    assert preflight["errors"] == [
+        "at least 2 schedulable GPU nodes are required for distributed training; "
+        "found 1 (node-a)"
+    ]
+    assert preflight["training_topology"] is None
+    with pytest.raises(RuntimeError, match="preflight"):
+        execute(harness)
+    assert harness.workloads == []
+
+
+@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+def test_the_native_three_node_run_records_no_limitation(training_case: Any) -> None:
+    harness = training_case
+    assert execute(harness) == 0
+    result = report(harness)
+    assert result["training_topology"]["native"] is True
+    assert result["training_topology"]["world_size"] == 24
+    assert result["limitations"] == []
+    for workload in harness.workloads:
+        assert workload.settings.expected_pods == 3
+        assert workload.settings.expected_gpu_count == 24
+
+
+@pytest.mark.parametrize("module", [c016, c021])
+def test_plan_details_carry_the_derived_topology(
+    module: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    regional = type(
+        "Settings", (), {"environment": lambda self: {"CLUSTER": "cluster-a"}}
+    )()
+    monkeypatch.setattr(module, "settings_from_arguments", lambda args: regional)
+    configured = module.configure(
+        module.parser().parse_args(
+            [
+                "--run-dir",
+                str(tmp_path),
+                "--site-file",
+                str(tmp_path / "site"),
+                "--host-probe-image",
+                "example",
+            ]
+        )
+    )
+    preflight = {
+        "release_id": "release-a",
+        "predecessor": {"valid": True},
+        "candidate_nodes": [{"uid": "uid-a"}, {"uid": "uid-b"}],
+        "training_topology": {"node_count": 2, "world_size": 16},
+    }
+    details = module.plan_details(configured, preflight)
+    assert details["training_topology"] == {"node_count": 2, "world_size": 16}
+    assert any(
+        "fewer than 2 schedulable GPU nodes" in item
+        for item in details["stop_conditions"]
+    ), details["stop_conditions"]
+    assert "derived training topology" in details["mutation"]

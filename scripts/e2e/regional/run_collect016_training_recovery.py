@@ -26,6 +26,7 @@ from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
 )
+from scripts.e2e.regional import training_topology  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -242,8 +243,7 @@ def read_only_preflight(
         errors.append("COLLECT-014 predecessor evidence is not PASS")
     if not settings.site_file.is_file():
         errors.append("regional site file does not exist")
-    if len(candidates) < 3:
-        errors.append("fewer than three idle Ready GPU nodes")
+    topology = training_topology.preflight_topology(candidates, errors)
     if regional.gpu_workloads():
         errors.append("GPU cluster already has active GPU workloads")
     if local_proof["verdict"] != "PASS":
@@ -251,6 +251,7 @@ def read_only_preflight(
     result = {
         **identity,
         "candidate_nodes": candidates,
+        "training_topology": topology.evidence() if topology else None,
         "predecessor": predecessor,
         "focused_tests_passed": local_proof["verdict"] == "PASS",
         "local_contracts": local_proof,
@@ -284,6 +285,7 @@ def managed_fixture(
     manifest: Path,
     job_id: str,
     attempt_id: str,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
 ) -> ManagedWorkloadFixture:
     return ManagedWorkloadFixture(
         RegionalLiveFixture(settings.regional),
@@ -293,8 +295,8 @@ def managed_fixture(
             job_id=job_id,
             attempt_id=attempt_id,
             restart_budget=1,
-            expected_pods=3,
-            expected_gpu_count=24,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
         ),
     )
 
@@ -389,6 +391,7 @@ def run_restart_budget_sections(
     workloads: list[ManagedWorkloadFixture],
     fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
     cleanup: base.CaseCleanup | None = None,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
 ) -> dict[str, Any]:
     """A and B. Resources land in ``workloads``/``fixtures`` the moment they exist.
 
@@ -400,15 +403,20 @@ def run_restart_budget_sections(
     cleanup = cleanup or base.CaseCleanup()
     job_id = f"c016-a-{suffix}"
     attempt_id = f"{job_id}-a001"
-    manifest = base.render_named_training_manifest(
-        case_dir / "a-workload.yaml",
-        name=f"gpu-fault-c016-a-{suffix}",
+    manifest = training_topology.render_topology_manifest(
+        base.render_named_training_manifest(
+            case_dir / "a-workload.yaml",
+            name=f"gpu-fault-c016-a-{suffix}",
+        ),
+        topology,
+        case_dir / "a-workload-topology.yaml",
     )
     workload = managed_fixture(
         settings,
         manifest=manifest,
         job_id=job_id,
         attempt_id=attempt_id,
+        topology=topology,
     )
     workloads.append(workload)
     require_action_time(180)
@@ -426,7 +434,7 @@ def run_restart_budget_sections(
         regional,
         case_settings,
         node=target_node,
-        expected_gpu_count=24,
+        expected_gpu_count=topology.world_size,
     )
     collector = CollectorAcceptanceFixture(
         regional,
@@ -462,7 +470,9 @@ def run_restart_budget_sections(
         job_id=job_id,
         attempt_id=attempt_id,
     )
-    errors = workload_case.workflow_errors(state_a, expected_gpu_count=24, xid=31)
+    errors = workload_case.workflow_errors(
+        state_a, expected_gpu_count=topology.world_size, xid=31
+    )
     if errors:
         raise RegionalFixtureError(
             "restart phase failed; refusing the budget injection"
@@ -474,6 +484,7 @@ def run_restart_budget_sections(
         state=state_a,
         node=target_node,
         source_uids=source_uids,
+        expected_gpu_count=topology.world_size,
     )
     target_attempt_id = target["observation"]["attempt_id"]
     marker_b = f"c016-b-{int(time.time())}"
@@ -529,6 +540,7 @@ def capture_post_restart_workload(
     state: dict[str, Any],
     node: str,
     source_uids: set[str],
+    expected_gpu_count: int = training_topology.NATIVE_TOPOLOGY.world_size,
 ) -> dict[str, Any]:
     workload.authorize_restart(state)
     target = workload.wait_restarted(source_uids, timeout_seconds=900)
@@ -560,7 +572,7 @@ def capture_post_restart_workload(
         regional,
         replace(source_settings, attempt_id=new_attempt),
         node=node,
-        expected_gpu_count=24,
+        expected_gpu_count=expected_gpu_count,
     )
     try:
         observed_at = datetime.fromisoformat(
@@ -601,21 +613,27 @@ def run_reset_section(
     workloads: list[ManagedWorkloadFixture],
     fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
     cleanup: base.CaseCleanup | None = None,
+    topology: training_topology.TrainingTopology = training_topology.NATIVE_TOPOLOGY,
 ) -> dict[str, Any]:
     """D. Like A/B, the workload and probe are registered as soon as they exist."""
 
     cleanup = cleanup or base.CaseCleanup()
     job_id = f"c016-d-{suffix}"
     attempt_id = f"{job_id}-a001"
-    manifest = base.render_named_training_manifest(
-        case_dir / "d-workload.yaml",
-        name=f"gpu-fault-c016-d-{suffix}",
+    manifest = training_topology.render_topology_manifest(
+        base.render_named_training_manifest(
+            case_dir / "d-workload.yaml",
+            name=f"gpu-fault-c016-d-{suffix}",
+        ),
+        topology,
+        case_dir / "d-workload-topology.yaml",
     )
     workload = managed_fixture(
         settings,
         manifest=manifest,
         job_id=job_id,
         attempt_id=attempt_id,
+        topology=topology,
     )
     workloads.append(workload)
     require_action_time(180)
@@ -633,7 +651,7 @@ def run_reset_section(
         regional,
         case_settings,
         node=target_node,
-        expected_gpu_count=24,
+        expected_gpu_count=topology.world_size,
     )
     reset_host = HostProbeFixture(
         HostProbeSettings(
@@ -693,6 +711,7 @@ def run_reset_section(
             state=state,
             node=target_node,
             source_uids=source_uids,
+            expected_gpu_count=topology.world_size,
         ),
     )
     target = state["post_restart_workload"]
@@ -712,9 +731,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "risk": "destructive",
         "predecessor": preflight["predecessor"],
         "mutation": (
-            "submit managed 24-GPU workloads, inject real kmsg XID31 twice "
-            "and XID109 once, then verify restart budget and reset ordering"
+            "submit managed distributed-training workloads sized by the derived "
+            "training topology (natively 3 nodes x 8 GPUs), inject real kmsg XID31 "
+            "twice and XID109 once, then verify restart budget and reset ordering"
         ),
+        "training_topology": preflight.get("training_topology"),
         "proof_scopes": {
             "D": "live-positive-XID109-reset",
             "dcgm_and_client_negative_contracts": "source-bound LOCAL pytest only",
@@ -728,8 +749,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "stop_conditions": [
             "COLLECT-014 predecessor evidence is not PASS",
-            "fewer than three idle GPU nodes or image prewarm fails",
-            "workload observation lacks 24 GPU UUIDs",
+            "fewer than 2 schedulable GPU nodes (the derived training "
+            "topology) or image prewarm fails",
+            "workload observation lacks the topology's GPU UUIDs (world size)",
             "restart budget or real reset workflow differs from contract",
             "workload/probe cleanup leaves residuals",
         ],
@@ -923,6 +945,9 @@ def execute_case(
         raise RegionalFixtureError("approved maintenance window has ended")
     regional = RegionalLiveFixture(settings.regional)
     candidates = [str(item["name"]) for item in preflight["candidate_nodes"]]
+    topology = training_topology.derive_training_topology(
+        preflight["candidate_nodes"], schedulable_only=False
+    )
     prewarm = ImagePrewarmFixture(
         regional,
         case_id=CASE_ID,
@@ -936,6 +961,10 @@ def execute_case(
         "verdict": "FAIL",
         "errors": [],
         "local_contracts": preflight.get("local_contracts"),
+        "training_topology": topology.evidence(),
+        "limitations": training_topology.topology_limitations(
+            topology, what="COLLECT-016 A/B/D"
+        ),
         **regional.evidence_identity(),
     }
     cleanup = base.CaseCleanup()
@@ -951,6 +980,7 @@ def execute_case(
             workloads=workloads,
             fixtures=fixtures,
             cleanup=cleanup,
+            topology=topology,
         )
         result["errors"].extend(ab["errors"])
         result.update({"a": ab["a"], "b": ab["b"]})
@@ -1002,6 +1032,7 @@ def execute_case(
             workloads=workloads,
             fixtures=fixtures,
             cleanup=cleanup,
+            topology=topology,
         )
         result["errors"].extend(d["errors"])
         result["d"] = d["d"]
