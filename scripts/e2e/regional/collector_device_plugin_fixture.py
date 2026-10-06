@@ -48,6 +48,37 @@ def excluding_node_affinity(
     return affinity
 
 
+#: Where kubelet listens for device plugins; the mount every device plugin
+#: DaemonSet declares and nothing else does (the product's
+#: ``node_operations.KUBELET_DEVICE_PLUGIN_DIR_SUFFIX`` is the same rule).
+KUBELET_DEVICE_PLUGIN_DIR_SUFFIX = "/device-plugins"
+
+
+def companion_daemonset(item: dict[str, Any]) -> bool:
+    """A DaemonSet that carries the plugin's token but is not the plugin.
+
+    The upstream k8s-device-plugin chart ships ``<release>-nvidia-device-plugin``
+    with ``...-gpu-feature-discovery`` and ``...-mps-control-daemon``, all three
+    labelled alike (no component label) and all naming the token. Only the
+    plugin's Pod template mounts the kubelet device-plugins directory; a
+    template that declares volumes but none there belongs to a companion. A
+    template without volumes is not judged.
+    """
+
+    spec = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+    volumes = spec.get("volumes")
+    if not isinstance(volumes, list) or not volumes:
+        return False
+    return not any(
+        isinstance(volume, dict)
+        and isinstance(((volume.get("hostPath") or {}).get("path")), str)
+        and volume["hostPath"]["path"]
+        .rstrip("/")
+        .endswith(KUBELET_DEVICE_PLUGIN_DIR_SUFFIX)
+        for volume in volumes
+    )
+
+
 class DevicePluginFixture:
     def __init__(
         self,
@@ -83,6 +114,7 @@ class DevicePluginFixture:
             for item in value.get("items", [])
             if self.token.lower() in json.dumps(item, sort_keys=True).lower()
             and int((item.get("status") or {}).get("desiredNumberScheduled") or 0) > 0
+            and not companion_daemonset(item)
         ]
         if len(matches) != 1:
             raise RegionalFixtureError(

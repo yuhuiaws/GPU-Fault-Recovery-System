@@ -1012,6 +1012,84 @@ def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere(
         plugin.discover()
 
 
+def _chart_daemonset(name: str, desired: int, *host_paths: str) -> dict:
+    item = _daemonset("kube-system", name, desired)
+    item["metadata"]["labels"] = {
+        "app.kubernetes.io/instance": "nvdp",
+        "app.kubernetes.io/name": "nvidia-device-plugin",
+    }
+    item["spec"]["template"]["spec"]["volumes"] = [
+        {"name": f"volume-{index}", "hostPath": {"path": path}}
+        for index, path in enumerate(host_paths)
+    ]
+    return item
+
+
+def test_device_plugin_discovery_skips_the_upstream_charts_companions(
+    tmp_path: Path,
+) -> None:
+    """A plain EKS cluster runs the upstream k8s-device-plugin chart: three
+    DaemonSets labelled alike (no component label), all naming the token --
+    the plugin, gpu-feature-discovery (desired > 0 as well) and the
+    mps-control-daemon. Only the plugin's template mounts the kubelet
+    device-plugins directory (live: "expected one nvidia-device-plugin
+    DaemonSet, found 2")."""
+
+    import json
+
+    from scripts.e2e.regional.collector_device_plugin_fixture import companion_daemonset
+
+    items = [
+        _chart_daemonset(
+            "nvdp-nvidia-device-plugin",
+            2,
+            "/var/lib/kubelet/device-plugins",
+            "/run/nvidia/mps",
+            "/run/nvidia/mps/shm",
+            "/var/run/cdi",
+        ),
+        _chart_daemonset(
+            "nvdp-nvidia-device-plugin-gpu-feature-discovery",
+            2,
+            "/etc/kubernetes/node-feature-discovery/features.d",
+            "/sys",
+            "/",
+        ),
+        _chart_daemonset(
+            "nvdp-nvidia-device-plugin-mps-control-daemon",
+            0,
+            "/run/nvidia/mps",
+            "/run/nvidia/mps/shm",
+        ),
+    ]
+
+    class Regional:
+        def kubectl(self, *_arguments: str, **_kwargs: object) -> str:
+            return json.dumps({"items": items})
+
+    plugin = collect_destructive.DevicePluginFixture(
+        Regional(),
+        token="nvidia-device-plugin",
+        node="node-a",
+        resource="nvidia.com/gpu",
+        case_dir=tmp_path,
+    )
+    assert plugin.discover()["name"] == "nvdp-nvidia-device-plugin"
+
+    items[2]["status"]["desiredNumberScheduled"] = 1
+    assert plugin.discover()["name"] == "nvdp-nvidia-device-plugin", (
+        "an MPS daemon that schedules somewhere mounts no device-plugins dir either"
+    )
+
+    del items[0]
+    with pytest.raises(RegionalFixtureError, match="found 0"):
+        plugin.discover()
+
+    assert companion_daemonset(_daemonset("kube-system", "bare-plugin", 1)) is False, (
+        "a template that declares no volumes is not judged"
+    )
+
+
 def test_a_marker_tagged_store_read_tolerates_the_kernel_clock_trailing_the_wall_clock() -> (
     None
 ):

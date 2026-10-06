@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from kubernetes import client as kubernetes_client
 
+from gpu_fault.adapters.kubernetes import node_operations
 from gpu_fault.adapters.kubernetes.primitives import (
     build_kubernetes_clients,
     kubernetes_request_timeout_seconds,
@@ -329,6 +330,139 @@ class _PluginCore:
         if self.delete_error is not None:
             raise self.delete_error
         self.deleted.append((namespace, name))
+
+
+def _host_volumes(*paths: str) -> list[dict[str, object]]:
+    return [
+        {"name": f"volume-{index}", "hostPath": {"path": path}}
+        for index, path in enumerate(paths)
+    ]
+
+
+def _chart_pod(name: str, uid: str, *paths: str) -> dict[str, object]:
+    return {
+        "metadata": {"name": name, "uid": uid},
+        "spec": {"volumes": _host_volumes(*paths)},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+
+
+#: The upstream k8s-device-plugin chart's Pods on one GPU node, as listed by
+#: ``app.kubernetes.io/name=nvidia-device-plugin``: the plugin and its
+#: gpu-feature-discovery companion carry the same labels; only the plugin
+#: mounts the kubelet device-plugins directory.
+def _plugin_pod(uid: str = "plugin-old") -> dict[str, object]:
+    return _chart_pod(
+        f"nvdp-nvidia-device-plugin-{uid}",
+        uid,
+        "/var/lib/kubelet/device-plugins",
+        "/run/nvidia/mps",
+        "/run/nvidia/mps/shm",
+        "/var/run/cdi",
+    )
+
+
+def _gfd_pod() -> dict[str, object]:
+    return _chart_pod(
+        "nvdp-nvidia-device-plugin-gpu-feature-discovery-x",
+        "gfd-1",
+        "/etc/kubernetes/node-feature-discovery/features.d",
+        "/sys",
+        "/",
+    )
+
+
+def test_gpu_plugin_restart_leaves_the_charts_companion_pods_alone() -> None:
+    """Live on a plain EKS cluster the restart FAILED "expected at most one
+    device plugin Pod on <node>, found 2": the chart's gpu-feature-discovery Pod
+    shares the plugin's labels. It is a companion, not the plugin: it is neither
+    deleted nor counted as the plugin's replacement."""
+
+    store = build_store()
+    context = _context(
+        store,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        parameters={"expected_count": 8},
+    )
+    core = _PluginCore(pods=[_gfd_pod(), _plugin_pod()])
+    core.node["status"]["allocatable"] = {"nvidia.com/gpu": "0"}
+
+    first = _adapter(core).execute(context)
+
+    assert first.status is WorkflowStepStatus.WAITING, first
+    node = first.details["node_results"]["node-a"]
+    assert node["deleted_pod"] == "kube-system/nvdp-nvidia-device-plugin-plugin-old"
+    assert node["companion_pods"] == [
+        "nvdp-nvidia-device-plugin-gpu-feature-discovery-x"
+    ]
+    assert core.deleted == [("kube-system", "nvdp-nvidia-device-plugin-plugin-old")]
+
+    # The Ready companion (another uid) is not the plugin's replacement Pod.
+    core.pods = [_gfd_pod()]
+    second = _adapter(core).execute(context)
+    assert second.status is WorkflowStepStatus.WAITING
+    assert second.details["node_results"]["node-a"]["waiting_for_replacement_pod"]
+
+    core.pods = [_gfd_pod(), _plugin_pod("plugin-new")]
+    core.node["status"]["allocatable"]["nvidia.com/gpu"] = "8"
+    third = _adapter(core).execute(context)
+    assert third.status is WorkflowStepStatus.SUCCEEDED, third
+    node = third.details["node_results"]["node-a"]
+    assert node["replacement_pod_uids"] == ["plugin-new"]
+    assert "companion_pods" not in node, "nothing to report once healthy"
+    assert core.node["metadata"]["annotations"] == {}
+
+
+def test_two_pods_that_both_mount_the_kubelet_socket_still_fail_closed() -> None:
+    store = build_store()
+    context = _context(
+        store,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        parameters={"expected_count": 8},
+    )
+    core = _PluginCore(pods=[_plugin_pod("a"), _plugin_pod("b"), _gfd_pod()])
+    core.node["status"]["allocatable"] = {"nvidia.com/gpu": "0"}
+
+    outcome = _adapter(core).execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "expected at most one device plugin Pod on node-a, found 2" in str(
+        outcome.error
+    )
+    assert outcome.details["companion_pods"] == [
+        "nvdp-nvidia-device-plugin-gpu-feature-discovery-x"
+    ]
+    assert core.deleted == []
+
+
+@pytest.mark.parametrize(
+    ("volumes", "expected"),
+    [
+        (None, None),
+        ([], None),
+        ([SimpleNamespace(host_path=None)], False),
+        (
+            [
+                SimpleNamespace(host_path=SimpleNamespace(path="/sys")),
+                SimpleNamespace(
+                    host_path=SimpleNamespace(path="/var/lib/kubelet/device-plugins/")
+                ),
+            ],
+            True,
+        ),
+        ([{"hostPath": {"path": "/data/kubelet/device-plugins"}}], True),
+        ([{"hostPath": {"path": "/"}}, {"emptyDir": {}}], False),
+    ],
+)
+def test_the_kubelet_device_plugin_mount_is_read_from_client_objects_and_dicts(
+    volumes, expected
+) -> None:
+    assert node_operations.mounts_kubelet_device_plugins(volumes) is expected
+    pod = SimpleNamespace(spec=SimpleNamespace(volumes=volumes))
+    assert node_operations.companion_pod(pod) is (expected is False)
+    assert node_operations.companion_pod({"metadata": {}}) is False, (
+        "a record without a spec is not judged"
+    )
 
 
 def test_plugin_restart_clears_its_annotation_when_the_pod_delete_fails() -> None:

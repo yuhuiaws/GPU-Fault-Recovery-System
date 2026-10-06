@@ -14176,7 +14176,12 @@ no FAIL is derived from them.
   switch; this has been fixed to succeed idempotently.
 - runner: device-plugin DaemonSet discovery only accepts matches with
   `desiredNumberScheduled > 0`, excluding the `...-mps-control-daemon` (desired=0) that
-  ships with the HyperPod chart.
+  ships with the HyperPod chart, and only a DaemonSet whose Pod template mounts the kubelet
+  `device-plugins` directory when it declares volumes (`companion_daemonset`): the upstream
+  k8s-device-plugin chart on a plain EKS cluster also ships `...-gpu-feature-discovery`
+  (desired > 0, the plugin's labels, no component label), which is not the plugin. The
+  product's `RESTART_GPU_DEVICE_PLUGIN` applies the same rule to the Pods it lists on the
+  node (`companion_pods`).
 - The runner's segment-A verdict corresponds item by item to this section: the collector
   probe inventory first drops by one and then returns to baseline (discovered/ACTIVE),
   `official_steps` equals the seven steps listed above item by item,

@@ -241,8 +241,7 @@ class KubernetesNodeOperationsMixin:
             namespace=namespace,
             label_selector=selector,
         )
-        pods = [pod for pod in listed if not pod_terminating(pod)]
-        terminating = len(listed) - len(pods)
+        pods, report = split_plugin_pods(listed, self._pod_name)
         ready_new_pods = [
             pod
             for pod in pods
@@ -292,7 +291,7 @@ class KubernetesNodeOperationsMixin:
         if len(pods) != 1:
             return WorkflowStepOutcome.failed(
                 f"expected at most one device plugin Pod on {node_id}, found {len(pods)}",
-                details={"terminating_plugin_pods": terminating},
+                details=report,
             )
         pod = pods[0]
         pod_uid = self._pod_uid(pod)
@@ -323,6 +322,8 @@ class KubernetesNodeOperationsMixin:
             "allocatable": allocatable,
             "expected": expected,
         }
+        if report["companion_pods"]:
+            result["companion_pods"] = report["companion_pods"]
         if took_over is not None:
             result["took_over_incident"] = took_over
         return result, True
@@ -887,6 +888,70 @@ class KubernetesNodeOperationsMixin:
                 "taints": taints,
             },
         }
+
+
+#: Where kubelet listens for device plugins. Every device plugin Pod mounts
+#: it (hostPath), whatever its chart names or labels it; nothing else does.
+KUBELET_DEVICE_PLUGIN_DIR_SUFFIX = "/device-plugins"
+
+
+def _field(value: Any, key: str, attribute: str) -> Any:
+    if value is None:
+        return None
+    return (
+        value.get(key) if isinstance(value, dict) else getattr(value, attribute, None)
+    )
+
+
+def mounts_kubelet_device_plugins(volumes: Any) -> bool | None:
+    """Whether a Pod's ``volumes`` reach the kubelet device-plugins directory.
+
+    True/False when volumes are declared; None when none are, so that a record
+    without a spec is not judged (a live Pod always declares its volumes).
+    """
+
+    if not volumes:
+        return None
+    for volume in volumes:
+        path = _field(_field(volume, "hostPath", "host_path"), "path", "path")
+        if isinstance(path, str) and path.rstrip("/").endswith(
+            KUBELET_DEVICE_PLUGIN_DIR_SUFFIX
+        ):
+            return True
+    return False
+
+
+def companion_pod(pod: Any) -> bool:
+    """A Pod that carries the device plugin's labels but is not the plugin.
+
+    The upstream k8s-device-plugin chart labels its gpu-feature-discovery and
+    mps-control-daemon DaemonSets exactly like the plugin
+    (``app.kubernetes.io/name=nvidia-device-plugin``, the same instance, no
+    component label), so a label selector lists their Pods on the node beside
+    the plugin's; live that failed RESTART_GPU_DEVICE_PLUGIN with "expected at
+    most one device plugin Pod, found 2". Only the plugin mounts the kubelet
+    device-plugins directory: a Pod that declares volumes but none there is a
+    companion to leave alone.
+    """
+
+    spec = _field(pod, "spec", "spec")
+    return mounts_kubelet_device_plugins(_field(spec, "volumes", "volumes")) is False
+
+
+def split_plugin_pods(
+    listed: list[Any], pod_name: Callable[[Any], str]
+) -> tuple[list[Any], dict[str, Any]]:
+    """The device plugin Pods among ``listed`` (one node, the plugin's label
+    selector), and a report of what was set aside: Pods kubelet is tearing down
+    (``terminating_plugin_pods``) and the chart's companions (``companion_pods``,
+    by name)."""
+
+    live = [pod for pod in listed if not pod_terminating(pod)]
+    report = {
+        "terminating_plugin_pods": len(listed) - len(live),
+        "companion_pods": [pod_name(pod) for pod in live if companion_pod(pod)],
+    }
+    return [pod for pod in live if not companion_pod(pod)], report
 
 
 def pod_terminating(pod: Any) -> bool:

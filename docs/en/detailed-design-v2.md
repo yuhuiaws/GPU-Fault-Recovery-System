@@ -1499,7 +1499,12 @@ and it falls to the `_classify_failure` fallback in `cluster_executor/dispatch.p
 `safety_rejection` + `absent`, and escalation classification goes through `containment_refused`: a node that cannot be seen cannot be treated as isolated;
 only a 404 on `RESTORE_SCHEDULING` is treated as nothing to do; device-plugin Pod not found → write the restart marker and return
 WAITING (`waiting_for_daemonset_pod: true`) to wait for the DaemonSet to recreate it; only after `restart_timeout_seconds`
-(default 180) does it FAIL, never silently skipped.
+(default 180) does it FAIL, never silently skipped. Among the Pods the label selector lists on the node, one that declares
+volumes but no hostPath at the kubelet `device-plugins` directory is not a device plugin (the upstream k8s-device-plugin
+chart's gpu-feature-discovery/mps-control-daemon carry the plugin's labels and no component label; on a plain EKS cluster
+this FAILED "expected at most one device plugin Pod, found 2"): the restart deletes only the plugin Pod, counts only the
+plugin's new Pod as its replacement, and records the ignored companions as `companion_pods`
+(`node_operations.companion_pod`).
 
 **⑫ Unit test scope**: idempotency of cordon+taint; lifting isolation must clear both cordon and taint;
 node disappearing during isolation → FAILED (`safety_rejection`/`absent`) while 404 when lifting isolation → no-op; RBAC 403 is non-retryable and lands on `executor-internal-error`; `STOP_WORKLOADS` covers the three carriers Job/PyTorchJob/
