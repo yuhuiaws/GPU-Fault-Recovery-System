@@ -599,13 +599,17 @@ def test_iso006_cut_must_be_proven_at_the_transport() -> None:
     assert iso006.cut_proven({"status": 403}) is False
 
 
-def test_iso006_latency_judgment_is_p95_within_twenty_percent_and_no_5xx() -> None:
-    baseline = [{"status": 200, "latency_seconds": 0.10} for _ in range(10)]
-    fine = [{"status": 200, "latency_seconds": 0.11} for _ in range(10)]
-    slow = [{"status": 200, "latency_seconds": 0.13} for _ in range(10)]
+def _claims(*latencies: float) -> list[dict[str, Any]]:
+    return [{"status": 200, "latency_seconds": value} for value in latencies]
+
+
+def test_iso006_latency_judgment_is_median_and_p95_within_bounds_and_no_5xx() -> None:
+    baseline = _claims(*([0.10] * 10))
+    fine = _claims(*([0.11] * 10))
+    slow = _claims(*([0.13] * 10))
     assert iso006.latency_errors(baseline, fine) == []
-    assert any("p95 rose" in item for item in iso006.latency_errors(baseline, slow)), (
-        "a 30% p95 increase passed the 20% bound"
+    assert any("p50 rose" in item for item in iso006.latency_errors(baseline, slow)), (
+        "a 30% shift of every claim passed the 20% bound"
     )
     assert any(
         "returned 503" in item
@@ -616,6 +620,51 @@ def test_iso006_latency_judgment_is_p95_within_twenty_percent_and_no_5xx() -> No
     assert iso006.latency_errors([], fine) == [
         "claim latency could not be measured in both phases"
     ]
+
+
+def test_iso006_latency_floors_read_the_bimodal_background_not_the_block() -> None:
+    """Live (attempt 7): the baseline saw the fast mode only (15-22 ms) and the
+    window the usual mix (eleven samples at 15-30 ms, eight at 56-91 ms) -- the
+    same tail the baselines of attempts 2, 3 and 6 showed with no block held.
+    The median moved 6.7 ms and the p95 56 ms; neither is the shared control
+    plane giving way, which moves every claim or ends in 5xx."""
+
+    baseline = _claims(0.0199, 0.0154, 0.0210, 0.0220, 0.0221)
+    window = _claims(
+        0.0175,
+        0.0284,
+        0.0686,
+        0.0193,
+        0.0778,
+        0.0206,
+        0.0181,
+        0.0912,
+        0.0150,
+        0.0206,
+        0.0189,
+        0.0563,
+        0.0587,
+        0.0202,
+        0.0694,
+        0.0277,
+        0.0295,
+        0.0170,
+        0.0607,
+    )
+    assert iso006.latency_errors(baseline, window) == []
+
+    every_claim_slower = _claims(*([0.040] * 19))
+    assert [
+        item[:17] for item in iso006.latency_errors(baseline, every_claim_slower)
+    ] == ["A claim p50 rose "], (
+        "a sustained shift of the median is still the block's doing"
+    )
+
+    heavier_tail = _claims(*([0.020] * 15), *([0.180] * 4))
+    assert [item[:17] for item in iso006.latency_errors(baseline, heavier_tail)] == [
+        "A claim p95 rose "
+    ], "a tail above the measured background (100 ms over the baseline) still fails"
+    assert iso006.LATENCY_P95_MAX_INCREASE == iso006.LATENCY_MAX_INCREASE
 
 
 def test_iso006_pressure_and_restart_judgments() -> None:
