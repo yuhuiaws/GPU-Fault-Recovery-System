@@ -453,13 +453,20 @@ def replacement_payload(
     event_id: str,
     observation: dict[str, Any],
     observed_at: datetime,
+    profile_version: str | None = None,
 ) -> dict[str, Any]:
+    """The synthetic finding; ``profile_version`` is the cluster's effective
+    Runtime Profile (the preflight's store reading), which the plan compiles
+    against -- on a mixed site the observation may carry the site's version."""
+
     return {
         "event_id": event_id,
         "cluster_id": settings.regional.cluster_id,
         "node_id": settings.fault_node,
         "observed_at": observed_at.isoformat(),
-        "runtime_profile_version": observation["runtime_profile_version"],
+        "runtime_profile_version": (
+            profile_version or observation["runtime_profile_version"]
+        ),
         "job_id": settings.job_id,
         "attempt_id": settings.attempt_id,
         "affected_workload_ids": observation["workload_ids"],
@@ -774,6 +781,47 @@ def cleanup_case(
     return result
 
 
+def effective_profile_version(preflight: dict[str, Any]) -> str | None:
+    """The cluster's effective Runtime Profile, from the preflight's store
+    reading: stamped on the workload (so its observation carries it) and
+    named by the synthetic finding, so the plan compiles REPLACE_NODE for
+    this cluster's own lifecycle adapter. ``None`` when the store had none."""
+
+    version = ((preflight.get("store") or {}).get("profile") or {}).get(
+        "profile_version"
+    )
+    return str(version) if version else None
+
+
+def pinned_workload(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    case_dir: Path,
+    profile_version: str | None,
+) -> ManagedWorkloadFixture:
+    """The single-node 8-GPU job pinned to the fault node, stamped with the
+    cluster's own profile version when the preflight read one."""
+
+    pinned_manifest = render_node_pinned_manifest(
+        settings.manifest,
+        case_dir / "pinned-workload.yaml",
+        node=settings.fault_node,
+    )
+    return ManagedWorkloadFixture(
+        regional,
+        ManagedWorkloadSettings(
+            manifest=pinned_manifest,
+            site_file=settings.site_file,
+            job_id=settings.job_id,
+            attempt_id=settings.attempt_id,
+            restart_budget=1,
+            expected_pods=1,
+            expected_gpu_count=8,
+            runtime_profile_version=profile_version,
+        ),
+    )
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -795,23 +843,8 @@ def execute_case(
     regional = RegionalLiveFixture(settings.regional)
     warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
     run_id = f"destr003-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    pinned_manifest = render_node_pinned_manifest(
-        settings.manifest,
-        case_dir / "pinned-workload.yaml",
-        node=settings.fault_node,
-    )
-    workload = ManagedWorkloadFixture(
-        regional,
-        ManagedWorkloadSettings(
-            manifest=pinned_manifest,
-            site_file=settings.site_file,
-            job_id=settings.job_id,
-            attempt_id=settings.attempt_id,
-            restart_budget=1,
-            expected_pods=1,
-            expected_gpu_count=8,
-        ),
-    )
+    profile_version = effective_profile_version(preflight)
+    workload = pinned_workload(settings, regional, case_dir, profile_version)
     prewarm = ImagePrewarmFixture(regional, case_id=CASE_ID, run_id=run_id)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
@@ -853,6 +886,7 @@ def execute_case(
                 event_id=event_id,
                 observation=observation,
                 observed_at=started_at,
+                profile_version=profile_version,
             )
         )
         write_json_atomic(case_dir / "injection.json", injection)

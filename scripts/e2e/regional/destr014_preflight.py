@@ -20,6 +20,7 @@ from scripts.e2e.regional.destr014_verdicts import (
     estimated_duration_seconds,
     lifetime_errors,
 )
+from gpu_fault.node_provider import parse_provider_id
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -27,6 +28,10 @@ from scripts.e2e.regional.regional_live_fixture import (
     component_python,
 )
 from scripts.e2e.regional import warm_spare_provider
+from scripts.e2e.regional.regional_workload_inventory import (
+    blocking_node_taints,
+    node_provider,
+)
 from scripts.e2e.regional.warm_spare_fixture import SPARE_LABEL
 
 
@@ -171,9 +176,10 @@ def preflight_errors(
             "the two target nodes hold every kube-dns endpoint; rebooting both "
             "would take cluster DNS down"
         )
+    expected_identity = agent_node_identity(sibling)
     if (
-        not sibling.get("uid")
-        or sibling_agent.get("node_instance_id") != sibling["uid"]
+        not expected_identity
+        or sibling_agent.get("node_instance_id") != expected_identity
         or not sibling_agent.get("runtime_profile_version")
         or any(
             not re.fullmatch(r"[0-9a-f]{64}", str(sibling_agent.get(key) or ""))
@@ -182,6 +188,13 @@ def preflight_errors(
     ):
         errors.append(
             "sibling Node Agent recovery identity is incomplete or mismatched"
+            + (
+                f" (node_instance_id {sibling_agent.get('node_instance_id')!r} is not "
+                f"the node's {expected_identity!r})"
+                if expected_identity
+                and sibling_agent.get("node_instance_id") != expected_identity
+                else ""
+            )
         )
     if fault_node == sibling_node:
         errors.append("fault and sibling nodes are identical")
@@ -193,10 +206,15 @@ def preflight_errors(
         (fault_node, fault, fault_agent),
         (sibling_node, sibling, sibling_agent),
     ):
+        # The warm-spare view carries the Node's raw taints: a plain-EKS node
+        # group's standing ``nvidia.com/gpu=present:NoSchedule`` is not
+        # isolation (live, gpu-eks-cluster: both nodes refused for it while
+        # Ready and uncordoned); only cordons, gpu-fault.io/* and NoExecute
+        # taints are, per provider (``blocking_node_taints``).
         if (
             node.get("ready") != "True"
             or node.get("unschedulable")
-            or node.get("taints")
+            or blocking_node_taints(node.get("taints"), node.get("labels"))
         ):
             errors.append(f"{name} is not Ready and schedulable")
         if (node.get("labels") or {}).get(SPARE_LABEL) == "true":
@@ -251,6 +269,22 @@ def preflight_errors(
         )
     )
     return errors
+
+
+def agent_node_identity(node: dict[str, Any]) -> str | None:
+    """The identity the node's Agent records as ``node_instance_id``.
+
+    HyperPod installs record the Kubernetes Node UID; a plain-EKS install
+    records the EC2 instance id behind the Node's ``providerID`` (the join
+    binds the Agent to the instance the eks adapter reboots). ``None`` when
+    the node view lacks the fact its provider needs -- fail-closed.
+    """
+
+    if node_provider(node.get("labels")) == "eks-managed":
+        parsed = parse_provider_id(node.get("provider_id"))
+        return parsed[1] if parsed else None
+    uid = node.get("uid")
+    return str(uid) if uid else None
 
 
 def managed_recovery_errors(seconds: int) -> list[str]:

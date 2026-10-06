@@ -21,6 +21,11 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.provider_lifecycle_owner import (
+    cluster_registration,
+    pinned_profile_version,
+    provider_owner_errors,
+)
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
     workflow_is_mutable,
@@ -52,6 +57,20 @@ class ReplacementContext:
     group_key: str
     workload_ids: list[str]
     source_gpu_count: int
+    #: The cluster's registration (provider, pinned profile), when recorded.
+    registration: Any | None = None
+    #: The profile the finding named when the registration's pin replaced it.
+    profile_repinned_from: str | None = None
+
+
+def _repin_reasons(context: ReplacementContext) -> list[str]:
+    if context.profile_repinned_from is None:
+        return []
+    return [
+        f"runtime profile re-pinned from {context.profile_repinned_from} (named by "
+        f"the finding) to {context.profile_version} (cluster "
+        f"{context.finding.cluster_id}'s registration)"
+    ]
 
 
 @dataclass
@@ -176,9 +195,15 @@ class NodeLifecycleOperationService:
         )
         if not allocation_nodes or finding.node_id not in allocation_nodes:
             return None
-        profile_version = (
+        named_version = (
             finding.runtime_profile_version or observation.runtime_profile_version
         )
+        # The cluster's own pin wins over the version the finding carries: a
+        # workload submitted under the site profile stamps that version on
+        # its observation, and a plan compiled from it names the other
+        # provider's adapter as owner (provider_lifecycle_owner).
+        registration = cluster_registration(self.store, finding.cluster_id)
+        profile_version = pinned_profile_version(registration, named_version)
         profile = None
         errors = []
         try:
@@ -204,6 +229,10 @@ class NodeLifecycleOperationService:
             group_key=group_key,
             workload_ids=sorted(workload_ids.union(observation.workload_ids)),
             source_gpu_count=observation.gpu_count,
+            registration=registration,
+            profile_repinned_from=(
+                named_version if profile_version != named_version else None
+            ),
         )
 
     def _state(
@@ -249,6 +278,7 @@ class NodeLifecycleOperationService:
                         [
                             *existing_incident.reasons,
                             context.finding.reason,
+                            *_repin_reasons(context),
                         ]
                     )
                 ),
@@ -270,7 +300,7 @@ class NodeLifecycleOperationService:
             aggregation_max_deadline=maximum,
             fault_nodes=[context.finding.node_id],
             gpu_uuids=sorted(set(context.finding.gpu_uuids)),
-            reasons=[context.finding.reason],
+            reasons=[context.finding.reason, *_repin_reasons(context)],
             primary_event_id=context.finding.event_id,
         )
 
@@ -316,6 +346,10 @@ class NodeLifecycleOperationService:
             state.gpu_uuids,
             context.workload_ids,
         )
+        # Fail closed before dispatch: a provider step whose owner this
+        # cluster's executor never advertises would wait for a claim that
+        # cannot come (live: 932 s, then a drain of a healthy node).
+        errors.extend(provider_owner_errors(steps, context.registration))
         requirements = {
             WorkflowOperation.VALIDATE_GPU: {},
             WorkflowOperation.VALIDATE_FABRIC: {},

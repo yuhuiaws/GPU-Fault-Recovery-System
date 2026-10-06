@@ -743,13 +743,19 @@ def replacement_payload(
     attempt_id: str,
     observation: dict[str, Any],
     observed_at: datetime,
+    profile_version: str | None = None,
 ) -> dict[str, Any]:
+    """The synthetic finding; ``profile_version`` is the cluster's effective
+    Runtime Profile, which the plan compiles against on a mixed site."""
+
     return {
         "event_id": event_id,
         "cluster_id": settings.regional.cluster_id,
         "node_id": settings.fault_node,
         "observed_at": observed_at.isoformat(),
-        "runtime_profile_version": observation["runtime_profile_version"],
+        "runtime_profile_version": (
+            profile_version or observation["runtime_profile_version"]
+        ),
         "job_id": job_id,
         "attempt_id": attempt_id,
         "affected_workload_ids": observation["workload_ids"],
@@ -778,6 +784,7 @@ def prepare_scenario_resources(
     run_dir: Path,
     attempt: int,
     scenario: str,
+    profile_version: str | None = None,
 ) -> ScenarioResources:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     job_id, attempt_id = scenario_identity(run_dir, attempt, scenario)
@@ -794,6 +801,9 @@ def prepare_scenario_resources(
             restart_budget=1,
             expected_pods=1,
             expected_gpu_count=8,
+            # The cluster's own pin, so the observation carries the version
+            # the control plane plans this cluster's REPLACE_NODE against.
+            runtime_profile_version=profile_version,
         ),
         state_path=directory / "workload-owner.json",
     )
@@ -922,7 +932,14 @@ def run_scenario(
     directory = case_dir / "scenarios" / scenario
     with controller_ownership(directory / "scenario-owner.json"):
         resources = prepare_scenario_resources(
-            settings, warm, regional, directory, run_dir, attempt, scenario
+            settings,
+            warm,
+            regional,
+            directory,
+            run_dir,
+            attempt,
+            scenario,
+            profile_version=profile_version,
         )
         return _run_scenario(
             settings,
@@ -1055,6 +1072,7 @@ def _run_scenario(
                 attempt_id=attempt_id,
                 observation=observation,
                 observed_at=started_at,
+                profile_version=profile_version,
             )
         )
         write_json_atomic(scenario_dir / "injection.json", injection)

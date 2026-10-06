@@ -247,6 +247,9 @@ class ManagedWorkloadSettings:
     restart_budget: int
     expected_pods: int
     expected_gpu_count: int
+    #: The Runtime Profile version to stamp on the workload: the target
+    #: cluster's own pin on a mixed site. ``None`` leaves the site's version.
+    runtime_profile_version: str | None = None
 
     def __post_init__(self) -> None:
         if not self.manifest.is_file():
@@ -924,6 +927,11 @@ class ManagedWorkloadFixture:
             "--namespace",
             self.regional.settings.namespace,
         ]
+        if self.settings.runtime_profile_version:
+            arguments += [
+                "--runtime-profile-version",
+                self.settings.runtime_profile_version,
+            ]
         submission: dict[str, Any] = {}
 
         def create_only(

@@ -1022,6 +1022,18 @@ Semantics and boundaries of `eks-managed`:
     --gpu-nodegroup gpu-p5en-efa-spot-node-group \
     --approve-profile-plan <plan_sha256> --reference CHG-<id>
   ```
+- Compile-time owner of node lifecycle steps: the control plane compiles `RESTART_NODE`/`REPLACE_NODE` against the
+  **cluster's registration** (`RegionalClusterRegistration.provider` and `runtime_profile_version`), not against the
+  profile version a finding or observation carries (`orchestration/provider_lifecycle_owner.py`). On a mixed site a
+  workload submitted under the site profile stamped `hyperpod-v1` on its observation, the synthetic replacement
+  finding repeated it, and the eks cluster's `REPLACE_NODE` compiled with `gpu-fault-hyperpod-adapter` as owner:
+  nothing claimed it, it failed on the unclaimed deadline 932 s later and the hand-off drained a healthy node
+  (gpu-eks-cluster DESTR-003). The cluster's own pinned profile now replaces the named version (the incident reasons
+  record `runtime profile re-pinned from … to …`), and a provider step whose owner is not this cluster's provider
+  adapter (`PROVIDER_NODE_REBOOT_OWNERS`) is refused **at plan time** as BLOCKED with the reason in words, never waited
+  for. `gpu-fault-training-submit --runtime-profile-version` also accepts any cluster's own pinned version
+  (`spec.clusters[].runtimeProfile`), so a workload's observation carries its target cluster's version directly; the
+  synthetic replacement route itself needs no eks-specific opening.
 - Device-plugin DaemonSet update strategy (a COLLECT-017 prerequisite): acceptance COLLECT-017 segments B/C
   temporarily exclude the target node from the NVIDIA/EFA device-plugin DaemonSets' affinity and support only
   DaemonSets configured as `OnDelete` beforehand (`RollingUpdate` would spread the temporary affinity to other nodes;

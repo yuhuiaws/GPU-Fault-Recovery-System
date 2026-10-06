@@ -83,11 +83,27 @@ def resolve_runtime_profile_version(args: argparse.Namespace) -> str:
         except (OSError, SiteConfigError, ValueError) as exc:
             raise TrainingSubmitError(f"cannot load site Profile: {exc}") from exc
         site_version = str(site.release_config["runtime_profile"]["version"])
-        if explicit and explicit != site_version:
+        # A mixed site pins some clusters to their own Runtime Profile
+        # (``spec.clusters[].runtimeProfile``); a workload bound for such a
+        # cluster is stamped with that version, which the cluster's Watcher
+        # then carries into its observations and the control plane plans by.
+        cluster_versions = {
+            str((item.get("runtime_profile") or {}).get("version") or "")
+            for item in site.release_config.get("clusters") or []
+            if isinstance(item, dict)
+        }
+        cluster_versions.discard("")
+        if explicit and explicit != site_version and explicit not in cluster_versions:
             raise TrainingSubmitError(
                 "--runtime-profile-version does not match the site Profile"
+                + (
+                    f" ({site_version}) or any cluster's own profile "
+                    f"({', '.join(sorted(cluster_versions))})"
+                    if cluster_versions
+                    else f" ({site_version})"
+                )
             )
-        return site_version
+        return explicit or site_version
     return explicit or os.getenv("GPU_FAULT_RUNTIME_PROFILE", "hyperpod-v1")
 
 

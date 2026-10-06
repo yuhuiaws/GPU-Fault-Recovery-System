@@ -211,3 +211,43 @@ def test_site_supplies_runtime_profile_and_rejects_mismatch(
     args.runtime_profile_version = "profile-v1"
     with pytest.raises(TrainingSubmitError, match="does not match"):
         training_submit_cli.resolve_runtime_profile_version(args)
+
+
+def test_site_accepts_a_clusters_own_pinned_profile_version(
+    tmp_path, monkeypatch
+) -> None:
+    """A mixed site pins the plain EKS cluster to its own Runtime Profile; a
+    workload bound for it is stamped with that version (its observation then
+    carries it, and the control plane plans REPLACE_NODE for the eks adapter).
+    Anything that is neither the site's nor a cluster's version is refused."""
+
+    site = tmp_path / "site.yaml"
+    site.write_text("site", encoding="utf-8")
+    monkeypatch.setattr(
+        training_submit_cli,
+        "load_site",
+        lambda _path: SimpleNamespace(
+            release_config={
+                "runtime_profile": {"version": "hyperpod-v1"},
+                "clusters": [
+                    {"cluster_id": "hp"},
+                    {
+                        "cluster_id": "gpu-eks-cluster",
+                        "provider": "eks-managed",
+                        "runtime_profile": {"version": "regional-eks-abc"},
+                    },
+                ],
+            }
+        ),
+    )
+    args = argparse.Namespace(site=site, runtime_profile_version=None)
+    assert training_submit_cli.resolve_runtime_profile_version(args) == "hyperpod-v1"
+    args.runtime_profile_version = "regional-eks-abc"
+    assert (
+        training_submit_cli.resolve_runtime_profile_version(args) == "regional-eks-abc"
+    )
+    args.runtime_profile_version = "hyperpod-v1"
+    assert training_submit_cli.resolve_runtime_profile_version(args) == "hyperpod-v1"
+    args.runtime_profile_version = "someone-elses"
+    with pytest.raises(TrainingSubmitError, match="regional-eks-abc"):
+        training_submit_cli.resolve_runtime_profile_version(args)

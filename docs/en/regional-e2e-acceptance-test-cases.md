@@ -9130,6 +9130,15 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   point replaces only the fault signal; `STOP_WORKLOADS`, `REPLACE_NODE`, spare allocation, the
   Node Agent fence, workload rebuild and Kubernetes mutations all take the real path. The report
   must state `synthetic_trigger=true` and must not describe it as a real hardware fault.
+- Both providers: on an `eks-managed` cluster the same synthetic route (`GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS`
+  on the API replicas, opened by `synthetic_replacement_route.py --open` exactly as on HyperPod) drives the
+  Kubernetes-level warm-spare handover of the eks adapter (`nodeReplace` OWN by `gpu-fault-eks-adapter`,
+  `warm-spare-v1`; no provider replacement exists). The runner stamps the pinned workload with the cluster's effective
+  Runtime Profile (the preflight's store reading, passed as `--runtime-profile-version`) and names it in the synthetic
+  finding, and the control plane compiles against the cluster's registration anyway
+  (`provider_lifecycle_owner`): a `REPLACE_NODE` owned by the other provider's adapter is refused at plan time as
+  BLOCKED instead of waiting 15 minutes unclaimed and draining the node, which is what an earlier `eks-managed` attempt
+  did when the observation carried the site's `hyperpod-v1`.
 - Purpose: **this is the only node replacement path this system supports** (`DESTR-004` is retired).
   The fault node is isolated but **not destroyed**; the workload migrates to a warm-spare GPU
   node that the customer provided in advance and brought under monitoring. The cluster size is
@@ -9979,6 +9988,14 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 - Level: `destructive-provider-reboot`. Two real `BatchRebootClusterNodes`
   calls (one for node-b, one for node-c); the reboot switch stays at its default (enabled);
   **no warm spare is declared, and calling `BatchReplaceClusterNodes` is forbidden.**
+- Both providers (preflight): the two nodes are judged with the per-provider taint rule
+  (`regional_workload_inventory.blocking_node_taints`): a plain-EKS node group's standing
+  `nvidia.com/gpu=present:NoSchedule` is not isolation, only cordons, `gpu-fault.io/*` and `NoExecute` taints
+  are (a HyperPod node still refuses any taint). The sibling Node Agent's `node_instance_id` must be the identity its
+  provider's installer records -- the Kubernetes Node UID on HyperPod, the EC2 instance id behind the Node's
+  `providerID` on `eks-managed` (`destr014_preflight.agent_node_identity`; an eks node without a `providerID` fails
+  closed). An earlier `eks-managed` attempt refused both Ready, uncordoned nodes for the GPU taint and the sibling's
+  identity for carrying the instance id.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr014_branch_exhaustion.py`. By default it only generates the
   plan; before execute it must read `DESTR-008=PASS` (chain: `010 → 001 → 002 → 009 →
