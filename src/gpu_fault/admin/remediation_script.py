@@ -166,6 +166,33 @@ def command_evidence(workflow_ids):
     }
 
 
+def node_validations(incident):
+    # SUCCEEDED workflows of the incident's cluster whose VALIDATE_GPU step names
+    # one of its nodes: a later validated restore of the node under *any*
+    # incident is evidence for a node action whose answer was lost (live: the
+    # heal of a DCGM incident validated the node seconds after a refused reset
+    # of an XID 46 incident, and the confirmation refused for want of its own
+    # incident's restore). Newest first, bounded; the admin side judges them.
+    nodes = set(incident.node_ids)
+    found = []
+    for item in store.list_workflows(statuses={WorkflowStatus.SUCCEEDED}, limit=10_000):
+        if WorkflowOperation.VALIDATE_GPU not in item.completed_operations or not any(
+            step.operation is WorkflowOperation.VALIDATE_GPU and nodes & set(step.node_ids)
+            for step in item.official_steps
+        ):
+            continue
+        if item.incident_id != incident.incident_id:
+            try:
+                other = store.get_incident(item.incident_id)
+            except Exception:  # noqa: BLE001 - an unreadable incident is no evidence
+                continue
+            if other.cluster_id != incident.cluster_id:
+                continue
+        found.append(item)
+    found.sort(key=lambda item: item.updated_at, reverse=True)
+    return [dump(item) for item in found[:10]]
+
+
 def node_inventory(incident):
     from gpu_fault.execution.node_rebinding import inventory_gpu_uuids
 
@@ -343,6 +370,7 @@ if payload["mode"] == "inspect":
             for node_id in incident.node_ids
         },
         "node_gpu_uuids": node_inventory(incident),
+        "node_validations": node_validations(incident),
     }
 elif payload["mode"] == "restore":
     from gpu_fault.orchestration.validated_restore import (

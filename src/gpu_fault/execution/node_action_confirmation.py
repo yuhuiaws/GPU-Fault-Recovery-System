@@ -754,6 +754,86 @@ def successor_validation(
     }
 
 
+def node_validation(
+    candidates: Sequence[WorkflowRequest],
+    workflow: WorkflowRequest,
+    incident: FaultIncident,
+    node_id: str,
+    execution: WorkflowStepExecution,
+    step: WorkflowStepSpec | None,
+) -> dict[str, Any] | None:
+    """A later SUCCEEDED validated restore of ``node_id`` under *any* incident.
+
+    ``successor_validation`` needs the restore to be this incident's own. The
+    product validates nodes, not incidents: a validated restore runs
+    ``VALIDATE_GPU`` over the node and ``RESTORE_SCHEDULING`` puts it back,
+    whichever incident it answers. Live (gpu-eks-cluster, XID 46): seconds
+    after a refused reset, the heal of the product's own DCGM incident on the
+    same node validated the GPU and uncordoned it, and this disposition still
+    sent the operator to reboot a node the product had just declared healthy.
+
+    Accepted when the candidate SUCCEEDED, completed ``VALIDATE_GPU`` and
+    ``RESTORE_SCHEDULING``, has a ``VALIDATE_GPU`` step naming the node whose
+    GPU scope (if any) covers the GPUs the action touched, and validated
+    *after* the action started -- a validation from before proves nothing
+    about it. The newest such validation wins; the confirmation names the
+    workflow and its incident. ``candidates`` are the same cluster's
+    SUCCEEDED workflows (the Pod gathers them; it reads the incidents).
+    """
+
+    acted = set(step.gpu_uuids) if step is not None else set()
+    best: tuple[datetime, WorkflowRequest, set[str]] | None = None
+    for candidate in candidates:
+        if (
+            candidate.request_id == workflow.request_id
+            or candidate.status is not WorkflowStatus.SUCCEEDED
+        ):
+            continue
+        completed = set(candidate.completed_operations)
+        if (
+            WorkflowOperation.VALIDATE_GPU not in completed
+            or WorkflowOperation.RESTORE_SCHEDULING not in completed
+        ):
+            continue
+        validating = [
+            item
+            for item in candidate.official_steps
+            if item.operation is WorkflowOperation.VALIDATE_GPU
+            and node_id in item.node_ids
+        ]
+        if not validating:
+            continue
+        scope = {gpu for item in validating for gpu in item.gpu_uuids}
+        if scope and acted and not acted <= scope:
+            continue
+        validated_at = max(
+            (
+                item.updated_at
+                for item in candidate.step_executions
+                if item.operation is WorkflowOperation.VALIDATE_GPU
+                and item.status is WorkflowStepStatus.SUCCEEDED
+            ),
+            default=candidate.updated_at,
+        )
+        if validated_at <= execution.started_at:
+            continue
+        if best is None or validated_at > best[0]:
+            best = (validated_at, candidate, scope)
+    if best is None:
+        return None
+    validated_at, candidate, scope = best
+    return {
+        "request_id": candidate.request_id,
+        "incident_id": candidate.incident_id,
+        "cross_incident": candidate.incident_id != incident.incident_id,
+        "status": candidate.status.value,
+        "completed_operations": [item.value for item in candidate.completed_operations],
+        "validated_gpu_uuids": sorted(scope),
+        "validated_at": validated_at.isoformat(),
+        "updated_at": candidate.updated_at.isoformat(),
+    }
+
+
 def _confirmation(
     execution: WorkflowStepExecution,
     step: WorkflowStepSpec | None,
@@ -825,6 +905,7 @@ def confirm_node_action(
     reference: str,
     now: datetime,
     successor: WorkflowRequest | None = None,
+    node_validations: Sequence[WorkflowRequest] = (),
 ) -> NodeActionConfirmationVerdict:
     """Judge the evidence for every unresolved node action on ``node_id``.
 
@@ -835,7 +916,9 @@ def confirm_node_action(
     the wrong thing. ``successor`` is the incident's current workflow when it
     is a later validated restore (``successor_validation``): for a node action
     other than a reboot it is accepted as evidence beside, or instead of, the
-    agent's terminal answer on the remote command.
+    agent's terminal answer on the remote command; so is any later validated
+    restore of the node among ``node_validations`` (``node_validation``),
+    whichever incident it answered.
     """
 
     refusals = _record_refusals(workflow, incident, node_id, remote_commands, now)
@@ -876,6 +959,10 @@ def confirm_node_action(
         else:
             terminal = _terminal_node_result(execution, node_id, remote_commands)
             validated_by = successor_validation(successor, workflow, incident, node_id)
+            if validated_by is None:
+                validated_by = node_validation(
+                    node_validations, workflow, incident, node_id, execution, step
+                )
             if terminal[0] is None and validated_by is None:
                 # A reboot since the action settles it as surely as its own
                 # answer would: no GPU reset survives a boot, and the driver
@@ -893,8 +980,9 @@ def confirm_node_action(
                     reasons.append(
                         f"no terminal Node Agent result for {execution.operation.value} "
                         f"on node {node_id} is recorded on step {execution.step_index} or "
-                        "its remote commands, no later validated restore of this "
-                        "incident validated the node, and no reboot since the action "
+                        "its remote commands, no later validated restore of this or "
+                        "any incident validated the node after the action, and no "
+                        "reboot since the action "
                         "is proven (" + "; ".join(rebooted) + "); the agent ledger on "
                         "the node is the only record and this disposition cannot read it"
                     )

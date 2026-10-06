@@ -936,3 +936,153 @@ def test_a_different_unresolved_command_on_the_confirmed_step_is_flagged_again()
         "an operator confirmed one command's outcome, not a later command's"
     )
     assert len(refreshed.step_executions) == len(confirmed.step_executions) + 1
+
+
+def _other_incidents_validation(**overrides):
+    """The heal of another incident on the same node, run after the reset."""
+
+    values = {
+        "request_id": "workflow-heal-dcgm-541560c45428",
+        "incident_id": "inc-drain-after-workflow-82ab3511",
+        "updated_at": NOW - timedelta(minutes=5),
+    }
+    values.update(overrides)
+    return _validating_successor().model_copy(update=values)
+
+
+def test_a_refused_reset_is_confirmed_by_a_later_validated_restore_of_any_incident() -> (
+    None
+):
+    """Live (gpu-eks-cluster, XID 46): the product's own drain incident on the
+    same node ran a heal whose VALIDATE_GPU/VALIDATE_HOST/VALIDATE_FABRIC and
+    RESTORE_SCHEDULING all SUCCEEDED seconds after the refused reset, yet the
+    confirmation wanted this incident's restore and sent the operator to reboot
+    a node the product had just validated. A validated node is a validated
+    node; the audit names the workflow and the incident that did it."""
+
+    workflow = _refused_reset_workflow()
+    heal = _other_incidents_validation()
+    incident = _incident(
+        fencing_token=1,
+        state="ESCALATED",
+        workflow_request_id="workflow-restore-attempt-failed",
+    )
+
+    verdict = confirm_node_action(
+        workflow=workflow,
+        incident=incident,
+        node_id=NODE,
+        node=_node(),
+        agent=_agent(),
+        remote_commands=[],
+        actor=ACTOR,
+        reference="CHG-XID-46",
+        now=NOW,
+        successor=None,
+        node_validations=[heal],
+    )
+
+    assert verdict.refusals == (), verdict.refusals
+    [confirmation] = verdict.confirmations
+    assert confirmation["settled_by"] == "validated_restore"
+    assert confirmation["terminal_node_result"] is None
+    assert confirmation["validated_by_workflow"] == {
+        "request_id": heal.request_id,
+        "incident_id": heal.incident_id,
+        "cross_incident": True,
+        "status": "SUCCEEDED",
+        "completed_operations": [
+            "VALIDATE_GPU",
+            "VALIDATE_HOST",
+            "VALIDATE_FABRIC",
+            "RESTORE_SCHEDULING",
+        ],
+        "validated_gpu_uuids": ["GPU-7"],
+        "validated_at": heal.updated_at.isoformat(),
+        "updated_at": heal.updated_at.isoformat(),
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": WorkflowStatus.FAILED},
+        {"updated_at": STARTED - timedelta(minutes=1)},
+        {"completed_operations": [WorkflowOperation.RESTORE_SCHEDULING]},
+        {
+            "official_steps": [
+                workflow_step(
+                    WorkflowOperation.VALIDATE_GPU, node_ids=[NODE], gpu_uuids=["GPU-9"]
+                ),
+                workflow_step(WorkflowOperation.RESTORE_SCHEDULING, node_ids=[NODE]),
+            ]
+        },
+        {
+            "official_steps": [
+                workflow_step(WorkflowOperation.VALIDATE_GPU, node_ids=[SIBLING]),
+                workflow_step(WorkflowOperation.RESTORE_SCHEDULING, node_ids=[SIBLING]),
+            ]
+        },
+    ],
+    ids=["failed", "before-the-action", "no-validate", "other-gpu", "other-node"],
+)
+def test_a_validation_that_does_not_cover_the_action_is_no_evidence(
+    changes: dict,
+) -> None:
+    workflow = _refused_reset_workflow()
+    incident = _incident(
+        fencing_token=1,
+        state="ESCALATED",
+        workflow_request_id="workflow-restore-attempt-failed",
+    )
+
+    verdict = confirm_node_action(
+        workflow=workflow,
+        incident=incident,
+        node_id=NODE,
+        node=_node(),
+        agent=_agent(),
+        remote_commands=[],
+        actor=ACTOR,
+        reference="CHG-XID-46",
+        now=NOW,
+        node_validations=[_other_incidents_validation(**changes)],
+    )
+
+    assert verdict.confirmations == ()
+    assert any(
+        "no later validated restore of this or any incident validated the node "
+        "after the action" in reason
+        for reason in verdict.refusals
+    ), verdict.refusals
+
+
+def test_the_newest_covering_validation_is_the_one_named() -> None:
+    workflow = _refused_reset_workflow()
+    incident = _incident(
+        fencing_token=1,
+        state="ESCALATED",
+        workflow_request_id="workflow-restore-attempt-failed",
+    )
+    older = _other_incidents_validation(
+        request_id="workflow-heal-older", updated_at=NOW - timedelta(minutes=30)
+    )
+    newer = _other_incidents_validation(
+        request_id="workflow-heal-newer", updated_at=NOW - timedelta(minutes=2)
+    )
+
+    verdict = confirm_node_action(
+        workflow=workflow,
+        incident=incident,
+        node_id=NODE,
+        node=_node(),
+        agent=_agent(),
+        remote_commands=[],
+        actor=ACTOR,
+        reference="CHG-XID-46",
+        now=NOW,
+        node_validations=[older, newer],
+    )
+
+    [confirmation] = verdict.confirmations
+    assert confirmation["validated_by_workflow"]["request_id"] == "workflow-heal-newer"

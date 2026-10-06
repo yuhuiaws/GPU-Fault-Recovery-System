@@ -967,3 +967,139 @@ def test_the_cli_help_names_the_disposition(capsys: pytest.CaptureFixture[str]) 
     assert DISPOSITION in help_text
     assert "--node" in help_text
     assert "outcome" in help_text.lower()
+
+
+# --------------------------------------------- a later validated restore of the node
+
+
+def _parked_reset_inspection() -> dict:
+    """A RESET_GPU parked with an unknown outcome; the incident ESCALATED after
+    its own restore attempt failed, pointing at that attempt."""
+
+    reset = WorkflowOperation.RESET_GPU
+    workflow = _dump(
+        _workflow_model(
+            official_steps=[
+                workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=[NODE]),
+                workflow_step(WorkflowOperation.QUIESCE_GPU_SERVICES, node_ids=[NODE]),
+                workflow_step(reset, node_ids=[NODE], gpu_uuids=["GPU-0246-0"]),
+                workflow_step(WorkflowOperation.RESTORE_GPU_SERVICES, node_ids=[NODE]),
+            ],
+            completed_step_indexes=[0, 1],
+            completed_operations=[
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.QUIESCE_GPU_SERVICES,
+            ],
+            step_executions=[
+                workflow_step_execution(
+                    2,
+                    reset,
+                    WorkflowStepStatus.FAILED,
+                    phase="official",
+                    adapter_operation_id="remote/cmd-reset",
+                    details={
+                        "outcome_unknown": True,
+                        "manual_confirmation_required": True,
+                        "remote_command_id": "cmd-reset",
+                    },
+                    started_at=STARTED,
+                    updated_at=STARTED + timedelta(minutes=3),
+                )
+            ],
+        )
+    )
+    attempt = _dump(
+        _workflow_model(
+            status=WorkflowStatus.FAILED,
+            blocked_kind=None,
+            official_steps=[
+                workflow_step(WorkflowOperation.VALIDATE_GPU, node_ids=[NODE])
+            ],
+            completed_step_indexes=[],
+            completed_operations=[],
+            step_executions=[],
+            blocked_reasons=[],
+        ).model_copy(update={"request_id": "workflow-restore-attempt"})
+    )
+    inspection = _inspection(
+        incident=_dump(
+            _incident_model(
+                state=IncidentState.ESCALATED,
+                workflow_request_id="workflow-restore-attempt",
+                node_ids=[NODE],
+            )
+        ),
+        workflow=attempt,
+        blocked_workflows=[workflow],
+        agents={NODE: _agent_dump(boot_id=OLD_BOOT)},
+        remote_commands={WORKFLOW: [], "workflow-restore-attempt": []},
+    )
+    return inspection
+
+
+def _heal_of_another_incident(**overrides) -> dict:
+    operations = [
+        WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
+        WorkflowOperation.VALIDATE_FABRIC,
+        WorkflowOperation.RESTORE_SCHEDULING,
+    ]
+    identity = {
+        "request_id": overrides.pop("request_id", "workflow-heal-dcgm"),
+        "incident_id": overrides.pop("incident_id", "inc-drain-after-dcgm"),
+    }
+    values = {
+        "status": WorkflowStatus.SUCCEEDED,
+        "blocked_kind": None,
+        "fencing_token": 2,
+        "official_steps": [workflow_step(item, node_ids=[NODE]) for item in operations],
+        "completed_step_indexes": [0, 1, 2, 3],
+        "completed_operations": operations,
+        "step_executions": [],
+        "blocked_reasons": [],
+        "updated_at": NOW - timedelta(minutes=10),
+    }
+    values.update(overrides)
+    return _dump(_workflow_model(**values).model_copy(update=identity))
+
+
+def test_the_plan_settles_a_reset_on_a_later_validated_restore_of_any_incident() -> (
+    None
+):
+    """Live (gpu-eks-cluster, XID 46): the node was never rebooted, but the
+    product's own DCGM incident healed it -- VALIDATE_GPU/HOST/FABRIC and
+    RESTORE_SCHEDULING SUCCEEDED -- after the refused reset. That validation is
+    the evidence, whichever incident it answered; the audit names it."""
+
+    inspection = _parked_reset_inspection()
+    inspection["node_validations"] = [_heal_of_another_incident()]
+    nodes = _nodes()
+    nodes[NODE]["status"]["nodeInfo"]["bootID"] = OLD_BOOT
+
+    plan = _plan(inspection, nodes=nodes)
+
+    (confirmation,) = plan.confirmations
+    assert confirmation["settled_by"] == "validated_restore"
+    assert confirmation["validated_by_workflow"]["request_id"] == "workflow-heal-dcgm"
+    assert (
+        confirmation["validated_by_workflow"]["incident_id"] == "inc-drain-after-dcgm"
+    )
+    assert confirmation["validated_by_workflow"]["cross_incident"] is True
+    assert confirmation["previous_boot_id"] is None, "no reboot proof was needed"
+
+
+def test_without_a_covering_validation_the_plan_still_names_the_missing_proof() -> None:
+    inspection = _parked_reset_inspection()
+    inspection["node_validations"] = [
+        _heal_of_another_incident(updated_at=STARTED - timedelta(minutes=5))
+    ]
+    nodes = _nodes()
+    nodes[NODE]["status"]["nodeInfo"]["bootID"] = OLD_BOOT
+
+    with pytest.raises(BootstrapError) as refused:
+        _plan(inspection, nodes=nodes)
+
+    assert "no later validated restore of this or any incident validated the node" in (
+        str(refused.value)
+    )
+    assert "no reboot since the action is proven" in str(refused.value)

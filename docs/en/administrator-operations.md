@@ -3122,7 +3122,8 @@ with details carrying `outcome_unknown: true, manual_confirmation_required: true
 the node Ready on a new boot with the Agent back, but the product had no entry point to record that fact -- this command is that entry point.
 **Reboot evidence is accepted for a `RESET_GPU` with unknown outcome too**: the confirmation of a GPU reset used to
 accept only two kinds of evidence -- the Agent's terminal receipt (SUCCEEDED/FAILED in the step's or the remote command's
-`node_results`) or a later SUCCEEDED validated restore of the same incident -- and refused "no terminal Node Agent result
+`node_results`) or a later SUCCEEDED validated restore of the same incident (now: of the same **node** under any incident, see
+below) -- and refused "no terminal Node Agent result
 ... and no later validated restore" when both were missing, even after the node had been rebooted from EC2 and the
 Agent was back: an open workflow nothing could close (and the `uninstall` "active workflows" gate with it). It now works
 like `RESTART_NODE`: a reboot since the action -- kubelet and the Agent agree on a boot id that differs from the one
@@ -3185,8 +3186,14 @@ which steps are pending -- a wrong node does not confirm something else). `RESTA
 action (taken in order from `agent_baselines` on the step or its remote command, the STOP ownership authorisation `stop_reboot_authorization_v1`,
 the single-node incident's `source_boot_id`; refused when none exists -- the record cannot prove the reboot). Other node actions (such as `RESET_GPU`):
 the remote command carries the Agent's own terminal answer (`node_results`, SUCCEEDED/FAILED; the Agent refusing before the action also counts as terminal),
-**or** a later validated restore of the same incident has completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node, and the incident is
-RECOVERED and points at it. A BLOCKED record's deadline being long past is no grounds for refusal -- that is exactly why it was stopped.
+**or** a later validated restore has completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node -- this incident's own (the incident
+RECOVERED and pointing at it), **or any incident's** on the same node (the product validates nodes, not incidents: a SUCCEEDED
+workflow of the cluster whose `VALIDATE_GPU` step names the node, whose GPU scope, if any, covers the GPUs the action touched,
+and whose validation completed after the action started; the Pod's inspection lists such workflows as `node_validations` and the
+confirmation records the one it rests on as `validated_by_workflow` with its `incident_id` and `cross_incident=true`). Live
+(gpu-eks-cluster, XID 46): the heal of the product's own DCGM incident validated and uncordoned the node seconds after a refused
+reset, and the confirmation still sent the operator to reboot a node the product had just declared healthy. A BLOCKED
+record's deadline being long past is no grounds for refusal -- that is exactly why it was stopped.
 When the terminal answer of a `RESET_GPU` is `OWNERSHIP_FINAL_CLIENTS_CHANGED`, its details carry `persistent_device_clients`
 (`gpu_uuid`/`pid`/`device`/`process_name`, at most 8 entries): read there whether the holder is a lingering workload or a platform daemon
 (DCGM host engine, exporter, health monitoring agent) before deciding to clear the holder or quiesce again; no node login is needed to reproduce it.

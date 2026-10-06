@@ -661,6 +661,14 @@ def build_confirm_node_action_plan(
         and str(pointer.get("request_id")) != workflow.request_id
         else None
     )
+    # Later validated restores of the node under any incident of the cluster
+    # (``node_validation``); an image whose inspect predates them returns none.
+    raw_validations = inspection.get("node_validations")
+    node_validations = [
+        WorkflowRequest.model_validate(item)
+        for item in (raw_validations if isinstance(raw_validations, list) else [])
+        if isinstance(item, dict)
+    ]
     verdict = confirm_node_action(
         workflow=workflow,
         incident=incident,
@@ -672,6 +680,7 @@ def build_confirm_node_action_plan(
         reference=reference or "(no reference: plan only)",
         now=stamp,
         successor=successor,
+        node_validations=node_validations,
     )
     if verdict.refusals:
         raise BootstrapError(

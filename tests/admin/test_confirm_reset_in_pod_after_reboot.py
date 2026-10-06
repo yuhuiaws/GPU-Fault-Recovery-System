@@ -200,3 +200,151 @@ def test_the_pod_still_refuses_a_reboot_it_cannot_prove_and_says_so(
     assert has_unresolved_node_action(store.get_workflow(RESET_WORKFLOW)), (
         "a refusal writes nothing"
     )
+
+
+HEAL_INCIDENT = "inc-drain-after-workflow-82ab3511"
+HEAL_WORKFLOW = "workflow-heal-541560c45428"
+
+
+def _heal_store():
+    """The same parked reset, no reboot since -- but the product's own drain
+    incident on the node ran a heal that validated and uncordoned it after the
+    refused reset (live, gpu-eks-cluster)."""
+
+    store = _reset_store()
+    _agent_record(store, boot_id=OLD_BOOT)
+    validated_at = NOW - timedelta(minutes=10)
+    operations = [
+        OP.VALIDATE_GPU,
+        OP.VALIDATE_HOST,
+        OP.VALIDATE_FABRIC,
+        OP.RESTORE_SCHEDULING,
+    ]
+    store.save_workflow(
+        workflow_request(
+            HEAL_WORKFLOW,
+            HEAL_INCIDENT,
+            status=WorkflowStatus.SUCCEEDED,
+            fencing_token=2,
+            official_steps=[
+                workflow_step(item, node_ids=[NODE]) for item in operations
+            ],
+            completed_step_indexes=[0, 1, 2, 3],
+            completed_operations=operations,
+            step_executions=[
+                workflow_step_execution(
+                    index,
+                    item,
+                    phase="official",
+                    started_at=validated_at - timedelta(minutes=1),
+                    updated_at=validated_at,
+                )
+                for index, item in enumerate(operations)
+            ],
+            created_at=STARTED + timedelta(minutes=30),
+            updated_at=validated_at,
+        )
+    )
+    store.save_incident(
+        fault_incident(
+            HEAL_INCIDENT,
+            "dcgm-fields-82ab3511",
+            cluster_id="gpu-a",
+            node_ids=[NODE],
+            state=IncidentState.RECOVERED,
+            workflow_request_id=HEAL_WORKFLOW,
+            fencing_token=2,
+            created_at=STARTED + timedelta(minutes=30),
+            updated_at=validated_at,
+        )
+    )
+    return store
+
+
+def _old_boot_nodes() -> dict:
+    nodes = _nodes()
+    nodes[NODE]["status"]["nodeInfo"]["bootID"] = OLD_BOOT
+    return nodes
+
+
+def test_a_later_heal_of_another_incident_settles_the_reset_without_a_reboot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = _heal_store()
+    run = _pod(monkeypatch, capsys, store)
+
+    inspection = run(
+        {
+            "mode": "inspect",
+            "incident_id": INCIDENT,
+            "action_incident_id": f"inc-operator-{INCIDENT}-confirm-node-action",
+        }
+    )
+    assert [item["request_id"] for item in inspection["node_validations"]] == [
+        HEAL_WORKFLOW
+    ], "the Pod lists the other incident's validated restore of the node"
+
+    plan = module.build_confirm_node_action_plan(
+        inspection,
+        incident_id=INCIDENT,
+        node_id=NODE,
+        operator=OPERATOR,
+        reference="CHG-2026-1006-02",
+        live_nodes=_old_boot_nodes(),
+        now=datetime.now(timezone.utc),
+    )
+    (confirmation,) = plan.confirmations
+    assert confirmation["settled_by"] == "validated_restore"
+    assert confirmation["validated_by_workflow"]["request_id"] == HEAL_WORKFLOW
+    assert confirmation["validated_by_workflow"]["incident_id"] == HEAL_INCIDENT
+    assert confirmation["validated_by_workflow"]["cross_incident"] is True
+    assert confirmation["observed_boot_id"] == OLD_BOOT, "no reboot was needed"
+
+    result = run(
+        module.confirmation_payload(
+            plan, operator=OPERATOR, reference="CHG-2026-1006-02"
+        )
+    )
+
+    assert result["no_op"] is False
+    saved = store.get_workflow(RESET_WORKFLOW)
+    reset = next(
+        item for item in saved.step_executions if item.operation is OP.RESET_GPU
+    )
+    assert reset.details["operator_confirmed"]["validated_by_workflow"][
+        "incident_id"
+    ] == (HEAL_INCIDENT)
+    assert has_unresolved_node_action(saved) is False
+
+
+def test_a_validation_of_another_cluster_or_before_the_action_is_not_listed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = _heal_store()
+    elsewhere = store.get_incident(HEAL_INCIDENT).model_copy(
+        update={"cluster_id": "gpu-b"}
+    )
+    store.save_incident(elsewhere, expected=store.get_incident(HEAL_INCIDENT))
+    run = _pod(monkeypatch, capsys, store)
+
+    inspection = run(
+        {
+            "mode": "inspect",
+            "incident_id": INCIDENT,
+            "action_incident_id": f"inc-operator-{INCIDENT}-confirm-node-action",
+        }
+    )
+
+    assert inspection["node_validations"] == [], (
+        "another cluster's node is not this one"
+    )
+    with pytest.raises(Exception, match="no later validated restore of this or any"):
+        module.build_confirm_node_action_plan(
+            inspection,
+            incident_id=INCIDENT,
+            node_id=NODE,
+            operator=OPERATOR,
+            reference="CHG-2026-1006-02",
+            live_nodes=_old_boot_nodes(),
+            now=datetime.now(timezone.utc),
+        )
