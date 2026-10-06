@@ -566,7 +566,13 @@ def test_network_probe_blocks_output_and_forward_and_restores_both(
     )
     inserts = [command for command in calls if command[:2] == ["iptables", "-I"]]
     assert [command[2] for command in inserts] == ["OUTPUT", "FORWARD"], inserts
-    timer = next(command for command in calls if command[0] == "systemd-run")
+    # ``require_binaries`` probes ``systemd-run --version`` first; the timer is
+    # the systemd-run call that arms the restore.
+    timer = next(
+        command
+        for command in calls
+        if command[0] == "systemd-run" and command[1:] != ["--version"]
+    )
     script = timer[-1]
     assert f"iptables -D OUTPUT -j {chain}" in script
     assert f"iptables -D FORWARD -j {chain}" in script

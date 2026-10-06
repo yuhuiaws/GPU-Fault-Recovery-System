@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from gpu_fault.execution.node_action_uncertainty import (
     restoration_refusal,
     unresolved_node_action,
@@ -201,4 +203,83 @@ def test_the_failure_compensation_restores_even_while_an_outcome_is_unknown() ->
     )
     assert unresolved_node_action(unknown) is True, (
         "the record still parks for confirm-node-action afterwards"
+    )
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"workflow_deadline_remote_command_cancellation": {"cancelled": 1}},
+        {
+            "workflow_deadline_remote_command_cancellation": {
+                "cancelled": 0,
+                "cancellation_requested": 1,
+            }
+        },
+        {"workflow_lifetime_exceeded": True},
+        {"step_waiting_timeout_seconds": 600},
+        {"remote_status_source": "workflow-timeout"},
+        {"remote_status": "LEASED"},
+        {"node_action_state": "PENDING", "node_action_command_id": "agent/reset"},
+    ],
+    ids=[
+        "deadline-cancelled",
+        "cancellation-requested",
+        "lifetime",
+        "step-wait",
+        "workflow-source",
+        "open-remote",
+        "pending-on-agent",
+    ],
+)
+def test_the_compensation_waits_while_the_control_plane_gave_up_on_an_open_command(
+    details: dict[str, Any],
+) -> None:
+    """A remote command the workflow deadline, lifetime or step wait cancelled
+    reads FAILED in the Store, but the agent never answered: whatever it had
+    started may still be running on the node, so the failure compensation does
+    not restore the GPU services over it. Only an answer from the agent --
+    even an unknown or refused one -- lets the compensation run."""
+
+    steps = [
+        workflow_step(OP.QUIESCE_GPU_SERVICES, node_ids=["node-a"]),
+        workflow_step(OP.RESET_GPU, node_ids=["node-a"]),
+        workflow_step(OP.RESTORE_GPU_SERVICES, node_ids=["node-a"]),
+    ]
+    gave_up = _reset_execution(
+        {
+            "manual_confirmation_required": True,
+            "outcome_unknown": True,
+            "remote_status": "FAILED",
+            **details,
+        }
+    )
+    answered = _reset_execution(
+        {
+            "manual_confirmation_required": True,
+            "outcome_unknown": True,
+            "remote_status": "FAILED",
+        }
+    )
+
+    def landing(execution: Any) -> Any:
+        return workflow_request(
+            "wf-reset",
+            "inc-reset",
+            status=WorkflowStatus.RUNNING,
+            official_steps=steps,
+            completed_step_indexes=[0],
+            step_executions=[
+                workflow_step_execution(0, OP.QUIESCE_GPU_SERVICES),
+                execution,
+            ],
+            pending_failure_step_index=1,
+            pending_failure_error="reset",
+        )
+
+    assert restoration_refusal(landing(gave_up), steps[2]) is not None, (
+        "the agent never answered: the reset may still be running"
+    )
+    assert restoration_refusal(landing(answered), steps[2]) is None, (
+        "the agent answered with an unknown outcome: nothing is in flight"
     )

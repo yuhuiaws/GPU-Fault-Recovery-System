@@ -8762,7 +8762,11 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   `nvidia-smi` query) spans both samples of the final ownership recheck while persistence mode is off and is now
   classified query-only, recorded in `physical_ownership_checks[].query_only_device_clients`, no longer
   `OWNERSHIP_FINAL_CLIENTS_CHANGED`; an ownership refusal after a busy retry carries `node_action_outcome_known`,
-  `reset_verdict=not-applied` and `gpu_readback` (the target GPU re-read with `nvidia-smi -q` after the refusal); the
+  `reset_verdict=not-applied` and `gpu_readback` (the target GPU re-read with `nvidia-smi -q` after the refusal); a
+  refusal before the GPU's first reset was spawned (`gpu_reset_attempts_spawned=0`) is `reset_verdict=not-attempted`
+  with the GPU under `reset_not_attempted` rather than `reset_failed` and `node_action_not_started` -- a known "not
+  performed" verdict, not `outcome_unknown`, so the record no longer parks BLOCKED (such a refusal used to park with
+  `reset_not_attempted=[]` and `outcome_unknown=true`); the
   failure compensation's RESTORE_GPU_SERVICES runs even while the record carries an unresolved node action (the node is
   isolated; host services and taint come back first, the record then parks BLOCKED for `confirm-node-action` on a
   really unknown outcome); the display stack is unloaded with a re-read of `/proc/modules` per module,

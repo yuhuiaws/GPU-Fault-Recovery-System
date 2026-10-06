@@ -457,14 +457,36 @@ _OPEN_REMOTE_STATUSES = frozenset({"PENDING", "LEASED", "WAITING"})
 
 
 def _may_still_execute(details: Mapping[str, Any]) -> bool:
-    """Whether the node action behind ``details`` may be running on the agent."""
+    """Whether the node action behind ``details`` may be running on the agent.
+
+    True while the command is in flight (PENDING on the agent, or an open
+    remote status) -- and when the control plane gave up on an open command
+    itself: a workflow deadline or lifetime that cancelled it, or a step wait
+    that ran out. The agent never answered then; the command reads FAILED in
+    the Store, but whatever it had started may still be running on the node.
+    Only an answer from the agent -- a terminal receipt, unknown or refused --
+    says nothing is in flight.
+    """
 
     if details.get("node_action_state") == "PENDING" and details.get(
         "node_action_command_id"
     ):
         return True
     status = details.get("remote_status")
-    return isinstance(status, str) and status.upper() in _OPEN_REMOTE_STATUSES
+    if isinstance(status, str) and status.upper() in _OPEN_REMOTE_STATUSES:
+        return True
+    cancellation = details.get("workflow_deadline_remote_command_cancellation")
+    if isinstance(cancellation, Mapping) and any(
+        isinstance(cancellation.get(key), int) and cancellation[key] > 0
+        for key in ("cancelled", "cancellation_requested")
+    ):
+        return True
+    if details.get("workflow_lifetime_exceeded") is True:
+        return True
+    if "step_waiting_timeout_seconds" in details:
+        return True
+    source = details.get("remote_status_source")
+    return isinstance(source, str) and source.startswith("workflow-")
 
 
 def unrestored_quiesces(

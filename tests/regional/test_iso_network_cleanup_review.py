@@ -61,4 +61,11 @@ def test_block_refuses_an_existing_chain_without_touching_it(
                 restore_seconds=60,
             )
         )
-    assert calls == [["iptables", "-S"]]
+    # Only read-only probes ran: the binaries check (``iptables -S`` and two
+    # ``--version`` calls) and the chain read; nothing armed or inserted.
+    assert calls == [
+        ["iptables", "-S"],
+        ["systemd-run", "--version"],
+        ["systemctl", "--version"],
+        ["iptables", "-S"],
+    ]

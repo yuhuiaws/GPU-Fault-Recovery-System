@@ -195,7 +195,15 @@ class ResetOperationsMixin:
     ) -> int:
         released = [] if released is None else released
         for attempt in range(1, self._RESET_BUSY_ATTEMPTS + 1):
-            require_physical_ownership()
+            try:
+                require_physical_ownership()
+            except OwnershipRefused as refused:
+                # Refused before this attempt was spawned. How many resets the
+                # command did spawn first is what tells a reset that was
+                # never attempted from one refused busy and then refused at
+                # the boundary before its retry (``_reset_gpu``).
+                refused.action_details["gpu_reset_attempts_spawned"] = attempt - 1
+                raise
             try:
                 self._run_checked(command, timeout=timeout)
                 return attempt
@@ -323,6 +331,15 @@ class ResetOperationsMixin:
                 # ones nothing touched. Only RuntimeError is wrapped, so the
                 # retryable classification of anything else is unchanged.
                 unknown = isinstance(exc, ResetOutcomeUnknown)
+                # A refusal at the pre-spawn boundary before any reset of this
+                # GPU was spawned: nothing was attempted on it, so it belongs
+                # with the GPUs nothing touched, not with a failed reset (live,
+                # gpu-eks-cluster: ``reset_not_attempted`` was empty for a
+                # reset that was never performed).
+                not_attempted = (
+                    isinstance(exc, OwnershipRefused)
+                    and exc.action_details.get("gpu_reset_attempts_spawned") == 0
+                )
                 raise ResetProgressError(
                     f"{exc} (GPU {gpu_uuid}, {index + 1} of {len(gpu_uuids)})",
                     action_details={
@@ -346,7 +363,9 @@ class ResetOperationsMixin:
                             if unknown
                             else {
                                 "node_action_outcome_known": True,
-                                "reset_verdict": "not-applied",
+                                "reset_verdict": (
+                                    "not-attempted" if not_attempted else "not-applied"
+                                ),
                                 "gpu_readback": {
                                     gpu_uuid: self._gpu_readback(gpu_uuid)
                                 },
@@ -354,8 +373,12 @@ class ResetOperationsMixin:
                         ),
                         "reset_completed": completed,
                         "reset_outcome_unknown": [gpu_uuid] if unknown else [],
-                        "reset_failed": [] if unknown else [gpu_uuid],
-                        "reset_not_attempted": gpu_uuids[index + 1 :],
+                        "reset_failed": (
+                            [] if unknown or not_attempted else [gpu_uuid]
+                        ),
+                        "reset_not_attempted": gpu_uuids[
+                            index if not_attempted else index + 1 :
+                        ],
                         **self._reload_display_modules(released),
                     },
                 ) from exc

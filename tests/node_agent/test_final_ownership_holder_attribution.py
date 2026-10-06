@@ -219,7 +219,15 @@ def test_the_node_action_result_carries_the_holders_through_the_reset_wrapper(
     assert result.details["persistent_device_clients"] == [HOLDER]
     assert result.details["persistent_device_client_count"] == 1
     assert result.details["node_action_not_started"] is True
-    assert result.details["reset_failed"] == ["GPU-a"]
+    # Refused before the first reset of the GPU was spawned: the GPU was never
+    # attempted, so it is listed with the GPUs nothing touched, not as failed,
+    # and the verdict is known (live the record said ``reset_not_attempted=[]``
+    # for a reset that was never performed and parked as unknown).
+    assert result.details["reset_failed"] == []
+    assert result.details["reset_not_attempted"] == ["GPU-a"]
+    assert result.details["reset_verdict"] == "not-attempted"
+    assert result.details["gpu_reset_attempts_spawned"] == 0
+    assert result.details["node_action_outcome_known"] is True
     assert [item for item in hardware.commands if "--gpu-reset" in item] == []
     # The ledger answer a later poll replays is the same attributed result.
     assert agent.ledger.get(result.command_id) == result

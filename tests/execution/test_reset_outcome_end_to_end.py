@@ -170,9 +170,14 @@ def test_real_reset_timeout_remains_unknown_through_workflow_and_both_ladders(
         assert failure.details[key] == value
         assert results[0].details[key] == value
     assert not results[0].retryable, "a timed-out reset must not be resubmitted"
-    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE]
+    # The failure compensation restores the host services although the reset's
+    # outcome is unknown: the node is isolated already, nothing is in flight on
+    # the agent (the timed-out nvidia-smi returned), and withholding it left a
+    # dark node (``restoration_refusal``). The record still parks for the
+    # operator, with its services up.
+    assert [context.step.operation for context in h.adapter.calls] == [QUIESCE, RESTORE]
     assert saved.branch_escalation_counts == {}
-    assert RESTORE not in saved.completed_operations
+    assert RESTORE in saved.completed_operations
     classification = HardwareEscalationService.classify(saved)
     assert classification is not None
     assert classification[:3] == (

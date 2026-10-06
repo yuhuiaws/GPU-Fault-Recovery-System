@@ -229,7 +229,18 @@ def test_real_reset_wrapper_and_ledger_preserve_checkpoint_uncertainty(
         # withheld the restore on a reset that was never performed).
         assert "outcome_unknown" not in result.details, result.details
         assert result.details["node_action_outcome_known"] is True
-        assert result.details["reset_verdict"] == "not-applied"
+        # The busy GPU was spawned once and refused before its retry: not
+        # applied. The second GPU was never spawned at all: not attempted, and
+        # it is listed with the GPUs nothing touched rather than as failed.
+        assert result.details["reset_verdict"] == (
+            "not-attempted" if kind == "second-gpu" else "not-applied"
+        )
+        assert result.details["reset_failed"] == (
+            [] if kind == "second-gpu" else ["GPU-a"]
+        )
+        assert result.details["reset_not_attempted"] == (
+            ["GPU-b"] if kind == "second-gpu" else []
+        )
         assert result.details["manual_confirmation_required"] is True
         assert [
             item["sequence"] for item in result.details["physical_ownership_checks"]

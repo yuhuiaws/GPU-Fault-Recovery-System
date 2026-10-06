@@ -161,7 +161,11 @@ def test_legacy_barrier_uncertainty_blocks_restore_escalation_and_later_commits(
         item for item in barrier.participants if item.node_id == "node-b"
     )
     assert participant.commit_details == progress, participant
-    assert [item.step.operation for item in h.adapter.calls] == [QUIESCE], (
+    # The failure compensation restores the host services although node-b's
+    # commit outcome is unknown: the node is isolated, the agent answered
+    # (nothing is in flight) and withholding the restore left a dark node
+    # (``restoration_refusal``). The record still parks for the operator.
+    assert [item.step.operation for item in h.adapter.calls] == [QUIESCE, RESTORE], (
         h.adapter.calls
     )
     assert [node for action, node in polls if action is operation] == NODES[:2], polls
