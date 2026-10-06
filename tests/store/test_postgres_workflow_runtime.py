@@ -242,7 +242,13 @@ def test_uncertain_execution_keeps_postgres_node_occupancy_in_every_mode(
         assert result.status is WorkflowStatus.BLOCKED
         assert saved.blocked_kind is BlockedKind.NEEDS_OPERATOR
         assert occupying is not None and occupying.request_id == saved.request_id
-        assert [call.step.operation for call in adapter.calls] == operations[:2]
+        # The compensation restore runs although the reset's outcome is unknown:
+        # the node is isolated already, and withholding it left the host
+        # services stopped on a dark node (``restoration_refusal``). The record
+        # still parks for ``confirm-node-action`` and keeps the node occupied.
+        assert [call.step.operation for call in adapter.calls] == operations, (
+            "the compensation restore must run with the node isolated"
+        )
         current_incident = store.get_incident(incident.incident_id)
         store.save_incident(
             current_incident.model_copy(update={"state": IncidentState.RECOVERED}),
