@@ -283,7 +283,7 @@ def test_configuration_and_plan_keep_bound_identity(
     assert details["preflight_identity"]["release_id"] == "release-a"
 
 
-@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+@pytest.mark.parametrize("training_case", [c016, c017, c021], indirect=True)
 def test_two_schedulable_gpu_nodes_run_the_case_on_the_derived_topology(
     training_case: Any,
 ) -> None:
@@ -309,6 +309,10 @@ def test_two_schedulable_gpu_nodes_run_the_case_on_the_derived_topology(
     assert len(result["limitations"]) == 1
     assert "2-node/16-rank topology" in result["limitations"][0]
     assert "1 peer node(s) rather than 2" in result["limitations"][0]
+    if harness.module is c017:
+        assert result["c"]["peer_nodes"] == ["node-b"], (
+            "segment C excludes the target's plugin only; the one peer is named"
+        )
     for workload in harness.workloads:
         assert workload.settings.expected_pods == 2
         assert workload.settings.expected_gpu_count == 16
@@ -320,7 +324,7 @@ def test_two_schedulable_gpu_nodes_run_the_case_on_the_derived_topology(
     assert "replicas: 1" in rendered, "one Worker beside the Master on two nodes"
 
 
-@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+@pytest.mark.parametrize("training_case", [c016, c017, c021], indirect=True)
 def test_one_schedulable_gpu_node_is_refused_by_name(training_case: Any) -> None:
     harness = training_case
     harness.candidate_count = 1
@@ -333,9 +337,12 @@ def test_one_schedulable_gpu_node_is_refused_by_name(training_case: Any) -> None
     with pytest.raises(RuntimeError, match="preflight"):
         execute(harness)
     assert harness.workloads == []
+    assert harness.plugins == [], (
+        "no plugin DaemonSet is touched on a refused preflight"
+    )
 
 
-@pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
+@pytest.mark.parametrize("training_case", [c016, c017, c021], indirect=True)
 def test_the_native_three_node_run_records_no_limitation(training_case: Any) -> None:
     harness = training_case
     assert execute(harness) == 0

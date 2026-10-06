@@ -14,7 +14,11 @@ import pytest
 
 from gpu_fault.models import Environment
 from gpu_fault.watcher import AttemptObservation, ContainerObservation, WorkloadPhase
-from scripts.e2e.regional import collect017_training, collect021_passive
+from scripts.e2e.regional import (
+    collect017_training,
+    collect021_passive,
+    training_topology,
+)
 from scripts.e2e.regional import run_collect016_training_recovery as c016
 from scripts.e2e.regional import run_collect017_efa_plugin as c017
 from scripts.e2e.regional import run_collect021_late_xid_after_pod_death as c021
@@ -339,7 +343,8 @@ def make_training_workload_collectors(
                     for index in range(settings.expected_pods)
                 ],
                 "heartbeat_logs": {
-                    f"trainer-{index}": "HEARTBEAT step=0 all_reduce=300"
+                    f"trainer-{index}": "HEARTBEAT step=0 "
+                    + training_topology.all_reduce_marker(settings.expected_gpu_count)
                     for index in range(settings.expected_pods)
                 },
             }
@@ -372,7 +377,12 @@ def make_training_workload_collectors(
             value = deepcopy(self.source)
             self.progress += 1
             value["heartbeat_logs"] = {
-                f"trainer-{index}": (f"HEARTBEAT step={self.progress} all_reduce=300")
+                f"trainer-{index}": (
+                    f"HEARTBEAT step={self.progress} "
+                    + training_topology.all_reduce_marker(
+                        self.settings.expected_gpu_count
+                    )
+                )
                 for index in range(self.settings.expected_pods)
             }
             if harness.problem == "pod-change":

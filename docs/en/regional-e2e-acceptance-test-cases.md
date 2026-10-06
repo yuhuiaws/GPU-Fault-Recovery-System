@@ -14126,6 +14126,18 @@ GPU hardware damage be inflicted or a forbidden persistent holder be deployed to
   `RollingUpdate` or an unknown strategy would spread the temporary affinity change to
   other nodes; the runner must refuse, and must not switch the update strategy to
   OnDelete online just to pass the precheck.
+- Two-node topology (a two-node `eks-managed` cluster): segment C's managed training spans the
+  cluster's schedulable GPU nodes as derived by `training_topology` (natively three nodes x 8 GPUs = 24
+  ranks; two nodes x 8 = 16 on the two-node cluster; fewer than two is the named refusal
+  `at least 2 schedulable GPU nodes are required ...`, replacing the old "three GPU nodes are
+  required"). The preflight, the plan and the evidence carry `training_topology`; the PyTorchJob is the
+  named manifest rewritten for the topology (`c-workload-topology.yaml`). Segments B and C exclude only
+  the **target node's** plugin Pods; the evidence names the other training nodes as `peer_nodes`. What a
+  two-node run cannot show is recorded in `limitations`: the loss is ridden through by one untouched peer
+  Pod rather than two, and the heartbeat/all-reduce contract is proven at world size 16. No segment needs
+  a third node: A unbinds one EFA function on the target, B changes the target's GPU allocatable, C
+  removes the target's EFA plugin under a job that must keep training on every Pod -- the peer count only
+  widens the "untouched" evidence. Nothing in the verdicts is relaxed.
 - Before temporarily excluding the target node, first create a GPU-local, least-privilege
   watchdog Job/ServiceAccount/Role/RoleBinding and confirm it is ARMED; it restores the
   original affinity at the 600-second boundary. The missing-value, null and
@@ -14204,7 +14216,7 @@ no FAIL is derived from them.
    VALIDATE_GPU                     SUCCEEDED
    ```
 
-#### C. EFA device-plugin during three-node managed training
+#### C. EFA device-plugin during managed training (three nodes natively, two on a two-node cluster)
 
 1. `kubectl apply` the complete managed YAML with a unique suffix directly (the submit
    CLI's `--dry-run` may be used only to render the metadata, but the real submission
@@ -14216,17 +14228,17 @@ no FAIL is derived from them.
    attempt_id=efa-plugin-managed-<unique-suffix>-a001
    ```
 
-2. Three Pods occupy three verified nodes, 8 GPUs per Pod, 24 NCCL ranks in total; the
-   EFA count uses the current inventory and allocatable baseline. The Watcher reports a
-   RUNNING Observation.
+2. One Pod per schedulable GPU node of the derived topology (three Pods, 8 GPUs each, 24 NCCL ranks
+   natively; two Pods and 16 ranks on a two-node cluster); the EFA count uses the current inventory and
+   allocatable baseline. The Watcher reports a RUNNING Observation.
 3. On any node that actually hosts a training Pod, delete the EFA plugin; the EFA
    allocatable goes from the current baseline to 0 and stays there for more than two
    sampling periods. During that time:
    - the latest valid NCCL heartbeat step of every original Pod is above the
      pre-injection baseline;
    - `all_reduce=300.0` keeps succeeding;
-   - the complete UID set, nodes and attempt of the three Pods are exactly the same
-     before and after.
+   - the complete UID set, nodes and attempt of every Pod are exactly the same
+     before and after (the peer Pods are named in `peer_nodes`).
 4. The finding must be associated with the same job/attempt, and the workflow must not
    contain `STOP_WORKLOADS/RESTART_WORKLOAD`:
 

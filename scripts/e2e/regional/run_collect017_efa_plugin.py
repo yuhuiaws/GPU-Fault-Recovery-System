@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
+from scripts.e2e.regional import training_topology  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -139,6 +140,12 @@ def read_only_preflight(
         encoding="utf-8",
     )
     errors = []
+    # Segment C's managed training runs on the cluster's schedulable GPU nodes
+    # (the target node and its peers); the topology it can run is derived here
+    # and refused by name below two nodes.
+    topology = training_topology.preflight_topology(
+        training_topology.schedulable_training_nodes(regional.gpu_nodes()), errors
+    )
     if not predecessor["valid"]:
         errors.append("COLLECT-016 predecessor evidence is not PASS")
     if node["ready"] != "True" or node["unschedulable"]:
@@ -154,6 +161,7 @@ def read_only_preflight(
     result = {
         **identity,
         "node": node,
+        "training_topology": topology.evidence() if topology else None,
         "predecessor": predecessor,
         "focused_tests_passed": completed.returncode == 0,
         "cpu_blast": regional.cpu_blast_snapshot(),
@@ -650,13 +658,11 @@ def run_training_plugin(
     case_dir: Path,
     attempt: int,
 ) -> dict[str, Any]:
-    candidates = [
-        str(item["name"])
-        for item in regional.gpu_nodes()
-        if item["ready"] == "True" and not item["unschedulable"]
-    ]
-    if len(candidates) < 3:
-        raise RegionalFixtureError("three GPU nodes are required")
+    # The managed training spans the cluster's schedulable GPU nodes: three
+    # natively, two on a two-node eks-managed cluster (one target, one
+    # untouched peer). Fewer than two is the topology's own named refusal.
+    topology = training_topology.derive_training_topology(regional.gpu_nodes())
+    candidates = list(topology.candidate_nodes)
     prewarm = ImagePrewarmFixture(
         regional,
         case_id=CASE_ID,
@@ -665,14 +671,24 @@ def run_training_plugin(
     workload: ManagedWorkloadFixture | None = None
     plugin: base.DevicePluginFixture | None = None
     plugin_restored = False
-    result: dict[str, Any] = {"errors": []}
+    result: dict[str, Any] = {
+        "errors": [],
+        "training_topology": topology.evidence(),
+        "limitations": training_topology.topology_limitations(
+            topology, what="COLLECT-017 C"
+        ),
+    }
     try:
         require_action_time(180)
         prewarm.create(candidates)
         suffix = f"{int(time.time())}-{attempt}"
-        manifest = base.render_named_training_manifest(
-            case_dir / "c-workload.yaml",
-            name=f"gpu-fault-efa-plugin-managed-{suffix}",
+        manifest = training_topology.render_topology_manifest(
+            base.render_named_training_manifest(
+                case_dir / "c-workload.yaml",
+                name=f"gpu-fault-efa-plugin-managed-{suffix}",
+            ),
+            topology,
+            case_dir / "c-workload-topology.yaml",
         )
         job_id = f"efa-plugin-managed-{suffix}"
         attempt_id = f"{job_id}-a001"
@@ -684,15 +700,20 @@ def run_training_plugin(
                 job_id=job_id,
                 attempt_id=attempt_id,
                 restart_budget=1,
-                expected_pods=3,
-                expected_gpu_count=24,
+                expected_pods=topology.node_count,
+                expected_gpu_count=topology.world_size,
             ),
         )
         require_action_time(180)
         workload.submit()
         source = workload.wait_running(timeout_seconds=900)
         uids = {str(item["uid"]) for item in source["pods"]}
+        # The EFA plugin is excluded from the target node only; every other
+        # training node is a peer whose Pods must ride the loss untouched.
         target = str(source["pods"][0]["node"])
+        result["peer_nodes"] = sorted(
+            {str(item["node"]) for item in source["pods"][1:]} - {target}
+        )
         node = json.loads(regional.kubectl("gpu", "get", "node", target, "-o", "json"))
         baseline = int(node["status"]["allocatable"].get("vpc.amazonaws.com/efa", 0))
         plugin = base.DevicePluginFixture(
@@ -807,8 +828,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "release_id": preflight["release_id"],
             "node_uid": preflight["node"]["uid"],
         },
+        "training_topology": preflight.get("training_topology"),
         "stop_conditions": [
             "COLLECT-016 predecessor evidence is not PASS",
+            "fewer than 2 schedulable GPU nodes for segment C's managed training "
+            "(the derived training topology)",
             "target node is not idle or plugin DaemonSet discovery is ambiguous",
             "EFA bind fail-safe cannot be armed",
             "allocatable or training Pod UID assertions fail",
@@ -876,6 +900,8 @@ def execute_case(
         c = run_training_plugin(settings, regional, case_dir, attempt)
         result["errors"].extend(c["errors"])
         result["c"] = c
+        result["training_topology"] = c.get("training_topology")
+        result["limitations"] = c.get("limitations", [])
         if regional.cpu_blast_snapshot() != preflight["cpu_blast"]:
             result["errors"].append("control-plane EKS state differs from baseline")
         result["verdict"] = "PASS" if not result["errors"] else "FAIL"
