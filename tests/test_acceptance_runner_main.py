@@ -658,3 +658,62 @@ def test_no_two_runners_share_a_main_body() -> None:
         "runners carry an identical main(); fold them onto "
         f"live_driver_guard.run_standard_case: {duplicated}"
     )
+
+
+def _module_level_imports(tree: ast.Module) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            found.append((node.lineno, node.module))
+        elif isinstance(node, ast.Import):
+            found.extend((node.lineno, alias.name) for alias in node.names)
+    return found
+
+
+def _source_tree_on_path_before(tree: ast.Module, source: str, line: int) -> bool:
+    """Whether a module-level statement before ``line`` puts ``ROOT / "src"``
+    on ``sys.path`` (the two-path preamble the gpu_fault-importing drivers use)."""
+
+    for node in tree.body:
+        if node.lineno >= line or not isinstance(node, (ast.For, ast.If, ast.Expr)):
+            continue
+        segment = ast.get_source_segment(source, node) or ""
+        if "sys.path" in segment and '"src"' in segment:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("name", (*STANDARD_RUNNERS, *SELECTED_RUNNERS))
+def test_runner_binds_gpu_fault_to_the_checkout_before_importing_it(name: str) -> None:
+    """A driver run from an installed wheel -- the deploy-host bundle venv, whose
+    gpu_fault closure omits modules the regional fixtures reach (for one,
+    ``gpu_fault.policy.catalog`` behind ``tools.run_fault_test_cases``) -- must
+    bind ``gpu_fault`` to this checkout's ``src`` before its first gpu_fault
+    import. ``scripts.e2e.regional`` inserts ``src`` on import, so a driver
+    whose first first-party import is ``scripts.*`` is covered; one that
+    imports ``gpu_fault`` first has to put ``src`` on ``sys.path`` itself. A
+    DESTR-002 head that imported ``gpu_fault.cluster_scope`` first answered
+    ``--help`` in the dev venv and failed it under the deploy-host bundle."""
+
+    path = REGIONAL / f"{name}.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = _module_level_imports(tree)
+    gpu_fault_lines = [
+        line for line, module in imports if module.split(".")[0] == "gpu_fault"
+    ]
+    if not gpu_fault_lines:
+        return
+    first_gpu_fault = min(gpu_fault_lines)
+    scripts_lines = [
+        line
+        for line, module in imports
+        if module.split(".")[0] == "scripts" and line < first_gpu_fault
+    ]
+    assert scripts_lines or _source_tree_on_path_before(
+        tree, source, first_gpu_fault
+    ), (
+        f"{path.name} imports gpu_fault at line {first_gpu_fault} before any "
+        "scripts.* import and without putting ROOT / 'src' on sys.path; under "
+        "the deploy-host bundle venv it would bind the reduced wheel closure"
+    )

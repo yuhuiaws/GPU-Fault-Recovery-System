@@ -13,8 +13,13 @@ from pathlib import Path
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# ``src`` goes first on purpose: a standalone driver run from an installed
+# wheel (the deploy-host bundle carries a reduced gpu_fault closure) must bind
+# gpu_fault to this checkout before its first gpu_fault import, exactly as
+# ``scripts.e2e.regional`` does for the drivers that import scripts first.
+for _path in (ROOT, ROOT / "src"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
