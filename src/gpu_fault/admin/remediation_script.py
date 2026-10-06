@@ -182,14 +182,18 @@ def refuse_drift(expected, observed):
         if expected[key] != observed[key]
     }
     if drift:
-        raise SystemExit(
-            "submit-remediation: incident moved since inspection: "
-            + json.dumps(drift, sort_keys=True)
-        )
+        refuse("incident moved since inspection: " + json.dumps(drift, sort_keys=True))
 
 
 def refuse(reason):
-    raise SystemExit("submit-remediation: " + reason)
+    # The refusal travels on stdout as JSON, where the admin side shows it after
+    # its ordinary redaction; stderr is blacked out wholesale ("<sensitive
+    # output redacted>") and left the operator guessing which rule had refused
+    # (live: a reboot-confirmed RESET_GPU, refused by the rule below for want
+    # of a terminal result, reported as nothing at all).
+    message = "submit-remediation: " + reason
+    print(json.dumps({"error": message, "error_kind": "refused"}))
+    raise SystemExit(message)
 
 
 def confirmed_step(workflow, executions, item, node_id, operator, reference, now):
@@ -279,19 +283,26 @@ def recheck_live_facts(incident, node_id, items, node_evidence, now):
         )
     for item in items:
         confirmation = item["confirmation"]
-        if confirmation.get("operation") == "RESTART_NODE":
+        operation = confirmation.get("operation")
+        # A reboot is the proof for RESTART_NODE and, since the admin side
+        # accepts it, for any node action settled by a reboot since the action
+        # (``settled_by`` = reboot_since_action): no GPU reset survives a boot.
+        if operation == "RESTART_NODE" or confirmation.get("settled_by") in (
+            "boot_transition",
+            "reboot_since_action",
+        ):
             previous = confirmation.get("previous_boot_id")
             if not previous or previous == agent.boot_id:
                 refuse(
                     f"node {node_id} still runs boot {agent.boot_id} recorded before "
-                    "RESTART_NODE; the reboot did not happen"
+                    f"{operation}; the reboot did not happen"
                 )
         elif not confirmation.get("terminal_node_result") and not confirmation.get(
             "validated_by_workflow"
         ):
             refuse(
-                f"confirmation for {confirmation.get('operation')} on {node_id} "
-                "cites neither a terminal Node Agent result nor a validating restore"
+                f"confirmation for {operation} on {node_id} cites neither a terminal "
+                "Node Agent result, nor a validating restore, nor a reboot since the action"
             )
 
 

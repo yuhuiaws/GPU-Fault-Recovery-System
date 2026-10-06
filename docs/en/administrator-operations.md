@@ -3129,7 +3129,12 @@ like `RESTART_NODE`: a reboot since the action -- kubelet and the Agent agree on
 recorded before the action (`agent_baselines`, `stop_reboot_authorization`, or a single-node incident's `source_boot_id`;
 the Agent incarnation changed too) -- is enough: no GPU reset survives a boot, and the node runs a freshly loaded driver.
 The confirmation's `settled_by` names the basis: `terminal_node_result`/`validated_restore`/`reboot_since_action`
-(`boot_transition` for `RESTART_NODE` itself). Afterwards: a QUARANTINED incident takes the restore of §9.2 or
+(`boot_transition` for `RESTART_NODE` itself). The in-Pod script (shipped with the CLI bundle, so it works against an
+older control plane too) re-checks the reboot evidence for a `settled_by=reboot_since_action` confirmation -- the Agent's
+and kubelet's boot id agree and differ from `previous_boot_id` -- and no longer demands a terminal receipt; its refusals
+(drift, missing evidence, a reference mismatch) now travel as JSON on stdout and the CLI shows them after "workflow
+reconcile execution failed: ..." -- until now the operator saw only `<sensitive output redacted>` (stderr is blacked out
+whole; a traceback still is, but names its exception class). Afterwards: a QUARANTINED incident takes the restore of §9.2 or
 `--close-quarantined` with node evidence; an ESCALATED one (a restore attempt FAILED, say) is closed RECOVERED on the
 operator's authority with `workflow-reconcile --close-incident <id>`, the parked record ends SUPERSEDED with it and the
 node is no longer occupied.

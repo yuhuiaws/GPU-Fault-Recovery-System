@@ -688,8 +688,11 @@ def _pod(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], st
 
     def run(payload: dict) -> dict:
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        # A refusal of an earlier run left its JSON line on stdout (the script
+        # prints what refused it before it exits); the result is the last line.
+        capsys.readouterr()
         exec(compile(module.REMEDIATION_SCRIPT, "<submit-remediation>", "exec"), {})
-        return json.loads(capsys.readouterr().out)
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
     return run
 

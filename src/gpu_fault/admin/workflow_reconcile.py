@@ -604,9 +604,9 @@ def run_control_plane_script(
         timeout_seconds=900,
     )
     if completed.returncode:
-        detail = diagnostic_text(completed.stderr, sensitive=True)
         raise BootstrapError(
-            "workflow reconcile execution failed" + (f": {detail}" if detail else "")
+            "workflow reconcile execution failed"
+            + _script_failure_detail(completed.stdout, completed.stderr)
         )
     try:
         value = json.loads(completed.stdout)
@@ -615,6 +615,39 @@ def run_control_plane_script(
     if not isinstance(value, dict):
         raise BootstrapError("workflow reconcile returned a non-object result")
     return value
+
+
+_EXCEPTION_CLASS = re.compile(
+    r"^(?:[A-Za-z_][\w.]*\.)?([A-Z][A-Za-z0-9]*(?:Error|Exit|Exception|Refused|Blocked))\b"
+)
+
+
+def _script_failure_detail(stdout: str | None, stderr: str | None) -> str:
+    """What the operator may read of a failed in-Pod script.
+
+    A refusal the script itself raised travels as JSON on stdout
+    (``{"error": ..., "error_kind": "refused"}``) and is shown after the
+    ordinary redaction -- its text is composed from record fields. Anything
+    else is a traceback on stderr, which stays blacked out: only the exception
+    class of its last line is named, so "<sensitive output redacted>" at least
+    says what kind of failure it hides (live: a reboot-confirmed RESET_GPU
+    refused by the Pod script, reported as nothing at all).
+    """
+
+    for line in reversed((stdout or "").strip().splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            return ": " + diagnostic_text(payload["error"])
+        break
+    detail = diagnostic_text(stderr, sensitive=True)
+    last = (stderr or "").strip().splitlines()[-1:] or [""]
+    match = _EXCEPTION_CLASS.match(last[0].strip())
+    if match and detail:
+        return f": {match.group(1)}: {detail}"
+    return f": {detail}" if detail else ""
 
 
 # The historical name; the reconcile paths and their tests still bind it.

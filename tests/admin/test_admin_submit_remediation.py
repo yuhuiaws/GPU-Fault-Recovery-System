@@ -1008,8 +1008,11 @@ def test_the_in_pod_restore_mode_creates_the_pair_and_is_idempotent(
 
     def run(payload: dict) -> dict:
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        # A refusal of an earlier run left its JSON line on stdout (the script
+        # prints what refused it before it exits); the result is the last line.
+        capsys.readouterr()
         exec(compile(module.REMEDIATION_SCRIPT, "<submit-remediation>", "exec"), {})
-        return json.loads(capsys.readouterr().out)
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
     payload = {
         "mode": "restore",
@@ -1256,8 +1259,11 @@ def test_the_in_pod_restore_mode_restores_the_named_subset_only(
 
     def run(payload: dict) -> dict:
         monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        # A refusal of an earlier run left its JSON line on stdout (the script
+        # prints what refused it before it exits); the result is the last line.
+        capsys.readouterr()
         exec(compile(module.REMEDIATION_SCRIPT, "<submit-remediation>", "exec"), {})
-        return json.loads(capsys.readouterr().out)
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
     payload = {
         "mode": "restore",
