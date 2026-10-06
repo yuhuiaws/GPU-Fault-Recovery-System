@@ -871,6 +871,7 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
     seen: dict[str, object] = {}
     reboot_event = {
         "event_name": "BatchRebootClusterNodes",
+        "session_issuer_role_name": "executor",
         "user_identity": {"session_issuer_arn": "arn:aws:iam::1:role/executor"},
     }
     # The chain the node grows after the injection: the reboot's failed
@@ -915,7 +916,7 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
             seen["reboot_wait"] = kwargs
             return [reboot_event]
 
-        def provider_events(self, *_args: object) -> list:
+        def provider_events(self, *_args: object, **_kwargs: object) -> list:
             return [reboot_event]
 
         def provider_events_provisional(self, _ended_at: object) -> bool:
@@ -933,6 +934,8 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
             return {"workflows": workflows}
 
     class Provider:
+        provider = "hyperpod"
+
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
@@ -943,9 +946,6 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
             return {"node_recovery": "None"}
 
     monkeypatch.setattr(collect_destructive, "WarmSpareLiveFixture", Provider)
-    monkeypatch.setattr(
-        collect_destructive, "provider_event_actor_matches_role", lambda *_: True
-    )
     result = collect_destructive.run_collect015(
         Settings(), Regional(), Collector(), tmp_path, 1, cleanup=collect.CaseCleanup()
     )
@@ -959,10 +959,16 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
     assert seen["submission_query"] == ("wf-reboot", "hp"), seen
     assert result["submission"] == {"state": "SUBMITTED"}, result
     assert seen["reboot_wait"] == {
-        "event_names": set(collect_destructive.REBOOT_EVENTS),
+        "event_names": {"BatchRebootClusterNodes", "RebootClusterNodes"},
         "expected_count": 1,
+        "event_source": "sagemaker.amazonaws.com",
     }, seen
     assert result["provider_events_provisional"] is True, result
+    assert result["replacement_guard"] == {
+        "provider": "hyperpod",
+        "node_recovery": "None",
+    }, result
+    assert result["refused_provider_calls"] == [], result
 
 
 def _daemonset(namespace: str, name: str, desired: int) -> dict:

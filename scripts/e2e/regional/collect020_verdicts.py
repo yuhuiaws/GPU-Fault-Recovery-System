@@ -288,7 +288,16 @@ def no_reboot_errors(
 
 
 def marker_retirement_errors(activity: dict[str, Any]) -> list[str]:
-    """ARCH-I4: every marker of a RECOVERED incident says when and why it retired."""
+    """ARCH-I4: every marker of a RECOVERED incident says when and why it retired.
+
+    Markers are judged on the incidents that carry them. The case needs at
+    least one RECOVERED incident whose markers retired -- the identity incident
+    -- but a RECOVERED incident that never carried a marker is not a defect:
+    the drain-after successor a failed ``RUN_DCGM_DIAGNOSTIC`` opens
+    (``DRAIN_AND_QUARANTINE``) has none, and the runner's validated restore
+    recovers it beside the identity incident. Requiring markers of it reported
+    a retirement nobody could have written.
+    """
 
     recovered = {
         str(item.get("incident_id"))
@@ -297,15 +306,17 @@ def marker_retirement_errors(activity: dict[str, Any]) -> list[str]:
     }
     if not recovered:
         return ["no incident of the case reached RECOVERED"]
-    errors: list[str] = []
     markers = [
         item
         for item in activity.get("markers") or []
         if str(item.get("incident_id")) in recovered
     ]
-    marked = {str(item.get("incident_id")) for item in markers}
-    for incident_id in sorted(recovered - marked):
-        errors.append(f"recovered incident {incident_id} has no retirement markers")
+    if not markers:
+        return [
+            "no RECOVERED incident carries a marker to retire: "
+            + ", ".join(sorted(recovered))
+        ]
+    errors: list[str] = []
     for marker in markers:
         if not marker.get("retired_at"):
             errors.append(f"marker {marker.get('marker_id')} has no retired_at")

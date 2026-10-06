@@ -154,6 +154,7 @@ class NodeActionExecutor(
         now: Callable[[], datetime] = (lambda: datetime.now(timezone.utc)),
         sleep: Callable[[float], None] = time.sleep,
         require_final_ownership: bool = False,
+        cluster_provider: str = "hyperpod",
     ) -> None:
         if len(secret) < 32:
             raise ValueError("node action shared secret must be at least 32 characters")
@@ -237,6 +238,8 @@ class NodeActionExecutor(
         self._counter_lock = RLock()
         self._counters: dict[str, int] = dict.fromkeys(COUNTER_NAMES, 0)
         self.runner = runner
+        # Who owns the machines: a plain EKS node runs no host DCGM by design.
+        self.cluster_provider = cluster_provider
         self.device_client_finder = device_client_finder or self._device_clients
         self.gpu_device_path_finder = gpu_device_path_finder or self._gpu_device_paths
         self.device_client_samples = device_client_samples

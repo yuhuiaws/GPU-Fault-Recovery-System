@@ -54,6 +54,54 @@ DIAGNOSTIC_EVIDENCE_PATTERNS = (
 )
 
 
+#: ``DCGM_ST_CONNECTION_NOT_VALID`` (-30) as the exit status dcgmi returns when
+#: no nv-hostengine answers; its connection errors in words, for older builds.
+DCGM_CONNECTION_NOT_VALID_EXIT = 226
+DCGM_HOSTENGINE_ERROR = re.compile(
+    r"unable to (?:establish a connection to|connect to) "
+    r"(?:the specified host|host ?engine)",
+    re.IGNORECASE,
+)
+DCGM_UNAVAILABLE_GUIDANCE = {
+    "DCGM_TOOL_UNAVAILABLE": (
+        "dcgmi is not installed on this node (plain EKS NVIDIA AMIs ship no "
+        "DCGM host tools); GPU metrics still come from the exporter's embedded "
+        "hostengine. Install datacenter-gpu-manager on the node image if the "
+        "quick diagnostic is required."
+    ),
+    "DCGM_HOSTENGINE_UNAVAILABLE": (
+        "dcgmi found no nv-hostengine to connect to (a plain EKS node runs DCGM "
+        "only inside the exporter's embedded hostengine); GPU metrics still come "
+        "from the exporter. Run a host nv-hostengine on the node image if the "
+        "quick diagnostic is required."
+    ),
+}
+
+
+def dcgm_hostengine_unreachable(result: subprocess.CompletedProcess) -> bool:
+    """True when dcgmi ran but reached no hostengine and graded nothing."""
+
+    try:
+        json.loads(result.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        pass
+    else:
+        return False
+    text = f"{result.stdout or ''}\n{result.stderr or ''}"
+    return result.returncode == DCGM_CONNECTION_NOT_VALID_EXIT or bool(
+        DCGM_HOSTENGINE_ERROR.search(text)
+    )
+
+
+def dcgm_unavailable_recommendation(action_code: str) -> dict[str, Any]:
+    return {
+        "action_code": action_code,
+        "priority": "REVIEW",
+        "instruction": DCGM_UNAVAILABLE_GUIDANCE[action_code],
+        "trigger_tests": ["dcgmi diag"],
+    }
+
+
 class DiagnosticOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     field_diagnostic_enabled: bool
@@ -61,6 +109,7 @@ class DiagnosticOperationsMixin:
     _capture_efa_rdma_state: Callable[..., Any]
     _capture_hung_process_state: Callable[..., Any]
     _verify_no_clients: Callable[..., Any]
+    cluster_provider: str
     diagnostic_max_archives: int
     diagnostic_output_dir: Path
     diagnostic_retention_seconds: int
@@ -535,6 +584,7 @@ class DiagnosticOperationsMixin:
 
     def _run_dcgm_diagnostic(self, command: NodeActionCommand) -> dict[str, Any]:
         tool_unavailable: str | None = None
+        unavailable_code = "DCGM_TOOL_UNAVAILABLE"
         try:
             result = self.runner(
                 ["dcgmi", "diag", "-r", "1", "-j"],
@@ -550,6 +600,18 @@ class DiagnosticOperationsMixin:
             tool_unavailable = f"dcgmi unavailable on this node: {exc}"
             result = subprocess.CompletedProcess(
                 ["dcgmi", "diag", "-r", "1", "-j"], 127, "", tool_unavailable
+            )
+        if self.cluster_provider == "eks-managed" and dcgm_hostengine_unreachable(
+            result
+        ):
+            # The image may ship dcgmi without a host nv-hostengine (live
+            # 2026-10-06, exit status 226 = DCGM_ST_CONNECTION_NOT_VALID): on
+            # plain EKS that is the same configuration fact, not a GPU fault.
+            # HyperPod runs a host hostengine, so there it stays a failure.
+            unavailable_code = "DCGM_HOSTENGINE_UNAVAILABLE"
+            tool_unavailable = (
+                "dcgmi cannot reach a host nv-hostengine on this node: exit "
+                f"status {result.returncode}"
             )
         output = result.stdout or ""
         if result.stderr:
@@ -619,20 +681,7 @@ class DiagnosticOperationsMixin:
         else:
             outcome = "INCONCLUSIVE"
         recommendations = (
-            [
-                {
-                    "action_code": "DCGM_TOOL_UNAVAILABLE",
-                    "priority": "REVIEW",
-                    "instruction": (
-                        "dcgmi is not installed on this node (plain EKS NVIDIA "
-                        "AMIs ship no DCGM host tools); GPU metrics still come "
-                        "from the exporter's embedded hostengine. Install "
-                        "datacenter-gpu-manager on the node image if the quick "
-                        "diagnostic is required."
-                    ),
-                    "trigger_tests": ["dcgmi diag"],
-                }
-            ]
+            [dcgm_unavailable_recommendation(unavailable_code)]
             if tool_unavailable is not None
             else build_dcgm_recommendations(
                 diagnostic_findings,

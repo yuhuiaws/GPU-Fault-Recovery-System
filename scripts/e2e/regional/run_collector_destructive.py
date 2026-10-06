@@ -54,6 +54,7 @@ from scripts.e2e.regional.collector_inventory_reboot import (  # noqa: E402
     run_collect004 as run_collect004,
     wait_mismatch_finding as wait_mismatch_finding,
 )
+from scripts.e2e.regional import collect015_provider as collect015  # noqa: E402
 from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
     capture_reboot_scope,
 )
@@ -76,7 +77,6 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
-    provider_event_actor_matches_role,
     required,
     run_case_main,
     settings_from_arguments,
@@ -122,8 +122,6 @@ INGEST_FUTURE_TOLERANCE = timedelta(seconds=30)
 FAIL_CLOSED_SAFETY_MARGIN = timedelta(seconds=60)
 FAIL_CLOSED_REASON = "requires fabric_partition and complete node GPU inventory"
 FULL_FABRIC_RESET_ACTIONS = frozenset({"RESET_ALL_GPUS_AND_NVSWITCHES"})
-REBOOT_EVENTS = frozenset({"BatchRebootClusterNodes", "RebootClusterNodes"})
-REPLACE_EVENTS = frozenset({"BatchReplaceClusterNodes", "ReplaceClusterNodes"})
 # `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` unset or any of these spellings is "false".
 FALSE_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
 DESTRUCTIVE_PROBE = Path(__file__).with_name("probes") / "destructive_node_probe.py"
@@ -1128,8 +1126,13 @@ def collect015_workflow_errors(
     node_after: dict[str, Any],
     node_recovery: Any,
     allow_replace: str | None,
+    provider: str | None = None,
 ) -> list[str]:
-    """COLLECT-015's control-plane readings around the ALWAYS_FATAL reboot."""
+    """COLLECT-015's control-plane readings around the ALWAYS_FATAL reboot.
+
+    ``provider`` selects the recovery authority the reboot must not compete
+    with: HyperPod ``NodeRecovery=None``, or ``not-applicable`` on plain EKS.
+    """
 
     errors = []
     if workflow is None:
@@ -1150,11 +1153,9 @@ def collect015_workflow_errors(
         errors.append(
             f"HyperPod submission record is {submission.get('state')!r}, not SUBMITTED"
         )
-    if node_recovery not in (None, "None"):
-        errors.append(
-            f"HyperPod cluster NodeRecovery is {node_recovery!r}; the reboot must "
-            "not compete with automatic recovery"
-        )
+    errors.extend(
+        collect015.node_recovery_guard_errors(node_recovery, provider=provider)
+    )
     if str(allow_replace or "").strip().lower() not in FALSE_ENV_VALUES:
         errors.append(
             f"executor GPU_FAULT_ALLOW_HYPERPOD_REPLACE={allow_replace!r} is not false"
@@ -1229,6 +1230,7 @@ def run_collect015(
             node_after=regional.node_snapshot(settings.node),
             node_recovery=recovery.get("node_recovery"),
             allow_replace=executor_flags.get("GPU_FAULT_ALLOW_HYPERPOD_REPLACE"),
+            provider=provider.provider,
         )
     )
     if node_after["boot_id"] == baseline_node["boot_id"]:
@@ -1236,23 +1238,24 @@ def run_collect015(
     provider_after = provider.provider_inventory()
     if provider_after != baseline_provider:
         errors.append("provider node identity changed during reboot")
-    reboot = regional.wait_provider_events(
-        started_at,
-        event_names=set(REBOOT_EVENTS),
-        expected_count=1,
+    # Plain EKS has no NodeRecovery: no replacement may be in flight instead.
+    guard = collect015.replacement_guard(
+        regional,
+        node=settings.node,
+        cluster_name=settings.hyperpod_cluster,
+        provider=provider.provider,
+        recovery=recovery,
     )
-    ended_at = datetime.now(timezone.utc)
-    events = regional.provider_events(started_at, ended_at)
-    replace = [item for item in events if item["event_name"] in REPLACE_EVENTS]
-    if len(reboot) != 1:
-        errors.append("CloudTrail reboot count is not one")
-    elif not provider_event_actor_matches_role(
-        reboot[0],
-        settings.executor_role_arn,
-    ):
-        errors.append("reboot actor is not the executor role")
-    if replace:
-        errors.append("CloudTrail contains provider replacement")
+    errors.extend(guard["errors"])
+    # One accepted reboot in the provider's own CloudTrail source; refused calls
+    # (Karpenter dry-runs) are not mutations; "no replacement" stays provisional.
+    calls = collect015.provider_calls(
+        regional,
+        started_at,
+        provider=provider.provider,
+        executor_role_arn=settings.executor_role_arn,
+    )
+    errors.extend(calls["errors"])
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
@@ -1260,12 +1263,9 @@ def run_collect015(
         "workflow": workflow,
         "submission": submission_state.get("submission"),
         "cluster_recovery": recovery,
+        "replacement_guard": guard["guard"],
         "executor_flags": executor_flags,
-        "provider_events": events,
-        "reboot_events": reboot,
-        # "no replacement" is a negative claim inside CloudTrail's delivery
-        # window; DESTR-013 re-checks the whole run once it has caught up.
-        "provider_events_provisional": regional.provider_events_provisional(ended_at),
+        **calls["evidence"],
     }
 
 

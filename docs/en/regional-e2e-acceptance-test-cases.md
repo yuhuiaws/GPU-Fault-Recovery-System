@@ -14440,7 +14440,13 @@ reboot, and the marker carries retirement fields after restore**
     searching the reason -- that there is no `gpu_expected_count_unknown` and no
     `gpu_inventory_mismatch`; boot_id unchanged;
   - after restore, every marker of the RECOVERED incident carries `retired_at` and
-    `retired_reason`; the node has no ownership, no taint, and is schedulable.
+    `retired_reason`; the node has no ownership, no taint, and is schedulable. Markers are
+    judged on the incidents that carry them: at least one RECOVERED incident (the identity
+    incident) must carry markers and every such marker must have retired, while a RECOVERED
+    incident that never carried a marker -- the `drain-after` successor a failed
+    `RUN_DCGM_DIAGNOSTIC` opens (`DRAIN_AND_QUARANTINE`), recovered by the runner's
+    validated restore -- is not a `marker_retirement` error (`collect020_verdicts.
+    marker_retirement_errors`; an `eks-managed` run failed only on that successor).
 - Known limitations: DCGM's `device-lost` edge reason comes from the DCGM exporter, which
   the nvidia-smi shadow cannot reach, so it has unit tests only; the return of the UUID is
   itself an identity change and may open a second incident, all of which are restored and
@@ -14593,6 +14599,24 @@ live whole-node reboot**
   ④ `ALLOW_HYPERPOD_REPLACE` must be false
   ("allow reboot, forbid replace" relies on this switch, not on
   `ENABLE_HYPERPOD_ADAPTER`).
+- Provider coverage (`collect015_provider.py`): the same case id runs on both providers. The
+  provider comes from the GPU nodes' labels (`WarmSpareLiveFixture.provider`). On HyperPod the
+  readings above hold word for word. On an `eks-managed` cluster the reboot is the eks adapter's
+  EC2 `RebootInstances`, read from CloudTrail's `ec2.amazonaws.com` source (the SageMaker source
+  never shows it); the window is split by the shared `partition_provider_events`, so Karpenter's
+  refused `RunInstances` dry-runs (`Client.DryRunOperation`) are recorded as
+  `refused_provider_calls` and never counted, and the reboot count names what it saw
+  (`N accepted ['RebootInstances'] calls; M refused reboot calls, K refused provider calls`);
+  a replacement is any accepted EC2 `RunInstances`/`TerminateInstances`/`StopInstances`/
+  `StartInstances`. Hard constraint ① has no HyperPod NodeRecovery to read there: the cluster
+  fact must read `not-applicable`, and the evidence records the provider's equivalent in
+  `replacement_guard` -- the node's managed node group `ACTIVE` without health issues and its
+  Auto Scaling instance `InService`/`HEALTHY` (`eks:DescribeNodegroup`,
+  `autoscaling:DescribeAutoScalingInstances`, read by the operator's credentials) -- so no
+  provider-side health replacement is in flight for the instance that was rebooted; an unreadable
+  group or instance fails closed. The provider inventory (name, instance id) and the Node UID
+  must still be unchanged. An earlier `eks-managed` attempt rebooted the node and failed only on
+  the HyperPod-shaped guard and the SageMaker-scoped reboot count.
 
 #### Steps
 

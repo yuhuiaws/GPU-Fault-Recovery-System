@@ -1022,15 +1022,32 @@ Semantics and boundaries of `eks-managed`:
     --gpu-nodegroup gpu-p5en-efa-spot-node-group \
     --approve-profile-plan <plan_sha256> --reference CHG-<id>
   ```
+- Device-plugin DaemonSet update strategy (a COLLECT-017 prerequisite): acceptance COLLECT-017 segments B/C
+  temporarily exclude the target node from the NVIDIA/EFA device-plugin DaemonSets' affinity and support only
+  DaemonSets configured as `OnDelete` beforehand (`RollingUpdate` would spread the temporary affinity to other nodes;
+  the runner refuses with `plugin exclusion requires the explicitly supported OnDelete deployment policy` and never
+  changes the strategy online). The upstream k8s-device-plugin chart on plain EKS (Helm release `nvdp`) defaults to
+  `RollingUpdate`: set it through Helm values after the join rather than patching the DaemonSet (the next
+  `helm upgrade` would revert a patch):
+  `helm upgrade nvdp nvdp/nvidia-device-plugin -n kube-system --reuse-values --set updateStrategy.type=OnDelete`;
+  the EFA plugin (`aws-efa-k8s-device-plugin` chart) takes `OnDelete` in its values the same way. The product has no
+  reason against it: `RESTART_GPU_DEVICE_PLUGIN` only deletes the plugin Pod and lets the DaemonSet recreate it,
+  independent of the update strategy; of the chart's three identically labelled DaemonSets only the one mounting the
+  kubelet `device-plugins` directory is the plugin (GFD and MPS are companions).
 - DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
-  `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has neither nv-hostengine nor dcgmi, so an `eks-managed` cluster's
+  `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has no host nv-hostengine (a `dcgmi` binary may still be present,
+  from the image or installed by hand), so an `eks-managed` cluster's
   exporter is rendered without `DCGM_REMOTE_HOSTENGINE_INFO` and runs its embedded hostengine in the container
   (`NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=utility`, GPUs injected by the AMI's default NVIDIA
   container runtime; annotation `gpu-fault.io/dcgm-hostengine: embedded`). hostNetwork, the loopback bind on 9400, the
   instance-type affinity and the counters ConfigMap are unchanged, the node collector keeps scraping
-  `http://127.0.0.1:9400/metrics`, and the HyperPod text is byte-identical. No DCGM is installed on the node: the quick
-  DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on such nodes (a configuration warning that
-  never drains the node) and the diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
+  `http://127.0.0.1:9400/metrics`, and the HyperPod text is byte-identical. The node runs no host hostengine: the
+  quick DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` (no `dcgmi`) or
+  `WARN`/`DCGM_HOSTENGINE_UNAVAILABLE` (`dcgmi` present but no hostengine to connect to: exit status 226 =
+  `DCGM_ST_CONNECTION_NOT_VALID`, or its connection error text, with no gradable JSON) on such nodes -- both
+  configuration warnings that never drain the node; the Agent reads that semantics from
+  `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`, and a HyperPod node that cannot reach its host hostengine still fails
+  with `DCGM_EXECUTION_REVIEW`. The diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
   carries an extra `dcgm_eks_managed` document group for the approver.
 - GPU reset quiesce: on HyperPod `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
   containers it knows by name (`gpu-fault-system/exporter`, `kube-system/nvidia-device-plugin-ctr`, HyperPod's HMA). A

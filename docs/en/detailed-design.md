@@ -671,6 +671,8 @@ with no large-model call:
 | `GPU_FIELD_DIAGNOSTIC` | SM/compute/stress | Collect a bug report and run the NVIDIA Field Diagnostic |
 | `DEEP_DIAGNOSTIC_REVIEW` | unrecognised test | Keep drained; review the evidence manually and run deep diagnostics |
 | `DCGM_EXECUTION_REVIEW` | non-zero exit or unparseable JSON | Check `dcgmi`/hostengine and stderr, then re-run diagnostics |
+| `DCGM_TOOL_UNAVAILABLE` | no `dcgmi` on the node (plain EKS NVIDIA AMI) | Configuration `WARN`, the node is not drained; install datacenter-gpu-manager on the node image if the quick diagnostic is required |
+| `DCGM_HOSTENGINE_UNAVAILABLE` | `dcgmi` on an `eks-managed` node reaches no host nv-hostengine (exit status 226 = `DCGM_ST_CONNECTION_NOT_VALID`, no gradable JSON) | Configuration `WARN`, the node is not drained; GPU metrics still come from the exporter's embedded hostengine, run a host nv-hostengine on the image if the quick diagnostic is required (on HyperPod the same reading stays `DCGM_EXECUTION_REVIEW`) |
 
 The `diagnostic_findings`, `recommended_actions`, `evidence_ref` and SHA-256
 returned by the Node Agent, together with the control-plane action, are written to the step execution. The incident reasons after a diagnostic-failure escalation

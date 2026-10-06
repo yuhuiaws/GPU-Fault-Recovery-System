@@ -143,12 +143,51 @@ def test_identity_does_not_borrow_another_incidents_dcgm_notice() -> None:
     )
 
 
-def test_identity_requires_markers_for_each_recovered_incident() -> None:
+def test_identity_requires_a_recovered_incident_with_retired_markers() -> None:
     activity = identity_activity()
     activity["markers"] = []
     assert identity.marker_retirement_errors(activity) == [
-        "recovered incident identity-incident has no retirement markers"
+        "no RECOVERED incident carries a marker to retire: identity-incident"
     ]
+    activity = identity_activity()
+    activity["incidents"][0]["state"] = "ESCALATED"
+    assert identity.marker_retirement_errors(activity) == [
+        "no incident of the case reached RECOVERED"
+    ]
+
+
+def test_a_recovered_drain_after_successor_without_markers_is_not_a_defect() -> None:
+    """The failed RUN_DCGM_DIAGNOSTIC's DRAIN_AND_QUARANTINE successor carries
+    no marker; the validated restore recovers it beside the identity incident.
+    Only the markers that exist are judged, and every one must have retired."""
+
+    activity = identity_activity()
+    activity["incidents"].append(
+        {
+            "incident_id": "inc-drain-after-workflow-a",
+            "state": "RECOVERED",
+            "reasons": [
+                "temperature_diagnostic remediation failed; failed operation or "
+                "validation: RUN_DCGM_DIAGNOSTIC"
+            ],
+        }
+    )
+    assert identity.marker_retirement_errors(activity) == []
+    activity["markers"][0]["retired_reason"] = ""
+    assert identity.marker_retirement_errors(activity) == [
+        "marker identity-marker has no retired_reason"
+    ]
+    activity["markers"].append(
+        {
+            "incident_id": "inc-drain-after-workflow-a",
+            "marker_id": "late-marker",
+            "retired_at": None,
+            "retired_reason": "x",
+        }
+    )
+    assert "marker late-marker has no retired_at" in identity.marker_retirement_errors(
+        activity
+    ), "a marker the successor does carry is judged like any other"
 
 
 @pytest.mark.parametrize(

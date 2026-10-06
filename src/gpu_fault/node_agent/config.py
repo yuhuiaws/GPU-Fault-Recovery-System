@@ -311,6 +311,10 @@ def _executor_from_settings(
             "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART", False
         ),
         service_quiesce_enabled=quiesce_enabled,
+        cluster_provider=(
+            str(os.getenv("GPU_FAULT_CLUSTER_PROVIDER") or "hyperpod").strip()
+            or "hyperpod"
+        ),
         diagnostic_output_dir=os.getenv(
             "GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR",
             "/var/lib/gpu-fault/diagnostics",
