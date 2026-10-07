@@ -23,6 +23,31 @@ from gpu_fault.models import WorkloadState
 LOGGER = logging.getLogger(__name__)
 
 
+GPU_PRODUCT_DISCOVERY_MODES = frozenset({"auto", "required", "disabled"})
+
+#: Seconds between two late GPU identity discovery attempts while the product
+#: is unknown (``gpu_fault.collectors.identity_refresh``). One attempt costs at
+#: most nvidia-smi's bounded 15 s when the driver hangs, so this also caps how
+#: often a record's delivery can be held by it.
+GPU_IDENTITY_REFRESH_INTERVAL_SECONDS = 60
+
+
+def gpu_product_discovery_mode() -> str:
+    """``GPU_FAULT_GPU_PRODUCT_DISCOVERY`` (``auto`` by default), validated.
+
+    Shared by the start-up discovery here and the late re-discovery in
+    :mod:`gpu_fault.collectors.identity_refresh`, so ``disabled`` means no
+    ``nvidia-smi`` call at any point of the collector's life.
+    """
+
+    mode = os.getenv("GPU_FAULT_GPU_PRODUCT_DISCOVERY", "auto").lower()
+    if mode not in GPU_PRODUCT_DISCOVERY_MODES:
+        raise CollectorError(
+            "GPU_FAULT_GPU_PRODUCT_DISCOVERY must be auto, required, or disabled"
+        )
+    return mode
+
+
 def context_from_environment(
     *,
     discover_product: bool = False,
@@ -55,11 +80,7 @@ def context_from_environment(
     cuda_version = os.getenv("GPU_FAULT_CUDA_VERSION") or None
     configured_product = os.getenv("GPU_FAULT_GPU_PRODUCT")
     product = normalize_gpu_product(configured_product) if configured_product else None
-    discovery_mode = os.getenv("GPU_FAULT_GPU_PRODUCT_DISCOVERY", "auto").lower()
-    if discovery_mode not in {"auto", "required", "disabled"}:
-        raise CollectorError(
-            "GPU_FAULT_GPU_PRODUCT_DISCOVERY must be auto, required, or disabled"
-        )
+    discovery_mode = gpu_product_discovery_mode()
     if discover_product and discovery_mode != "disabled":
         try:
             discovered_product = discover_gpu_product(runner)
@@ -77,7 +98,9 @@ def context_from_environment(
                 # collection errors they are.
                 LOGGER.warning(
                     "nvidia-smi product discovery unavailable and no GPU product "
-                    "is configured; starting without a product: %s",
+                    "is configured; starting without a product (the collectors "
+                    "that stamp it retry the discovery every %d s): %s",
+                    GPU_IDENTITY_REFRESH_INTERVAL_SECONDS,
                     exc,
                 )
             else:

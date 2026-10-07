@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +153,20 @@ class BranchHarness:
             "lifecycle_state": "ACTIVE",
             "allowed_operations": list(case.AGENT_OPERATIONS),
             "generation": 4,
+        }
+        # The probe's per-node GPU inventory identity: fresh, from the node's
+        # boot, one product -- what the preflight requires before injecting.
+        self.gpu_identity = {
+            node: {
+                "snapshot_id": f"gpu-inventory-{node}",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "source": "NVIDIA_SMI",
+                "source_boot_id": f"boot-{node}",
+                "device_count": 8,
+                "products": ["H200"],
+                "product": "H200",
+            }
+            for node in NODES
         }
         self.profile = profile()
         self.profile["capabilities"].append(
@@ -576,6 +590,7 @@ class BranchRegional:
                 "profile": deepcopy(self.h.profile),
                 "release_id": "release-test",
                 "agent": deepcopy(self.h.agent),
+                "gpu_identity": deepcopy(self.h.gpu_identity.get(kwargs.get("node"))),
                 "queue": deepcopy(self.h.queue),
                 "remote_commands": {"open_by_cluster": {}},
             }

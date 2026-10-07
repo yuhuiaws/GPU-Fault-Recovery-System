@@ -1,6 +1,9 @@
 [Unit]
 Description=GPU fault kernel XID/SXID collector
-After=network-online.target
+# Ordered after the driver's persistence daemon as well: a collector that
+# starts before the driver answers discovers no GPU product and stamps
+# product=None on what it posts until its late re-discovery succeeds.
+After=network-online.target nvidia-persistenced.service
 Wants=network-online.target
 
 [Service]

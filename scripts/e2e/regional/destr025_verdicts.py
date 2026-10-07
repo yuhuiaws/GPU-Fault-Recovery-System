@@ -38,6 +38,9 @@ from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     lifetime_errors,
     node_reboot_verdict,
 )
+from scripts.e2e.regional.gpu_identity_preflight import (  # noqa: E402
+    gpu_identity_errors,
+)
 from scripts.e2e.regional.run_destr002_hyperpod_reboot import (  # noqa: E402
     capability,
 )
@@ -524,6 +527,7 @@ def preflight_errors(
     budget: dict[str, Any],
     identity_errors: list[str],
     verify_max_attempts: int,
+    gpu_identity: dict[str, Any] | None,
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
@@ -536,6 +540,11 @@ def preflight_errors(
     if not tests.get("passed"):
         errors.append("focused regression tests failed")
     errors.extend(_node_errors(node, node_snapshot, agent))
+    # The injected XID 79 must carry (or be given) a GPU product, or the policy
+    # quarantines the node as NOT_APPLICABLE instead of starting the ladder.
+    errors.extend(
+        gpu_identity_errors(node, gpu_identity, boot_id=node_snapshot.get("boot_id"))
+    )
     if business_workloads:
         errors.append(f"{node} carries a non-system workload: {business_workloads}")
     if gpu_workloads:

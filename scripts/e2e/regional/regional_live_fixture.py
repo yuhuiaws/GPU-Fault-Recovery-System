@@ -1117,6 +1117,7 @@ class RegionalLiveFixture:
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "event_id": (last.get("event") or {}).get("event_id"),
                     "decision": (last.get("decision") or {}).get("disposition"),
+                    "decision_reasons": (last.get("decision") or {}).get("reasons"),
                     "workflow_status": workflow.get("status"),
                     "completed_operations": workflow.get("completed_operations") or [],
                     "command_statuses": [

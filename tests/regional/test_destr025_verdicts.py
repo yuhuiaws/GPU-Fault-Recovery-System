@@ -9,6 +9,7 @@ import argparse
 import copy
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -507,12 +508,40 @@ def _clean_preflight_arguments() -> dict[str, Any]:
         "budget": {"readable": True, "scopes": {"node:x": {"active": 0, "limit": 1}}},
         "identity_errors": [],
         "verify_max_attempts": 6,
+        "gpu_identity": {
+            "snapshot_id": "gpu-inventory-1",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "source": "NVIDIA_SMI",
+            "source_boot_id": "boot-current",
+            "device_count": 8,
+            "products": ["H200"],
+            "product": "H200",
+        },
     }
 
 
 def test_a_clean_idle_node_passes_preflight() -> None:
     assert verdicts.preflight_errors(**_clean_preflight_arguments()) == [], (
         "a Ready, idle, unowned node with an ACTIVE agent passes"
+    )
+
+
+def test_preflight_refuses_a_node_without_a_product_bearing_gpu_identity() -> None:
+    """The injected XID 79 must resolve against a product: a node whose stored
+    GPU inventory is missing, product-less or from an earlier boot would have
+    its XID quarantined as NOT_APPLICABLE instead of starting the ladder."""
+    arguments = _clean_preflight_arguments()
+    arguments["gpu_identity"] = None
+    missing = verdicts.preflight_errors(**arguments)
+    assert any("GPU inventory identity" in item for item in missing), missing
+    arguments = _clean_preflight_arguments()
+    arguments["node_snapshot"]["boot_id"] = "boot-after-reboot"
+    rebooted = verdicts.preflight_errors(**arguments)
+    assert any("boot-after-reboot" in item for item in rebooted), rebooted
+    arguments = _clean_preflight_arguments()
+    arguments["node_snapshot"]["boot_id"] = "boot-current"
+    assert verdicts.preflight_errors(**arguments) == [], (
+        "a fresh same-boot single-product identity passes"
     )
 
 

@@ -83,17 +83,29 @@ def guaranteed_interval(
     ):
         raise BoundaryDenied("physical interval witness identity or continuity differs")
     actions = end["actions"]
-    if not isinstance(actions, list) or len(actions) != 1:
-        raise BoundaryDenied("physical interval requires exactly one reset invocation")
-    action = actions[0]
-    if (
-        action["operation"] != "RESET_GPU"
-        or action["gpu_uuid"] != scope.gpu_uuid
-        or action["returncode"] != 0
-        or _integer(action["pid"]) <= 0
-    ):
-        raise BoundaryDenied("physical reset invocation or target differs")
+    if not isinstance(actions, list) or not actions:
+        raise BoundaryDenied("physical interval requires a reset invocation")
+    for item in actions:
+        if (
+            item["operation"] != "RESET_GPU"
+            or item["gpu_uuid"] != scope.gpu_uuid
+            or _integer(item["pid"]) <= 0
+        ):
+            raise BoundaryDenied("physical reset invocation or target differs")
+    applied = [item for item in actions if item["returncode"] == 0]
+    if len(applied) != 1:
+        raise BoundaryDenied(
+            "physical interval requires exactly one applied reset invocation"
+        )
+    action = applied[0]
     began, ended = _integer(action["started_ns"]), _integer(action["ended_ns"])
+    refused = [item for item in actions if item["returncode"] != 0]
+    if refused:
+        _require_refusals_accounted(
+            refused, workflow=workflow, node=scope.node, began=began
+        )
+    first_began = min(_integer(item["started_ns"]) for item in actions)
+    last_ended = max(_integer(item["ended_ns"]) for item in actions)
     before_ids = {
         (row.get("command_id"), row.get("attempt")) for row in baseline["ledger"]
     }
@@ -122,11 +134,15 @@ def guaranteed_interval(
         datetime.fromisoformat(str(row[key]).replace("Z", "+00:00"))
         for key in ("started_at", "completed_at")
     ]
-    if any(stamp.tzinfo is None for stamp in command_times) or not (
-        int(command_times[0].timestamp() * 1e9)
-        <= began
-        < ended
-        <= int(command_times[1].timestamp() * 1e9)
+    if (
+        any(stamp.tzinfo is None for stamp in command_times)
+        or not began < ended
+        or not (
+            int(command_times[0].timestamp() * 1e9)
+            <= first_began
+            <= last_ended
+            <= int(command_times[1].timestamp() * 1e9)
+        )
     ):
         raise BoundaryDenied("physical reset escaped its Agent command interval")
     clocks = capture["clock_exchanges"]
@@ -161,6 +177,69 @@ def guaranteed_interval(
     if inner[0] >= inner[1]:
         raise BoundaryDenied("clock uncertainty consumes the physical reset interval")
     return inner
+
+
+def reset_receipt_calls(
+    workflow: dict[str, Any], *, node: str
+) -> list[dict[str, Any]] | None:
+    """The Agent's ``physical_calls`` receipt for ``node``'s RESET_GPU step.
+
+    ``None`` when the workflow record carries no such receipt for the node.
+    A SUCCEEDED execution wins over earlier attempts; otherwise the last one.
+    """
+
+    found: list[dict[str, Any]] | None = None
+    for step in workflow.get("step_executions") or []:
+        if not isinstance(step, dict) or step.get("operation") != "RESET_GPU":
+            continue
+        results = (step.get("details") or {}).get("node_results") or {}
+        calls = (results.get(node) or {}).get("physical_calls")
+        if not isinstance(calls, list):
+            continue
+        if found is None or step.get("status") == "SUCCEEDED":
+            found = calls
+    return found
+
+
+def _require_refusals_accounted(
+    refused: list[dict[str, Any]],
+    *,
+    workflow: dict[str, Any],
+    node: str,
+    began: int,
+) -> None:
+    """Refused ``--gpu-reset`` invocations are not physical resets.
+
+    On p5en nodes the driver routinely answers the first ``nvidia-smi
+    --gpu-reset`` busy (exit 255); the Agent unloads the display modules and
+    its attempt 2 performs the reset, so the witness sees two invocations in
+    the window although exactly one reset was applied (live, eks-managed
+    attempt 11). A refused invocation is accepted only when the Agent's own
+    receipt for this node names exactly that many ``busy`` attempts and one
+    applied ``reset``, and it ended before the applied reset began -- so it
+    can neither be a second reset nor overlap the interval being proven.
+    """
+
+    calls = reset_receipt_calls(workflow, node=node)
+    if calls is None:
+        raise BoundaryDenied(
+            "refused reset invocations are not accounted for by an Agent receipt"
+        )
+    busy = [
+        item
+        for item in calls
+        if item.get("outcome") == "busy" and "--gpu-reset" in str(item.get("command"))
+    ]
+    resets = [item for item in calls if item.get("outcome") == "reset"]
+    if len(busy) != len(refused) or len(resets) != 1:
+        raise BoundaryDenied(
+            "refused reset invocations differ from the Agent receipt's busy attempts"
+        )
+    for item in refused:
+        if _integer(item["ended_ns"]) > began:
+            raise BoundaryDenied(
+                "a refused reset invocation overlaps the applied reset"
+            )
 
 
 def physical_overlap_errors(

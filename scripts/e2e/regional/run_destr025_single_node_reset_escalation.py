@@ -316,6 +316,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         node=settings.node,
         node_snapshot=node,
         agent=state.get("agent") or {},
+        gpu_identity=state.get("gpu_identity"),
         profile=state.get("profile"),
         queue=state.get("queue") or {},
         remote_commands=state.get("remote_commands") or {},

@@ -255,11 +255,22 @@ def injection_errors(
 ) -> list[str]:
     errors: list[str] = []
     request_ids = set()
+    dispositions: dict[str, dict[str, Any]] = {}
     for node, state in zip(nodes, (first, second), strict=True):
         event = state.get("event") or {}
         decision = state.get("decision") or {}
         incident = state.get("incident") or {}
         workflow = state.get("workflow") or {}
+        # Each event's own verdict, so a split is explained by the record that
+        # caused it (live: one EXECUTABLE, one NOT_APPLICABLE "product UNKNOWN"
+        # from a collector that restarted before the driver).
+        dispositions[node] = {
+            "disposition": decision.get("disposition"),
+            "official_action": decision.get("official_action"),
+            "reasons": decision.get("reasons"),
+            "product": event.get("product"),
+            "gpu_identity_source": event.get("gpu_identity_source"),
+        }
         if event.get("xid") != EXPECTED_XID:
             errors.append(f"{node} event is not XID {EXPECTED_XID}: {event.get('xid')}")
         if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
@@ -267,7 +278,9 @@ def injection_errors(
         if decision.get("official_action") != "RESET_GPU":
             errors.append(
                 f"{node} policy did not resolve to RESET_GPU: "
-                f"{decision.get('official_action')}"
+                f"official_action={decision.get('official_action')} "
+                f"disposition={decision.get('disposition')} "
+                f"reasons={decision.get('reasons')} product={event.get('product')}"
             )
         request_id = workflow.get("request_id") or incident.get("workflow_request_id")
         if not request_id:
@@ -278,6 +291,7 @@ def injection_errors(
     if len(request_ids) != 1:
         errors.append(
             f"the two events did not land in one workflow: {sorted(map(str, request_ids))}"
+            f"; decisions: {dispositions}"
         )
     return errors
 

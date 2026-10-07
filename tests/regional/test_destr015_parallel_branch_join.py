@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -412,12 +413,26 @@ def _state(node: str, request_id: str = REQUEST, xid: int = 46) -> dict[str, Any
 
 def test_injection_must_land_both_events_in_one_workflow() -> None:
     assert verdicts.injection_errors(_state(NODE_A), _state(NODE_B), nodes=NODES) == []
-    split = verdicts.injection_errors(
-        _state(NODE_A), _state(NODE_B, "workflow-other"), nodes=NODES
-    )
+    quarantined = _state(NODE_B, "workflow-other")
+    quarantined["decision"] = {
+        "official_action": "RESET_GPU",
+        "disposition": "NOT_APPLICABLE",
+        "reasons": ["Catalog XID 46 is not applicable to product UNKNOWN"],
+    }
+    quarantined["event"]["product"] = None
+    quarantined["event"]["gpu_identity_source"] = "NO_FRESH_GPU_INVENTORY"
+    split = verdicts.injection_errors(_state(NODE_A), quarantined, nodes=NODES)
     assert any("one workflow" in item for item in split), (
         "expected any('one workflow' in item for item in split) to be true"
     )
+    joined = "\n".join(split)
+    for needle in (
+        "NOT_APPLICABLE",
+        "product UNKNOWN",
+        "NO_FRESH_GPU_INVENTORY",
+        "'disposition': 'EXECUTABLE'",
+    ):
+        assert needle in joined, f"{needle!r} missing from the split verdict: {split}"
     wrong_xid = verdicts.injection_errors(
         _state(NODE_A), _state(NODE_B, xid=79), nodes=NODES
     )
@@ -790,13 +805,65 @@ def _preflight_arguments(**overrides: Any) -> dict[str, Any]:
         "tests": {"passed": True},
         "control_env": {"aggregation_window_seconds": 5, "job_lifetime_seconds": 3600},
         "runtime_identity_errors": [],
+        "gpu_identities": {node: _gpu_identity() for node in NODES},
     }
     value.update(overrides)
     return value
 
 
+def _gpu_identity(**overrides: Any) -> dict[str, Any]:
+    """A fresh same-boot single-product inventory identity, as the probe reads it."""
+
+    return {
+        "snapshot_id": "gpu-inventory-1",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "source": "NVIDIA_SMI",
+        "source_boot_id": "boot-current",
+        "device_count": 8,
+        "products": ["H200"],
+        "product": "H200",
+        **overrides,
+    }
+
+
 def test_preflight_happy_shape_passes() -> None:
     assert destr015.preflight_errors(nodes=NODES, **_preflight_arguments()) == []
+
+
+def test_preflight_refuses_a_node_whose_collector_identity_has_no_product() -> None:
+    """Live eks-managed attempt 10: node B had rebooted (DESTR-025), its kernel
+    collector restarted before the driver and stamped product=None, the policy
+    quarantined its XID 46 as NOT_APPLICABLE and the two events made two records.
+    The inventory identity is what the control plane falls back to, so the case
+    refuses while it is missing, product-less, from another boot or stale."""
+    missing = destr015.preflight_errors(
+        nodes=NODES,
+        **_preflight_arguments(gpu_identities={NODE_A: _gpu_identity(), NODE_B: None}),
+    )
+    assert [item for item in missing if NODE_B in item and "GPU inventory" in item], (
+        missing
+    )
+    productless = destr015.preflight_errors(
+        nodes=NODES,
+        **_preflight_arguments(
+            gpu_identities={
+                NODE_A: _gpu_identity(),
+                NODE_B: _gpu_identity(product=None, products=[]),
+            }
+        ),
+    )
+    assert any("names no single product" in item for item in productless), productless
+    arguments = _preflight_arguments(
+        node_snapshots={
+            NODE_A: _node(NODE_A, boot_id="boot-current"),
+            NODE_B: _node(NODE_B, boot_id="boot-after-reboot"),
+        }
+    )
+    rebooted = destr015.preflight_errors(nodes=NODES, **arguments)
+    assert any(NODE_B in item and "boot-after-reboot" in item for item in rebooted), (
+        rebooted
+    )
+    assert not any(NODE_A in item and "boot" in item for item in rebooted), rebooted
 
 
 def test_preflight_refuses_identical_or_unready_nodes_and_inactive_agents() -> None:

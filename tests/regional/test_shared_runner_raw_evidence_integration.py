@@ -158,6 +158,9 @@ class ProbeStore:
     def get_agent(self, *_args: Any) -> Any:
         raise NotFoundError("agent is absent")
 
+    def get_gpu_inventory_snapshot(self, *_args: Any) -> Any:
+        return None
+
     def processor_queue_stats(self) -> dict[str, int]:
         return {"depth": 0}
 

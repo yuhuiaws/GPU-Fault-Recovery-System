@@ -18,6 +18,7 @@ from gpu_fault.channel_registry import (
     COLLECTOR_HEALTH_PATH,
     FABRIC_MANAGER_PATH,
 )
+from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.logs.fabric_manager_cursor import FabricManagerCursorState
 from gpu_fault.collectors.logs.fabric_manager_receipts import (
@@ -137,6 +138,11 @@ class FabricManagerLogCollector:
         self.stale_lines_skipped = 0
         self.sink = sink
         self.context = context
+        # Started before the driver, every SXID would carry ``product=None``
+        # (the SXID policy fails closed on it); re-discovered once nvidia-smi
+        # answers. ``runner`` here is journalctl's, so the default bounded
+        # nvidia-smi runner is used for the re-discovery.
+        self._identity = GpuIdentityRefresher(context)
         self.node_id = node_id
         self.boot_id = boot_id or _read_boot_id()
         self.interval_seconds = interval_seconds
@@ -205,6 +211,7 @@ class FabricManagerLogCollector:
 
     def _collect_round(self, round_receipt: RoundReceipt) -> CollectorStats:
         collected_at = self.now()
+        self.context = self._identity.refresh(collected_at)
         try:
             records = [
                 *self._journal_records(collected_at),

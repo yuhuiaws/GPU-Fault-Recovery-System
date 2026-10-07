@@ -194,6 +194,112 @@ def test_branch_overlap_cannot_mask_an_unproven_physical_interval(defect):
     ), defect
 
 
+def busy_then_success(captures, workflow, *, node="node-b", receipt=True):
+    """The p5en shape: attempt 1 refused busy (exit 255), attempt 2 applied.
+
+    The witness records both invocations; the Agent's receipt names the busy
+    attempt and the one applied reset.
+    """
+
+    applied = captures[node]["end"]["actions"][0]
+    refused = {
+        **applied,
+        "pid": applied["pid"] - 1,
+        "returncode": 255,
+        "started_ns": BASE + 1 * SECOND,
+        "ended_ns": BASE + 3 * SECOND,
+    }
+    captures[node]["end"]["actions"] = [refused, applied]
+    if receipt:
+        workflow["step_executions"] = [
+            {
+                "operation": "RESET_GPU",
+                "status": "SUCCEEDED",
+                "details": {
+                    "node_results": {
+                        node: {
+                            "reset_attempts": 2,
+                            "physical_calls": [
+                                {
+                                    "attempt": 1,
+                                    "command": f"nvidia-smi --gpu-reset -i GPU-{node}",
+                                    "outcome": "busy",
+                                },
+                                {"command": "rmmod nvidia_drm", "outcome": "released"},
+                                {
+                                    "attempt": 2,
+                                    "command": f"nvidia-smi --gpu-reset -i GPU-{node}",
+                                    "outcome": "reset",
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+        ]
+    return refused
+
+
+def test_a_busy_refused_first_attempt_is_not_a_second_physical_reset():
+    """Live eks-managed attempt 11: both nodes' first ``nvidia-smi --gpu-reset``
+    was refused busy by the driver and the Agent's attempt 2 reset the GPU; the
+    proof saw two invocations and denied "exactly one reset invocation"
+    although exactly one reset was applied."""
+    captures, scopes, workflow, hosts = interval_fixture()
+    busy_then_success(captures, workflow)
+    assert (
+        physical_overlap_errors(captures, scopes=scopes, workflow=workflow, hosts=hosts)
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected"),
+    [
+        ("no-receipt", "not accounted for by an Agent receipt"),
+        ("receipt-without-busy", "differ from the Agent receipt"),
+        ("two-applied-in-receipt", "differ from the Agent receipt"),
+        ("refused-overlaps-applied", "overlaps the applied reset"),
+        ("refused-after-command", "escaped its Agent command interval"),
+        ("refused-other-gpu", "invocation or target differs"),
+        ("two-applied", "exactly one applied reset invocation"),
+        ("none-applied", "exactly one applied reset invocation"),
+    ],
+)
+def test_refused_invocations_must_match_the_agent_receipt(defect, expected):
+    captures, scopes, workflow, hosts = interval_fixture()
+    refused = busy_then_success(captures, workflow, receipt=defect != "no-receipt")
+    calls = (
+        workflow["step_executions"][0]["details"]["node_results"]["node-b"][
+            "physical_calls"
+        ]
+        if defect != "no-receipt"
+        else []
+    )
+    actions = captures["node-b"]["end"]["actions"]
+    if defect == "receipt-without-busy":
+        calls[0]["outcome"] = "reset"
+        calls[2]["outcome"] = "released"
+    elif defect == "two-applied-in-receipt":
+        calls[0]["outcome"] = "reset"
+    elif defect == "refused-overlaps-applied":
+        refused["ended_ns"] = actions[1]["started_ns"] + SECOND
+    elif defect == "refused-after-command":
+        # The Agent command started at NOW; a refusal before it is not this
+        # command's attempt.
+        refused.update(started_ns=BASE - 3 * SECOND, ended_ns=BASE - 1 * SECOND)
+    elif defect == "refused-other-gpu":
+        refused["gpu_uuid"] = "GPU-other"
+    elif defect == "two-applied":
+        refused["returncode"] = 0
+    elif defect == "none-applied":
+        actions[1]["returncode"] = 255
+    errors = physical_overlap_errors(
+        captures, scopes=scopes, workflow=workflow, hosts=hosts
+    )
+    assert errors and expected in errors[0], (defect, errors)
+
+
 def quoted(value):
     return '"' + "".join(f"\\x{byte:02x}" for byte in value.encode()) + '"'
 

@@ -24,6 +24,7 @@ from gpu_fault.channel_registry import (
 from gpu_fault.collectors.logs.fabric_manager import (
     SXID_SUMMARY_PATTERN,
 )
+from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
@@ -183,6 +184,15 @@ def _count_queue_drop(
         )
 
 
+# GPU identity after a boot: ``context_from_environment`` discovers the product
+# once, at start, and a collector that comes up before the driver answers would
+# stamp ``product=None`` on every XID for its whole life -- the control plane's
+# product gate then quarantines the node as "not applicable to product UNKNOWN"
+# instead of resetting the GPU (live, eks-managed, after a reboot). The
+# ``GpuIdentityRefresher`` re-runs the discovery, at most once a minute, both in
+# the idle gaps of the live stream (so the identity is usually known before the
+# first XID) and right before a record is stamped (so the first XID after the
+# driver answers carries it even when the stream was never idle).
 class KernelLogCollector:
     def __init__(
         self,
@@ -206,6 +216,7 @@ class KernelLogCollector:
             raise ValueError("kernel delivery queue size must be at least 1")
         self.sink = sink
         self.context = context
+        self._identity = GpuIdentityRefresher(context)
         self.node_id = node_id
         self.kmsg_path = kmsg_path
         self.uptime_path = uptime_path
@@ -286,6 +297,7 @@ class KernelLogCollector:
                 duplicates += 1
                 continue
             collected_at = self.now()
+            self.context = self._identity.refresh(collected_at)
             monotonic = parsed.get("monotonic_us")
             observed_at = self._observed_at(parsed, collected_at=collected_at)
             payload: dict[str, Any] = {
@@ -766,6 +778,7 @@ class KernelLogCollector:
         self,
         observed_at: datetime,
     ) -> None:
+        self.context = self._identity.refresh(observed_at)
         try:
             self._maybe_health_summary(observed_at)
         except CollectorError as exc:

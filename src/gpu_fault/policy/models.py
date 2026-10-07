@@ -311,6 +311,9 @@ class XidEvent(StrictModel):
     job_id: str | None = None
     attempt_id: str | None = None
     workload_identity_source: str | None = None
+    #: Where a product the collector did not stamp came from (``GPU_INVENTORY:<snapshot>``), or why
+    #: none could be found (``NO_FRESH_GPU_INVENTORY``); ``None`` when the collector stamped it.
+    gpu_identity_source: str | None = None
     fabric_partition: str | None = None
     runtime_profile_version: str | None = None
     workload_state: WorkloadState = WorkloadState.UNKNOWN
@@ -402,6 +405,7 @@ class SxidEvent(StrictModel):
     job_id: str | None = None
     attempt_id: str | None = None
     workload_identity_source: str | None = None
+    gpu_identity_source: str | None = None
     runtime_profile_version: str | None = None
     workload_state: WorkloadState = WorkloadState.UNKNOWN
     affected_workload_ids: list[str] = Field(default_factory=list)

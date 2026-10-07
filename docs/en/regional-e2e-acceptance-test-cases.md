@@ -10617,6 +10617,16 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   refused by kubelet with `UnexpectedAdmissionError … no healthy devices present` (upstream nvdp 0.17.1 still reported the
   devices unhealthy across the reset; allocatable returned to 8/8 a little later); the runner's managed-workload verdict
   FAILs honestly on the actual Pod phase. Executor-level judgement: `tests/execution/test_restart_device_plugin_gate.py`.
+- Both events must carry a GPU product to land in one workflow: on `eks-managed` attempt 10 the node DESTR-025 had just rebooted
+  restarted its kernel collector before the driver answered, its injected XID 46 carried no product, and the policy opened a separate
+  quarantine record for it as `NOT_APPLICABLE` (`Catalog XID 46 is not applicable to product UNKNOWN`) while the other node's event was
+  `EXECUTABLE` on its own -- a product identity gap, not aggregation-window timing. The collectors now retry the discovery before
+  stamping, the control plane falls back to the node's fresh same-boot GPU inventory (event `gpu_identity_source`), and the runner's
+  preflight refuses by name with `GPU inventory identity` while either target node's stored inventory identity is missing, names no single
+  product, is from an older boot or is older than 180 s (`details.preflight_errors` in `plan.json`, `gpu_identities` in `preflight.json`);
+  the injection verdict prints each event's `disposition`/`reasons`/`product`/`gpu_identity_source` when "the two events did not land in
+  one workflow", and every `timeline.json` entry carries `decision_reasons`. Judgement: `tests/regional/test_gpu_identity_preflight.py`,
+  `tests/app_services/test_xid_product_from_inventory.py`, `tests/collectors/test_gpu_identity_refresh.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr015_parallel_branch_join.py`. By default it only generates the
   plan; before execute it must read `DESTR-012=PASS` (chain: `010 → 001 → 002 → 009 →
@@ -10759,7 +10769,12 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
      same boot, so the comparison is exact); the witness is bound to its own new successful ledger
      row, workflow/incident/fencing/GPU, and via the offset bound of the two exchanges (200 ppm plus a
      50 ms margin) the conservative inner intervals of the two reset processes' exec/exit are derived,
-     and the two inner intervals must overlap; the offset uncertainty is written into the evidence.
+     and the two inner intervals must overlap; a `nvidia-smi --gpu-reset` invocation the driver refused busy
+     (routine for the first attempt on p5en; the Agent unloads the display modules and its attempt 2 resets) is
+     not a physical reset: the proof counts the applied invocations (exit 0, exactly one) and requires the refused
+     ones to match the Agent receipt's `physical_calls` `busy` attempts and to end before the applied one began
+     (the `eks-managed` attempt-11 shape, judged in `tests/regional/test_acceptance_physical_interval_alignment.py`);
+     the offset uncertainty is written into the evidence.
      `RESTART_WORKLOAD` executed exactly once, SUCCEEDED, with `started_at` no earlier than the
      completion time of both `RESTORE_SCHEDULING`, and details source/target GPU counts both 16;
      workflow SUCCEEDED, incident RECOVERED;
@@ -12296,7 +12311,10 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
 > `BatchRebootClusterNodes` or EC2 `RebootInstances`, read from the provider's own CloudTrail source with refused calls
 > (Karpenter dry-runs) set aside and the EC2 launch/terminate/stop/start mutations as the forbidden replacement set
 > (`destr016_verdicts.provider_reboot_evidence`). Everything else -- the known RESET_GPU refusal, the one-branch DAG, the
-> executor env window, the host ledger, the node identity -- is judged identically. Plain-EKS prerequisites as in DESTR-002.
+> executor env window, the host ledger, the node identity -- is judged identically. Plain-EKS prerequisites as in DESTR-002. The preflight
+> also requires the target node's stored GPU inventory identity to name one product, come from the current boot and be at most 180 s old
+> (`store.gpu_identity` in `preflight.json`); otherwise the injected XID 79 would be quarantined as `product UNKNOWN` instead of starting the
+> ladder (see DESTR-015).
 > On `eks-managed` the `gpu-fault.io/quiesce` taint QUIESCE_GPU_SERVICES applied survives the reboot: once RESTART_NODE is
 > confirmed the eks lifecycle adapter strips it and records `details.quiesce_taint_removed_nodes` on that step, which is
 > what lets the validation tail observe the node (HyperPod has neither the taint nor the record); a VALIDATE_* that

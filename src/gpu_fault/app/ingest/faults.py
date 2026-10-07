@@ -275,6 +275,79 @@ class FaultIngestionService:
             updates["runtime_profile_version"] = context.runtime_profile_version
         return event.model_copy(update=updates)
 
+    def _enrich_gpu_identity(
+        self,
+        event: XidEvent | SxidEvent,
+    ) -> XidEvent | SxidEvent:
+        """Fill a product-less fault from the node's own fresh GPU inventory.
+
+        The collectors stamp the GPU product they discovered at start-up. One
+        that started before the driver answered -- every reboot, until the
+        units were ordered after ``nvidia-persistenced`` -- stamps none, and the
+        policy's product gate then reads the XID as "not applicable to product
+        UNKNOWN" and quarantines the node instead of resetting the GPU (live,
+        ``eks-managed``: one of two same-window XID 46 became a NOT_APPLICABLE
+        quarantine record while its sibling started the reset). The node's GPU
+        inventory is the same hardware's identity, read by nvidia-smi on the
+        node, so it stands in -- only when it is fresh (``gpu_inventory_max_age``),
+        from the event's boot and names exactly one product. Anything less
+        leaves the event as it came and the gate fails closed as before; either
+        way ``gpu_identity_source`` records what happened.
+        """
+
+        if event.product is not None:
+            return event
+        snapshot = self._fresh_gpu_inventory(
+            cluster_id=event.cluster_id,
+            node_id=event.node_id,
+            event_time=event.observed_at,
+            source_boot_id=event.source_boot_id,
+        )
+        products = (
+            {device.product for device in snapshot.devices}
+            if snapshot is not None
+            else set()
+        )
+        code = (
+            f"XID {event.xid}" if isinstance(event, XidEvent) else f"SXID {event.sxid}"
+        )
+        if snapshot is None or len(products) != 1 or None in products:
+            LOGGER.warning(
+                "%s on %s/%s carries no GPU product and the node has no fresh "
+                "single-product GPU inventory from its boot to stand in (%s); "
+                "the product gate fails closed",
+                code,
+                event.cluster_id,
+                event.node_id,
+                (
+                    "no fresh inventory"
+                    if snapshot is None
+                    else f"products={sorted(item or 'UNKNOWN' for item in products)}"
+                ),
+            )
+            return event.model_copy(
+                update={"gpu_identity_source": "NO_FRESH_GPU_INVENTORY"}
+            )
+        product = products.pop()
+        LOGGER.warning(
+            "%s on %s/%s carries no GPU product; using %s from GPU inventory %s "
+            "(observed %s, boot %s). The node's collector started before the "
+            "driver answered; restart it or wait for its re-discovery",
+            code,
+            event.cluster_id,
+            event.node_id,
+            product,
+            snapshot.snapshot_id,
+            snapshot.observed_at.isoformat(),
+            snapshot.source_boot_id,
+        )
+        return event.model_copy(
+            update={
+                "product": product,
+                "gpu_identity_source": f"GPU_INVENTORY:{snapshot.snapshot_id}",
+            }
+        )
+
     def _fresh_gpu_inventory(
         self,
         *,
@@ -532,7 +605,7 @@ class FaultIngestionService:
         # the dynamic recovery action (security review H-10).
         if event.xid_154_action is not None:
             event = event.model_copy(update={"xid_154_action": None})
-        event = self._enrich_fault_identity(event)
+        event = self._enrich_gpu_identity(self._enrich_fault_identity(event))
         if event.ingested_at is None:
             event = event.model_copy(update={"ingested_at": datetime.now(timezone.utc)})
         transaction = (
@@ -559,7 +632,7 @@ class FaultIngestionService:
 
     def ingest_sxid(self, event: SxidEvent) -> FaultPolicyDecision:
         report_processor_replay_phase("sxid_identity")
-        event = self._enrich_fault_identity(event)
+        event = self._enrich_gpu_identity(self._enrich_fault_identity(event))
         if event.ingested_at is None:
             event = event.model_copy(update={"ingested_at": datetime.now(timezone.utc)})
         report_processor_replay_phase("sxid_policy")

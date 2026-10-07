@@ -320,6 +320,27 @@ if node_id:
         ).model_dump(mode="json")
     except (KeyError, NotFoundError):
         pass
+# The node's GPU inventory is what fills a product-less XID on the control
+# plane; the XID-injecting cases refuse to inject when it cannot.
+gpu_identity = None
+if node_id:
+    inventory = store.get_gpu_inventory_snapshot(cluster_id, node_id)
+    if inventory is not None:
+        products = sorted({item.product for item in inventory.devices if item.product})
+        gpu_identity = {
+            "snapshot_id": inventory.snapshot_id,
+            "observed_at": inventory.observed_at.isoformat(),
+            "source": inventory.source.value,
+            "source_boot_id": inventory.source_boot_id,
+            "device_count": len(inventory.devices),
+            "products": products,
+            "product": (
+                products[0]
+                if len(products) == 1
+                and all(item.product for item in inventory.devices)
+                else None
+            ),
+        }
 submission = None
 if hyperpod_cluster and commands:
     restart_command = next(
@@ -373,6 +394,7 @@ print(json.dumps({
     "restart_budget": restart_budget,
     "agent": agent,
     "profile": profile,
+    "gpu_identity": gpu_identity,
     "submission": (
         submission.model_dump(mode="json")
         if submission is not None else None

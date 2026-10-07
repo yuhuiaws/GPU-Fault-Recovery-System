@@ -429,6 +429,9 @@ class _FakeStore:
     def get_agent(self, _cluster: str, _node: str):
         raise NotFoundError("no agent")
 
+    def get_gpu_inventory_snapshot(self, _cluster: str, _node: str):
+        return None
+
     def processor_queue_stats(self) -> dict[str, Any]:
         return {"depth": 0, "oldest_age_seconds": None}
 
@@ -487,11 +490,14 @@ def test_store_probe_filters_commands_by_the_resolved_workflow_by_default(
 def test_store_probe_passes_an_explicit_workflow_filter_to_the_store(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _payload, store = _run_store_probe(
+    payload, store = _run_store_probe(
         monkeypatch, capsys, [*_EIGHT_ARGUMENTS, "workflow-x,workflow-y"]
     )
 
     assert store.command_filters == [["workflow-x", "workflow-y"]]
+    assert payload["gpu_identity"] is None, (
+        "a node without an inventory snapshot reports no GPU identity"
+    )
 
 
 def test_store_snapshot_only_appends_the_filter_argument_when_given(

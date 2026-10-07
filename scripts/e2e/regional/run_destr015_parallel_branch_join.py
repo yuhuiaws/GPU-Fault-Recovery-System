@@ -80,6 +80,9 @@ from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
     workflow_errors,
     workload_errors,
 )
+from scripts.e2e.regional.gpu_identity_preflight import (  # noqa: E402
+    gpu_identity_errors,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -158,6 +161,7 @@ def preflight_errors(
     tests: dict[str, Any],
     control_env: dict[str, Any],
     runtime_identity_errors: list[str],
+    gpu_identities: dict[str, dict[str, Any] | None],
     arbiter_pods: dict[str, list[str]] | None = None,
     dns_nodes: list[str] | None = None,
 ) -> list[str]:
@@ -205,6 +209,14 @@ def preflight_errors(
             errors.append(
                 f"{node} carries a critical system workload: {business_workloads[node]}"
             )
+        # The injected XID must carry (or be given) a GPU product, or the
+        # policy quarantines the node as NOT_APPLICABLE instead of joining it
+        # into the two-branch workflow (eks-managed attempt 10, after a reboot).
+        errors.extend(
+            gpu_identity_errors(
+                node, gpu_identities.get(node), boot_id=snapshot.get("boot_id")
+            )
+        )
     errors.extend(workload_case.managed_owner_errors(profile))
     reset = workload_case.capability(profile, "gpuReset")
     if reset is None:
@@ -637,6 +649,9 @@ def read_only_preflight(
         "arbiter_pods": arbiter_pods,
         "dns_nodes": dns_nodes,
         "agents": {node: stores[node].get("agent") for node in settings.nodes},
+        "gpu_identities": {
+            node: stores[node].get("gpu_identity") for node in settings.nodes
+        },
         "store": state,
         "runtime_identity": runtime_identity,
         "focused_tests": tests,
@@ -659,6 +674,7 @@ def read_only_preflight(
         tests=tests,
         control_env=env,
         runtime_identity_errors=runtime_identity_errors(runtime_identity),
+        gpu_identities=result["gpu_identities"],
         arbiter_pods=arbiter_pods,
         dns_nodes=dns_nodes,
     )

@@ -17,6 +17,7 @@ from gpu_fault.collectors.gpu.inventory_cadence import (
     GpuInventoryCadence,
     TemperatureLimitProbe,
 )
+from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
@@ -114,6 +115,9 @@ class NvidiaSmiMetricsCollector:
         # ``run(timeout=15)`` kills it and then waits for ever, so the round
         # never ends and ``run()`` never gets to report the failure.
         self.runner = runner if runner is not None else BoundedProcessRunner()
+        # Started before the driver, the batches (and the inventory) would
+        # carry ``product=None`` for ever; re-discovered once nvidia-smi answers.
+        self._identity = GpuIdentityRefresher(context, runner=self.runner)
         self.inventory_interval_seconds = (
             inventory_interval_seconds
             if inventory_interval_seconds is not None
@@ -164,6 +168,7 @@ class NvidiaSmiMetricsCollector:
 
     def collect_once(self) -> GpuMetricBatch:
         started_at = self.now()
+        self.context = self._identity.refresh(started_at)
         self._inventory.deliver_if_due(
             self.sink,
             self.context,

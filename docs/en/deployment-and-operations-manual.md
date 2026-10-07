@@ -4374,10 +4374,10 @@ Every new GPU node ends up with the following host systemd services installed an
 
 | Service | Purpose | Default state |
 |---|---|---|
-| `gpu-fault-kernel-collector` | Continuously reads `/dev/kmsg` and reports NVIDIA XIDs | Enabled |
+| `gpu-fault-kernel-collector` | Continuously reads `/dev/kmsg` and reports NVIDIA XIDs (`After=network-online.target nvidia-persistenced.service`: starts after the driver's persistence daemon so the start-up GPU product discovery can succeed) | Enabled |
 | `gpu-fault-fabric-manager-collector` | Reads the Fabric Manager journal/log and reports SXIDs | Enabled |
-| `gpu-fault-metrics-collector` | Scrapes the DCGM Exporter and performs node-side edge filtering | Enabled |
-| `gpu-fault-host-collector` | Collects CPU, memory, disk, network, RDMA/EFA, GPU/EFA inventory | Enabled |
+| `gpu-fault-metrics-collector` | Scrapes the DCGM Exporter and performs node-side edge filtering (also `After=nvidia-persistenced.service`) | Enabled |
+| `gpu-fault-host-collector` | Collects CPU, memory, disk, network, RDMA/EFA, GPU/EFA inventory (also `After=nvidia-persistenced.service`) | Enabled |
 | `gpu-fault-node-agent` | Heartbeat, diagnostics and controlled node actions | Enabled |
 | `gpu-fault-gpu-persistence` | oneshot: `nvidia-smi -pm 1` turns on GPU persistence mode (`After=nvidia-persistenced.service`) | Enabled |
 | `gpu-fault-certificate-check.timer` | Periodically checks the remaining validity of the control-plane CA/leaf certificates: fires the same-named `.service` 5 minutes after boot and every 12 hours thereafter, with up to 10 minutes of random delay | Enabled when a control-plane CA (`--ca-certificate`) is configured |
@@ -7539,7 +7539,7 @@ that local inference.
 | `GPU_FAULT_RUNTIME_PROFILE_VERSION` | Recommended required |
 | `GPU_FAULT_CONTROL_PLANE_TOKEN` | Optional |
 | `GPU_FAULT_GPU_PRODUCT` | Optional fallback; must be filled in `disabled` mode |
-| `GPU_FAULT_GPU_PRODUCT_DISCOVERY` | `auto`; optionally `required/disabled`. Under `auto` when `nvidia-smi` is unavailable: if `GPU_FAULT_GPU_PRODUCT` is configured the configured value is used, otherwise it **starts without a product** and logs a WARNING (host telemetry keeps being delivered, and timeouts are reported as collection errors); only `required` refuses to start |
+| `GPU_FAULT_GPU_PRODUCT_DISCOVERY` | `auto`; optionally `required/disabled`. Under `auto` when `nvidia-smi` is unavailable: if `GPU_FAULT_GPU_PRODUCT` is configured the configured value is used, otherwise it **starts without a product** and logs a WARNING (host telemetry keeps being delivered, and timeouts are reported as collection errors); only `required` refuses to start. A kernel / metrics (DCGM, nvidia-smi) / Fabric Manager collector that started without a product retries the same discovery at most once per 60 s before it stamps the identity (`collectors/identity_refresh.py`); on success it logs the WARNING `GPU identity discovered after start`, and the XIDs/SXIDs/metric batches after it carry the product and the driver branch/CUDA version the configuration left empty; `disabled` never retries |
 | `GPU_FAULT_DRIVER_BRANCH` | Recommended |
 | `GPU_FAULT_CUDA_VERSION` | Recommended |
 | `GPU_FAULT_METRICS_INTERVAL_SECONDS` | DCGM 15, nvidia-smi 30 |
@@ -7564,6 +7564,8 @@ The system reads all visible GPUs, not just the first card, and normalises names
 - `auto`: prefers `nvidia-smi`; the explicit configuration may be used when the CLI is unavailable.
 - `required`: refuses to start when auto-discovery fails, with no fallback.
 - `disabled`: runs no command and uses only the explicit configuration.
+
+A collector that started without a product under `auto` does not stay blind: the kernel, metrics (DCGM/nvidia-smi) and Fabric Manager collectors retry the same `nvidia-smi` discovery every 60 s before stamping the identity (the kernel collector also in the idle gaps of its stream read); on success they log the WARNING `GPU identity discovered after start (attempt N): product=… driver_branch=… cuda_version=…` and fill the driver branch/CUDA version the configuration left empty; a failed retry only logs a WARNING and never holds a record (the three collector units are also ordered `After=nvidia-persistenced.service`, so a normal boot no longer starts them before the driver). The control plane has its own fallback: an XID/SXID without a product takes it from the node's GPU inventory when that inventory is from the **same boot, younger than 180 s** (`GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS`) and names one product on every device; the event's `gpu_identity_source` records `GPU_INVENTORY:<snapshot_id>`. Otherwise it records `NO_FRESH_GPU_INVENTORY` and the policy fails closed as before (`NOT_APPLICABLE … product UNKNOWN`, Administrator Operations §7).
 
 The legacy generic Kubernetes Collector manifests in the repository are not implemented as a delivered capability; their images and
 `REPLACE_WITH_GPU_PRODUCT` placeholders cannot be used in production. Regional HyperPod data-plane nodes are installed via the

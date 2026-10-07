@@ -16,6 +16,7 @@ from gpu_fault.collectors.gpu.inventory_cadence import (
     GpuInventoryCadence,
     TemperatureLimitProbe,
 )
+from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
@@ -328,6 +329,9 @@ class DcgmMetricsCollector:
         # waits for ever, and ``collect_once`` never returns -- with no watchdog
         # on the metrics unit, the node that matters most goes silent.
         self.runner = runner if runner is not None else BoundedProcessRunner()
+        # Started before the driver, the batches (and the inventory) would
+        # carry ``product=None`` for ever; re-discovered once nvidia-smi answers.
+        self._identity = GpuIdentityRefresher(context, runner=self.runner)
         self.edge_filter_enabled = (
             edge_filter_enabled
             if edge_filter_enabled is not None
@@ -916,6 +920,7 @@ class DcgmMetricsCollector:
         """
 
         observed_at = self.now()
+        self.context = self._identity.refresh(observed_at)
         self._inventory.deliver_if_due(
             self.sink,
             self.context,
