@@ -18,6 +18,10 @@ from gpu_fault_release.regional_release_aurora_refresh import (
     verify_aurora_refresh_snapshot,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_departed_nodes import (
+    departed_node_ids,
+    kubernetes_node_names,
+)
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
     ReleaseComponent,
@@ -1093,21 +1097,40 @@ def validate_agent_rollback_target(
     config_digest = str(identity.get("config_digest") or "")
     if not artifact or not config_digest:
         raise ReleaseError(f"{target.cluster_id} rollback Agent pins are incomplete")
+    items = gpu_node_items(release, target, fresh=True)
+    # A recorded node the cluster no longer has (spot reclaim mid-release) is
+    # verified against nothing: it is dropped from the expected set only on
+    # the proof ``regional_release_departed_nodes`` reads, and that proof is
+    # written into the release state beside this verification.
+    departed = departed_node_ids(
+        release,
+        target,
+        node_names,
+        phase="rollback-verifying",
+        what="rollback Agent node set",
+        present_node_names=kubernetes_node_names(items),
+    )
+    expected = tuple(sorted(name for name in node_names if name not in departed))
+    if not expected:
+        raise ReleaseError(
+            f"{target.cluster_id} rollback Agent node set is empty: every recorded "
+            "node departed"
+        )
     if not agents_converged(
-        gpu_node_items(release, target, fresh=True),
+        items,
         target,
         artifact,
         bundle_sha=identity.get("installer_bundle_sha256"),
         template_sha=identity.get("installer_template_sha256"),
         config_digest=config_digest,
         require_node_uid=True,
-        node_names=frozenset(node_names),
+        node_names=frozenset(expected),
     ):
         raise ReleaseError(f"{target.cluster_id} rollback node annotations mismatch")
     if not release._agent_heartbeats_converged(
         target,
-        node_count=len(node_names),
-        node_names=tuple(sorted(node_names)),
+        node_count=len(expected),
+        node_names=expected,
         artifact_sha=artifact,
         config_digest=config_digest,
         runtime_profile_version=str(identity.get("runtime_profile_version") or ""),

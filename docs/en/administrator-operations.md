@@ -1494,6 +1494,11 @@ above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
   2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
   3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.
      `--supersede-failed-transaction` does not apply to a transaction that is rolling back.
+  4. When every rollback stops at `<cluster> rollback validation failed: <cluster> rollback Agent heartbeat mismatch` and
+     that cluster lost a spot node mid-release, hand-edit nothing: resumed with a build carrying this fix, the verification
+     drops the departed node from the snapshot's expected set on a three-way proof (Kubernetes + provider inventory + Agent
+     record) and records it under `departed_nodes` (§10.2, "a spot reclaim mid-release"); an unproven departure refuses,
+     naming the node and the reason.
 - Converging a site that stopped in `partial-convergence` with the extra `status` header line `partial: N node(s)
   excluded by the product's own isolation: …` (the upgrade wave excluded nodes the product itself isolated -- a
   `gpu-fault.io/quarantined`/`gpu-fault.io/quiesce` taint or a cordon with `gpu-fault.io/incident-id` -- and rolled the
@@ -3568,6 +3573,52 @@ gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-depart
   --node hyperpod-<instance-id> --reference CHG-12345
 # 4. Deploy again; the control_api check now counts only Agents that were not retired
 make release-deploy SITE=/secure/path/site.yaml
+```
+
+**A spot reclaim mid-release (`rollback-verifying` stops at `rollback Agent heartbeat mismatch`).** When a release starts, the
+snapshot records each cluster's set of ACTIVE, lease-valid Agent nodes (`agent_identities[<cluster>].node_ids`); the rollback
+verification (`validate_agent_rollback_target`) requires **every** node of that set to have an ACTIVE, lease-valid Agent back on
+the previous pin -- the control-plane probe `agent_convergence` must report `active` and `aligned` both equal to the recorded
+node count. A node reclaimed mid-release never heartbeats again (its record is first a lease-expired `ACTIVE`, then `REVOKED`
+once retired), the count is short by one for good, and every resumed rollback stops at `<cluster> rollback validation failed:
+<cluster> rollback Agent heartbeat mismatch` -- the node-annotation check just before it looks only at Nodes Kubernetes has, so
+it passes. The same reclaim leaves the node's never-dispatched PENDING record, on which the fleet wave safety gate blocks the
+next upgrade wave and the automatic rollback alike with `fleet wave safety blocked by active destructive workflows`. The three
+gates now share one proof that the node left (`gpu_fault_release/regional_release_departed_nodes.py`, read read-only from the
+deploy host, never decided inside the Pod):
+
+- the node is absent from the cluster's Kubernetes Nodes (a NotReady or cordoned Node still exists and stays expected);
+- the provider no longer has it -- HyperPod: the instance of `hyperpod-<instance-id>` is not in `aws sagemaker
+  list-cluster-nodes`; eks-managed: the fleet-recorded `node_instance_id` is `terminated` or unknown to `aws ec2
+  describe-instances`;
+- its Agent record holds no live lease: `REVOKED`, absent, or expired (the control-plane probe `agent_lifecycle_facts`, unlike
+  `active_agent_identities`, reads such records). A record with a live lease means the node did not leave.
+
+A node meeting all three is dropped from the expected set of the rollback verification and of the resume validation (`resume
+node set drifted` no longer fires for it), and `node_count` shrinks with it; its never-dispatched record is listed separately
+at the wave gate -- the probe `rollout_wave_safety` reports such records (PENDING, no step execution, no owner / live lease /
+budget claim / remote command, past the ten-minute dispatch guard, still named by the incident) under
+`never_dispatched_destructive_workflows`, still counted in `destructive_workflow_count`, and the engine sets one aside on the
+proof alone. The proof is written to the release state as `departed_nodes` (`live_release.departed_nodes` in `status`: node,
+provider, instance id, the Kubernetes and provider readings with their times, the Agent record's state) and logged as
+`departed-node-excluded cluster=… phase=… nodes=… agents=… retire=…`. Anything short of it -- the instance still listed, the
+EC2 instance running or stopped, a failed AWS call, a node name without an instance id, an Agent with a live lease -- keeps
+failing closed, and the refusal names the node and the reason (`<cluster> rollback Agent node set names nodes missing from
+Kubernetes that are not provably departed: <node>: …`). The operator's exit, with no hand edit:
+
+```bash
+# 1. Rerun the same deploy unchanged with a build carrying this fix: the engine resumes the rollback, the verification
+#    counts only the nodes that exist and records departed_nodes, and the run ends with
+#    "rollback recovery completed; rerun deploy to start a new transaction" (exit code 2 is expected)
+# 2. If the node's Agent record is still ACTIVE (lease expired), retire it: the rollback verification does not require
+#    this (the evidence's retire=<node> and retire_hint remind you), the next release's control_api coverage check does
+#    (the fourth shape; ten-minute guard)
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents \
+  --node hyperpod-<instance-id> --dry-run
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents \
+  --node hyperpod-<instance-id> --reference CHG-12345
+# 3. Close the node's never-dispatched record and the ESCALATED incident in the complete sequence above (the release
+#    preflight's workflow_safety still lists it), then rerun the same deploy to open a new transaction
 ```
 
 When a manual migration or purge is required, first record the replicas, stop ingress, drain the consumers, then stop all writers.

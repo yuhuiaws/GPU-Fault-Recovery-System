@@ -46,6 +46,9 @@ from gpu_fault_release.regional_release_prerequisite_repair import (
     matches_pre_repair_state,
     prepare_prerequisite_repair,
 )
+from gpu_fault_release.regional_release_departed_nodes import (
+    departed_nodes_summary,
+)
 from gpu_fault_release.regional_release_product_isolation import (
     PRODUCT_ISOLATED_NODES_STATE_KEY,
     operator_recovery_commands,
@@ -922,6 +925,7 @@ def build_release_summary(
             # --accept-schema-change: the operator reads the snapshot id here.
             "schema_change_acceptance": state.get("schema_change_acceptance"),
             **product_isolation_summary(state),
+            **departed_nodes_summary(state),
         }
         result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:

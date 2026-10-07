@@ -909,6 +909,16 @@ server certificate for that stable hostname:
   probe `agent_heartbeat_barrier` accepts per-cluster `required_identities`) and a rollback restores the profile per cluster;
   a site stopped in `rollback-failed` reruns the same `deploy` to finish the rollback, then reruns it to open a new
   transaction (see Administrator Operations §5.0.2).
+- A node a spot reclaim removes mid-release: the rollback verification, the resume validation and the fleet wave safety gate
+  share one proof of departure, read read-only from the deploy host (`gpu_fault_release/regional_release_departed_nodes.py`):
+  the node is absent from the cluster's Kubernetes Nodes, the provider no longer has it (HyperPod: `aws sagemaker
+  list-cluster-nodes`; eks-managed: the fleet-recorded `node_instance_id` is `terminated` or unknown to `aws ec2
+  describe-instances`), and its Agent record holds no live lease (the control-plane probe `agent_lifecycle_facts` reads
+  `REVOKED` and expired records). A node that meets all three is dropped from the snapshot's expected `node_ids`; the wave probe
+  `rollout_wave_safety` lists never-dispatched PENDING destructive records separately as `never_dispatched_destructive_workflows`
+  (with the incident's cluster and nodes, still counted in `destructive_workflow_count`) and the engine sets one aside only on
+  that proof. The proof is written to the release state as `departed_nodes` and logged as `departed-node-excluded`; anything
+  short of it fails closed, naming the node and the reason (Administrator Operations §10.2, "a spot reclaim mid-release").
 - The certificate SAN must cover the full stable private hostname; a short CN alone is not enough.
 - Import the server certificate and private key into ACM and terminate TLS at the NLB 443 listener.
 - The NLB Security Group only allows TCP 443 from the NAT EIPs of each GPU cluster.

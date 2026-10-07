@@ -119,6 +119,86 @@ def test_resume_validator_rejects_node_set_drift() -> None:
         )
 
 
+def test_resume_narrows_the_recorded_node_set_by_a_proven_departure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, previous, loaded, plan, _metadata = _fixture()
+    previous["agent_identities"]["gpu-a"]["node_ids"] = ["node-a", "node-b"]
+    asked = []
+
+    def departed(_release, target, node_ids, *, phase, what, present_node_names=None):
+        asked.append(
+            (target.cluster_id, tuple(node_ids), phase, what, present_node_names)
+        )
+        return frozenset({"node-b"})
+
+    monkeypatch.setattr(RESUME, "departed_node_ids", departed)
+    validated = []
+    monkeypatch.setattr(
+        RESUME,
+        "validate_gpu_rollback_target",
+        lambda *_args, **_kwargs: validated.append(_kwargs["components"]),
+    )
+    plan = RESUME.ReleaseExecutionPlan(
+        nodes=(RESUME.ReleaseComponent.EXECUTOR, RESUME.ReleaseComponent.VERIFY)
+    )
+
+    RESUME.validate_resume_checkpoint(
+        release, loaded=loaded, previous=previous, plan=plan
+    )
+
+    assert asked == [
+        (
+            "gpu-a",
+            ("node-a", "node-b"),
+            "resume",
+            "resume previous node set",
+            ("node-a",),
+        )
+    ]
+    assert validated == [frozenset({RESUME.ReleaseComponent.EXECUTOR})]
+
+
+def test_resume_only_asks_about_departure_when_recorded_nodes_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, previous, loaded, plan, _metadata = _fixture()
+    setattr(release, "_target_node_names", lambda _target: ("node-a", "node-b"))
+    monkeypatch.setattr(
+        RESUME,
+        "departed_node_ids",
+        lambda *_args, **_kwargs: pytest.fail("an extra node is drift, not departure"),
+    )
+    plan = RESUME.ReleaseExecutionPlan(
+        nodes=(RESUME.ReleaseComponent.EXECUTOR, RESUME.ReleaseComponent.VERIFY)
+    )
+
+    with pytest.raises(RESUME.ReleaseError, match="node set drifted"):
+        RESUME.validate_resume_checkpoint(
+            release, loaded=loaded, previous=previous, plan=plan
+        )
+
+
+def test_resume_refuses_a_missing_node_whose_departure_is_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, previous, loaded, plan, _metadata = _fixture()
+    previous["agent_identities"]["gpu-a"]["node_ids"] = ["node-a", "node-b"]
+
+    def unproven(*_args, **_kwargs):
+        raise RESUME.ReleaseError("gpu-a resume previous node set names nodes ...")
+
+    monkeypatch.setattr(RESUME, "departed_node_ids", unproven)
+    plan = RESUME.ReleaseExecutionPlan(
+        nodes=(RESUME.ReleaseComponent.EXECUTOR, RESUME.ReleaseComponent.VERIFY)
+    )
+
+    with pytest.raises(RESUME.ReleaseError, match="not provably departed|names nodes"):
+        RESUME.validate_resume_checkpoint(
+            release, loaded=loaded, previous=previous, plan=plan
+        )
+
+
 def test_cpu_only_resume_does_not_require_gpu_previous_identity() -> None:
     release, previous, loaded, _plan, _metadata = _fixture()
     previous["agent_identities"] = {}

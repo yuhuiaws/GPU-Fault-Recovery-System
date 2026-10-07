@@ -37,6 +37,9 @@ from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
 )
+from gpu_fault_release.regional_release_departed_nodes import (
+    departed_workflow_exclusions,
+)
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
@@ -978,16 +981,28 @@ def ensure_rollout_wave_safe(
             )
         destructive_count = int(snapshot.get("destructive_workflow_count") or 0)
         if destructive_count:
-            raise ReleaseError(
-                "fleet wave safety blocked by active destructive workflows: "
-                + json.dumps(
-                    {
-                        "count": destructive_count,
-                        "request_ids": snapshot.get("destructive_workflows") or [],
-                    },
-                    sort_keys=True,
+            # A never-dispatched record of a node that provably left cannot be
+            # mid-anything on an Agent this wave restarts; the proof is the
+            # engine's, read from the deploy host, and is recorded.
+            excluded, notes = departed_workflow_exclusions(release, snapshot)
+            remaining = destructive_count - len(excluded)
+            if remaining > 0:
+                blocked: dict[str, Any] = {
+                    "count": remaining,
+                    "request_ids": [
+                        request_id
+                        for request_id in snapshot.get("destructive_workflows") or []
+                        if request_id not in excluded
+                    ],
+                }
+                if excluded:
+                    blocked["departed_node_workflows"] = sorted(excluded)
+                if notes:
+                    blocked["departure_unproven"] = list(notes)
+                raise ReleaseError(
+                    "fleet wave safety blocked by active destructive workflows: "
+                    + json.dumps(blocked, sort_keys=True)
                 )
-            )
         blockers = list(snapshot.get("agent_blockers") or [])
         blocker_count = int(snapshot.get("agent_blocker_count") or len(blockers))
         if not blocker_count:

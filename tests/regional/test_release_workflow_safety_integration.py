@@ -22,6 +22,10 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
+from gpu_fault.workflow_resolution import (
+    DEPARTED_NODE_PROOF_REASON,
+    never_dispatched_reconciliation_reasons,
+)
 from tests._builders import (
     fault_incident,
     workflow_request,
@@ -415,3 +419,105 @@ def test_the_wave_probe_sets_the_confirmed_parked_record_aside_too(
     report = wave_report(monkeypatch, capsys, unconfirmed, incident)
     assert report["destructive_workflow_count"] == 1
     assert report["operator_confirmed_destructive_workflow_count"] == 0
+
+
+DEPARTED_NODE = "hyperpod-i-0000000000000000"
+
+
+def _never_dispatched_pair(
+    *, age: timedelta = timedelta(minutes=11), dispatched: bool = False
+):
+    """The record the live 2026-10-06 reclaim left: PENDING, never handed out."""
+
+    created = datetime.now(timezone.utc) - age
+    workflow = workflow_request(
+        "workflow-nd",
+        "incident-nd",
+        status=WorkflowStatus.PENDING,
+        created_at=created,
+        official_steps=[
+            workflow_step(WorkflowOperation.RESET_GPU, node_ids=[DEPARTED_NODE])
+        ],
+        step_executions=(
+            [
+                workflow_step_execution(
+                    0, WorkflowOperation.RESET_GPU, WorkflowStepStatus.WAITING
+                )
+            ]
+            if dispatched
+            else []
+        ),
+    )
+    incident = fault_incident(
+        "incident-nd",
+        "event-nd",
+        cluster_id="gpu-a",
+        node_ids=[DEPARTED_NODE],
+        state=IncidentState.ESCALATED,
+        workflow_request_id=workflow.request_id,
+        fencing_token=workflow.fencing_token,
+    )
+    return workflow, incident
+
+
+def test_the_wave_probe_lists_a_never_dispatched_record_with_its_nodes(
+    monkeypatch, capsys
+) -> None:
+    workflow, incident = _never_dispatched_pair()
+
+    report = wave_report(monkeypatch, capsys, workflow, incident)
+
+    assert report["destructive_workflow_count"] == 1, (
+        "the probe reports; setting the record aside is the engine's decision"
+    )
+    assert report["never_dispatched_destructive_workflow_count"] == 1
+    assert report["never_dispatched_destructive_workflows"] == [
+        {
+            "request_id": "workflow-nd",
+            "incident_id": "incident-nd",
+            "cluster_id": "gpu-a",
+            "node_ids": [DEPARTED_NODE],
+            "created_at": workflow.created_at.isoformat(),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "condition", ["dispatched", "young", "remote-command", "other-generation"]
+)
+def test_the_wave_probe_lists_only_records_no_adapter_ever_held(
+    monkeypatch, capsys, condition
+) -> None:
+    workflow, incident = _never_dispatched_pair(
+        dispatched=condition == "dispatched",
+        age=timedelta(minutes=1) if condition == "young" else timedelta(minutes=11),
+    )
+    commands = []
+    if condition == "remote-command":
+        commands = [
+            SimpleNamespace(
+                workflow_request_id=workflow.request_id,
+                status=RemoteCommandStatus.SUCCEEDED,
+            )
+        ]
+    if condition == "other-generation":
+        incident = incident.model_copy(update={"workflow_request_id": "workflow-x"})
+
+    report = wave_report(monkeypatch, capsys, workflow, incident, commands)
+
+    assert report["destructive_workflow_count"] == 1
+    assert report["never_dispatched_destructive_workflows"] == []
+
+
+def test_the_probe_and_the_product_agree_on_what_was_never_dispatched() -> None:
+    now = datetime.now(timezone.utc)
+    listed, incident = _never_dispatched_pair()
+    assert never_dispatched_reconciliation_reasons(
+        listed, incident, [], evaluated_at=now
+    ) == [DEPARTED_NODE_PROOF_REASON], (
+        "the record the probe lists lacks only the proof the engine then reads"
+    )
+    held, incident = _never_dispatched_pair(dispatched=True)
+    assert never_dispatched_reconciliation_reasons(
+        held, incident, [], evaluated_at=now
+    ) != [DEPARTED_NODE_PROOF_REASON]

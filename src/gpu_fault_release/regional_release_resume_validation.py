@@ -25,6 +25,7 @@ from gpu_fault_release.regional_release_profile_model import (
     target_runtime_profile_version,
 )
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
+from gpu_fault_release.regional_release_departed_nodes import departed_node_ids
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 
 GPU_COMPONENTS = frozenset(
@@ -512,7 +513,20 @@ def validate_resume_checkpoint(
         )
         if not node_names:
             raise ReleaseError(f"{target.cluster_id} resume previous node set is empty")
-        if set(release._target_node_names(target)) != set(node_names):
+        live_names = tuple(release._target_node_names(target))
+        if set(live_names) < set(node_names):
+            # Recorded nodes the cluster lost mid-release: only a proven
+            # departure narrows the set; anything else is drift.
+            departed = departed_node_ids(
+                release,
+                target,
+                node_names,
+                phase="resume",
+                what="resume previous node set",
+                present_node_names=live_names,
+            )
+            node_names = tuple(name for name in node_names if name not in departed)
+        if set(live_names) != set(node_names):
             raise ReleaseError(f"{target.cluster_id} resume node set drifted")
         if target.cluster_id in completed:
             _validate_candidate_components(
