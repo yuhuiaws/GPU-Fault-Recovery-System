@@ -9,6 +9,7 @@ import pytest
 from gpu_fault.app import ApplicationContext
 from gpu_fault.fleet import AgentRecord
 from gpu_fault.models import WorkflowOperation
+from gpu_fault.regional import RegionalClusterRegistration
 from scripts.perf import benchmark_regional_action_executor as benchmark
 from scripts.perf import regional_action_capacity_suite as suite
 from tests._builders import build_store
@@ -769,4 +770,159 @@ def test_run_heartbeat_refresher_is_throttled_to_its_interval() -> None:
     assert len(calls) == 3, "one refresh per 30 s window: t=0, t=31, t=62"
     assert calls[0] == {"run_id": "run-a", "clusters": 3, "lease_seconds": 900}, (
         "the refresh carries the run scope and lease"
+    )
+
+
+def _registration(cluster_id: str, provider: str) -> RegionalClusterRegistration:
+    return RegionalClusterRegistration(
+        cluster_id=cluster_id,
+        region="us-west-2",
+        hyperpod_cluster_name=cluster_id if provider == "hyperpod" else "",
+        eks_cluster_arn=f"arn:aws:eks:us-west-2:123456789012:cluster/{cluster_id}",
+        provider=provider,
+        token_sha256="e" * 64,
+        allowed_namespaces=["training"],
+        agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
+    )
+
+
+def _live_agent(
+    cluster_id: str, *, seen_offset_seconds: int, profile: str
+) -> AgentRecord:
+    return AgentRecord(
+        cluster_id=cluster_id,
+        node_id=f"node-{cluster_id}",
+        endpoint=f"http://{cluster_id}:9099",
+        agent_protocol_version=3,
+        node_action_key_version=2,
+        agent_version="0.10.0",
+        artifact_sha256="a" * 64,
+        compatibility_digest="b" * 64,
+        policy_version="catalog-v1",
+        runtime_profile_version=profile,
+        config_digest="c" * 64,
+        allowed_operations=[WorkflowOperation.RESET_GPU],
+        first_seen_at=NOW - timedelta(minutes=5),
+        last_seen_at=NOW + timedelta(seconds=seen_offset_seconds),
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+
+
+def _mixed_site_context() -> ApplicationContext:
+    context = ApplicationContext(store=build_store())
+    context.store.save_regional_cluster(_registration("hp-cluster", "hyperpod"))
+    context.store.save_regional_cluster(_registration("gpu-eks-cluster", "eks-managed"))
+    context.store.save_agent(
+        _live_agent("hp-cluster", seen_offset_seconds=0, profile="hyperpod-v1")
+    )
+    # The eks node reported last: the old "most recently seen" rule chose it.
+    context.store.save_agent(
+        _live_agent(
+            "gpu-eks-cluster", seen_offset_seconds=30, profile="regional-eks-316d"
+        )
+    )
+    return context
+
+
+def test_seed_takes_its_agent_template_from_the_synthetic_clusters_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live mixed site, integrated-32-disabled: the most recently seen Agent was
+    the eks-managed node, every synthetic workflow was planned against the eks
+    profile, RESTART_NODE/REPLACE_NODE belonged to gpu-fault-eks-adapter and the
+    simulated executor never claimed them. The synthetic clusters register as
+    hyperpod, so the template must be a hyperpod cluster's Agent."""
+    monkeypatch.delenv("ACTION_AGENT_IDENTITY_JSON", raising=False)
+    monkeypatch.delenv(MODULE.SYNTHETIC_PROVIDER_ENV, raising=False)
+    context = _mixed_site_context()
+
+    template, identity, source = MODULE.agent_source(
+        context, NOW + timedelta(seconds=60)
+    )
+
+    assert (
+        template.cluster_id,
+        template.runtime_profile_version,
+        identity,
+        source,
+    ) == ("hp-cluster", "hyperpod-v1", None, "live-agent"), (
+        "the hyperpod Agent is the template although the eks Agent reported later"
+    )
+
+    monkeypatch.setenv(MODULE.SYNTHETIC_PROVIDER_ENV, "eks-managed")
+    template, _identity, _source = MODULE.agent_source(
+        context, NOW + timedelta(seconds=60)
+    )
+    assert template.cluster_id == "gpu-eks-cluster", (
+        "an eks synthetic set takes the eks Agent"
+    )
+
+    monkeypatch.setenv(MODULE.SYNTHETIC_PROVIDER_ENV, "hyperpod")
+    eks_only = ApplicationContext(store=build_store())
+    eks_only.store.save_regional_cluster(
+        _registration("gpu-eks-cluster", "eks-managed")
+    )
+    eks_only.store.save_agent(
+        _live_agent(
+            "gpu-eks-cluster", seen_offset_seconds=0, profile="regional-eks-316d"
+        )
+    )
+    with pytest.raises(RuntimeError, match="hyperpod cluster .* eks-managed"):
+        MODULE.agent_source(eks_only, NOW + timedelta(seconds=60))
+
+    monkeypatch.setenv(MODULE.SYNTHETIC_PROVIDER_ENV, "openstack")
+    with pytest.raises(RuntimeError, match="not a cluster provider"):
+        MODULE.agent_source(context, NOW + timedelta(seconds=60))
+
+
+def _profile_with_reboot_owner(version: str, owner: str):
+    from gpu_fault.app import default_simulated_profile
+    from gpu_fault.models import CapabilityName
+
+    profile = default_simulated_profile()
+    return profile.model_copy(
+        update={
+            "profile_version": version,
+            "capabilities": [
+                claim.model_copy(update={"owner": owner})
+                if claim.capability
+                in {CapabilityName.NODE_REBOOT, CapabilityName.NODE_REPLACE}
+                else claim
+                for claim in profile.capabilities
+            ],
+        }
+    )
+
+
+def test_seed_refuses_a_profile_whose_reboot_owner_is_the_other_provider() -> None:
+    context = ApplicationContext(store=build_store())
+    context.store.save_profile(
+        _profile_with_reboot_owner("hyperpod-v1", "gpu-fault-hyperpod-adapter")
+    )
+    context.store.save_profile(
+        _profile_with_reboot_owner("regional-eks-316d", "gpu-fault-eks-adapter")
+    )
+
+    assert MODULE.verify_profile_provider(context, "hyperpod-v1", "hyperpod") == {
+        "synthetic_provider": "hyperpod",
+        "node_reboot_owner": "gpu-fault-hyperpod-adapter",
+    }
+    assert MODULE.verify_profile_provider(
+        context, "regional-eks-316d", "eks-managed"
+    ) == {
+        "synthetic_provider": "eks-managed",
+        "node_reboot_owner": "gpu-fault-eks-adapter",
+    }
+    with pytest.raises(RuntimeError, match="gpu-fault-eks-adapter.*hyperpod"):
+        MODULE.verify_profile_provider(context, "regional-eks-316d", "hyperpod")
+    with pytest.raises(RuntimeError, match="not registered"):
+        MODULE.verify_profile_provider(context, "missing-v1", "hyperpod")
+
+
+def test_simulated_executor_advertises_every_provider_lifecycle_owner() -> None:
+    from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
+
+    assert set(PROVIDER_NODE_REBOOT_OWNERS.values()) <= set(benchmark.OWNERS), (
+        "a RESTART_NODE/REPLACE_NODE of either provider must be claimable by the "
+        "simulated executor"
     )

@@ -111,6 +111,15 @@ synthetic Agent identity and simulated Executor claims from the isolated CPU con
 release state and the current process's required pins; when the two disagree it fails closed.
 Only live registry mode still requires the real data-plane Executor Deployment and the active
 Agent identity to match the release pin.
+In live registry mode the synthetic Agent template is taken from a real Agent **of the same provider as the
+synthetic registrations** (they register as `hyperpod`; `ACTION_SYNTHETIC_PROVIDER` changes it): on a mixed site an
+Agent of the other provider is never chosen, however recent. Whether the template comes from a live Agent or from the
+release state, the seed checks that the Runtime Profile's `nodeReboot` owner is that provider's lifecycle adapter
+(`PROVIDER_NODE_REBOOT_OWNERS`) and fails closed before any load is sent, recording `synthetic_provider` and
+`node_reboot_owner` in the seed summary. Previously, on a mixed site, the template fell on an eks-managed node, every
+synthetic workflow was planned against the eks profile, RESTART_NODE/REPLACE_NODE belonged to `gpu-fault-eks-adapter`,
+the simulated executor never claimed them and the unclaimed command held every other workflow of the cluster PENDING.
+The simulated executor now advertises both providers' lifecycle adapter owners.
 
 Only when the formal `gpu-fault-system` control plane is genuinely approved for use may the
 command supply both:

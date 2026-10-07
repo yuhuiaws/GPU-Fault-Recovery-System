@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS, cluster_provider
 from gpu_fault.collector_requirements import required_collectors_for_agent
 from gpu_fault.fleet import AgentLifecycleState, AgentRecord
 from gpu_fault.gpu_metrics import (
@@ -15,6 +16,8 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSource,
 )
 from gpu_fault.models import (
+    CapabilityMode,
+    CapabilityName,
     FaultIncident,
     IncidentState,
     WorkflowOperation,
@@ -22,12 +25,23 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
 )
+from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from gpu_fault.telemetry_models import TelemetryMetricLatest
 
 KUBERNETES_OWNER = "gpu-fault-kubernetes-adapter"
 NODE_OWNER = "gpu-fault-node-agent"
 HYPERPOD_OWNER = "gpu-fault-hyperpod-adapter"
+#: The provider the synthetic ``perf-cap-*`` clusters are registered as
+#: (``regional_capacity_registry.synthetic_cluster_entry`` registers them
+#: without a provider, which the registry reads as ``hyperpod``). The Agent
+#: template, and therefore the Runtime Profile every synthetic workflow is
+#: planned against, must come from a cluster of this provider: a mixed site's
+#: most recently seen Agent was an eks-managed node, its profile owned
+#: RESTART_NODE/REPLACE_NODE through ``gpu-fault-eks-adapter``, no simulated
+#: executor claimed them, and the integrated suite stalled after
+#: STOP_WORKLOADS with every other workflow of the cluster held PENDING.
+SYNTHETIC_PROVIDER_ENV = "ACTION_SYNTHETIC_PROVIDER"
 IDENTITY_KEYS = {
     "agent_protocol_version",
     "node_action_key_version",
@@ -131,6 +145,27 @@ def release_bound_synthetic_agent(
     )
 
 
+def synthetic_provider() -> str:
+    """The provider the synthetic clusters are registered as (default hyperpod)."""
+
+    try:
+        return cluster_provider(os.getenv(SYNTHETIC_PROVIDER_ENV) or None).value
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{SYNTHETIC_PROVIDER_ENV} is not a cluster provider: {exc}"
+        ) from exc
+
+
+def agent_cluster_provider(context: ApplicationContext, cluster_id: str) -> str | None:
+    """The registered provider of ``cluster_id``, or ``None`` when unregistered."""
+
+    try:
+        registration = context.store.get_regional_cluster(cluster_id)
+    except (NotFoundError, KeyError):
+        return None
+    return cluster_provider(registration.provider).value
+
+
 def agent_source(
     context: ApplicationContext,
     now: datetime,
@@ -143,6 +178,7 @@ def agent_source(
                 "release-bound synthetic Agent identity is not an object"
             )
         return None, identity, "release-state"
+    provider = synthetic_provider()
     live_agents = [
         agent
         for agent in context.store.list_agents()
@@ -151,11 +187,62 @@ def agent_source(
         and agent.lease_expires_at is not None
         and agent.lease_expires_at > now
     ]
-    if not live_agents:
+    # Only an Agent of the synthetic clusters' own provider is a template: its
+    # Runtime Profile names that provider's lifecycle adapter as the owner of
+    # RESTART_NODE/REPLACE_NODE, which is what the simulated executor claims.
+    providers = {
+        agent.cluster_id: agent_cluster_provider(context, agent.cluster_id)
+        for agent in live_agents
+    }
+    matching = [
+        agent for agent in live_agents if providers[agent.cluster_id] == provider
+    ]
+    if not matching:
+        seen = sorted({str(value) for value in providers.values()}) or ["none"]
         raise RuntimeError(
-            "action capacity seed requires one live production Agent identity"
+            "action capacity seed requires one live production Agent on a "
+            f"{provider} cluster (the synthetic clusters' provider); live Agents "
+            f"found on clusters of provider: {', '.join(seen)}"
         )
-    return max(live_agents, key=lambda item: item.last_seen_at), None, "live-agent"
+    return max(matching, key=lambda item: item.last_seen_at), None, "live-agent"
+
+
+def verify_profile_provider(
+    context: ApplicationContext, runtime_profile_version: str, provider: str
+) -> dict[str, str]:
+    """Refuse a Runtime Profile whose reboot owner is not ``provider``'s adapter.
+
+    Every synthetic workflow is planned against this profile; a RESTART_NODE or
+    REPLACE_NODE owned by the other provider's adapter is never claimed by the
+    simulated executor and holds the whole cluster behind the unclaimed
+    command (the mixed-site integrated run). Checked before any load is sent.
+    """
+
+    expected = PROVIDER_NODE_REBOOT_OWNERS[provider]
+    try:
+        profile = context.store.get_profile(runtime_profile_version)
+    except NotFoundError as exc:
+        raise RuntimeError(
+            f"synthetic Agent runtime Profile {runtime_profile_version} is not "
+            "registered on the control plane"
+        ) from exc
+    owners = sorted(
+        {
+            str(claim.owner)
+            for claim in profile.capabilities
+            if claim.capability is CapabilityName.NODE_REBOOT
+            and claim.mode in {CapabilityMode.OWN, CapabilityMode.DELEGATE}
+        }
+    )
+    if owners != [expected]:
+        raise RuntimeError(
+            f"synthetic Agent runtime Profile {runtime_profile_version} owns "
+            f"nodeReboot through {owners or ['nobody']}, but the synthetic clusters "
+            f"are {provider} clusters whose lifecycle adapter is {expected}: on a "
+            f"mixed site the Agent template must come from a {provider} cluster "
+            f"(or set {SYNTHETIC_PROVIDER_ENV})"
+        )
+    return {"synthetic_provider": provider, "node_reboot_owner": expected}
 
 
 def save_synthetic_agent(
@@ -542,6 +629,9 @@ def main() -> None:
             runtime_profile_version = ""
         if not runtime_profile_version:
             raise RuntimeError("synthetic Agent runtime Profile is missing")
+        provider_facts = verify_profile_provider(
+            context, runtime_profile_version, synthetic_provider()
+        )
         if seed_mode in {"correlated-agents", "integrated-agents"}:
             workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "2"))
             for cluster_index in range(clusters):
@@ -581,6 +671,7 @@ def main() -> None:
                         "agents_created": agents_created,
                         "agent_identity_source": identity_source,
                         "runtime_profile_version": runtime_profile_version,
+                        **provider_facts,
                     },
                     sort_keys=True,
                 )
@@ -661,6 +752,7 @@ def main() -> None:
                 "agents_created": agents_created,
                 "agent_identity_source": identity_source,
                 "runtime_profile_version": runtime_profile_version,
+                **provider_facts,
             },
             sort_keys=True,
         )

@@ -11,10 +11,15 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from urllib import error, request
 
+# Every owner a planned step can carry, both providers' lifecycle adapters
+# included: the simulator stands in for whichever executor the synthetic
+# cluster's profile names (a profile from the other provider's cluster still
+# fails the seed's provider check; this list is not what hides that).
 OWNERS = [
     "gpu-fault-kubernetes-adapter",
     "gpu-fault-node-agent",
     "gpu-fault-hyperpod-adapter",
+    "gpu-fault-eks-adapter",
     "gpu-fault-validation-adapter",
 ]
 DELAYS = {
