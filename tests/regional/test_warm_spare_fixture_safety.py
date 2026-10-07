@@ -374,3 +374,72 @@ def test_failover_cleanup_does_not_release_resources_after_unproved_quiescence(
     assert result["workload_and_spare_cleanup_deferred"] is True
     assert result["errors"]
     assert calls == ["prewarm"]
+
+
+class _Coordinator:
+    def __init__(self) -> None:
+        self.released: list[tuple[list[str], str]] = []
+
+    def release(self, nodes: list[str], incident_id: str) -> None:
+        self.released.append((list(nodes), incident_id))
+
+
+def _release_spares(monkeypatch: pytest.MonkeyPatch, capsys: Any, adapters: list[Any]):
+    import gpu_fault.cluster_executor as cluster_executor
+
+    monkeypatch.setattr(
+        cluster_executor,
+        "executor_from_environment",
+        lambda: SimpleNamespace(adapters=adapters),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["release", json.dumps(["spare-a"]), "incident-owned"]
+    )
+    exec(compile(warm.RELEASE_SPARES, "<release-spares>", "exec"), {"__name__": "t"})
+    return json.loads(capsys.readouterr().out.splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    "owner", ["gpu-fault-hyperpod-adapter", "gpu-fault-eks-adapter"]
+)
+def test_release_spares_uses_whichever_provider_adapter_holds_the_coordinator(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any, owner: str
+) -> None:
+    """Live 2026-10-07 (gpu-eks-cluster DESTR-003 attempt 9): keyed on the
+    HyperPod owner string the probe raised StopIteration on the eks executor
+    and the handed-over spare stayed ALLOCATED and reserved."""
+
+    coordinator = _Coordinator()
+    adapters = [
+        SimpleNamespace(owner="gpu-fault-kubernetes-adapter"),
+        SimpleNamespace(owner="gpu-fault-node-agent", spare_coordinator=None),
+        SimpleNamespace(owner=owner, spare_coordinator=coordinator),
+    ]
+
+    report = _release_spares(monkeypatch, capsys, adapters)
+
+    assert coordinator.released == [(["spare-a"], "incident-owned")]
+    assert report == {
+        "adapter_owner": owner,
+        "incident_id": "incident-owned",
+        "released_nodes": ["spare-a"],
+    }
+
+
+def test_release_spares_names_the_adapters_when_no_coordinator_exists(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    adapters = [
+        SimpleNamespace(owner="gpu-fault-kubernetes-adapter"),
+        SimpleNamespace(owner="gpu-fault-eks-adapter", spare_coordinator=None),
+    ]
+
+    with pytest.raises(
+        RuntimeError, match="no lifecycle adapter with a spare"
+    ) as failed:
+        _release_spares(monkeypatch, capsys, adapters)
+
+    assert "gpu-fault-eks-adapter" in str(failed.value), str(failed.value)
+    assert "gpu-fault-hyperpod-adapter" not in warm.RELEASE_SPARES, (
+        "the release must not be keyed on one provider's owner string"
+    )

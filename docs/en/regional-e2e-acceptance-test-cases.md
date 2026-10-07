@@ -9139,6 +9139,14 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   (`provider_lifecycle_owner`): a `REPLACE_NODE` owned by the other provider's adapter is refused at plan time as
   BLOCKED instead of waiting 15 minutes unclaimed and draining the node, which is what an earlier `eks-managed` attempt
   did when the observation carried the site's `hyperpod-v1`.
+  The cleanup's spare release takes the same product path -- inside the GPU cluster's executor Pod it calls the provider
+  lifecycle adapter's own `spare_coordinator.release` (re-cordon, drop `spare-reservation`/`spare-reserved-at`,
+  `spare-pool-state` back to `AVAILABLE`) -- selecting the adapter by "holds a spare coordinator" rather than by the
+  HyperPod owner string (on `eks-managed` attempt 9 the latter raised StopIteration in the Pod and the spare stayed
+  ALLOCATED and reserved, refusing DESTR-008/014 and `config spare --release` after it); the probe tries the Ready Pods in
+  turn, an exec kubectl refuses before the script runs moves to the next Pod without spending an attempt, and the failure
+  text carries a safe failure class (`[StopIteration]`, `[kubectl: unable to upgrade connection]`) with `app=`/`pods
+  tried:` while values stay redacted.
 - Purpose: **this is the only node replacement path this system supports** (`DESTR-004` is retired).
   The fault node is isolated but **not destroyed**; the workload migrates to a warm-spare GPU
   node that the customer provided in advance and brought under monitoring. The cluster size is

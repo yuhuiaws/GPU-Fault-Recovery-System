@@ -275,3 +275,44 @@ def test_pod_python_execs_into_a_running_pod_only_when_told(
 
     assert selections == ["ready", "running"], "Ready is the default selection"
     assert "ready-pod" in calls[0] and "running-pod" in calls[1], calls
+
+
+def test_command_failure_names_the_exception_class_but_not_its_message() -> None:
+    """Live 2026-10-07 (gpu-eks-cluster DESTR-003 cleanup): the spare release
+    probe raised StopIteration inside the executor Pod and the evidence read
+    only ``command failed (1): <sensitive output redacted> (step: kubectl exec)``.
+    The class of the failure is not a value; the message may be."""
+
+    from scripts.e2e.regional.regional_commands import (
+        RegionalCommandFailed,
+        exec_refused_before_script,
+        failure_class,
+    )
+
+    secret = "only-a-local-traceback-fixture-secret"
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "<stdin>", line 9, in <module>\n'
+        f"RuntimeError: no spare coordinator for {secret}\n"
+    )
+    failed = RegionalCommandFailed(1, traceback, ["kubectl", "exec", "-i", "pod"])
+    assert "[RuntimeError]" in str(failed), str(failed)
+    assert "(step: kubectl exec)" in str(failed), str(failed)
+    assert secret not in str(failed), "the message of the exception is a value"
+    assert exec_refused_before_script(failed) is False, (
+        "the script ran and raised; another Pod would run it again"
+    )
+
+    assert failure_class("Traceback ...\nStopIteration\n") == "StopIteration"
+    refused = RegionalCommandFailed(
+        1,
+        f"error: unable to upgrade connection: container not found ({secret})",
+        ["kubectl", "exec", "-i", "pod"],
+    )
+    assert "[kubectl: unable to upgrade connection]" in str(refused), str(refused)
+    assert secret not in str(refused)
+    assert exec_refused_before_script(refused) is True, (
+        "kubectl never attached; the script did not run"
+    )
+    assert failure_class("") == "" and failure_class(None) == ""
+    assert failure_class(f"some unclassified text {secret}") == ""

@@ -89,15 +89,72 @@ def command_step_label(command: Sequence[str]) -> str:
     return " ".join(label)
 
 
+#: The last line of a Python traceback names the exception class; the class
+#: is not a value and may be shown beside redacted output.
+_EXCEPTION_CLASS = re.compile(
+    r"^(?P<name>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Exit|Interrupt|Iteration|"
+    r"Warning|Timeout|Refused|Denied|Failed|Conflict|NotFound))\b"
+)
+#: kubectl's own failure heads for an exec that never reached the script.
+_KUBECTL_FAILURE_HEADS = (
+    ("unable to upgrade connection", "unable to upgrade connection"),
+    ("container not found", "container not found"),
+    ("error dialing backend", "error dialing backend"),
+    ("not found", "not found"),
+    ("Unauthorized", "Unauthorized"),
+    ("Forbidden", "Forbidden"),
+    ("no such host", "no such host"),
+    ("connection refused", "connection refused"),
+)
+
+
+def failure_class(stderr: str | None) -> str:
+    """What kind of failure ``stderr`` describes, without any of its values.
+
+    A Python traceback's last line names the exception class (``StopIteration``,
+    ``RuntimeError``); a kubectl exec that never reached the script fails with
+    one of a few fixed heads. Either is safe beside redacted output and tells
+    the operator which half failed. Live 2026-10-07 (gpu-eks-cluster DESTR-003):
+    the spare release probe raised StopIteration inside the executor Pod and
+    the evidence read only ``command failed (1): <sensitive output redacted>
+    (step: kubectl exec)``.
+    """
+
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    match = _EXCEPTION_CLASS.match(lines[-1])
+    if match is not None:
+        return match.group("name")
+    text = "\n".join(lines)
+    for needle, label in _KUBECTL_FAILURE_HEADS:
+        if re.search(re.escape(needle), text, re.IGNORECASE):
+            return f"kubectl: {label}"
+    return ""
+
+
+def exec_refused_before_script(error: BaseException) -> bool:
+    """Whether a Pod exec failed before the script ran: kubectl could not reach
+    or attach to the Pod (``kubectl:`` failure class, or the replica is gone).
+    Such an exec repeated on another Pod repeats nothing."""
+
+    if bool(getattr(error, "replica_disappeared", False)):
+        return True
+    return str(getattr(error, "failure_class", "") or "").startswith("kubectl:")
+
+
 class RegionalCommandFailed(RegionalFixtureError):
     def __init__(
         self, returncode: int, stderr: str, command: Sequence[str] | None = None
     ) -> None:
         self.replica_disappeared = replica_vanished(RuntimeError(stderr))
         self.step = command_step_label(command) if command else ""
+        self.failure_class = failure_class(stderr)
         message = f"command failed ({returncode}): " + diagnostic_text(
             stderr, sensitive=True
         )
+        if self.failure_class:
+            message += f" [{self.failure_class}]"
         if self.step:
             message += f" (step: {self.step})"
         super().__init__(message)

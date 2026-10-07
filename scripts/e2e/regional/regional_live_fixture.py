@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -29,8 +29,10 @@ from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
 from scripts.e2e.regional.regional_commands import (  # noqa: E402
     RegionalCommandTimeout as RegionalCommandTimeout,
     RegionalFixtureError as RegionalFixtureError,
+    exec_refused_before_script,
     run_fixture_command,
 )
+from scripts.e2e.regional.regional_pod_exec import exec_pod_script  # noqa: E402
 from scripts.e2e.regional import regional_pod_inventory  # noqa: E402
 from scripts.e2e.regional.release_pins import (  # noqa: E402
     RELEASE_METADATA_CONFIGMAP,
@@ -810,70 +812,63 @@ class RegionalLiveFixture:
         if attempts < 1:
             raise ValueError("attempts must be at least 1")
         last_error: Exception | None = None
+        tried: list[str] = []
         for _attempt in range(attempts):
-            try:
-                pod = self.ready_pod(plane, app) if require_ready else None
-                if pod is None:
-                    pod = regional_pod_inventory.running_pod(self, plane, app)
-                output = self.kubectl(
-                    plane,
-                    "exec",
-                    "-i",
-                    pod,
-                    "--",
-                    component_python(plane),
-                    "-",
-                    *arguments,
-                    input_text=script,
-                    timeout=timeout,
+            # The component's Pods in turn (``pod_candidates``): an exec kubectl
+            # refused before the script ran moves to the next Pod within the
+            # same attempt; the script failing is final for the attempt.
+            refused: Exception | None = None
+            for pod in regional_pod_inventory.pod_candidates(
+                self, plane, app, require_ready=require_ready
+            ):
+                tried.append(pod)
+                try:
+                    return exec_pod_script(
+                        self,
+                        plane,
+                        pod,
+                        script,
+                        arguments,
+                        interpreter=component_python(plane),
+                        timeout=timeout,
+                    )
+                except RegionalCommandTimeout as exc:
+                    raise RegionalFixtureError(
+                        f"{plane} Pod probe timed out; not retried because the "
+                        f"script may already have run: {exc}"
+                    ) from exc
+                except Exception as exc:
+                    if exec_refused_before_script(exc):
+                        refused = exc
+                        continue
+                    last_error = exc
+                    break
+            else:
+                last_error = refused or RegionalFixtureError(
+                    f"no {'Ready' if require_ready else 'Running'} {plane} Pod "
+                    f"for app={app}"
                 )
-                value = json.loads(output.splitlines()[-1])
-                if not isinstance(value, dict):
-                    raise RegionalFixtureError("Pod probe did not return a JSON object")
-                return cast(dict[str, Any], value)
-            except RegionalCommandTimeout as exc:
-                raise RegionalFixtureError(
-                    f"{plane} Pod probe timed out; not retried because the script "
-                    f"may already have run: {exc}"
-                ) from exc
-            except Exception as exc:
-                last_error = exc
-                if _attempt + 1 < attempts:
-                    time.sleep(1)
-        raise RegionalFixtureError(f"{plane} Pod probe failed: {last_error}")
-
-    def cpu_python(
-        self,
-        script: str,
-        *arguments: str,
-        timeout: int = 180,
-        attempts: int = 3,
-    ) -> dict[str, Any]:
-        return self.pod_python(
-            "cpu",
-            "gpu-fault-api-ha",
-            script,
-            *arguments,
-            timeout=timeout,
-            attempts=attempts,
+            if _attempt + 1 < attempts:
+                time.sleep(1)
+        raise RegionalFixtureError(
+            f"{plane} Pod probe failed (app={app}, pods tried: {len(tried)}): "
+            f"{last_error}"
         )
 
-    def executor_python(
-        self,
-        script: str,
-        *arguments: str,
-        timeout: int = 180,
-        attempts: int = 3,
-        require_ready: bool = True,
+    # ``pod_python`` for the two components every runner probes, with the
+    # probe defaults spelled out so a recording double sees them.
+    def cpu_python(
+        self, script: str, *arguments: str, **options: Any
     ) -> dict[str, Any]:
+        options = {"timeout": 180, "attempts": 3, **options}
+        return self.pod_python("cpu", "gpu-fault-api-ha", script, *arguments, **options)
+
+    def executor_python(
+        self, script: str, *arguments: str, **options: Any
+    ) -> dict[str, Any]:
+        options = {"timeout": 180, "attempts": 3, "require_ready": True, **options}
         return self.pod_python(
-            "gpu",
-            "gpu-fault-cluster-executor",
-            script,
-            *arguments,
-            timeout=timeout,
-            attempts=attempts,
-            require_ready=require_ready,
+            "gpu", "gpu-fault-cluster-executor", script, *arguments, **options
         )
 
     def store_snapshot(

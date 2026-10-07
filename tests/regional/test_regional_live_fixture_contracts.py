@@ -708,3 +708,95 @@ def test_waiting_projection_keeps_timestamps_only_when_the_record_has_them() -> 
     assert projected_bare["error"] is None
     assert projected_stamped["started_at"] == "2026-09-06T10:02:00+00:00"
     assert "updated_at" not in projected_stamped, projected_stamped
+
+
+def test_pod_python_moves_to_the_next_pod_when_kubectl_refused_the_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-07 (gpu-eks-cluster DESTR-003 cleanup): the first Ready
+    executor Pod was on a node the case had just handed over. An exec kubectl
+    refuses before the script runs is not an attempt spent; the next Pod is."""
+
+    from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
+    regional = _regional(tmp_path)
+    execs: list[str] = []
+
+    def kubectl(_plane: str, *args: Any, **_kwargs: Any) -> str:
+        pod = args[args.index("-i") + 1]
+        execs.append(pod)
+        if pod == "pod-a":
+            raise RegionalCommandFailed(
+                1,
+                "error: unable to upgrade connection: container not found",
+                ["kubectl", "exec", "-i", pod],
+            )
+        return '{"ok": true}\n'
+
+    monkeypatch.setattr(
+        regional, "ready_pods", lambda *_a, **_k: [{"name": "pod-a"}, {"name": "pod-b"}]
+    )
+    monkeypatch.setattr(regional, "kubectl", kubectl)
+    monkeypatch.setattr(live_fixture_module.time, "sleep", lambda _s: None)
+
+    value = regional.pod_python(
+        "gpu", "gpu-fault-cluster-executor", "print()", attempts=1
+    )
+
+    assert value == {"ok": True}
+    assert execs == ["pod-a", "pod-b"], "the refused exec moved on within one attempt"
+
+
+def test_pod_python_does_not_retry_a_script_failure_on_another_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The script ran and raised: running it on another Pod is a second
+    mutation, so ``attempts=1`` means exactly one exec, as before."""
+
+    from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
+    regional = _regional(tmp_path)
+    execs: list[str] = []
+
+    def kubectl(_plane: str, *args: Any, **_kwargs: Any) -> str:
+        execs.append(args[args.index("-i") + 1])
+        raise RegionalCommandFailed(
+            1,
+            "Traceback (most recent call last):\nStopIteration\n",
+            ["kubectl", "exec", "-i", "pod"],
+        )
+
+    monkeypatch.setattr(
+        regional, "ready_pods", lambda *_a, **_k: [{"name": "pod-a"}, {"name": "pod-b"}]
+    )
+    monkeypatch.setattr(regional, "kubectl", kubectl)
+    monkeypatch.setattr(live_fixture_module.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RegionalFixtureError) as failed:
+        regional.pod_python("gpu", "gpu-fault-cluster-executor", "print()", attempts=1)
+
+    assert execs == ["pod-a"], execs
+    message = str(failed.value)
+    assert "app=gpu-fault-cluster-executor" in message and "pods tried: 1" in message
+    assert "[StopIteration]" in message, message
+
+
+def test_pod_python_reports_when_no_pod_can_be_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.regional_commands import RegionalCommandFailed
+
+    regional = _regional(tmp_path)
+
+    def refusing(_plane: str, *args: Any, **_kwargs: Any) -> str:
+        raise RegionalCommandFailed(
+            1, "error: unable to upgrade connection", ["kubectl", "exec"]
+        )
+
+    monkeypatch.setattr(regional, "ready_pods", lambda *_a, **_k: [{"name": "pod-a"}])
+    monkeypatch.setattr(regional, "kubectl", refusing)
+    monkeypatch.setattr(live_fixture_module.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RegionalFixtureError, match="pods tried: 2") as failed:
+        regional.pod_python("cpu", "gpu-fault-api-ha", "print()", attempts=2)
+    assert "kubectl: unable to upgrade connection" in str(failed.value)

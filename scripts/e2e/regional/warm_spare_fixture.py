@@ -30,6 +30,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     component_python,
 )
+from scripts.e2e.regional.warm_spare_release import RELEASE_SPARES  # noqa: E402
 
 SPARE_LABEL = "gpu-fault.io/spare"
 SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
@@ -247,31 +248,6 @@ else:
         "refusal": None,
         "state": incident.state.value,
     }, sort_keys=True))
-"""
-
-
-RELEASE_SPARES = r"""
-import json
-import sys
-
-from gpu_fault.cluster_executor import executor_from_environment
-
-nodes = json.loads(sys.argv[1])
-incident_id = sys.argv[2]
-executor = executor_from_environment()
-adapter = next(
-    item
-    for item in executor.adapters
-    if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
-)
-coordinator = adapter.spare_coordinator
-if coordinator is None:
-    raise RuntimeError("spare coordinator is unavailable")
-coordinator.release(nodes, incident_id)
-print(json.dumps({
-    "released_nodes": nodes,
-    "incident_id": incident_id,
-}, sort_keys=True))
 """
 
 

@@ -17,6 +17,7 @@ executor can claim, and the runner reads it as such from the healthy cluster.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
@@ -64,6 +65,40 @@ def running_pod(fixture: Any, plane: str, app: str) -> str:
     if not pods:
         raise RegionalFixtureError(f"no Running {plane} Pod for app={app}")
     return str(pods[0]["name"])
+
+
+def pod_candidates(
+    fixture: Any, plane: str, app: str, *, require_ready: bool
+) -> Iterator[str]:
+    """The Pods a probe may exec into, in order: the one the single-Pod selection
+    names (``ready_pod`` / ``running_pod``) first, then -- read only if asked for
+    a second -- the rest of the inventory.
+
+    An exec kubectl refuses before the script runs (the Pod is restarting on a
+    node the case just handed over, its container is gone) can move to the next
+    Pod without repeating anything (live 2026-10-07, gpu-eks-cluster DESTR-003
+    cleanup). The inventory beyond the first Pod is best effort: when it cannot
+    be read the single selection stands alone, as it always did.
+    """
+
+    first = str(
+        fixture.ready_pod(plane, app)
+        if require_ready
+        else running_pod(fixture, plane, app)
+    )
+    yield first
+    try:
+        pods = (
+            fixture.ready_pods(plane, app)
+            if require_ready
+            else running_pods(fixture, plane, app)
+        )
+    except Exception:  # noqa: BLE001 - the selection above is the contract
+        return
+    for item in pods:
+        name = str(item["name"])
+        if name != first:
+            yield name
 
 
 def _pod_records(value: Any, *, require_ready: bool) -> list[dict[str, Any]]:

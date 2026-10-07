@@ -872,7 +872,7 @@ remote_owners = {
     for item in os.getenv(
         "GPU_FAULT_REMOTE_EXECUTION_OWNERS",
         "gpu-fault-kubernetes-adapter,gpu-fault-node-agent,"
-        "gpu-fault-hyperpod-adapter",
+        "gpu-fault-hyperpod-adapter,gpu-fault-eks-adapter",
     ).split(",")
     if item.strip()
 }
