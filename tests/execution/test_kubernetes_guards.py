@@ -919,3 +919,160 @@ def test_restore_uncordons_an_allocated_spare_and_an_ordinary_node() -> None:
 
         assert outcome.status is WorkflowStepStatus.SUCCEEDED
         assert core.node["spec"]["unschedulable"] is False, (labels, pool_state)
+
+
+def _quiesce_tainted(core: FakeCoreApi, incident_id: str) -> None:
+    core.node["spec"]["taints"].append(
+        {
+            "key": "gpu-fault.io/quiesce",
+            "value": quarantine_taint_value(incident_id),
+            "effect": "NoExecute",
+        }
+    )
+
+
+def _confirmed_reboot_context(store, core, *, quiesce_record: bool):
+    """The unconfirmed reboot of ``_unconfirmed_reboot_context`` with its
+    operation id confirmed, on a record whose QUIESCE tainted the node."""
+
+    base = _unconfirmed_reboot_context(store, core, "incident-active")
+    executions = list(base.workflow.step_executions)
+    if quiesce_record:
+        executions.append(
+            workflow_step_execution(
+                1,
+                WorkflowOperation.QUIESCE_GPU_SERVICES,
+                details={"quiesce_taint_nodes": ["node-a"]},
+            )
+        )
+    request = WorkflowExecutionRequest(
+        expected_fencing_token=3,
+        confirm_cluster_name="hp-cluster",
+        confirmed_adapter_operation_ids=["reboot-op-1"],
+    )
+    return WorkflowStepContext(
+        workflow=copy_model(base.workflow, step_executions=executions),
+        incident=base.incident,
+        step=base.step,
+        step_index=0,
+        request=request,
+        idempotency_key=base.idempotency_key,
+    )
+
+
+def test_a_confirmed_reboot_strips_the_quiesce_taint_the_retired_restore_owed() -> None:
+    """Live 2026-10-07 (gpu-eks-cluster DESTR-025): the eks-managed quiesce taint
+    survived the RESTART_NODE rung -- the ladder had retired the restore that
+    lifts it -- so the exporter never came back and the rung's VALIDATE_GPU
+    waited out its cap behind ``quiesce_taint_present``. The confirmed reboot
+    now carries the restore's taint half and records it like a restore."""
+
+    from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
+
+    store = build_store()
+    core = _isolated_node("incident-active")
+    _quiesce_tainted(core, "incident-active")
+    context = _confirmed_reboot_context(store, core, quiesce_record=True)
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert [item["key"] for item in core.node["spec"]["taints"]] == [
+        "sagemaker.amazonaws.com/node-health-status",
+        "gpu-fault.io/quarantined",
+    ], "only the quiesce taint goes; the quarantine taint is RESTORE_SCHEDULING's"
+    assert outcome.details["quiesce_taint_removed_nodes"] == ["node-a"], outcome.details
+    assert core.node["spec"]["unschedulable"] is True, "the re-cordon still happens"
+    recorded = copy_model(
+        context.workflow,
+        step_executions=[
+            *context.workflow.step_executions,
+            workflow_step_execution(
+                0,
+                WorkflowOperation.RESTART_NODE,
+                WorkflowStepStatus.SUCCEEDED,
+                details=outcome.details,
+            ),
+        ],
+    )
+    assert quiesce_taint_nodes_held(recorded) == set(), (
+        "the record no longer owes the node its untaint"
+    )
+
+
+def test_an_unconfirmed_reboot_leaves_the_quiesce_taint_until_the_node_is_back() -> (
+    None
+):
+    store = build_store()
+    core = _isolated_node("incident-active")
+    _quiesce_tainted(core, "incident-active")
+    context = _unconfirmed_reboot_context(store, core, "incident-active")
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert "gpu-fault.io/quiesce" in {
+        item["key"] for item in core.node["spec"]["taints"]
+    }, "a node still rebooting keeps its taint; the exporter is not wanted yet"
+    assert "quiesce_taint_removed_nodes" not in outcome.details, outcome.details
+
+
+def test_a_confirmed_reboot_of_an_untainted_node_patches_and_records_nothing() -> None:
+    """The HyperPod shape: no quiesce taint, no QUIESCE taint record."""
+
+    store = build_store()
+    core = _isolated_node("incident-active")
+    context = _confirmed_reboot_context(store, core, quiesce_record=False)
+    core.node["spec"]["unschedulable"] = True
+    patches: list[dict] = []
+    original = core.patch_node
+
+    def counting_patch(name, body):
+        patches.append(body)
+        return original(name, body)
+
+    core.patch_node = counting_patch
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert patches == [], "nothing to strip, nothing written"
+    assert "quiesce_taint_removed_nodes" not in outcome.details, outcome.details
+    assert "quiesce_taint_error" not in outcome.details, outcome.details
+
+
+def test_a_quiesce_untaint_that_fails_is_named_and_does_not_fail_the_reboot() -> None:
+    store = build_store()
+    core = _isolated_node("incident-active")
+    _quiesce_tainted(core, "incident-active")
+    context = _confirmed_reboot_context(store, core, quiesce_record=True)
+    core.node["spec"]["unschedulable"] = True
+    original = core.patch_node
+
+    def refusing_patch(name, body):
+        if "taints" in body.get("spec", {}):
+            raise _api_error(500, "etcd unavailable")
+        return original(name, body)
+
+    core.patch_node = refusing_patch
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, "the reboot did happen"
+    assert "quiesce_taint_removed_nodes" not in outcome.details, outcome.details
+    assert "node-a: " in outcome.details["quiesce_taint_error"], outcome.details
+    assert "gpu-fault.io/quiesce" in {
+        item["key"] for item in core.node["spec"]["taints"]
+    }, "the taint stays, named; the validation's quiesce_taint_present then says so"

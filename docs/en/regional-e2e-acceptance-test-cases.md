@@ -12281,6 +12281,11 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
 > (Karpenter dry-runs) set aside and the EC2 launch/terminate/stop/start mutations as the forbidden replacement set
 > (`destr016_verdicts.provider_reboot_evidence`). Everything else -- the known RESET_GPU refusal, the one-branch DAG, the
 > executor env window, the host ledger, the node identity -- is judged identically. Plain-EKS prerequisites as in DESTR-002.
+> On `eks-managed` the `gpu-fault.io/quiesce` taint QUIESCE_GPU_SERVICES applied survives the reboot: once RESTART_NODE is
+> confirmed the eks lifecycle adapter strips it and records `details.quiesce_taint_removed_nodes` on that step, which is
+> what lets the validation tail observe the node (HyperPod has neither the taint nor the record); a VALIDATE_* that
+> cannot see the node because of that taint climbs to no REPLACE_NODE (`validation_unobserved` stage, in line with
+> the case's "no replace authorised").
 
 **Known failure of a single-node RESET_GPU: escalates to a real RESTART_NODE inside the same workflow record and closes there, producing no reboot-after successor**
 

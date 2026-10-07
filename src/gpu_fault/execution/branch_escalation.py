@@ -34,9 +34,10 @@ from gpu_fault.execution.node_action_uncertainty import UNRESOLVED_NODE_ACTION
 from gpu_fault.orchestration.dag_branching import branch_node_ids
 from gpu_fault.orchestration.escalation import (
     executor_rejected_failure,
-    node_action_refused_before_acting,
     next_rung,
+    node_action_refused_before_acting,
     unknown_outcome_failure,
+    validation_unobserved_failure,
 )
 
 if TYPE_CHECKING:
@@ -146,9 +147,14 @@ class BranchEscalator:
         refused = node_action_refused_before_acting(details)
         unknown = not refused and unknown_outcome_failure(details)
         rejected = executor_rejected_failure(details)
+        # A validation starved behind the product's own quiesce taint saw
+        # nothing: no verdict to climb from (live 2026-10-07, gpu-eks-cluster
+        # DESTR-025: the reboot rung's VALIDATE_GPU climbed to a REPLACE_NODE
+        # no spare could serve, and the exhausted branch quarantined the node).
+        unobserved = validation_unobserved_failure(details)
         rung = (
             None
-            if unknown or rejected or refused
+            if unknown or rejected or refused or unobserved
             else next_rung(step.operation, recovery_context)
         )
         taken = workflow.branch_escalation_counts.get(lineage_node, 0)
@@ -173,6 +179,12 @@ class BranchEscalator:
                         "boundary before touching the GPU; nothing was applied, "
                         "an operator decides; no rung"
                         if refused
+                        else "the validation could not observe the node: the "
+                        "product's own quiesce taint kept the exporter off it; "
+                        "nothing about the GPU was learned, an operator restores "
+                        "the node (submit-remediation --disposition restore); "
+                        "no rung"
+                        if unobserved
                         else "no further rung"
                         if rung is None
                         else f"{taken} rung(s) already taken"
@@ -302,6 +314,10 @@ class BranchEscalator:
         ):
             # An attested safety refusal is adopted like an executor rejection:
             # exhausted with its reason, never confirmed as an outcome.
+            return None
+        if validation_unobserved_failure(details):
+            # Nothing was learned about the node; the whole-workflow path hands
+            # it to an operator without a rung (``VALIDATION_UNOBSERVED_STAGE``).
             return None
         recovery_context = self._recovery_context(
             workflow, set(range(len(workflow.official_steps)))

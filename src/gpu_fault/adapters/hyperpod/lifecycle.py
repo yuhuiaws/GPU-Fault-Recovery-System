@@ -20,6 +20,7 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.adapters.hyperpod.confirmation import HyperPodConfirmationMixin
 from gpu_fault.adapters.hyperpod.notifications import HyperPodNotificationMixin
+from gpu_fault.adapters.hyperpod.reboot_quiesce import release_quiesce_taint
 from gpu_fault.adapters.kubernetes.adapter import KubernetesWorkflowAdapter
 from gpu_fault.adapters.kubernetes.primitives import (
     NodePatchConflict,
@@ -595,6 +596,9 @@ class HyperPodLifecycleStepAdapter(
                     **base_details,
                     "externally_confirmed": True,
                     "confirmation_source": "explicit-operation-id",
+                    **release_quiesce_taint(
+                        self.kubernetes_adapter, context, base_details
+                    ),
                 }
                 notification_id = self._notify_node_restarted(
                     context,
@@ -612,6 +616,9 @@ class HyperPodLifecycleStepAdapter(
                 details = {
                     **base_details,
                     **automatic_confirmation,
+                    **release_quiesce_taint(
+                        self.kubernetes_adapter, context, base_details
+                    ),
                 }
                 notification_id = self._notify_node_restarted(
                     context,

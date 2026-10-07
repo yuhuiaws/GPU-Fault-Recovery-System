@@ -83,6 +83,16 @@ CONTAINMENT_REFUSED_STAGE = "containment_refused"
 # plans evidence and the support ticket only -- no quarantine, no reboot --
 # because the chain's own cordon is already on a node nothing was done to.
 NODE_ACTION_REFUSED_STAGE = "node_action_refused"
+# A validation that never observed its node: every node it waited for was
+# pending behind the product's own quiesce taint (``quiesce_taint_present`` in
+# ``node_pending``, written by the validation adapter) and no node was seen
+# failing. Nothing about the hardware was learned, so neither ladder climbs
+# -- live 2026-10-07 (gpu-eks-cluster DESTR-025) the reboot rung's VALIDATE_GPU
+# starved behind the taint the retired restore would have lifted, climbed to a
+# REPLACE_NODE no spare could serve, and the exhausted branch quarantined the
+# node. The hand-off plans evidence and the ticket only, like a refusal: the
+# node keeps the chain's cordon and the operator's restore lifts the taint.
+VALIDATION_UNOBSERVED_STAGE = "validation_unobserved"
 # A failure whose outcome nobody knows. Three producers write it into the step
 # details (``status_source`` never crosses into a step record, so details are
 # the contract): the node-action fold, when the agent's attempt closed
@@ -302,6 +312,32 @@ def escalation_descends_from(
     return False
 
 
+def validation_unobserved_failure(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED validation never observed its node because the
+    product's own quiesce taint kept the exporter off it.
+
+    True only when every node the step was still waiting for is pending with
+    ``quiesce_taint_present`` and no node was observed failing: the step's
+    verdict is "could not look", not "looked and found a fault". Both ladders
+    read this and climb on neither -- a REPLACE_NODE after such a validation
+    replaces a node nothing was learned about.
+    """
+
+    if details is None:
+        return False
+    pending = details.get("node_pending")
+    if not isinstance(pending, Mapping) or not pending:
+        return False
+    if details.get("failed_nodes_observed") or details.get("node_failures_observed"):
+        return False
+    if details.get("failed_nodes") or details.get("node_failures"):
+        return False
+    return all(
+        isinstance(record, Mapping) and record.get("quiesce_taint_present") is True
+        for record in pending.values()
+    )
+
+
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 
@@ -385,6 +421,65 @@ def _unknown_outcome_failures(
     ]
 
 
+def _unobserved_validation_failures(
+    executions: list[WorkflowStepExecution],
+) -> list[WorkflowStepExecution]:
+    """The record's latest FAILED step, when it is a validation that could not
+    observe its node (``validation_unobserved_failure``); else empty.
+
+    The latest failure is the one the ladder stopped on: an earlier FAILED
+    reset was answered by the reboot rung that ran after it, and classifying
+    the record by that reset would plan a second reboot of a node whose first
+    one succeeded.
+    """
+
+    latest = max(
+        (
+            execution
+            for execution in executions
+            if execution.status is WorkflowStepStatus.FAILED
+        ),
+        key=lambda execution: execution.step_index,
+        default=None,
+    )
+    if (
+        latest is None
+        or latest.operation not in _VALIDATION_OPERATIONS
+        or not validation_unobserved_failure(latest.details)
+    ):
+        return []
+    return [latest]
+
+
+def _no_verdict_classification(
+    executions: list[WorkflowStepExecution],
+) -> tuple[str, RecoveryAction, WorkflowOperation, list[WorkflowStepExecution]] | None:
+    """The operator hand-offs for a record whose failure carries no hardware
+    verdict: an unknown outcome (the step may have run, or may still be
+    running -- an operator confirms, no rung is climbed on a guess), or a
+    validation that could not look at the node because the product's own
+    quiesce taint kept the exporter off it (no verdict, no rung, no
+    quarantine -- the operator's restore lifts the taint)."""
+
+    unknown_failures = _unknown_outcome_failures(executions)
+    if unknown_failures:
+        return (
+            MANUAL_CONFIRMATION_STAGE,
+            RecoveryAction.ESCALATE_OPERATOR,
+            WorkflowOperation.ESCALATE_SUPPORT,
+            unknown_failures,
+        )
+    unobserved = _unobserved_validation_failures(executions)
+    if unobserved:
+        return (
+            VALIDATION_UNOBSERVED_STAGE,
+            RecoveryAction.ESCALATE_OPERATOR,
+            WorkflowOperation.ESCALATE_SUPPORT,
+            unobserved,
+        )
+    return None
+
+
 def _refused_containment(
     executions: list[WorkflowStepExecution],
 ) -> bool:
@@ -439,7 +534,11 @@ def _escalation_operations(
 ) -> list[WorkflowOperation]:
     """The operation sequence the escalation workflow plans (see ``emit``)."""
 
-    if failed_stage in (CONTAINMENT_REFUSED_STAGE, NODE_ACTION_REFUSED_STAGE):
+    if failed_stage in (
+        CONTAINMENT_REFUSED_STAGE,
+        NODE_ACTION_REFUSED_STAGE,
+        VALIDATION_UNOBSERVED_STAGE,
+    ):
         # The adapter refused the isolation (absent node, foreign
         # generation): there is nothing this workflow can isolate, and
         # planning MARK_UNSCHEDULABLE / QUARANTINE again on the same node
@@ -686,16 +785,9 @@ class HardwareEscalationService:
         handled, verdict = _pre_action_classification(failed_executions)
         if handled:
             return verdict
-        unknown_failures = _unknown_outcome_failures(workflow.step_executions)
-        if unknown_failures:
-            # The step may have run, or may still be running, on the node. An
-            # operator confirms what happened; no rung is climbed on a guess.
-            return (
-                MANUAL_CONFIRMATION_STAGE,
-                RecoveryAction.ESCALATE_OPERATOR,
-                WorkflowOperation.ESCALATE_SUPPORT,
-                unknown_failures,
-            )
+        hand_off = _no_verdict_classification(workflow.step_executions)
+        if hand_off is not None:
+            return hand_off
         failed_operation_set = {
             execution.operation
             for execution in workflow.step_executions
@@ -911,10 +1003,19 @@ class HardwareEscalationService:
             selected = _failed_step_nodes(workflow, execution, list(step_nodes))
             failed_nodes.update(selected)
             reported_failures = execution.details.get("node_failures", {})
+            # A validation that never observed the node has no failure to
+            # report; its pending reason names what kept it from looking (and
+            # the operator's exit), which is what the hand-off should carry.
+            pending = execution.details.get("node_pending")
+            pending = pending if isinstance(pending, dict) else {}
             for node_id in selected:
                 reasons = reported_failures.get(node_id, [])
                 if not isinstance(reasons, list):
                     reasons = [str(reasons)]
+                if not reasons and isinstance(pending.get(node_id), dict):
+                    reason = pending[node_id].get("reason")
+                    if isinstance(reason, str) and reason:
+                        reasons = [reason]
                 node_failures.setdefault(node_id, []).extend(
                     str(reason) for reason in reasons
                 )

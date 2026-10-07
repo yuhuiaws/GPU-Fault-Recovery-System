@@ -47,10 +47,18 @@ import pytest  # noqa: E402
 
 from gpu_fault.execution.branch_escalation import BranchEscalator  # noqa: E402
 from gpu_fault.execution.models import WorkflowExecutionRequest  # noqa: E402
-from gpu_fault.models import IncidentState, RecoveryAction, WorkflowStatus  # noqa: E402
+from gpu_fault.models import (  # noqa: E402
+    IncidentState,
+    RecoveryAction,
+    WorkflowEventCode,
+    WorkflowStatus,
+)
 from gpu_fault.orchestration.arbitration import RecoveryArbiter  # noqa: E402
 from gpu_fault.orchestration.dag_branching import DagBrancher  # noqa: E402
-from gpu_fault.orchestration.escalation import HardwareEscalationService  # noqa: E402
+from gpu_fault.orchestration.escalation import (  # noqa: E402
+    VALIDATION_UNOBSERVED_STAGE,
+    HardwareEscalationService,
+)
 from tests._builders import (  # noqa: E402
     active_workflow_executor,
     copy_model,
@@ -693,3 +701,158 @@ def test_a_single_node_plan_with_an_unknown_outcome_is_not_adopted():
     assert saved.dag_enabled is False
     assert "RESTART_NODE" not in _operations(adapter)
     assert saved.exhausted_branch_ids == []
+
+
+QUIESCE = WorkflowOperation.QUIESCE_GPU_SERVICES
+RESTORE = WorkflowOperation.RESTORE_GPU_SERVICES
+RELEASE = WorkflowOperation.RESTORE_SCHEDULING
+UNOBSERVED_VALIDATION = {
+    "node_pending": {
+        "node-a": {
+            "missing_or_stale_collectors": ["GPU_METRICS"],
+            "quiesce_taint_present": True,
+            "quiesce_taint_holders": {"workflow-active": "incident-00000000"},
+            "reason": (
+                "the node still carries the gpu-fault quiesce taint (NoExecute) of "
+                "workflow-active; the exporter cannot run until it is removed -- "
+                "restore the owner incident (gpu-fault-admin submit-remediation "
+                "--disposition restore)"
+            ),
+        }
+    },
+    "pending_nodes": ["node-a"],
+    "failed_nodes_observed": [],
+    "node_failures_observed": {},
+    "step_waiting_seconds": 603,
+    "step_waiting_timeout_seconds": 600,
+}
+
+
+def _single_node_reset_chain(store):
+    """The DESTR-025 record: one node, QUIESCE -> RESET -> RESTORE -> VALIDATE -> release."""
+
+    return workflow_state(store, [QUIESCE, RESET, RESTORE, VALIDATIONS[0], RELEASE])
+
+
+def _operations(adapter) -> list[str]:
+    return [call.rsplit("/", 1)[1] for call in adapter.calls]
+
+
+def test_a_reboot_rung_that_released_the_quiesce_taint_lets_the_validation_run():
+    """Live 2026-10-07 (gpu-eks-cluster DESTR-025, attempt 9): QUIESCE tainted the
+    node (eks-managed), RESET_GPU failed on the busy device, the in-place ladder
+    retired the chain's RESTORE_GPU_SERVICES and ran RESTART_NODE -- which left
+    the NoExecute taint on the rebooted node, so VALIDATE_GPU never saw the
+    exporter and the branch climbed to REPLACE_NODE. The provider lifecycle
+    adapter now records the taint release on the confirmed reboot
+    (``quiesce_taint_removed_nodes``); the record's accounting balances and the
+    validation tail runs on the same record, as it does on HyperPod."""
+
+    from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
+
+    store = build_store()
+    incident, workflow = _single_node_reset_chain(store)
+    outcomes = {
+        QUIESCE: WorkflowStepOutcome.succeeded(
+            details={"quiesce_taint_nodes": ["node-a"]}
+        ),
+        RESET: WorkflowStepOutcome.failed(
+            "node agent node-a: GpuClientsActive: GPU device clients are still active"
+        ),
+        REBOOT: WorkflowStepOutcome.succeeded(
+            details={
+                "action": "REBOOT",
+                "confirmation_source": "eks-running-and-new-agent-incarnation",
+                "quiesce_taint_removed_nodes": ["node-a"],
+            }
+        ),
+        **_ok(RESTORE, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(
+        store,
+        workflow,
+        outcomes,
+        escalator=_escalator(),
+        operations=ALL_OPERATIONS | {QUIESCE, RESTORE},
+    )
+
+    assert result.status is WorkflowStatus.SUCCEEDED, (result, saved.events[-3:])
+    operations = _operations(adapter)
+    assert operations.index("RESTART_NODE") < operations.index("VALIDATE_GPU"), (
+        operations
+    )
+    assert "REPLACE_NODE" not in operations, operations
+    assert "RESTORE_GPU_SERVICES" not in operations, (
+        "the reboot settled the quiesce; no restore is owed or compensated"
+    )
+    assert quiesce_taint_nodes_held(saved) == set(), (
+        "the reboot record lifted the taint the QUIESCE record applied"
+    )
+    assert saved.branch_escalation_counts == {"node-a": 1}, (
+        saved.branch_escalation_counts
+    )
+    assert saved.exhausted_branch_ids == [], saved.exhausted_branch_ids
+    assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED
+
+
+def test_a_validation_starved_by_the_products_own_taint_takes_no_replace_rung():
+    """The plan-time guard for the same record when the taint is still there
+    (a reboot confirmed before this fix, or an untaint that failed): the
+    validation saw nothing, so no REPLACE_NODE is appended -- DESTR-025
+    authorises no replace -- and the whole-workflow hand-off is the operator's
+    restore, not a quarantine."""
+
+    store = build_store()
+    incident, workflow = _single_node_reset_chain(store)
+    outcomes = {
+        QUIESCE: WorkflowStepOutcome.succeeded(
+            details={"quiesce_taint_nodes": ["node-a"]}
+        ),
+        RESET: WorkflowStepOutcome.failed(
+            "node agent node-a: GpuClientsActive: GPU device clients are still active"
+        ),
+        REBOOT: WorkflowStepOutcome.succeeded(details={"action": "REBOOT"}),
+        VALIDATIONS[0]: WorkflowStepOutcome.failed(
+            "step 6/VALIDATE_GPU stayed non-terminal for 603s, past the 600s per-step cap",
+            details=dict(UNOBSERVED_VALIDATION),
+        ),
+        **_ok(RESTORE, REPLACE, RESTART_JOB, *VALIDATIONS[1:]),
+    }
+
+    result, adapter, saved = _run(
+        store,
+        workflow,
+        outcomes,
+        escalator=_escalator(),
+        operations=ALL_OPERATIONS | {QUIESCE, RESTORE},
+    )
+
+    operations = _operations(adapter)
+    assert "REPLACE_NODE" not in operations, operations
+    assert result.status is WorkflowStatus.FAILED, result
+    assert str(saved.terminal_failure_reason).startswith(
+        "node branch escalation exhausted: branch:node-a"
+    ), saved.terminal_failure_reason
+    exhausted = next(
+        event
+        for event in saved.events
+        if str(event.code) == str(WorkflowEventCode.BRANCH_EXHAUSTED.value)
+    )
+    assert "could not observe the node" in str(exhausted.reason), exhausted.reason
+    assert "submit-remediation --disposition restore" in str(exhausted.reason), (
+        exhausted.reason
+    )
+    assert saved.branch_escalation_counts == {"node-a": 1}, (
+        saved.branch_escalation_counts
+    )
+    classification = HardwareEscalationService.classify(saved)
+    assert classification is not None, "the operator is told"
+    stage, action, operation, flagged = classification
+    assert stage == VALIDATION_UNOBSERVED_STAGE, stage
+    assert (action, operation) == (
+        RecoveryAction.ESCALATE_OPERATOR,
+        WorkflowOperation.ESCALATE_SUPPORT,
+    )
+    assert [item.operation for item in flagged] == [WorkflowOperation.VALIDATE_GPU]
+    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED

@@ -1091,7 +1091,21 @@ Semantics and boundaries of `eks-managed`:
   between the quiesce and the restore the taint stays on the node: the validated restore's RESTORE_SCHEDULING strips
   it together with the cordon and the quarantine taint; `workflow-reconcile`, the orphaned-annotation cleanup and
   `config spare` all treat it as isolation still in place. HyperPod never gets this taint (its quiesce stops kubelet;
-  nothing restarts the containers). **Every exit of the window removes the taint**: every QUIESCE outcome
+  nothing restarts the containers). **The reboot rung lifts it itself**: the RESTART_NODE a failed RESET_GPU escalates to inside the same record
+  retires the RESTORE_GPU_SERVICES that would have lifted the taint, and taints survive a reboot (2026-10-07,
+  gpu-eks-cluster DESTR-025: the exporter could not return to the node, VALIDATE_GPU waited out its 600 s with
+  `quiesce_taint_present`, the ladder climbed to a REPLACE_NODE no spare could serve, and the exhausted branch
+  quarantined the node -- the same chain passed on HyperPod, which has no taint). The provider lifecycle adapter now
+  strips every `gpu-fault.io/quiesce` taint of the node when the reboot is confirmed (explicit operation id, or
+  provider Running plus a new Agent incarnation) and records it in the RESTART_NODE's
+  `details.quiesce_taint_removed_nodes`, one path for both providers (a HyperPod node carries none and gets no
+  patch); an untaint that fails is only named (`quiesce_taint_error`) and does not fail a reboot that happened.
+  **A validation that cannot see the node climbs no ladder**: when a VALIDATE_* FAILS with every node of
+  `node_pending` carrying `quiesce_taint_present` and no node observed failing, the branch ladder appends no
+  REPLACE_NODE (the `BRANCH_EXHAUSTED` reason reads `the validation could not observe the node`) and the record
+  classifies as the `validation_unobserved` stage: the hand-off (`support-after-<workflow>`) plans FREEZE_EVIDENCE
+  and ESCALATE_SUPPORT only -- no quarantine, no reboot or replace successor -- and the incident's reasons carry the
+  node's pending reason and its exit (the restore of §9.2). **Every exit of the window removes the taint**: every QUIESCE outcome
   (WAITING/FAILED/SUCCEEDED) records `details.quiesce_taint_nodes`; a quiesce the Agent refused or whose window expired
   untaints at once and records `quiesce_taint_removed_nodes`; a QUIESCE that tainted but never completed owes the
   RESTORE_GPU_SERVICES compensation like a completed one (`execution/node_action_uncertainty.unrestored_quiesces` reads
