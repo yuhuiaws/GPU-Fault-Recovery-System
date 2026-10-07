@@ -10569,6 +10569,38 @@ replacement should ever be attempted.
   This case should run after the stages "destructive capability acceptance (including non-destructive
   fail-closed negative cases)" and "Warm spare", because it must cover the **full period** of
   CloudTrail for all earlier destructive cases.
+- Both providers: the audit first reads, from the CPU durable registry, the provider of the registration
+  `--hyperpod-cluster` names (the HyperPod name, or an eks-managed registration's cluster id / EKS cluster
+  name) and only then chooses the provider API; the HyperPod path is unchanged. An `eks-managed`
+  registration is never asked a `sagemaker` command:
+  - Cluster side: EKS `DescribeCluster` (`ACTIVE`, ARN equal to the registered EKS ARN; plain EKS has no
+    NodeRecovery, recorded as `not-applicable`).
+  - Node inventory: the GPU Nodes' `providerID` → EC2 `DescribeInstances` (instance type, the
+    `eks:nodegroup-name` / `eks:cluster-name` tags, AZ) → EKS `DescribeNodegroup` for every managed node
+    group they belong to (`clusterName` is the registered cluster, `ACTIVE`, no health issue); every GPU
+    instance must carry the registered cluster's `eks:cluster-name` tag; the inventory must not change
+    during the audit.
+  - IAM side: simulated against the GPU instance ARNs (never `*`) with the `aws:ResourceTag/eks:cluster-name`
+    context: `ec2:RebootInstances` must be `allowed`; `ec2:TerminateInstances` / `StopInstances` /
+    `StartInstances` / `RunInstances` must be denied.
+  - CloudTrail side: in the `ec2.amazonaws.com` source, enumerated verb by verb (`RunInstances`,
+    `TerminateInstances`, `StopInstances`, `StartInstances`, `RebootInstances`), judging only accepted calls
+    made by the executor role: any replacement verb non-empty is FAIL; refused calls carrying an
+    `errorCode` (Karpenter's `RunInstances` dry-runs) are set aside and counted; calls by other principals
+    (the managed node group, Auto Scaling, Karpenter) are counted, not judged -- they are not the product's
+    actions, the platform legitimately launches and terminates instances on plain EKS, so HyperPod's
+    actor-independent rule does not transfer. The positive control is the executor role's
+    `RebootInstances` (same `--expect-no-reboots` rule); its targets must belong to the registered cluster
+    (by the `eks:cluster-name` tag; an instance EC2 no longer knows is recorded as `unbound`, not failed --
+    it cannot be a replacement by the product, which would show as that role's `RunInstances` /
+    `TerminateInstances`).
+  - Switch side unchanged: `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false` and the two companions, reboot
+    independently enabled, recorded per replica; the eks lifecycle adapter has no replacement path at all --
+    what is disproved here is that no configuration can make one appear.
+  - When any AWS/kubectl command fails, the error text names the command class and the error code (for
+    example `aws sagemaker describe-cluster failed (exit 254) [ResourceNotFound]`), never the output. The
+    report carries `provider`, `positive_control_event`, `cloudtrail_refused_calls`,
+    `cloudtrail_foreign_calls` and `reboot_instance_bindings`.
 - Scope: this case only disproves the **node-level** constraints (constraints 1 and 2).
   The **task-level** constraint (constraint 3, disabling HyperPod auto-resume) is carried by
   `DESTR-012` group B (configuration disproof) and group D (runtime guard live test);

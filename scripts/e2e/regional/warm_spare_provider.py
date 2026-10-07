@@ -145,6 +145,9 @@ def eks_cluster_recovery(
 
 #: The EC2 tag EKS puts on a managed node group's instances.
 EKS_NODEGROUP_TAG = "eks:nodegroup-name"
+#: The EC2 tag EKS puts on every instance of a cluster: the provider-side
+#: binding of a GPU node to its registered EKS cluster.
+EKS_CLUSTER_TAG = "eks:cluster-name"
 
 
 def _eks_gpu_nodes(
@@ -227,6 +230,7 @@ def eks_instance_facts(
             facts[str(instance.get("InstanceId"))] = {
                 "instance_type": instance.get("InstanceType"),
                 "instance_group": tags.get(EKS_NODEGROUP_TAG),
+                "cluster_name": tags.get(EKS_CLUSTER_TAG),
                 "availability_zone": (instance.get("Placement") or {}).get(
                     "AvailabilityZone"
                 ),

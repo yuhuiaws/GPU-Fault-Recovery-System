@@ -30,6 +30,14 @@ EKS = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/gpu"
 HYPERPOD = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/physical-id"
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/regional/executor"
 SENSITIVE = "private-diagnostic-sentinel"
+# The live mixed site's second registration: a plain EKS GPU cluster.
+EKS_CLUSTER_ID = "gpu-eks-cluster"
+EKS_GPU_NAME = "gpu-eks"
+EKS_GPU = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/{EKS_GPU_NAME}"
+INSTANCES = ("i-00000000000000001", "i-00000000000000002")
+NODEGROUP = "gpu-p5en-group"
+KARPENTER_ROLE = f"arn:aws:iam::{ACCOUNT}:role/karpenter-controller"
+ASG_ROLE = f"arn:aws:iam::{ACCOUNT}:role/aws-service-role/AWSServiceRoleForAutoScaling"
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -127,6 +135,8 @@ class LocalAudit:
         }
         write_json(self.cpu_config, self.kubeconfig)
         write_json(self.gpu_config, self.kubeconfig)
+        # The live two-cluster shape: the HyperPod registration and the plain
+        # EKS one share the durable registry; the CLI's cluster names which.
         self.registry = {
             "generation": 3,
             "registrations": [
@@ -135,9 +145,19 @@ class LocalAudit:
                     "region": REGION,
                     "hyperpod_cluster_name": "managed",
                     "eks_cluster_arn": EKS,
-                }
+                    "provider": "hyperpod",
+                },
+                {
+                    "cluster_id": EKS_CLUSTER_ID,
+                    "region": REGION,
+                    "hyperpod_cluster_name": "",
+                    "eks_cluster_arn": EKS_GPU,
+                    "provider": "eks-managed",
+                },
             ],
         }
+        self.provider = "hyperpod"
+        self.failing: dict[tuple[str, str], tuple[int, str]] = {}
         self.recovery = {
             "ClusterName": "managed",
             "ClusterArn": HYPERPOD,
@@ -231,6 +251,9 @@ class LocalAudit:
             self.event(audit.POSITIVE_CONTROL_EVENT)
         ]
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.ec2_events: dict[str, list[dict[str, Any]]] = {}
+        self.ec2_iam: dict[str, Any] = {}
+        self.instance_tags: dict[str, dict[str, str]] = {}
         self.before_command: Callable[[list[str]], None] | None = None
         self.pages: dict[str, dict[str, Any]] | None = None
         self.pytest_code = 0
@@ -267,6 +290,152 @@ class LocalAudit:
                 return NOW
 
         monkeypatch.setattr(audit, "datetime", Clock)
+
+    def use_eks(self) -> None:
+        """Target the registry's eks-managed member instead of the HyperPod one."""
+
+        self.provider = "eks-managed"
+        self.argv[self.argv.index("--hyperpod-cluster") + 1] = EKS_CLUSTER_ID
+        write_json(
+            self.predecessor,
+            {
+                "case_id": audit.PREDECESSOR_CASE_ID,
+                "verdict": "PASS",
+                "release_id": "release-a",
+                "cluster_id": EKS_CLUSTER_ID,
+            },
+        )
+        self.state["cluster_ids"] = ["cluster-a", EKS_CLUSTER_ID]
+        for pod, environment in self.environments.items():
+            if pod.startswith("executor"):
+                environment["cluster_id"] = EKS_CLUSTER_ID
+        self.eks_gpu = {
+            "cluster": {
+                "name": EKS_GPU_NAME,
+                "arn": EKS_GPU,
+                "status": "ACTIVE",
+                "endpoint": "https://gpu.example.invalid",
+                "certificateAuthority": {"data": self.ca},
+            }
+        }
+        self.nodes = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": f"ip-10-0-0-{index}.{REGION}.compute.internal",
+                        "labels": {"eks.amazonaws.com/nodegroup": NODEGROUP},
+                    },
+                    "spec": {"providerID": f"aws:///{REGION}c/{instance}"},
+                    "status": {"allocatable": {"nvidia.com/gpu": "8"}},
+                }
+                for index, instance in enumerate(INSTANCES, start=1)
+            ]
+        }
+        self.instance_tags = {
+            instance: {
+                "eks:nodegroup-name": NODEGROUP,
+                "eks:cluster-name": EKS_GPU_NAME,
+            }
+            for instance in INSTANCES
+        }
+        self.nodegroup = {
+            "nodegroup": {
+                "nodegroupName": NODEGROUP,
+                "clusterName": EKS_GPU_NAME,
+                "status": "ACTIVE",
+                "health": {"issues": []},
+            }
+        }
+        self.ec2_iam = {
+            "EvaluationResults": [
+                {
+                    "EvalActionName": action,
+                    "EvalDecision": (
+                        "allowed" if action == "ec2:RebootInstances" else "implicitDeny"
+                    ),
+                    "ResourceSpecificResults": [
+                        {
+                            "EvalResourceName": f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/{i}",
+                            "EvalResourceDecision": (
+                                "allowed"
+                                if action == "ec2:RebootInstances"
+                                else "implicitDeny"
+                            ),
+                        }
+                        for i in INSTANCES
+                    ],
+                }
+                for action in audit.EKS_IAM_ACTIONS
+            ]
+        }
+        self.ec2_events = {name: [] for name in audit.EKS_EVENT_NAMES}
+        # Live shape: two reboots by the executor role, Karpenter's refused
+        # RunInstances dry-runs about once a minute, one Auto Scaling
+        # termination by the service-linked role.
+        self.ec2_events["RebootInstances"] = [
+            self.ec2_event("RebootInstances", [instance]) for instance in INSTANCES
+        ]
+        self.ec2_events["RunInstances"] = [
+            self.ec2_event(
+                "RunInstances",
+                None,
+                issuer=KARPENTER_ROLE,
+                errorCode="Client.DryRunOperation",
+            )
+            for _ in range(3)
+        ]
+        self.ec2_events["TerminateInstances"] = [
+            self.ec2_event(
+                "TerminateInstances", ["i-0000000000000000"], issuer=ASG_ROLE
+            )
+        ]
+
+    def ec2_event(
+        self,
+        name: str,
+        instance_ids: list[str] | None,
+        *,
+        issuer: str = ROLE,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        at = (NOW - timedelta(hours=1)).isoformat()
+        event_id = f"{name}-{len(self.calls)}-{abs(hash((name, tuple(instance_ids or []), issuer)))}"
+        detail: dict[str, Any] = {
+            "eventID": event_id,
+            "requestID": "request-" + event_id,
+            "eventSource": "ec2.amazonaws.com",
+            "eventName": name,
+            "eventTime": at,
+            "awsRegion": REGION,
+            "recipientAccountId": ACCOUNT,
+            "requestParameters": (
+                {"instancesSet": {"items": [{"instanceId": i} for i in instance_ids]}}
+                if instance_ids is not None
+                else {"instancesSet": {"items": [{"minCount": 1, "maxCount": 1}]}}
+            ),
+            "responseElements": {"_return": True} if name == "RebootInstances" else {},
+            "userIdentity": {
+                "type": "AssumedRole",
+                "arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/{issuer.rsplit('/', 1)[-1]}/s",
+                "accountId": ACCOUNT,
+                "sessionContext": {
+                    "sessionIssuer": {
+                        "type": "Role",
+                        "arn": issuer,
+                        "accountId": ACCOUNT,
+                    }
+                },
+            },
+            **overrides,
+        }
+        if "errorCode" in detail:
+            detail["responseElements"] = None
+        return {
+            "EventId": event_id,
+            "EventName": name,
+            "EventTime": at,
+            "CloudTrailEvent": json.dumps(detail),
+        }
 
     def event(self, name: str, **overrides: Any) -> dict[str, Any]:
         at = (NOW - timedelta(hours=1)).isoformat()
@@ -311,6 +480,15 @@ class LocalAudit:
                 command, self.pytest_code, stdout=SENSITIVE, stderr=""
             )
         if command[0] == "aws":
+            if tuple(command[1:3]) in self.failing:
+                returncode, stderr = self.failing[tuple(command[1:3])]
+                return subprocess.CompletedProcess(
+                    command, returncode, stdout="", stderr=stderr
+                )
+            if self.provider == "eks-managed" and command[1] == "sagemaker":
+                pytest.fail(
+                    "an eks-managed registration must never be asked the SageMaker API"
+                )
             if command[1:3] == ["sagemaker", "describe-cluster"]:
                 value = self.recovery
             elif command[1:3] == ["sagemaker", "list-cluster-nodes"]:
@@ -325,7 +503,44 @@ class LocalAudit:
                     ]
                 }
             elif command[1:3] == ["eks", "describe-cluster"]:
-                value = self.eks
+                name = command[command.index("--name") + 1]
+                value = self.eks_gpu if name == EKS_GPU_NAME else self.eks
+            elif command[1:3] == ["eks", "describe-nodegroup"]:
+                assert command[command.index("--cluster-name") + 1] == EKS_GPU_NAME
+                assert command[command.index("--nodegroup-name") + 1] == NODEGROUP
+                value = self.nodegroup
+            elif command[1:3] == ["ec2", "describe-instances"]:
+                wanted = (
+                    command[command.index("--filters") + 1]
+                    .split("Values=")[1]
+                    .split(",")
+                )
+                value = {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": instance,
+                                    "InstanceType": "p5en.48xlarge",
+                                    "Placement": {"AvailabilityZone": f"{REGION}c"},
+                                    "State": {"Name": "running"},
+                                    "Tags": [
+                                        {"Key": key, "Value": tag}
+                                        for key, tag in self.instance_tags[
+                                            instance
+                                        ].items()
+                                    ],
+                                }
+                                for instance in wanted
+                                if instance in self.instance_tags
+                            ]
+                        }
+                    ]
+                }
+            elif command[1:3] == ["iam", "simulate-principal-policy"] and command[
+                command.index("--action-names") + 1
+            ].startswith("ec2:"):
+                value = self.ec2_iam
             elif command[1:3] == ["iam", "simulate-principal-policy"]:
                 value = {
                     "EvaluationResults": [
@@ -348,11 +563,15 @@ class LocalAudit:
                     if "--next-token" in command
                     else ""
                 )
-                value = (
-                    self.pages[token]
-                    if self.pages is not None and name == audit.POSITIVE_CONTROL_EVENT
-                    else {"Events": self.events[name]}
-                )
+                if name in self.ec2_events:
+                    value = {"Events": self.ec2_events[name]}
+                else:
+                    value = (
+                        self.pages[token]
+                        if self.pages is not None
+                        and name == audit.POSITIVE_CONTROL_EVENT
+                        else {"Events": self.events[name]}
+                    )
             else:
                 pytest.fail(f"unexpected AWS command verb: {command[1:3]}")
         elif command[0] == "kubectl":
@@ -364,6 +583,8 @@ class LocalAudit:
                 value = self.pods[app]
             elif operation[:2] == ["get", "namespace"]:
                 value = {"metadata": {"uid": "gpu-kube-system-uid"}}
+            elif operation[:2] == ["get", "nodes"]:
+                value = self.nodes
             elif operation[:2] == ["get", "serviceaccount"]:
                 value = self.service_account
             elif operation[:3] == ["get", "configmap", "gpu-fault-release-metadata"]:
@@ -1049,3 +1270,175 @@ def test_release_pin_table_is_the_product_fleet_pin_table() -> None:
         )
         for field, name in binding.EXECUTOR_PIN_ENVIRONMENT.items()
     }
+
+
+def test_eks_registration_is_audited_through_eks_ec2_and_the_executor_role(
+    local_audit: LocalAudit,
+) -> None:
+    """Live 2026-10-07, mixed site: the audit of the plain-EKS member died in
+    ``sagemaker describe-cluster`` (ResourceNotFound). An eks-managed
+    registration is read through EKS/EC2 and judged in ec2.amazonaws.com."""
+
+    local_audit.use_eks()
+    code, result = local_audit.run()
+    assert code == 0 and result["verdict"] == "PASS", result
+    assert (
+        result["provider"] == "eks-managed" and result["cluster_id"] == EKS_CLUSTER_ID
+    )
+    assert result["positive_control_event"] == "RebootInstances"
+    assert result["cluster"] == {
+        "cluster_name": EKS_GPU_NAME,
+        "cluster_arn": EKS_GPU,
+        "cluster_status": "ACTIVE",
+        "node_recovery": "not-applicable",
+        "orchestrator": None,
+        "provider": "eks-managed",
+    }
+    assert not [c for c, _ in local_audit.calls if c[:2] == ["aws", "sagemaker"]]
+    [simulation] = local_audit.iam_calls()
+    actions = simulation[
+        simulation.index("--action-names") + 1 : simulation.index("--resource-arns")
+    ]
+    assert actions == list(audit.EKS_IAM_ACTIONS)
+    assert simulation[
+        simulation.index("--resource-arns") + 1 : simulation.index("--context-entries")
+    ] == [f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/{i}" for i in INSTANCES], (
+        "simulate against the GPU instances, never *"
+    )
+    assert simulation[simulation.index("--context-entries") + 1] == (
+        f"ContextKeyName=aws:ResourceTag/eks:cluster-name,ContextKeyValues={EKS_GPU_NAME},"
+        "ContextKeyType=string"
+    )
+    assert result["iam_decisions"]["ec2:RebootInstances"] == "allowed"
+    assert result["cloudtrail_refused_calls"]["RunInstances"] == 3
+    assert result["cloudtrail_foreign_calls"]["TerminateInstances"] == 1
+    assert result["cloudtrail_events"]["TerminateInstances"] == []
+    assert [
+        item["instance_ids"] for item in result["cloudtrail_events"]["RebootInstances"]
+    ] == [[INSTANCES[0]], [INSTANCES[1]]]
+    assert result["reboot_instance_bindings"] == {
+        "bound": sorted(INSTANCES),
+        "unbound": [],
+        "outside_cluster": [],
+    }
+    inventory = result["inventory_before"]
+    assert inventory["count"] == 2 and inventory["cluster_name"] == EKS_GPU_NAME
+    assert inventory["nodegroups"] == {
+        NODEGROUP: {
+            "cluster_name": EKS_GPU_NAME,
+            "status": "ACTIVE",
+            "health_issue_codes": [],
+        }
+    }
+    assert inventory["instance_cluster_tags"] == {i: EKS_GPU_NAME for i in INSTANCES}
+    assert result["inventory_after"] == inventory
+    assert result["executor_replica_count"] == 3, (
+        "the replace switches are still judged"
+    )
+
+
+def test_eks_audit_fails_on_an_accepted_ec2_replacement_by_the_executor_role(
+    local_audit: LocalAudit,
+) -> None:
+    local_audit.use_eks()
+    local_audit.ec2_events["TerminateInstances"].append(
+        local_audit.ec2_event("TerminateInstances", [INSTANCES[1]])
+    )
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert result["errors"] == [
+        "CloudTrail contains an accepted EC2 TerminateInstances by the executor role"
+    ], result
+    assert result["cloudtrail_foreign_calls"]["TerminateInstances"] == 1, (
+        "the Auto Scaling termination stays a counted foreign call"
+    )
+
+
+def test_eks_audit_binds_the_executor_roles_reboots_to_the_registered_cluster(
+    local_audit: LocalAudit,
+) -> None:
+    local_audit.use_eks()
+    local_audit.ec2_events["RebootInstances"].append(
+        local_audit.ec2_event("RebootInstances", ["i-0000000000000000"])
+    )
+    local_audit.instance_tags["i-0000000000000000"] = {"eks:cluster-name": "other"}
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert result["errors"] == [
+        "CloudTrail contains 1 RebootInstances target(s) by the executor role "
+        "outside the registered EKS cluster"
+    ], result
+    assert result["reboot_instance_bindings"]["outside_cluster"] == [
+        "i-0000000000000000"
+    ]
+    describes = [
+        c for c, _ in local_audit.calls if c[1:3] == ["ec2", "describe-instances"]
+    ]
+    assert any(
+        "i-0000000000000000" in c[c.index("--filters") + 1] for c in describes
+    ), "a rebooted instance that is no longer a GPU node is looked up by filter"
+
+
+def test_eks_audit_records_a_rebooted_instance_ec2_no_longer_knows(
+    local_audit: LocalAudit,
+) -> None:
+    local_audit.use_eks()
+    local_audit.ec2_events["RebootInstances"].append(
+        local_audit.ec2_event("RebootInstances", ["i-0000000000000000"])
+    )
+    code, result = local_audit.run()
+    assert code == 0 and result["verdict"] == "PASS", result
+    assert result["reboot_instance_bindings"]["unbound"] == ["i-0000000000000000"]
+
+
+def test_eks_audit_fails_when_iam_permits_a_replacement_verb(
+    local_audit: LocalAudit,
+) -> None:
+    local_audit.use_eks()
+    for item in local_audit.ec2_iam["EvaluationResults"]:
+        if item["EvalActionName"] == "ec2:TerminateInstances":
+            item["EvalDecision"] = "allowed"
+            for row in item["ResourceSpecificResults"]:
+                row["EvalResourceDecision"] = "allowed"
+    code, result = local_audit.run()
+    assert code == 1 and result["errors"] == [
+        "executor IAM permits ec2:TerminateInstances"
+    ], result
+
+
+def test_eks_audit_fails_on_an_untagged_instance_or_degraded_node_group(
+    local_audit: LocalAudit,
+) -> None:
+    local_audit.use_eks()
+    del local_audit.instance_tags[INSTANCES[1]]["eks:cluster-name"]
+    local_audit.nodegroup["nodegroup"]["status"] = "DEGRADED"
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    # The untagged instance is also the one the role rebooted: no longer bound
+    # to the registered cluster, that reboot is judged outside it as well.
+    assert result["errors"] == [
+        "CloudTrail contains 1 RebootInstances target(s) by the executor role "
+        "outside the registered EKS cluster",
+        f"1 GPU instance(s) are not tagged eks:cluster-name={EKS_GPU_NAME}",
+        f"managed node group {NODEGROUP} is not ACTIVE on the registered EKS cluster",
+    ], result
+
+
+def test_a_failed_provider_command_names_its_class_and_error_code(
+    local_audit: LocalAudit, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live 2026-10-07: "RegionalCommandFailed: ResourceNotFound: <sensitive
+    output redacted>" named neither the API asked nor the step."""
+
+    local_audit.failing[("sagemaker", "describe-cluster")] = (
+        254,
+        "\nAn error occurred (ResourceNotFound) when calling the DescribeCluster "
+        f"operation: {SENSITIVE}\n",
+    )
+    code, result = local_audit.run()
+    assert code == 1 and result["verdict"] == "FAIL", result
+    assert (
+        result["error"]
+        == "aws sagemaker describe-cluster failed (exit 254) [ResourceNotFound]"
+    )
+    assert SENSITIVE not in json.dumps(result) + capsys.readouterr().out

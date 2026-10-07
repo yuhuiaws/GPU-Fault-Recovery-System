@@ -542,3 +542,226 @@ def test_destr011_is_recorded_as_superseded() -> None:
     assert destr013.SUPERSEDED_CASE_IDS == ("GF-REGIONAL-DESTR-011",)
     assert destr013.POSITIVE_CONTROL_EVENT in destr013.EVENT_NAMES
     assert "UpdateCluster" in destr013.FORBIDDEN_EVENT_NAMES
+
+
+# --------------------------------------------------------------------------- #
+# eks-managed branch (live mixed site: the registry's second cluster)
+# --------------------------------------------------------------------------- #
+EKS_NAME = "gpu-eks"
+INSTANCE_A = "i-00000000000000001"
+INSTANCE_B = "i-00000000000000002"
+
+
+def _trail(**events: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = {name: [] for name in destr013.EKS_EVENT_NAMES}
+    rows.update(events)
+    return {"events": rows, "refused_calls": {}, "foreign_calls": {}}
+
+
+def _reboot(*instance_ids: str) -> dict[str, Any]:
+    return {
+        "event_time": NOW.isoformat(),
+        "event_name": "RebootInstances",
+        "event_id": "event-" + "-".join(instance_ids),
+        "instance_ids": list(instance_ids),
+    }
+
+
+def test_window_errors_name_the_providers_positive_control_event() -> None:
+    errors, provisional = destr013.window_errors(
+        started_at=NOW - timedelta(hours=3),
+        ended_at=NOW - timedelta(minutes=20),
+        now=NOW,
+        accept_recent_window=False,
+        reboot_events=0,
+        expect_no_reboots=False,
+        control_event=destr013.EKS_POSITIVE_CONTROL_EVENT,
+    )
+    assert provisional is False
+    assert errors and errors[0].startswith("no RebootInstances in the window"), errors
+    errors, _provisional = destr013.window_errors(
+        started_at=NOW - timedelta(hours=3),
+        ended_at=NOW - timedelta(minutes=20),
+        now=NOW,
+        accept_recent_window=False,
+        reboot_events=2,
+        expect_no_reboots=True,
+        control_event=destr013.EKS_POSITIVE_CONTROL_EVENT,
+    )
+    assert errors == [
+        "--expect-no-reboots was given but 2 RebootInstances event(s) are in the window"
+    ]
+
+
+def test_eks_cloudtrail_invariant_judges_the_executor_roles_ec2_calls_only() -> None:
+    tags = {INSTANCE_A: EKS_NAME, INSTANCE_B: EKS_NAME}
+    clean = _trail(RebootInstances=[_reboot(INSTANCE_A), _reboot(INSTANCE_B)])
+    assert destr013.eks_cloudtrail_invariant_errors(
+        clean, instance_cluster_tags=tags, eks_name=EKS_NAME
+    ) == ([], {"bound": [INSTANCE_A, INSTANCE_B], "unbound": [], "outside_cluster": []})
+
+    replaced = _trail(
+        RebootInstances=[_reboot(INSTANCE_A)],
+        TerminateInstances=[
+            {
+                "event_time": "t",
+                "event_name": "TerminateInstances",
+                "event_id": "x",
+                "instance_ids": [INSTANCE_B],
+            }
+        ],
+        RunInstances=[
+            {
+                "event_time": "t",
+                "event_name": "RunInstances",
+                "event_id": "y",
+                "instance_ids": [],
+            }
+        ],
+    )
+    errors, _bindings = destr013.eks_cloudtrail_invariant_errors(
+        replaced, instance_cluster_tags=tags, eks_name=EKS_NAME
+    )
+    assert errors == [
+        "CloudTrail contains an accepted EC2 RunInstances by the executor role",
+        "CloudTrail contains an accepted EC2 TerminateInstances by the executor role",
+    ]
+
+    foreign = _trail(
+        RebootInstances=[_reboot(INSTANCE_A), _reboot("i-0000000000000000")]
+    )
+    errors, bindings = destr013.eks_cloudtrail_invariant_errors(
+        foreign,
+        instance_cluster_tags={**tags, "i-0000000000000000": "other-cluster"},
+        eks_name=EKS_NAME,
+    )
+    assert errors == [
+        "CloudTrail contains 1 RebootInstances target(s) by the executor role "
+        "outside the registered EKS cluster"
+    ]
+    assert bindings["outside_cluster"] == ["i-0000000000000000"]
+    errors, bindings = destr013.eks_cloudtrail_invariant_errors(
+        foreign,
+        instance_cluster_tags={**tags, "i-0000000000000000": ""},
+        eks_name=EKS_NAME,
+    )
+    assert errors, "an instance EC2 knows but does not tag to the cluster is outside it"
+
+    gone = _trail(RebootInstances=[_reboot(INSTANCE_A), _reboot("i-0000000000000000")])
+    errors, bindings = destr013.eks_cloudtrail_invariant_errors(
+        gone, instance_cluster_tags=tags, eks_name=EKS_NAME
+    )
+    assert errors == [], "an instance EC2 no longer describes is recorded, not judged"
+    assert bindings == {
+        "bound": [INSTANCE_A],
+        "unbound": ["i-0000000000000000"],
+        "outside_cluster": [],
+    }
+
+    nameless = _trail(RebootInstances=[_reboot()])
+    errors, _bindings = destr013.eks_cloudtrail_invariant_errors(
+        nameless, instance_cluster_tags=tags, eks_name=EKS_NAME
+    )
+    assert errors == [
+        "CloudTrail RebootInstances by the executor role names no instance"
+    ]
+
+
+def test_eks_iam_errors_allow_reboot_only() -> None:
+    clean = {
+        "ec2:RebootInstances": "allowed",
+        "ec2:RunInstances": "implicitDeny",
+        "ec2:StartInstances": "implicitDeny",
+        "ec2:StopInstances": "explicitDeny",
+        "ec2:TerminateInstances": "implicitDeny",
+    }
+    assert destr013.eks_iam_errors(clean) == []
+    assert destr013.eks_iam_errors({**clean, "ec2:TerminateInstances": "allowed"}) == [
+        "executor IAM permits ec2:TerminateInstances"
+    ]
+    assert destr013.eks_iam_errors({**clean, "ec2:RebootInstances": "mixed"}) == [
+        "executor IAM does not allow ec2:RebootInstances"
+    ]
+    assert destr013.eks_iam_errors({}) == [
+        f"executor IAM permits {action}" for action in destr013.EKS_IAM_ACTIONS[1:]
+    ] + ["executor IAM does not allow ec2:RebootInstances"]
+
+
+def _eks_inventory(**overrides: Any) -> dict[str, Any]:
+    value = {
+        "count": 2,
+        "sha256": "f" * 64,
+        "cluster_name": EKS_NAME,
+        "nodes": [
+            {
+                "node_logical_id": "node-a",
+                "instance_id": INSTANCE_A,
+                "instance_group": "gpu",
+            },
+            {
+                "node_logical_id": "node-b",
+                "instance_id": INSTANCE_B,
+                "instance_group": "gpu",
+            },
+        ],
+        "nodegroups": {
+            "gpu": {
+                "cluster_name": EKS_NAME,
+                "status": "ACTIVE",
+                "health_issue_codes": [],
+            }
+        },
+        "instance_cluster_tags": {INSTANCE_A: EKS_NAME, INSTANCE_B: EKS_NAME},
+    }
+    value.update(overrides)
+    return value
+
+
+def test_eks_inventory_errors_bind_nodes_to_the_registered_cluster() -> None:
+    assert destr013.eks_inventory_errors(_eks_inventory()) == []
+    assert destr013.eks_inventory_errors(
+        _eks_inventory(nodes=[], instance_cluster_tags={})
+    ) == ["EKS GPU node inventory is empty"]
+    assert destr013.eks_inventory_errors(
+        _eks_inventory(instance_cluster_tags={INSTANCE_A: EKS_NAME, INSTANCE_B: ""})
+    ) == [f"1 GPU instance(s) are not tagged eks:cluster-name={EKS_NAME}"]
+    degraded = _eks_inventory(
+        nodegroups={
+            "gpu": {
+                "cluster_name": "other",
+                "status": "DEGRADED",
+                "health_issue_codes": ["AsgInstanceLaunchFailures"],
+            }
+        }
+    )
+    assert destr013.eks_inventory_errors(degraded) == [
+        "managed node group gpu is not ACTIVE on the registered EKS cluster",
+        "managed node group gpu reports health issues: ['AsgInstanceLaunchFailures']",
+    ]
+    assert destr013.provider_inventory_errors(
+        "eks-managed", _eks_inventory(), _eks_inventory(count=1)
+    ) == ["EKS GPU node inventory changed during the read-only audit"]
+
+
+def test_provider_dispatch_keeps_hyperpod_messages_and_vocabulary() -> None:
+    assert destr013.provider_control_event("hyperpod") == "BatchRebootClusterNodes"
+    assert destr013.provider_control_event("eks-managed") == "RebootInstances"
+    assert destr013.provider_cluster_errors(
+        "hyperpod", {"cluster_status": "Updating", "node_recovery": "Automatic"}
+    ) == ["HyperPod cluster is not InService", "HyperPod NodeRecovery is not None"]
+    assert destr013.provider_cluster_errors(
+        "eks-managed", {"cluster_status": "UPDATING"}
+    ) == ["EKS cluster is not ACTIVE"]
+    assert destr013.provider_iam_errors(
+        "hyperpod", {"sagemaker:BatchReplaceClusterNodes": "allowed"}
+    ) == [
+        "executor IAM permits BatchReplaceClusterNodes",
+        "executor IAM does not allow BatchRebootClusterNodes",
+    ]
+    assert set(destr013.EKS_EVENT_NAMES) == {
+        "RebootInstances",
+        "RunInstances",
+        "StartInstances",
+        "StopInstances",
+        "TerminateInstances",
+    }

@@ -178,6 +178,7 @@ def test_the_eks_inventory_is_the_gpu_nodes_provider_identity() -> None:
     assert facts["i-0a"] == {
         "instance_type": "p5en.48xlarge",
         "instance_group": "gpu-p5en-efa-spot-node-group",
+        "cluster_name": "gpu-eks-cluster",
         "availability_zone": "us-west-2c",
         "state": "running",
     }

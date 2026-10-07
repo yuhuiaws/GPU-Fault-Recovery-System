@@ -33,13 +33,32 @@ from scripts.e2e.regional.acceptance_scope import current_acceptance_scope  # no
 from scripts.e2e.regional.acceptance_supervision import (  # noqa: E402
     bind_command_supervision,
 )
+from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
+    RebootEvidenceError,
+    normalize_provider_event,
+)
 from scripts.e2e.regional.destr013_audit_evidence import (  # noqa: E402
     SYNTHETIC_ROUTE_ENV,
     AuditError,
     arn_parts,
+    eks_cluster_facts,
+    eks_node_inventory,
     json_object,
     run,
     target_evidence,
+)
+from scripts.e2e.regional.destr013_eks_audit import (  # noqa: E402,F401
+    EKS_CLUSTER_TAG_CONTEXT as EKS_CLUSTER_TAG_CONTEXT,
+    EKS_EVENT_NAMES,
+    EKS_EVENT_SOURCE,
+    EKS_FORBIDDEN_EVENT_NAMES as EKS_FORBIDDEN_EVENT_NAMES,
+    EKS_IAM_ACTIONS,
+    EKS_MANAGED,
+    EKS_POSITIVE_CONTROL_EVENT,
+    eks_cloudtrail_invariant_errors,
+    eks_iam_decisions,
+    eks_iam_errors,
+    eks_inventory_errors,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     PROVIDER_EVENT_VISIBILITY_SECONDS,
@@ -51,6 +70,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     required as require_text,
 )
+from scripts.e2e.regional.warm_spare_provider import eks_instance_facts  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-DESTR-013"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-HA-004"
@@ -228,6 +248,7 @@ def window_errors(
     accept_recent_window: bool,
     reboot_events: int,
     expect_no_reboots: bool,
+    control_event: str = POSITIVE_CONTROL_EVENT,
 ) -> tuple[list[str], bool]:
     """Errors about the query window itself, and whether the negative is provisional.
 
@@ -257,14 +278,14 @@ def window_errors(
             )
     if reboot_events == 0 and not expect_no_reboots:
         errors.append(
-            f"no {POSITIVE_CONTROL_EVENT} in the window; an empty query cannot "
+            f"no {control_event} in the window; an empty query cannot "
             "distinguish a quiet cluster from the wrong region or hours "
             "(pass --expect-no-reboots if the run drove no reboot case)"
         )
     if reboot_events and expect_no_reboots:
         errors.append(
             f"--expect-no-reboots was given but {reboot_events} "
-            f"{POSITIVE_CONTROL_EVENT} event(s) are in the window"
+            f"{control_event} event(s) are in the window"
         )
     return errors, provisional
 
@@ -616,6 +637,279 @@ def cloudtrail_events(
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Provider dispatch: HyperPod reads as before; an eks-managed registration is
+# read through EKS, EC2 and the ec2.amazonaws.com CloudTrail source instead.
+# --------------------------------------------------------------------------- #
+def provider_control_event(provider: str) -> str:
+    return (
+        EKS_POSITIVE_CONTROL_EVENT
+        if provider == EKS_MANAGED
+        else POSITIVE_CONTROL_EVENT
+    )
+
+
+def read_cluster(
+    provider: str, region: str, cluster: str, registration: dict[str, Any]
+) -> dict[str, Any]:
+    if provider == EKS_MANAGED:
+        return eks_cluster_facts(region, str(registration["eks_cluster_arn"]))
+    return cluster_recovery(region, cluster)
+
+
+def read_inventory(
+    provider: str,
+    region: str,
+    cluster: str,
+    *,
+    kubeconfig: Path,
+    context: str,
+    namespace: str,
+    eks_name: str,
+) -> dict[str, Any]:
+    if provider == EKS_MANAGED:
+        return eks_node_inventory(kubeconfig, context, namespace, region, eks_name)
+    return node_inventory(region, cluster)
+
+
+def read_iam(
+    provider: str,
+    region: str,
+    role_arn: str,
+    *,
+    cluster_arn: str,
+    inventory: dict[str, Any],
+) -> dict[str, str]:
+    if provider == EKS_MANAGED:
+        return eks_iam_decisions(
+            region,
+            role_arn,
+            cluster_arn=cluster_arn,
+            eks_name=str(inventory["cluster_name"]),
+            instance_ids=[
+                str(row["instance_id"])
+                for row in inventory["nodes"]
+                if row.get("instance_id")
+            ],
+        )
+    return iam_decisions(region, role_arn, cluster_arn)
+
+
+def provider_iam_errors(provider: str, decisions: dict[str, str]) -> list[str]:
+    if provider == EKS_MANAGED:
+        return eks_iam_errors(decisions)
+    errors = []
+    if decisions.get("sagemaker:BatchReplaceClusterNodes") not in {
+        "implicitDeny",
+        "explicitDeny",
+    }:
+        errors.append("executor IAM permits BatchReplaceClusterNodes")
+    if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
+        errors.append("executor IAM does not allow BatchRebootClusterNodes")
+    return errors
+
+
+def _lookup_pages(
+    region: str, started_at: datetime, ended_at: datetime, event_name: str
+) -> Iterator[dict[str, Any]]:
+    """Every row of one event name's lookup, page by page, with the same
+    pagination discipline as the HyperPod read."""
+
+    token = ""
+    seen: set[str] = set()
+    for _page in range(1000):
+        value = json_object(
+            run(
+                [
+                    "aws",
+                    "cloudtrail",
+                    "lookup-events",
+                    "--region",
+                    region,
+                    "--start-time",
+                    started_at.isoformat(),
+                    "--end-time",
+                    ended_at.isoformat(),
+                    "--lookup-attributes",
+                    f"AttributeKey=EventName,AttributeValue={event_name}",
+                    "--output",
+                    "json",
+                    "--no-paginate",
+                    *(["--next-token", token] if token else []),
+                ]
+            ).stdout,
+            "CloudTrail page",
+        )
+        if not isinstance(value.get("Events"), list):
+            raise AuditError("CloudTrail page has no complete Events inventory")
+        for item in value["Events"]:
+            if not isinstance(item, dict):
+                raise AuditError("CloudTrail event is malformed")
+            yield item
+        next_token = value.get("NextToken")
+        if next_token is None:
+            return
+        if not isinstance(next_token, str) or not next_token or next_token in seen:
+            raise AuditError("CloudTrail pagination is malformed or repeated")
+        seen.add(next_token)
+        token = next_token
+    raise AuditError("CloudTrail pagination exceeds the audit bound")
+
+
+def eks_cloudtrail_events(
+    region: str,
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    account: str,
+    role_arn: str,
+) -> dict[str, Any]:
+    """The window's EC2 node mutations in ``ec2.amazonaws.com``, split three
+    ways: calls AWS refused (an errorCode), accepted calls by other principals
+    (counted, not judged) and accepted calls by the executor role -- what the
+    invariant judges, with the instances each names."""
+
+    events: dict[str, list[dict[str, Any]]] = {name: [] for name in EKS_EVENT_NAMES}
+    refused = {name: 0 for name in EKS_EVENT_NAMES}
+    foreign = {name: 0 for name in EKS_EVENT_NAMES}
+    for event_name in EKS_EVENT_NAMES:
+        for item in _lookup_pages(region, started_at, ended_at, event_name):
+            try:
+                event = normalize_provider_event(item)
+            except RebootEvidenceError:
+                raise AuditError("CloudTrail event detail is malformed") from None
+            if event["event_source"] != EKS_EVENT_SOURCE:
+                if not event["event_source"]:
+                    raise AuditError("CloudTrail event source is missing")
+                continue
+            at = parse_time(event["event_time"], "CloudTrail event time")
+            if (
+                event["event_name"] != event_name
+                or item.get("EventName") != event_name
+                or event["aws_region"] != region
+                or event["recipient_account_id"] != account
+                or not started_at <= at <= ended_at
+            ):
+                raise AuditError(
+                    "CloudTrail event identity/time differs from the target window"
+                )
+            if event["api_error_code"]:
+                refused[event_name] += 1
+                continue
+            if event["session_issuer_arn"] != role_arn:
+                foreign[event_name] += 1
+                continue
+            if event["normalization_errors"]:
+                raise AuditError("CloudTrail event detail is malformed")
+            events[event_name].append(
+                {
+                    "event_time": at.isoformat(),
+                    "event_name": event_name,
+                    "event_id": event["event_id"],
+                    "instance_ids": list(event["request_node_ids"] or []),
+                }
+            )
+    return {"events": events, "refused_calls": refused, "foreign_calls": foreign}
+
+
+def read_cloudtrail(
+    provider: str,
+    region: str,
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    cluster_arn: str,
+    cluster_name: str,
+    role_arn: str,
+) -> dict[str, Any]:
+    if provider == EKS_MANAGED:
+        return eks_cloudtrail_events(
+            region,
+            started_at,
+            ended_at,
+            account=arn_parts(cluster_arn, "eks")[4],
+            role_arn=role_arn,
+        )
+    return {
+        "events": cloudtrail_events(
+            region,
+            started_at,
+            ended_at,
+            cluster_arn=cluster_arn,
+            cluster_name=cluster_name,
+            role_arn=role_arn,
+        )
+    }
+
+
+def provider_trail_errors(
+    provider: str,
+    trail: dict[str, Any],
+    *,
+    region: str,
+    inventory: dict[str, Any],
+    eks_name: str,
+) -> tuple[list[str], dict[str, list[str]] | None]:
+    if provider != EKS_MANAGED:
+        return cloudtrail_invariant_errors(trail["events"]), None
+    tags = dict(inventory.get("instance_cluster_tags") or {})
+    rebooted = sorted(
+        {
+            str(instance_id)
+            for item in trail["events"].get(EKS_POSITIVE_CONTROL_EVENT, [])
+            for instance_id in item.get("instance_ids") or []
+        }
+    )
+    missing = [instance_id for instance_id in rebooted if instance_id not in tags]
+    if missing:
+        # Instances the role rebooted that are no longer GPU nodes: bind the
+        # ones EC2 still describes by their cluster tag.
+        facts = eks_instance_facts(
+            lambda argv: run(argv).stdout, region=region, instance_ids=missing
+        )
+        tags.update(
+            {
+                instance_id: str(
+                    (facts.get(instance_id) or {}).get("cluster_name") or ""
+                )
+                for instance_id in missing
+                if instance_id in facts
+            }
+        )
+    return eks_cloudtrail_invariant_errors(
+        trail, instance_cluster_tags=tags, eks_name=eks_name
+    )
+
+
+def provider_inventory_errors(
+    provider: str, before: dict[str, Any], after: dict[str, Any]
+) -> list[str]:
+    errors = []
+    if provider == EKS_MANAGED:
+        if before != after:
+            errors.append("EKS GPU node inventory changed during the read-only audit")
+        errors.extend(eks_inventory_errors(before))
+        return errors
+    if before != after:
+        errors.append("HyperPod node inventory changed during the read-only audit")
+    if not before["count"]:
+        errors.append("HyperPod node inventory is empty")
+    return errors
+
+
+def provider_cluster_errors(provider: str, recovery: dict[str, Any]) -> list[str]:
+    if provider == EKS_MANAGED:
+        if recovery.get("cluster_status") != "ACTIVE":
+            return ["EKS cluster is not ACTIVE"]
+        return []
+    errors = []
+    if recovery.get("cluster_status") != "InService":
+        errors.append("HyperPod cluster is not InService")
+    if recovery.get("node_recovery") != "None":
+        errors.append("HyperPod NodeRecovery is not None")
+    return errors
+
+
 def _walk(value: Any) -> Iterator[Any]:
     if isinstance(value, dict):
         yield value
@@ -733,7 +1027,14 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--cpu-context", default="")
     value.add_argument("--namespace", default="gpu-fault-system")
     value.add_argument("--region", default="")
-    value.add_argument("--hyperpod-cluster", default="")
+    value.add_argument(
+        "--hyperpod-cluster",
+        default="",
+        help=(
+            "the HyperPod cluster name, or the cluster id / EKS cluster name of "
+            "an eks-managed registration (the provider is read from the registry)"
+        ),
+    )
     value.add_argument("--executor-role-arn", default="")
     value.add_argument("--window-start", required=True)
     value.add_argument("--window-end", required=True)
@@ -757,9 +1058,13 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def audit(
-    arguments: argparse.Namespace, case_dir: Path, result: dict[str, Any]
-) -> None:
+def audit_targets(
+    arguments: argparse.Namespace,
+) -> tuple[Path, str, Path, str, str, str, str]:
+    """The CLI/environment targets, each required by name in this order:
+    GPU kubeconfig and context, CPU kubeconfig and context, Region, the
+    registered cluster (``--hyperpod-cluster``) and the executor role ARN."""
+
     kubeconfig = (
         Path(
             required(
@@ -809,6 +1114,21 @@ def audit(
         arguments.executor_role_arn or os.getenv("GPU_FAULT_EXECUTOR_ROLE_ARN", ""),
         "executor role ARN",
     )
+    return kubeconfig, context, cpu_kubeconfig, cpu_context, region, cluster, role_arn
+
+
+def audit(
+    arguments: argparse.Namespace, case_dir: Path, result: dict[str, Any]
+) -> None:
+    (
+        kubeconfig,
+        context,
+        cpu_kubeconfig,
+        cpu_context,
+        region,
+        cluster,
+        role_arn,
+    ) = audit_targets(arguments)
     started_at = parse_time(arguments.window_start, "window start")
     ended_at = parse_time(arguments.window_end, "window end")
     if ended_at <= started_at:
@@ -832,7 +1152,6 @@ def audit(
             / f"{PREDECESSOR_CASE_ID}.json"
         ).resolve()
     )
-    recovery = cluster_recovery(region, cluster)
     target_arguments: dict[str, Any] = {
         "gpu_kubeconfig": kubeconfig,
         "gpu_context": context,
@@ -843,10 +1162,20 @@ def audit(
         "cluster": cluster,
         "role_arn": role_arn,
     }
-    target = target_evidence(**target_arguments, recovery=recovery)
+
+    def read_recovery(provider: str, registration: dict[str, Any]) -> dict[str, Any]:
+        return read_cluster(provider, region, cluster, registration)
+
+    target = target_evidence(**target_arguments, read_recovery=read_recovery)
+    recovery = target["cluster"]
+    provider = str(target["provider"])
+    eks_name = str(target["registration"]["eks_cluster_arn"]).rsplit("/", 1)[-1]
+    control_event = provider_control_event(provider)
     result.update(
         release_id=target["release_id"],
         cluster_id=target["cluster_id"],
+        provider=provider,
+        positive_control_event=control_event,
         target_binding=target,
     )
     predecessor = predecessor_evidence(
@@ -860,12 +1189,21 @@ def audit(
         raise AuditError(
             "HA-004 predecessor is not formal PASS for this release/cluster"
         )
-    inventory_before = node_inventory(region, cluster)
+    inventory_arguments: dict[str, Any] = {
+        "kubeconfig": kubeconfig,
+        "context": context,
+        "namespace": target_arguments["namespace"],
+        "eks_name": eks_name,
+    }
+    inventory_before = read_inventory(provider, region, cluster, **inventory_arguments)
     environments = target["executor_environment"]
     api_env = target["api_environment"]
     cluster_arn = recovery["cluster_arn"]
-    decisions = iam_decisions(region, role_arn, cluster_arn)
-    events = cloudtrail_events(
+    decisions = read_iam(
+        provider, region, role_arn, cluster_arn=cluster_arn, inventory=inventory_before
+    )
+    trail = read_cloudtrail(
+        provider,
         region,
         started_at,
         ended_at,
@@ -873,37 +1211,32 @@ def audit(
         cluster_name=cluster,
         role_arn=role_arn,
     )
+    events = trail["events"]
     manifests = manifest_invariants()
     tests = focused_tests(case_dir)
-    inventory_after = node_inventory(region, cluster)
-    recovery_after = cluster_recovery(region, cluster)
-    target_after = target_evidence(**target_arguments, recovery=recovery_after)
-    errors = []
-    if recovery.get("cluster_status") != "InService":
-        errors.append("HyperPod cluster is not InService")
-    if recovery.get("node_recovery") != "None":
-        errors.append("HyperPod NodeRecovery is not None")
+    inventory_after = read_inventory(provider, region, cluster, **inventory_arguments)
+    target_after = target_evidence(**target_arguments, read_recovery=read_recovery)
+    recovery_after = target_after["cluster"]
+    errors = provider_cluster_errors(provider, recovery)
     if recovery_after != recovery or target_after != target:
         errors.append(
             "release/registration/EKS/IRSA or replica identity drifted during audit"
         )
     errors.extend(environment_errors(environments))
     errors.extend(synthetic_route_errors(api_env))
-    if decisions.get("sagemaker:BatchReplaceClusterNodes") not in {
-        "implicitDeny",
-        "explicitDeny",
-    }:
-        errors.append("executor IAM permits BatchReplaceClusterNodes")
-    if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
-        errors.append("executor IAM does not allow BatchRebootClusterNodes")
-    errors.extend(cloudtrail_invariant_errors(events))
+    errors.extend(provider_iam_errors(provider, decisions))
+    trail_errors, reboot_bindings = provider_trail_errors(
+        provider, trail, region=region, inventory=inventory_before, eks_name=eks_name
+    )
+    errors.extend(trail_errors)
     window_problems, provisional = window_errors(
         started_at=started_at,
         ended_at=ended_at,
         now=datetime.now(timezone.utc),
         accept_recent_window=bool(arguments.accept_recent_window),
-        reboot_events=len(events.get(POSITIVE_CONTROL_EVENT, [])),
+        reboot_events=len(events.get(control_event, [])),
         expect_no_reboots=bool(arguments.expect_no_reboots),
+        control_event=control_event,
     )
     errors.extend(window_problems)
     timestamps_after = run_timestamps(arguments.run_dir)
@@ -916,10 +1249,9 @@ def audit(
     )
     if manifests["violations"]:
         errors.extend(cast(list[str], manifests["violations"]))
-    if inventory_before != inventory_after:
-        errors.append("HyperPod node inventory changed during the read-only audit")
-    if not inventory_before["count"]:
-        errors.append("HyperPod node inventory is empty")
+    errors.extend(
+        provider_inventory_errors(provider, inventory_before, inventory_after)
+    )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     incomplete = provisional and not errors
@@ -945,6 +1277,9 @@ def audit(
             "api_replica_count": len(api_env),
             "iam_decisions": decisions,
             "cloudtrail_events": events,
+            "cloudtrail_refused_calls": trail.get("refused_calls", {}),
+            "cloudtrail_foreign_calls": trail.get("foreign_calls", {}),
+            "reboot_instance_bindings": reboot_bindings,
             "cloudtrail_provisional": provisional,
             **run_evidence_fields(arguments.run_dir, timestamps),
             "manifest_invariants": manifests,

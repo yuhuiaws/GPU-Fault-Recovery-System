@@ -22,6 +22,7 @@ import importlib
 import json
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +32,17 @@ from scripts.e2e.regional.guardrail_audit_evidence import (
     complete_pod_population,
     registration_identity,
 )
-from scripts.e2e.regional.regional_commands import run_fixture_command
+from scripts.e2e.regional.regional_commands import (
+    command_step_label,
+    failure_class,
+    run_fixture_command,
+)
 from scripts.e2e.regional.regional_live_fixture import component_python
+from scripts.e2e.regional.warm_spare_provider import (
+    eks_instance_facts,
+    eks_instance_ids,
+    eks_provider_inventory,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 yaml = importlib.import_module("yaml")
@@ -70,6 +80,21 @@ class AuditError(RuntimeError):
     """A controlled diagnostic that contains no raw probe output."""
 
 
+_AWS_ERROR = re.compile(
+    r"An error occurred \(([A-Za-z0-9_.]{1,64})\) when calling the [A-Za-z0-9_]+ operation"
+)
+
+
+def command_failure_class(stderr: str | None) -> str:
+    """The AWS error code (``ResourceNotFound``) or the Python/kubectl failure
+    class a failed command's stderr names -- a fixed token, never a value."""
+
+    match = _AWS_ERROR.search(stderr or "")
+    if match is not None:
+        return match.group(1)
+    return failure_class(stderr)
+
+
 def run(
     command: list[str],
     *,
@@ -78,9 +103,21 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return run_fixture_command(
-        command, cwd=ROOT, timeout=timeout, input_text=input_text, check=check, env=env
+    completed = run_fixture_command(
+        command, cwd=ROOT, timeout=timeout, input_text=input_text, check=False, env=env
     )
+    if check and completed.returncode:
+        # Name the command class and the error code, nothing of the output:
+        # live 2026-10-07 the eks-managed registration's audit died with
+        # "RegionalCommandFailed: ResourceNotFound: <sensitive output
+        # redacted>" and nothing said which API had been asked.
+        label = command_step_label(command) or str(command[0])
+        failure = command_failure_class(completed.stderr)
+        raise AuditError(
+            f"{label} failed (exit {completed.returncode})"
+            + (f" [{failure}]" if failure else "")
+        )
+    return completed
 
 
 def kubectl(
@@ -229,6 +266,112 @@ def eks_binding(
         "eks_cluster_arn": eks_arn,
         "kubeconfig_sha256": digest,
         "namespace_uid": anchor,
+    }
+
+
+def eks_cluster_facts(region: str, eks_arn: str) -> dict[str, Any]:
+    """``aws eks describe-cluster`` in the HyperPod ``cluster_recovery`` shape
+    for an eks-managed registration: plain EKS has no NodeRecovery."""
+
+    parts = arn_parts(eks_arn, "eks")
+    value = json_object(
+        run(
+            [
+                "aws",
+                "eks",
+                "describe-cluster",
+                "--region",
+                region,
+                "--name",
+                parts[5].split("/", 1)[1],
+                "--output",
+                "json",
+            ]
+        ).stdout,
+        "EKS description",
+    ).get("cluster")
+    if not isinstance(value, dict):
+        raise AuditError("EKS description has no cluster")
+    return {
+        "cluster_name": value.get("name"),
+        "cluster_arn": value.get("arn"),
+        "cluster_status": value.get("status"),
+        "node_recovery": "not-applicable",
+        "orchestrator": None,
+        "provider": "eks-managed",
+    }
+
+
+def eks_node_inventory(
+    kubeconfig: Path, context: str, namespace: str, region: str, eks_name: str
+) -> dict[str, Any]:
+    """The GPU nodes' provider identity on an eks-managed cluster -- the
+    ``list-cluster-nodes`` counterpart, read provider-side.
+
+    Node ``providerID`` -> EC2 ``DescribeInstances`` (instance type, node
+    group and cluster tags, zone) -> EKS ``DescribeNodegroup`` for every node
+    group the nodes belong to. ``instance_cluster_tags`` maps each instance to
+    its ``eks:cluster-name`` tag (``""`` when EC2 knows the instance but it
+    carries none), which binds the nodes to the registered cluster.
+    """
+
+    document = json_object(
+        kubectl(kubeconfig, context, namespace, "get", "nodes", "-o", "json"),
+        "GPU node inventory",
+    )
+    facts = eks_instance_facts(
+        lambda argv: run(argv).stdout,
+        region=region,
+        instance_ids=eks_instance_ids(document),
+    )
+    inventory = eks_provider_inventory(document, instances=facts)
+    nodegroups: dict[str, dict[str, Any]] = {}
+    for name in sorted(
+        {
+            str(row["instance_group"])
+            for row in inventory["nodes"]
+            if row.get("instance_group")
+        }
+    ):
+        group = json_object(
+            run(
+                [
+                    "aws",
+                    "eks",
+                    "describe-nodegroup",
+                    "--region",
+                    region,
+                    "--cluster-name",
+                    eks_name,
+                    "--nodegroup-name",
+                    name,
+                    "--output",
+                    "json",
+                ]
+            ).stdout,
+            "EKS node group",
+        ).get("nodegroup")
+        if not isinstance(group, dict):
+            raise AuditError("EKS node group description has no nodegroup")
+        issues = (group.get("health") or {}).get("issues") or []
+        nodegroups[name] = {
+            "cluster_name": group.get("clusterName"),
+            "status": group.get("status"),
+            "health_issue_codes": sorted(
+                {str(item.get("code")) for item in issues if isinstance(item, dict)}
+            ),
+        }
+    return {
+        **inventory,
+        "cluster_name": eks_name,
+        "nodegroups": nodegroups,
+        "instance_cluster_tags": {
+            str(row["instance_id"]): str(
+                (facts.get(str(row["instance_id"])) or {}).get("cluster_name") or ""
+            )
+            for row in inventory["nodes"]
+            if row.get("instance_id")
+        },
     }
 
 
@@ -526,9 +669,16 @@ def target_evidence(
     region: str,
     cluster: str,
     role_arn: str,
-    recovery: dict[str, Any],
+    read_recovery: Callable[[str, dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Bind the supplied targets to the durable registration and deployed pins."""
+    """Bind the supplied targets to the durable registration and deployed pins.
+
+    ``read_recovery(provider, registration)`` reads the cluster through the
+    provider the durable registration names -- SageMaker ``describe-cluster``
+    on HyperPod, EKS ``describe-cluster`` on eks-managed -- so an eks-managed
+    registration is never asked the SageMaker API (live 2026-10-07: the
+    mixed site's second cluster died there with ResourceNotFound).
+    """
     try:
         _, cpu_digest = kubeconfig_cluster(cpu_kubeconfig, cpu_context)
         api = pod_population(cpu_kubeconfig, cpu_context, namespace, API_APP, "api")
@@ -548,22 +698,36 @@ def target_evidence(
             ) from None
         if type(registry.get("generation")) is not int or registry["generation"] < 1:
             raise AuditError("target registry generation is missing")
-        hp = arn_parts(recovery.get("cluster_arn"), "sagemaker")
+        provider = str(registration.get("provider") or "hyperpod")
+        recovery = read_recovery(provider, registration)
         eks = arn_parts(registration["eks_cluster_arn"], "eks")
         role = arn_parts(role_arn, "iam")
-        if (
-            recovery.get("cluster_name") != cluster
-            or hp[1] != eks[1]
-            or hp[1] != role[1]
-            or hp[3] != region
-            or eks[3] != region
-            or role[3]
-            or hp[4] != eks[4]
-            or hp[4] != role[4]
-            or recovery.get("orchestrator")
-            != {"Eks": {"ClusterArn": registration["eks_cluster_arn"]}}
-        ):
-            raise AuditError("target HyperPod/EKS/IRSA identity is inconsistent")
+        if provider == "eks-managed":
+            if (
+                recovery.get("provider") != "eks-managed"
+                or recovery.get("cluster_arn") != registration["eks_cluster_arn"]
+                or recovery.get("cluster_name") != eks[5].split("/", 1)[1]
+                or eks[1] != role[1]
+                or eks[3] != region
+                or role[3]
+                or eks[4] != role[4]
+            ):
+                raise AuditError("target EKS/IRSA identity is inconsistent")
+        else:
+            hp = arn_parts(recovery.get("cluster_arn"), "sagemaker")
+            if (
+                recovery.get("cluster_name") != cluster
+                or hp[1] != eks[1]
+                or hp[1] != role[1]
+                or hp[3] != region
+                or eks[3] != region
+                or role[3]
+                or hp[4] != eks[4]
+                or hp[4] != role[4]
+                or recovery.get("orchestrator")
+                != {"Eks": {"ClusterArn": registration["eks_cluster_arn"]}}
+            ):
+                raise AuditError("target HyperPod/EKS/IRSA identity is inconsistent")
         binding = eks_binding(
             gpu_kubeconfig,
             gpu_context,
@@ -652,6 +816,8 @@ def target_evidence(
         return {
             "release_id": state["release_id"],
             "cluster_id": registration["cluster_id"],
+            "provider": provider,
+            "cluster": recovery,
             "registration": registration,
             "registry_generation": registry["generation"],
             "release_pins": {
