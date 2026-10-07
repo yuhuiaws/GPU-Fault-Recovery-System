@@ -148,109 +148,31 @@ def test_aurora_preflight_requires_declared_and_observed_124_acu(
     assert {item["actual_acu"] for item in result["instances"].values()} == {124.0}
 
 
-def test_aurora_fixture_sets_124_128_before_capacity_check(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The harness resizes through the shared ``aurora_capacity`` reconciler --
-    the one writer of the ACU window -- and every AWS call still goes through
-    the registry-validated ``aws_json`` so the target check applies to it."""
-
-    modified: list[tuple[str, ...]] = []
-    shell_commands: list[list[str]] = []
-
-    def fake_shell_run(arguments, **_kwargs):
-        shell_commands.append(list(arguments))
-        return SimpleNamespace(stdout=b"{}")
-
-    def fake_aws_json(*arguments: str, **_kwargs):
-        operation = arguments[1]
-        if operation == "modify-db-cluster":
-            modified.append(arguments)
-            return {}
-        if operation == "describe-db-clusters":
-            target = bool(modified)
-            return {
-                "DBClusters": [
-                    {
-                        "Status": "available",
-                        "ServerlessV2ScalingConfiguration": {
-                            "MinCapacity": 124.0 if target else 0.5,
-                            "MaxCapacity": 128.0 if target else 8.0,
-                        },
-                        "DBClusterMembers": [
-                            {
-                                "DBInstanceIdentifier": "writer-a",
-                                "IsClusterWriter": True,
-                            },
-                            {
-                                "DBInstanceIdentifier": "reader-a",
-                                "IsClusterWriter": False,
-                            },
-                        ],
-                    }
-                ]
+def _aurora_cluster(min_acu: float, max_acu: float) -> dict:
+    return {
+        "DBClusters": [
+            {
+                "Status": "available",
+                "ServerlessV2ScalingConfiguration": {
+                    "MinCapacity": min_acu,
+                    "MaxCapacity": max_acu,
+                },
+                "DBClusterMembers": [
+                    {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
+                    {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
+                ],
             }
-        if operation == "describe-db-instances":
-            return {
-                "DBInstances": [
-                    {
-                        "DBInstanceStatus": "available",
-                        "DBInstanceClass": "db.serverless",
-                    }
-                ]
-            }
-        return {
-            "Datapoints": [
-                {"Timestamp": datetime.now(UTC).isoformat(), "Maximum": 124.0}
-            ]
-        }
-
-    monkeypatch.setattr(suite, "shell_run", fake_shell_run)
-    monkeypatch.setattr(suite, "aws_json", fake_aws_json)
-
-    result = suite.ensure_aurora_capacity("aurora-a", timeout_seconds=5, configure=True)
-
-    assert modified, "Aurora modify command was not issued before validation"
-    assert "MinCapacity=124,MaxCapacity=128" in modified[0]
-    assert "--apply-immediately" in modified[0]
-    assert "--region" in modified[0], "the registry-validated caller adds the region"
-    assert not any("modify-db-cluster" in command for command in shell_commands), (
-        "the harness must not spell the modify itself"
-    )
-    assert result["initial_scaling"] == {"min_acu": 0.5, "max_acu": 8.0}
-    assert result["scaling_modified"] is True
-    assert result["min_acu"] == 124.0
+        ]
+    }
 
 
-def test_aurora_fixture_keeps_a_window_at_or_above_the_formal_floor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """128/128 (the 50-* preset floor) satisfies 124/128; it is not lowered.
-
-    Lowering it behind ``gpu-fault-admin config`` left the desired and live
-    windows apart and the next preset apply refused the drift (2026-09-13).
-    """
-
+def _aurora_aws(window: tuple[float, float], acu: float):
     def fake_aws_json(*arguments: str, **_kwargs):
         assert arguments[1] != "modify-db-cluster", (
-            "a window above the floor was lowered"
+            "the runner must never modify Aurora"
         )
         if arguments[1] == "describe-db-clusters":
-            return {
-                "DBClusters": [
-                    {
-                        "Status": "available",
-                        "ServerlessV2ScalingConfiguration": {
-                            "MinCapacity": 128.0,
-                            "MaxCapacity": 128.0,
-                        },
-                        "DBClusterMembers": [
-                            {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
-                            {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
-                        ],
-                    }
-                ]
-            }
+            return _aurora_cluster(*window)
         if arguments[1] == "describe-db-instances":
             return {
                 "DBInstances": [
@@ -261,51 +183,50 @@ def test_aurora_fixture_keeps_a_window_at_or_above_the_formal_floor(
                 ]
             }
         return {
-            "Datapoints": [
-                {"Timestamp": datetime.now(UTC).isoformat(), "Maximum": 128.0}
-            ]
+            "Datapoints": [{"Timestamp": datetime.now(UTC).isoformat(), "Maximum": acu}]
         }
 
-    monkeypatch.setattr(suite, "aws_json", fake_aws_json)
+    return fake_aws_json
+
+
+@pytest.mark.parametrize("configure", [True, False])
+def test_aurora_fixture_refuses_a_window_below_the_formal_floor_without_modifying(
+    monkeypatch: pytest.MonkeyPatch, configure: bool
+) -> None:
+    """Aurora is administrator-managed. Live 2026-10-07 the runner raised a site
+    from 82/128 to 124/128 with no reviewed record and the next two
+    ``gpu-fault-admin config`` applies failed closed on that drift; the runner
+    now verifies the formal window and names the configuration remedy, whatever
+    the acknowledgement flag says."""
+
+    monkeypatch.setattr(suite, "aws_json", _aurora_aws((82.0, 128.0), 82.0))
+
+    with pytest.raises(
+        RuntimeError, match="does not modify an administrator-managed window"
+    ) as refusal:
+        suite.ensure_aurora_capacity("aurora-a", timeout_seconds=1, configure=configure)
+
+    message = str(refusal.value)
+    assert "live 82/128" in message and "formal 124/128" in message
+    assert "spec.aurora {minAcu: 124, maxAcu: 128}" in message
+    assert "gpu-fault-admin config" in message
+
+
+def test_aurora_fixture_keeps_a_window_at_or_above_the_formal_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """128/128 (the 50-* preset floor) satisfies 124/128; it is read, recorded
+    and never lowered -- the runner issues no modify at all."""
+
+    monkeypatch.setattr(suite, "aws_json", _aurora_aws((128.0, 128.0), 128.0))
 
     result = suite.ensure_aurora_capacity("aurora-a", timeout_seconds=5, configure=True)
 
     assert result["scaling_modified"] is False
+    assert result["administrator_managed"] is True
     assert result["initial_scaling"] == {"min_acu": 128.0, "max_acu": 128.0}
+    assert result["required_window"] == {"min_acu": 124.0, "max_acu": 128.0}
     assert result["min_acu"] == 128.0
-
-
-def test_aurora_fixture_refuses_to_resize_without_authorization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_aws_json(*arguments: str, **_kwargs):
-        assert arguments[1] != "modify-db-cluster", "an unauthorized modify"
-        if arguments[1] == "describe-db-clusters":
-            return {
-                "DBClusters": [
-                    {
-                        "Status": "available",
-                        "ServerlessV2ScalingConfiguration": {
-                            "MinCapacity": 0.5,
-                            "MaxCapacity": 8.0,
-                        },
-                        "DBClusterMembers": [
-                            {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
-                            {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
-                        ],
-                    }
-                ]
-            }
-        return {
-            "DBInstances": [
-                {"DBInstanceStatus": "available", "DBInstanceClass": "db.serverless"}
-            ]
-        }
-
-    monkeypatch.setattr(suite, "aws_json", fake_aws_json)
-
-    with pytest.raises(RuntimeError, match="not authorized"):
-        suite.ensure_aurora_capacity("aurora-a", timeout_seconds=1, configure=False)
 
 
 def test_remediation_budget_preflight_reads_every_live_worker(

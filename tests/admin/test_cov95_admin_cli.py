@@ -90,6 +90,14 @@ def context(tmp_path, monkeypatch):
         lambda **_options: {"scale_up": False, "modified": True},
     )
     monkeypatch.setattr(cli, "reconcile_aurora_capacity", rollback)
+    monkeypatch.setattr(
+        cli,
+        "verify_aurora_capacity",
+        lambda **options: {
+            "min_acu": options["expected"].min_acu,
+            "max_acu": options["expected"].max_acu,
+        },
+    )
     return state
 
 

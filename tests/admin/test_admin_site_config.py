@@ -93,6 +93,7 @@ class Stubs:
         self.events: list[str] = []
         self.calls: dict[str, list[dict[str, object]]] = {
             "request": [],
+            "verify": [],
             "release": [],
             "await": [],
             "rollback": [],
@@ -121,6 +122,17 @@ class Stubs:
             self._record("rollback", kwargs)
             return {"modified": True, "before": {}, "after": {}}
 
+        def verify(**kwargs):
+            # An apply that leaves Aurora alone reads the window; the stub
+            # answers the reviewed one.
+            self._record("verify", kwargs)
+            return {
+                "min_acu": kwargs["expected"].min_acu,
+                "max_acu": kwargs["expected"].max_acu,
+                "instances": [],
+            }
+
+        monkeypatch.setattr(admin_cli, "verify_aurora_capacity", verify)
         monkeypatch.setattr(admin_cli, "request_aurora_capacity", request)
         monkeypatch.setattr(admin_cli, "_run_automatic_release", release)
         monkeypatch.setattr(admin_cli, "await_aurora_capacity", wait)

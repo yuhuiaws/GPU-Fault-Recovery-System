@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.admin import cli, release_child, release_state
+from gpu_fault.admin.aurora_capacity import AuroraCapacityDriftError
 from gpu_fault.admin.config import (
     AdminConfig,
     AdminConfigError,
@@ -76,6 +77,7 @@ class ConfigScenario:
         self.driver_error: Exception | None = None
         self.read_error: Exception | None = None
         self.request_error: Exception | None = None
+        self.verify_error: Exception | None = None
         self.await_error: Exception | None = None
         self.rollback_error: Exception | None = None
         self.rollback_calls = 0
@@ -115,6 +117,13 @@ class ConfigScenario:
         if self.request_error is not None:
             raise self.request_error
         return {"modified": True, "scale_up": True}
+
+    def verify(self, **options: Any) -> dict[str, Any]:
+        self.events.append("verify")
+        if self.verify_error is not None:
+            raise self.verify_error
+        expected = options["expected"]
+        return {"min_acu": expected.min_acu, "max_acu": expected.max_acu}
 
     def wait(self, **_options: Any) -> dict[str, Any]:
         self.events.append("await")
@@ -231,6 +240,7 @@ def scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ConfigScenario:
     monkeypatch.setattr(release_child, "run_driver", value.driver)
     monkeypatch.setattr(cli, "verify_prebuilt_release", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "request_aurora_capacity", value.request)
+    monkeypatch.setattr(cli, "verify_aurora_capacity", value.verify)
     monkeypatch.setattr(cli, "await_aurora_capacity", value.wait)
     monkeypatch.setattr(cli, "reconcile_aurora_capacity", value.rollback)
     return value
@@ -461,7 +471,9 @@ def test_cpu_only_partial_release_preserves_desired_without_aurora_calls(
     scenario.driver_action = lambda: setattr(scenario, "live", scenario.candidate())
     with pytest.raises(AdminConfigError, match="RELEASE_OUTCOME_UNPROVEN"):
         scenario.run()
-    assert scenario.events == ["read", "release", "read"]
+    # The unchanged window is verified read-only before the roles roll; no
+    # request and no rollback touch Aurora.
+    assert scenario.events == ["read", "verify", "release", "read"]
     scenario.assert_retained("RELEASE_OUTCOME_UNPROVEN")
 
 
@@ -803,3 +815,82 @@ def test_retry_request_failure_on_committed_target_cannot_restore_old_capacity(
         scenario.run()
     assert scenario.driver_calls == 1
     scenario.assert_retained("TARGET_COMMITTED")
+
+
+def test_aurora_drift_refused_before_any_modify_restores_desired_without_a_rollback(
+    scenario: ConfigScenario,
+) -> None:
+    """Live 2026-10-07 (perf harness had moved 82/128 to 124/128): the request
+    was refused before any modify, the Aurora rollback was then refused by the
+    same rule, and the unapplied 128/128 target was kept as the next apply's
+    reviewed current. Nothing was modified, so nothing is rolled back and the
+    target is not retained; the error names the three windows and the exits."""
+
+    scenario.request_error = AuroraCapacityDriftError(
+        (124.0, 128.0), (8.0, 32.0), (16.0, 64.0)
+    )
+
+    with pytest.raises(AdminConfigError, match="differs from both") as refusal:
+        scenario.run()
+
+    message = str(refusal.value)
+    assert "nothing was modified" in message
+    assert f"gpu-fault-admin deploy --state-dir {scenario.root}" in message
+    assert "spec.aurora" in message
+    assert scenario.rollback_calls == 0, "an untouched window has nothing to roll back"
+    assert scenario.driver_calls == 0, "the roles must not roll on a refused window"
+    assert load_desired_admin_config(scenario.root) == scenario.before, (
+        "the unapplied target must not become the next apply's reviewed current"
+    )
+    result = scenario.failure()
+    assert result["status"] == "FAILED"
+    assert (
+        result["details"]["release_recovery"]["reason"]
+        == "UNCHANGED_COMMITTED_BASELINE"
+    )
+    assert result["details"]["release_recovery"]["restore_before"] is True
+    assert "target retained" not in result["error"]
+    assert "aurora_rollback" not in result["details"]
+
+
+def test_unchanged_aurora_is_verified_read_only_before_the_roles_roll(
+    scenario: ConfigScenario,
+) -> None:
+    """An apply that does not change Aurora still proves the live window is the
+    reviewed one (live 2026-10-07: 32-enabled went APPLIED over moved Aurora);
+    drift fails closed before the roles roll, with nothing to roll back."""
+
+    first = scenario.before.patched({"workflow": {"dispatcherWorkers": 9}})
+    scenario.desired = first
+    write_admin_config_file(scenario.root / "admin-config.yaml", first, overwrite=True)
+    scenario.driver_code = 0
+
+    assert scenario.run() == 0
+    assert "request" not in scenario.events and "verify" in scenario.events
+    assert scenario.events.index("verify") < scenario.events.index("release")
+    assert load_desired_admin_config(scenario.root) == first
+
+    # The roles now run ``first``; a later apply finds the window moved.
+    scenario.live = release_document(first)
+    scenario.desired = first.patched({"workflow": {"dispatcherWorkers": 11}})
+    write_admin_config_file(
+        scenario.root / "admin-config.yaml", scenario.desired, overwrite=True
+    )
+    scenario.verify_error = AuroraCapacityDriftError((124.0, 128.0), (8.0, 32.0))
+    scenario.events.clear()
+
+    with pytest.raises(
+        AdminConfigError, match="differs from the reviewed current 8/32"
+    ):
+        scenario.run()
+
+    assert "release" not in scenario.events and scenario.rollback_calls == 0
+    assert load_desired_admin_config(scenario.root) == first, (
+        "the refused apply must leave the reviewed current where it was"
+    )
+    result = scenario.failure()
+    assert (
+        result["details"]["release_recovery"]["reason"]
+        == "UNCHANGED_COMMITTED_BASELINE"
+    )
+    assert "target retained" not in result["error"]

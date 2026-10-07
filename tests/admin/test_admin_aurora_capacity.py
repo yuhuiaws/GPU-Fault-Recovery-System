@@ -239,7 +239,9 @@ def test_reconcile_rejects_unreviewed_live_capacity(
 
     monkeypatch.setattr(aurora, "_aws_json", fake_aws)
 
-    with pytest.raises(AdminConfigError, match="differs from both"):
+    with pytest.raises(
+        aurora.AuroraCapacityDriftError, match="differs from both"
+    ) as refusal:
         aurora.reconcile_aurora_capacity(
             aws_region="us-east-1",
             cluster_id="aurora-a",
@@ -248,6 +250,18 @@ def test_reconcile_rejects_unreviewed_live_capacity(
             timeout_seconds=1,
             poll_seconds=0,
         )
+    assert isinstance(refusal.value, AdminConfigError), (
+        "callers catching the base still do"
+    )
+    assert (refusal.value.live, refusal.value.expected, refusal.value.desired) == (
+        (16.0, 64.0),
+        (0.5, 8.0),
+        (8.0, 32.0),
+    ), "the three windows are the caller's evidence"
+    assert str(refusal.value) == (
+        "live Aurora capacity 16/64 differs from both the reviewed current 0.5/8 and "
+        "desired 8/32 administrator configuration; nothing was modified"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -581,3 +595,36 @@ def test_request_settles_the_window_and_leaves_the_acu_ramp_to_await() -> None:
 
     assert "get-metric-statistics" in rds.operations()
     assert {item["actual_acu"] for item in settled["instances"]} == {8.0}
+
+
+def test_verify_accepts_the_reviewed_window_and_refuses_drift_without_modifying() -> (
+    None
+):
+    """An apply that leaves Aurora alone still proves the window it recorded
+    (live 2026-10-07: a 32-enabled apply went APPLIED over a window the perf
+    harness had moved); the check is read-only either way."""
+
+    rds = FakeRds(16.0, 64.0)
+
+    observed = aurora.verify_aurora_capacity(
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        expected=AuroraCapacityConfig(min_acu=16.0, max_acu=64.0),
+        aws_json=rds,
+    )
+
+    assert (observed["min_acu"], observed["max_acu"]) == (16.0, 64.0)
+    with pytest.raises(
+        aurora.AuroraCapacityDriftError, match="differs from the reviewed current 0.5/8"
+    ) as refusal:
+        aurora.verify_aurora_capacity(
+            aws_region="us-east-1",
+            cluster_id="aurora-a",
+            expected=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+            aws_json=rds,
+        )
+    assert refusal.value.live == (16.0, 64.0) and refusal.value.desired is None
+    assert "nothing was modified" in str(refusal.value)
+    assert not any(mutate for _arguments, mutate in rds.calls), (
+        "verification is read-only"
+    )

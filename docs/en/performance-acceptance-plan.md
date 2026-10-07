@@ -596,8 +596,10 @@ every exhausted branch must be a budget denial and its reboot must be validated.
 The formal CPU control-plane capacity conclusion uses one and the same runner round and no
 longer stitches together the three results of ingestion, Action seed and correlated-action:
 
-This entry point modifies the live CPU registry, creates simulated Jobs in the GPU perf
-namespace, and may adjust Aurora to `Min=124, Max=128`. Before execution the Region, CPU
+This entry point modifies the live CPU registry and creates simulated Jobs in the GPU perf
+namespace; it only verifies that Aurora is not below `Min=124, Max=128` and **never modifies
+Aurora** -- Aurora is managed by `gpu-fault-admin config` against a reviewed record, the runner has
+no such record, and its change would be refused by the next `config` as somebody else's. Before execution the Region, CPU
 kubeconfig, GPU context, Aurora cluster ID, maintenance window, stop conditions and restore
 values must be stated and approved explicitly. The current workspace must already have been
 converted into a clean, signed release that completed verify/stability; a formal capacity
@@ -642,6 +644,9 @@ kind: AdminConfig
 spec:
   capacity:
     preset: 32-disabled
+  aurora:
+    minAcu: 124
+    maxAcu: 128
 ```
 
 ```bash
@@ -649,6 +654,13 @@ gpu-fault-admin config \
   --state-dir "${STATE_DIR}" \
   --reference PERF-32-DISABLED
 ```
+
+Both `32-*` rounds must write `aurora: 124/128` explicitly: the preset itself carries only the topology floor
+`82/128` (administrator capacity configuration §4.6); the formal window `124/128` is set by `config` through the
+reviewed path and the runner will not set it for you. The `50-*` presets' own floor is `128/128`, so nothing more is
+written there (`config` only raises a preset's floor, never lowers it). The last step runs `config` once more with the
+site AdminConfig saved before the load test (including the site's own `aurora`), which restores Aurora together with
+the site configuration.
 
 After the configuration command completes verify/stability, run the runner for the same round:
 
@@ -706,8 +718,14 @@ counted in each path's `transport_retries`, not only the final HTTP success; the
 executor must aggregate `claim_error_counts` by HTTP status or exception type and save bounded
 time samples that contain no URL, token, cluster ID or exception body.
 
-Before registering the synthetic registry the runner records the original Min/Max and raises
-Aurora to `Min=124, Max=128` only when below the floor (a window above the floor is left as is),
+Before registering the synthetic registry the runner records the current Min/Max and verifies it is not
+below `124/128` (a window above the floor is accepted as is); it **never modifies Aurora**: below the floor it
+fails closed and the error names the remedy -- write `aurora: 124/128` explicitly in admin-config.yaml and apply it
+with `gpu-fault-admin config`. The runner has no reviewed record, so any Aurora change from it is refused by the
+next `config` as somebody else's (live: after the runner raised 82/128 to 124/128, both the `50-disabled` apply and the
+site-config restore failed closed before modifying anything). `--configure-aurora-capacity --confirm-aurora-scaling
+SET_AURORA_MIN_124_MAX_128` only acknowledges that the round requires the formal window; it authorizes no write.
+The runner
 then hard-verifies that both `db.serverless` instances are `available` and that the actual
 CloudWatch capacity of each is not below 124 ACU; at the same time it reads
 `GPU_FAULT_REMEDIATION_MAX_ACTIVE_*` from every control-worker Pod one by one and requires them
@@ -789,12 +807,16 @@ On any verdict failure, critical alert, undrained queue, cleanup residual, uncon
 or unavailable Aurora, stop the remaining rounds immediately. Failed artifacts go into
 `aborted/` and cannot serve as formal PASS evidence.
 
-The runner records the original Min/Max in `aurora-preflight.json.initial_scaling` but does not
-restore Aurora capacity automatically. After all rounds end, the original Min/Max must be
-restored per that record through the approved AWS/IaC process, and the cluster and both
-`db.serverless` instances verified available again; at the same time run
-`gpu-fault-admin config` once with the AdminConfig saved before the load test to restore the
-site's original configuration and run `verify` again.
+The runner records each round's starting Min/Max in `aurora-preflight.json.initial_scaling`
+(`scaling_modified` is always false, `administrator_managed: true`) and never modifies Aurora. After all
+rounds end, run `gpu-fault-admin config` once with the AdminConfig saved before the load test: the site
+configuration is restored together with its `aurora` window through the reviewed path (`config` waits for the
+cluster and both `db.serverless` instances to be available on the original window), then run `verify` again. If a
+`config` refuses with `AuroraCapacityDriftError` (the live window is neither the reviewed current nor the target;
+the refusal happens before any modify, no Aurora compensation is made and `desired.json` is restored to the
+pre-change configuration), follow its hint: first `gpu-fault-admin deploy --state-dir <dir>` to converge Aurora
+back to the `desired.json` window, or write the live window explicitly into admin-config.yaml to bring it under
+review, then rerun.
 
 ## 9. spool A/B Method
 

@@ -123,7 +123,9 @@ and, in order:
    `desired.json` before the change), `pending.json` (configuration before and after, site identity, signed release identity,
    executor, reference, start time), then changes `desired.json` to the target configuration.
 4. When Aurora Min/Max changed, first calls RDS `modify-db-cluster` and waits for the cluster, writer and reader
-   to return to `available` on the new window (three consecutive observations).
+   to return to `available` on the new window (three consecutive observations); when it did not change, checks
+   read-only that the live window equals the pre-change value (`verify_aurora_capacity`), so an apply is never
+   recorded `APPLIED` over a window somebody else moved.
 5. Rolls only the affected CPU roles and completes verify/stability/commit.
 6. When raising Min ACU, only now waits for the `ServerlessDatabaseCapacity` of both writer and reader to reach the new
    Min. This step and the role rollout are independent; it is placed after the rollout so that the scale-up ramp time does not serially occupy the whole
@@ -136,6 +138,14 @@ Only when it is proven that the roles are still on the originally committed conf
 rollback has been verified and cleaned up does it restore the pre-change Min/Max and `desired.json`.
 `result.json` is recorded as `FAILED` with `details.release_recovery` and the actual Aurora compensation result;
 `pending.json` is kept, and the administrator's YAML is not rewritten.
+
+**Aurora drift** (the live window is neither the pre-change value nor the target, e.g. moved by a tool without a
+reviewed record) is refused before any modify with `AuroraCapacityDriftError`: nothing was changed by this apply, so
+no Aurora compensation is made, `desired.json` is restored to the pre-change configuration and `result.json` records
+`FAILED` with the three windows. Two remedies: `gpu-fault-admin deploy --state-dir <dir>` converges Aurora per
+`desired.json` (deploy has no reviewed record and converges live to desired), or write the live window explicitly into
+admin-config.yaml to bring it under review (desired equal to live is accepted). The performance runner therefore only
+verifies Aurora and never modifies it (performance acceptance plan §8.4).
 
 A failed finalisation of a committed candidate, disabled automatic rollback, a failed rollback, an incomplete state or a read failure all keep the pending
 target and do not automatically lower the database capacity. If the release subprocess has partially aligned the local management configuration, the CLI writes back

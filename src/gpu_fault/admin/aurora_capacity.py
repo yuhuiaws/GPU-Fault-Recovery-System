@@ -27,6 +27,49 @@ from typing import Any, Protocol, Sequence
 
 from gpu_fault.admin.config import AdminConfigError, AuroraCapacityConfig
 
+
+def _window_text(window: tuple[float, float]) -> str:
+    return f"{window[0]:g}/{window[1]:g}"
+
+
+class AuroraCapacityDriftError(AdminConfigError):
+    """The live window is somebody else's change and nothing was modified.
+
+    Raised before any ``modify-db-cluster``: the live window matches neither
+    the reviewed current configuration (``expected``) nor, when there is one,
+    the ``desired`` target. Live 2026-10-07 the perf harness had moved a site's
+    window from 82/128 to 124/128 with no reviewed record; the next ``config``
+    apply refused the drift, then its Aurora *rollback* was refused by the same
+    rule although nothing had been changed, and the unapplied target was kept
+    as the next apply's reviewed current. Callers read the three windows here
+    and decide the remedy; this error itself claims no modification.
+    """
+
+    def __init__(
+        self,
+        live: tuple[float, float],
+        expected: tuple[float, float],
+        desired: tuple[float, float] | None = None,
+    ) -> None:
+        self.live = live
+        self.expected = expected
+        self.desired = desired
+        if desired is None:
+            message = (
+                f"live Aurora capacity {_window_text(live)} differs from the reviewed "
+                f"current {_window_text(expected)} administrator configuration; "
+                "nothing was modified"
+            )
+        else:
+            message = (
+                f"live Aurora capacity {_window_text(live)} differs from both the "
+                f"reviewed current {_window_text(expected)} and desired "
+                f"{_window_text(desired)} administrator configuration; nothing was "
+                "modified"
+            )
+        super().__init__(message)
+
+
 AURORA_ENGINE_VERSION = "16.8"
 """Engine version every new control-plane cluster is created on.
 
@@ -460,9 +503,10 @@ def _modify_window(
         (expected.min_acu, expected.max_acu),
         (desired.min_acu, desired.max_acu),
     }:
-        raise AdminConfigError(
-            "live Aurora capacity differs from both the reviewed current and "
-            "desired administrator configuration"
+        raise AuroraCapacityDriftError(
+            live_capacity,
+            (expected.min_acu, expected.max_acu),
+            (desired.min_acu, desired.max_acu),
         )
     # A scale-up is only done when the instances actually run at the new floor;
     # the reviewed record is the baseline when there is one (a resumed apply
@@ -482,6 +526,34 @@ def _modify_window(
             mutate=True,
         )
     return initial, modified, desired.min_acu > baseline
+
+
+def verify_aurora_capacity(
+    *,
+    aws_region: str,
+    cluster_id: str,
+    expected: AuroraCapacityConfig,
+    aws_json: AwsJsonCaller | None = None,
+) -> dict[str, Any]:
+    """Read-only: the live window must be the reviewed current one.
+
+    An apply that leaves Aurora alone still claims the window its record
+    carries; this proves it before the roles roll. Live 2026-10-07 a
+    ``32-enabled`` apply went APPLIED over a window the perf harness had moved,
+    and the next apply read that drift as its own failure.
+    """
+
+    expected.validate()
+    observed = observe_aurora_capacity(
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        include_observed_capacity=False,
+        aws_json=_caller(aws_json),
+    )
+    live = _configured_capacity(observed)
+    if live != (expected.min_acu, expected.max_acu):
+        raise AuroraCapacityDriftError(live, (expected.min_acu, expected.max_acu))
+    return observed
 
 
 def request_aurora_capacity(

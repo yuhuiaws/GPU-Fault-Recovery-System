@@ -22,9 +22,11 @@ from gpu_fault.admin.deploy_host_binding import (
     is_readonly_command,
 )
 from gpu_fault.admin.aurora_capacity import (
+    AuroraCapacityDriftError,
     await_aurora_capacity,
     reconcile_aurora_capacity,
     request_aurora_capacity,
+    verify_aurora_capacity,
 )
 from gpu_fault.admin.bootstrap import bootstrap_from_arns, discover_cluster
 from gpu_fault.admin.bootstrap_common import (
@@ -51,7 +53,6 @@ from gpu_fault.admin.command_log import (
 from gpu_fault.admin.config import (
     AdminConfig,
     AdminConfigApply,
-    AuroraCapacityConfig,
     admin_config_change_plan,
     begin_admin_config_apply,
     complete_admin_config_apply,
@@ -63,6 +64,13 @@ from gpu_fault.admin.config_file import (
     admin_config_file_path,
     load_admin_config_file,
     write_admin_config_file,
+)
+from gpu_fault.admin.config_aurora import (
+    aurora_drift_remedy,
+    await_site_aurora,
+    request_site_aurora,
+    rollback_site_aurora,
+    verify_site_aurora,
 )
 from gpu_fault.admin.config_parser import AdminConfigError
 from gpu_fault.admin.config_recovery import (
@@ -1032,67 +1040,6 @@ def _approver_identity() -> str:
     )
 
 
-def _site_aurora(site: RenderedSite) -> tuple[str, str]:
-    """``(aws_region, cluster_id)`` of the site's control-plane Aurora."""
-
-    return (
-        str(site.release_config["aws_region"]),
-        str(site.release_config["health"]["aurora_cluster_id"]),
-    )
-
-
-def _request_site_aurora(
-    site: RenderedSite,
-    *,
-    expected: AuroraCapacityConfig,
-    desired: AuroraCapacityConfig,
-) -> dict[str, Any]:
-    aws_region, cluster_id = _site_aurora(site)
-    return request_aurora_capacity(
-        aws_region=aws_region,
-        cluster_id=cluster_id,
-        expected=expected,
-        desired=desired,
-    )
-
-
-def _await_site_aurora(
-    site: RenderedSite,
-    *,
-    desired: AuroraCapacityConfig,
-    requested: dict[str, Any],
-) -> dict[str, Any]:
-    """Finish a scale-up once the roles rolled: both instances at the new floor."""
-
-    if not requested["scale_up"]:
-        return requested
-    aws_region, cluster_id = _site_aurora(site)
-    after = await_aurora_capacity(
-        aws_region=aws_region,
-        cluster_id=cluster_id,
-        desired=desired,
-        modified=bool(requested["modified"]),
-    )
-    return {**requested, "after": after}
-
-
-def _rollback_site_aurora(
-    site: RenderedSite,
-    changed: bool,
-    current: AdminConfig,
-    desired: AdminConfig,
-) -> dict[str, Any] | None:
-    if not changed:
-        return None
-    aws_region, cluster_id = _site_aurora(site)
-    return reconcile_aurora_capacity(
-        aws_region=aws_region,
-        cluster_id=cluster_id,
-        expected=desired.aurora,
-        desired=current.aurora,
-    )
-
-
 def _roll_admin_config(
     arguments: argparse.Namespace,
     site: RenderedSite,
@@ -1108,6 +1055,9 @@ def _roll_admin_config(
 
     aurora: dict[str, Any] | None = None
     rolled = False
+    # Whether this apply may have moved the window: only then is there an Aurora
+    # rollback to make. A drift refusal happens before any modify.
+    aurora_touched = False
     started_at = datetime.now(UTC)
 
     def fail(error: str) -> AdminConfigError | None:
@@ -1128,17 +1078,27 @@ def _roll_admin_config(
             release_id=release_id,
             error=error,
             recovery=recovery,
-            restore_aurora=lambda: _rollback_site_aurora(
-                site, apply.aurora_changed, apply.before, apply.desired
+            restore_aurora=lambda: rollback_site_aurora(
+                site,
+                apply.aurora_changed and aurora_touched,
+                apply.before,
+                apply.desired,
+                reconcile=reconcile_aurora_capacity,
             ),
         )
 
     try:
         if apply.aurora_changed:
-            aurora = _request_site_aurora(
+            aurora_touched = True
+            aurora = request_site_aurora(
                 site,
                 expected=apply.before.aurora,
                 desired=apply.desired.aurora,
+                request=request_aurora_capacity,
+            )
+        else:
+            aurora = verify_site_aurora(
+                site, expected=apply.before.aurora, verify=verify_aurora_capacity
             )
         returncode = _run_automatic_release(
             repository_root=site.repository_root,
@@ -1149,11 +1109,22 @@ def _roll_admin_config(
         )
         rolled = returncode == 0
         if rolled and aurora is not None:
-            aurora = _await_site_aurora(
+            aurora = await_site_aurora(
                 site,
                 desired=apply.desired.aurora,
                 requested=aurora,
+                wait=await_aurora_capacity,
             )
+    except AuroraCapacityDriftError as exc:
+        # Somebody else moved the window and nothing was modified here: there is
+        # no Aurora rollback to make and no reason to retain the target (live
+        # 2026-10-07 the refused rollback of an untouched window did both).
+        aurora_touched = False
+        error = f"{type(exc).__name__}: {exc}" + aurora_drift_remedy(
+            arguments.state_dir
+        )
+        failure = fail(error)
+        raise failure or AdminConfigError(error) from exc
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         if rolled:

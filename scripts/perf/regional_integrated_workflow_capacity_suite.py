@@ -17,9 +17,7 @@ if str(ROOT / "src") not in sys.path:
 
 from gpu_fault.admin.aurora_capacity import (  # noqa: E402
     observe_aurora_capacity,
-    reconcile_aurora_capacity,
 )
-from gpu_fault.admin.config import AuroraCapacityConfig  # noqa: E402
 
 if __package__:
     from .regional_action_capacity_suite import (
@@ -339,21 +337,22 @@ def ensure_aurora_capacity(
     timeout_seconds: int,
     configure: bool,
 ) -> dict:
-    """Hold at least the formal 124/128 window through the one writer of it.
+    """Verify the formal 124/128 window; never modify an administrator-managed one.
 
-    ``aurora_capacity.reconcile_aurora_capacity`` issues the modify (when
-    authorized) and waits for RDS to really settle -- the same settle rule
-    ``config apply`` uses, so the harness cannot start against a cluster that
-    is about to flip to ``modifying``. The harness's own preflight then reads
-    the window and per-instance ACU into the report shape the suite expects.
-
-    124/128 is a floor, not an exact window: the ``50-*`` capacity presets pin
-    Aurora at 128/128 (their node count fixes that Min), and lowering it to
-    124 behind ``gpu-fault-admin config`` left the site's desired window and
-    the live one apart -- the next preset apply refused the drift (live
-    2026-09-13). A window at or above the floor is kept as it is.
+    Aurora is administrator-managed: ``gpu-fault-admin config`` moves the window
+    against a reviewed record and refuses any other change as somebody else's.
+    The runner has no such record, so a modify from here is exactly that change
+    -- live 2026-10-07 it raised a site from 82/128 to 124/128 under the
+    ``32-disabled`` preset and the next two ``config`` applies (``50-disabled``
+    and the site restore) failed closed on the drift. The formal window is a
+    floor the administrator configures beside the preset (``spec.aurora``
+    124/128 for the ``32-*`` rounds; the ``50-*`` presets' own floor is
+    128/128); below it the runner refuses and names that remedy. A window above
+    the floor is accepted as it is. ``configure`` is the run's acknowledgement
+    that it requires the formal window; it authorizes no write.
     """
 
+    del configure
     initial_state = observe_aurora_capacity(
         aws_region=AWS_REGION,
         cluster_id=cluster_id,
@@ -366,30 +365,26 @@ def ensure_aurora_capacity(
     }
     live_min = float(initial["min_acu"] or 0)
     live_max = float(initial["max_acu"] or 0)
-    modified = live_min < FORMAL_AURORA_MIN_ACU or live_max < FORMAL_AURORA_MAX_ACU
-    if modified:
-        if not configure:
-            raise RuntimeError(
-                "Aurora is below 124/128 and automatic capacity configuration "
-                "was not authorized"
-            )
-        reconcile_aurora_capacity(
-            aws_region=AWS_REGION,
-            cluster_id=cluster_id,
-            desired=AuroraCapacityConfig(
-                min_acu=max(live_min, FORMAL_AURORA_MIN_ACU),
-                max_acu=max(live_max, FORMAL_AURORA_MAX_ACU),
-            ),
-            timeout_seconds=timeout_seconds,
-            poll_seconds=0 if timeout_seconds < 60 else 10.0,
-            aws_json=_registry_aws_json,
+    if live_min < FORMAL_AURORA_MIN_ACU or live_max < FORMAL_AURORA_MAX_ACU:
+        raise RuntimeError(
+            f"Aurora is below the formal {FORMAL_AURORA_MIN_ACU:g}/"
+            f"{FORMAL_AURORA_MAX_ACU:g} window (live {live_min:g}/{live_max:g}); the "
+            "perf runner does not modify an administrator-managed window -- write "
+            "spec.aurora {minAcu: 124, maxAcu: 128} beside the capacity preset in "
+            "<state-dir>/admin-config.yaml, apply it with gpu-fault-admin config, "
+            "then rerun"
         )
     result = aurora_capacity_preflight(
         cluster_id,
         timeout_seconds=timeout_seconds,
     )
     result["initial_scaling"] = initial
-    result["scaling_modified"] = modified
+    result["scaling_modified"] = False
+    result["administrator_managed"] = True
+    result["required_window"] = {
+        "min_acu": FORMAL_AURORA_MIN_ACU,
+        "max_acu": FORMAL_AURORA_MAX_ACU,
+    }
     return result
 
 
