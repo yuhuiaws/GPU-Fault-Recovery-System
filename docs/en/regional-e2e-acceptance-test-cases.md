@@ -8920,8 +8920,11 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   DESTR-003/005/008/022 on `eks-managed` presuppose a declared warm spare (`gpu-fault-admin config spare --declare`; no
   HyperPod health label, topology = node group + instance type) and take `--hyperpod-cluster` as the cluster's `cluster_id`
   (= the EKS cluster name): the cluster fact is `aws eks describe-cluster` (`ACTIVE`, `node_recovery=not-applicable`), the
-  provider inventory is the Kubernetes GPU nodes (name, providerID instance id, node group, instance type, Ready) with a
-  sha256 drift comparison, provider mutation events are read from `sagemaker` and EC2 `Terminate/Stop/Run/StartInstances`
+  provider inventory holds provider-side identity only: the Kubernetes GPU nodes' names and the EC2 instance ids behind
+  their `providerID`, plus the instance type, `eks:nodegroup-name` tag and availability zone EC2 `describe-instances`
+  reports for each (`warm_spare_provider.eks_instance_facts`) -- no Ready, allocatable or Kubernetes label -- with a
+  sha256 drift comparison (DESTR-008's topology-mismatch scenario relabels the spare's node group, and the label-built
+  inventory used to read it as "provider node inventory changed" and stop the matrix; a replaced instance is still drift), provider mutation events are read from `sagemaker` and EC2 `Terminate/Stop/Run/StartInstances`
   (refused calls recorded apart as `refused_provider_calls`),
   and the profile is expected to OWN `nodeReplace` through `gpu-fault-eks-adapter`; a spare-less cluster is still refused in
   preflight (fail closed). AUTH-015 selects nodes with `cluster_scope.node_selector`
@@ -10003,7 +10006,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   provider's installer records -- the Kubernetes Node UID on HyperPod, the EC2 instance id behind the Node's
   `providerID` on `eks-managed` (`destr014_preflight.agent_node_identity`; an eks node without a `providerID` fails
   closed). An earlier `eks-managed` attempt refused both Ready, uncordoned nodes for the GPU taint and the sibling's
-  identity for carrying the instance id.
+  identity for carrying the instance id. The execute path's host recovery binding (`destr014_recovery.make_binding`)
+  checks the sibling Agent against the same provider identity (it used to compare the Node UID alone, and an eks run
+  the preflight had accepted stopped there with "Agent and Node UID differ"); the binding itself still keys on the
+  Node UID. Judgement: `tests/regional/test_destr014_binding_identity.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr014_branch_exhaustion.py`. By default it only generates the
   plan; before execute it must read `DESTR-008=PASS` (chain: `010 → 001 → 002 → 009 →

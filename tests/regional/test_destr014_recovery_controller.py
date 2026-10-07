@@ -291,21 +291,24 @@ def test_make_binding_requires_same_agent_incarnation_and_runtime_pins() -> None
         "installer_bundle_sha256": value["bundle_sha256"],
         "runtime_profile_version": value["profile_version"],
     }
+    # A HyperPod node: the provider identity the Agent records is the Node UID.
     result = controller.make_binding(
         scope=scope,
         owner=value["owner"],
         agent=agent,
         restore_at=value["restore_at"],
         expires_at=value["expires_at"],
+        node_identity=scope["node_uid"],
     )
     assert result == value
-    with pytest.raises(controller.RegionalFixtureError, match="Node UID"):
+    with pytest.raises(controller.RegionalFixtureError, match="provider identity"):
         controller.make_binding(
             scope=scope,
             owner=value["owner"],
             agent={**agent, "node_instance_id": "other"},
             restore_at=value["restore_at"],
             expires_at=value["expires_at"],
+            node_identity=scope["node_uid"],
         )
     with pytest.raises(probe.RecoveryError):
         controller.make_binding(
@@ -314,6 +317,7 @@ def test_make_binding_requires_same_agent_incarnation_and_runtime_pins() -> None
             agent={},
             restore_at=value["restore_at"],
             expires_at=value["expires_at"],
+            node_identity=scope["node_uid"],
         )
 
 

@@ -592,7 +592,13 @@ class WarmSpareLiveFixture:
 
     def provider_inventory(self) -> dict[str, Any]:
         if self.provider == warm_spare_provider.EKS_MANAGED:
-            return warm_spare_provider.eks_provider_inventory(self._gpu_nodes())
+            nodes = self._gpu_nodes()
+            facts = warm_spare_provider.eks_instance_facts(
+                lambda argv: self.regional.run(argv, timeout=180).stdout,
+                region=self.regional.settings.region,
+                instance_ids=warm_spare_provider.eks_instance_ids(nodes),
+            )
+            return warm_spare_provider.eks_provider_inventory(nodes, instances=facts)
         value = json.loads(
             self.regional.run(
                 [

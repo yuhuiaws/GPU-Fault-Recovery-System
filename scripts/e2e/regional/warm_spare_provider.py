@@ -5,10 +5,10 @@ fact was ``sagemaker describe-cluster`` (``InService``, ``NodeRecovery=None``),
 the node inventory ``sagemaker list-cluster-nodes``, the spare's health gate
 the health-monitoring-agent label and its topology the instance group. A
 plain-EKS (``eks-managed``) cluster has none of those; the equivalent facts
-are the EKS cluster status (``ACTIVE``), the GPU nodes as Kubernetes reports
-them (name, EC2 instance id from ``spec.providerID``, managed node group,
-instance type, Ready), no health label at all, and the node group as the
-failure-domain group. Each function here takes the provider and returns the
+are the EKS cluster status (``ACTIVE``), the GPU nodes' provider identity
+(name, EC2 instance id from ``spec.providerID``, and the instance type, node
+group tag and availability zone EC2 reports for it), no health label at all,
+and the node group as the failure-domain group. Each function here takes the provider and returns the
 same shape the runners already judge, so the case logic reads one way for
 both.
 """
@@ -26,6 +26,7 @@ from gpu_fault.cluster_scope import (
     PROVIDER_NODE_REBOOT_OWNERS,
     cluster_provider,
 )
+from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from scripts.e2e.regional.guardrail_audit_evidence import (
     ProviderCallInventory,
     provider_call_inventory,
@@ -142,36 +143,127 @@ def eks_cluster_recovery(
     }
 
 
-def eks_provider_inventory(nodes_document: Mapping[str, Any]) -> dict[str, Any]:
-    """The GPU nodes as Kubernetes reports them, in the HyperPod inventory shape.
+#: The EC2 tag EKS puts on a managed node group's instances.
+EKS_NODEGROUP_TAG = "eks:nodegroup-name"
 
-    Stable across a case that replaces nothing: a Spot replacement shows up as a
-    new instance id under a new name and changes the digest, which is exactly
-    the drift the postflight compares against.
+
+def _eks_gpu_nodes(
+    nodes_document: Mapping[str, Any],
+    instances: Mapping[str, Mapping[str, Any]] | None,
+) -> list[tuple[str | None, str | None]]:
+    """``(node name, EC2 instance id)`` of the GPU nodes.
+
+    A node is a GPU node when Kubernetes reports ``nvidia.com/gpu`` capacity or
+    allocatable, or when EC2 says its instance type is an accelerator type: the
+    Kubernetes view alone drops a node whose device plugin is away.
+    """
+
+    rows: list[tuple[str | None, str | None]] = []
+    for item in nodes_document.get("items", []) or []:
+        status = item.get("status") or {}
+        provider_id = str((item.get("spec") or {}).get("providerID") or "")
+        instance_id = provider_id.rsplit("/", 1)[-1] or None
+        facts = (instances or {}).get(instance_id or "") or {}
+        if not (
+            (status.get("capacity") or {}).get("nvidia.com/gpu")
+            or (status.get("allocatable") or {}).get("nvidia.com/gpu")
+            or expected_accelerator_counts(facts.get("instance_type")) is not None
+        ):
+            continue
+        rows.append(((item.get("metadata") or {}).get("name"), instance_id))
+    return rows
+
+
+def eks_instance_ids(nodes_document: Mapping[str, Any]) -> list[str]:
+    """The EC2 instance ids behind the GPU nodes' ``providerID``."""
+
+    return sorted(
+        {
+            instance_id
+            for _name, instance_id in _eks_gpu_nodes(nodes_document, None)
+            if instance_id
+        }
+    )
+
+
+def eks_instance_facts(
+    command: Callable[[list[str]], str],
+    *,
+    region: str,
+    instance_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """``aws ec2 describe-instances`` reduced to each instance's identity facts.
+
+    A filter, not ``--instance-ids``: an id EC2 no longer knows (a replaced
+    Spot instance past its terminated grace) must read as absent, not fail the
+    call. ``state`` is reported for the evidence but kept out of the digest.
+    """
+
+    if not instance_ids:
+        return {}
+    document = json.loads(
+        command(
+            [
+                "aws",
+                "ec2",
+                "describe-instances",
+                "--region",
+                region,
+                "--filters",
+                f"Name=instance-id,Values={','.join(sorted(set(instance_ids)))}",
+                "--output",
+                "json",
+            ]
+        )
+    )
+    facts: dict[str, dict[str, Any]] = {}
+    for reservation in document.get("Reservations") or []:
+        for instance in reservation.get("Instances") or []:
+            tags = {
+                str(tag.get("Key")): tag.get("Value")
+                for tag in instance.get("Tags") or []
+                if isinstance(tag, Mapping)
+            }
+            facts[str(instance.get("InstanceId"))] = {
+                "instance_type": instance.get("InstanceType"),
+                "instance_group": tags.get(EKS_NODEGROUP_TAG),
+                "availability_zone": (instance.get("Placement") or {}).get(
+                    "AvailabilityZone"
+                ),
+                "state": (instance.get("State") or {}).get("Name"),
+            }
+    return facts
+
+
+def eks_provider_inventory(
+    nodes_document: Mapping[str, Any],
+    *,
+    instances: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The GPU nodes' provider identity, in the HyperPod inventory shape.
+
+    Identity only, read provider-side: the node name, the EC2 instance id
+    behind ``spec.providerID``, and the instance type, node group
+    (``eks:nodegroup-name`` tag) and availability zone EC2 reports for that
+    instance (``instances``, from :func:`eks_instance_facts`). Nothing that a
+    scenario moves is in the digest: not the Ready condition, not the
+    allocatable GPUs, not a Kubernetes label -- DESTR-008's topology-mismatch
+    scenario relabels the spare's node group and used to read as "provider
+    node inventory changed" on ``eks-managed``, where HyperPod's
+    ``list-cluster-nodes`` never saw a label edit. A Spot replacement still
+    shows up as a new instance id under a new name and changes the digest.
     """
 
     rows = []
-    for item in nodes_document.get("items", []) or []:
-        status = item.get("status") or {}
-        if not (status.get("allocatable") or {}).get("nvidia.com/gpu"):
-            continue
-        metadata = item.get("metadata") or {}
-        labels = metadata.get("labels") or {}
-        provider_id = str((item.get("spec") or {}).get("providerID") or "")
+    for name, instance_id in _eks_gpu_nodes(nodes_document, instances):
+        facts = (instances or {}).get(instance_id or "") or {}
         rows.append(
             {
-                "node_logical_id": metadata.get("name"),
-                "instance_id": provider_id.rsplit("/", 1)[-1] or None,
-                "instance_group": labels.get(EKS_NODEGROUP_LABEL),
-                "instance_type": instance_type({"labels": labels}),
-                "status": next(
-                    (
-                        "Running" if condition.get("status") == "True" else "NotReady"
-                        for condition in status.get("conditions", []) or []
-                        if condition.get("type") == "Ready"
-                    ),
-                    "Unknown",
-                ),
+                "node_logical_id": name,
+                "instance_id": instance_id,
+                "instance_group": facts.get("instance_group"),
+                "instance_type": facts.get("instance_type"),
+                "availability_zone": facts.get("availability_zone"),
             }
         )
     rows.sort(key=lambda row: (str(row["node_logical_id"]), str(row["instance_id"])))

@@ -55,6 +55,7 @@ from scripts.e2e.regional.run_destr015_parallel_branch_join import (  # noqa: E4
 from scripts.e2e.regional.destr014_preflight import (  # noqa: E402
     BUDGET_HEADROOM as BUDGET_HEADROOM,
     _control_env,
+    agent_node_identity,
     budget_headroom,
     executor_env_snapshot,
     managed_recovery_errors,
@@ -849,6 +850,7 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         agent=run.preflight["recovery_agent"],
         restore_at=restore_at,
         expires_at=expires_at,
+        node_identity=agent_node_identity(run.preflight["sibling_node"]),
     )
     run.recovery_window.arm(binding)
     run.agent_disabled = True

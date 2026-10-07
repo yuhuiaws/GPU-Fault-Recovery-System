@@ -21,6 +21,7 @@ from scripts.e2e.regional import warm_spare_provider as provider
 from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
 
 EKS_NODEGROUP = "eks.amazonaws.com/nodegroup"
+EKS_NODEGROUP_TAG = "eks:nodegroup-name"
 SAGEMAKER_CLUSTER = "sagemaker.amazonaws.com/cluster-name"
 NODE_A = "ip-10-0-33-205.us-west-2.compute.internal"
 NODE_B = "ip-10-0-41-164.us-west-2.compute.internal"
@@ -119,7 +120,31 @@ def test_cluster_facts_are_judged_per_provider() -> None:
     assert provider.lifecycle_owner(None) == "gpu-fault-hyperpod-adapter"
 
 
-def test_the_eks_inventory_is_the_gpu_nodes_as_kubernetes_reports_them() -> None:
+def _ec2(
+    instance: str, *, group: str = "gpu-p5en-efa-spot-node-group"
+) -> dict[str, Any]:
+    return {
+        "InstanceId": instance,
+        "InstanceType": "p5en.48xlarge",
+        "Placement": {"AvailabilityZone": "us-west-2c"},
+        "State": {"Name": "running"},
+        "Tags": [
+            {"Key": "eks:cluster-name", "Value": "gpu-eks-cluster"},
+            {"Key": EKS_NODEGROUP_TAG, "Value": group},
+        ],
+    }
+
+
+def _describe_instances(*instances: dict[str, Any]) -> dict[str, Any]:
+    return {"Reservations": [{"Instances": list(instances)}]}
+
+
+def test_the_eks_inventory_is_the_gpu_nodes_provider_identity() -> None:
+    """Live DESTR-008 attempt 11 (eks-managed): the topology-mismatch scenario
+    relabels the spare's node group and the Kubernetes-label inventory read it
+    as "provider node inventory changed"; HyperPod's list-cluster-nodes never
+    saw a label edit. Identity comes from EC2 now, and nothing a scenario moves
+    (Ready, allocatable, labels) is in the digest."""
     nodes = {
         "items": [
             _eks_node(NODE_B, "i-0b", ready=False),
@@ -127,25 +152,86 @@ def test_the_eks_inventory_is_the_gpu_nodes_as_kubernetes_reports_them() -> None
             {"metadata": {"name": "cpu-node", "labels": {}}, "status": {}},
         ]
     }
-    inventory = provider.eks_provider_inventory(nodes)
-    assert inventory["count"] == 2
-    assert [row["node_logical_id"] for row in inventory["nodes"]] == [NODE_A, NODE_B]
-    assert inventory["nodes"][0] == {
-        "node_logical_id": NODE_A,
-        "instance_id": "i-0a",
-        "instance_group": "gpu-p5en-efa-spot-node-group",
+    commands: list[list[str]] = []
+
+    def command(argv: list[str]) -> str:
+        commands.append(list(argv))
+        return json.dumps(_describe_instances(_ec2("i-0a"), _ec2("i-0b")))
+
+    assert provider.eks_instance_ids(nodes) == ["i-0a", "i-0b"]
+    facts = provider.eks_instance_facts(
+        command, region="us-west-2", instance_ids=["i-0b", "i-0a", "i-0a"]
+    )
+    assert commands == [
+        [
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
+            "us-west-2",
+            "--filters",
+            "Name=instance-id,Values=i-0a,i-0b",
+            "--output",
+            "json",
+        ]
+    ], "one filtered read; an id EC2 forgot must read as absent, not fail the call"
+    assert facts["i-0a"] == {
         "instance_type": "p5en.48xlarge",
-        "status": "Running",
+        "instance_group": "gpu-p5en-efa-spot-node-group",
+        "availability_zone": "us-west-2c",
+        "state": "running",
     }
-    assert inventory["nodes"][1]["status"] == "NotReady"
-    again = provider.eks_provider_inventory(nodes)
-    assert again["sha256"] == inventory["sha256"], (
-        "the digest is stable for the same nodes"
+    inventory = provider.eks_provider_inventory(nodes, instances=facts)
+    assert inventory["count"] == 2
+    assert inventory["nodes"] == [
+        {
+            "node_logical_id": NODE_A,
+            "instance_id": "i-0a",
+            "instance_group": "gpu-p5en-efa-spot-node-group",
+            "instance_type": "p5en.48xlarge",
+            "availability_zone": "us-west-2c",
+        },
+        {
+            "node_logical_id": NODE_B,
+            "instance_id": "i-0b",
+            "instance_group": "gpu-p5en-efa-spot-node-group",
+            "instance_type": "p5en.48xlarge",
+            "availability_zone": "us-west-2c",
+        },
+    ], "identity only: no Ready status, no label-derived group"
+
+    mutated = json.loads(json.dumps(nodes))
+    spare = mutated["items"][0]
+    spare["metadata"]["labels"][EKS_NODEGROUP] = "acceptance-mismatch-8-bfead8e890"
+    spare["status"]["conditions"][0]["status"] = "True"
+    spare["status"]["allocatable"] = {}
+    spare["status"]["capacity"] = {}
+    assert (
+        provider.eks_provider_inventory(mutated, instances=facts)["sha256"]
+        == inventory["sha256"]
+    ), "a label edit, a Ready flip or a device plugin away is not provider drift"
+
+    replaced = {"items": [_eks_node(NODE_A, "i-0a"), _eks_node(NODE_B, "i-0c")]}
+    replaced_facts = {**facts, "i-0c": facts["i-0b"]}
+    assert (
+        provider.eks_provider_inventory(replaced, instances=replaced_facts)["sha256"]
+        != inventory["sha256"]
+    ), "a replaced instance is drift"
+    regrouped = {**facts, "i-0b": {**facts["i-0b"], "instance_group": "other-group"}}
+    assert (
+        provider.eks_provider_inventory(nodes, instances=regrouped)["sha256"]
+        != inventory["sha256"]
+    ), "EC2 moving the instance to another node group is drift"
+    forgotten = provider.eks_provider_inventory(
+        nodes, instances={"i-0a": facts["i-0a"]}
     )
-    replaced = provider.eks_provider_inventory(
-        {"items": [_eks_node(NODE_A, "i-0a"), _eks_node(NODE_B, "i-0c")]}
+    assert forgotten["nodes"][1]["instance_group"] is None, (
+        "an instance EC2 no longer reports has no provider identity"
     )
-    assert replaced["sha256"] != inventory["sha256"], "a replaced instance is drift"
+    assert forgotten["sha256"] != inventory["sha256"]
+    assert (
+        provider.eks_instance_facts(command, region="us-west-2", instance_ids=[]) == {}
+    )
 
 
 class _Regional:
@@ -165,6 +251,10 @@ class _Regional:
         self.commands.append(list(argv))
         if argv[:3] == ["aws", "eks", "describe-cluster"]:
             return SimpleNamespace(stdout=json.dumps(self.describe))
+        if argv[:3] == ["aws", "ec2", "describe-instances"]:
+            return SimpleNamespace(
+                stdout=json.dumps(_describe_instances(_ec2("i-0a"), _ec2("i-0b")))
+            )
         if argv[:3] == ["aws", "cloudtrail", "lookup-events"]:
             return SimpleNamespace(
                 stdout=json.dumps(
@@ -194,7 +284,11 @@ def test_the_fixture_reads_eks_facts_without_sagemaker() -> None:
         "node_recovery": "not-applicable",
         "provider": "eks-managed",
     }
-    assert warm.provider_inventory()["count"] == 2
+    inventory = warm.provider_inventory()
+    assert inventory["count"] == 2
+    assert {row["instance_group"] for row in inventory["nodes"]} == {
+        "gpu-p5en-efa-spot-node-group"
+    }, "the node group is EC2's tag, read through the fixture's aws transport"
     calls = warm.provider_calls(NOW, NOW)
     assert {item["event_name"] for item in calls["mutations"]} == {
         "TerminateInstances",

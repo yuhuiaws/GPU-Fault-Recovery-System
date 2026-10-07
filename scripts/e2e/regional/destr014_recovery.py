@@ -375,7 +375,19 @@ def make_binding(
     agent: dict[str, Any],
     restore_at: int,
     expires_at: int,
+    node_identity: str | None,
 ) -> dict[str, Any]:
+    """The durable host recovery binding, or a refusal when the Agent is not
+    the node's.
+
+    ``node_identity`` is what the node's provider installer recorded as the
+    Agent's ``node_instance_id`` (``destr014_preflight.agent_node_identity``):
+    the Kubernetes Node UID on HyperPod, the EC2 instance id behind the Node's
+    ``providerID`` on ``eks-managed``. Comparing the Agent against the Node UID
+    alone stopped every eks run here after its preflight had already accepted
+    the node by the provider-aware rule.
+    """
+
     binding = {
         "case_id": host.CASE,
         "run_id": scope["run_id"],
@@ -394,8 +406,12 @@ def make_binding(
         "expires_at": expires_at,
     }
     host.binding_key(binding)
-    if agent.get("node_instance_id") != binding["node_uid"]:
-        raise RegionalFixtureError("DESTR-014 Agent and Node UID differ")
+    if not node_identity or agent.get("node_instance_id") != node_identity:
+        raise RegionalFixtureError(
+            "DESTR-014 Agent identity differs from the node's provider identity "
+            f"(Agent node_instance_id={agent.get('node_instance_id')!r}, "
+            f"node={scope.get('node')!r} expects {node_identity!r})"
+        )
     return binding
 
 
