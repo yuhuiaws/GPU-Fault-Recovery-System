@@ -22,6 +22,7 @@ from scripts.e2e.regional.warm_spare_fixture import (
 )
 from tests.regional import test_destr014_branch_exhaustion as data
 from tests.regional._cov95_destr_branches import (
+    INSTANCE_IDS,
     BranchHarness,
     BranchRegional,
     BranchWarm,
@@ -192,13 +193,33 @@ class ExhaustionHarness(BranchHarness):
             for node, snapshot in self.nodes.items()
         }
         self.recovery_transport = RecoveryTransport(self, self.host)
-        self.provider = {"count": 2, "sha256": "f" * 64}
+        self.provider = {
+            "count": 2,
+            "sha256": "f" * 64,
+            "nodes": [
+                {
+                    "instance_id": INSTANCE_IDS[node],
+                    "node_logical_id": f"logical-{node}",
+                    "status": "Running",
+                }
+                for node in (data.FAULT, data.SIBLING)
+            ],
+        }
+        # The live HyperPod shape: one accepted BatchRebootClusterNodes per
+        # node, naming its logical id, in the SageMaker source.
         self.events = [
             {
                 "event_name": "BatchRebootClusterNodes",
+                "event_source": "sagemaker.amazonaws.com",
                 "session_issuer_role_name": "executor",
+                "api_error": False,
+                "api_error_code": None,
+                "request_node_ids": None,
+                "request_node_logical_ids": [f"logical-{node}"],
+                "response_failed_node_count": 0,
             }
-        ] * 2
+            for node in (data.FAULT, data.SIBLING)
+        ]
         self.arbiters, self.dns = healthy_placement()
         self.regional = ExhaustionRegional(self)
         self.workload = ExhaustionWorkload(self)

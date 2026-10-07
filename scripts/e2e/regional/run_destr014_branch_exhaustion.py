@@ -89,6 +89,10 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
 )
+from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
+    partition_provider_events,
+    provider_event_source,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -144,8 +148,11 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     host_errors,
     injection_errors,
     lifetime_errors,
+    node_reboot_identities,
     operator_hold_reasons,
     product_hold_reasons,
+    provider_forbidden_events,
+    provider_reboot_events,
     quarantine_taint_value,
     reset_reached_commit,
     schedulability_errors,
@@ -1003,6 +1010,54 @@ def _control_plane_errors(
     return errors, workflow, incident
 
 
+def provider_reboot_audit(run: _LiveRun) -> tuple[list[str], list[dict[str, Any]]]:
+    """The two provider reboots in CloudTrail, in the cluster provider's own
+    source and vocabulary: SageMaker ``BatchRebootClusterNodes`` on HyperPod,
+    EC2 ``RebootInstances`` in ``ec2.amazonaws.com`` on eks-managed (attempt 14
+    read the SageMaker source on an eks cluster and saw nothing). Polls through
+    CloudTrail's delivery lag for the two reboots before the full-window read;
+    the refused calls (Karpenter dry-runs) stay visible in the evidence.
+    Returns the verdict errors and the window's events."""
+
+    settings = run.settings
+    provider_name = run.warm.provider
+    source = provider_event_source(provider_name)
+    run.regional.wait_provider_events(
+        run.started_at,
+        event_names=set(provider_reboot_events(provider_name)),
+        expected_count=2,
+        event_source=source,
+    )
+    events = run.regional.provider_events(
+        run.started_at, datetime.now(timezone.utc), event_source=source
+    )
+    identities = node_reboot_identities(
+        run.preflight["provider_inventory"],
+        {
+            name: run.warm.node_snapshot(name)
+            for name in (settings.fault_node, settings.sibling_node)
+        },
+    )
+    write_json_atomic(
+        run.case_dir / "provider-events.json",
+        {
+            "provider": provider_name,
+            "event_source": source,
+            "node_identities": identities,
+            "refused_provider_calls": partition_provider_events(events)[1],
+            "events": events,
+        },
+    )
+    errors = cloudtrail_errors(
+        events,
+        settings.fault_node,
+        settings.sibling_node,
+        provider=provider_name,
+        identities=identities,
+    )
+    return errors, events
+
+
 def _data_plane_errors(
     run: _LiveRun, state: dict[str, Any]
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -1082,14 +1137,11 @@ def _data_plane_errors(
             incident_id=run.follow_up_incident_id or run.incident_id,
         )
     )
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
-    errors.extend(
-        cloudtrail_errors(provider, settings.fault_node, settings.sibling_node)
-    )
+    audit_errors, provider = provider_reboot_audit(run)
+    errors.extend(audit_errors)
     provider_before = run.preflight["provider_inventory"]
     if run.warm.provider_inventory()["count"] != provider_before["count"]:
-        errors.append("HyperPod node count changed")
+        errors.append("provider node count changed")
     if run.regional.cpu_blast_snapshot() != run.preflight["cpu_blast"]:
         errors.append("control-plane EKS state differs from baseline")
     errors.extend(

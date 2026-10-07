@@ -253,7 +253,8 @@ phases:
         只等部署 executor 的巡检按 TTL 回收；热备全程保持 cordon，不触发任何 workflow，必须在 DESTR-014 归还 spare 之前执行。
       - DESTR-014 不声明任何 warm spare（它要的正是 REPLACE_NODE 因热备不足而失败），
         执行前必须先按 DESTR-003 的 --release 归还已声明的 spare。
-      - DESTR-014 含两次真实 BatchRebootClusterNodes，必须先于 DESTR-013 执行，
+      - DESTR-014 含两次真实 provider reboot（HyperPod BatchRebootClusterNodes，eks-managed 为
+        EC2 RebootInstances），必须先于 DESTR-013 执行，
         使其落在 DESTR-013 覆盖的 CloudTrail 时间窗内。
   - sequence: 15
     name: 故障转移与约束否证

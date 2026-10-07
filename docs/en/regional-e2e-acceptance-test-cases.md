@@ -10039,8 +10039,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 
 **Two-node repair of the same job: one branch wraps up with a reboot after a known failure, the other keeps manual protection while its reboot outcome is unknown**
 
-- Level: `destructive-provider-reboot`. Two real `BatchRebootClusterNodes`
-  calls (one for node-b, one for node-c); the reboot switch stays at its default (enabled);
+- Level: `destructive-provider-reboot`. Two real provider reboots (HyperPod `BatchRebootClusterNodes`,
+  EC2 `RebootInstances` on an eks-managed cluster; one for node-b, one for node-c); the reboot switch
+  stays at its default (enabled);
   **no warm spare is declared, and calling `BatchReplaceClusterNodes` is forbidden.**
 - Both providers (preflight): the two nodes are judged with the per-provider taint rule
   (`regional_workload_inventory.blocking_node_taints`): a plain-EKS node group's standing
@@ -10365,11 +10366,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      steps of the original branch enter `superseded_step_indexes`, and
      `[RESTART_NODE, VALIDATE_GPU, VALIDATE_HOST, VALIDATE_FABRIC,
      RESTORE_SCHEDULING]` is appended, with the join now depending on the new branch tail.
-     `RESTART_NODE` submits a real reboot (CloudTrail `BatchRebootClusterNodes` with `Username` equal
-     to the executor role); the holder disappears with the reboot; the Node Agent re-registers with a
+     `RESTART_NODE` submits a real reboot (CloudTrail `BatchRebootClusterNodes`, or `RebootInstances` in the
+     `ec2.amazonaws.com` source on eks-managed, with `Username` equal to the executor role); the holder
+     disappears with the reboot; the Node Agent re-registers with a
      **new** `boot_id`; all three `VALIDATE_*` and `RESTORE_SCHEDULING` are SUCCEEDED, node-b has no
      taint and is schedulable.
-  7. node-c: `RESTART_NODE` submits a real reboot (the second `BatchRebootClusterNodes`);
+  7. node-c: `RESTART_NODE` submits a real reboot (the second provider reboot);
      the node returns to `Ready=True`, but the control plane **never** receives a new `boot_id`
      (the Agent has been disabled); the step stays WAITING until
      `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS` (compressed to 600 s by the control-plane
@@ -10390,11 +10392,16 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
       characters of `sha256(incident_id)`; the manual-reconciliation reason and the original command
       identity are preserved; there is **no** new reboot / replace workflow under that incident.
       node-b returning to scheduling must not release node-c's protection.
-  11. **Core disproof assertion**: query CloudTrail over the window recorded in step 1:
-      `BatchRebootClusterNodes` **exactly twice**,
-      `BatchReplaceClusterNodes` and `BatchDeleteClusterNodes` both `[]`
-      (enumerated verb by verb, no contains); the `list-cluster-nodes` total node count equals the
-      baseline.
+  11. **Core disproof assertion**: query CloudTrail over the window recorded in step 1 in the provider's
+      own event source (HyperPod `sagemaker.amazonaws.com`, eks-managed `ec2.amazonaws.com`), after
+      waiting out CloudTrail's delivery lag: accepted provider reboots (`BatchRebootClusterNodes` /
+      `RebootInstances`) **exactly once per node** -- attributed to node-b and node-c by the request's
+      node logical id (HyperPod) or EC2 instance id (eks-managed), so two reboots of one node, one request
+      naming both, or a reboot of a node outside the case all fail; refused calls carrying an
+      `errorCode` (Karpenter's `RunInstances` dry-runs) are set aside and not counted; among accepted
+      calls `BatchReplaceClusterNodes` and `BatchDeleteClusterNodes` (eks-managed:
+      `Run/Terminate/Stop/StartInstances`) are both `[]` (enumerated verb by verb, no contains); the
+      provider's total node count equals the baseline.
   12. The `BLAST-001` comparison is still IDENTICAL.
   13. The plan, pre-injection, post-terminal and post-cleanup snapshots are bound to the same
       release-state and key CPU/GPU Deployment template digests; any drift fails closed.
@@ -10402,8 +10409,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   while the physical outcome and the cleanup are not yet reconciled the public verdict must be
   `BLOCKED`, and the formal sequence must not continue.
   Any of the following is a blocker:
-  `RESTART_WORKLOAD` was executed or the job shows a new attempt; `BatchRebootClusterNodes`
-  is not exactly twice; any `BatchReplaceClusterNodes` / `BatchDeleteClusterNodes` appears;
+  `RESTART_WORKLOAD` was executed or the job shows a new attempt; accepted provider reboots are not
+  exactly one per node; any accepted `BatchReplaceClusterNodes` / `BatchDeleteClusterNodes`
+  (eks-managed: `Run/Terminate/Stop/StartInstances`) appears;
   node-c is still WAITING indefinitely after the bounded wait, or an unknown outcome is treated as an
   ordinary failure and replacement/restore continues;
   node-b's `RESET_GPU` fails before `VERIFY_NO_GPU_CLIENTS`
@@ -10482,7 +10490,7 @@ replacement should ever be attempted.
   - `disable` without `--now` relies on "the reboot definitely happens": if node-c's reboot is not
     submitted, the failsafe timer re-`enable`s the Agent at expiry and the round is recorded
     `INCOMPLETE`.
-  - The exactly-two `BatchRebootClusterNodes` assertion assumes no other case runs in parallel within
+  - The one-accepted-provider-reboot-per-node assertion assumes no other case runs in parallel within
     this window; running `COLLECT-004` / `COLLECT-015` in the same window pollutes the count.
 
 ### GF-REGIONAL-DESTR-013

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,12 +22,25 @@ if str(ROOT) not in sys.path:
 from gpu_fault.adapters.common import (  # noqa: E402
     quarantine_taint_value as product_quarantine_taint_value,
 )
+from gpu_fault.node_provider import parse_provider_id  # noqa: E402
 from gpu_fault.recovery_safety import (  # noqa: E402
     recovery_safety_errors,
     unresolved_details,
 )
+from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
+    partition_provider_events,
+    provider_event_source,
+    reboot_event_names,
+)
+from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
+    EC2_REPLACEMENT_MUTATIONS,
+)
 from scripts.e2e.regional.warm_spare_fixture import QUARANTINE_TAINT  # noqa: E402
 
+# The HyperPod vocabulary; ``provider_reboot_events`` / ``provider_forbidden_events``
+# select the EC2 one (RebootInstances; Run/Terminate/Stop/StartInstances in
+# ``ec2.amazonaws.com``) for an eks-managed cluster, so both providers run the
+# case under one id.
 REBOOT_EVENTS = {"BatchRebootClusterNodes", "RebootClusterNodes"}
 FORBIDDEN_EVENTS = {
     "BatchDeleteClusterNodes",
@@ -442,20 +456,126 @@ def host_errors(
     return errors
 
 
+def provider_reboot_events(provider: str | None) -> frozenset[str]:
+    """The CloudTrail event names the product's reboot leaves on ``provider``."""
+
+    return frozenset(reboot_event_names(provider or "hyperpod"))
+
+
+def provider_forbidden_events(provider: str | None) -> frozenset[str]:
+    """The provider mutations that would mean a replacement, not a reboot."""
+
+    if (provider or "hyperpod") == "eks-managed":
+        return EC2_REPLACEMENT_MUTATIONS
+    return frozenset(FORBIDDEN_EVENTS)
+
+
+def node_reboot_identities(
+    provider_inventory: Mapping[str, Any] | None,
+    nodes: Mapping[str, Mapping[str, Any] | None],
+) -> dict[str, dict[str, str | None]]:
+    """Per node name, the identities a provider reboot request can carry.
+
+    ``instance_id`` is read from the Node's ``providerID`` (the warm-spare node
+    view); ``node_logical_id`` is the provider inventory row of that instance
+    (the HyperPod logical id a ``BatchRebootClusterNodes`` names; on
+    eks-managed the row's logical id is the node name and EC2
+    ``RebootInstances`` names the instance). Either may be ``None``; the
+    verdict then refuses to attribute a reboot to that node.
+    """
+
+    rows = (provider_inventory or {}).get("nodes") or []
+    by_instance = {
+        str(row.get("instance_id")): row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("instance_id")
+    }
+    identities: dict[str, dict[str, str | None]] = {}
+    for name, view in nodes.items():
+        parsed = parse_provider_id((view or {}).get("provider_id"))
+        instance_id = parsed[1] if parsed else None
+        row = by_instance.get(instance_id) if instance_id else None
+        logical = (row or {}).get("node_logical_id")
+        identities[name] = {
+            "instance_id": instance_id,
+            "node_logical_id": str(logical) if logical else None,
+        }
+    return identities
+
+
+def _names_node(event: Mapping[str, Any], identity: Mapping[str, Any]) -> bool:
+    """True when the reboot request is the singleton naming this node."""
+
+    instance_id = identity.get("instance_id")
+    logical_id = identity.get("node_logical_id")
+    requested_instances = event.get("request_node_ids")
+    requested_logical = event.get("request_node_logical_ids")
+    return bool(
+        (instance_id and requested_instances == [instance_id])
+        or (logical_id and requested_logical == [logical_id])
+    )
+
+
 def cloudtrail_errors(
     events: list[dict[str, Any]],
     fault_node: str,
     sibling_node: str,
+    *,
+    provider: str | None = None,
+    identities: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
+    """One accepted provider reboot per node, in the provider's own CloudTrail
+    vocabulary and source, and no replacement.
+
+    ``identities`` is ``node_reboot_identities``: a reboot is attributed to a
+    node by the request's node logical id (HyperPod) or EC2 instance id
+    (eks-managed), so two reboots of one node, a batch naming both, or a reboot
+    of a node outside the case all fail. Calls AWS refused (an ``errorCode``:
+    Karpenter's ``RunInstances`` dry-runs on plain EKS) are set aside and named
+    in the count, never counted as a reboot or a replacement.
+    """
+
+    provider_name = provider or "hyperpod"
+    names = provider_reboot_events(provider_name)
+    source = provider_event_source(provider_name)
+    accepted, refused = partition_provider_events(events)
+    mutations = [item for item in accepted if isinstance(item, Mapping)]
+    reboots = [item for item in mutations if item.get("event_name") in names]
+    per_node: dict[str, list[Mapping[str, Any]]] = {fault_node: [], sibling_node: []}
+    stray = 0
+    for item in reboots:
+        targets = [
+            node
+            for node in (fault_node, sibling_node)
+            if _names_node(item, identities.get(node) or {})
+        ]
+        if item.get("event_source") == source and len(targets) == 1:
+            per_node[targets[0]].append(item)
+        else:
+            stray += 1
     errors: list[str] = []
-    reboots = [item for item in events if item.get("event_name") in REBOOT_EVENTS]
-    if len(reboots) != 2:
+    aside = f"{len(refused)} refused provider calls set aside"
+    for node in (fault_node, sibling_node):
+        identity = identities.get(node) or {}
+        if not identity.get("instance_id") and not identity.get("node_logical_id"):
+            errors.append(
+                f"{node} has no provider identity (providerID or inventory row); "
+                "its reboot cannot be attributed"
+            )
+        elif len(per_node[node]) != 1:
+            errors.append(
+                f"CloudTrail does not contain exactly one accepted {provider_name} "
+                f"reboot {sorted(names)} for {node}: got {len(per_node[node])} "
+                f"({aside})"
+            )
+    if stray:
         errors.append(
-            "CloudTrail does not contain exactly two BatchRebootClusterNodes "
-            f"(one per node): got {len(reboots)}"
+            f"CloudTrail contains {stray} accepted reboot call(s) in {source} "
+            "not attributable to exactly one case node"
         )
-    for item in events:
-        if item.get("event_name") in FORBIDDEN_EVENTS:
+    forbidden = provider_forbidden_events(provider_name)
+    for item in mutations:
+        if item.get("event_name") in forbidden:
             errors.append(
                 f"CloudTrail contains a forbidden mutation: {item['event_name']}"
             )

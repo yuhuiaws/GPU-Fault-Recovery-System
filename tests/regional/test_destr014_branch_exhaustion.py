@@ -440,25 +440,6 @@ def _event(name: str) -> dict[str, str]:
     }
 
 
-def test_cloudtrail_requires_exactly_two_reboots_and_no_replace() -> None:
-    two = [_event("BatchRebootClusterNodes"), _event("BatchRebootClusterNodes")]
-    assert destr014.cloudtrail_errors(two, FAULT, SIBLING) == []
-    one = destr014.cloudtrail_errors(two[:1], FAULT, SIBLING)
-    assert any("BatchRebootClusterNodes" in item for item in one), one
-    three = destr014.cloudtrail_errors(
-        [*two, _event("RebootClusterNodes")], FAULT, SIBLING
-    )
-    assert three, "three reboots must be refused"
-    replaced = destr014.cloudtrail_errors(
-        [*two, _event("BatchReplaceClusterNodes")], FAULT, SIBLING
-    )
-    assert any("BatchReplaceClusterNodes" in item for item in replaced), replaced
-    deleted = destr014.cloudtrail_errors(
-        [*two, _event("BatchDeleteClusterNodes")], FAULT, SIBLING
-    )
-    assert any("BatchDeleteClusterNodes" in item for item in deleted), deleted
-
-
 def _ledger_row(command_id: str, operation: str, state: str, completed: str) -> dict:
     return {
         "command_id": command_id,

@@ -17,6 +17,12 @@ from tests.regional import test_destr014_branch_exhaustion as verdicts
 from tests.regional.test_destr014_recovery_controller import ProbeTransport
 from tests.regional.test_destr014_recovery_probe import HostHarness
 
+# The EC2 instance behind each node's providerID (synthetic ids only).
+INSTANCE_IDS = {
+    verdicts.FAULT: "i-00000000000000001",
+    verdicts.SIBLING: "i-00000000000000002",
+}
+
 
 class RunnerHarness:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -37,6 +43,7 @@ class RunnerHarness:
         self.case_dir = self.directory / "cases" / case.CASE_ID
         self.case_dir.mkdir(parents=True)
         self.calls: list[str] = []
+        self.provider_sources: list[str | None] = []
         self.failures: dict[str, BaseException] = {}
         self.advance: dict[str, float] = {}
         self.probe_residuals: dict[str, bool] = {}
@@ -93,7 +100,7 @@ class RunnerHarness:
             "store": {
                 "profile": {"profile_version": self.host.scope["profile_version"]}
             },
-            "provider_inventory": {"count": 2, "sha256": "inventory"},
+            "provider_inventory": self.provider_inventory(),
             "cpu_blast": {"unchanged": True},
             "control_env": {"poll_interval_seconds": 5},
         }
@@ -202,6 +209,23 @@ class RunnerHarness:
         self.event("workload.running")
         return {"pods": [{"uid": "pod-one"}, {"uid": "pod-two"}]}
 
+    def provider_inventory(self) -> dict[str, Any]:
+        """The HyperPod inventory rows the live preflight records: the EC2
+        instance behind each node and its logical id."""
+
+        return {
+            "count": 2,
+            "sha256": "inventory",
+            "nodes": [
+                {
+                    "instance_id": INSTANCE_IDS[node],
+                    "node_logical_id": f"logical-{node}",
+                    "status": "Running",
+                }
+                for node in (verdicts.FAULT, verdicts.SIBLING)
+            ],
+        }
+
     def read_preflight(self, *_args: Any) -> dict[str, Any]:
         self.event("preflight.read")
         return copy.deepcopy(self.preflight)
@@ -249,9 +273,33 @@ class RunnerHarness:
                 else {},
             }
 
-        def provider(*args: Any) -> list[dict[str, str]]:
+        def provider(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            # The live HyperPod shape: one accepted BatchRebootClusterNodes per
+            # node, each naming its logical id in the SageMaker source.
             self.event("provider.events")
-            return [{"event_name": "BatchRebootClusterNodes"}] * 2
+            self.provider_sources.append(kwargs.get("event_source"))
+            return [
+                {
+                    "event_name": "BatchRebootClusterNodes",
+                    "event_source": "sagemaker.amazonaws.com",
+                    "api_error": False,
+                    "api_error_code": None,
+                    "request_node_ids": None,
+                    "request_node_logical_ids": [f"logical-{node}"],
+                    "response_failed_node_count": 0,
+                }
+                for node in (verdicts.FAULT, verdicts.SIBLING)
+            ]
+
+        def wait_provider(started_at: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            self.event("provider.wait")
+            return [
+                item
+                for item in provider(
+                    started_at, event_source=kwargs.get("event_source")
+                )
+                if item["event_name"] in kwargs["event_names"]
+            ]
 
         return SimpleNamespace(
             settings=self.settings.regional,
@@ -267,6 +315,7 @@ class RunnerHarness:
             wait_node_ready=lambda *args, **kwargs: self.event("node.ready"),
             node_snapshot=node,
             provider_events=provider,
+            wait_provider_events=wait_provider,
             cpu_blast_snapshot=lambda: {"unchanged": True},
             release_id=lambda: self.live_release,
         )
@@ -279,7 +328,13 @@ class RunnerHarness:
             return {"workflow_request_id": "restore-test"}
 
         return SimpleNamespace(
-            provider_inventory=lambda: {"count": 2},
+            provider="hyperpod",
+            provider_inventory=self.provider_inventory,
+            node_snapshot=lambda node: {
+                "name": node,
+                "uid": self.node_uids[node],
+                "provider_id": f"aws:///us-west-2a/{INSTANCE_IDS[node]}",
+            },
             wait_incident_idle=lambda *_args: self.event("quiescence"),
             reactivate_agent=lambda *_args: self.event("agent.reactivate"),
             create_restore_workflow=create,

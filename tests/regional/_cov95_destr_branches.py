@@ -116,6 +116,11 @@ def branch_pods(*, restarted: bool = False) -> list[dict[str, Any]]:
     ]
 
 
+# The EC2 instance behind each node's providerID (synthetic ids only); the
+# provider inventory rows and CloudTrail reboot requests name these.
+INSTANCE_IDS = dict(zip(NODES, ("i-00000000000000001", "i-00000000000000002")))
+
+
 class BranchHarness:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         site = tmp_path / "site.yaml"
@@ -140,6 +145,7 @@ class BranchHarness:
             node: {
                 "name": node,
                 "uid": f"uid-{node}",
+                "provider_id": f"aws:///us-west-2a/{INSTANCE_IDS[node]}",
                 "boot_id": f"boot-{node}",
                 "ready": "True",
                 "unschedulable": False,
@@ -670,9 +676,19 @@ class BranchRegional:
             "workflow": {"request_id": request},
         }
 
-    def provider_events(self, *args: Any) -> list[dict[str, Any]]:
-        self.h.call("provider.events")
+    def provider_events(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self.h.call("provider.events", kwargs.get("event_source"))
         return deepcopy(self.h.events)
+
+    def wait_provider_events(
+        self, started_at: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        self.h.call("provider.wait", kwargs.get("event_source"))
+        return [
+            deepcopy(item)
+            for item in self.h.events
+            if item.get("event_name") in kwargs["event_names"]
+        ]
 
     def provider_events_provisional(self, *args: Any) -> bool:
         return True
