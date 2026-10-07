@@ -23,6 +23,9 @@ PINS = {
     "cluster_id": "test-cluster",
     "node": "test-node",
     "node_uid": "test-node-uid",
+    # HyperPod shape by default: the Agent is bound to the Node UID. The eks
+    # tests rewrite the env with an EC2 instance id.
+    "agent_identity": "test-node-uid",
     "artifact_sha256": "a" * 64,
     "bundle_sha256": "b" * 64,
     "profile_version": "test-profile",
@@ -70,7 +73,7 @@ class Host:
         python = write(self.roots / "usr/bin/python3", "independent Python")
         env = write(
             self.roots / "etc/node-agent.env",
-            "\n".join(f"{probe.PIN_KEYS[k]}={v}" for k, v in PINS.items()),
+            "\n".join(f"{env}={PINS[k]}" for k, env in probe.PIN_KEYS.items()),
         )
         fake_paths = {
             "ROOT": root,
@@ -156,7 +159,9 @@ class Host:
             "case_id": CASE,
             "run_id": "test-service-run",
             "owner": "c" * 32,
-            **{k: PINS[k] for k in ("cluster_id", "node", "node_uid")},
+            **{
+                k: PINS[k] for k in ("cluster_id", "node", "node_uid", "agent_identity")
+            },
             "release_id": "test-release",
             "plan_sha256": "d" * 64,
             "helper_sha256": hashlib.sha256(

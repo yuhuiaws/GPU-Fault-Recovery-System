@@ -92,6 +92,57 @@ def require_report(
                 )
 
 
+def baseline_refusals(
+    snapshot: Any, *, service: str, scope: dict[str, Any]
+) -> list[str]:
+    """Why the host's service baseline is not the approved target, by name.
+
+    Each refusal names the condition and what was observed -- the service
+    unit, the pins (cluster id, node name, the Agent's identity) and the
+    systemd state fields -- none of which is a secret. The pins are compared
+    against the provider-aware scope: ``agent_identity`` is the Node UID on
+    HyperPod and the EC2 instance id on ``eks-managed``.
+    """
+
+    if not isinstance(snapshot, dict):
+        return [f"snapshot is {type(snapshot).__name__}, not a JSON object"]
+    refusals: list[str] = []
+    if snapshot.get("service") != service:
+        refusals.append(f"service is {snapshot.get('service')!r}, not {service!r}")
+    pins = snapshot.get("pins")
+    if not isinstance(pins, dict):
+        refusals.append(f"snapshot has no pins ({type(pins).__name__})")
+    else:
+        for key in ("cluster_id", "node", "agent_identity"):
+            if pins.get(key) != scope[key]:
+                refusals.append(
+                    f"pin {key} is {pins.get(key)!r}, approved target {scope[key]!r}"
+                )
+    state = snapshot.get("state")
+    if not isinstance(state, dict):
+        refusals.append(f"snapshot has no state ({type(state).__name__})")
+        return refusals
+    missing = sorted(probe.STATE_FIELDS - state.keys())
+    if missing:
+        refusals.append(f"state lacks fields {missing} (observed {sorted(state)})")
+    elif not probe.running(state):
+        refusals.append(
+            "service is not running: "
+            + ", ".join(
+                f"{key}={state.get(key)!r}"
+                for key in (
+                    "LoadState",
+                    "ActiveState",
+                    "SubState",
+                    "Job",
+                    "MainPID",
+                    "ControlPID",
+                )
+            )
+        )
+    return refusals
+
+
 class ServiceWindowController:
     def __init__(
         self,
@@ -99,11 +150,18 @@ class ServiceWindowController:
         *,
         cluster_id: str,
         node_uid: str,
+        agent_identity: str,
         plan_sha256: str,
         release_id: str,
         maintenance_expires_at: datetime,
         read_node_uid: Callable[[], str],
     ) -> None:
+        """``agent_identity`` is what the node's provider installer bound the
+        Agent to (``node_agent_identity.agent_node_identity``): the Node UID on
+        HyperPod, the EC2 instance id on ``eks-managed``. The host probe pins
+        the service baseline to the Agent's own ``GPU_FAULT_NODE_INSTANCE_ID``,
+        which is this -- comparing it with ``node_uid`` refused every eks stop."""
+
         self.host = host
         self.read_node_uid = read_node_uid
         if (
@@ -117,6 +175,7 @@ class ServiceWindowController:
         for key, value in (
             ("cluster ID", cluster_id),
             ("Node UID", node_uid),
+            ("Agent identity", agent_identity),
             ("release ID", release_id),
         ):
             probe.safe_id(value, key)
@@ -141,6 +200,7 @@ class ServiceWindowController:
             **self.host_scope,
             "cluster_id": cluster_id,
             "node_uid": node_uid,
+            "agent_identity": agent_identity,
             "plan_sha256": plan_sha256,
             "release_id": release_id,
             "maintenance_expires_at": int(maintenance_expires_at.timestamp()),
@@ -292,6 +352,7 @@ class ServiceWindowController:
             "cluster_id",
             "node",
             "node_uid",
+            "agent_identity",
             "release_id",
             "plan_sha256",
         ):
@@ -378,19 +439,11 @@ class ServiceWindowController:
         snapshot = self.invoke(
             lambda: self.host.execute("snapshot", "--service", service)
         )
-        pins = snapshot.get("pins")
-        if (
-            snapshot.get("service") != service
-            or not isinstance(pins, dict)
-            or any(
-                pins.get(k) != self.scope[k] for k in ("cluster_id", "node", "node_uid")
-            )
-            or not isinstance(snapshot.get("state"), dict)
-            or not probe.STATE_FIELDS <= snapshot["state"].keys()
-            or not probe.running(snapshot["state"])
-        ):
+        refusals = baseline_refusals(snapshot, service=service, scope=self.scope)
+        if refusals:
             raise RegionalFixtureError(
-                "service baseline does not match the approved target"
+                "service baseline does not match the approved target: "
+                + "; ".join(refusals)
             )
         now = int(time.time())
         binding = {
@@ -402,6 +455,7 @@ class ServiceWindowController:
                     "cluster_id",
                     "node",
                     "node_uid",
+                    "agent_identity",
                     "release_id",
                     "plan_sha256",
                 )

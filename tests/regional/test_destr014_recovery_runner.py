@@ -80,6 +80,7 @@ class RunnerHarness:
                 "uid": self.node_uids[verdicts.SIBLING],
                 "boot_id": self.host.boot,
             },
+            "sibling_identity": self.node_uids[verdicts.SIBLING],
             "recovery_agent": {
                 "node_instance_id": self.node_uids[verdicts.SIBLING],
                 "artifact_sha256": self.host.scope["artifact_sha256"],

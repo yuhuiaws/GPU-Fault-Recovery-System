@@ -20,7 +20,6 @@ from scripts.e2e.regional.destr014_verdicts import (
     estimated_duration_seconds,
     lifetime_errors,
 )
-from gpu_fault.node_provider import parse_provider_id
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -28,10 +27,8 @@ from scripts.e2e.regional.regional_live_fixture import (
     component_python,
 )
 from scripts.e2e.regional import warm_spare_provider
-from scripts.e2e.regional.regional_workload_inventory import (
-    blocking_node_taints,
-    node_provider,
-)
+from scripts.e2e.regional.node_agent_identity import agent_node_identity
+from scripts.e2e.regional.regional_workload_inventory import blocking_node_taints
 from scripts.e2e.regional.warm_spare_fixture import SPARE_LABEL
 
 
@@ -269,22 +266,6 @@ def preflight_errors(
         )
     )
     return errors
-
-
-def agent_node_identity(node: dict[str, Any]) -> str | None:
-    """The identity the node's Agent records as ``node_instance_id``.
-
-    HyperPod installs record the Kubernetes Node UID; a plain-EKS install
-    records the EC2 instance id behind the Node's ``providerID`` (the join
-    binds the Agent to the instance the eks adapter reboots). ``None`` when
-    the node view lacks the fact its provider needs -- fail-closed.
-    """
-
-    if node_provider(node.get("labels")) == "eks-managed":
-        parsed = parse_provider_id(node.get("provider_id"))
-        return parsed[1] if parsed else None
-    uid = node.get("uid")
-    return str(uid) if uid else None
 
 
 def managed_recovery_errors(seconds: int) -> list[str]:

@@ -23,6 +23,9 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
 )
+from scripts.e2e.regional.node_agent_identity import (  # noqa: E402
+    agent_node_identity,
+)
 from scripts.e2e.regional import warm_spare_provider  # noqa: E402
 from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -37,6 +40,7 @@ SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
 SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
+HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
 EKS_NODEGROUP_LABEL = warm_spare_provider.EKS_NODEGROUP_LABEL
 NODE_PATCH_ATTEMPTS = 3
@@ -564,6 +568,7 @@ class WarmSpareLiveFixture:
                 for key in (
                     SPARE_LABEL,
                     HYPERPOD_HEALTH_LABEL,
+                    HYPERPOD_CLUSTER_LABEL,
                     INSTANCE_GROUP_LABEL,
                     EKS_NODEGROUP_LABEL,
                     *INSTANCE_TYPE_LABELS,
@@ -1428,10 +1433,14 @@ class WarmSpareServiceFixture:
             )
         )
         self.run_id = run_id
+        identity = agent_node_identity(warm.node_snapshot(node))
+        if not identity:
+            raise RegionalFixtureError(f"{node} has no provider-side Agent identity")
         self.window = ServiceWindowController(
             self.host,
             cluster_id=warm.regional.settings.cluster_id,
             node_uid=node_uid,
+            agent_identity=identity,
             plan_sha256=plan_sha256,
             release_id=release_id,
             maintenance_expires_at=maintenance_expires_at,

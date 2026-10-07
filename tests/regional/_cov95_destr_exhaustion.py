@@ -136,6 +136,10 @@ class ExhaustionHarness(BranchHarness):
         for node in self.nodes.values():
             node.update(
                 labels={
+                    # A HyperPod node carries the cluster label; the Agent
+                    # identity rule reads the provider from it (no label at
+                    # all means "cannot tell" and fails closed).
+                    "sagemaker.amazonaws.com/cluster-name": "hp",
                     INSTANCE_GROUP_LABEL: "group-a",
                     "node.kubernetes.io/instance-type": "p4d.24xlarge",
                 },

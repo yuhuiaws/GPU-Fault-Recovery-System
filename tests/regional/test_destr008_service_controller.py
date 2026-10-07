@@ -24,6 +24,7 @@ def build(transport: Transport, **overrides: Any) -> controller.ServiceWindowCon
     kwargs = {
         "cluster_id": PINS["cluster_id"],
         "node_uid": PINS["node_uid"],
+        "agent_identity": PINS["agent_identity"],
         "plan_sha256": "d" * 64,
         "release_id": "test-release",
         "maintenance_expires_at": datetime.fromtimestamp(2_000_001_200, timezone.utc),
@@ -326,7 +327,10 @@ def test_fixture_facade_resume_uses_journals_and_never_sets_service_name(
                 cluster_id=PINS["cluster_id"],
             )
         ),
-        node_snapshot=lambda _node: {"uid": PINS["node_uid"]},
+        node_snapshot=lambda _node: {
+            "uid": PINS["node_uid"],
+            "labels": {"sagemaker.amazonaws.com/cluster-name": "hp"},
+        },
     )
     monkeypatch.setattr(fixture, "HostProbeFixture", lambda _settings: transport)
     kwargs = {
@@ -390,7 +394,8 @@ settings = HostProbeSettings(kubeconfig=Path(sys.argv[1]), context="test-context
  case_id="GF-REGIONAL-DESTR-008", run_id="test-child-run",
  probe_script=Path(sys.argv[2]), state_directory=Path(sys.argv[1]).parent)
 window = ServiceWindowController(HostProbeFixture(settings), cluster_id="test-cluster",
- node_uid="test-node-uid", plan_sha256="d"*64, release_id="test-release",
+ node_uid="test-node-uid", agent_identity="test-node-uid", plan_sha256="d"*64,
+ release_id="test-release",
  maintenance_expires_at=datetime.fromtimestamp(2000001200, timezone.utc),
  read_node_uid=lambda: "test-node-uid")
 window.acquire(existing=False)
@@ -411,6 +416,7 @@ os._exit(17)
         host,
         cluster_id="test-cluster",
         node_uid="test-node-uid",
+        agent_identity="test-node-uid",
         plan_sha256="d" * 64,
         release_id="test-release",
         maintenance_expires_at=datetime.fromtimestamp(2_000_001_200, timezone.utc),
@@ -425,6 +431,7 @@ os._exit(17)
             host,
             cluster_id="test-cluster",
             node_uid="test-node-uid",
+            agent_identity="test-node-uid",
             plan_sha256="d" * 64,
             release_id="test-release",
             maintenance_expires_at=datetime.fromtimestamp(2_000_001_200, timezone.utc),
@@ -708,3 +715,209 @@ def test_controller_lock_must_be_private(setup: Any) -> None:
     with pytest.raises(RegionalFixtureError, match="lock is not private"):
         setup.window.create()
     assert setup.transport.creates == 0
+
+
+EKS_INSTANCE = "i-00000000000000001"
+
+
+def _eks_agent_env(host: Host) -> None:
+    """The node's Agent env as a plain-EKS install writes it: the instance id."""
+
+    pins = {**PINS, "agent_identity": EKS_INSTANCE}
+    write(
+        host.roots / "etc/node-agent.env",
+        "\n".join(f"{env}={pins[k]}" for k, env in probe.PIN_KEYS.items()),
+    )
+
+
+def test_eks_service_window_pins_the_baseline_to_the_agents_instance_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live eks-managed DESTR-008 attempt 12, scenario kubernetes-not-ready: the
+    Agent env carries the EC2 instance id, the controller compared it with the
+    Kubernetes Node UID and refused "service baseline does not match the approved
+    target" before stopping kubelet; the matrix stopped there."""
+    monkeypatch.setenv("INVOCATION_ID", "a" * 32)
+    host = Host(tmp_path, monkeypatch)
+    _eks_agent_env(host)
+    transport = Transport(host, tmp_path / "controller")
+    window = build(transport, agent_identity=EKS_INSTANCE)
+    try:
+        window.create()
+        assert window.stop("kubelet.service", delay_seconds=15)["phase"] == "SCHEDULED"
+        binding = probe.private_read(window.path)["binding"]
+        assert (binding["node_uid"], binding["agent_identity"]) == (
+            PINS["node_uid"],
+            EKS_INSTANCE,
+        ), "the binding keeps the Node UID and carries the Agent's identity apart"
+        host.fire_stop()
+        assert window.restore()["phase"] == "RESTORED"
+        residuals = window.cleanup()
+        assert all(v is False for v in residuals.values()), residuals
+    finally:
+        window.close()
+
+
+def test_the_refusal_names_the_mismatched_pin_and_what_was_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INVOCATION_ID", "a" * 32)
+    host = Host(tmp_path, monkeypatch)
+    _eks_agent_env(host)
+    transport = Transport(host, tmp_path / "controller")
+    window = build(transport)  # a Node-UID expectation against an eks Agent
+    try:
+        window.create()
+        with pytest.raises(RegionalFixtureError) as refused:
+            window.stop("kubelet.service", delay_seconds=15)
+    finally:
+        window.close()
+    message = str(refused.value)
+    assert message.startswith(
+        "service baseline does not match the approved target: "
+    ), message
+    assert (
+        f"pin agent_identity is {EKS_INSTANCE!r}, approved target {PINS['node_uid']!r}"
+        in message
+    ), message
+    assert "pin cluster_id" not in message and "pin node " not in message, message
+    assert transport.commands == ["snapshot"], "nothing was armed or stopped"
+
+
+def test_baseline_refusals_name_every_failing_condition() -> None:
+    scope = {
+        "cluster_id": "cluster-a",
+        "node": "node-a",
+        "agent_identity": EKS_INSTANCE,
+    }
+    running = {
+        "Id": "kubelet.service",
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "running",
+        "UnitFileState": "enabled",
+        "MainPID": "4242",
+        "ControlPID": "0",
+        "InvocationID": "b" * 32,
+        "ExecMainStartTimestampMonotonic": "1000",
+        "Job": "",
+    }
+    good = {"service": "kubelet.service", "pins": dict(scope), "state": running}
+    assert (
+        controller.baseline_refusals(good, service="kubelet.service", scope=scope) == []
+    )
+    assert controller.baseline_refusals(
+        None, service="kubelet.service", scope=scope
+    ) == ["snapshot is NoneType, not a JSON object"]
+
+    other = {**good, "service": "gpu-fault-node-agent.service"}
+    assert controller.baseline_refusals(
+        other, service="kubelet.service", scope=scope
+    ) == ["service is 'gpu-fault-node-agent.service', not 'kubelet.service'"]
+
+    pinless = {**good, "pins": None}
+    assert controller.baseline_refusals(
+        pinless, service="kubelet.service", scope=scope
+    ) == ["snapshot has no pins (NoneType)"]
+
+    stale = {
+        **good,
+        "state": {k: v for k, v in running.items() if k not in {"Job", "MainPID"}},
+    }
+    (refusal,) = controller.baseline_refusals(
+        stale, service="kubelet.service", scope=scope
+    )
+    assert refusal.startswith("state lacks fields ['Job', 'MainPID'] (observed ["), (
+        refusal
+    )
+
+    stopped = {
+        **good,
+        "state": {**running, "ActiveState": "inactive", "SubState": "dead"},
+    }
+    (refusal,) = controller.baseline_refusals(
+        stopped, service="kubelet.service", scope=scope
+    )
+    assert refusal == (
+        "service is not running: LoadState='loaded', ActiveState='inactive', "
+        "SubState='dead', Job='', MainPID='4242', ControlPID='0'"
+    )
+
+    moved = {**good, "pins": {**scope, "node": "node-b", "agent_identity": "uid-a"}}
+    assert controller.baseline_refusals(
+        moved, service="kubelet.service", scope=scope
+    ) == [
+        "pin node is 'node-b', approved target 'node-a'",
+        f"pin agent_identity is 'uid-a', approved target {EKS_INSTANCE!r}",
+    ]
+
+
+def test_fixture_facade_derives_the_agent_identity_from_the_nodes_provider(
+    setup: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = setup.transport
+    settings = transport.settings
+    monkeypatch.setattr(fixture, "HostProbeFixture", lambda _settings: transport)
+    kwargs = {
+        "node": settings.node,
+        "image": settings.image,
+        "case_id": CASE,
+        "run_id": settings.run_id,
+        "state_directory": settings.state_directory,
+        "node_uid": PINS["node_uid"],
+        "plan_sha256": "d" * 64,
+        "release_id": "test-release",
+        "maintenance_expires_at": datetime.fromtimestamp(2_000_001_200, timezone.utc),
+    }
+
+    def warm(snapshot: dict[str, Any]) -> Any:
+        return cast(
+            fixture.WarmSpareLiveFixture,
+            SimpleNamespace(
+                regional=SimpleNamespace(
+                    settings=SimpleNamespace(
+                        gpu_kubeconfig=settings.kubeconfig,
+                        gpu_context=settings.context,
+                        namespace=settings.namespace,
+                        cluster_id=PINS["cluster_id"],
+                    )
+                ),
+                node_snapshot=lambda _node: snapshot,
+            ),
+        )
+
+    eks = fixture.WarmSpareServiceFixture(
+        warm(
+            {
+                "uid": PINS["node_uid"],
+                "labels": {
+                    "eks.amazonaws.com/nodegroup": "gpu-p5en-efa-spot-node-group"
+                },
+                "provider_id": f"aws:///us-west-2c/{EKS_INSTANCE}",
+            }
+        ),
+        **kwargs,
+    )
+    assert eks.window.scope["agent_identity"] == EKS_INSTANCE
+    assert eks.window.scope["node_uid"] == PINS["node_uid"]
+    hyperpod = fixture.WarmSpareServiceFixture(
+        warm(
+            {
+                "uid": PINS["node_uid"],
+                "labels": {"sagemaker.amazonaws.com/cluster-name": "hp"},
+                "provider_id": f"aws:///us-west-2c/{EKS_INSTANCE}",
+            }
+        ),
+        **kwargs,
+    )
+    assert hyperpod.window.scope["agent_identity"] == PINS["node_uid"]
+    with pytest.raises(RegionalFixtureError, match="no provider-side Agent identity"):
+        fixture.WarmSpareServiceFixture(
+            warm(
+                {
+                    "uid": PINS["node_uid"],
+                    "labels": {"eks.amazonaws.com/nodegroup": "g"},
+                }
+            ),
+            **kwargs,
+        )

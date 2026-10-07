@@ -80,3 +80,31 @@ def test_an_unknown_node_identity_fails_closed() -> None:
     assert agent_node_identity({"labels": {"eks.amazonaws.com/nodegroup": "g"}}) is None
     with pytest.raises(RegionalFixtureError, match="expects None"):
         _binding(_agent(INSTANCE), None)
+
+
+def test_the_plain_node_projection_never_yields_an_identity() -> None:
+    """Live eks-managed attempt 12: the binding was fed ``regional.node_snapshot``
+    (no labels, no providerID), the helper fell back to the Node UID and the
+    execute path refused the Agent that correctly recorded the instance id."""
+    projection = {
+        "name": SCOPE["node"],
+        "uid": UID,
+        "boot_id": "boot-sibling",
+        "ready": "True",
+        "taints": [],
+        "ownership_annotations": {},
+    }
+    assert agent_node_identity(projection) is None, (
+        "a view that cannot tell its provider must not guess the Node UID"
+    )
+    warm_view = {
+        **projection,
+        "labels": {
+            "eks.amazonaws.com/nodegroup": "gpu-p5en-efa-spot-node-group",
+            "node.kubernetes.io/instance-type": "p5en.48xlarge",
+        },
+        "provider_id": f"aws:///us-west-2c/{INSTANCE}",
+    }
+    assert agent_node_identity(warm_view) == INSTANCE
+    binding = _binding(_agent(INSTANCE), agent_node_identity(warm_view))
+    assert binding["node_uid"] == UID

@@ -398,6 +398,11 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "release_id": state.get("release_id"),
         "fault_node": regional.node_snapshot(settings.fault_node),
         "sibling_node": regional.node_snapshot(settings.sibling_node),
+        # The identity the sibling's Agent must carry, read from the warm-spare
+        # node view (labels + providerID): the plain projection above has
+        # neither, and resolving it from there fell back to the Node UID on an
+        # eks node whose Agent correctly records the instance id (attempt 12).
+        "sibling_identity": agent_node_identity(sibling),
         "arbiter_pods": arbiter_pods,
         "dns_nodes": dns_nodes,
         "store": state,
@@ -850,7 +855,7 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         agent=run.preflight["recovery_agent"],
         restore_at=restore_at,
         expires_at=expires_at,
-        node_identity=agent_node_identity(run.preflight["sibling_node"]),
+        node_identity=run.preflight.get("sibling_identity"),
     )
     run.recovery_window.arm(binding)
     run.agent_disabled = True

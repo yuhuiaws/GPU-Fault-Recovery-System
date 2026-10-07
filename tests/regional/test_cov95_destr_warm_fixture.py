@@ -387,7 +387,10 @@ def test_holder_and_service_fixture_keep_deadline_and_private_probe_state(
                 cluster_id=PINS["cluster_id"],
             )
         ),
-        node_snapshot=lambda _node: {"uid": PINS["node_uid"]},
+        node_snapshot=lambda _node: {
+            "uid": PINS["node_uid"],
+            "labels": {"sagemaker.amazonaws.com/cluster-name": "hp"},
+        },
     )
 
     def build(settings: Any) -> Any:

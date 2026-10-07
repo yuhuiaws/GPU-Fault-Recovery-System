@@ -102,7 +102,9 @@ def test_prepare_rejects_drift_and_nonrenewable_deadline(
             }[defect]
         ] = "f" * 64
     elif defect == "node":
-        binding["node_uid"] = "another-node-uid"
+        # The probe pins the baseline to the Agent's own identity (the Node UID
+        # on HyperPod, the EC2 instance id on eks), never to a Node UID.
+        binding["agent_identity"] = "another-agent-identity"
     elif defect == "boot":
         binding["boot_id"] = "another-boot"
     else:

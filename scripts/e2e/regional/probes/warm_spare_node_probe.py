@@ -44,7 +44,10 @@ HEX = re.compile(r"[0-9a-f]{64}")
 PIN_KEYS = {
     "cluster_id": "GPU_FAULT_NODE_CLUSTER_ID",
     "node": "NODE_NAME",
-    "node_uid": "GPU_FAULT_NODE_INSTANCE_ID",
+    # What the provider's installer bound the Agent to: the Kubernetes Node UID
+    # on HyperPod, the EC2 instance id on eks-managed. Never compared with a
+    # Node UID; the controller supplies the provider-aware expectation.
+    "agent_identity": "GPU_FAULT_NODE_INSTANCE_ID",
     "artifact_sha256": "GPU_FAULT_NODE_ARTIFACT_SHA256",
     "bundle_sha256": "GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256",
     "profile_version": "GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION",
@@ -56,6 +59,7 @@ BINDING_KEYS = {
     "cluster_id",
     "node",
     "node_uid",
+    "agent_identity",
     "release_id",
     "plan_sha256",
     "helper_sha256",
@@ -652,18 +656,28 @@ class ServiceWindow:
     def initialize(self) -> None:
         baseline = definition(self.service)
         before = service_snapshot(self.service)
-        if (
-            not running(before)
-            or digest({"definition": baseline, "state": before})
-            != self.binding["baseline_sha256"]
-            or baseline["host_sha256"] != self.binding["host_sha256"]
-            or baseline["boot_id"] != self.binding["boot_id"]
-            or any(
-                baseline["pins"][k] != self.binding[k]
-                for k in ("cluster_id", "node", "node_uid")
+        changed = [
+            name
+            for name, differs in (
+                ("running", not running(before)),
+                (
+                    "baseline_sha256",
+                    digest({"definition": baseline, "state": before})
+                    != self.binding["baseline_sha256"],
+                ),
+                ("host_sha256", baseline["host_sha256"] != self.binding["host_sha256"]),
+                ("boot_id", baseline["boot_id"] != self.binding["boot_id"]),
+                *(
+                    (f"pins.{k}", baseline["pins"][k] != self.binding[k])
+                    for k in ("cluster_id", "node", "agent_identity")
+                ),
             )
-        ):
-            raise ProbeError("service baseline or host binding changed")
+            if differs
+        ]
+        if changed:
+            raise ProbeError(
+                "service baseline or host binding changed: " + ", ".join(changed)
+            )
         now = time.time()
         elapsed = boot_seconds()
         self.record = {

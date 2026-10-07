@@ -9542,7 +9542,13 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   Before S3 stops kubelet and S6 stops the Node Agent, the host probe first creates an independent recovery
   service with a fixed deadline plus a stop service/timer, and verifies the ARMED state of the independent invocation. The runner uses a 420-second
   recovery interval, S3 additionally has a 15-second stop delay, and recovery has a further fixed 180-second wrap-up budget.
-  This window does not modify the original services' enablement and cannot be extended by retries.
+  This window does not modify the original services' enablement and cannot be extended by retries. The host probe pins the
+  service baseline to the node Agent's own identity (`GPU_FAULT_NODE_INSTANCE_ID` in `/etc/gpu-fault/node-agent.env`, pin
+  `agent_identity`): the Kubernetes Node UID on HyperPod, the EC2 instance id behind `providerID` on `eks-managed`
+  (`node_agent_identity.agent_node_identity`, shared with DESTR-014); the controller used to compare it with the Node UID, and
+  on eks attempt 12 S3 refused before stopping kubelet with "service baseline does not match the approved target" and the
+  matrix stopped. The refusal now names each failing condition with what was observed (service, pins, state fields/states --
+  never a secret). Judgement: `tests/regional/test_destr008_service_controller.py`.
   The stop-service action of these two scenarios **must be placed after the workload is Running and before the synthetic
   replacement signal is emitted** (the runner's `apply_late()`); it cannot be grouped with the label/annotation
   injections at the start of the scenario: the stopped unit is only effective until the failsafe timer expires, and submitting the
@@ -10008,8 +10014,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   closed). An earlier `eks-managed` attempt refused both Ready, uncordoned nodes for the GPU taint and the sibling's
   identity for carrying the instance id. The execute path's host recovery binding (`destr014_recovery.make_binding`)
   checks the sibling Agent against the same provider identity (it used to compare the Node UID alone, and an eks run
-  the preflight had accepted stopped there with "Agent and Node UID differ"); the binding itself still keys on the
-  Node UID. Judgement: `tests/regional/test_destr014_binding_identity.py`.
+  the preflight had accepted stopped there with "Agent and Node UID differ"); the preflight resolves that identity from
+  the warm-spare node view (labels + `providerID`) and records it as `sibling_identity` in `preflight.json` -- the plain
+  `regional.node_snapshot` projection has neither, resolving from it fell back to the Node UID and refused an Agent that
+  correctly recorded the instance id (attempt 12); `node_agent_identity.agent_node_identity` answers None for a view that
+  cannot tell its provider (fail-closed) instead of falling back. The binding itself still keys on the Node UID.
+  Judgement: `tests/regional/test_destr014_binding_identity.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr014_branch_exhaustion.py`. By default it only generates the
   plan; before execute it must read `DESTR-008=PASS` (chain: `010 → 001 → 002 → 009 →
